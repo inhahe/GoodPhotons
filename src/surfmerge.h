@@ -137,12 +137,12 @@ struct SurfMis {
 struct SurfPhoton {
     Vec3  p{0, 0, 0};
     Vec3  wo{0, 0, 0};         // unit, toward the PREVIOUS light vertex
-    float nx = 0.0f, ny = 0.0f, nz = 0.0f;   // the surface's geometric normal there, unoriented
     float lambda = 0.0f;
     float beta   = 0.0f;       // throughput carried here at `lambda` (emission + 1/p(lam) in)
     float cx = 0.0f, cy = 0.0f, cz = 0.0f;   // cie{X,Y,Z}(lambda), cached at store time
     unsigned misIdx = 0;
 };
+static_assert(sizeof(SurfPhoton) == 72, "SurfPhoton's size is quoted in -jsurf-count's memory notes");
 
 // A per-thread bank, merged into the map at the end of the light pass (mirrors BeamBank).
 struct SurfBank {

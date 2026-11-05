@@ -15347,9 +15347,9 @@ static bool g_jSurf = true;
 // rather than importing a second one into the same denominator.
 static double g_jSurfRadius = 0.0;
 // -jsurf-count: the resource ceiling on STORED surface photons, the point-merge counterpart of
-// `-beamcount`. It is a memory bound and nothing else — a SurfPhoton plus its SurfMis is 72 B,
-// so 4 M is ~288 MB, and the default `-n 2000000` on a scene with no media (where the beam
-// budget measures nothing and so never lowers the subpath count) asks for 7.3 M / 500 MB before
+// `-beamcount`. It is a memory bound and nothing else — a SurfPhoton plus its SurfMis is 112 B,
+// so 4 M is ~450 MB, and the default `-n 2000000` on a scene with no media (where the beam
+// budget measures nothing and so never lowers the subpath count) asks for 7.3 M / 820 MB before
 // a single pixel is traced. That is the failure this exists to stop.
 //
 // It lowers the SUBPATH COUNT rather than thinning the map, deliberately: mode J cannot trim a

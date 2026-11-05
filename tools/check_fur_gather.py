@@ -3,11 +3,12 @@
     python tools/check_fur_gather.py [--out png/check_fur_gather] [--exe ftrace.exe] [--record]
 
 A ball in a coat of `type diffuse` fur (fur_creature's density and strand radius) on a floor under
-a ceiling panel. Every density estimate keeps only the photons near its gather point's tangent
-plane (gatherplane.h, known-issues MERGE-PROXIMITY), except at a point on a curve: a strand far
-thinner than the radius has no tangent plane at that scale, and the photons around it lie on its
-neighbours. With the plane test applied there too, the coat lost a fifth to two fifths of its
-light (CPU, of mode R: M 0.87 -> 0.55, S 1.45 -> 0.87, U 2.36 -> 1.85).
+a ceiling panel. A mode-M or mode-S gather keeps only the photons near its gather point's tangent
+plane (gatherplane.h, known-issues MERGE-PROXIMITY), except at a point on a strand thinner than
+the radius: such a strand has no tangent plane at that scale, and the photons around it lie on
+its neighbours. With the plane test applied there too, the coat lost two fifths of its light
+(CPU, of mode R: M 0.87 -> 0.55, S 1.45 -> 0.87). Mode U, which takes no plane test, is held to
+its value too.
 
 The coat is the mean over the ball's middle, two seeds, against mode R's on the GPU. In modes M, S
 and U on the CPU and the GPU it must lie within 10 % of the value recorded below. Those values

@@ -472,7 +472,8 @@ struct PhotonMap {
 
     // ------------------------- PER-QUERY ADAPTIVE GATHER RADIUS -------------------------
     // Returns the radius this particular gather should use: the radius of the smallest disc
-    // around `p` that holds `kGather` photons facing the same way as `n`, capped at `radius`.
+    // around `p` that holds `kGather` photons of its own surface (onGatherSurface), capped at
+    // `radius`.
     // `kGather <= 0` returns `radius` unchanged, so every caller is bit-identical when the
     // feature is off.
     //
@@ -507,9 +508,10 @@ struct PhotonMap {
     // every surface junction.
     static const int kAdaptBins = 16;   // covers r down to r * 2^-8 = r/256
 
-    // `slack`: the gather's own plane-test slack (gatherSlack), which its sum must use too.
-    double adaptiveRadius(const Vec3& p, const Vec3& n, double slack) const {
+    // `fiberR`: the gather point's curve radius (0 off one); its sum takes gatherSlack(fiberR) too.
+    double adaptiveRadius(const Vec3& p, const Vec3& n, double fiberR) const {
         if (kGather <= 0.0 || photons.empty() || radius <= 0.0) return radius;
+        const double slack = gatherSlack(fiberR);
         int hist[kAdaptBins] = {0};
         const double r2 = radius * radius;
         const double invR2 = 1.0 / r2;
@@ -525,7 +527,7 @@ struct PhotonMap {
                         Vec3 d = p - pp[k];
                         const double d2 = dot(d, d);
                         if (d2 > r2) continue;
-                        if (!onGatherSurface(p, n, pp[k], photons[k].n, slack)) continue;
+                        if (!onGatherSurface(p, n, pp[k], photons[k].n, d2, slack)) continue;
                         // Shell index: t in (2^-(i+1), 2^-i] -> i. ilogb(t) is the exponent e
                         // with t = m*2^e, m in [1,2), so i = -e-1. d2 == 0 lands in the
                         // innermost shell (ilogb(0) is FP_ILOGB0, clamped below).

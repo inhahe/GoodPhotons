@@ -82,7 +82,6 @@
 #include "camera.h"
 #include "render.h"
 #include "bdpt.h"        // bsdfF, bsdfPdf, isConnectibleMat, isTwoSidedMat, offsetOrigin, glossyExponent
-#include "gatherplane.h" // nearGatherPlane — which light vertices a merge keeps (MERGE-PROXIMITY)
 #include "color.h"
 
 namespace vcm {
@@ -1260,9 +1259,6 @@ inline Vec3 traceCameraSubpath(const Scene& scene, const Camera& cam, const Rend
                     // on the skin bleeds into every skin gather point within the radius.
                     // Measured: opaque hair 2.79x mode R with this merge, 1.029x without.
                     if (lv.mat && lv.mat->type == MatType::Hair) return;
-                    // another surface's vertex, off this one's tangent plane (MERGE-PROXIMITY;
-                    // no band on a curve, gatherBandSlack)
-                    if (!nearGatherPlane(h.p, ngoCam, lv.p, lv.ng, gatherBandSlack(ctx.radius, h.fiberRadius))) return;
                     Vec3 wMerge = lv.wo;                                // incident illumination dir
                     if (mergeFromBehind(camTwoSided, wMerge, ngoCam)) return;
                     // camera BSDF evaluated at the light vertex's wavelength (XYZ estimate).

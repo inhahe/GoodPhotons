@@ -94,8 +94,9 @@ inline double gatherFootprintArea(const Scene& sc, const Vec3& p, const Vec3& n,
             Hit h = sc.closestHit(ray, t0, nullptr, /*skipHair=*/false,
                                   /*skipCamHidden=*/true);
             if (!h.valid || h.t > span) break;
-            // THE FACING TEST MUST BE THE PHOTON QUERY'S, EXACTLY. That query keeps a photon
-            // when `dot(ph.n, n) >= 0.5` — SIGNED, against consistently-oriented normals —
+            // THE FACING TEST MUST BE THE PHOTON QUERY'S, EXACTLY. That query (onGatherSurface)
+            // keeps a photon when `dot(ph.n, n) >= 0.5` — SIGNED, against consistently-oriented
+            // normals — and it lies in the tangent-plane band, which the test below adds —
             // so a back face is rejected and contributes no photons. The first version of
             // this loop used `fabs(dot(h.n, n))`, which is wrong twice over: `Hit::n` is
             // oriented AGAINST the ray, so its sign carries no information here, and the

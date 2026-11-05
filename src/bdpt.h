@@ -55,7 +55,6 @@
 #include "bsdf_eval.h"    // bsdfF / bsdfPdf — the evaluable half, shared with backward.h
 #include "photonbeams.h"  // BeamMap — mode J (UPBP) merges camera rays against photon beams
 #include "surfmerge.h"    // SurfMap — mode J's OTHER merge kind, the point x point (VCM's VM)
-#include "gatherplane.h"  // nearGatherPlane — which stored vertices a merge keeps (MERGE-PROXIMITY)
 #include "beamgather.h"   // gatherPhotonBeamsW — the Beam x Ray estimator, with a MIS hook
 #include "parallel.h"          // ft::stopRequested — cooperative -stop inside mode J's beam pass
 #include "render_progress.h"   // StageProgress — deposit progress for the live window/title
@@ -2439,7 +2438,7 @@ struct BeamBudgetReq {
     //   tries to store ~7 M photons for a 64x64 image.
     //
     //   `maxSurfPhotons` -- a pure MEMORY ceiling, applied always. A SurfPhoton + its SurfMis
-    //   is 72 B, so an unbounded map is the one way this feature can take the process down;
+    //   is 112 B, so an unbounded map is the one way this feature can take the process down;
     //   it lowers nPaths, never thins the map (a thinned map's survival probability is exactly
     //   what a MIS weight cannot read -- the same reason mode J refuses to trim its beams).
     long long surfPaths      = 0;   // subpath target from the surface side; 0 = no opinion
@@ -2819,7 +2818,6 @@ inline void traceLightBeamPass(const Scene& scene, const Camera& cam, long long 
                         SurfPhoton ph;
                         ph.p      = path[u].p;
                         ph.wo     = dPrev;                 // unit, toward the previous vertex
-                        ph.nx = (float)path[u].ng.x; ph.ny = (float)path[u].ng.y; ph.nz = (float)path[u].ng.z;
                         ph.lambda = (float)hb.lam[0];
                         ph.beta   = (float)path[u].beta;
                         ph.cx = (float)cieX(ph.lambda);
@@ -4852,9 +4850,6 @@ struct BdptRenderer {
                                     const SurfPhoton& ph = photons->pts[(size_t)idx];
                                     const SurfMis* lm = photons->misOf((size_t)idx);
                                     if (!lm) return;      // no weight: refuse (see misOf)
-                                    // another surface's photon, off this one's tangent plane
-                                    if (!nearGatherPlane(vk.p, ngo, ph.p, Vec3{ph.nx, ph.ny, ph.nz},
-                                                         1e-3 * photons->radius)) return;
                                     if (mergeFromBehind(vkTwoSided, ph.wo, ngo)) return;
                                     const double lam = (double)ph.lambda;
                                     double fCam = bsdfF(*vk.mat, vk.ns, woCam, ph.wo, lam,

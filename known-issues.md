@@ -655,6 +655,27 @@ Measured, GPU mode M against mode R:
   does. Its fiber gate had never fired there, so GPU S read check_fur_gather's coat at 3.06 of
   mode R against the CPU's 1.45; it now reads 1.33 (CURVE-GATHER).
 
+**Revised in 0.432.1** after the Opus review of 0.431.0, measured on `tools/check_gather_base.py`
+(a closed 3 cm box on a lit floor, radius 0.1; the floor 0-2 and 2-5 cm from its base, of mode R):
+- The probe went on through an off-band face above the plane, into a solid resting on the surface,
+  and counted the solid's own bottom as covered floor: modes M and S read 0.73-0.84 there (0.430.2:
+  0.97-1.01). It now counts the faces it crosses, and an odd count where it meets the gather's
+  surface is a miss: 0.964-1.002. A closed shelf hovering 5 cm over the floor is crossed twice and
+  its column counts, so beside it the floor reads the plain disc average across the shelf's shadow
+  (0.75 at 2-5 cm, where 0.430.2's 0.98 came from the shelf top's photons, which also leaked
+  onto the floor under it). A single open quad hovering within the radius is the one shape the count
+  misreads. A probe that meets sixteen faces without an answer is a miss.
+- Modes U and J take neither test any more: with no footprint they read the box's base at 0.62 and
+  0.61 (0.430.2: 0.94, 1.01), and their shrinking radius makes the bias they keep vanish as they
+  converge. Mode J's stored photon is 72 B again; check_bitid shows U and J identical to 0.430.2.
+- The probe takes the photon test's slack (the map's radius, not the adaptive one), a curve takes
+  the band once it is as thick as the radius, and the scalar rules are templates both backends
+  share (`gatherplane.h`).
+- check_bitid against 0.430.2: M and S differ in flat and shapes by mean +0.06 % at most; mapped
+  and smooth unchanged. fur_creature 0.9663 of R (2 blocks moved); gallery_rain 1.9908, 29 blocks
+  moved, all but one between 0.430.2's and 0.431.0's value. The exception is a shadowed slab edge
+  on the left, already 54 % bright in mode M and now 79 %.
+
 Every photon gather (mode M's `queryR`, S's, U's VCM merge, J's surface merge) takes the photons
 within a sphere of its radius, whatever surface they lie on. Its only filter is a facing test
 (M and S: `dot(ph.n, n) >= 0.5` on true normals since 0.400.7; J and U: `mergeFromBehind`),

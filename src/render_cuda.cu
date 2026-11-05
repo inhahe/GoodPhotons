@@ -7547,32 +7547,15 @@ __device__ static bool dProbePassesThrough(const DMaterial& m) {
     }
 }
 
-// Host twins withinGatherBand / onGatherSurface / nearGatherPlane (gatherplane.h, where the argument
-// lives: MERGE-PROXIMITY): a stored photon or light vertex belongs to a gather's surface when it
-// lies near the gather point's tangent plane -- and, in modes M and S, faces the same way.
-__device__ static inline bool dWithinGatherBand(Real off, Real d2, Real c, Real slack) {
-    if (off <= slack) return true;
-    const Real s = sqrt(fmax((Real)0, (Real)1 - c * c));
-    const Real k = (Real)kGatherPlaneTol + s;
-    const Real e = off - slack;
-    return e * e <= k * k * d2;
-}
+// The vector glue of gatherplane.h's rule (MERGE-PROXIMITY), which both backends call: a stored
+// photon belongs to a mode-M or mode-S gather's surface when it faces the gather point's way and
+// lies near its tangent plane (host onGatherSurface). `d2` = |pp - x|^2, from the caller's radius
+// test; `slack` from gatherBandSlack.
 __device__ static inline bool dOnGatherSurface(const DVec3& x, const DVec3& n, const DVec3& pp,
-                                               const DVec3& pn, Real slack) {
+                                               const DVec3& pn, Real d2, Real slack) {
     const Real c = dot(pn, n);
-    if (c < (Real)0.5) return false;
-    const DVec3 d = pp - x;
-    return dWithinGatherBand(fabs(dot(d, n)), dot(d, d), c, slack);
-}
-__device__ static inline bool dNearGatherPlane(const DVec3& x, const DVec3& n, const DVec3& pp,
-                                               const DVec3& pn, Real slack) {
-    const DVec3 d = pp - x;
-    return dWithinGatherBand(fabs(dot(d, n)), dot(d, d), fabs(dot(pn, n)), slack);
-}
-// Host twin gatherBandSlack: a gather of radius `radius` at a point on a curve of radius `fiberR`
-// (0 off one) takes no band, as a strand has no tangent plane at the radius's scale.
-__device__ static inline Real dGatherBandSlack(Real radius, Real fiberR) {
-    return fiberR > (Real)0 ? (Real)HUGE_VAL : radius * (Real)1e-3;
+    if (c < (Real)kGatherFacingCos) return false;
+    return withinGatherBand<Real>(fabs(dot(pp - x, n)), d2, c, slack);
 }
 
 // ---- GATHER FOOTPRINT (M-GATHERAREA), device twin of photonmap_render.h ----------------------
@@ -7595,8 +7578,9 @@ __device__ static inline Real dGatherBandSlack(Real radius, Real fiberR) {
 //     covered by definition -- and the gate then fires on nearly every gather and the
 //     correction stops happening. Measured: cap_gyroid -16.9 % stratified against -4.3 %
 //     independent. Do not "improve" this without re-reading the host comment.
+// `slack`: the gather's plane-test slack (gatherBandSlack at its map's radius), its photon test's.
 __device__ static double dGatherCoverage(const DScene& sc, const DVec3& p, const DVec3& n,
-                                         Real r, DRng& rng, int M, Real fiberR = (Real)0) {
+                                         Real r, Real slack, DRng& rng, int M, Real fiberR = (Real)0) {
     if (M <= 0 || !(r > (Real)0)) return 1.0;
     DVec3 t, b; onb(n, t, b);
     double area = 0.0;                       // in units of the full disc; 1.0 == fully covered
@@ -7615,11 +7599,16 @@ __device__ static double dGatherCoverage(const DScene& sc, const DVec3& p, const
         // Through any surface that holds no photon (dProbePassesThrough), and through a fiber of
         // opacity below 1 with the probability it is absent -- the coin every walk tosses there
         // (host twin gatherCoverageRaw). `h.t` stays the depth from the launch point.
+        // A photon-holding face off the band: below it a miss, above it crossed and counted, an
+        // odd count where the probe meets this surface being the inside of a solid resting on it
+        // -- a miss too (host twin gatherCoverageRaw, where the reasoning lives).
         DHit h;
         {
             DVec3 o = q + n * r;
             const DVec3 dn = n * (Real)(-1);
             Real tAcc = (Real)0, curveTmin = (Real)0;
+            int crossed = 0;                     // photon-holding faces passed above the band
+            bool found = false;                  // the probe ended on what it counts
             for (int pass = 0; pass < 16; ++pass) {
                 // Past a strand the curve tmin clears its tube and a surface just behind it must
                 // still be found: tmin 0 then, as every curve-tmin caller does.
@@ -7627,19 +7616,6 @@ __device__ static double dGatherCoverage(const DScene& sc, const DVec3& p, const
                                (Real)2 * r - tAcc, false, curveTmin);
                 if (!h.valid) break;
                 h.t += tAcc;
-                // A face off the gather's tangent-plane band (at the photon test's slack, so none
-                // on a curve) is another surface's (host twin): on through one above it, none of
-                // this surface under the probe once below it. Not a hair strand, whose coin below
-                // decides, as the host's.
-                if (!(sc.mats[h.matId].type == D_HAIR && h.fiberRadius > (Real)0)) {
-                    const Real dzH = r - h.t;
-                    if (!dWithinGatherBand(fabs(dzH), (Real)(rr * rr) + dzH * dzH, dot(dShadedNg(h), n),
-                                           dGatherBandSlack(r, fiberR))) {
-                        if (dzH > (Real)0) { tAcc = h.t; o = h.p; curveTmin = (Real)0; continue; }
-                        h.valid = false;
-                        break;
-                    }
-                }
                 const DMaterial& hm = sc.mats[h.matId];
                 // Only a face above the plane, by more than the relaunch's own tmin skips: one on it
                 // is the surface's height (a glass box standing on the floor) -- host twin.
@@ -7647,11 +7623,22 @@ __device__ static double dGatherCoverage(const DScene& sc, const DVec3& p, const
                     tAcc = h.t; o = h.p; curveTmin = (Real)0;
                     continue;
                 }
-                if (hm.type != D_HAIR || !(h.fiberRadius > (Real)0)) break;
-                const double op = dHairOpacityAt(sc, hm, h);
-                if (op >= 1.0 || (double)rng.uniform() < op) break;   // the strand IS here
-                tAcc = h.t; o = h.p; curveTmin = (Real)2.5 * h.fiberRadius;
+                if (hm.type == D_HAIR && h.fiberRadius > (Real)0) {
+                    const double op = dHairOpacityAt(sc, hm, h);
+                    if (op >= 1.0 || (double)rng.uniform() < op) { found = true; break; }   // the strand IS here
+                    tAcc = h.t; o = h.p; curveTmin = (Real)2.5 * h.fiberRadius;
+                    continue;
+                }
+                const Real dzH = r - h.t;
+                if (withinGatherBand<Real>(fabs(dzH), (Real)(rr * rr) + dzH * dzH, dot(dShadedNg(h), n), slack)) {
+                    found = (crossed & 1) == 0;
+                    break;
+                }
+                if (!(dzH > (Real)0)) break;                            // below the band: a miss
+                ++crossed;
+                tAcc = h.t; o = h.p; curveTmin = (Real)0;
             }
+            if (!found) h.valid = false;         // a miss, or sixteen faces without an answer
         }
         if (!h.valid) continue;
         const double c = (double)dot(dShadedNg(h), n);   // the host twin's facing test
@@ -7736,15 +7723,16 @@ __device__ static inline void dPmNeighborhood(const DPhotonMap& pm, const DVec3&
 //
 // Returns pm.radius exactly when kGather <= 0 or the whole disc holds fewer than k photons,
 // so a fixed-radius map keeps the fixed-radius path. The surface test matches the caller's
-// (dOnGatherSurface at the caller's `slack`, dGatherBandSlack; a mismatch would divide accepted
+// (dOnGatherSurface at gatherBandSlack(pm.radius, fiberR), as its sum; a mismatch would divide accepted
 // photons by an area chosen for a rejected population and print a dark seam along every surface
 // junction).
 #define PM_ADAPT_BINS 16                     // covers r down to r * 2^-8 = r/256
 template <int NB = PM_ADAPT_BINS>
 __device__ static inline Real dPmAdaptiveRadius(const DPhotonMap& pm, const DVec3& p,
-                                                const DVec3& n, Real slack) {
+                                                const DVec3& n, Real fiberR) {
     if (!(pm.kGather > (Real)0) || pm.photons == nullptr || !(pm.radius > (Real)0))
         return pm.radius;
+    const Real slack = gatherBandSlack<Real>(pm.radius, fiberR);
     int hist[NB];
 #pragma unroll
     for (int i = 0; i < NB; ++i) hist[i] = 0;
@@ -7755,7 +7743,7 @@ __device__ static inline Real dPmAdaptiveRadius(const DPhotonMap& pm, const DVec
         DVec3 d = p - ph.pos;
         Real d2 = dot(d, d);
         if (d2 > r2) return;
-        if (!dOnGatherSurface(p, n, ph.pos, ph.n, slack)) return;
+        if (!dOnGatherSurface(p, n, ph.pos, ph.n, d2, slack)) return;
         // Shell index: t in (2^-(i+1), 2^-i] -> i, i.e. i = -ilogb(t) - 1.
         Real t = d2 * invR2;
         int i = (t > (Real)0) ? (-ilogb((double)t) - 1) : (NB - 1);
@@ -8888,34 +8876,7 @@ struct DSurfPhoton {
     DVec3 p, wo;                              // wo: unit, toward the PREVIOUS light vertex
     float lambda, beta, cx, cy, cz;           // cie{X,Y,Z}(lambda), cached at store time
     unsigned misIdx;
-    unsigned nOct;                            // the surface's geometric normal, unoriented (dPackOct)
 };
-// A unit vector in 32 bits (octahedral, 16 bits a coordinate; ~1e-4 rad): mode J's stored photon's
-// normal, which only its merge's plane test reads (dNearGatherPlane).
-__host__ __device__ static inline unsigned dPackOct(double x, double y, double z) {
-    const double l1 = fabs(x) + fabs(y) + fabs(z);
-    if (!(l1 > 0.0)) return 0x80008000u;
-    x /= l1; y /= l1;
-    if (z < 0.0) {
-        const double ox = (1.0 - fabs(y)) * (x >= 0.0 ? 1.0 : -1.0);
-        const double oy = (1.0 - fabs(x)) * (y >= 0.0 ? 1.0 : -1.0);
-        x = ox; y = oy;
-    }
-    const unsigned ux = (unsigned)floor((x * 0.5 + 0.5) * 65535.0 + 0.5);
-    const unsigned uy = (unsigned)floor((y * 0.5 + 0.5) * 65535.0 + 0.5);
-    return (ux & 0xFFFFu) | ((uy & 0xFFFFu) << 16);
-}
-__device__ static inline DVec3 dUnpackOct(unsigned v) {
-    Real x = (Real)(v & 0xFFFFu) * (Real)(2.0 / 65535.0) - (Real)1;
-    Real y = (Real)(v >> 16) * (Real)(2.0 / 65535.0) - (Real)1;
-    const Real z = (Real)1 - fabs(x) - fabs(y);
-    if (z < (Real)0) {
-        const Real ox = ((Real)1 - fabs(y)) * (x >= (Real)0 ? (Real)1 : (Real)-1);
-        const Real oy = ((Real)1 - fabs(x)) * (y >= (Real)0 ? (Real)1 : (Real)-1);
-        x = ox; y = oy;
-    }
-    return normalize(DVec3{x, y, z});
-}
 struct DSurfMis {                             // the light-side half of the merge's MIS weight
     double sumC, sumMb, sumMs, pdfFwdA;
     float  rCoef;
@@ -18703,8 +18664,6 @@ __device__ static void dSurfMergeAt(const DScene& sc, const DSurfMap& sm, const 
             const DSurfPhoton& ph = sm.pts[idx];
             const DVec3 dd{vk.p.x - ph.p.x, vk.p.y - ph.p.y, vk.p.z - ph.p.z};
             if (ddot(dd, dd) > r2) continue;
-            // another surface's photon (host twin nearGatherPlane)
-            if (!dNearGatherPlane(vk.p, ngo, ph.p, dUnpackOct(ph.nOct), sm.radius * (Real)1e-3)) continue;
             if (dMergeFromBehind(vkTwoSided, ph.wo, ngo)) continue;   // host twin mergeFromBehind
             const DSurfMis& lm = sm.mis[ph.misIdx];
             const Real lam = (Real)ph.lambda;
@@ -19326,11 +19285,13 @@ __device__ static void dPhotonGatherSub(const DScene& sc, const DPhotonMap& pm,
             const DVec3 gn = dShadedNg(h);   // the true normal, as the photons carry it
             // Density estimate at y, folding the visible-point reflectance per photon wavelength.
             float gx = 0.f, gy = 0.f, gz = 0.f;
+            const Real slkM = gatherBandSlack<Real>(pm.radius, h.fiberRadius);
             dPmNeighborhood(pm, h.p, [&](int k) {
                 const DGatherPhoton& ph = pm.photons[k];
                 DVec3 d = h.p - ph.pos;
-                if (dot(d, d) > r2) return;
-                if (!dOnGatherSurface(h.p, gn, ph.pos, ph.n, dGatherBandSlack(pm.radius, h.fiberRadius))) return;
+                const Real d2 = dot(d, d);
+                if (d2 > r2) return;
+                if (!dOnGatherSurface(h.p, gn, ph.pos, ph.n, d2, slkM)) return;
                 float rhoY = (float)dDiffuseRho(sc, m, h, (Real)ph.lambda);
                 float rhoV = (float)dDiffuseRho(sc, visMat, visHit, (Real)ph.lambda);
                 float w = rhoY * rhoV;
@@ -19342,7 +19303,7 @@ __device__ static void dPhotonGatherSub(const DScene& sc, const DPhotonMap& pm,
             // (DGatherPhoton), so the correction multiplies the sum rather than a normalisation.
             if (sc.gatherArea) {
                 const double ms = dGatherAreaScale(sc.gaBias,
-                    dGatherCoverage(sc, h.p, gn, (Real)sqrt((double)r2), rng, sc.gatherArea,
+                    dGatherCoverage(sc, h.p, gn, (Real)sqrt((double)r2), slkM, rng, sc.gatherArea,
                                     h.fiberRadius));
                 gx = (float)((double)gx * ms);
                 gy = (float)((double)gy * ms);
@@ -19352,14 +19313,16 @@ __device__ static void dPhotonGatherSub(const DScene& sc, const DPhotonMap& pm,
                 // The caustic map gathers at its own PER-QUERY radius (dPmAdaptiveRadius).
                 // pX/pY/pZ carry the fold for the map's fixed radius, so rescale the sum by
                 // the area ratio r^2/r_q^2 rather than re-folding every record.
-                const Real rq  = dPmAdaptiveRadius(pmC, h.p, gn, dGatherBandSlack(pmC.radius, h.fiberRadius));
+                const Real slkC = gatherBandSlack<Real>(pmC.radius, h.fiberRadius);
+                const Real rq  = dPmAdaptiveRadius(pmC, h.p, gn, h.fiberRadius);
                 const Real r2q = rq * rq;
                 float cx = 0.f, cy = 0.f, cz = 0.f;
                 dPmNeighborhood(pmC, h.p, [&](int k) {
                     const DGatherPhoton& ph = pmC.photons[k];
                     DVec3 d = h.p - ph.pos;
-                    if (dot(d, d) > r2q) return;
-                    if (!dOnGatherSurface(h.p, gn, ph.pos, ph.n, dGatherBandSlack(pmC.radius, h.fiberRadius))) return;
+                    const Real d2 = dot(d, d);
+                    if (d2 > r2q) return;
+                    if (!dOnGatherSurface(h.p, gn, ph.pos, ph.n, d2, slkC)) return;
                     float rhoY = (float)dDiffuseRho(sc, m, h, (Real)ph.lambda);
                     float rhoV = (float)dDiffuseRho(sc, visMat, visHit, (Real)ph.lambda);
                     float w = rhoY * rhoV;
@@ -19371,7 +19334,7 @@ __device__ static void dPhotonGatherSub(const DScene& sc, const DPhotonMap& pm,
                 // on that map's rq. One shared coverage would be cheaper and wrong.
                 double cs = 1.0;
                 if (sc.gatherArea)
-                    cs = dGatherAreaScale(sc.gaBias, dGatherCoverage(sc, h.p, gn, rq, rng, sc.gatherArea,
+                    cs = dGatherAreaScale(sc.gaBias, dGatherCoverage(sc, h.p, gn, rq, slkC, rng, sc.gatherArea,
                                                           h.fiberRadius));
                 gx += cx * (float)(aw * cs);
                 gy += cy * (float)(aw * cs);
@@ -19951,11 +19914,13 @@ __device__ static void dPhotonGather(const DScene& sc, const DPhotonMap& pm,
             // far below the 8-bit output quantum, and FP64 FMAs would issue at 1/64 rate. The
             // per-sample total is promoted to double once at the end (film math stays double).
             float gx = 0.f, gy = 0.f, gz = 0.f;
+            const Real slkM = gatherBandSlack<Real>(pm.radius, h.fiberRadius);
             dPmNeighborhood(pm, h.p, [&](int k) {
                 const DGatherPhoton& ph = pm.photons[k];
                 DVec3 d = h.p - ph.pos;
-                if (dot(d, d) > r2) return;
-                if (!dOnGatherSurface(h.p, gn, ph.pos, ph.n, dGatherBandSlack(pm.radius, h.fiberRadius))) return;   // another surface's
+                const Real d2 = dot(d, d);
+                if (d2 > r2) return;
+                if (!dOnGatherSurface(h.p, gn, ph.pos, ph.n, d2, slkM)) return;   // another surface's
                 // SPECGATHER: the walk's reflectances belong at THIS photon's wavelength,
                 // not the camera's. Exactly 1.0 when every one of them was flat.
                 float rho = (float)(dDiffuseRho(sc, m, h, (Real)ph.lambda)
@@ -19970,7 +19935,7 @@ __device__ static void dPhotonGather(const DScene& sc, const DPhotonMap& pm,
             // (DGatherPhoton), so the correction multiplies the sum rather than a normalisation.
             if (sc.gatherArea) {
                 const double ms = dGatherAreaScale(sc.gaBias,
-                    dGatherCoverage(sc, h.p, gn, (Real)sqrt((double)r2), rng, sc.gatherArea,
+                    dGatherCoverage(sc, h.p, gn, (Real)sqrt((double)r2), slkM, rng, sc.gatherArea,
                                     h.fiberRadius));
                 gx = (float)((double)gx * ms);
                 gy = (float)((double)gy * ms);
@@ -19980,14 +19945,16 @@ __device__ static void dPhotonGather(const DScene& sc, const DPhotonMap& pm,
             // header comment and dPmAdaptiveRadius). The area ratio r^2/r_q^2 corrects the
             // fixed-radius normalisation already folded into pX/pY/pZ.
             if (causOn) {
-                const Real rq  = dPmAdaptiveRadius(pmC, h.p, gn, dGatherBandSlack(pmC.radius, h.fiberRadius));
+                const Real slkC = gatherBandSlack<Real>(pmC.radius, h.fiberRadius);
+                const Real rq  = dPmAdaptiveRadius(pmC, h.p, gn, h.fiberRadius);
                 const Real r2q = rq * rq;
                 float cx = 0.f, cy = 0.f, cz = 0.f;
                 dPmNeighborhood(pmC, h.p, [&](int k) {
                     const DGatherPhoton& ph = pmC.photons[k];
                     DVec3 d = h.p - ph.pos;
-                    if (dot(d, d) > r2q) return;
-                    if (!dOnGatherSurface(h.p, gn, ph.pos, ph.n, dGatherBandSlack(pmC.radius, h.fiberRadius))) return;
+                    const Real d2 = dot(d, d);
+                    if (d2 > r2q) return;
+                    if (!dOnGatherSurface(h.p, gn, ph.pos, ph.n, d2, slkC)) return;
                     // SPECGATHER: the walk's reflectances belong at THIS photon's wavelength,
                     // not the camera's. Exactly 1.0 when every one of them was flat.
                     float rho = (float)(dDiffuseRho(sc, m, h, (Real)ph.lambda)
@@ -20002,7 +19969,7 @@ __device__ static void dPhotonGather(const DScene& sc, const DPhotonMap& pm,
                 // on that map's rq. One shared coverage would be cheaper and wrong.
                 double cs = 1.0;
                 if (sc.gatherArea)
-                    cs = dGatherAreaScale(sc.gaBias, dGatherCoverage(sc, h.p, gn, rq, rng, sc.gatherArea,
+                    cs = dGatherAreaScale(sc.gaBias, dGatherCoverage(sc, h.p, gn, rq, slkC, rng, sc.gatherArea,
                                                           h.fiberRadius));
                 gx += cx * (float)(aw * cs);
                 gy += cy * (float)(aw * cs);
@@ -20556,11 +20523,13 @@ __global__ void kSppmGather(DScene sc, DPhotonMap pm, DSppmState st, int resX, i
         double M = 0.0;
         // the camera prefix's factors at each photon's wavelength (SPPM-SPECTRAL)
         const float* ratio = st.vpSpec[pix] ? st.vpRatio + (size_t)pix * DSpecThr::K : nullptr;
+        const Real slkS = gatherBandSlack<Real>((Real)R, h.fiberRadius);
         dPmNeighborhood(pm, h.p, [&](int k) {
             const DGatherPhoton& ph = pm.photons[k];
             DVec3 d = h.p - ph.pos;
-            if (dot(d, d) > r2) return;
-            if (!dOnGatherSurface(h.p, gn, ph.pos, ph.n, dGatherBandSlack((Real)R, h.fiberRadius))) return;   // another surface's photon
+            const Real d2 = dot(d, d);
+            if (d2 > r2) return;
+            if (!dOnGatherSurface(h.p, gn, ph.pos, ph.n, d2, slkS)) return;   // another surface's photon
             float rho = (float)dDiffuseRho(sc, m, h, (Real)ph.lambda);
             if (ratio) rho *= ratio[DSpecThr::binOf((Real)ph.lambda)];
             gx += rho * ph.pX;
@@ -20588,7 +20557,7 @@ __global__ void kSppmGather(DScene sc, DPhotonMap pm, DSppmState st, int resX, i
                                  + 0x5851F42D4C957F2DULL;
             DRng grng; grng.seedUnit(s, seedBase + 23);
             const double cs = dGatherAreaScale(sc.gaBias,
-                dGatherCoverage(sc, h.p, gn, (Real)R, grng, sc.gatherArea, h.fiberRadius));
+                dGatherCoverage(sc, h.p, gn, (Real)R, slkS, grng, sc.gatherArea, h.fiberRadius));
             gx = (float)((double)gx * cs);
             gy = (float)((double)gy * cs);
             gz = (float)((double)gz * cs);
@@ -21758,9 +21727,6 @@ __global__ void kVcmCameraT(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx
                               DVec3 d = h.p - lv.p;
                               if (ddot(d, d) > r2) continue;
                               if (edges + lv.edges > ctx.maxDepth) continue;
-                              // another surface's vertex (host twin nearGatherPlane; none on a curve)
-                              if (!dNearGatherPlane(h.p, ngoCam, lv.p, lv.ng,
-                                                    dGatherBandSlack((Real)ctx.radius, h.fiberRadius))) continue;
                               DVec3 wMerge = lv.wo;
                               if (dMergeFromBehind(dTwoSidedType(mp->type), wMerge, ngoCam))
                                   continue;   // host twin mergeFromBehind
@@ -22318,7 +22284,6 @@ kJSurfLightT(DScene sc, DCamera cam, int diffraction, int maxDepth,
                         DSurfPhoton& ph = out.pts[slot];
                         ph.p      = path[u].p;
                         ph.wo     = dp;                 // unit, toward the previous vertex
-                        ph.nOct   = dPackOct((double)path[u].ng.x, (double)path[u].ng.y, (double)path[u].ng.z);
                         ph.lambda = (float)lambda;
                         ph.beta   = (float)path[u].beta;
                         ph.cx = (float)cx; ph.cy = (float)cy; ph.cz = (float)cz;
@@ -25368,7 +25333,6 @@ static void uploadSurfMapCuda(const bdpt::SurfMap* smap, DUpload& up, gpu::DSurf
         d.lambda = q.lambda; d.beta = q.beta;
         d.cx = q.cx; d.cy = q.cy; d.cz = q.cz;
         d.misIdx = q.misIdx;
-        d.nOct = gpu::dPackOct(q.nx, q.ny, q.nz);
     }
     // Every SurfMis field is copied below, and a field a copy misses reaches the device as 0. Both
     // structs carry their padding explicitly, so any field added to either changes its size and

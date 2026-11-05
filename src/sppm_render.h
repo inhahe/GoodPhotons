@@ -396,8 +396,9 @@ inline void sppmPass(const Scene& scene, const Camera& cam, SPPMState& st,
                 const Vec3 gn = orientedGeoN(h);   // the true normal, as the photons carry it
                 double M = 0.0;          // photons found this pass
                 Vec3   phi{0, 0, 0};     // local flux sum (XYZ, per-photon wavelength)
-                pm.queryR(h.p, P.radius, [&](const Photon& ph, double, int k) {
-                    if (!onGatherSurface(h.p, gn, pm.pos[k], ph.n, gatherBandSlack(P.radius, h.fiberRadius))) return;   // another surface's
+                const double slack = gatherBandSlack(P.radius, h.fiberRadius);
+                pm.queryR(h.p, P.radius, [&](const Photon& ph, double d2, int k) {
+                    if (!onGatherSurface(h.p, gn, pm.pos[k], ph.n, d2, slack)) return;   // another surface's
                     double rho = clamp01(diffuseReflectance(scene, m, h, ph.lambda));
                     double f = rho * (1.0 / PI);
                     // the camera prefix's factors at this photon's wavelength (SPPM-SPECTRAL)
@@ -430,7 +431,7 @@ inline void sppmPass(const Scene& scene, const Camera& cam, SPPMState& st,
                     grng.seed(((uint64_t)y << 20) ^ (uint64_t)x,
                               0x9e3779b97f4a7c15ULL ^ (uint64_t)st.passes);
                     phi = phi * gatherAreaScale(
-                        gatherCoverage(scene, h.p, gn, P.radius, grng, gaM, h.matId,
+                        gatherCoverage(scene, h.p, gn, P.radius, slack, grng, gaM, h.matId,
                                        h.fiberRadius));
                 }
                 // Progressive radius / flux update (shared-statistics PPM).
