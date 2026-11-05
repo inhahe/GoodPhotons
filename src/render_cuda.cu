@@ -13218,12 +13218,17 @@ struct DVertex {
     // The hit's DHit::patOwnSide: matId is the part a mix resolved to, so a connection
     // rebuilding the hit from it could not decide the surface's rule again.
     int   patOwnSide = 0;
+    // The hit's vertex colour (DHit::vcol, -1 if none) and its barycentrics in 16 bits each
+    // (dPackBary), so a connection shades a vertex-coloured mesh as the walk did
+    // (VCOL-BDPT-GPU). The quantum, 1.5e-5 of a barycentric, is far below a colour's.
+    int   vcol = -1;
+    unsigned short vb0q = 0, vb1q = 0;
 };
 #if FTRACE_GPU_FP32
 // BDPT holds 2 * BDPT_MAXV of these per thread in local memory: a field that grows it costs
 // occupancy. No padding is left (back filled the hole after lightIdx, patOwnSide the tail
-// after nUp), so a new field grows it by 8 B.
-static_assert(sizeof(DVertex) == 136, "DVertex changed size");
+// after nUp, the vertex colour the next 8 B), so a new field grows it by 8 B.
+static_assert(sizeof(DVertex) == 144, "DVertex changed size");
 #endif
 // dShadedNg of the hit a vertex was made at; a light or camera vertex (back 0) keeps its ng.
 __device__ static inline DVec3 dVertexGeoN(const DVertex& v) { return v.back ? v.ng * (Real)(-1) : v.ng; }
@@ -13276,6 +13281,13 @@ struct DHeroBundle {
 // evaluate textured / patterned / record-driven params on the connection BSDF exactly as
 // the sampler did — the enabler for per-hit BSDFs in GPU BDPT (M9). Only p/n/ng/u/v are
 // read by those helpers (t/valid/sensorId are unused there).
+// A barycentric in 16 bits and back (DVertex / DVcmLV::vb0q, vb1q).
+__device__ static inline unsigned short dPackBary(Real b) {
+    const Real c = b < (Real)0 ? (Real)0 : (b > (Real)1 ? (Real)1 : b);
+    return (unsigned short)(c * (Real)65535 + (Real)0.5);
+}
+__device__ static inline Real dUnpackBary(unsigned short q) { return (Real)q * (Real)(1.0 / 65535.0); }
+
 __device__ static inline DHit dVertHit(const DVertex& vt) {
     DHit h;
     h.t = (Real)0; h.valid = true;
@@ -13284,12 +13296,10 @@ __device__ static inline DHit dVertHit(const DVertex& vt) {
     h.u = vt.u; h.v = vt.v; h.curv = vt.curv;
     h.tangent = vt.tangent; h.fiberRadius = vt.fiberR; h.pscale = vt.pscale;
     h.back = vt.back != 0; h.patOwnSide = vt.patOwnSide != 0;
-    // EVERY other field defined too. DHit has members with no default (vcol, vb0, vb1,
-    // bitangentSign), and dDiffuseRho reads vcol -- which gates the per-vertex colour lookup --
-    // so a reconstructed hit used to carry whatever the stack held there. vcol = -1 is "no
-    // vertex colour", which is what a connection evaluation must assume: DVertex does not carry
-    // the colour, so a vertex-coloured mesh is shaded uncoloured by the connections (logged).
-    h.vcol = -1; h.vb0 = (Real)0; h.vb1 = (Real)0; h.bitangentSign = (Real)1;
+    // The vertex colour, as the walk's hit had it (dDiffuseRho reads vcol), and EVERY other
+    // field defined: DHit has members with no default (bitangentSign).
+    h.vcol = vt.vcol; h.vb0 = dUnpackBary(vt.vb0q); h.vb1 = dUnpackBary(vt.vb1q);
+    h.bitangentSign = (Real)1;
     return h;
 }
 
@@ -17557,6 +17567,7 @@ __device__ static void dRandomWalk(const DScene& sc, const DCamera& cam, int dif
         v.areaScale = (v.lightIdx >= 0) ? dLightAreaScaleAt(sc, sc.emitters[v.lightIdx], h.ng, h.deformTri) : 1.0;
         v.mediumId = -1;
         v.u = h.u; v.v = h.v; v.curv = h.curv;   // per-hit texcoords + curvature for textured/patterned/record BSDF eval (M9, O3)
+        v.vcol = h.vcol; v.vb0q = dPackBary(h.vb0); v.vb1q = dPackBary(h.vb1);   // and its vertex colour
         // The strand frame and radius: dBsdfF / dBsdfPdf read them at a D_HAIR vertex (the fiber
         // BCSDF's frame), the connections' far-side clearance reads them, and fiberR > 0 is how
         // dSurfMergeSite knows a vertex sits on ANY curve primitive. 0 off a curve (DHit default).
@@ -20698,9 +20709,11 @@ struct DVcmLV {
     DVec3  tangent;        // fiber axis at a strand vertex (its BCSDF frame for VC / splats, 0.364.0)
     Real   fiberR;         // fiber radius (far-side clearance of a connection that ends on it); 0 off a strand
     Real   pscale;         // the hit's DHit::pscale (DVertex::pscale)
+    int    vcol;           // the hit's vertex colour and packed barycentrics (DVertex's)
+    unsigned short vb0q, vb1q;
 };
 #if FTRACE_GPU_FP32
-static_assert(sizeof(DVcmLV) == 152, "DVcmLV changed size: it is the largest allocation in a session");
+static_assert(sizeof(DVcmLV) == 160, "DVcmLV changed size: it is the largest allocation in a session");
 #endif
 // dVertexGeoN's twin for a stored light vertex.
 __device__ static inline DVec3 dLvGeoN(const DVcmLV& v) { return v.back ? v.ng * (Real)(-1) : v.ng; }
@@ -20742,6 +20755,7 @@ __device__ static inline DVertex dVertFromHit(const DHit& h, int matId) {
     v.beta = 0; v.pdfFwd = 0; v.pdfRev = 0; v.delta = 0; v.matId = matId; v.lightIdx = -1;
     v.emitPatW = (Real)1;   // BSDF-only helper vertex; never read for emission
     v.areaScale = 1.0; v.mediumId = -1; v.u = h.u; v.v = h.v; v.curv = h.curv;
+    v.vcol = h.vcol; v.vb0q = dPackBary(h.vb0); v.vb1q = dPackBary(h.vb1);
     v.tangent = h.tangent; v.fiberR = h.fiberRadius; v.pscale = h.pscale;
     v.back = h.back ? 1 : 0; v.patOwnSide = h.patOwnSide ? 1 : 0;
     return v;
@@ -20751,6 +20765,7 @@ __device__ static inline DVertex dVertFromLV(const DVcmLV& lv) {
     v.beta = 0; v.pdfFwd = 0; v.pdfRev = 0; v.delta = 0; v.matId = lv.matId; v.lightIdx = -1;
     v.emitPatW = (Real)1;   // BSDF-only helper vertex; never read for emission
     v.areaScale = 1.0; v.mediumId = -1; v.u = lv.u; v.v = lv.v; v.curv = lv.curv;
+    v.vcol = lv.vcol; v.vb0q = lv.vb0q; v.vb1q = lv.vb1q;
     v.tangent = lv.tangent; v.fiberR = lv.fiberR; v.pscale = lv.pscale;
     v.back = lv.back; v.patOwnSide = lv.patOwnSide;
     return v;
@@ -21226,6 +21241,7 @@ __global__ void kVcmLightT(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx,
                     lv.cx = cieLx; lv.cy = cieLy; lv.cz = cieLz;
                     lv.dVCM = dVCM; lv.dVC = dVC; lv.dVM = dVM;
                     lv.matId = matId; lv.edges = edges; lv.u = h.u; lv.v = h.v; lv.curv = h.curv;
+                    lv.vcol = h.vcol; lv.vb0q = dPackBary(h.vb0); lv.vb1q = dPackBary(h.vb1);
                     lv.tangent = h.tangent; lv.fiberR = h.fiberRadius; lv.pscale = h.pscale;
                     lv.back = h.back ? 1 : 0; lv.patOwnSide = h.patOwnSide ? 1 : 0;
                     lv.nUp = (short)nUp;

@@ -92,7 +92,8 @@ Each names the section its line is in.
 5. **CURVE-GATHER** (4.2) — modes M, S and U read a coat of diffuse fur at 0.7-2.4 of mode R; never
    gather at a curve vertex, as mode J does. Modes M and S done, 0.433.3; mode U left
    (VCM-THIN-CURVES).
-6. **VCOL-BDPT-GPU** (4.2) — GPU modes D and J connect to a vertex-coloured mesh without its colours.
+6. ~~**VCOL-BDPT-GPU** (4.2) — GPU modes D and J connect to a vertex-coloured mesh without its colours.~~
+   Done, 0.433.4.
 7. **MODEM-BEAM-CARRIER**, **JSPEC-GAPS**' rest and **MODEM-REDPASS** (4.2) — mode M's beams, and
    mode J's last camera-side factors, at the camera's wavelength.
 8. **UPBP-BEAM-RADIUS** with **J-FOG-REALCAM** (4.3) — mode J's beam kernel never shrinks: fog 1-4 %
@@ -166,8 +167,8 @@ Then the rest of 4.2-4.6 in their order, 4.7's bookkeeping alongside whatever to
   glass, where GPU mode M and both mode S do not.
 - [x] **MODEM-COMPOTE-NAN** (0.433.1) — the spectral carrier's ratio overflowed a float in the
   device's gather (and mode S's per-pixel copy); the float side now takes ratio / peak.
-- [ ] **VCOL-BDPT-GPU** — GPU modes D/J shade a vertex-coloured mesh without its colour in every
-  connection (`DVertex` does not carry `vcol`).
+- [x] **VCOL-BDPT-GPU** (0.433.4) — `DVertex` and `DVcmLV` carry the hit's vertex colour; GPU
+  modes D, J and U had read a vertex-coloured sphere near grey.
 - [ ] **MODEM-BEAM-CARRIER** — mode M's beam gather reads the camera's spectral factors at its
   wavelength.
 - [ ] **JSPEC-GAPS**, its still-open list — `aGlassCam` in the gather, support where a factor is

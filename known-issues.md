@@ -1958,7 +1958,16 @@ would equally fit a J beam bias (the `-beamk` knee section measures a few per ce
 Neither has been ruled out. The test that would settle it is D at several times 1541 spp, to see
 whether its media mean keeps rising toward J's, or a mode-R reference of the media region.
 
-## OPEN (2026-10-18): VCOL-BDPT-GPU — GPU modes D/J shade a vertex-coloured mesh WITHOUT its vertex colour in every connection
+## FIXED (2026-11-04, 0.433.4; opened 2026-10-18): VCOL-BDPT-GPU — GPU modes D/J shade a vertex-coloured mesh WITHOUT its vertex colour in every connection
+
+**Fixed in 0.433.4** as proposed: `DVertex`, and mode U's `DVcmLV` too, carry the hit's vertex
+colour index and its two barycentrics in 16 bits each (`dPackBary`), and `dVertHit` restores them.
+That adds 8 B each (144 and 160 B), where three 32-bit fields would have added 16 to the largest
+allocation of a mode-U session. It was not a small error. `tools/check_vcol_bdpt.py` (a hue-ramp PLY
+sphere under an area light) read the sphere on 0.433.3, against mode R, at saturation 0.08 (mode D)
+and 0.06 (mode U) on the GPU: near grey, the connections that carry its direct light uncoloured.
+Now GPU modes D, J (without its surface merges, too noisy on so small a sphere) and U and CPU mode
+D read it within 1.3 % per channel and in saturation.
 
 `dVertHit` rebuilds a hit from a BDPT vertex for the connection-side BSDF evaluations, and
 `DVertex` does not carry the per-vertex colour (`DHit::vcol` / `vb0` / `vb1`). Until 0.385.0 those
