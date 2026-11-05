@@ -504,7 +504,18 @@ as plain white. **Proper fix:** one shared "sample the glossy lobe" helper per b
 a weight (multiply, roulette, roulette on a bundle's max), so it returns the weight and leaves
 that choice to them. Check plain glossy's images bit-identical with tools/check_bitid.py.
 
-## OPEN (2026-11-04, 0.422.0): MODEM-GPU-CORNER — GPU mode M reads one corner of a box 15 % bright
+## OPEN (2026-11-04, 0.422.0; narrowed 0.433.2): MODEM-GPU-CORNER — GPU mode M reads one corner of a box 15 % bright
+
+**The corner was noise; a 1 % red residual on `flat` is what is left (0.433.2).** The same box, the
+same settings, its corner block (row 3, column 10) GPU/CPU: x1.206 at 1.0 sigma with two seeds,
+x1.176 at 1.6 sigma with six, x1.074 at 0.8 sigma with eight seeds at 8 M photons. The excess
+shrinks as the budget grows and is never significant: the block is a dim corner whose two-seed
+error estimate let a fluctuation look like a bias. No block of the frame passes 2.6 sigma at 8 M,
+and the frame reads 1.0004. check_bitid's `flat` scene (mode M, 64 spp, 2 M photons, six seeds a
+backend) still reads GPU/CPU 0.9895 / 0.9987 / 1.0007 per channel, with relative standard errors
+0.003 / 0.003 / 0.004: red is 1 % low on the GPU at 3.5 sigma. Small, and the next thing to
+look at here.
+
 
 On check_motion's box held still (`scene(u=0.8)`, 96 x 72, 128 spp, -n 2000000, two seeds), GPU
 mode M matches CPU mode M over the frame (0.9998) but for one 8x8 block, the right wall's upper

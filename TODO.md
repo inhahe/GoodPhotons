@@ -87,8 +87,8 @@ Each names the section its line is in.
 3. ~~**VCM-SPEC** and **SPPM-SPECTRAL** (4.2) — modes U and S merge at the camera's wavelength, so
    a coloured surface seen before a merge washes out (the fix mode J got in 0.386.1, JSPEC).~~ Done:
    mode S 0.432.0, mode U 0.433.0.
-4. **MODEM-GPU-CORNER** and ~~**MODEM-COMPOTE-NAN**~~ (4.2, the NaN done 0.433.1) — GPU mode M reads a box's corner 15 %
-   bright, and writes NaN pixels on gallery_rain's gem compote.
+4. ~~**MODEM-GPU-CORNER** and **MODEM-COMPOTE-NAN** (4.2)~~ — the NaN done 0.433.1; the corner was
+   noise (0.433.2), and what is left of the entry, a 1 % red residual on `flat`, moves to the end.
 5. **CURVE-GATHER** (4.2) — modes M, S and U read a coat of diffuse fur at 0.7-2.4 of mode R; never
    gather at a curve vertex, as mode J does.
 6. **VCOL-BDPT-GPU** (4.2) — GPU modes D and J connect to a vertex-coloured mesh without its colours.
@@ -154,8 +154,8 @@ Then the rest of 4.2-4.6 in their order, 4.7's bookkeeping alongside whatever to
 - [ ] **HAZE-SUN-B** — mode B lights an unbounded sunlit haze at 0.163 of mode R, its floor 0.846.
 - [x] **VCM-SPEC** (0.433.0) — mode U's camera walk carries mode J's spectral carrier, and each
   merge reads it at the light vertex's wavelengths.
-- [ ] **MODEM-GPU-CORNER** — GPU mode M reads one corner of a box 15 % bright (and two smaller
-  one-block residuals).
+- [ ] **MODEM-GPU-CORNER**, what is left — the corner was noise (0.433.2); GPU mode M reads
+  check_bitid's `flat` red 1 % low against the CPU (3.5 sigma).
 - [ ] **CURVE-GATHER** — modes M, S and U misread a coat of `type diffuse` curves
   (`tools/check_fur_gather.py`), M's two backends differently; VCM-THIN-CURVES is its mode-U half.
 - [ ] **PROBE-PARITY-LIMITS** — the footprint probe's crossing count misreads an open surface
