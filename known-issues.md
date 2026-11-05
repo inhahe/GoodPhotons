@@ -303,11 +303,13 @@ nothing. Since 0.434.11 a closed isosurface says its side too (capped, or an SDF
 an `open` expression's surface may end at its container). What follows is left for photon-holding
 geometry that cannot say (open quads, open meshes, open isosurfaces, curves). Two shapes break the
 rule:
-- **A photon-holding open surface hovering within the radius** (a single-quad diffuse table top, a
-  leaf, a sheet of paper, a lampshade) is crossed once. The floor under it is taken for a solid's
-  inside and is a miss, so a floor that does receive photons there is divided by too little area
-  and reads bright. 0.431.0 counted it covered. The parity cannot tell it from the lid of a
-  bottomless box built from five quads, whose floor inside is a true miss.
+- FIXED (0.434.13): **an open surface hovering within the radius** (a single-quad diffuse table top,
+  a leaf, a lampshade) was crossed once, so the floor under it, which does receive photons, was a
+  miss and read bright. An odd parity now puts a column inside only where the low leg -- from just
+  over the gather point to the column's foot -- crosses an odd count of such faces too: a
+  bottomless box's or an open cup's walls close its floor in, a hovering sheet leaves it open. The
+  same leg let 0.434.13 count non-photon-holding open faces in the parity again (0.434.9 had
+  dropped them for open mirror and lamp sheets, and so lost an open glossy cup's floor).
 - **An open solid taller than the radius** (a bottomless box of quads, a mesh that is not
   watertight -- an imported asset often is not) holds the probe's origin, r above the plane, so the
   probe crosses nothing, meets the floor in the band, and counts it. The photon sum has nothing
@@ -318,12 +320,9 @@ rule:
 Proper fix, for open meshes whose holes are planar (a statue's bottom left open on the floor): take a
 consistently wound piece whose boundary edges all lie in one plane as closed by that plane. Its
 volume taken about a point in the plane is the closed solid's, the cap's own tetrahedra vanishing
-there, so its side is known as a closed piece's is. For an open photon-holding sheet the parity
-cannot tell a table top from a bottomless box's lid; a lateral leg at the surface's own height
-from the gather point to the column (blocked by the box's walls, open under the table) could,
-taken only where the parity says inside. tools/check_gather_base.py covers the closed solids, the
-balls and the open sheets that hold no photon; neither shape above (Opus review of
-90e0486..bea7be1).
+there, so its side is known as a closed piece's is. tools/check_gather_base.py covers the closed
+solids, the balls, the open sheets (`mirrorsheet`, `lampsheet`, `tablesheet`) and an open box
+(`openbox`); not an open solid taller than the radius.
 
 ## OPEN (2026-11-04, 0.433.1): MODEM-CPU-DARKGLASS-BLUE — CPU mode M reads blue 15 % low through glass that absorbs blue strongly
 

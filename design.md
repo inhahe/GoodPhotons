@@ -987,11 +987,16 @@ preview's GGX gets glTF's own α back.
 metalness types the material (metal, dielectric, or by the map per texel), and the mean roughness
 is its constant. Both are taken over the metallicRoughness map with each texel weighed by the
 surface area mapped onto it. Materials are built before meshes, so a pre-pass walks the same nodes
-the emit pass does (`forEachMeshInstance`, shared by both). It collects, per glTF texture, the UV
-triangles and world areas of every placed primitive whose material maps it, `skip_material` aside.
-`bindTex` rasterises them over the decoded, downscaled map: `gltfimpl::texelWeights` spreads a
-triangle's area over the texel centres it covers, or onto its centroid's texel, wrapping as the
-repeat sampler does. A map nothing placed samples falls back to equal weights.
+the emit pass does (`forEachMeshInstance`, shared by both). It collects, per glTF material, the UV
+triangles and world areas of every placed primitive with it, `skip_material` aside, so two
+materials sharing one atlas are each typed by their own part of it. `bindTex` rasterises them over
+the decoded, downscaled map, once per binding for every material that maps it (the cache entry
+keeps each material's means, `MapMeans`): `gltfimpl::coverTexels` spreads a triangle's area over
+the texel centres it covers, or onto its centroid's texel, mapping UVs past the edge as the map's
+sampler does (repeat, clamp, mirror), counting and then adding so nothing per texel is stored. A
+triangle tiled over more than four maps' worth of texels (a floor with repeated UVs) covers the
+map about evenly and is not rasterised: its area is spread over every texel alike. A material no
+placed surface uses falls back to equal weights. The UVs are released once the materials are built.
 `tools/downscale_glb.py` reports the same weighted means. Every consumer that thresholds `roughness` sees the
 converted value. One consequence: an imported surface counts as caustic glossy below
 `kCausticGlossRoughness` 0.15, which is glTF 0.31. Before the conversion the cut sat at glTF 0.15.
@@ -5700,7 +5705,9 @@ as the one at fault.
   the marking pass; an `open` expression's surface may end at its container, and says nothing);
   and a triangle's when `markSolidFaces` (main.cpp, over `watertight::markSolidFaces`) found
   its connected piece closed, consistently wound and with every face's corner normals on one side
-  of its winding, the whole piece on the same side; the volume says out or in. It goes per mesh
+  of its winding, the whole piece on the same side; the volume says out or in, and a piece of no
+  volume (a double-sided card) is no solid. Corners weld at 1e-7 of the piece set's extent, never
+  more than a thousandth of its shortest edge. It goes per mesh
   object, then over every triangle no mesh object holds (quads, a light's own surface) as one pool,
   in which six quads meeting edge to edge form a box. The pass runs once per batch with a mode-M or
   mode-S camera and a footprint taken, before the exposure meter; the flag sits in `Tri`'s and
@@ -5715,9 +5722,9 @@ as the one at fault.
   a 30 cm box the floor read 0.56 of its value at its true coverage before 0.434.10). The segment
   is one bounded `occluded` ray in open air, curves unseen, and is not traced at all where the
   probe's own crossings decide, nor, on the host, where no closed solid's box comes within r√2 of the
-  gather point (`Scene::solidNear`: a tree over the boxes `markSolidFaces` takes -- every sphere, each
-  instance of an asset with marked triangles, each mesh object's marked triangles together, each
-  marked loose one; off for a scene that moves). On gallery.ftsl the segments cost CPU mode M 7-15 %
+  gather point (`Scene::solidNear`: a tree over the boxes `markSolidFaces` takes -- each closed piece
+  the classifier found, an asset's under each instance that places it, and every sphere and closed
+  isosurface light does not pass; off for a scene that moves). On gallery.ftsl the segments cost CPU mode M 7-15 %
   without the boxes and about 4 % with them; GPU mode M 1 %, mode S nothing measurable. A solid's face in the band but above the plane, met
   from inside, is crossed and passed (PROBE-UNDERSIDE): a ball's tilted underside, which the band
   widens to take in, holds no photon facing the gather's way, and the floor below is the column's
@@ -5727,10 +5734,14 @@ as the one at fault.
   more): the surface, where the probe ends. One on the plane, a box's own bottom, decides nothing:
   on it to within rounding (1e-7 r on the host, 2 `RAY_EPS` on the device), so the underside of a
   ball resting on the floor is above it all but at the point it touches.
-  A photon-holding face that cannot say (an open quad, a curve, an open isosurface, an open
-  mesh) keeps the parity, odd meaning inside, and either rule puts the column inside. One that holds no photon
-  and cannot say -- an open mirror or glossy sheet, a light's quad -- counts for nothing: an open
-  sheet encloses nothing, and the floor under it is lit from the sides. `-gageom`'s march climbs and
+  An opaque face that cannot say (an open quad, a curve, an open isosurface, an open mesh), photon-
+  holding or not, keeps the parity, odd meaning inside -- but only where the **low leg** agrees
+  (0.434.13): the segment from just over the gather point (1 % of r up) to the column's foot must
+  cross an odd count of such faces too (`opaqueCrossingsAlong`, asked only for an odd parity). A
+  bottomless box of quads or an open glossy cup standing on the surface walls its floor off, so it
+  stays a miss; a sheet hovering over it -- a diffuse table top, a mirror, a light's quad --
+  encloses nothing, and the floor under it, lit from the sides, is covered. Either rule puts the
+  column inside. `-gageom`'s march climbs and
   decides each in-band layer of a column by the faces above it: the next solid face it meets above
   the layer, met from inside meaning inside, and the parity of the rest, so a coaster's top counts
   while the floor inside the coaster under it does not; a layer no solid face in the window decides

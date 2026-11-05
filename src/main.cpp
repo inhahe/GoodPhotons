@@ -19127,16 +19127,19 @@ static void markSolidFaces(Scene& scene) {
     const auto t0 = std::chrono::steady_clock::now();
     size_t seen = 0, solid = 0;
     std::vector<char> done(scene.blasList.size(), 0), held(scene.tris.size(), 0);
+    // Each closed piece's bounds, for the boxes below: per asset, in its own frame, and in the world.
+    std::vector<std::vector<watertight::PieceBox>> blasPieces(scene.blasList.size());
+    std::vector<watertight::PieceBox> worldPieces;
     for (const MeshGroup& g : scene.meshGroups) {
         if (g.shapeOnly) continue;
         if (g.blasId >= 0 && g.blasId < (int)scene.blasList.size()) {
             if (done[(size_t)g.blasId]) continue;
             done[(size_t)g.blasId] = 1;
             std::vector<Tri>& tr = scene.blasList[(size_t)g.blasId].tris;
-            solid += watertight::markSolidFaces(tr.data(), tr.size());
+            solid += watertight::markSolidFaces(tr.data(), tr.size(), &blasPieces[(size_t)g.blasId]);
             seen += tr.size();
         } else if (g.triStart + g.triCount <= scene.tris.size()) {
-            solid += watertight::markSolidFaces(scene.tris.data() + g.triStart, g.triCount);
+            solid += watertight::markSolidFaces(scene.tris.data() + g.triStart, g.triCount, &worldPieces);
             seen += g.triCount;
             std::fill(held.begin() + (std::ptrdiff_t)g.triStart,
                       held.begin() + (std::ptrdiff_t)(g.triStart + g.triCount), (char)1);
@@ -19145,7 +19148,7 @@ static void markSolidFaces(Scene& scene) {
     std::vector<Tri*> loose;
     for (size_t i = 0; i < scene.tris.size(); ++i)
         if (!held[i]) loose.push_back(&scene.tris[i]);
-    solid += watertight::markSolidFaces(loose.data(), loose.size());
+    solid += watertight::markSolidFaces(loose.data(), loose.size(), &worldPieces);
     seen += loose.size();
     // An isosurface bounds a closed solid unless an `open` expression's surface may end at its
     // container (Implicit::solidSide).
@@ -19154,42 +19157,38 @@ static void markSolidFaces(Scene& scene) {
         im.solidSide = im.capped || !fieldHasExpr(im.nodes);
         isoSolid += im.solidSide ? 1 : 0;
     }
-    // The solids' world boxes (Scene::solidNear): every sphere and closed isosurface; an asset's
-    // marked triangles under each instance that places it; a mesh object's marked triangles
-    // together; each marked loose one.
+    // The solids' world boxes (Scene::solidNear), those a footprint's segment can meet: every
+    // sphere and closed isosurface light does not pass, and each closed piece -- an asset's under
+    // each instance that places it.
+    const auto opaqueMat = [&](int matId) {
+        return !(matId >= 0 && matId < (int)scene.mats.size() && passesLight(scene, scene.mats[(size_t)matId]));
+    };
     std::vector<Aabb> boxes;
     for (const Implicit& im : scene.implicits)
-        if (im.solidSide) boxes.push_back(im.bounds);
-    for (const Sphere& s : scene.spheres) {
+        if (im.solidSide && opaqueMat(im.matId)) boxes.push_back(im.bounds);
+    for (const Sphere& sp : scene.spheres) {
+        if (!opaqueMat(sp.matId)) continue;
         Aabb b;
-        b.expand(s.c - Vec3(s.r, s.r, s.r));
-        b.expand(s.c + Vec3(s.r, s.r, s.r));
+        b.expand(sp.c - Vec3(sp.r, sp.r, sp.r));
+        b.expand(sp.c + Vec3(sp.r, sp.r, sp.r));
         boxes.push_back(b);
     }
-    const auto addTri = [](Aabb& b, const Tri& t) { b.expand(t.v0); b.expand(t.v1); b.expand(t.v2); };
-    std::vector<Aabb> blasBox(scene.blasList.size());
-    for (size_t k = 0; k < scene.blasList.size(); ++k)
-        for (const Tri& t : scene.blasList[k].tris)
-            if (t.solidFace) addTri(blasBox[k], t);
+    for (const watertight::PieceBox& pb : worldPieces) {
+        Aabb b;
+        b.expand(pb.lo);
+        b.expand(pb.hi);
+        boxes.push_back(b);
+    }
     for (const MeshInstance& inst : scene.instances) {
-        if (inst.blasId < 0 || inst.blasId >= (int)blasBox.size()) continue;
-        const Aabb& lb = blasBox[(size_t)inst.blasId];
-        if (!(lb.lo.x <= lb.hi.x)) continue;                   // no marked triangle in the asset
-        Aabb b;
-        for (int c = 0; c < 8; ++c)
-            b.expand(inst.toWorld.apply(Vec3((c & 1) ? lb.hi.x : lb.lo.x, (c & 2) ? lb.hi.y : lb.lo.y,
-                                             (c & 4) ? lb.hi.z : lb.lo.z)));
-        boxes.push_back(b);
+        if (inst.blasId < 0 || inst.blasId >= (int)blasPieces.size()) continue;
+        for (const watertight::PieceBox& lb : blasPieces[(size_t)inst.blasId]) {
+            Aabb b;
+            for (int c = 0; c < 8; ++c)
+                b.expand(inst.toWorld.apply(Vec3((c & 1) ? lb.hi.x : lb.lo.x, (c & 2) ? lb.hi.y : lb.lo.y,
+                                                 (c & 4) ? lb.hi.z : lb.lo.z)));
+            boxes.push_back(b);
+        }
     }
-    for (const MeshGroup& g : scene.meshGroups) {
-        if (g.shapeOnly || g.blasId >= 0 || g.triStart + g.triCount > scene.tris.size()) continue;
-        Aabb b;
-        for (size_t i = g.triStart; i < g.triStart + g.triCount; ++i)
-            if (scene.tris[i].solidFace) addTri(b, scene.tris[i]);
-        if (b.lo.x <= b.hi.x) boxes.push_back(b);
-    }
-    for (const Tri* t : loose)
-        if (t->solidFace) { Aabb b; addTri(b, *t); boxes.push_back(b); }
     scene.solidBoundsBvh.build(boxes);
     scene.solidBoundsKnown = !scene.hasMotion();
     if (seen || !scene.implicits.empty())
@@ -24882,6 +24881,9 @@ static int run(int argc, char** argv) {
         const RenderCam& rc = toRender.front();
         return roiAuditReport(scene, rc.cam, rc.res, rc.resY, roiAuditFile);
     }
+    // The footprint diagnostics measure what the renderer's probe and march do, which read the
+    // closed solids' sides: marked as for a mode-M or mode-S batch.
+    if (gaFootprintR > 0.0 || gaFpAreaR > 0.0) markSolidFaces(scene);
     if (gaFootprintR > 0.0) {
         if (toRender.empty()) { std::fprintf(stderr, "[gafootprint] no camera selected\n"); return 1; }
         const RenderCam& rc = toRender.front();

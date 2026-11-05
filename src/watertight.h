@@ -24,6 +24,7 @@
 #include <unordered_map>
 #include <algorithm>
 #include <cstdint>
+#include <cfloat>
 #include <cmath>
 #include "geometry.h"   // Vec3, Tri
 
@@ -135,7 +136,10 @@ inline Report checkTris(const Tri* tris, size_t n) {
 // Its enclosed volume, taken on that side, says which way the normals point: a positive one marks
 // the piece's faces 1 (normals out: from behind is leaving), a negative one 2 (normals in, as a
 // room's may be: from behind is entering). Every other face is 0. Returns how many were marked.
-inline size_t markSolidFaces(Tri* const* tris, size_t n) {
+// `boxes`, when given, gets each closed piece's bounds (lo, hi), so a caller can tell where solids
+// lie without looking at every face.
+struct PieceBox { Vec3 lo, hi; };
+inline size_t markSolidFaces(Tri* const* tris, size_t n, std::vector<PieceBox>* boxes = nullptr) {
     if (n == 0) return 0;
     Vec3 lo = tris[0]->v0, hi = tris[0]->v0;
     for (size_t i = 0; i < n; ++i)
@@ -144,7 +148,21 @@ inline size_t markSolidFaces(Tri* const* tris, size_t n) {
             hi.x = std::max(hi.x, p->x); hi.y = std::max(hi.y, p->y); hi.z = std::max(hi.z, p->z);
         }
     const double diag = std::sqrt((hi.x-lo.x)*(hi.x-lo.x) + (hi.y-lo.y)*(hi.y-lo.y) + (hi.z-lo.z)*(hi.z-lo.z));
-    const double inv  = 1.0 / std::max(1e-9, diag * 1e-7);   // check()'s weld
+    // check()'s weld, 1e-7 of the extent -- but never more than a thousandth of the shortest edge:
+    // a pool of loose triangles spans a whole scene, and a ground quad kilometres wide must not
+    // weld a millimetre box's corners together.
+    double minEdge = DBL_MAX;
+    for (size_t i = 0; i < n; ++i) {
+        const Vec3* c[3] = {&tris[i]->v0, &tris[i]->v1, &tris[i]->v2};
+        for (int k = 0; k < 3; ++k) {
+            const Vec3 e = *c[(k + 1) % 3] - *c[k];
+            const double l = std::sqrt(dot(e, e));
+            if (l > 0.0 && l < minEdge) minEdge = l;
+        }
+    }
+    double weld = std::max(1e-9, diag * 1e-7);
+    if (minEdge < DBL_MAX) weld = std::min(weld, std::max(1e-12, minEdge * 1e-3));
+    const double inv  = 1.0 / weld;
     // Weld by sorting the corners' quantised positions (flat arrays: a scene's worth of triangles
     // costs a sort, where hash maps cost a node per corner).
     struct Corner { long long x, y, z; uint32_t at; };
@@ -215,20 +233,34 @@ inline size_t markSolidFaces(Tri* const* tris, size_t n) {
         q = e;
     }
     size_t marked = 0;
+    std::vector<int> boxOf;                       // a marked piece's slot in *boxes, or -1
+    if (boxes) boxOf.assign(parent.size(), -1);
     for (size_t i = 0; i < n; ++i) {
         const int piece = root(vid[i*3]);
+        // A piece of no thickness -- a double-sided card, its two faces wound against each other
+        // -- is closed and encloses nothing: its sign is rounding's, so it is no solid.
         const double v = vol[(size_t)piece] * (double)side[(size_t)piece];
-        const unsigned char s = (bad[(size_t)piece] || v == 0.0) ? 0 : (v > 0.0 ? 1 : 2);
+        const bool flat = std::fabs(v) <= 1e-9 * diag * diag * diag;
+        const unsigned char s = (bad[(size_t)piece] || flat) ? 0 : (v > 0.0 ? 1 : 2);
         tris[i]->solidFace = s;
         marked += s ? 1 : 0;
+        if (boxes && s) {
+            int& slot = boxOf[(size_t)piece];
+            if (slot < 0) { slot = (int)boxes->size(); boxes->push_back(PieceBox{tris[i]->v0, tris[i]->v0}); }
+            PieceBox& b = (*boxes)[(size_t)slot];
+            for (const Vec3* p : {&tris[i]->v0, &tris[i]->v1, &tris[i]->v2}) {
+                b.lo.x = std::min(b.lo.x, p->x); b.lo.y = std::min(b.lo.y, p->y); b.lo.z = std::min(b.lo.z, p->z);
+                b.hi.x = std::max(b.hi.x, p->x); b.hi.y = std::max(b.hi.y, p->y); b.hi.z = std::max(b.hi.z, p->z);
+            }
+        }
     }
     return marked;
 }
 // The same over a contiguous run.
-inline size_t markSolidFaces(Tri* tris, size_t n) {
+inline size_t markSolidFaces(Tri* tris, size_t n, std::vector<PieceBox>* boxes = nullptr) {
     std::vector<Tri*> p(n);
     for (size_t i = 0; i < n; ++i) p[i] = tris + i;
-    return markSolidFaces(p.data(), n);
+    return markSolidFaces(p.data(), n, boxes);
 }
 
 } // namespace watertight

@@ -7665,6 +7665,21 @@ __device__ static int dSolidSideAlong(const DScene& sc, DVec3 o, const DVec3& d,
     return side;
 }
 
+// Host twin opaqueCrossingsAlong (gafootprint.h): how many opaque faces that cannot say their side
+// the segment crosses, curves unseen, up to 15.
+__device__ static int dOpaqueCrossingsAlong(const DScene& sc, DVec3 o, const DVec3& d, Real len, Real eps) {
+    int cnt = 0;
+    Real done = (Real)0;
+    for (int k = 0; k < 32 && done < len && cnt < 15; ++k) {
+        const DHit h = closestHit(sc, o, d, (Real)0, len - done, false, len - done);
+        if (!h.valid) break;
+        if (!h.solid && !dPassesLight(sc, sc.mats[h.matId])) ++cnt;
+        done += h.t + eps;
+        o = h.p + d * eps;
+    }
+    return cnt;
+}
+
 // `slack`: the gather's plane-test slack (gatherBandSlack at its map's radius), its photon test's.
 __device__ static double dGatherCoverage(const DScene& sc, const DVec3& p, const DVec3& n,
                                          Real r, Real slack, DRng& rng, int M, Real fiberR = (Real)0) {
@@ -7698,9 +7713,9 @@ __device__ static double dGatherCoverage(const DScene& sc, const DVec3& p, const
             Real tAcc = (Real)0, curveTmin = (Real)0;
             // The opaque faces passed above the plane: a closed solid's says which side the probe
             // went (`lastSolid`, +1 into, -1 out of), and where it crosses none the side it began
-            // on, along the segment from the gather point to its top, taken when asked (`kAsk`); a
-            // photon-holding one that cannot say counts toward the parity (`crossed`), one that
-            // holds none for nothing; either count can put the column inside (host twin
+            // on, along the segment from the gather point to its top, taken when asked (`kAsk`); one
+            // that cannot say counts toward the parity (`crossed`), whose odd count the low leg must
+            // confirm (parityInside); either can put the column inside (host twin
             // gatherCoverageRaw).
             constexpr int kAsk = 2;
             int crossed = 0, lastSolid = kAsk;
@@ -7711,6 +7726,14 @@ __device__ static double dGatherCoverage(const DScene& sc, const DVec3& p, const
                     lastSolid = dSolidSideAlong(sc, so, (top - so) * ((Real)1 / len), len, pathEps);
                 }
                 return lastSolid;
+            };
+            // An odd parity puts the column inside only if the low leg agrees (host twin's
+            // parityInside, opaqueCrossingsAlong): a cup's wall, not a hovering sheet.
+            const auto parityInside = [&]() {
+                if (!(crossed & 1)) return false;
+                if (!(rr > (double)pathEps)) return true;
+                const Real hL = (Real)0.01 * r;   // host kLowLegFrac
+                return (dOpaqueCrossingsAlong(sc, p + n * hL, (q - p) * (Real)(1.0 / rr), (Real)rr, pathEps) & 1) != 0;
             };
             bool found = false;                  // the probe ended on what it counts
             bool ended = false;                  // ... or on what it does not
@@ -7734,13 +7757,13 @@ __device__ static double dGatherCoverage(const DScene& sc, const DVec3& p, const
                 // Only a face above the plane, by more than the relaunch's own tmin skips: one on it
                 // is the surface's height (a glass box standing on the floor). An opaque one is a
                 // crossing all the same (dPassesLight) -- host twin.
-                const auto cross = [&](bool holds) {
+                const auto cross = [&]() {
                     if (dPassesLight(sc, hm)) return;
                     if (h.solid) lastSolid = ((h.solid > 0) == h.back) ? -1 : 1;   // leaving : entering
-                    else if (holds) ++crossed;
+                    else ++crossed;
                 };
                 if (dProbePassesThrough(sc, hm) && r - h.t > fmaxf((Real)1e-3 * r, (Real)2 * RAY_EPS)) {
-                    cross(false);
+                    cross();
                     tAcc = h.t; o = h.p; curveTmin = (Real)0;
                     continue;
                 }
@@ -7757,17 +7780,17 @@ __device__ static double dGatherCoverage(const DScene& sc, const DVec3& p, const
                     // surface in the band; met from outside it is the surface, and one on the
                     // plane says nothing (host twin), "on" to within rounding: 2 RAY_EPS here.
                     if (h.solid && dzH > fmaxf((Real)1e-7 * r, (Real)2 * RAY_EPS) && (h.solid > 0) == h.back) {
-                        cross(true);
-                        if (!under.valid) { under = h; underFound = (crossed & 1) == 0 && side() <= 0; }
+                        cross();
+                        if (!under.valid) { under = h; underFound = !parityInside() && side() <= 0; }
                         tAcc = h.t; o = h.p; curveTmin = (Real)0;
                         continue;
                     }
-                    found = (crossed & 1) == 0 && side() <= 0;
+                    found = !parityInside() && side() <= 0;
                     ended = true;
                     break;
                 }
                 if (!(dzH > (Real)0)) break;                            // below the band: a miss
-                cross(true);
+                cross();
                 tAcc = h.t; o = h.p; curveTmin = (Real)0;
             }
             if (!ended && under.valid) { h = under; found = underFound; }
@@ -13542,6 +13565,12 @@ __device__ static inline bool dOnSurface(const DVertex& v) {
 __device__ static inline bool dConnectibleType(int tp) {
     return tp == D_DIFFUSE || tp == D_GLOSSY || tp == D_FLUORESCENT || tp == D_DIFFUSETRANSMIT ||
            tp == D_HAIR;   // fiber BCSDF: narrow lobes, but finite (bsdf_eval.h isConnectibleMat)
+}
+// Whether the connections may use a light vertex stored under the lobe of type `tp`: a lobe they
+// can evaluate, a hair fiber aside (host twin lightVertexConnects). The store and the connection
+// loop both read this one.
+__device__ static inline bool dLvConnects(int tp) {
+    return dConnectibleType(tp) && tp != D_HAIR;
 }
 // Whether a light walk stores the vertex a merge gathers under the lobe `m` (host twin
 // storesMergeVertex).
@@ -21572,7 +21601,7 @@ __global__ void kVcmLightT(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx,
             // nor splat, and the walk ends after its scatter below. A compound's merge vertex is
             // stored whatever lobe the pick took (storeP), for the merges alone where that lobe
             // does not connect (host twin).
-            const bool connectible = dConnectibleType(mp->type) && mp->type != D_HAIR;
+            const bool connectible = dLvConnects(mp->type);
             if (connectible || storeP > 0.0) {
                 if (stored < vcmCap) {
                     DVcmLV lv;
@@ -22097,11 +22126,9 @@ __global__ void kVcmCameraT(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx
                 int pb = pathBegin[lp], pe = pathEnd[lp];
                 for (int j = pb; j < pe; ++j) {
                     const DVcmLV& lv = grid.lv[j];
-                    // A compound's merge vertex stored under a lobe that does not connect (host
-                    // twin lightVertexConnects).
-                    if (!(dConnectibleType(sc.mats[lv.matId].type) && sc.mats[lv.matId].type != D_HAIR))
-                        continue;
                     if (edges + lv.edges + 1 > ctx.maxDepth) continue;
+                    // A compound's merge vertex stored under a lobe that does not connect.
+                    if (!dLvConnects(sc.mats[lv.matId].type)) continue;
                     DVec3 dv = lv.p - h.p; double dist2 = ddot(dv, dv);
                     if (dist2 <= 1e-12) continue;
                     double distc = sqrt(dist2); DVec3 w = dv * (Real)(1.0 / distc);

@@ -84,39 +84,59 @@ constexpr double kGltfMinRoughness = 1e-3;
 // triangles that sample it -- `uv` six per triangle (glTF's u, v: texel row v*h, Texture's
 // layout once the loader's 1 - v is undone by its lookup), `area` each triangle's world area.
 // A triangle's area is spread over the texel centres it covers, or put on the texel under its
-// centroid when it covers none; UVs outside [0, 1) wrap, as the repeat sampler does. All zero
-// when nothing samples the map: the caller then weighs every texel alike.
-inline std::vector<float> texelWeights(int w, int h, const std::vector<float>& uv,
-                                       const std::vector<float>& area) {
-    std::vector<float> wt((size_t)w * (size_t)h, 0.0f);
-    if (w <= 0 || h <= 0) return wt;
-    const auto wrap = [](long long i, int n) { long long m = i % n; return (size_t)(m < 0 ? m + n : m); };
-    std::vector<std::pair<long long, long long>> cover;
+// centroid when it covers none, each `add(texelIndex, share)`; a UV outside [0, 1) maps as the
+// texture's sampler does (`wrap`). A triangle tiled across more than four maps' worth of texels
+// (a floor with its UVs repeated) covers the map about evenly and is not rasterised: its area is
+// returned, to be spread over every texel alike by the caller. Two passes over each triangle's
+// texels, counting and then adding, so nothing per texel is stored.
+template <class Add>
+inline double coverTexels(int w, int h, TexWrap wrap, const std::vector<float>& uv,
+                          const std::vector<float>& area, Add&& add) {
+    if (w <= 0 || h <= 0) return 0.0;
+    const auto index = [wrap](long long i, int n) -> size_t {
+        if (wrap == TexWrap::Clamp) return (size_t)(i < 0 ? 0 : i >= n ? n - 1 : i);
+        if (wrap == TexWrap::Mirror) {
+            long long m = i % (2LL * n);
+            if (m < 0) m += 2LL * n;
+            return (size_t)(m < n ? m : 2LL * n - 1 - m);
+        }
+        long long m = i % n;
+        return (size_t)(m < 0 ? m + n : m);
+    };
+    double uniform = 0.0;
     for (size_t t = 0; t < area.size(); ++t) {
         const double x0 = uv[t*6+0] * w, y0 = uv[t*6+1] * h, x1 = uv[t*6+2] * w, y1 = uv[t*6+3] * h,
                      x2 = uv[t*6+4] * w, y2 = uv[t*6+5] * h;
         const double d = (x1 - x0) * (y2 - y0) - (x2 - x0) * (y1 - y0);   // twice the signed UV area
-        cover.clear();
+        long long n = 0;
+        long long xa = 0, xb = 0, ya = 0, yb = 0;
+        const auto inside = [&](long long x, long long y) {
+            const double px = x + 0.5, py = y + 0.5;
+            const double b1 = ((px - x0) * (y2 - y0) - (x2 - x0) * (py - y0)) / d;
+            const double b2 = ((x1 - x0) * (py - y0) - (px - x0) * (y1 - y0)) / d;
+            return b1 >= 0.0 && b2 >= 0.0 && b1 + b2 <= 1.0;
+        };
         if (std::fabs(d) > 1e-12) {
-            const long long xa = (long long)std::floor(std::min({x0, x1, x2})),
-                            xb = (long long)std::ceil(std::max({x0, x1, x2})),
-                            ya = (long long)std::floor(std::min({y0, y1, y2})),
-                            yb = (long long)std::ceil(std::max({y0, y1, y2}));
-            if ((xb - xa) * (yb - ya) > 64ll * w * h) continue;   // a corrupt UV, not a surface
+            xa = (long long)std::floor(std::min({x0, x1, x2})); xb = (long long)std::ceil(std::max({x0, x1, x2}));
+            ya = (long long)std::floor(std::min({y0, y1, y2})); yb = (long long)std::ceil(std::max({y0, y1, y2}));
+            if ((double)(xb - xa) * (double)(yb - ya) > 4.0 * (double)w * (double)h) {
+                uniform += area[t];
+                continue;
+            }
             for (long long y = ya; y < yb; ++y)
-                for (long long x = xa; x < xb; ++x) {
-                    const double px = x + 0.5, py = y + 0.5;
-                    const double b1 = ((px - x0) * (y2 - y0) - (x2 - x0) * (py - y0)) / d;
-                    const double b2 = ((x1 - x0) * (py - y0) - (px - x0) * (y1 - y0)) / d;
-                    if (b1 >= 0.0 && b2 >= 0.0 && b1 + b2 <= 1.0) cover.push_back({x, y});
-                }
+                for (long long x = xa; x < xb; ++x) n += inside(x, y) ? 1 : 0;
         }
-        if (cover.empty())
-            cover.push_back({(long long)std::floor((x0 + x1 + x2) / 3.0), (long long)std::floor((y0 + y1 + y2) / 3.0)});
-        const float share = area[t] / (float)cover.size();
-        for (const auto& c : cover) wt[wrap(c.second, h) * (size_t)w + wrap(c.first, w)] += share;
+        if (n == 0) {
+            add(index((long long)std::floor((y0 + y1 + y2) / 3.0), h) * (size_t)w +
+                index((long long)std::floor((x0 + x1 + x2) / 3.0), w), (double)area[t]);
+            continue;
+        }
+        const double share = (double)area[t] / (double)n;
+        for (long long y = ya; y < yb; ++y)
+            for (long long x = xa; x < xb; ++x)
+                if (inside(x, y)) add(index(y, h) * (size_t)w + index(x, w), share);
     }
-    return wt;
+    return uniform;
 }
 
 // Read an entire file into a byte vector. Returns false on open failure.
@@ -623,7 +643,14 @@ inline int loadGltf(Scene& s, const char* path, int fallbackMat, const Affine& x
     const minijson::Value* texturesArr = doc.root.find("textures");
     const minijson::Value* imagesArr   = doc.root.find("images");
     const minijson::Value* samplersArr = doc.root.find("samplers");
-    struct TexCacheEnt { int gltfTex; int role; double p0, p1, p2; int sceneTex; double meanMetal, meanRough, metalFrac, murkyFrac; };
+    // A metallicRoughness map's means, for one glTF material (`mat`) or for the map's every texel
+    // alike (`mat` -1: a material no placed surface uses, or a map no material weighs).
+    struct MapMeans { int mat = -1; double meanMetal = 0.0, meanRough = 0.0, metalFrac = 0.0, murkyFrac = 0.0; };
+    struct TexCacheEnt {
+        int gltfTex; int role; double p0, p1, p2; int sceneTex;
+        MapMeans all;                  // every texel alike
+        std::vector<MapMeans> perMat;  // each material that maps it, weighed by its own surface
+    };
     std::vector<TexCacheEnt> texCache;
     bool texStopped = false;   // buildReflCoeff refused: `ftrace -stop` during scene load
 
@@ -670,12 +697,13 @@ inline int loadGltf(Scene& s, const char* path, int fallbackMat, const Affine& x
     // GLTF-MAP-MEAN-GUTTERS: the surface behind each metallicRoughness map, for its means. An
     // atlas is not all surface -- gutters and background that no hit samples weighed a third of
     // a Meshy gnome's -- so the means that type a material and set its constant roughness weigh
-    // each texel by the surface area mapped onto it (texelWeights). Gathered per glTF texture,
-    // from every primitive the file places with a material that maps it, `skip_material` aside:
-    // `mrUV[ti]` six glTF UVs per triangle, `mrArea[ti]` its world area.
+    // each texel by the surface area mapped onto it (coverTexels). Gathered per glTF material,
+    // from every primitive the file places with it, `skip_material` aside, so two materials that
+    // share one atlas are each typed by their own part of it: `mrUV[m]` six glTF UVs per
+    // triangle, `mrArea[m]` its world area, `mrOfMat[m]` the material's metallicRoughness map.
     std::vector<std::vector<float>> mrUV, mrArea;
+    std::vector<int> mrOfMat;   // glTF material -> its metallicRoughnessTexture, or -1
     if (importMaterials && texturesArr && texturesArr->isArray() && meshes && meshes->isArray()) {
-        std::vector<int> mrOfMat;   // glTF material -> its metallicRoughnessTexture, or -1
         if (const minijson::Value* mats = doc.root.find("materials"); mats && mats->isArray())
             for (const minijson::Value& mj : mats->arr) {
                 int ti = -1;
@@ -684,8 +712,8 @@ inline int loadGltf(Scene& s, const char* path, int fallbackMat, const Affine& x
                         ti = t->intAt("index", -1);
                 mrOfMat.push_back(ti >= 0 && ti < (int)texturesArr->arr.size() ? ti : -1);
             }
-        mrUV.resize(texturesArr->arr.size());
-        mrArea.resize(texturesArr->arr.size());
+        mrUV.resize(mrOfMat.size());
+        mrArea.resize(mrOfMat.size());
         forEachMeshInstance([&](int meshIdx, const Affine& world) {
             if (meshIdx < 0 || meshIdx >= (int)meshes->arr.size()) return;
             const minijson::Value* prims = meshes->arr[(size_t)meshIdx].find("primitives");
@@ -708,8 +736,8 @@ inline int loadGltf(Scene& s, const char* path, int fallbackMat, const Affine& x
                 } else {
                     for (uint32_t i = 0; i < (uint32_t)nv; ++i) idx.push_back(i);
                 }
-                std::vector<float>& U = mrUV[(size_t)mrOfMat[(size_t)m]];
-                std::vector<float>& A = mrArea[(size_t)mrOfMat[(size_t)m]];
+                std::vector<float>& U = mrUV[(size_t)m];
+                std::vector<float>& A = mrArea[(size_t)m];
                 for (size_t i = 0; i + 2 < idx.size(); i += 3) {
                     if (idx[i] >= nv || idx[i+1] >= nv || idx[i+2] >= nv) continue;
                     Vec3 p[3];
@@ -731,19 +759,27 @@ inline int loadGltf(Scene& s, const char* path, int fallbackMat, const Affine& x
     // receives the mean of the map's BLUE channel -- for a metallicRoughness map that is
     // the mean metallic, which is the only thing the single-BSDF material choice below
     // can act on (ftrace has no per-texel metal/dielectric blend).
+    // `mat`: the glTF material binding it, whose own surface weighs the means (MapMeans).
     auto bindTex = [&](int ti, TexRole role, double p0, double p1, double p2,
                        double* outMeanMetal, double* outMeanRough = nullptr,
-                       double* outMetalFrac = nullptr, double* outMurkyFrac = nullptr) -> int {
+                       double* outMetalFrac = nullptr, double* outMurkyFrac = nullptr,
+                       int mat = -1) -> int {
         if (texStopped) return -1;
         if (!texturesArr || !texturesArr->isArray() || ti < 0 || ti >= (int)texturesArr->arr.size())
             return -1;
+        const auto give = [&](const TexCacheEnt& e) {
+            const MapMeans* mm = &e.all;
+            for (const MapMeans& x : e.perMat)
+                if (x.mat == mat) { mm = &x; break; }
+            if (outMeanMetal) *outMeanMetal = mm->meanMetal;
+            if (outMeanRough) *outMeanRough = mm->meanRough;
+            if (outMetalFrac) *outMetalFrac = mm->metalFrac;
+            if (outMurkyFrac) *outMurkyFrac = mm->murkyFrac;
+        };
         for (const TexCacheEnt& e : texCache)
             if (e.gltfTex == ti && e.role == (int)role &&
                 e.p0 == p0 && e.p1 == p1 && e.p2 == p2) {
-                if (outMeanMetal) *outMeanMetal = e.meanMetal;
-                if (outMeanRough) *outMeanRough = e.meanRough;
-                if (outMetalFrac) *outMetalFrac = e.metalFrac;
-                if (outMurkyFrac) *outMurkyFrac = e.murkyFrac;
+                give(e);
                 return e.sceneTex;
             }
         const minijson::Value& tj = texturesArr->arr[ti];
@@ -775,64 +811,65 @@ inline int loadGltf(Scene& s, const char* path, int fallbackMat, const Affine& x
 
         // `murkyFrac`: the share of texels whose metalness is neither clearly metal nor clearly not
         // (strictly between 0.15 and 0.85) -- the -import-metal hint's heuristic, below. Each mean
-        // and share weighs a texel by the surface mapped onto it (mrUV, texelWeights), so an
-        // atlas's gutters weigh nothing; a map no placed surface samples weighs all alike.
-        double meanMetal = 0.0, meanRoughOut = p0, metalFrac = 0.0, murkyFrac = 0.0;
-        std::vector<float> texW;
-        double wSum = 0.0;
-        if ((role == TexRole::Metalness || role == TexRole::Roughness) && ti < (int)mrArea.size() &&
-            !mrArea[(size_t)ti].empty()) {
-            texW = texelWeights(tex.w, tex.h, mrUV[(size_t)ti], mrArea[(size_t)ti]);
-            for (float x : texW) wSum += x;
-            if (!(wSum > 0.0)) texW.clear();
-        }
-        const auto weightOf = [&](size_t i) { return texW.empty() ? 1.0 : (double)texW[i]; };
-        const double wTotal = texW.empty() ? (double)tex.rgb.size() : wSum;
-        if (role == TexRole::Metalness) {
-            // B * metallicFactor, broadcast so scalarAt (which averages RGB) reads metalness.
-            double acc = 0.0, above = 0.0, murky = 0.0;
-            for (size_t i = 0; i < tex.rgb.size(); ++i) {
-                Vec3& c = tex.rgb[i];
-                const double mv = std::min(1.0, std::max(0.0, c.z * p0)), wi = weightOf(i);
-                acc += wi * mv;
-                if (mv >= 0.5) above += wi;
-                if (mv > 0.15 && mv < 0.85) murky += wi;
-                c = Vec3{mv, mv, mv};
+        // and share weighs a texel by the surface its material maps onto it (mrUV, coverTexels), so
+        // an atlas's gutters weigh nothing and two materials sharing one are each typed by their own
+        // part of it; a material no placed surface samples weighs all texels alike (`all`).
+        // `p1` carries metallicFactor for the Roughness role, `p0` for the Metalness one.
+        MapMeans all;
+        std::vector<MapMeans> perMat;
+        if (role == TexRole::Metalness || role == TexRole::Roughness) {
+            const size_t n = tex.rgb.size();
+            const double mf = (role == TexRole::Roughness) ? p1 : p0;
+            std::vector<float> mvA(n), gA;
+            for (size_t i = 0; i < n; ++i) mvA[i] = (float)std::min(1.0, std::max(0.0, tex.rgb[i].z * mf));
+            if (role == TexRole::Roughness) {
+                gA.resize(n);
+                for (size_t i = 0; i < n; ++i) gA[i] = (float)gltfRoughness(tex.rgb[i].y * p0);
             }
-            meanMetal = wTotal > 0.0 ? acc / wTotal : 0.0;
-            metalFrac = wTotal > 0.0 ? above / wTotal : 0.0;
-            murkyFrac = wTotal > 0.0 ? murky / wTotal : 0.0;
-        } else if (role == TexRole::Roughness) {
-            // Each texel as an ftrace roughness (gltfRoughness), so the map, its mean and the
-            // constant that stands in for it all mean what the asset's author saw.
-            // glTF packs occlusion/roughness/metalness into R/G/B of one image. ftrace's
-            // scalarAt averages the three channels, so the G plane has to be broadcast to
-            // all three or a rough surface would read as (0 + rough + metal)/3. The mean
-            // metallic is harvested first, before B is overwritten.
-            double aboveHalf = 0.0, murky = 0.0;
-            for (size_t i = 0; i < tex.rgb.size(); ++i) {
-                const double mv = std::min(1.0, std::max(0.0, tex.rgb[i].z * p1)), wi = weightOf(i);   // p1 carries metallicFactor
-                meanMetal += wi * mv;
-                if (mv >= 0.5) aboveHalf += wi;
-                if (mv > 0.15 && mv < 0.85) murky += wi;
+            struct Acc { double w = 0.0, metal = 0.0, above = 0.0, murky = 0.0, rough = 0.0; };
+            const auto accAt = [&](Acc& a, size_t i, double wi) {
+                const double mv = mvA[i];
+                a.w += wi; a.metal += wi * mv;
+                if (mv >= 0.5) a.above += wi;
+                if (mv > 0.15 && mv < 0.85) a.murky += wi;
+                if (!gA.empty()) a.rough += wi * gA[i];
+            };
+            const auto meansOf = [&](const Acc& a, int m) {
+                MapMeans r;
+                r.mat = m;
+                if (a.w > 0.0) {
+                    r.meanMetal = a.metal / a.w; r.metalFrac = a.above / a.w; r.murkyFrac = a.murky / a.w;
+                }
+                r.meanRough = (!gA.empty() && a.w > 0.0) ? a.rough / a.w : p0;
+                return r;
+            };
+            Acc acc0;
+            for (size_t i = 0; i < n; ++i) accAt(acc0, i, 1.0);
+            all = meansOf(acc0, -1);
+            for (size_t m = 0; m < mrOfMat.size() && m < mrArea.size() && n > 0; ++m) {
+                if (mrOfMat[m] != ti || mrArea[m].empty()) continue;
+                Acc a;
+                const double even = coverTexels(tex.w, tex.h, tex.wrap, mrUV[m], mrArea[m],
+                                                [&](size_t i, double share) { accAt(a, i, share); });
+                if (even > 0.0) {   // tiled surface: its area over every texel alike
+                    const double k = even / (double)n;
+                    a.w += k * acc0.w; a.metal += k * acc0.metal; a.above += k * acc0.above;
+                    a.murky += k * acc0.murky; a.rough += k * acc0.rough;
+                }
+                if (a.w > 0.0) perMat.push_back(meansOf(a, (int)m));
             }
-            meanMetal = wTotal > 0.0 ? meanMetal / wTotal : 0.0;
-            metalFrac = wTotal > 0.0 ? aboveHalf / wTotal : 0.0;
-            murkyFrac = wTotal > 0.0 ? murky / wTotal : 0.0;
-            double meanR = 0.0;
-            for (size_t i = 0; i < tex.rgb.size(); ++i) {
-                Vec3& c = tex.rgb[i];
-                const double g = gltfRoughness(c.y * p0);
-                meanR += weightOf(i) * g;
-                c = Vec3{g, g, g};
+            // The texels as ftrace reads them, broadcast so scalarAt (which averages RGB) reads
+            // the one plane: the metalness for the Metalness role; for the Roughness role each
+            // texel as an ftrace roughness (gltfRoughness), so the map, its mean and the constant
+            // that stands in for it all mean what the asset's author saw. (glTF packs occlusion /
+            // roughness / metalness into R/G/B of one image.) The mean roughness is the material's
+            // constant: a Meshy-class export writes `roughnessFactor 1.0` and puts the real value
+            // in the map, so the factor alone made every consumer that cannot sample the texture
+            // -- the preview rasterizers among them -- draw a lobe so broad it was invisible.
+            for (size_t i = 0; i < n; ++i) {
+                const float v = gA.empty() ? mvA[i] : gA[i];
+                tex.rgb[i] = Vec3{v, v, v};
             }
-            // The map's MEAN roughness, harvested like the mean metalness above and used as
-            // the material's constant. The factor alone is the wrong representative: a
-            // Meshy-class export writes `roughnessFactor 1.0` and puts the real value in the
-            // map, so every consumer that cannot sample the texture -- the preview
-            // rasterizers among them -- saw a fully rough surface and drew a lobe so broad
-            // it was invisible. Alice's map means 0.25 (satin); the factor said 1.0.
-            meanRoughOut = wTotal > 0.0 ? meanR / wTotal : p0;
         } else if (role == TexRole::Color) {
             if (p0 != 1.0 || p1 != 1.0 || p2 != 1.0)
                 for (Vec3& c : tex.rgb) c = Vec3{c.x * p0, c.y * p1, c.z * p2};
@@ -851,11 +888,9 @@ inline int loadGltf(Scene& s, const char* path, int fallbackMat, const Affine& x
                     : role == TexRole::Metalness ? ":metal" : ":normal");
         const int id = (int)s.textures.size();
         s.textures.push_back(std::move(tex));
-        texCache.push_back(TexCacheEnt{ti, (int)role, p0, p1, p2, id, meanMetal, meanRoughOut, metalFrac, murkyFrac});
-        if (outMeanMetal) *outMeanMetal = meanMetal;
-        if (outMeanRough) *outMeanRough = meanRoughOut;
-        if (outMetalFrac) *outMetalFrac = metalFrac;
-        if (outMurkyFrac) *outMurkyFrac = murkyFrac;
+        if (role != TexRole::Metalness && role != TexRole::Roughness) all.meanRough = p0;
+        texCache.push_back(TexCacheEnt{ti, (int)role, p0, p1, p2, id, all, std::move(perMat)});
+        give(texCache.back());
         return id;
     };
 
@@ -954,7 +989,7 @@ inline int loadGltf(Scene& s, const char* path, int fallbackMat, const Affine& x
                 if (mrTex.index >= 0) {
                     double meanMetal = metallic, meanRough = roughness;
                     roughTexId = bindTex(mrTex.index, TexRole::Roughness, roughness, metallic, 0.0,
-                                         &meanMetal, &meanRough, &metalFrac, &murkyFrac);
+                                         &meanMetal, &meanRough, &metalFrac, &murkyFrac, (int)i);
                     if (roughTexId >= 0) {
                         // `meanMetal` already carries metallicFactor (passed as p1), so this is
                         // an assignment, not a second multiply -- squaring it would read a
@@ -1244,6 +1279,9 @@ inline int loadGltf(Scene& s, const char* path, int fallbackMat, const Affine& x
             }
         }
     }
+    // The maps' means are taken: their surfaces' UVs are not needed past the materials.
+    std::vector<std::vector<float>>().swap(mrUV);
+    std::vector<std::vector<float>>().swap(mrArea);
     auto resolveMat = [&](int gltfMatIdx) -> int {
         if (importMaterials && gltfMatIdx >= 0 && gltfMatIdx < (int)matMap.size())
             return matMap[gltfMatIdx];

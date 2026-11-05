@@ -1,8 +1,9 @@
 """Regression check: modes M and S read the floor at the base of an object standing on it as mode R does.
 
     python tools/check_gather_base.py [--out png/check_gather_base] [--exe ftrace.exe]
-                                      [--objects diffuse,mirror,coated,coaster,tower,isotower,ball,
-                                                 meshball,diffuseball,smallball,mirrorsheet,lampsheet]
+                                      [--objects diffuse,mirror,coated,coaster,openbox,tower,isotower,
+                                                 ball,meshball,diffuseball,smallball,mirrorsheet,
+                                                 lampsheet,tablesheet]
 
 A closed 3 cm box (six quads) standing on a lit floor, seen from straight above, modes M and S at a
 pinned gather radius of 0.1 on the CPU and the GPU, against mode R on the GPU. A mode-M or mode-S
@@ -22,7 +23,10 @@ so the probe passes their faces, but they are opaque: their faces are crossings 
 (passesLight), or the floor under them counts as covered again. A diffuse box 5 mm tall (`coaster`)
 has its top in the floor's band from 5 cm away, so the floor's gather takes the top's photons there,
 and the top must count as covered: met from outside, a closed solid's face in the band is the
-surface, not a crossing. A diffuse box 30 cm tall (`tower`), off to one side so the foot of its near
+surface, not a crossing. A glossy box with no bottom face (`openbox`), an open shell that cannot
+say its side and holds no photon, still shadows the floor inside it: its lid counts toward the
+parity, which the walls confirm along the low leg from the gather point to the column. A diffuse
+box 30 cm tall (`tower`), off to one side so the foot of its near
 face is seen past its top: every probe over it begins inside it, r above the floor, and crosses none
 of its faces going down, so it must know from the path up from the gather point and across that it
 began inside (PROBE-PATH); `isotower` is the same tower as an isosurface, an SDF box, whose side
@@ -40,7 +44,8 @@ climbing from below, must take the underside it enters to say the floor under it
 floor is held from the contact out to 10 cm.
 Then a mirror quad and a light's own quad hovering 8 cm over the floor, seen
 from the same low view: open sheets that hold no photon, which enclose nothing, so the floor under
-them is the whole disc's coverage too (held as the balls' ring is).
+them is the whole disc's coverage too (held as the balls' ring is); so is a diffuse quad hovering
+there (`tablesheet`), which holds photons and is crossed once, its low leg open.
 
 The floor 0-2 cm and 2-5 cm out from a box's base must each read within 7 % of mode R (two seeds
 apiece). The floor 4-12 cm from a ball's contact must read within 3 % of the same render with the
@@ -168,8 +173,12 @@ def side_dist(occluded=True, radius=BOX):
 # over mode R, and mode S 15-25 %, however the coverage is taken. So that ring holds each estimate to
 # the same render with the footprint correction off (`-gatherarea 0`): the same photons, so the
 # ratio is the coverage alone, which is the whole disc there since the floor is all present.
-def _box(mat, height=0.03):
-    return ([mat] + box(-BOX, 0.0, -BOX, BOX, height, BOX, "obj"), TOP_CAM,
+def _box(mat, height=0.03, bottom=True):
+    faces = box(-BOX, 0.0, -BOX, BOX, height, BOX, "obj")
+    if not bottom:
+        faces = [f for f in faces if "origin %g 0 %g  u %g 0 0" % (-BOX, -BOX, 2 * BOX) not in f]
+        assert len(faces) == 5
+    return ([mat] + faces, TOP_CAM,
             lambda: top_dist(lambda X, Z: np.maximum(np.abs(X), np.abs(Z)) - BOX), RINGS, "the base",
             "R")
 
@@ -224,6 +233,10 @@ OBJECTS = {
     # takes its photons, so there the probe must end on it as covered (a closed solid's face met
     # from outside), and the march count it while dropping the floor inside the box below it.
     "coaster": _box('material "obj" { type diffuse reflect 0.5 }', height=0.005),
+    # A glossy box with no bottom face -- an open shell, as an imported cup or bowl often is -- whose
+    # faces cannot say their side and hold no photon: its lid still puts the floor inside it out
+    # of the parity, which its walls confirm along the low leg.
+    "openbox": _box('material "obj" { type glossy reflect 0.6 roughness 0.3 }', bottom=False),
     # A box 30 cm tall holds every probe over it from its start r above the floor, so the probe
     # crosses none of its faces going down: it must know it begins inside (PROBE-PATH).
     "tower": _tower('material "obj" { type diffuse reflect 0.5 }'),
@@ -245,6 +258,9 @@ OBJECTS = {
                            quad((-BOX, 0.08, -BOX), (0, 0, 2 * BOX), (2 * BOX, 0, 0), "obj"), SIDE_LIGHT]),
     "lampsheet": _sheet(["light area { origin %g 0.08 %g  u %g 0 0  v 0 0 %g  normal 0 -1 0  power 5  "
                          "spd preset:d65 }" % (-BOX, -BOX, 2 * BOX, 2 * BOX), SIDE_LIGHT]),
+    # A sheet that holds photons, a table top: crossed once, but the low leg under it is open.
+    "tablesheet": _sheet(['material "obj" { type diffuse reflect 0.5 }',
+                          quad((-BOX, 0.08, -BOX), (0, 0, 2 * BOX), (2 * BOX, 0, 0), "obj"), SIDE_LIGHT]),
 }
 
 

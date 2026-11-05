@@ -4541,8 +4541,10 @@ struct Scene {
     // ray is a connection segment rather than a traced ray — but it is off by default there,
     // because an ordinary NEE shadow ray must still be blocked by a hidden flat or turning
     // off primary visibility would silently change the lighting.
+    // `tMaxIn`: the nearest hit closer than this, or none -- a segment's end, so its traversal
+    // stops there rather than searching the scene beyond it.
     Hit closestHit(const Ray& r, double tmin = 1e-6, TraversalStats* stats = nullptr,
-                   bool skipHair = false, bool skipCamHidden = false) const {
+                   bool skipHair = false, bool skipCamHidden = false, double tMaxIn = DBL_MAX) const {
         ++raystats::tls;
         // Leaving a hair fiber the strand's own body is excluded by `curveTmin`, so the blanket
         // self-intersection tmin has nothing left to protect against and would only re-open the
@@ -4550,7 +4552,8 @@ struct Scene {
         // under the fur gets tunnelled through. Device twin: render_cuda.cu bkRadiance.
         if (r.curveTmin > 0.0) tmin = 0.0;
         Hit h;
-        double tMax = DBL_MAX;
+        h.t = tMaxIn;
+        double tMax = tMaxIn;
         const size_t nT = tris.size();
         const size_t nS = spheres.size();
         const size_t nI = implicits.size();

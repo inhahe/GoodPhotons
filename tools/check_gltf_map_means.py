@@ -14,12 +14,20 @@ metal. Rendered (mode R, CPU, fixed seed) against the same quad on a map of 0.2 
   - the importer's part-metal note (it prints one for a map that is part metal by its weighted
     texels) names neither the gutter map nor the uniform one.
 
+The means are each material's own: a trim and a fabric sharing one atlas, the trim on its metal
+part, render byte for byte as the two on maps of their own. A map's sampler maps the UVs past its
+edge: under clamp, a quad's UVs out to 1.3 weigh the edge column, metal (the note says 23.8 %).
+And a surface tiled across many maps' worth of texels weighs the whole map alike rather than
+nothing: a floor tiled twenty times over the gutter map, beside a chart a hundredth its size, types
+the material METAL (69 % metal by surface).
+
 Exits 1 on any failure.
 """
 import argparse
 import io
 import json
 import os
+import re
 import struct
 import subprocess
 import sys
@@ -78,6 +86,66 @@ def write_glb(path, gutter, u_max):
         f.write(struct.pack("<4sII", b"glTF", 2, 12 + len(body)) + body)
 
 
+def write_glb_quads(path, quads, maps, wrap=10497, mat_map=None):
+    """Quads side by side along x (each 1 m by `w` m), each `(w, (u0, u1), (v0, v1), material)`;
+    `maps` metallicRoughness maps, each a function x, y -> 8-bit metalness on a 100 px square
+    (roughness 0.5 throughout); material k uses map `mat_map[k]` (map k by default); `wrap` the
+    maps' sampler wrapS."""
+    if mat_map is None:
+        mat_map = list(range(len(maps)))
+    from PIL import Image
+    base = Image.new("RGB", (8, 8), (200, 160, 110))
+    pos, nrm, uv, idx = [], [], [], []
+    prims = []
+    x0 = -0.5 * sum(q[0] for q in quads)
+    for k, (w, (u0, u1), (v0, v1), mat) in enumerate(quads):
+        b = len(pos) // 3
+        pos += [x0, -0.5, 0, x0 + w, -0.5, 0, x0 + w, 0.5, 0, x0, 0.5, 0]
+        nrm += [0, 0, 1] * 4
+        uv += [u0, v1, u1, v1, u1, v0, u0, v0]
+        prims.append((len(idx), mat))
+        idx += [b, b + 1, b + 2, b, b + 2, b + 3]
+        x0 += w
+    imgs = [png(base)]
+    for f in maps:
+        mr = Image.new("RGB", (100, 100))
+        for y in range(100):
+            for x in range(100):
+                mr.putpixel((x, y), (0, 128, f(x, y)))
+        imgs.append(png(mr))
+    parts = [struct.pack("<%df" % len(pos), *pos), struct.pack("<%df" % len(nrm), *nrm),
+             struct.pack("<%df" % len(uv), *uv)]
+    parts += [struct.pack("<6H", *idx[o:o + 6]) for o, _ in prims]
+    parts += imgs
+    views, blob = [], b""
+    for p in parts:
+        views.append({"buffer": 0, "byteOffset": len(blob), "byteLength": len(p)})
+        blob += p + b"\0" * (-len(p) % 4)
+    nq, nv = len(prims), len(pos) // 3
+    doc = {
+        "asset": {"version": "2.0"}, "scene": 0, "scenes": [{"nodes": [0]}], "nodes": [{"mesh": 0}],
+        "meshes": [{"primitives": [{"attributes": {"POSITION": 0, "NORMAL": 1, "TEXCOORD_0": 2},
+                                    "indices": 3 + k, "material": m} for k, (_, m) in enumerate(prims)]}],
+        "materials": [{"name": "m%d" % k, "pbrMetallicRoughness": {
+            "baseColorTexture": {"index": 0}, "metallicRoughnessTexture": {"index": 1 + mat_map[k]},
+            "metallicFactor": 1.0, "roughnessFactor": 1.0}} for k in range(len(mat_map))],
+        "samplers": [{"wrapS": wrap, "wrapT": wrap}],
+        "textures": [{"source": 0}] + [{"source": 1 + k, "sampler": 0} for k in range(len(maps))],
+        "images": [{"bufferView": 3 + nq + k, "mimeType": "image/png"} for k in range(1 + len(maps))],
+        "accessors": [
+            {"bufferView": 0, "componentType": 5126, "count": nv, "type": "VEC3",
+             "min": [min(pos[0::3]), -0.5, 0], "max": [max(pos[0::3]), 0.5, 0]},
+            {"bufferView": 1, "componentType": 5126, "count": nv, "type": "VEC3"},
+            {"bufferView": 2, "componentType": 5126, "count": nv, "type": "VEC2"}] +
+            [{"bufferView": 3 + k, "componentType": 5123, "count": 6, "type": "SCALAR"} for k in range(nq)],
+        "bufferViews": views, "buffers": [{"byteLength": len(blob)}]}
+    js = json.dumps(doc).encode("utf-8")
+    js += b" " * (-len(js) % 4)
+    body = struct.pack("<I4s", len(js), b"JSON") + js + struct.pack("<I4s", len(blob), b"BIN\0") + blob
+    with open(path, "wb") as f:
+        f.write(struct.pack("<4sII", b"glTF", 2, 12 + len(body)) + body)
+
+
 def scene(mesh_file):
     return NL.join([
         'camera "c" { eye 0 -0.9 1.2  look_at 0 0 0  up 0 0 1  fov_y 45  film { res 48 48 } }',
@@ -128,6 +196,40 @@ def main():
     check("  ... where the whole of it, sampled, differs", w != u)
     check("  ... and no part-metal note for either", "part metal" not in glog and "part metal" not in ulog,
           glog.strip()[-300:] if "part metal" in glog else "")
+
+    # Two materials sharing one atlas: a trim on its metal 30 %, a fabric on the rest. Each is typed
+    # by its own part of it, as if each had a map of its own.
+    trim_fabric = [(0.5, (0.7, 1.0), (0.0, 1.0), 0), (0.5, (0.0, 0.7), (0.0, 1.0), 1)]
+    write_glb_quads(os.path.join(d, "shared.glb"), trim_fabric, [lambda x, y: 255 if x >= 70 else 0],
+                    mat_map=[0, 0])
+    write_glb_quads(os.path.join(d, "separate.glb"), trim_fabric, [lambda x, y: 255, lambda x, y: 0])
+    sh, _ = render("shared")
+    se, _ = render("separate")
+    check("two materials sharing an atlas import as each on its own map", sh == se,
+          "%d of %d bytes differ" % (sum(x != y for x, y in zip(sh, se)), len(sh)))
+
+    def note(log):
+        m = re.search(r"is part metal \(([0-9.]+)% of its texels.*?imported as (METAL|NON-METAL)", log, re.S)
+        return (float(m.group(1)), m.group(2)) if m else None
+
+    # A clamp sampler: UVs past 1 read the edge texels, metal here, so they weigh them (23.8 %).
+    write_glb_quads(os.path.join(d, "clamp.glb"), [(1.0, (0.0, 1.3), (0.0, 1.0), 0)],
+                    [lambda x, y: 255 if x == 99 else METAL], wrap=33071)
+    _, clog = render("clamp")
+    n = note(clog)
+    check("a clamped map's edge texels weigh the surface past them", n is not None and 20.0 < n[0] < 28.0,
+          "note %s" % (n,))
+
+    # A floor tiled twenty times over the gutter map and a chart a hundredth its size, one material:
+    # the floor's area counts, spread over the map alike (69 % metal, typed METAL), though it is
+    # not rasterised.
+    write_glb_quads(os.path.join(d, "tiled.glb"),
+                    [(1.0, (0.0, 20.0), (0.0, 20.0), 0), (0.01, (0.0, CHART), (0.0, 1.0), 0)],
+                    [lambda x, y: METAL if x < CHART * 100 else GUTTER])
+    _, tlog = render("tiled")
+    n = note(tlog)
+    check("a tiled surface weighs the map it covers", n is not None and 65.0 < n[0] < 73.0 and n[1] == "METAL",
+          "note %s" % (n,))
     if fails:
         print("FAILED: " + ", ".join(fails))
         return 1

@@ -36,7 +36,7 @@ inline int solidSideAlong(const Scene& sc, Vec3 o, const Vec3& d, double len, do
     if (!sc.occluded(o, d, len, 0.0, false, len)) return side;
     double done = 0.0;
     for (int k = 0; k < 32 && done < len; ++k) {
-        const Hit h = sc.closestHit(Ray{o, d, len - done}, 0.0);
+        const Hit h = sc.closestHit(Ray{o, d, len - done}, 0.0, nullptr, false, false, len - done);
         if (!h.valid || done + h.t > len) break;
         const Material* m = (h.matId >= 0 && h.matId < (int)sc.mats.size()) ? &sc.mats[(size_t)h.matId] : nullptr;
         if (h.solid && !(m && passesLight(sc, *m))) side = ((h.solid > 0) == h.back) ? -1 : 1;
@@ -45,6 +45,31 @@ inline int solidSideAlong(const Scene& sc, Vec3 o, const Vec3& d, double len, do
     }
     return side;
 }
+
+// How many opaque faces that cannot say their side (no Hit::solid; passesLight not) the segment
+// from `o` along unit `d`, `len` long, crosses, curves unseen, up to 15. Where the footprint's
+// parity of such faces above the plane puts a column inside, the probe and the march confirm it
+// along the segment from just over the gather point to the column's foot (`lowLeg`): a cup or a
+// bottomless box of quads standing on the surface walls the column off (odd), a sheet hovering
+// over it -- a table top, a mirror, a lamp's quad -- leaves the way open, and the floor under it
+// lit from the sides (even). `eps` as solidSideAlong's. Device twin dOpaqueCrossingsAlong.
+inline int opaqueCrossingsAlong(const Scene& sc, Vec3 o, const Vec3& d, double len, double eps) {
+    int n = 0;
+    if (!(len > 0.0) || !sc.occluded(o, d, len, 0.0, false, len)) return 0;
+    double done = 0.0;
+    for (int k = 0; k < 32 && done < len && n < 15; ++k) {
+        const Hit h = sc.closestHit(Ray{o, d, len - done}, 0.0, nullptr, false, false, len - done);
+        if (!h.valid || done + h.t > len) break;
+        const Material* m = (h.matId >= 0 && h.matId < (int)sc.mats.size()) ? &sc.mats[(size_t)h.matId] : nullptr;
+        if (!h.solid && !(m && passesLight(sc, *m))) ++n;
+        done += h.t + eps;
+        o = h.p + d * eps;
+    }
+    return n;
+}
+// The low leg's height above the gather point's tangent plane, as a share of the radius: under
+// any lid the parity can count, over the surface's own relief.
+constexpr double kLowLegFrac = 0.01;
 
 // The geometric footprint: same-facing surface area inside the gather ball, measured from
 // the GEOMETRY rather than inferred from a photon statistic.
@@ -198,10 +223,11 @@ inline double gatherFootprintArea(const Scene& sc, const Vec3& p, const Vec3& n,
             // a small ball's tilted underside lies in the band the tilt widens, and a thin solid's
             // top may too (a coaster's), itself a layer the faces above it decide; one on the
             // plane (a box's own bottom) says nothing, "on" it to within rounding, as in the probe
-            // (a resting ball's underside near its contact is above it). Off the band, a photon-
-            // holding face that cannot say counts toward the parity, and one that holds none, an
-            // open sheet, for nothing (the probe's rule).
-            const bool opaque = !(mm && (passesLight(sc, *mm) || mm->type == MatType::Hair));
+            // (a resting ball's underside near its contact is above it). One that cannot say counts
+            // toward the parity where the probe would cross it: off the band, or a face that holds
+            // no photon above the plane, which the probe passes through.
+            const bool strand = mm && mm->type == MatType::Hair && h.fiberRadius > 0.0;
+            const bool opaque = !(mm && passesLight(sc, *mm)) && !strand;
             if (opaque && h.solid && off > 1e-7 * r) {
                 if ((h.solid > 0) != h.back) { dec[0] += pend[0]; dec[1] += pend[1]; }   // entered: below is outside
                 pend[0] = pend[1] = 0.0;
@@ -210,22 +236,32 @@ inline double gatherFootprintArea(const Scene& sc, const Vec3& p, const Vec3& n,
             // glossy ball's steep side, which the tilt-widened band takes in); on the plane it is
             // the surface's height, where the probe ends on it.
             const bool passed = mm && probePassesThrough(sc, *mm) && off > 1e-3 * r;
-            if (h.t <= span && withinGatherBand(std::fabs(off), dot(dh, dh), std::fabs(c), slack)) {
-                if (c >= kGatherFacingCos && !passed) pend[crossed & 1] += cellArea / c;
-            } else if (off > 0.0 && opaque && !h.solid && mm && holdsPhotons(sc, *mm, h.fiberRadius)) {
+            if (passed) {
+                if (opaque && !h.solid) ++crossed;
+            } else if (h.t <= span && withinGatherBand(std::fabs(off), dot(dh, dh), std::fabs(c), slack)) {
+                if (c >= kGatherFacingCos) pend[crossed & 1] += cellArea / c;
+            } else if (off > 0.0 && opaque && !h.solid) {
                 ++crossed;
             }
             tl = h.t - tBase + eps; ct = 0.0;
         }
         // Layers no solid face above decided lie on the column top's side.
-        double rest = pend[crossed & 1];
-        if (rest > 0.0 && solidsNear < 0) solidsNear = sc.solidNear(p, r * 1.4143) ? 1 : 0;
-        if (rest > 0.0 && solidsNear) {
+        const int ev = crossed & 1;                  // the bin of layers with an even count above
+        double restEv = pend[ev], restOdd = pend[ev ^ 1];
+        if ((restEv > 0.0 || restOdd > 0.0) && solidsNear < 0) solidsNear = sc.solidNear(p, r * 1.4143) ? 1 : 0;
+        if ((restEv > 0.0 || restOdd > 0.0) && solidsNear) {
             const Vec3 o = p + n * eps, colTop = q + n * r;
             const double len = length(colTop - o);
-            if (solidSideAlong(sc, o, (colTop - o) * (1.0 / len), len, eps) > 0) rest = 0.0;
+            if (solidSideAlong(sc, o, (colTop - o) * (1.0 / len), len, eps) > 0) restEv = restOdd = 0.0;
         }
-        area += dec[crossed & 1] + rest;
+        double col = dec[ev] + restEv;
+        // An odd count above puts a layer inside only where the low leg agrees (the probe's
+        // parityInside): a cup's floor, not the floor under a hovering sheet.
+        const double odd = dec[ev ^ 1] + restOdd;
+        if (odd > 0.0 && rr > eps &&
+            (opaqueCrossingsAlong(sc, p + n * (kLowLegFrac * r), (q - p) * (1.0 / rr), rr, eps) & 1) == 0)
+            col += odd;
+        area += col;
         if (layers >= maxLayers && incomplete) *incomplete = true;
     }
     return area;

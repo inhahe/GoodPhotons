@@ -460,10 +460,11 @@ inline double gatherCoverageRaw(const Scene& scene, const Vec3& p, const Vec3& n
             // of, 0 none). Where it crosses none, the side the probe began on decides (PROBE-PATH):
             // the side solidSideAlong finds along the segment from the gather point to the probe's
             // top, taken only when it is asked (`kAsk`). So a column inside a solid taller than r
-            // is inside though the probe crosses none of its faces. A photon-holding face that
-            // cannot say counts toward a parity (`crossed`, odd inside); one that holds none and
-            // cannot say -- an open mirror or a light's quad -- counts for nothing, an open sheet
-            // enclosing nothing. Either count can put the column inside.
+            // is inside though the probe crosses none of its faces. An opaque face that cannot say
+            // counts toward a parity (`crossed`), whose odd count puts the column inside when the
+            // low leg agrees (parityInside): a bottomless box's lid or an open cup's top over a
+            // floor its walls close in, not a sheet hovering over an open one. Either rule can
+            // put the column inside.
             constexpr int kAsk = 2;
             int crossed = 0, lastSolid = kAsk;
             const auto side = [&]() {
@@ -475,10 +476,19 @@ inline double gatherCoverageRaw(const Scene& scene, const Vec3& p, const Vec3& n
                 }
                 return lastSolid;
             };
-            const auto cross = [&](const Hit& c, const Material* cm, bool holds) {
+            const auto cross = [&](const Hit& c, const Material* cm) {
                 if (cm && passesLight(scene, *cm)) return;
                 if (c.solid) lastSolid = ((c.solid > 0) == c.back) ? -1 : 1;   // leaving : entering
-                else if (holds) ++crossed;
+                else ++crossed;
+            };
+            // An odd parity puts the column inside only if the low leg, from just over the gather
+            // point to the column's foot, crosses an odd count of such faces too (a cup's wall;
+            // opaqueCrossingsAlong): asked only then.
+            const auto parityInside = [&]() {
+                if (!(crossed & 1)) return false;
+                if (!(rr > pathEps)) return true;
+                const double hL = kLowLegFrac * r;
+                return (opaqueCrossingsAlong(scene, p + n * hL, (q - p) * (1.0 / rr), rr, pathEps) & 1) != 0;
             };
             bool found = false;                  // the probe ended on what it counts
             bool ended = false;                  // ... or on what it does not: either way, it ended
@@ -508,7 +518,7 @@ inline double gatherCoverageRaw(const Scene& scene, const Vec3& p, const Vec3& n
                 // height, and passing it would skip the surface beside it. An opaque one is a
                 // crossing all the same: a mirror box shadows the floor under it.
                 if (pm && probePassesThrough(scene, *pm) && r - h.t > 1e-3 * r) {
-                    cross(h, pm, false);
+                    cross(h, pm);
                     tAcc = h.t;
                     pr = Ray{h.p + pr.d * 1e-9, pr.d};
                     continue;
@@ -538,18 +548,18 @@ inline double gatherCoverageRaw(const Scene& scene, const Vec3& p, const Vec3& n
                     // underside of a ball resting on the floor would be "on" it for 5 mm round the
                     // point it touches, which a probe from inside the ball must leave by.
                     if (h.solid && dzH > 1e-7 * r && (h.solid > 0) == h.back) {
-                        cross(h, pm, true);
-                        if (!under.valid) { under = h; underFound = (crossed & 1) == 0 && side() <= 0; }
+                        cross(h, pm);
+                        if (!under.valid) { under = h; underFound = !parityInside() && side() <= 0; }
                         tAcc = h.t;
                         pr = Ray{h.p + pr.d * 1e-9, pr.d};
                         continue;
                     }
-                    found = (crossed & 1) == 0 && side() <= 0;
+                    found = !parityInside() && side() <= 0;
                     ended = true;
                     break;
                 }
                 if (!(dzH > 0.0)) break;                                // below the band: a miss
-                cross(h, pm, true);
+                cross(h, pm);
                 tAcc = h.t;
                 pr = Ray{h.p + pr.d * 1e-9, pr.d};
             }
