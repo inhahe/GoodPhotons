@@ -7908,6 +7908,11 @@ __constant__ int c_jSpecOn = 0;
 __constant__ int c_jTrSpec = 0;
 __constant__ double c_jDispWin = 10.0;   // the dispersive window's width, nm (host g_jDispWinNm)
 __constant__ int    c_jDispAll = 0;      // -jdispall (host g_jDispAll)
+// The camera wavelength's density mass in each carrier bin, for DJSpecRun's support (host twin
+// JSpecRun::supportShare): uploaded by renderBdptCuda and vcmSessionBegin from the emission
+// sampler, which both device walks draw from. All zero turns it off.
+#define DJSPEC_K_BINS 24
+__constant__ double c_jBinQ[DJSPEC_K_BINS];
 // Merges after a specular bounce read the light-side density's 0 as 1 (host bdpt::g_jDeltaMerge,
 // MODE-J-SDS, 0.387.0). 0 = the pre-0.387.0 reading, for A/B runs (FTRACE_JDELTA=0).
 __constant__ int    c_jDeltaMerge = 1;
@@ -8082,15 +8087,24 @@ struct DJSpec {   // 120 B, unpadded: one rides on every recorded segment and ey
     }
 };
 static_assert(sizeof(DJSpec) == 120, "DJSpec has picked up padding");
+static_assert(DJSPEC_K_BINS == DJSPEC_K, "c_jBinQ holds one mass per carrier bin");
 struct DJSpecRun {
     double r[DJSPEC_K];
     int    any;
     double logS;                     // see DJSpec::logS
     int    disp;                     // see DJSpec::disp
     double lamC, invPdfC;
+    unsigned hole;                   // bins where a folded weight or coin was 0 (host twin JSpecRun::hole)
     __device__ void init() {
         for (int k = 0; k < DJSPEC_K; ++k) r[k] = 1.0;
-        any = 0; logS = 0.0; disp = 0; lamC = 0.0; invPdfC = 0.0;
+        any = 0; logS = 0.0; disp = 0; lamC = 0.0; invPdfC = 0.0; hole = 0u;
+    }
+    // The share of the camera wavelength's density whose walk could have come this way (host twin).
+    __device__ double supportShare() const {
+        if (!hole) return 1.0;
+        double open = 0.0;
+        for (int k = 0; k < DJSPEC_K; ++k) if (!(hole >> k & 1u)) open += c_jBinQ[k];
+        return (open > 0.0) ? open : 1.0;
     }
     __device__ void markDisp(double lam, double invPdf) {
         if (disp) return;
@@ -8112,12 +8126,15 @@ struct DJSpecRun {
             if (probeFlat && fabs(v[k] - atCam) > tol) probeFlat = false;
             if (j == 2 && probeFlat) return;
         }
-        mulVec(v, atCam);
+        mulVec(v, atCam, true);
     }
-    // The fold from values already in hand at the bin centres (host twin JSpecRun::mulVec).
-    // `v` is overwritten.
-    __device__ void mulVec(double* v, double atCam) {
+    // The fold from values already in hand at the bin centres (host twin JSpecRun::mulVec, where
+    // `support` is explained). `v` is overwritten.
+    __device__ void mulVec(double* v, double atCam, bool support = false) {
         if (!(atCam > 0.0)) return;
+        if (support)
+            for (int k = 0; k < DJSPEC_K; ++k)
+                if (!(v[k] > 0.0)) hole |= 1u << k;
         // Magnitudes past a float go to logS (host twin JSpecRun::mul).
         double inv = 1.0;
         if (atCam < 1e-280) logS -= log(atCam); else inv = 1.0 / atCam;
@@ -8144,7 +8161,7 @@ struct DJSpecRun {
     }
     __device__ void snap(DJSpec& o) const {
         o.any = any;
-        o.logS = logS;
+        o.logS = logS - log(supportShare());   // the merges past a hole stand in for it
         o.disp = disp; o.lamC = (float)lamC; o.invPdfC = (float)invPdfC;
         for (int k = 0; k < DJSPEC_K; ++k) o.r[k] = (float)r[k];
     }
@@ -17731,7 +17748,7 @@ __device__ static void dRandomWalk(const DScene& sc, const DCamera& cam, int dif
                     if (sec) secF[i] = fc / pdfH; else hv[jk + 1] = (double)clamp01((Real)(fc / pdfH));
                 }
                 // The clamped factor at every bin over the clamped one at lambda (host twin).
-                if (nJ) jrun->mulVec(hv + 1, hv[0]);
+                if (nJ) jrun->mulVec(hv + 1, hv[0], true);   // a fiber's weight: its zeros are holes
                 break;
             }
             case D_DIFFUSE:
@@ -17982,7 +17999,7 @@ __device__ static int dGenCameraSubpath(const DScene& sc, const DCamera& cam, in
         c.delta = 0;             // connectible: t=1 traces light into the lens
         path[0] = c; int n = 1;
         if (jrun) {
-            jrun->mulVec(wB, (double)wl);
+            jrun->mulVec(wB, (double)wl, true);   // a bin the lens passes nothing at is a hole
             if (c_jDispAll) jrun->markDisp((double)lambda, (double)hb.invPdf[0]);
         }
         double pdfDir = dLensPdfDir(cam, ro, rd, lambda);
@@ -21060,7 +21077,7 @@ __device__ static void dVcmScatter(const DScene& sc, const DMaterial& m, const D
                 const double fc = (double)dHairFCos(hsi, wi);
                 if (sec) secF[i] = fc / pdfH; else hv[jk + 1] = (double)clamp01((Real)(fc / pdfH));
             }
-            if (nJ) jr->mulVec(hv + 1, hv[0]);
+            if (nJ) jr->mulVec(hv + 1, hv[0], true);   // a fiber's weight: its zeros are holes
             break;
         }
         case D_MIRROR: {
@@ -25335,6 +25352,17 @@ static int g_jSpecHost = 1, g_jTrSpecHost = 0, g_jDeltaMergeHost = 1, g_jHalfHos
 void cudaSetJSwitches(int jSpec, int trSpec, int deltaMerge, int half) {
     g_jSpecHost = jSpec; g_jTrSpecHost = trSpec; g_jDeltaMergeHost = deltaMerge; g_jHalfHost = half;
 }
+// gpu::c_jBinQ from the sampler the camera walk's wavelength is drawn from: on the device both modes
+// draw from the emission sampler (dSampleSceneLambda), where the host's mode J draws from camSampler.
+static void uploadJBinQ(const EmissionSampler& s) {
+    double q[DJSPEC_K];
+    for (int k = 0; k < DJSPEC_K; ++k) {
+        const double lo = LAMBDA_MIN + k * (LAMBDA_MAX - LAMBDA_MIN) / (double)DJSPEC_K;
+        const double hi = LAMBDA_MIN + (k + 1) * (LAMBDA_MAX - LAMBDA_MIN) / (double)DJSPEC_K;
+        q[k] = s.cdfAt(hi) - s.cdfAt(lo);
+    }
+    CUDA_CHECK(cudaMemcpyToSymbol(gpu::c_jBinQ, q, sizeof(q)));
+}
 // The aimed sun (bdpt.h SunAim): host copies, uploaded at the top of every renderBdptCuda.
 static std::vector<gpu::Real> g_sunAimWHost;
 static std::vector<double> g_sunAimRHost;
@@ -26052,6 +26080,8 @@ Film renderBdptCuda(const Scene& scene, const Camera& cam, int resX, int resY,
     // Mode J's switches, as the host settled them for this render (cudaSetJSwitches).
     CUDA_CHECK(cudaMemcpyToSymbol(gpu::c_jHalf, &g_jHalfHost, sizeof(int)));
     CUDA_CHECK(cudaMemcpyToSymbol(gpu::c_jSpecOn, &g_jSpecHost, sizeof(int)));
+    uploadJBinQ(scene.emitSampler);   // the camera walk's wavelength density (DJSpecRun::hole):
+                                      // the device's draw (dSampleSceneLambda), not camSampler
     CUDA_CHECK(cudaMemcpyToSymbol(gpu::c_jTrSpec, &g_jTrSpecHost, sizeof(int)));
     CUDA_CHECK(cudaMemcpyToSymbol(gpu::c_jDeltaMerge, &g_jDeltaMergeHost, sizeof(int)));
     CUDA_CHECK(cudaMemcpyToSymbol(gpu::c_jDispWin, &g_jDispWinHost, sizeof(double)));
@@ -28414,6 +28444,7 @@ VcmSession* vcmSessionBegin(const Scene& scene, const Camera& cam, int resX, int
     CUDA_CHECK(cudaMemcpyToSymbol(gpu::c_jSpecOn, &g_jSpecHost, sizeof(int)));
     CUDA_CHECK(cudaMemcpyToSymbol(gpu::c_jDispWin, &g_jDispWinHost, sizeof(double)));
     CUDA_CHECK(cudaMemcpyToSymbol(gpu::c_jDispAll, &g_jDispAllHost, sizeof(int)));
+    uploadJBinQ(scene.emitSampler);   // mode U's bundles are drawn from it (DJSpecRun::hole)
     VcmSession* s = new VcmSession();
     s->resX = resX; s->resY = resY; s->npix = (size_t)resX * resY;
     s->diffraction = diffraction ? 1 : 0;

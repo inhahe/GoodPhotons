@@ -1,0 +1,33 @@
+# Mode J's merges in a fog seen through a gel that is exactly zero over part of the band
+# (known-issues JSPEC-GAPS, "support"). The gel passes nothing below 497.08 nm and 0.9 above it: the
+# edge sits on a boundary of the 24-bin spectral carrier (360 + 7 x 470 / 24), so what is measured is
+# the support and not the carrier's resolution of an edge inside a bin (SPECGATHER-BIN-RESOLUTION:
+# a 500-520 nm ramp left modes J and M both 5 % low in green).
+# A camera walk at a wavelength the gel blocks dies at it, so no merge beyond it is made from that
+# walk at any wavelength; the merges from the walks that pass must stand in for them. A fog box over
+# a grey floor, lit by a big sphere lamp from above, as in _jfog_*; every mode at -max-bounce 32.
+
+scene {
+    units    meters
+    spectral 360 830 1
+}
+
+material "grey" { type diffuse reflect 0.5 }
+material "gel"  { type filter  transmit table { 360:0 497.07:0 497.09:0.9 830:0.9 } }
+
+quad { origin -3 0 -3   u 0 0 6   v 6 0 0   material grey }
+
+quad { origin -0.6 0.1 1.2   u 1.2 0 0   v 0 1.3 0   material gel }
+
+medium {
+    sigma_t 3.0   albedo 0.9   g 0.0
+    bounds { min -0.4 0.32 -0.4   max 0.4 1.12 0.4 }
+}
+
+light sphere { center 0 3.0 0.4   radius 0.7   spd preset:bb6500 }
+
+camera "cam" {
+    eye 0 0.9 3.2   look_at 0 0.72 0   up 0 1 0   fov_y 34
+    mode J
+    film { res 240 200 }
+}

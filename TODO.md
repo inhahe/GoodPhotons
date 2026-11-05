@@ -94,9 +94,9 @@ Each names the section its line is in.
    (VCM-THIN-CURVES).
 6. ~~**VCOL-BDPT-GPU** (4.2) — GPU modes D and J connect to a vertex-coloured mesh without its colours.~~
    Done, 0.433.4.
-7. ~~**MODEM-BEAM-CARRIER**~~ (0.433.5), **JSPEC-GAPS**' rest and ~~**MODEM-REDPASS**~~ (not
-   reproduced) (4.2) — mode
-   M's beams, and mode J's last camera-side factors, at the camera's wavelength.
+7. ~~**MODEM-BEAM-CARRIER**~~ (0.433.5), ~~**JSPEC-GAPS**' support~~ (0.433.11) and
+   ~~**MODEM-REDPASS**~~ (not reproduced) (4.2) — mode M's beams, and mode J's last camera-side
+   factors, at the camera's wavelength. Done.
 8. **UPBP-BEAM-RADIUS** with **J-FOG-REALCAM** (4.3) — mode J's beam kernel never shrinks: fog 1-4 %
    low, never converging.
 9. **GLTF-ROUGHNESS-MAP** and **GLTF-MAP-MEAN-GUTTERS** (4.2) — glTF imports rougher than glTF means,
@@ -178,9 +178,10 @@ Then the rest of 4.2-4.6 in their order, 4.7's bookkeeping alongside whatever to
 - [x] **MODEM-BEAM-CARRIER** (0.433.5) — mode M's beam gather reads its walk's spectral carrier and
   the glass around the segment at each beam's wavelength (fog through tinted glass: R 0.54, G 2.63
   of mode R before).
-- [ ] **JSPEC-GAPS**, its still-open list — support where a factor is
-  zero at the camera's wavelength (mode U's carrier too, since 0.433.0), dispersive refraction
-  without `-jdispall`.
+- [x] **JSPEC-GAPS**' support (0.433.11) — modes J and U divide the merges past a factor that is 0
+  somewhere by the share of the camera wavelength's density left open (a fog through a gel read
+  0.64 of mode R in mode J, a wall behind one 0.71 in mode U). Left by design: dispersive
+  refraction and a real lens keep the camera's direction unless `-jdispall`.
 - [x] **MODEM-REDPASS** — not reproduced on 0.433.10 (scenes/_redpass.ftsl recreates it; green
   within 1.4 % of mode R in modes M and J on both backends).
 - [ ] **FWD-GLOSSY-INDIRECT** — modes A and B splat a rough reflector only where it is seen directly

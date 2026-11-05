@@ -1589,7 +1589,7 @@ inline void randomWalk(const Scene& scene, const Camera& cam, const Renderer& ma
                                                              sigB ? sigB[k] : -1.0);
                         hv[k] = clamp01(hairFoldFCos(la, hk, wl, cosLong, nullptr) / pdfH);
                     }
-                    jsw->run.mulVec(hv, betaFactor);
+                    jsw->run.mulVec(hv, betaFactor, true);   // a fiber's weight: its zeros are holes
                 }
                 break;
             }
@@ -1842,7 +1842,11 @@ inline int generateCameraSubpath(const Scene& scene, const Camera& cam, const Re
                                  JSpecWalk* jsw = nullptr) {
     const double lambda = hb.lam[0];
     path.clear();
-    if (jsw) { jsw->reset(); jsw->vert.resize(1); }   // eye[0], the camera: no factor yet
+    if (jsw) {                                      // eye[0], the camera: no factor yet
+        jsw->reset();
+        jsw->vert.resize(1);
+        jsw->run.walkDensity = &scene.camSampler;   // the camera wavelength's density (the support)
+    }
     // The camera vertex is wavelength-neutral: every λ in the bundle leaves it with
     // throughput 1 (the per-pixel radiance convention), so the bundle starts C wide.
     // (Hero is gated off for a lensed camera, whose ray IS wavelength-dependent.)
@@ -1885,7 +1889,7 @@ inline int generateCameraSubpath(const Scene& scene, const Camera& cam, const Re
                 Pcg32 rk = rngLens; Ray rr; double wk = 0.0;
                 wb[k] = genLens(rk, JSpec::lamOf(k), rr, wk) ? std::max(0.0, wk) : 0.0;
             }
-            jsw->run.mulVec(wb, wLens);
+            jsw->run.mulVec(wb, wLens, true);   // a bin the lens passes nothing at is a hole
             if (g_jDispAll) jsw->run.markDisp(lambda, hb.invPdf[0]);
         }
         double pdfDir = cam.lensPdfDir(ray.o, ray.d, lambda);

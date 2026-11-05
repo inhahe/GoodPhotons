@@ -34,7 +34,9 @@ walk at every photon's wavelength, which a walk can do only for branches its own
   * a red gel filter, transmitting nothing below 595 nm, between the camera and a lit white wall:
     a weight, not a coin, but a walk drawn where it is zero carries nothing at any wavelength, the
     same support problem -- until 0.381.4 red behind it read at the share of walk wavelengths
-    above 595 nm; and a green band-pass gel (0 below 440 and above 600 nm, 0.9 from 500 to 560, linear
+    above 595 nm (and mode U, red only, host and device, whose merges re-express its walk on
+    JSPEC's carrier: 0.71 of mode R on the GPU and 0.67 on the CPU until 0.433.11); and a green
+    band-pass gel (0 below 440 and above 600 nm, 0.9 from 500 to 560, linear
     between): zero at all three wavelengths mode M's carrier once probed for flatness, so until
     0.381.7 it folded as a flat zero and the wall behind it rendered black. Its edges are ramps over
     several carrier bins, which both backends' spectral tables hold exactly (the device's are 5 nm
@@ -206,6 +208,15 @@ def main():
                 pairs += [("%s, mode %s%s / mode R, channel %d" % (
                     what, k, " (device)" if dev == "gpu" else "", c), [x[..., c] for x in mm],
                     [x[..., c] for x in rr], tol) for c in range(3)]
+        # Mode U's merges re-express its camera walk the same way (JSPEC's carrier), and a walk
+        # drawn below 595 nm dies at the red gel: the merges past it must stand in for it. Red
+        # only: behind a red-pass gel, green and blue in linear sRGB are near zero and negative.
+        if name == "filter":
+            for dev in devs:
+                uu = render_seeds(a.exe, d, name + ".ftsl", name + "_U" + ("g" if dev == "gpu" else ""),
+                                  ["-mode", "U"], dev, a.spp, rgb=True)
+                pairs.append(("%s, mode U%s / mode R, channel 0" % (what, " (device)" if dev == "gpu" else ""),
+                              [x[..., 0] for x in uu], [x[..., 0] for x in rr], tol))
     ok = True
     for pair in pairs:
         name, x1, x0 = pair[:3]

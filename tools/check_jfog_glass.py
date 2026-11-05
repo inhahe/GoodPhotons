@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """Regression gate: modes J's and M's beam merges in a fog beside, behind and inside coloured glass.
 
-Three scenes (scenes/_jfog_floor, _jfog_behind, _jfog_inside; their headers say what each guards),
-each rendered in mode R, the reference, and in modes J and M (`-beams`) on the GPU and on the CPU.
-The fog's region of the frame is compared channel by channel. Every arm runs at -max-bounce 32:
-modes D, J and U default to 8 edges and mode R to 32, and a comparison across two caps measures the
-cap.
+Four scenes (scenes/_jfog_floor, _jfog_behind, _jfog_inside, _jfog_gel; their headers say what each
+guards), each rendered in mode R, the reference, and in modes J and M (`-beams`) on the GPU and on
+the CPU. The fog's region of the frame is compared channel by channel. Every arm runs at
+-max-bounce 32: modes D, J and U default to 8 edges and mode R to 32, and a comparison across two
+caps measures the cap.
 
 What failed before 0.391.4 (fog region, J / R):
   floor   GPU 1.043 (the device's beam-merge weight lacked the point merge at the vertex a beam
@@ -21,13 +21,19 @@ segment at the camera's wavelength (MODEM-BEAM-CARRIER), GPU / CPU: floor 0.997 
 R 0.54 / 0.55, G 2.63 / 2.69; inside R 0.66 / 0.68, G 1.28 / 1.31. And 0.433.5: behind R 0.985 /
 0.998, G 1.017 / 1.037; inside R 1.000 / 1.018, G 0.975 / 0.995.
 
+The gel scene sees the fog through a filter that passes exactly nothing below 497 nm. Until 0.433.11
+mode J read it at R 0.640, G 0.650 of mode R on both backends: a camera walk drawn where the gel is
+opaque dies there, and the merges from the walks that pass did not stand in for it (known-issues
+JSPEC-GAPS, the support). 0.433.11 reads R 0.987, G 1.003-1.004 in mode J, and mode M, which has
+had the same rule since 0.381.4, 0.988-1.001 and 1.001-1.025.
+
 Blue is left out of the tinted scenes: the glass passes about 1 % of it, so its ratio is
 noise. The behind scene's green keeps a wider tolerance for the bins' resolution (known-issues
 J-GPU-ETAPREVS, the note on the carrier).
 
 Usage::
 
-    python tools/check_jfog_glass.py [--out DIR] [--exe EXE] [--scenes floor,behind,inside]
+    python tools/check_jfog_glass.py [--out DIR] [--exe EXE] [--scenes floor,behind,inside,gel]
                                      [--arms J-gpu,J-cpu,M-gpu,M-cpu]
 
 Exit status is non-zero if any channel of any arm misses mode R by more than its tolerance.
@@ -52,6 +58,7 @@ _SCENES = {
     "floor":  (2.0, 2.0, 2.0),
     "behind": (3.0, 5.0, None),
     "inside": (3.0, 3.0, None),
+    "gel":    (3.0, 3.0, None),
 }
 _ARMS = {
     "J-gpu": ["-mode", "J", "-device", "gpu", "-spp", "512", "-beamepochs", "32"],

@@ -2669,10 +2669,22 @@ red got past the cap that had stopped λ_c and read 1.3 % high around blond fur.
 by far less. They keep the ratio re-expression and the λ_c direction, a sub-pixel chromatic blur,
 unless `-jdispall` opens the window for them as well.
 
-**Still not re-expressed:** the support of a factor that is zero at λ_c (known-issues.md,
-JSPEC-GAPS). The camera-side glass absorption on the gather's own partial segment is, since 0.391.3,
-taken at the beam's wavelength (`PathSeg::glassMat`). Mode M's beam gather reads its own carrier the
-same way since 0.433.5 (SPECGATHER, "Beams").
+**The support (0.433.11).** A ratio re-expresses a walk at another wavelength only where its own
+wavelength could carry it: a walk drawn where a factor is exactly 0 (a gel opaque there, a coin
+whose branch is impossible there, glass dark enough to underflow) dies at that event and makes no
+merge beyond it at any wavelength. So `JSpecRun::hole` marks, per bin, where a folded weight or coin
+was 0 (`mul`, and `mulVec` for a fiber's or a real lens's weights; not the media term, whose zeros
+are one ratio-tracking realization's), and `snap` divides every merge past a hole by the share of
+the camera wavelength's density left open (`supportShare`, into `logS`, which `atC()` undoes for
+a windowed merge, whose light is the walk's own wavelength). That is SPECGATHER's support rule with
+indicators: unbiased, because which bins are holes depends on the branches the walk took and never
+on its wavelength. The device reads the share from `c_jBinQ`, the density's mass per bin, uploaded
+from the sampler its walks draw from (the emission sampler for both device modes; the host's mode J
+draws from `camSampler`). A fog seen through a gel opaque below 500 nm read 0.65 / 0.62 of mode R
+in mode J before (`tools/check_jfog_glass.py`, scene `gel`). The camera-side glass absorption on the
+gather's own partial segment is, since 0.391.3, taken at the beam's wavelength
+(`PathSeg::glassMat`). Mode M's beam gather reads its own carrier the same way since 0.433.5
+(SPECGATHER, "Beams").
 
 **Measured** (`_fog_cornell`, `-max-bounce 8 -beamcount 1e5 -beamk 2 -nojsurf -beamsinmin 0`, CPU,
 J 1024 spp against D 4096 spp, 64²). Before: J/D −2.30 %, by block 0.86–1.10, R/G/B 0.958 / 0.979

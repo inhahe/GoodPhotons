@@ -1846,11 +1846,20 @@ around the fur, so the carrier re-expresses the clamped factor. Bit-identity aga
 (grey walls with the carrier on; coloured walls under `FTRACE_JSPEC=0` and on): md5-identical, CPU
 and GPU.
 
+**Support, closed in 0.433.11.** A walk at a wavelength where a factor is zero carries nothing at
+any wavelength: a gel opaque at λ_c, a coin whose branch is impossible there, glass dark enough at
+λ_c that `beta` underflows. The merges past such an event now divide by the share of the camera
+wavelength's density left open (`JSpecRun::hole`, `supportShare`; design.md, JSPEC, "The
+support"), modes J and U, both backends. Measured on `scenes/_jfog_gel.ftsl` (a fog seen through a
+gel passing nothing below 497 nm, an edge on a carrier bin's boundary), fog region against mode R,
+R and G: mode J 0.640 0.650 on both backends before, 0.987 1.003 (GPU) and 0.987 1.004 (CPU) after.
+With the gel's edge as a 500-520 nm ramp instead, inside a bin, modes J and M alike read green 5 %
+low after: SPECGATHER-BIN-RESOLUTION, not the support. Mode U, which has no media, on
+check_coat_modes' red gel (nothing below 595 nm) before a lit wall, the wall's red against mode R:
+GPU 0.710 -> 1.000, CPU 0.666 -> 1.003, and mode J's surface merges there 0.559 -> 0.987; the
+check now holds mode U's red there.
+
 **Still open:**
-- **Support.** A walk at a wavelength where a factor is zero carries nothing at any wavelength.
-  That covers a gel opaque at λ_c and glass dark enough at λ_c that `beta` underflows. SPECGATHER
-  divides by the probability the walk's wavelength could take the branch (MODE-M-FOLD-SUPPORT);
-  JSPEC does not yet.
 - **Dispersive refraction and a real lens without `-jdispall`** keep the λ_c direction for every
   wavelength, a chromatic blur of about a pixel. That is the default, because the window's noise
   is the price of the exact answer.

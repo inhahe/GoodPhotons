@@ -480,7 +480,7 @@ inline void scatterSample(const Scene& scene, const Renderer& mats, const Materi
                                                          sigB ? sigB[k] : -1.0);
                     hv[k] = clamp01(hairFoldFCos(la, hk, wl, cosLong, nullptr) / pdfH);
                 }
-                jr->mulVec(hv, betaFactor);
+                jr->mulVec(hv, betaFactor, true);   // a fiber's weight: its zeros are holes
             }
             // sigma_a is per-λ, so each secondary re-evaluates its own fiber along the
             // hero's sampled direction; the bundle survives a strand rather than de-heroing.
@@ -953,6 +953,7 @@ inline Vec3 traceCameraSubpath(const Scene& scene, const Camera& cam, const Rend
     // factors at its own: beta * at(lambda_v). FTRACE_JSPEC=0 turns it off with mode J's.
     const bool jOn = bdpt::jSpecEnabled();
     JSpecRun jr;
+    jr.walkDensity = &scene.emitSampler;   // the pixel's bundle is drawn from it (JSpecRun::hole)
     Vec3 prevP = cam.eye;
     // Has this eye chain passed through ONLY delta (specular) vertices so far? That is the
     // precondition for the escaped-sun strategy below; tracked explicitly rather than

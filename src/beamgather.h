@@ -118,7 +118,34 @@ struct JSpecRun {
     double logS = 0.0;                 // see JSpec::logS
     bool   disp = false;               // see JSpec::disp
     double lamC = 0.0, invPdfC = 0.0;
+    // THE SUPPORT (JSPEC-GAPS). Bit k is set once a factor this walk folded was exactly 0 at bin
+    // k: a gel opaque there, a coin whose branch is impossible there, glass dark enough to
+    // underflow. A walk drawn at such a wavelength dies at that event and makes no merge beyond
+    // it, at any wavelength, so the walks that pass stand in for it: snap() divides every merge
+    // past a hole by the share of the camera wavelength's density (`walkDensity`) left open, as
+    // SPECGATHER's support correction does (photonmap_render.h SpecThr::p). Which bins are holes
+    // depends on the branches the walk took, never on its own wavelength, so the division stays
+    // unbiased. The media term is not marked: a ratio-tracking estimate's zeros are one
+    // realization's. Null `walkDensity` turns the correction off.
+    unsigned hole = 0;
+    const EmissionSampler* walkDensity = nullptr;
+    static_assert(JSpec::K <= 32, "JSpecRun::hole holds one bit per bin");
     JSpecRun() { for (double& x : r) x = 1.0; }
+    // The share of the camera wavelength's density whose walk could have taken every branch and
+    // carried every weight this one did (1 with no hole).
+    double supportShare() const {
+        if (!hole || !walkDensity) return 1.0;
+        double open = 0.0;
+        for (int k = 0; k < JSpec::K; ++k) {
+            if (hole >> k & 1u) continue;
+            const double lo = LAMBDA_MIN + k * (LAMBDA_MAX - LAMBDA_MIN) / (double)JSpec::K;
+            const double hi = LAMBDA_MIN + (k + 1) * (LAMBDA_MAX - LAMBDA_MIN) / (double)JSpec::K;
+            open += walkDensity->cdfAt(hi) - walkDensity->cdfAt(lo);
+        }
+        // Every bin a hole while the walk itself passed: the bins cannot resolve the support,
+        // and the walk's own wavelength serves (SpecThr::rescale's fallback).
+        return (open > 0.0) ? open : 1.0;
+    }
     // The path is valid only at lambda_c from here on (JSpec::disp). The first event fixes it.
     void markDisp(double lam, double invPdf) {
         if (disp) return;
@@ -142,12 +169,17 @@ struct JSpecRun {
         }
         double v[JSpec::K];
         for (int k = 0; k < JSpec::K; ++k) v[k] = f(JSpec::lamOf(k));
-        mulVec(v, atCam);
+        mulVec(v, atCam, true);
     }
     // The same fold from values already evaluated at the bin centres (`v[k]` at lamOf(k)), for a
     // factor whose evaluation shares work across wavelengths (a fiber, a lens trace).
-    void mulVec(const double* v, double atCam) {
+    // `support`: whether a zero in `v` is a hole in the walk's support (a weight or a coin, as from
+    // mul), not one realization's (the media term).
+    void mulVec(const double* v, double atCam, bool support = false) {
         if (!(atCam > 0.0)) return;
+        if (support)
+            for (int k = 0; k < JSpec::K; ++k)
+                if (!(v[k] > 0.0)) hole |= 1u << k;
         // A factor all but zero at lambda_c (deep in a glass's absorption band) would overflow
         // 1/atCam; its magnitude goes to logS instead (JSpec::logS).
         double inv = 1.0;
@@ -174,7 +206,7 @@ struct JSpecRun {
     }
     void snap(JSpec& s) const {
         s.any = any;
-        s.logS = logS;
+        s.logS = logS - std::log(supportShare());   // the merges past a hole stand in for it
         s.disp = disp; s.lamC = (float)lamC; s.invPdfC = (float)invPdfC;
         for (int k = 0; k < JSpec::K; ++k) s.r[k] = (float)r[k];
     }
