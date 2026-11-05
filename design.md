@@ -969,6 +969,22 @@ takes the first glossy child's lobe with `f0` scaled by its selection weight, on
 child's colour, and only when pass 1 found no lobe of its own. `PShade` is the host bake both
 rasterizers upload from, so the CUDA preview gets it too.
 
+### Imported roughness is converted to ftrace's lobe (0.434.4)
+
+glTF's roughness `r` is perceptual (GGX α = `r²`). `Material::roughness` is the width of a Phong
+lobe about the mirror direction, exponent `2/r_t² − 2` (`glossyExponent`), which every glossy
+lobe, coat and frosted-glass jitter reads. By half-width that lobe is a GGX α of `0.646 r_t`
+(0.647 at `r_t` 0.05, 0.68 at 0.5). `gltfimpl::gltfRoughness` maps one to the other:
+`r_t = min(1, r² / 0.646)`. It is applied wherever a glTF roughness enters:
+- to each texel of the roughness map, in the `TexRole::Roughness` bind, so the map's mean,
+  which becomes the material's constant, is already in ftrace's units;
+- to the factor, when there is no map.
+
+The preview's `previewRough(r_t) = sqrt(0.646 r_t)` is the inverse of the same equivalence, so the
+preview's GGX gets glTF's own α back. Every consumer that thresholds `roughness` sees the
+converted value. One consequence: an imported surface counts as caustic glossy below
+`kCausticGlossRoughness` 0.15, which is glTF 0.31. Before the conversion the cut sat at glTF 0.15.
+
 ### `MatType::Layered` on the GPU (0.317.0)
 
 The coat is a set of FIELDS on the parent material, and the device has no way to shade fields --

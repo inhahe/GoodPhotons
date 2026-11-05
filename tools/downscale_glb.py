@@ -298,13 +298,15 @@ def resample(img: Image.Image, kind: str, mask, tex: int) -> Image.Image:
 def importer_stats(mr, factors: dict) -> str:
     """The two numbers ftrace's glTF importer derives from a metal-roughness map `mr` over ALL
     its texels (src/gltf.h): mean metalness, which types the material, and mean roughness, its
-    constant -- so a result whose numbers moved would import as a different material."""
+    constant, each texel's in ftrace's units as gltfRoughness converts it (r^2 / 0.646, at most
+    1) -- so a result whose numbers moved would import as a different material."""
     if mr is None:
         return "no metal-roughness map"
     a = np.asarray(mr, dtype=np.float64) / 255.0
+    r = np.clip(a[..., 1] * factors['roughnessFactor'], 0, 1)
     return "mean metalness %.4f, roughness %.4f" % (
         np.clip(a[..., 2] * factors['metallicFactor'], 0, 1).mean(),
-        np.clip(a[..., 1] * factors['roughnessFactor'], 0, 1).mean())
+        np.minimum(1.0, r * r / 0.646).mean())
 
 
 def patch_glb(path: str, samplers: dict, factors: dict):

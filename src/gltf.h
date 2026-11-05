@@ -66,6 +66,15 @@ namespace gltfimp { inline bool metalMixImport = false; }
 
 namespace gltfimpl {
 
+// GLTF-ROUGHNESS-MAP: a glTF roughness `r` as the ftrace roughness of the same lobe width. glTF's is
+// perceptual, its GGX alpha r^2; ftrace's r_t is a Phong lobe of exponent 2 / r_t^2 - 2, which by
+// half-width is a GGX alpha of 0.646 r_t (0.647 at r_t 0.05, 0.68 at 0.5, 0.70 at 0.6), the
+// equivalence the preview's previewRough inverts. So r_t = r^2 / 0.646, at most 1.
+inline double gltfRoughness(double r) {
+    r = std::min(1.0, std::max(0.0, r));
+    return std::min(1.0, r * r / 0.646);
+}
+
 // Read an entire file into a byte vector. Returns false on open failure.
 inline bool readFileBytes(const std::string& authored, std::vector<uint8_t>& out) {
     // External buffer/image URIs are already resolved against the .gltf's own
@@ -639,6 +648,8 @@ inline int loadGltf(Scene& s, const char* path, int fallbackMat, const Affine& x
             metalFrac = n ? above / (double)n : 0.0;
             murkyFrac = n ? murky / (double)n : 0.0;
         } else if (role == TexRole::Roughness) {
+            // Each texel as an ftrace roughness (gltfRoughness), so the map, its mean and the
+            // constant that stands in for it all mean what the asset's author saw.
             // glTF packs occlusion/roughness/metalness into R/G/B of one image. ftrace's
             // scalarAt averages the three channels, so the G plane has to be broadcast to
             // all three or a rough surface would read as (0 + rough + metal)/3. The mean
@@ -656,7 +667,7 @@ inline int loadGltf(Scene& s, const char* path, int fallbackMat, const Affine& x
             murkyFrac = n ? murky / (double)n : 0.0;
             double meanR = 0.0;
             for (Vec3& c : tex.rgb) {
-                const double g = std::min(1.0, std::max(0.0, c.y * p0));
+                const double g = gltfRoughness(c.y * p0);
                 meanR += g;
                 c = Vec3{g, g, g};
             }
@@ -803,6 +814,9 @@ inline int loadGltf(Scene& s, const char* path, int fallbackMat, const Affine& x
                         roughness = meanRough;
                     }
                 }
+                // With no map the factor is the whole roughness, in glTF's units (with one, the
+                // map's mean above is already in ftrace's).
+                if (roughTexId < 0) roughness = gltfRoughness(roughness);
                 if (nrmTex.index >= 0)
                     normalTexId = bindTex(nrmTex.index, TexRole::Normal, 0.0, 0.0, 0.0, nullptr);
                 if (texStopped) { err = "scene load stopped"; return 0; }

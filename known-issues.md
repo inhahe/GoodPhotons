@@ -3832,7 +3832,7 @@ and GPU), B, D, both raster previews and hair; GPU mode M differed by 3e-9 relat
 run-to-run nondeterminism, not the change. The textured flakes take the skirt's blue in the tracer and
 in the preview.
 
-## OPEN (2026-09-28): GLTF-ROUGHNESS-MAP — a glTF roughness is fed to the tracers' Phong lobe raw, so imports render rougher than glTF means
+## DONE (2026-11-05, 0.434.4): GLTF-ROUGHNESS-MAP — a glTF roughness is fed to the tracers' Phong lobe raw, so imports render rougher than glTF means
 
 Found while explaining GLTF-LAYERED-DEFAULT (it does not affect that ratio: both import forms share
 the lobe). glTF's `roughness` is *perceptual*: its GGX α is `r²`. The importer copies `r` straight
@@ -3844,6 +3844,18 @@ blurrier than its author saw in a glTF viewer. Only for r near 1 do the two agre
 import `r_t = min(1, r² / 0.646)` (1.55 r²), applied to the constant and to the roughness map
 per texel, validated against a GGX reference at a few r. It changes the look of every glTF, so it
 waits for its own A/B rather than riding along with another change.
+
+**Fixed in 0.434.4:** `gltfimpl::gltfRoughness(r) = min(1, r^2 / 0.646)`, applied to each texel of
+the roughness map (so its mean, the material's constant, is in ftrace's units too) and to the
+factor when there is no map. The half-width ratio α / r_t it rests on, computed from the two lobes:
+0.647 at r_t 0.05, 0.659 at 0.3, 0.682 at 0.5, 0.699 at 0.6. The preview's previewRough inverts
+the same relation, so its GGX gets glTF's own α back. `tools/check_gltf_roughness.py`: a glTF metal
+quad renders byte-identically to the FTSL glossy of the converted roughness, and a constant map
+does too. 0.434.3 failed it: the import there matched the raw roughness instead. The A/B
+(`png/gltfrough`, mode R on the GPU, the mesh quick-view studio): the pocket camera's body and
+lens ring glossier, a mean |diff| of 3.75/255. Alice2 barely moves, 0.15/255, because her maps are
+mostly rough and r near 1 changes little. The cinema camera is too small in its frame to read.
+`tools/downscale_glb.py` prints the importer's mean roughness in the converted units.
 
 ## DONE (2026-10-23, 0.395.0): PHYSLENS-FRONT-SAMPLING — light entered a physical lens through a uniform front-element sample, which wasted most samples on a lens whose front glass dwarfs its stop
 

@@ -99,8 +99,8 @@ Each names the section its line is in.
    factors, at the camera's wavelength. Done.
 8. ~~**UPBP-BEAM-RADIUS**~~ (0.434.0) with **J-FOG-REALCAM** (4.3) — mode J's beam kernel shrinks
    per epoch now; J-FOG-REALCAM's CPU-only extra deficit is what is left.
-9. **GLTF-ROUGHNESS-MAP** and **GLTF-MAP-MEAN-GUTTERS** (4.2) — glTF imports rougher than glTF means,
-   and their mean metalness and roughness counting the atlas gutters.
+9. ~~**GLTF-ROUGHNESS-MAP**~~ (0.434.4) and **GLTF-MAP-MEAN-GUTTERS** (4.2) — glTF imports rougher
+   than glTF means (done), and their mean metalness and roughness counting the atlas gutters.
 10. **FWD-GLOSSY-INDIRECT** (4.2) — modes A and B leave a rough reflector black in a mirror or
     through glass.
 11. **CPU-ONLY-BUILD** (4.4) — a build without CUDA does not compile.
@@ -214,8 +214,8 @@ Then the rest of 4.2-4.6 in their order, 4.7's bookkeeping alongside whatever to
 - [ ] **SPECTRAL-BUNDLE, what is left** — the other modes' media gates (the device's mode D among
   them); a fiber with a dispersive index (`hair.h` takes one `eta`).
 - [ ] **ALICE2-CHEEK-DOT** — a pinprick dark dot on the Alice2 face in front of each ear.
-- [ ] **GLTF-ROUGHNESS-MAP** — a glTF roughness is fed to the Phong lobe raw, so imports render
-  rougher than glTF means.
+- [x] **GLTF-ROUGHNESS-MAP** — a glTF roughness is fed to the Phong lobe raw, so imports render
+  rougher than glTF means. 0.434.4.
 - [ ] **"a quad's emission is invisible from the side its winding faces away from"** — re-check
   against AREA-LIGHT-SIDE (0.377.2), which fixed a neighbouring case.
 - [ ] **"`-dual-scatter` drops the coat's indirect illumination"** (its part 2).

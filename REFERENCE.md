@@ -3506,7 +3506,8 @@ backend and the instanced path to prove it.
 glTF brings
 its node transform hierarchy, per-vertex normals/UVs, and `pbrMetallicRoughness`
 materials (base color upsampled to a reflectance spectrum, metallic → glossy tint,
-roughness → lobe width; `import_materials no` forces the FTSL `material` instead), plus
+roughness → lobe width, converted to ftrace's units, see below; `import_materials no` forces
+the FTSL `material` instead), plus
 the four KHR extensions that describe **glass** — without which a transmissive asset
 arrives opaque and white, since that is literally what its core block says:
 `KHR_materials_transmission` (≥ 0.5 → a `dielectric`, the same 0.5 cut `metallic` uses),
@@ -3533,6 +3534,16 @@ are worth knowing about:
   channel multiplies `metallicFactor` before the ≥ 0.5 diffuse-vs-metal cut, because
   exporters routinely write `metallicFactor 1.0` and put the real (near-zero) metalness in
   the map — reading the factor alone turns a painted character into a mirror.
+* **Roughness is converted to ftrace's units, so a highlight is as wide as the asset's author
+  saw it** (0.434.4). glTF's roughness `r` is perceptual: its GGX α is `r²`. ftrace's
+  `roughness` is a Phong lobe of exponent `2/r_t² − 2`, as wide as a GGX α of about `0.646 r_t`.
+  So the import takes `r_t = min(1, r² / 0.646)`: the factor when there is no map, and each
+  texel of the map (with the map's mean as the material's constant). Before 0.434.4, `r` was
+  copied raw, so every imported glossy surface was blurrier than glTF means: α 0.16 for a glTF
+  0.25, where glTF means 0.0625. The two agree only near `r` 1. The raster preview's GGX now
+  comes out at glTF's own α for `r` up to 0.8. Past that, ftrace's lobe is already at its widest
+  (`r_t` 1, a cosine lobe). Frosted glass (`KHR_materials_transmission` with a roughness)
+  uses the same conversion for its refracted lobe.
 * **A metal is tinted by the base-colour texture, texel by texel** (0.367.2). glTF's metal F0
   *is* its base colour, so a textured metal — a whole-metal material, or the metal lobe of
   `-import-metal mix` — reflects in the texture's colour at every hit, and a vertex colour
