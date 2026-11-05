@@ -23,8 +23,8 @@
 // dominant cost of a heterogeneous render, and an indirect call per hit would be paid on
 // mode M's behalf for a feature mode M does not use. As a template with a
 // return-1.0 default functor the constant folds away and mode M's generated code is what it
-// was; `gatherPhotonBeams` below is that instantiation, kept under its old name and
-// signature so every existing call site is untouched.
+// was; `gatherPhotonBeams` below is that instantiation, under its old name, which also hands
+// over mode M's camera carrier and glass (MODEM-BEAM-CARRIER).
 #pragma once
 #include <mutex>
 #include <cstdlib>
@@ -219,16 +219,22 @@ inline Vec3 jSpecFoldColor(const JSpec& cs, const Emitter& em, const Vec3& fallb
 // `kFoldGatherTime` says whether this weight lets the GATHER-TIME SPECTRAL FOLD (0.256.0,
 // Scene::BowLut, PhotonBeam::achro == 2) be taken. Folding integrates λ out of the
 // contribution, which is an exact substitution only if NOTHING ELSE in the term depends on λ.
-// A weight of exactly 1 satisfies that trivially, so mode M folds. A MIS weight does not — see
-// the long note at the fold's use site below — so mode J does not. In mode J the practical
-// reason is even simpler than the theoretical one, and it is measured: a folded beam cannot
-// also be a `-beamspec` bundle, and in mode J the bundle is worth far more.
+// A weight of exactly 1 satisfies that trivially, so mode M folds, unless its camera carrier is
+// live: the carrier is a function of λ too, and the fold then falls back to the beam's own
+// wavelength. A MIS weight does not — see the long note at the fold's use site below — so mode J
+// does not. In mode J the practical reason is even simpler than the theoretical one, and it is
+// measured: a folded beam cannot also be a `-beamspec` bundle, and in mode J the bundle is worth
+// far more.
 struct BeamWeightOne {
     static constexpr bool kFoldGatherTime = true;
+    // Mode M's camera side, as the gather reads it (MODEM-BEAM-CARRIER): its walk's spectral
+    // carrier at this segment (SpecThr::toJSpec), null while the walk has met nothing chromatic,
+    // and the dielectric the segment runs through, null outside one.
+    const JSpec*    spec  = nullptr;
+    const Material* glass = nullptr;
     double operator()(const BeamHit&, const PhotonBeam&, double, double) const { return 1.0; }
-    // No camera-side spectral carrier (JSpec). Mode M passes none.
-    const JSpec* camSpec() const { return nullptr; }
-    const Material* glassCam() const { return nullptr; }
+    const JSpec* camSpec() const { return spec; }
+    const Material* glassCam() const { return glass; }
 };
 
 // --- Deterministic transmittance, for MIS WEIGHTS ONLY --------------------------------
@@ -723,6 +729,11 @@ inline Vec3 gatherPhotonBeamsW(const Scene& scene, const Renderer& mats, const B
                                double aGlassCam, Pcg32& rng, const WeightFn& w1) {
     Vec3 acc{0, 0, 0};
     if (bm.empty() || bm.nEmitted <= 0) return acc;
+    // The camera-side spectral carrier (JSPEC: mode J's, or mode M's re-expressed), or null.
+    // Constant over the segment.
+    const JSpec* camSpec = w1.camSpec();
+    const bool   specOn  = camSpec && camSpec->on();
+    const bool   dispOn  = specOn && camSpec->disp;
     // VOLCACHE: replace the order >= 2 beam queries with a march of the cached fluence.
     // `phase` is the ISOTROPIC 1/(4 pi) -- see volcache.h for why a scalar cache admits no
     // other, and why the build refuses anisotropic media rather than pretending.
@@ -754,7 +765,10 @@ inline Vec3 gatherPhotonBeamsW(const Scene& scene, const Renderer& mats, const B
                 const double ss = md.sigma_s(550.0) * md.densityAt(p, &vcTabs);
                 if (!(ss > 0.0)) continue;
                 const double T = mats.mediaTransmittance(scene, oc, dc, t, 550.0, rng);
-                acc += fl * (ss * T * dt);   // phase already folded in by inScatter
+                // phase already folded in by inScatter. A cached colour has no wavelength for the
+                // carrier to be read at: atC() undoes the scale the caller's beta() puts back, so
+                // this share takes the camera's own throughput, as it did before any carrier.
+                acc += fl * (ss * T * dt * (specOn ? camSpec->atC() : 1.0));
             }
         }
     }
@@ -785,10 +799,17 @@ inline Vec3 gatherPhotonBeamsW(const Scene& scene, const Renderer& mats, const B
     }
     const double invN = 1.0 / (double)bm.nEmitted;
     const PatTables tabs = scene.patTables();
-    // Mode J's camera-side spectral carrier (JSPEC), or null. Constant over the segment.
-    const JSpec* camSpec = w1.camSpec();
-    const bool   specOn  = camSpec && camSpec->on();
-    const bool   dispOn  = specOn && camSpec->disp;
+    // An unfolded beam's colour. A gather-time fold's record (achro == 2) holds its emitter's mean
+    // colour, the fallback BeamBank::push asks for, which belongs only with the folded phase: with
+    // the phase at the beam's wavelength it is neither estimator, so such a beam unfolded takes
+    // that wavelength's colour (the device's upload demotes the same record the same way).
+    const auto unfoldedCie = [&](const PhotonBeam& b, size_t i) {
+        if (b.achro != 2) return bm.cie[i];
+        const double l = (double)b.lambda;
+        return Vec3(cieX(l), cieY(l), cieZ(l));
+    };
+    int  foldEm = -1;              // the emitter whose fold colour `foldCol` holds (JSPEC, below)
+    Vec3 foldCol{0, 0, 0};
     bm.gather(oc, dc, tMax, [&](const BeamHit& bh) {
         const PhotonBeam& b = bm.beams[bh.idx];
         // Skip only if THIS beam's own medium has a ready grid -- a partially-cached scene
@@ -844,8 +865,13 @@ inline Vec3 gatherPhotonBeamsW(const Scene& scene, const Renderer& mats, const B
         // time and keeps its bundle; this gate is the belt to that braces, and it is what makes
         // the gather bit-identical to pre-0.256.0 should a folded bank reach it anyway (a
         // `-loadmap` of a map some other mode wrote). See known-issues.md, UPBP-BOWFOLD.
+        //
+        // Nor under a live camera carrier (mode M behind coloured glass, MODEM-BEAM-CARRIER): the
+        // carrier is a function of lambda, so the fold would have to integrate it with the phase
+        // table, which holds the integral without it. The beam then counts at its own wavelength,
+        // unbiased and as noisy as an unfolded beam.
         const Scene::BowLut* bow =
-            (WeightFn::kFoldGatherTime && b.achro == 2)
+            (WeightFn::kFoldGatherTime && b.achro == 2 && !specOn)
                 ? scene.bowLut((int)b.emIdx, b.med) : nullptr;
         Vec3   bowCie{0, 0, 0};
         double phase;
@@ -903,15 +929,24 @@ inline Vec3 gatherPhotonBeamsW(const Scene& scene, const Renderer& mats, const B
             }
         } else if (specOn) {
             if (b.achro == 1) {
-                const Vec3 c0 = bm.cie[bh.idx];
-                acc += ((b.srcEm >= 0 && b.srcEm < (int)scene.emitters.size())
-                            ? jSpecFoldColor(*camSpec, scene.emitters[(size_t)b.srcEm], c0)
-                            : c0) * w;
+                const Vec3& c0 = bm.cie[bh.idx];
+                if (b.srcEm >= 0 && b.srcEm < (int)scene.emitters.size() &&
+                    scene.emitters[(size_t)b.srcEm].foldN > 0) {
+                    // Constant over the segment for one emitter, and most beams in a frame share
+                    // one: computed once per run of them (it is 12 reads of the carrier).
+                    if ((int)b.srcEm != foldEm) {
+                        foldEm = (int)b.srcEm;
+                        foldCol = jSpecFoldColor(*camSpec, scene.emitters[(size_t)b.srcEm], c0);
+                    }
+                    acc += foldCol * w;
+                } else {
+                    acc += c0 * w;
+                }
             } else {
-                acc += (bow ? bowCie : bm.cie[bh.idx]) * (w * camSpec->at(lam));
+                acc += unfoldedCie(b, bh.idx) * (w * camSpec->at(lam));
             }
         } else {
-            acc += (bow ? bowCie : bm.cie[bh.idx]) * w;
+            acc += (bow ? bowCie : unfoldedCie(b, bh.idx)) * w;
         }
         // SECONDARY wavelengths of the bundle. They share this beam's geometry, its kernel
         // weight and BOTH transmittance marches — the bundle only exists on a path whose
@@ -949,10 +984,15 @@ inline Vec3 gatherPhotonBeamsW(const Scene& scene, const Renderer& mats, const B
     return acc;
 }
 
-// Mode M's instantiation: the estimator with no MIS partner, under its historical name and
-// signature. Bit-identical to the pre-0.215.0 function it replaces.
+// Mode M's instantiation: the estimator with no MIS partner. `camSpec` and `glassCam` are the
+// camera side BeamWeightOne describes; the caller scales the result by its throughput, through
+// camSpec->beta() when it passes a carrier. Both null (no chromatic factor met, no glass around
+// the segment) is the gather exactly as it was before either existed.
 inline Vec3 gatherPhotonBeams(const Scene& scene, const Renderer& mats, const BeamMap& bm,
                               const Vec3& oc, const Vec3& dc, double tMax,
-                              double aGlassCam, Pcg32& rng) {
-    return gatherPhotonBeamsW(scene, mats, bm, oc, dc, tMax, aGlassCam, rng, BeamWeightOne{});
+                              double aGlassCam, Pcg32& rng,
+                              const JSpec* camSpec, const Material* glassCam) {
+    BeamWeightOne w;
+    w.spec = camSpec; w.glass = glassCam;
+    return gatherPhotonBeamsW(scene, mats, bm, oc, dc, tMax, aGlassCam, rng, w);
 }

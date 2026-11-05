@@ -1132,6 +1132,20 @@ struct SpecThr {
         for (int k = 0; k < K; ++k) m = std::max(m, v[k] / cam * pscale);
         return (m > 0.0) ? m : 1.0;
     }
+    // The carrier as the beam gather reads it (JSpec, beamgather.h: mode J's carrier, read between
+    // bin centres), the ratio over its peak and the peak in logS, so neither leaves a float. False,
+    // and `js` untouched, while nothing chromatic was folded: the gather then takes no carrier.
+    bool toJSpec(JSpec& js) const {
+        static_assert(JSpec::K == K, "mode M's carrier and the beam gather's share a grid");
+        if (!any) return false;
+        const double pk = peak();
+        const bool live = cam > 1e-300;
+        js.any = true;
+        js.disp = false; js.lamC = 0.0f; js.invPdfC = 0.0f;
+        js.logS = std::log(pk);
+        for (int k = 0; k < K; ++k) js.r[k] = live ? (float)(v[k] / cam * pscale / pk) : 0.0f;
+        return true;
+    }
 };
 
 // The media transmittance of one straight CAMERA segment -- one ratio-tracking sample, or
@@ -1478,6 +1492,16 @@ inline Vec3 photonGather(const Scene& scene, const PhotonMap& pm, Ray ray,
     const bool gneeOn = BackwardRenderer::glossyNeeOn();
     BackwardRenderer::GlossyMis gmis;
     bool hairArrival = false;   // HAIR-NEE: the previous vertex was a fiber that already took its direct light
+    // The beam gather over one straight camera segment, times the throughput. The walk's spectral
+    // factors and the glass the segment runs through are read at each beam's own wavelength
+    // (MODEM-BEAM-CARRIER), as the surface gather reads them at each photon's.
+    const auto gatherBeams = [&](const Vec3& o, const Vec3& d, double len, double aG, int glass) {
+        JSpec js;
+        const bool jsOn = sthr.toJSpec(js);
+        return gatherPhotonBeams(scene, mats, *bm, o, d, len, aG, rng, jsOn ? &js : nullptr,
+                                 glass >= 0 ? &scene.mats[glass] : nullptr) *
+               (jsOn ? js.beta(thr) : thr);
+    };
     for (int b = 0; b < maxBounce; ++b) {
         const int    cmIdx  = stk.topMat();
         const double aGlass = (cmIdx >= 0) ? scene.mats[cmIdx].absorb(lambda) : 0.0;
@@ -1493,7 +1517,7 @@ inline Vec3 photonGather(const Scene& scene, const PhotonMap& pm, Ray ray,
                 [&](const Vec3& so, const Vec3& sd, double slen, double&) -> bool {
                     if (volOn || sunOn) {
                         if (volOn) { MStatTimer _t(&mStats().beamNs, &mStats().beamN);
-                          L += gatherPhotonBeams(scene, mats, *bm, so, sd, slen, aGlass, rng) * thr; }
+                          L += gatherBeams(so, sd, slen, aGlass, cmIdx); }
                         if (sunOn) L += sunNeeMarch(scene, mats, so, sd, slen, aGlass, lambda, invPdfL, rng) * thr;
                         {   double Tv[SpecThr::K + 1];
                             camMediaTrSpec(scene, mats, so, sd, slen, lambda, rng, Tv);
@@ -1529,9 +1553,8 @@ inline Vec3 photonGather(const Scene& scene, const PhotonMap& pm, Ray ray,
         if (volOn || sunOn) {
             const double dSeg = h.valid ? h.t : 1e30;
             if (volOn) { MStatTimer _t(&mStats().beamNs, &mStats().beamN);
-              L += gatherPhotonBeams(scene, mats, *bm, ray.o, ray.d, dSeg, aGlass, rng)
-                   * thr;
-              }
+              L += gatherBeams(ray.o, ray.d, dSeg, aGlass, cmIdx);
+            }
             if (sunOn) L += sunNeeMarch(scene, mats, ray.o, ray.d, dSeg, aGlass, lambda, invPdfL, rng) * thr;
             // Extinction along the camera segment: what is behind the fog gets dimmed.
             {   // SPECGATHER: extinction is spectral too, and with a coloured medium badly so.

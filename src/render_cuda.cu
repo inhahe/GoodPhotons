@@ -8158,6 +8158,16 @@ __device__ static bool dJSpecFoldColor(const DScene& sc, const DJSpec& js, int e
     }
     return true;
 }
+// dJSpecFoldColor kept across one camera segment's beam hits: constant for one emitter over the
+// segment, and most beams in a frame share one, so it is computed once per run of them.
+struct DFoldCache { int em; bool ok; double x, y, z; };
+__device__ static bool dJSpecFoldColorC(const DScene& sc, const DJSpec& js, int em, DFoldCache* fc,
+                                        double& cx, double& cy, double& cz) {
+    if (!fc) return dJSpecFoldColor(sc, js, em, cx, cy, cz);
+    if (fc->em != em) { fc->em = em; fc->ok = dJSpecFoldColor(sc, js, em, fc->x, fc->y, fc->z); }
+    cx = fc->x; cy = fc->y; cz = fc->z;
+    return fc->ok;
+}
 
 struct DBeamRec {
     DVec3 o, d;             // parent beam origin (world) and unit direction
@@ -8476,7 +8486,7 @@ __device__ static void dBeamHitEval(const DScene& sc, const DBeamMap& bm, const 
                                     const DPatEnv& env,
                                     double& oX, double& oY, double& oZ,
                                     const DJSpec* js = nullptr, int glassMatCam = -1,
-                                    const DCamera* cam = nullptr) {
+                                    const DCamera* cam = nullptr, DFoldCache* fc = nullptr) {
         if (b.med < 0 || b.med >= sc.mediaN) return;
         const DMedium& md = sc.media[b.med];
         const Real lam = b.lambda;
@@ -8496,7 +8506,9 @@ __device__ static void dBeamHitEval(const DScene& sc, const DBeamMap& bm, const 
         // false, because its MIS ratios are built from the monochromatic phase and a folded
         // colour cannot be paired with them.
         double bowX = 0.0, bowY = 0.0, bowZ = 0.0, bowPhase = 0.0;
-        const bool folded = (mw == nullptr) && b.achro == 2 &&
+        // Nor under a live camera carrier (mode M behind coloured glass, MODEM-BEAM-CARRIER;
+        // host twin, where the why is): the beam counts at its own wavelength.
+        const bool folded = (mw == nullptr) && b.achro == 2 && !(js && js->on()) &&
                             dBowEval(sc.bow, (int)b.emIdx, b.med, (double)(-cosT),
                                      bowX, bowY, bowZ, bowPhase);
         const double phase = folded ? bowPhase : (double)dMedPhase(md, -cosT, lam);
@@ -8523,10 +8535,11 @@ __device__ static void dBeamHitEval(const DScene& sc, const DBeamMap& bm, const 
         }
         if (!(w > 0.0)) return;
         if (b.absorb > 0.f)  w *= exp(-(double)b.absorb * (double)s);   // glass, beam side
-        // Glass, camera side: at the beam's wavelength wherever JSPEC is on, live carrier or not
-        // (host twin beamgather.h, where the why is), else at the camera sample's own.
+        // Glass, camera side: at the beam's wavelength in mode M, and in mode J wherever JSPEC is
+        // on, live carrier or not (host twin beamgather.h, where the why is); else at the camera
+        // sample's own.
         {
-            const double aC = (js && c_jSpecOn && glassMatCam >= 0)
+            const double aC = (glassMatCam >= 0 && (mw == nullptr || (js && c_jSpecOn)))
                             ? (double)specLookup(sc.mats[glassMatCam].absorb, lam) : aGlassCam;
             if (aC > 0.0) w *= exp(-aC * (double)t);
         }
@@ -8578,7 +8591,7 @@ __device__ static void dBeamHitEval(const DScene& sc, const DBeamMap& bm, const 
         }
         else if (folded) { const double pwf = (double)b.pw * w;
                       oX += bowX * pwf; oY += bowY * pwf; oZ += bowZ * pwf; }
-        else if (specOn && b.achro == 1 && dJSpecFoldColor(sc, *js, (int)b.emIdx, fcx, fcy, fcz)) {
+        else if (specOn && b.achro == 1 && dJSpecFoldColorC(sc, *js, (int)b.emIdx, fc, fcx, fcy, fcz)) {
                       const double pwf = (double)b.pw * w;
                       oX += fcx * pwf; oY += fcy * pwf; oZ += fcz * pwf; }
         else if (specOn && b.achro != 1) {
@@ -8789,13 +8802,16 @@ __device__ static void dGatherPhotonBeams(const DScene& sc, const DBeamMap& bm,
                                           const DCamera* cam = nullptr) {
     oX = oY = oZ = 0.0;
     // The cache's share first: it is additive and independent of the beam traversal, and it
-    // must run even when the split left no beams at all (nNodes == 0).
+    // must run even when the split left no beams at all (nNodes == 0). Under a carrier, atC()
+    // undoes the scale the caller's beta() puts back (host twin gatherPhotonBeamsW).
     dVolCacheMarch(sc, bm, oc, dc, tMax, rng, oX, oY, oZ);
+    if (js && js->on()) { const double a = js->atC(); oX *= a; oY *= a; oZ *= a; }
     if (bm.nNodes == 0) return;
     const DVec3 invD{(Real)1 / dc.x, (Real)1 / dc.y, (Real)1 / dc.z};
     Real tRoot;
     if (!boxHit(bm.nodes[0], oc, invD, (Real)0, tMax, tRoot)) return;
     const DPatEnv env = dPatEnvOf(sc);
+    DFoldCache fc{-2, false, 0.0, 0.0, 0.0};   // JSPEC's fold colour, per segment
     int stack[64]; int sp = 0; stack[sp++] = 0;
     // THIS is where a gather actually spends its time, so this is where cancellation has to
     // live. A probe ray visits thousands of nodes here (G = 8534 gathered beams on
@@ -8830,7 +8846,7 @@ __device__ static void dGatherPhotonBeams(const DScene& sc, const DBeamMap& bm,
                 if (!(x2 < 1.0)) continue;
                 if (routeMedJ && dRouteOfMed(sc, b.med) != 1) continue;   // D-routed merge (0.386.0)
                 dBeamHitEval(sc, bm, b, bm.primIdx[n.first + i], oc, dc, t, s, cosT, den, x2,
-                             aGlassCam, rng, mw, camTr, env, oX, oY, oZ, js, glassMatCam, cam);
+                             aGlassCam, rng, mw, camTr, env, oX, oY, oZ, js, glassMatCam, cam, &fc);
             }
         } else {
             Real tc;
@@ -19662,7 +19678,36 @@ struct DSpecThr {
         for (int k = 0; k < K; ++k) m = fmax(m, v[k] / cam * pscale);
         return (m > 0.0) ? m : 1.0;
     }
+    // The carrier as the beam gather reads it (host twin SpecThr::toJSpec). False, and `js`
+    // untouched, while nothing chromatic was folded.
+    __device__ bool toJSpec(DJSpec& js) const {
+        if (!any) return false;
+        const double pk = peak();
+        const bool live = cam > 1e-300;
+        js.any = 1; js.disp = 0; js.lamC = 0.0f; js.invPdfC = 0.0f;
+        js.logS = log(pk);
+        for (int k = 0; k < K; ++k) js.r[k] = live ? (float)(v[k] / cam * pscale / pk) : 0.0f;
+        return true;
+    }
 };
+static_assert(DSpecThr::K == DJSPEC_K, "mode M's carrier and the beam gather's share a grid");
+
+// Mode M's beam gather over one straight camera segment, ADDED to (oX, oY, oZ) times the walk's
+// throughput `thr`, with its spectral factors (`sthr`) and the glass the segment runs through
+// (`glass`, -1 if none) read at each beam's own wavelength (host twin: photonGather's
+// gatherBeams, MODEM-BEAM-CARRIER).
+__device__ static void dGatherBeamsM(const DScene& sc, const DBeamMap& bm, const DSpecThr& sthr,
+                                     double thr, const DVec3& o, const DVec3& d, Real len,
+                                     double aGlass, int glass, DRng& rng,
+                                     double& oX, double& oY, double& oZ) {
+    DJSpec js;
+    const bool jsOn = sthr.toJSpec(js);
+    double bX, bY, bZ;
+    dGatherPhotonBeams(sc, bm, o, d, len, aGlass, rng, bX, bY, bZ, nullptr, nullptr, 0,
+                       jsOn ? &js : nullptr, glass);
+    const double t = jsOn ? js.beta(thr) : thr;
+    oX += bX * t; oY += bY * t; oZ += bZ * t;
+}
 
 // A material's reflect or transmit slot, folded into the carrier (DSpecThr::mul).
 __device__ static void dSpecFold(DSpecThr& st, const DScene& sc, const DMaterial& m, const DHit& h,
@@ -19783,7 +19828,7 @@ __device__ static void dPhotonGather(const DScene& sc, const DPhotonMap& pm,
                 const Real slen = (Real)gm.arc;
                 if ((volOn || sunOn) && slen > 0) {
                     double bX = 0.0, bY = 0.0, bZ = 0.0;
-                    if (volOn) dGatherPhotonBeams(sc, *bm, pro, rd, slen, aGlass, rng, bX, bY, bZ);
+                    if (volOn) dGatherBeamsM(sc, *bm, sthr, thr, pro, rd, slen, aGlass, cmIdx, rng, oX, oY, oZ);
                     if (sunOn) dSunNeeMarch(sc, pro, rd, slen, aGlass, lambda, invPdfL, rng, bX, bY, bZ);
                     oX += bX * thr; oY += bY * thr; oZ += bZ * thr;
                     {   // SPECGATHER: extinction is spectral too (badly so in a coloured medium)
@@ -19817,7 +19862,7 @@ __device__ static void dPhotonGather(const DScene& sc, const DPhotonMap& pm,
         if (volOn || sunOn) {
             const Real dSeg = h.valid ? h.t : (Real)1e30;
             double bX = 0.0, bY = 0.0, bZ = 0.0;
-            if (volOn) dGatherPhotonBeams(sc, *bm, ro, rd, dSeg, aGlass, rng, bX, bY, bZ);
+            if (volOn) dGatherBeamsM(sc, *bm, sthr, thr, ro, rd, dSeg, aGlass, cmIdx, rng, oX, oY, oZ);
             if (sunOn) dSunNeeMarch(sc, ro, rd, dSeg, aGlass, lambda, invPdfL, rng, bX, bY, bZ);
             oX += bX * thr; oY += bY * thr; oZ += bZ * thr;
             {   // SPECGATHER: extinction is spectral too (badly so in a coloured medium)

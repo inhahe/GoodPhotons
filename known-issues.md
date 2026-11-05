@@ -1458,7 +1458,34 @@ happen: only `-loadmap` makes such beams, and only mode M loads maps, which has 
 mode J folds a beam only while its subpath's spectral claim lives, which always records the
 emitter. The carrier's size (Opus) is JSPEC-CARRIER-SIZE below.
 
-## OPEN (2026-10-21): MODEM-BEAM-CARRIER — mode M's beam gather reads the camera path's spectral factors at the camera's wavelength
+## DONE (2026-11-04, 0.433.5): MODEM-BEAM-CARRIER — mode M's beam gather reads the camera path's spectral factors at the camera's wavelength
+
+**Fixed.** The beam gather now takes the carrier, on both backends (design.md, SPECGATHER, "Beams"):
+`SpecThr::toJSpec` / `DSpecThr::toJSpec` re-express it as the `JSpec` mode J's merges read, and the
+segment's dielectric absorbs over the partial segment at each beam's wavelength. While the carrier
+is live the gather-time bow fold (`achro == 2`) is declined and the beam counts at its own
+wavelength. An unfolded such beam had been paired with its emitter's mean colour on the host, which
+the device's upload had always demoted to the beam's own; both now agree. Fog region against mode R
+(scenes/_jfog_*, `-max-bounce 32`; GPU 20 M photons 64 spp, CPU 4 M photons 8 spp):
+
+| scene | before, GPU / CPU (R, G) | after, GPU / CPU (R, G) |
+|---|---|---|
+| floor (no glass) | 0.997 0.997 / 1.012 1.012 | unchanged |
+| behind (fog seen through the glass) | 0.541 2.629 / 0.554 2.692 | 0.985 1.017 / 0.998 1.037 |
+| inside (fog inside the glass) | 0.664 1.284 / 0.680 1.313 | 1.000 0.975 / 1.018 0.995 |
+
+`tools/check_jfog_glass.py` now runs mode M too (arms `M-gpu`, `M-cpu`). Cost, GPU, wall time of the
+whole render, two runs each: floor 30.5 / 31.3 s before and 30.8 / 31.5 after; inside 32.7 / 33.2
+and 33.9 / 33.8; behind, where the carrier is live over the fog, 48.7 / 47.0 and 50.3 / 49.7. Behind
+read 84 s until a deposit-folded beam's colour under the carrier (its emitter's 12-point fold,
+79 % of the beams here) was kept per emitter for the segment instead of rebuilt per hit, which
+mode J's gather now shares. The VOLCACHE prototype's share of the gather (`FTRACE_VOLCACHE`), a
+cached colour with no wavelength for the carrier to be read at, takes `JSpec::atC()`, so the caller's
+`beta()` leaves it at the camera's own throughput as before; mode J had scaled it by the carrier's
+peak since JSPEC.
+
+The original report:
+
 
 Found beside J-GPU-ETAPREVS. Mode M keeps a spectral carrier on its camera walk (SPECGATHER's
 `sthr`, photonmap_render.h), but only the SURFACE photon gather reads it: `gatherPhotonBeams` is
@@ -1743,8 +1770,6 @@ around the fur, so the carrier re-expresses the clamped factor. Bit-identity aga
 and GPU.
 
 **Still open:**
-- **`aGlassCam` inside the gather:** the camera segment's glass absorption over each beam's
-  closest-approach distance (media inside coloured glass) is read at λ_c.
 - **Support.** A walk at a wavelength where a factor is zero carries nothing at any wavelength.
   That covers a gel opaque at λ_c and glass dark enough at λ_c that `beta` underflows. SPECGATHER
   divides by the probability the walk's wavelength could take the branch (MODE-M-FOLD-SUPPORT);
@@ -1753,9 +1778,9 @@ and GPU.
   wavelength, a chromatic blur of about a pixel. That is the default, because the window's noise
   is the price of the exact answer.
 
-Related, mode M: its beam gather (`photonGather`, `L += gatherPhotonBeams(...) * thr`) still uses
-the scalar `thr`. SPECGATHER's carrier reaches its surface photons but not its beams, so fog seen in
-a coloured mirror is mis-coloured there.
+The camera segment's glass absorption over each beam's closest-approach distance, once on this
+list, is taken at the beam's wavelength since 0.391.3 (REVIEW-0388, `PathSeg::glassMat`), and mode
+M's beam gather reads its carrier since 0.433.5 (MODEM-BEAM-CARRIER).
 
 ## OPEN (2026-10-19): UPBP-W-CHROMATIC — in a medium whose sigma_t varies with wavelength, a beam merge's weight mixes two wavelengths and the frame tilts in colour
 

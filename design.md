@@ -463,7 +463,7 @@ MIS weight, because the balance-heuristic ratio depends on the merge geometry (`
 and so differs from hit to hit — a weight the caller cannot apply after the fact, because by then
 the hits have been summed. The default functor returns `1.0`, folds away, and leaves mode `M`'s
 generated code as it was; `gatherPhotonBeams` survives as that instantiation under its old name
-and signature, so every existing call site is untouched. The weight is applied *before* the
+(and, since 0.433.5, with mode M's carrier and glass as two more arguments: SPECGATHER). The weight is applied *before* the
 `w > 0` rejection, so a technique the weight kills costs no transmittance marches.
 
 **Camera SEGMENTS, not camera vertices.** A merge is an alternative to the camera's free-flight
@@ -1088,6 +1088,18 @@ moderate. So nothing stores or sums the ratio itself in float: `SpecThr::peak()`
 is its largest bin, the float side takes ratio / peak (the device's mode-M gathers, mode S's
 `vpRatio` on both backends) and the double throughput takes the peak. Mode J's carrier keeps its
 magnitude apart for the same reason (`JSpec::logS`). `tools/check_dark_glass.py` is the check.
+
+**Beams (0.433.5, MODEM-BEAM-CARRIER).** Each beam carries its own wavelength too, so the beam gather
+reads the carrier as mode J's does: `photonGather`'s `gatherBeams` (device: `dGatherBeamsM`) hands
+`gatherPhotonBeams` the carrier re-expressed as a `JSpec` (`SpecThr::toJSpec`: the ratio over its
+peak, the peak in `logS`) through `BeamWeightOne`, scales the result by `JSpec::beta(thr)`, and hands
+it the dielectric the segment runs through, whose absorption over the partial segment is then taken
+at each beam's wavelength. A deposit-folded beam (`achro == 1`) is re-coloured through its emitter's
+fold quadrature (`jSpecFoldColor`, computed once per emitter per segment). The gather-time bow fold
+(`achro == 2`) is declined while the carrier is live -- the carrier is a function of λ, and the bow
+table holds the integral without it -- and the beam counts at its own wavelength, as an unfolded
+beam. Nothing chromatic met and no glass around the segment: two nulls, and the gather as before.
+`tools/check_jfog_glass.py` holds mode M to mode R in fog beside, behind and inside coloured glass.
 
 **HAIR-NEE (0.334.0).** Mode M's walk collects radiance only where it finally gathers -- a
 diffuse surface -- so a chain that scatters strand to strand through a hair mass lands on the
@@ -2646,8 +2658,8 @@ unless `-jdispall` opens the window for them as well.
 
 **Still not re-expressed:** the support of a factor that is zero at λ_c (known-issues.md,
 JSPEC-GAPS). The camera-side glass absorption on the gather's own partial segment is, since 0.391.3,
-taken at the beam's wavelength (`PathSeg::glassMat`). Mode M's beam gather still multiplies by the
-scalar `thr`: its specular-chain carrier reaches its photons but not its beams (MODEM-BEAM-CARRIER).
+taken at the beam's wavelength (`PathSeg::glassMat`). Mode M's beam gather reads its own carrier the
+same way since 0.433.5 (SPECGATHER, "Beams").
 
 **Measured** (`_fog_cornell`, `-max-bounce 8 -beamcount 1e5 -beamk 2 -nojsurf -beamsinmin 0`, CPU,
 J 1024 spp against D 4096 spp, 64²). Before: J/D −2.30 %, by block 0.86–1.10, R/G/B 0.958 / 0.979
@@ -6279,8 +6291,8 @@ as the one at fault.
   template parameter (not a `std::function`: this is the innermost loop of the mode-`M` gather,
   and an indirect call per hit would be paid on mode `M`'s behalf for a feature it does not
   use). `BeamWeightOne` returns `1.0`, folds away, and `gatherPhotonBeams` is that
-  instantiation under the historical name and signature — verified `cmp`-identical against the
-  pre-split binary. Mode `J` needs a *per-hit* weight rather than a per-call one because the
+  instantiation under the historical name — verified `cmp`-identical against the pre-split binary
+  (it has since taken mode M's carrier and glass too: SPECGATHER, "Beams"). Mode `J` needs a *per-hit* weight rather than a per-call one because the
   balance-heuristic ratio between "merge this beam" and "connect this vertex" depends on the
   merge geometry — `sinθ` above all — and so differs from hit to hit; by the time control
   returns to the caller the hits have already been summed.

@@ -94,8 +94,8 @@ Each names the section its line is in.
    (VCM-THIN-CURVES).
 6. ~~**VCOL-BDPT-GPU** (4.2) — GPU modes D and J connect to a vertex-coloured mesh without its colours.~~
    Done, 0.433.4.
-7. **MODEM-BEAM-CARRIER**, **JSPEC-GAPS**' rest and **MODEM-REDPASS** (4.2) — mode M's beams, and
-   mode J's last camera-side factors, at the camera's wavelength.
+7. ~~**MODEM-BEAM-CARRIER**~~ (0.433.5), **JSPEC-GAPS**' rest and **MODEM-REDPASS** (4.2) — mode
+   M's beams, and mode J's last camera-side factors, at the camera's wavelength.
 8. **UPBP-BEAM-RADIUS** with **J-FOG-REALCAM** (4.3) — mode J's beam kernel never shrinks: fog 1-4 %
    low, never converging.
 9. **GLTF-ROUGHNESS-MAP** and **GLTF-MAP-MEAN-GUTTERS** (4.2) — glTF imports rougher than glTF means,
@@ -169,9 +169,10 @@ Then the rest of 4.2-4.6 in their order, 4.7's bookkeeping alongside whatever to
   device's gather (and mode S's per-pixel copy); the float side now takes ratio / peak.
 - [x] **VCOL-BDPT-GPU** (0.433.4) — `DVertex` and `DVcmLV` carry the hit's vertex colour; GPU
   modes D, J and U had read a vertex-coloured sphere near grey.
-- [ ] **MODEM-BEAM-CARRIER** — mode M's beam gather reads the camera's spectral factors at its
-  wavelength.
-- [ ] **JSPEC-GAPS**, its still-open list — `aGlassCam` in the gather, support where a factor is
+- [x] **MODEM-BEAM-CARRIER** (0.433.5) — mode M's beam gather reads its walk's spectral carrier and
+  the glass around the segment at each beam's wavelength (fog through tinted glass: R 0.54, G 2.63
+  of mode R before).
+- [ ] **JSPEC-GAPS**, its still-open list — support where a factor is
   zero at the camera's wavelength (mode U's carrier too, since 0.433.0), dispersive refraction
   without `-jdispall`.
 - [ ] **MODEM-REDPASS** — mode M reads a fog lit through a red-pass glass 8 % low in green.
