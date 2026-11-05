@@ -87,7 +87,7 @@ Each names the section its line is in.
 3. ~~**VCM-SPEC** and **SPPM-SPECTRAL** (4.2) — modes U and S merge at the camera's wavelength, so
    a coloured surface seen before a merge washes out (the fix mode J got in 0.386.1, JSPEC).~~ Done:
    mode S 0.432.0, mode U 0.433.0.
-4. **MODEM-GPU-CORNER** and **MODEM-COMPOTE-NAN** (4.2) — GPU mode M reads a box's corner 15 %
+4. **MODEM-GPU-CORNER** and ~~**MODEM-COMPOTE-NAN**~~ (4.2, the NaN done 0.433.1) — GPU mode M reads a box's corner 15 %
    bright, and writes NaN pixels on gallery_rain's gem compote.
 5. **CURVE-GATHER** (4.2) — modes M, S and U read a coat of diffuse fur at 0.7-2.4 of mode R; never
    gather at a curve vertex, as mode J does.
@@ -158,8 +158,10 @@ Then the rest of 4.2-4.6 in their order, 4.7's bookkeeping alongside whatever to
   one-block residuals).
 - [ ] **CURVE-GATHER** — modes M, S and U misread a coat of `type diffuse` curves
   (`tools/check_fur_gather.py`), M's two backends differently; VCM-THIN-CURVES is its mode-U half.
-- [ ] **MODEM-COMPOTE-NAN** — GPU mode M writes ~125 NaN pixels on gallery_rain's gem compote at
-  320 x 180.
+- [ ] **MODEM-CPU-DARKGLASS-BLUE** — CPU mode M reads blue 15 % low through strongly absorbing
+  glass, where GPU mode M and both mode S do not.
+- [x] **MODEM-COMPOTE-NAN** (0.433.1) — the spectral carrier's ratio overflowed a float in the
+  device's gather (and mode S's per-pixel copy); the float side now takes ratio / peak.
 - [ ] **VCOL-BDPT-GPU** — GPU modes D/J shade a vertex-coloured mesh without its colour in every
   connection (`DVertex` does not carry `vcol`).
 - [ ] **MODEM-BEAM-CARRIER** — mode M's beam gather reads the camera's spectral factors at its

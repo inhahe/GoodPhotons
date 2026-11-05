@@ -1135,6 +1135,17 @@ struct SpecThr {
         if (!any) return 1.0;
         return (cam > 1e-300) ? v[binOf(lamP)] / cam * pscale : 0.0;
     }
+    // The largest ratio over the bins (1 when nothing chromatic was folded). Where coloured glass
+    // absorbs at the walk's own wavelength and passes others, `cam` and with it the scalar
+    // throughput fall as far as the ratio climbs -- past a float's range (1e+38) behind a few
+    // centimetres of dark gem. Whatever stores or sums the ratio in float takes ratio / peak and
+    // multiplies the throughput, a double, by the peak (mode S's vpRatio, the device's gathers).
+    double peak() const {
+        if (!any || !(cam > 1e-300)) return 1.0;
+        double m = 0.0;
+        for (int k = 0; k < K; ++k) m = std::max(m, v[k] / cam * pscale);
+        return (m > 0.0) ? m : 1.0;
+    }
 };
 
 // The media transmittance of one straight CAMERA segment -- one ratio-tracking sample, or

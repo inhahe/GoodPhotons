@@ -19630,6 +19630,15 @@ struct DSpecThr {
         if (!any) return 1.0;
         return (cam > 1e-300) ? v[binOf(lamP)] / cam * pscale : 0.0;
     }
+    // The largest ratio over the bins, 1 when nothing chromatic was folded (host twin
+    // SpecThr::peak, where the why is): a float sum takes ratio / peak, the double throughput the
+    // peak -- the ratio itself passes FLT_MAX behind dark glass (MODEM-COMPOTE-NAN).
+    __device__ double peak() const {
+        if (!any || !(cam > 1e-300)) return 1.0;
+        double m = 0.0;
+        for (int k = 0; k < K; ++k) m = fmax(m, v[k] / cam * pscale);
+        return (m > 0.0) ? m : 1.0;
+    }
 };
 
 // A material's reflect or transmit slot, folded into the carrier (DSpecThr::mul).
@@ -19915,6 +19924,9 @@ __device__ static void dPhotonGather(const DScene& sc, const DPhotonMap& pm,
             // per-sample total is promoted to double once at the end (film math stays double).
             float gx = 0.f, gy = 0.f, gz = 0.f;
             const Real slkM = gatherBandSlack<Real>(pm.radius, h.fiberRadius);
+            // The carrier's peak goes into the double throughput, ratio / peak into the float sum
+            // (DSpecThr::peak): behind dark glass the ratio alone overflows a float.
+            const double pk = sthr.peak(), ipk = 1.0 / pk;
             dPmNeighborhood(pm, h.p, [&](int k) {
                 const DGatherPhoton& ph = pm.photons[k];
                 DVec3 d = h.p - ph.pos;
@@ -19924,7 +19936,7 @@ __device__ static void dPhotonGather(const DScene& sc, const DPhotonMap& pm,
                 // SPECGATHER: the walk's reflectances belong at THIS photon's wavelength,
                 // not the camera's. Exactly 1.0 when every one of them was flat.
                 float rho = (float)(dDiffuseRho(sc, m, h, (Real)ph.lambda)
-                                    * sthr.ratio((Real)ph.lambda));
+                                    * (sthr.ratio((Real)ph.lambda) * ipk));
                 gx += rho * ph.pX;
                 gy += rho * ph.pY;
                 gz += rho * ph.pZ;
@@ -19958,7 +19970,7 @@ __device__ static void dPhotonGather(const DScene& sc, const DPhotonMap& pm,
                     // SPECGATHER: the walk's reflectances belong at THIS photon's wavelength,
                     // not the camera's. Exactly 1.0 when every one of them was flat.
                     float rho = (float)(dDiffuseRho(sc, m, h, (Real)ph.lambda)
-                                        * sthr.ratio((Real)ph.lambda));
+                                        * (sthr.ratio((Real)ph.lambda) * ipk));
                     cx += rho * ph.pX;
                     cy += rho * ph.pY;
                     cz += rho * ph.pZ;
@@ -19975,7 +19987,8 @@ __device__ static void dPhotonGather(const DScene& sc, const DPhotonMap& pm,
                 gy += cy * (float)(aw * cs);
                 gz += cz * (float)(aw * cs);
             }
-            oX += (double)gx * thr; oY += (double)gy * thr; oZ += (double)gz * thr;
+            const double tp = thr * pk;
+            oX += (double)gx * tp; oY += (double)gy * tp; oZ += (double)gz * tp;
             return;
         }
 
@@ -20493,9 +20506,12 @@ __global__ void kSppmVisiblePoint(DScene sc, const __grid_constant__ DCamera cam
         st.vpHit[pix] = vp; st.vpThr[pix] = thr; st.vpValid[pix] = valid ? 1 : 0;
         const bool spec = valid && sthr.any;
         st.vpSpec[pix] = spec ? 1 : 0;
-        if (spec)
+        if (spec) {   // in float over its peak, the peak in vpThr (host twin)
+            const double pk = sthr.peak();
             for (int k = 0; k < DSpecThr::K; ++k)
-                st.vpRatio[(size_t)pix * DSpecThr::K + k] = (float)sthr.ratio(DSpecThr::lamOf(k));
+                st.vpRatio[(size_t)pix * DSpecThr::K + k] = (float)(sthr.ratio(DSpecThr::lamOf(k)) / pk);
+            st.vpThr[pix] = thr * pk;
+        }
         st.directSum[pix * 3 + 0] += dX;
         st.directSum[pix * 3 + 1] += dY;
         st.directSum[pix * 3 + 2] += dZ;

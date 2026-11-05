@@ -1081,6 +1081,14 @@ stack: the pixel keeps its ratio per bin (`SPPMPixel::vpRatio`, the device's `DS
 96 B a pixel, only read where `vpSpec` says some factor was not flat), and the gather multiplies
 each photon by its bin's. `tools/check_coat_modes.py` holds mode S to mode R per colour channel.
 
+**The ratio's range (0.433.1, MODEM-COMPOTE-NAN).** Where coloured glass absorbs at the walk's own
+wavelength and passes others, `cam`, and with it the scalar throughput, falls as far as the ratio
+climbs: behind a few centimetres of dark gem past 1e+38, a float's range, while their product stays
+moderate. So nothing stores or sums the ratio itself in float: `SpecThr::peak()` / `DSpecThr::peak()`
+is its largest bin, the float side takes ratio / peak (the device's mode-M gathers, mode S's
+`vpRatio` on both backends) and the double throughput takes the peak. Mode J's carrier keeps its
+magnitude apart for the same reason (`JSpec::logS`). `tools/check_dark_glass.py` is the check.
+
 **HAIR-NEE (0.334.0).** Mode M's walk collects radiance only where it finally gathers -- a
 diffuse surface -- so a chain that scatters strand to strand through a hair mass lands on the
 shadowed scalp or dress beneath it, and the mass's own lit glow (direct light scattered by the

@@ -92,7 +92,36 @@ curve as M and S treat a hair strand (light it by NEE, continue the path, gather
 and give U's light store, merge and dVC/dVM recursions the same predicate (`surfMergeSite`).
 Then re-record check_fur_gather's values, which should all move to about 1.
 
-## OPEN (2026-11-04, 0.430.2): MODEM-COMPOTE-NAN — GPU mode M writes NaN pixels on gallery_rain's gem compote
+## OPEN (2026-11-04, 0.433.1): MODEM-CPU-DARKGLASS-BLUE — CPU mode M reads blue 15 % low through glass that absorbs blue strongly
+
+`tools/check_dark_glass.py` (a 0.5 m slab, `absorb rgb 0 0 200`, over a lit floor, 64 x 48): the
+floor seen through the slab reads, against mode R, per channel R / G / B:
+- CPU mode M: 1.007 / 0.983 / 0.844 at 2 M photons and 8 spp; 1.008 / 0.980 / 0.855 at 8 M and 16 spp;
+- GPU mode M: 0.98-0.99 in blue;
+- CPU mode S: 1.009; GPU mode S: 0.943.
+Modes S and M on the CPU share the photon pass, so the suspect is mode M's own side: its caustic map,
+whose per-query radius may depend on the light's colour, or its gather's fold of the steep
+absorption across a carrier bin (SPECGATHER-BIN-RESOLUTION), though the GPU folds the same bins.
+Through the same slab with no absorption, CPU mode M reads blue 0.97-1.04, so the deficit is the
+absorption's. The check reports this channel instead of holding it (its KNOWN). Reproduce: the
+check.
+
+## FIXED (2026-11-04, 0.433.1; opened 2026-11-04, 0.430.2): MODEM-COMPOTE-NAN — GPU mode M writes NaN pixels on gallery_rain's gem compote
+
+**Cause and fix (0.433.1).** The camera walk's spectral carrier (SpecThr, SPECGATHER) re-expresses
+the walk at each photon's wavelength by a ratio that, behind glass absorbing at the walk's own
+wavelength and passing the photon's, reaches past 1e+38 while the scalar throughput falls as far.
+The device's mode-M gather multiplied that ratio into a float per photon. The float overflowed,
+and the XYZ-to-RGB conversion turned the infinities into NaN in every channel. The host gathers in
+double, hence CPU mode M's 0 NaN; the variants with no adaptive radius, no caustic pass, or one
+wavelength per path wrote the same 63 pixels at 320 x 180, because the camera walks were the
+same. Mode S's new per-pixel ratio (0.432.0) was float storage on both backends, with the same
+exposure. Now the float side takes ratio / peak (`SpecThr::peak`) and the double throughput the
+peak. gallery_rain, GPU mode M, 320 x 180: 63 -> 0 non-finite pixels.
+`tools/check_dark_glass.py` (a slab absorbing blue at 200/m over a lit floor) is the check. On
+0.433.0 it wrote 2433 NaN pixels in GPU mode M, and 2933 and 2037 in mode S on the GPU and the
+CPU. Now there are none, and the floor through the glass reads within 12 % of mode R per channel.
+
 
 `ftrace -in scenes/gallery_rain.ftsl -mode M -device gpu -spp 32 -n 8000000 -seed 1 -r 320 180`
 writes 124 pixels whose every channel is NaN (126 with `-seed 2`; none infinite), almost all of

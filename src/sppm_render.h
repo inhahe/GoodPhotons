@@ -44,8 +44,9 @@ struct SPPMPixel {
     double vpThr = 0.0;       // specular throughput camera -> visible point (0 = none)
     bool   vpValid = false;
     // SPPM-SPECTRAL: the walk's spectral factors as the gather needs them, one ratio per SpecThr
-    // bin (SpecThr::ratio at the bin), so a photon of wavelength L is weighted by the camera
-    // prefix's factors at L rather than at the walk's own wavelength. Read only when vpSpec.
+    // bin (SpecThr::ratio at the bin, over its peak, which vpThr carries: a ratio can pass a
+    // float), so a photon of wavelength L is weighted by the camera prefix's factors at L rather
+    // than at the walk's own wavelength. Read only when vpSpec.
     bool   vpSpec = false;
     float  vpRatio[SpecThr::K];
 };
@@ -357,9 +358,12 @@ inline void sppmPass(const Scene& scene, const Camera& cam, SPPMState& st,
                     sppmVisiblePoint(scene, ray, rng, diffraction, maxBounce,
                                      P.vpHit, P.vpThr, P.vpValid, directL, sthr);
                     P.vpSpec = P.vpValid && sthr.any;
-                    if (P.vpSpec)
+                    if (P.vpSpec) {   // in float over its peak, the peak in vpThr (SpecThr::peak)
+                        const double pk = sthr.peak();
                         for (int k = 0; k < SpecThr::K; ++k)
-                            P.vpRatio[k] = (float)sthr.ratio(SpecThr::lamOf(k));
+                            P.vpRatio[k] = (float)(sthr.ratio(SpecThr::lamOf(k)) / pk);
+                        P.vpThr *= pk;
+                    }
                     P.directSum += directL;
                 }
         };
