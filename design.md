@@ -5695,7 +5695,10 @@ as the one at fault.
   photon can be: a miss too. **Inside is decided by the faces' own side where they can say
   (PROBE-SOLID-SIDE).** A face that bounds a closed solid carries `Hit::solid` (device
   `DHit::solid`): +1 with the solid's normals out, -1 with them in. That is an analytic sphere's
-  always, and a triangle's when `markSolidFaces` (main.cpp, over `watertight::markSolidFaces`) found
+  always; an isosurface's when it bounds a closed solid, capped or with no expression leaf (an SDF
+  or a CSG of them), its gradient pointing out of the f < 0 inside (`Implicit::solidSide`, set by
+  the marking pass; an `open` expression's surface may end at its container, and says nothing);
+  and a triangle's when `markSolidFaces` (main.cpp, over `watertight::markSolidFaces`) found
   its connected piece closed, consistently wound and with every face's corner normals on one side
   of its winding, the whole piece on the same side; the volume says out or in. It goes per mesh
   object, then over every triangle no mesh object holds (quads, a light's own surface) as one pool,
@@ -5724,8 +5727,8 @@ as the one at fault.
   more): the surface, where the probe ends. One on the plane, a box's own bottom, decides nothing:
   on it to within rounding (1e-7 r on the host, 2 `RAY_EPS` on the device), so the underside of a
   ball resting on the floor is above it all but at the point it touches.
-  A photon-holding face that cannot say (an open quad, a curve, an isosurface, an open mesh) keeps
-  the parity, odd meaning inside, and either rule puts the column inside. One that holds no photon
+  A photon-holding face that cannot say (an open quad, a curve, an open isosurface, an open
+  mesh) keeps the parity, odd meaning inside, and either rule puts the column inside. One that holds no photon
   and cannot say -- an open mirror or glossy sheet, a light's quad -- counts for nothing: an open
   sheet encloses nothing, and the floor under it is lit from the sides. `-gageom`'s march climbs and
   decides each in-band layer of a column by the faces above it: the next solid face it meets above

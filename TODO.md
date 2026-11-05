@@ -169,7 +169,7 @@ Then the rest of 4.2-4.6 in their order, 4.7's bookkeeping alongside whatever to
   spheres, closed meshes) say their own side (0.434.5, PROBE-SOLID-SIDE); since 0.434.9 so do
   inward-wound meshes and quads closing a box, and open sheets that hold no photon count for
   nothing; since 0.434.10 a closed solid taller than the radius is known from the path to each
-  probe's top (PROBE-PATH).
+  probe's top (PROBE-PATH); since 0.434.11 a closed isosurface says its side too.
 - [x] **PROBE-UNDERSIDE** (0.434.10) — beside a ball resting on the floor the probe ended on the
   ball's tilted underside, seen from inside, where `-gageom`'s march counts the floor under it. It
   passes that face to the floor now; the diffuse ball's mode S 1.08-1.11 -> 1.00.

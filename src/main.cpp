@@ -3568,6 +3568,12 @@ static bool checkHitFieldsWritten() {
                                 intersectImplicit(down, L.scene.implicits[0], 1e-9, h) && h.pscale == 0.0 &&
                                 h.fiberRadius == 0.0 && !h.hasVcol && !h.back && h.tangent.z == 0.0 &&
                                 h.bitangentSign == 1.0 && h.solid == 0);
+        if (loaded && !L.scene.implicits.empty()) {
+            Implicit im = L.scene.implicits[0];
+            im.solidSide = true;               // as the marking pass sets it for an SDF
+            Hit hs = junkHit();
+            expect("a closed isosurface", intersectImplicit(down, im, 1e-9, hs) && hs.solid == 1);
+        }
     }
     std::printf("[checkpatops] reused hit record: every intersector writes every field it owns %s\n",
                 bad ? "FAIL" : "ok");
@@ -19092,9 +19098,19 @@ static void markSolidFaces(Scene& scene) {
         if (!held[i]) loose.push_back(&scene.tris[i]);
     solid += watertight::markSolidFaces(loose.data(), loose.size());
     seen += loose.size();
-    // The solids' world boxes (Scene::solidNear): every sphere; an asset's marked triangles under
-    // each instance that places it; a mesh object's marked triangles together; each marked loose one.
+    // An isosurface bounds a closed solid unless an `open` expression's surface may end at its
+    // container (Implicit::solidSide).
+    size_t isoSolid = 0;
+    for (Implicit& im : scene.implicits) {
+        im.solidSide = im.capped || !fieldHasExpr(im.nodes);
+        isoSolid += im.solidSide ? 1 : 0;
+    }
+    // The solids' world boxes (Scene::solidNear): every sphere and closed isosurface; an asset's
+    // marked triangles under each instance that places it; a mesh object's marked triangles
+    // together; each marked loose one.
     std::vector<Aabb> boxes;
+    for (const Implicit& im : scene.implicits)
+        if (im.solidSide) boxes.push_back(im.bounds);
     for (const Sphere& s : scene.spheres) {
         Aabb b;
         b.expand(s.c - Vec3(s.r, s.r, s.r));
@@ -19127,9 +19143,10 @@ static void markSolidFaces(Scene& scene) {
         if (t->solidFace) { Aabb b; addTri(b, *t); boxes.push_back(b); }
     scene.solidBoundsBvh.build(boxes);
     scene.solidBoundsKnown = !scene.hasMotion();
-    if (seen)
-        std::printf("[gather] %zu of %zu triangles bound closed solids, whose side the footprint "
-                    "probe reads (%.0f ms)\n", solid, seen,
+    if (seen || !scene.implicits.empty())
+        std::printf("[gather] %zu of %zu triangles and %zu of %zu isosurfaces bound closed solids, "
+                    "whose side the footprint probe reads (%.0f ms)\n", solid, seen, isoSolid,
+                    scene.implicits.size(),
                     std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
 }
 

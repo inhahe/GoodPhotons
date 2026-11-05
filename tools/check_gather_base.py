@@ -1,8 +1,8 @@
 """Regression check: modes M and S read the floor at the base of an object standing on it as mode R does.
 
     python tools/check_gather_base.py [--out png/check_gather_base] [--exe ftrace.exe]
-                                      [--objects diffuse,mirror,coated,coaster,tower,ball,meshball,
-                                                 diffuseball,smallball,mirrorsheet,lampsheet]
+                                      [--objects diffuse,mirror,coated,coaster,tower,isotower,ball,
+                                                 meshball,diffuseball,smallball,mirrorsheet,lampsheet]
 
 A closed 3 cm box (six quads) standing on a lit floor, seen from straight above, modes M and S at a
 pinned gather radius of 0.1 on the CPU and the GPU, against mode R on the GPU. A mode-M or mode-S
@@ -25,7 +25,8 @@ and the top must count as covered: met from outside, a closed solid's face in th
 surface, not a crossing. A diffuse box 30 cm tall (`tower`), off to one side so the foot of its near
 face is seen past its top: every probe over it begins inside it, r above the floor, and crosses none
 of its faces going down, so it must know from the path up from the gather point and across that it
-began inside (PROBE-PATH). Its shadow at its foot is too steep for mode R to be a reference within
+began inside (PROBE-PATH); `isotower` is the same tower as an isosurface, an SDF box, whose side
+its hits say as a closed mesh's do. Its shadow at its foot is too steep for mode R to be a reference within
 the radius, so it is held to its exact coverage (below). Then a glossy ball of the box's
 half-width resting on the floor, analytic and as a closed OBJ, seen from low beside it with a low
 light from the side reaching under its overhang. There, 4-12 cm from the point it rests on, the gap
@@ -199,8 +200,11 @@ def seg_cover(d, r=GATHER_R):
     return 1.0 - (r * r * np.arccos(d / r) - d * np.sqrt(r * r - d * d)) / (np.pi * r * r)
 
 
-def _tower(mat):
-    return ([mat] + box(TOWER_X0, 0.0, -BOX, -BOX, 0.3, BOX, "obj"), TOP_CAM,
+def _tower(mat, iso=False):
+    geo = (["isosurface { material obj  box { center %g 0.15 0  size %g 0.3 %g } }" % (
+               (TOWER_X0 - BOX) / 2, -BOX - TOWER_X0, 2 * BOX)] if iso else
+           box(TOWER_X0, 0.0, -BOX, -BOX, 0.3, BOX, "obj"))
+    return ([mat] + geo, TOP_CAM,
             lambda: top_dist(lambda X, Z: np.where((np.abs(Z) < BOX - GATHER_R) & (X <= BOX), BOX - X, np.nan)),
             RINGS, "the base", "coverage")
 
@@ -223,6 +227,8 @@ OBJECTS = {
     # A box 30 cm tall holds every probe over it from its start r above the floor, so the probe
     # crosses none of its faces going down: it must know it begins inside (PROBE-PATH).
     "tower": _tower('material "obj" { type diffuse reflect 0.5 }'),
+    # The same tower as an isosurface (an SDF box), which says its side as a closed mesh does.
+    "isotower": _tower('material "obj" { type diffuse reflect 0.5 }', iso=True),
     # A ball resting on the floor holds the probe's origin over the floor under its overhang, so
     # the probe leaves it before it meets the floor: a closed solid's face says it is out
     # (PROBE-SOLID-SIDE), where a parity reads the floor as inside.

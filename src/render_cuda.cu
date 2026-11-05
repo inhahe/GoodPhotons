@@ -834,6 +834,7 @@ struct DImplicit {
     double sphereCenter[3];  // world center for Container::Sphere
     double sphereRadius;     // world radius for Container::Sphere
     int    capped;           // 1 = draw container caps (closed); 0 = `open`
+    int    solidSide;        // 1 = bounds a closed solid, Hit::solid +1 (host Implicit::solidSide)
     // Oriented container box — device twin of Implicit::boxOriented/boxInv/boxLo/boxHi.
     // When set, the ray is mapped by boxInv and slab-tested against boxLo/boxHi there
     // instead of against the world AABB, which for a rotated box is strictly larger
@@ -4073,7 +4074,7 @@ __device__ static bool intersectImplicit(const DScene& sc, const DImplicit& im,
         hit.ng = DVec3(gx, gy, gz);
         double side = dx*gx + dy*gy + dz*gz;
         hit.back = !(side < 0.0);
-        hit.solid = 0;
+        hit.solid = im.solidSide ? 1 : 0;
         hit.n = hit.back ? DVec3(-gx, -gy, -gz) : DVec3(gx, gy, gz);
         hit.matId = im.matId; hit.sensorId = -1;
         if (im.uvProj != 0) {
@@ -23667,6 +23668,7 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
         d.sphereCenter[2] = im.sphereCenter.z;
         d.sphereRadius = im.sphereRadius;
         d.capped = im.capped ? 1 : 0;
+        d.solidSide = im.solidSide ? 1 : 0;
         d.boxOriented = im.boxOriented ? 1 : 0;
         for (int k = 0; k < 9; ++k) d.boxInvM[k] = im.boxInv.m[k];
         d.boxInvT[0] = im.boxInv.t.x; d.boxInvT[1] = im.boxInv.t.y; d.boxInvT[2] = im.boxInv.t.z;

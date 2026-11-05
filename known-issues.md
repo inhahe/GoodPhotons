@@ -299,8 +299,10 @@ itself which side the probe is on, so the floor under the overhang of a ball res
 longer read as the ball's inside. That parity error had been there for diffuse balls since 0.432.1.
 Since 0.434.9 that covers a mesh wound inward too, and quads that close a solid between them (a
 six-quad box), and an open sheet that holds no photon (a mirror quad, a light's quad) counts for
-nothing. What follows is left for photon-holding geometry that cannot say (open quads, open meshes,
-isosurfaces, curves). Two shapes break the rule:
+nothing. Since 0.434.11 a closed isosurface says its side too (capped, or an SDF or CSG of them;
+an `open` expression's surface may end at its container). What follows is left for photon-holding
+geometry that cannot say (open quads, open meshes, open isosurfaces, curves). Two shapes break the
+rule:
 - **A photon-holding open surface hovering within the radius** (a single-quad diffuse table top, a
   leaf, a sheet of paper, a lampshade) is crossed once. The floor under it is taken for a solid's
   inside and is a miss, so a floor that does receive photons there is divided by too little area
