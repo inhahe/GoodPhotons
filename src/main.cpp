@@ -16463,6 +16463,25 @@ static bool ftraceProcessAlive(long pid) {
 #endif
 }
 
+// When process `pid` started (100 ns ticks since 1601), or 0 where it cannot be read. A .run file
+// records its owner's, so -stop can tell a live ftrace from an unrelated process that has since
+// inherited a dead render's pid: a render killed outright (a crash, a failed CUDA launch) leaves its
+// .run behind, and the alive test alone would keep listing it under the new process.
+static unsigned long long processStartTicks(long pid) {
+#ifdef _WIN32
+    HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, (DWORD)pid);
+    if (!h) return 0;
+    FILETIME c, e, k, u;
+    unsigned long long t = 0;
+    if (GetProcessTimes(h, &c, &e, &k, &u))
+        t = ((unsigned long long)c.dwHighDateTime << 32) | (unsigned long long)c.dwLowDateTime;
+    CloseHandle(h);
+    return t;
+#else
+    (void)pid; return 0;
+#endif
+}
+
 // Publish this process in the stop channel and start watching for its sentinel.
 static void stopChannelStart(const std::string& what) {
     std::filesystem::path dir = stopChannelDir();
@@ -16477,7 +16496,7 @@ static void stopChannelStart(const std::string& what) {
     // ack, which would otherwise make our first -stop look pre-acknowledged.
     std::filesystem::remove(g_stopSentinelFile, ec);
     std::filesystem::remove(g_stopAckFile, ec);
-    { std::ofstream f(g_stopRunFile); f << what << "\n"; }
+    { std::ofstream f(g_stopRunFile); f << what << "\n" << "start " << processStartTicks(pid) << "\n"; }
     g_stopWatchQuit.store(false);
     g_stopWatchThread = std::thread([] {
         while (!g_stopWatchQuit.load(std::memory_order_relaxed)) {
@@ -16556,8 +16575,17 @@ static int runStopCommand(const char* who) {
         if (pid <= 0) continue;
         if (!ftraceProcessAlive(pid)) { std::filesystem::remove(de.path(), ec); continue; }
         if (ext != ".run") continue;                 // a live target's pending sentinel / ack
-        std::string what;
-        { std::ifstream f(de.path()); std::getline(f, what); }
+        std::string what, startLine;
+        { std::ifstream f(de.path()); std::getline(f, what); std::getline(f, startLine); }
+        // A recorded start time that is not the live process's: the pid was reused after its
+        // render died without unregistering, so this .run is a dead one's (processStartTicks).
+        // A .run with none (an older build's) is taken at its word.
+        unsigned long long recorded = 0;
+        if (startLine.rfind("start ", 0) == 0) recorded = std::strtoull(startLine.c_str() + 6, nullptr, 10);
+        if (recorded != 0) {
+            const unsigned long long now = processStartTicks(pid);
+            if (now != 0 && now != recorded) { std::filesystem::remove(de.path(), ec); continue; }
+        }
         live.emplace_back(pid, what);
     }
     std::sort(live.begin(), live.end());

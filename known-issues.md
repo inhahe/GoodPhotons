@@ -72,6 +72,16 @@ closed entries, where the cost is a broken historical link rather than a blocked
 Three references — `scenes/_gr_fly0.ftsl`, `scenes/silver_sphere_xenon.ftsl`, `scenes/x.ftsl` —
 name files that no longer exist at all, all in closed entries.
 
+## DONE (2026-11-05, 0.434.2): STOP-STALE-PID — `ftrace -stop` listed a crashed render under the unrelated process that inherited its pid
+
+Seen after GPU-PHOTON-LAUNCH-FAIL: the render that died on the failed launch never unregistered, and
+two hours later `ftrace -stop` still listed its command line under its pid, which a `bash` process
+had since taken. The listing reaps a `.run` file only when its pid is dead, and a reused pid is
+alive. A `-stop <pid>` aimed at it would have warned and then waited 120 s for a process that is not
+ftrace. **Fixed:** each `.run` file now records its owner's process start time (`processStartTicks`),
+and -stop reaps one whose live process started at another time. A `.run` from an older build, with
+no start time, is taken at its word.
+
 ## OPEN (2026-11-05, 0.434.1): COMPOUND-MERGE-PICK — modes U and J take a mix's or a layered coat's lobe probability twice in their merges
 
 Found by the Opus review of 0.433.5-0.433.11: COMPOUND-DOUBLE-PICK's photon-pass fix does not reach
