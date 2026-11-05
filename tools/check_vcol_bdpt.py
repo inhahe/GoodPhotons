@@ -1,4 +1,4 @@
-"""Regression check: the device's BDPT-family modes shade a vertex-coloured mesh in its colours.
+"""Regression check: the device's BDPT-family modes shade per-hit reflectance as the host does.
 
     python tools/check_vcol_bdpt.py [--out png/check_vcol_bdpt] [--exe ftrace.exe]
 
@@ -11,7 +11,13 @@ VCOL-BDPT-GPU). The host's vertex keeps the whole hit, so the CPU was right.
 Each mode on the GPU, and mode D on the CPU, must read the sphere's mean colour within 5 % of mode R
 (GPU) per channel -- of the channel, or of a tenth of the three together where it is smaller -- and
 its mean saturation within 5 % too. Two seeds. On 0.433.3 the GPU's read the sphere near grey
-(saturation 0.06-0.08 of mode R's in modes D and U). Exits 0 when every case holds, 1 otherwise.
+(saturation 0.06-0.08 of mode R's in modes D and U).
+
+And a grating floor whose reflectance ramps from 0.2 to 1 along it (`reflect [0.2 1](u)`), mirroring
+a lit wall: GPU modes D and J, and CPU mode D, must read its near and far halves within 5 % of mode
+R (GPU). Until 0.433.8 the device's walk for modes D and J weighted a grating by its bare reflect
+spectrum, not its slot (pattern, texture, record, vertex colour), and read the halves at 2.63 and
+1.30 of mode R. Exits 0 when every case holds, 1 otherwise.
 """
 import argparse
 import math
@@ -66,6 +72,47 @@ CASES = [("D_gpu", ["-mode", "D", "-device", "gpu", "-spp", "256"]),
          ("D_cpu", ["-mode", "D", "-device", "cpu", "-spp", "64"])]
 TOL = 0.05
 
+# The grating floor (see the docstring), and where on the film it is seen: (eye, look_at, fov_y).
+G_W, G_H = 96, 72
+G_CAM = ((0.0, 0.5, -1.6), (0.0, 0.0, 0.2), 40.0)
+G_CASES = [("D_gpu", ["-mode", "D", "-device", "gpu", "-spp", "256"]),
+           ("J_gpu", ["-mode", "J", "-device", "gpu", "-spp", "256", "-nojsurf"]),
+           ("D_cpu", ["-mode", "D", "-device", "cpu", "-spp", "64"])]
+
+
+def grating_scene():
+    (ex, ey, ez), (lx, ly, lz), fov = G_CAM
+    return NL.join([
+        "scene { units meters }",
+        'camera "c" { eye %g %g %g  look_at %g %g %g  up 0 1 0  fov_y %g  film { res %d %d } }' % (
+            ex, ey, ez, lx, ly, lz, fov, G_W, G_H),
+        'material "white" { type diffuse reflect 0.8 }',
+        'material "gr" { type grating  reflect [0.2 1](u)  groove_spacing 1600 }',
+        'quad { origin -1 0 -1  u 0 0 2  v 2 0 0  material gr }',
+        'quad { origin -1 0 1  u 0 1.5 0  v 2 0 0  material white }',
+        'light area { origin -0.4 1.4 -0.4  u 0.8 0 0  v 0 0 0.8  normal 0 -1 0  power 100  spd preset:d65 }',
+    ]) + NL
+
+
+def grating_halves():
+    """The film's view of the grating's near half (z < -0.1) and far half (z > 0.1), away from its
+    edges: a ray cast of the camera onto the floor."""
+    eye, look, fov = np.array(G_CAM[0]), np.array(G_CAM[1]), G_CAM[2]
+    f = (look - eye) / np.linalg.norm(look - eye)
+    r = np.cross(f, [0, 1, 0]); r /= np.linalg.norm(r)
+    u = np.cross(r, f)
+    th = math.tan(math.radians(fov) / 2)
+    z = np.full((G_H, G_W), np.nan)
+    for y in range(G_H):
+        for x in range(G_W):
+            d = f + (2 * (x + 0.5) / G_W - 1) * th * (G_W / G_H) * r + (1 - 2 * (y + 0.5) / G_H) * th * u
+            if d[1] >= 0:
+                continue
+            p = eye + d * (-eye[1] / d[1])
+            if abs(p[0]) < 0.85 and abs(p[2]) < 0.85:
+                z[y, x] = p[2]
+    return z < -0.1, z > 0.1
+
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split(NL)[0])
@@ -104,6 +151,22 @@ def main():
         ok &= good
         print("%-6s sphere colour, of mode R: %s  saturation %.3f  %s" % (
             name, " ".join("%.3f" % (x / r) for x, r in zip(xc, rc)), xs / rs, "ok" if good else "FAIL"))
+
+    gpath = os.path.join(out, "grating.ftsl")
+    cm.write(gpath, grating_scene())
+    near, far = grating_halves()
+
+    def gimage(tag, args, gpu):
+        return np.mean([cm.lum(cm.render(exe, out, gpath, "g%s_%d" % (tag, s), args, seed=s, want_gpu=gpu)[0])
+                        for s in (1, 2)], axis=0)
+
+    G = gimage("R_gpu", REF, True)
+    for name, args in G_CASES:
+        X = gimage(name, args, "gpu" in name)
+        q = [X[h].mean() / G[h].mean() for h in (near, far)]
+        good = all(abs(v - 1.0) <= TOL for v in q)
+        ok &= good
+        print("%-6s grating, of mode R: near %.3f  far %.3f  %s" % (name, q[0], q[1], "ok" if good else "FAIL"))
     print("PASS" if ok else "FAIL")
     return 0 if ok else 1
 

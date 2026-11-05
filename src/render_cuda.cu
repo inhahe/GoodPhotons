@@ -17817,7 +17817,8 @@ __device__ static void dRandomWalk(const DScene& sc, const DCamera& cam, int dif
                 break;
             }
             case D_GRATING: {
-                double r = clamp01(specLookup(mp->reflect, lambda));
+                // its reflect slot (texture, pattern, record, vertex colour), as the host's reflectSlot
+                double r = clamp01(dReflectSlot(sc, *mp, h, lambda, jrun ? &jbS : nullptr));
                 if (r <= 0) { terminate = true; break; }
                 DVec3 nro, nrd; int pickG = 0;
                 if (!gratingDiffract(*mp, h, rd, lambda, diffraction, rng, nro, nrd, nullptr,
@@ -17834,7 +17835,7 @@ __device__ static void dRandomWalk(const DScene& sc, const DCamera& cam, int dif
                                       bool live;
                                       const double ws = dGratingWsum(*mp, h, dIn, (Real)L, diffraction, pickG, live);
                                       return (live && ws > 0.0)
-                                                 ? (double)clamp01(specLookup(mp->reflect, (Real)L)) / ws : 0.0; },
+                                                 ? (double)clamp01((Real)dJSlotAt(sc, *mp, jbS, L, false)) / ws : 0.0; },
                                   r / wsC, true);
                     }
                     if (pickG != 0) jrun->markDisp((double)lambda, (double)hb.invPdf[0]);
@@ -20407,7 +20408,8 @@ __global__ void kFilmFold(double* film, double* hits, const double* sfilm, const
 
 // Trace one camera ray to its first diffuse/translucent hit (the "visible point"), following
 // specular surfaces exactly like dPhotonGather / CPU sppmVisiblePoint. Returns the specular
-// throughput in `thrOut` and the diffuse hit in `vp` (with the ORIGINAL matId, matching CPU);
+// throughput in `thrOut` and the diffuse hit in `vp`, its matId the lobe a compound resolved to
+// (as the host's), so the gather folds that lobe's reflectance and not the compound's;
 // emitter/env radiance reached directly or through specular is added to directL (XYZ, a
 // monochromatic MC estimate at the sampled lambda). `vpValid` is false when the ray
 // terminated (light, env, or absorption) without reaching a diffuse surface.
