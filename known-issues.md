@@ -1572,7 +1572,19 @@ so cannot be re-expressed per wavelength: mode J declines it for that reason. Mo
 to keep the fold only while the carrier is flat and fall back to the beam's own wavelength when it
 is not, or fold the carrier into the bow table's integral.
 
-## OPEN (2026-10-21): MODEM-REDPASS — mode M reads a fog lit through a red-pass glass 8 % low in green
+## NOT REPRODUCED (2026-11-04, 0.433.10; opened 2026-10-21): MODEM-REDPASS — mode M reads a fog lit through a red-pass glass 8 % low in green
+
+**Not reproduced on 0.433.10.** The original scene was never tracked; `scenes/_redpass.ftsl`
+recreates it from the description below (a sphere lamp shining on a fog box through a glass ball of
+this absorption, the camera beside the fog, not looking through the glass). Fog region against mode
+R, `-max-bounce 32`, R / G / B: GPU mode M 1.007 / 1.014 / 0.966, with the fold off (`-beamachro
+off`) 1.005 / 0.988 / 0.973; CPU mode M 1.001 / 0.990 / 1.006, fold off 1.001 / 0.995 / 1.011; GPU
+mode J 0.981 / 1.008 / 1.002. Green is within 1.4 % in every arm. Either a change since 0.391.5
+removed it, or the recreation lacks what the original had; nothing records the original's geometry
+beyond this entry. Reopen with a scene that shows it.
+
+The original report:
+
 
 Seen while testing REVIEW-0391's claim fix, not investigated. A fog box lit by a sphere lamp
 through a glass sphere whose `absorb table { 360:8 590:8 610:0 830:0 }` is exactly 0 above 610 nm

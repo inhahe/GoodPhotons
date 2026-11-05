@@ -94,7 +94,8 @@ Each names the section its line is in.
    (VCM-THIN-CURVES).
 6. ~~**VCOL-BDPT-GPU** (4.2) — GPU modes D and J connect to a vertex-coloured mesh without its colours.~~
    Done, 0.433.4.
-7. ~~**MODEM-BEAM-CARRIER**~~ (0.433.5), **JSPEC-GAPS**' rest and **MODEM-REDPASS** (4.2) — mode
+7. ~~**MODEM-BEAM-CARRIER**~~ (0.433.5), **JSPEC-GAPS**' rest and ~~**MODEM-REDPASS**~~ (not
+   reproduced) (4.2) — mode
    M's beams, and mode J's last camera-side factors, at the camera's wavelength.
 8. **UPBP-BEAM-RADIUS** with **J-FOG-REALCAM** (4.3) — mode J's beam kernel never shrinks: fog 1-4 %
    low, never converging.
@@ -180,7 +181,8 @@ Then the rest of 4.2-4.6 in their order, 4.7's bookkeeping alongside whatever to
 - [ ] **JSPEC-GAPS**, its still-open list — support where a factor is
   zero at the camera's wavelength (mode U's carrier too, since 0.433.0), dispersive refraction
   without `-jdispall`.
-- [ ] **MODEM-REDPASS** — mode M reads a fog lit through a red-pass glass 8 % low in green.
+- [x] **MODEM-REDPASS** — not reproduced on 0.433.10 (scenes/_redpass.ftsl recreates it; green
+  within 1.4 % of mode R in modes M and J on both backends).
 - [ ] **FWD-GLOSSY-INDIRECT** — modes A and B splat a rough reflector only where it is seen directly
   (and a layered clearcoat's sheen on neither backend).
 - [ ] **GLTF-MAP-MEAN-GUTTERS** — the importer's mean metalness and roughness count the atlas's
