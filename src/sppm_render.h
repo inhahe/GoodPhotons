@@ -144,7 +144,12 @@ inline void sppmVisiblePoint(const Scene& scene, Ray ray, Pcg32& rng, bool diffr
             if (c < 0) return;
             mp = &scene.mats[c];
         } else if (mp->type == MatType::Layered) {
-            int c = mixResolveChild(scene, *mp, h, rng.uniform());  // body lobe: honours a bound weight map (device twin: dResolveCompound)
+            // The coat with probability R (its Fresnel reflectance here), else a body lobe, as
+            // mode M's walk and the device's dResolveCompound resolve it: the coat is a glossy
+            // material of its own (Material::coatChild), shaded by the switch below.
+            const double R = layeredCoatReflectance(scene, *mp, h, ray.d, lambda);
+            int c = (rng.uniform() < R) ? mp->coatChild
+                                        : mixResolveChild(scene, *mp, h, rng.uniform());  // body lobe: honours a bound weight map
             if (c < 0) return;
             mp = &scene.mats[c];
         }
@@ -179,7 +184,12 @@ inline void sppmVisiblePoint(const Scene& scene, Ray ray, Pcg32& rng, bool diffr
             case MatType::Diffuse:
             case MatType::DiffuseTransmit:
             case MatType::Fluorescent:
-                vp = h; thrOut = thr; vpValid = true;   // record the visible point
+                // Record the visible point under the lobe the walk resolved -- a layered body's
+                // base, a mix's child -- whose reflectance the gather folds per photon, as mode M's
+                // gather does: the compound's own slot is not that surface's colour (a red car
+                // paint's green and blue read 7x mode R gathered through it).
+                vp = h; vp.matId = (int)(mp - scene.mats.data());
+                thrOut = thr; vpValid = true;
                 return;
             case MatType::Mirror: {
                 const double r = clamp01(reflectSlot(scene, m, h, lambda));

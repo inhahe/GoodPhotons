@@ -37,7 +37,10 @@ the message saying why, and the same film given `roughness 0` -- the specular co
 roughness at all -- to load. And it requires mode B to render a `layered` car-paint sphere the
 same on the GPU as on the CPU (sphere mean per channel, 5 standard errors and 3 %): the device
 gives a layered coat a synthetic glossy lobe, which must not take the glossy camera splat the
-host never gives a coat (known-issues FWD-GLOSSY-INDIRECT).
+host never gives a coat (known-issues FWD-GLOSSY-INDIRECT). And mode S, on each backend, to mode R
+(GPU, 4096 spp): until 0.433.2 both gathered a layered body's visible point through the compound's
+own reflect slot rather than the resolved base's (the red paint's green and blue read 7x), and the
+host's walk never took the coat.
 Exits 1 on any failure.
 """
 import argparse
@@ -221,15 +224,19 @@ def main():
         with open(coat, "w", encoding="utf-8", newline="") as f:
             f.write(COAT)
         m = masks()[0][1]                    # the first sphere, now car paint
-        args = ["-mode", "B", "-n", "60000000"]
-        mc = stats(render(exe, out, coat, "coat_B_cpu", args + ["-device", "cpu"]), m)
-        mg = stats(render(exe, out, coat, "coat_B_gpu", args + ["-device", "gpu"]), m)
-        ratio = deviation(mg[0], mc[0])
-        z = np.abs(mg[0] - mc[0]) / np.maximum(np.hypot(mg[1], mc[1]), 1e-30)
-        bad = (z > 5.0) & (np.abs(ratio - 1.0) > 0.03)
-        ok &= not bad.any()
-        print("coat   car-paint sphere, mode B, GPU / CPU %s%s"
-              % (" ".join("%.3f" % x for x in ratio), " FAIL" if bad.any() else ""))
+        ref = stats(render(exe, out, coat, "coat_R_gpu", ["-mode", "R", "-device", "gpu", "-spp", "4096"]), m)
+        mb = [stats(render(exe, out, coat, "coat_B_" + d, ["-mode", "B", "-n", "60000000", "-device", d]), m)
+              for d in ("cpu", "gpu")]
+        ms = [stats(render(exe, out, coat, "coat_S_" + d, ["-mode", "S", "-spp", "256", "-device", d]), m)
+              for d in ("cpu", "gpu")]
+        for what, x, x0 in (("mode B, GPU / CPU", mb[1], mb[0]),
+                            ("mode S, CPU / mode R", ms[0], ref), ("mode S, GPU / mode R", ms[1], ref)):
+            ratio = deviation(x[0], x0[0])
+            z = np.abs(x[0] - x0[0]) / np.maximum(np.hypot(x[1], x0[1]), 1e-30)
+            bad = (z > 5.0) & (np.abs(ratio - 1.0) > 0.03)
+            ok &= not bad.any()
+            print("coat   car-paint sphere, %s %s%s"
+                  % (what, " ".join("%.3f" % v for v in ratio), " FAIL" if bad.any() else ""))
 
     scene, scene_a = os.path.join(out, "spheres.ftsl"), os.path.join(out, "spheres_lens.ftsl")
     for path, text in ((scene, SCENE), (scene_a, SCENE_A)):

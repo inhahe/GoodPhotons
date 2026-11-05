@@ -7646,7 +7646,7 @@ __device__ static double dGatherCoverage(const DScene& sc, const DVec3& p, const
         // tangle gate below are held fixed by construction and the arms differ in one quantity.
         const double dz = (double)r - (double)h.t;   // hit height above the tangent plane
         const bool inBall = !sc.gaBall || (rr * rr + dz * dz <= (double)r * (double)r);
-        if (c >= 0.5) { if (inBall) area += 1.0 / c; }  // same 60-deg acceptance as the query
+        if (c >= kGatherFacingCos) { if (inBall) area += 1.0 / c; }  // the query's facing test
         else          ++nRej;                // geometry IS here, facing the wrong way: a tangle
     }
     // THE TANGLE GATE, host twin in photonmap_render.h. A high reject share means the disc is
@@ -17259,6 +17259,65 @@ __device__ static double dStepFactorAt(const DScene& sc, const DMaterial& m, con
     return f;
 }
 
+// One scatter's factor folded into a camera walk's spectral carrier, at every bin over its value at
+// lambda -- the fold modes J and U share (dRandomWalk, dVcmScatter; host twins bdpt.h randomWalk and
+// vcm.h scatterSample, where the reasoning lives). The slots are read through the shape the walk's
+// own read captured (`jbS`: patterns, records, stochastic tiling and coats included; `tpS` the
+// transmit pattern), a dielectric step through its record. `cH` is an iridescent glossy's
+// half-vector cosine, `hmRefl` whether a half mirror reflected, `reflLobe` whether a
+// diffuse-transmit lobe did. Hair and the grating fold where they are sampled.
+__device__ static void dJFoldLobe(DJSpecRun& jr, const DScene& sc, const DMaterial& m, const DHit& h,
+                                  const DVec3& rd, Real lambda, const DJBase& jbS, Real tpS,
+                                  const DStepRecord& jSt, Real cH, bool hmRefl, bool reflLobe) {
+    switch (m.type) {
+        case D_DIFFUSE:
+        case D_FLUORESCENT:
+        case D_GLOSSY:
+        case D_MIRROR: {
+            const bool dif = (m.type == D_DIFFUSE || m.type == D_FLUORESCENT);
+            auto fJ = [&](double L) {
+                const double v = dJSlotAt(sc, m, jbS, L, dif);
+                return (m.type == D_GLOSSY && m.iridescence)
+                           ? v * (double)dIridescenceR(sc, m, &h, (Real)L, cH) : v; };
+            jr.mul(fJ, fJ((double)lambda), m.type == D_MIRROR);
+            break;
+        }
+        case D_DIFFUSETRANSMIT: {   // the lobe's albedo, normalised as dDiffuseTransmitAlbedos does
+            auto fJ = [&](double L) {
+                const double rR = dJSlotAt(sc, m, jbS, L, true);
+                Real tv = specLookup(m.transmit, (Real)L);
+                if (m.transmitPat >= 0) tv = tv * tpS;
+                const double rT = (double)clamp01(tv);
+                const double sum = rR + rT;
+                const double nrm = (sum > 1.0) ? 1.0 / sum : 1.0;
+                return (reflLobe ? rR : rT) * nrm; };
+            jr.mul(fJ, fJ((double)lambda), false);
+            break;
+        }
+        case D_FILTER: {            // dTransmitSlot, its pattern captured
+            auto fJ = [&](double L) {
+                Real tv = specLookup(m.transmit, (Real)L);
+                if (m.transmitPat >= 0) tv = tv * tpS;
+                return (double)clamp01(tv); };
+            jr.mul(fJ, fJ((double)lambda), true);
+            break;
+        }
+        case D_HALFMIRROR: {
+            auto fJ = [&](double L) { const double r = dJSlotAt(sc, m, jbS, L, false);
+                                      return hmRefl ? r : 1.0 - r; };
+            jr.mul(fJ, fJ((double)lambda), true);
+            break;
+        }
+        case D_DIELECTRIC:
+        case D_THINFILM:
+        case D_MULTILAYER:
+            jr.mul([&](double L) { return dStepFactorAt(sc, m, h, rd, jSt, (Real)L); },
+                   jSt.factor, false);
+            break;
+        default: break;
+    }
+}
+
 
 // --- Subpath ray segments, for the mode-J (UPBP) beam merge ---------------------------
 //
@@ -17673,12 +17732,14 @@ __device__ static void dRandomWalk(const DScene& sc, const DCamera& cam, int dif
                 break;
             }
             case D_MIRROR: {
-                double r = clamp01(specLookup(mp->reflect, lambda));
+                // The reflect slot, pattern and all, as the host's walk reads it; its shape is
+                // captured once and the secondaries read through it.
+                double r = clamp01(dReflectSlot(sc, *mp, h, lambda, &jbS));
                 wi = reflectv(rd, path[cur].ns); betaFactor = r; delta = 1;
                 // Mirror direction is λ-independent: keep the bundle, reweight per-λ.
                 keepBundle = true; secChromatic = true;
                 for (int i = 0; i + 1 < nUp; ++i)
-                    secF[i] = clamp01(specLookup(mp->reflect, hb.lam[i + 1]));
+                    secF[i] = clamp01(dJSlotAt(sc, *mp, jbS, (double)hb.lam[i + 1], false));
                 break;
             }
             case D_DIELECTRIC:
@@ -17697,7 +17758,7 @@ __device__ static void dRandomWalk(const DScene& sc, const DCamera& cam, int dif
                 break;
             }
             case D_HALFMIRROR: {
-                double r = clamp01(specLookup(mp->reflect, lambda));
+                double r = clamp01(dReflectSlot(sc, *mp, h, lambda, jrun ? &jbS : nullptr));   // as the host's
                 if (rng.uniform() < r) { wi = reflectv(rd, path[cur].ns); jHmRefl = true; } else { wi = rd; lobe = DL_FREE; }
                 betaFactor = 1.0; delta = 1;
                 break;
@@ -17753,63 +17814,10 @@ __device__ static void dRandomWalk(const DScene& sc, const DCamera& cam, int dif
 
         // JSPEC (host twin randomWalk, where the reasoning is): this scatter's factor at every
         // bin over the value `betaFactor` took at lambda. Hair and the grating fold in their cases.
-        if (jrun) {
-            switch (mp->type) {
-                // The reflect slot through the shape the walk's own read captured (DJBase): exact,
-                // patterns, records, stochastic tiling and coats included.
-                case D_DIFFUSE:
-                case D_FLUORESCENT:
-                case D_GLOSSY: {
-                    const bool dif = (mp->type != D_GLOSSY);
-                    // ...times an iridescent lobe's interference reflectance at the sampled pair.
-                    const Real cHj = mp->iridescence ? dHalfVectorCos(wo, wi) : (Real)1;
-                    auto fJ = [&](double L) {
-                        const double v = dJSlotAt(sc, *mp, jbS, L, dif);
-                        return mp->iridescence ? v * (double)dIridescenceR(sc, *mp, &h, (Real)L, cHj) : v; };
-                    jrun->mul(fJ, fJ((double)lambda), false);
-                    break;
-                }
-                case D_DIFFUSETRANSMIT: {   // the lobe's albedo, normalised as dDiffuseTransmitAlbedos does
-                    const bool reflJ = dot(wi, path[cur].ns) > (Real)0;
-                    auto fJ = [&](double L) {
-                        const double rR = dJSlotAt(sc, *mp, jbS, L, true);
-                        Real tv = specLookup(mp->transmit, (Real)L);
-                        if (mp->transmitPat >= 0) tv = tv * tpS;
-                        const double rT = (double)clamp01(tv);
-                        const double sum = rR + rT;
-                        const double nrm = (sum > 1.0) ? 1.0 / sum : 1.0;
-                        return (reflJ ? rR : rT) * nrm; };
-                    jrun->mul(fJ, fJ((double)lambda), false);
-                    break;
-                }
-                case D_MIRROR:
-                    jrun->mul([&](double L) { return (double)clamp01(specLookup(mp->reflect, (Real)L)); },
-                              betaFactor, true);
-                    break;
-                case D_FILTER: {   // dTransmitSlot, its pattern captured
-                    auto fJ = [&](double L) {
-                        Real tv = specLookup(mp->transmit, (Real)L);
-                        if (mp->transmitPat >= 0) tv = tv * tpS;
-                        return (double)clamp01(tv); };
-                    jrun->mul(fJ, fJ((double)lambda), true);
-                    break;
-                }
-                case D_HALFMIRROR: {
-                    const double r0 = (double)clamp01(specLookup(mp->reflect, lambda));
-                    jrun->mul([&](double L) { const double r = (double)clamp01(specLookup(mp->reflect, (Real)L));
-                                              return jHmRefl ? r : 1.0 - r; },
-                              jHmRefl ? r0 : 1.0 - r0, true);
-                    break;
-                }
-                case D_DIELECTRIC:
-                case D_THINFILM:
-                case D_MULTILAYER:
-                    jrun->mul([&](double L) { return dStepFactorAt(sc, *mp, h, rd, jSt, (Real)L); },
-                              jSt.factor, false);
-                    break;
-                default: break;
-            }
-        }
+        if (jrun)
+            dJFoldLobe(*jrun, sc, *mp, h, rd, lambda, jbS, tpS, jSt,
+                       mp->iridescence ? dHalfVectorCos(wo, wi) : (Real)1, jHmRefl,
+                       dot(wi, path[cur].ns) > (Real)0);
 
         path[cur].delta = delta;
         if (delta) { pdfW = 0.0; pdfRevW = 0.0; }
@@ -20377,7 +20385,8 @@ __device__ static void dSppmVisiblePoint(const DScene& sc, DVec3 ro, DVec3 rd, R
         }
 
         if (m.type == D_DIFFUSE || m.type == D_DIFFUSETRANSMIT || m.type == D_FLUORESCENT) {
-            vp = h; thrOut = thr; vpValid = true;        // record the visible point (parent matId)
+            // under the lobe the walk resolved, whose reflectance the gather folds (host twin)
+            vp = h; vp.matId = matId; thrOut = thr; vpValid = true;
             return;
         }
 
@@ -20482,7 +20491,8 @@ __global__ void kSppmVisiblePoint(DScene sc, const __grid_constant__ DCamera cam
         double pdf = 0.0;
         Real lambda = dSampleSceneLambda(sc, rng, pdf);
         st.vpValid[pix] = 0;
-        if (pdf <= 0.0) return;
+        st.vpSpec[pix] = 0;
+        if (pdf <= 0.0) continue;   // this pixel only: the thread owns more of the grid
         double invPdfL = dInvPdfLambda(sc, lambda);
 
         DVec3 ro, rd;
@@ -20531,7 +20541,7 @@ __global__ void kSppmGather(DScene sc, DPhotonMap pm, DSppmState st, int resX, i
     for (long long pix = g; pix < npix; pix += G) {
         if (!st.vpValid[pix]) continue;
         const DHit h = st.vpHit[pix];
-        const DMaterial& m = sc.mats[h.matId];           // parent matId, matching CPU SPPM
+        const DMaterial& m = sc.mats[h.matId];           // the resolved lobe's (host twin)
         const DVec3 gn = dShadedNg(h);                  // the true normal, as the photons carry it
         double R = st.radius[pix];
         Real r2 = (Real)(R * R);
@@ -20921,7 +20931,7 @@ __device__ static void dVcmScatter(const DScene& sc, const DMaterial& m, const D
             break;
         }
         case D_GRATING: {
-            double r = clamp01(dReflectSlot(sc, m, h, lambda));
+            double r = clamp01(dReflectSlot(sc, m, h, lambda, jr ? &jbS : nullptr));
             if (r <= 0) { terminate = true; break; }
             DVec3 nro, nrd; int pickG = 0;
             if (!gratingDiffract(m, h, rd, lambda, diffraction, rng, nro, nrd, nullptr,
@@ -20936,9 +20946,8 @@ __device__ static void dVcmScatter(const DScene& sc, const DMaterial& m, const D
                     jr->mul([&](double L) {
                                 bool live;
                                 const double ws = dGratingWsum(m, h, rd, (Real)L, diffraction, pickG, live);
-                                return (live && ws > 0.0)
-                                           ? (double)clamp01(specLookup(m.reflect, (Real)L)) / ws : 0.0; },
-                            (double)clamp01(specLookup(m.reflect, lambda)) / wsC, true);
+                                return (live && ws > 0.0) ? dJSlotAt(sc, m, jbS, L, false) / ws : 0.0; },
+                            r / wsC, true);
                 if (pickG != 0) jr->markDisp((double)lambda, jInvPdf);
             }
             break;
@@ -20948,57 +20957,10 @@ __device__ static void dVcmScatter(const DScene& sc, const DMaterial& m, const D
     // A lobe that leaves on the wrong side of the true surface ends the walk (host twin).
     if (!terminate && dLeavesWrongSide(h, wi, lobe)) terminate = true;
     if (!terminate) cosThetaOut = fabs(ddot(wi, ns));
-    // VCM-SPEC: the other lobes' factors at every bin, each over its value at lambda through the
-    // same reader (hair and the grating folded in their cases).
-    if (jr && !terminate) {
-        switch (m.type) {
-            case D_DIFFUSE:
-            case D_FLUORESCENT:
-            case D_GLOSSY:
-            case D_MIRROR: {
-                const bool dif = (m.type == D_DIFFUSE || m.type == D_FLUORESCENT);
-                auto fJ = [&](double L) {
-                    const double v = dJSlotAt(sc, m, jbS, L, dif);
-                    return (m.type == D_GLOSSY && m.iridescence)
-                               ? v * (double)dIridescenceR(sc, m, &h, (Real)L, jcH) : v; };
-                jr->mul(fJ, fJ((double)lambda), m.type == D_MIRROR);
-                break;
-            }
-            case D_DIFFUSETRANSMIT: {   // the lobe's albedo, normalised as dDiffuseTransmitAlbedos does
-                auto fJ = [&](double L) {
-                    const double rR = dJSlotAt(sc, m, jbS, L, true);
-                    Real tv = specLookup(m.transmit, (Real)L);
-                    if (m.transmitPat >= 0) tv = tv * tpS;
-                    const double rT = (double)clamp01(tv);
-                    const double sum = rR + rT;
-                    const double nrm = (sum > 1.0) ? 1.0 / sum : 1.0;
-                    return (jReflLobe ? rR : rT) * nrm; };
-                jr->mul(fJ, fJ((double)lambda), false);
-                break;
-            }
-            case D_FILTER: {
-                auto fJ = [&](double L) {
-                    Real tv = specLookup(m.transmit, (Real)L);
-                    if (m.transmitPat >= 0) tv = tv * tpS;
-                    return (double)clamp01(tv); };
-                jr->mul(fJ, fJ((double)lambda), true);
-                break;
-            }
-            case D_HALFMIRROR: {
-                auto fJ = [&](double L) { const double r = dJSlotAt(sc, m, jbS, L, false);
-                                          return jHmRefl ? r : 1.0 - r; };
-                jr->mul(fJ, fJ((double)lambda), true);
-                break;
-            }
-            case D_DIELECTRIC:
-            case D_THINFILM:
-            case D_MULTILAYER:
-                jr->mul([&](double L) { return dStepFactorAt(sc, m, h, rd, jSt, (Real)L); },
-                        jSt.factor, false);
-                break;
-            default: break;
-        }
-    }
+    // VCM-SPEC: the other lobes' factors at every bin (mode J's fold; hair and the grating fold in
+    // their cases).
+    if (jr && !terminate)
+        dJFoldLobe(*jr, sc, m, h, rd, lambda, jbS, tpS, jSt, jcH, jHmRefl, jReflLobe);
 }
 
 // Phase 1: `nPaths` light subpaths. Stores connectible vertices into the per-path slab
@@ -28265,14 +28227,12 @@ bool cudaVcmSupported(const Scene& scene) {
 VcmSession* vcmSessionBegin(const Scene& scene, const Camera& cam, int resX, int resY,
                             bool diffraction, int maxDepth, int heroC) {
     if (!cudaAvailable() || !cudaVcmSupported(scene)) return nullptr;
-    // The camera walk's spectral carrier (VCM-SPEC) takes mode J's switches: FTRACE_JSPEC, as
-    // bdpt::jSpecEnabled reads it, and -jdispwin / -jdispall (cudaSetJDisp).
-    {   const char* e = std::getenv("FTRACE_JSPEC");
-        const int jSpec = !(e && e[0] == '0');
-        CUDA_CHECK(cudaMemcpyToSymbol(gpu::c_jSpecOn, &jSpec, sizeof(int)));
-        CUDA_CHECK(cudaMemcpyToSymbol(gpu::c_jDispWin, &g_jDispWinHost, sizeof(double)));
-        CUDA_CHECK(cudaMemcpyToSymbol(gpu::c_jDispAll, &g_jDispAllHost, sizeof(int)));
-    }
+    // The camera walk's spectral carrier (VCM-SPEC) takes mode J's switches, as the host settled
+    // them for this render: bdpt::jSpecEnabled (cudaSetJSwitches) and -jdispwin / -jdispall
+    // (cudaSetJDisp).
+    CUDA_CHECK(cudaMemcpyToSymbol(gpu::c_jSpecOn, &g_jSpecHost, sizeof(int)));
+    CUDA_CHECK(cudaMemcpyToSymbol(gpu::c_jDispWin, &g_jDispWinHost, sizeof(double)));
+    CUDA_CHECK(cudaMemcpyToSymbol(gpu::c_jDispAll, &g_jDispAllHost, sizeof(int)));
     VcmSession* s = new VcmSession();
     s->resX = resX; s->resY = resY; s->npix = (size_t)resX * resY;
     s->diffraction = diffraction ? 1 : 0;

@@ -92,6 +92,40 @@ curve as M and S treat a hair strand (light it by NEE, continue the path, gather
 and give U's light store, merge and dVC/dVM recursions the same predicate (`surfMergeSite`).
 Then re-record check_fur_gather's values, which should all move to about 1.
 
+## FIXED (2026-11-04, 0.433.2): SPPM-COMPOUND-PARENT — mode S shaded a layered or mix body's visible point by the compound's own reflect slot
+
+Mode S's visible-point walk resolves a compound (a `layered` body to its coat or base, a `mix` to a
+child) and shades the walk by the child, but recorded the visible point under the compound's own
+material id, and the gather folded *that* material's reflectance per photon. A compound's own
+reflect slot is not its surface's colour. On check_rough_irid's car-paint sphere (a red base under
+a clear coat), mode S read green and blue at 7x mode R on both backends. The device's kernel said
+"parent matId, matching CPU SPPM", so the two agreed with each other and nothing compared them to
+mode R. The host's walk also never tossed the coat's coin, which the device's does. Both are fixed
+in 0.433.2: the visible point carries the lobe the walk resolved, as mode M's gather uses it, and
+the host takes the coat with probability R. check_rough_irid now holds mode S's car-paint sphere to
+mode R on each backend (CPU 0.96 / 1.20 / 0.77, GPU 0.89 / 1.08 / 0.88: within its 5-sigma test on
+a red sphere's small green and blue). Found checking the coat coin's fix against mode R (Opus review
+of 90e0486..bea7be1).
+
+## OPEN (2026-11-04, 0.432.1): PROBE-PARITY-LIMITS — two shapes the footprint probe's crossing count misreads
+
+Modes M and S count the photon-holding faces their footprint probe crosses above the gather's
+tangent-plane band, and take an odd count to mean the column lies inside a solid resting on the
+surface (the halo fix, 0.432.1; the same count in `-gageom`'s march). Two shapes break the rule:
+- **An open surface hovering within the radius** (a single-quad table top, a leaf, a sheet of
+  paper, a lampshade) is crossed once. The floor under it is taken for a solid's inside and is a
+  miss, so a floor that does receive photons there is divided by too little area and reads bright.
+  0.431.0 counted it covered.
+- **A solid taller than the radius** holds the probe's origin, r above the plane, so the probe
+  crosses nothing, meets the floor (or the solid's own coplanar bottom) in the band, and counts
+  it. The photon sum has nothing there, so the floor reads dark near the base. This halo predates
+  0.431.0: before the band, the first hit was the same.
+Proper fix: decide inside from outside with the faces' own orientation where it can be trusted (a
+closed mesh's or an analytic solid's outward normals, `Hit::back`), and use the count only for
+geometry that cannot say; or launch the probe from just above the band and look up for a ceiling
+instead of down for a floor. tools/check_gather_base.py covers the 3 cm box only (Opus review of
+90e0486..bea7be1).
+
 ## OPEN (2026-11-04, 0.433.1): MODEM-CPU-DARKGLASS-BLUE — CPU mode M reads blue 15 % low through glass that absorbs blue strongly
 
 `tools/check_dark_glass.py` (a 0.5 m slab, `absorb rgb 0 0 200`, over a lit floor, 64 x 48): the
@@ -392,6 +426,11 @@ Each merge reads the carrier at the light vertex's wavelengths (design.md, JSPEC
 `tools/check_rough_irid.py`'s spheres, which now hold mode U per channel on both backends, 0.432.1
 read the beetle's blue x1.25 and the chameleon's red x1.67 of mode R on the CPU (x1.21 and x1.60
 on the GPU). Now every sphere and channel is within 1.4 % on both.
+The carrier is mode J's, and so is its gap (JSPEC-GAPS): it has no support correction like mode M's
+(MODE-M-FOLD-SUPPORT). A camera walk at a wavelength where some factor is zero (outside a band-pass
+gel, at a coat opaque or a total reflection there) carries nothing, so merges seen through such an
+element are low by the share of camera wavelengths that cannot pass. check_rough_irid has no gel
+or coin case; check_coat_modes' coin scenes hold modes M and S only.
 
 Mode J had this bug and lost it in 0.386.1 (JSPEC, design.md); mode U never got the fix. A merge
 pairs the camera subpath, which ran at the camera sample's wavelength λ_c, with photons traced
@@ -701,8 +740,9 @@ Measured, GPU mode M against mode R:
   surface is a miss: 0.964-1.002. A closed shelf hovering 5 cm over the floor is crossed twice and
   its column counts, so beside it the floor reads the plain disc average across the shelf's shadow
   (0.75 at 2-5 cm, where 0.430.2's 0.98 came from the shelf top's photons, which also leaked
-  onto the floor under it). A single open quad hovering within the radius is the one shape the count
-  misreads. A probe that meets sixteen faces without an answer is a miss.
+  onto the floor under it). Two shapes the count misreads, an open surface hovering within the
+  radius and a solid taller than it, are PROBE-PARITY-LIMITS. A probe that meets sixteen faces
+  without an answer is a miss.
 - Modes U and J take neither test any more: with no footprint they read the box's base at 0.62 and
   0.61 (0.430.2: 0.94, 1.01), and their shrinking radius makes the bias they keep vanish as they
   converge. Mode J's stored photon is 72 B again; check_bitid shows U and J identical to 0.430.2.

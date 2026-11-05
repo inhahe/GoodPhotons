@@ -158,6 +158,8 @@ Then the rest of 4.2-4.6 in their order, 4.7's bookkeeping alongside whatever to
   one-block residuals).
 - [ ] **CURVE-GATHER** — modes M, S and U misread a coat of `type diffuse` curves
   (`tools/check_fur_gather.py`), M's two backends differently; VCM-THIN-CURVES is its mode-U half.
+- [ ] **PROBE-PARITY-LIMITS** — the footprint probe's crossing count misreads an open surface
+  hovering within the radius, and a solid taller than it.
 - [ ] **MODEM-CPU-DARKGLASS-BLUE** — CPU mode M reads blue 15 % low through strongly absorbing
   glass, where GPU mode M and both mode S do not.
 - [x] **MODEM-COMPOTE-NAN** (0.433.1) — the spectral carrier's ratio overflowed a float in the
@@ -167,7 +169,8 @@ Then the rest of 4.2-4.6 in their order, 4.7's bookkeeping alongside whatever to
 - [ ] **MODEM-BEAM-CARRIER** — mode M's beam gather reads the camera's spectral factors at its
   wavelength.
 - [ ] **JSPEC-GAPS**, its still-open list — `aGlassCam` in the gather, support where a factor is
-  zero at the camera's wavelength, dispersive refraction without `-jdispall`.
+  zero at the camera's wavelength (mode U's carrier too, since 0.433.0), dispersive refraction
+  without `-jdispall`.
 - [ ] **MODEM-REDPASS** — mode M reads a fog lit through a red-pass glass 8 % low in green.
 - [ ] **FWD-GLOSSY-INDIRECT** — modes A and B splat a rough reflector only where it is seen directly
   (and a layered clearcoat's sheen on neither backend).

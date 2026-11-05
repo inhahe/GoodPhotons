@@ -2675,7 +2675,9 @@ the rain against the sky stayed within 0.3–0.9 % (known-issues.md, RAIN-J-VS-D
 `traceCameraSubpath`, the device's `kVcmCameraT`). Each lobe `scatterSample` / `dVcmScatter` samples
 is folded where it is sampled, as mode J's walk folds it: the slots through the shape their own read
 captured (`DJBase`, on the device), the dielectric step through its record, the grating's order
-and the half mirror's coin. Coloured glass is folded along each segment and a layered coat's coin
+and the half mirror's coin. On the device the per-lobe fold is one function both walks call
+(`dJFoldLobe`), and both read a mirror's and a half mirror's reflect slot, pattern included, as
+their host twins do (mode J's device walk read the bare spectrum there until 0.433.2). Coloured glass is folded along each segment and a layered coat's coin
 where it is tossed. Each merge reads the carrier snapshotted at its camera vertex, at the light
 vertex's hero and secondary wavelengths, or through the dispersive window once a grating's order
 (or, under `-jdispall`, a dispersive refraction) opened it. Mode U's device session uploads mode
@@ -5601,9 +5603,13 @@ as the one at fault.
   floor inside a bottomless one), where no photon can be: a miss too. Counted as covered, every
   object standing on a surface ringed its base with a dark halo (0.75 of mode R within 5 cm of a
   3 cm box at radius 0.1; 0.99 with the count). A closed shelf hovering within the radius is
-  crossed twice, and the floor under it counts (the plain disc average across its shadow); an
-  open single quad there is the one shape the count misreads. Sixteen faces without an answer are
-  a miss. `gatherCoverage` /
+  crossed twice, and the floor under it counts (the plain disc average across its shadow). Two
+  shapes the count misreads (known-issues PROBE-PARITY-LIMITS): an open surface hovering within the
+  radius (one quad, a leaf) is crossed once, so the floor under it is taken for a solid's inside and
+  reads bright; and a solid taller than the radius holds the probe's origin, so nothing is crossed
+  and the floor under it counts, the dark halo every version before 0.431.0 had at such a base too.
+  `-gageom`'s march takes the same count per column. Sixteen faces without an answer are a miss.
+  `gatherCoverage` /
   `gatherAreaScale` in `photonmap_render.h`, device twin `dGatherCoverage` in `render_cuda.cu`.
   Each map's coverage is taken at that map's radius and scales that map's estimate alone: the
   caustic map gathers at its own per-query radius, so the main map's correction must not reach it

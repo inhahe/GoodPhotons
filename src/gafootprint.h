@@ -6,6 +6,21 @@
 #include <cmath>
 #include "gatherplane.h"
 
+// Whether a footprint (the probe, or the march below) passes through a surface of material `m` rather than stopping on it:
+// one no photon is ever stored on -- anything but a diffuse, diffuse-transmitting or fluorescent
+// surface, or a compound or fiber that may be one. The photons near such a face lie on the surface
+// beyond it, and a face within the radius above the tangent plane would otherwise be counted and
+// then ball-rejected for its height, though that surface is there (known-issues
+// GATHERAREA-TRANSPARENT). Device twin dProbePassesThrough.
+inline bool probePassesThrough(const Material& m) {
+    switch (m.type) {
+        case MatType::Dielectric: case MatType::ThinFilm: case MatType::Multilayer:
+        case MatType::Filter: case MatType::HalfMirror: case MatType::Mirror:
+        case MatType::Glossy: case MatType::Grating: return true;
+        default: return false;
+    }
+}
+
 // The geometric footprint: same-facing surface area inside the gather ball, measured from
 // the GEOMETRY rather than inferred from a photon statistic.
 //
@@ -76,6 +91,10 @@ inline double gatherFootprintArea(const Scene& sc, const Vec3& p, const Vec3& n,
     }
     const double cellArea = (kPi * r2) / (double)kDisc;
     double area = 0.0;
+    // THE PROBE'S CROSSING RULE, per column (photonmap_render.h gatherCoverageRaw, where the why
+    // is): photon-holding faces off the band above the plane are another surface's, and an odd
+    // count of them over a column puts its in-band layers inside a solid resting on the surface
+    // (the floor under a box), where no photon can be -- so that column counts nothing.
     for (int i = 0; i < kDisc; ++i) {
         // Sunflower placement: equal-area radii, golden-angle azimuth. Deterministic, so two
         // runs of the same scene give the same footprint and an A/B compares one thing.
@@ -89,6 +108,8 @@ inline double gatherFootprintArea(const Scene& sc, const Vec3& p, const Vec3& n,
         const double span = 2.0 * half;
         double t0 = eps;
         int layers = 0;
+        double colArea = 0.0;
+        int crossed = 0;
         for (; layers < maxLayers; ++layers) {
             Ray ray{start, n};
             Hit h = sc.closestHit(ray, t0, nullptr, /*skipHair=*/false,
@@ -116,10 +137,17 @@ inline double gatherFootprintArea(const Scene& sc, const Vec3& p, const Vec3& n,
             const double c = dot(h.ng, n) * orient;
             // Same-facing and in the tangent-plane band: what the photon query keeps.
             const Vec3 dh = h.p - p;
-            if (c >= 0.5 && withinGatherBand(std::fabs(dot(dh, n)), dot(dh, dh), c, slack))
-                area += cellArea / c;
+            const double off = dot(dh, n);           // signed height above the tangent plane
+            if (withinGatherBand(std::fabs(off), dot(dh, dh), std::fabs(c), slack)) {
+                if (c >= kGatherFacingCos) colArea += cellArea / c;
+            } else if (off > 0.0) {
+                const Material* mm = (h.matId >= 0 && h.matId < (int)sc.mats.size()) ? &sc.mats[h.matId] : nullptr;
+                // not a face holding no photon, nor a hair strand (the probe's coin decides those)
+                if (!(mm && (probePassesThrough(*mm) || mm->type == MatType::Hair))) ++crossed;
+            }
             t0 = h.t + eps;
         }
+        if ((crossed & 1) == 0) area += colArea;
         if (layers >= maxLayers && incomplete) *incomplete = true;
     }
     return area;

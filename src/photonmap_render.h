@@ -306,20 +306,6 @@ inline std::vector<GaDiagMat>& gaDiag() {
     return t;
 }
 
-// Whether a footprint probe passes through a surface of material `m` rather than stopping on it:
-// one no photon is ever stored on -- anything but a diffuse, diffuse-transmitting or fluorescent
-// surface, or a compound or fiber that may be one. The photons near such a face lie on the surface
-// beyond it, and a face within the radius above the tangent plane would otherwise be counted and
-// then ball-rejected for its height, though that surface is there (known-issues
-// GATHERAREA-TRANSPARENT). Device twin dProbePassesThrough.
-inline bool probePassesThrough(const Material& m) {
-    switch (m.type) {
-        case MatType::Dielectric: case MatType::ThinFilm: case MatType::Multilayer:
-        case MatType::Filter: case MatType::HalfMirror: case MatType::Mirror:
-        case MatType::Glossy: case MatType::Grating: return true;
-        default: return false;
-    }
-}
 
 // The estimator itself. Wrapped by `gatherCoverage` below, which only records the result -- the
 // wrapper exists so that every early return here (flat-interior gate, tangle gate, fiber gate)
@@ -502,7 +488,7 @@ inline double gatherCoverageRaw(const Scene& scene, const Vec3& p, const Vec3& n
             GaDiagMat& g = gaDiag()[matId];
             if (!(h.valid && h.t <= 2.0 * r))          g.miss.fetch_add(1, std::memory_order_relaxed);
             else {
-                if (dot(orientedGeoN(h), n) < 0.5) g.reject.fetch_add(1, std::memory_order_relaxed);
+                if (dot(orientedGeoN(h), n) < kGatherFacingCos) g.reject.fetch_add(1, std::memory_order_relaxed);
                 else                   g.accept.fetch_add(1, std::memory_order_relaxed);
                 // Depth below the tangent plane, over ANY hit (accepted or rejected) -- the
                 // question is where the geometry is, not which way it faces.
@@ -530,7 +516,7 @@ inline double gatherCoverageRaw(const Scene& scene, const Vec3& p, const Vec3& n
             // arms differ in exactly one quantity.
             const double dz = r - h.t;      // signed height of the hit above the tangent plane
             const bool inBall = !gaBallOn() || (rr * rr + dz * dz <= r * r);
-            if (c >= 0.5) { if (inBall) area += 1.0 / c; }
+            if (c >= kGatherFacingCos) { if (inBall) area += 1.0 / c; }
             else          ++nRej;
             depthSum += (h.t - r) / r;   // < 0 when the geometry sits ABOVE the tangent plane
             ++nHit;
