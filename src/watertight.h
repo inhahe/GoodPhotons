@@ -121,41 +121,53 @@ inline Report checkTris(const Tri* tris, size_t n) {
     return check(pos, idx);
 }
 
-// Marks the faces of `tris` (one mesh object) that bound a closed solid facing outward, so that a
-// ray meeting one from behind is leaving the solid (Tri::solidFace, Hit::solid). "Facing" is the
-// intersector's: it turns a face's `ng` to the side its shading normals are on (intersectTri), so
-// a face counts by the side all three corner normals agree on, and one whose corners disagree
-// cannot say. Taken per connected piece (triangles sharing a welded vertex), which must have:
+// Marks the faces of one mesh object (`tris`, pointers into wherever they live) that bound a closed
+// solid, so a ray meeting one from behind its normal is leaving the solid or entering it
+// (Tri::solidFace, Hit::solid). "Behind" is the intersector's: it turns a face's `ng` to the side its
+// interpolated shading normal is on (intersectTri), so a face counts by the side its corner normals
+// lie on. Corners exactly in its plane flip nothing; one corner on each side means it cannot say.
+// Taken per connected piece (triangles sharing a welded vertex), which must have:
 //   - every edge used by exactly two of its faces, in opposite directions: closed and consistently
 //     wound;
 //   - every face's normals on one side of its winding, the same side over the whole piece, so
 //     `back` keeps one meaning there (an OBJ wound against its normals is fine, if it is so
-//     throughout);
-//   - a positive enclosed volume, taken on that side: it faces outward.
-// Every other face is cleared. Returns how many were marked.
-inline size_t markSolidFaces(Tri* tris, size_t n) {
+//     throughout).
+// Its enclosed volume, taken on that side, says which way the normals point: a positive one marks
+// the piece's faces 1 (normals out: from behind is leaving), a negative one 2 (normals in, as a
+// room's may be: from behind is entering). Every other face is 0. Returns how many were marked.
+inline size_t markSolidFaces(Tri* const* tris, size_t n) {
     if (n == 0) return 0;
-    Vec3 lo = tris[0].v0, hi = tris[0].v0;
+    Vec3 lo = tris[0]->v0, hi = tris[0]->v0;
     for (size_t i = 0; i < n; ++i)
-        for (const Vec3* p : {&tris[i].v0, &tris[i].v1, &tris[i].v2}) {
+        for (const Vec3* p : {&tris[i]->v0, &tris[i]->v1, &tris[i]->v2}) {
             lo.x = std::min(lo.x, p->x); lo.y = std::min(lo.y, p->y); lo.z = std::min(lo.z, p->z);
             hi.x = std::max(hi.x, p->x); hi.y = std::max(hi.y, p->y); hi.z = std::max(hi.z, p->z);
         }
     const double diag = std::sqrt((hi.x-lo.x)*(hi.x-lo.x) + (hi.y-lo.y)*(hi.y-lo.y) + (hi.z-lo.z)*(hi.z-lo.z));
     const double inv  = 1.0 / std::max(1e-9, diag * 1e-7);   // check()'s weld
-    std::unordered_map<detail::VKey, int, detail::VKeyHash> weld;
-    weld.reserve(n * 2);
-    std::vector<int> vid(n * 3);
+    // Weld by sorting the corners' quantised positions (flat arrays: a scene's worth of triangles
+    // costs a sort, where hash maps cost a node per corner).
+    struct Corner { long long x, y, z; uint32_t at; };
+    std::vector<Corner> cs(n * 3);
     for (size_t i = 0; i < n; ++i) {
-        const Vec3* c[3] = {&tris[i].v0, &tris[i].v1, &tris[i].v2};
-        for (int k = 0; k < 3; ++k) {
-            detail::VKey key{ std::llround(c[k]->x*inv), std::llround(c[k]->y*inv), std::llround(c[k]->z*inv) };
-            auto it = weld.emplace(key, (int)weld.size()).first;
-            vid[i * 3 + k] = it->second;
-        }
+        const Vec3* c[3] = {&tris[i]->v0, &tris[i]->v1, &tris[i]->v2};
+        for (int k = 0; k < 3; ++k)
+            cs[i * 3 + k] = Corner{ std::llround(c[k]->x*inv), std::llround(c[k]->y*inv),
+                                    std::llround(c[k]->z*inv), (uint32_t)(i * 3 + k) };
     }
+    std::sort(cs.begin(), cs.end(), [](const Corner& a, const Corner& b) {
+        return a.x != b.x ? a.x < b.x : a.y != b.y ? a.y < b.y : a.z < b.z;
+    });
+    std::vector<int> vid(n * 3);
+    int nv = 0;
+    for (size_t q = 0; q < cs.size(); ++q) {
+        if (q > 0 && (cs[q].x != cs[q-1].x || cs[q].y != cs[q-1].y || cs[q].z != cs[q-1].z)) ++nv;
+        vid[cs[q].at] = nv;
+    }
+    ++nv;
+    std::vector<Corner>().swap(cs);
     // The pieces: union-find over welded vertices.
-    std::vector<int> parent(weld.size());
+    std::vector<int> parent((size_t)nv);
     for (size_t v = 0; v < parent.size(); ++v) parent[v] = (int)v;
     const auto root = [&](int v) {
         while (parent[(size_t)v] != v) { parent[(size_t)v] = parent[(size_t)parent[(size_t)v]]; v = parent[(size_t)v]; }
@@ -168,38 +180,55 @@ inline size_t markSolidFaces(Tri* tris, size_t n) {
     std::vector<char> bad(parent.size(), 0);
     std::vector<char> side(parent.size(), 0);     // +1 / -1: the piece's faces' normals with / against winding
     std::vector<double> vol(parent.size(), 0.0);
-    std::unordered_map<detail::EKey, detail::EdgeUse, detail::EKeyHash> edges;
-    edges.reserve(n * 3);
+    // Each directed edge as (low, high) and which way it runs; sorted, every undirected edge's uses
+    // are one run, which must be one each way.
+    struct Edge { int a, b; bool rev; };
+    std::vector<Edge> es;
+    es.reserve(n * 3);
     for (size_t i = 0; i < n; ++i) {
-        const Tri& t = tris[i];
+        const Tri& t = *tris[i];
         const int piece = root(vid[i*3]);
         const int c[3] = {vid[i*3], vid[i*3+1], vid[i*3+2]};
         for (int k = 0; k < 3; ++k) {
             const int u = c[k], v = c[(k + 1) % 3];
             if (u == v) continue;                    // a degenerate edge, as check() ignores it
-            const bool swap = u > v;
-            detail::EdgeUse& eu = edges[detail::EKey{ swap ? v : u, swap ? u : v }];
-            if (swap) eu.rev++; else eu.fwd++;
+            es.push_back(u < v ? Edge{u, v, false} : Edge{v, u, true});
         }
         // Volume relative to the box's corner keeps the sums' rounding to the object's own scale.
         const Vec3 a = t.v0 - lo, b = t.v1 - lo, d = t.v2 - lo;
         vol[(size_t)piece] += dot(a, cross(b, d));
         const double c0 = dot(t.gn, t.n0), c1 = dot(t.gn, t.n1), c2 = dot(t.gn, t.n2);
-        const char s = (c0 > 0.0 && c1 > 0.0 && c2 > 0.0) ? 1 : (c0 < 0.0 && c1 < 0.0 && c2 < 0.0) ? -1 : 0;
+        const bool anyNeg = c0 < 0.0 || c1 < 0.0 || c2 < 0.0, anyPos = c0 > 0.0 || c1 > 0.0 || c2 > 0.0;
+        const char s = (anyNeg && anyPos) ? 0 : anyNeg ? -1 : 1;   // all in-plane: nothing flips it
         char& ps = side[(size_t)piece];
         if (s == 0 || (ps != 0 && ps != s)) bad[(size_t)piece] = 1;
         ps = s;
     }
-    for (const auto& kv : edges)
-        if (!(kv.second.fwd == 1 && kv.second.rev == 1)) bad[(size_t)root((int)kv.first.a)] = 1;
+    std::sort(es.begin(), es.end(), [](const Edge& x, const Edge& y) {
+        return x.a != y.a ? x.a < y.a : x.b < y.b;
+    });
+    for (size_t q = 0; q < es.size();) {
+        size_t e = q;
+        int fwd = 0, rev = 0;
+        for (; e < es.size() && es[e].a == es[q].a && es[e].b == es[q].b; ++e) (es[e].rev ? rev : fwd)++;
+        if (!(fwd == 1 && rev == 1)) bad[(size_t)root(es[q].a)] = 1;
+        q = e;
+    }
     size_t marked = 0;
     for (size_t i = 0; i < n; ++i) {
         const int piece = root(vid[i*3]);
-        const bool s = !bad[(size_t)piece] && vol[(size_t)piece] * (double)side[(size_t)piece] > 0.0;
-        tris[i].solidFace = s ? 1 : 0;
+        const double v = vol[(size_t)piece] * (double)side[(size_t)piece];
+        const unsigned char s = (bad[(size_t)piece] || v == 0.0) ? 0 : (v > 0.0 ? 1 : 2);
+        tris[i]->solidFace = s;
         marked += s ? 1 : 0;
     }
     return marked;
+}
+// The same over a contiguous run.
+inline size_t markSolidFaces(Tri* tris, size_t n) {
+    std::vector<Tri*> p(n);
+    for (size_t i = 0; i < n; ++i) p[i] = tris + i;
+    return markSolidFaces(p.data(), n);
 }
 
 } // namespace watertight

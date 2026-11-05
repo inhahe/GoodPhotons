@@ -286,23 +286,28 @@ and take an odd count to mean the column lies inside a solid resting on the surf
 0.432.1; the same count in `-gageom`'s march). The faces counted were the photon-holding ones; since
 0.434.5 they are every face light cannot cross (`passesLight`), so a mirror box or an opaque coat
 over a glossy body shadows the floor under it as a diffuse box does. Also since 0.434.5, a face that
-bounds a closed solid wound outward (an analytic sphere, a closed mesh: `Hit::solid`,
-PROBE-SOLID-SIDE) says itself which side the probe is on, so the floor under the overhang of a ball
-resting on it is no longer read as the ball's inside. That parity error had been there for diffuse
-balls since 0.432.1. What follows is left for geometry that cannot say (quads, open meshes,
+bounds a closed solid (an analytic sphere, a closed mesh: `Hit::solid`, PROBE-SOLID-SIDE) says
+itself which side the probe is on, so the floor under the overhang of a ball resting on it is no
+longer read as the ball's inside. That parity error had been there for diffuse balls since 0.432.1.
+Since 0.434.9 that covers a mesh wound inward too, and quads that close a solid between them (a
+six-quad box), and an open sheet that holds no photon (a mirror quad, a light's quad) counts for
+nothing. What follows is left for photon-holding geometry that cannot say (open quads, open meshes,
 isosurfaces, curves). Two shapes break the rule:
-- **An open surface hovering within the radius** (a single-quad table top, a leaf, a sheet of
-  paper, a lampshade) is crossed once. The floor under it is taken for a solid's inside and is a
-  miss, so a floor that does receive photons there is divided by too little area and reads bright.
-  0.431.0 counted it covered.
+- **A photon-holding open surface hovering within the radius** (a single-quad diffuse table top, a
+  leaf, a sheet of paper, a lampshade) is crossed once. The floor under it is taken for a solid's
+  inside and is a miss, so a floor that does receive photons there is divided by too little area
+  and reads bright. 0.431.0 counted it covered. The parity cannot tell it from the lid of a
+  bottomless box built from five quads, whose floor inside is a true miss.
 - **A solid taller than the radius** holds the probe's origin, r above the plane, so the probe
   crosses nothing, meets the floor (or the solid's own coplanar bottom) in the band, and counts
   it. The photon sum has nothing there, so the floor reads dark near the base. This halo predates
   0.431.0: before the band, the first hit was the same.
-Proper fix: decide inside from outside with the faces' own orientation where it can be trusted (a
-closed mesh's or an analytic solid's outward normals, `Hit::back`), and use the count only for
-geometry that cannot say; or launch the probe from just above the band and look up for a ceiling
-instead of down for a floor. tools/check_gather_base.py covers the 3 cm box only (Opus review of
+Proper fix: the faces' own side (`Hit::solid`) already decides where a closed solid's face is met;
+the probe meets none in a tall closed solid because its window ends inside it. Look up from just
+above the band, past the window, for the nearest solid face: an upward ray from inside a closed
+solid must leave it, met from inside. The parity stays for open geometry, where nothing better is
+known. tools/check_gather_base.py covers the boxes (closed, so since 0.434.9
+solids), the balls and the open sheets that hold no photon; neither shape above (Opus review of
 90e0486..bea7be1).
 
 ## OPEN (2026-11-04, 0.433.1): MODEM-CPU-DARKGLASS-BLUE — CPU mode M reads blue 15 % low through glass that absorbs blue strongly

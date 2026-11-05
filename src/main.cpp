@@ -3519,7 +3519,7 @@ static bool checkPatternNudge() {
 static Hit junkHit() {
     Hit h;
     h.t = 1e30; h.matId = -7; h.pscale = 777.0; h.fiberRadius = 0.5; h.hasVcol = true; h.back = true;
-    h.tangent = Vec3(0, 0, 9); h.bitangentSign = -1.0; h.curv = 99.0;
+    h.tangent = Vec3(0, 0, 9); h.bitangentSign = -1.0; h.curv = 99.0; h.solid = 7;
     return h;
 }
 static bool checkHitFieldsWritten() {
@@ -3534,21 +3534,24 @@ static bool checkHitFieldsWritten() {
         Hit h = junkHit();
         const Sphere s{Vec3(0, 0, 0), 0.5, 0};
         expect("a sphere", intersectSphere(down, s, 1e-9, h) && h.pscale == 0.5 && h.fiberRadius == 0.0 &&
-                           !h.hasVcol && !h.back);
+                           !h.hasVcol && !h.back && h.solid == 1);
     }
     {
         Hit h = junkHit();
         Tri t{Vec3(-1, 0, -1), Vec3(-1, 0, 1), Vec3(1, 0, 1), 0, -1, {}};
         t.finalize();
         expect("a triangle", intersectTri(down, t, 1e-9, h) && h.pscale == t.reach && h.fiberRadius == 0.0 &&
-                             !h.hasVcol && !h.back);
+                             !h.hasVcol && !h.back && h.solid == 0);
+        Hit hi = junkHit();
+        t.solidFace = 2;                       // a closed solid's face, its normal in
+        expect("an inward solid's triangle", intersectTri(down, t, 1e-9, hi) && hi.solid == -1);
     }
     {
         Hit h = junkHit();
         CurveSeg cs;
         cs.p0 = Vec3(-1, 0, 0); cs.p1 = Vec3(1, 0, 0); cs.r0 = cs.r1 = 0.5;
         expect("a curve", intersectCurveSeg(makeCurveRay(down.d), down, cs, 1e-9, h) && h.pscale == 1.5 &&
-                          !h.hasVcol && !h.back);
+                          !h.hasVcol && !h.back && h.solid == 0);
     }
     {
         ftsl::Loaded L;
@@ -3564,7 +3567,7 @@ static bool checkHitFieldsWritten() {
         expect("an isosurface", loaded && L.scene.implicits.size() == 1 &&
                                 intersectImplicit(down, L.scene.implicits[0], 1e-9, h) && h.pscale == 0.0 &&
                                 h.fiberRadius == 0.0 && !h.hasVcol && !h.back && h.tangent.z == 0.0 &&
-                                h.bitangentSign == 1.0);
+                                h.bitangentSign == 1.0 && h.solid == 0);
     }
     std::printf("[checkpatops] reused hit record: every intersector writes every field it owns %s\n",
                 bad ? "FAIL" : "ok");
@@ -3710,6 +3713,7 @@ static int checkPatOps() {
 // an interpolated normal across its face's plane, so n and ng no longer tell it; and a
 // normal-mapped surface's normal seen from behind is its normal from the front, negated.
 static long ftraceCurrentPid();
+static void markSolidFaces(Scene& scene);   // defined with the render dispatch
 static int checkDevHits() {
 #ifndef HAVE_CUDA
     std::printf("[checkdevhits] built without CUDA -- SKIPPED\n");
@@ -3883,6 +3887,7 @@ static int checkDevHits() {
     for (int i = 0; i < 2; ++i) add(Vec3(2.0 * i + 0.1, 2 + 3, 0.2), Vec3(0, -1, 0), 3, i);
 
     std::vector<DevHitProbeOut> dev(rays.size());
+    markSolidFaces(L.scene);   // so a closed piece's triangles carry their side too (Hit::solid)
     if (!cudaHitProbe(sc, rays.data(), (int)rays.size(), dev.data())) {
         std::printf("[checkdevhits] probe launch failed FAIL\n");
         return 1;
@@ -3890,7 +3895,8 @@ static int checkDevHits() {
 
     const char* fieldName[] = {"validity", "material", "back", "own-side flag", "t", "point", "shading normal",
                                "geometric normal", "pscale", "curvature", "strand radius", "vertex colour",
-                               "tangent", "pattern height", "pattern normal", "cavity", "shaded-side ng"};
+                               "tangent", "pattern height", "pattern normal", "cavity", "shaded-side ng",
+                               "solid side"};
     const int nField = (int)(sizeof(fieldName) / sizeof(fieldName[0]));
     std::vector<int> badField(nField, 0);
     // Host-side: hits whose `back` is not the side the ray met ng from; hits where n against ng
@@ -3917,7 +3923,7 @@ static int checkDevHits() {
             }
         }
         const DevHitProbeOut& o = dev[i];
-        bool b[17] = {};
+        bool b[18] = {};
         b[0] = (o.valid != 0) != h.valid;
         if (h.valid && o.valid) {
             ++hits;
@@ -3938,6 +3944,7 @@ static int checkDevHits() {
             b[11] = (o.vcol >= 0) != h.hasVcol;
             b[12] = !closest && std::fabs(o.tangentZ - h.tangent.z) > 1e-4;
             b[16] = vdot(o.sng, orientedGeoN(h)) < 0.999;
+            b[17] = o.solid != (int)h.solid;
             if (closest) {
                 const bool fromBehind = dot(r.d, h.ng) > 0.0;
                 backOff += (h.back != fromBehind) ? 1 : 0;
@@ -17547,8 +17554,8 @@ static void readRadCacheSection(std::istream& in, bool adopt = true) {
     in.read((char*)&n, 8);
     // Sanity bound before allocating from a file's word: a table can never hold more cells
     // than the largest capacity the flag accepts, and the record count is otherwise attacker-
-    // or corruption-controlled.
-    if (!in || n > (uint64_t)1 << 28) { in.clear(); return; }
+    // or corruption-controlled. A section that cannot be read is no section: `in` goes back.
+    if (!in || n > (uint64_t)1 << 28) { in.clear(); in.seekg(at); return; }
     if (!adopt) {
         in.seekg((std::streamoff)n * (std::streamoff)(8 + sizeof(RadCacheCell)), std::ios::cur);
         in.clear();
@@ -17561,7 +17568,7 @@ static void readRadCacheSection(std::istream& in, bool adopt = true) {
         in.read((char*)&p.keys[(size_t)i], 8);
         in.read((char*)&p.cells[(size_t)i], sizeof(RadCacheCell));
     }
-    if (!in) { in.clear(); return; }
+    if (!in) { in.clear(); in.seekg(at); return; }
     in.clear();
     p.have = true; p.guard = guard; p.pass = pass;
     p.nSample = ctr[0]; p.nEvicted = ctr[1]; p.nTerm = ctr[2];
@@ -17642,38 +17649,49 @@ static bool checkpointHasBytes(std::ifstream& in, std::streamoff n) {
     return end >= 0 && (std::streamoff)(end - here) >= n;
 }
 
+// A sidecar's header, read and checked against this render: its film's size, sample count and
+// energy, and the bytes of film that follow it (`body`), present in full. Null when the sidecar is
+// this render's, else why not, for readCheckpoint to say and a silent reader to ignore.
+struct CheckpointHead {
+    int32_t rx = 0, ry = 0;
+    long long N = 0;
+    double en[5] = {0, 0, 0, 0, 0};
+    std::streamoff body = 0;
+};
+static const char* readCheckpointHead(std::ifstream& in, int res, int resY, uint64_t guard,
+                                      char mode, CheckpointHead& h) {
+    char magic[8];
+    in.read(magic, 8);
+    if (!in || std::memcmp(magic, "FTBUF01\n", 8) != 0) return "is not a recognised checkpoint; ignoring";
+    int32_t m = 0;
+    uint64_t g = 0;
+    in.read((char*)&h.rx, 4); in.read((char*)&h.ry, 4); in.read((char*)&m, 4);
+    in.read((char*)&h.N, 8);
+    in.read((char*)h.en, sizeof h.en);
+    in.read((char*)&g, 8);
+    if (!in) return "is truncated; starting fresh";
+    if (h.rx != res || h.ry != resY || m != (int32_t)(unsigned char)mode || g != guard)
+        return "does not match this render (scene/mode/resolution differ); starting fresh";
+    h.body = (std::streamoff)h.rx * h.ry * (std::streamoff)(sizeof(Vec3) + sizeof(double));
+    if (!checkpointHasBytes(in, h.body)) return "is truncated; starting fresh";
+    return nullptr;
+}
+
 static bool readCheckpoint(const std::string& outPath, int res, int resY, uint64_t guard,
                            char mode, Checkpoint& c) {
     std::ifstream in(checkpointPath(outPath), std::ios::binary);
     if (!in) return false;
-    char magic[8];
-    in.read(magic, 8);
-    if (!in || std::memcmp(magic, "FTBUF01\n", 8) != 0) {
-        std::fprintf(stderr, "[resume] %s is not a recognised checkpoint; ignoring\n",
-                     checkpointPath(outPath).c_str());
+    // Callers pass their live accumulator, so `c` must not change unless the load succeeds: a
+    // truncated body is caught from the file size (readCheckpointHead) before anything is
+    // written to it.
+    CheckpointHead hd;
+    if (const char* why = readCheckpointHead(in, res, resY, guard, mode, hd)) {
+        std::fprintf(stderr, "[resume] checkpoint %s %s\n", checkpointPath(outPath).c_str(), why);
         return false;
     }
-    int32_t rx = 0, ry = 0, m = 0; long long N = 0;
-    in.read((char*)&rx, 4); in.read((char*)&ry, 4); in.read((char*)&m, 4);
-    in.read((char*)&N, 8);
-    double en[5] = {0,0,0,0,0}; in.read((char*)en, sizeof en);
-    uint64_t g = 0; in.read((char*)&g, 8);
-    if (!in) { std::fprintf(stderr, "[resume] checkpoint %s truncated; starting fresh\n",
-                            checkpointPath(outPath).c_str()); return false; }
-    if (rx != res || ry != resY || m != (int32_t)(unsigned char)mode || g != guard) {
-        std::fprintf(stderr, "[resume] checkpoint %s does not match this render "
-                             "(scene/mode/resolution differ); starting fresh\n",
-                     checkpointPath(outPath).c_str());
-        return false;
-    }
-    // Callers pass their live accumulator, so `c` must not change unless the load succeeds:
-    // a truncated body is caught from the file size before anything is written to it.
-    const std::streamoff body = (std::streamoff)rx * ry * (std::streamoff)(sizeof(Vec3) + sizeof(double));
-    if (!checkpointHasBytes(in, body)) {
-        std::fprintf(stderr, "[resume] checkpoint %s truncated; starting fresh\n",
-                     checkpointPath(outPath).c_str());
-        return false;
-    }
+    const int32_t rx = hd.rx, ry = hd.ry;
+    const long long N = hd.N;
+    const double* en = hd.en;
     c.film.resX = rx; c.film.resY = ry; c.film.alloc();
     in.read((char*)c.film.xyz.data(), c.film.xyz.size() * sizeof(Vec3));
     in.read((char*)c.film.hits.data(), c.film.hits.size() * sizeof(double));
@@ -17700,19 +17718,10 @@ static CheckpointCounts peekCheckpointCounts(const std::string& outPath, int res
     CheckpointCounts k;
     std::ifstream in(checkpointPath(outPath), std::ios::binary);
     if (!in) return k;
-    char magic[8];
-    int32_t rx = 0, ry = 0, m = 0; long long N = 0;
-    double en[5]; uint64_t g = 0;
-    in.read(magic, 8);
-    in.read((char*)&rx, 4); in.read((char*)&ry, 4); in.read((char*)&m, 4);
-    in.read((char*)&N, 8); in.read((char*)en, sizeof en); in.read((char*)&g, 8);
-    if (!in || std::memcmp(magic, "FTBUF01\n", 8) != 0 || rx != res || ry != resY ||
-        m != (int32_t)(unsigned char)mode || g != guard)
-        return k;
-    const std::streamoff body = (std::streamoff)rx * ry * (std::streamoff)(sizeof(Vec3) + sizeof(double));
-    if (!checkpointHasBytes(in, body)) return k;
-    in.seekg(body, std::ios::cur);
-    k.N = N;
+    CheckpointHead hd;
+    if (readCheckpointHead(in, res, resY, guard, mode, hd)) return k;
+    in.seekg(hd.body, std::ios::cur);
+    k.N = hd.N;
     readRadCacheSection(in, /*adopt=*/false);
     k.lightEpochs = readLightEpochSection(in);
     return k;
@@ -19053,24 +19062,40 @@ static void prepareSunAim(const Scene& scene) {
 #endif
 }
 
-// PROBE-SOLID-SIDE: marks the faces of every mesh object that bound a closed solid wound outward
-// (watertight::markSolidFaces), so the footprint probes of modes M and S can tell inside a solid
-// from outside off the side a face is met from (Hit::solid). An asset's triangles are marked once,
-// however many instances place it; quads and the other primitives are no mesh object, and stay
-// unmarked (a sphere's hit says it is solid itself).
+// PROBE-SOLID-SIDE: marks the triangles that bound a closed solid (watertight::markSolidFaces), so
+// the footprint probes of modes M and S can tell inside a solid from outside off the side a face is
+// met from (Hit::solid). Each mesh object by itself, an asset's once however many instances place
+// it; then every triangle no mesh object holds -- quads, a light's own surface -- as one pool, in
+// which a box of six quads meeting edge to edge is a closed piece as a mesh is. (A sphere's hit
+// says it is solid itself.)
 static void markSolidFaces(Scene& scene) {
-    std::vector<char> done(scene.blasList.size(), 0);
+    const auto t0 = std::chrono::steady_clock::now();
+    size_t seen = 0, solid = 0;
+    std::vector<char> done(scene.blasList.size(), 0), held(scene.tris.size(), 0);
     for (const MeshGroup& g : scene.meshGroups) {
         if (g.shapeOnly) continue;
         if (g.blasId >= 0 && g.blasId < (int)scene.blasList.size()) {
             if (done[(size_t)g.blasId]) continue;
             done[(size_t)g.blasId] = 1;
             std::vector<Tri>& tr = scene.blasList[(size_t)g.blasId].tris;
-            watertight::markSolidFaces(tr.data(), tr.size());
+            solid += watertight::markSolidFaces(tr.data(), tr.size());
+            seen += tr.size();
         } else if (g.triStart + g.triCount <= scene.tris.size()) {
-            watertight::markSolidFaces(scene.tris.data() + g.triStart, g.triCount);
+            solid += watertight::markSolidFaces(scene.tris.data() + g.triStart, g.triCount);
+            seen += g.triCount;
+            std::fill(held.begin() + (std::ptrdiff_t)g.triStart,
+                      held.begin() + (std::ptrdiff_t)(g.triStart + g.triCount), (char)1);
         }
     }
+    std::vector<Tri*> loose;
+    for (size_t i = 0; i < scene.tris.size(); ++i)
+        if (!held[i]) loose.push_back(&scene.tris[i]);
+    solid += watertight::markSolidFaces(loose.data(), loose.size());
+    seen += loose.size();
+    if (seen)
+        std::printf("[gather] %zu of %zu triangles bound closed solids, whose side the footprint "
+                    "probe reads (%.0f ms)\n", solid, seen,
+                    std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
 }
 
 static int runRender(const Scene& scene, const Camera& cam, char mode,
@@ -20380,9 +20405,16 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
             }
             uint64_t lsEpoch = 0;                    // whose realization the maps hold now
             uint64_t nRealized = 1;                  // realizations this frame drew (epoch 0's)
-            // The wall-clock refresh's count, for the checkpoint (lsEpochBase).
+            // The realizations the film holds, for the checkpoint, so a later wall-clock resume goes
+            // on past them (lsEpochBase): under the wall-clock refresh the loaded ones and those drawn
+            // since; under fixed epochs, which index their realizations by the frame's samples, the
+            // latest drawn and every one before it, or the loaded count where a wall-clock piece left
+            // more.
+            const long long loadedEpochs = prog->lightEpochs ? *prog->lightEpochs : 0;
             const auto keepLightEpochs = [&]() {
-                if (prog->lightEpochs && !nFixed) *prog->lightEpochs = (long long)(lsEpochBase + nRealized);
+                if (prog->lightEpochs)
+                    *prog->lightEpochs = nFixed ? std::max(loadedEpochs, (long long)(lsEpoch + 1))
+                                                : (long long)(lsEpochBase + nRealized);
             };
             keepLightEpochs();
             for (; !stopAll && sppAll < sppTarget && !ft::stopRequested(); ++epoch) {
@@ -27629,6 +27661,15 @@ static int run(int argc, char** argv) {
         return 0;
     }
 
+    // The footprint probes of modes M and S read which side of a closed solid a face is met from
+    // (Hit::solid): marked once for the whole batch, before the meter below gathers as the frames
+    // will, and only where a footprint is taken at all.
+    if (gatherAreaSamples() > 0 || gaGeomOn()) {
+        bool gathers = false;
+        for (const RenderCam& rc : toRender) gathers = gathers || rc.mode == 'M' || rc.mode == 'S';
+        if (gathers) markSolidFaces(scene);
+    }
+
     // -----------------------------------------------------------------------------
     // Exposure-lock meter pre-pass (REAL render). For every locked group being
     // rendered, meter its selector-chosen frame(s) with a quick *reduced-sample* CPU
@@ -28052,13 +28093,6 @@ static int run(int argc, char** argv) {
         }
         flights.push_back({i});
     };
-    // The footprint probes of modes M and S read which side of a closed solid a face is met from
-    // (Hit::solid): marked once, for the whole batch.
-    {
-        bool gathers = false;
-        for (const RenderCam& rc : toRender) gathers = gathers || rc.mode == 'M' || rc.mode == 'S';
-        if (gathers) markSolidFaces(scene);
-    }
     std::vector<int> groupM, groupMApart, restIdx;
     bool mModeBudgeted = false;   // a mode-M camera dropped from groupM by the budget test
     bool mBlurApart = false;      // ... or one blurring a moving scene the device cannot take alone

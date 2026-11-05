@@ -164,9 +164,10 @@ Then the rest of 4.2-4.6 in their order, 4.7's bookkeeping alongside whatever to
 - [ ] **CURVE-GATHER**, mode U's half (VCM-THIN-CURVES) — modes M and S done (0.433.3); mode U
   still merges on a `type diffuse` strand. Was: modes M, S and U misread a coat of `type diffuse` curves
   (`tools/check_fur_gather.py`), M's two backends differently; VCM-THIN-CURVES is its mode-U half.
-- [ ] **PROBE-PARITY-LIMITS** — the footprint probe's crossing count misreads an open surface
-  hovering within the radius, and a solid taller than it. Closed solids (analytic spheres, closed
-  meshes) now say their own side (0.434.5, PROBE-SOLID-SIDE); the count is left for the rest.
+- [ ] **PROBE-PARITY-LIMITS** — the footprint probe's crossing count misreads a photon-holding open
+  surface hovering within the radius, and a solid taller than it. Closed solids (analytic spheres,
+  closed meshes) say their own side (0.434.5, PROBE-SOLID-SIDE); since 0.434.9 so do inward-wound
+  meshes and quads closing a box, and open sheets that hold no photon count for nothing.
 - [ ] **PROBE-UNDERSIDE** — beside a ball resting on the floor the probe ends on the ball's tilted
   underside, seen from inside, where `-gageom`'s march counts the floor under it (0.939 of the probe
   at radius 0.1, diffuse ball).

@@ -121,8 +121,10 @@ struct Tri {
     // its shape at the frame's instant, which is one of the keys.
     int vkeys = -1;
     int vkeyCount = 0;
-    // 1 on the boundary of a closed solid wound outward (Scene::markSolidFaces), so a ray that
-    // meets it from behind (Hit::back) is leaving the solid. 0 on any face that cannot say.
+    // On the boundary of a closed solid (main.cpp markSolidFaces, over watertight::markSolidFaces):
+    // 1 with its normal out, so a ray meeting it from behind (Hit::back) is leaving the solid; 2 with
+    // it in. 0 on any face that cannot say. Set before a mode-M or mode-S batch, and read only by
+    // its footprint probes.
     unsigned char solidFace = 0;
     // triReach of the vertices, baked here for the hit to copy (Hit::pscale).
     double reach = 0.0;
@@ -300,11 +302,12 @@ struct Hit {
     // direction, dot(d, n), but not of one normal against another). An instance keeps its
     // local one, which that same property makes the world one too.
     bool back = false;
-    // The face bounds a closed solid wound outward (an analytic sphere, a triangle that
-    // Scene::markSolidFaces found so), so `back` says the ray is leaving it. False where the side
-    // a ray meets a face from says nothing of inside and out (an open quad, a curve, an
-    // isosurface). Every intersector writes it (the record is reused).
-    bool solid = false;
+    // The face bounds a closed solid, so `back` says which way the ray crosses it: +1 with the
+    // solid's normals out (from behind is leaving: an analytic sphere, a triangle Tri::solidFace
+    // marks 1), -1 with them in (from behind is entering), 0 where the side a ray meets a face from
+    // says nothing of inside and out (an open quad, a curve, an isosurface). Every intersector
+    // writes it (the record is reused).
+    signed char solid = 0;
     // The surface's material lets light cross it (Material::patOwnSide), so its patterns see
     // its own side, ng's: their normal and curvature turned there when `back`, its cavity
     // probed about ng (patCtxFromHit). Decided once, by Scene::markPatSide at the closest-hit
@@ -675,7 +678,7 @@ inline bool intersectTri(const TriShear& sh, const Ray& r, const Tri& tri,
     hit.ng = gn;
     hit.n = flipped ? -ns : ns;
     hit.back = flipped;
-    hit.solid = tri.solidFace != 0;
+    hit.solid = tri.solidFace == 1 ? 1 : tri.solidFace == 2 ? -1 : 0;
     hit.tangent = tri.tangent;             // per-triangle tangent (constant across the face)
     // For tangent-space normal mapping (C6): the frame is built about the normal on ng's side,
     // and the triangle's sign is taken about its winding (Tri::finalize).
@@ -737,7 +740,7 @@ inline bool intersectSphere(const Ray& r, const Sphere& s, double tmin, Hit& hit
     bool sFlipped = !(dot(r.d, ng) < 0.0);
     hit.n = sFlipped ? -ng : ng;
     hit.back = sFlipped;
-    hit.solid = true;
+    hit.solid = 1;
     // Analytic mean curvature of a sphere: 1/R everywhere, negated when seen from
     // inside (a room-sized sphere is concave to anything standing in it).
     hit.curv = (s.r > 1e-12) ? ((sFlipped ? -1.0 : 1.0) / s.r) : 0.0;

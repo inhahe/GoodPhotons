@@ -5688,26 +5688,36 @@ as the one at fault.
   below), and weighted by `1/cos(tilt)` because the
   probe samples PROJECTED area while the estimator needs SURFACE area. A photon-holding face off
   the band is another surface's: one below it ends the probe as a miss, and the probe goes on
-  through one above it. Every face it crosses above the plane that light cannot cross
-  (`passesLight`: anything but glass, a filter, a half mirror, a clear film, a diffuse transmitter
-  or a compound with such a lobe) is counted, photon-holding or not. Where it then meets the
-  gather's surface, the column may lie inside an opaque solid resting on it (a box's own bottom
-  face, or the floor inside a bottomless one), where no photon can be: a miss too. A mirror box
-  counts as much as a diffuse one (0.434.5). **Inside is decided by the faces' own side where they
-  can say (PROBE-SOLID-SIDE).** A face that bounds a closed solid wound outward carries
-  `Hit::solid` (device `DHit::solid`): an analytic sphere's always, and a triangle's when
-  `markSolidFaces` (main.cpp, over `watertight::markSolidFaces`) found its connected piece closed,
-  consistently wound, of positive volume and with every corner's normal on its winding side. That
-  pass runs once per batch with a mode-M or mode-S camera; the flag sits in `Tri`'s and `DTri`'s
-  padding. For such a face `Hit::back` says whether the probe went into the solid or out of it,
-  and the last one crossed, the nearest the plane, puts the column inside when it was an entry.
-  That holds even where the probe began inside the solid: under the overhang of a ball resting on
-  the floor, its origin r above the plane lies in the ball, and parity read the floor there as
-  inside (check_bitid's glossy mesh ball, mode S 1.84 of mode R before the rule). Every other face
-  (a quad, a curve, an isosurface, an open mesh) keeps the parity, odd meaning inside, and either
-  rule puts the column inside. `-gageom`'s march climbs, so there the first such face above the
-  plane decides, met from inside meaning inside. An in-band face seen from behind decides nothing:
-  a room built as one closed box is seen from inside everywhere. Counted as covered, every
+  through one above it. The opaque faces it crosses above the plane (`passesLight`: anything but
+  glass, a filter, a half mirror, a clear film, a diffuse transmitter or a compound with such a
+  lobe) say whether the column, where it then meets the gather's surface, lies inside an opaque
+  solid resting on it (a box's own bottom face, or the floor inside a bottomless one), where no
+  photon can be: a miss too. **Inside is decided by the faces' own side where they can say
+  (PROBE-SOLID-SIDE).** A face that bounds a closed solid carries `Hit::solid` (device
+  `DHit::solid`): +1 with the solid's normals out, -1 with them in. That is an analytic sphere's
+  always, and a triangle's when `markSolidFaces` (main.cpp, over `watertight::markSolidFaces`) found
+  its connected piece closed, consistently wound and with every face's corner normals on one side
+  of its winding, the whole piece on the same side; the volume says out or in. It goes per mesh
+  object, then over every triangle no mesh object holds (quads, a light's own surface) as one pool,
+  in which six quads meeting edge to edge form a box. The pass runs once per batch with a mode-M or
+  mode-S camera and a footprint taken, before the exposure meter; the flag sits in `Tri`'s and
+  `DTri`'s padding (FP32). For such a face `Hit::back` and the sign say whether the probe went into
+  the solid or out of it, and the last one crossed, the nearest the plane, puts the column inside
+  when it was an entry. A solid's face in the band but above the plane, met from inside, counts too:
+  a ball's tilted underside, which the band widens to take in. Met from outside it is a thin solid's
+  top lying in the band (a coaster's, whose photons the floor's gather takes 5 cm away and more): the
+  surface, where the probe ends. One on the plane, a box's own bottom, decides nothing. That
+  holds even where the probe began inside the solid: under the overhang of a ball resting on the
+  floor, its origin r above the plane lies in the ball, and parity read the floor there as inside.
+  A photon-holding face that cannot say (an open quad, a curve, an isosurface, an open mesh) keeps
+  the parity, odd meaning inside, and either rule puts the column inside. One that holds no photon
+  and cannot say -- an open mirror or glossy sheet, a light's quad -- counts for nothing: an open
+  sheet encloses nothing, and the floor under it is lit from the sides. `-gageom`'s march climbs and
+  decides each in-band layer of a column by the faces above it: the next solid face it meets above
+  the layer, met from inside meaning inside, and the parity of the rest, so a coaster's top counts
+  while the floor inside the coaster under it does not. An in-band
+  face seen from behind on the plane decides nothing: a room built as one closed box is seen from
+  inside everywhere. Counted as covered, every
   object standing on a surface ringed its base with a dark halo (0.75 of mode R within 5 cm of a
   3 cm box at radius 0.1; 0.99 with the count). A closed shelf hovering within the radius is
   crossed twice, and the floor under it counts (the plain disc average across its shadow). Two

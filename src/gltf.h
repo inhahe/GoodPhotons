@@ -74,6 +74,11 @@ inline double gltfRoughness(double r) {
     r = std::min(1.0, std::max(0.0, r));
     return std::min(1.0, r * r / 0.646);
 }
+// The least roughness a glTF glossy, coat or metal lobe is given: glossyExponent's own clamp, so the
+// floor widens no lobe the tracers can represent and only keeps a constant of 0 off the planar-mirror
+// path (isPlanarMirrorMat), which a glTF metal is not. The same for the constant and for a map's
+// texels, which glossyExponent clamps there.
+constexpr double kGltfMinRoughness = 1e-3;
 
 // GLTF-MAP-MEAN-GUTTERS: how much surface each texel of a `w` x `h` map carries, from the
 // triangles that sample it -- `uv` six per triangle (glTF's u, v: texel row v*h, Texture's
@@ -1083,7 +1088,7 @@ inline int loadGltf(Scene& s, const char* path, int fallbackMat, const Affine& x
                     wantCoat = gltfimp::dielectricSpecular;
                 } else if (metallic >= 0.5) {
                     m.type = MatType::Glossy;
-                    m.roughness = std::max(0.02, roughness);
+                    m.roughness = std::max(kGltfMinRoughness, roughness);
                 } else {
                     // A DIELECTRIC. glTF gives it a specular lobe as well as an albedo -- F0 =
                     // ((n-1)/(n+1))^2, 4 % at the default ior 1.5, carrying the SAME roughness
@@ -1134,7 +1139,7 @@ inline int loadGltf(Scene& s, const char* path, int fallbackMat, const Affine& x
                         // GLTF-LAYERED-DEFAULT). An import means what the asset was authored for.
                         lay.coatScatter = 2;
                         lay.ior = iorConstant(khrIor);           // KHR_materials_ior, else 1.5
-                        lay.roughness = std::max(0.02, roughness);
+                        lay.roughness = std::max(kGltfMinRoughness, roughness);
                         lay.roughnessTex = roughTexId;           // glTF's roughness drives the coat
                         if (normalTexId >= 0) {
                             lay.normalTex = normalTexId;         // the coat follows the same bumps
@@ -1152,7 +1157,7 @@ inline int loadGltf(Scene& s, const char* path, int fallbackMat, const Affine& x
                         Material coat;
                         coat.type = MatType::Glossy;
                         coat.reflect = rgbToReflectanceJH(1.0, 1.0, 1.0);
-                        coat.roughness = std::max(0.02, roughness);
+                        coat.roughness = std::max(kGltfMinRoughness, roughness);
                         coat.roughnessTex = roughTexId;
                         if (normalTexId >= 0) {
                             coat.normalTex = normalTexId;
@@ -1190,7 +1195,7 @@ inline int loadGltf(Scene& s, const char* path, int fallbackMat, const Affine& x
                     metal.type = MatType::Glossy;
                     metal.reflect = rgbToReflectanceJH(r, g, b);   // glTF: base colour IS the metal's tint
                     metal.reflectTex = reflectTexId;
-                    metal.roughness = std::max(0.02, roughness);
+                    metal.roughness = std::max(kGltfMinRoughness, roughness);
                     metal.roughnessTex = roughTexId;
                     if (normalTexId >= 0) { metal.normalTex = normalTexId; metal.normalStrength = normalScale; }
                     const int metalId = (int)s.mats.size();

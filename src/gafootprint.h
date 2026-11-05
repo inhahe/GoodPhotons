@@ -89,10 +89,11 @@ inline double gatherFootprintArea(const Scene& sc, const Vec3& p, const Vec3& n,
     double area = 0.0;
     // THE PROBE'S CROSSING RULE, per column (photonmap_render.h gatherCoverageRaw, where the why
     // is): faces off the band above the plane are another surface's, and the opaque ones
-    // (passesLight) say whether the column's in-band layers lie inside a solid resting on the
-    // surface (the floor under a box), where no photon can be -- so that column counts nothing.
-    // The march climbs, so the first closed solid's face above the plane (Hit::solid) decides
-    // by itself, met from inside (back) meaning inside; the rest count toward a parity.
+    // (passesLight) say whether an in-band layer lies inside a solid resting on the surface (the
+    // floor under a box), where no photon can be -- so that layer counts nothing. The nearest
+    // closed solid's face above a layer (Hit::solid) decides by itself, met from inside meaning
+    // inside; photon-holding faces that cannot say count toward a parity, and open sheets that
+    // hold none for nothing.
     for (int i = 0; i < kDisc; ++i) {
         // Sunflower placement: equal-area radii, golden-angle azimuth. Deterministic, so two
         // runs of the same scene give the same footprint and an A/B compares one thing.
@@ -113,9 +114,13 @@ inline double gatherFootprintArea(const Scene& sc, const Vec3& p, const Vec3& n,
         // just behind it (closestHit then drops the blanket tmin, as every curve-tmin caller does).
         double tBase = 0.0, tl = eps, ct = 0.0;
         int layers = 0;
-        double colArea = 0.0;
+        // Each in-band layer is decided by the faces above it, as the probe's is: the nearest closed
+        // solid's face above it, and the parity of those that cannot say. Climbing, a layer waits
+        // in `pend` until the next solid face decides it (`dec` if outside, dropped if inside),
+        // binned by the parity of the crossings below it, so the column's total says which bin has
+        // an even count above.
+        double pend[2] = {0.0, 0.0}, dec[2] = {0.0, 0.0};
         int crossed = 0;
-        int firstSolid = 0;                      // the first closed solid's face above: -1 out of it
         int strandSkips = 0;
         for (; layers < maxLayers; ++layers) {
             Ray ray{start + n * tBase, n, ct};
@@ -156,19 +161,27 @@ inline double gatherFootprintArea(const Scene& sc, const Vec3& p, const Vec3& n,
             // Same-facing and in the tangent-plane band: what the photon query keeps.
             const Vec3 dh = h.p - p;
             const double off = dot(dh, n);           // signed height above the tangent plane
+            // An opaque face above the plane (no hair strand: the probe's coin decides those). A
+            // closed solid's decides the layers below it by its side, in the band or out of it --
+            // a small ball's tilted underside lies in the band the tilt widens, and a thin solid's
+            // top may too (a coaster's), itself a layer the faces above it decide; one on the
+            // plane (a box's own bottom) says nothing. Off the band, a photon-holding face that
+            // cannot say counts toward the parity, and one that holds none, an open sheet, for
+            // nothing (the probe's rule).
+            const bool opaque = !(mm && (passesLight(sc, *mm) || mm->type == MatType::Hair));
+            if (opaque && h.solid && off > 1e-3 * r) {
+                if ((h.solid > 0) != h.back) { dec[0] += pend[0]; dec[1] += pend[1]; }   // entered: below is outside
+                pend[0] = pend[1] = 0.0;
+            }
             if (h.t <= span && withinGatherBand(std::fabs(off), dot(dh, dh), std::fabs(c), slack)) {
-                if (c >= kGatherFacingCos) colArea += cellArea / c;
-            } else if (off > 0.0) {
-                // an opaque face, photon-holding or not, but no hair strand (the probe's coin
-                // decides those)
-                if (!(mm && (passesLight(sc, *mm) || mm->type == MatType::Hair))) {
-                    if (!h.solid) ++crossed;
-                    else if (firstSolid == 0) firstSolid = h.back ? -1 : 1;
-                }
+                if (c >= kGatherFacingCos) pend[crossed & 1] += cellArea / c;
+            } else if (off > 0.0 && opaque && !h.solid && mm && holdsPhotons(sc, *mm, h.fiberRadius)) {
+                ++crossed;
             }
             tl = h.t - tBase + eps; ct = 0.0;
         }
-        if ((crossed & 1) == 0 && firstSolid >= 0) area += colArea;
+        // Layers no solid face above decided lie outside every solid.
+        area += dec[crossed & 1] + pend[crossed & 1];
         if (layers >= maxLayers && incomplete) *incomplete = true;
     }
     return area;

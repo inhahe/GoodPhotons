@@ -711,7 +711,7 @@ bool cudaPatOpProbe(const PatNode* prog, const int* off, const int* len, int nPr
 // hold against its own intersectors, closestHit and patCtxFromHit.
 struct DevHitProbeRay { double o[3], d[3]; int kind, index; };
 struct DevHitProbeOut {
-    int    valid, matId, back, patOwnSide, vcol;
+    int    valid, matId, back, patOwnSide, vcol, solid;
     double t, p[3], n[3], ng[3], pscale, fiberRadius, curv, tangentZ;
     double q[3], qn[3], qcurv;   // dPatIn: the point, normal and curvature a pattern reads there
     double cavity;               // dCavityOf: its `cavity`, where the material reads it

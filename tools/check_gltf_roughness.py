@@ -8,7 +8,8 @@ Writes one-quad GLBs of a metal (no coat, so the material is one glossy lobe) an
 (mode R, CPU, fixed seed) against the same quad with `import_materials no` and the FTSL glossy
 material the import should produce:
 
-  - roughnessFactor 0.5, no map: byte-identical to `roughness 0.25/0.646`;
+  - roughnessFactor 0.5, no map: byte-identical to `roughness 0.25/0.646`; and 0.05 to
+    `roughness 0.0025/0.646`, the importer's floor being the exponent's own clamp (1e-3);
   - roughnessFactor 1, a constant map of G 128: within float noise of `roughness (128/255)^2/0.646`
     (the map is sampled bilinearly, so the texel need not come back to the last bit);
   - each against the raw roughness the importer used to copy, which must differ, so the rig can
@@ -137,6 +138,13 @@ def main():
           "%d of %d bytes differ" % (sum(x != y for x, y in zip(imp, conv)), len(imp)))
     rel = np.abs(imp_img - raw_img).sum() / max(1e-30, raw_img.sum())
     check("  ... and not as the raw 0.5", rel > 0.02, "relative L1 %.3f" % rel)
+
+    # 1b. A low factor, below where a floor in ftrace's units would reach: as sharp as glTF means.
+    write_glb(os.path.join(d, "low.glb"), 0.05)
+    imp, _ = render("low_import", scene("low.glb"))
+    conv, _ = render("low_ftsl", scene("low.glb", 0.05 * 0.05 / 0.646))
+    check("factor 0.05 imports as roughness 0.0025/0.646 (byte-identical)", imp == conv,
+          "%d of %d bytes differ" % (sum(x != y for x, y in zip(imp, conv)), len(imp)))
 
     # 2. A constant map under factor 1.
     g = 128

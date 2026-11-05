@@ -168,10 +168,12 @@ struct LightVertex {
     // went on (compoundMergeStoreProb, COMPOUND-MERGE-PICK); 1 elsewhere. The connections never read
     // it: they evaluate the lobe the walk took, the mixture's own sampling.
     double mergeW = 1.0;
-    // Whether the connections (the camera's, and the t=1 splat) may use it: the lobe the walk took
-    // here is connectible. A compound's merge vertex stored under a mirror or glass pick is not.
-    bool   connects = true;
 };
+// Whether the connections may use a stored light vertex: the lobe its walk took is connectible. A
+// compound's merge vertex stored under a mirror or glass pick is not (compoundMergeStoreProb).
+inline bool lightVertexConnects(const LightVertex& lv) {
+    return lv.mat && isConnectibleMat(*lv.mat) && !isFiberMat(*lv.mat);
+}
 
 // The hero bundle's SECONDARY wavelengths for a stored light vertex. Deliberately a
 // SEPARATE array indexed in lockstep with `lightVerts` rather than extra fields inside
@@ -807,7 +809,6 @@ inline void traceLightSubpath(const Scene& scene, const Camera& cam, const Rende
             lv.dVCM = dVCM; lv.dVC = dVC; lv.dVM = dVM;
             lv.matId = h.matId; lv.mat = mp; lv.hit = h; lv.edges = edges;
             lv.mergeW = (storeP > 0.0) ? 1.0 / storeP : 1.0;
-            lv.connects = connectible;
             out.push_back(lv);
             if (C > 1) {                              // lockstep secondary payload
                 LightVertexSec ls; ls.nUp = nUp;
@@ -1254,7 +1255,7 @@ inline Vec3 traceCameraSubpath(const Scene& scene, const Camera& cam, const Rend
             // (c) Vertex connection: connect to the PAIRED light subpath's vertices.
             for (int j = pathBegin; j < pathEnd; ++j) {
                 const LightVertex& lv = lightVerts[j];
-                if (!lv.connects) continue;                           // a merge vertex only
+                if (!lightVertexConnects(lv)) continue;              // a merge vertex only
                 if (edges + lv.edges + 1 > ctx.maxDepth) continue;   // full path too long
                 Vec3 d = lv.p - h.p; double dist2 = dot(d, d);
                 if (dist2 <= 1e-12) continue;
@@ -1356,8 +1357,9 @@ inline Vec3 traceCameraSubpath(const Scene& scene, const Camera& cam, const Rend
                     // never deposited on). The merge treats a stored vertex purely as a photon
                     // and evaluates the CAMERA BSDF against it, so a photon on a strand lying
                     // on the skin bleeds into every skin gather point within the radius.
-                    // Measured: opaque hair 2.79x mode R with this merge, 1.029x without.
-                    if (lv.mat && lv.mat->type == MatType::Hair) return;
+                    // Measured: opaque hair 2.79x mode R with this merge, 1.029x without. On the
+                    // strand, not of its lobe: a mix's hair lobe picked on a mesh is no strand.
+                    if (lv.mat && lv.mat->type == MatType::Hair && lv.hit.fiberRadius > 0.0) return;
                     Vec3 wMerge = lv.wo;                                // incident illumination dir
                     if (mergeFromBehind(camTwoSided, wMerge, ngoCam)) return;
                     // camera BSDF evaluated at the light vertex's wavelength (XYZ estimate).

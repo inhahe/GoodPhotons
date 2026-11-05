@@ -449,18 +449,20 @@ inline double gatherCoverageRaw(const Scene& scene, const Vec3& p, const Vec3& n
         {
             Ray pr{q + n * r, n * -1.0};
             double tAcc = 0.0;
-            // The opaque faces (passesLight) passed above the plane, which say whether the column
-            // ends inside a solid resting on this surface. One that bounds a closed solid wound
-            // outward (Hit::solid) says itself whether the probe went into it or out of it, so the
-            // last such, the nearest the plane, says whether the column ends in one (`lastSolid`:
-            // +1 into, -1 out of, 0 none) even where the probe began inside it (under the overhang
-            // of a ball resting on the floor). Every other face counts toward a parity (`crossed`),
-            // odd inside. Either puts the column inside.
+            // The opaque faces (passesLight) passed above the plane say whether the column ends
+            // inside a solid resting on this surface. One that bounds a closed solid (Hit::solid)
+            // says itself whether the probe went into it or out of it, so the last such, the
+            // nearest the plane, says whether the column ends in one (`lastSolid`: +1 into, -1 out
+            // of, 0 none), even where the probe began inside it (under the overhang of a ball
+            // resting on the floor). A photon-holding face that cannot say counts toward a parity
+            // (`crossed`, odd inside); one that holds none and cannot say -- an open mirror or a
+            // light's quad -- counts for nothing, an open sheet enclosing nothing. Either count can
+            // put the column inside.
             int crossed = 0, lastSolid = 0;
-            const auto cross = [&](const Hit& c, const Material* cm) {
+            const auto cross = [&](const Hit& c, const Material* cm, bool holds) {
                 if (cm && passesLight(scene, *cm)) return;
-                if (c.solid) lastSolid = c.back ? -1 : 1;
-                else         ++crossed;
+                if (c.solid) lastSolid = ((c.solid > 0) == c.back) ? -1 : 1;   // leaving : entering
+                else if (holds) ++crossed;
             };
             bool found = false;                  // the probe ended on what it counts
             // A strand the probe passes through costs none of the sixteen faces, up to 48 of them:
@@ -485,7 +487,7 @@ inline double gatherCoverageRaw(const Scene& scene, const Vec3& p, const Vec3& n
                 // height, and passing it would skip the surface beside it. An opaque one is a
                 // crossing all the same: a mirror box shadows the floor under it.
                 if (pm && probePassesThrough(scene, *pm) && r - h.t > 1e-3 * r) {
-                    cross(h, pm);
+                    cross(h, pm, false);
                     tAcc = h.t;
                     pr = Ray{h.p + pr.d * 1e-9, pr.d};
                     continue;
@@ -501,11 +503,18 @@ inline double gatherCoverageRaw(const Scene& scene, const Vec3& p, const Vec3& n
                 }
                 const double dzH = r - h.t;
                 if (withinGatherBand(std::fabs(dzH), rr * rr + dzH * dzH, dot(orientedGeoN(h), n), slack)) {
+                    // A closed solid's face in the band but above the plane, met from inside (a
+                    // ball's tilted underside, which the band widens to take in), is crossed
+                    // first: the probe leaves the ball over the floor. Met from outside it is the
+                    // solid's top in the band (a coaster's), a surface the gather's photons lie
+                    // on, which the faces above it decide. One on the plane (a box's own bottom)
+                    // is the surface's height, and says nothing.
+                    if (h.solid && dzH > 1e-3 * r && (h.solid > 0) == h.back) cross(h, pm, true);
                     found = (crossed & 1) == 0 && lastSolid <= 0;
                     break;
                 }
                 if (!(dzH > 0.0)) break;                                // below the band: a miss
-                cross(h, pm);
+                cross(h, pm, true);
                 tAcc = h.t;
                 pr = Ray{h.p + pr.d * 1e-9, pr.d};
             }

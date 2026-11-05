@@ -5562,10 +5562,13 @@ inline double compoundMergeStoreProb(const Scene& scene, const Material& m, doub
     bool any = layered && valid(m.coatChild) && keep(scene.mats[(size_t)m.coatChild]);
     for (int c : m.mixChildren) any = any || (valid(c) && keep(scene.mats[(size_t)c]));
     if (!any) return 0.0;
-    double body = 1.0;                   // mixResolveChild's chance of a child (no leftover slice)
-    if (!(m.mixChildren.size() == 2 && (m.mixWeightPat >= 0 || m.mixWeightTex >= 0))) {
+    // mixResolveChild's chance of a valid child: a slot naming none ends the walk as the leftover does.
+    double body = 1.0;
+    if (!(m.mixChildren.size() == 2 && (m.mixWeightPat >= 0 || m.mixWeightTex >= 0) &&
+          valid(m.mixChildren[0]) && valid(m.mixChildren[1]))) {
         body = 0.0;
-        for (double w : m.mixWeights) body += w;
+        for (size_t k = 0; k < m.mixChildren.size() && k < m.mixWeights.size(); ++k)
+            if (valid(m.mixChildren[k])) body += m.mixWeights[k];
         if (body > 1.0) body = 1.0;
     }
     return layered ? (valid(m.coatChild) ? coatR : 0.0) + (1.0 - coatR) * body : body;

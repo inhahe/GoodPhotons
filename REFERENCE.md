@@ -3552,7 +3552,10 @@ are worth knowing about:
   So the import takes `r_t = min(1, r² / 0.646)`: the factor when there is no map, and each
   texel of the map (with the map's mean as the material's constant). Before 0.434.4, `r` was
   copied raw, so every imported glossy surface was blurrier than glTF means: α 0.16 for a glTF
-  0.25, where glTF means 0.0625. The two agree only near `r` 1. The raster preview's GGX now
+  0.25, where glTF means 0.0625. The two agree only near `r` 1. The least it is given is `r_t`
+  0.001 (glTF 0.025), the tracers' own floor; from 0.434.4 to 0.434.8 a factor with no map was
+  floored at `r_t` 0.02 after the conversion, so a constant under glTF 0.11 imported as 0.11 while a
+  map's texels did not. The raster preview's GGX now
   comes out at glTF's own α for `r` up to 0.8. Past that, ftrace's lobe is already at its widest
   (`r_t` 1, a cosine lobe). Frosted glass (`KHR_materials_transmission` with a roughness)
   uses the same conversion for its refracted lobe.

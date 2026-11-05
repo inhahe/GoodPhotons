@@ -302,7 +302,7 @@ struct Vertex {
     // pick took (compoundMergeStoreProb, COMPOUND-MERGE-PICK): the merges' share of it, 1 over the
     // chance that pick went on. 0 anywhere else, where the vertex's own lobe decides
     // (surfMergeSite) at weight 1. The connections never read it.
-    double mergeW = 0.0;
+    double compoundMergeW = 0.0;
     // Area-measure pdfs of sampling THIS vertex from the previous / next vertex
     // along the two transport directions. Delta vertices store 0 (skipped in MIS).
     double pdfFwd = 0.0;
@@ -1234,8 +1234,8 @@ inline void randomWalk(const Scene& scene, const Camera& cam, const Renderer& ma
 
         // Resolve material (Mix -> child, or absorbed on the leftover slice).
         const Material* mp = &scene.mats[h.matId];
-        // A compound's merge vertex, for a light walk's surface photons (Vertex::mergeW): stored
-        // whatever lobe the pick takes, at 1 over the chance it goes on; 0 where none could be.
+        // A compound's merge vertex, for a light walk's surface photons (Vertex::compoundMergeW):
+        // stored whatever lobe the pick takes, at 1 over the chance it goes on; 0 where none could be.
         double storeP = 0.0;
         if (mp->type == MatType::Mix) {
             storeP = compoundMergeStoreProb(scene, *mp, 0.0, storesMergeVertex);
@@ -1290,7 +1290,7 @@ inline void randomWalk(const Scene& scene, const Camera& cam, const Renderer& ma
         v.type = VType::Surface;
         v.p = h.p; v.ns = h.n; v.ng = h.ng; v.hit = h;
         v.matId = h.matId; v.mat = mp; v.beta = beta;
-        v.mergeW = (storeP > 0.0) ? 1.0 / storeP : 0.0;
+        v.compoundMergeW = (storeP > 0.0) ? 1.0 / storeP : 0.0;
         v.nUp = nUp;
         for (int i = 0; i + 1 < nUp; ++i) v.betaSec[i] = betaSec[i];
         if (mp->isLight) {
@@ -2322,8 +2322,8 @@ inline bool surfMergeSite(const Vertex& v) {
     // NOR ON A LIGHT BLOCK'S OWN SURFACE (`reflectsNothing`). A merge there contributes nothing,
     // since it reflects nothing, but a photon stored there would be gathered by every OTHER
     // surface within the radius (known-issues J-LAMP-PHOTONS).
-    return v.type == VType::Surface && !v.delta && v.mat && isConnectibleMat(*v.mat) &&
-           !v.mat->reflectsNothing && !isFiberMat(*v.mat) && !(v.hit.fiberRadius > 0.0);
+    return v.type == VType::Surface && !v.delta && v.mat && storesMergeVertex(*v.mat) &&
+           !(v.hit.fiberRadius > 0.0);
 }
 inline double mergeEtaPrimeSurf(const Vertex& v, double pLight) {
     if (!surfMergeSite(v)) return 0.0;
@@ -2820,8 +2820,8 @@ inline void traceLightBeamPass(const Scene& scene, const Camera& cam, long long 
                 // too since 0.387.0, with that 0 read as 1 (MODE-J-SDS; mergeLightDensity).
                 const double plU = mergeLightDensity(path[u].pdfFwd, path[u - 1].delta);
                 // A compound's merge vertex is a photon whatever lobe the light's pick took there
-                // (Vertex::mergeW), off a curve like any other.
-                const bool compoundSite = path[u].mergeW > 0.0 && path[u].type == VType::Surface &&
+                // (Vertex::compoundMergeW), off a curve like any other.
+                const bool compoundSite = path[u].compoundMergeW > 0.0 && path[u].type == VType::Surface &&
                                           !(path[u].hit.fiberRadius > 0.0);
                 if (wantSurf && (surfMergeSite(path[u]) || compoundSite) && plU > 0.0 &&
                     path[u].beta > 0.0) {
@@ -2829,21 +2829,21 @@ inline void traceLightBeamPass(const Scene& scene, const Camera& cam, long long 
                     // a connection to y_u needs only y_{u-1} not to be one (SurfMis::gateC1); `gate`
                     // reads y_u's own lobe, the light's.
                     const unsigned char gateMerge = dPrev ? 0 : 1;
-                    Vec3 dPrev = path[u - 1].p - path[u].p;
-                    const double rho2 = dot(dPrev, dPrev);
+                    Vec3 toPrev = path[u - 1].p - path[u].p;
+                    const double rho2 = dot(toPrev, toPrev);
                     if (rho2 > 0.0) {
                         const double rho = std::sqrt(rho2);
-                        dPrev = dPrev * (1.0 / rho);
+                        toPrev = toPrev * (1.0 / rho);
                         // The cosine of pdfRev*(y_{u-1}) is at y_{u-1} and faces back along
                         // this same edge; 1 at a medium vertex, which has no normal.
                         const double cosPrev = path[u - 1].onSurface()
-                                             ? std::fabs(dot(path[u - 1].ns, dPrev)) : 1.0;
+                                             ? std::fabs(dot(path[u - 1].ns, toPrev)) : 1.0;
                         SurfBank& sb = sbanks[(size_t)tid];
                         SurfPhoton ph;
                         ph.p      = path[u].p;
-                        ph.wo     = dPrev;                 // unit, toward the previous vertex
+                        ph.wo     = toPrev;                 // unit, toward the previous vertex
                         ph.lambda = (float)hb.lam[0];
-                        ph.beta   = (float)(path[u].beta * (compoundSite ? path[u].mergeW : 1.0));
+                        ph.beta   = (float)(path[u].beta * (compoundSite ? path[u].compoundMergeW : 1.0));
                         ph.cx = (float)cieX(ph.lambda);
                         ph.cy = (float)cieY(ph.lambda);
                         ph.cz = (float)cieZ(ph.lambda);

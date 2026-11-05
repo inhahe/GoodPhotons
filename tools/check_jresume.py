@@ -84,7 +84,8 @@ def main():
 
     log = run(False)
     k0 = sidecar_count(ftbuf)
-    check("a fresh render's sidecar records its realizations", k0 is not None and k0 > 1, "count %s" % k0)
+    # One or more: the CPU may draw a single realization in the budget, the resumes' growth is held below.
+    check("a fresh render's sidecar records its realizations", k0 is not None and k0 >= 1, "count %s" % k0)
     check("  ... and it says nothing of a resume", "resuming after" not in log)
     prev = k0 or 0
     for piece in (1, 2):

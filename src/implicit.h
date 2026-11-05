@@ -417,7 +417,7 @@ inline bool intersectImplicit(const Ray& r, const Implicit& im, double tmin, Hit
         hit.t = th; hit.p = p; hit.valid = true;
         hit.ng = ng;
         hit.back = !(dot(r.d, ng) < 0.0);
-        hit.solid = false;
+        hit.solid = 0;
         hit.n  = hit.back ? -ng : ng;
         hit.matId = im.matId; hit.sensorId = -1;
         if (im.uvProj != UvProjection::None) {
