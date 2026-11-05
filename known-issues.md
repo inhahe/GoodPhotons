@@ -1296,7 +1296,15 @@ Final: 0.385.0 130–134 s, 0.386.0 49–52 s for 32 spp (2.6x), against mode D'
 `_fog_cornell` (homogeneous fog, dense hits, none of this helps) is ~4 % slower (7.1 s against
 6.8 s for 16 spp at 96²); see the design note for what was ruled out.
 
-## OPEN (2026-10-20): CPU-ONLY-BUILD — a build without CUDA does not compile
+## DONE (2026-11-05; opened 2026-10-20): CPU-ONLY-BUILD — a build without CUDA does not compile
+
+**Fixed 2026-11-05.** main.cpp includes `render_cuda.h` and `raster_cuda.h` in every build: they
+are plain C++ interfaces, and the types the entry names (`PatOpProbeIn`, `raster_cuda::NdResident`)
+are all a CPU-only build needed of them; only the calls stay under `HAVE_CUDA`. `keepDegen` read
+`gpuRaster`, which only a CUDA build declares. `build_cpu` then compiled and linked with nothing
+else behind those errors. Its binary passes `-checkpatops` (host only), says it renders on the CPU
+for `-device gpu`, and writes HDR output identical to the CUDA build's CPU path on check_bitid's
+`flat` in modes R, M and S. README's build section says how to make one.
 
 `build_cpu` (`scraps/build_cpu.bat`, configured with an empty `CMAKE_CUDA_COMPILER`, kept so CPU
 work can build while a render holds `build_cuda*/bin/ftrace.exe`) fails in `main.cpp`: code outside

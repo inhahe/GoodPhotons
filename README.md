@@ -332,8 +332,12 @@ The binary lands at `build/bin/ftrace` (`.exe` on Windows).
 > cmake -B build -S . -G "Visual Studio 18 2026" -A x64 \
 >   -T "cuda=C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v13.4"
 > ```
-> A CUDA-linked `ftrace.exe` is ~3 MB vs ~0.8 MB for a CPU-only build — a quick size
-> check tells you which you got.
+> A CUDA-linked `ftrace.exe` is ~24 MB vs ~7 MB for a CPU-only build — a quick size
+> check tells you which you got. To build CPU-only on purpose (or beside a CUDA build, say while
+> a render holds its `ftrace.exe`), configure a directory of its own with the CUDA compiler
+> blanked: `cmake -S . -B build_cpu -DCMAKE_CUDA_COMPILER=`, then
+> `cmake --build build_cpu --config Release --target ftrace`. `-device gpu` then says so and
+> renders on the CPU.
 >
 > **After any change of host compiler or CUDA toolkit, run `python tools/check_device_probe.py`.**
 > The GPU half of the binary is compiled against the host compiler's headers, so a toolchain

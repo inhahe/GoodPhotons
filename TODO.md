@@ -105,7 +105,7 @@ Each names the section its line is in.
 10. ~~**FWD-GLOSSY-INDIRECT**~~ (0.434.8) (4.2) — modes A and B leave a rough reflector black in a
     mirror or through glass, and splat no clearcoat sheen. Done; LAYERED-BODY-COIN and
     FWD-SMOOTH-COAT logged.
-11. **CPU-ONLY-BUILD** (4.4) — a build without CUDA does not compile.
+11. ~~**CPU-ONLY-BUILD** (4.4) — a build without CUDA does not compile.~~ Done.
 12. **BLUR-EPOCH-COST** (4.5) — a blurred clock-budgeted mode M or J spends its clock rebuilding.
 13. **UPBP-W-CHROMATIC** (4.3) — mode J's beam weight mixes two wavelengths in a chromatic medium.
 14. **FEATHER-IS-A-THRESHOLD** (4.2) — `feather` shrinks a cloud instead of ramping it; the fix
@@ -302,8 +302,8 @@ Then the rest of 4.2-4.6 in their order, 4.7's bookkeeping alongside whatever to
 
 ### 4.4 Tech debt
 
-- [ ] **CPU-ONLY-BUILD** — a build without CUDA does not compile (`main.cpp` names device-only types
-  outside `#ifdef HAVE_CUDA`).
+- [x] **CPU-ONLY-BUILD** — a build without CUDA did not compile (`main.cpp` named device-only types
+  outside `#ifdef HAVE_CUDA`). The two device headers are included in every build now.
 - [ ] **GLOSSY-SAMPLE-SITES** — the interference factor is applied by hand at every glossy sampler.
 - [ ] **REMAP0-IMPOSSIBLE** — the MIS sums read a zero density as a delta's, whatever made it zero
   (only the sun's is special-cased).

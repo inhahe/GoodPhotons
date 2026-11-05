@@ -189,11 +189,11 @@
                                // Unconditional — section 1 of the check (the structural
                                // invariants) runs in a CPU-only build too.
 #include <cstdarg>             // checkLattice's variadic failure reporter
-#ifdef HAVE_CUDA
+// Plain C++ interfaces to the device code, included in a CPU-only build too: the types they
+// declare (probe records, the resident -nd warp, the raster's settings) are named outside
+// `HAVE_CUDA`, and only the calls into them need the device.
 #include "render_cuda.h"
 #include "raster_cuda.h"   // GPU preview rasterizer (device twin of raster::renderFrame)
-#endif
-struct CudaSceneHold;      // render_cuda.h; named in signatures a CPU-only build compiles too
 #ifdef HAVE_CUDA
 // A device copy of a scene kept across calls (cudaHoldScene), released with its owner.
 using SceneHoldPtr = std::unique_ptr<CudaSceneHold, void (*)(CudaSceneHold*)>;
@@ -26792,7 +26792,11 @@ static int run(int argc, char** argv) {
                 };
                 // Keep zero-area triangles when the GPU rasterizer is in play, so the
                 // slot layout the resident path writes into cannot shift under it.
+#ifdef HAVE_CUDA
                 const bool keepDegen = (gpuRaster != nullptr);
+#else
+                const bool keepDegen = false;
+#endif
                 ndLastStats = ndwarp::apply(ndModel, ndCfg, scene, &ndCache, keepDegen);
                 ndWarpStart = (int)ndModel.keep.size();
                 ndHostStale = false;
