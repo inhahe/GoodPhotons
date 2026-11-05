@@ -1890,7 +1890,21 @@ segSumM would be precomputed at JSpec's 24 bins per camera path and interpolated
 that means 2 × 24 floats more per wavefront segment record. Achromatic media, which is nearly all
 of them (gallery_rain's included), are unaffected.
 
-## OPEN (2026-10-19): UPBP-BEAM-RADIUS — mode J's beam kernel never shrinks, so its O(r) blur bias never goes away
+## DONE (2026-11-05, 0.434.0; opened 2026-10-19): UPBP-BEAM-RADIUS — mode J's beam kernel never shrinks, so its O(r) blur bias never goes away
+
+**Fixed in 0.434.0.** Each light-side epoch e builds its beam map at r * (e+1)^(alpha-1) under
+`-vcmalpha` (progressive photon beams' 1D schedule; the surface merges' is (alpha-1)/2), the `-beamk`
+floor scaled with it so buildAuto does not widen the radius back, and the merge weight's kappa
+follows from the map's radius. Epoch 0 is unchanged; `-vcmalpha 1` holds the radius still.
+`_fog_cornell` (64x64, `-max-bounce 8 -beamcount 1e5 -beamk 2 -nojsurf -beamsinmin 0`, GPU, J 4096
+spp against D 16384), J/D: fixed radius -0.704 % (4 seeds, standard error 0.08 %); 256 epochs
+-0.430 %; one epoch per sample (`-beamepochs 4096`) -0.065 % on seed 1, whose fixed-radius and
+256-epoch runs read -0.859 % and -0.593 %. So the deficit falls with the epochs' radius, and per-sample
+epochs all but remove it; they cost light-side rebuilds (about 30 min a seed there against 2.5 for
+256). J-FOG-REALCAM, the same blur on a larger scale, is measured in its entry.
+
+The original report:
+
 
 `-beamblur` (default 0.01 of a medium's mean free path) sets the beam × ray kernel's radius once,
 and every epoch reuses it. The kernel blurs beams across surfaces where there are none, so a

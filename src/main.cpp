@@ -14168,8 +14168,10 @@ static bool jSkipHostBvh() {
     return g_jDevBeamOk && !g_jHostLight && !envOff;
 }
 
+// `radScale` scales every medium's kernel radius and, with it, the `-beamk` floor that would
+// otherwise widen a smaller radius straight back: mode J's per-epoch shrink (UPBP-BEAM-RADIUS).
 static double buildBeamMap(BeamMap& bm, const char* tag, double work, bool quiet = false,
-                           const Scene* vcScene = nullptr) {
+                           const Scene* vcScene = nullptr, double radScale = 1.0) {
     // `quiet` exists for mode J's light-side REFRESH (see g_beamFreeze): that rebuilds this
     // map once per progressive epoch, and re-printing the same four-line map description on
     // every rebuild would bury the render's own status lines under a description that has not
@@ -14324,11 +14326,11 @@ static double buildBeamMap(BeamMap& bm, const char* tag, double work, bool quiet
         // Explicit radius: one value for every medium, but still split by the same
         // area-optimal rule buildAuto uses. The rule keys off the radius, so an explicit one
         // feeds it directly — nothing scene-scale here.
-        bm.setUniformRadius(g_beamRadiusAbs);
+        bm.setUniformRadius(g_beamRadiusAbs * radScale);
         const double areaBefore = bm.totalBoxArea();
         double meanSplit = 0.0;
         bm.build(g_beamSplitLen, splitBudget, work, &meanSplit, /*skipBvh*/ jSkipHostBvh());
-        r = g_beamRadiusAbs;
+        r = g_beamRadiusAbs * radScale;
         say("%s photon beams: %zu stored -> %zu after split, kernel radius %.4g "
                     "(-beamradius), mean split %.4g, box area %.4g -> %.4g m^2 (%.2fx), "
                     "BVH in %s\n", tag, raw, bm.beams.size(), r, meanSplit,
@@ -14355,10 +14357,13 @@ static double buildBeamMap(BeamMap& bm, const char* tag, double work, bool quiet
                             100.0 * (double)nS / (double)raw, pT > 0 ? 100.0 * pS / pT : 0.0);
         }
     } else {
+        // A scene's per-medium `beam_blur` scales with the rest (<= 0 still means the global).
+        std::vector<double> medBlur = g_medBeamBlur;
+        for (double& b : medBlur) if (b > 0.0) b *= radScale;
         const BeamMap::AutoInfo ai =
-            bm.buildAuto(g_beamBlur, g_beamK, g_beamAreaSlack, splitBudget, g_beamSplitLen, work,
-                         /*skipBvh*/ jSkipHostBvh(),
-                         g_medBeamBlur.empty() ? nullptr : &g_medBeamBlur);   // scene `beam_blur`
+            bm.buildAuto(g_beamBlur * radScale, g_beamK * radScale, g_beamAreaSlack, splitBudget,
+                         g_beamSplitLen, work, /*skipBvh*/ jSkipHostBvh(),
+                         medBlur.empty() ? nullptr : &medBlur);   // scene `beam_blur`
         r = bm.radius;
         // One line PER MEDIUM: the radius is per medium now, so a single number would hide
         // exactly the thing that makes a two-medium scene work. mfp is the measured mean stored
@@ -19640,6 +19645,19 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
             const double r  = surfRadius0 * std::pow(it, 0.5 * (g_vcmAlpha - 1.0));
             return (r > 0.0) ? r : surfRadius0;    // guards a pathological -vcmalpha
         };
+        // THE BEAM KERNEL SHRINKS TOO (UPBP-BEAM-RADIUS). A beam merge's kernel is 1D, so its bias
+        // is O(r), and held at `-beamblur` it was a floor: mode J read a walled fog 0.7 % low at
+        // the default radius, 1.8 % at 4x, 0.1 % at a quarter, whatever the sample count
+        // (J-FOGCORNELL). Progressive photon beams' schedule for a 1D kernel, under the same
+        // -vcmalpha and epoch index as the point merges: r_e = r * (e+1)^(alpha-1). The epochs'
+        // mean bias is then the Cesaro mean of O(r_e), which goes to 0, and each epoch's
+        // variance, O(1/r_e), grows slowly enough that the mean's still falls. Epoch 0 keeps `r`
+        // exactly, so a single-epoch render is unchanged; -vcmalpha 1 holds it still. The merge
+        // weight follows on its own: its kappa is read off the map's radius at gather time.
+        auto beamRadScaleFor = [&](uint64_t epoch) {
+            const double s = std::pow((double)(epoch + 1), g_vcmAlpha - 1.0);
+            return (s > 0.0 && s <= 1.0) ? s : 1.0;   // guards a pathological -vcmalpha
+        };
         if (!wantBeams && !wantSurf)
             std::printf("mode J: %s, so there is nothing to merge against; "
                         "this render is mode D exactly (-jsurf adds surface merges).\n",
@@ -19920,7 +19938,7 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
                 if (first) liveWindowPlaceholder(res, resY, "building beam map\xE2\x80\xA6");
                 buildBeamMap(bmap, "mode J:",
                              (double)res * (double)resY * (double)(spp > 0 ? spp : 16),
-                             /*quiet*/!first, &scene);
+                             /*quiet*/!first, &scene, beamRadScaleFor(epoch));
             }
             const double buildSec =
                 std::chrono::duration<double>(std::chrono::steady_clock::now() - tp0).count();

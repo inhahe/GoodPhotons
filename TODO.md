@@ -97,8 +97,8 @@ Each names the section its line is in.
 7. ~~**MODEM-BEAM-CARRIER**~~ (0.433.5), ~~**JSPEC-GAPS**' support~~ (0.433.11) and
    ~~**MODEM-REDPASS**~~ (not reproduced) (4.2) — mode M's beams, and mode J's last camera-side
    factors, at the camera's wavelength. Done.
-8. **UPBP-BEAM-RADIUS** with **J-FOG-REALCAM** (4.3) — mode J's beam kernel never shrinks: fog 1-4 %
-   low, never converging.
+8. ~~**UPBP-BEAM-RADIUS**~~ (0.434.0) with **J-FOG-REALCAM** (4.3) — mode J's beam kernel shrinks
+   per epoch now; J-FOG-REALCAM's CPU-only extra deficit is what is left.
 9. **GLTF-ROUGHNESS-MAP** and **GLTF-MAP-MEAN-GUTTERS** (4.2) — glTF imports rougher than glTF means,
    and their mean metalness and roughness counting the atlas gutters.
 10. **FWD-GLOSSY-INDIRECT** (4.2) — modes A and B leave a rough reflector black in a mirror or
@@ -250,8 +250,9 @@ Then the rest of 4.2-4.6 in their order, 4.7's bookkeeping alongside whatever to
 
 ### 4.3 Estimator approximations and accuracy debt
 
-- [ ] **UPBP-BEAM-RADIUS** — mode J's beam kernel never shrinks, so its O(r) blur bias never goes
-  away; **J-FOG-REALCAM** (realcam in fog 2-4 % low) is the same blur, larger.
+- [x] **UPBP-BEAM-RADIUS** (0.434.0) — mode J's beam kernel shrinks per light-side epoch under
+  -vcmalpha (_fog_cornell -0.70 % of mode D fixed, -0.43 % at 256 epochs, -0.07 % per sample).
+- [ ] **J-FOG-REALCAM**, what is left — CPU mode J reads realcam's fog up to 2.8 % below GPU mode J.
 - [ ] **UPBP-W-CHROMATIC** — in a chromatic medium a beam merge's weight mixes two wavelengths and
   the frame tilts in colour.
 - [ ] **P-HEROSPLIT-FIRST** — blurred mode P under `-herosplit` files a sample by the hero's first
