@@ -10374,10 +10374,28 @@ sees the instant, exactly as a static scene with those transforms would show it.
   the shutter is sampled, and sets `-beamfreeze` aside. Mode J times each realization in
   `realize` (`atEpochJ`), on 64 fixed epochs of a fixed `-spp`, and shares none across cameras.
   Under a clock (`-time`, `-noise`, `-forever`: no total to split) an epoch of either ends after 4
-  samples, so many epochs sample the shutter -- which a light side dear to rebuild pays for in
-  rebuilds (known-issues BLUR-EPOCH-COST). Any rule that bounds the rebuilds' share instead (an
-  epoch sized by `-beamrefresh`, or one gathering as long as it rebuilt) ran 1 to 8 epochs of a
-  short `-noise` render, which then blurred too coarsely, the noise estimate blind to it. A camera moving over a still scene leaves M's and S's maps
+  samples, so many epochs sample the shutter. Any rule that bounds the rebuilds' share by
+  making epochs fewer (an epoch sized by `-beamrefresh`, or one gathering as long as it rebuilt)
+  ran 1 to 8 epochs of a short `-noise` render, which then blurred too coarsely, the noise
+  estimate blind to it. **Modes M and J make each epoch cheaper instead (BLUR-EPOCH-COST):**
+  under `-time` or `-forever` an epoch after the first draws the photons (mode J: light subpaths)
+  its light side can afford, its rebuild about as long as its samples' gather (`EpochSizer`). The
+  light side's time is fit as a + b n over the refresh epochs, so a cost the count cannot shrink
+  (a grid, a map build, a pass's setup) is not taken for a per-photon one -- which would shrink the
+  count, raise its apparent cost, and spiral down to the floor (it did, to 6 of mode J's 6912
+  subpaths, whose surface map then came back empty) -- and the count never goes below where that
+  fixed cost is half the light side, nor below N/1024. The CPU's mode M passes the count to
+  `buildLightSide(epoch, salt, nEpoch)`; the device loop's `nPassM` reads the device's own light-side
+  time (`PmRadiiPin::lightSec`); mode J's `nBlurJ` caps `Nepoch`. Each map divides by its own
+  nEmitted and is binned at epoch 0's radii (mode J's shrink on the epoch index, as before), so
+  fewer photons are the same estimator at more variance; mode M's aimed pass and caustic gather
+  target (`kGather`) scale with the count, and the beams rebuild at epoch 0's per-medium radii
+  (`BeamRadiiPin`, which every mode-M refresh now keeps, blurred or not). A fixed `-spp` and
+  `-noise`, which in mode M is a sample count, keep N. On check_motion's box at `-time 20`: mode M
+  at `-n 8000000`, 15 epochs and 57 samples became 1361 and 5444 on the CPU (about 139 k photons
+  each), 12 and 48 became 137 and 548 on the GPU; CPU mode J at `-n 2000000`, 58 and 580 became 286
+  and 2851. GPU mode J's epochs there are gather-bound (its merges against the maps grow with them
+  too), so its count stays N. A camera moving over a still scene leaves M's and S's maps
   timeless: their gathers pose each sample (`renderPhotonCamera`, `sppmPass`'s camera worker),
   and a shared mode M map still serves several such cameras, gathered on the CPU. U and J take
   one time a pass or epoch even then, because their light subpaths are traced for the camera
@@ -10604,7 +10622,8 @@ sees the instant, exactly as a static scene with those transforms would show it.
   0.429.0), and the device refresh loop
   times each epoch (`atEpochM`: the host's PassTimeScope, the camera posed on the host;
   `renderPhotonMapSharedCuda` reads `g_passMotionU` into the scene, `hostPassU`, and bakes the
-  camera pinned there, its keys left behind: `bakeCamera`'s `pinned`, `pinToPass`), a 64th of a fixed `-spp` or 4 samples under a clock,
+  camera pinned there, its keys left behind: `bakeCamera`'s `pinned`, `pinToPass`), a 64th of a fixed `-spp` or 4 samples under a clock
+  (the photons sized to the gather under `-time`/`-forever`, as on the host),
   `-beamfreeze` set aside (and not costing a budgeted render the device, `budgetedGpuM`). The
   loop's epochs share one device copy of the scene (`cudaHoldScene`, `sceneHold`), and a blur's
   epochs write the running average on the `-interval` cadence and after the last; a write between

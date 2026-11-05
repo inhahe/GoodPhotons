@@ -62,7 +62,8 @@ cube whose keys scale and shear it together. It requires:
     panel, a spot and a ball alone) and the deforming glowing sheet as mode R on the CPU does; so does mode P, its backward samples split by their own path's first event -- also with
     fog in front of a mirror, and on a floor of a mix of a diffuse and a glossy child; and fur in
     front of a mirror renders the same under -dual-scatter as without. Mode M under
-    a -noise budget blurs too, and mode J whose surface map comes back empty blurs as mode D does.
+    a -noise budget blurs too, and modes M and J under -time, their epochs' light sides sized to
+    their gather; and mode J whose surface map comes back empty blurs as mode D does.
   * The camera's own motion, in the box held still: a camera with `motion` keys and no shutter
     renders byte for byte the still camera at its keys' instant (CPU, and GPU); with the shutter,
     the mean of 32 renders from its poses through it (mode R; modes D and B agree with mode R, and
@@ -950,19 +951,24 @@ def main():
     # one time: against blurred mode R, within their own bias (a density estimate's radius), and
     # the blur really there ---
     # (Mode M under a -noise budget, which has no total to split, ends an epoch every few samples,
-    # so its shutter is sampled by many epochs too.)
+    # so its shutter is sampled by many epochs too. Under -time each epoch of mode M or J also
+    # draws only the photons or subpaths its rebuild can afford against its gather, BLUR-EPOCH-COST.)
     # On the GPU too: S and U a pass, and J's camera pass an epoch, at one time.
     shared_cases = [("M", "M", ["-spp", "128", "-n", "2000000"], "cpu"),
                     ("M under -noise", "M", ["-noise", "6.25", "-n", "2000000"], "cpu"),
+                    ("M under -time", "M", ["-time", "20", "-n", "2000000"], "cpu"),
                     ("S", "S", ["-spp", "128", "-n", "200000"], "cpu"),
                     ("U", "U", ["-spp", "256"], "cpu"), ("J", "J", ["-spp", "128", "-jsurf"], "cpu"),
+                    ("J under -time", "J", ["-time", "20", "-jsurf"], "cpu"),
                     ("P", "P", ["-spp", "256", "-n", "20000000"], "cpu")]
     if not a.no_gpu:
         shared_cases += [("M on the GPU", "M", ["-spp", "128", "-n", "2000000"], "gpu"),
                          ("M under -noise on the GPU", "M", ["-noise", "6.25", "-n", "2000000"], "gpu"),
+                         ("M under -time on the GPU", "M", ["-time", "20", "-n", "2000000"], "gpu"),
                          ("S on the GPU", "S", ["-spp", "128", "-n", "200000"], "gpu"),
                          ("U on the GPU", "U", ["-spp", "256"], "gpu"),
                          ("J on the GPU", "J", ["-spp", "128", "-jsurf"], "gpu"),
+                         ("J under -time on the GPU", "J", ["-time", "20", "-jsurf"], "gpu"),
                          ("P on the GPU", "P", ["-spp", "256", "-n", "20000000"], "gpu")]
     for label, mode, margs, dev in shared_cases:
         tag = label.replace(" ", "_").replace("-", "")

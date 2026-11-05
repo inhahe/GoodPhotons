@@ -106,7 +106,8 @@ Each names the section its line is in.
     mirror or through glass, and splat no clearcoat sheen. Done; LAYERED-BODY-COIN and
     FWD-SMOOTH-COAT logged.
 11. ~~**CPU-ONLY-BUILD** (4.4) — a build without CUDA does not compile.~~ Done.
-12. **BLUR-EPOCH-COST** (4.5) — a blurred clock-budgeted mode M or J spends its clock rebuilding.
+12. ~~**BLUR-EPOCH-COST** (4.5) — a blurred clock-budgeted mode M or J spends its clock rebuilding.~~
+    Done, 0.434.12.
 13. **UPBP-W-CHROMATIC** (4.3) — mode J's beam weight mixes two wavelengths in a chromatic medium.
 14. **FEATHER-IS-A-THRESHOLD** (4.2) — `feather` shrinks a cloud instead of ramping it; the fix
     changes `gallery_rain`'s cloud edges, so show the user before it lands.
@@ -337,8 +338,9 @@ Then the rest of 4.2-4.6 in their order, 4.7's bookkeeping alongside whatever to
 
 ### 4.5 Performance
 
-- [ ] **BLUR-EPOCH-COST** — a blurred clock epoch of mode M or J rebuilds its light side every 4
-  samples (the entry's catch: mode M's caustic map rebuilds at a fixed neighbour count).
+- [x] **BLUR-EPOCH-COST** (0.434.12) — a blurred clock epoch of mode M or J rebuilt its whole
+  light side every 4 samples; it draws what its light side can afford against its gather now, the
+  caustic neighbour count scaled with it.
 - [ ] **JSPEC-CARRIER-SIZE** — every mode-J GPU thread reserves a 120-byte spectral carrier per
   segment and per eye vertex, chromatic scene or not.
 - [ ] **RADCACHE-BATCHES** — under `-radcache` a fixed budget's CPU batches follow its samples, not

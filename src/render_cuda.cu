@@ -27234,6 +27234,7 @@ std::vector<Film> renderPhotonMapSharedCuda(const Scene& scene, const std::vecto
                                             double causticAdaptK, PmRadiiPin* pin,
                                             const CudaSceneHold* held) {
     using namespace gpu;
+    const auto tCall = std::chrono::steady_clock::now();
     int nc = (int)cams.size();
     std::vector<Film> out(nc);
     for (int c = 0; c < nc; ++c) { out[c].resX = resX[c]; out[c].resY = resY[c]; out[c].alloc(); }
@@ -27938,6 +27939,7 @@ std::vector<Film> renderPhotonMapSharedCuda(const Scene& scene, const std::vecto
     // partials (see uploadBeamMapCuda). nNodes == 0 is the "no volume gather" sentinel.
     DBeamMap dbm{};
     uploadBeamMapCuda(scene, bmap, up, dbm, stage, /*withMis=*/false);
+    if (pin) pin->lightSec = std::chrono::duration<double>(std::chrono::steady_clock::now() - tCall).count();
 
     // ---- gather each camera ----
     // Pull the current device accumulation for camera c into out[c] (film + hit map).

@@ -286,6 +286,9 @@ struct PmRadiiPin {
     double radius  = 0.0;   // global map gather radius (0 = not decided yet: adapt and record)
     double radiusC = 0.0;   // caustic map gather radius
     double kGather = 0.0;   // caustic per-query adaptive target (0 = fixed radius)
+    // Out, every pass: seconds from the call to its first gather, the light side's cost (upload,
+    // deposit, map and beam builds), which a clock blur's epochs are sized by (BLUR-EPOCH-COST).
+    double lightSec = 0.0;
 };
 
 // (g_gpuQuietRebuild — the refresh-epoch narration gate — lives in render_progress.h, because
