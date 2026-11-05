@@ -993,6 +993,18 @@ Once the device did it properly the two backends disagreed outright (`scraps/lay
 lacquer coat peaked at 0.254 on the GPU against 0.005 on the CPU), so both now take the coat with
 probability R, as the BDPT walk always has.
 
+**Where a photon on a compound deposits (0.433.10, COMPOUND-DOUBLE-PICK).** A camera walk resolves a
+mix or layered surface to one lobe, with that lobe's probability (a mix's weight; the coat's R or the
+body's 1 - R), and gathers if the lobe is diffuse. The photon walk resolves it too, and used to
+deposit after its own pick, so the photons on a diffuse lobe already carried that probability and the
+camera's pick took it a second time: a mix's diffuse weight squared (`mix { layer white 0.5 }` read
+0.50 of mode R), a coat's Fresnel taken in and out (a clearcoat 0.89). The photon pass now deposits
+at the compound, at full power, before its own pick whenever some lobe the camera could pick gathers
+(`compoundGathers`, render.h; device `dCompoundGathers`), and the lobe's own case deposits nothing.
+The model is then mode R's: one pick, on the camera's side, and the body's albedo as
+`coatedAlbedoAt` gives it. `tools/check_compound_gather.py` holds modes M and S on both backends to
+mode R on a mix, a diffuse-glossy mix, a clearcoat and a thin-film coat.
+
 ### Object view navigates differently from scene view (0.319.0)
 
 `ftrace model.glb` and `-explore scene.ftsl` shared one navigation model — a fly camera — which is

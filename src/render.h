@@ -225,6 +225,25 @@ inline int photonVertexKind(const Scene& scene, const Material& m, const Hit& h)
     }
 }
 
+// COMPOUND-DOUBLE-PICK: whether a photon arriving at the compound `m` (a mix, or a layered stack's
+// bodies) is gathered there: whether some lobe a camera walk can resolve it to takes a density
+// estimate -- a diffuse lobe that is no gatherless strand, or a diffuse_transmit one. The photon pass
+// deposits at such a surface BEFORE its own pick, at full power: the camera walk picks a lobe too,
+// with the lobe's probability, so a deposit made after the photon's pick carried that probability a
+// second time (a mix's diffuse weight squared; a coat's Fresnel taken on the way in and again on the
+// way out). Device twin dCompoundGathers.
+inline bool compoundGathers(const Scene& scene, const Material& m, double fiberRadius) {
+    if (m.type != MatType::Mix && m.type != MatType::Layered) return false;
+    for (int c : m.mixChildren) {
+        if (c < 0 || c >= (int)scene.mats.size()) continue;
+        const Material& k = scene.mats[(size_t)c];
+        if (k.reflectsNothing) continue;
+        if (k.type == MatType::DiffuseTransmit) return true;
+        if (k.type == MatType::Diffuse && !gatherlessStrand(k, fiberRadius)) return true;
+    }
+    return false;
+}
+
 // --- Fluorescence interaction (shared by the forward tracer and -checkfluoro) --
 // A fluorescent surface has two competing channels: elastic diffuse reflection
 // (albedo rho, wavelength preserved) and dye excitation (prob aEff = min(eps,
@@ -3423,6 +3442,10 @@ struct Renderer {
             ++surfHits;   // a surface interaction follows: chords after it are not direct light
 
             const Material* matp = &scene.mats[h.matId];
+            // COMPOUND-DOUBLE-PICK: a mix or layered surface takes its deposit here, before the
+            // photon's own pick (compoundGathers); the lobe's case below then deposits nothing.
+            const bool compoundDeposit = compoundGathers(scene, *matp, h.fiberRadius);
+            if (compoundDeposit) depositPhoton(h.p, orientedGeoN(h), lambda, beta, sawFocus && !sawScatter);
             // Layered (coat over body): split the photon at the interface BEFORE the
             // switch. With prob R (Fresnel/Airy/manual) the coat reflects it as a
             // specular/glossy lobe (lossless, continue); otherwise it enters the body,
@@ -3624,8 +3647,9 @@ struct Renderer {
                     }
                     Vec3 ngo = orientedGeoN(h);
                     Vec3 wi = Vec3{-ray.d.x, -ray.d.y, -ray.d.z};   // toward the previous (light-side) vertex
-                    // Photon-map deposit: incident flux at this translucent vertex.
-                    depositPhoton(h.p, ngo, lambda, beta, sawFocus && !sawScatter);
+                    // Photon-map deposit: incident flux at this translucent vertex (or at the
+                    // compound it was picked from, above).
+                    if (!compoundDeposit) depositPhoton(h.p, ngo, lambda, beta, sawFocus && !sawScatter);
                     sawScatter = true;   // whatever leaves this vertex is diffuse indirect light
                     if (nCam > 0 && !forwardCatch) {
                         camSplatAll(scene, cams, nCam, h.p,  h.n,  ngo, wi, lambda, beta, rhoR, rng);
@@ -3692,8 +3716,9 @@ struct Renderer {
                     // Photon-map deposit: incident flux at this diffuse vertex. Stored
                     // BEFORE the Russian-roulette reflect/absorb so the record captures
                     // the arriving power (direct on the first hit, indirect thereafter).
-                    // Not on a strand, where no gather takes it (CURVE-GATHER).
-                    if (!gatherlessStrand(m, h.fiberRadius))
+                    // Not on a strand, where no gather takes it (CURVE-GATHER), nor where the
+                    // compound it was picked from took it (above).
+                    if (!compoundDeposit && !gatherlessStrand(m, h.fiberRadius))
                         depositPhoton(h.p, ngo, lambda, beta, sawFocus && !sawScatter);
                     sawScatter = true;   // whatever leaves this vertex is diffuse indirect light
                     if (nCam > 0 && !forwardCatch) {
@@ -3962,6 +3987,14 @@ struct Renderer {
             }
 
             const Material* matp = &scene.mats[h.matId];
+            // COMPOUND-DOUBLE-PICK (scalar twin): the compound's deposit, every live wavelength,
+            // before the pick; the lobe's case below then deposits nothing.
+            const bool compoundDeposit = compoundGathers(scene, *matp, h.fiberRadius);
+            if (compoundDeposit) {
+                const bool caus = sawFocus && !sawScatter;
+                const Vec3 ngoC = orientedGeoN(h);
+                for (int i = 0; i < nUp; ++i) depositPhoton(h.p, ngoC, lam[i], beta[i], caus);
+            }
             // Layered coat. The coat interface is NOT dispersive in DIRECTION -- the sheen is
             // a glossy lobe about the mirror direction and the body-lobe pick is a material
             // index -- so the only λ dependence is the scalar coat reflectance R(λ), and ONE
@@ -4024,8 +4057,9 @@ struct Renderer {
                     // stays energy-consistent with the scalar single-λ deposit.
                     {
                         const bool caus = sawFocus && !sawScatter;
-                        for (int i = 0; i < nUp; ++i)
-                            depositPhoton(h.p, ngo, lam[i], beta[i], caus);
+                        if (!compoundDeposit)   // else the compound took it (above)
+                            for (int i = 0; i < nUp; ++i)
+                                depositPhoton(h.p, ngo, lam[i], beta[i], caus);
                         sawScatter = true;   // past a diffuse vertex it is indirect light
                     }
                     if (nCam > 0 && !forwardCatch) {
@@ -4197,7 +4231,8 @@ struct Renderer {
                     // stays energy-consistent with the scalar single-λ deposit.
                     {
                         const bool caus = sawFocus && !sawScatter;
-                        if (!gatherlessStrand(m, h.fiberRadius))   // not on a strand (CURVE-GATHER)
+                        // not on a strand (CURVE-GATHER), nor where the compound took it (above)
+                        if (!compoundDeposit && !gatherlessStrand(m, h.fiberRadius))
                             for (int i = 0; i < nUp; ++i)
                                 depositPhoton(h.p, ngo, lam[i], beta[i], caus);
                         sawScatter = true;   // past a diffuse vertex it is indirect light

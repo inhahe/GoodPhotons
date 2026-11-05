@@ -7551,6 +7551,20 @@ __device__ static bool dProbePassesThrough(const DMaterial& m) {
 __device__ static inline bool dGatherlessStrand(const DMaterial& m, const DHit& h) {
     return m.type == D_DIFFUSE && h.fiberRadius > (Real)0;
 }
+// Whether a photon arriving at the compound `m` is gathered there, so the photon pass deposits it
+// before its own pick (host twin compoundGathers, COMPOUND-DOUBLE-PICK, where the reasoning lives).
+__device__ static bool dCompoundGathers(const DScene& sc, const DMaterial& m, const DHit& h) {
+    if (m.type != D_MIX && m.type != D_LAYERED) return false;
+    for (int k = 0; k < m.mixCount; ++k) {
+        const int c = m.mixChild[k];
+        if (c < 0) continue;
+        const DMaterial& km = sc.mats[c];
+        if (km.matReflectsNothing) continue;
+        if (km.type == D_DIFFUSETRANSMIT) return true;
+        if (km.type == D_DIFFUSE && !dGatherlessStrand(km, h)) return true;
+    }
+    return false;
+}
 
 // The vector glue of gatherplane.h's rule (MERGE-PROXIMITY), which both backends call: a stored
 // photon belongs to a mode-M or mode-S gather's surface when it faces the gather point's way and
@@ -12288,6 +12302,11 @@ __device__ static int shadeStep(const DScene& sc, const DCamSet& cs,
 
     const DMaterial* mptr = &sc.mats[h.matId];
     int matIndex = h.matId;
+    // COMPOUND-DOUBLE-PICK (host twin tracePhoton): a mix or layered surface takes its deposit
+    // here, before the photon's own pick; the lobe's branch below then deposits nothing.
+    const bool compoundDeposit = dCompoundGathers(sc, *mptr, h);
+    if (compoundDeposit)
+        depositPhoton(cs, h.p, dShadedNg(h), beta, lambda, dPathIsCaustic(pathC), dPathCausticW(pathC));
     // Stochastic mix: resolve to a child lobe (or absorb) before dispatch.
     if (dIsCompound(mptr->type)) {
         int child = dResolveCompound(sc, *mptr, h, rd, lambda, rng);
@@ -12323,8 +12342,10 @@ __device__ static int shadeStep(const DScene& sc, const DCamSet& cs,
         DVec3 nb = h.n * (Real)(-1);
         DVec3 ngo = dShadedNg(h);   // geo normal on shading side
         DVec3 wiPrev = -rd;                                             // toward previous (light-side)
-        // photon-map deposit (mode M), routed to the caustic map on an L.S+.D path
-        depositPhoton(cs, h.p, ngo, beta, lambda, dPathIsCaustic(pathC), dPathCausticW(pathC));
+        // photon-map deposit (mode M), routed to the caustic map on an L.S+.D path, unless the
+        // compound this lobe was picked from took it (above)
+        if (!compoundDeposit)
+            depositPhoton(cs, h.p, ngo, beta, lambda, dPathIsCaustic(pathC), dPathCausticW(pathC));
         if (pathC) pathC->bits |= PV_BIT_SCATTER;   // past here it is diffuse indirect light
         // Both lobes get the adjoint correction; |cos| in the factor makes it lobe-agnostic,
         // so h.n / ngo serve the transmit lobe too (nb = -h.n is used only for the splat side).
@@ -12345,7 +12366,7 @@ __device__ static int shadeStep(const DScene& sc, const DCamSet& cs,
         DVec3 wiPrev = -rd;                                             // toward previous (light-side)
         // photon-map deposit (mode M), routed to the caustic map on an L.S+.D path; not on a strand,
         // where no gather takes it (CURVE-GATHER, host twin render.h)
-        if (!dGatherlessStrand(m, h))
+        if (!compoundDeposit && !dGatherlessStrand(m, h))   // nor where the compound took it (above)
             depositPhoton(cs, h.p, ngo, beta, lambda, dPathIsCaustic(pathC), dPathCausticW(pathC));
         if (pathC) pathC->bits |= PV_BIT_SCATTER;   // past here it is diffuse indirect light
         splatSurfaceAll(sc, cs, camMode, h.p, h.n, ngo, wiPrev, lambda, beta, rho, rng);
@@ -12671,6 +12692,14 @@ __device__ static int shadeStepHero(const DScene& sc, const DCamSet& cs, int cam
 
     const DMaterial* mptr = &sc.mats[h.matId];
     int matIndex = h.matId;
+    // COMPOUND-DOUBLE-PICK (scalar twin): the compound's deposit, every live wavelength, before the pick.
+    const bool compoundDeposit = dCompoundGathers(sc, *mptr, h);
+    if (compoundDeposit) {
+        const bool caus = dPathIsCaustic(pathC);
+        const Real cw = dPathCausticW(pathC);
+        const DVec3 ngoC = dShadedNg(h);
+        for (int i = 0; i < nUp; ++i) depositPhoton(cs, h.p, ngoC, beta[i], lam[i], caus, cw);
+    }
     if (dIsCompound(mptr->type)) {
         int cpF = -1; double cRF = 0.0, cCosF = 1.0, cUF = 0.0; Real cThF = (Real)0;
         int child = dResolveCompound(sc, *mptr, h, rd, lam[0], rng, &cpF, &cRF, &cCosF, &cThF, &cUF);
@@ -12706,7 +12735,8 @@ __device__ static int shadeStepHero(const DScene& sc, const DCamSet& cs, int cam
         { const bool caus = dPathIsCaustic(pathC);
           // ...with the aimed caustic pass's MIS weight, as the scalar deposits carry it.
           const Real cw = dPathCausticW(pathC);
-          for (int i = 0; i < nUp; ++i) depositPhoton(cs, h.p, ngo, beta[i], lam[i], caus, cw);
+          if (!compoundDeposit)   // else the compound took it (above)
+              for (int i = 0; i < nUp; ++i) depositPhoton(cs, h.p, ngo, beta[i], lam[i], caus, cw);
           if (pathC) pathC->bits |= PV_BIT_SCATTER; }   // past here: diffuse indirect light
         if (camMode == CAM_A || camMode == CAM_B) {
             splatSurfaceAllHero(sc, cs, camMode, h.p, h.n, ngo, wiPrev, lam, beta, rhoR, nUp, rng);
@@ -12838,7 +12868,7 @@ __device__ static int shadeStepHero(const DScene& sc, const DCamSet& cs, int cam
       // ...with the aimed caustic pass's MIS weight, as the scalar deposits carry it; not on a
       // strand (CURVE-GATHER).
       const Real cw = dPathCausticW(pathC);
-      if (!dGatherlessStrand(m, h))
+      if (!compoundDeposit && !dGatherlessStrand(m, h))   // nor where the compound took it (above)
           for (int i = 0; i < nUp; ++i) depositPhoton(cs, h.p, ngo, beta[i], lam[i], caus, cw);
       if (pathC) pathC->bits |= PV_BIT_SCATTER; }   // past here: diffuse indirect light
     if (camMode == CAM_A || camMode == CAM_B) {

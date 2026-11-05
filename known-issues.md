@@ -72,6 +72,33 @@ closed entries, where the cost is a broken historical link rather than a blocked
 Three references — `scenes/_gr_fly0.ftsl`, `scenes/silver_sphere_xenon.ftsl`, `scenes/x.ftsl` —
 name files that no longer exist at all, all in closed entries.
 
+## DONE (2026-11-04, 0.433.10): COMPOUND-DOUBLE-PICK — modes M and S took a mix's or a layered coat's lobe probability twice
+
+Found while testing the Opus review's finding on the layered coat's coin (0.433.9). A camera walk
+resolves a `mix` or `layered` surface to one lobe with that lobe's probability (a mix's weight; the
+coat's Fresnel R or the body's 1 - R) and gathers if the lobe is diffuse. The photon walk resolved it
+too, and deposited only after its own pick, so the photons on a diffuse lobe already carried the
+probability and the camera's pick took it again: a mix's diffuse weight squared, a coat's Fresnel
+taken on the way in and again on the way out. Mode R, the reference, takes one pick (camera side),
+as the layered model intends (scene.h: the entry Fresnel is the resolver's selection probability).
+Both backends, both modes; the design notes' identity tests used coats of reflectance exactly 0 and
+1, where a doubled pick cannot show.
+
+**Fixed:** the photon pass deposits at the compound, at full power, before its own pick whenever
+some lobe the camera could pick gathers (`compoundGathers` / `dCompoundGathers`), and the lobe's own
+case then deposits nothing. A wall of each, its mean against mode R per channel
+(`tools/check_compound_gather.py`; M CPU, M GPU, S CPU, S GPU):
+
+| wall (green; M CPU, M GPU, S CPU, S GPU) | 0.433.5 | 0.433.10 |
+|---|---|---|
+| mix | 0.496 0.498 0.502 0.499 | 0.991 0.996 1.003 0.999 |
+| mix2 | 0.564 0.566 0.563 0.544 | 0.993 0.996 0.997 0.976 |
+| clearcoat | 0.891 0.888 0.890 0.889 | 1.004 1.001 1.002 1.002 |
+| thinfilm | 0.716 0.713 0.715 0.714 | 1.005 1.003 1.003 1.002 |
+
+`thinfilm` also needs the coat's coin folded into the carrier (0.433.9, from the review), and
+before both fixes read R G B 0.952 0.716 0.801 / 0.950 0.715 0.800 (M CPU / S CPU).
+
 ## FIXED FOR MODES M AND S (2026-11-04, 0.433.3; opened 2026-11-04, 0.431.0): CURVE-GATHER — modes M, S and U misread a coat of `type diffuse` curves, and M's two backends disagree on it
 
 **Modes M and S, fixed in 0.433.3** by the fix proposed below. Their camera walks never gather on a
@@ -128,6 +155,18 @@ the host takes the coat with probability R. check_rough_irid now holds mode S's 
 mode R on each backend (CPU 0.96 / 1.20 / 0.77, GPU 0.89 / 1.08 / 0.88: within its 5-sigma test on
 a red sphere's small green and blue). Found checking the coat coin's fix against mode R (Opus review
 of 90e0486..bea7be1).
+
+## OPEN (2026-11-04, 0.433.10): GPU-PHOTON-LAUNCH-FAIL — one GPU photon pass died with "unspecified launch failure", not reproduced
+
+Seen once, running tools/check_compound_gather.py on 0.433.10 while check_bitid rendered on the GPU
+from another process: GPU mode M on its `mix2` wall (a mix of half white diffuse, half rough glossy),
+`-seed 2 -n 8000000 -spp 32`, printed `[cuda] forward kernel failed: unspecified launch failure` at
+13 % of the photon trace and exited 0xC0000409. The same render's seed 1 had just succeeded. Three
+reruns of the exact command on 0.433.10 and three on 0.433.9, one set beside another GPU check, all
+succeeded; check_bitid's GPU mode M cases ran clean on both. The change in 0.433.10 (a deposit before
+a compound's pick) writes through the same bounds-checked `depositPhoton`. So: an intermittent fault
+in the photon kernel, or the driver's under two contexts, of unknown cause. If it recurs, run the
+command under `compute-sanitizer --tool memcheck` and note what else held the GPU.
 
 ## OPEN (2026-11-04, 0.433.6): CURVE-CAUSTIC — modes M and S light a `type diffuse` strand only by NEE and its diffuse continuation, so a caustic from a point or spot light misses it
 

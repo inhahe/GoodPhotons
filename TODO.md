@@ -169,6 +169,11 @@ Then the rest of 4.2-4.6 in their order, 4.7's bookkeeping alongside whatever to
   device's gather (and mode S's per-pixel copy); the float side now takes ratio / peak.
 - [x] **VCOL-BDPT-GPU** (0.433.4) — `DVertex` and `DVcmLV` carry the hit's vertex colour; GPU
   modes D, J and U had read a vertex-coloured sphere near grey.
+- [ ] **GPU-PHOTON-LAUNCH-FAIL** — one GPU photon pass died with "unspecified launch failure"
+  (mode M, a mix wall, beside another GPU process); six reruns clean. Watch for a recurrence.
+- [x] **COMPOUND-DOUBLE-PICK** (0.433.10) — modes M and S took a mix's or a layered coat's lobe
+  probability on the photon's side and again on the camera's (a half-weight mix 0.50 of mode R, a
+  clearcoat 0.89); found testing the review's coat-coin finding.
 - [x] **MODEM-BEAM-CARRIER** (0.433.5) — mode M's beam gather reads its walk's spectral carrier and
   the glass around the segment at each beam's wavelength (fog through tinted glass: R 0.54, G 2.63
   of mode R before).
@@ -342,6 +347,8 @@ Then the rest of 4.2-4.6 in their order, 4.7's bookkeeping alongside whatever to
 
 ### 4.6 Missing features and scoped follow-ups
 
+- [ ] **CURVE-CAUSTIC** — modes M and S miss a point or spot light's caustic on a `type diffuse`
+  strand (0.433.3 stopped depositing there); the fix is a strand-shaped estimate on the caustic map.
 - [ ] **DEFORM-LIMITS** — a dynamic elastic must be first in its mesh's stack.
 - [ ] **MOTION-LIGHT-RIGID** — a spot, beam or aimed light its keys stretch unevenly, and a sun or
   sky in a moving group, stay at the instant.
