@@ -981,7 +981,18 @@ lobe, coat and frosted-glass jitter reads. By half-width that lobe is a GGX α o
 - to the factor, when there is no map.
 
 The preview's `previewRough(r_t) = sqrt(0.646 r_t)` is the inverse of the same equivalence, so the
-preview's GGX gets glTF's own α back. Every consumer that thresholds `roughness` sees the
+preview's GGX gets glTF's own α back.
+
+**The map's means weigh the surface, not the texels (0.434.7, GLTF-MAP-MEAN-GUTTERS).** The mean
+metalness types the material (metal, dielectric, or by the map per texel), and the mean roughness
+is its constant. Both are taken over the metallicRoughness map with each texel weighed by the
+surface area mapped onto it. Materials are built before meshes, so a pre-pass walks the same nodes
+the emit pass does (`forEachMeshInstance`, shared by both). It collects, per glTF texture, the UV
+triangles and world areas of every placed primitive whose material maps it, `skip_material` aside.
+`bindTex` rasterises them over the decoded, downscaled map: `gltfimpl::texelWeights` spreads a
+triangle's area over the texel centres it covers, or onto its centroid's texel, wrapping as the
+repeat sampler does. A map nothing placed samples falls back to equal weights.
+`tools/downscale_glb.py` reports the same weighted means. Every consumer that thresholds `roughness` sees the
 converted value. One consequence: an imported surface counts as caustic glossy below
 `kCausticGlossRoughness` 0.15, which is glTF 0.31. Before the conversion the cut sat at glTF 0.15.
 

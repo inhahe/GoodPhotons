@@ -3538,6 +3538,11 @@ are worth knowing about:
   channel multiplies `metallicFactor` before the ≥ 0.5 diffuse-vs-metal cut, because
   exporters routinely write `metallicFactor 1.0` and put the real (near-zero) metalness in
   the map — reading the factor alone turns a painted character into a mirror.
+  **The map's means count only the surface** (0.434.7). Both the mean metalness and the mean
+  roughness (the material's constant) weigh each texel by the area of surface mapped onto it.
+  An atlas's gutters and background, which no hit samples, then weigh nothing. They had weighed
+  a third of a Meshy gnome's map, and an atlas with metal-filled gutters could be typed a metal.
+  A texel two surfaces share (mirrored UV islands) counts for both.
 * **Roughness is converted to ftrace's units, so a highlight is as wide as the asset's author
   saw it** (0.434.4). glTF's roughness `r` is perceptual: its GGX α is `r²`. ftrace's
   `roughness` is a Phong lobe of exponent `2/r_t² − 2`, as wide as a GGX α of about `0.646 r_t`.

@@ -99,8 +99,9 @@ Each names the section its line is in.
    factors, at the camera's wavelength. Done.
 8. ~~**UPBP-BEAM-RADIUS**~~ (0.434.0) with **J-FOG-REALCAM** (4.3) — mode J's beam kernel shrinks
    per epoch now; J-FOG-REALCAM's CPU-only extra deficit is what is left.
-9. ~~**GLTF-ROUGHNESS-MAP**~~ (0.434.4) and **GLTF-MAP-MEAN-GUTTERS** (4.2) — glTF imports rougher
-   than glTF means (done), and their mean metalness and roughness counting the atlas gutters.
+9. ~~**GLTF-ROUGHNESS-MAP**~~ (0.434.4) and ~~**GLTF-MAP-MEAN-GUTTERS**~~ (0.434.7) (4.2) — glTF
+   imports rougher than glTF means, and their mean metalness and roughness counting the atlas
+   gutters. Done.
 10. **FWD-GLOSSY-INDIRECT** (4.2) — modes A and B leave a rough reflector black in a mirror or
     through glass.
 11. **CPU-ONLY-BUILD** (4.4) — a build without CUDA does not compile.
@@ -193,7 +194,7 @@ Then the rest of 4.2-4.6 in their order, 4.7's bookkeeping alongside whatever to
   within 1.4 % of mode R in modes M and J on both backends).
 - [ ] **FWD-GLOSSY-INDIRECT** — modes A and B splat a rough reflector only where it is seen directly
   (and a layered clearcoat's sheen on neither backend).
-- [ ] **GLTF-MAP-MEAN-GUTTERS** — the importer's mean metalness and roughness count the atlas's
+- [x] **GLTF-MAP-MEAN-GUTTERS** — the importer's mean metalness and roughness count the atlas's
   gutters.
 - [ ] **FEATHER-IS-A-THRESHOLD** — a mesh-bound medium's `feather` shrinks the silhouette instead of
   ramping the density.

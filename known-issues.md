@@ -3973,7 +3973,7 @@ sampler (no gain). `-checklens` asserts coverage, aimed-vs-unaimed irradiance at
 points, and importance x lensPdfDir = cosF A_front / A_film for every camera ray;
 `tools/check_physlens.py` R aimed against R unaimed and across devices.
 
-## OPEN (2026-10-23): GLTF-MAP-MEAN-GUTTERS — the importer's mean metalness and roughness count the atlas gutters
+## DONE (2026-11-05, 0.434.7): GLTF-MAP-MEAN-GUTTERS — the importer's mean metalness and roughness count the atlas gutters
 
 Found by the review of `tools/downscale_glb.py`. `src/gltf.h` (the `TexRole::Metalness` and
 `TexRole::Roughness` branches, ~620-670) averages the metal-roughness map over **every texel**
@@ -3990,6 +3990,14 @@ for source and result so a shift is visible. **Proper fix:** weight the means by
 Rasterise the mesh's UV triangles over the map at import (the loader has the UVs) and average
 over covered texels only, or weight each texel by the surface area mapped onto it. This changes
 the import of every textured glTF with gutters, Alice's included, so it needs its own A/B.
+
+**Fixed in 0.434.7** the second way. A pre-pass over the placed primitives (the emit pass's own node
+walk, `forEachMeshInstance`) collects per texture the UV triangles and world areas of the surfaces
+mapping it. `gltfimpl::texelWeights` spreads each triangle's area over the texel centres it covers,
+and every mean and share in `bindTex` is weighted by that. `tools/check_gltf_map_means.py`: a quad
+sampling 30 % of its map (metalness 0.2), the rest a gutter of metalness 1 (all-texel mean 0.76,
+a metal), renders byte-identically to the same quad on a uniform 0.2 map. 0.434.6 typed it a metal.
+`tools/downscale_glb.py` prints the weighted means.
 
 ## DONE (2026-09-28, 0.371.0): GLTF-LAYERED-DEFAULT — `layered` was never the glTF import (0.317.0–0.367.2), then rendered the Alice2 GLB a third darker; explained, fixed, and the default again
 

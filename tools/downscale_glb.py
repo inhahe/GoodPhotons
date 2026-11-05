@@ -295,18 +295,43 @@ def resample(img: Image.Image, kind: str, mask, tex: int) -> Image.Image:
     return Image.fromarray(np.round(np.clip(res, 0.0, 1.0) * 255).astype(np.uint8))
 
 
-def importer_stats(mr, factors: dict) -> str:
-    """The two numbers ftrace's glTF importer derives from a metal-roughness map `mr` over ALL
-    its texels (src/gltf.h): mean metalness, which types the material, and mean roughness, its
-    constant, each texel's in ftrace's units as gltfRoughness converts it (r^2 / 0.646, at most
-    1) -- so a result whose numbers moved would import as a different material."""
+def surface_weights(uv_corners: np.ndarray, areas: np.ndarray, h: int, w: int, k: int = 4) -> np.ndarray:
+    """How much surface each texel of an h x w map carries: each face's area spread over k*k
+    points of its UV triangle (v up, as MeshLab gives it), wrapped as the repeat sampler does.
+    The importer spreads it over the texel centres the triangle covers (gltf.h texelWeights); a
+    face's points land on those texels in the same shares, so the two agree but for faces of a
+    texel or two."""
+    i, j = np.meshgrid(np.arange(k), np.arange(k), indexing="ij")
+    b1, b2 = ((i + 0.5) / k).ravel(), ((j + 0.5) / k).ravel()
+    fold = b1 + b2 > 1.0                                   # the square's far half, folded back
+    b1, b2 = np.where(fold, 1.0 - b1, b1), np.where(fold, 1.0 - b2, b2)
+    p = (uv_corners[:, None, 0, :] * (1.0 - b1 - b2)[None, :, None] + uv_corners[:, None, 1, :] * b1[None, :, None]
+         + uv_corners[:, None, 2, :] * b2[None, :, None])
+    cols = np.floor(p[..., 0] * w).astype(np.int64) % w
+    rows = np.floor((1.0 - p[..., 1]) * h).astype(np.int64) % h
+    out = np.zeros((h, w))
+    np.add.at(out, (rows.ravel(), cols.ravel()), np.repeat(areas / (k * k), k * k))
+    return out
+
+
+def face_areas(V: np.ndarray, F: np.ndarray) -> np.ndarray:
+    return 0.5 * np.linalg.norm(np.cross(V[F[:, 1]] - V[F[:, 0]], V[F[:, 2]] - V[F[:, 0]]), axis=1)
+
+
+def importer_stats(mr, factors: dict, weight=None) -> str:
+    """The two numbers ftrace's glTF importer derives from a metal-roughness map `mr` (src/gltf.h):
+    mean metalness, which types the material, and mean roughness, its constant, each texel's in
+    ftrace's units as gltfRoughness converts it (r^2 / 0.646, at most 1), and each weighed by the
+    surface mapped onto it (`weight`, surface_weights; None: all alike) -- so a result whose
+    numbers moved would import as a different material."""
     if mr is None:
         return "no metal-roughness map"
     a = np.asarray(mr, dtype=np.float64) / 255.0
     r = np.clip(a[..., 1] * factors['roughnessFactor'], 0, 1)
+    wt = np.ones(a.shape[:2]) if weight is None or not weight.sum() > 0 else weight
     return "mean metalness %.4f, roughness %.4f" % (
-        np.clip(a[..., 2] * factors['metallicFactor'], 0, 1).mean(),
-        np.minimum(1.0, r * r / 0.646).mean())
+        np.average(np.clip(a[..., 2] * factors['metallicFactor'], 0, 1), weights=wt),
+        np.average(np.minimum(1.0, r * r / 0.646), weights=wt))
 
 
 def patch_glb(path: str, samplers: dict, factors: dict):
@@ -368,6 +393,7 @@ def main():
     if textured and not ms.current_mesh().has_wedge_tex_coord():
         ap.error("the source has no UVs: pass --no-texture")
     W0 = ms.current_mesh().wedge_tex_coord_matrix().reshape(-1, 3, 2) if textured else None
+    A0 = face_areas(ms.current_mesh().vertex_matrix(), ms.current_mesh().face_matrix()) if textured else None
     decimate(ms, a.faces, textured)
     defects = edge_defects(ms.current_mesh().face_matrix())
     if defects != src_defects:
@@ -404,9 +430,13 @@ def main():
         mat = trimesh.visual.material.PBRMaterial(
             **out, **{k: v for k, v in factors.items() if v is not None})
         kw['visual'] = trimesh.visual.TextureVisuals(uv=uniq[:, 1:3], material=mat)
+        src_mr, res_mr = images.get('metallicRoughnessTexture', (0, None))[1], out.get('metallicRoughnessTexture')
+        W1 = m.wedge_tex_coord_matrix().reshape(-1, 3, 2)
         print("importer stats: source %s; result %s" % (
-            importer_stats(images.get('metallicRoughnessTexture', (0, None))[1], factors),
-            importer_stats(out.get('metallicRoughnessTexture'), factors)))
+            importer_stats(src_mr, factors, None if src_mr is None else
+                           surface_weights(W0, A0, src_mr.height, src_mr.width)),
+            importer_stats(res_mr, factors, None if res_mr is None else
+                           surface_weights(W1, face_areas(V, F), res_mr.height, res_mr.width))))
     mesh = trimesh.Trimesh(**kw)
     mesh.export(a.out)
     if textured:
