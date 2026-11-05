@@ -83,7 +83,8 @@ Each names the section its line is in.
 1. ~~**MERGE-PROXIMITY** (4.2) — every photon gather (M, S, U, J) takes photons from any surface in
    its radius: a table top gathers the floor's light.~~ Done, 0.431.0.
 2. ~~**HAZE-SUN-B** (4.2) — mode B lights an unbounded sunlit haze at 0.16 of mode R.~~ Decided
-   (2026-11-05): R, D and J stay, and the forward modes warn. Done, 0.434.15.
+   (2026-11-05): R, D and J stay, and the modes whose haze comes from forward photons warn. Done,
+   0.434.15 (A, B, C) and 0.434.16 (P, V, M -beams); its blur half is HAZE-BLUR-DOMAIN (15).
 3. ~~**VCM-SPEC** and **SPPM-SPECTRAL** (4.2) — modes U and S merge at the camera's wavelength, so
    a coloured surface seen before a merge washes out (the fix mode J got in 0.386.1, JSPEC).~~ Done:
    mode S 0.432.0, mode U 0.433.0.
@@ -111,14 +112,17 @@ Each names the section its line is in.
 13. **UPBP-W-CHROMATIC** (4.3) — mode J's beam weight mixes two wavelengths in a chromatic medium.
 14. **FEATHER-IS-A-THRESHOLD** (4.2) — `feather` shrinks a cloud instead of ramping it; the fix
     changes `gallery_rain`'s cloud edges, so show the user before it lands.
-15. **GLOSSY-SAMPLE-SITES** (4.4) — the interference factor applied by hand at two dozen sites.
-16. **JSPEC-CARRIER-SIZE** (4.5) — every mode-J GPU thread reserves the spectral carrier.
-17. **RADCACHE-BATCHES** (4.5) — `-radcache`'s fixed batches outlast `-stop` and the interval.
-18. **P-HEROSPLIT-FIRST**, **ROUGH-IRID-AIR** (4.3) — narrow estimator gaps.
-19. **REMAP0-IMPOSSIBLE** (4.4) — the MIS sums read every zero density as a delta's.
-20. **BEAMEPOCHS-CHUNK-PIN** (4.5) — `-beamepochs` pins cheap scenes' GPU chunks to 1 spp.
-21. **DEFORM-LIMITS**, **MOTION-LIGHT-RIGID**, **PER-OBJECT-MODES** (4.6) — what is left of them.
-22. **BLACK-PIXELS-ONCE** (4.2) — one render's black pixels, never reproduced.
+15. **HAZE-BLUR-DOMAIN** (4.2) — under a blur, modes D and J weigh together strategies that take
+    different haze for a mover outside the instant's sphere. Measure first; one fix needs the
+    user's word.
+16. **GLOSSY-SAMPLE-SITES** (4.4) — the interference factor applied by hand at two dozen sites.
+17. **JSPEC-CARRIER-SIZE** (4.5) — every mode-J GPU thread reserves the spectral carrier.
+18. **RADCACHE-BATCHES** (4.5) — `-radcache`'s fixed batches outlast `-stop` and the interval.
+19. **P-HEROSPLIT-FIRST**, **ROUGH-IRID-AIR** (4.3) — narrow estimator gaps.
+20. **REMAP0-IMPOSSIBLE** (4.4) — the MIS sums read every zero density as a delta's.
+21. **BEAMEPOCHS-CHUNK-PIN** (4.5) — `-beamepochs` pins cheap scenes' GPU chunks to 1 spp.
+22. **DEFORM-LIMITS**, **MOTION-LIGHT-RIGID**, **PER-OBJECT-MODES** (4.6) — what is left of them.
+23. **BLACK-PIXELS-ONCE** (4.2) — one render's black pixels, never reproduced.
 
 Then the rest of 4.2-4.6 in their order, 4.7's bookkeeping alongside whatever touches its entries.
 
@@ -158,8 +162,12 @@ Then the rest of 4.2-4.6 in their order, 4.7's bookkeeping alongside whatever to
 
 - [x] **MERGE-PROXIMITY** (0.431.0) — every gather keeps only the photons near its tangent plane
   (`gatherplane.h`), except on a curve; mode M's sheet lit from below read 21x, now 0.
-- [x] **HAZE-SUN-B** (0.434.15) — mode B lights an unbounded sunlit haze at 0.163 of mode R, its
-  floor 0.846; the forward modes say so (the user's choice, 4.1).
+- [x] **HAZE-SUN-B** (0.434.15, 0.434.16) — mode B lights an unbounded sunlit haze at 0.163 of
+  mode R, its floor 0.846; the modes whose haze comes from forward photons (A, B, C, P, V,
+  M -beams) say so (the user's choice, 4.1).
+- [ ] **HAZE-BLUR-DOMAIN** — under a blur, a mover outside the instant's sphere in an unbounded
+  sunlit haze: the NEE leg, a BDPT light subpath from the swept disc and a forward photon each give
+  its sunlight a different haze, and modes D and J weigh the first two together.
 - [x] **VCM-SPEC** (0.433.0) — mode U's camera walk carries mode J's spectral carrier, and each
   merge reads it at the light vertex's wavelengths.
 - [ ] **MODEM-GPU-CORNER**, what is left — the corner was noise (0.433.2); GPU mode M reads

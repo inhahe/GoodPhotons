@@ -485,12 +485,17 @@ Refused at load, never rendered wrong:
 
 ## DONE (2026-11-05, 0.434.15; opened 0.411.1): HAZE-SUN-B — mode B lights an unbounded sunlit haze far dimmer than mode R
 
-**Decided 2026-11-05** (the user, TODO 4.1): modes R, D and J keep lighting an unbounded haze out to
-the horizon, and the forward modes (A, B, C) print, once per scene, that they light it only near
-the scene -- where a sun or a sky lights a medium with no bounds that attenuates
-(`warnForwardUnboundedHaze`, main.cpp). Bounding the medium makes the modes agree.
-`tools/check_haze_warning.py` holds A, B and C to the warning, and R, a bounded haze and a light in
-the scene to none. The rest of this entry is how it stood.
+**Decided 2026-11-05** (the user, TODO 4.1): mode R, and modes D and J under a sun (they refuse a
+sky), keep lighting an unbounded haze out to the horizon, and the modes whose haze comes from
+forward photons say they light it only near the scene, where a sun or a sky lights a medium with
+no bounds that attenuates. Those modes are A, B and C, P (its forward film), V (which compares
+it) and M under `-beams` (main.cpp `modeLightsHazeOnlyNearScene`). The warning goes to stderr,
+once per scene file, after every camera's mode is resolved (`warnHazeOnlyNearScene`; 0.434.15
+for A, B and C, 0.434.16 for the rest). Bounding the medium makes the modes agree.
+`tools/check_haze_warning.py` holds those modes to the warning (and a sky, and two cameras on one
+shared flight), and modes R, D and J, M without `-beams`, a bounded haze, a medium that does not
+attenuate and a light in the scene to none. The blur half of this entry is HAZE-BLUR-DOMAIN,
+below; the rest is how it stood.
 
 `scenes/_haze_sun_b_vs_r.ftsl` (a 2 m floor under a high sun in `medium { sigma_t 0.04  albedo
 0.5 }`, no bounds; 96x72): mode B's floor converges to **0.846** of mode R's, and the haze seen
@@ -507,18 +512,42 @@ each medium collision to the camera. Mode D agrees with R here (1.012), so the f
 suspect: its camera splat from medium vertices, or how far it lets the haze reach. Proper fix:
 one domain for the unbounded haze in every mode (the slab beyond the entry disc's plane is the
 natural one, since that is where the photons start), and a check that modes R, D and B agree on
-this scene. Under a blur the strategies disagree once more, for a mover outside the instant's
-sphere: a BDPT sun subpath entering outside the instant's disc walks the haze from the swept disc
-(it may not be dropped or shortened alone, being a strategy MIS weighs), a forward photon there
-starts just short of the mover, and the NEE leg counts `mediaExitDistance` from the mover. One
-domain for every estimator -- clipping an unbounded medium to the instant's sphere inside
-`mediaTr` and the free-flight samplers -- would end both (review of 51eb7ef..af7de14).
+this scene.
 
 Re-measured on 0.431.0 (GPU, against mode R at 1024 spp): mode J agrees too (haze 0.981, floor
 1.025), and mode B reads 0.144 and 0.910. So the three modes scenes are rendered with agree, and one
 domain for every mode would change all three to suit the one that cannot light the haze it never
 emits into. That is now a decision for the user (TODO.md 4.1): clip in every mode, or keep R, D and
 J and have the forward modes warn that they light an unbounded haze only near the scene.
+
+## OPEN (2026-11-05, 0.434.16; found in review of 51eb7ef..af7de14): HAZE-BLUR-DOMAIN — under a blur, modes D and J's strategies take different haze for a mover outside the instant's sphere
+
+Split from HAZE-SUN-B, whose decision (keep mode R's domain for an unbounded haze) leaves it
+standing. In a scene with motion, a path with a time draws a sun's or a sky's light through the
+swept entry disc (`Scene::lightRadius`), wider and further out than the instant's, so that a
+mover outside the instant's sphere is still lit. For such a mover in an unbounded haze, three
+estimators give the sun's light three different haze lengths:
+
+- the NEE leg (modes R, D and J) dims it by the haze over `mediaExitDistance` from the mover,
+  `|centre - p| + sceneRadius` -- the instant's sphere, since no medium moves;
+- a BDPT light subpath (D and J) entering outside the instant's disc is left on the swept disc
+  (`Scene::skyEntryPastHaze` with `mayDrop` false: MIS weighs it as a strategy, so it may not be
+  dropped or shortened alone) and walks the haze from there;
+- a forward photon (A, B, C, P, V, M -beams) entering there starts just short of the mover and
+  crosses none.
+
+So D and J weigh together strategies that disagree about that light, and their image of the mover
+is biased, while R's stands on the NEE leg alone. Not measured yet. Reproduce: a ball that sweeps
+from inside the scene's sphere to outside it across a shutter, under `light sun` in
+`medium { sigma_t 0.04 }` with no bounds; compare mode D's and mode R's ball (CPU, matched
+seeds) with the haze on and off. The forward photons' answer is outside the kept domain anyway
+(they warn: HAZE-SUN-B). Proper fix: a BDPT sun or sky subpath must cross exactly the haze the NEE
+leg counts for the vertex it reaches, which `|centre - p| + sceneRadius` makes awkward (it hangs
+on the vertex, which the free flight has yet to sample). Either the subpath's first medium leg is
+weighed by the NEE leg's transmittance instead of its own, or the shadow leg's far end becomes the
+slab beyond the instant's entry-disc plane -- the length a still scene's subpath already walks --
+which would move mode R's sunlit haze slightly off the sun's axis, and so needs the user's word
+(they asked that R, D and J stay as they are).
 
 ## FIXED (2026-11-04, 0.424.0; opened 2026-11-03, 0.410.1): MOTION-ZOOM-APERTURE — a camera's zoom across the shutter keeps the instant's aperture and focus
 

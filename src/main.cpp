@@ -18127,6 +18127,17 @@ static constexpr bool modeFormsLensImage(char mode) {
     return mode == 'R' || mode == 'D' || mode == 'J' || mode == 'A' || mode == 'B' || mode == 'C' ||
            mode == 'V';
 }
+// AN UNBOUNDED HAZE UNDER A SUN OR A SKY (known-issues HAZE-SUN-B). Forward emission sends a
+// distant light in through a disc the size of the scene, so of a medium with no bounds it lights
+// only the column behind that disc. The camera-side estimators light the haze along every camera
+// ray out to the horizon -- mode R (and W, on it) under either light, modes D and J under a sun
+// (they refuse a sky) -- and theirs is the domain kept. The modes listed here take that haze
+// from forward photons: A, B and C render with them, P composites their film, V compares it
+// with mode R's, and M gathers their beams under -beams (without, it renders no medium at all).
+static bool modeLightsHazeOnlyNearScene(char mode) {
+    return mode == 'A' || mode == 'B' || mode == 'C' || mode == 'P' || mode == 'V' ||
+           (mode == 'M' && g_beamGather);
+}
 
 // Core capability check: return a reason string if `mode` cannot render `scene` with a
 // camera of the given `projection`, else nullptr. Volumetric emission restricts every mode
@@ -18362,6 +18373,47 @@ static bool resolveCameraModes(Scene& scene, const std::vector<CamRequest>& cams
         out[i] = fallback;
     }
     return true;
+}
+
+// Tells the user, once per scene file, what modeLightsHazeOnlyNearScene means for this run: a sun
+// or a sky lights a medium with no bounds that attenuates, and some camera renders in one of
+// those modes. `modes` holds the mode each camera of the run renders in, as finally resolved
+// (lens routing, -on-unsupported); `scenePath` names the scene file, the key that keeps a -serve
+// session, which reloads its scene for every frame, from repeating it.
+static void warnHazeOnlyNearScene(const Scene& scene, const std::vector<char>& modes,
+                                  const char* scenePath) {
+    if (scene.sunCount == 0 && scene.envIndex < 0) return;
+    if (std::none_of(scene.media.begin(), scene.media.end(),
+                     [](const Medium& md) { return !md.bounded && md.attenuates(); }))
+        return;
+    std::string which;   // the affected modes, each once, in the order the cameras use them
+    for (char m : modes)
+        if (modeLightsHazeOnlyNearScene(m) && which.find(m) == std::string::npos) which += m;
+    if (which.empty()) return;
+    static bool said = false;
+    static std::string saidFor;
+    const std::string key = scenePath ? scenePath : "";
+    if (said && saidFor == key) return;
+    said = true;
+    saidFor = key;
+    const bool one = which.size() == 1;
+    std::string label = one ? "mode " : "modes ";
+    for (size_t i = 0; i < which.size(); ++i) {
+        if (i) label += ", ";
+        label += which[i];
+    }
+    const char* kept = scene.envIndex >= 0
+        ? "Mode R lights all of it (modes D and J refuse a sky)."
+        : "Modes R, D and J light all of it.";
+    std::fprintf(stderr,
+                 "[%s] warning: a medium with no bounds, lit by the sun or the sky. %s that light "
+                 "in through a disc the size of the scene, so %s the haze only near the scene: "
+                 "haze farther off -- toward the horizon -- renders dark (on a test scene, 0.15 "
+                 "of mode R's), and surfaces lose the light it would scatter onto them (that "
+                 "scene's floor, 0.9). %s Give the medium `bounds` to make the modes agree "
+                 "(known-issues HAZE-SUN-B).\n",
+                 label.c_str(), one ? "This mode sends" : "These modes send",
+                 one ? "it lights" : "they light", kept);
 }
 
 // CPU counterpart of the GPU gpuSppChunks helper: render `sppTarget` samples-per-pixel
@@ -19217,31 +19269,6 @@ static void markSolidFaces(Scene& scene) {
                     std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
 }
 
-// HAZE-SUN-B: the forward modes (A, B, C) emit a sun's or a sky's light through a disc the size of
-// the scene, so of a medium with no bounds they light only the haze in the column behind that disc;
-// the backward modes (R, D, J) light all of it, out to the horizon. The domain an unbounded haze
-// has is a matter of definition (a haze without end would let no sunlight through at all), and
-// the backward modes' is the one kept: the forward modes say so, once per scene, where it applies.
-static void warnForwardUnboundedHaze(const Scene& scene, char mode) {
-    if (!(mode == 'A' || mode == 'B' || mode == 'C')) return;
-    static uint64_t saidFor = 0;
-    if (saidFor == scene.generation) return;
-    bool distant = false;
-    for (const Emitter& e : scene.emitters)
-        if (e.shape == EmitterShape::Sun || e.shape == EmitterShape::Env) { distant = true; break; }
-    if (!distant) return;
-    for (const Medium& md : scene.media) {
-        if (md.bounded || !md.attenuates()) continue;
-        saidFor = scene.generation;
-        std::printf("[mode %c] warning: a medium with no bounds, lit by the sun or the sky. This mode "
-                    "sends that light in through a disc the size of the scene, so it lights the haze "
-                    "only near the scene, and haze farther off -- toward the horizon -- renders dark "
-                    "(on a test scene, 0.15 of mode R's). Modes R, D and J light all of it. Give the "
-                    "medium `bounds` to make the modes agree (known-issues HAZE-SUN-B).\n", mode);
-        return;
-    }
-}
-
 static int runRender(const Scene& scene, const Camera& cam, char mode,
                      long long N, int res, int resY, long long spp, int nThreads,
                      const char* device, bool diffraction,
@@ -19253,7 +19280,6 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
                      double noiseTarget = 0.0, bool wavefront = false,
                      double* exposureAnchor = nullptr, bool rgbBackward = false,
                      BatchCache* batch = nullptr) {
-    warnForwardUnboundedHaze(scene, mode);
     // PER-OBJECT RENDER MODES (0.386.0): `mode D` / `mode J` on an object, group, material or
     // medium (Material::route, Medium::route). Modes D and J are one renderer -- J is D plus its
     // merges -- so a frame can switch between them path by path: each path is routed by what its
@@ -24910,6 +24936,11 @@ static int run(int argc, char** argv) {
         }
         toRender.push_back({"", c, mode, fresX, fresY, (exposureCli > 0.0 ? exposureCli : 0.0), forceExposureLock ? 0 : -1, cLook, cUp, cFov});
     }
+    {
+        std::vector<char> modes;
+        for (const RenderCam& rc : toRender) modes.push_back(rc.mode);
+        warnHazeOnlyNearScene(scene, modes, inFile);
+    }
 
     // -roiboxes: derive per-material ROIs from primary visibility, print them, exit.
     // Placed HERE, after `toRender` is final, so the boxes come from exactly the camera
@@ -28466,7 +28497,6 @@ static int run(int argc, char** argv) {
     // one interval and `-resume` continues from the saved films. This mirrors the forward
     // A/B/C loop in runRender, generalised to N cameras riding one shared flight.
     auto runSharedGroup = [&](const std::vector<int>& idx, char groupMode) {
-        warnForwardUnboundedHaze(scene, groupMode);
         if (idx.empty() || g_stopRequested) return;
         g_windowMode = modeLabel(groupMode);   // title bar shows this shared group's mode
         const int nc = (int)idx.size();
