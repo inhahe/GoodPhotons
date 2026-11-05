@@ -13435,28 +13435,28 @@ __device__ static inline bool dConnectibleType(int tp) {
     return tp == D_DIFFUSE || tp == D_GLOSSY || tp == D_FLUORESCENT || tp == D_DIFFUSETRANSMIT ||
            tp == D_HAIR;   // fiber BCSDF: narrow lobes, but finite (bsdf_eval.h isConnectibleMat)
 }
-// Whether a light walk stores the vertex a merge gathers under the lobe `m` (host twin: vcm.h and
-// bdpt.h's storesVertex / storesPhoton).
+// Whether a light walk stores the vertex a merge gathers under the lobe `m` (host twin
+// storesMergeVertex).
 __device__ static inline bool dStoresMergeVertex(const DMaterial& m) {
     return dConnectibleType(m.type) && m.type != D_HAIR && !m.matReflectsNothing;
 }
-// The probability that resolving the compound `m` at `h` picks a lobe that stores one, the coat with
-// `coatR` (host twin compoundPickProb, COMPOUND-MERGE-PICK, where the reasoning lives).
-__device__ static double dCompoundPickProb(const DScene& sc, const DMaterial& m, const DHit& h, double coatR) {
-    const auto kept = [&](int c) { return c >= 0 && dStoresMergeVertex(sc.mats[c]); };
-    double body = 0.0;
-    if ((m.mixWeightPat >= 0 || m.mixWeightTex >= 0) && m.mixCount == 2) {
-        Real t = (m.mixWeightPat >= 0)
-               ? (Real)dPatternScalarAt(sc, m.mixWeightPat, h)
-               : (Real)dTexScalarAt(sc.textures[m.mixWeightTex], h.u, h.v);
-        if (t < 0) t = 0; else if (t > 1) t = 1;
-        body = (kept(m.mixChild[0]) ? (double)t : 0.0) + (kept(m.mixChild[1]) ? 1.0 - (double)t : 0.0);
-    } else {
-        for (int k = 0; k < m.mixCount; ++k) if (kept(m.mixChild[k])) body += (double)m.mixWeight[k];
+// A light walk's merge vertex at the compound `m`, stored whatever lobe the pick takes: 1 over its
+// share, the chance the pick goes on (the coat with `coatR`); 0 when no lobe of `m` could hold one
+// (host twin compoundMergeStoreProb, COMPOUND-MERGE-PICK, where the reasoning lives).
+__device__ static double dCompoundMergeStoreProb(const DScene& sc, const DMaterial& m, double coatR) {
+    if (m.type != D_MIX && m.type != D_LAYERED) return 1.0;
+    const bool layered = m.type == D_LAYERED;
+    bool any = layered && m.coatChild >= 0 && dStoresMergeVertex(sc.mats[m.coatChild]);
+    for (int k = 0; k < m.mixCount; ++k)
+        any = any || (m.mixChild[k] >= 0 && dStoresMergeVertex(sc.mats[m.mixChild[k]]));
+    if (!any) return 0.0;
+    double body = 1.0;                   // dMixResolveChild's chance of a child (no leftover slice)
+    if (!((m.mixWeightPat >= 0 || m.mixWeightTex >= 0) && m.mixCount == 2)) {
+        body = 0.0;
+        for (int k = 0; k < m.mixCount; ++k) body += (double)m.mixWeight[k];
+        if (body > 1.0) body = 1.0;
     }
-    if (m.type == D_MIX) return body;
-    if (m.type == D_LAYERED) return (kept(m.coatChild) ? coatR : 0.0) + (1.0 - coatR) * body;
-    return 1.0;
+    return layered ? (m.coatChild >= 0 ? coatR : 0.0) + (1.0 - coatR) * body : body;
 }
 
 // --- MODE J (UPBP): eta' of the merge technique at a medium vertex ----------------------
@@ -13488,9 +13488,7 @@ __device__ static double dCompoundPickProb(const DScene& sc, const DMaterial& m,
 // every other surface within the radius (bdpt.h).
 __device__ static inline bool dSurfMergeSite(const DScene& sc, const DVertex& v) {
     if (v.type != BV_SURFACE || v.delta || v.matId < 0) return false;
-    const DMaterial& m = sc.mats[v.matId];
-    return dConnectibleType(m.type) && m.type != D_HAIR && !m.matReflectsNothing &&
-           !(v.fiberR > (Real)0);
+    return dStoresMergeVertex(sc.mats[v.matId]) && !(v.fiberR > (Real)0);
 }
 
 // bdpt.h connOrigin / connFiberStep twins for a BDPT vertex (dFiberConnOrigin / dFiberStep take a
@@ -17534,8 +17532,8 @@ __device__ static void dRandomWalk(const DScene& sc, const DCamera& cam, int dif
                                    DPathSeg* segs = nullptr, int* nSegs = nullptr,
                                    int maxSegs = 0, DJSpecRun* jrun = nullptr,
                                    DJSpec* vspec = nullptr, float* mergeW = nullptr) {
-    // `mergeW`, if given, takes each vertex's merge share (host twin Vertex::mergeW): 1 over the
-    // probability that the pick at a compound there stores a merge vertex, 1 elsewhere.
+    // `mergeW`, if given, takes each vertex's share as a compound's merge vertex (host twin
+    // Vertex::mergeW): 1 over the chance the pick there went on, or 0 where it is none.
     const Real lambda = hb.lam[0];   // the hero drives geometry, sampling and every pdf
     if (maxDepth == 0) return;
     double pdfFwd = pdfDir;
@@ -17637,7 +17635,7 @@ __device__ static void dRandomWalk(const DScene& sc, const DCamera& cam, int dif
             v.nUp = nUp;
             v.pdfFwd = dConvertDensity(pdfFwd, path[prevIdx], v);
             path[n] = v; int cur = n; n++;
-            if (mergeW) mergeW[cur] = 1.0f;              // a medium vertex is no compound
+            if (mergeW) mergeW[cur] = 0.0f;              // a medium vertex is no compound
             if (jrun && vspec) jrun->snap(vspec[cur]);   // JSPEC: the carrier arriving here
             for (int i = 0; i + 1 < nUp; ++i) pathSec[cur * secStride + i] = betaSec[i];
             if (++bounces >= maxDepth) return;
@@ -17680,12 +17678,12 @@ __device__ static void dRandomWalk(const DScene& sc, const DCamera& cam, int dif
 
         const DMaterial* mp = &sc.mats[h.matId];
         int matId = h.matId;
-        double pickStore = 1.0;   // COMPOUND-MERGE-PICK (mergeW)
+        double storeP = 0.0;      // COMPOUND-MERGE-PICK (mergeW)
         if (dIsCompound(mp->type)) {
             int coatPick = -1; double coatR = 0.0, coatCos = 1.0, coatU = 0.0; Real coatTh = (Real)0;
             int child = dResolveCompound(sc, *mp, h, rd, lambda, rng,     // honours per-hit blend mask
                                          &coatPick, &coatR, &coatCos, &coatTh, &coatU);
-            if (mergeW) pickStore = dCompoundPickProb(sc, *mp, h, coatR);
+            if (mergeW) storeP = dCompoundMergeStoreProb(sc, *mp, coatR);
             if (child < 0) return;
             // THE HERO BUNDLE at a coat's coin (host twin randomWalk, where the reasoning is): one
             // coin compared per wavelength; if they disagree the bundle collapses AT this vertex.
@@ -17727,7 +17725,7 @@ __device__ static void dRandomWalk(const DScene& sc, const DCamera& cam, int dif
         v.nUp = nUp;
         v.pdfFwd = dConvertDensity(pdfFwd, path[n - 1], v);
         path[n] = v; int cur = n; n++;
-        if (mergeW) mergeW[cur] = (pickStore > 0.0) ? (float)(1.0 / pickStore) : 1.0f;
+        if (mergeW) mergeW[cur] = (storeP > 0.0) ? (float)(1.0 / storeP) : 0.0f;
         if (jrun && vspec) jrun->snap(vspec[cur]);   // JSPEC: the carrier arriving here (coin included)
         for (int i = 0; i + 1 < nUp; ++i) pathSec[cur * secStride + i] = betaSec[i];
         if (++bounces >= maxDepth) {
@@ -20918,7 +20916,7 @@ struct DVcmLV {
     DVec3  p, ns, ng, wo;
     double beta;
     double dVCM, dVC, dVM;
-    double cx, cy, cz;     // cie(lambda) cached at store time (bit-identical per gather)
+    float  cx, cy, cz;     // cie(lambda) cached at store time, read by every merge that gathers it
     float  lambda;
     int    matId, edges;
     Real   u, v;
@@ -20928,9 +20926,12 @@ struct DVcmLV {
                            // in VCM than in every other integrator. Costs 8 B/slot after
                            // alignment (the slab goes 128 -> 136 B), which is the price
                            // of that consistency on the largest allocation in a session.
-    // Hero wavelengths still live here (1 == de-hero'd / single-λ), and the hit's DHit::back
-    // and DHit::patOwnSide (DVertex's) -- in one word, so the slot does not grow.
-    short  nUp;
+    // Hero wavelengths still live here (1 == de-hero'd / single-λ); whether the connections may
+    // use it (host twin LightVertex::connects: a compound's merge vertex under a mirror or glass
+    // pick may not); and the hit's DHit::back and DHit::patOwnSide (DVertex's) -- in one word, so
+    // the slot does not grow.
+    signed char   nUp;
+    unsigned char connects;
     unsigned char back, patOwnSide;
     DVec3  tangent;        // fiber axis at a strand vertex (its BCSDF frame for VC / splats, 0.364.0)
     Real   fiberR;         // fiber radius (far-side clearance of a connection that ends on it); 0 off a strand
@@ -20940,7 +20941,7 @@ struct DVcmLV {
     float  mergeW;         // the merges' share of it (host twin LightVertex::mergeW)
 };
 #if FTRACE_GPU_FP32
-static_assert(sizeof(DVcmLV) == 168, "DVcmLV changed size: it is the largest allocation in a session");
+static_assert(sizeof(DVcmLV) == 152, "DVcmLV changed size: it is the largest allocation in a session");
 #endif
 // dVertexGeoN's twin for a stored light vertex.
 __device__ static inline DVec3 dLvGeoN(const DVcmLV& v) { return v.back ? v.ng * (Real)(-1) : v.ng; }
@@ -21429,12 +21430,12 @@ __global__ void kVcmLightT(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx,
 
             const DMaterial* mp = &sc.mats[h.matId];
             int matId = h.matId;
-            double pickStore = 1.0;   // COMPOUND-MERGE-PICK (DVcmLV::mergeW)
+            double storeP = 0.0;      // COMPOUND-MERGE-PICK (DVcmLV::mergeW)
             if (dIsCompound(mp->type)) {
                 int coatPick = -1; double coatR = 0.0, coatCos = 1.0, coatU = 0.0; Real coatTh = (Real)0;
                 int c = dResolveCompound(sc, *mp, h, rdCur, lamAll[0], rng,
                                          &coatPick, &coatR, &coatCos, &coatTh, &coatU);
-                pickStore = dCompoundPickProb(sc, *mp, h, coatR);
+                storeP = dCompoundMergeStoreProb(sc, *mp, coatR);
                 if (c < 0) break;
                 // One coat coin for the bundle, compared per wavelength; disagreeing wavelengths
                 // collapse it to the hero here (vcm.h, bdpt.h HERO-COAT-COIN).
@@ -21461,20 +21462,24 @@ __global__ void kVcmLightT(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx,
             DVec3 ngo = dShadedNg(h);
 
             // A strand is never a light vertex (vcm.h traceLightSubpath, 0.365.0): neither stored
-            // nor splat, and the walk ends after its scatter below.
-            if (dConnectibleType(mp->type) && mp->type != D_HAIR) {
+            // nor splat, and the walk ends after its scatter below. A compound's merge vertex is
+            // stored whatever lobe the pick took (storeP), for the merges alone where that lobe
+            // does not connect (host twin).
+            const bool connectible = dConnectibleType(mp->type) && mp->type != D_HAIR;
+            if (connectible || storeP > 0.0) {
                 if (stored < vcmCap) {
                     DVcmLV lv;
                     lv.p = h.p; lv.ns = h.n; lv.ng = h.ng; lv.wo = wo;
                     lv.beta = beta; lv.lambda = (float)lambda;
-                    lv.cx = cieLx; lv.cy = cieLy; lv.cz = cieLz;
+                    lv.cx = (float)cieLx; lv.cy = (float)cieLy; lv.cz = (float)cieLz;
                     lv.dVCM = dVCM; lv.dVC = dVC; lv.dVM = dVM;
                     lv.matId = matId; lv.edges = edges; lv.u = h.u; lv.v = h.v; lv.curv = h.curv;
                     lv.vcol = h.vcol; lv.vb0q = dPackBary(h.vb0); lv.vb1q = dPackBary(h.vb1);
-                    lv.mergeW = (pickStore > 0.0) ? (float)(1.0 / pickStore) : 1.0f;
+                    lv.mergeW = (storeP > 0.0) ? (float)(1.0 / storeP) : 1.0f;
+                    lv.connects = connectible ? 1 : 0;
                     lv.tangent = h.tangent; lv.fiberR = h.fiberRadius; lv.pscale = h.pscale;
                     lv.back = h.back ? 1 : 0; lv.patOwnSide = h.patOwnSide ? 1 : 0;
-                    lv.nUp = (short)nUp;
+                    lv.nUp = (signed char)nUp;
                     lvSlab[i * vcmCap + stored] = lv;
                     if (NS > 0 && lvSec) {
                         DVcmSec* row = lvSec + (size_t)(i * vcmCap + stored) * secStride;
@@ -21483,7 +21488,7 @@ __global__ void kVcmLightT(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx,
                     stored++;
                 }
                 // Connect this vertex to the pinhole camera (t=1 light-image splat).
-                if (!cam.hasLens && edges + 1 <= ctx.maxDepth) {
+                if (connectible && !cam.hasLens && edges + 1 <= ctx.maxDepth) {
                     DVec3 toCam = cam.eye - h.p;
                     double dist2c = ddot(toCam, toCam);
                     if (dist2c > 1e-12) {
@@ -21986,6 +21991,7 @@ __global__ void kVcmCameraT(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx
                 int pb = pathBegin[lp], pe = pathEnd[lp];
                 for (int j = pb; j < pe; ++j) {
                     const DVcmLV& lv = grid.lv[j];
+                    if (!lv.connects) continue;                       // a merge vertex only
                     if (edges + lv.edges + 1 > ctx.maxDepth) continue;
                     DVec3 dv = lv.p - h.p; double dist2 = ddot(dv, dv);
                     if (dist2 <= 1e-12) continue;
@@ -22145,7 +22151,7 @@ __global__ void kVcmCameraT(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx
                                   ax = (double)cieX(lc) * wc; ay = (double)cieY(lc) * wc; az = (double)cieZ(lc) * wc;
                               }
                               if (lvUp > 1) { double inv = 1.0 / lvUp; ax *= inv; ay *= inv; az *= inv; }
-                              const double mw = (double)lv.mergeW;   // COMPOUND-MERGE-PICK
+                              const double mw = (double)lv.mergeW;   // a compound's (COMPOUND-MERGE-PICK)
                               mx += ax * mw; my += ay * mw; mz += az * mw;
                           }
                     }}}
@@ -22625,8 +22631,8 @@ kJSurfLightT(DScene sc, DCamera cam, int diffraction, int maxDepth,
         const Real lambda = hb.lam[0];
         DVertex path[MAXV];
         double   pathSec[1];            // secStride 0: never written, never read
-        float    mergeW[MAXV];          // each vertex's merge share (COMPOUND-MERGE-PICK)
-        for (int k = 0; k < MAXV; ++k) mergeW[k] = 1.0f;
+        float    mergeW[MAXV];          // a compound's merge vertex's share (COMPOUND-MERGE-PICK)
+        for (int k = 0; k < MAXV; ++k) mergeW[k] = 0.0f;
         const int np = dGenLightSubpath(sc, cam, diffraction, hb, maxDepth + 1, rng,
                                         path, pathSec, 0, MAXV, mergeW);
         if (np <= 0) continue;
@@ -22652,7 +22658,10 @@ kJSurfLightT(DScene sc, DCamera cam, int diffraction, int maxDepth,
             // A photon that arrived through glass (pdfFwd 0 after a delta y_{u-1}) is stored too
             // since 0.387.0, with that 0 read as 1 (host: traceLightBeamPass's store; MODE-J-SDS).
             const double plU = dMergeLightDensity((double)path[u].pdfFwd, path[u - 1].delta != 0);
-            if (dSurfMergeSite(sc, path[u]) && plU > 0.0 && path[u].beta > 0.0) {
+            // A compound's merge vertex is a photon whatever lobe the pick took (host twin).
+            const bool compoundSite = mergeW[u] > 0.0f && path[u].type == BV_SURFACE &&
+                                      !(path[u].fiberR > (Real)0);
+            if ((dSurfMergeSite(sc, path[u]) || compoundSite) && plU > 0.0 && path[u].beta > 0.0) {
                 DVec3 dp = path[u - 1].p - path[u].p;
                 const double rho2 = ddot(dp, dp);
                 if (rho2 > 0.0) {
@@ -22669,7 +22678,7 @@ kJSurfLightT(DScene sc, DCamera cam, int diffraction, int maxDepth,
                         ph.p      = path[u].p;
                         ph.wo     = dp;                 // unit, toward the previous vertex
                         ph.lambda = (float)lambda;
-                        ph.beta   = (float)(path[u].beta * (double)mergeW[u]);   // COMPOUND-MERGE-PICK
+                        ph.beta   = (float)(path[u].beta * (compoundSite ? (double)mergeW[u] : 1.0));
                         ph.cx = (float)cx; ph.cy = (float)cy; ph.cz = (float)cz;
                         ph.misIdx = (unsigned)slot;     // appended 1:1, so index == slot
                         DSurfMis& sm = out.mis[slot];
@@ -22679,7 +22688,8 @@ kJSurfLightT(DScene sc, DCamera cam, int diffraction, int maxDepth,
                         sm.pdfFwdA = plU;                 // a delta y_{u-1}'s 0 reads 1
                         sm.rCoef   = (float)(cosPrev /
                                              (rho2 * dMisRemap0(path[u - 1].pdfFwd)));
-                        sm.gateC1  = (unsigned char)(gate > 0.0 ? 1 : 0);
+                        // The merged path scatters at y_u through the camera's lobe (host twin).
+                        sm.gateC1  = (unsigned char)(dPrev ? 0 : 1);
                         sm.vert    = (unsigned short)u;
                     }
                 }

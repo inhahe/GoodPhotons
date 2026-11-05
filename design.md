@@ -1022,14 +1022,23 @@ The model is then mode R's: one pick, on the camera's side, and the body's albed
 mode R on a mix, a diffuse-glossy mix, a clearcoat and a thin-film coat.
 
 Modes U and J merge too, against the vertices their light walks store, and a light walk resolves a
-compound before storing, under a lobe that can hold a vertex only (0.434.3, COMPOUND-MERGE-PICK).
-That vertex also serves the connections, which must evaluate the lobe the walk took, so it cannot be
-moved before the pick as the photon was. Instead it carries the merges' share of it
-(`LightVertex::mergeW`, `Vertex::mergeW` for mode J's surface photons, the device's
-`DVcmLV::mergeW` and `dRandomWalk`'s `mergeW` output): 1 over the probability that the pick there
-stores a vertex (`compoundPickProb`, scene.h; `dCompoundPickProb`), the weight of a mix's lobes that
-store one, R times the coat's plus 1 - R times the body's for a layered stack. A clearcoat over a
-diffuse body stores under both and has 1; a mix with an absorbing remainder does not.
+compound before storing (COMPOUND-MERGE-PICK). The vertex a merge gathers stands for the flux arriving
+at the surface whichever lobe the pick then takes: the merge evaluates the camera's lobe, never the
+light's. So since 0.434.6 it is stored whatever lobe the pick takes, a mirror or glass lobe included,
+whenever some lobe of the compound could hold one (`compoundMergeStoreProb`, scene.h;
+`dCompoundMergeStoreProb`). Where the lobe taken does not connect, it is a merge vertex only
+(`LightVertex::connects`, `DVcmLV::connects`: the connections and the t=1 splat skip it). Mode J's
+photon store takes it whatever `surfMergeSite` says of the lobe, and gives it the connection gate of
+y_{u-1} alone (`SurfMis::gateC1`), because the merged path scatters at y_u through the camera's
+lobe. Only the pick's leftover slice ends the walk with nothing stored. So the vertex carries the
+merges' share of it (`LightVertex::mergeW`, `Vertex::mergeW` for mode J's surface photons, the
+device's `DVcmLV::mergeW` and `dRandomWalk`'s `mergeW` output, 0 there off a compound): 1 over the
+chance the pick goes on, a mix's weights summed (a weight map's two children always sum to 1), R
+for the coat plus 1 - R times the bodies' for a layered stack. It costs a sum, and its variance does
+not grow as the storing lobes' weight falls. 0.434.3 had stored the vertex only under a lobe that can
+hold one, at 1 over that lobe's chance, and that chance stayed in the variance. Every stack and
+every mix whose weights sum to 1 has a share of 1; only a mix with an absorbing remainder weighs
+more.
 
 ### Object view navigates differently from scene view (0.319.0)
 

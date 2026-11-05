@@ -5544,37 +5544,31 @@ inline int mixResolveChild(const Scene& scene, const Material& m, const Hit& h, 
     return mixPickChild(m, u);
 }
 
-// COMPOUND-MERGE-PICK: the probability that resolving the compound `m` at `h` picks a lobe whose
-// material `keep` accepts -- a mix's weights (or its two-way weight map) over the kept children, the
-// leftover slice keeping nothing, and for a layered stack its coat with `coatR`, the coat's reflectance
-// at the hit, and its body with 1 - coatR. 1 for anything not compound. A light walk stores the vertex
-// a merge gathers only under a lobe that can hold one, so the merges divide it by this: the vertex
-// stands for the flux arriving at the surface, whatever lobe the walk then took (the photon pass of
-// modes M and S deposits before its pick for the same reason, COMPOUND-DOUBLE-PICK).
+// COMPOUND-MERGE-PICK: a light walk's merge vertex at the compound `m`. The vertex a merge gathers
+// stands for the flux arriving at the surface whichever lobe the walk's pick then takes (a merge
+// evaluates the camera's lobe, never the light's), so the walk stores it whenever it goes on past the
+// pick and some lobe of `m` could hold one (`keep`), the pick landing on a mirror or glass lobe
+// included. Only the pick's leftover slice ends the walk with nothing stored, so the merges take the
+// vertex at 1 over this: the probability the pick goes on -- a mix's weights summed (at most 1; a
+// two-way weight map's children always sum to 1), a stack's coat with its reflectance `coatR` and its
+// bodies with the rest. 0 when no lobe of `m` could hold a merge vertex; 1 off a compound. It reads
+// no weight map, so it costs a sum. (The photon pass of modes M and S deposits before its pick for
+// the same reason, COMPOUND-DOUBLE-PICK.) Device twin dCompoundMergeStoreProb.
 template <class Keep>
-inline double compoundPickProb(const Scene& scene, const Material& m, const Hit& h, double coatR,
-                               const Keep& keep) {
-    const auto kept = [&](int c) {
-        return c >= 0 && c < (int)scene.mats.size() && keep(scene.mats[(size_t)c]);
-    };
-    const auto bodyProb = [&]() {
-        if (m.mixChildren.size() == 2 && (m.mixWeightPat >= 0 || m.mixWeightTex >= 0)) {
-            double t;    // mixResolveChild's weight of child 0
-            if (m.mixWeightPat >= 0 && m.mixWeightPat < (int)scene.patterns.size())
-                t = scene.patterns[m.mixWeightPat].eval(patCtxFromHit(scene, h));
-            else
-                t = scene.textures[m.mixWeightTex].scalarAt(h.u, h.v);
-            if (t < 0.0) t = 0.0; else if (t > 1.0) t = 1.0;
-            return (kept(m.mixChildren[0]) ? t : 0.0) + (kept(m.mixChildren[1]) ? 1.0 - t : 0.0);
-        }
-        double p = 0.0;
-        for (size_t k = 0; k < m.mixChildren.size(); ++k)
-            if (kept(m.mixChildren[k])) p += m.mixWeights[k];
-        return p;
-    };
-    if (m.type == MatType::Mix) return bodyProb();
-    if (m.type == MatType::Layered) return (kept(m.coatChild) ? coatR : 0.0) + (1.0 - coatR) * bodyProb();
-    return 1.0;
+inline double compoundMergeStoreProb(const Scene& scene, const Material& m, double coatR, const Keep& keep) {
+    if (m.type != MatType::Mix && m.type != MatType::Layered) return 1.0;
+    const auto valid = [&](int c) { return c >= 0 && c < (int)scene.mats.size(); };
+    const bool layered = m.type == MatType::Layered;
+    bool any = layered && valid(m.coatChild) && keep(scene.mats[(size_t)m.coatChild]);
+    for (int c : m.mixChildren) any = any || (valid(c) && keep(scene.mats[(size_t)c]));
+    if (!any) return 0.0;
+    double body = 1.0;                   // mixResolveChild's chance of a child (no leftover slice)
+    if (!(m.mixChildren.size() == 2 && (m.mixWeightPat >= 0 || m.mixWeightTex >= 0))) {
+        body = 0.0;
+        for (double w : m.mixWeights) body += w;
+        if (body > 1.0) body = 1.0;
+    }
+    return layered ? (valid(m.coatChild) ? coatR : 0.0) + (1.0 - coatR) * body : body;
 }
 
 // Deterministic mixResolveChild for the Whitted preview (-mode W). A pattern/texture

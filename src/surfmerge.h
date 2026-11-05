@@ -122,8 +122,9 @@ struct SurfMis {
                                // vertex's BSDF pdf toward the photon's `wo`, which is the
                                // only factor of R it could not know here. Exactly BeamMis::
                                // rCoef's role, one vertex earlier.
-    unsigned char gateC1 = 0;  // 1 if connecting y_{j-1} to y_j is a legal strategy. y_j is
-                               // never delta (surfMergeSite), so this asks about y_{j-1}.
+    unsigned char gateC1 = 0;  // 1 if connecting y_{j-1} to y_j is a legal strategy. In the
+                               // merged path y_j scatters through the camera's lobe, never a
+                               // delta, so this asks about y_{j-1}.
     unsigned char pad_ = 0;    // explicit, so the struct has no implicit padding a new field could
                                // hide in: the device upload copies every field and asserts the size
     unsigned short vert = 0;   // j — the light subpath index, for the depth cap only. Merging

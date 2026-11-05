@@ -298,10 +298,11 @@ struct Vertex {
     // see BdptRenderer::renderRows. Both spellings are the same estimator.
     double betaSec[hero::kHeroMax - 1] = {0};
     int nUp = 1;          // live wavelengths (1 = hero off, or already de-hero'd)
-    // A surface merge's share of this vertex, as a light vertex: 1 over the probability that the
-    // walk's pick at a compound here lands on a lobe that stores a photon (compoundPickProb,
-    // COMPOUND-MERGE-PICK); 1 off a compound. The connections never read it.
-    double mergeW = 1.0;
+    // Above 0 where this is a compound's merge vertex, which a light walk stores whatever lobe its
+    // pick took (compoundMergeStoreProb, COMPOUND-MERGE-PICK): the merges' share of it, 1 over the
+    // chance that pick went on. 0 anywhere else, where the vertex's own lobe decides
+    // (surfMergeSite) at weight 1. The connections never read it.
+    double mergeW = 0.0;
     // Area-measure pdfs of sampling THIS vertex from the previous / next vertex
     // along the two transport directions. Delta vertices store 0 (skipped in MIS).
     double pdfFwd = 0.0;
@@ -1233,14 +1234,11 @@ inline void randomWalk(const Scene& scene, const Camera& cam, const Renderer& ma
 
         // Resolve material (Mix -> child, or absorbed on the leftover slice).
         const Material* mp = &scene.mats[h.matId];
-        // The lobes a surface photon can be stored under (surfMergeSite: a non-delta, non-fiber
-        // surface), for the merges' share of this vertex (Vertex::mergeW).
-        const auto storesPhoton = [](const Material& k) {
-            return isConnectibleMat(k) && !isFiberMat(k) && !k.reflectsNothing;
-        };
-        double pickStore = 1.0;
+        // A compound's merge vertex, for a light walk's surface photons (Vertex::mergeW): stored
+        // whatever lobe the pick takes, at 1 over the chance it goes on; 0 where none could be.
+        double storeP = 0.0;
         if (mp->type == MatType::Mix) {
-            pickStore = compoundPickProb(scene, *mp, h, 0.0, storesPhoton);
+            storeP = compoundMergeStoreProb(scene, *mp, 0.0, storesMergeVertex);
             int c = mixResolveChild(scene, *mp, h, rng.uniform());
             if (c < 0) return;                       // absorbed
             mp = &scene.mats[c];
@@ -1251,7 +1249,7 @@ inline void randomWalk(const Scene& scene, const Camera& cam, const Renderer& ma
             // every MIS density downstream evaluates -- the same convention a mix already uses,
             // where the pdf stored is the resolved child's and not the mixture's.
             const double R = layeredCoatReflectance(scene, *mp, h, ray.d, lambda);
-            pickStore = compoundPickProb(scene, *mp, h, R, storesPhoton);
+            storeP = compoundMergeStoreProb(scene, *mp, R, storesMergeVertex);
             const double uCoat = rng.uniform();
             const bool coatPick = (uCoat < R);
             // THE HERO BUNDLE (0.386.2). One coin serves every live wavelength, compared per
@@ -1292,7 +1290,7 @@ inline void randomWalk(const Scene& scene, const Camera& cam, const Renderer& ma
         v.type = VType::Surface;
         v.p = h.p; v.ns = h.n; v.ng = h.ng; v.hit = h;
         v.matId = h.matId; v.mat = mp; v.beta = beta;
-        v.mergeW = (pickStore > 0.0) ? 1.0 / pickStore : 1.0;
+        v.mergeW = (storeP > 0.0) ? 1.0 / storeP : 0.0;
         v.nUp = nUp;
         for (int i = 0; i + 1 < nUp; ++i) v.betaSec[i] = betaSec[i];
         if (mp->isLight) {
@@ -2821,7 +2819,16 @@ inline void traceLightBeamPass(const Scene& scene, const Camera& cam, long long 
                 // A photon that arrived through glass (pdfFwd 0 after a delta y_{u-1}) is stored
                 // too since 0.387.0, with that 0 read as 1 (MODE-J-SDS; mergeLightDensity).
                 const double plU = mergeLightDensity(path[u].pdfFwd, path[u - 1].delta);
-                if (wantSurf && surfMergeSite(path[u]) && plU > 0.0 && path[u].beta > 0.0) {
+                // A compound's merge vertex is a photon whatever lobe the light's pick took there
+                // (Vertex::mergeW), off a curve like any other.
+                const bool compoundSite = path[u].mergeW > 0.0 && path[u].type == VType::Surface &&
+                                          !(path[u].hit.fiberRadius > 0.0);
+                if (wantSurf && (surfMergeSite(path[u]) || compoundSite) && plU > 0.0 &&
+                    path[u].beta > 0.0) {
+                    // The merged path scatters at y_u through the camera's lobe, never a delta, so
+                    // a connection to y_u needs only y_{u-1} not to be one (SurfMis::gateC1); `gate`
+                    // reads y_u's own lobe, the light's.
+                    const unsigned char gateMerge = dPrev ? 0 : 1;
                     Vec3 dPrev = path[u - 1].p - path[u].p;
                     const double rho2 = dot(dPrev, dPrev);
                     if (rho2 > 0.0) {
@@ -2836,7 +2843,7 @@ inline void traceLightBeamPass(const Scene& scene, const Camera& cam, long long 
                         ph.p      = path[u].p;
                         ph.wo     = dPrev;                 // unit, toward the previous vertex
                         ph.lambda = (float)hb.lam[0];
-                        ph.beta   = (float)(path[u].beta * path[u].mergeW);   // COMPOUND-MERGE-PICK
+                        ph.beta   = (float)(path[u].beta * (compoundSite ? path[u].mergeW : 1.0));
                         ph.cx = (float)cieX(ph.lambda);
                         ph.cy = (float)cieY(ph.lambda);
                         ph.cz = (float)cieZ(ph.lambda);
@@ -2848,7 +2855,7 @@ inline void traceLightBeamPass(const Scene& scene, const Camera& cam, long long 
                         sm.pdfFwdA = plU;                  // a delta y_{u-1}'s 0 reads 1
                         sm.rCoef   = (float)(cosPrev /
                                              (rho2 * misRemap0(path[u - 1].pdfFwd)));
-                        sm.gateC1  = (unsigned char)(gate > 0.0 ? 1 : 0);
+                        sm.gateC1  = gateMerge;
                         sm.vert    = (unsigned short)u;
                         sb.pts.push_back(ph);
                         sb.mis.push_back(sm);

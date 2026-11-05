@@ -23,7 +23,9 @@ mix2 0.56, clearcoat 0.89, all four modes alike. And until 0.433.9 neither walk 
 coat's coin into its spectral carrier, which the thin film needs. Modes U and J store the vertex a
 merge gathers only under a lobe that can hold one, so until 0.434.3 their merges took the pick twice
 too (COMPOUND-MERGE-PICK): mix read 0.713 (CPU) and 0.745 (GPU) of mode R in mode U, 0.63 in mode J
-with -jsurf, where 0.434.3 reads 1.006 and 0.995, and about 1.00 in J. Exits 0 when every case holds.
+with -jsurf, where 0.434.3 reads 1.006 and 0.995, and about 1.00 in J. Since 0.434.6 the light walks
+store that vertex whatever lobe they pick, a mirror included (mixmirror, mixmap test it), at 1 over
+the chance the pick goes on. Exits 0 when every case holds.
 """
 import argparse
 import os

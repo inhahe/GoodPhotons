@@ -94,6 +94,18 @@ GPU 0.745 -> 0.995, mode J `-jsurf` (GPU) 0.63 -> 1.00 0.97 1.03 (its channels s
 check's budget, so mode J is an opt-in arm there, `--extra`); every mode U wall within 2.5 %, and
 mode U is one of the check's default cases now.
 
+**Reworked in 0.434.6** after the Opus review of 0.434.0-0.434.3. 0.434.3's weight was 1 over the
+chance the pick stores, which leaves that chance in the variance: a mix of 10 % white and 90 %
+mirror stored one vertex in ten at weight 10. The vertex is now stored whatever lobe the pick takes,
+the mirror included, whenever some lobe of the compound could hold one
+(`compoundMergeStoreProb`, scene.h; `dCompoundMergeStoreProb`). It is a merge vertex only, kept
+from the connections, where that lobe does not connect: `LightVertex::connects`, `DVcmLV::connects`.
+Mode J's photon store takes it too, whatever `surfMergeSite` says of the lobe, and its connection
+gate reads y_{u-1} alone, because the merged path scatters at y_u through the camera's lobe. Only the
+pick's leftover slice still ends the walk with nothing stored, so the weight is 1 over the chance
+the pick goes on. That is a sum of weights, so no weight map is evaluated twice. DVcmLV's cached
+CIE values are floats now, so it is 152 B (160 before 0.434.3).
+
 
 Found by the Opus review of 0.433.5-0.433.11: COMPOUND-DOUBLE-PICK's photon-pass fix does not reach
 the merges of modes U and J. Their light walks resolve a compound to one lobe and store a vertex

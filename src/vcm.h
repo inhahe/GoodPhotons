@@ -91,6 +91,7 @@ using bdpt::bsdfFAdjoint;   // particle-vertex connections; see bsdf_eval.h
 using bdpt::bsdfPdf;
 using bdpt::isConnectibleMat;
 using bdpt::isFiberMat;
+using bdpt::storesMergeVertex;
 using bdpt::isTwoSidedMat;
 
 // Offset a connection/shadow-ray origin off a surface along the geometric normal, flipped
@@ -163,10 +164,13 @@ struct LightVertex {
     const Material* mat = nullptr;
     Hit    hit;           // for textured albedo / roughness at merge & connect
     int    edges = 0;     // number of edges from the light emitter to this vertex
-    // The merges' share of this vertex: 1 over the probability that the walk's pick at a compound here
-    // lands on a lobe that stores one (compoundPickProb, COMPOUND-MERGE-PICK); 1 off a compound. The
-    // connections never read it: they evaluate the lobe the walk took, the mixture's own sampling.
+    // The merges' share of this vertex: at a compound, 1 over the probability the walk's pick there
+    // went on (compoundMergeStoreProb, COMPOUND-MERGE-PICK); 1 elsewhere. The connections never read
+    // it: they evaluate the lobe the walk took, the mixture's own sampling.
     double mergeW = 1.0;
+    // Whether the connections (the camera's, and the t=1 splat) may use it: the lobe the walk took
+    // here is connectible. A compound's merge vertex stored under a mirror or glass pick is not.
+    bool   connects = true;
 };
 
 // The hero bundle's SECONDARY wavelengths for a stored light vertex. Deliberately a
@@ -751,13 +755,11 @@ inline void traceLightSubpath(const Scene& scene, const Camera& cam, const Rende
 
         // Resolve material (Mix -> child).
         const Material* mp = &scene.mats[h.matId];
-        // The lobes a light vertex is stored under (connectible, below), for LightVertex::mergeW.
-        const auto storesVertex = [](const Material& k) {
-            return isConnectibleMat(k) && !isFiberMat(k) && !k.reflectsNothing;
-        };
-        double pickStore = 1.0;
+        // A compound's merge vertex is stored whatever lobe the pick takes, if any could hold one,
+        // at 1 over the chance the pick goes on (compoundMergeStoreProb; 0: none could).
+        double storeP = 0.0;
         if (mp->type == MatType::Mix) {
-            pickStore = compoundPickProb(scene, *mp, h, 0.0, storesVertex);
+            storeP = compoundMergeStoreProb(scene, *mp, 0.0, storesMergeVertex);
             int c = mixResolveChild(scene, *mp, h, rng.uniform());
             if (c < 0) return;
             mp = &scene.mats[c];
@@ -767,7 +769,7 @@ inline void traceLightSubpath(const Scene& scene, const Camera& cam, const Rende
             // the whole bundle, compared per wavelength; where the wavelengths disagree the
             // bundle collapses to the hero at this vertex (bdpt.h, HERO-COAT-COIN).
             const double R = layeredCoatReflectance(scene, *mp, h, rd, lambda);
-            pickStore = compoundPickProb(scene, *mp, h, R, storesVertex);
+            storeP = compoundMergeStoreProb(scene, *mp, R, storesMergeVertex);
             const double uCoat = rng.uniform();
             const bool coatPick = (uCoat < R);
             for (int i = 0; nUp > 1 && i + 1 < nUp; ++i)
@@ -797,14 +799,15 @@ inline void traceLightSubpath(const Scene& scene, const Camera& cam, const Rende
         // A strand is never a light vertex (0.365.0): neither stored nor splat, and the walk
         // ends after its scatter below (bdpt.h randomWalk's Hair case has the reasoning).
         bool connectible = isConnectibleMat(*mp) && !isFiberMat(*mp);
-        if (connectible) {
+        if (connectible || storeP > 0.0) {
             LightVertex lv;
             lv.p = h.p; lv.ns = h.n; lv.ng = h.ng; lv.wo = wo;
             lv.beta = beta; lv.lambda = (float)lambda;
             lv.cx = cieX(lv.lambda); lv.cy = cieY(lv.lambda); lv.cz = cieZ(lv.lambda);
             lv.dVCM = dVCM; lv.dVC = dVC; lv.dVM = dVM;
             lv.matId = h.matId; lv.mat = mp; lv.hit = h; lv.edges = edges;
-            lv.mergeW = (pickStore > 0.0) ? 1.0 / pickStore : 1.0;
+            lv.mergeW = (storeP > 0.0) ? 1.0 / storeP : 1.0;
+            lv.connects = connectible;
             out.push_back(lv);
             if (C > 1) {                              // lockstep secondary payload
                 LightVertexSec ls; ls.nUp = nUp;
@@ -818,7 +821,7 @@ inline void traceLightSubpath(const Scene& scene, const Camera& cam, const Rende
 
             // Connect this vertex to the pinhole camera (light-image splat, t=1). The
             // path here has (edges + 1) edges: skip if it would exceed maxDepth.
-            if (!cam.hasLens() && edges + 1 <= ctx.maxDepth) {
+            if (connectible && !cam.hasLens() && edges + 1 <= ctx.maxDepth) {
                 Vec3 toCam = cam.eye - h.p;
                 double dist2c = dot(toCam, toCam);
                 if (dist2c > 1e-12) {
@@ -1251,6 +1254,7 @@ inline Vec3 traceCameraSubpath(const Scene& scene, const Camera& cam, const Rend
             // (c) Vertex connection: connect to the PAIRED light subpath's vertices.
             for (int j = pathBegin; j < pathEnd; ++j) {
                 const LightVertex& lv = lightVerts[j];
+                if (!lv.connects) continue;                           // a merge vertex only
                 if (edges + lv.edges + 1 > ctx.maxDepth) continue;   // full path too long
                 Vec3 d = lv.p - h.p; double dist2 = dot(d, d);
                 if (dist2 <= 1e-12) continue;

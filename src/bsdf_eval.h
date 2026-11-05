@@ -57,6 +57,14 @@ inline bool isTwoSidedMat(const Material& m) {
 // the test is what keeps `hair` correct on a triangle mesh with smoothed normals.
 inline bool isFiberMat(const Material& m) { return m.type == MatType::Hair; }
 
+// Whether a light walk stores the vertex a merge gathers under the lobe `k`: one the camera can
+// connect to, and no fiber or light block. The store gates of modes U (vcm.h) and J (bdpt.h
+// surfMergeSite, the material half) and a compound's (scene.h compoundMergeStoreProb) read this one
+// predicate. Device twin dStoresMergeVertex.
+inline bool storesMergeVertex(const Material& k) {
+    return isConnectibleMat(k) && !isFiberMat(k) && !k.reflectsNothing;
+}
+
 // --- Fiber (MatType::Hair) in a bidirectional estimator ---------------------------
 //
 // BDPT's whole vocabulary is "f, its pdf, and a geometry term carrying cos(ns, w) at
