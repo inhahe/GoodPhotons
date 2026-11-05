@@ -42,6 +42,11 @@ CASES = [("M_cpu", ["-mode", "M", "-device", "cpu", "-n", "4000000", "-spp", "16
          ("M_gpu", ["-mode", "M", "-device", "gpu", "-n", "8000000", "-spp", "32"]),
          ("S_cpu", ["-mode", "S", "-device", "cpu", "-spp", "32"]),
          ("S_gpu", ["-mode", "S", "-device", "gpu", "-spp", "64"])]
+# Modes U and J merge too (J's surface merges with -jsurf), and their light walks pick a compound's
+# lobe before they store a vertex as the photon pass did (EXTRA_CASES, --extra).
+EXTRA_CASES = [("U_cpu", ["-mode", "U", "-device", "cpu", "-spp", "64"]),
+               ("U_gpu", ["-mode", "U", "-device", "gpu", "-spp", "256"]),
+               ("J_gpu", ["-mode", "J", "-device", "gpu", "-spp", "256", "-jsurf"])]
 TOL = 0.03
 
 
@@ -63,6 +68,8 @@ def main():
     ap.add_argument("--out", default=os.path.join(ROOT, "png", "check_compound_gather"))
     ap.add_argument("--exe", default=os.path.join(ROOT, "ftrace.exe"))
     ap.add_argument("--only", default=",".join(WALLS))
+    ap.add_argument("--extra", action="store_true", help="modes U and J too (EXTRA_CASES)")
+    ap.add_argument("--cases", default="", help="only these cases, by name")
     a = ap.parse_args()
     exe, out = os.path.abspath(a.exe), os.path.abspath(a.out)
     os.makedirs(out, exist_ok=True)
@@ -78,7 +85,10 @@ def main():
 
         r = wall("R", REF, False)
         floor = 0.1 * r.sum()
-        for tag, args in CASES:
+        cases = CASES + (EXTRA_CASES if a.extra else [])
+        if a.cases:
+            cases = [c for c in CASES + EXTRA_CASES if c[0] in a.cases.split(",")]
+        for tag, args in cases:
             x = wall(tag, args, "gpu" in tag)
             good = all(abs(xi - ri) <= TOL * max(abs(ri), floor) for xi, ri in zip(x, r))
             ok &= good

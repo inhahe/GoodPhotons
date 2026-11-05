@@ -460,13 +460,15 @@ inline double gatherCoverageRaw(const Scene& scene, const Vec3& p, const Vec3& n
                 // On through a face that holds no photon -- but only one above the plane: a face ON
                 // it (a glass box standing on the floor, coplanar with it) is the surface's own
                 // height, and passing it would skip the surface beside it.
-                if (pm && probePassesThrough(*pm) && r - h.t > 1e-3 * r) {
+                if (pm && probePassesThrough(scene, *pm) && r - h.t > 1e-3 * r) {
                     tAcc = h.t;
                     pr = Ray{h.p + pr.d * 1e-9, pr.d};
                     continue;
                 }
-                if (pm && gatherlessStrand(*pm, h.fiberRadius)) {
-                    // Holds no photon, and the surface the gather's photons lie on is beyond it.
+                if (pm && h.fiberRadius > 0.0 && pm->type != MatType::Hair &&
+                    !holdsPhotons(scene, *pm, h.fiberRadius)) {
+                    // Holds no photon (a diffuse strand, or a compound of them), and the surface
+                    // the gather's photons lie on is beyond it.
                     if (skip < 48) ++skip;
                     tAcc = h.t;
                     pr = Ray{h.p + pr.d * 1e-9, pr.d, 2.5 * h.fiberRadius + 1e-9};   // through the tube
@@ -1115,11 +1117,7 @@ struct SpecThr {
     // did: then the bins cannot resolve the support, and the walk's own probability serves.
     void rescale() {
         double D = 0.0;
-        for (int k = 0; k < K; ++k) {
-            const double lo = LAMBDA_MIN + k * (LAMBDA_MAX - LAMBDA_MIN) / (double)K;
-            const double hi = LAMBDA_MIN + (k + 1) * (LAMBDA_MAX - LAMBDA_MIN) / (double)K;
-            D += (walkDensity->cdfAt(hi) - walkDensity->cdfAt(lo)) * p[k];
-        }
+        for (int k = 0; k < K; ++k) D += walkDensity->binMass[k] * p[k];
         pscale = (D > 0.0) ? pcam / D : 1.0;
     }
     // The correction a photon of wavelength `lamP` needs. Denominator is `cam`, so this
@@ -1156,6 +1154,19 @@ struct SpecThr {
         return true;
     }
 };
+
+// SPECGATHER: a layered coat's coat-or-body coin at every bin, as modes J and U fold it, for mode M's
+// walk and mode S's. A thin-film coat's reflectance swings across the band, and the body under it
+// keeps 1 - R(lambda). `R` is the coat's reflectance at the walk's wavelength for the direction `d`
+// the walk met it along, `coatPick` the branch it took.
+inline void foldCoatCoin(SpecThr& sthr, const Scene& scene, const Material& lm, const Hit& h,
+                         const Vec3& d, bool coatPick, double R) {
+    const double pc = coatPick ? R : 1.0 - R;
+    sthr.mulCoin([&](double L, double& pr) {
+        const double rL = layeredCoatReflectance(scene, lm, h, d, L);
+        return pr = coatPick ? rL : 1.0 - rL;
+    }, pc, pc, false);
+}
 
 // The media transmittance of one straight CAMERA segment -- one ratio-tracking sample, or
 // pbeams::kSunDiscTrSamples of them when the segment points into a sun's disc (see the constant's
@@ -1646,17 +1657,7 @@ inline Vec3 photonGather(const Scene& scene, const PhotonMap& pm, Ray ray,
             int c = coatPick ? mp->coatChild
                              : mixResolveChild(scene, *mp, h, rng.uniform());  // body lobe: honours a bound weight map (device twin: dResolveCompound)
             if (c < 0) return L;
-            // SPECGATHER: the coin at every bin, as modes J and U fold it. A thin-film coat's
-            // reflectance swings across the band, and the body under it keeps 1 - R(lambda).
-            {
-                const Material& lm = *mp;
-                const Vec3 d0 = ray.d;
-                const double pc = coatPick ? R : 1.0 - R;
-                sthr.mulCoin([&](double Lw, double& pr) {
-                    const double rL = layeredCoatReflectance(scene, lm, h, d0, Lw);
-                    return pr = coatPick ? rL : 1.0 - rL;
-                }, pc, pc, false);
-            }
+            foldCoatCoin(sthr, scene, *mp, h, ray.d, coatPick, R);   // SPECGATHER
             mp = &scene.mats[c];
         }
         const Material& m = *mp;

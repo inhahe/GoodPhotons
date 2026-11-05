@@ -6,19 +6,15 @@
 #include <cmath>
 #include "gatherplane.h"
 
-// Whether a footprint (the probe, or the march below) passes through a surface of material `m` rather than stopping on it:
-// one no photon is ever stored on -- anything but a diffuse, diffuse-transmitting or fluorescent
-// surface, or a compound or fiber that may be one. The photons near such a face lie on the surface
-// beyond it, and a face within the radius above the tangent plane would otherwise be counted and
-// then ball-rejected for its height, though that surface is there (known-issues
-// GATHERAREA-TRANSPARENT). Device twin dProbePassesThrough.
-inline bool probePassesThrough(const Material& m) {
-    switch (m.type) {
-        case MatType::Dielectric: case MatType::ThinFilm: case MatType::Multilayer:
-        case MatType::Filter: case MatType::HalfMirror: case MatType::Mirror:
-        case MatType::Glossy: case MatType::Grating: return true;
-        default: return false;
-    }
+// Whether a footprint (the probe, or the march below) passes through a face of material `m` off a
+// curve, rather than stopping on it: one no photon is stored on (holdsPhotons), a hair fiber aside,
+// whose opacity coin the probe tosses. The photons near such a face lie on the surface beyond it,
+// and a face within the radius above the tangent plane would otherwise be counted and then
+// ball-rejected for its height, though that surface is there (known-issues
+// GATHERAREA-TRANSPARENT). A strand is passed whatever its height (the callers). Device twin
+// dProbePassesThrough.
+inline bool probePassesThrough(const Scene& scene, const Material& m) {
+    return m.type != MatType::Hair && !holdsPhotons(scene, m, 0.0);
 }
 
 // The geometric footprint: same-facing surface area inside the gather ball, measured from
@@ -114,6 +110,7 @@ inline double gatherFootprintArea(const Scene& sc, const Vec3& p, const Vec3& n,
         int layers = 0;
         double colArea = 0.0;
         int crossed = 0;
+        int strandSkips = 0;
         for (; layers < maxLayers; ++layers) {
             Ray ray{start, n};
             Hit h = sc.closestHit(ray, t0, nullptr, /*skipHair=*/false,
@@ -139,8 +136,14 @@ inline double gatherFootprintArea(const Scene& sc, const Vec3& p, const Vec3& n,
             // opposes and drops out, stacked thin shells all agree and are all counted, and an
             // authored quad works whichever way its `u x v` happens to point.
             const Material* mm = (h.matId >= 0 && h.matId < (int)sc.mats.size()) ? &sc.mats[h.matId] : nullptr;
-            // A strand that holds no photon is neither area nor a crossing: the probe passes it.
-            if (mm && gatherlessStrand(*mm, h.fiberRadius)) { t0 = h.t + eps; continue; }
+            // A strand that holds no photon is neither area nor a crossing: the probe passes it, and
+            // so does this march, through the tube and, like the probe, for none of the column's
+            // layers up to 48 strands, so a coat deeper than the layers still reaches the skin.
+            if (mm && h.fiberRadius > 0.0 && mm->type != MatType::Hair && !holdsPhotons(sc, *mm, h.fiberRadius)) {
+                t0 = h.t + 2.5 * h.fiberRadius + eps;
+                if (strandSkips < 48) { ++strandSkips; --layers; }
+                continue;
+            }
             const double c = dot(h.ng, n) * orient;
             // Same-facing and in the tangent-plane band: what the photon query keeps.
             const Vec3 dh = h.p - p;
@@ -149,7 +152,7 @@ inline double gatherFootprintArea(const Scene& sc, const Vec3& p, const Vec3& n,
                 if (c >= kGatherFacingCos) colArea += cellArea / c;
             } else if (off > 0.0) {
                 // not a face holding no photon, nor a hair strand (the probe's coin decides those)
-                if (!(mm && (probePassesThrough(*mm) || mm->type == MatType::Hair))) ++crossed;
+                if (!(mm && (probePassesThrough(sc, *mm) || mm->type == MatType::Hair))) ++crossed;
             }
             t0 = h.t + eps;
         }

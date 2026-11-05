@@ -7537,23 +7537,18 @@ struct DGatherPhoton {
     float lambda;           // wavelength (nm) — rho(lambda_p) still varies per photon
 };
 
-// Whether a footprint probe passes through a surface of material `m`: one no photon is ever stored
-// on (host twin probePassesThrough, where the reasoning lives).
-__device__ static bool dProbePassesThrough(const DMaterial& m) {
-    switch (m.type) {
-        case D_DIELECTRIC: case D_THINFILM: case D_MULTILAYER: case D_FILTER: case D_HALFMIRROR:
-        case D_MIRROR: case D_GLOSSY: case D_GRATING: return true;
-        default: return false;
-    }
-}
+
 // A strand that holds no photon, where modes M and S never gather (host twin gatherlessStrand,
 // where the reasoning lives).
+__device__ static inline bool dGatherlessStrandR(const DMaterial& m, Real fiberRadius) {
+    return m.type == D_DIFFUSE && fiberRadius > (Real)0;
+}
 __device__ static inline bool dGatherlessStrand(const DMaterial& m, const DHit& h) {
-    return m.type == D_DIFFUSE && h.fiberRadius > (Real)0;
+    return dGatherlessStrandR(m, h.fiberRadius);
 }
 // Whether a photon arriving at the compound `m` is gathered there, so the photon pass deposits it
 // before its own pick (host twin compoundGathers, COMPOUND-DOUBLE-PICK, where the reasoning lives).
-__device__ static bool dCompoundGathers(const DScene& sc, const DMaterial& m, const DHit& h) {
+__device__ static bool dCompoundGathers(const DScene& sc, const DMaterial& m, Real fiberRadius) {
     if (m.type != D_MIX && m.type != D_LAYERED) return false;
     for (int k = 0; k < m.mixCount; ++k) {
         const int c = m.mixChild[k];
@@ -7561,9 +7556,27 @@ __device__ static bool dCompoundGathers(const DScene& sc, const DMaterial& m, co
         const DMaterial& km = sc.mats[c];
         if (km.matReflectsNothing) continue;
         if (km.type == D_DIFFUSETRANSMIT) return true;
-        if (km.type == D_DIFFUSE && !dGatherlessStrand(km, h)) return true;
+        if (km.type == D_DIFFUSE && !dGatherlessStrandR(km, fiberRadius)) return true;
     }
     return false;
+}
+// Whether the gathers count a face of material `m` as one that holds photons (host twin
+// holdsPhotons, where the reasoning lives).
+__device__ static bool dHoldsPhotons(const DScene& sc, const DMaterial& m, Real fiberRadius) {
+    if (m.matReflectsNothing) return false;
+    switch (m.type) {
+        case D_DIFFUSE:        return !dGatherlessStrandR(m, fiberRadius);
+        case D_DIFFUSETRANSMIT:
+        case D_FLUORESCENT:    return true;
+        case D_MIX:
+        case D_LAYERED:        return dCompoundGathers(sc, m, fiberRadius);
+        default:               return false;
+    }
+}
+// Whether a footprint probe passes through a face of material `m` off a curve: one that holds no
+// photon, a hair fiber aside (host twin probePassesThrough, where the reasoning lives).
+__device__ static bool dProbePassesThrough(const DScene& sc, const DMaterial& m) {
+    return m.type != D_HAIR && !dHoldsPhotons(sc, m, (Real)0);
 }
 
 // The vector glue of gatherplane.h's rule (MERGE-PROXIMITY), which both backends call: a stored
@@ -7638,11 +7651,12 @@ __device__ static double dGatherCoverage(const DScene& sc, const DVec3& p, const
                 const DMaterial& hm = sc.mats[h.matId];
                 // Only a face above the plane, by more than the relaunch's own tmin skips: one on it
                 // is the surface's height (a glass box standing on the floor) -- host twin.
-                if (dProbePassesThrough(hm) && r - h.t > fmaxf((Real)1e-3 * r, (Real)2 * RAY_EPS)) {
+                if (dProbePassesThrough(sc, hm) && r - h.t > fmaxf((Real)1e-3 * r, (Real)2 * RAY_EPS)) {
                     tAcc = h.t; o = h.p; curveTmin = (Real)0;
                     continue;
                 }
-                if (dGatherlessStrand(hm, h)) {           // no photon, and the surface is beyond it
+                if (h.fiberRadius > (Real)0 && hm.type != D_HAIR && !dHoldsPhotons(sc, hm, h.fiberRadius)) {
+                    // no photon (a diffuse strand, or a compound of them), and the surface is beyond it
                     if (skip < 48) ++skip;
                     tAcc = h.t; o = h.p; curveTmin = (Real)2.5 * h.fiberRadius;
                     continue;
@@ -8615,8 +8629,10 @@ __device__ static void dBeamHitEval(const DScene& sc, const DBeamMap& bm, const 
             // Windowed (DJSpec::disp; host twin gatherPhotonBeamsW): light at lambda_c only,
             // coloured there. A flat-folded beam is read at lambda_c from its emitter's SPD.
             const Real lc = (Real)js->lamC;
-            if (b.achro == 1) {
-                if (b.emIdx >= 0 && b.emIdx < sc.nEmitters && sc.emSpdInv) {
+            // A deposit-folded beam the upload named its emitter for (a flat path's; host twin
+            // flatFoldEmitter) is read at lambda_c from that emitter's SPD; any other at its own.
+            if (b.achro == 1 && b.emIdx >= 0) {
+                if (b.emIdx < sc.nEmitters && sc.emSpdInv) {
                     const double dens = (double)specLookup(sc.emitters[b.emIdx].emitSpd, lc) *
                                         (double)sc.emSpdInv[b.emIdx];
                     const double pwf = (double)b.pw * w * dens * (double)js->invPdfC * js->atC();
@@ -8635,7 +8651,10 @@ __device__ static void dBeamHitEval(const DScene& sc, const DBeamMap& bm, const 
         else if (specOn && b.achro == 1 && dJSpecFoldColorC(sc, *js, (int)b.emIdx, fc, fcx, fcy, fcz)) {
                       const double pwf = (double)b.pw * w;
                       oX += fcx * pwf; oY += fcy * pwf; oZ += fcz * pwf; }
-        else if (specOn && b.achro != 1) {
+        else if (specOn && b.achro == 1) {   // not recoloured: at its own wavelength (host twin)
+                      const double q = (double)b.pw * w * js->at((double)lam);
+                      oX += (double)cieX(lam) * q; oY += (double)cieY(lam) * q; oZ += (double)cieZ(lam) * q; }
+        else if (specOn) {
                       const double q = w * js->at((double)lam);
                       oX += (double)b.pX * q; oY += (double)b.pY * q; oZ += (double)b.pZ * q; }
         else        { oX += (double)b.pX * w; oY += (double)b.pY * w; oZ += (double)b.pZ * w; }
@@ -12321,7 +12340,7 @@ __device__ static int shadeStep(const DScene& sc, const DCamSet& cs,
     int matIndex = h.matId;
     // COMPOUND-DOUBLE-PICK (host twin tracePhoton): a mix or layered surface takes its deposit
     // here, before the photon's own pick; the lobe's branch below then deposits nothing.
-    const bool compoundDeposit = dCompoundGathers(sc, *mptr, h);
+    const bool compoundDeposit = dCompoundGathers(sc, *mptr, h.fiberRadius);
     if (compoundDeposit)
         depositPhoton(cs, h.p, dShadedNg(h), beta, lambda, dPathIsCaustic(pathC), dPathCausticW(pathC));
     // Stochastic mix: resolve to a child lobe (or absorb) before dispatch.
@@ -12710,7 +12729,7 @@ __device__ static int shadeStepHero(const DScene& sc, const DCamSet& cs, int cam
     const DMaterial* mptr = &sc.mats[h.matId];
     int matIndex = h.matId;
     // COMPOUND-DOUBLE-PICK (scalar twin): the compound's deposit, every live wavelength, before the pick.
-    const bool compoundDeposit = dCompoundGathers(sc, *mptr, h);
+    const bool compoundDeposit = dCompoundGathers(sc, *mptr, h.fiberRadius);
     if (compoundDeposit) {
         const bool caus = dPathIsCaustic(pathC);
         const Real cw = dPathCausticW(pathC);
@@ -19765,6 +19784,19 @@ struct DSpecThr {
 };
 static_assert(DSpecThr::K == DJSPEC_K, "mode M's carrier and the beam gather's share a grid");
 
+// SPECGATHER: a layered coat's coin at every bin, for mode M's walk and mode S's (host twin
+// foldCoatCoin): `coatPick` and `coatR` as dResolveCompound returned them, `coatCos` and `coatTh` the
+// incidence and film it captured.
+__device__ static void dFoldCoatCoin(DSpecThr& sthr, const DScene& sc, const DMaterial& lm, int coatPick,
+                                     double coatR, double coatCos, Real coatTh) {
+    const bool cp = coatPick == 1;
+    const double pc = cp ? coatR : 1.0 - coatR;
+    sthr.mulCoin(sc, [&](Real L, double& pr) {
+        const double r = dCoatRAtJ(lm, coatCos, coatTh, L);
+        return pr = cp ? r : 1.0 - r;
+    }, pc, pc, false);
+}
+
 // CURVE-GATHER: a camera walk's step at a strand that holds no photon (host twin strandStep, where the
 // why is): its direct light by NEE times `thr` as it arrived, returned; its reflectance into `thr`
 // and, if given, the carrier; the ray turned along its diffuse lobe; `cont` false where the walk has
@@ -20001,16 +20033,7 @@ __device__ static void dPhotonGather(const DScene& sc, const DPhotonMap& pm,
             int coatPick = -1; double coatR = 0.0, coatCos = 1.0; Real coatTh = (Real)0;
             int child = dResolveCompound(sc, *mp, h, rd, lambda, rng, &coatPick, &coatR, &coatCos, &coatTh);
             if (child < 0) return;                       // absorbed by the mix
-            // SPECGATHER: a layered coat's coin at every bin (host twin photonGather).
-            if (coatPick >= 0) {
-                const DMaterial& lm = *mp;
-                const bool cp = coatPick == 1;
-                const double pc = cp ? coatR : 1.0 - coatR;
-                sthr.mulCoin(sc, [&](Real L, double& pr) {
-                    const double r = dCoatRAtJ(lm, coatCos, coatTh, L);
-                    return pr = cp ? r : 1.0 - r;
-                }, pc, pc, false);
-            }
+            if (coatPick >= 0) dFoldCoatCoin(sthr, sc, *mp, coatPick, coatR, coatCos, coatTh);   // SPECGATHER
             mp = &sc.mats[child]; matId = child;
         }
         const DMaterial& m = *mp;
@@ -20531,16 +20554,7 @@ __device__ static void dSppmVisiblePoint(const DScene& sc, DVec3 ro, DVec3 rd, R
             int coatPick = -1; double coatR = 0.0, coatCos = 1.0; Real coatTh = (Real)0;
             int child = dResolveCompound(sc, *mp, h, rd, lambda, rng, &coatPick, &coatR, &coatCos, &coatTh);
             if (child < 0) return;                       // absorbed by the mix
-            // SPECGATHER: a layered coat's coin at every bin (host twin photonGather).
-            if (coatPick >= 0) {
-                const DMaterial& lm = *mp;
-                const bool cp = coatPick == 1;
-                const double pc = cp ? coatR : 1.0 - coatR;
-                sthr.mulCoin(sc, [&](Real L, double& pr) {
-                    const double r = dCoatRAtJ(lm, coatCos, coatTh, L);
-                    return pr = cp ? r : 1.0 - r;
-                }, pc, pc, false);
-            }
+            if (coatPick >= 0) dFoldCoatCoin(sthr, sc, *mp, coatPick, coatR, coatCos, coatTh);   // SPECGATHER
             mp = &sc.mats[child]; matId = child;
         }
         const DMaterial& m = *mp;
@@ -25355,13 +25369,8 @@ void cudaSetJSwitches(int jSpec, int trSpec, int deltaMerge, int half) {
 // gpu::c_jBinQ from the sampler the camera walk's wavelength is drawn from: on the device both modes
 // draw from the emission sampler (dSampleSceneLambda), where the host's mode J draws from camSampler.
 static void uploadJBinQ(const EmissionSampler& s) {
-    double q[DJSPEC_K];
-    for (int k = 0; k < DJSPEC_K; ++k) {
-        const double lo = LAMBDA_MIN + k * (LAMBDA_MAX - LAMBDA_MIN) / (double)DJSPEC_K;
-        const double hi = LAMBDA_MIN + (k + 1) * (LAMBDA_MAX - LAMBDA_MIN) / (double)DJSPEC_K;
-        q[k] = s.cdfAt(hi) - s.cdfAt(lo);
-    }
-    CUDA_CHECK(cudaMemcpyToSymbol(gpu::c_jBinQ, q, sizeof(q)));
+    static_assert(sizeof(s.binMass) == sizeof(double) * DJSPEC_K, "c_jBinQ mirrors EmissionSampler::binMass");
+    CUDA_CHECK(cudaMemcpyToSymbol(gpu::c_jBinQ, s.binMass, sizeof(s.binMass)));
 }
 // The aimed sun (bdpt.h SunAim): host copies, uploaded at the top of every renderBdptCuda.
 static std::vector<gpu::Real> g_sunAimWHost;
@@ -25717,7 +25726,9 @@ static void drawBeamTr0(const BeamMap* bmap, DUpload& up, gpu::DBeamMap& dbm) {
     }
 }
 
-static void uploadBeamMapCuda(const BeamMap* bmap, DUpload& up, gpu::DBeamMap& dbm,
+// `scene` names each deposit-folded beam's emitter for the gather only where the beam's colour is
+// that emitter's mean (gatherPhotonBeamsW's flatFoldEmitter, where the why is).
+static void uploadBeamMapCuda(const Scene& scene, const BeamMap* bmap, DUpload& up, gpu::DBeamMap& dbm,
                               const StageProgress* stage, bool withMis, bool lbvh = false) {
     // `lbvh` means the host deliberately skipped its tree because a device one is coming, so an
     // empty `bvh.nodes` is expected rather than a malformed map. Without that distinction the
@@ -25771,7 +25782,12 @@ static void uploadBeamMapCuda(const BeamMap* bmap, DUpload& up, gpu::DBeamMap& d
         r.pw = (float)w;
         // A gather-time fold names its emitter in `emIdx`; a DEPOSIT fold (achro == 1) carries it
         // in `srcEm`, and JSPEC needs it to re-colour the beam for a chromatic camera path.
-        r.emIdx = (b.achro == 2) ? (short)b.emIdx : (b.achro == 1 ? (short)b.srcEm : (short)-1);
+        bool flatFold = false;
+        if (b.achro == 1 && b.srcEm >= 0 && b.srcEm < (int)scene.emitters.size()) {
+            const Vec3& cm = scene.emitters[(size_t)b.srcEm].cieMean;
+            flatFold = b.cieA[0] == (float)cm.x && b.cieA[1] == (float)cm.y && b.cieA[2] == (float)cm.z;
+        }
+        r.emIdx = (b.achro == 2) ? (short)b.emIdx : (flatFold ? (short)b.srcEm : (short)-1);
         r.achro = (short)b.achro;
         r.lambda = b.lambda; r.absorb = b.absorb; r.med = b.med;
         r.nSec = (unsigned char)b.nSec; r.pad = 0;
@@ -25947,7 +25963,7 @@ Film renderBdptCuda(const Scene& scene, const Camera& cam, int resX, int resY,
     const bool envOff = std::getenv("FTRACE_JLBVH") &&
                         std::atoi(std::getenv("FTRACE_JLBVH")) == 0;
     const bool wantLbvh = !g_jHostLight && !envOff;
-    if (bmap) uploadBeamMapCuda(bmap, up, dbm, stage, /*withMis=*/true, wantLbvh);
+    if (bmap) uploadBeamMapCuda(scene, bmap, up, dbm, stage, /*withMis=*/true, wantLbvh);
     if (bmap) drawBeamTr0(bmap, up, dbm);
     // FTRACE_JLBVH=1: rebuild the NODES on the device over the very same sub-beams. Same beams,
     // same gather, a different tree -- so an image difference is a traversal-acceptance
@@ -27730,7 +27746,7 @@ std::vector<Film> renderPhotonMapSharedCuda(const Scene& scene, const std::vecto
     // Mode M's volume gather: the same device layout mode J's merges use, minus the MIS
     // partials (see uploadBeamMapCuda). nNodes == 0 is the "no volume gather" sentinel.
     DBeamMap dbm{};
-    uploadBeamMapCuda(bmap, up, dbm, stage, /*withMis=*/false);
+    uploadBeamMapCuda(scene, bmap, up, dbm, stage, /*withMis=*/false);
 
     // ---- gather each camera ----
     // Pull the current device accumulation for camera c into out[c] (film + hit map).

@@ -136,12 +136,8 @@ struct JSpecRun {
     double supportShare() const {
         if (!hole || !walkDensity) return 1.0;
         double open = 0.0;
-        for (int k = 0; k < JSpec::K; ++k) {
-            if (hole >> k & 1u) continue;
-            const double lo = LAMBDA_MIN + k * (LAMBDA_MAX - LAMBDA_MIN) / (double)JSpec::K;
-            const double hi = LAMBDA_MIN + (k + 1) * (LAMBDA_MAX - LAMBDA_MIN) / (double)JSpec::K;
-            open += walkDensity->cdfAt(hi) - walkDensity->cdfAt(lo);
-        }
+        for (int k = 0; k < JSpec::K; ++k)
+            if (!(hole >> k & 1u)) open += walkDensity->binMass[k];
         // Every bin a hole while the walk itself passed: the bins cannot resolve the support,
         // and the walk's own wavelength serves (SpecThr::rescale's fallback).
         return (open > 0.0) ? open : 1.0;
@@ -831,14 +827,24 @@ inline Vec3 gatherPhotonBeamsW(const Scene& scene, const Renderer& mats, const B
     }
     const double invN = 1.0 / (double)bm.nEmitted;
     const PatTables tabs = scene.patTables();
-    // An unfolded beam's colour. A gather-time fold's record (achro == 2) holds its emitter's mean
-    // colour, the fallback BeamBank::push asks for, which belongs only with the folded phase: with
-    // the phase at the beam's wavelength it is neither estimator, so such a beam unfolded takes
-    // that wavelength's colour (the device's upload demotes the same record the same way).
+    // A beam's colour at its own wavelength: a folded record's colour belongs with its fold, and a
+    // fold not taken leaves the single sample the beam was drawn as (the device's upload demotes a
+    // gather-time fold's record the same way).
     const auto unfoldedCie = [&](const PhotonBeam& b, size_t i) {
-        if (b.achro != 2) return bm.cie[i];
+        if (b.achro == 0) return bm.cie[i];
         const double l = (double)b.lambda;
         return Vec3(cieX(l), cieY(l), cieZ(l));
+    };
+    // The emitter a deposit-folded beam (achro == 1) can be recoloured from under a carrier, or
+    // null. Only a path that met no chromatic factor stores its emitter's mean colour exactly, and
+    // only its spectrum is that emitter's SPD; mode M also folds a coloured bounce into the colour
+    // (Renderer foldT), whose spectrum the carrier cannot be read against, so such a beam counts at
+    // its own wavelength instead. Mode J folds only such flat paths.
+    const auto flatFoldEmitter = [&](const PhotonBeam& b) -> const Emitter* {
+        if (b.achro != 1 || b.srcEm < 0 || b.srcEm >= (int)scene.emitters.size()) return nullptr;
+        const Emitter& em = scene.emitters[(size_t)b.srcEm];
+        return (b.cieA[0] == (float)em.cieMean.x && b.cieA[1] == (float)em.cieMean.y &&
+                b.cieA[2] == (float)em.cieMean.z) ? &em : nullptr;
     };
     int  foldEm = -1;              // the emitter whose fold colour `foldCol` holds (JSPEC, below)
     Vec3 foldCol{0, 0, 0};
@@ -952,33 +958,28 @@ inline Vec3 gatherPhotonBeamsW(const Scene& scene, const Renderer& mats, const B
             // Windowed (JSpec::disp): only light at lambda_c counts, coloured there.
             const double lc = (double)camSpec->lamC;
             const Vec3 cieC(cieX(lc), cieY(lc), cieZ(lc));
-            if (b.achro == 1) {
-                if (b.srcEm >= 0 && b.srcEm < (int)scene.emitters.size())
-                    acc += jDispFoldColor(*camSpec, scene.emitters[(size_t)b.srcEm]) * (w * camSpec->atC());
+            const Emitter* flat = flatFoldEmitter(b);
+            if (flat) {
+                acc += jDispFoldColor(*camSpec, *flat) * (w * camSpec->atC());
             } else {
                 const double ww = jDispWeight(*camSpec, lam);
                 if (ww > 0.0) acc += cieC * (w * ww * camSpec->atC());
             }
         } else if (specOn) {
-            if (b.achro == 1) {
-                const Vec3& c0 = bm.cie[bh.idx];
-                if (b.srcEm >= 0 && b.srcEm < (int)scene.emitters.size() &&
-                    scene.emitters[(size_t)b.srcEm].foldN > 0) {
-                    // Constant over the segment for one emitter, and most beams in a frame share
-                    // one: computed once per run of them (it is 12 reads of the carrier).
-                    if ((int)b.srcEm != foldEm) {
-                        foldEm = (int)b.srcEm;
-                        foldCol = jSpecFoldColor(*camSpec, scene.emitters[(size_t)b.srcEm], c0);
-                    }
-                    acc += foldCol * w;
-                } else {
-                    acc += c0 * w;
+            const Emitter* flat = flatFoldEmitter(b);
+            if (flat && flat->foldN > 0) {
+                // Constant over the segment for one emitter, and most beams in a frame share
+                // one: computed once per run of them (it is 12 reads of the carrier).
+                if ((int)b.srcEm != foldEm) {
+                    foldEm = (int)b.srcEm;
+                    foldCol = jSpecFoldColor(*camSpec, *flat, bm.cie[bh.idx]);
                 }
+                acc += foldCol * w;
             } else {
                 acc += unfoldedCie(b, bh.idx) * (w * camSpec->at(lam));
             }
         } else {
-            acc += (bow ? bowCie : unfoldedCie(b, bh.idx)) * w;
+            acc += (bow ? bowCie : (b.achro == 1 ? bm.cie[bh.idx] : unfoldedCie(b, bh.idx))) * w;
         }
         // SECONDARY wavelengths of the bundle. They share this beam's geometry, its kernel
         // weight and BOTH transmittance marches — the bundle only exists on a path whose

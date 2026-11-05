@@ -154,16 +154,7 @@ inline void sppmVisiblePoint(const Scene& scene, Ray ray, Pcg32& rng, bool diffr
             int c = coatPick ? mp->coatChild
                              : mixResolveChild(scene, *mp, h, rng.uniform());  // body lobe: honours a bound weight map
             if (c < 0) return;
-            // SPECGATHER: the coin at every bin (mode M's walk, where the why is).
-            {
-                const Material& lm = *mp;
-                const Vec3 d0 = ray.d;
-                const double pc = coatPick ? R : 1.0 - R;
-                sthr.mulCoin([&](double L, double& pr) {
-                    const double rL = layeredCoatReflectance(scene, lm, h, d0, L);
-                    return pr = coatPick ? rL : 1.0 - rL;
-                }, pc, pc, false);
-            }
+            foldCoatCoin(sthr, scene, *mp, h, ray.d, coatPick, R);   // SPECGATHER
             mp = &scene.mats[c];
         }
         const Material& m = *mp;

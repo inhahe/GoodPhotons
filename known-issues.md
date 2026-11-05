@@ -72,6 +72,27 @@ closed entries, where the cost is a broken historical link rather than a blocked
 Three references — `scenes/_gr_fly0.ftsl`, `scenes/silver_sphere_xenon.ftsl`, `scenes/x.ftsl` —
 name files that no longer exist at all, all in closed entries.
 
+## OPEN (2026-11-05, 0.434.1): COMPOUND-MERGE-PICK — modes U and J take a mix's or a layered coat's lobe probability twice in their merges
+
+Found by the Opus review of 0.433.5-0.433.11: COMPOUND-DOUBLE-PICK's photon-pass fix does not reach
+the merges of modes U and J. Their light walks resolve a compound to one lobe and store a vertex
+(the one the merges gather) only where that lobe can take one (vcm.h's light walk, bdpt.h's
+surfMergeSite), so the stored vertices on a compound carry the lobe's probability; the camera walk
+then resolves the compound again and merges under its own lobe, which takes the probability a
+second time. The merges are MIS-combined with connections that are right, so the frame is darkened
+in proportion to the merge weight there. tools/check_compound_gather.py's walls on 0.434.0, against
+mode R: `mix { layer white 0.5 }` mode U CPU 0.713, GPU 0.745, mode J with `-jsurf` (GPU) 0.63;
+the Fresnel clearcoat mode U 1.00 (its merges carry little there), mode J 0.94-1.05 per channel.
+
+Proper fix: the photon pass's, in the light walks' terms. A light vertex on a compound stands for
+the incident flux whatever lobe the light walk then took, so its merge contribution divides by the
+probability of the lobes that store one (sum of the storing lobes' weights, times 1 - R for a coat),
+or the vertex is stored before the pick for merging alone. The connections from that vertex stay as
+they are: they evaluate the lobe the light walk took, which is the mixture's own sampling. Host
+(vcm.h, bdpt.h) and device (kVcmLightT, the device's mode-J light pass), and the merges' MIS partials
+read the same vertex, so whichever form is taken must leave them consistent. check_compound_gather
+then holds modes U and J too (its EXTRA_CASES, --extra).
+
 ## DONE (2026-11-04, 0.433.10): COMPOUND-DOUBLE-PICK — modes M and S took a mix's or a layered coat's lobe probability twice
 
 Found while testing the Opus review's finding on the layered coat's coin (0.433.9). A camera walk
@@ -155,6 +176,16 @@ the host takes the coat with probability R. check_rough_irid now holds mode S's 
 mode R on each backend (CPU 0.96 / 1.20 / 0.77, GPU 0.89 / 1.08 / 0.88: within its 5-sigma test on
 a red sphere's small green and blue). Found checking the coat coin's fix against mode R (Opus review
 of 90e0486..bea7be1).
+
+## OPEN (2026-11-04, 0.433.11): SPPM-LOWPASS-DEVHOST — at 16 passes mode S's device reads check_coat_modes' coated balls 16 % bluer than its host
+
+Seen once, running tools/check_coat_modes.py at `--spp 16` (a smoke test; the check's budget is
+256): its pair "mode S device / host, channel 2" (the bubble and the dichroic ball over a floor,
+`-n 2000000`) read a worst tile of x1.158 at 11.5 sigma. At 256 passes the same pair passes (5 sigma
+and 5 %), on 0.433.10 and before. A difference that shrinks with the pass count is the shape of two
+radius schedules or two first-pass radii that differ between the backends; not looked into. To
+start: render that scene in mode S on both backends at 8, 16, 64 and 256 passes and see whether the
+gap falls as the radius does.
 
 ## OPEN (2026-11-04, 0.433.10): GPU-PHOTON-LAUNCH-FAIL — one GPU photon pass died with "unspecified launch failure", not reproduced
 

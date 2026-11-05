@@ -297,6 +297,10 @@ inline bool spectrumKnots(const Spectrum& s, std::vector<double>& x, std::vector
 // sRGB under D65). The earlier three-lobe placeholder was removed once the
 // proper fit landed; `rgb r g b` in FTSL routes through the JH upsampler.
 
+// The spectral carriers' bin count (JSpec::K, SpecThr::K), and so the wavelengths at which the
+// question "does this vary over the band?" is asked.
+constexpr int kBandProbeBins = 24;
+
 // --- Emission importance sampling ------------------------------------------
 // Precomputes a CDF over [LAMBDA_MIN, LAMBDA_MAX] to sample lambda ~ SPD, and
 // exposes the integral so photon weights stay physically consistent.
@@ -304,6 +308,10 @@ struct EmissionSampler {
     std::vector<double> cdf;   // size N+1
     double step = 1.0;
     double integral = 0.0;     // integral of SPD over range
+    // The density's mass in each of the spectral carriers' kBandProbeBins bins, which their support
+    // rule divides by (SpecThr::rescale, JSpecRun::supportShare, the device's c_jBinQ). Filled by
+    // build(), once, so a walk reads it rather than walking the CDF.
+    double binMass[kBandProbeBins] = {};
 
     void build(const Spectrum& spd, double stepNm = 1.0) {
         step = stepNm;
@@ -317,6 +325,11 @@ struct EmissionSampler {
         }
         integral = acc;
         if (acc > 0) for (auto& c : cdf) c /= acc; // normalise to [0,1]
+        for (int k = 0; k < kBandProbeBins; ++k) {
+            const double lo = LAMBDA_MIN + k * (LAMBDA_MAX - LAMBDA_MIN) / (double)kBandProbeBins;
+            const double hi = LAMBDA_MIN + (k + 1) * (LAMBDA_MAX - LAMBDA_MIN) / (double)kBandProbeBins;
+            binMass[k] = cdfAt(hi) - cdfAt(lo);
+        }
     }
 
     // Invert the CDF at a supplied uniform u in [0,1). Sets pdf (per nm) and

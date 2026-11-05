@@ -83,9 +83,6 @@ inline const char* matTypeName(MatType t) {
     }
 }
 
-// The spectral carriers' bin count (JSpec::K, SpecThr::K), and so the wavelengths at which the
-// question "does this vary over the band?" is asked.
-constexpr int kBandProbeBins = 24;
 // Whether f(lambda) differs anywhere over the band, read at the centres of `bins` bins (relative
 // tolerance 1e-12). One predicate for every such question. A question about what a carrier will
 // see asks at the carriers' own grid, kBandProbeBins (bdpt::anyMediumSigmaTChromatic); a physical
@@ -4964,6 +4961,42 @@ struct Scene {
         return h;
     }
 };
+
+// COMPOUND-DOUBLE-PICK: whether a photon arriving at the compound `m` (a mix, or a layered stack's
+// bodies) is gathered there: whether some lobe a camera walk can resolve it to takes a density
+// estimate -- a diffuse lobe that is no gatherless strand, or a diffuse_transmit one. The photon pass
+// deposits at such a surface BEFORE its own pick, at full power: the camera walk picks a lobe too,
+// with the lobe's probability, so a deposit made after the photon's pick carried that probability a
+// second time (a mix's diffuse weight squared; a coat's Fresnel taken on the way in and again on the
+// way out). Device twin dCompoundGathers.
+inline bool compoundGathers(const Scene& scene, const Material& m, double fiberRadius) {
+    if (m.type != MatType::Mix && m.type != MatType::Layered) return false;
+    for (int c : m.mixChildren) {
+        if (c < 0 || c >= (int)scene.mats.size()) continue;
+        const Material& k = scene.mats[(size_t)c];
+        if (k.reflectsNothing) continue;
+        if (k.type == MatType::DiffuseTransmit) return true;
+        if (k.type == MatType::Diffuse && !gatherlessStrand(k, fiberRadius)) return true;
+    }
+    return false;
+}
+
+// Whether the photon gathers count a face of material `m` (unresolved; `fiberRadius` the hit's, 0
+// off a curve) as one that holds photons: what the photon pass deposits on, and the fluorescent
+// surface every gather treats as one. The coverage probes and -gageom's march pass through any
+// other: a specular face (above the gather's plane), a strand, a compound none of whose lobes
+// gathers. Device twin dHoldsPhotons.
+inline bool holdsPhotons(const Scene& scene, const Material& m, double fiberRadius) {
+    if (m.reflectsNothing) return false;
+    switch (m.type) {
+        case MatType::Diffuse:         return !gatherlessStrand(m, fiberRadius);
+        case MatType::DiffuseTransmit:
+        case MatType::Fluorescent:     return true;
+        case MatType::Mix:
+        case MatType::Layered:         return compoundGathers(scene, m, fiberRadius);
+        default:                       return false;
+    }
+}
 
 // ---- Is a SPECTRAL BEAM BUNDLE valid in this scene? ---------------------------------------
 // A photon beam that carries several wavelengths (photonbeams.h, `-beamspec`) shares ONE

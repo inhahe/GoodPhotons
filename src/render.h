@@ -225,25 +225,6 @@ inline int photonVertexKind(const Scene& scene, const Material& m, const Hit& h)
     }
 }
 
-// COMPOUND-DOUBLE-PICK: whether a photon arriving at the compound `m` (a mix, or a layered stack's
-// bodies) is gathered there: whether some lobe a camera walk can resolve it to takes a density
-// estimate -- a diffuse lobe that is no gatherless strand, or a diffuse_transmit one. The photon pass
-// deposits at such a surface BEFORE its own pick, at full power: the camera walk picks a lobe too,
-// with the lobe's probability, so a deposit made after the photon's pick carried that probability a
-// second time (a mix's diffuse weight squared; a coat's Fresnel taken on the way in and again on the
-// way out). Device twin dCompoundGathers.
-inline bool compoundGathers(const Scene& scene, const Material& m, double fiberRadius) {
-    if (m.type != MatType::Mix && m.type != MatType::Layered) return false;
-    for (int c : m.mixChildren) {
-        if (c < 0 || c >= (int)scene.mats.size()) continue;
-        const Material& k = scene.mats[(size_t)c];
-        if (k.reflectsNothing) continue;
-        if (k.type == MatType::DiffuseTransmit) return true;
-        if (k.type == MatType::Diffuse && !gatherlessStrand(k, fiberRadius)) return true;
-    }
-    return false;
-}
-
 // --- Fluorescence interaction (shared by the forward tracer and -checkfluoro) --
 // A fluorescent surface has two competing channels: elastic diffuse reflection
 // (albedo rho, wavelength preserved) and dye excitation (prob aEff = min(eps,
