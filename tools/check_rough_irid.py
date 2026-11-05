@@ -34,13 +34,21 @@ judged against its own background. Drop that once the offset is fixed.
 
 It also requires a CLEAR coating given a `roughness` (a soap film) to be refused at load, with
 the message saying why, and the same film given `roughness 0` -- the specular coating, as with no
-roughness at all -- to load. And it requires mode B to render a `layered` car-paint sphere the
-same on the GPU as on the CPU (sphere mean per channel, 5 standard errors and 3 %): the device
-gives a layered coat a synthetic glossy lobe, which must not take the glossy camera splat the
-host never gives a coat (known-issues FWD-GLOSSY-INDIRECT). And mode S, on each backend, to mode R
-(GPU, 4096 spp): until 0.433.2 both gathered a layered body's visible point through the compound's
-own reflect slot rather than the resolved base's (the red paint's green and blue read 7x), and the
-host's walk never took the coat.
+roughness at all -- to load. And it requires mode B to render a `layered` car-paint sphere as
+mode R does (GPU, 4096 spp), on each backend, within 8 % (LAYERED-BODY-COIN: the coated body's
+share is the photon's coin's), and the GPU as the CPU (sphere mean per channel, 5 standard errors and
+3 %). The coat's sheen splats at the stack's vertex, whichever lobe its coin takes, as the coat's
+lobe toward the camera at the coat's reflectance there (known-issues FWD-GLOSSY-INDIRECT). And mode
+S, on each backend, to mode R: until 0.433.2 both gathered a layered body's visible point through
+the compound's own reflect slot rather than the resolved base's (the red paint's green and blue read
+7x), and the host's walk never took the coat. (`--only coat`.)
+
+Then the glossy sphere seen in a flat mirror on the back wall, and through a glass sphere set in
+front of it (`--only views`): mode B, both walks on both backends, against mode R over the pixels
+that see it there. Those pixels come from an analytic trace: a reflection in the mirror's plane, or
+two refractions through the glass at the d line, eroded by a pixel for its dispersion. The forward
+mode reaches it there only through the closed-form specular connections, which must take the glossy
+lobe toward the first specular point.
 Exits 1 on any failure.
 """
 import argparse
@@ -92,6 +100,20 @@ COAT = SCENE.replace('material "glossy" { type glossy reflect 0.8  roughness 0.2
                      'material "glossy" { type layered  ior 1.5  coat { roughness 0.05 }'
                      '  layer "base" 1 }')
 assert COAT != SCENE
+# The rough glossy sphere seen in a flat mirror on the back wall, and through a glass sphere in front
+# of it: mode B reaches it there only through the closed-form specular connections, which must take
+# the glossy lobe toward the first specular point (FWD-GLOSSY-INDIRECT).
+MIRROR_Z = -1.95
+GLASS_C, GLASS_R, GLASS_N = (-0.62, 0.62, 1.35), 0.3, 1.5168   # BK7 at the d line
+MIRROR = SCENE.replace('material "chameleon" { preset chameleon }',
+                       'material "chameleon" { preset chameleon }' + NL +
+                       'material "mirror" { type mirror  reflect 0.9 }' + NL +
+                       'quad { origin -1.8 0.02 %g  u 3.6 0 0  v 0 1.6 0  material mirror }' % MIRROR_Z)
+GLASS = SCENE.replace('material "chameleon" { preset chameleon }',
+                      'material "chameleon" { preset chameleon }' + NL +
+                      'material "glass" { type dielectric  ior glass:BK7 }' + NL +
+                      'sphere { center %g %g %g  radius %g  material glass }' % (GLASS_C + (GLASS_R,)))
+assert MIRROR != SCENE and GLASS != SCENE
 REF = ("R_cpu", ["-mode", "R", "-device", "cpu", "-spp", "4096"])
 CASES = [   # the A cases render SCENE_A, through the lens
     ("A_cpu", ["-mode", "A", "-device", "cpu", "-n", "120000000"]),
@@ -157,6 +179,79 @@ def masks():
         lab = np.where(closer, k, lab)
         inner = np.where(closer, np.sqrt(np.maximum(-disc + rad * rad, 0)) < 0.85 * rad, inner)
     return [(n, (lab == k) & inner) for k, (n, _, _) in enumerate(SPHERES)] + [("rest", lab == -1)]
+
+
+def hit_sphere(o, d, c, rad):
+    """Per ray (o, d unit; arrays ... x 3), the nearer positive hit distance on a sphere, inf on a
+    miss, and whether the ray passes within 85 % of its radius of the centre."""
+    oc = o - np.array(c)
+    b = (d * oc).sum(-1)
+    disc = b * b - ((oc * oc).sum(-1) - rad * rad)
+    sq = np.sqrt(np.maximum(disc, 0))
+    t0, t1 = -b - sq, -b + sq
+    t = np.where(disc <= 0, np.inf, np.where(t0 > 1e-9, t0, np.where(t1 > 1e-9, t1, np.inf)))
+    return t, np.sqrt(np.maximum(rad * rad - disc, 0)) < 0.85 * rad
+
+
+def first_sphere(o, d):
+    """Per ray, the index into SPHERES of the first sphere it meets (-1: none), its distance, and
+    whether it meets that one through the inner 85 % of its radius."""
+    best = np.full(d.shape[:-1], np.inf)
+    lab = np.full(d.shape[:-1], -1)
+    inner = np.zeros(d.shape[:-1], bool)
+    for k, (_, c, rad) in enumerate(SPHERES):
+        t, inn = hit_sphere(o, d, c, rad)
+        closer = t < best
+        best, lab, inner = np.where(closer, t, best), np.where(closer, k, lab), np.where(closer, inn, inner)
+    return lab, best, inner
+
+
+def refract(d, n, eta):
+    """d refracted through a surface of unit normal n (against d) at index ratio eta; nan on
+    total internal reflection."""
+    c = -(d * n).sum(-1, keepdims=True)
+    k = 1.0 - eta * eta * (1.0 - c * c)
+    return np.where(k >= 0, eta * d + (eta * c - np.sqrt(np.maximum(k, 0))) * n, np.nan)
+
+
+def mirror_mask():
+    """The pixels that see the glossy sphere (SPHERES[0]) in the back-wall mirror, through its
+    inner 85 %: the camera ray meets the mirror first, and its reflection meets that sphere first."""
+    eye = np.array(EYE)
+    d, _ = frame()
+    tm = (MIRROR_Z - eye[2]) / d[..., 2]
+    P = eye + d * tm[..., None]
+    on = (tm > 0) & (P[..., 0] > -1.75) & (P[..., 0] < 1.75) & (P[..., 1] > 0.07) & (P[..., 1] < 1.57)
+    _, tb, _ = first_sphere(np.broadcast_to(eye, d.shape), d)
+    on &= tb > tm
+    r = d * np.array([1.0, 1.0, -1.0])
+    lab, _, inner = first_sphere(P, r)
+    return on & (lab == 0) & inner
+
+
+def glass_mask():
+    """The pixels that see the glossy sphere through the glass one, at the d line: the camera ray
+    meets the glass first, crosses it, and leaves toward that sphere, through its inner 85 %."""
+    eye = np.broadcast_to(np.array(EYE), (H, W, 3))
+    d, _ = frame()
+    tg, _ = hit_sphere(eye, d, GLASS_C, GLASS_R)
+    _, tb, _ = first_sphere(eye, d)
+    ok = np.isfinite(tg) & (tg < tb)
+    P1 = eye + d * np.where(ok, tg, 0)[..., None]
+    n1 = (P1 - np.array(GLASS_C)) / GLASS_R
+    d1 = refract(d, n1, 1.0 / GLASS_N)
+    d1 = d1 / np.linalg.norm(d1, axis=-1, keepdims=True)
+    t2, _ = hit_sphere(P1 + d1 * 1e-7, d1, GLASS_C, GLASS_R)
+    P2 = P1 + d1 * np.where(np.isfinite(t2), t2, 0)[..., None]
+    n2 = (P2 - np.array(GLASS_C)) / GLASS_R
+    d2 = refract(d1, -n2, GLASS_N)
+    d2 = d2 / np.linalg.norm(d2, axis=-1, keepdims=True)
+    good = ok & np.isfinite(t2) & np.all(np.isfinite(d2), axis=-1)
+    lab, _, inner = first_sphere(P2, np.where(good[..., None], d2, [0.0, 0.0, 1.0]))
+    m = good & (lab == 0) & inner
+    # Its rim, where the dispersion of the real glass moves the image from the d line's, out.
+    from scipy import ndimage
+    return ndimage.binary_erosion(m, iterations=1)
 
 
 def render(exe, out, scene, tag, args, seeds=(1, 2)):
@@ -229,14 +324,46 @@ def main():
               for d in ("cpu", "gpu")]
         ms = [stats(render(exe, out, coat, "coat_S_" + d, ["-mode", "S", "-spp", "256", "-device", d]), m)
               for d in ("cpu", "gpu")]
-        for what, x, x0 in (("mode B, GPU / CPU", mb[1], mb[0]),
-                            ("mode S, CPU / mode R", ms[0], ref), ("mode S, GPU / mode R", ms[1], ref)):
+        # Mode B against mode R at 8 %: the coated body's share is weighed by the photon's coin, at
+        # the light's angle, where a camera walk weighs it at its own (known-issues
+        # LAYERED-BODY-COIN), and the red body reads 5 % low for it.
+        for what, x, x0, tol in (("mode B, GPU / CPU", mb[1], mb[0], 0.03),
+                                 ("mode B, CPU / mode R", mb[0], ref, 0.08),
+                                 ("mode B, GPU / mode R", mb[1], ref, 0.08),
+                                 ("mode S, CPU / mode R", ms[0], ref, 0.03),
+                                 ("mode S, GPU / mode R", ms[1], ref, 0.03)):
             ratio = deviation(x[0], x0[0])
             z = np.abs(x[0] - x0[0]) / np.maximum(np.hypot(x[1], x0[1]), 1e-30)
-            bad = (z > 5.0) & (np.abs(ratio - 1.0) > 0.03)
+            bad = (z > 5.0) & (np.abs(ratio - 1.0) > tol)
             ok &= not bad.any()
             print("coat   car-paint sphere, %s %s%s"
                   % (what, " ".join("%.3f" % v for v in ratio), " FAIL" if bad.any() else ""))
+
+    if not a.only or "views" in a.only.split(","):
+        # The glossy sphere in the mirror and through the glass: mode B, both walks, both backends,
+        # against mode R over the pixels that see it there.
+        for name, text, mk in (("mirror", MIRROR, mirror_mask), ("glass", GLASS, glass_mask)):
+            path = os.path.join(out, name + ".ftsl")
+            with open(path, "w", encoding="utf-8", newline="") as f:
+                f.write(text)
+            m = mk()
+            dev = "cpu" if a.no_gpu else "gpu"
+            ref = stats(render(exe, out, path, "%s_R_%s" % (name, dev),
+                               ["-mode", "R", "-device", dev, "-spp", "4096"]), m)
+            for tag, args in (("B_cpu", ["-mode", "B", "-device", "cpu", "-n", "120000000"]),
+                              ("B1_cpu", ["-mode", "B", "-device", "cpu", "-n", "120000000", "-heroc", "1"]),
+                              ("B_gpu", ["-mode", "B", "-device", "gpu", "-n", "120000000"]),
+                              ("B1_gpu", ["-mode", "B", "-device", "gpu", "-n", "120000000", "-heroc", "1"])):
+                if a.no_gpu and "gpu" in args:
+                    continue
+                x = stats(render(exe, out, path, "%s_%s" % (name, tag), args), m)
+                ratio = deviation(x[0], ref[0])
+                z = np.abs(x[0] - ref[0]) / np.maximum(np.hypot(x[1], ref[1]), 1e-30)
+                bad = (z > 5.0) & (np.abs(ratio - 1.0) > 0.03)
+                ok &= not bad.any()
+                print("%-6s glossy sphere in the %s (%d px), of mode R: %s%s" % (
+                    tag, name, m.sum(), " ".join("%.3f" % v for v in ratio), " FAIL" if bad.any() else ""),
+                    flush=True)
 
     scene, scene_a = os.path.join(out, "spheres.ftsl"), os.path.join(out, "spheres_lens.ftsl")
     for path, text in ((scene, SCENE), (scene_a, SCENE_A)):

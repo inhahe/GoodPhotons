@@ -10114,13 +10114,28 @@ direction the connection found — `glossyF(ns, wc, wl)`, the pair swapped as
 splat a glossy vertex **before** sampling its continuation, on the same terms a diffuse vertex
 does (`!forwardCatch`, every camera). `glossySplats(m)` excludes the roughness-0 glossy, which
 `isPlanarMirrorMat` gives to the analytic mirror connection (a delta has no splat, and taking
-both would count it twice), and the device's `dGlossySplats` the synthetic coat lobe a layered
-material is given on upload (`DMaterial::coatLobe`): the host shades a coat inline in
-tracePhoton's Layered branch and splats no sheen, so neither backend images a clearcoat's
-highlight in A/B. A glossy vertex takes only the direct splat, not the closed-form mirror and
-glass-sphere connections (`camSpecularSplatAll`), which build their weight from a Lambertian
-`rho/pi`; a rough reflector seen in a mirror is black in B (known-issues FWD-GLOSSY-INDIRECT). Mode `P` is unaffected: it assigns a pixel to the forward layer by
-its first-hit material, so a glossy first hit is still the backward layer's.
+both would count it twice).
+
+**In mirrors and through glass, and a coat's sheen (0.434.8, FWD-GLOSSY-INDIRECT).** The
+closed-form mirror and glass-sphere connections (`camSpecularSplatAllVtxN`: dielectric sphere,
+mirror sphere, mirror plane) weigh a vertex through `SpecVtx`, whose `term`/`shape` were
+Lambertian. A glossy vertex now passes its `GlossySplat` (`SpecVtx::glossy`, `DSpecVtx::glossy`;
+`camSpecularSplatAllGlossy` on both backends). The dielectric sphere's `term` takes the lobe
+toward the first specular point at that wavelength. The mirror legs (`splatMirrorLegs`) share one
+geometry over a hero bundle, so they evaluate the lobe per wavelength there in place of each
+wavelength's weight: an iridescent lobe's colour turns with the direction. Every diffuse and
+volume vertex keeps its arithmetic.
+A layered stack's coat sheen splats at the stack's vertex, before the coin, whichever lobe the
+coin then takes: `GlossySplat` (`DGlossySplat`) with `stack` set evaluates the coat child's lobe
+times the stack's coat reflectance toward the camera, `layeredCoatReflectance(-wc)`. That is the
+R a camera-side walk picks the coat with, at its own incidence. Neither of the coin's outcomes
+splats the coat, so nothing counts twice: a coat reflection continues unseen at that vertex, and
+the device's coat child (`DMaterial::coatLobe`) is still kept from the plain glossy splat. A
+smooth coat (roughness 0) is a delta lobe and splats nothing (`glossySplats` of the coat child).
+The body's share keeps the photon's coin, `1 - R` at the light's angle, where a camera walk takes
+`1 - R` at its own. The layered model is not reciprocal, so mode B reads a coated body a few
+percent off mode R (check_rough_irid's car paint). Mode `P` is unaffected: it assigns a pixel to
+the forward layer by its first-hit material, so a glossy first hit is still the backward layer's.
 
 **Rough interference reflector (`Material::iridescence`).** An opaque `thinfilm` or
 `multilayer` given a `roughness` (`ftsl.h roughenInterference`) becomes a `Glossy` with

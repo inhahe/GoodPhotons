@@ -232,6 +232,16 @@ a compound's pick) writes through the same bounds-checked `depositPhoton`. So: a
 in the photon kernel, or the driver's under two contexts, of unknown cause. If it recurs, run the
 command under `compute-sanitizer --tool memcheck` and note what else held the GPU.
 
+**Seen again on 0.434.8**, the same way: check_rough_irid's GPU mode B on its car-paint scene
+(`-mode B -n 60000000 -seed 1`), while check_bitid rendered on the GPU from another process, died
+with `[cuda] forward kernel failed: unspecified launch failure`. The same build had rendered that
+case clean beside nothing an hour earlier. Alone, three reruns (seeds 1, 2, 1) succeeded, and
+compute-sanitizer's memcheck on it found 0 errors, alone at 2M photons and twice at 4M beside
+another process's GPU renders (memcheck serialises the kernels, which may be what hides it). Both
+occurrences were the forward photon kernel, beside another process's GPU renders, so: run GPU
+checks one at a time, and read a lone launch failure beside another GPU job as this entry until
+it reproduces alone.
+
 ## OPEN (2026-11-04, 0.433.6): CURVE-CAUSTIC — modes M and S light a `type diffuse` strand only by NEE and its diffuse continuation, so a caustic from a point or spot light misses it
 
 Found by the Opus review of 0.433.3-0.433.4. Since CURVE-GATHER the photon pass stores nothing on a
@@ -638,7 +648,32 @@ every wavelength. Fixed by writing the index n - ik and taking the decaying root
 backends; `-checkmultilayer` gained the two cases that catch it (design.md, "The Abelès matrix's
 sign convention"). Anything rendered with an absorbing stack before 0.403.0 changes colour.
 
-## OPEN (2026-11-02, 0.401.0): FWD-GLOSSY-INDIRECT — modes A and B splat a rough reflector only where it is seen directly
+## OPEN (2026-11-05, 0.434.8): LAYERED-BODY-COIN — a forward mode weighs a coated body by the photon's coin, at the light's angle
+
+Found validating FWD-GLOSSY-INDIRECT on check_rough_irid's car-paint sphere (red diffuse under a
+1.5 coat of roughness 0.05). Mode B reads it 0.946 / 0.982 / 0.974 of mode R per channel on both
+backends, the red body's channel lowest. A layered stack is resolved by a coin with the coat's
+reflectance R at the incident direction. A camera walk (mode R) weighs the body by 1 - R at the
+camera's angle; a photon (modes A and B) by 1 - R at the light's. A real coat applies both: light
+crosses the interface going in and coming out. The model is not reciprocal, so the forward and
+backward modes converge to slightly different images of a coated body, by a few percent where
+the two angles' Fresnel differ. **Proper fix:** either make the forward body splat carry
+(1 - R(theta_c)) / (1 - R(theta_in)), so modes A and B emulate the camera-side convention (the
+splat has theta_c, as the coat sheen's does), or move every mode to the reciprocal
+(1 - R_in)(1 - R_out) with the internal-reflection term coatedAlbedo already models. The second
+changes every coated render, so it wants its own A/B. check_rough_irid holds B to R at 8 % on the
+car paint for this.
+
+## OPEN (2026-11-05, 0.434.8): FWD-SMOOTH-COAT — a smooth clearcoat shows no sheen in modes A and B
+
+A `layered` coat of roughness 0 is a delta lobe: the deterministic coat splat (GlossySplat::stack)
+cannot evaluate it toward the camera, and the closed-form mirror connection handles only flat
+planes and spheres of a mirror material, not a coated surface. So a polished coat's mirror
+reflection is missing in the forward modes, while its body renders. **Proper fix:** treat a
+smooth coat like a mirror in the analytic connections (a coated sphere as a mirror sphere of
+reflectance R(theta), a coated plane as a mirror plane), weighted by R at the reflection's angle.
+
+## DONE (2026-11-05, 0.434.8): FWD-GLOSSY-INDIRECT — modes A and B splat a rough reflector only where it is seen directly
 
 Since 0.401.0 a rough glossy photon vertex splats to the camera through its lobe (render.h
 `glossySplats`), but only directly: the closed-form mirror and glass-sphere connections
@@ -652,6 +687,19 @@ synthetic coat lobe is excluded by `DMaterial::coatLobe` to match). **Proper fix
 instead of `rho/pi`, on both backends; and splat the coat term deterministically at a layered
 vertex (`R(theta) * lobe`, both backends), validated against modes R and D on a car-paint scene,
 whose coat sheen is defined by `bsdf_eval.h`'s layered term.
+
+**Fixed in 0.434.8**, both parts, on both backends and both walks:
+- `SpecVtx::glossy` / `DSpecVtx::glossy` carries a glossy vertex's `GlossySplat` into the three
+  connectors (`camSpecularSplatAllGlossy`). The dielectric sphere's `term` and the mirror legs
+  evaluate the lobe toward the first specular point per wavelength.
+- At a layered vertex, before its coin, the coat's lobe splats toward the camera at the stack's
+  coat reflectance there (`GlossySplat::stack`). That is the R a camera walk picks the coat with.
+check_rough_irid, mode B against mode R:
+- the glossy sphere in a mirror, 0.434.7 black (0.004 of R), now 0.975-0.999 per channel (hero
+  and scalar, CPU and GPU);
+- through a glass sphere, 0.970-1.022;
+- the car paint, 0.824 / 0.144 / 0.229 before (no sheen) and 0.946 / 0.982 / 0.974 now. The rest
+  is LAYERED-BODY-COIN. A smooth coat is FWD-SMOOTH-COAT.
 
 ## OPEN (2026-11-02, 0.401.0): ROUGH-IRID-AIR — a rough interference reflector always interferes against air
 

@@ -1492,10 +1492,13 @@ metal presets, and the rough interference reflectors (`thinfilm` / `multilayer` 
 `roughness`). Since 0.401.0, on the CPU and the GPU, in modes `A` and `B`; until then such
 a surface was black there, which is why a scene with rough metal looked different in `B`
 than in `R`. (A sharp lobe still converges slowly this way — the splat is a light-tracing
-estimate of a highlight — so a near-mirror is better seen in `R` or `D`.) Only the direct view
-is splatted: a rough reflector seen **in a mirror or through a glass sphere** (the closed-form
-connections above, which a diffuse vertex takes) is still black in `B`, and so is a `layered`
-material's clearcoat sheen (its body is not).
+estimate of a highlight — so a near-mirror is better seen in `R` or `D`.) Since 0.434.8 it is
+also seen **in a mirror or through a glass sphere**: the closed-form connections above, which a
+diffuse vertex takes, evaluate the rough lobe toward the first specular point, where a diffuse
+vertex gives `ρ/π`. A `layered` material's clearcoat **sheen** splats too, at every photon that
+reaches the coat, whichever way the photon then goes: the coat's lobe toward the camera, times
+the coat's reflectance at the camera's angle. A smooth coat (`roughness 0`) is a delta lobe and
+still shows no sheen in `B`; neither does a rough reflector seen in a mirror *mesh*.
 
 **Still black in `B`, by design:** a glass or mirror **mesh** (only world-space triangles
 grouped into planes, and analytic spheres, are collected — an instanced/BLAS mirror is

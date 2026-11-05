@@ -348,8 +348,13 @@ struct GlossySplat {
     const Hit* h;
     Vec3 ns;   // shading normal
     Vec3 wl;   // toward the previous, light-side vertex
+    // A layered stack whose coat `m` is (its coatChild), or null. The coat's lobe then carries
+    // the stack's coat reflectance toward `wc`: a camera-side walk takes the coat with R at its
+    // own incidence, so that is the R its sheen is seen with (FWD-GLOSSY-INDIRECT).
+    const Material* stack = nullptr;
     double f(const Vec3& wc, double lambda) const {
-        return glossyF(*scene, *m, h, ns, wc, wl, lambda);
+        const double v = glossyF(*scene, *m, h, ns, wc, wl, lambda);
+        return stack ? v * layeredCoatReflectance(*scene, *stack, *h, -wc, lambda) : v;
     }
 };
 
@@ -1715,10 +1720,19 @@ struct Renderer {
         // (its aim) says: `gated` turns on that second test, against `plane`.
         bool gated = false;
         Vec3 plane;
+        // A rough glossy vertex (FWD-GLOSSY-INDIRECT): its lobe toward the first specular point,
+        // at `lambda` here and at each wavelength in the mirror legs, replaces the Lambertian
+        // rho/pi, and `weight` is unused. Null for a diffuse or volume vertex.
+        const GlossySplat* glossy = nullptr;
+        double lambda = 0.0;
         // Throughput at the vertex for a connection leaving toward `wP` (unit, toward
         // the sphere). Returns <0 to signal "reject" (camera-side behind a surface).
         double term(const Vec3& wP) const {
             if (volume) return weight * hgPhase(dot(wIn, wP), g);
+            if (glossy) {
+                const double c = dot(np, wP);
+                return c <= 0.0 ? -1.0 : glossy->f(wP, lambda) * c;
+            }
             if (gated && dot(plane, wP) <= 0.0) return -1.0;
             double cosSurf = dot(np, wP);
             return cosSurf <= 0.0 ? -1.0 : (weight / PI) * cosSurf;
@@ -2156,11 +2170,14 @@ struct Renderer {
                          int px, int py, double omega, const Vec3& p, const Vec3& wP,
                          double dP, const Vec3& R, const Vec3& wRE, double dE, double D,
                          double shape, const double* lam, const double* beta,
-                         const double* w, int nUp, Pcg32& rng) const {
+                         const double* w, int nUp, Pcg32& rng,
+                         const GlossySplat* gs = nullptr) const {
         const double invD2Omega = 1.0 / (D * D * omega);
         for (int i = 0; i < nUp; ++i) {
             double refl = clamp01(reflectSlot(scene, mm, hm, lam[i]));
-            double contrib = beta[i] * (w[i] * shape) * refl * invD2Omega;
+            // A glossy vertex's lobe toward wP, at this wavelength (shape is cos/pi there).
+            const double wi = gs ? gs->f(wP, lam[i]) * PI : w[i];
+            double contrib = beta[i] * (wi * shape) * refl * invD2Omega;
             if (contrib <= 0.0) continue;
             if (!scene.media.empty()) {
                 contrib *= mediaTransmittance(scene, p, wP,  dP, lam[i], rng);
@@ -2213,7 +2230,7 @@ struct Renderer {
         if (!mirrorSeenAt(scene, eye, -wRE, dE, hm) || !scene.mirrorClaims(mp, hm)) return;
 
         splatMirrorLegs(scene, film, scene.mats[hm.matId], hm, px, py, omega,
-                        p, wP, dP, R, wRE, dE, D, shape, lam, beta, w, nUp, rng);
+                        p, wP, dP, R, wRE, dE, D, shape, lam, beta, w, nUp, rng, vt.glossy);
     }
 
     // Connect vertex p to the pinhole `cam` by reflection in one SPHERICAL mirror.
@@ -2339,7 +2356,7 @@ struct Renderer {
             if (!mirrorSeenAt(scene, eye, -wRE, dE, hm)) continue;
 
             splatMirrorLegs(scene, film, scene.mats[hm.matId], hm, px, py, omega,
-                            p, wP, dP, ch.P1, wRE, dE, D, shape, lam, beta, w, nUp, rng);
+                            p, wP, dP, ch.P1, wRE, dE, D, shape, lam, beta, w, nUp, rng, vt.glossy);
         }
     }
 
@@ -2364,7 +2381,7 @@ struct Renderer {
         // the visit order — and the film accumulation order — is exactly the old scan's.
         if (!scene.dielSphereIdx.empty()) {
             for (int i = 0; i < nUp; ++i) {
-                SpecVtx vi = vt; vi.weight = w[i];
+                SpecVtx vi = vt; vi.weight = w[i]; vi.lambda = lam[i];
                 for (int si : scene.dielSphereIdx) {
                     Sphere moved;
                     const Sphere& S = scene.sphereNow(scene.spheres[(size_t)si], moved);
@@ -2415,6 +2432,18 @@ struct Renderer {
         SpecVtx vt; vt.volume = false; vt.np = n; vt.weight = rho;
         if (plane) { vt.gated = true; vt.plane = *plane; }                 // see SpecVtx
         camSpecularSplatAllVtx(scene, cams, nCam, p, vt, lambda, beta, rng);
+    }
+    // Glossy vertex (FWD-GLOSSY-INDIRECT): the rough lobe seen in a mirror or through a glass
+    // sphere, as camSplatAll's `gs` splats it directly. Its value toward the first specular point
+    // replaces the Lambertian rho/pi, at each of the `nUp` wavelengths (an iridescent lobe's colour
+    // turns with the direction, so it is evaluated per wavelength, not shared).
+    void camSpecularSplatAllGlossy(const Scene& scene, const CamTarget* cams, int nCam,
+                                   const Vec3& p, const Vec3& n, const double* lam,
+                                   const double* beta, int nUp, const GlossySplat& gs,
+                                   Pcg32& rng) const {
+        SpecVtx vt; vt.volume = false; vt.np = n; vt.weight = 0.0; vt.glossy = &gs;
+        const double w[hero::kHeroMax] = {};   // a glossy vertex's weight is in its lobe
+        camSpecularSplatAllVtxN(scene, cams, nCam, p, vt, lam, beta, w, nUp, rng);
     }
     // Hero variant. The sphere REFRACTION is dispersive (glass IOR varies per λ), so it
     // cannot share one geometry — each wavelength traces its own refracted image, which
@@ -3445,6 +3474,19 @@ struct Renderer {
                 // the coat's roughness lobe is sampled once, so a reflected bundle would be
                 // riding a direction chosen for the hero alone.
                 retireSpectral(FK_Layered);
+                // THE COAT'S SHEEN splats here, whichever lobe the coin below takes: the coat's
+                // lobe toward the camera at the coat's reflectance there (GlossySplat::stack).
+                // Neither of the coin's outcomes splats it: a coat reflection is a glossy bounce
+                // the camera never sees at this vertex, and the body splats only itself.
+                if (nCam > 0 && !forwardCatch && cm.coatChild >= 0 &&
+                    glossySplats(scene.mats[(size_t)cm.coatChild]) &&
+                    (specularSideSplats || !isSpecularType(cm.type))) {
+                    const Vec3 wl{-ray.d.x, -ray.d.y, -ray.d.z};
+                    const GlossySplat gsp{&scene, &scene.mats[(size_t)cm.coatChild], &h, h.n, wl, &cm};
+                    camSplatAll(scene, cams, nCam, h.p, h.n, orientedGeoN(h), wl, lambda, beta,
+                                0.0, rng, nullptr, &gsp);
+                    camSpecularSplatAllGlossy(scene, cams, nCam, h.p, h.n, &lambda, &beta, 1, gsp, rng);
+                }
                 double R = layeredCoatReflectance(scene, cm, h, ray.d, lambda);
                 if (rng.uniform() < R) {                    // coat reflection
                     double cr = materialRoughness(scene, cm, h);
@@ -3526,6 +3568,7 @@ struct Renderer {
                         const GlossySplat gsp{&scene, &m, &h, h.n, wl};
                         camSplatAll(scene, cams, nCam, h.p, h.n, orientedGeoN(h), wl, lambda, beta,
                                     0.0, rng, nullptr, &gsp);
+                        camSpecularSplatAllGlossy(scene, cams, nCam, h.p, h.n, &lambda, &beta, 1, gsp, rng);
                     }
                     if (!interactPhotonSpecular(scene, cams, nCam, m, h, ray, beta, lambda, stk, rng, e))
                         return;
@@ -3991,6 +4034,17 @@ struct Renderer {
             // re-entering would deposit the photon into the film twice.
             if (matp->type == MatType::Layered) {
                 const Material& cm = *matp;
+                // The coat's sheen, over the bundle, before its coin (see the scalar twin).
+                if (nCam > 0 && !forwardCatch && cm.coatChild >= 0 &&
+                    glossySplats(scene.mats[(size_t)cm.coatChild]) &&
+                    (specularSideSplats || !isSpecularType(cm.type))) {
+                    const Vec3 wl{-ray.d.x, -ray.d.y, -ray.d.z};
+                    const GlossySplat gsp{&scene, &scene.mats[(size_t)cm.coatChild], &h, h.n, wl, &cm};
+                    double unused[hero::kHeroMax] = {};
+                    camSplatAllHero(scene, cams, nCam, h.p, h.n, orientedGeoN(h), wl, lam, beta,
+                                    unused, nUp, rng, nullptr, &gsp);
+                    camSpecularSplatAllGlossy(scene, cams, nCam, h.p, h.n, lam, beta, nUp, gsp, rng);
+                }
                 double Rl[hero::kHeroMax];
                 for (int i = 0; i < nUp; ++i)
                     Rl[i] = layeredCoatReflectance(scene, cm, h, ray.d, lam[i]);
@@ -4107,6 +4161,7 @@ struct Renderer {
                         double unused[hero::kHeroMax] = {};
                         camSplatAllHero(scene, cams, nCam, h.p, h.n, orientedGeoN(h), wl, lam, beta,
                                         unused, nUp, rng, nullptr, &gsp);
+                        camSpecularSplatAllGlossy(scene, cams, nCam, h.p, h.n, lam, beta, nUp, gsp, rng);
                     }
                     double c[hero::kHeroMax];
                     for (int i = 0; i < nUp; ++i)

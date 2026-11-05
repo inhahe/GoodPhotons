@@ -6184,25 +6184,36 @@ __device__ static double dGlossyF(const DScene& sc, const DMaterial& m, const DH
     const double lobe = (e + 1.0) / (2.0 * DPI) * pow(cosLobe, e);
     return r * lobe / cosWi;
 }
+__device__ static double dLayeredCoatReflectance(const DScene& sc, const DMaterial& m,
+                                                 const DHit& h, const DVec3& d, Real lambda,
+                                                 double* cosIOut, Real* thOut);
 // A glossy photon vertex's camera splat (host twin GlossySplat): the splats evaluate the ADJOINT
-// lobe toward the camera point they find, which is dGlossyF with the pair swapped.
+// lobe toward the camera point they find, which is dGlossyF with the pair swapped. `stack`: the
+// layered stack whose coat `m` is, whose coat reflectance toward the camera the lobe then carries.
 struct DGlossySplat {
     const DScene*    sc;
     const DMaterial* m;
     const DHit*      h;
     DVec3 ns;   // shading normal
     DVec3 wl;   // toward the previous, light-side vertex
+    const DMaterial* stack = nullptr;
     __device__ Real f(const DVec3& wc, Real lambda) const {
-        return (Real)dGlossyF(*sc, *m, *h, ns, wc, wl, lambda);
+        const Real v = (Real)dGlossyF(*sc, *m, *h, ns, wc, wl, lambda);
+        return stack ? v * (Real)dLayeredCoatReflectance(*sc, *stack, *h, -wc, lambda, nullptr, nullptr) : v;
     }
 };
 // Twin of glossySplats: a glossy lobe with a finite value splats in the forward modes. The one
 // without, roughness pinned at 0 with nothing to vary it, is the analytic planar-mirror
 // connection's (dIsPlanarMirrorMat), and splatting it too would count it twice. A layered
-// material's synthetic coat lobe (coatLobe) does not splat either: the host splats no coat.
+// material's synthetic coat lobe (coatLobe) does not splat when the coin takes it: the coat
+// splats at the stack's vertex instead, whichever lobe the coin takes (dCoatSplats).
 __device__ static inline bool dIsPlanarMirrorMat(const DMaterial& m);
 __device__ static inline bool dGlossySplats(const DMaterial& m) {
     return m.type == D_GLOSSY && !m.coatLobe && !dIsPlanarMirrorMat(m);
+}
+// Whether a layered stack's coat `coat` splats at the stack's vertex: a lobe with a finite value.
+__device__ static inline bool dCoatSplats(const DMaterial& coat) {
+    return coat.type == D_GLOSSY && !dIsPlanarMirrorMat(coat);
 }
 
 // `gs` (optional): a glossy vertex, whose f replaces rho/pi toward the camera (DGlossySplat).
@@ -9446,11 +9457,18 @@ struct DSpecVtx {
     // aim) says: `gated` turns on that second test, against `plane`. Host twin SpecVtx.
     bool   gated = false;
     D3     plane;
+    // A rough glossy vertex: its lobe toward the first specular point replaces rho/pi, at
+    // `lambda` here and per wavelength in the mirror legs (host twin SpecVtx::glossy).
+    const DGlossySplat* glossy = nullptr;
     // Throughput at the vertex for a connection leaving toward `wP` (unit, toward the
     // sphere). Returns <0 to signal "reject" (camera-side behind a surface). A rainbow
     // medium uses its tabulated Airy phase; HG media use the analytic lobe.
     __device__ double term(const D3& wP) const {
         if (volume) return weight * (double)dMedPhase(*med, (Real)d3dot(wIn, wP), lambda);
+        if (glossy) {
+            const double c = d3dot(np, wP);
+            return c <= 0.0 ? -1.0 : (double)glossy->f(wP.toR(), lambda) * c;
+        }
         if (gated && d3dot(plane, wP) <= 0.0) return -1.0;
         double cosSurf = d3dot(np, wP);
         return cosSurf <= 0.0 ? -1.0 : (weight / DPI) * cosSurf;
@@ -10010,13 +10028,15 @@ __device__ static void dSplatMirrorLegs(const DScene& sc, const DCamera& cam, do
         double* hits, const DMaterial& mm, const DHit& hm, int px, int py, double omega,
         const D3& p, const D3& wP, double dP, const D3& R, const D3& wRE, double dE,
         double D, double shape, const Real* lam, const Real* beta, const Real* w,
-        int nUp, DRng& rng) {
+        int nUp, DRng& rng, const DGlossySplat* gs = nullptr) {
     const double invD2Omega = 1.0 / (D * D * omega);
     const DVec3 wPR = wP.toR(), wRER = wRE.toR();
     const DVec3 pR = p.toR(), RR = R.toR();
     for (int i = 0; i < nUp; ++i) {
         double refl = clamp01((double)dReflectSlot(sc, mm, hm, lam[i]));
-        double contrib = (double)beta[i] * ((double)w[i] * shape) * refl * invD2Omega;
+        // A glossy vertex's lobe toward wP, at this wavelength (shape is cos/pi there).
+        const double wi = gs ? (double)gs->f(wPR, lam[i]) * DPI : (double)w[i];
+        double contrib = (double)beta[i] * (wi * shape) * refl * invD2Omega;
         if (contrib <= 0.0) continue;
         if (sc.mediaN > 0) {
             contrib *= (double)dMediaTransmittance(sc, pR, wPR,  (Real)dP, lam[i], rng);
@@ -10071,7 +10091,7 @@ __device__ static void dConnectSpecularPlane(const DScene& sc, const DCamera& ca
     if (!dMirrorSeenAt(sc, eye, D3(0,0,0) - wRE, dE, hm) || !dMirrorClaims(sc, mp, hm)) return;
 
     dSplatMirrorLegs(sc, cam, film, hits, sc.mats[hm.matId], hm, px, py, omega,
-                     p, wP, dP, R, wRE, dE, D, shape, lam, beta, w, nUp, rng);
+                     p, wP, dP, R, wRE, dE, D, shape, lam, beta, w, nUp, rng, vt.glossy);
 }
 
 // Connect vertex p to the pinhole `cam` by reflection in one SPHERICAL mirror. Same 1-D
@@ -10203,7 +10223,7 @@ __device__ static void dConnectSpecularSphereMirror(const DScene& sc, const DCam
         if (!dMirrorSeenAt(sc, eye, D3(0,0,0) - wRE, dE, hm)) continue;
 
         dSplatMirrorLegs(sc, cam, film, hits, sc.mats[hm.matId], hm, px, py, omega,
-                         p, wP, dP, ch.P1, wRE, dE, D, shape, lam, beta, w, nUp, rng);
+                         p, wP, dP, ch.P1, wRE, dE, D, shape, lam, beta, w, nUp, rng, vt.glossy);
     }
 }
 
@@ -10281,6 +10301,17 @@ __device__ static void camSpecularSplatAll(const DScene& sc, const DCamSet& cs, 
     vt.med = nullptr; vt.lambda = lambda;
     if (plane) { vt.gated = true; vt.plane = D3(*plane); }               // see DSpecVtx
     camSpecularSplatAllVtx(sc, cs, camMode, D3(p), vt, lambda, beta, rng);
+}
+// Glossy vertex: the rough lobe seen in a mirror or through a glass sphere (host twin
+// Renderer::camSpecularSplatAllGlossy).
+__device__ static void camSpecularSplatAllGlossy(const DScene& sc, const DCamSet& cs, int camMode,
+                                                 const DVec3& p, const DVec3& n, const Real* lam,
+                                                 const Real* beta, int nUp, const DGlossySplat& gs,
+                                                 DRng& rng) {
+    DSpecVtx vt; vt.volume = false; vt.np = D3(n); vt.weight = 0.0; vt.g = 0;
+    vt.med = nullptr; vt.lambda = lam[0]; vt.glossy = &gs;
+    const Real w[hero::kHeroMax] = {};   // a glossy vertex's weight is in its lobe
+    camSpecularSplatAllVtxN(sc, cs, camMode, D3(p), vt, lam, beta, w, nUp, rng);
 }
 // Volume vertex: refract the fog in-scatter at p through every glass sphere, so the
 // glowing haze itself bends through the glass the camera flies through.
@@ -11964,6 +11995,7 @@ __device__ static int interactSpecular(const DScene& sc, const DCamSet& cs, int 
             const DGlossySplat gsp{&sc, &m, &h, h.n, wl};
             splatSurfaceAll(sc, cs, camMode, h.p, h.n, dShadedNg(h), wl, lambda, beta, (Real)0, rng,
                             nullptr, &gsp);
+            camSpecularSplatAllGlossy(sc, cs, camMode, h.p, h.n, &lambda, &beta, 1, gsp, rng);
         }
         Real r = clamp01(dReflectSlot(sc, m, h, lambda));
         if (rng.uniform() >= r) { eAbsorbed += beta; return WF_TERMINATE; }
@@ -12374,6 +12406,17 @@ __device__ static int shadeStep(const DScene& sc, const DCamSet& cs,
     const bool compoundDeposit = dCompoundGathers(sc, *mptr, h.fiberRadius);
     if (compoundDeposit)
         depositPhoton(cs, h.p, dShadedNg(h), beta, lambda, dPathIsCaustic(pathC), dPathCausticW(pathC));
+    // A layered stack's coat sheen splats here, whichever lobe the pick below takes (host twin
+    // tracePhoton, FWD-GLOSSY-INDIRECT).
+    if (mptr->type == D_LAYERED && mptr->coatChild >= 0 && (camMode == CAM_A || camMode == CAM_B) &&
+        dCoatSplats(sc.mats[mptr->coatChild]) && !(cs.pSplit && dIsSpecularType(mptr->type))) {
+        const DVec3 wl = -rd;
+        DGlossySplat gsp{&sc, &sc.mats[mptr->coatChild], &h, h.n, wl};
+        gsp.stack = mptr;
+        splatSurfaceAll(sc, cs, camMode, h.p, h.n, dShadedNg(h), wl, lambda, beta, (Real)0, rng,
+                        nullptr, &gsp);
+        camSpecularSplatAllGlossy(sc, cs, camMode, h.p, h.n, &lambda, &beta, 1, gsp, rng);
+    }
     // Stochastic mix: resolve to a child lobe (or absorb) before dispatch.
     if (dIsCompound(mptr->type)) {
         int child = dResolveCompound(sc, *mptr, h, rd, lambda, rng);
@@ -12767,6 +12810,17 @@ __device__ static int shadeStepHero(const DScene& sc, const DCamSet& cs, int cam
         const DVec3 ngoC = dShadedNg(h);
         for (int i = 0; i < nUp; ++i) depositPhoton(cs, h.p, ngoC, beta[i], lam[i], caus, cw);
     }
+    // The coat's sheen, over the bundle, before its pick (scalar twin).
+    if (mptr->type == D_LAYERED && mptr->coatChild >= 0 && (camMode == CAM_A || camMode == CAM_B) &&
+        dCoatSplats(sc.mats[mptr->coatChild]) && !(cs.pSplit && dIsSpecularType(mptr->type))) {
+        const DVec3 wl = -rd;
+        DGlossySplat gsp{&sc, &sc.mats[mptr->coatChild], &h, h.n, wl};
+        gsp.stack = mptr;
+        const Real unused[hero::kHeroMax] = {};
+        splatSurfaceAllHero(sc, cs, camMode, h.p, h.n, dShadedNg(h), wl, lam, beta, unused, nUp, rng,
+                            nullptr, &gsp);
+        camSpecularSplatAllGlossy(sc, cs, camMode, h.p, h.n, lam, beta, nUp, gsp, rng);
+    }
     if (dIsCompound(mptr->type)) {
         int cpF = -1; double cRF = 0.0, cCosF = 1.0, cUF = 0.0; Real cThF = (Real)0;
         int child = dResolveCompound(sc, *mptr, h, rd, lam[0], rng, &cpF, &cRF, &cCosF, &cThF, &cUF);
@@ -12868,6 +12922,7 @@ __device__ static int shadeStepHero(const DScene& sc, const DCamSet& cs, int cam
             Real unused[hero::kHeroMax] = {};
             splatSurfaceAllHero(sc, cs, camMode, h.p, h.n, dShadedNg(h), wl, lam, beta, unused, nUp,
                                 rng, nullptr, &gsp);
+            camSpecularSplatAllGlossy(sc, cs, camMode, h.p, h.n, lam, beta, nUp, gsp, rng);
         }
         Real c[hero::kHeroMax];
         Real q = (Real)0;

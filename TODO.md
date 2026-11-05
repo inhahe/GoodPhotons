@@ -102,8 +102,9 @@ Each names the section its line is in.
 9. ~~**GLTF-ROUGHNESS-MAP**~~ (0.434.4) and ~~**GLTF-MAP-MEAN-GUTTERS**~~ (0.434.7) (4.2) — glTF
    imports rougher than glTF means, and their mean metalness and roughness counting the atlas
    gutters. Done.
-10. **FWD-GLOSSY-INDIRECT** (4.2) — modes A and B leave a rough reflector black in a mirror or
-    through glass.
+10. ~~**FWD-GLOSSY-INDIRECT**~~ (0.434.8) (4.2) — modes A and B leave a rough reflector black in a
+    mirror or through glass, and splat no clearcoat sheen. Done; LAYERED-BODY-COIN and
+    FWD-SMOOTH-COAT logged.
 11. **CPU-ONLY-BUILD** (4.4) — a build without CUDA does not compile.
 12. **BLUR-EPOCH-COST** (4.5) — a blurred clock-budgeted mode M or J spends its clock rebuilding.
 13. **UPBP-W-CHROMATIC** (4.3) — mode J's beam weight mixes two wavelengths in a chromatic medium.
@@ -192,8 +193,11 @@ Then the rest of 4.2-4.6 in their order, 4.7's bookkeeping alongside whatever to
   refraction and a real lens keep the camera's direction unless `-jdispall`.
 - [x] **MODEM-REDPASS** — not reproduced on 0.433.10 (scenes/_redpass.ftsl recreates it; green
   within 1.4 % of mode R in modes M and J on both backends).
-- [ ] **FWD-GLOSSY-INDIRECT** — modes A and B splat a rough reflector only where it is seen directly
-  (and a layered clearcoat's sheen on neither backend).
+- [x] **FWD-GLOSSY-INDIRECT** — modes A and B splat a rough reflector only where it is seen directly
+  (and a layered clearcoat's sheen on neither backend). 0.434.8.
+- [ ] **LAYERED-BODY-COIN** — a forward mode weighs a coated body by the photon's coin, at the light's
+  angle (5 % on the car paint).
+- [ ] **FWD-SMOOTH-COAT** — a smooth clearcoat shows no sheen in modes A and B.
 - [x] **GLTF-MAP-MEAN-GUTTERS** — the importer's mean metalness and roughness count the atlas's
   gutters.
 - [ ] **FEATHER-IS-A-THRESHOLD** — a mesh-bound medium's `feather` shrinks the silhouette instead of
