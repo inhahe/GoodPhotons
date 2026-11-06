@@ -127,7 +127,8 @@ Each names the section its line is in.
 18. **HAZE-BLUR-DOMAIN** (4.2) — under a blur, modes D and J weigh together strategies that take
     different haze for a mover outside the instant's sphere. Measured 2026-11-06: not only a
     blur's, 1-2 % in any unbounded sunlit haze; blocked on the user's choice of domain (4.1).
-19. **GLOSSY-SAMPLE-SITES** (4.4) — the interference factor applied by hand at two dozen sites.
+19. ~~**GLOSSY-SAMPLE-SITES** (4.4) — the interference factor applied by hand at two dozen sites.~~
+    Done 2026-11-06: `drawGlossy` / `dDrawGlossy` return the direction with its factor.
 20. **JSPEC-CARRIER-SIZE** (4.5) — every mode-J GPU thread reserves the spectral carrier.
 21. **RADCACHE-BATCHES** (4.5) — `-radcache`'s fixed batches outlast `-stop` and the interval.
 22. **P-HEROSPLIT-FIRST**, **ROUGH-IRID-AIR** (4.3) — narrow estimator gaps.
@@ -351,7 +352,8 @@ Then the rest of 4.2-4.6 in their order, 4.7's bookkeeping alongside whatever to
 - [x] **MODEM-CPU-NONDET** (0.434.23) — CPU mode M's light-side refresh ended on the clock, and its
   camera pass stratified wavelengths per clock-sized call; both deterministic now. 0.434.24: the
   wavelengths follow a golden-ratio sequence by absolute sample, which no resume or stop tilts.
-- [ ] **GLOSSY-SAMPLE-SITES** — the interference factor is applied by hand at every glossy sampler.
+- [x] **GLOSSY-SAMPLE-SITES** — the interference factor is applied by hand at every glossy sampler.
+  Done 2026-11-06: one draw helper per backend carries it.
 - [ ] **REMAP0-IMPOSSIBLE** — the MIS sums read a zero density as a delta's, whatever made it zero
   (only the sun's is special-cased).
 

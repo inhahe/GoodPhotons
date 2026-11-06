@@ -228,17 +228,17 @@ inline void sppmVisiblePoint(const Scene& scene, Ray ray, Pcg32& rng, bool diffr
                 const double r = clamp01(reflectSlot(scene, m, h, lambda));
                 thr *= r;
                 sthr.mul([&](double L) { return clamp01(reflectSlot(scene, m, h, L)); }, r);
-                Vec3 o = sampleGlossy(reflect(ray.d, h.n), materialRoughness(scene, m, h), rng);
+                const GlossyDraw gd = drawGlossy(scene, m, h, ray.d, h.n, ray.d * -1.0, rng);
+                const Vec3& o = gd.o;
                 if (dot(o, h.n) <= 0.0) return;
                 // An iridescent lobe's interference reflectance at the pair's half-vector. Where it
                 // is 0 at the walk's own wavelength the path carries nothing (and the ratio would
                 // divide by it).
-                if (m.iridescence) {
-                    const double cH = halfVectorCos(ray.d * -1.0, o);
-                    const double Rh = iridescenceR(scene, m, &h, lambda, cH);
+                if (gd.irid) {
+                    const double Rh = gd.R(lambda);
                     if (!(Rh > 0.0)) return;
                     thr *= Rh;
-                    sthr.mul([&](double L) { return iridescenceR(scene, m, &h, L, cH); }, Rh);
+                    sthr.mul([&](double L) { return gd.R(L); }, Rh);
                 }
                 if (gneeOn) {
                     gmis.pdf = bdpt::bsdfPdf(m, h.n, ray.d * -1.0, o, lambda, scene, &h);

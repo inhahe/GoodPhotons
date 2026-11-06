@@ -392,21 +392,20 @@ inline void scatterSample(const Scene& scene, const Renderer& mats, const Materi
             break;
         }
         case MatType::Glossy: {
-            Vec3 mdir = reflect(rayDir, ns);
-            wi = sampleGlossy(mdir, materialRoughness(scene, *mp, h), rng);
+            const GlossyDraw gd = drawGlossy(scene, *mp, h, rayDir, ns, wo, rng);
+            wi = gd.o;
             if (dot(wi, ns) <= 0) { terminate = true; break; }
             double r = clamp01(reflectSlot(scene, *mp, h, lambda));
-            // An iridescent lobe's interference reflectance at the sampled pair's half-vector
-            // (render.h iridescenceR): bsdfF's r for this pair.
-            const double cH = mp->iridescence ? halfVectorCos(wo, wi) : 1.0;
-            if (mp->iridescence) r *= iridescenceR(scene, *mp, &h, lambda, cH);
+            // An iridescent lobe's interference reflectance at the sampled pair's half-vector:
+            // bsdfF's r for this pair.
+            if (gd.irid) r *= gd.R(lambda);
             pdfW = bsdfPdf(*mp, ns, wo, wi, lambda, scene, &h);
             pdfRevW = bsdfPdf(*mp, ns, wi, wo, lambda, scene, &h);
             betaFactor = r;
             if (pdfW <= 0) terminate = true;      // r <= 0 is caught by the caller's max test
             if (jr) jr->mul([&](double L) {
                                 const double rL = clamp01(reflectSlot(scene, *mp, h, L));
-                                return mp->iridescence ? rL * iridescenceR(scene, *mp, &h, L, cH) : rL; },
+                                return gd.irid ? rL * gd.R(L) : rL; },
                             betaFactor, false);
             // The glossy LOBE (mirror direction + roughness exponent) carries no wavelength
             // dependence, so the whole bundle follows the sampled direction and only the
@@ -415,7 +414,7 @@ inline void scatterSample(const Scene& scene, const Renderer& mats, const Materi
                 *secChromatic = true;
                 for (int i = 0; i < nSec; ++i) {
                     secF[i] = clamp01(reflectSlot(scene, *mp, h, lamAll[i + 1]));
-                    if (mp->iridescence) secF[i] *= iridescenceR(scene, *mp, &h, lamAll[i + 1], cH);
+                    if (gd.irid) secF[i] *= gd.R(lamAll[i + 1]);
                 }
             }
             break;

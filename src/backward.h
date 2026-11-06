@@ -2447,13 +2447,12 @@ struct BackwardRenderer {
                 // exactly as the rng path sets it below.
                 if (whitted) {
                     if (!wAtt(r)) return false;
-                    Vec3 o = whittedGlossyDir(reflect(ray.d, h.n),
-                                              materialRoughness(scene, m, h), gi.sIdx, gi.bounce);
+                    const GlossyDraw gd = glossyAt(scene, m, h, ray.d * -1.0,
+                        whittedGlossyDir(reflect(ray.d, h.n), materialRoughness(scene, m, h),
+                                         gi.sIdx, gi.bounce));
+                    const Vec3& o = gd.o;
                     if (dot(o, h.n) <= 0) return false;
-                    // An iridescent lobe's interference reflectance at the pair's half-vector.
-                    if (m.iridescence &&
-                        !wAtt(iridescenceR(scene, m, &h, lambda, halfVectorCos(ray.d * -1.0, o))))
-                        return false;
+                    if (gd.irid && !wAtt(gd.R(lambda))) return false;
                     if (gm) {
                         gm->pdf = bdpt::bsdfPdf(m, h.n, ray.d * -1.0, o, lambda, scene, &h);
                         gm->from = h.p;
@@ -2463,12 +2462,11 @@ struct BackwardRenderer {
                     specularArrival = true; return true;
                 }
                 if (rng.uniform() >= r) return false;
-                Vec3 o = sampleGlossy(reflect(ray.d, h.n), materialRoughness(scene, m, h), rng);
+                const GlossyDraw gd = drawGlossy(scene, m, h, ray.d, h.n, ray.d * -1.0, rng);
+                const Vec3& o = gd.o;
                 if (dot(o, h.n) <= 0) return false;
-                // An iridescent lobe's interference reflectance, at the half-vector of the pair
-                // it now knows (f * cos / pdf = r * R, which bsdfF carries for the NEE above).
-                if (m.iridescence)
-                    thr *= iridescenceR(scene, m, &h, lambda, halfVectorCos(ray.d * -1.0, o));
+                // f * cos / pdf = r * R, which bsdfF carries for the NEE above.
+                if (gd.irid) thr *= gd.R(lambda);
                 // The other half of the weight, for whatever this direction goes on to hit.
                 if (gm) {
                     gm->pdf = bdpt::bsdfPdf(m, h.n, ray.d * -1.0, o, lambda, scene, &h);
@@ -3616,13 +3614,13 @@ struct BackwardRenderer {
                         ray = Ray{h.p + ray.d * 1e-6, ray.d};       // direction unchanged
                     } else if (whitted) {
                         // Glossy: the lobe off the deterministic lattice (mirror at sample 0).
-                        Vec3 o = whittedGlossyDir(reflect(ray.d, h.n),
-                                                  materialRoughness(scene, m, h), gi.sIdx, b);
+                        const GlossyDraw gd = glossyAt(scene, m, h, ray.d * -1.0,
+                            whittedGlossyDir(reflect(ray.d, h.n), materialRoughness(scene, m, h),
+                                             gi.sIdx, b));
+                        const Vec3& o = gd.o;
                         if (dot(o, h.n) <= 0) { finish(); return; }
-                        if (m.iridescence) {   // interference reflectance at the half-vector, per λ
-                            const double cH = halfVectorCos(ray.d * -1.0, o);
-                            for (int i = 0; i < nUp; ++i) thr[i] *= iridescenceR(scene, m, &h, lam[i], cH);
-                        }
+                        if (gd.irid)   // interference reflectance at the half-vector, per λ
+                            for (int i = 0; i < nUp; ++i) thr[i] *= gd.R(lam[i]);
                         if (glossyNee) {   // the other half of the weight -- see the scalar twin
                             gmis.pdf = bdpt::bsdfPdf(m, h.n, ray.d * -1.0, o, lam[0], scene, &h);
                             gmis.from = h.p;
@@ -3630,12 +3628,11 @@ struct BackwardRenderer {
                         }
                         if (!continueAlong(h, o, Lobe::Reflect, ray)) { finish(); return; }
                     } else {
-                        Vec3 o = sampleGlossy(reflect(ray.d, h.n), materialRoughness(scene, m, h), rng);
+                        const GlossyDraw gd = drawGlossy(scene, m, h, ray.d, h.n, ray.d * -1.0, rng);
+                        const Vec3& o = gd.o;
                         if (dot(o, h.n) <= 0) { finish(); return; }
-                        if (m.iridescence) {   // interference reflectance at the half-vector, per λ
-                            const double cH = halfVectorCos(ray.d * -1.0, o);
-                            for (int i = 0; i < nUp; ++i) thr[i] *= iridescenceR(scene, m, &h, lam[i], cH);
-                        }
+                        if (gd.irid)   // interference reflectance at the half-vector, per λ
+                            for (int i = 0; i < nUp; ++i) thr[i] *= gd.R(lam[i]);
                         if (glossyNee) {
                             gmis.pdf = bdpt::bsdfPdf(m, h.n, ray.d * -1.0, o, lam[0], scene, &h);
                             gmis.from = h.p;

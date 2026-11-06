@@ -1416,14 +1416,13 @@ inline void randomWalk(const Scene& scene, const Camera& cam, const Renderer& ma
                 break;
             }
             case MatType::Glossy: {
-                Vec3 mdir = reflect(ray.d, cur.ns);   // ray.d == -wo (incoming dir)
-                wi = sampleGlossy(mdir, materialRoughness(scene, *mp, h), rng);
+                const GlossyDraw gd = drawGlossy(scene, *mp, h, ray.d, cur.ns, wo, rng);   // ray.d == -wo
+                wi = gd.o;
                 if (dot(wi, cur.ns) <= 0) { terminate = true; break; }
                 double r = clamp01(reflectSlot(scene, *mp, h, lambda));
-                // An iridescent lobe's interference reflectance, at the half-vector of the pair
-                // just sampled (render.h iridescenceR) -- bsdfF's r for this pair.
-                const double cH = mp->iridescence ? halfVectorCos(wo, wi) : 1.0;
-                if (mp->iridescence) r *= iridescenceR(scene, *mp, &h, lambda, cH);
+                // An iridescent lobe's interference reflectance at the pair's half-vector:
+                // bsdfF's r for this pair.
+                if (gd.irid) r *= gd.R(lambda);
                 // FOLD-GLOSSY (0.260.1): the lobe's direction is wavelength-free, so the claim
                 // survives; the albedo is folded exactly as Diffuse's is above (render.h's
                 // tracePhoton does the same -- one PhotonBeam bank, one rule). Not an iridescent
@@ -1452,7 +1451,7 @@ inline void randomWalk(const Scene& scene, const Camera& cam, const Renderer& ma
                 secChromatic = true;
                 for (int i = 0; i + 1 < nUp; ++i) {
                     secF[i] = clamp01(reflectSlot(scene, *mp, h, hb.lam[i + 1]));
-                    if (mp->iridescence) secF[i] *= iridescenceR(scene, *mp, &h, hb.lam[i + 1], cH);
+                    if (gd.irid) secF[i] *= gd.R(hb.lam[i + 1]);
                 }
                 break;
             }

@@ -924,7 +924,15 @@ sites do not carry the medium stack's exterior index. **Proper fix:** thread the
 into the glossy sampling and evaluation sites (the photon walks and the backward walks have the
 stack; the BSDF evaluators would take it as an argument).
 
-## OPEN (2026-11-02, 0.401.0, tech debt): GLOSSY-SAMPLE-SITES — the interference factor is applied by hand at every glossy sampler
+## DONE (2026-11-06; opened 2026-11-02, 0.401.0, tech debt): GLOSSY-SAMPLE-SITES — the interference factor is applied by hand at every glossy sampler
+
+**Done:** every glossy sampler draws its direction through `drawGlossy` (or `glossyAt`, for a
+Whitted lattice's direction), render.h, and on the device `dDrawGlossy` / `dGlossyAt`. Each returns
+a `GlossyDraw` holding the direction and the factor `R(lambda)` (the interference reflectance at
+the pair's half-vector, exactly 1 on a plain lobe, its half-vector cosine computed once). Its
+`irid` flag keeps the roulette sites from drawing a number on a plain lobe. The sites still choose
+how to take R (multiplied in, a roulette, a roulette on a bundle's largest), but none can take a
+direction without it. check_bitid identical; check_rough_irid passes. The rest is how it stood.
 
 An iridescent glossy's direction is drawn from the plain lobe and its weight multiplied by
 `iridescenceR` at the half-vector afterwards, at about a dozen host and a dozen device sites

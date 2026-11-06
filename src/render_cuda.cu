@@ -6187,6 +6187,33 @@ __device__ static inline Real dHalfVectorCos(const DVec3& a, const DVec3& b) {
     const Real c = (Real)0.5 * length(a + b);
     return c < (Real)1 ? c : (Real)1;
 }
+// Twin of GlossyDraw (render.h): a direction drawn from a glossy lobe, and the factor R the draw
+// leaves beyond the `reflect` slot -- an iridescent lobe's interference reflectance at the pair's
+// half-vector, exactly 1 on a plain lobe. Every device glossy sampler draws through dDrawGlossy
+// or dGlossyAt; how to take R is the caller's.
+struct DGlossyDraw {
+    DVec3 o;
+    bool irid;
+    Real cH;   // 1 on a plain lobe
+    const DScene* sc;
+    const DMaterial* m;
+    const DHit* h;
+    __device__ Real R(Real lambda) const { return irid ? dIridescenceR(*sc, *m, h, lambda, cH) : (Real)1; }
+};
+__device__ static inline DGlossyDraw dGlossyAt(const DScene& sc, const DMaterial& m, const DHit& h,
+                                               const DVec3& wo, const DVec3& o) {
+    DGlossyDraw g;
+    g.o = o;
+    g.irid = m.iridescence != 0;
+    g.cH = g.irid ? dHalfVectorCos(wo, o) : (Real)1;
+    g.sc = &sc; g.m = &m; g.h = &h;
+    return g;
+}
+__device__ static inline DGlossyDraw dDrawGlossy(const DScene& sc, const DMaterial& m, const DHit& h,
+                                                 const DVec3& dIn, const DVec3& n, const DVec3& wo,
+                                                 DRng& rng) {
+    return dGlossyAt(sc, m, h, wo, sampleGlossy(reflectv(dIn, n), dMatRoughness(sc, m, h), rng));
+}
 // Twin of glossyF: r * lobe / cos(wi), the lobe mirrored about wo, r the reflect slot times an
 // iridescent glossy's interference reflectance; 0 unless both lie above `ns` and wi in the lobe.
 // Double, as dBsdfF is.
@@ -12144,13 +12171,12 @@ __device__ static int interactSpecular(const DScene& sc, const DCamSet& cs, int 
         }
         Real r = clamp01(dReflectSlot(sc, m, h, lambda));
         if (rng.uniform() >= r) { eAbsorbed += beta; return WF_TERMINATE; }
-        DVec3 o = sampleGlossy(reflectv(rd, h.n), dMatRoughness(sc, m, h), rng);
+        const DGlossyDraw gd = dDrawGlossy(sc, m, h, rd, h.n, -rd, rng);
+        const DVec3& o = gd.o;
         if (dot(o, h.n) <= 0) { eAbsorbed += beta; return WF_TERMINATE; }
         // An iridescent lobe's interference reflectance, known only now that the pair is: a
         // second roulette, beta unchanged (host twin interactPhotonSpecular).
-        if (m.iridescence &&
-            rng.uniform() >= dIridescenceR(sc, m, &h, lambda, dHalfVectorCos(-rd, o)))
-            { eAbsorbed += beta; return WF_TERMINATE; }
+        if (gd.irid && rng.uniform() >= gd.R(lambda)) { eAbsorbed += beta; return WF_TERMINATE; }
         if (!dContinueAlong(h, o, DL_REFLECT, ro, rd)) { eAbsorbed += beta; return WF_TERMINATE; } return WF_CONTINUE;
     } else if (m.type == D_FLUORESCENT) {
         // Two competing channels: elastic diffuse reflection (albedo rho, wavelength
@@ -13087,16 +13113,16 @@ __device__ static int shadeStepHero(const DScene& sc, const DCamSet& cs, int cam
         } else if (m.type == D_FILTER) {
             ro = dOffsetAlong(h.p, h.ng, rd);   // straight through, direction unchanged
         } else {
-            DVec3 o = sampleGlossy(reflectv(rd, h.n), dMatRoughness(sc, m, h), rng);
+            const DGlossyDraw gd = dDrawGlossy(sc, m, h, rd, h.n, -rd, rng);
+            const DVec3& o = gd.o;
             if (dot(o, h.n) <= 0) { for (int i = 0; i < nUp; ++i) eAbsorbed += (double)beta[i]; return WF_TERMINATE; }
-            if (m.iridescence) {
+            if (gd.irid) {
                 // The interference reflectance at the pair's half-vector, per λ, by the same
                 // roulette-on-the-max and bounded reweight as above (host twin).
-                const Real cH = dHalfVectorCos(-rd, o);
                 Real R[hero::kHeroMax];
                 Real qR = (Real)0;
                 for (int i = 0; i < nUp; ++i) {
-                    R[i] = dIridescenceR(sc, m, &h, lam[i], cH);
+                    R[i] = gd.R(lam[i]);
                     if (R[i] > qR) qR = R[i];
                 }
                 if (rng.uniform() >= qR) { for (int i = 0; i < nUp; ++i) eAbsorbed += (double)beta[i]; return WF_TERMINATE; }
@@ -15897,14 +15923,13 @@ __device__ static bool bkInteract(const DScene& sc, const DMaterial* mp, const D
             // in mode W's headline configuration.
             if (whitted) {
                 if (!dWhittedAttenuate(thr, (double)r, dLocalN2(sc, stk, lambda))) return false;
-                DVec3 o = dWhittedGlossyDir(reflectv(rd, h.n), dMatRoughness(sc, *mp, h),
-                                            gi.sIdx, gi.bounce);
+                const DGlossyDraw gd = dGlossyAt(sc, *mp, h, rd * (Real)(-1),
+                    dWhittedGlossyDir(reflectv(rd, h.n), dMatRoughness(sc, *mp, h), gi.sIdx, gi.bounce));
+                const DVec3& o = gd.o;
                 if (dot(o, h.n) <= 0) return false;
                 // An iridescent lobe's interference reflectance at the pair's half-vector.
-                if (mp->iridescence &&
-                    !dWhittedAttenuate(thr, (double)dIridescenceR(sc, *mp, &h, lambda,
-                                                                  dHalfVectorCos(rd * (Real)(-1), o)),
-                                       dLocalN2(sc, stk, lambda))) return false;
+                if (gd.irid && !dWhittedAttenuate(thr, (double)gd.R(lambda), dLocalN2(sc, stk, lambda)))
+                    return false;
                 if (gm) {
                     gm->pdf = dGlossyPdfHit(sc, *mp, h, rd * (Real)(-1), o);
                     gm->from = h.p;
@@ -15913,11 +15938,12 @@ __device__ static bool bkInteract(const DScene& sc, const DMaterial* mp, const D
                 if (!dContinueAlong(h, o, DL_REFLECT, ro, rd)) return false; specularArrival = true; return true;
             }
             if (rng.uniform() >= r) return false;
-            DVec3 o = sampleGlossy(reflectv(rd, h.n), dMatRoughness(sc, *mp, h), rng);
+            const DGlossyDraw gd = dDrawGlossy(sc, *mp, h, rd, h.n, rd * (Real)(-1), rng);
+            const DVec3& o = gd.o;
             if (dot(o, h.n) <= 0) return false;
             // An iridescent lobe's interference reflectance at the pair's half-vector (the NEE
             // above carries it inside dGlossyFHit).
-            if (mp->iridescence) thr *= dIridescenceR(sc, *mp, &h, lambda, dHalfVectorCos(rd * (Real)(-1), o));
+            if (gd.irid) thr *= gd.R(lambda);
             if (gm) {                    // the other half of the weight, for whatever `o` hits
                 gm->pdf = dGlossyPdfHit(sc, *mp, h, rd * (Real)(-1), o);
                 gm->from = h.p;
@@ -16652,24 +16678,22 @@ __device__ static void bkRadianceHeroLoop(const DScene& sc, int diffraction,
                     ro = dOffsetAlong(h.p, h.ng, rd);                       // direction unchanged
                 } else if (whitted) {
                     // Glossy: the lobe off the deterministic lattice (mirror at sample 0).
-                    DVec3 o = dWhittedGlossyDir(reflectv(rd, h.n), dMatRoughness(sc, *mp, h),
-                                                gi.sIdx, b);
+                    const DGlossyDraw gd = dGlossyAt(sc, *mp, h, rd * (Real)(-1),
+                        dWhittedGlossyDir(reflectv(rd, h.n), dMatRoughness(sc, *mp, h), gi.sIdx, b));
+                    const DVec3& o = gd.o;
                     if (dot(o, h.n) <= 0) return;
-                    if (mp->iridescence) {   // interference reflectance at the half-vector, per λ
-                        const Real cH = dHalfVectorCos(rd * (Real)(-1), o);
-                        for (int i = 0; i < nUp; ++i) thr[i] *= (double)dIridescenceR(sc, *mp, &h, lam[i], cH);
-                    }
+                    if (gd.irid)   // interference reflectance at the half-vector, per λ
+                        for (int i = 0; i < nUp; ++i) thr[i] *= (double)gd.R(lam[i]);
                     if (sc.bkGlossyNee)   // the other half of the weight -- see the scalar twin
                         { gmis.pdf = dGlossyPdfHit(sc, *mp, h, rd * (Real)(-1), o);
                           gmis.from = h.p; gmis.n = h.n; }
                     if (!dContinueAlong(h, o, DL_REFLECT, ro, rd)) return;
                 } else {
-                    DVec3 o = sampleGlossy(reflectv(rd, h.n), dMatRoughness(sc, *mp, h), rng);
+                    const DGlossyDraw gd = dDrawGlossy(sc, *mp, h, rd, h.n, rd * (Real)(-1), rng);
+                    const DVec3& o = gd.o;
                     if (dot(o, h.n) <= 0) return;
-                    if (mp->iridescence) {   // interference reflectance at the half-vector, per λ
-                        const Real cH = dHalfVectorCos(rd * (Real)(-1), o);
-                        for (int i = 0; i < nUp; ++i) thr[i] *= (double)dIridescenceR(sc, *mp, &h, lam[i], cH);
-                    }
+                    if (gd.irid)   // interference reflectance at the half-vector, per λ
+                        for (int i = 0; i < nUp; ++i) thr[i] *= (double)gd.R(lam[i]);
                     if (sc.bkGlossyNee)      // the other half of the weight, for what `o` hits
                         { gmis.pdf = dGlossyPdfHit(sc, *mp, h, rd * (Real)(-1), o);
                           gmis.from = h.p; gmis.n = h.n; }
@@ -18050,14 +18074,13 @@ __device__ static void dRandomWalk(const DScene& sc, const DCamera& cam, int dif
                 break;
             }
             case D_GLOSSY: {
-                DVec3 mdir = reflectv(rd, path[cur].ns);   // rd == -wo (incoming dir)
-                wi = sampleGlossy(mdir, dMatRoughness(sc, *mp, h), rng);   // per-hit roughness
+                const DGlossyDraw gd = dDrawGlossy(sc, *mp, h, rd, path[cur].ns, wo, rng);   // rd == -wo
+                wi = gd.o;
                 if (dot(wi, path[cur].ns) <= 0) { terminate = true; break; }
                 double r = clamp01(dReflectSlot(sc, *mp, h, lambda, jrun ? &jbS : nullptr));      // per-hit reflect
-                // An iridescent lobe's interference reflectance at the sampled pair's half-vector
-                // (dIridescenceR): dBsdfF's r for this pair. Host twin bdpt.h randomWalk.
-                const Real cH = mp->iridescence ? dHalfVectorCos(wo, wi) : (Real)1;
-                if (mp->iridescence) r *= (double)dIridescenceR(sc, *mp, &h, lambda, cH);
+                // An iridescent lobe's interference reflectance at the sampled pair's half-vector:
+                // dBsdfF's r for this pair. Host twin bdpt.h randomWalk.
+                if (gd.irid) r *= (double)gd.R(lambda);
                 pdfW = dBsdfPdf(sc, path[cur], wo, wi, lambda);
                 pdfRevW = dBsdfPdf(sc, path[cur], wi, wo, lambda);
                 betaFactor = r;
@@ -18069,7 +18092,7 @@ __device__ static void dRandomWalk(const DScene& sc, const DCamera& cam, int dif
                 secChromatic = true;
                 for (int i = 0; i + 1 < nUp; ++i) {
                     secF[i] = clamp01(dReflectSlot(sc, *mp, h, hb.lam[i + 1]));
-                    if (mp->iridescence) secF[i] *= dIridescenceR(sc, *mp, &h, hb.lam[i + 1], cH);
+                    if (gd.irid) secF[i] *= gd.R(hb.lam[i + 1]);
                 }
                 break;
             }
@@ -19875,10 +19898,11 @@ __device__ static void dPhotonGatherSub(const DScene& sc, const DPhotonMap& pm,
             }
             case D_GLOSSY: {
                 thr *= (double)clamp01(dReflectSlot(sc, m, h, lambda));
-                DVec3 o = sampleGlossy(reflectv(rd, h.n), dMatRoughness(sc, m, h), rng);
+                const DGlossyDraw gd = dDrawGlossy(sc, m, h, rd, h.n, -rd, rng);
+                const DVec3& o = gd.o;
                 if (dot(o, h.n) <= 0) return;
                 // An iridescent lobe's interference reflectance at the pair's half-vector.
-                if (m.iridescence) thr *= (double)dIridescenceR(sc, m, &h, lambda, dHalfVectorCos(-rd, o));
+                if (gd.irid) thr *= (double)gd.R(lambda);
                 if (!dContinueAlong(h, o, DL_REFLECT, ro, rd)) return; break;
             }
             case D_DIELECTRIC:
@@ -20626,18 +20650,18 @@ __device__ static void dPhotonGather(const DScene& sc, const DPhotonMap& pm,
                     thr *= rC;
                     dSpecFold(sthr, sc, m, h, rC, false);   // SPECGATHER
                 }
-                DVec3 o = sampleGlossy(reflectv(rd, h.n), dMatRoughness(sc, m, h), rng);
+                const DGlossyDraw gd = dDrawGlossy(sc, m, h, rd, h.n, -rd, rng);
+                const DVec3& o = gd.o;
                 if (dot(o, h.n) <= 0) return;
                 // An iridescent lobe's interference reflectance at the pair's half-vector, into the
                 // scalar and the spectral throughput alike; where it is 0 at the walk's own
                 // wavelength the path carries nothing (and sthr's ratio would divide by it).
                 // Host twin photonmap_render.h.
-                if (m.iridescence) {
-                    const Real cH = dHalfVectorCos(-rd, o);
-                    const double Rh = (double)dIridescenceR(sc, m, &h, lambda, cH);
+                if (gd.irid) {
+                    const double Rh = (double)gd.R(lambda);
                     if (!(Rh > 0.0)) return;
                     thr *= Rh;
-                    sthr.mul(sc, [&](double Lw) { return (double)dIridescenceR(sc, m, &h, (Real)Lw, cH); }, Rh);
+                    sthr.mul(sc, [&](double Lw) { return (double)gd.R((Real)Lw); }, Rh);
                 }
                 if (sc.bkGlossyNee) {                       // the lobe's own density, for the weight above
                     gmis.pdf  = dGlossyPdfHit(sc, m, h, rd * (Real)(-1), o);
@@ -20998,16 +21022,16 @@ __device__ static void dSppmVisiblePoint(const DScene& sc, DVec3 ro, DVec3 rd, R
                 const double r = (double)clamp01(dReflectSlot(sc, m, h, lambda));
                 thr *= r;
                 dSpecFold(sthr, sc, m, h, r, false);
-                DVec3 o = sampleGlossy(reflectv(rd, h.n), dMatRoughness(sc, m, h), rng);
+                const DGlossyDraw gd = dDrawGlossy(sc, m, h, rd, h.n, -rd, rng);
+                const DVec3& o = gd.o;
                 if (dot(o, h.n) <= 0) return;
                 // An iridescent lobe's interference reflectance at the pair's half-vector; where it
                 // is 0 at the walk's own wavelength the path carries nothing.
-                if (m.iridescence) {
-                    const Real cH = dHalfVectorCos(-rd, o);
-                    const double Rh = (double)dIridescenceR(sc, m, &h, lambda, cH);
+                if (gd.irid) {
+                    const double Rh = (double)gd.R(lambda);
                     if (!(Rh > 0.0)) return;
                     thr *= Rh;
-                    sthr.mul(sc, [&](double Lw) { return (double)dIridescenceR(sc, m, &h, (Real)Lw, cH); }, Rh);
+                    sthr.mul(sc, [&](double Lw) { return (double)gd.R((Real)Lw); }, Rh);
                 }
                 if (!dContinueAlong(h, o, DL_REFLECT, ro, rd)) return; break;
             }
@@ -21392,15 +21416,14 @@ __device__ static void dVcmScatter(const DScene& sc, const DMaterial& m, const D
             break;
         }
         case D_GLOSSY: {
-            DVec3 mdir = reflectv(rd, ns);
-            wi = sampleGlossy(mdir, dMatRoughness(sc, m, h), rng);
+            const DGlossyDraw gd = dDrawGlossy(sc, m, h, rd, ns, wo, rng);
+            wi = gd.o;
             if (dot(wi, ns) <= 0) { terminate = true; break; }
             double r = clamp01(dReflectSlot(sc, m, h, lambda, jr ? &jbS : nullptr));
             // An iridescent lobe's interference reflectance at the sampled pair's half-vector:
             // dBsdfF's r for this pair. Host twin vcm.h.
-            const Real cH = m.iridescence ? dHalfVectorCos(wo, wi) : (Real)1;
-            jcH = cH;
-            if (m.iridescence) r *= (double)dIridescenceR(sc, m, &h, lambda, cH);
+            jcH = gd.cH;
+            if (gd.irid) r *= (double)gd.R(lambda);
             pdfW = dBsdfPdf(sc, vt, wo, wi, lambda);
             pdfRevW = dBsdfPdf(sc, vt, wi, wo, lambda);
             betaFactor = r;
@@ -21412,7 +21435,7 @@ __device__ static void dVcmScatter(const DScene& sc, const DMaterial& m, const D
                 *secChromatic = true;
                 for (int i = 0; i < nSec; ++i) {
                     secF[i] = clamp01(dReflectSlot(sc, m, h, lamAll[i + 1]));
-                    if (m.iridescence) secF[i] *= dIridescenceR(sc, m, &h, lamAll[i + 1], cH);
+                    if (gd.irid) secF[i] *= gd.R(lamAll[i + 1]);
                 }
             }
             break;

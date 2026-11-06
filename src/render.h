@@ -316,6 +316,39 @@ inline double halfVectorCos(const Vec3& a, const Vec3& b) {
     return c < 1.0 ? c : 1.0;
 }
 
+// A direction drawn from a glossy lobe, and the factor the draw leaves beyond the lobe's `reflect`
+// slot: f * cos / pdf = reflect(lambda) * R(lambda), R being an iridescent lobe's interference
+// reflectance at the pair's half-vector and exactly 1 on a plain lobe. Every glossy sampler draws
+// through drawGlossy (or glossyAt, for a direction a lattice chose), so the factor comes with
+// the direction; how to take it -- multiplied in, a roulette, a roulette on a bundle's largest --
+// is the caller's. `irid` says whether R can differ from 1, for the callers whose roulette would
+// otherwise draw a number on a plain lobe.
+struct GlossyDraw {
+    Vec3 o;              // the direction; the caller ends the path where it is not above the surface
+    bool irid = false;   // the lobe interferes
+    double cH = 1.0;     // the half-vector cosine R reads (1 on a plain lobe)
+    const Scene* scene = nullptr;
+    const Material* m = nullptr;
+    const Hit* h = nullptr;
+    double R(double lambda) const { return irid ? iridescenceR(*scene, *m, h, lambda, cH) : 1.0; }
+};
+// `o` drawn from m's lobe at h some other way; `wo` the direction back along the incoming ray.
+inline GlossyDraw glossyAt(const Scene& scene, const Material& m, const Hit& h, const Vec3& wo,
+                           const Vec3& o) {
+    GlossyDraw g;
+    g.o = o;
+    g.irid = m.iridescence != 0;
+    if (g.irid) g.cH = halfVectorCos(wo, o);
+    g.scene = &scene; g.m = &m; g.h = &h;
+    return g;
+}
+// A draw from m's lobe about the mirror of the incoming direction `dIn` in the normal `n`; `wo`
+// the direction back along it, as the caller holds it.
+inline GlossyDraw drawGlossy(const Scene& scene, const Material& m, const Hit& h, const Vec3& dIn,
+                             const Vec3& n, const Vec3& wo, Pcg32& rng) {
+    return glossyAt(scene, m, h, wo, sampleGlossy(reflect(dIn, n), materialRoughness(scene, m, h), rng));
+}
+
 // The glossy BSDF for the pair (wo, wi), both unit and pointing away from the surface, the lobe
 // mirrored about `wo`: r * lobe / cos(wi), in bsdf_eval.h's convention (see its header), r the
 // `reflect` slot -- times the interference reflectance on an iridescent glossy. 0 unless both
@@ -2556,13 +2589,12 @@ struct Renderer {
                 double r = clamp01(reflectSlot(scene, m, h, lambda));
                 // Russian roulette on reflectance (see Mirror).
                 if (rng.uniform() >= r) { e.absorbed += beta; return false; }
-                Vec3 o = sampleGlossy(reflect(ray.d, h.n), materialRoughness(scene, m, h), rng);
+                const GlossyDraw gd = drawGlossy(scene, m, h, ray.d, h.n, ray.d * -1.0, rng);
+                const Vec3& o = gd.o;
                 if (dot(o, h.n) <= 0) { e.absorbed += beta; return false; } // below surface
                 // An iridescent lobe's interference reflectance, known only now that the pair
-                // is (iridescenceR at its half-vector): a second roulette, beta unchanged.
-                if (m.iridescence &&
-                    rng.uniform() >= iridescenceR(scene, m, &h, lambda, halfVectorCos(ray.d * -1.0, o)))
-                    { e.absorbed += beta; return false; }
+                // is: a second roulette, beta unchanged.
+                if (gd.irid && rng.uniform() >= gd.R(lambda)) { e.absorbed += beta; return false; }
                 if (!continueAlong(h, o, Lobe::Reflect, ray)) { e.absorbed += beta; return false; }
                 return true;
             }
@@ -4179,14 +4211,14 @@ struct Renderer {
                     } else if (m.type == MatType::Filter) {
                         ray = Ray{h.p + ray.d * 1e-6, ray.d};      // direction unchanged
                     } else {
-                        Vec3 o = sampleGlossy(reflect(ray.d, h.n), materialRoughness(scene, m, h), rng);
+                        const GlossyDraw gd = drawGlossy(scene, m, h, ray.d, h.n, ray.d * -1.0, rng);
+                        const Vec3& o = gd.o;
                         if (dot(o, h.n) <= 0) { e.absorbed += activeSum(); return; }  // below surface
-                        if (m.iridescence) {
+                        if (gd.irid) {
                             // The interference reflectance at the pair's half-vector, per λ, by
                             // the same roulette-on-the-max and bounded reweight as above.
-                            const double cH = halfVectorCos(ray.d * -1.0, o);
                             double R[hero::kHeroMax];
-                            for (int i = 0; i < nUp; ++i) R[i] = iridescenceR(scene, m, &h, lam[i], cH);
+                            for (int i = 0; i < nUp; ++i) R[i] = gd.R(lam[i]);
                             const double qR = hero::maxOf(R, nUp);
                             if (rng.uniform() >= qR) { e.absorbed += activeSum(); return; }
                             for (int i = 0; i < nUp; ++i) {
