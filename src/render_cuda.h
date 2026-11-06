@@ -343,7 +343,7 @@ void cudaSetJDisp(double winNm, int all);
 // (bdpt::anyMediumSigmaTChromatic), a delta bounce's light density read as 1
 // (bdpt::g_jDeltaMerge), and the half-render diagnostic (bdpt::jHalfMode: 0 full, 1
 // connections, 2 merges; the device has no merges-raw).
-void cudaSetJSwitches(int jSpec, int trSpec, int deltaMerge, int half);
+void cudaSetJSwitches(int jSpec, int trSpec, int deltaMerge, int half, int chroma);
 // The aimed sun for modes D/J (MODE-J-SDS, 0.387.0; bdpt.h SunAim): the target spheres (centres
 // relative to the scene centre as x,y,z triples, radii), SUM r^2 and the aimed share. n == 0 or
 // f == 0: the uniform disc.

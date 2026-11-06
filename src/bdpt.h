@@ -94,6 +94,15 @@ inline bool jSpecEnabled() {
     }();
     return on;
 }
+// FTRACE_JCHROMA=0 reads a mode-J merge weight's camera half at the camera's wavelength even in a
+// medium whose extinction varies with wavelength (ChromaMis), for A/B runs. Both devices.
+inline bool jChromaEnabled() {
+    static const bool on = [] {
+        const char* e = std::getenv("FTRACE_JCHROMA");
+        return !(e && e[0] == '0');
+    }();
+    return on;
+}
 
 // Diagnostic knob for mode J: `FTRACE_J_HALF=connections` or `=merges` renders only one
 // half of the UPBP estimator, MIS weights and all. Neither half is a correct image on its
@@ -4093,13 +4102,19 @@ struct BeamMergeWeight {
     // merge makes a J-routed path only inside a J medium (see routeOfEye). 0 = no such limit.
     int    routeMedJ = 0;
     // JSPEC: the camera walk's spectral carrier at this segment's origin (PathSeg::spec), or
-    // null. Read by gatherPhotonBeamsW, not by the weight: the MIS densities stay at lambda_c.
+    // null. Read by gatherPhotonBeamsW, not by the weight, whose wavelength terms are chromaM's.
     const JSpec* spec = nullptr;
     const JSpec* camSpec() const { return spec; }
     // ...and the coloured glass the segment runs through (PathSeg::glassMat), or null: under
     // JSPEC the merge takes its absorption over the partial segment at the beam's wavelength too.
     const Material* glass = nullptr;
     const Material* glassCam() const { return glass; }
+    // UPBP-W-CHROMATIC (ChromaMis): in a medium whose extinction varies with wavelength, this
+    // segment's segSumM and etaKCoef at each of JSpec's bins (K each), read at the beam's
+    // wavelength along with the merge's own sigma_t and Tr; null elsewhere, and then all four
+    // are the camera's.
+    const double* chromaM = nullptr;
+    const double* chromaK = nullptr;
 
     double operator()(const BeamHit& bh, const PhotonBeam& b, double dens, double phase) const {
         if (diag) diag->hits.fetch_add(1, std::memory_order_relaxed);
@@ -4130,10 +4145,14 @@ struct BeamMergeWeight {
         double gC = sg->pdfDir * invT2;                      // camera side (the free flight)
         if (lensCam) gC *= lensCam->lensAimRatio(sg->o, sg->o + sg->d * tc);
         if (!(gL > 0.0)) return 0.0;                         // delta light-side density
-        const double sigT = scene->media[b.med].sigmaT(lamCam) * dens;
+        const double lamW = chromaM ? (double)b.lambda : lamCam;
+        const double sigT = scene->media[b.med].sigmaT(lamW) * dens;
         if (!(sigT > 0.0)) return 0.0;
-        const double trC = camTr->at(tc);                             // Tr~(x -> eye[k])
+        const double trC = chromaM ? trDet(*scene, sg->o, sg->d, tc, lamW, *tabs)
+                                   : camTr->at(tc);                   // Tr~(x -> eye[k])
         if (!(trC > 0.0)) return 0.0;
+        const double etaKCoefW = chromaM ? specBinAt(chromaK, lamW) : etaKCoef;
+        const double segSumMW  = chromaM ? specBinAt(chromaM, lamW) : segSumM;
         // eta of THIS merge against C1 — the numerator of the weight, and a term of its
         // denominator (a technique competes with itself at ratio exactly its own).
         const double etaS = kappa * bh.sinT * gL / (sigT * trC);
@@ -4154,7 +4173,7 @@ struct BeamMergeWeight {
         // vertex (etaKCoef carries its sin/sigma_t/Tr), the point form when it is a stored-
         // photon site (eta = kappaS * pdfRev, so the coefficient IS kappaS). Both read the
         // same PATCHED pdfRev — the density of eye[k] seen from the merge point x.
-        const double etaK = (kappa * etaKCoef + etaKSurf) * pdfRevK;
+        const double etaK = (kappa * etaKCoefW + etaKSurf) * pdfRevK;
         // The merge AT y_{s-1}. Its sin(theta) and p_L were known when the beam was
         // deposited (its outgoing direction IS the beam); only the transmittance over the
         // now-known y_{s-1} -> x span is left.
@@ -4177,7 +4196,7 @@ struct BeamMergeWeight {
                                 + etaPrevTerm + etaPrevS)        // light-side merges
                          + etaS                                  // this merge
                          + C1 * etaK                             // merge at eye[k]
-                         + C1 * C2 * segSumM;                    // camera-side merges
+                         + C1 * C2 * segSumMW;                   // camera-side merges
         if (!(den > 0.0)) return 0.0;
         return etaS / den;
     }
@@ -4209,9 +4228,9 @@ struct BeamMergeWeight {
 // p_merge/p_C1 = n_m * pi r_s^2 * pl_j — the light-side area density alone. See
 // mergeEtaPrimeSurf for that derivation and its SmallVCM cross-check.
 //
-// SPECTRAL MISMATCH: same documented approximation as BeamMergeWeight — the photon carries
-// its own wavelength, the camera path another, and the two BSDF pdfs above are evaluated at
-// the PHOTON's (they pair with light-side densities). See that struct's note.
+// WAVELENGTH: the photon carries its own, the camera path another. The two BSDF pdfs above are
+// evaluated at the PHOTON's (they pair with light-side densities), and in a medium whose
+// extinction varies with wavelength so are the camera half's beam etas (chromaM, ChromaMis).
 struct SurfMergeWeight {
     double kappaB = 0.0;      // n_m * 2 r_b     — the OTHER merge kind, for the denominator
     double kappaS = 0.0;      // n_m * pi r_s^2  — THIS technique's constant
@@ -4232,8 +4251,13 @@ struct SurfMergeWeight {
                                 // scaled by their kappas       (segSumM[k-1])
     int    camVert      = 0;    // k
     int    maxDepth     = 0;
+    // UPBP-W-CHROMATIC (ChromaMis): segSumM and etaKm1Coef at each of JSpec's bins (K each), read
+    // at the photon's wavelength; null where no medium's extinction varies with wavelength.
+    const double* chromaM   = nullptr;
+    const double* chromaKm1 = nullptr;
 
-    double operator()(const SurfMis& lm, double pdfDirRev, double pdfDirFwd) const {
+    // `lam` is the photon's wavelength, read only through chromaM.
+    double operator()(const SurfMis& lm, double pdfDirRev, double pdfDirFwd, double lam) const {
         // THE DEPTH CAP, exactly as BeamMergeWeight's and for the same reason, at this merge's
         // depth j+k-1 (see SHAPE). Past the cap the merged path is one no connection strategy
         // builds, so its energy would have nothing to MIS against; AT the cap it is one they do
@@ -4251,14 +4275,16 @@ struct SurfMergeWeight {
         // pdfRev(eye[k-1]) in the MERGED path, and with it the camera loop's second step.
         const double pdfRevKm1 = pdfDirFwd * cosPrev * invDistPrev2;
         const double D2 = pdfRevKm1 * invPdfFwdKm1;
+        const double etaKm1 = chromaM ? specBinAt(chromaKm1, lam) : etaKm1Coef;
+        const double sumM   = chromaM ? specBinAt(chromaM, lam) : segSumM;
         const double den = (double)lm.gateC1                     // C1 itself (ratio 1)
                          + R * (lm.sumC                          // light-side connections
                                 + kappaB * lm.sumMb              // light-side merges, both
                                 + kappaS * lm.sumMs)             //   kinds, scaled here
                          + etaS                                  // this merge
                          + D1 * (gateD1                          // connect eye[k]<->eye[k-1]
-                                 + etaKm1Coef * pdfRevKm1        // merge at eye[k-1]
-                                 + D2 * (segSumC + segSumM));    // everything further in
+                                 + etaKm1 * pdfRevKm1            // merge at eye[k-1]
+                                 + D2 * (segSumC + sumM));       // everything further in
         if (!(den > 0.0)) return 0.0;
         return etaS / den;
     }
@@ -4301,6 +4327,108 @@ inline void cameraSideSums(const Scene& scene, const std::vector<Vertex>& eye, i
                             isFiberMat(*eye[(size_t)k].mat);
         segSumC[(size_t)k] = fiberK ? 0.0 : gate + carry;
         segSumM[(size_t)k] = fiberK ? 0.0 : eK + carryM;
+    }
+}
+
+// --- A merge weight's camera half at the merged light's wavelength (UPBP-W-CHROMATIC) -------
+//
+// A balance-heuristic weight is a ratio of the densities with which the competing techniques
+// would make ONE path, and a path has one wavelength: read at two, the weights of a merged path
+// stop summing to one. A merge's light half was written at its beam's or photon's wavelength
+// (BeamMis, SurfMis). Its camera half has a medium's sigma_t * Tr in every beam eta (the merge
+// itself, the one at eye[k], those summed into segSumM), and those were read at the camera's.
+// Where sigma_t is flat they agree; in a medium whose extinction varies with wavelength they do
+// not, and the frame tilts in colour against mode D (known-issues UPBP-W-CHROMATIC). Everything
+// else in the camera half is a ratio of direction and area densities (BDPT's vertex densities
+// carry no free-flight term: it cancels between the strategies), which no wavelength enters but
+// a rainbow phase's (UPBP-W-RAINBOW).
+//
+// So in such a scene the wavelength-dependent part is tabulated at the K bins of JSpec's grid,
+// once per camera path -- from geometry taken once per vertex, the segment's per-medium depths
+// (trDetDepthMedium) -- and each merge reads it at its own beam's or photon's wavelength,
+// interpolated as JSpec is (specBinAt). The connections' weights (misWeight) belong to paths of
+// the camera's one wavelength and stay there. The device's twins are dChromaBeamEta1 and
+// DChromaRun.
+struct ChromaMis {
+    static constexpr int K = JSpec::K;
+    bool on = false;
+    int M = 0;                         // scene.media.size()
+    std::vector<double> sig;           // sig[m*K + b]: media[m].sigmaT at JSpec::lamOf(b)
+    void build(const Scene& scene) {
+        on = jChromaEnabled() && anyMediumSigmaTChromatic(scene);
+        if (!on) return;
+        M = (int)scene.media.size();
+        sig.assign((size_t)M * K, 0.0);
+        for (int m = 0; m < M; ++m)
+            for (int b = 0; b < K; ++b) sig[(size_t)m * K + b] = scene.media[(size_t)m].sigmaT(JSpec::lamOf(b));
+    }
+    // mergeEtaPrimeBeam with pLight 1, at every bin: sin / (sigma_t * Tr) for a beam merge at the
+    // medium vertex v, between the unit directions `a` and `dout`, Tr over the segment
+    // v -> v + dout*dn, into out[K]; all 0 where no beam merge exists. Each medium's depth over
+    // the segment (trDetDepthMedium) is taken once and spread over the bins.
+    void beamEta1(const Scene& scene, const PatTables& tabs, const Vertex& v, const Vec3& a,
+                  const Vec3& dout, double dn, double* out) const {
+        for (int b = 0; b < K; ++b) out[b] = 0.0;
+        if (v.type != VType::Medium || v.mediumId < 0 || v.mediumId >= M || !(dn > 0.0)) return;
+        const double c = dot(a, dout);
+        const double s2 = 1.0 - c * c;
+        if (!(s2 > 0.0)) return;
+        const double sn = std::sqrt(s2);
+        const double dens = scene.media[(size_t)v.mediumId].densityAt(v.p, &tabs);
+        double depth[K] = {};              // sum over media of sigma_t(bin) * depth
+        for (int m = 0; m < M; ++m) {
+            const double L = trDetDepthMedium(scene.media[(size_t)m], v.p, dout, dn, &tabs);
+            if (!(L > 0.0)) continue;
+            for (int b = 0; b < K; ++b) {
+                const double st = sig[(size_t)m * K + b];
+                if (st > 0.0) depth[b] += st * L;   // a medium trDet skips adds nothing
+            }
+        }
+        for (int b = 0; b < K; ++b) {
+            const double st = sig[(size_t)v.mediumId * K + b] * dens;
+            if (!(st > 0.0)) continue;
+            const double t = std::exp(-depth[b]);
+            if (t > 0.0) out[b] = sn / (st * t);
+        }
+    }
+};
+
+// cameraSideSums' merge half at every bin of `cm`: segSumMB[k*K + b] is segSumM[k] at bin b, and
+// eta1B[k*K + b] the merge AT eye[k-1] (both kinds, scaled) with its light density left out --
+// the coefficient a point merge at eye[k] multiplies by its own patched density. segSumC has no
+// wavelength in it and stays with cameraSideSums.
+inline void cameraSideSumsChroma(const Scene& scene, const PatTables& tabs,
+                                 const std::vector<Vertex>& eye, int nE, const MergeK& mk,
+                                 const ChromaMis& cm, std::vector<double>& segSumMB,
+                                 std::vector<double>& eta1B) {
+    constexpr int K = ChromaMis::K;
+    segSumMB.assign((size_t)nE * K, 0.0);
+    eta1B.assign((size_t)nE * K, 0.0);
+    double tmp[K];
+    for (int k = 2; k < nE; ++k) {
+        const Vertex& v = eye[(size_t)k - 1];
+        double* e1 = &eta1B[(size_t)k * K];
+        if (mk.beam > 0.0 && v.type == VType::Medium) {
+            // mergeEtaPrimeBeam's directions: arriving from eye[k], leaving for eye[k-2].
+            Vec3 din = v.p - eye[(size_t)k].p;
+            const double dl = std::sqrt(dot(din, din));
+            Vec3 dout = eye[(size_t)k - 2].p - v.p;
+            const double dn = std::sqrt(dot(dout, dout));
+            if (dl > 0.0 && dn > 0.0) {
+                cm.beamEta1(scene, tabs, v, din * (1.0 / dl), dout * (1.0 / dn), dn, tmp);
+                for (int b = 0; b < K; ++b) e1[b] = mk.beam * tmp[b];
+            }
+        }
+        if (mk.surf > 0.0 && v.type != VType::Medium && surfMergeSite(v))
+            for (int b = 0; b < K; ++b) e1[b] += mk.surf;
+        const double pL = mergeLightDensity(eye[(size_t)k - 1].pdfRev, eye[(size_t)k].delta);
+        const double rC = misRemap0(eye[(size_t)k - 1].pdfRev) / misRemap0(eye[(size_t)k - 1].pdfFwd);
+        const bool fiberK = !eye[(size_t)k].delta && eye[(size_t)k].mat &&
+                            isFiberMat(*eye[(size_t)k].mat);
+        double* s = &segSumMB[(size_t)k * K];
+        const double* sPrev = &segSumMB[(size_t)(k - 1) * K];
+        for (int b = 0; b < K; ++b)
+            s[b] = fiberK ? 0.0 : ((pL > 0.0 ? e1[b] * pL : 0.0) + rC * sPrev[b]);
     }
 }
 
@@ -4349,6 +4477,10 @@ struct BdptRenderer {
         PathSegs segs;
         // Camera-side MIS accumulators, one entry per eye vertex (Phase 3b). Same hoist.
         std::vector<double> segSumC, segSumM;
+        // ...and their wavelength-dependent half at JSpec's bins, where a medium's extinction
+        // varies with wavelength (ChromaMis): segSumM and the point merges' eta at eye[k-1] per
+        // eye vertex, and one segment's eta at eye[k].
+        std::vector<double> chromaM, chromaE1, chromaK(ChromaMis::K);
         JSpecWalk jsw;     // JSPEC: the camera walk's spectral carrier (mode J merges only)
         const uint64_t nPix = (uint64_t)camFilm.resX * (uint64_t)camFilm.resY;
         // Hero gate, matching BackwardRenderer: bundling needs a wavelength-independent
@@ -4402,6 +4534,9 @@ struct BdptRenderer {
         // wavelength (JSpec, beamgather.h). Only the merges read it; the walk draws nothing extra,
         // so the paths are the ones it always took. FTRACE_JSPEC=0 turns it off for A/B runs.
         const bool jSpecOn = (mergeOn || surfOn) && jSpecEnabled();
+        // UPBP-W-CHROMATIC: every merge weight's camera half at the merged light's wavelength.
+        ChromaMis chroma;
+        if (mk.any()) chroma.build(scene);
         // Motion blur (ROADMAP 11): each sample's subpaths at one time of their own. Mode J's
         // merges render an epoch at a time instead (their light side is traced for one camera at
         // one time): the caller poses cam0 at the epoch's time and sets g_passMotionU, which every
@@ -4719,6 +4854,9 @@ struct BdptRenderer {
                         const double lamCam = hb.lam[0];
                         const PatTables tabs = scene.patTables();
                         if (mk.any()) cameraSideSums(scene, eye, nE, mk, lamCam, segSumC, segSumM);
+                        if (chroma.on)
+                            cameraSideSumsChroma(scene, tabs, eye, nE, mk, chroma, chromaM,
+                                                 chromaE1);
                         TrRay camTr;
                         for (const PathSeg& sg : segs) {
                             if (!mergeOn) break;
@@ -4772,6 +4910,7 @@ struct BdptRenderer {
                                 w1.camVert    = (int)(k < (size_t)nE ? k : (size_t)nE - 1);
                                 w1.maxDepth   = maxDepth;
                                 if (k == 0 && cam.hasLens()) w1.lensCam = &cam;
+                                if (chroma.on) std::fill(chromaK.begin(), chromaK.end(), 0.0);
                                 // The merge AT eye[k]. Its light-side incoming direction is
                                 // -sg.d whatever x turns out to be, so sin(theta) and the
                                 // whole coefficient are merge-point INDEPENDENT and belong
@@ -4792,7 +4931,15 @@ struct BdptRenderer {
                                                                 lamCam, tabs);
                                         if (s2 > 0.0 && sT > 0.0 && tr > 0.0)
                                             w1.etaKCoef = std::sqrt(s2) / (sT * tr);
+                                        if (chroma.on)
+                                            chroma.beamEta1(scene, tabs, vk, sg.d, dp, dn,
+                                                            chromaK.data());
                                     }
+                                }
+                                if (chroma.on) {
+                                    const size_t kk = k < (size_t)nE ? k : (size_t)nE - 1;
+                                    w1.chromaM = &chromaM[kk * ChromaMis::K];
+                                    w1.chromaK = chromaK.data();
                                 }
                                 // ...and the POINT merge at eye[k], for the case the segment
                                 // leaves a SURFACE into the medium. Its eta is kappaS *
@@ -4862,6 +5009,10 @@ struct BdptRenderer {
                                     : 0.0;
                                 sw.segSumC      = segSumC[(size_t)k - 1];
                                 sw.segSumM      = segSumM[(size_t)k - 1];
+                                if (chroma.on) {
+                                    sw.chromaM   = &chromaM[((size_t)k - 1) * ChromaMis::K];
+                                    sw.chromaKm1 = &chromaE1[(size_t)k * ChromaMis::K];
+                                }
                                 sw.camVert      = k;
                                 sw.maxDepth     = maxDepth;
                                 const Vec3 ngo = vertexGeoN(vk);
@@ -4890,7 +5041,7 @@ struct BdptRenderer {
                                     const double pdfDirFwd = bsdfPdf(*vk.mat, vk.ns, ph.wo,
                                                                      woCam, lam, scene,
                                                                      &vk.hit);
-                                    const double w = sw(*lm, pdfDirRev, pdfDirFwd);
+                                    const double w = sw(*lm, pdfDirRev, pdfDirFwd, lam);
                                     if (!(w > 0.0)) return;
                                     // JSPEC: the camera prefix (eye[0..k-1] and the edge into
                                     // eye[k]) at the photon's wavelength; eye[k]'s own BSDF is

@@ -19348,7 +19348,8 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
 #ifdef HAVE_CUDA
         cudaSetRouting(on, def, anyMedJ, sD, sJ);
         cudaSetJSwitches(bdpt::jSpecEnabled() ? 1 : 0, bdpt::anyMediumSigmaTChromatic(scene) ? 1 : 0,
-                         bdpt::g_jDeltaMerge ? 1 : 0, std::min(bdpt::jHalfMode(), 2));
+                         bdpt::g_jDeltaMerge ? 1 : 0, std::min(bdpt::jHalfMode(), 2),
+                         bdpt::jChromaEnabled() ? 1 : 0);
 #endif
     }
     // The aimed sun (bdpt.h SunAim): settled before the first BDPT-family light subpath.

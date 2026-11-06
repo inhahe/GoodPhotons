@@ -1473,6 +1473,9 @@ struct DScene {
     const double*    camCdf; const double* camVisCdf; const double* camWCdf;
     double           camG;
     const DMedium*   media;    // participating media array (superposed); null if none
+    // UPBP-W-CHROMATIC: media[m]'s sigma_t at the JSpec bins, chromaSig[m*DJSPEC_K + b], when
+    // some medium's extinction varies with wavelength; null otherwise (DChromaRun).
+    const double*    chromaSig;
     DBowTab bow;   // gather-time spectral fold tables (FOLD-GPU (2)); bow.tab null = none
     int              mediaN;   // number of media (0 => vacuum)
     // Volumetric blackbody emission ("fire", ROADMAP C3). Photon birth splits emitter-
@@ -7949,6 +7952,23 @@ __device__ static double dTrDetMedium(const DMedium& m, const DVec3& o, const DV
         tau += dMedDensityAt(m, o + dir * (Real)(ta + ((double)i + 0.5) * dt), env);
     return exp(-stBase * tau * dt);
 }
+// dTrDetMedium's optical depth with sigma_t's wavelength part left out (host twin
+// trDetDepthMedium): the density integrated over the medium's part of the segment by the same
+// clip and quadrature, so the segment's transmittance at any wavelength is exp(-sigma_t * this).
+__device__ static double dTrDetDepthMedium(const DMedium& m, const DVec3& o, const DVec3& dir,
+                                           double dist, const DPatEnv& env) {
+    double ta, tb;
+    if (!dMedClip(m, o, dir, 0.0, dist, ta, tb)) return 0.0;
+    const double L = tb - ta;
+    if (!(L > 0.0)) return 0.0;
+    if (!m.heterogeneous) return L;
+    const int kN = 4;                       // dTrDetMedium's midpoint rule
+    const double dt = L / (double)kN;
+    double tau = 0.0;
+    for (int i = 0; i < kN; ++i)
+        tau += dMedDensityAt(m, o + dir * (Real)(ta + ((double)i + 0.5) * dt), env);
+    return tau * dt;
+}
 __device__ static double dTrDet(const DScene& sc, const DVec3& o, const DVec3& dir,
                                 double dist, Real lambda, const DPatEnv& env) {
     double Tr = 1.0;
@@ -8036,9 +8056,12 @@ __device__ static inline double dMisRemap0(double f) { return f != 0.0 ? f : 1.0
 // camera walk at lambda_c with a beam at its own wavelength; the walk's spectral factors sit in
 // `beta` at lambda_c, and the carrier re-expresses them at the beam's. `c_jSpecOn` is the host's
 // bdpt::jSpecEnabled() (FTRACE_JSPEC=0 restores the old estimator); `c_jTrSpec` says some medium's
-// sigma_t is chromatic, so a segment folds its transmittance ratio too.
+// sigma_t is chromatic, so a segment folds its transmittance ratio too, and then -- unless
+// `c_jChroma` (bdpt::jChromaEnabled, FTRACE_JCHROMA=0) is off -- every merge weight reads its
+// camera half at the merged light's wavelength (DChromaRun; host twin bdpt.h ChromaMis).
 __constant__ int c_jSpecOn = 0;
 __constant__ int c_jTrSpec = 0;
+__constant__ int c_jChroma = 1;
 __constant__ double c_jDispWin = 10.0;   // the dispersive window's width, nm (host g_jDispWinNm)
 __constant__ int    c_jDispAll = 0;      // -jdispall (host g_jDispAll)
 // The camera wavelength's density mass in each carrier bin, for DJSpecRun's support (host twin
@@ -8180,6 +8203,19 @@ __device__ static inline double dMergeLightDensity(double p, bool fromDelta) {
 }
 #define DJSPEC_K    24     // JSpec::K
 static_assert(DJSPEC_K == kBandProbeBins, "the device carrier's grid must be the host's (JSpec::K)");
+// A table over the DJSPEC_K bins read at `lam` (host twin specBinAt, where the why is): between
+// bin centres, geometric where both are live, held flat past the outer two. In double, as the
+// host's: the merge weights' tables run far past a float.
+__device__ static double dSpecBinAt(const double* r, double lam) {
+    const double u = (lam - DLMIN) / (DLMAX - DLMIN) * (double)DJSPEC_K - 0.5;
+    if (!(u > 0.0)) return r[0];
+    if (u >= (double)(DJSPEC_K - 1)) return r[DJSPEC_K - 1];
+    const int i = (int)u;
+    const double f = u - (double)i;
+    const double a = r[i], b = r[i + 1];
+    if (a > 0.0 && b > 0.0) return a * pow(b / a, f);
+    return a + (b - a) * f;
+}
 #define DJSPEC_FOLD 12     // scene.h kFoldBins (static_assert'ed at the upload)
 struct DJSpec {   // 120 B, unpadded: one rides on every recorded segment and eye vertex
     float  r[DJSPEC_K];
@@ -8490,6 +8526,11 @@ struct DBeamMergeW {
     double segSumM    = 0.0;  // camera-side merge accumulator, kappa factored out
     int    camVert    = 0;    // k: the camera subpath index of the vertex this segment leaves
     int    maxDepth   = 0;    // the same cap the connection loop applies
+    // UPBP-W-CHROMATIC (DChromaRun): segSumM and etaKCoef at the DJSPEC_K bins, one after the
+    // other, read at the beam's wavelength with the merge's own sigma_t and Tr; null where no
+    // medium's extinction varies with wavelength. A queued segment's points into the queue's own
+    // table (DWfQueue::chroma), an inline one's into the camera kernel's.
+    const double* chroma = nullptr;
 };
 
 // Beam x Ray 1D single-scatter estimate along the camera segment [oc, oc + dc*tMax] —
@@ -8567,10 +8608,12 @@ __device__ __forceinline__ void dGatherRetire() {
 // y_{s-1}. Every term below is a density RATIO against that one, so the weight is
 // etaS / (sum of them) and no absolute path density is ever formed.
 //
-// SPECTRAL MISMATCH (documented approximation, and the host makes the same one): the beam
-// carries its own wavelength and the camera path another. Camera-side quantities use `lamCam`,
-// light-side ones the beam's, and the phase value at x — computed once by the gather — serves
-// both densities there. It perturbs the weight, never the estimator's support.
+// WAVELENGTH: the beam carries its own and the camera path another. Light-side quantities use
+// the beam's; the camera side's are free of wavelength but for its beam etas' sigma_t * Tr (and
+// a rainbow phase's densities, UPBP-W-RAINBOW), read at the camera's -- or, where some medium's
+// extinction varies with wavelength, at the beam's (mw.chroma; host twin ChromaMis, where the
+// why is). The phase value at x, computed
+// once by the gather, serves both densities there.
 //
 // A DELTA light-side density returns 0, i.e. drops the merge: `lm->pdfDir` is 0 when the light
 // walk left y_{s-1} by a specular bounce, and dMisWeight's own merge terms vanish in exactly
@@ -8600,10 +8643,14 @@ __device__ static double dBeamMergeWeight(const DScene& sc, const DBeamMergeW& m
     if (mw.camVert == 0 && cam && cam->hasLens) gC *= dLensAimRatio(*cam, oc, oc + dc * (Real)tCam);
     if (!(gL > 0.0)) return 0.0;                     // delta light-side density
     if (b.med < 0 || b.med >= sc.mediaN) return 0.0;
-    const double sigT = (double)medSigmaT(sc.media[b.med], (Real)mw.lamCam) * dens;
+    const Real lamW = mw.chroma ? b.lambda : (Real)mw.lamCam;
+    const double sigT = (double)medSigmaT(sc.media[b.med], lamW) * dens;
     if (!(sigT > 0.0)) return 0.0;
-    const double trC = camTr.at(sc, oc, dc, tCam, (Real)mw.lamCam, env);   // Tr~(x -> eye[k])
+    const double trC = mw.chroma ? dTrDet(sc, oc, dc, tCam, lamW, env)
+                                 : camTr.at(sc, oc, dc, tCam, lamW, env);   // Tr~(x -> eye[k])
     if (!(trC > 0.0)) return 0.0;
+    const double etaKCoef = mw.chroma ? dSpecBinAt(mw.chroma + DJSPEC_K, (double)lamW) : mw.etaKCoef;
+    const double segSumM  = mw.chroma ? dSpecBinAt(mw.chroma, (double)lamW) : mw.segSumM;
     // eta of THIS merge against C1 — the numerator of the weight, and a term of its
     // denominator (a technique competes with itself at ratio exactly its own).
     const double etaS = mw.kappa * sinT * gL / (sigT * trC);
@@ -8618,7 +8665,7 @@ __device__ static double dBeamMergeWeight(const DScene& sc, const DBeamMergeW& m
     const double C1 = dMisRemap0(gL) / dMisRemap0(gC);
     const double pdfRevK = phase * mw.cosFacK * invT2;   // pdfRev(eye[k]) in the merged path
     const double C2   = pdfRevK * mw.invPdfFwdK;
-    const double etaK = (mw.kappa * mw.etaKCoef + mw.etaKSurf) * pdfRevK;  // merge AT eye[k]
+    const double etaK = (mw.kappa * etaKCoef + mw.etaKSurf) * pdfRevK;  // merge AT eye[k]
     // The merge AT y_{s-1}. Its sin(theta) and p_L were known when the beam was deposited
     // (its outgoing direction IS the beam); only the transmittance over the now-known
     // y_{s-1} -> x span is left.
@@ -8637,7 +8684,7 @@ __device__ static double dBeamMergeWeight(const DScene& sc, const DBeamMergeW& m
                             + etaPrevTerm + etaPrevS)        // light-side merges, BOTH kinds
                      + etaS                                  // this merge
                      + C1 * etaK                             // merge at eye[k]
-                     + C1 * C2 * mw.segSumM;                 // camera-side merges (pre-scaled)
+                     + C1 * C2 * segSumM;                    // camera-side merges (pre-scaled)
     if (!(den > 0.0)) return 0.0;
     return etaS / den;
 }
@@ -9106,7 +9153,7 @@ struct DWfSeg {
     int    glassMat;    // DPathSeg::glassMat, for the camera-side glass under JSPEC
 };
 #if FTRACE_GPU_FP32
-static_assert(sizeof(DWfSeg) == 400, "DWfSeg changed size: update renderBdptCuda's segCap note");
+static_assert(sizeof(DWfSeg) == 408, "DWfSeg changed size: update renderBdptCuda's segCap note");
 #endif
 struct DWfHit { int seg; int beam; float t, s; };
 // One band of the wave-schedule PROFILE (see renderBdptCuda): what the paths of pixel slots
@@ -9116,6 +9163,7 @@ static std::vector<WfBand> g_wfProfile;
 static int g_wfProfileResX = -1, g_wfProfileResY = -1, g_wfProfileDepth = -1;
 struct DWfQueue {
     DWfSeg* segs;  int* nSegs; int segCap;
+    double* chroma;     // 2*DJSPEC_K per segment slot (DBeamMergeW::chroma), or null when off
     DWfHit* hits;  int* nHits; int hitCap;
     int*    overflow;   // [0] segments gathered inline (queue full), [1] hits evaluated on the spot
     // WAVE ORDER (0.261.1). runMul == 0 -- the default, and every non-wavefront launch -- makes a
@@ -18933,6 +18981,86 @@ __device__ static inline double dVmGatherCorr(const DVec3& wp, const DVec3& ns, 
     return fabs(ddot(wp, ns)) / den;
 }
 
+// --- A merge weight's camera half at the merged light's wavelength (UPBP-W-CHROMATIC) ----------
+// Device twin of bdpt.h's ChromaMis and cameraSideSumsChroma, where the why is.
+//
+// dMergeEtaPrime with pLight 1 at every bin: sin / (sigma_t * Tr) for a beam merge at the medium
+// vertex v, between the unit directions `a` and `dout`, Tr over v -> v + dout*dn; all 0 where no
+// beam merge exists. Each medium's depth over the segment is taken once and spread over the bins.
+__device__ static void dChromaBeamEta1(const DScene& sc, const DVertex& v, const DVec3& a,
+                                       const DVec3& dout, double dn, const DPatEnv& env,
+                                       double* out) {
+    for (int b = 0; b < DJSPEC_K; ++b) out[b] = 0.0;
+    if (v.type != BV_MEDIUM || v.mediumId < 0 || v.mediumId >= sc.mediaN || !(dn > 0.0)) return;
+    const double c = ddot(a, dout);
+    const double s2 = 1.0 - c * c;
+    if (!(s2 > 0.0)) return;
+    const double sn = sqrt(s2);
+    const double dens = dMedDensityAt(sc.media[v.mediumId], v.p, env);
+    double depth[DJSPEC_K];
+    for (int b = 0; b < DJSPEC_K; ++b) depth[b] = 0.0;
+    for (int m = 0; m < sc.mediaN; ++m) {
+        const double L = dTrDetDepthMedium(sc.media[m], v.p, dout, dn, env);
+        if (!(L > 0.0)) continue;
+        for (int b = 0; b < DJSPEC_K; ++b) {
+            const double st = sc.chromaSig[m * DJSPEC_K + b];
+            if (st > 0.0) depth[b] += st * L;   // a medium dTrDet skips adds nothing
+        }
+    }
+    for (int b = 0; b < DJSPEC_K; ++b) {
+        const double st = sc.chromaSig[v.mediumId * DJSPEC_K + b] * dens;
+        if (!(st > 0.0)) continue;
+        const double t = exp(-depth[b]);
+        if (t > 0.0) out[b] = sn / (st * t);
+    }
+}
+// cameraSideSumsChroma's rows one at a time, so a thread keeps three rows rather than the walk's
+// whole table: `m` is segSumM at row k at every bin, `mPrev` row k-1, `e1` the merge at eye[k-1]
+// (both kinds, scaled) with its light density left out. Rows 0 and 1 are 0, as the host's are.
+struct DChromaRun {
+    double m[DJSPEC_K], mPrev[DJSPEC_K], e1[DJSPEC_K];
+    int k;
+    __device__ void reset() {
+        k = 1;
+        for (int b = 0; b < DJSPEC_K; ++b) m[b] = mPrev[b] = e1[b] = 0.0;
+    }
+    // Up to row kt (< nE). The walk records its segments and vertices in order, so this only
+    // ever climbs; asked for a lower row it starts over.
+    __device__ void advanceTo(int kt, const DScene& sc, const DVertex* eye, double kappaB,
+                              double kappaS, const DPatEnv& env) {
+        if (kt < k) reset();
+        while (k < kt) {
+            ++k;
+            const DVertex& v = eye[k - 1];
+            for (int b = 0; b < DJSPEC_K; ++b) e1[b] = 0.0;
+            if (kappaB > 0.0 && v.type == BV_MEDIUM) {
+                // dMergeEtaPrime's directions: arriving from eye[k], leaving for eye[k-2].
+                DVec3 din = v.p - eye[k].p;
+                const double dl = sqrt(ddot(din, din));
+                DVec3 dout = eye[k - 2].p - v.p;
+                const double dn = sqrt(ddot(dout, dout));
+                if (dl > 0.0 && dn > 0.0) {
+                    double tmp[DJSPEC_K];
+                    dChromaBeamEta1(sc, v, din * (Real)(1.0 / dl), dout * (Real)(1.0 / dn), dn,
+                                    env, tmp);
+                    for (int b = 0; b < DJSPEC_K; ++b) e1[b] = kappaB * tmp[b];
+                }
+            }
+            if (kappaS > 0.0 && v.type != BV_MEDIUM && dSurfMergeSite(sc, v))
+                for (int b = 0; b < DJSPEC_K; ++b) e1[b] += kappaS;
+            const double pL = dMergeLightDensity((double)eye[k - 1].pdfRev, eye[k].delta != 0);
+            const double rC = dMisRemap0(eye[k - 1].pdfRev) / dMisRemap0(eye[k - 1].pdfFwd);
+            const bool fiberK = !eye[k].delta && eye[k].type == BV_SURFACE &&
+                                eye[k].matId >= 0 && sc.mats[eye[k].matId].type == D_HAIR;
+            for (int b = 0; b < DJSPEC_K; ++b) {
+                const double mb = fiberK ? 0.0 : ((pL > 0.0 ? e1[b] * pL : 0.0) + rC * m[b]);
+                mPrev[b] = m[b];
+                m[b] = mb;
+            }
+        }
+    }
+};
+
 // Device twin of bdpt.h's SurfMergeWeight. Every field is a constant of the GATHER SITE, so it
 // is built once per camera vertex and the per-photon call is the three lines at the bottom.
 struct DSurfMergeW {
@@ -18940,8 +19068,13 @@ struct DSurfMergeW {
     double invPdfFwdK = 1.0, gateD1 = 0.0, cosPrev = 1.0, invDistPrev2 = 0.0;
     double invPdfFwdKm1 = 1.0, etaKm1Coef = 0.0, segSumC = 0.0, segSumM = 0.0;
     int camVert = 0, maxDepth = 0;
+    // UPBP-W-CHROMATIC (host twin SurfMergeWeight::chromaM): segSumM and etaKm1Coef at the
+    // DJSPEC_K bins, read at the photon's wavelength `lam`; null where nothing is chromatic.
+    const double* chromaM = nullptr;
+    const double* chromaKm1 = nullptr;
 
-    __device__ double operator()(const DSurfMis& lm, double pdfDirRev, double pdfDirFwd) const {
+    __device__ double operator()(const DSurfMis& lm, double pdfDirRev, double pdfDirFwd,
+                                 double lam) const {
         if ((int)lm.vert + camVert - 1 > maxDepth) return 0.0;   // merge depth is j + k - 1
         const double etaS = kappaS * lm.pdfFwdA;
         if (!(etaS > 0.0)) return 0.0;
@@ -18949,10 +19082,12 @@ struct DSurfMergeW {
         const double D1 = dMisRemap0(lm.pdfFwdA) * invPdfFwdK;
         const double pdfRevKm1 = pdfDirFwd * cosPrev * invDistPrev2;
         const double D2 = pdfRevKm1 * invPdfFwdKm1;
+        const double etaKm1 = chromaM ? dSpecBinAt(chromaKm1, lam) : etaKm1Coef;
+        const double sumM   = chromaM ? dSpecBinAt(chromaM, lam) : segSumM;
         const double den = (double)lm.gateC1
                          + R * (lm.sumC + kappaB * lm.sumMb + kappaS * lm.sumMs)
                          + etaS
-                         + D1 * (gateD1 + etaKm1Coef * pdfRevKm1 + D2 * (segSumC + segSumM));
+                         + D1 * (gateD1 + etaKm1 * pdfRevKm1 + D2 * (segSumC + sumM));
         if (!(den > 0.0)) return 0.0;
         return etaS / den;
     }
@@ -18988,7 +19123,7 @@ __device__ static void dSurfMergeAt(const DScene& sc, const DSurfMap& sm, const 
             fCam *= dVmGatherCorr(ph.wo, vk.ns, ngo);
             const double pdfDirRev = dBsdfPdf(sc, vk, woCam, ph.wo, lam);
             const double pdfDirFwd = dBsdfPdf(sc, vk, ph.wo, woCam, lam);
-            const double w = sw(lm, pdfDirRev, pdfDirFwd);
+            const double w = sw(lm, pdfDirRev, pdfDirFwd, (double)lam);
             if (!(w > 0.0)) continue;
             if (js && js->disp) {   // windowed (DJSpec::disp): light at lambda_c only, coloured there
                 const double ww = js->winW((double)lam);
@@ -19347,6 +19482,14 @@ kBdptT(DScene sc, const __grid_constant__ DCamera cam, double* camFilm, double* 
                     segSumM[k] = fiberK ? 0.0 : eK + carryM;
                 }
             }
+            // UPBP-W-CHROMATIC (DChromaRun): where some medium's extinction varies with
+            // wavelength, every merge weight's camera half is read at the merged light's.
+            const bool chromaOn = c_jTrSpec && c_jChroma && sc.chromaSig &&
+                                  (mergeKappa > 0.0 || kappaSurf > 0.0);
+            const DPatEnv envC = dPatEnvOf(sc);
+            DChromaRun crun;
+            if (chromaOn) crun.reset();
+            double cbuf[2 * DJSPEC_K];   // this segment's segSumM and etaKCoef bins
             for (int i = 0; mergeOn && i < nSegs; ++i) {
                 const DPathSeg& sg = segs[i];
                 if (!(sg.beta > 0.0)) continue;
@@ -19386,6 +19529,7 @@ kBdptT(DScene sc, const __grid_constant__ DCamera cam, double* camFilm, double* 
                     // at light vertex j on this segment makes a path of depth j + k + 1.
                     mw.camVert    = k;
                     mw.maxDepth   = maxDepth;
+                    if (chromaOn) for (int b = 0; b < DJSPEC_K; ++b) cbuf[DJSPEC_K + b] = 0.0;
                     // The merge AT eye[k]. Its light-side incoming direction is -sg.d
                     // whatever x turns out to be, so sin(theta) and the whole coefficient are
                     // merge-point INDEPENDENT and belong here, not in the per-hit weight.
@@ -19404,14 +19548,22 @@ kBdptT(DScene sc, const __grid_constant__ DCamera cam, double* camFilm, double* 
                             const double tr = dTrDet(sc, vk.p, dp, dn, lambda, env);
                             if (s2 > 0.0 && sT > 0.0 && tr > 0.0)
                                 mw.etaKCoef = sqrt(s2) / (sT * tr);
+                            if (chromaOn)
+                                dChromaBeamEta1(sc, vk, sg.d, dp, dn, env, cbuf + DJSPEC_K);
                         }
+                    }
+                    if (chromaOn) {
+                        crun.advanceTo(k < 0 ? 0 : k, sc, eye, mergeKappa, kappaSurf, envC);
+                        for (int b = 0; b < DJSPEC_K; ++b) cbuf[b] = crun.m[b];
+                        mw.chroma = cbuf;
                     }
                 }
                 // WAVEFRONT (UPBP-CONV): hand the segment -- and the weight state just built for
                 // it -- to the queue; kWfBeamHits / kWfBeamEval do the gather after this kernel.
-                // A full queue means this segment is gathered inline, right here, as before.
+                // A full queue means this segment is gathered inline, right here, as before, and
+                // so does a chromatic one when the queue has no table for its bins.
                 bool queued = false;
-                if (wq.segs) {
+                if (wq.segs && (!mw.chroma || wq.chroma)) {
                     const int si = atomicAdd(wq.nSegs, 1);
                     if (si < wq.segCap) {
                         DWfSeg& ws = wq.segs[si];
@@ -19419,6 +19571,11 @@ kBdptT(DScene sc, const __grid_constant__ DCamera cam, double* camFilm, double* 
                         ws.beta = sg.spec.beta(sg.beta) * wJ;   // JSPEC: the carrier's scale folded in
                         ws.routeMedJ = routeMedJ;
                         ws.mw = mw; ws.tr = camTr; ws.px = px; ws.py = py; ws.lambda = (float)lambda;
+                        if (mw.chroma) {   // the bins move into the queue's table with the segment
+                            double* q = wq.chroma + (size_t)si * 2 * DJSPEC_K;
+                            for (int b = 0; b < 2 * DJSPEC_K; ++b) q[b] = cbuf[b];
+                            ws.mw.chroma = q;
+                        }
                         ws.spec = sg.spec;   // JSPEC (any == 0 when the carrier is off)
                         ws.glassMat = sg.glassMat;
                         // The segment's own stream: its sample and its index along the walk, under
@@ -19452,7 +19609,9 @@ kBdptT(DScene sc, const __grid_constant__ DCamera cam, double* camFilm, double* 
             if (kappaSurf > 0.0 && sm.nPts > 0 && (!routeOn || routeR == 1)) {
                 const double vmNorm = 1.0 / kappaSurf;
                 const int kEnd = (nE < maxDepth + 1) ? nE : maxDepth + 1;   // past it every merge is capped
+                if (chromaOn) crun.reset();
                 for (int k = 1; k < kEnd; ++k) {
+                    if (chromaOn) crun.advanceTo(k, sc, eye, mergeKappa, kappaSurf, envC);
                     const DVertex& vk = eye[k];
                     if (!dSurfMergeSite(sc, vk) || !(vk.beta > 0.0)) continue;
                     const DVertex& vp = eye[k - 1];
@@ -19481,6 +19640,7 @@ kBdptT(DScene sc, const __grid_constant__ DCamera cam, double* camFilm, double* 
                     }
                     sw.segSumC      = (k - 1 < (int)SEGN) ? segSumC[k - 1] : 0.0;
                     sw.segSumM      = (k - 1 < (int)SEGN) ? segSumM[k - 1] : 0.0;
+                    if (chromaOn) { sw.chromaM = crun.mPrev; sw.chromaKm1 = crun.e1; }
                     sw.camVert      = k;
                     sw.maxDepth     = maxDepth;
                     // JSPEC: the carrier arriving at eye[k] (the walk's snapshot), coin included;
@@ -24488,6 +24648,17 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
         }
         sc.media  = dmeds.empty() ? nullptr : (const DMedium*)keep(uploadVec(dmeds));
         sc.mediaN = (int)dmeds.size();
+        // UPBP-W-CHROMATIC's table (DChromaRun), read only where c_jTrSpec says some medium's
+        // extinction varies with wavelength -- the host's test for ChromaMis -- and c_jChroma.
+        sc.chromaSig = nullptr;
+        if (!scene.media.empty()) {
+            std::vector<double> sig(scene.media.size() * (size_t)DJSPEC_K);
+            for (size_t m = 0; m < scene.media.size(); ++m)
+                for (int b = 0; b < DJSPEC_K; ++b)
+                    sig[m * DJSPEC_K + b] = scene.media[m].sigmaT(
+                        LAMBDA_MIN + ((double)b + 0.5) * (LAMBDA_MAX - LAMBDA_MIN) / (double)DJSPEC_K);
+            sc.chromaSig = (const double*)keep(uploadVec(sig));
+        }
         // GATHER-TIME SPECTRAL FOLD tables (FOLD-GPU (2), host: Scene::bowLuts). One
         // kBowBins-entry table per eligible (emitter, medium) pair, flattened into one buffer
         // with an offset table; -1 marks a pair the host has no table for, which is the same
@@ -25583,8 +25754,10 @@ static int    g_jDispAllHost = 0;
 void cudaSetJDisp(double winNm, int all) { g_jDispWinHost = winNm; g_jDispAllHost = all; }
 // Mode J's estimator switches (see cudaSetJSwitches): uploaded at the top of every renderBdptCuda.
 static int g_jSpecHost = 1, g_jTrSpecHost = 0, g_jDeltaMergeHost = 1, g_jHalfHost = 0;
-void cudaSetJSwitches(int jSpec, int trSpec, int deltaMerge, int half) {
+static int g_jChromaHost = 1;
+void cudaSetJSwitches(int jSpec, int trSpec, int deltaMerge, int half, int chroma) {
     g_jSpecHost = jSpec; g_jTrSpecHost = trSpec; g_jDeltaMergeHost = deltaMerge; g_jHalfHost = half;
+    g_jChromaHost = chroma;
 }
 // gpu::c_jBinQ from the sampler the camera walk's wavelength is drawn from: on the device both modes
 // draw from the emission sampler (dSampleSceneLambda), where the host's mode J draws from camSampler.
@@ -26319,6 +26492,7 @@ Film renderBdptCuda(const Scene& scene, const Camera& cam, int resX, int resY,
     uploadJBinQ(scene.emitSampler);   // the camera walk's wavelength density (DJSpecRun::hole):
                                       // the device's draw (dSampleSceneLambda), not camSampler
     CUDA_CHECK(cudaMemcpyToSymbol(gpu::c_jTrSpec, &g_jTrSpecHost, sizeof(int)));
+    CUDA_CHECK(cudaMemcpyToSymbol(gpu::c_jChroma, &g_jChromaHost, sizeof(int)));
     CUDA_CHECK(cudaMemcpyToSymbol(gpu::c_jDeltaMerge, &g_jDeltaMergeHost, sizeof(int)));
     CUDA_CHECK(cudaMemcpyToSymbol(gpu::c_jDispWin, &g_jDispWinHost, sizeof(double)));
     CUDA_CHECK(cudaMemcpyToSymbol(gpu::c_jDispAll, &g_jDispAllHost, sizeof(int)));
@@ -26341,12 +26515,16 @@ Film renderBdptCuda(const Scene& scene, const Camera& cam, int resX, int resY,
     int* d_wfCounters = nullptr;
     long long waveSamples = 0;
     if (mergeOn && !(std::getenv("FTRACE_NOWAVEFRONT") && std::atoi(std::getenv("FTRACE_NOWAVEFRONT")) != 0)) {
-        const int segCap = 1 << 20;          // 400 B each (~420 MB), 128 of them JSPEC's
+        const int segCap = 1 << 20;          // 408 B each (~430 MB), 128 of them JSPEC's
         const int hitCap = 1 << 25;          // 16 B each  (512 MB): a dense map yields thousands of
                                              // candidates per segment (_fog_cornell: ~2000), and a
                                              // spilled candidate is evaluated divergently, on the spot
         CUDA_CHECK(cudaMalloc(&wq.segs, (size_t)segCap * sizeof(DWfSeg)));
         CUDA_CHECK(cudaMalloc(&wq.hits, (size_t)hitCap * sizeof(DWfHit)));
+        // ...and, where the merge weights read their camera half at the beam's wavelength
+        // (UPBP-W-CHROMATIC), that half's two bin tables per slot: 384 B each (~400 MB).
+        if (g_jTrSpecHost && g_jChromaHost)
+            CUDA_CHECK(cudaMalloc(&wq.chroma, (size_t)segCap * 2 * DJSPEC_K * sizeof(double)));
         CUDA_CHECK(cudaMalloc(&d_wfCounters, 4 * sizeof(int)));
         wq.nSegs = d_wfCounters; wq.nHits = d_wfCounters + 1; wq.overflow = d_wfCounters + 2;
         wq.segCap = segCap; wq.hitCap = hitCap;
@@ -26597,6 +26775,7 @@ Film renderBdptCuda(const Scene& scene, const Camera& cam, int resX, int resY,
                      (wfMsWall - wfMsWalk - wfMsHits - wfMsEval) / 1e3);
         for (auto& e : wfEv) cudaEventDestroy(e);
         cudaFree(wq.segs); cudaFree(wq.hits); cudaFree(d_wfCounters);
+        if (wq.chroma) cudaFree(wq.chroma);
     }
     cudaFree(d_cam); cudaFree(d_splat);
     g_lastBdptOverheadSec =

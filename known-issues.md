@@ -521,6 +521,20 @@ domain for every mode would change all three to suit the one that cannot light t
 emits into. That is now a decision for the user (TODO.md 4.1): clip in every mode, or keep R, D and
 J and have the forward modes warn that they light an unbounded haze only near the scene.
 
+## OPEN (2026-11-05, 0.434.19): UPBP-W-RAINBOW — in a rainbow-phase medium, mode J's merge weights read the camera side's phase densities at the camera's wavelength
+
+The sibling of UPBP-W-CHROMATIC (fixed 0.434.19), which put the camera half's beam etas -- the
+sigma_t * Tr terms -- at the merged light's wavelength. That half also holds direction densities:
+at every camera-path medium vertex the recorded `pdfFwd` and `pdfRev` include the phase function's
+density for the turn there, read at the camera's wavelength, and they enter every merge weight
+through the ratios rC of `cameraSideSums` (segSumC and segSumM alike) and through `cosFacK`'s
+neighbour. A Henyey-Greenstein phase has no wavelength, so this matters only for `phase rainbow`,
+whose lobes move with wavelength -- `gallery_rain`'s rain, which mode J renders. Unmeasured: the
+reproduction is a rainbow-phase rain lit by a sun, mode J against mode D per channel (a
+check_jchroma-style rig with the medium's coefficients flat). Proper fix, if it shows: tabulate
+the phase-dependent ratios per bin with the rest (`ChromaMis` / `DChromaRun` already carry rows
+per vertex), so segSumC becomes wavelength-dependent too in such a scene.
+
 ## OPEN (2026-11-05, 0.434.18): J-CPU-NONDET — CPU mode J renders a heterogeneous medium differently run to run
 
 `-device cpu` is meant to be deterministic (it is the reference and validation baseline, and
@@ -2080,7 +2094,7 @@ once). The scenes are made by `scraps/jspec2/make_scenes.py`:
 | `shapes`: stochastic texture, record-driven albedo, coat over a striped body | 0.995 / 0.983 / 1.003 (−1.3 %) | 1.006 / 0.991 / 0.999 (−0.5 %) |
 | `hair`: a blond fur ball, whole frame | 0.988 / 0.997 / 0.999 | 0.994 / 0.994 / 0.989 |
 | `lens`: coloured walls through an SF10 singlet, `-jdispall` | 0.972 / 0.980 / 1.021 (−1.9 %) | 0.993 / 0.991 / 0.994 (−0.9 %) |
-| `hetmed`: heterogeneous coloured medium | 0.974 / 1.004 / 1.029 | 0.982 / 1.003 / 1.014 (UPBP-W-CHROMATIC) |
+| `hetmed`: heterogeneous coloured medium | 0.974 / 1.004 / 1.029 | 0.982 / 1.003 / 1.014 (UPBP-W-CHROMATIC; 1.002 / 0.998 / 0.997 since its fix, 0.434.19) |
 
 Luma sits at the beam kernel's blur level, −0.5 to −1 % (J-FOGCORNELL). The grating's orders are
 small and dark, so their numbers carry a few percent of noise. Without the window, though, the old
@@ -2112,7 +2126,23 @@ The camera segment's glass absorption over each beam's closest-approach distance
 list, is taken at the beam's wavelength since 0.391.3 (REVIEW-0388, `PathSeg::glassMat`), and mode
 M's beam gather reads its carrier since 0.433.5 (MODEM-BEAM-CARRIER).
 
-## OPEN (2026-10-19): UPBP-W-CHROMATIC — in a medium whose sigma_t varies with wavelength, a beam merge's weight mixes two wavelengths and the frame tilts in colour
+## FIXED (2026-11-05, 0.434.19; opened 2026-10-19): UPBP-W-CHROMATIC — in a medium whose sigma_t varies with wavelength, a beam merge's weight mixes two wavelengths and the frame tilts in colour
+
+**Fixed in 0.434.19.** Where some medium's extinction varies with wavelength, every merge weight
+(beam and point) reads its camera half at the merged beam's or photon's wavelength: the merge's
+own sigma_t and Tr exactly, and the beam etas at eye[k] and in segSumM from a table at JSpec's 24
+bins, built once per camera path from each segment's per-medium depths (bdpt.h `ChromaMis`,
+`cameraSideSumsChroma`; the device's `DChromaRun`, and a queued segment's two rows in
+`DWfQueue::chroma`). The connections' weights stay at the camera's wavelength, theirs being
+single-wavelength paths. Re-measured first on 0.434.17 (GPU, 3 seeds, J 2048 against D 8192 at
+64x64): X / Y / Z 0.9865 / 0.9992 / 1.0223. After: 1.0024 / 0.9976 / 0.9967, flat by block. On
+the CPU the binned tables read within 0.2 % per channel of a brute-force weight that recomputed
+every term at the beam's exact wavelength per hit. `tools/check_jchroma.py` (GPU, 64x64, mode J on
+3 seeds against a mode-R reference, which agrees with mode D there and costs a fraction of it)
+holds X and Z over Y within 0.8 % and fails under `FTRACE_JCHROMA=0`, which restores the old
+weight on both backends. Not covered: a rainbow phase in an achromatic medium, whose camera-side
+direction densities (phase pdfs at camera-path medium vertices) also carry the camera's
+wavelength (UPBP-W-RAINBOW). The rest of this entry is how it stood.
 
 A beam merge's MIS weight reads its light half at the beam's wavelength (BeamMis, from the light
 walk). Its camera half reads the camera's wavelength: the merge's own eta (sigma_t(x) and the
@@ -16131,7 +16161,11 @@ relative to the connections that compete with them. **The fix** is to defer `sum
 per-beam `sin(θ)·p_L/σ_t` partial *unmultiplied* along with its medium id, and apply `2r` when the
 gather reads it, which needs one extra float and a byte per beam.
 
-**(b) The weight mixes two wavelengths.** Camera-side quantities (`σ_t(x)`, `Tr̃` along the camera
+**(b) The weight mixes two wavelengths. Wrong, and fixed in 0.434.19:** the claim below that the
+weights still sum to one does not hold -- in a medium whose extinction varies with wavelength the
+frame tilted in colour (UPBP-W-CHROMATIC), and the camera half is now read at the merged light's
+wavelength there. What follows is the original analysis.
+Camera-side quantities (`σ_t(x)`, `Tr̃` along the camera
 segment, `eye[]` densities) are evaluated at the *camera* path's `λ`; light-side quantities baked
 into `BeamMis::sumC`/`sumM` were evaluated at the *beam's* `λ` when it was deposited; and the phase
 value at the merge point is the one the gather already computed, at the beam's `λ`, used for both

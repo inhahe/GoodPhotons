@@ -1272,10 +1272,12 @@ that converges to the same physical image.
   > and both backends reproduce it to 0.1 %. Its beam
   > map has **no trim** and is sized by `-n` alone, which
   > is the resource that bites first — **pass a smaller `-n` before anything else** (see the
-  > box below); and the weights carry three deliberate approximations
-  > (one scene-wide kernel radius, a weight built from two wavelengths, and a merge dropped
-  > after a specular light bounce) — all of them weight *quality*, none of them bias. See
-  > **UPBP-W** in `known-issues.md`.
+  > box below); and the weights carry two deliberate approximations
+  > (one scene-wide kernel radius, and a merge dropped after a specular light bounce) — both
+  > weight *quality*, not bias. See **UPBP-W** in `known-issues.md`. A third, a weight built from
+  > two wavelengths, turned out to tilt the colour of a medium whose extinction varies with
+  > wavelength by 1-2 %; since 0.434.19 such a scene's merge weights are read at the merged
+  > light's wavelength (UPBP-W-CHROMATIC).
   >
   > **Two estimator errors were found later, and fixed in 0.386.0 and 0.386.1.** A merge on the sun's
   > first chord took its light density from the 0.53° cone instead of the planar density every

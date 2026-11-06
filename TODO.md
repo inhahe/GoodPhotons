@@ -84,7 +84,7 @@ Each names the section its line is in.
    its radius: a table top gathers the floor's light.~~ Done, 0.431.0.
 2. ~~**HAZE-SUN-B** (4.2) — mode B lights an unbounded sunlit haze at 0.16 of mode R.~~ Decided
    (2026-11-05): R, D and J stay, and the modes whose haze comes from forward photons warn. Done,
-   0.434.15 (A, B, C) and 0.434.16-18 (P, V, M); its blur half is HAZE-BLUR-DOMAIN (16).
+   0.434.15 (A, B, C) and 0.434.16-18 (P, V, M); its blur half is HAZE-BLUR-DOMAIN (17).
 3. ~~**VCM-SPEC** and **SPPM-SPECTRAL** (4.2) — modes U and S merge at the camera's wavelength, so
    a coloured surface seen before a merge washes out (the fix mode J got in 0.386.1, JSPEC).~~ Done:
    mode S 0.432.0, mode U 0.433.0.
@@ -109,23 +109,26 @@ Each names the section its line is in.
 11. ~~**CPU-ONLY-BUILD** (4.4) — a build without CUDA does not compile.~~ Done.
 12. ~~**BLUR-EPOCH-COST** (4.5) — a blurred clock-budgeted mode M or J spends its clock rebuilding.~~
     Done, 0.434.12.
-13. **UPBP-W-CHROMATIC** (4.3) — mode J's beam weight mixes two wavelengths in a chromatic medium.
+13. ~~**UPBP-W-CHROMATIC** (4.3) — mode J's beam weight mixes two wavelengths in a chromatic medium.~~
+    Done, 0.434.19.
 14. ~~**FEATHER-IS-A-THRESHOLD** (4.2) — `feather` shrinks a cloud instead of ramping it; the fix
     changes `gallery_rain`'s cloud edges, so show the user before it lands.~~ Shown, approved
     (2026-11-05), done 0.434.17.
-15. **J-CPU-NONDET** (4.4) — CPU mode J renders a heterogeneous medium differently run to run
+15. **UPBP-W-RAINBOW** (4.3) — mode J's merge weights read a rainbow phase's camera-side
+    densities at the camera's wavelength (`gallery_rain`'s rain). Measure first.
+16. **J-CPU-NONDET** (4.4) — CPU mode J renders a heterogeneous medium differently run to run
     (found validating UPBP-W-CHROMATIC); the CPU is the validation baseline.
-16. **HAZE-BLUR-DOMAIN** (4.2) — under a blur, modes D and J weigh together strategies that take
+17. **HAZE-BLUR-DOMAIN** (4.2) — under a blur, modes D and J weigh together strategies that take
     different haze for a mover outside the instant's sphere. Measure first; one fix needs the
     user's word.
-17. **GLOSSY-SAMPLE-SITES** (4.4) — the interference factor applied by hand at two dozen sites.
-18. **JSPEC-CARRIER-SIZE** (4.5) — every mode-J GPU thread reserves the spectral carrier.
-19. **RADCACHE-BATCHES** (4.5) — `-radcache`'s fixed batches outlast `-stop` and the interval.
-20. **P-HEROSPLIT-FIRST**, **ROUGH-IRID-AIR** (4.3) — narrow estimator gaps.
-21. **REMAP0-IMPOSSIBLE** (4.4) — the MIS sums read every zero density as a delta's.
-22. **BEAMEPOCHS-CHUNK-PIN** (4.5) — `-beamepochs` pins cheap scenes' GPU chunks to 1 spp.
-23. **DEFORM-LIMITS**, **MOTION-LIGHT-RIGID**, **PER-OBJECT-MODES** (4.6) — what is left of them.
-24. **BLACK-PIXELS-ONCE** (4.2) — one render's black pixels, never reproduced.
+18. **GLOSSY-SAMPLE-SITES** (4.4) — the interference factor applied by hand at two dozen sites.
+19. **JSPEC-CARRIER-SIZE** (4.5) — every mode-J GPU thread reserves the spectral carrier.
+20. **RADCACHE-BATCHES** (4.5) — `-radcache`'s fixed batches outlast `-stop` and the interval.
+21. **P-HEROSPLIT-FIRST**, **ROUGH-IRID-AIR** (4.3) — narrow estimator gaps.
+22. **REMAP0-IMPOSSIBLE** (4.4) — the MIS sums read every zero density as a delta's.
+23. **BEAMEPOCHS-CHUNK-PIN** (4.5) — `-beamepochs` pins cheap scenes' GPU chunks to 1 spp.
+24. **DEFORM-LIMITS**, **MOTION-LIGHT-RIGID**, **PER-OBJECT-MODES** (4.6) — what is left of them.
+25. **BLACK-PIXELS-ONCE** (4.2) — one render's black pixels, never reproduced.
 
 Then the rest of 4.2-4.6 in their order, 4.7's bookkeeping alongside whatever touches its entries.
 
@@ -284,8 +287,10 @@ Then the rest of 4.2-4.6 in their order, 4.7's bookkeeping alongside whatever to
 - [x] **UPBP-BEAM-RADIUS** (0.434.0) — mode J's beam kernel shrinks per light-side epoch under
   -vcmalpha (_fog_cornell -0.70 % of mode D fixed, -0.43 % at 256 epochs, -0.07 % per sample).
 - [ ] **J-FOG-REALCAM**, what is left — CPU mode J reads realcam's fog up to 2.8 % below GPU mode J.
-- [ ] **UPBP-W-CHROMATIC** — in a chromatic medium a beam merge's weight mixes two wavelengths and
-  the frame tilts in colour.
+- [x] **UPBP-W-CHROMATIC** (0.434.19) — in a chromatic medium a beam merge's weight mixed two
+  wavelengths and the frame tilted in colour (`tools/check_jchroma.py`).
+- [ ] **UPBP-W-RAINBOW** — the same mix in a rainbow-phase medium, through the camera side's phase
+  densities; unmeasured.
 - [ ] **P-HEROSPLIT-FIRST** — blurred mode P under `-herosplit` files a sample by the hero's first
   event alone.
 - [ ] **ROUGH-IRID-AIR** — a rough interference reflector always interferes against air.

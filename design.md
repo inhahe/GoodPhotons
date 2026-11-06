@@ -2118,9 +2118,11 @@ quadrature for a heterogeneous one.
 merges are actually gathered. `mergeKappa == 0` deletes every merge term and makes both weight
 functions byte-identical to mode `D`'s — which is what keeps gate 1 alive.
 
-Three approximations are deliberate and documented under **UPBP-W** in `known-issues.md`: one
-scene-wide kernel radius (`BeamMap::radRef`), a weight built from two wavelengths, and a merge
-dropped when the light-side density is delta. All three are weight *quality*, not bias.
+Two approximations are deliberate and documented under **UPBP-W** in `known-issues.md`: one
+scene-wide kernel radius (`BeamMap::radRef`), and a merge dropped when the light-side density is
+delta. Both are weight *quality*, not bias. A weight built from two wavelengths was listed as a
+third until a medium whose extinction varies with wavelength showed it to be a bias; since
+0.434.19 the camera half is read at the merged light's wavelength there (UPBP-W-CHROMATIC, below).
 
 **The depth cap (0.219.0), which is not optional.** The merged path has `s = j+1` light vertices
 and `t = k+2` camera ones, so its depth is `j + k + 1` — up to `2·maxDepth + 2`. The connection
@@ -2777,6 +2779,38 @@ vertex's hero and secondary wavelengths, or through the dispersive window once a
 J's switches itself (`c_jSpecOn`, `c_jDispWin`, `c_jDispAll`), and `FTRACE_JSPEC=0` turns both
 modes' carriers off. `tools/check_rough_irid.py` holds mode U to mode R per channel on both
 backends.
+
+### Mode `J`'s merge weights at the merged light's wavelength (UPBP-W-CHROMATIC, 0.434.19)
+
+A balance-heuristic weight is a ratio of the densities with which the competing techniques would
+make one path, and a path has one wavelength. A merge's light half is written at its beam's or
+photon's (`BeamMis`, `SurfMis`). Its camera half is free of wavelength but for the beam etas, each
+of which divides by a medium's `sigma_t * Tr` (the merge itself, the one at `eye[k]`, those summed
+into `segSumM`), and those were read at the camera's. Where `sigma_t` is flat the two agree. In a
+medium whose extinction varies with wavelength the weights of a merged path did not sum to one,
+and the frame tilted in colour: on `scraps/jspec2/hetmed.ftsl` (GPU, 3 seeds, J 2048 against D
+8192 spp) X / Y / Z read 0.9865 / 0.9992 / 1.0223. BDPT's vertex densities carry no free-flight
+term (it cancels between the strategies), so nothing else in the camera half has a wavelength in
+it; the connections' weights (`misWeight`) are single-wavelength paths and stay at the camera's.
+
+So where some medium's extinction varies with wavelength (`anyMediumSigmaTChromatic`), the
+wavelength-dependent part of the camera half is tabulated at the K bins of JSpec's grid and every
+merge reads it at its own beam's or photon's wavelength, geometrically interpolated as JSpec is
+(`specBinAt`); the merge's own `sigma_t` and `Tr` are evaluated there exactly. A medium's
+extinction is `sigma_t(lambda) * density(x)`, so a segment's transmittance at every bin comes from
+its per-medium depths, taken once (`trDetDepthMedium` / `dTrDetDepthMedium`). On the CPU
+`ChromaMis` holds the scene's `sigma_t` per bin and `cameraSideSumsChroma` fills the camera path's
+table (`segSumM` and the point merges' eta at `eye[k-1]` per vertex); the device builds the same
+rows one vertex at a time (`DChromaRun`, three rows per thread instead of the walk's table) and a
+queued segment carries its two rows in the queue's own table (`DWfQueue::chroma`, allocated only
+then). `FTRACE_JCHROMA=0` turns it off on both backends for A/B runs; a scene with no chromatic
+medium never builds a table and renders as before.
+
+**Measured** (same scene and budget): X / Y / Z 1.0024 / 0.9976 / 0.9967, flat across the frame
+by 8x8 block; Z over Y went from 1.023 to 0.999 and X over Y from 0.987 to 1.005. On the CPU
+(32x32, 3 seeds) the binned tables read within 0.2 % per channel of a brute-force weight that
+recomputed every camera-side term at the beam's exact wavelength for each hit.
+`tools/check_jchroma.py` holds the tilt within 0.8 % on the GPU and fails under `FTRACE_JCHROMA=0`.
 
 ### Mode `J` merges through glass, and the aimed sun (MODE-J-SDS, 0.387.0)
 

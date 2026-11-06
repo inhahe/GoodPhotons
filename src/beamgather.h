@@ -90,26 +90,32 @@ struct JSpec {
     static double lamOf(int k) {
         return LAMBDA_MIN + (k + 0.5) * (LAMBDA_MAX - LAMBDA_MIN) / (double)K;
     }
-    // Interpolated between bin centres (see below for how), held flat past the outer two.
-    // SpecThr reads the nearest bin; interpolating costs one more load and follows a steep
-    // reflectance edge (a red wall's ~600 nm rise) instead of stepping across it.
-    double at(double lam) const {
-        if (!any) return 1.0;
-        const double u = (lam - LAMBDA_MIN) / (LAMBDA_MAX - LAMBDA_MIN) * (double)K - 0.5;
-        if (!(u > 0.0)) return (double)r[0];
-        if (u >= (double)(K - 1)) return (double)r[K - 1];
-        const int i = (int)u;
-        const double f = u - (double)i;
-        // Geometric between two live bins: the carrier's factors are largely exponentials in
-        // wavelength (glass absorption over a path, a medium's transmittance), which a straight
-        // line overestimates by the convexity of exp across a bin; geometric interpolation is
-        // exact wherever the exponent is linear in wavelength within the bin. A dead bin keeps
-        // the straight line, which reaches 0 at that bin rather than everywhere next to it.
-        const double a = (double)r[i], b = (double)r[i + 1];
-        if (a > 0.0 && b > 0.0) return a * std::pow(b / a, f);
-        return a + (b - a) * f;
-    }
+    // Interpolated between bin centres (specBinAt), held flat past the outer two. SpecThr reads
+    // the nearest bin; interpolating costs one more load and follows a steep reflectance edge (a
+    // red wall's ~600 nm rise) instead of stepping across it.
+    double at(double lam) const;
 };
+
+// A table over JSpec's K bins (bin b at JSpec::lamOf(b)) read at `lam`: interpolated between bin
+// centres and held flat past the outer two. Geometric between two live bins, because what these
+// tables hold is largely exponential in wavelength (glass absorption over a path, a medium's
+// transmittance), which a straight line overestimates by the convexity of exp across a bin;
+// geometric interpolation is exact wherever the exponent is linear in wavelength within the bin.
+// A dead bin keeps the straight line, which reaches 0 at that bin rather than everywhere next
+// to it.
+template <typename T>
+inline double specBinAt(const T* r, double lam) {
+    constexpr int K = JSpec::K;
+    const double u = (lam - LAMBDA_MIN) / (LAMBDA_MAX - LAMBDA_MIN) * (double)K - 0.5;
+    if (!(u > 0.0)) return (double)r[0];
+    if (u >= (double)(K - 1)) return (double)r[K - 1];
+    const int i = (int)u;
+    const double f = u - (double)i;
+    const double a = (double)r[i], b = (double)r[i + 1];
+    if (a > 0.0 && b > 0.0) return a * std::pow(b / a, f);
+    return a + (b - a) * f;
+}
+inline double JSpec::at(double lam) const { return any ? specBinAt(r, lam) : 1.0; }
 
 // The running product a camera walk accumulates (in double) and snapshots into JSpec.
 struct JSpecRun {
@@ -300,6 +306,26 @@ inline double trDetMedium(const Medium& med, const Vec3& o, const Vec3& dir, dou
     for (int i = 0; i < kN; ++i)
         tau += med.densityAt(o + dir * (ta + (i + 0.5) * dt), tabs);
     return std::exp(-stBase * tau * dt);
+}
+
+// trDetMedium's optical depth with sigma_t's wavelength part left out: a medium's extinction is
+// sigma_t(lambda) * density(x), so over a fixed segment trDetMedium is exp(-sigma_t(lambda) * L)
+// with L this, the density integrated over the medium's part of the segment by the same clip and
+// quadrature. Taken once, it gives the segment's transmittance at any number of wavelengths
+// (ChromaMis, bdpt.h). 0 where the segment misses the medium.
+inline double trDetDepthMedium(const Medium& med, const Vec3& o, const Vec3& dir, double dist,
+                               const PatTables* tabs) {
+    double ta, tb;
+    if (!med.clipToBounds(o, dir, 0.0, dist, ta, tb)) return 0.0;
+    const double L = tb - ta;
+    if (!(L > 0.0)) return 0.0;
+    if (!med.heterogeneous()) return L;
+    constexpr int kN = 4;   // trDetMedium's midpoint rule
+    const double dt = L / (double)kN;
+    double tau = 0.0;
+    for (int i = 0; i < kN; ++i)
+        tau += med.densityAt(o + dir * (ta + (i + 0.5) * dt), tabs);
+    return tau * dt;
 }
 
 // Same, over every medium in the scene (extinction adds, so transmittance multiplies).
