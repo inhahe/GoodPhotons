@@ -397,12 +397,16 @@ such term; mode V's comparison reports its scale the same way.
 fixed schedule under `-time`/`-noise`/`-forever` as well, whose target is `kUnboundedSpp`, so the
 third batch was about 16 million samples, and neither the budget nor a stop landed. `-mode R
 -radcache -time 8` on cornell was still running at 50 s; its `-stop` waited out the 120 s and
-failed. Mode P's twin already excluded a budget. Mode R now takes the clock schedule there too.
-And mode R's camera pass now **abandons a stopped batch** at the next pixel
-(`BackwardRenderer::abandonOnStop`, set only by cpuSppChunks, which drops a stopped chunk and
-writes the samples before it), so `-stop` lands within a pixel's time, however long the batch.
-`tools/check_radcache_stop.py` holds both: the budget ends at 7.8 s of 6, and a stop inside a
-40 s batch of `-spp 200000` lands in 2.3 s with the 10 spp before it (0.434.26 took 28.1 s).
+failed. A render the clock ends (`SppProgress::clockEnds`: `-time`, `-forever`) now takes the
+clock's chunks, as mode P's twin always did, and `-noise` alone, being a sample count in these
+modes (100/sqrt(spp)), renders to `ceil((100/pct)^2)` on the fixed schedule. And the camera pass
+of modes R and P now **abandons a stopped batch** at the next pixel
+(`BackwardRenderer::abandonOnStop`), marks its film `abandoned`, and skips the cache's update;
+the caller drops it and writes the samples before it, so `-stop` lands within a pixel's time,
+however long the batch. Every camera pass that stops part-way (D, J and M's too) now marks its
+film so, and a batch that finished before the stop landed is kept; mode M's flights no longer
+write a stopped frame's partial bands. `tools/check_radcache_stop.py` holds the budget (7.8 s of
+6) and the stop in both modes (0.434.26 took 28.1 s for a 3200-spp batch).
 
 **Still open:** `-interval` writes, window repaints and the status line still land only at
 batch ends, and a resume draws its own schedule. The proper fix the entry proposed (advance the

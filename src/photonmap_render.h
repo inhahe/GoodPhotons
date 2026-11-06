@@ -2074,6 +2074,7 @@ inline Film renderPhotonCamera(const Scene& scene, const Camera& cam, int resX, 
     if (nThreads < 1) nThreads = 1;
     Film out; out.resX = resX; out.resY = resY; out.alloc();
     std::vector<Film> bands(nThreads);
+    std::atomic<bool> stopped{false};   // a band stopped part-way (`-stop`)
     const uint64_t nPix = (uint64_t)resX * (uint64_t)resY;
     // Under a blur: a moving scene's pass is at one time (g_passMotionU, the camera already posed
     // there by the caller); a still scene seen by a moving camera keeps its maps timeless, and
@@ -2096,8 +2097,9 @@ inline Film renderPhotonCamera(const Scene& scene, const Camera& cam, int resX, 
                 // thing that makes a gather slow enough to want stopping is a slow gather:
                 // with an oversized `-beams` kernel radius one scanline can be half a minute,
                 // and the poll (one relaxed atomic load) is free against even a fast one.
-                // A partially filled band is fine — every caller discards the film on a stop.
-                if (ft::stopRequested()) return;
+                // A partially filled band is fine: the film says it was abandoned, and every
+                // caller discards it.
+                if (ft::stopRequested()) { stopped = true; return; }
                 const uint64_t pixIdx = (uint64_t)py * (uint64_t)resX + (uint64_t)px;
                 // STRATIFIED hero wavelength (0.314.0; device twin and the reasoning: kGather
                 // in render_cuda.cu): a golden-ratio sequence over the pixel's samples by their
@@ -2128,5 +2130,6 @@ inline Film renderPhotonCamera(const Scene& scene, const Camera& cam, int resX, 
     for (int t = 0; t < nThreads; ++t) pool.emplace_back(worker, t);
     for (auto& th : pool) th.join();
     for (int t = 0; t < nThreads; ++t) out.merge(bands[t]);
+    out.abandoned = stopped.load();
     return out;
 }

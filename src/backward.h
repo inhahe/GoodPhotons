@@ -394,9 +394,11 @@ struct BackwardRenderer {
     // against an exact reference in the same run, with the pixel noise cancelling out.
     bool   radAudit = false;
     // renderRows returns at the next pixel once a clean stop is requested, leaving its film
-    // partial: only for a caller that then drops the whole call (cpuSppChunks), which a long
-    // fixed -radcache batch needs for `-stop` to land in time (RADCACHE-BATCHES).
+    // partial and `abandoned` set: only for a caller that then drops the whole call (mode R's
+    // cpuSppChunks, mode P's batches), which a long fixed -radcache batch needs for `-stop` to
+    // land in time (RADCACHE-BATCHES).
     bool   abandonOnStop = false;
+    mutable bool abandoned = false;
     // -radcache-validate: fraction of readable vertices that trace their tail to full length
     // instead of terminating, and report (offer, tail) back to the cell they would have read.
     // This is the one measurement the update pass CANNOT make, because it is taken through the
@@ -4129,7 +4131,7 @@ struct BackwardRenderer {
         };
         for (int py = y0; py < y1; ++py) {
             for (int px = 0; px < film.resX; ++px) {
-                if (abandonOnStop && ft::stopRequested()) return;
+                if (abandonOnStop && ft::stopRequested()) { abandoned = true; return; }
                 const uint64_t pixIdx = (uint64_t)py * (uint64_t)film.resX + (uint64_t)px;
                 double tPhase = 0.5;
                 if (blur && !whitted) {

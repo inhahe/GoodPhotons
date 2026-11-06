@@ -131,8 +131,8 @@ Each names the section its line is in.
     Done 2026-11-06: `drawGlossy` / `dDrawGlossy` return the direction with its factor.
 20. **JSPEC-CARRIER-SIZE** (4.5) — every mode-J GPU thread reserves the spectral carrier.
 21. **RADCACHE-BATCHES** (4.5) — `-radcache`'s fixed batches outlast `-stop` and the interval.
-    0.434.27: a budget no longer hangs in them and `-stop` lands mid-batch; the interval writes and
-    a resume's schedule need a canonical cache merge first (known-issues).
+    0.434.27: a budget no longer hangs in them and `-stop` lands mid-batch (modes R and P); the
+    interval writes and a resume's schedule need a canonical cache merge first (known-issues).
 22. **P-HEROSPLIT-FIRST**, **ROUGH-IRID-AIR** (4.3) — narrow estimator gaps.
 23. **REMAP0-IMPOSSIBLE** (4.4) — the MIS sums read every zero density as a delta's.
 24. **BEAMEPOCHS-CHUNK-PIN** (4.5) — `-beamepochs` pins cheap scenes' GPU chunks to 1 spp.

@@ -8,6 +8,10 @@ struct Film {
     int resX = 256, resY = 256;
     std::vector<Vec3> xyz;     // accumulated XYZ per pixel
     std::vector<double> hits;  // photon contributions per pixel (diagnostics)
+    // A camera pass stopped part-way (`-stop`) returned this: it holds only some of the call's
+    // pixels, so it is not an estimate of anything and the caller must not merge or write it.
+    // merge() leaves it alone.
+    bool abandoned = false;
     void alloc() { xyz.assign((size_t)resX * resY, {}); hits.assign((size_t)resX * resY, 0.0); }
     void add(int px, int py, const Vec3& c) {
         size_t i = (size_t)py * resX + px;

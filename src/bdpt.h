@@ -4442,6 +4442,7 @@ inline void cameraSideSumsChroma(const Scene& scene, const PatTables& tabs,
 // carries the whole-film camera importance (cameraWe; through a physical lens,
 // lensW / (W*H)), which makes spp the light-tracing normaliser (renderBdpt explains).
 struct BdptRenderer {
+    mutable bool abandoned = false;   // renderRows stopped part-way (`-stop`): its films are partial
     int maxDepth = 8;          // maximum path length in edges (connection cost ~ depth^2)
     bool diffraction = true;   // mirrors Renderer::diffraction for MatType::Grating
     int heroC = 1;             // wavelengths bundled per path pair (1 = plain single-λ)
@@ -4569,9 +4570,9 @@ struct BdptRenderer {
                 // against a rebuild. One relaxed atomic load per pixel is free next to a full
                 // BDPT path.
                 //
-                // Returning leaves the rest of this thread's band at whatever it has so far;
-                // the caller drops a stopped chunk rather than merging a partial one.
-                if (ft::stopRequested()) return;
+                // Returning leaves the rest of this thread's band at whatever it has so far,
+                // and says so (`abandoned`): the caller drops the chunk rather than merging it.
+                if (ft::stopRequested()) { abandoned = true; return; }
                 const uint64_t pixIdx = (uint64_t)py * (uint64_t)camFilm.resX + (uint64_t)px;
                 for (long long si = 0; si < spp; ++si) {
                     // PER-MODE SAMPLE COUNTS (see g_routeSppD): kD / kJ sub-samples of this base

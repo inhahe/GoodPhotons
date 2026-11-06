@@ -43,6 +43,11 @@ struct SppProgress {
     // realizations its film holds, the loaded ones included, so the checkpoint the reporter
     // writes records it (main.cpp kLightEpochTag). Null: nobody keeps one.
     long long* lightEpochs = nullptr;
+
+    // The render ends on the clock (-time, -forever, or -noise where it is not a sample count), so
+    // it has no total to split: cpuSppChunks then sizes its chunks by the clock even under
+    // -radcache, whose fixed schedule needs one.
+    bool clockEnds = false;
 };
 
 // Progress through a phase that has NO pixels yet.

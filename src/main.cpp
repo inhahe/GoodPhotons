@@ -16149,6 +16149,7 @@ static Film renderBackward(const Scene& scene, const Camera& cam, int resX, int 
         }
         return br;
     };
+    std::atomic<bool> stoppedAny{false};   // a band stopped part-way (abandonOnStop)
     auto worker = [&](int tid) {
         BackwardRenderer br = makeBr();
         br.specFirstFilm = specFirst;   // mode P's blurred split (BackwardRenderer::specFirstFilm)
@@ -16156,11 +16157,15 @@ static Film renderBackward(const Scene& scene, const Camera& cam, int resX, int 
         if (rcOn) br.radBank = &rcBanks[tid];
         int y0 = bandLo + bandN * tid / nThreads, y1 = bandLo + bandN * (tid + 1) / nThreads;
         br.renderRows(scene, cam, film, y0, y1, spp, sampleBase);
+        if (br.abandoned) stoppedAny = true;
         raystats::flushThread();   // -raystats: fold this worker's tally into the total
     };
     std::vector<std::thread> pool;
     for (int t = 0; t < nThreads; ++t) pool.emplace_back(worker, t);
     for (auto& th : pool) th.join();
+    // A pass a stop abandoned is dropped by its caller, so the cache does not advance on it
+    // (the table a stop's checkpoint saves holds only the samples its film does).
+    if (stoppedAny) { out.abandoned = true; return out; }
     // ---- -radcache: mark -> update -> apply, once per chunk ---------------------------
     // All three steps run after the join and before the next chunk, so the table is immutable
     // for the whole of any render pass. That is what makes the table's state a pure function
@@ -16241,6 +16246,7 @@ static Film renderBdpt(const Scene& scene, const Camera& cam, int resX, int resY
     if (!scene.emissiveVolumes.empty() && (beams || photons))
         throw std::logic_error("mode J reached a scene with a fire, which it cannot render");
     std::vector<Film> camBands(nThreads), splatBands(nThreads);
+    std::atomic<bool> stoppedAny{false};   // a band stopped part-way (`-stop`)
     auto worker = [&](int tid) {
         bdpt::BdptRenderer br; br.maxDepth = maxDepth; br.diffraction = diffraction;
         br.heroC = g_heroC;   // renderRows applies the media/GRIN/lens gate itself
@@ -16250,6 +16256,7 @@ static Film renderBdpt(const Scene& scene, const Camera& cam, int resX, int resY
         Film& sf = splatBands[tid]; sf.resX = resX; sf.resY = resY; sf.alloc();
         int y0 = resY * tid / nThreads, y1 = resY * (tid + 1) / nThreads;
         br.renderRows(scene, cam, cf, sf, y0, y1, spp, sampleBase);
+        if (br.abandoned) stoppedAny = true;
     };
     std::vector<std::thread> pool;
     for (int t = 0; t < nThreads; ++t) pool.emplace_back(worker, t);
@@ -16269,6 +16276,7 @@ static Film renderBdpt(const Scene& scene, const Camera& cam, int resX, int resY
     Film out; out.resX = resX; out.resY = resY; out.alloc();
     for (size_t i = 0; i < out.xyz.size(); ++i)
         out.xyz[i] = cam_film.xyz[i] + splat_film.xyz[i];
+    out.abandoned = stoppedAny.load();
     return out;
 }
 
@@ -18427,7 +18435,9 @@ static void warnHazeOnlyNearScene(const Scene& scene, const std::vector<char>& m
 // by the completed spp). Chunk size adapts toward ~0.4s so early frames appear quickly
 // and the per-chunk thread-spawn overhead stays negligible.
 //
-// ...EXCEPT under -radcache, where the split must not depend on the clock. Ordinarily the
+// ...EXCEPT under -radcache with a total to split (a fixed -spp, or a -noise that is one), where
+// the split must not depend on the clock; a render that ends on the clock (prog->clockEnds) keeps
+// the clock's chunks, its image being the clock's anyway. Ordinarily the
 // chunk boundaries are invisible: per-(pixel,sample) seeding means chunk `c` starting at
 // absolute sample `base` renders exactly the samples [base, base+c) whatever the split, so
 // a slow machine and a fast one produce the same film. The radiance cache breaks that
@@ -18460,6 +18470,11 @@ static void warnHazeOnlyNearScene(const Scene& scene, const std::vector<char>& m
 // 1, then 9, then an equal split of the remainder into kFixedChunks-2 pieces. That is a
 // pure function of sppTarget, keeps the fast first previews, and lands within a few chunks
 // of what the timed rule converges to here.
+//
+// A chunk a stop abandoned part-way comes back `abandoned` and is dropped: the film returned
+// then holds the chunks before it, and is `abandoned` too when it falls short of sppTarget, so
+// a caller that writes it knows the frame is unfinished. A chunk that completed before the stop
+// landed is kept.
 static Film cpuSppChunks(long long sppTarget, const SppProgress* prog, int resX, int resY,
                          const std::function<Film(long long, unsigned long long)>& renderOne) {
     if (!prog || !prog->report) return renderOne(sppTarget, 0);
@@ -18482,10 +18497,11 @@ static Film cpuSppChunks(long long sppTarget, const SppProgress* prog, int resX,
     // clock-free schedule. `g_radCache` (not `rcOn`) deliberately -- when the cache is set
     // but inert (-whitted / -direct-only) the two schedules give the same film anyway, so
     // the broader condition costs nothing and cannot drift out of sync with the read site.
-    // Not under a -time/-noise/-forever budget, whose target (kUnboundedSpp) has no total to
-    // split -- the even batches would each be millions of samples, so neither the budget nor a
-    // stop would ever land -- and whose end the clock decides anyway (mode P's twin agrees).
-    const bool fixedSchedule = g_radCache && sppTarget < kUnboundedSpp;
+    // Not where the clock ends the render (-time/-forever): its target, kUnboundedSpp, has no
+    // total to split -- the even batches would each be millions of samples, so neither the
+    // budget nor a stop would ever land -- and the clock decides its image anyway (mode P's
+    // twin agrees).
+    const bool fixedSchedule = g_radCache && !prog->clockEnds;
     // Chunk count to aim for under the fixed schedule. 64 is the measured-good neighbourhood
     // (the timed rule settles on ~65 here); the cache wants many update rounds, and the
     // per-chunk thread-spawn overhead is negligible next to a 200^2 x 16 spp chunk.
@@ -18500,17 +18516,19 @@ static Film cpuSppChunks(long long sppTarget, const SppProgress* prog, int resX,
         long long c = chunk; if (c > sppTarget - done) c = sppTarget - done;
         auto t0 = clk::now();
         Film f = renderOne(c, seedBias + (unsigned long long)done);
-        // A renderer may now ABANDON its chunk part-way when `-stop` / Ctrl-C arrives —
-        // mode D/J's camera pass polls per pixel (bdpt.h renderRows). Such a film covers
+        // A renderer may ABANDON its chunk part-way when `-stop` / Ctrl-C arrives (the camera
+        // passes of modes D, J, M and, here, R poll per pixel), and says so. Such a film covers
         // only the pixels reached before the stop, so merging it while crediting the full
         // `c` spp would divide a partial image by a whole sample count and bake a dark
         // band in permanently. Throw it away instead: `acc` already holds a complete,
         // correctly normalised render of `done` spp, which is exactly what should be
         // written out. Report once more so the final image and checkpoint are flushed with
         // the spp count that is genuinely in them (skipped at done == 0, where there is no
-        // image yet and reporting would write a black frame over nothing).
-        if (ft::stopRequested()) {
+        // image yet and reporting would write a black frame over nothing). A chunk that
+        // finished before the stop landed is merged as usual, and the report below stops.
+        if (f.abandoned) {
             if (done > 0) prog->report(acc, done, /*final*/true);
+            acc.abandoned = true;
             break;
         }
         acc.merge(f);
@@ -18528,7 +18546,10 @@ static Film cpuSppChunks(long long sppTarget, const SppProgress* prog, int resX,
             if (next > c * 8 + 1) next = c * 8 + 1;   // ramp up gently
             chunk = next;
         }
-        if (prog->report(acc, done, done >= sppTarget)) break;
+        if (prog->report(acc, done, done >= sppTarget)) {
+            if (done < sppTarget && ft::stopRequested()) acc.abandoned = true;
+            break;
+        }
     }
     return acc;
 }
@@ -18557,8 +18578,14 @@ static int runSppProgressive(
     // A time/noise/forever budget renders "until the budget", so open the spp target to a
     // large-but-safe cap (keeps pixel*sppTotal seed indices well inside int64). A plain
     // fixed-spp render just targets sppReq and still shows progress along the way.
-    const bool budgeted = (timeBudgetSec > 0.0 || noiseTarget > 0.0 || runForever);
-    const long long sppTarget = budgeted ? kUnboundedSpp : sppReq;
+    //
+    // -noise alone is a sample count here -- the noise figure below is 100/sqrt(spp) -- so it
+    // renders to that count, with a fixed target's chunking (cpuSppChunks: -radcache's
+    // schedule needs a total, or the image would follow the clock). Not in mode W, which has
+    // no noise to meet.
+    const long long noiseSpp = (noiseTarget > 0.0 && !g_whitted)
+        ? (long long)std::ceil((100.0 / noiseTarget) * (100.0 / noiseTarget)) : 0;
+    const bool clockEnds = timeBudgetSec > 0.0 || runForever || (noiseTarget > 0.0 && noiseSpp == 0);
     if (intervalSec <= 0.0) intervalSec = 15.0;
 
     // --- disk resume (mode R / D): reload a saved SUM film + spp count from the .ftbuf
@@ -18574,6 +18601,8 @@ static int runSppProgressive(
                     checkpointPath(outPath).c_str(), baseSpp);
     }
     const bool haveBase = baseSpp > 0 && base.film.resX == res && base.film.resY == resY;
+    const long long sppTarget = clockEnds ? kUnboundedSpp
+                              : noiseSpp > 0 ? std::max(1LL, noiseSpp - baseSpp) : sppReq;
 
     if (preview) { enableAnsiTerminal(); g_previewRows = 0; }
     // Trap Ctrl-C (and Windows Ctrl-Break) so a long render stops cleanly with the
@@ -18592,6 +18621,7 @@ static int runSppProgressive(
 
     SppProgress prog;
     prog.sampleBase = baseSpp;   // bias fresh seeds past the loaded samples
+    prog.clockEnds = clockEnds;
     long long lightEpochs = haveBase ? base.lightEpochs : 0;   // mode J's, kept through the resume
     prog.lightEpochs = &lightEpochs;
     TrailingRate sppMeter;
@@ -18857,15 +18887,19 @@ static int runCompositeProgressive(
                 if (blurP) acc.spec.merge(sp);
             } else
 #endif
+            // A stop abandons the batch's backward pass part-way (abandonOnStop), and the
+            // partial films are dropped: the forward half above keeps its own count.
             if (blurP) {
                 Film sp; sp.resX = res; sp.resY = resY; sp.alloc();
                 r = renderBackward(scene, cam, res, resY, dSpp, nThreads, diffraction,
-                                   (uint64_t)acc.spp, false, nullptr, 0, -1, &sp);
-                acc.spec.merge(sp);
+                                   (uint64_t)acc.spp, false, nullptr, 0, -1, &sp,
+                                   /*abandonOnStop*/true);
+                if (!r.abandoned) acc.spec.merge(sp);
             } else
                 r = renderBackward(scene, cam, res, resY, dSpp, nThreads, diffraction,
-                                   (uint64_t)acc.spp);
-            acc.ref.merge(r); acc.spp += dSpp;
+                                   (uint64_t)acc.spp, false, nullptr, 0, -1, nullptr,
+                                   /*abandonOnStop*/true);
+            if (!r.abandoned) { acc.ref.merge(r); acc.spp += dSpp; }
         }
         // The next batch, adapted toward ~0.5 s so early frames appear fast, a stop or a save
         // lands soon, and overhead stays low. Both layers draw each photon and each sample by its
@@ -19769,7 +19803,7 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
 #endif
             return cpuSppChunks(sppTarget, p, res, resY,
                 [&](long long c, unsigned long long off) {
-                    // cpuSppChunks drops a stopped chunk, so it may be abandoned part-way.
+                    // cpuSppChunks drops an abandoned chunk, so it may stop part-way.
                     return renderBackward(scene, cam, res, resY, c, nThreads, diffraction, off,
                                           false, nullptr, 0, -1, nullptr, /*abandonOnStop*/true);
                 });
@@ -29726,6 +29760,13 @@ static int run(int argc, char** argv) {
                                               g_pmCaustics ? &pmC : nullptr);
                 });
             std::string op = outFor(rc.name);
+            // A stop inside the frame leaves it unfinished (partial bands, or fewer samples
+            // than `spp`): not written, as a frame the stop never reached is not.
+            if (f.abandoned) {
+                std::printf("[camera] '%s' stopped part-way: %s not written\n",
+                            rc.name.c_str(), op.c_str());
+                break;
+            }
             if (toRender.size() > 1)
                 std::printf("[camera] '%s' (mode M, %dx%d) -> %s\n",
                             rc.name.c_str(), rc.res, rc.resY, op.c_str());
