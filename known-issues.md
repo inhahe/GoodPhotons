@@ -670,6 +670,19 @@ the ball 1.0030, the haze round it 1.0018 (each mode's seed spread 0.0004 and 0.
 0.9997. With keys at ±40 m, the ball at x = 32: the ball 1.0275 and the haze 1.0260 (spread
 0.0002). So D is biased bright, by an amount that grows with the mover's distance past the
 instant's sphere: a few tenths of a percent close by, a few percent tens of metres out.
+**And it is not only a blur's.** The same ball held still at x = 6.4 (no motion, so inside the
+scene's own sphere): mode D 1.0175 of mode R on the ball, 1.0113 on the haze (spread 0.0002 and
+0.003). A still scene's sun subpath walks the haze from the entry disc's plane, `sceneRadius +
+(y - centre) . dir` to its first vertex y, where every NEE leg counts `|centre - y| +
+sceneRadius`, never less; so D and J weigh together strategies that disagree in any unbounded
+sunlit haze. HAZE-SUN-B's "mode D agrees with R here (1.012)" was this, read as agreement. The
+fix is the user's decision (TODO 4.1): (a) weigh a sun subpath's first leg by the NEE leg's
+haze, `exp(-sigma_t (L_nee - L_walk))` over the unbounded media (exact for them, being
+homogeneous; bounded media inside the sphere cross whole either way), in modes D and J on both
+devices, moving D and J 1-2 % dimmer to meet R; or (b) end every NEE leg, and a camera path's
+escape, at the entry plane's slab instead -- one domain shared with the subpaths and the
+forward photons -- moving R (and D and J's NEE strategies) 1-2 % brighter. The scenes and the
+comparison: `scraps/hazeblur/` (haze, clear, far and still `.ftsl`, `run*.sh`, `cmp.py`).
 Reproduce: a ball that sweeps
 from inside the scene's sphere to outside it across a shutter, under `light sun` in
 `medium { sigma_t 0.04 }` with no bounds; compare mode D's and mode R's ball (CPU, matched

@@ -125,8 +125,8 @@ Each names the section its line is in.
     per-call wavelength strata, a second clock dependence); its review's follow-ups 0.434.24 (a
     golden-ratio wavelength sequence in place of the strata, a resume's fresh first light side).
 18. **HAZE-BLUR-DOMAIN** (4.2) — under a blur, modes D and J weigh together strategies that take
-    different haze for a mover outside the instant's sphere. Measure first; one fix needs the
-    user's word.
+    different haze for a mover outside the instant's sphere. Measured 2026-11-06: not only a
+    blur's, 1-2 % in any unbounded sunlit haze; blocked on the user's choice of domain (4.1).
 19. **GLOSSY-SAMPLE-SITES** (4.4) — the interference factor applied by hand at two dozen sites.
 20. **JSPEC-CARRIER-SIZE** (4.5) — every mode-J GPU thread reserves the spectral carrier.
 21. **RADCACHE-BATCHES** (4.5) — `-radcache`'s fixed batches outlast `-stop` and the interval.
@@ -140,6 +140,14 @@ Then the rest of 4.2-4.6 in their order, 4.7's bookkeeping alongside whatever to
 
 ### 4.1 Decisions the user owes (each blocks its fix)
 
+- [ ] **HAZE-BLUR-DOMAIN** (measured 2026-11-06 on 0.434.24) — in an unbounded sunlit haze, modes
+  D and J's sun subpaths walk the haze from the entry disc's plane while their NEE legs, and mode
+  R's, count it out to `|centre - p| + sceneRadius`. So D reads 1-2 % brighter than R in a still
+  scene (1.0175 on a sunlit ball, 1.011 on the haze), and more for a mover far past the instant's
+  sphere under a blur (1.0275 at 32 m). (a) Weigh the subpaths' first leg by the NEE leg's haze:
+  R stays, D and J move 1-2 % dimmer to meet it. (b) End every NEE leg at the entry plane's slab,
+  the domain the subpaths and the forward photons already use: R (and D and J's NEE strategies)
+  move 1-2 % brighter. Recommended: (a), since R is the reference and HAZE-SUN-B kept its domain.
 - [x] **J-CPU-NONDET** — decided 2026-11-06: (b), done in 0.434.21 (`tools/check_jdeterminism.py`).
   CPU mode J is not repeatable at a fixed `-spp`, because its light-side
   epochs end on the clock (renderChunked: an epoch lasts its rebuild time over `-beamrefresh`'s
