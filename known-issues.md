@@ -568,8 +568,20 @@ each call's samples, and `cpuSppChunks` sizes the calls by the clock, so even a 
 moved with the machine's speed and thread count (cornell at 256 spp: `-t 1` against 32,
 rel-RMS 0.47). It now stratifies by a sample's absolute index over the frame's `-spp`, as the
 device always has (`renderPhotonCamera`'s `sppTotal`). `tools/check_jdeterminism.py` holds mode M
-too (0.434.22 fails it); cornell at 256 spp is identical at `-t 1`, 7 and 32. The rest of this
-entry is how it stood.
+too (0.434.22 fails it); cornell at 256 spp is identical at `-t 1`, 7 and 32.
+
+**0.434.24 (review of 0.434.23)** replaced those strata. Strata over the frame's samples tilted a
+pixel's spectrum wherever only part of them rendered: a resume (its samples past the loaded ones
+cover only the upper strata, and those past the new `-spp` none), a stopped render or a live
+image (the lower strata only), and each epoch (one slice). The CPU shared path (flybys,
+`-beamfreeze`, `-savemap`) also still stratified per clock-sized call. Each sample now takes the
+golden-ratio sequence's point at its absolute index (`goldenFrac`, rng.h), any run of which is
+even, on both devices. The same review moved both loops onto one rule (`bdpt::CountedEpochs`),
+counted each segment a mode M camera path traces (final-gather rays and bounces were free),
+summed a query's candidates before the thread-local add, stopped the realization counts from
+including a light side drawn but never rendered, and salted a resumed render's first light side
+past the loaded samples (it gathered from the first session's epoch 0 again;
+check_jdeterminism holds that too). The rest of this entry is how it stood.
 
 Mode J's half of this was J-CPU-NONDET (below). Mode M has the same refresh rule in its own loop
 (main.cpp, the mode-M epoch loop: an epoch lasts its rebuild time over `-beamrefresh`'s share), so

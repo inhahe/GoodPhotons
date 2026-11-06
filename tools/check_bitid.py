@@ -25,7 +25,7 @@ a few samples:
 And one scene with modes of its own (SCENE_MODES):
   fog      a heterogeneous coloured fog in a grey box, CPU mode J only, at 256 spp and
            -beamrefresh 0.5: several light-side epochs, whose layout on the CPU follows work
-           counts (bdpt.h JWork), with the merges' transmittance estimates drawing from the
+           counts (workcount.h), with the merges' transmittance estimates drawing from the
            camera's stream -- the case a single sample cannot show.
 
 `compare` prints, per case, "identical", or how it differs: the pixels that changed, the

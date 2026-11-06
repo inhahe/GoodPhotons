@@ -447,6 +447,7 @@ struct PhotonMap {
         if (photons.empty()) return;
         int ix, iy, iz; cellCoord(p, ix, iy, iz);
         const double r2 = r * r;
+        long long cand = 0;   // the candidates tested: a gather's cost, for the CPU refresh
         // No per-axis bounds tests: the lattice is hashed, so an out-of-bbox cell coordinate is
         // a legal bucket lookup that simply finds no photon within r (or finds an aliased one
         // and rejects it on distance, below).
@@ -461,7 +462,7 @@ struct PhotonMap {
                     // ~85% of the candidates in this 3x3x3 box fail the test, and for those
                     // the fat payload record is never touched at all.
                     const Vec3* __restrict pp = pos.data();
-                    bdpt::tlCandidates() += cellStart[c + 1] - cellStart[c];   // a gather's cost
+                    cand += cellStart[c + 1] - cellStart[c];
                     for (int k = cellStart[c]; k < cellStart[c + 1]; ++k) {
                         Vec3 d = p - pp[k];
                         double d2 = dot(d, d);
@@ -470,6 +471,7 @@ struct PhotonMap {
                 }
             }
         }
+        bdpt::tlCandidates() += cand;
     }
 
     // ------------------------- PER-QUERY ADAPTIVE GATHER RADIUS -------------------------
@@ -518,6 +520,7 @@ struct PhotonMap {
         const double r2 = radius * radius;
         const double invR2 = 1.0 / r2;
         int ix, iy, iz; cellCoord(p, ix, iy, iz);
+        long long cand = 0;   // the candidates tested, as queryR counts them
         for (int dz = -1; dz <= 1; ++dz) {
             const int cz = iz + dz;
             for (int dy = -1; dy <= 1; ++dy) {
@@ -525,7 +528,7 @@ struct PhotonMap {
                 for (int dx = -1; dx <= 1; ++dx) {
                     const int c = (int)cellIndex(ix + dx, cy, cz);
                     const Vec3* __restrict pp = pos.data();
-                    bdpt::tlCandidates() += cellStart[c + 1] - cellStart[c];   // a gather's cost
+                    cand += cellStart[c + 1] - cellStart[c];
                     for (int k = cellStart[c]; k < cellStart[c + 1]; ++k) {
                         Vec3 d = p - pp[k];
                         const double d2 = dot(d, d);
@@ -543,6 +546,7 @@ struct PhotonMap {
                 }
             }
         }
+        bdpt::tlCandidates() += cand;
         // Largest i (smallest shell) whose cumulative population still reaches k.
         long long C = 0;
         for (int i = kAdaptBins - 1; i >= 0; --i) {

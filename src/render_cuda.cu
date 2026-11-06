@@ -20804,27 +20804,25 @@ __global__ void kGather(DScene sc, DPhotonMap pm, DPhotonMap pmC, DBeamMap bm, c
         int py = (int)(pix / resX);
 
         double pdf = 0.0;
-        // STRATIFIED hero wavelength (0.314.0): sample s of this pixel's sppTotal takes stratum s
-        // of the emission CDF, jittered within the stratum, under a per-pixel random rotation so
-        // neighbouring pixels do not walk the spectrum in step. One monochromatic sample's CIE
-        // weight varies 0..1 across the band, which at 32 spp was +-25 % of luminance on any
-        // bright spectral term -- the sun's disc through the cloud twinkled frame to frame, and
-        // the rainbow's chroma grain was mostly this. Stratified over N strata the same integral
-        // converges like 1/N^1.5 instead of 1/sqrt(N). The jitter draw stands in for the sampler's
-        // own uniform, so the rest of the sample's stream is unchanged. Host twin:
-        // renderPhotonCamera (photonmap_render.h), which stratifies within its chunk.
-        const long long sIdx = gidx - pix * sppTotal;
-        Real lambda;
-        if (sppTotal > 1 && sIdx >= 0 && sIdx < sppTotal) {
-            DRng rrot;
-            rrot.seedUnit((unsigned long long)pix, seedBase ^ 0x5851F42D4C957F2DULL);
-            double u = (double)rrot.uniform() + ((double)sIdx + (double)rng.uniform()) / (double)sppTotal;
-            u -= floor(u);
-            if (!(u < 1.0)) u = 0.999999999;
-            lambda = dSampleSceneLambdaU(sc, u, pdf);
-        } else {
-            lambda = dSampleSceneLambda(sc, rng, pdf);
-        }
+        // STRATIFIED hero wavelength (0.314.0): sample s of this pixel takes the s-th point of the
+        // golden-ratio sequence over the emission CDF, under a per-pixel random rotation so
+        // neighbouring pixels do not walk the spectrum in step and every sample is uniform. One
+        // monochromatic sample's CIE weight varies 0..1 across the band, which at 32 spp was
+        // +-25 % of luminance on any bright spectral term -- the sun's disc through the cloud
+        // twinkled frame to frame, and the rainbow's chroma grain was mostly this; spread evenly
+        // the same integral converges nearly like 1/N instead of 1/sqrt(N). A sequence rather than
+        // N strata because any run of it is even: a stop that keeps only the launch's first
+        // chunks keeps a tilt-free spectrum. `s` counts from this call's first sample, the call
+        // being one epoch under its own salt (the shared path's refresh loop). Host twin:
+        // renderPhotonCamera (photonmap_render.h), whose goldenFrac (rng.h) this computes.
+        const unsigned long long sIdx = (unsigned long long)(gidx - pix * sppTotal);
+        DRng rrot;
+        rrot.seedUnit((unsigned long long)pix, seedBase ^ 0x5851F42D4C957F2DULL);
+        double u = (double)rrot.uniform()
+                 + (double)((sIdx * 0x9E3779B97F4A7C15ULL) >> 11) * (1.0 / 9007199254740992.0);
+        u -= floor(u);
+        if (!(u < 1.0)) u = 0.999999999;
+        Real lambda = dSampleSceneLambdaU(sc, u, pdf);
         // Retire on the reject path too. It is a rare sample, but an undercount here would
         // leave the bar stalled just short of 100% at the end of a launch — which reads as
         // exactly the wedged render this counter exists to rule out.

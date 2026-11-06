@@ -20632,22 +20632,16 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
             // rebuild at -beamrefresh's share. The device, and any render under a
             // -time/-noise/-forever budget, keeps the clock.
             const bool countEpochs = !useGpu && !budgetedJ && !nFixed && !blurEpochsJ;
-            long long lightWorkJ = 0;              // the last rebuild's light-side units
-            long long camWorkJ = 0, camSppJ = 0;   // camera-side units, and the samples they bought
-            // The samples a rebuild of `units` buys at -beamrefresh's share, at least one and at
-            // most what is left: clamped as a double, since a tiny share makes it huge.
-            const auto countedLen = [&](long long units) -> long long {
-                const long long left = sppTarget - sppAll;
-                if (camSppJ <= 0 || camWorkJ <= 0) return std::min(1LL, left);
-                const double q = (double)units / (g_beamRefreshFrac * (double)camWorkJ / (double)camSppJ);
-                if (!(q < (double)left)) return left;
-                return std::max(1LL, (long long)std::ceil(q));
-            };
-            long long extend0 = 0;   // epoch 0's samples still to render on its own map, after the pricing one
+            long long lightWorkJ = 0;   // the last rebuild's light-side units
+            bdpt::CountedEpochs counted;
+            counted.target = sppTarget;
+            counted.share  = g_beamRefreshFrac;
+            counted.build0 = build0WorkJ;
             for (; !stopAll && sppAll < sppTarget && !ft::stopRequested(); ++epoch) {
                 double rebuildSec = 0.0;
-                const bool continuing = extend0 > 0;   // this iteration carries on epoch 0
+                const bool continuing = countEpochs && counted.continuing();   // on epoch 0's map
                 const uint64_t want = nFixed ? (uint64_t)((base + sppAll) / epLen) : epoch;
+                bool drew = false;   // this iteration drew a realization
                 if (nFixed ? want != lsEpoch : (epoch > 0 && !continuing)) {
                     nBlurJ = sizeEpochsJ ? nNextJ : 0;
                     const long long lw0 = bdpt::jWork().light.load(std::memory_order_relaxed);
@@ -20660,6 +20654,7 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
                     if (photonsPtr) photonsPtr = curS;
                     lsEpoch = want;
                     ++nRealized;
+                    drew = true;
                     keepLightEpochs();
                     // A refresh that came back empty would leave the gather pointing at an
                     // empty map, which silently turns the rest of the render into mode D.
@@ -20760,12 +20755,7 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
                 // own `quiet` argument follows one screen up. Restored immediately after, so
                 // any later non-epoch caller narrates normally.
                 g_gpuQuietRebuild = (epoch != 0);
-                long long countLen = 0;
-                if (countEpochs)
-                    countLen = continuing ? extend0
-                             : (epoch == 0) ? std::min(1LL, sppTarget - sppAll)   // the pricing sample
-                             : countedLen(lightWorkJ);
-                extend0 = 0;
+                const long long countLen = countEpochs ? counted.next(lightWorkJ, sppAll) : 0;
                 const long long cw0 = bdpt::jWork().cam.load(std::memory_order_relaxed);
                 const auto tg = clk::now();
                 Film f = renderEpoch(nFixed ? std::min<long long>((long long)(want + 1) * epLen, total)
@@ -20774,16 +20764,8 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
                                      &inner, held);
                 const double callSec = std::chrono::duration<double>(clk::now() - tg).count();
                 const long long cw = bdpt::jWork().cam.load(std::memory_order_relaxed) - cw0;
+                if (countEpochs) counted.rendered(cw, epochSpp, sppAll);
                 if (countEpochs && epochSpp > 0) {
-                    camWorkJ += cw;
-                    camSppJ  += epochSpp;
-                    // Priced, epoch 0 runs on to its own build's share (less the sample just
-                    // rendered) before the first rebuild, as the clock would let it.
-                    if (epoch == 0 && !continuing && build0WorkJ > 0) {
-                        const long long l0 = countedLen(build0WorkJ);
-                        if (l0 > 1 && sppAll + epochSpp < sppTarget)
-                            extend0 = std::min(l0 - 1, sppTarget - sppAll - epochSpp);
-                    }
                     // FTRACE_JWORK=1: each side's units and seconds, for checking the units'
                     // relative costs (bdpt::JWork) against the clock they stand in for.
                     static const bool jworkDiag = std::getenv("FTRACE_JWORK") != nullptr;
@@ -20817,7 +20799,10 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
                         if (gatherSec > 0.0) nNextJ = sizerJ.next(lastNepochJ, lightSec, gatherSec);
                     }
                 }
-                if (epochSpp <= 0) break;      // produced nothing; refreshing again cannot help
+                if (epochSpp <= 0) {           // produced nothing; refreshing again cannot help
+                    if (drew) { --nRealized; keepLightEpochs(); }   // a realization the film lacks
+                    break;
+                }
                 acc.merge(f);
                 sppAll += epochSpp;
                 // Epoch 0 has rendered its first sample: settle K for the batch. Epoch 0 simply
@@ -21030,8 +21015,17 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
                    bdpt::jWorkBeamBuild(pmC.photons.size()) +
                    (wantBeams ? bdpt::jWorkBeamBuild(bmap.beams.size()) : 0);
         };
+        // A RESUMED render draws its first light side under a salt past every one the loaded
+        // samples used (their count, as each later epoch's saltOff is), so it gathers from no map
+        // the checkpoint already averaged; and under a blur takes its shutter times off the same.
+        const uint64_t saltOff0 = resume
+            ? (uint64_t)peekCheckpointCounts(outPath, res, resY,
+                                             checkpointGuard(scene, mode, res, resY, &cam), mode).N
+            : 0;
+        uint64_t heldSalt = saltOff0;   // the salt offset the held maps were drawn under
+        epochSaltOff = saltOff0;
         atEpoch(0);
-        buildLightSide(0);
+        buildLightSide(0, saltOff0);
         const long long build0WorkM = lightWorkM();
         double buildSec = std::chrono::duration<double>(std::chrono::steady_clock::now() - tp0).count();
         std::printf("mode M: deposited %zu photons from %lld emitted in %s; "
@@ -21041,16 +21035,13 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
         if (pm.photons.empty())
             std::fprintf(stderr, "[mode M] warning: 0 photons deposited — no diffuse "
                                  "surfaces reached? The image will be black.\n");
-        // The frame's samples, over which the camera pass stratifies its wavelengths by absolute
-        // index (renderPhotonCamera); 0 under a budget, which has no total.
-        const long long sppTotalM = (timeBudgetSec > 0.0 || noiseTarget > 0.0 || runForever) ? 0 : spp;
         auto renderEpoch = [&](long long sppTarget, const SppProgress* p) -> Film {
             return cpuSppChunks(sppTarget, p, res, resY,
                 [&](long long c, unsigned long long off) {
                     return renderPhotonCamera(scene, camEpoch, res, resY, pm, c, nThreads,
                                               diffraction, effMaxBounce(), off, g_pmFinalGather,
                                               wantBeams ? &bmap : nullptr,
-                                              g_pmCaustics ? &pmC : nullptr, sppTotalM);
+                                              g_pmCaustics ? &pmC : nullptr);
                 });
         };
         // ---------------------------------------------------------------------------------
@@ -21080,34 +21071,36 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
             EpochSizer sizer(N);
             sizer.keepNeighbours(kGatherC);
             long long nNext = N, nUsed = N;
-            if (blurEpochs) epochSaltOff = prog ? (uint64_t)prog->sampleBase : 0ull;
+            // Every light side of this render is salted past the loaded samples, epoch 0's
+            // included: one the build above drew under another salt is drawn again.
+            const uint64_t saltOff = prog ? (uint64_t)prog->sampleBase : 0ull;
+            epochSaltOff = saltOff;
             // MODEM-CPU-NONDET: at a fixed -spp the refresh rule runs in work counts (bdpt::JWork)
             // instead of seconds, as mode J's does on the CPU (J-CPU-NONDET), so the render repeats
-            // exactly: epoch 0's first sample prices a sample, epoch 0 runs on to its own build's
-            // share, and each later epoch as many samples as keep its rebuild at -beamrefresh's.
+            // exactly (bdpt::CountedEpochs).
             const bool countEpochsM = !blurEpochs && !(timeBudgetSec > 0.0 || noiseTarget > 0.0 ||
                                                        runForever);
-            long long lightWorkJ = 0, camWorkJ = 0, camSppJ = 0;
-            const auto countedLen = [&](long long units) -> long long {
-                const long long left = sppTarget - sppAll;
-                if (camSppJ <= 0 || camWorkJ <= 0) return std::min(1LL, left);
-                const double q = (double)units / (g_beamRefreshFrac * (double)camWorkJ / (double)camSppJ);
-                if (!(q < (double)left)) return left;
-                return std::max(1LL, (long long)std::ceil(q));
-            };
-            long long extend0 = 0;      // epoch 0's samples still to render on its own maps
-            uint64_t nRealM = 1;        // realizations drawn (epoch 0's)
+            long long lightWorkJ = 0;   // the last rebuild's light-side units
+            bdpt::CountedEpochs counted;
+            counted.target = sppTarget;
+            counted.share  = g_beamRefreshFrac;
+            counted.build0 = build0WorkM;
+            // The realizations drawn, numbering each one's salt: epoch 0's, then one per rebuild.
+            uint64_t nRealM = 1;
             for (; !stopAll && sppAll < sppTarget && !ft::stopRequested(); ++epoch) {
                 double rebuildSec = 0.0;
-                const bool continuing = extend0 > 0;   // this iteration carries on epoch 0
-                if ((epoch > 0 && !continuing) || (blurEpochs && epochSaltOff)) {
+                const bool continuing = countEpochsM && counted.continuing();   // on epoch 0's maps
+                const bool redraw0 = epoch == 0 && heldSalt != saltOff;
+                bool drew = false;   // this iteration drew a realization of its own
+                if ((epoch > 0 && !continuing) || redraw0) {
                     auto tr = clk::now();
                     atEpoch(epoch);
                     nUsed = sizeEpochs ? nNext : N;
-                    // Numbered by realization, not iteration: epoch 0's continuation draws none.
-                    buildLightSide(countEpochsM ? nRealM : epoch,
-                                   prog ? (uint64_t)prog->sampleBase : 0ull, nUsed);
-                    ++nRealM;
+                    // Numbered by realization, not iteration: epoch 0's continuation draws none,
+                    // and its redraw replaces it.
+                    buildLightSide(redraw0 ? 0 : nRealM, saltOff, nUsed);
+                    heldSalt = saltOff;
+                    if (!redraw0) { ++nRealM; drew = true; }
                     lightWorkJ = lightWorkM();
                     rebuildSec = std::chrono::duration<double>(clk::now() - tr).count();
                     if (sizeEpochs) sizer.add(nUsed, rebuildSec);
@@ -21128,11 +21121,12 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
                     // then, which the average takes like any other.
                     const bool lost = !sizeEpochs && (pm.photons.empty() || (wantBeams && bmap.empty()));
                     if (lost) {
+                        if (drew) --nRealM;
                         std::fprintf(stderr, "[mode M] light-side refresh produced an empty "
                                              "%s; stopping here with the %lld spp already "
                                              "averaged over %llu realization(s).\n",
                                      pm.photons.empty() ? "photon map" : "beam map",
-                                     sppAll, (unsigned long long)epoch);
+                                     sppAll, (unsigned long long)(epoch == 0 ? 0 : nRealM));
                         break;
                     }
                     if (epoch == 1 && sizeEpochs)
@@ -21140,7 +21134,7 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
                                     "light side at a new time in the shutter, drawing the photons "
                                     "its rebuild can afford against its %lld samples' gather: "
                                     "%lld of %lld now ...\n", blurEpochSpp, nUsed, N);
-                    else if (countEpochsM ? nRealM == 2 : epoch == 1)   // the first redraw
+                    else if (drew && nRealM == 2)   // the first redraw
                         std::printf("mode M: light-side refresh — redrawing %lld photons under "
                                     "a fresh salt every ~%.0f%% of the %s and averaging "
                                     "the realizations, so the MAP noise falls with the render "
@@ -21178,26 +21172,15 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
                     if (countEpochsM) return false;   // the epoch runs its whole share
                     return std::chrono::duration<double>(clk::now() - tEpoch).count() >= epochSec;
                 };
-                long long countLen = 0;
-                if (countEpochsM)
-                    countLen = continuing ? extend0
-                             : (epoch == 0) ? std::min(1LL, sppTarget - sppAll)   // the pricing sample
-                             : countedLen(lightWorkJ);
-                extend0 = 0;
+                const long long countLen = countEpochsM ? counted.next(lightWorkJ, sppAll) : 0;
                 const long long cw0 = bdpt::jWork().cam.load(std::memory_order_relaxed);
                 const long long cc0 = bdpt::jWork().camCand.load(std::memory_order_relaxed);
                 Film f = renderEpoch(blurEpochs ? std::min(sppTarget - sppAll, blurEpochSpp)
                                      : countEpochsM ? countLen : sppTarget - sppAll,
                                      &inner);
+                const long long cw = bdpt::jWork().camSince(cw0, cc0);
+                if (countEpochsM) counted.rendered(cw, epochSpp, sppAll);
                 if (countEpochsM && epochSpp > 0) {
-                    const long long cw = bdpt::jWork().camSince(cw0, cc0);
-                    camWorkJ += cw;
-                    camSppJ  += epochSpp;
-                    if (epoch == 0 && !continuing) {
-                        const long long l0 = countedLen(build0WorkM);
-                        if (l0 > 1 && sppAll + epochSpp < sppTarget)
-                            extend0 = std::min(l0 - 1, sppTarget - sppAll - epochSpp);
-                    }
                     // FTRACE_JWORK=1: each side's units and seconds (bdpt::JWork's constants).
                     static const bool jworkDiagM = std::getenv("FTRACE_JWORK") != nullptr;
                     if (jworkDiagM)
@@ -21208,7 +21191,10 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
                                     epochSpp, cw,
                                     std::chrono::duration<double>(clk::now() - tEpoch).count());
                 }
-                if (epochSpp <= 0) break;      // produced nothing; refreshing again cannot help
+                if (epochSpp <= 0) {           // produced nothing; refreshing again cannot help
+                    if (drew) --nRealM;        // a realization the film lacks
+                    break;
+                }
                 acc.merge(f);
                 sppAll += epochSpp;
                 // Epoch 0's build holds one-time work (the radius searches): sized from epoch 1 on.
@@ -21217,11 +21203,10 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
                     nNext = sizer.next(nUsed, rebuildSec, gatherSec);
                 }
             }
-            const unsigned long long nReal = countEpochsM ? nRealM : (unsigned long long)epoch;
-            if (nReal > 1)
+            if (nRealM > 1)
                 std::printf("mode M: averaged %llu independent light-side realizations "
                             "(%lld spp total) — the map noise fell with the render, not just "
-                            "the gather noise\n", nReal, sppAll);
+                            "the gather noise\n", (unsigned long long)nRealM, sppAll);
             return acc;
         };
         {   // The phase split VOLCACHE asks for (`FTRACE_MSTATS=1`): surface estimate against
@@ -29704,8 +29689,8 @@ static int run(int argc, char** argv) {
             // watch. Verified before the fix on a 6-frame curve: frames landed on disk
             // while the title never advanced past "preparing.".
             //
-            // Routing through cpuSppChunks (what the single-camera mode-M path at ~14447
-            // already does) also makes a slow frame converge ON SCREEN rather than appearing
+            // Routing through cpuSppChunks (what the single-camera mode-M path, runRender's
+            // renderEpoch, already does) also makes a slow frame converge ON SCREEN rather than appearing
             // all at once at the end — which matters at delivery resolution, where one frame's
             // gather is far longer than a window repaint interval. It is bit-identical to the
             // old single-shot call: renderPhotonCamera seeds per (pixel, ABSOLUTE sample), so

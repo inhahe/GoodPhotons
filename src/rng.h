@@ -160,6 +160,14 @@ inline double passTime(uint64_t k, uint64_t salt) {
     return u - std::floor(u);
 }
 
+// The k-th point, in [0, 1), of the golden-ratio (Kronecker) sequence: frac(k * 0.618...), in
+// exact 64-bit fixed point so no k loses precision. Any run of consecutive k -- not only a prefix
+// -- spreads as evenly as such a run can, so a sequence cut anywhere, or resumed anywhere, stays
+// even. Rotated by a uniform offset, each point is uniform. Device twin: kGather (render_cuda.cu).
+inline double goldenFrac(uint64_t k) {
+    return (double)((k * 0x9E3779B97F4A7C15ULL) >> 11) * (1.0 / 9007199254740992.0);
+}
+
 // A unit direction uniform over the sphere, from two uniforms: u1 sets z, u2 the azimuth.
 // pdf = 1/(4 pi).
 inline Vec3 uniformSphere(double u1, double u2) {

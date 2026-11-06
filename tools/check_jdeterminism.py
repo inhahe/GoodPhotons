@@ -4,7 +4,7 @@
 
 `-device cpu` is the reference and validation device, so it must repeat itself. Mode J splits a
 render into light-side epochs, each drawing a new beam map; on the CPU at a fixed -spp an epoch
-ends on work counts (bdpt.h JWork: vertices traced, connections, beams and photons weighed, the
+ends on work counts (workcount.h: vertices traced, connections, beams and photons weighed, the
 beam map's build), not on the clock, which made which samples met which map depend on the
 machine's speed (known-issues J-CPU-NONDET). Mode M's loop does the same (MODEM-CPU-NONDET), and
 its camera pass stratifies its wavelengths by a sample's absolute index rather than within each
@@ -17,7 +17,8 @@ map takes other draws -- rendered at 32x32 in mode J (256 spp, beam merges only)
   - and at one thread, the same again: the counts are sums over the frame, which no division of
     it among threads changes.
 
-Each needs more than one epoch to mean anything, and says how many it got.
+Each needs more than one epoch to mean anything, and says how many it got. And mode M resumed
+from a checkpoint draws its first light side under a salt of its own, not the first session's.
 
 Exits 1 on any failure.
 """
@@ -94,6 +95,25 @@ def main():
         check("mode %s: a second run is byte for byte the first" % mode, second == first)
         single, _ = render(mode, "t1", ("-t", "1"))
         check("mode %s: so is a run at one thread" % mode, single == first)
+
+    # A resumed mode M render must not gather from a light side the checkpoint already averaged:
+    # its first is drawn under a salt past the loaded samples', so it deposits another count.
+    def deposited(spp, extra):
+        png = os.path.join(d, "M_resume.png")
+        cmd = [exe, "-in", ftsl, "-device", "cpu", "-max-bounce", "8", "-no-meter", "-hdr",
+               "-seed", "1", "-o", png, "-mode", "M", "-beams", "-n", "20000", "-spp", str(spp),
+               "-beamrefresh", "0.5"] + list(extra)
+        p = subprocess.run(cmd, cwd=d, capture_output=True, text=True, encoding="utf-8",
+                           errors="replace")
+        if p.returncode != 0:
+            print((p.stdout + p.stderr)[-1500:])
+            raise SystemExit("render failed: " + " ".join(cmd))
+        m = re.search(r"mode M: deposited (\d+) photons", p.stdout)
+        return int(m.group(1)) if m else -1
+    d0 = deposited(16, ("-checkpoint",))
+    d1 = deposited(32, ("-checkpoint", "-resume"))
+    check("mode M: a resume draws its first light side afresh", d0 > 0 and d1 > 0 and d1 != d0,
+          "%d photons, then %d" % (d0, d1))
     if fails:
         print("FAILED: " + ", ".join(fails))
         return 1

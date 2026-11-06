@@ -5,10 +5,13 @@
 // under a -time/-noise/-forever budget -- but measured in counts, which a machine's speed cannot
 // change, so the render repeats exactly, at any thread count (known-issues J-CPU-NONDET,
 // MODEM-CPU-NONDET). One unit: a vertex traced (a light subpath's or a camera sample's), a
-// connection evaluated, a beam, photon or photon-map candidate a camera-side gather weighs; a
-// rebuild adds kJWorkRebuildFixed, and each map it builds kJWorkPerBeamLog per item times the log
-// of the map's size. Both sides accumulate per thread and add once per pass.
+// segment of a mode-M camera path traced, a connection evaluated, a beam or photon a camera-side
+// gather weighs; a photon-map query's candidate is a sixteenth of one (tlCandidates). A rebuild
+// adds kJWorkRebuildFixed, and each map it builds kJWorkPerBeamLog per item times the log of the
+// map's size. Both sides accumulate per thread and add once per pass. CountedEpochs turns the
+// counts into epoch lengths.
 #pragma once
+#include <algorithm>
 #include <atomic>
 #include <cmath>
 #include <cstddef>
@@ -28,12 +31,12 @@ struct JWork {
 };
 inline JWork& jWork() { static JWork w; return w; }
 
-// A camera thread's count where no weight object carries a pointer to one (mode M's camera rays
-// and beam gathers): CamWorkFlush adds it to jWork().cam when the thread's pass ends. A photon
-// map's query candidates go to tlCandidates and camCand instead, at a sixteenth of a unit each
-// (JWork::camSince): a candidate
-// is one distance test, and mode M's photon trace measured some 18x a candidate's cost per unit
-// on scenes/cornell.ftsl (FTRACE_JWORK=1), where a beam hit costs about what a light unit does.
+// A camera thread's count where no weight object carries a pointer to one (mode M's camera
+// segments and beam gathers): CamWorkFlush adds it to jWork().cam when the thread's pass ends. A
+// photon map's query candidates go to tlCandidates and camCand instead, at a sixteenth of a unit
+// each (JWork::camSince): a candidate is one distance test, and mode M's photon trace measured
+// some 18x a candidate's cost per unit on scenes/cornell.ftsl (FTRACE_JWORK=1), where a beam hit
+// costs about what a light unit does.
 inline long long& tlWork() { thread_local long long w = 0; return w; }
 inline long long& tlCandidates() { thread_local long long c = 0; return c; }
 struct CamWorkFlush {
@@ -58,5 +61,52 @@ inline long long jWorkBeamBuild(size_t nBeams) {
     return nBeams ? (long long)(kJWorkPerBeamLog * (double)nBeams * std::log2((double)nBeams + 1.0))
                   : 0;
 }
+
+// The counted refresh rule: how many samples each render call of a counted refresh loop takes.
+// A light side of `units` buys the samples whose camera work keeps it at -beamrefresh's share of
+// the two, a sample priced at the camera work of every sample rendered so far. The first call
+// renders one sample, which prices a sample; epoch 0 then runs on, on the same maps, to its own
+// build's share (`build0`), as the clock would let it; each later epoch runs its rebuild's share.
+// A loop asks next() before each call, and tells rendered() what the call did.
+struct CountedEpochs {
+    long long target = 0;   // the frame's samples
+    double share = 0.1;     // -beamrefresh
+    long long build0 = 0;   // epoch 0's light side, in units (0: epoch 0 does not run on)
+
+    // Whether the next call carries on epoch 0, on its maps, rather than following a rebuild.
+    bool continuing() const { return rest0 > 0; }
+    // The next call's samples, `done` of the target rendered and `rebuild` the units of the light
+    // side drawn for it (unread for epoch 0's calls).
+    long long next(long long rebuild, long long done) const {
+        if (rest0 > 0) return rest0;
+        return camSpp > 0 ? lenFor(rebuild, done) : std::min(1LL, target - done);
+    }
+    // A call rendered `spp` samples (none: the loop ends) for `units` of camera work, `done` of
+    // the target rendered before it.
+    void rendered(long long units, long long spp, long long done) {
+        const bool priced = camSpp > 0;
+        rest0 = 0;
+        if (spp <= 0) return;
+        camWork += units;
+        camSpp  += spp;
+        if (!priced && build0 > 0) {
+            const long long l0 = lenFor(build0, done);
+            if (l0 > 1 && done + spp < target) rest0 = std::min(l0 - 1, target - done - spp);
+        }
+    }
+
+private:
+    long long camWork = 0, camSpp = 0;   // camera units so far, and the samples they bought
+    long long rest0 = 0;                 // epoch 0's samples still to render on its own maps
+    // The samples `units` of light side buy, at least one and at most what is left: clamped as a
+    // double, since a tiny share makes the quotient huge.
+    long long lenFor(long long units, long long done) const {
+        const long long left = target - done;
+        if (camSpp <= 0 || camWork <= 0) return std::min(1LL, left);
+        const double q = (double)units / (share * (double)camWork / (double)camSpp);
+        if (!(q < (double)left)) return left;
+        return std::max(1LL, (long long)std::ceil(q));
+    }
+};
 
 }  // namespace bdpt

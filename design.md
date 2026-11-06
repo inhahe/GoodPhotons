@@ -813,13 +813,16 @@ That turned out to be the smaller half. With the transmittance averaged the disc
 3100–5300 between seeds while every other pixel stayed bit-identical: the rest was the **hero
 wavelength** — each camera sample evaluates the disc's blackbody at one λ, and CIE-Y under a
 random λ has ~140 % relative spread, ±25 % at 32 spp. So (0.314.0) the gather **stratifies λ
-across a pixel's samples**: in `kGather` sample `s` of `sppTotal` takes stratum `s` of the
-emission CDF (`dSampleSceneLambdaU`), jittered within the stratum, under a per-pixel random
-rotation (a `DRng` seeded from the pixel) so neighbours do not walk the spectrum in step; the
-jitter draw stands in for the sampler's own uniform, so the sample's remaining stream is
-unchanged. `renderPhotonCamera` does the same per chunk (`photonGather(..., lambdaU)`,
-`EmitSampler::sampleAt`), each chunk being a complete stratification on its own. This is the
-1/√N → ~1/N^1.5 improvement of every bright spectral term in mode M's gather, not just the disc.
+across a pixel's samples**: sample `s` takes the `s`-th point of the golden-ratio sequence
+(`goldenFrac` in rng.h, exact in 64-bit fixed point) over the emission CDF
+(`dSampleSceneLambdaU`; `photonGather(..., lambdaU)`, `EmitSampler::sampleAt` on the host), under
+a per-pixel random rotation so neighbours do not walk the spectrum in step and each sample is
+uniform. On the host `s` is the sample's absolute index in the frame, on the device its index in
+the call (one epoch, under its own salt). Since 0.434.24 a sequence rather than N jittered strata:
+any run of it is even, so neither the calls a clock sizes, nor an epoch's slice, nor a resume, nor
+a stop that keeps a prefix can tilt a pixel's spectrum, where strata over the frame's samples tilted
+all four. This is the 1/√N → ~1/N improvement of every bright spectral term in mode M's gather,
+not just the disc.
 
 **Cost.** Per camera segment and medium: 64 shadow rays and 64 short ratio-tracking calls, plus
 the incremental camera transmittance -- independent of the beam count, which is the point; the
@@ -2195,9 +2198,11 @@ and the device keep the clock. **Mode M's CPU loop does the same since 0.434.23*
 (MODEM-CPU-NONDET; the counters live in `workcount.h`): its light units are the photon paths and
 each grid's or map's build, its camera units the rays, the beams weighed and a sixteenth of each
 photon-map query candidate (thread-local, flushed per pass, the candidates divided once over the
-whole span). Its camera pass also stratifies wavelengths by absolute sample index over the frame's
-`-spp` (`renderPhotonCamera`'s `sppTotal`, as the device does) rather than within each
-clock-sized call.
+whole span), and each segment its paths trace. Its camera pass also draws wavelengths by absolute
+sample index (the golden-ratio sequence above) rather than per clock-sized call. Both loops take
+their lengths from one rule, `bdpt::CountedEpochs`. A resumed mode M render draws its first light
+side under a salt past the loaded samples' (as mode J's `lsSalt0`), so it gathers from no map the
+checkpoint averaged.
 
 **MODE `J`'S SURFACE LIGHT SIDE RUNS ON THE DEVICE, PER CHUNK (0.272.0).** `-jsurf`'s surface
 photon map is traced by `kJSurfLightT` — the device twin of the deposit in `traceLightBeamPass` —
