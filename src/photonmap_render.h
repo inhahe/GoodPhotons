@@ -1468,7 +1468,7 @@ inline Vec3 photonGatherSub(const Scene& scene, const PhotonMap& pm, Ray ray, Pc
                 const Vec3& o = gd.o;
                 if (dot(o, h.n) <= 0.0) return L;
                 // An iridescent lobe's interference reflectance at the pair's half-vector.
-                if (gd.irid) thr *= gd.R(lambda);
+                thr *= gd.R(lambda);
                 if (gneeOn) {
                     gmis.pdf = bdpt::bsdfPdf(m, h.n, ray.d * -1.0, o, lambda, scene, &h);
                     gmis.from = h.p;

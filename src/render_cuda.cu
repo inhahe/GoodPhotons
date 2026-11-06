@@ -6189,8 +6189,10 @@ __device__ static inline Real dHalfVectorCos(const DVec3& a, const DVec3& b) {
 }
 // Twin of GlossyDraw (render.h): a direction drawn from a glossy lobe, and the factor R the draw
 // leaves beyond the `reflect` slot -- an iridescent lobe's interference reflectance at the pair's
-// half-vector, exactly 1 on a plain lobe. Every device glossy sampler draws through dDrawGlossy
-// or dGlossyAt; how to take R is the caller's.
+// half-vector, exactly 1 on a plain lobe. Every device sampler of a Glossy material's lobe draws
+// through dDrawGlossy or dGlossyAt, and the JSPEC fold (dJFoldLobe) reads the same draw; how to
+// take R is the caller's. Not the RGB backward path, which refuses an iridescent material
+// (cudaBackwardRGBSupported). The draw keeps the hit's address, so it takes no temporary.
 struct DGlossyDraw {
     DVec3 o;
     bool irid;
@@ -6214,6 +6216,10 @@ __device__ static inline DGlossyDraw dDrawGlossy(const DScene& sc, const DMateri
                                                  DRng& rng) {
     return dGlossyAt(sc, m, h, wo, sampleGlossy(reflectv(dIn, n), dMatRoughness(sc, m, h), rng));
 }
+__device__ DGlossyDraw dGlossyAt(const DScene&, const DMaterial&, const DHit&&, const DVec3&,
+                                 const DVec3&) = delete;
+__device__ DGlossyDraw dDrawGlossy(const DScene&, const DMaterial&, const DHit&&, const DVec3&,
+                                   const DVec3&, const DVec3&, DRng&) = delete;
 // Twin of glossyF: r * lobe / cos(wi), the lobe mirrored about wo, r the reflect slot times an
 // iridescent glossy's interference reflectance; 0 unless both lie above `ns` and wi in the lobe.
 // Double, as dBsdfF is.
@@ -15943,7 +15949,7 @@ __device__ static bool bkInteract(const DScene& sc, const DMaterial* mp, const D
             if (dot(o, h.n) <= 0) return false;
             // An iridescent lobe's interference reflectance at the pair's half-vector (the NEE
             // above carries it inside dGlossyFHit).
-            if (gd.irid) thr *= gd.R(lambda);
+            thr *= gd.R(lambda);
             if (gm) {                    // the other half of the weight, for whatever `o` hits
                 gm->pdf = dGlossyPdfHit(sc, *mp, h, rd * (Real)(-1), o);
                 gm->from = h.p;
@@ -16682,8 +16688,15 @@ __device__ static void bkRadianceHeroLoop(const DScene& sc, int diffraction,
                         dWhittedGlossyDir(reflectv(rd, h.n), dMatRoughness(sc, *mp, h), gi.sIdx, b));
                     const DVec3& o = gd.o;
                     if (dot(o, h.n) <= 0) return;
-                    if (gd.irid)   // interference reflectance at the half-vector, per λ
-                        for (int i = 0; i < nUp; ++i) thr[i] *= (double)gd.R(lam[i]);
+                    if (gd.irid) {   // interference reflectance at the half-vector, per λ
+                        double thrMax = 0.0;
+                        for (int i = 0; i < nUp; ++i) {
+                            thr[i] *= (double)gd.R(lam[i]);
+                            if (thr[i] > thrMax) thrMax = thr[i];
+                        }
+                        // the bundle's bailout again, as the scalar walk's dWhittedAttenuate takes it
+                        if (thrMax * dLocalN2(sc, stk, lam[0]) <= kWhittedCutoff) return;
+                    }
                     if (sc.bkGlossyNee)   // the other half of the weight -- see the scalar twin
                         { gmis.pdf = dGlossyPdfHit(sc, *mp, h, rd * (Real)(-1), o);
                           gmis.from = h.p; gmis.n = h.n; }
@@ -17654,11 +17667,13 @@ __device__ static double dStepFactorAt(const DScene& sc, const DMaterial& m, con
 // vcm.h scatterSample, where the reasoning lives). The slots are read through the shape the walk's
 // own read captured (`jbS`: patterns, records, stochastic tiling and coats included; `tpS` the
 // transmit pattern), a dielectric step through its record. `cH` is an iridescent glossy's
-// half-vector cosine, `hmRefl` whether a half mirror reflected, `reflLobe` whether a
-// diffuse-transmit lobe did. Hair and the grating fold where they are sampled.
+// draw (dDrawGlossy), whose interference factor it re-weighs, `hmRefl` whether a half mirror
+// reflected, `reflLobe` whether a diffuse-transmit lobe did. Hair and the grating fold where they
+// are sampled.
 __device__ static void dJFoldLobe(DJSpecRun& jr, const DScene& sc, const DMaterial& m, const DHit& h,
                                   const DVec3& rd, Real lambda, const DJBase& jbS, Real tpS,
-                                  const DStepRecord& jSt, Real cH, bool hmRefl, bool reflLobe) {
+                                  const DStepRecord& jSt, const DGlossyDraw& gd, bool hmRefl,
+                                  bool reflLobe) {
     switch (m.type) {
         case D_DIFFUSE:
         case D_FLUORESCENT:
@@ -17667,8 +17682,7 @@ __device__ static void dJFoldLobe(DJSpecRun& jr, const DScene& sc, const DMateri
             const bool dif = (m.type == D_DIFFUSE || m.type == D_FLUORESCENT);
             auto fJ = [&](double L) {
                 const double v = dJSlotAt(sc, m, jbS, L, dif);
-                return (m.type == D_GLOSSY && m.iridescence)
-                           ? v * (double)dIridescenceR(sc, m, &h, (Real)L, cH) : v; };
+                return (m.type == D_GLOSSY) ? v * (double)gd.R((Real)L) : v; };
             jr.mul(fJ, fJ((double)lambda), m.type == D_MIRROR);
             break;
         }
@@ -17971,6 +17985,8 @@ __device__ static void dRandomWalk(const DScene& sc, const DCamera& cam, int dif
         if (ddot(dwo, dwo) == 0.0) return;
         DVec3 wo = normalize(dwo);
         DVec3 wi; double pdfW = 0, pdfRevW = 0, betaFactor = 0; int delta = 0; bool terminate = false;
+        DGlossyDraw gd;   // a D_GLOSSY scatter's draw, which its JSPEC fold re-weighs too
+        gd.irid = false; gd.cH = (Real)1;
         // What wi is, for dLeavesWrongSide (host twin randomWalk): a reflection unless the case
         // says otherwise -- DL_TRANSMIT for a lobe drawn through the surface, DL_FREE for a
         // direction no lobe drew about the shading normal.
@@ -18074,13 +18090,13 @@ __device__ static void dRandomWalk(const DScene& sc, const DCamera& cam, int dif
                 break;
             }
             case D_GLOSSY: {
-                const DGlossyDraw gd = dDrawGlossy(sc, *mp, h, rd, path[cur].ns, wo, rng);   // rd == -wo
+                gd = dDrawGlossy(sc, *mp, h, rd, path[cur].ns, wo, rng);   // rd == -wo
                 wi = gd.o;
                 if (dot(wi, path[cur].ns) <= 0) { terminate = true; break; }
-                double r = clamp01(dReflectSlot(sc, *mp, h, lambda, jrun ? &jbS : nullptr));      // per-hit reflect
-                // An iridescent lobe's interference reflectance at the sampled pair's half-vector:
-                // dBsdfF's r for this pair. Host twin bdpt.h randomWalk.
-                if (gd.irid) r *= (double)gd.R(lambda);
+                // per-hit reflect, times an iridescent lobe's interference reflectance at the
+                // sampled pair's half-vector: dBsdfF's r for this pair. Host twin bdpt.h randomWalk.
+                double r = clamp01(dReflectSlot(sc, *mp, h, lambda, jrun ? &jbS : nullptr))
+                         * (double)gd.R(lambda);
                 pdfW = dBsdfPdf(sc, path[cur], wo, wi, lambda);
                 pdfRevW = dBsdfPdf(sc, path[cur], wi, wo, lambda);
                 betaFactor = r;
@@ -18212,8 +18228,7 @@ __device__ static void dRandomWalk(const DScene& sc, const DCamera& cam, int dif
         // JSPEC (host twin randomWalk, where the reasoning is): this scatter's factor at every
         // bin over the value `betaFactor` took at lambda. Hair and the grating fold in their cases.
         if (jrun)
-            dJFoldLobe(*jrun, sc, *mp, h, rd, lambda, jbS, tpS, jSt,
-                       mp->iridescence ? dHalfVectorCos(wo, wi) : (Real)1, jHmRefl,
+            dJFoldLobe(*jrun, sc, *mp, h, rd, lambda, jbS, tpS, jSt, gd, jHmRefl,
                        dot(wi, path[cur].ns) > (Real)0);
 
         path[cur].delta = delta;
@@ -19902,7 +19917,7 @@ __device__ static void dPhotonGatherSub(const DScene& sc, const DPhotonMap& pm,
                 const DVec3& o = gd.o;
                 if (dot(o, h.n) <= 0) return;
                 // An iridescent lobe's interference reflectance at the pair's half-vector.
-                if (gd.irid) thr *= (double)gd.R(lambda);
+                thr *= (double)gd.R(lambda);
                 if (!dContinueAlong(h, o, DL_REFLECT, ro, rd)) return; break;
             }
             case D_DIELECTRIC:
@@ -21398,7 +21413,8 @@ __device__ static void dVcmScatter(const DScene& sc, const DMaterial& m, const D
     Real tpS = (Real)1;                                       // the transmit pattern's multiplier
     DStepRecord jSt;
     bool jHmRefl = false, jReflLobe = false;
-    Real jcH = (Real)1;
+    DGlossyDraw gd;   // a D_GLOSSY scatter's draw, which its JSPEC fold re-weighs too
+    gd.irid = false; gd.cH = (Real)1;
     switch (m.type) {
         case D_DIFFUSE:
         case D_FLUORESCENT: {
@@ -21416,14 +21432,12 @@ __device__ static void dVcmScatter(const DScene& sc, const DMaterial& m, const D
             break;
         }
         case D_GLOSSY: {
-            const DGlossyDraw gd = dDrawGlossy(sc, m, h, rd, ns, wo, rng);
+            gd = dDrawGlossy(sc, m, h, rd, ns, wo, rng);
             wi = gd.o;
             if (dot(wi, ns) <= 0) { terminate = true; break; }
-            double r = clamp01(dReflectSlot(sc, m, h, lambda, jr ? &jbS : nullptr));
-            // An iridescent lobe's interference reflectance at the sampled pair's half-vector:
-            // dBsdfF's r for this pair. Host twin vcm.h.
-            jcH = gd.cH;
-            if (gd.irid) r *= (double)gd.R(lambda);
+            // times an iridescent lobe's interference reflectance at the sampled pair's
+            // half-vector: dBsdfF's r for this pair. Host twin vcm.h.
+            double r = clamp01(dReflectSlot(sc, m, h, lambda, jr ? &jbS : nullptr)) * (double)gd.R(lambda);
             pdfW = dBsdfPdf(sc, vt, wo, wi, lambda);
             pdfRevW = dBsdfPdf(sc, vt, wi, wo, lambda);
             betaFactor = r;
@@ -21585,7 +21599,7 @@ __device__ static void dVcmScatter(const DScene& sc, const DMaterial& m, const D
     // VCM-SPEC: the other lobes' factors at every bin (mode J's fold; hair and the grating fold in
     // their cases).
     if (jr && !terminate)
-        dJFoldLobe(*jr, sc, m, h, rd, lambda, jbS, tpS, jSt, jcH, jHmRefl, jReflLobe);
+        dJFoldLobe(*jr, sc, m, h, rd, lambda, jbS, tpS, jSt, gd, jHmRefl, jReflLobe);
 }
 
 // Phase 1: `nPaths` light subpaths. Stores connectible vertices into the per-path slab

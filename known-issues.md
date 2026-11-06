@@ -495,8 +495,9 @@ traces light, after every camera's mode is resolved (`warnHazeOnlyNearScene`; 0.
 and C, 0.434.16-18 for the rest). Bounding the medium makes the modes agree.
 `tools/check_haze_warning.py` holds those modes to the warning (and a sky, two cameras on one
 shared flight, and a -serve session of two scene files), and modes R, D and J, a `-raster`
-preview, a bounded haze, a medium that does not attenuate and a light in the scene to none. The blur half of this entry is HAZE-BLUR-DOMAIN,
-below; the rest is how it stood.
+preview, a bounded haze, a medium that does not attenuate and a light in the scene to none. Modes
+D and J's own disagreement with R in such a haze (1-2 %, still or blurred; the 1.012 below was
+it) is HAZE-BLUR-DOMAIN, below; the rest is how it stood.
 
 `scenes/_haze_sun_b_vs_r.ftsl` (a 2 m floor under a high sun in `medium { sigma_t 0.04  albedo
 0.5 }`, no bounds; 96x72): mode B's floor converges to **0.846** of mode R's, and the haze seen
@@ -645,7 +646,7 @@ with a K from the sample count), which is deterministic but no longer adapts to 
 light side is. Then add a heterogeneous medium at more than one sample to check_bitid's mode-J
 scenes.
 
-## OPEN (2026-11-05, 0.434.16; found in review of 51eb7ef..af7de14): HAZE-BLUR-DOMAIN — under a blur, modes D and J's strategies take different haze for a mover outside the instant's sphere
+## OPEN (2026-11-05, 0.434.16; found in review of 51eb7ef..af7de14; widened 2026-11-06): HAZE-BLUR-DOMAIN — modes D and J's sun subpaths take less unbounded haze than their NEE leg: 1-2 % bright in a still scene, more for a mover far out under a blur
 
 Split from HAZE-SUN-B, whose decision (keep mode R's domain for an unbounded haze) leaves it
 standing. In a scene with motion, a path with a time draws a sun's or a sky's light through the

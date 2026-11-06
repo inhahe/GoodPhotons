@@ -1340,6 +1340,7 @@ inline void randomWalk(const Scene& scene, const Camera& cam, const Renderer& ma
         if (dot(dwo, dwo) == 0.0) return;
         Vec3 wo = normalize(dwo);
         Vec3 wi; double pdfW = 0.0, pdfRevW = 0.0, betaFactor = 0.0;
+        GlossyDraw gd;   // a Glossy scatter's draw, which its JSPEC fold below re-weighs too
         // Hero bundle: per-secondary throughput factor, i.e. secF[i] = f_{i+1}·cos/pdf
         // for the lobe the hero actually sampled (pdf is always the hero's). This is the
         // ABSOLUTE factor, not a ratio to the hero's: a ratio would be undefined exactly
@@ -1416,18 +1417,17 @@ inline void randomWalk(const Scene& scene, const Camera& cam, const Renderer& ma
                 break;
             }
             case MatType::Glossy: {
-                const GlossyDraw gd = drawGlossy(scene, *mp, h, ray.d, cur.ns, wo, rng);   // ray.d == -wo
+                gd = drawGlossy(scene, *mp, h, ray.d, cur.ns, wo, rng);   // ray.d == -wo
                 wi = gd.o;
                 if (dot(wi, cur.ns) <= 0) { terminate = true; break; }
-                double r = clamp01(reflectSlot(scene, *mp, h, lambda));
-                // An iridescent lobe's interference reflectance at the pair's half-vector:
+                // times an iridescent lobe's interference reflectance at the pair's half-vector:
                 // bsdfF's r for this pair.
-                if (gd.irid) r *= gd.R(lambda);
+                double r = clamp01(reflectSlot(scene, *mp, h, lambda)) * gd.R(lambda);
                 // FOLD-GLOSSY (0.260.1): the lobe's direction is wavelength-free, so the claim
                 // survives; the albedo is folded exactly as Diffuse's is above (render.h's
                 // tracePhoton does the same -- one PhotonBeam bank, one rule). Not an iridescent
                 // albedo, which depends on the sampled direction: it retires, as in tracePhoton.
-                if (achroPath && mp->iridescence) {
+                if (achroPath && gd.irid) {
                     fldWhy = FK_DeclineGlossy;
                 } else if (achroPath) {
                     fldK = foldEm ? foldEm->foldN : 0;
@@ -1724,15 +1724,11 @@ inline void randomWalk(const Scene& scene, const Camera& cam, const Renderer& ma
                     jr.mul([&](double L) { return clamp01(diffuseReflectance(scene, *mp, h, L)); },
                            betaFactor, false);
                     break;
-                case MatType::Glossy: {        // f*cos/pdf = r: the reflect slot IS the factor,
-                    // times an iridescent lobe's interference reflectance at the sampled pair
-                    const double cHj = halfVectorCos(wo, wi);
-                    jr.mul([&](double L) {
-                               double r = clamp01(reflectSlot(scene, *mp, h, L));
-                               return mp->iridescence ? r * iridescenceR(scene, *mp, &h, L, cHj) : r; },
+                case MatType::Glossy:          // f*cos/pdf = r: the reflect slot IS the factor,
+                    // times the draw's interference reflectance at the sampled pair
+                    jr.mul([&](double L) { return clamp01(reflectSlot(scene, *mp, h, L)) * gd.R(L); },
                            betaFactor, false);
                     break;
-                }
                 case MatType::DiffuseTransmit: {   // the lobe's albedo over the lambda one
                     const bool reflJ = dot(wi, cur.ns) > 0.0;
                     double rR0, rT0; diffuseTransmitAlbedos(*mp, lambda, scene, &h, rR0, rT0);

@@ -10297,9 +10297,9 @@ Where it reaches each estimator:
 | Site | What it does with `R` |
 |---|---|
 | `glossyF` / `dGlossyF` / `dGlossyFHit` (every BSDF evaluation: NEE, MIS, BDPT connections, the splat) | multiplies the lobe's `r` |
-| Sampling sites (forward `interactPhotonSpecular`, backward, BDPT / VCM walks, photon-map and SPPM camera walks, both backends) | the direction is drawn from the plain lobe, then the throughput is multiplied by `R` (or survives a roulette on it, in the forward photon walk where the weight must stay 1) |
+| Sampling sites (forward `interactPhotonSpecular`, backward and Whitted, BDPT / VCM walks, photon-map and SPPM camera walks, both backends) | the direction is drawn through `drawGlossy` (`glossyAt` for a Whitted lattice's; `dDrawGlossy` / `dGlossyAt` on the device), whose `GlossyDraw` carries `R(lambda)`, exactly 1 on a plain lobe; the site multiplies its throughput by it, or (the forward photon walk, where the weight must stay 1) survives a roulette on it, `irid` keeping that roulette off a plain lobe. A layered coat's sheen lobe draws `sampleGlossy` itself: a coat never interferes |
 | Hero bundles (forward `shadeStepHero`, backward hero) | one direction for the bundle, `R` per member; the forward walk's roulette is on the bundle's largest `R`, the rest reweighted |
-| Spectral fold, JSPEC (`bdpt.h`) | an iridescent vertex retires the fold (`FK_DeclineGlossy`): `R` is wavelength-divergent; JSPEC's per-λ factor includes `R` |
+| Spectral fold, JSPEC (`bdpt.h`, `vcm.h`, `dJFoldLobe`) | an iridescent vertex retires the fold (`FK_DeclineGlossy`): `R` is wavelength-divergent; JSPEC's per-λ factor reads `R` from the walk's own draw |
 | Denoiser guides (`denoise_guide.h`) | the albedo and mirror-tint guides take `R` at the view cosine |
 | Raster preview (`raster.h reflectRgb`) | one tint, `R` at normal incidence |
 | `-rgb` (`cudaBackwardRGBSupported`) | out of scope: falls back to the spectral backward |

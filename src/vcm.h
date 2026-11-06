@@ -395,17 +395,16 @@ inline void scatterSample(const Scene& scene, const Renderer& mats, const Materi
             const GlossyDraw gd = drawGlossy(scene, *mp, h, rayDir, ns, wo, rng);
             wi = gd.o;
             if (dot(wi, ns) <= 0) { terminate = true; break; }
-            double r = clamp01(reflectSlot(scene, *mp, h, lambda));
-            // An iridescent lobe's interference reflectance at the sampled pair's half-vector:
-            // bsdfF's r for this pair.
-            if (gd.irid) r *= gd.R(lambda);
+            // times an iridescent lobe's interference reflectance at the sampled pair's
+            // half-vector: bsdfF's r for this pair.
+            double r = clamp01(reflectSlot(scene, *mp, h, lambda)) * gd.R(lambda);
             pdfW = bsdfPdf(*mp, ns, wo, wi, lambda, scene, &h);
             pdfRevW = bsdfPdf(*mp, ns, wi, wo, lambda, scene, &h);
             betaFactor = r;
             if (pdfW <= 0) terminate = true;      // r <= 0 is caught by the caller's max test
             if (jr) jr->mul([&](double L) {
                                 const double rL = clamp01(reflectSlot(scene, *mp, h, L));
-                                return gd.irid ? rL * gd.R(L) : rL; },
+                                return rL * gd.R(L); },
                             betaFactor, false);
             // The glossy LOBE (mirror direction + roughness exponent) carries no wavelength
             // dependence, so the whole bundle follows the sampled direction and only the

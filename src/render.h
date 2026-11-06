@@ -318,11 +318,13 @@ inline double halfVectorCos(const Vec3& a, const Vec3& b) {
 
 // A direction drawn from a glossy lobe, and the factor the draw leaves beyond the lobe's `reflect`
 // slot: f * cos / pdf = reflect(lambda) * R(lambda), R being an iridescent lobe's interference
-// reflectance at the pair's half-vector and exactly 1 on a plain lobe. Every glossy sampler draws
-// through drawGlossy (or glossyAt, for a direction a lattice chose), so the factor comes with
-// the direction; how to take it -- multiplied in, a roulette, a roulette on a bundle's largest --
-// is the caller's. `irid` says whether R can differ from 1, for the callers whose roulette would
-// otherwise draw a number on a plain lobe.
+// reflectance at the pair's half-vector and exactly 1 on a plain lobe. Every sampler of a Glossy
+// material's lobe draws through drawGlossy (or glossyAt, for a direction a lattice chose), so the
+// factor comes with the direction, and so does every fold that re-weighs it (mode J's spectral
+// carrier). How to take R -- multiplied in, a roulette, a roulette on a bundle's largest -- is the
+// caller's; `irid` says whether R can differ from 1, for a roulette or a per-wavelength loop
+// that would otherwise run on a plain lobe. A layered coat's sheen lobe draws sampleGlossy
+// itself: a coat never interferes. The draw keeps the hit's address, so it takes no temporary.
 struct GlossyDraw {
     Vec3 o;              // the direction; the caller ends the path where it is not above the surface
     bool irid = false;   // the lobe interferes
@@ -348,6 +350,9 @@ inline GlossyDraw drawGlossy(const Scene& scene, const Material& m, const Hit& h
                              const Vec3& n, const Vec3& wo, Pcg32& rng) {
     return glossyAt(scene, m, h, wo, sampleGlossy(reflect(dIn, n), materialRoughness(scene, m, h), rng));
 }
+GlossyDraw glossyAt(const Scene&, const Material&, const Hit&&, const Vec3&, const Vec3&) = delete;
+GlossyDraw drawGlossy(const Scene&, const Material&, const Hit&&, const Vec3&, const Vec3&,
+                      const Vec3&, Pcg32&) = delete;
 
 // The glossy BSDF for the pair (wo, wi), both unit and pointing away from the surface, the lobe
 // mirrored about `wo`: r * lobe / cos(wi), in bsdf_eval.h's convention (see its header), r the

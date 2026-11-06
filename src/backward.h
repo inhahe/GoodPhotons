@@ -2466,7 +2466,7 @@ struct BackwardRenderer {
                 const Vec3& o = gd.o;
                 if (dot(o, h.n) <= 0) return false;
                 // f * cos / pdf = r * R, which bsdfF carries for the NEE above.
-                if (gd.irid) thr *= gd.R(lambda);
+                thr *= gd.R(lambda);
                 // The other half of the weight, for whatever this direction goes on to hit.
                 if (gm) {
                     gm->pdf = bdpt::bsdfPdf(m, h.n, ray.d * -1.0, o, lambda, scene, &h);
@@ -3619,8 +3619,12 @@ struct BackwardRenderer {
                                              gi.sIdx, b));
                         const Vec3& o = gd.o;
                         if (dot(o, h.n) <= 0) { finish(); return; }
-                        if (gd.irid)   // interference reflectance at the half-vector, per λ
+                        if (gd.irid) {   // interference reflectance at the half-vector, per λ
                             for (int i = 0; i < nUp; ++i) thr[i] *= gd.R(lam[i]);
+                            // the bundle's bailout again, as the scalar walk's wAtt takes it
+                            if (hero::maxOf(thr, nUp) * Renderer::localN2(scene, stk, lam[0]) <= kWhittedCutoff)
+                                { finish(); return; }
+                        }
                         if (glossyNee) {   // the other half of the weight -- see the scalar twin
                             gmis.pdf = bdpt::bsdfPdf(m, h.n, ray.d * -1.0, o, lam[0], scene, &h);
                             gmis.from = h.p;
