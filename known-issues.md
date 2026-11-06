@@ -521,7 +521,19 @@ domain for every mode would change all three to suit the one that cannot light t
 emits into. That is now a decision for the user (TODO.md 4.1): clip in every mode, or keep R, D and
 J and have the forward modes warn that they light an unbounded haze only near the scene.
 
-## OPEN (2026-11-05, 0.434.19): UPBP-W-RAINBOW — in a rainbow-phase medium, mode J's merge weights read the camera side's phase densities at the camera's wavelength
+## WONTFIX (2026-11-06, measured on 0.434.22; opened 0.434.19): UPBP-W-RAINBOW — in a rainbow-phase medium, mode J's merge weights read the camera side's phase densities at the camera's wavelength
+
+**Measured, and too small to fix.** With the CPU deterministic since J-CPU-NONDET's fix, the
+effect could be measured paired instead of through noisy images: an experiment
+(`FTRACE_JRAINBOW=1`, `scraps/upbpw_rainbow/jrainbow_experiment.patch`) re-read every camera-path
+medium vertex's phase density at the beam's wavelength -- the forward and reverse densities it
+gives its neighbours (scaled by phase(cos, lambda_b) / phase(cos, lambda_c)), the segment's own
+direction density, and the camera-side sums recomputed from them -- and rendered the same seed with
+it and without (CPU, 64x48, 256 spp, `-nojsurf`). An HG fog reproduced the normal image byte for
+byte, as it must. `scraps/upbpw_rainbow/bow100.ftsl` (0.1 mm droplets): whole frame +0.05 %, X over
+Y +0.02 %, Z over Y -0.02 %; `bow.ftsl` (0.5 mm, the sharp bow): +0.07 %, +0.04 %, -0.01 %; 0.5-0.7 %
+rel-RMS per pixel. So the old weight's bias is of that order -- some 25x below mode J's kernel-blur
+bias (J-FOGCORNELL, about -0.4 %) and far inside its noise. The rest of this entry is how it stood.
 
 The sibling of UPBP-W-CHROMATIC (fixed 0.434.19), which put the camera half's beam etas -- the
 sigma_t * Tr terms -- at the merged light's wavelength. That half also holds direction densities:

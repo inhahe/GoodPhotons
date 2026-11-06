@@ -114,9 +114,9 @@ Each names the section its line is in.
 14. ~~**FEATHER-IS-A-THRESHOLD** (4.2) — `feather` shrinks a cloud instead of ramping it; the fix
     changes `gallery_rain`'s cloud edges, so show the user before it lands.~~ Shown, approved
     (2026-11-05), done 0.434.17.
-15. **UPBP-W-RAINBOW** (4.3) — mode J's merge weights read a rainbow phase's camera-side
-    densities at the camera's wavelength (`gallery_rain`'s rain). Measure first: three image
-    comparisons were too noisy (4-10 % a seed), so next is a direct partition-of-unity audit.
+15. ~~**UPBP-W-RAINBOW** (4.3) — mode J's merge weights read a rainbow phase's camera-side
+    densities at the camera's wavelength (`gallery_rain`'s rain).~~ Measured paired on the now
+    deterministic CPU: +0.05-0.07 % of the frame, 0.04 % in colour. Too small to fix (WONTFIX).
 16. ~~**J-CPU-NONDET** (4.4) — CPU mode J renders a heterogeneous medium differently run to run
     (found validating UPBP-W-CHROMATIC); the CPU is the validation baseline.~~ Its epochs ended on
     the clock; they end on work counts since 0.434.21 (the user's option b).
@@ -300,8 +300,8 @@ Then the rest of 4.2-4.6 in their order, 4.7's bookkeeping alongside whatever to
 - [ ] **J-FOG-REALCAM**, what is left — CPU mode J reads realcam's fog up to 2.8 % below GPU mode J.
 - [x] **UPBP-W-CHROMATIC** (0.434.19) — in a chromatic medium a beam merge's weight mixed two
   wavelengths and the frame tilted in colour (`tools/check_jchroma.py`).
-- [ ] **UPBP-W-RAINBOW** — the same mix in a rainbow-phase medium, through the camera side's phase
-  densities; unmeasured.
+- [x] **UPBP-W-RAINBOW** — the same mix in a rainbow-phase medium, through the camera side's phase
+  densities: measured at +0.05-0.07 % of the frame, too small to fix.
 - [ ] **P-HEROSPLIT-FIRST** — blurred mode P under `-herosplit` files a sample by the hero's first
   event alone.
 - [ ] **ROUGH-IRID-AIR** — a rough interference reflector always interferes against air.
