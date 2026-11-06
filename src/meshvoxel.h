@@ -40,11 +40,13 @@
 //
 // FEATHERING (`feather <metres>`): the trilinear ramp above spans exactly ONE voxel, so the
 // bake is effectively a hard silhouette -- a cloud bounded this way has a crisp cut-out edge
-// where real cloud has a diffuse one. `featherGrid` replaces the 0/1 occupancy with
-// `saturate(distance-to-the-outside / feather)`, i.e. the fog reaches full density only
-// `feather` metres INSIDE the surface and ramps smoothly to zero at it. It is a pure
-// post-pass on the lattice, so nothing downstream changes: the same fp16 grid, the same
-// trilinear sample, the same majorant (the maximum is still 1). Distance comes from an exact
+// where real cloud has a diffuse one. `featherGrid` replaces the 0/1 occupancy with a
+// smoothstep of the distance to the outside over the feather, i.e. the fog reaches full density
+// only `feather` metres INSIDE the surface and ramps smoothly to zero on the silhouette's own
+// voxels, so the trilinear sample leaks nothing past them. The grid stays fp16 and its maximum
+// 1 (the same majorant), but a feathered lattice is read as a WEIGHT on the density, not
+// thresholded at 0.5 like a binary one: the loader sets Medium::boundRamp, and every reader goes
+// through Medium::meshWeight (the device's dMeshWeight). Distance comes from an exact
 // Euclidean distance transform (Felzenszwalb & Huttenlocher 2012's separable lower-envelope
 // algorithm, three O(n) passes over the axes), not a chamfer approximation -- an approximate
 // metric shows up as faceted banding in the very gradient the feature exists to produce.
@@ -243,15 +245,19 @@ inline void edt1d(const std::vector<double>& f, std::vector<double>& d, int n,
 }
 
 // Turn a 0/1 occupancy lattice into a feathered one: each solid voxel's value becomes
-// `saturate(distance-to-the-nearest-empty-voxel / featherVox)`, so density ramps from 0 at
-// the silhouette to 1 once `featherVox` voxels inside. `featherVox` is in VOXELS (the caller
-// converts the author's metres by dividing by the voxel edge). A value <= 0 is a no-op.
+// `smoothstep((distance-to-the-nearest-empty-voxel - 1) / featherVox)`, so density ramps from
+// 0 on the voxels of the silhouette (one voxel from the outside) to 1 once `featherVox` voxels
+// further in. Starting the ramp there rather than at the empty voxels keeps the trilinear
+// sample at 0 everywhere outside the solid voxels: the fog never reaches past the mesh.
+// `featherVox` is in VOXELS (the caller converts the author's metres by dividing by the voxel
+// edge). Returns whether the lattice now ramps; below one voxel there is no ramp to resolve,
+// and the lattice is left binary.
 //
 // Distances are measured to the nearest EMPTY voxel, and the bake already surrounds the
 // lattice with a one-voxel zero shell, so a solid region touching the lattice edge still
 // feathers rather than being cut flat.
-inline void featherGrid(VdbGrid& g, double featherVox) {
-    if (g.data.empty() || !(featherVox > 0.0)) return;
+inline bool featherGrid(VdbGrid& g, double featherVox) {
+    if (g.data.empty() || !(featherVox >= 1.0)) return false;
     const int nx = g.nx, ny = g.ny, nz = g.nz;
     const size_t n = (size_t)nx * ny * nz;
     auto idx = [nx, ny](int i, int j, int k) { return ((size_t)k * ny + (size_t)j) * nx + i; };
@@ -294,7 +300,7 @@ inline void featherGrid(VdbGrid& g, double featherVox) {
                 edt1d(t.f, t.d, nx, t.v, t.z);
                 for (int i = 0; i < nx; ++i) dist[idx(i, j, k)] = t.d[i];
             }
-        })) return;
+        })) return false;
     if (!ft::parallelFor((size_t)nz, 1, [&](size_t kk) {           // along y
             const int k = (int)kk; EdtScratch& t = scratch();
             for (int i = 0; i < nx; ++i) {
@@ -302,7 +308,7 @@ inline void featherGrid(VdbGrid& g, double featherVox) {
                 edt1d(t.f, t.d, ny, t.v, t.z);
                 for (int j = 0; j < ny; ++j) dist[idx(i, j, k)] = t.d[j];
             }
-        })) return;
+        })) return false;
     if (!ft::parallelFor((size_t)ny, 1, [&](size_t jj) {           // along z
             const int j = (int)jj; EdtScratch& t = scratch();
             for (int i = 0; i < nx; ++i) {
@@ -310,19 +316,20 @@ inline void featherGrid(VdbGrid& g, double featherVox) {
                 edt1d(t.f, t.d, nz, t.v, t.z);
                 for (int k = 0; k < nz; ++k) dist[idx(i, j, k)] = t.d[k];
             }
-        })) return;
+        })) return false;
 
     // Smoothstep rather than a linear ramp: a linear ramp leaves a visible crease where it
     // reaches 1, which on a cloud edge reads as a second, softer silhouette.
     const double inv = 1.0 / featherVox;
     for (size_t t = 0; t < n; ++t) {
         if (!g.data[t]) continue;
-        double u = std::sqrt(dist[t]) * inv;
+        double u = (std::sqrt(dist[t]) - 1.0) * inv;
         if (u >= 1.0) continue;                       // already full density; leave the 1
         if (u < 0.0) u = 0.0;
         g.data[t] = floatToHalfBits((float)(u * u * (3.0 - 2.0 * u)));
     }
     g.maxVal = 1.0f;
+    return true;
 }
 
 // Fraction of the lattice that came out solid — a cheap sanity signal for the loader's

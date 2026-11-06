@@ -5170,11 +5170,12 @@ Mode `R` lights the haze along every camera ray out to the horizon (the sun's li
 by the haze inside the scene's bounds), and so do modes `D` and `J` under a sun (they refuse a
 sky). Forward emission sends the sun's and the sky's light in through a disc the size of the
 scene, so the modes whose haze comes from forward photons -- `A`, `B` and `C`, `P` (its forward
-film), `V` (which compares that film with mode `R`'s) and `M -beams` -- light only the haze near
-the scene: haze toward the horizon renders dark, and surfaces lose the light it would scatter onto
-them. On a sunlit test haze, mode `B`'s haze reads 0.15 of mode `R`'s and its floor 0.9. Those
-modes say so in a warning on stderr, once per scene file (since 0.434.15; `P`, `V` and `M -beams`
-since 0.434.16). To make every mode agree, give the medium `bounds`.
+film), `V` (which compares that film with mode `R`'s) and `M` (its beams under `-beams`, and with
+or without them the photons that light its surfaces) -- light only the haze near the scene: haze
+toward the horizon renders dark, and surfaces lose the light it would scatter onto them. On a
+sunlit test haze, mode `B`'s haze reads 0.15 of mode `R`'s and its floor 0.9. Those modes say so
+in a warning on stderr, once per scene file, when they render (since 0.434.15; `P`, `V` and `M`
+since 0.434.16-18). To make every mode agree, give the medium `bounds`.
 
 **Bounded, heterogeneous fog (blobs).** The medium isn't limited to a single global
 haze. Add `bounds { min <x y z> max <x y z> }` to confine it to an axis-aligned box —
@@ -5197,8 +5198,10 @@ a body or a bottle, wrong for a cloud. `feather <metres>` fixes that: it replace
 occupancy with a smoothstep of the **exact Euclidean distance** to the outside (Felzenszwalb
 & Huttenlocher's separable transform, three linear-time sweeps — isotropic, no axis-aligned
 banding), so density rises from zero at the surface to full that far in and the silhouette
-becomes a falloff *zone* the way real cloud edges are. (Before 0.434.17 the density stepped at
-the ramp's midpoint instead, so `feather` only moved a hard edge inward.) Pair it with
+becomes a falloff *zone* the way real cloud edges are. The ramp starts on the silhouette's own
+voxels, so no fog reaches past the mesh, and a feather under one voxel has no ramp to resolve:
+the edge stays hard, and the loader says so. (Before 0.434.17 the density stepped at the ramp's
+midpoint instead, so `feather` only moved a hard edge inward.) Pair it with
 `mesh { … shape_only yes }`, which loads a mesh purely as a shape and strips its triangles
 from the scene once the bound is baked, so the shell defining the fog isn't also drawn
 around it. An *open* fog sphere is directly viewable in every mode.

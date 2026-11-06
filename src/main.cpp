@@ -18133,10 +18133,10 @@ static constexpr bool modeFormsLensImage(char mode) {
 // ray out to the horizon -- mode R (and W, on it) under either light, modes D and J under a sun
 // (they refuse a sky) -- and theirs is the domain kept. The modes listed here take that haze
 // from forward photons: A, B and C render with them, P composites their film, V compares it
-// with mode R's, and M gathers their beams under -beams (without, it renders no medium at all).
+// with mode R's, and M gathers their beams under -beams; without, M renders no medium, but its
+// photons still cross the haze, so the surfaces it lights lose what the haze beyond would add.
 static bool modeLightsHazeOnlyNearScene(char mode) {
-    return mode == 'A' || mode == 'B' || mode == 'C' || mode == 'P' || mode == 'V' ||
-           (mode == 'M' && g_beamGather);
+    return mode == 'A' || mode == 'B' || mode == 'C' || mode == 'P' || mode == 'V' || mode == 'M';
 }
 
 // Core capability check: return a reason string if `mode` cannot render `scene` with a
@@ -18379,7 +18379,7 @@ static bool resolveCameraModes(Scene& scene, const std::vector<CamRequest>& cams
 // or a sky lights a medium with no bounds that attenuates, and some camera renders in one of
 // those modes. `modes` holds the mode each camera of the run renders in, as finally resolved
 // (lens routing, -on-unsupported); `scenePath` names the scene file, the key that keeps a -serve
-// session, which reloads its scene for every frame, from repeating it.
+// session, which reloads its scenes for every frame, from repeating it for any of them.
 static void warnHazeOnlyNearScene(const Scene& scene, const std::vector<char>& modes,
                                   const char* scenePath) {
     if (scene.sunCount == 0 && scene.envIndex < 0) return;
@@ -18390,12 +18390,8 @@ static void warnHazeOnlyNearScene(const Scene& scene, const std::vector<char>& m
     for (char m : modes)
         if (modeLightsHazeOnlyNearScene(m) && which.find(m) == std::string::npos) which += m;
     if (which.empty()) return;
-    static bool said = false;
-    static std::string saidFor;
-    const std::string key = scenePath ? scenePath : "";
-    if (said && saidFor == key) return;
-    said = true;
-    saidFor = key;
+    static std::set<std::string> saidFor;
+    if (!saidFor.insert(scenePath ? scenePath : "").second) return;
     const bool one = which.size() == 1;
     std::string label = one ? "mode " : "modes ";
     for (size_t i = 0; i < which.size(); ++i) {
@@ -24936,11 +24932,6 @@ static int run(int argc, char** argv) {
         }
         toRender.push_back({"", c, mode, fresX, fresY, (exposureCli > 0.0 ? exposureCli : 0.0), forceExposureLock ? 0 : -1, cLook, cUp, cFov});
     }
-    {
-        std::vector<char> modes;
-        for (const RenderCam& rc : toRender) modes.push_back(rc.mode);
-        warnHazeOnlyNearScene(scene, modes, inFile);
-    }
 
     // -roiboxes: derive per-material ROIs from primary visibility, print them, exit.
     // Placed HERE, after `toRender` is final, so the boxes come from exactly the camera
@@ -25360,6 +25351,13 @@ static int run(int argc, char** argv) {
     // in a fraction of a second per frame. Honours the same camera list / -camera
     // selection / -window live view as the real renderer.
     // -----------------------------------------------------------------------------
+    // Every run that traces no light (the ROI and footprint reports above, this preview and
+    // -explore, which implies it) has left or is about to; the rest render in their modes.
+    if (!doRaster) {
+        std::vector<char> modes;
+        for (const RenderCam& rc : toRender) modes.push_back(rc.mode);
+        warnHazeOnlyNearScene(scene, modes, inFile);
+    }
     if (doRaster) {
         // -raster-gpu (G2): render implicit isosurfaces by casting a deterministic primary
         // ray per pixel on the GPU (renderIsoPreviewCuda) instead of marching-cubes

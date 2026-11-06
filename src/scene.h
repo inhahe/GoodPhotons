@@ -733,16 +733,21 @@ struct Medium {
     // membership, so a `density` formula still multiplies on top and shapes the fog
     // WITHIN the mesh silhouette — the same semantics a named isosurface bound has.
     std::shared_ptr<VdbGrid> boundGrid;
-    // A FEATHERED lattice (`feather`, meshvox::featherGrid) ramps from 0 at the silhouette to 1
-    // that far inside, and the density follows it -- occupancy times the field -- rather than
-    // stepping at its 0.5 crossing, which would only move the hard edge inward. An unfeathered
-    // one keeps the 0.5 isosurface.
+    // A FEATHERED lattice (`feather`, meshvox::featherGrid) ramps from 0 on the silhouette's own
+    // voxels to 1 that far inside, and the density follows it -- occupancy times the field --
+    // rather than stepping at its 0.5 crossing, which would only move the hard edge inward. An
+    // unfeathered one keeps the 0.5 isosurface. Set only when the lattice really ramps.
     bool boundRamp = false;
-    bool insideMesh(const Vec3& p) const {
-        if (!boundGrid) return false;
+    // What the mesh bound makes of the density at p: the feathered occupancy, or 1 inside the
+    // 0.5 isosurface of a binary lattice; 0 outside. The device's dMeshWeight is its twin, and
+    // every reader of the lattice goes through one or the other.
+    double meshWeight(const Vec3& p) const {
+        if (!boundGrid) return 0.0;
         const double occ = boundGrid->sample(p);
-        return boundRamp ? occ > 0.0 : occ >= 0.5;
+        if (boundRamp) return occ > 0.0 ? std::min(1.0, occ) : 0.0;
+        return occ >= 0.5 ? 1.0 : 0.0;
     }
+    bool insideMesh(const Vec3& p) const { return meshWeight(p) > 0.0; }
 
     // --- Optional volumetric blackbody EMISSION (fire) ----------------------
     // When `temperature` is set (a second imported grid giving T in Kelvin per
@@ -856,17 +861,16 @@ struct Medium {
     double densityAt(const Vec3& p, const PatTables* tabs = nullptr) const {
         if (boundShape == MediumBound::Implicit && !insideField(p, tabs)) return 0.0;
         if (boundShape == MediumBound::Mesh) {
-            if (!boundGrid) return 0.0;
-            const double occ = boundGrid->sample(p);
-            if (boundRamp) return (occ > 0.0) ? std::min(1.0, occ) * densityFieldAt(p, tabs) : 0.0;
-            if (occ < 0.5) return 0.0;
+            const double w = meshWeight(p);   // exactly 1 inside an unfeathered bound
+            return w > 0.0 ? w * densityFieldAt(p, tabs) : 0.0;
         }
         return densityFieldAt(p, tabs);
     }
 
     // The density FIELD alone, with no membership carve — i.e. what `densityAt` would
     // return if every point were inside the bound. This exists for majorant estimation:
-    // an implicit/mesh membership multiplies the field by 0 or 1, so the field's own
+    // an implicit/mesh membership multiplies the field by a weight in [0, 1] (0 or 1, but for
+    // a feathered mesh), so the field's own
     // peak is always a valid (conservative) majorant, whereas sampling `densityAt` on a
     // coarse grid can miss a thin or low-volume-fraction shape entirely and majorise to
     // ~0, which would make delta/ratio tracking silently drop the medium.

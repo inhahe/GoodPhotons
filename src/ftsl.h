@@ -8675,21 +8675,24 @@ private:
                              "distance in metres and cannot be negative");
                         return false;
                     }
+                    bool feathered = false;
                     if (feath > 0.0) {
                         // Voxel edge = extent along the longest axis / that axis' voxel count.
                         const Vec3 ex = occ.wmax - occ.wmin;
                         const int nmx = std::max(occ.nx, std::max(occ.ny, occ.nz));
                         const double vh = std::max({ex.x, ex.y, ex.z}) / std::max(1, nmx - 1);
                         const double fv = (vh > 0.0) ? feath / vh : 0.0;
-                        if (fv < 1.0)
+                        feathered = meshvox::featherGrid(occ, fv);
+                        if (!feathered)
                             std::fprintf(stderr,
                                 "[medium] NOTE: mesh bound \"%s\" feather %.3g m is %.2f voxel(s) "
-                                "at `voxels %d` — below one voxel it cannot resolve a ramp; "
-                                "raise `voxels` or `feather`.\n", onm.c_str(), feath, fv, vres);
-                        meshvox::featherGrid(occ, fv);
-                        std::fprintf(stderr,
-                            "[medium] mesh bound \"%s\": feathered %.3g m (%.1f voxels) inward\n",
-                            onm.c_str(), feath, fv);
+                                "at `voxels %d` — below one voxel it cannot resolve a ramp, so the "
+                                "edge stays hard; raise `voxels` or `feather`.\n",
+                                onm.c_str(), feath, fv, vres);
+                        else
+                            std::fprintf(stderr,
+                                "[medium] mesh bound \"%s\": feathered %.3g m (%.1f voxels) inward\n",
+                                onm.c_str(), feath, fv);
                     }
                     // A mesh that voxelizes to nothing would silently render as no fog at
                     // all, which reads as "the medium block did nothing" rather than as a
@@ -8702,7 +8705,7 @@ private:
                     med.bounded = true;
                     med.boundShape = MediumBound::Mesh;
                     med.boundGrid = std::make_shared<VdbGrid>(std::move(occ));
-                    med.boundRamp = feath > 0.0;
+                    med.boundRamp = feathered;
                     med.bmin = med.boundGrid->wmin;
                     med.bmax = med.boundGrid->wmax;
                 } else {
@@ -8825,7 +8828,7 @@ private:
                         // to 0 and the medium would vanish. The data pass runs before this
                         // one, so L.scene.grids/scatters/dataPool are already populated.
                         // densityFieldAt, not densityAt: the membership carve of an
-                        // implicit/mesh bound only multiplies by 0 or 1, so the uncarved
+                        // implicit/mesh bound only multiplies by a weight in [0, 1], so the uncarved
                         // field peak is the conservative majorant, and probing the carved
                         // one on a 25^3 grid can miss a thin shape and majorise to 0.
                         peak = std::max(peak, med.densityFieldAt(p, &tabs));

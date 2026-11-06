@@ -8,13 +8,16 @@ sun; they refuse a sky), while forward emission sends the sun's and the sky's li
 disc the size of the scene and lights only the haze behind it -- on the scene below mode B's haze
 is 0.15 of mode R's. The backward modes' domain is the one kept, and every mode whose haze comes
 from forward photons says so (main.cpp modeLightsHazeOnlyNearScene): A, B and C, P (its forward
-film), V (which compares it), M under -beams. The sun over a floor in such a haze (the scene of
+film), V (which compares it), and M, whose photons cross the haze to the surfaces it lights,
+with or without -beams. The sun over a floor in such a haze (the scene of
 scenes/_haze_sun_b_vs_r.ftsl, tiny here), rendered for a moment:
 
-  - modes A, B, C, P, V and M -beams print the warning once, on stderr;
+  - modes A, B, C, P, V and M (with and without -beams) print the warning once, on stderr;
   - under a sun it names R, D and J as lighting all of it; under a sky only R;
   - two mode-B cameras sharing one forward flight print it once;
-  - modes R, D and J do not, nor mode M without -beams (which renders no medium);
+  - a -serve session given the sunlit scene, the sky's, then the sunlit one again prints it
+    twice: once per scene file;
+  - modes R, D and J do not, nor a -raster preview, which traces no light;
   - nor does mode B with the medium given `bounds`, or a medium that does not attenuate, or
     under a ball light in the scene instead.
 
@@ -81,7 +84,8 @@ def main():
         if not ok:
             fails.append(name)
 
-    for mode, extra in (("A", ()), ("B", ()), ("C", ()), ("P", ()), ("V", ()), ("M", ("-beams",))):
+    for mode, extra in (("A", ()), ("B", ()), ("C", ()), ("P", ()), ("V", ()), ("M", ("-beams",)),
+                        ("M", ())):
         name = "mode %s%s" % (mode, " -beams" if extra else "")
         n, err, out = run("haze", scene(HAZE, SUN), mode, extra)
         check("%s warns of the unbounded haze, once, on stderr" % name, n == 1,
@@ -96,8 +100,17 @@ def main():
     for mode in "RDJ":
         n, _, _ = run("haze", scene(HAZE, SUN), mode)
         check("mode %s does not" % mode, n == 0, "said %d times" % n)
-    n, _, _ = run("haze", scene(HAZE, SUN), "M")
-    check("nor mode M without -beams", n == 0, "said %d times" % n)
+    n, _, _ = run("haze", scene(HAZE, SUN), "B", ("-raster",))
+    check("nor a -raster preview", n == 0, "said %d times" % n)
+    # -serve: the -in scene first, then each path read from stdin.
+    haze, sky = os.path.join(d, "haze.ftsl"), os.path.join(d, "sky.ftsl")
+    p = subprocess.run([exe, "-serve", "-in", haze, "-mode", "B", "-device", "cpu", "-seed", "1",
+                        "-no-meter", "-n", "20000", "-o", os.path.join(d, "serve.png")],
+                       cwd=d, input=NL.join([sky, haze, "quit"]) + NL, capture_output=True,
+                       text=True, encoding="utf-8", errors="replace")
+    n = p.stderr.count(MARK)
+    check("-serve warns once per scene file (sun, sky, sun again: twice)", n == 2,
+          "said %d times, rc %d" % (n, p.returncode))
     n, _, _ = run("bounded", scene(BOUNDED, SUN), "B")
     check("nor mode B with the medium bounded", n == 0, "said %d times" % n)
     n, _, _ = run("clear", scene(CLEAR, SUN), "B")

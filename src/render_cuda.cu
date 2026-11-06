@@ -977,8 +977,7 @@ struct DMedium {
     double           emissionScale;   // brightness multiplier on the Planck term
     int              bounded;         // 1 => clip to the bound region
     int              boundShape;      // 0 => box [bmin,bmax], 1 => sphere, 2 => implicit field,
-                                      // 3 => MESH containment (boundGrid occupancy >= 0.5,
-                                      //      or > 0 when feathered: boundRamp)
+                                      // 3 => MESH containment (dMeshWeight)
     DVec3            bmin, bmax;
     DVec3            bcenter;
     double           bradius;
@@ -2988,21 +2987,26 @@ __device__ static double dVdbSample(const DVdbGrid& g, const DVec3& p) {
 // Dimensionless density multiplier at a world point (>= 0). Device twin of
 // Medium::densityAt: the shared pattern VM with x y z r live (f/normal/uv read 0).
 // For an implicit bound the multiplier is 0 outside the field (medium absent there).
+// What a mesh bound makes of the density at p (host twin Medium::meshWeight): the feathered
+// occupancy, or 1 inside the 0.5 isosurface of a binary lattice; 0 outside, and everywhere
+// for a lattice that baked empty (uploaded as no bricks), as the host's samples 0 there.
+__device__ static double dMeshWeight(const DMedium& m, const DVec3& p) {
+    if (!m.boundGrid.brickData) return 0.0;
+    const double occ = dVdbSample(m.boundGrid, p);
+    if (m.boundRamp) return occ > 0.0 ? (occ < 1.0 ? occ : 1.0) : 0.0;
+    return occ >= 0.5 ? 1.0 : 0.0;
+}
+
 __device__ static double dMedDensityAt(const DMedium& m, const DVec3& p, const DPatEnv& env) {
     if (m.boundShape == 2 && m.boundField) {   // implicit-field membership carve-out
         double f = dFieldEval(m.boundField, m.boundFieldN, p.x, p.y, p.z, m.boundFieldExpr, env);
         bool inside = m.boundInsideNeg ? (f < 0.0) : (f > 0.0);
         if (!inside) return 0.0;
     }
-    double ramp = 1.0;   // a feathered mesh bound's occupancy (host Medium::densityAt)
-    if (m.boundShape == 3 && m.boundGrid.brickData) {   // mesh-containment carve-out
-        const double occ = dVdbSample(m.boundGrid, p);
-        if (m.boundRamp) {
-            if (!(occ > 0.0)) return 0.0;
-            ramp = occ < 1.0 ? occ : 1.0;
-        } else if (occ < 0.5) {
-            return 0.0;
-        }
+    double ramp = 1.0;   // the mesh bound's weight; exactly 1 inside an unfeathered one
+    if (m.boundShape == 3) {
+        ramp = dMeshWeight(m, p);
+        if (!(ramp > 0.0)) return 0.0;
     }
     // Imported .nvdb/.vdb volume: trilinearly sample the uploaded sparse brick grid.
     // Takes precedence over the pattern-VM density.
@@ -3102,10 +3106,7 @@ __device__ static bool dMedInside(const DMedium& m, const DVec3& p, const DPatEn
         double f = dFieldEval(m.boundField, m.boundFieldN, p.x, p.y, p.z, m.boundFieldExpr, env);
         return m.boundInsideNeg ? (f < 0.0) : (f > 0.0);
     }
-    if (m.boundShape == 3 && m.boundGrid.brickData) {   // mesh containment
-        const double occ = dVdbSample(m.boundGrid, p);
-        return m.boundRamp ? occ > 0.0 : occ >= 0.5;
-    }
+    if (m.boundShape == 3) return dMeshWeight(m, p) > 0.0;   // mesh containment
     return p.x >= m.bmin.x && p.x <= m.bmax.x && p.y >= m.bmin.y &&
            p.y <= m.bmax.y && p.z >= m.bmin.z && p.z <= m.bmax.z;
 }

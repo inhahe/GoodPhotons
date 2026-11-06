@@ -489,12 +489,13 @@ Refused at load, never rendered wrong:
 sky), keep lighting an unbounded haze out to the horizon, and the modes whose haze comes from
 forward photons say they light it only near the scene, where a sun or a sky lights a medium with
 no bounds that attenuates. Those modes are A, B and C, P (its forward film), V (which compares
-it) and M under `-beams` (main.cpp `modeLightsHazeOnlyNearScene`). The warning goes to stderr,
-once per scene file, after every camera's mode is resolved (`warnHazeOnlyNearScene`; 0.434.15
-for A, B and C, 0.434.16 for the rest). Bounding the medium makes the modes agree.
-`tools/check_haze_warning.py` holds those modes to the warning (and a sky, and two cameras on one
-shared flight), and modes R, D and J, M without `-beams`, a bounded haze, a medium that does not
-attenuate and a light in the scene to none. The blur half of this entry is HAZE-BLUR-DOMAIN,
+it) and M, whose photons light its surfaces through the haze with or without `-beams` (main.cpp
+`modeLightsHazeOnlyNearScene`). The warning goes to stderr, once per scene file, in a run that
+traces light, after every camera's mode is resolved (`warnHazeOnlyNearScene`; 0.434.15 for A, B
+and C, 0.434.16-18 for the rest). Bounding the medium makes the modes agree.
+`tools/check_haze_warning.py` holds those modes to the warning (and a sky, two cameras on one
+shared flight, and a -serve session of two scene files), and modes R, D and J, a `-raster`
+preview, a bounded haze, a medium that does not attenuate and a light in the scene to none. The blur half of this entry is HAZE-BLUR-DOMAIN,
 below; the rest is how it stood.
 
 `scenes/_haze_sun_b_vs_r.ftsl` (a 2 m floor under a high sun in `medium { sigma_t 0.04  albedo
@@ -519,6 +520,22 @@ Re-measured on 0.431.0 (GPU, against mode R at 1024 spp): mode J agrees too (haz
 domain for every mode would change all three to suit the one that cannot light the haze it never
 emits into. That is now a decision for the user (TODO.md 4.1): clip in every mode, or keep R, D and
 J and have the forward modes warn that they light an unbounded haze only near the scene.
+
+## OPEN (2026-11-05, 0.434.18): J-CPU-NONDET — CPU mode J renders a heterogeneous medium differently run to run
+
+`-device cpu` is meant to be deterministic (it is the reference and validation baseline, and
+check_bitid holds mode J to it). On `scraps/jspec2/hetmed.ftsl` (a heterogeneous coloured fog in a
+box) it is not: `ftrace -in scraps/jspec2/hetmed.ftsl -device cpu -r 32 -max-bounce 8 -no-meter
+-hdr -seed 1 -beamcount 100000 -beamk 2 -nojsurf -mode J -spp 1024`, run twice by the same binary,
+gives two images 2 % apart in rel-RMS (677 of 1024 pixels differ, largest 0.2 of the mean; same
+beam budget in both logs). That is different random samples, not summation order. The likely
+cause: the light pass builds the beam map in parallel, so the beams' order in it follows thread
+timing, and the gather draws a ratio-tracked transmittance from the pixel's stream for every beam
+it hits, in map order -- so the draws land on different beams each run. check_bitid's scenes
+would not show it if their media are homogeneous (no draws in the gather). Proper fix: order the
+map deterministically after the parallel build (by subpath index), or give each hit's draws a
+stream of their own keyed on (pixel sample, beam index); then add a heterogeneous medium to
+check_bitid's mode-J scenes.
 
 ## OPEN (2026-11-05, 0.434.16; found in review of 51eb7ef..af7de14): HAZE-BLUR-DOMAIN — under a blur, modes D and J's strategies take different haze for a mover outside the instant's sphere
 
@@ -1871,11 +1888,14 @@ What it does not do:
 **Fixed in 0.434.17**, after the user saw `gallery_rain`'s cloud before and after (a softer
 rim, the cloud about 4 % larger in area, its inside unchanged). A
 feathered bound sets `Medium::boundRamp`: its density is the occupancy times the field, and
-membership is any occupancy above 0, on both devices (`Medium::densityAt` / `insideMesh`,
-`dMedDensityAt` / `dMedInside`). The ramp never exceeds 1, so the field's peak stays a valid
-majorant. `tools/check_feather.py` renders a feathered box of absorbing fog against a sky in
-mode R and holds its optical-depth profile to the ramp within 0.08 on each device (worst 0.036);
-0.434.16 reads the band up to 0.84 short. The rest of this entry is how it stood.
+membership is any occupancy above 0, on both devices (`Medium::meshWeight`, the device's
+`dMeshWeight`, read by the density and membership tests alike). The ramp never exceeds 1, so the
+field's peak stays a valid majorant. In 0.434.18 (review of 0.434.16-17) the ramp starts on the
+silhouette's own voxels, so the trilinear sample leaks nothing past the mesh, and a feather
+under one voxel leaves the lattice binary and `boundRamp` off. `tools/check_feather.py` renders
+a feathered cube of absorbing fog against a sky in mode R and holds its optical-depth profile to
+the ramp within 0.08 on each device, and a sub-voxel feather to the unfeathered image byte for
+byte; 0.434.16 read the band up to 0.84 short. The rest of this entry is how it stood.
 
 Found while checking host/device media agreement for RAIN-J-VS-D. The loader's comment (ftsl.h, `feather <metres>`) says
 the density "ramps from 0 at the mesh surface to full only that far INSIDE it". But both host

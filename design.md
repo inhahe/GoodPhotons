@@ -3193,9 +3193,11 @@ holding a glass ball), and on the device `-rgb`, mode S and every one of those.
   inside the scene's sphere (`mediaExitDistance`). An endless haze has no physical answer (it
   would let no sunlight through), and the backward modes' is the one kept (HAZE-SUN-B, decided
   2026-11-05). The per-mode table in main.cpp names the modes whose haze comes from forward
-  photons (`modeLightsHazeOnlyNearScene`: A, B, C, P, V, and M under `-beams`), and once every
-  camera's mode is resolved, `warnHazeOnlyNearScene` says so on stderr, once per scene file,
-  where a sun or sky lights such a medium.
+  photons (`modeLightsHazeOnlyNearScene`: A, B, C, P, V, and M, whose photons light its
+  surfaces through the haze even without `-beams`), and once every camera's mode is resolved
+  and the run is one that traces light (not `-raster`/`-explore` or a diagnostic report),
+  `warnHazeOnlyNearScene` says so on stderr, once per scene file, where a sun or sky lights such
+  a medium.
   Backward does cone NEE and adds the direct disc view on a ray miss only when
   `specularArrival` is true — a single unbiased estimator with **no MIS weight**, since
   NEE runs at precisely the material types that then clear that flag. `Scene::sunCount`
@@ -8429,11 +8431,14 @@ as the one at fault.
     value (`nx²+ny²+nz²+1`), because F&H intersects parabolas by *subtracting* two seeds and
     `1e300 - 1e300` is pure cancellation noise; and the ramp is a smoothstep rather than a
     linear one, because a linear ramp creases visibly where it reaches 1 and that crease reads
-    as a second, softer silhouette. The density follows the ramp: a feathered bound sets
-    `Medium::boundRamp`, so `densityAt` (the device's `dMedDensityAt`) multiplies the field by
-    the occupancy and membership is any occupancy above 0, where an unfeathered bound keeps the
-    0.5 isosurface (a threshold would only move the hard edge half the feather inward;
-    `tools/check_feather.py`). Because it only ever *lowers* density it is majorant-safe
+    as a second, softer silhouette. The ramp is `smoothstep((d - 1) / feather)` in voxels: 0
+    on the silhouette's own voxels, so the trilinear sample is 0 everywhere past them and the
+    fog never leaks outside the mesh. The density follows it: a feathered bound sets
+    `Medium::boundRamp`, and `Medium::meshWeight` (the device's `dMeshWeight`, which every
+    reader of the lattice goes through) returns the occupancy as a weight on the field, where an
+    unfeathered bound returns 1 inside the 0.5 isosurface (a threshold would only move the hard
+    edge half the feather inward; `tools/check_feather.py`). Under one voxel `featherGrid`
+    leaves the lattice binary and reports it, so `boundRamp` stays off. Because it only ever *lowers* density it is majorant-safe
     for free (`maxVal` stays 1). `ftsl.h` takes the value in **world metres**, divides by the
     voxel edge, warns below one voxel, and **rejects the key on sphere/isosurface bounds**,
     which are carved analytically and have no lattice to soften.
