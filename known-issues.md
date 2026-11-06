@@ -535,8 +535,11 @@ check_jchroma-style rig with the medium's coefficients flat). First look (2026-1
 `scraps/upbpw_rainbow/bow.ftsl`: a sun behind the camera, a bounded `phase rainbow` fog with flat
 coefficients, 64x48, GPU, mode J against mode R at 4x its spp): too noisy to tell -- with 0.1 mm
 droplets and J at 4096 spp the seeds still scatter by 5 % in X over Y and Z over Y (means 0.993 and
-1.011), and 0.5 mm droplets scatter by 10 %. A quieter rig (a wider bow, a larger frame, or the
-weights' partition of unity measured directly) comes first. Proper fix, if it shows: tabulate
+1.011), and 0.5 mm droplets scatter by 10 %. A third (albedo 0.6, `-max-bounce 4`, 6 seeds, R at
+65536 spp) still scatters by 4 % a seed (means 0.995 and 1.010): the merges in a sharp rainbow
+lobe are this noisy at any affordable budget, so the effect must be measured some other way --
+the weights' partition of unity directly (an audit like the one JSPEC used, FTRACE_J_AUDIT), or
+the two estimates' difference paired on one seed with the camera side read at each wavelength. Proper fix, if it shows: tabulate
 the phase-dependent ratios per bin with the rest (`ChromaMis` / `DChromaRun` already carry rows
 per vertex), so segSumC becomes wavelength-dependent too in such a scene.
 
@@ -545,16 +548,28 @@ per vertex), so segSumC becomes wavelength-dependent too in such a scene.
 `-device cpu` is meant to be deterministic (it is the reference and validation baseline, and
 check_bitid holds mode J to it). On `scraps/jspec2/hetmed.ftsl` (a heterogeneous coloured fog in a
 box) it is not: `ftrace -in scraps/jspec2/hetmed.ftsl -device cpu -r 32 -max-bounce 8 -no-meter
--hdr -seed 1 -beamcount 100000 -beamk 2 -nojsurf -mode J -spp 1024`, run twice by the same binary,
-gives two images 2 % apart in rel-RMS (677 of 1024 pixels differ, largest 0.2 of the mean; same
-beam budget in both logs). That is different random samples, not summation order. The likely
-cause: the light pass builds the beam map in parallel, so the beams' order in it follows thread
-timing, and the gather draws a ratio-tracked transmittance from the pixel's stream for every beam
-it hits, in map order -- so the draws land on different beams each run. check_bitid's scenes
-would not show it if their media are homogeneous (no draws in the gather). Proper fix: order the
-map deterministically after the parallel build (by subpath index), or give each hit's draws a
-stream of their own keyed on (pixel sample, beam index); then add a heterogeneous medium to
-check_bitid's mode-J scenes.
+-hdr -seed 1 -beamcount 100000 -beamk 2 -nojsurf -mode J -spp 256`, run twice by the same binary,
+gives two images 2 % apart in rel-RMS (same beam budget and epoch count in both logs).
+
+**Cause (found 2026-11-06), and it is a design choice, not a race:** with no `-beamepochs`, mode J
+ends each light-side epoch on the CLOCK -- `renderChunked` (main.cpp) sets an epoch's length to its
+measured rebuild and setup time over `-beamrefresh`'s share -- so which camera samples meet which
+light-side realization depends on how fast the machine ran. The connection half alone
+(`FTRACE_J_HALF=connections`) is byte-identical run to run; the merge half is not, at one thread as
+at 32, while the light pass itself is deterministic (each thread takes a fixed range of subpaths and
+the banks are concatenated in thread order). check_bitid never sees it: it renders mode J at
+`-spp 1`, which has one epoch. `-beamepochs K` (epochs laid over sample counts) or `-beamfreeze`
+make a render deterministic today.
+
+**The fix needs the user's word (TODO 4.1):** (a) keep the clock schedule, document that a
+deterministic mode-J render needs `-beamepochs K`, and pass it in the validation tools; or (b) on
+the CPU at a fixed `-spp`, end epochs on deterministic work counts instead of seconds (subpaths
+traced and beams built against the camera samples gathered since), which keeps the refresh
+adaptive and makes it repeatable, at the cost of a cost model in counts that the clock now
+provides for free; or (c) on the CPU at a fixed `-spp`, fixed epochs by default (`-beamepochs K`
+with a K from the sample count), which is deterministic but no longer adapts to how expensive the
+light side is. Then add a heterogeneous medium at more than one sample to check_bitid's mode-J
+scenes.
 
 ## OPEN (2026-11-05, 0.434.16; found in review of 51eb7ef..af7de14): HAZE-BLUR-DOMAIN — under a blur, modes D and J's strategies take different haze for a mover outside the instant's sphere
 
