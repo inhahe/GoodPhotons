@@ -5197,7 +5197,8 @@ a body or a bottle, wrong for a cloud. `feather <metres>` fixes that: it replace
 occupancy with a smoothstep of the **exact Euclidean distance** to the outside (Felzenszwalb
 & Huttenlocher's separable transform, three linear-time sweeps — isotropic, no axis-aligned
 banding), so density rises from zero at the surface to full that far in and the silhouette
-becomes a falloff *zone* the way real cloud edges are. Pair it with
+becomes a falloff *zone* the way real cloud edges are. (Before 0.434.17 the density stepped at
+the ramp's midpoint instead, so `feather` only moved a hard edge inward.) Pair it with
 `mesh { … shape_only yes }`, which loads a mesh purely as a shape and strips its triangles
 from the scene once the bound is baked, so the shell defining the fog isn't also drawn
 around it. An *open* fog sphere is directly viewable in every mode.

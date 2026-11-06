@@ -8702,6 +8702,7 @@ private:
                     med.bounded = true;
                     med.boundShape = MediumBound::Mesh;
                     med.boundGrid = std::make_shared<VdbGrid>(std::move(occ));
+                    med.boundRamp = feath > 0.0;
                     med.bmin = med.boundGrid->wmin;
                     med.bmax = med.boundGrid->wmax;
                 } else {

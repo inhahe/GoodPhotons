@@ -733,8 +733,15 @@ struct Medium {
     // membership, so a `density` formula still multiplies on top and shapes the fog
     // WITHIN the mesh silhouette — the same semantics a named isosurface bound has.
     std::shared_ptr<VdbGrid> boundGrid;
+    // A FEATHERED lattice (`feather`, meshvox::featherGrid) ramps from 0 at the silhouette to 1
+    // that far inside, and the density follows it -- occupancy times the field -- rather than
+    // stepping at its 0.5 crossing, which would only move the hard edge inward. An unfeathered
+    // one keeps the 0.5 isosurface.
+    bool boundRamp = false;
     bool insideMesh(const Vec3& p) const {
-        return boundGrid && boundGrid->sample(p) >= 0.5;
+        if (!boundGrid) return false;
+        const double occ = boundGrid->sample(p);
+        return boundRamp ? occ > 0.0 : occ >= 0.5;
     }
 
     // --- Optional volumetric blackbody EMISSION (fire) ----------------------
@@ -848,7 +855,12 @@ struct Medium {
     // a parameter, not a member, because it points into Scene's vectors — see PatTables.
     double densityAt(const Vec3& p, const PatTables* tabs = nullptr) const {
         if (boundShape == MediumBound::Implicit && !insideField(p, tabs)) return 0.0;
-        if (boundShape == MediumBound::Mesh && !insideMesh(p)) return 0.0;
+        if (boundShape == MediumBound::Mesh) {
+            if (!boundGrid) return 0.0;
+            const double occ = boundGrid->sample(p);
+            if (boundRamp) return (occ > 0.0) ? std::min(1.0, occ) * densityFieldAt(p, tabs) : 0.0;
+            if (occ < 0.5) return 0.0;
+        }
         return densityFieldAt(p, tabs);
     }
 

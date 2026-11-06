@@ -977,7 +977,8 @@ struct DMedium {
     double           emissionScale;   // brightness multiplier on the Planck term
     int              bounded;         // 1 => clip to the bound region
     int              boundShape;      // 0 => box [bmin,bmax], 1 => sphere, 2 => implicit field,
-                                      // 3 => MESH containment (boundGrid occupancy >= 0.5)
+                                      // 3 => MESH containment (boundGrid occupancy >= 0.5,
+                                      //      or > 0 when feathered: boundRamp)
     DVec3            bmin, bmax;
     DVec3            bcenter;
     double           bradius;
@@ -994,6 +995,7 @@ struct DMedium {
     // densGrid because it decides MEMBERSHIP only — a `density` field still multiplies
     // on top, shaping the fog within the mesh silhouette. ---
     DVdbGrid          boundGrid;
+    int               boundRamp;      // 1 => feathered: density x occupancy (host Medium::boundRamp)
     // --- Optional gradient-index (GRIN) refractive field n(x,y,z) (mirrors host Medium) ---
     // When `iorN > 0` this region bends rays along the Eikonal ray equation; the forward
     // megakernel/wavefront march through it (dGrinMarch) before each bounce's closestHit.
@@ -2992,17 +2994,24 @@ __device__ static double dMedDensityAt(const DMedium& m, const DVec3& p, const D
         bool inside = m.boundInsideNeg ? (f < 0.0) : (f > 0.0);
         if (!inside) return 0.0;
     }
+    double ramp = 1.0;   // a feathered mesh bound's occupancy (host Medium::densityAt)
     if (m.boundShape == 3 && m.boundGrid.brickData) {   // mesh-containment carve-out
-        if (dVdbSample(m.boundGrid, p) < 0.5) return 0.0;
+        const double occ = dVdbSample(m.boundGrid, p);
+        if (m.boundRamp) {
+            if (!(occ > 0.0)) return 0.0;
+            ramp = occ < 1.0 ? occ : 1.0;
+        } else if (occ < 0.5) {
+            return 0.0;
+        }
     }
     // Imported .nvdb/.vdb volume: trilinearly sample the uploaded sparse brick grid.
     // Takes precedence over the pattern-VM density.
-    if (m.densGrid.brickData) return dVdbSample(m.densGrid, p);
-    if (!m.heterogeneous || !m.density) return 1.0;
+    if (m.densGrid.brickData) return ramp * dVdbSample(m.densGrid, p);
+    if (!m.heterogeneous || !m.density) return ramp;
     double r = sqrt((double)p.x * p.x + (double)p.y * p.y + (double)p.z * p.z);
     double d = dPatternEval(m.density, m.densityN, p.x, p.y, p.z, 0.0,
                             0.0, 0.0, 0.0, r, 0.0, 0.0, 0.0, 0.0, 0.0, env);
-    return d > 0.0 ? d : 0.0;
+    return d > 0.0 ? ramp * d : 0.0;
 }
 
 // Planck spectral radiance at temperature `kelvin`, wavelength `lambdaNm` (device twin
@@ -3093,8 +3102,10 @@ __device__ static bool dMedInside(const DMedium& m, const DVec3& p, const DPatEn
         double f = dFieldEval(m.boundField, m.boundFieldN, p.x, p.y, p.z, m.boundFieldExpr, env);
         return m.boundInsideNeg ? (f < 0.0) : (f > 0.0);
     }
-    if (m.boundShape == 3 && m.boundGrid.brickData)   // mesh containment
-        return dVdbSample(m.boundGrid, p) >= 0.5;
+    if (m.boundShape == 3 && m.boundGrid.brickData) {   // mesh containment
+        const double occ = dVdbSample(m.boundGrid, p);
+        return m.boundRamp ? occ > 0.0 : occ >= 0.5;
+    }
     return p.x >= m.bmin.x && p.x <= m.bmax.x && p.y >= m.bmin.y &&
            p.y <= m.bmax.y && p.z >= m.bmin.z && p.z <= m.bmax.z;
 }
@@ -24442,6 +24453,7 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
                 uploadVdbGrid(*m.boundGrid, dm.boundGrid, "mesh bound");
             else
                 clearVdbGrid(dm.boundGrid);
+            dm.boundRamp = m.boundRamp ? 1 : 0;
             dm.bmin = {m.bmin.x, m.bmin.y, m.bmin.z};
             dm.bmax = {m.bmax.x, m.bmax.y, m.bmax.z};
             dm.bcenter = {m.bcenter.x, m.bcenter.y, m.bcenter.z};

@@ -8429,7 +8429,11 @@ as the one at fault.
     value (`nx²+ny²+nz²+1`), because F&H intersects parabolas by *subtracting* two seeds and
     `1e300 - 1e300` is pure cancellation noise; and the ramp is a smoothstep rather than a
     linear one, because a linear ramp creases visibly where it reaches 1 and that crease reads
-    as a second, softer silhouette. Because it only ever *lowers* density it is majorant-safe
+    as a second, softer silhouette. The density follows the ramp: a feathered bound sets
+    `Medium::boundRamp`, so `densityAt` (the device's `dMedDensityAt`) multiplies the field by
+    the occupancy and membership is any occupancy above 0, where an unfeathered bound keeps the
+    0.5 isosurface (a threshold would only move the hard edge half the feather inward;
+    `tools/check_feather.py`). Because it only ever *lowers* density it is majorant-safe
     for free (`maxVal` stays 1). `ftsl.h` takes the value in **world metres**, divides by the
     voxel edge, warns below one voxel, and **rejects the key on sphere/isosurface bounds**,
     which are carved analytically and have no lattice to soften.

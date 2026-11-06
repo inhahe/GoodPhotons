@@ -110,8 +110,9 @@ Each names the section its line is in.
 12. ~~**BLUR-EPOCH-COST** (4.5) — a blurred clock-budgeted mode M or J spends its clock rebuilding.~~
     Done, 0.434.12.
 13. **UPBP-W-CHROMATIC** (4.3) — mode J's beam weight mixes two wavelengths in a chromatic medium.
-14. **FEATHER-IS-A-THRESHOLD** (4.2) — `feather` shrinks a cloud instead of ramping it; the fix
-    changes `gallery_rain`'s cloud edges, so show the user before it lands.
+14. ~~**FEATHER-IS-A-THRESHOLD** (4.2) — `feather` shrinks a cloud instead of ramping it; the fix
+    changes `gallery_rain`'s cloud edges, so show the user before it lands.~~ Shown, approved
+    (2026-11-05), done 0.434.17.
 15. **HAZE-BLUR-DOMAIN** (4.2) — under a blur, modes D and J weigh together strategies that take
     different haze for a mover outside the instant's sphere. Measure first; one fix needs the
     user's word.
@@ -216,8 +217,8 @@ Then the rest of 4.2-4.6 in their order, 4.7's bookkeeping alongside whatever to
 - [ ] **FWD-SMOOTH-COAT** — a smooth clearcoat shows no sheen in modes A and B.
 - [x] **GLTF-MAP-MEAN-GUTTERS** — the importer's mean metalness and roughness count the atlas's
   gutters.
-- [ ] **FEATHER-IS-A-THRESHOLD** — a mesh-bound medium's `feather` shrinks the silhouette instead of
-  ramping the density.
+- [x] **FEATHER-IS-A-THRESHOLD** (0.434.17) — a mesh-bound medium's `feather` shrinks the silhouette
+  instead of ramping the density (`tools/check_feather.py`).
 - [ ] **BLACK-PIXELS-ONCE** — one GPU mode-R render had pure-black pixels four reruns did not.
 
 - [ ] **D-SILENT-EXIT** — one host mode-D render ended with no output and no image during a CUDA

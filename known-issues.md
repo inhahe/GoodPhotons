@@ -1866,7 +1866,16 @@ What it does not do:
   them would need the same partition argument per pair, with weights that sum to one across
   renderers.
 
-## OPEN (2026-10-18): FEATHER-IS-A-THRESHOLD — a mesh-bound medium's `feather` shrinks the silhouette instead of ramping the density
+## FIXED (2026-11-05, 0.434.17; opened 2026-10-18): FEATHER-IS-A-THRESHOLD — a mesh-bound medium's `feather` shrinks the silhouette instead of ramping the density
+
+**Fixed in 0.434.17**, after the user saw `gallery_rain`'s cloud before and after (a softer
+rim, the cloud about 4 % larger in area, its inside unchanged). A
+feathered bound sets `Medium::boundRamp`: its density is the occupancy times the field, and
+membership is any occupancy above 0, on both devices (`Medium::densityAt` / `insideMesh`,
+`dMedDensityAt` / `dMedInside`). The ramp never exceeds 1, so the field's peak stays a valid
+majorant. `tools/check_feather.py` renders a feathered box of absorbing fog against a sky in
+mode R and holds its optical-depth profile to the ramp within 0.08 on each device (worst 0.036);
+0.434.16 reads the band up to 0.84 short. The rest of this entry is how it stood.
 
 Found while checking host/device media agreement for RAIN-J-VS-D. The loader's comment (ftsl.h, `feather <metres>`) says
 the density "ramps from 0 at the mesh surface to full only that far INSIDE it". But both host
