@@ -20282,6 +20282,8 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
                 buildBeamMap(bmap, "mode J:",
                              (double)res * (double)resY * (double)(spp > 0 ? spp : 16),
                              /*quiet*/!first, &scene, beamRadScaleFor(epoch + lsEpochBase));
+                bdpt::jWork().light.fetch_add(bdpt::jWorkBeamBuild(bmap.beams.size()),
+                                              std::memory_order_relaxed);
             }
             const double buildSec =
                 std::chrono::duration<double>(std::chrono::steady_clock::now() - tp0).count();
@@ -20612,13 +20614,24 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
             const bool sizeEpochsJ = blurEpochsJ && !nFixed && (timeBudgetSec > 0.0 || runForever);
             EpochSizer sizerJ(nAllJ > 0 ? nAllJ : N);
             long long nNextJ = 0;
+            // J-CPU-NONDET: on the CPU at a fixed -spp the refresh rule is applied in work counts
+            // (bdpt::JWork) instead of seconds, so the epochs, and with them the image, are the same
+            // on every run. Epoch 0 renders one sample, which prices a sample; each later one as
+            // many as keep its rebuild at -beamrefresh's share. The device, and any render under a
+            // -time/-noise/-forever budget, keeps the clock.
+            const bool countEpochs = !useGpu && !budgetedJ && !nFixed && !blurEpochsJ;
+            long long lightWorkJ = 0;              // the last rebuild's light-side units
+            long long camWorkJ = 0, camSppJ = 0;   // camera-side units, and the samples they bought
             for (; !stopAll && sppAll < sppTarget && !ft::stopRequested(); ++epoch) {
                 double rebuildSec = 0.0;
                 const uint64_t want = nFixed ? (uint64_t)((base + sppAll) / epLen) : epoch;
                 if (nFixed ? want != lsEpoch : epoch > 0) {
                     nBlurJ = sizeEpochsJ ? nNextJ : 0;
+                    const long long lw0 = bdpt::jWork().light.load(std::memory_order_relaxed);
                     rebuildSec = nFixed ? realize(want, 0)
                                         : realize(epoch, prog ? (uint64_t)prog->sampleBase : 0ull);
+                    lightWorkJ = bdpt::jWork().light.load(std::memory_order_relaxed) - lw0 +
+                                 bdpt::kJWorkRebuildFixed;
                     if (beamsPtr)   beamsPtr   = curB;
                     if (photonsPtr) photonsPtr = curS;
                     lsEpoch = want;
@@ -20707,7 +20720,7 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
                     const bool stopNow = prog->report(comb, tot, final && tot >= sppTarget);
                     reportSec += std::chrono::duration<double>(clk::now() - tRep).count();
                     if (stopNow) { stopAll = true; return true; }
-                    if (nFixed) return false;       // a fixed epoch runs its whole share
+                    if (nFixed || countEpochs) return false;   // the epoch runs its whole share
                     // A blurred moving scene's clock epoch (a budget has no total to split) ends
                     // after a few samples, so the shutter is sampled by many epochs
                     // (known-issues BLUR-EPOCH-COST).
@@ -20723,11 +20736,40 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
                 // own `quiet` argument follows one screen up. Restored immediately after, so
                 // any later non-epoch caller narrates normally.
                 g_gpuQuietRebuild = (epoch != 0);
+                long long countLen = 0;
+                if (countEpochs) {
+                    countLen = 1;
+                    if (epoch > 0 && camSppJ > 0 && camWorkJ > 0) {
+                        const double perSpp = (double)camWorkJ / (double)camSppJ;
+                        countLen = (long long)std::ceil((double)lightWorkJ /
+                                                        (g_beamRefreshFrac * perSpp));
+                        if (countLen < 1) countLen = 1;
+                    }
+                    countLen = std::min(countLen, sppTarget - sppAll);
+                }
+                const long long cw0 = bdpt::jWork().cam.load(std::memory_order_relaxed);
                 const auto tg = clk::now();
                 Film f = renderEpoch(nFixed ? std::min<long long>((long long)(want + 1) * epLen, total)
                                                   - (base + sppAll)
-                                            : sppTarget - sppAll, &inner, held);
+                                            : countEpochs ? countLen : sppTarget - sppAll,
+                                     &inner, held);
                 const double callSec = std::chrono::duration<double>(clk::now() - tg).count();
+                if (countEpochs && epochSpp > 0) {
+                    const long long cw = bdpt::jWork().cam.load(std::memory_order_relaxed) - cw0;
+                    camWorkJ += cw;
+                    camSppJ  += epochSpp;
+                    // FTRACE_JWORK=1: each side's units and seconds, for checking the units'
+                    // relative costs (bdpt::JWork) against the clock they stand in for.
+                    static const bool jworkDiag = std::getenv("FTRACE_JWORK") != nullptr;
+                    if (jworkDiag)
+                        std::printf("[jwork] epoch %llu: rebuild %lld units (%lld of them the beam "
+                                    "build) %.4fs (%.3g s/unit), %lld spp %lld units %.4fs "
+                                    "(%.3g s/unit)\n",
+                                    (unsigned long long)epoch, lightWorkJ,
+                                    curB ? bdpt::jWorkBeamBuild(curB->beams.size()) : 0LL,
+                                    rebuildSec, lightWorkJ ? rebuildSec / (double)lightWorkJ : 0.0,
+                                    epochSpp, cw, callSec, cw ? callSec / (double)cw : 0.0);
+                }
                 lsGatherSec += callSec;
                 g_gpuQuietRebuild = false;
                 if (sizeEpochsJ && lastNepochJ > 0) {

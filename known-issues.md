@@ -543,7 +543,17 @@ the two estimates' difference paired on one seed with the camera side read at ea
 the phase-dependent ratios per bin with the rest (`ChromaMis` / `DChromaRun` already carry rows
 per vertex), so segSumC becomes wavelength-dependent too in such a scene.
 
-## OPEN (2026-11-05, 0.434.18): J-CPU-NONDET — CPU mode J renders a heterogeneous medium differently run to run
+## FIXED (2026-11-06, 0.434.21; opened 0.434.18): J-CPU-NONDET — CPU mode J renders a heterogeneous medium differently run to run
+
+**Fixed in 0.434.21, the user's option (b):** on the CPU at a fixed `-spp` (no `-beamepochs`, no
+`-time`/`-noise`/`-forever`), the refresh rule runs in work counts (`bdpt::JWork`, design.md "On
+the CPU at a fixed -spp"): epoch 0 renders one sample, each later epoch
+`ceil(rebuild units / (-beamrefresh * units per sample))`. The command below now renders
+byte-identically run to run, and at `-t 1` as at 32; `tools/check_jdeterminism.py` holds both
+(0.434.20 fails both). The constants were fitted against the clock (`FTRACE_JWORK=1`): the light
+side then took 16 % of hetmed's render at 512 spp and 12 % of `_fog_cornell`'s at 64, against the
+clock's 37 % and 3 %, both counting the first build's one-time pilot. The rest of this entry is
+how it stood.
 
 `-device cpu` is meant to be deterministic (it is the reference and validation baseline, and
 check_bitid holds mode J to it). On `scraps/jspec2/hetmed.ftsl` (a heterogeneous coloured fog in a

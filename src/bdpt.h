@@ -94,6 +94,32 @@ inline bool jSpecEnabled() {
     }();
     return on;
 }
+// WORK COUNTS for mode J's light-side refresh on the CPU (J-CPU-NONDET). An epoch of a fixed -spp
+// render there lasts as many camera samples as keep its light side's rebuild near -beamrefresh's
+// share of the time -- the rule the clock applies elsewhere -- but measured in counts, which a
+// machine's speed cannot change, so the render repeats exactly. One unit: a vertex traced (a
+// light subpath's or a camera sample's), a connection evaluated, a beam or photon a merge weighs;
+// a rebuild adds kJWorkRebuildFixed, and its beam map kJWorkPerBeamLog for each beam times the log
+// of the map's size. Both sides accumulate per thread and add once per pass.
+struct JWork {
+    std::atomic<long long> light{0};   // the light passes' (main.cpp adds each beam map's build)
+    std::atomic<long long> cam{0};     // the camera passes'
+};
+inline JWork& jWork() { static JWork w; return w; }
+// Fitted against the clock (FTRACE_JWORK=1, the CPU at 32 threads) on hetmed's small map, a map of
+// 100 000 beams and _fog_cornell's of 10 million, whose rebuilds took 0.11 s, 0.26-0.5 s and 1.8 s:
+// a rebuild costs about 0.1 s of fixed start-up (its passes' threads, the BVH builder) plus the
+// beam build, against a camera unit's 0.6-2 e-7 s. Off by up to 2-3x on any one scene -- the
+// camera units' own cost moves that much with the medium -- which moves the light side's share
+// between about 5 and 20 % at the default -beamrefresh 0.10.
+constexpr long long kJWorkRebuildFixed = 500000;
+// A beam map's build in JWork units: its sort and SAH BVH, n log n in the beams.
+constexpr double kJWorkPerBeamLog = 0.17;
+inline long long jWorkBeamBuild(size_t nBeams) {
+    return nBeams ? (long long)(kJWorkPerBeamLog * (double)nBeams * std::log2((double)nBeams + 1.0))
+                  : 0;
+}
+
 // FTRACE_JCHROMA=0 reads a mode-J merge weight's camera half at the camera's wavelength even in a
 // medium whose extinction varies with wavelength (ChromaMis), for A/B runs. Both devices.
 inline bool jChromaEnabled() {
@@ -2636,6 +2662,7 @@ inline void traceLightBeamPass(const Scene& scene, const Camera& cam, long long 
         std::vector<BeamMis>& misBank = misBanks[(size_t)tid];
         std::vector<double> accC, accMb, accMs;        // per-subpath, reused
         const PatTables tabs = scene.patTables();
+        long long workLight = 0;                       // JWork: this thread's vertices
         const long long lo = total * tid / nThreads, hi = total * (tid + 1) / nThreads;
         long long done = 0;
         for (long long i = lo; i < hi; ++i) {
@@ -2659,6 +2686,7 @@ inline void traceLightBeamPass(const Scene& scene, const Camera& cam, long long 
             hb.C = 1;
             segs.clear();
             generateLightSubpath(scene, cam, mats, hb, maxDepth + 1, rng, path, &segs, &bs);
+            workLight += (long long)path.size();
             // The deposit form this subpath's segments will use, decided once (it is a
             // property of the emitter, not of the segment; `sg.achro` supplies the per-segment
             // half). See BeamSpectral for why the hero wavelength is REPLACED rather than
@@ -2961,6 +2989,7 @@ inline void traceLightBeamPass(const Scene& scene, const Camera& cam, long long 
         // thrown away, so counting them here would report more progress than the pass will
         // ever have work for and drive the percentage past 100.
         if (!pilot) tracedTotal.fetch_add(done & 0xFFF, std::memory_order_relaxed);
+        if (!pilot) jWork().light.fetch_add(workLight, std::memory_order_relaxed);
         // Count what was actually emitted, not what was asked for: an early `-stop` that
         // reported the full share would scale the whole map down and darken the merges.
         emitted[(size_t)tid] = done;
@@ -4115,8 +4144,10 @@ struct BeamMergeWeight {
     // are the camera's.
     const double* chromaM = nullptr;
     const double* chromaK = nullptr;
+    long long* work = nullptr;   // JWork: the camera pass's count, one per beam weighed
 
     double operator()(const BeamHit& bh, const PhotonBeam& b, double dens, double phase) const {
+        if (work) ++*work;
         if (diag) diag->hits.fetch_add(1, std::memory_order_relaxed);
         if (routeMedJ && routeOfMedium(*scene, b.med) != ROUTE_J) return 0.0;   // a D-routed merge
         if (raw) return 1.0;                  // diagnostic: unweighted BB1D, i.e. mode M's
@@ -4255,9 +4286,11 @@ struct SurfMergeWeight {
     // at the photon's wavelength; null where no medium's extinction varies with wavelength.
     const double* chromaM   = nullptr;
     const double* chromaKm1 = nullptr;
+    long long* work = nullptr;   // JWork: the camera pass's count, one per photon weighed
 
     // `lam` is the photon's wavelength, read only through chromaM.
     double operator()(const SurfMis& lm, double pdfDirRev, double pdfDirFwd, double lam) const {
+        if (work) ++*work;
         // THE DEPTH CAP, exactly as BeamMergeWeight's and for the same reason, at this merge's
         // depth j+k-1 (see SHAPE). Past the cap the merged path is one no connection strategy
         // builds, so its energy would have nothing to MIS against; AT the cap it is one they do
@@ -4481,6 +4514,11 @@ struct BdptRenderer {
         // varies with wavelength (ChromaMis): segSumM and the point merges' eta at eye[k-1] per
         // eye vertex, and one segment's eta at eye[k].
         std::vector<double> chromaM, chromaE1, chromaK(ChromaMis::K);
+        long long workCam = 0;   // JWork: this thread's camera-side count, added at the end
+        struct AddWork {
+            long long& w;
+            ~AddWork() { jWork().cam.fetch_add(w, std::memory_order_relaxed); }
+        } addWork{workCam};
         JSpecWalk jsw;     // JSPEC: the camera walk's spectral carrier (mode J merges only)
         const uint64_t nPix = (uint64_t)camFilm.resX * (uint64_t)camFilm.resY;
         // Hero gate, matching BackwardRenderer: bundling needs a wavelength-independent
@@ -4673,10 +4711,12 @@ struct BdptRenderer {
                             }
                         }
                     }
+                    workCam += nE + nL;
                     for (int t = 1; t <= nE; ++t)
                         for (int s = 0; s <= sMax; ++s) {
                             int depth = t + s - 2;
                             if ((s == 1 && t == 1) || depth < 0 || depth > maxDepth) continue;
+                            ++workCam;
                             int spx = 0, spy = 0; bool isSplat = false;
                             double Lsec[hero::kHeroMax - 1] = {0};
                             int nUpConn = 0;
@@ -4886,6 +4926,7 @@ struct BdptRenderer {
                             w1.glass = (jSpecOn && sg.glassMat >= 0)
                                      ? &scene.mats[(size_t)sg.glassMat] : nullptr;
                             w1.lamCam = lamCam; w1.kappa = mergeKappa;
+                            w1.work = &workCam;
                             w1.kappaS = mk.surf;
                             w1.tabs = &tabs;
                             w1.raw = (jHalf == 3);
@@ -4993,6 +5034,7 @@ struct BdptRenderer {
                                 if (!(d2 > 0.0)) continue;
                                 woCam = woCam * (1.0 / std::sqrt(d2));
                                 SurfMergeWeight sw;
+                                sw.work         = &workCam;
                                 sw.kappaB       = mk.beam;
                                 sw.kappaS       = mk.surf;
                                 sw.invPdfFwdK   = 1.0 / misRemap0(vk.pdfFwd);

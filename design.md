@@ -2176,6 +2176,21 @@ itself stays on the device across a frame's epochs since 0.392.0), so a scene wh
 are dear stretches its epochs out and degrades gracefully toward `-beamfreeze` instead of
 thrashing.
 
+**On the CPU at a fixed `-spp` the same rule runs in work counts (J-CPU-NONDET, 0.434.21).** A
+clock makes which samples meet which realization depend on the machine's speed, so the CPU, the
+validation device, did not repeat itself in a heterogeneous medium (its transmittance estimates
+draw from the camera's stream). `bdpt::JWork` counts both sides instead: the light pass's
+vertices and each beam map's build (`kJWorkPerBeamLog` per beam times log n, plus
+`kJWorkRebuildFixed` a rebuild), and the camera pass's vertices, connections and the beams and
+photons its merge weights weigh. Epoch 0 renders one sample, which prices a sample; each later
+epoch runs `ceil(rebuild units / (-beamrefresh * units per sample))` samples, whole, never cut by
+the clock. The constants were fitted against the clock on three maps from 12 thousand to 10
+million beams and are good to 2-3x on any one scene (the camera units' own cost moves that much
+with the medium), so the light side lands at 5-20 % of the time instead of 10 %. Counts are
+sums over the frame, so the image is the same at any `-t`; `tools/check_jdeterminism.py` holds
+it. `FTRACE_JWORK=1` prints each epoch's units and seconds. A `-time`/`-noise`/`-forever` budget
+and the device keep the clock.
+
 **MODE `J`'S SURFACE LIGHT SIDE RUNS ON THE DEVICE, PER CHUNK (0.272.0).** `-jsurf`'s surface
 photon map is traced by `kJSurfLightT` — the device twin of the deposit in `traceLightBeamPass` —
 and gridded on the device with the machinery `vcmSessionPass` already used (bbox reduce, cell

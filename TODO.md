@@ -117,9 +117,9 @@ Each names the section its line is in.
 15. **UPBP-W-RAINBOW** (4.3) — mode J's merge weights read a rainbow phase's camera-side
     densities at the camera's wavelength (`gallery_rain`'s rain). Measure first: three image
     comparisons were too noisy (4-10 % a seed), so next is a direct partition-of-unity audit.
-16. **J-CPU-NONDET** (4.4) — CPU mode J renders a heterogeneous medium differently run to run
-    (found validating UPBP-W-CHROMATIC); the CPU is the validation baseline. Cause found: its
-    epochs end on the clock. **Waiting on the user (4.1).**
+16. ~~**J-CPU-NONDET** (4.4) — CPU mode J renders a heterogeneous medium differently run to run
+    (found validating UPBP-W-CHROMATIC); the CPU is the validation baseline.~~ Its epochs ended on
+    the clock; they end on work counts since 0.434.21 (the user's option b).
 17. **HAZE-BLUR-DOMAIN** (4.2) — under a blur, modes D and J weigh together strategies that take
     different haze for a mover outside the instant's sphere. Measure first; one fix needs the
     user's word.
@@ -136,7 +136,8 @@ Then the rest of 4.2-4.6 in their order, 4.7's bookkeeping alongside whatever to
 
 ### 4.1 Decisions the user owes (each blocks its fix)
 
-- [ ] **J-CPU-NONDET** — CPU mode J is not repeatable at a fixed `-spp`, because its light-side
+- [x] **J-CPU-NONDET** — decided 2026-11-06: (b), done in 0.434.21 (`tools/check_jdeterminism.py`).
+  CPU mode J is not repeatable at a fixed `-spp`, because its light-side
   epochs end on the clock (renderChunked: an epoch lasts its rebuild time over `-beamrefresh`'s
   share). (a) Keep that, document that a deterministic render needs `-beamepochs K`, and pass it in
   the validation tools; (b) on the CPU at a fixed `-spp`, end epochs on work counts (subpaths and
@@ -333,8 +334,8 @@ Then the rest of 4.2-4.6 in their order, 4.7's bookkeeping alongside whatever to
 
 - [x] **CPU-ONLY-BUILD** — a build without CUDA did not compile (`main.cpp` named device-only types
   outside `#ifdef HAVE_CUDA`). The two device headers are included in every build now.
-- [ ] **J-CPU-NONDET** — CPU mode J renders a heterogeneous medium 2 % differently run to run; the
-  parallel light pass orders the beam map by thread timing (suspected).
+- [x] **J-CPU-NONDET** (0.434.21) — CPU mode J rendered a heterogeneous medium 2 % differently run
+  to run: its epochs ended on the clock; they end on work counts now.
 - [ ] **GLOSSY-SAMPLE-SITES** — the interference factor is applied by hand at every glossy sampler.
 - [ ] **REMAP0-IMPOSSIBLE** — the MIS sums read a zero density as a delta's, whatever made it zero
   (only the sun's is special-cased).
