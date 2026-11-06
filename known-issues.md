@@ -581,7 +581,17 @@ counted each segment a mode M camera path traces (final-gather rays and bounces 
 summed a query's candidates before the thread-local add, stopped the realization counts from
 including a light side drawn but never rendered, and salted a resumed render's first light side
 past the loaded samples (it gathered from the first session's epoch 0 again;
-check_jdeterminism holds that too). The rest of this entry is how it stood.
+check_jdeterminism holds that too).
+
+**0.434.25 (review of 0.434.24):** that salted first build was a *first* build, so it re-adapted
+the gather radius from another realization (0.06929 to 0.06476 on check_jdeterminism's fog) and
+averaged two estimators. Epoch 0 is again built under salt 0, for the radii, and a resume redraws
+it at them under its own salt before its first sample (`-beamfreeze` included);
+check_jdeterminism checks the radii, the redraw and that a resume repeats itself, and 0.434.24
+fails the first two. Counting camera segments moved no constant: `FTRACE_JWORK=1` puts a light
+unit and a camera unit within 25 % of each other in seconds (`_fog_cornell -beams`: 5.6e-8 and
+5.2e-8 s; cornell `-pmfg 16`: 1.8e-8 and 2.2e-8 s), where an uncounted final gather had priced a
+sample at a twelfth of its cost. The rest of this entry is how it stood.
 
 Mode J's half of this was J-CPU-NONDET (below). Mode M has the same refresh rule in its own loop
 (main.cpp, the mode-M epoch loop: an epoch lasts its rebuild time over `-beamrefresh`'s share), so
@@ -652,7 +662,15 @@ estimators give the sun's light three different haze lengths:
   crosses none.
 
 So D and J weigh together strategies that disagree about that light, and their image of the mover
-is biased, while R's stands on the NEE leg alone. Not measured yet. Reproduce: a ball that sweeps
+is biased, while R's stands on the NEE leg alone. **Measured (0.434.24, CPU, 512 spp, two seeds
+each):** a white ball of radius 1 held sharp by an instantaneous shutter at t = 0.4 (keys ±8 m,
+so it sits at x = 6.4, outside the instant's sphere of about 1.5 m round a 2x2 floor), under
+`light sun { dir 0.3 1 0.2 }` in `medium { sigma_t 0.04  albedo 0.5 }`. Mode D against mode R:
+the ball 1.0030, the haze round it 1.0018 (each mode's seed spread 0.0004 and 0.003); in clear air
+0.9997. With keys at ±40 m, the ball at x = 32: the ball 1.0275 and the haze 1.0260 (spread
+0.0002). So D is biased bright, by an amount that grows with the mover's distance past the
+instant's sphere: a few tenths of a percent close by, a few percent tens of metres out.
+Reproduce: a ball that sweeps
 from inside the scene's sphere to outside it across a shutter, under `light sun` in
 `medium { sigma_t 0.04 }` with no bounds; compare mode D's and mode R's ball (CPU, matched
 seeds) with the haze on and off. The forward photons' answer is outside the kept domain anyway

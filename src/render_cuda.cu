@@ -20814,12 +20814,11 @@ __global__ void kGather(DScene sc, DPhotonMap pm, DPhotonMap pmC, DBeamMap bm, c
         // N strata because any run of it is even: a stop that keeps only the launch's first
         // chunks keeps a tilt-free spectrum. `s` counts from this call's first sample, the call
         // being one epoch under its own salt (the shared path's refresh loop). Host twin:
-        // renderPhotonCamera (photonmap_render.h), whose goldenFrac (rng.h) this computes.
+        // renderPhotonCamera (photonmap_render.h).
         const unsigned long long sIdx = (unsigned long long)(gidx - pix * sppTotal);
         DRng rrot;
         rrot.seedUnit((unsigned long long)pix, seedBase ^ 0x5851F42D4C957F2DULL);
-        double u = (double)rrot.uniform()
-                 + (double)((sIdx * 0x9E3779B97F4A7C15ULL) >> 11) * (1.0 / 9007199254740992.0);
+        double u = (double)rrot.uniform() + goldenFrac(sIdx);
         u -= floor(u);
         if (!(u < 1.0)) u = 0.999999999;
         Real lambda = dSampleSceneLambdaU(sc, u, pdf);

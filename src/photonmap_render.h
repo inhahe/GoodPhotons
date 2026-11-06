@@ -1290,6 +1290,7 @@ inline Vec3 photonGatherSub(const Scene& scene, const PhotonMap& pm, Ray ray, Pc
                             bool diffraction, int maxBounce, double lambda, double invPdfL,
                             double norm, const Hit& visHit, const Material& visMat,
                             const PhotonMap* pmC = nullptr, double normC = 0.0) {
+    bdpt::LocalWork work;   // its segments, for the CPU refresh (MODEM-CPU-NONDET)
     Vec3 L{0, 0, 0};
     double thr = 1.0;
     bool specularSeen = false;                           // any specular bounce so far?
@@ -1307,7 +1308,7 @@ inline Vec3 photonGatherSub(const Scene& scene, const PhotonMap& pm, Ray ray, Pc
     bool hairArrival = false;   // HAIR-NEE: the previous vertex was a fiber that already took its direct light
 
     for (int b = 0; b < maxBounce; ++b) {
-        ++bdpt::tlWork();   // a segment traced, for the CPU refresh (MODEM-CPU-NONDET)
+        ++work.n;
         if (grinAny) {
             double arc = 0.0;
             grin::marchSegments(scene, ray,
@@ -1561,17 +1562,15 @@ inline Vec3 photonGatherSub(const Scene& scene, const PhotonMap& pm, Ray ray, Pc
 //
 // `pmC` (optional) is the CAUSTIC map (see tracePhotonPass): a disjoint half of the same
 // deposits, gathered at its own much finer radius and simply added.
-// `lambdaU` >= 0 is a stratified uniform for the hero wavelength (renderPhotonCamera); < 0 draws
-// it from `rng` as before.
-inline Vec3 photonGather(const Scene& scene, const PhotonMap& pm, Ray ray,
-                         Pcg32& rng, bool diffraction, int maxBounce, int fgRays = 0,
-                         const BeamMap* bm = nullptr, const PhotonMap* pmC = nullptr,
-                         double lambdaU = -1.0) {
+// `lambdaU`, in [0, 1), is the hero wavelength's uniform: renderPhotonCamera's stratified one.
+inline Vec3 photonGather(const Scene& scene, const PhotonMap& pm, Ray ray, double lambdaU,
+                         Pcg32& rng, bool diffraction, int maxBounce, int fgRays,
+                         const BeamMap* bm, const PhotonMap* pmC) {
+    bdpt::LocalWork work;   // its segments, for the CPU refresh (MODEM-CPU-NONDET)
     Vec3 L{0, 0, 0};
     double thr = 1.0;
     double pdfL = 0.0;
-    double lambda = (lambdaU >= 0.0) ? scene.emitSampler.sampleAt(lambdaU, pdfL)
-                                     : scene.emitSampler.sample(rng, pdfL);
+    double lambda = scene.emitSampler.sampleAt(lambdaU, pdfL);
     if (pdfL <= 0.0) return L;
     const double invPdfL = scene.invPdfLambda(lambda);
 
@@ -1623,7 +1622,7 @@ inline Vec3 photonGather(const Scene& scene, const PhotonMap& pm, Ray ray,
                (jsOn ? js.beta(thr) : thr);
     };
     for (int b = 0; b < maxBounce; ++b) {
-        ++bdpt::tlWork();   // a segment traced, for the CPU refresh (MODEM-CPU-NONDET)
+        ++work.n;
         const int    cmIdx  = stk.topMat();
         const double aGlass = (cmIdx >= 0) ? scene.mats[cmIdx].absorb(lambda) : 0.0;
         // Curved pre-pass. The volume estimator runs PER STRAIGHT SUB-SEGMENT of the curve:
@@ -2119,8 +2118,8 @@ inline Film renderPhotonCamera(const Scene& scene, const Camera& cam, int resX, 
                     double u = lambdaRot + goldenFrac(sampleBase + (uint64_t)s);
                     u -= std::floor(u);
                     const double lambdaU = (u < 1.0) ? u : 0.999999999;
-                    f.add(px, py, photonGather(scene, pm, ray, rng, diffraction, maxBounce,
-                                               fgRays, bm, pmC, lambdaU));
+                    f.add(px, py, photonGather(scene, pm, ray, lambdaU, rng, diffraction, maxBounce,
+                                               fgRays, bm, pmC));
                 }
             }
         }

@@ -2200,9 +2200,11 @@ each grid's or map's build, its camera units the rays, the beams weighed and a s
 photon-map query candidate (thread-local, flushed per pass, the candidates divided once over the
 whole span), and each segment its paths trace. Its camera pass also draws wavelengths by absolute
 sample index (the golden-ratio sequence above) rather than per clock-sized call. Both loops take
-their lengths from one rule, `bdpt::CountedEpochs`. A resumed mode M render draws its first light
-side under a salt past the loaded samples' (as mode J's `lsSalt0`), so it gathers from no map the
-checkpoint averaged.
+their lengths from one rule, `bdpt::CountedEpochs`. A resumed mode M render draws every light side
+under salts past the loaded samples' (their count), so it gathers from no map the checkpoint
+averaged; its first build still runs under salt 0, whose radii the loaded samples were gathered
+at, and is redrawn at them before the first sample, since an average over two radii would converge
+to neither estimator.
 
 **MODE `J`'S SURFACE LIGHT SIDE RUNS ON THE DEVICE, PER CHUNK (0.272.0).** `-jsurf`'s surface
 photon map is traced by `kJSurfLightT` — the device twin of the deposit in `traceLightBeamPass` —

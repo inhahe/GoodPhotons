@@ -39,6 +39,11 @@ inline JWork& jWork() { static JWork w; return w; }
 // costs about what a light unit does.
 inline long long& tlWork() { thread_local long long w = 0; return w; }
 inline long long& tlCandidates() { thread_local long long c = 0; return c; }
+// A pass's count kept locally and added to tlWork once, as the pass's scope ends, whichever way.
+struct LocalWork {
+    long long n = 0;
+    ~LocalWork() { tlWork() += n; }
+};
 struct CamWorkFlush {
     ~CamWorkFlush() {
         jWork().cam.fetch_add(tlWork(), std::memory_order_relaxed);

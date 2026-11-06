@@ -18,7 +18,8 @@ map takes other draws -- rendered at 32x32 in mode J (256 spp, beam merges only)
     it among threads changes.
 
 Each needs more than one epoch to mean anything, and says how many it got. And mode M resumed
-from a checkpoint draws its first light side under a salt of its own, not the first session's.
+from a checkpoint draws its light side under salts of its own, not the first session's, at the
+first session's radii, and the same way each time.
 
 Exits 1 on any failure.
 """
@@ -96,24 +97,39 @@ def main():
         single, _ = render(mode, "t1", ("-t", "1"))
         check("mode %s: so is a run at one thread" % mode, single == first)
 
-    # A resumed mode M render must not gather from a light side the checkpoint already averaged:
-    # its first is drawn under a salt past the loaded samples', so it deposits another count.
-    def deposited(spp, extra):
-        png = os.path.join(d, "M_resume.png")
+    # A resumed mode M render must not gather from a light side the checkpoint already averaged,
+    # so it draws its own under salts past the loaded samples'; but at the radii they were
+    # gathered at, or the average converges to neither estimator. And it repeats itself.
+    png = os.path.join(d, "M_resume.png")
+    def resumed(spp, extra):
         cmd = [exe, "-in", ftsl, "-device", "cpu", "-max-bounce", "8", "-no-meter", "-hdr",
                "-seed", "1", "-o", png, "-mode", "M", "-beams", "-n", "20000", "-spp", str(spp),
-               "-beamrefresh", "0.5"] + list(extra)
+               "-beamrefresh", "0.5", "-checkpoint"] + list(extra)
         p = subprocess.run(cmd, cwd=d, capture_output=True, text=True, encoding="utf-8",
                            errors="replace")
         if p.returncode != 0:
             print((p.stdout + p.stderr)[-1500:])
             raise SystemExit("render failed: " + " ".join(cmd))
-        m = re.search(r"mode M: deposited (\d+) photons", p.stdout)
-        return int(m.group(1)) if m else -1
-    d0 = deposited(16, ("-checkpoint",))
-    d1 = deposited(32, ("-checkpoint", "-resume"))
-    check("mode M: a resume draws its first light side afresh", d0 > 0 and d1 > 0 and d1 != d0,
-          "%d photons, then %d" % (d0, d1))
+        with open(png[:-4] + ".pfm", "rb") as f:
+            return p.stdout, f.read()
+    def radii(out):
+        return re.findall(r"adaptive gather radius: \S+ -> (\S+)", out)
+    out1, _ = resumed(16, ())
+    ckpt = [f for f in os.listdir(d) if f.startswith("M_resume") and f.endswith(".ftbuf")]
+    if len(ckpt) != 1:
+        raise SystemExit("expected one M_resume checkpoint, found %r" % ckpt)
+    ckpt = os.path.join(d, ckpt[0])
+    with open(ckpt, "rb") as f:
+        saved = f.read()
+    out2, img2 = resumed(32, ("-resume",))
+    check("mode M: a resume loads the checkpoint", "[resume] loaded" in out2)
+    check("mode M: ...and draws its light side afresh", "the light side is drawn afresh" in out2)
+    check("mode M: ...at the first session's radii", radii(out1) != [] and radii(out2) == radii(out1),
+          "%s, then %s" % (radii(out1), radii(out2)))
+    with open(ckpt, "wb") as f:
+        f.write(saved)
+    _, img3 = resumed(32, ("-resume",))
+    check("mode M: ...and repeats itself", img3 == img2)
     if fails:
         print("FAILED: " + ", ".join(fails))
         return 1
