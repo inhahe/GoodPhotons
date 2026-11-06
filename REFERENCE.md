@@ -5202,7 +5202,9 @@ occupancy with a smoothstep of the **exact Euclidean distance** to the outside (
 banding), so density rises from zero at the surface to full that far in and the silhouette
 becomes a falloff *zone* the way real cloud edges are. The ramp starts on the silhouette's own
 voxels, so no fog reaches past the mesh, and a feather under one voxel has no ramp to resolve:
-the edge stays hard, and the loader says so. (Before 0.434.17 the density stepped at the ramp's
+the edge stays hard, and the loader says so. A body thinner than about twice the feather never
+reaches full density, and one a voxel or two thick keeps none: the loader warns when a feather
+leaves a mesh bound under half its density. (Before 0.434.17 the density stepped at the ramp's
 midpoint instead, so `feather` only moved a hard edge inward.) Pair it with
 `mesh { … shape_only yes }`, which loads a mesh purely as a shape and strips its triangles
 from the scene once the bound is baked, so the shell defining the fog isn't also drawn

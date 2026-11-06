@@ -1,8 +1,9 @@
 """Regression check: mode J's colour matches mode R's in a medium whose extinction varies with
 wavelength.
 
-    python tools/check_jchroma.py [--out png/check_jchroma] [--exe ftrace.exe] [--device gpu]
-                                  [--seeds 3] [--tol 0.008] [--reuse-ref]
+    python tools/check_jchroma.py [--out png/check_jchroma] [--exe ftrace.exe]
+                                  [--variants gpu,gpu-jsurf,cpu] [--seeds 3] [--tol 0.008]
+                                  [--reuse-ref]
 
 A mode-J merge weight is a ratio of the densities with which the competing techniques would make
 one path, and must read them all at that path's one wavelength. Its light half is the beam's or
@@ -20,7 +21,13 @@ over Y's, within --tol -- before the fix X over Y read 0.987 and Z over Y 1.023 
 with seeds scattering by about 0.5 %. Mode J's own small bias (about -0.4 %, J-FOGCORNELL's kernel
 blur) is shared by the three channels and cancels there; the frame's Y must agree within 1.5 %.
 About 20 minutes on the GPU at the defaults: run it after a change to mode J's weights.
-`--reuse-ref` keeps the reference from an earlier run in --out, so a second run -- with
+--variants picks what is held: `gpu` (the default; beam merges), `gpu-jsurf` (point merges too,
+whose weights read the same tables: SurfMergeWeight, DSurfMergeW) and `cpu` (the host's
+ChromaMis; beam merges), each against mode R on its own device, about 20 minutes apiece. The CPU's
+mode J reads X over Y about 1.3 % lower than the GPU's here with the fix on or off -- a CPU-only
+bias of its own (known-issues J-FOG-REALCAM) -- so `cpu` is held to 1.5 %: with the fix it reads
+0.990 / 1.003, without 0.971 / 1.019 (the GPU: 1.002 / 0.994 and 0.984 / 1.016).
+`--reuse-ref` keeps the references from an earlier run in --out, so a second run -- with
 FTRACE_JCHROMA=0 in the environment, say, which reads the weights at the camera's wavelength as
 before the fix and fails -- renders only mode J.
 
@@ -81,7 +88,7 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__.split(NL)[0])
     ap.add_argument("--out", default=os.path.join(ROOT, "png", "check_jchroma"))
     ap.add_argument("--exe", default=os.path.join(ROOT, "ftrace.exe"))
-    ap.add_argument("--device", default="gpu")
+    ap.add_argument("--variants", default="gpu")
     ap.add_argument("--seeds", type=int, default=3)
     ap.add_argument("--tol", type=float, default=0.008)
     ap.add_argument("--rspp", type=int, default=32768)
@@ -94,9 +101,9 @@ def main():
     with open(ftsl, "w", encoding="utf-8", newline="") as f:
         f.write(SCENE)
 
-    def render(mode, seed, spp, extra=()):
-        png = os.path.join(d, "%s_%d.png" % (mode, seed))
-        cmd = [exe, "-in", ftsl, "-mode", mode, "-device", a.device, "-max-bounce", "8",
+    def render(dev, tag, mode, seed, spp, extra=()):
+        png = os.path.join(d, "%s_%s_%d.png" % (tag, mode, seed))
+        cmd = [exe, "-in", ftsl, "-mode", mode, "-device", dev, "-max-bounce", "8",
                "-no-meter", "-hdr", "-seed", str(seed), "-spp", str(spp), "-o", png] + list(extra)
         p = subprocess.run(cmd, cwd=d, capture_output=True, text=True, encoding="utf-8",
                            errors="replace")
@@ -104,28 +111,34 @@ def main():
         if p.returncode != 0:
             print(log[-1500:])
             raise SystemExit("render failed: " + " ".join(cmd))
-        if a.device == "gpu" and "on GPU" not in log:
+        if dev == "gpu" and "on GPU" not in log:
             print(log[-1500:])
             raise SystemExit("mode %s did not run on the GPU" % mode)
-        print("mode %s seed %d done" % (mode, seed), flush=True)
+        print("%s: mode %s seed %d done" % (tag, mode, seed), flush=True)
         return channel_means(png[:-4] + ".pfm")
 
-    ref_pfm = os.path.join(d, "R_1.pfm")
-    ref = channel_means(ref_pfm) if a.reuse_ref and os.path.exists(ref_pfm) else render("R", 1, a.rspp)
-    j = [0.0, 0.0, 0.0]
-    for sd in range(1, a.seeds + 1):
-        for c, v in enumerate(render("J", sd, a.jspp, ("-beamcount", "100000", "-beamk", "2",
-                                                       "-nojsurf"))):
-            j[c] += v / a.seeds
+    # device, mode-J flags, colour tolerance (the CPU's: J-FOG-REALCAM, above)
+    VARIANTS = {"gpu": ("gpu", ("-nojsurf",), a.tol), "gpu-jsurf": ("gpu", ("-jsurf",), a.tol),
+                "cpu": ("cpu", ("-nojsurf",), max(a.tol, 0.015))}
     fails = []
-    ratios = [j[c] / ref[c] for c in range(3)]
-    print("J/R  X %.4f  Y %.4f  Z %.4f" % tuple(ratios))
-    for name, c, tol in (("X over Y", 0, a.tol), ("Z over Y", 2, a.tol), ("Y", 1, 0.015)):
-        r = ratios[c] / ratios[1] if c != 1 else ratios[1]
-        ok = abs(r - 1.0) <= tol
-        print("%-9s %.4f  (tol %.3f)  %s" % (name, r, tol, "ok" if ok else "FAIL"))
-        if not ok:
-            fails.append(name)
+    for tag in a.variants.split(","):
+        dev, jflags, ctol = VARIANTS[tag]
+        ref_pfm = os.path.join(d, "%s_R_1.pfm" % dev)
+        ref = (channel_means(ref_pfm) if a.reuse_ref and os.path.exists(ref_pfm)
+               else render(dev, dev, "R", 1, a.rspp))
+        j = [0.0, 0.0, 0.0]
+        for sd in range(1, a.seeds + 1):
+            for c, v in enumerate(render(dev, tag, "J", sd, a.jspp,
+                                         ("-beamcount", "100000", "-beamk", "2") + jflags)):
+                j[c] += v / a.seeds
+        ratios = [j[c] / ref[c] for c in range(3)]
+        print("%s: J/R  X %.4f  Y %.4f  Z %.4f" % ((tag,) + tuple(ratios)))
+        for name, c, tol in (("X over Y", 0, ctol), ("Z over Y", 2, ctol), ("Y", 1, 0.015)):
+            r = ratios[c] / ratios[1] if c != 1 else ratios[1]
+            ok = abs(r - 1.0) <= tol
+            print("%s: %-9s %.4f  (tol %.3f)  %s" % (tag, name, r, tol, "ok" if ok else "FAIL"))
+            if not ok:
+                fails.append("%s %s" % (tag, name))
     if fails:
         print("FAILED: " + ", ".join(fails))
         return 1

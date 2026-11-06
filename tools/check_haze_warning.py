@@ -12,7 +12,8 @@ film), V (which compares it), and M, whose photons cross the haze to the surface
 with or without -beams. The sun over a floor in such a haze (the scene of
 scenes/_haze_sun_b_vs_r.ftsl, tiny here), rendered for a moment:
 
-  - modes A, B, C, P, V and M (with and without -beams) print the warning once, on stderr;
+  - modes A, B, C, P, V and M (with and without -beams) print the warning once, on stderr, and
+    mode M without -beams adds that it renders the haze itself not at all;
   - under a sun it names R, D and J as lighting all of it; under a sky only R;
   - two mode-B cameras sharing one forward flight print it once;
   - a -serve session given the sunlit scene, the sky's, then the sunlit one again prints it
@@ -33,6 +34,7 @@ NL = chr(10)
 MARK = "a medium with no bounds, lit by the sun or the sky"
 SUN_KEPT = "Modes R, D and J light all of it."
 SKY_KEPT = "Mode R lights all of it (modes D and J refuse a sky)."
+M_NOTE = "Mode M without -beams renders no haze at all"
 
 CAM = 'camera "%s" { eye %s  look_at 0 0 0  up 0 1 0  fov_y 45  film { res 24 18 } }'
 
@@ -92,6 +94,10 @@ def main():
               "said %d times%s" % (n, " (on stdout)" if MARK in out else ""))
         if mode == "B":
             check("under a sun it names R, D and J", SUN_KEPT in err)
+        if mode == "M":
+            note = M_NOTE in err
+            check("  and says the haze itself is not rendered" if not extra else
+                  "  and does not say the haze is not rendered", note == (not extra))
     n, err, _ = run("sky", scene(HAZE, SKY), "B")
     check("mode B under a sky warns once", n == 1, "said %d times" % n)
     check("and names only R, which renders a sky", SKY_KEPT in err and SUN_KEPT not in err)

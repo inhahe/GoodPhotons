@@ -251,12 +251,14 @@ inline void edt1d(const std::vector<double>& f, std::vector<double>& d, int n,
 // sample at 0 everywhere outside the solid voxels: the fog never reaches past the mesh.
 // `featherVox` is in VOXELS (the caller converts the author's metres by dividing by the voxel
 // edge). Returns whether the lattice now ramps; below one voxel there is no ramp to resolve,
-// and the lattice is left binary.
+// and the lattice is left binary. `kept`, if given, receives the solid voxels' mean value after
+// the feather: a body thinner than about twice the feather never reaches full density, and one
+// of a voxel or two keeps none, which the loader reports.
 //
 // Distances are measured to the nearest EMPTY voxel, and the bake already surrounds the
 // lattice with a one-voxel zero shell, so a solid region touching the lattice edge still
 // feathers rather than being cut flat.
-inline bool featherGrid(VdbGrid& g, double featherVox) {
+inline bool featherGrid(VdbGrid& g, double featherVox, double* kept = nullptr) {
     if (g.data.empty() || !(featherVox >= 1.0)) return false;
     const int nx = g.nx, ny = g.ny, nz = g.nz;
     const size_t n = (size_t)nx * ny * nz;
@@ -321,14 +323,20 @@ inline bool featherGrid(VdbGrid& g, double featherVox) {
     // Smoothstep rather than a linear ramp: a linear ramp leaves a visible crease where it
     // reaches 1, which on a cloud edge reads as a second, softer silhouette.
     const double inv = 1.0 / featherVox;
+    double sum = 0.0;
+    size_t solid = 0;
     for (size_t t = 0; t < n; ++t) {
         if (!g.data[t]) continue;
+        ++solid;
         double u = (std::sqrt(dist[t]) - 1.0) * inv;
-        if (u >= 1.0) continue;                       // already full density; leave the 1
+        if (u >= 1.0) { sum += 1.0; continue; }       // already full density; leave the 1
         if (u < 0.0) u = 0.0;
-        g.data[t] = floatToHalfBits((float)(u * u * (3.0 - 2.0 * u)));
+        const double v = u * u * (3.0 - 2.0 * u);
+        sum += v;
+        g.data[t] = floatToHalfBits((float)v);
     }
     g.maxVal = 1.0f;
+    if (kept) *kept = solid ? sum / (double)solid : 0.0;
     return true;
 }
 

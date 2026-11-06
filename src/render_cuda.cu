@@ -55,6 +55,7 @@
 #include <atomic>
 #include <mutex>
 #include <condition_variable>
+#include <type_traits>           // kBdptT's per-MERGE scratch (DChromaRunNone)
 #include <math.h>
 #include <float.h>
 
@@ -2987,9 +2988,6 @@ __device__ static double dVdbSample(const DVdbGrid& g, const DVec3& p) {
     return v > 0.0 ? v : 0.0;
 }
 
-// Dimensionless density multiplier at a world point (>= 0). Device twin of
-// Medium::densityAt: the shared pattern VM with x y z r live (f/normal/uv read 0).
-// For an implicit bound the multiplier is 0 outside the field (medium absent there).
 // What a mesh bound makes of the density at p (host twin Medium::meshWeight): the feathered
 // occupancy, or 1 inside the 0.5 isosurface of a binary lattice; 0 outside, and everywhere
 // for a lattice that baked empty (uploaded as no bricks), as the host's samples 0 there.
@@ -3000,6 +2998,9 @@ __device__ static double dMeshWeight(const DMedium& m, const DVec3& p) {
     return occ >= 0.5 ? 1.0 : 0.0;
 }
 
+// Dimensionless density multiplier at a world point (>= 0). Device twin of
+// Medium::densityAt: the shared pattern VM with x y z r live (f/normal/uv read 0).
+// For an implicit bound the multiplier is 0 outside the field (medium absent there).
 __device__ static double dMedDensityAt(const DMedium& m, const DVec3& p, const DPatEnv& env) {
     if (m.boundShape == 2 && m.boundField) {   // implicit-field membership carve-out
         double f = dFieldEval(m.boundField, m.boundFieldN, p.x, p.y, p.z, m.boundFieldExpr, env);
@@ -7996,22 +7997,41 @@ __device__ static double dTrDet(const DScene& sc, const DVec3& o, const DVec3& d
 struct DTrRay {
     static const int kMax = 4;
     double sigT[kMax], ta[kMax], tb[kMax];
+    int med[kMax];
     int n;
     int slow;
+    // `anyLam` keeps every crossed medium, even one with no extinction at `lam`, for atLam()
+    // (host twin TrRay::build); at() is unchanged by it.
     __device__ void build(const DScene& sc, const DVec3& oo, const DVec3& dd, double tMax,
-                          Real lam) {
+                          Real lam, bool anyLam = false) {
         n = 0; slow = 0;
         if (sc.mediaN > kMax) { slow = 1; return; }
         for (int i = 0; i < sc.mediaN; ++i) {
             const DMedium& m = sc.media[i];
             if (m.heterogeneous) { slow = 1; n = 0; return; }
             const double st = (double)medSigmaT(m, lam);
-            if (st <= 0.0) continue;                       // dTrDet's 1.0 factor
+            if (st <= 0.0 && !anyLam) continue;            // dTrDet's 1.0 factor
             double a, b;
             if (!dMedClip(m, oo, dd, 0.0, tMax, a, b)) continue;
             if (!(b - a > 0.0)) continue;
-            sigT[n] = st; ta[n] = a; tb[n] = b; ++n;
+            sigT[n] = st > 0.0 ? st : 0.0; ta[n] = a; tb[n] = b; med[n] = i; ++n;
         }
+    }
+    // dTrDet at another wavelength along the same intervals (host twin TrRay::atLam).
+    __device__ double atLam(const DScene& sc, const DVec3& oo, const DVec3& dd, double t,
+                            Real lam, const DPatEnv& env) const {
+        if (slow) return dTrDet(sc, oo, dd, t, lam, env);
+        double Tr = 1.0;
+        for (int i = 0; i < n; ++i) {
+            const double st = (double)medSigmaT(sc.media[med[i]], lam);
+            if (st <= 0.0) continue;                       // dTrDet's 1.0 factor
+            const double hi = t < tb[i] ? t : tb[i];
+            const double L = hi - ta[i];
+            if (!(L > 0.0)) continue;
+            Tr *= exp(-st * L);
+            if (Tr <= 0.0) return 0.0;
+        }
+        return Tr;
     }
     __device__ double at(const DScene& sc, const DVec3& oo, const DVec3& dd, double t,
                          Real lam, const DPatEnv& env) const {
@@ -8646,7 +8666,7 @@ __device__ static double dBeamMergeWeight(const DScene& sc, const DBeamMergeW& m
     const Real lamW = mw.chroma ? b.lambda : (Real)mw.lamCam;
     const double sigT = (double)medSigmaT(sc.media[b.med], lamW) * dens;
     if (!(sigT > 0.0)) return 0.0;
-    const double trC = mw.chroma ? dTrDet(sc, oc, dc, tCam, lamW, env)
+    const double trC = mw.chroma ? camTr.atLam(sc, oc, dc, tCam, lamW, env)
                                  : camTr.at(sc, oc, dc, tCam, lamW, env);   // Tr~(x -> eye[k])
     if (!(trC > 0.0)) return 0.0;
     const double etaKCoef = mw.chroma ? dSpecBinAt(mw.chroma + DJSPEC_K, (double)lamW) : mw.etaKCoef;
@@ -9153,7 +9173,7 @@ struct DWfSeg {
     int    glassMat;    // DPathSeg::glassMat, for the camera-side glass under JSPEC
 };
 #if FTRACE_GPU_FP32
-static_assert(sizeof(DWfSeg) == 408, "DWfSeg changed size: update renderBdptCuda's segCap note");
+static_assert(sizeof(DWfSeg) == 424, "DWfSeg changed size: update renderBdptCuda's segCap note");
 #endif
 struct DWfHit { int seg; int beam; float t, s; };
 // One band of the wave-schedule PROFILE (see renderBdptCuda): what the paths of pixel slots
@@ -19061,6 +19081,17 @@ struct DChromaRun {
     }
 };
 
+// What a kernel that merges nothing keeps in its place (kBdptT<MERGE = false>), so mode D pays
+// no per-thread storage for tables it never fills: every use sits behind `chromaOn`, which is
+// false there at compile time.
+struct DChromaRunNone {
+    double m[1], mPrev[1], e1[1];
+    int k;
+    __device__ void reset() {}
+    __device__ void advanceTo(int, const DScene&, const DVertex*, double, double,
+                              const DPatEnv&) {}
+};
+
 // Device twin of bdpt.h's SurfMergeWeight. Every field is a constant of the GATHER SITE, so it
 // is built once per camera vertex and the per-photon call is the three lines at the bottom.
 struct DSurfMergeW {
@@ -19444,6 +19475,16 @@ kBdptT(DScene sc, const __grid_constant__ DCamera cam, double* camFilm, double* 
             // accumulates strictly camera-side of eye[k] is independent of WHERE along the
             // segment a beam is hit, so it is summed here and read off per segment.
             double segSumC[SEGN], segSumM[SEGN];
+            // UPBP-W-CHROMATIC (DChromaRun): where some medium's extinction varies with
+            // wavelength, every merge weight's camera half is read at the merged light's.
+            // Only a merging kernel holds the tables (DChromaRunNone); with them, the
+            // camera-wavelength segSumM below goes unread and is not summed.
+            const bool chromaOn = MERGE && c_jTrSpec && c_jChroma && sc.chromaSig &&
+                                  (mergeKappa > 0.0 || kappaSurf > 0.0);
+            const DPatEnv envC = dPatEnvOf(sc);
+            typename std::conditional<MERGE, DChromaRun, DChromaRunNone>::type crun;
+            if (chromaOn) crun.reset();
+            double cbuf[MERGE ? 2 * DJSPEC_K : 1];   // this segment's segSumM and etaKCoef bins
             if (mergeKappa > 0.0 || kappaSurf > 0.0) {
                 for (int k = 0; k < nE && k < (int)SEGN; ++k) segSumC[k] = segSumM[k] = 0.0;
                 for (int k = 1; k < nE && k < (int)SEGN; ++k) {
@@ -19457,7 +19498,7 @@ kBdptT(DScene sc, const __grid_constant__ DCamera cam, double* camFilm, double* 
                     // there is no single kappa to factor. A vertex is a medium point or a
                     // surface, never both, so exactly one of these is non-zero.
                     double eK = 0.0;
-                    if (k >= 2) {
+                    if (k >= 2 && !chromaOn) {
                         const double plK = dMergeLightDensity((double)eye[k - 1].pdfRev,
                                                               eye[k].delta != 0);
                         eK = mergeKappa * dMergeEtaPrime(sc, eye[k].p, eye[k - 1], eye[k - 2].p,
@@ -19482,14 +19523,6 @@ kBdptT(DScene sc, const __grid_constant__ DCamera cam, double* camFilm, double* 
                     segSumM[k] = fiberK ? 0.0 : eK + carryM;
                 }
             }
-            // UPBP-W-CHROMATIC (DChromaRun): where some medium's extinction varies with
-            // wavelength, every merge weight's camera half is read at the merged light's.
-            const bool chromaOn = c_jTrSpec && c_jChroma && sc.chromaSig &&
-                                  (mergeKappa > 0.0 || kappaSurf > 0.0);
-            const DPatEnv envC = dPatEnvOf(sc);
-            DChromaRun crun;
-            if (chromaOn) crun.reset();
-            double cbuf[2 * DJSPEC_K];   // this segment's segSumM and etaKCoef bins
             for (int i = 0; mergeOn && i < nSegs; ++i) {
                 const DPathSeg& sg = segs[i];
                 if (!(sg.beta > 0.0)) continue;
@@ -19509,7 +19542,7 @@ kBdptT(DScene sc, const __grid_constant__ DCamera cam, double* camFilm, double* 
                 // segment hundreds of hits. Built unconditionally so the gather's `camTr` is
                 // never dangling — cheap (one clip per medium).
                 DTrRay camTr;
-                camTr.build(sc, sg.o, sg.d, sg.tMax, lambda);
+                camTr.build(sc, sg.o, sg.d, sg.tMax, lambda, chromaOn);
                 DBeamMergeW mw;
                 mw.kappa = mergeKappa; mw.lamCam = (double)lambda; mw.pdfDirCam = sg.pdfDir;
                 if (mergeKappa > 0.0) {
@@ -23671,6 +23704,11 @@ static void uploadMotion(const Scene& scene, DUpload& up) {
 // independent). Every cudaMalloc'd pointer is recorded in up.frees; call freeUpload(up)
 // when done. The camera is baked separately (bakeCamera) so one baked scene can serve a
 // whole multi-camera shared pass.
+// Mode J's estimator switches (see cudaSetJSwitches): uploaded at the top of every renderBdptCuda,
+// and read by the scene upload (UPBP-W-CHROMATIC's table).
+static int g_jSpecHost = 1, g_jTrSpecHost = 0, g_jDeltaMergeHost = 1, g_jHalfHost = 0;
+static int g_jChromaHost = 1;
+
 static void buildUploadScene(const Scene& scene, DUpload& up) {
     using namespace gpu;
     auto keep = [&](void* p) { if (p) up.frees.push_back(p); return p; };
@@ -24648,15 +24686,15 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
         }
         sc.media  = dmeds.empty() ? nullptr : (const DMedium*)keep(uploadVec(dmeds));
         sc.mediaN = (int)dmeds.size();
-        // UPBP-W-CHROMATIC's table (DChromaRun), read only where c_jTrSpec says some medium's
-        // extinction varies with wavelength -- the host's test for ChromaMis -- and c_jChroma.
+        // UPBP-W-CHROMATIC's table (DChromaRun), read where c_jTrSpec says some medium's
+        // extinction varies with wavelength -- the host's test for ChromaMis -- and c_jChroma;
+        // only then is it uploaded (cudaSetJSwitches runs before any render's upload).
         sc.chromaSig = nullptr;
-        if (!scene.media.empty()) {
+        if (!scene.media.empty() && g_jTrSpecHost && g_jChromaHost) {
             std::vector<double> sig(scene.media.size() * (size_t)DJSPEC_K);
             for (size_t m = 0; m < scene.media.size(); ++m)
                 for (int b = 0; b < DJSPEC_K; ++b)
-                    sig[m * DJSPEC_K + b] = scene.media[m].sigmaT(
-                        LAMBDA_MIN + ((double)b + 0.5) * (LAMBDA_MAX - LAMBDA_MIN) / (double)DJSPEC_K);
+                    sig[m * DJSPEC_K + b] = scene.media[m].sigmaT(bandBinLambda(b));
             sc.chromaSig = (const double*)keep(uploadVec(sig));
         }
         // GATHER-TIME SPECTRAL FOLD tables (FOLD-GPU (2), host: Scene::bowLuts). One
@@ -25752,9 +25790,6 @@ void cudaSetRouting(int on, int routeDefault, int anyMedJ, double sppD, double s
 static double g_jDispWinHost = 10.0;
 static int    g_jDispAllHost = 0;
 void cudaSetJDisp(double winNm, int all) { g_jDispWinHost = winNm; g_jDispAllHost = all; }
-// Mode J's estimator switches (see cudaSetJSwitches): uploaded at the top of every renderBdptCuda.
-static int g_jSpecHost = 1, g_jTrSpecHost = 0, g_jDeltaMergeHost = 1, g_jHalfHost = 0;
-static int g_jChromaHost = 1;
 void cudaSetJSwitches(int jSpec, int trSpec, int deltaMerge, int half, int chroma) {
     g_jSpecHost = jSpec; g_jTrSpecHost = trSpec; g_jDeltaMergeHost = deltaMerge; g_jHalfHost = half;
     g_jChromaHost = chroma;
@@ -26515,16 +26550,34 @@ Film renderBdptCuda(const Scene& scene, const Camera& cam, int resX, int resY,
     int* d_wfCounters = nullptr;
     long long waveSamples = 0;
     if (mergeOn && !(std::getenv("FTRACE_NOWAVEFRONT") && std::atoi(std::getenv("FTRACE_NOWAVEFRONT")) != 0)) {
-        const int segCap = 1 << 20;          // 408 B each (~430 MB), 128 of them JSPEC's
+        const int segCap = 1 << 20;          // 424 B each (~445 MB), 128 of them JSPEC's
         const int hitCap = 1 << 25;          // 16 B each  (512 MB): a dense map yields thousands of
                                              // candidates per segment (_fog_cornell: ~2000), and a
                                              // spilled candidate is evaluated divergently, on the spot
         CUDA_CHECK(cudaMalloc(&wq.segs, (size_t)segCap * sizeof(DWfSeg)));
         CUDA_CHECK(cudaMalloc(&wq.hits, (size_t)hitCap * sizeof(DWfHit)));
         // ...and, where the merge weights read their camera half at the beam's wavelength
-        // (UPBP-W-CHROMATIC), that half's two bin tables per slot: 384 B each (~400 MB).
-        if (g_jTrSpecHost && g_jChromaHost)
-            CUDA_CHECK(cudaMalloc(&wq.chroma, (size_t)segCap * 2 * DJSPEC_K * sizeof(double)));
+        // (UPBP-W-CHROMATIC), that half's two bin tables per slot: 384 B each (~400 MB). Only
+        // with room to spare: without the table a chromatic segment is gathered inline in the
+        // camera kernel (the queue test there), which is slower but the same estimator, where a
+        // failed or paged-out allocation would abort the render or crawl it.
+        if (g_jTrSpecHost && g_jChromaHost) {
+            const size_t want = (size_t)segCap * 2 * DJSPEC_K * sizeof(double);
+            size_t freeB = 0, totalB = 0;
+            const bool room = cudaMemGetInfo(&freeB, &totalB) == cudaSuccess &&
+                              freeB > want + ((size_t)512 << 20);
+            if (!room || cudaMalloc(&wq.chroma, want) != cudaSuccess) {
+                (void)cudaGetLastError();   // a failed cudaMalloc leaves its error behind
+                wq.chroma = nullptr;
+                static bool said = false;
+                if (!said) {
+                    said = true;
+                    std::printf("[jchroma] no room on the device for the wavefront queue's chroma "
+                                "table (%.0f MB): chromatic segments are gathered inline -- "
+                                "slower, the same estimator\n", want / 1048576.0);
+                }
+            }
+        }
         CUDA_CHECK(cudaMalloc(&d_wfCounters, 4 * sizeof(int)));
         wq.nSegs = d_wfCounters; wq.nHits = d_wfCounters + 1; wq.overflow = d_wfCounters + 2;
         wq.segCap = segCap; wq.hitCap = hitCap;

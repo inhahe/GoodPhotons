@@ -2803,8 +2803,18 @@ its per-medium depths, taken once (`trDetDepthMedium` / `dTrDetDepthMedium`). On
 table (`segSumM` and the point merges' eta at `eye[k-1]` per vertex); the device builds the same
 rows one vertex at a time (`DChromaRun`, three rows per thread instead of the walk's table) and a
 queued segment carries its two rows in the queue's own table (`DWfQueue::chroma`, allocated only
-then). `FTRACE_JCHROMA=0` turns it off on both backends for A/B runs; a scene with no chromatic
+then, and only with room to spare: without it a chromatic segment is gathered inline, the same
+estimator). The merge's own transmittance reuses the segment's clip (`TrRay::atLam` /
+`DTrRay::atLam`), so only `sigma_t` is looked up per hit; a kernel that merges nothing holds no
+chroma storage (`DChromaRunNone`); and under chroma the camera-wavelength `segSumM`, unread, is not
+summed. `FTRACE_JCHROMA=0` turns it off on both backends for A/B runs; a scene with no chromatic
 medium never builds a table and renders as before.
+
+The connections' weights read the camera half's beam etas exactly at their wavelength and a merge
+reads them from the bins, so the weights of a merged path sum to one up to the bins'
+interpolation error. On `hetmed` that error read within 0.2 % of a brute-force weight exact at
+every hit, inside the noise; an exact merge weight on the device would need every camera vertex's
+geometry in each queued segment.
 
 **Measured** (same scene and budget): X / Y / Z 1.0024 / 0.9976 / 0.9967, flat across the frame
 by 8x8 block; Z over Y went from 1.023 to 0.999 and X over Y from 0.987 to 1.005. On the CPU
@@ -8472,7 +8482,10 @@ as the one at fault.
     reader of the lattice goes through) returns the occupancy as a weight on the field, where an
     unfeathered bound returns 1 inside the 0.5 isosurface (a threshold would only move the hard
     edge half the feather inward; `tools/check_feather.py`). Under one voxel `featherGrid`
-    leaves the lattice binary and reports it, so `boundRamp` stays off. Because it only ever *lowers* density it is majorant-safe
+    leaves the lattice binary and reports it, so `boundRamp` stays off. Starting on the
+    silhouette's voxels costs a thin body its density -- a sheet a voxel or two thick keeps
+    none, one thinner than about twice the feather never reaches full -- so `featherGrid`
+    reports the solid voxels' mean value afterwards and the loader warns below one half. Because it only ever *lowers* density it is majorant-safe
     for free (`maxVal` stays 1). `ftsl.h` takes the value in **world metres**, divides by the
     voxel edge, warns below one voxel, and **rejects the key on sphere/isosurface bounds**,
     which are carved analytically and have no lattice to soften.

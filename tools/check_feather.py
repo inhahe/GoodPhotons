@@ -22,8 +22,10 @@ are fine enough (320 across) that either way moves the optical depth by 0.02 at 
     band clear, about 0.5 short there);
   - inside: the full density, through 1.2 m of it between the front and back bands (optical
     depth ~2.4; a density 5 % short reads 0.09 low);
-  - and a feather under one voxel, which has no ramp to resolve, leaves the bound as it is
-    unfeathered: the CPU's image byte for byte.
+  - a feather under one voxel, which has no ramp to resolve, leaves the bound as it is
+    unfeathered: the CPU's image byte for byte;
+  - and a sheet a voxel or two thick under a feather of several, which the ramp (starting on the
+    silhouette's own voxels) leaves with no density at all, makes the loader say so.
 
 Exits 1 on any failure.
 """
@@ -47,8 +49,8 @@ RES = 160
 TOL = 0.08         # in optical depth
 
 
-def box_obj(path):
-    hx, hy, hz = HALF
+def box_obj(path, half=HALF):
+    hx, hy, hz = half
     v = [(sx * hx, sy * hy, sz * hz) for sx in (-1, 1) for sy in (-1, 1) for sz in (-1, 1)]
     ix = {p: i + 1 for i, p in enumerate(v)}
     def q(a, b, c, d):   # one face, wound counter-clockwise seen from outside
@@ -64,7 +66,7 @@ def box_obj(path):
         f.write(NL.join(["v %.6f %.6f %.6f" % p for p in v] + faces) + NL)
 
 
-def scene_text(obj, feather=FEATHER):
+def scene_text(obj, feather=FEATHER, res=RES):
     fk = "  feather %g" % feather if feather else ""
     return NL.join([
         "scene { units meters }",
@@ -73,7 +75,7 @@ def scene_text(obj, feather=FEATHER):
         'mesh "box" { file "%s"  material w  shape_only yes }' % obj.replace(chr(92), "/"),
         'medium { sigma_t %g  albedo 0  bounds { object "box"  voxels 320%s } }' % (SIGMA, fk),
         'camera "c" { eye 0 0 %g  look_at 0 0 0  up 0 1 0  fov_y %g  film { res %d %d } }'
-        % (EYE, FOV, RES, RES)]) + NL
+        % (EYE, FOV, res, res)]) + NL
 
 
 def read_pfm(path):
@@ -196,6 +198,18 @@ def main():
             imgs.append(f.read())
     check("cpu: a feather under one voxel leaves the edge hard", imgs[0] == imgs[1],
           "" if imgs[0] == imgs[1] else "the images differ")
+    # A sheet 1.6 voxels thick (6.25 mm voxels) under a feather of 8.
+    sheet = os.path.join(d, "sheet.obj")
+    box_obj(sheet, (1.0, 1.0, 0.005))
+    path = os.path.join(d, "sheet.ftsl")
+    with open(path, "w", encoding="utf-8", newline="") as f:
+        f.write(scene_text(sheet, 0.05, 16))
+    p = subprocess.run([exe, "-in", path, "-mode", "R", "-device", "cpu", "-seed", "1", "-no-meter",
+                        "-spp", "1", "-o", os.path.join(d, "sheet.png")],
+                       cwd=d, capture_output=True, text=True, encoding="utf-8", errors="replace")
+    said = re.search(r"WARNING: mesh bound \"box\" keeps 0% of its density", p.stdout + p.stderr)
+    check("cpu: a feather that empties a thin sheet is reported", p.returncode == 0 and bool(said),
+          "" if said else "no warning (rc %d)" % p.returncode)
     if fails:
         print("FAILED: " + ", ".join(fails))
         return 1

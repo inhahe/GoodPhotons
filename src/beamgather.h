@@ -87,9 +87,7 @@ struct JSpec {
     // -- the path is evaluated at lambda_c and so is the light it takes -- but the caller scales
     // `beta` by exp(logS) (beta()), which this undoes.
     double atC() const { return (logS == 0.0) ? 1.0 : std::exp(-logS); }
-    static double lamOf(int k) {
-        return LAMBDA_MIN + (k + 0.5) * (LAMBDA_MAX - LAMBDA_MIN) / (double)K;
-    }
+    static double lamOf(int k) { return bandBinLambda(k); }
     // Interpolated between bin centres (specBinAt), held flat past the outer two. SpecThr reads
     // the nearest bin; interpolating costs one more load and follows a steep reflectance edge (a
     // red wall's ~600 nm rise) instead of stepping across it.
@@ -366,7 +364,7 @@ inline double trDet(const Scene& scene, const Vec3& o, const Vec3& dir, double d
 // `slow` then routes every evaluation on this ray straight back to `trDet`.
 struct TrRay {
     static constexpr int kMax = 8;
-    struct Crossed { double sigT, ta, tb; };
+    struct Crossed { double sigT, ta, tb; int med; };
     Crossed xs[kMax];
     int n = 0;
     bool slow = false;                 // heterogeneous medium, or more than kMax media
@@ -375,20 +373,41 @@ struct TrRay {
     Vec3 o{0, 0, 0}, d{0, 0, 0};
     double lambda = 0.0;
 
+    // `anyLam` keeps every crossed medium, even one with no extinction at `lam`, for atLam(),
+    // which reads other wavelengths along the same intervals; at() is unchanged by it (such a
+    // medium contributes exp(0)).
     void build(const Scene& sc, const Vec3& oo, const Vec3& dd, double tMax, double lam,
-               const PatTables& tb) {
+               const PatTables& tb, bool anyLam = false) {
         scene = &sc; tabs = &tb; o = oo; d = dd; lambda = lam;
         n = 0; slow = false;
         if ((int)sc.media.size() > kMax) { slow = true; return; }
-        for (const Medium& m : sc.media) {
+        for (size_t mi = 0; mi < sc.media.size(); ++mi) {
+            const Medium& m = sc.media[mi];
             if (m.heterogeneous()) { slow = true; n = 0; return; }
             const double st = m.sigmaT(lam);
-            if (st <= 0.0) continue;                       // trDet's 1.0 factor
+            if (st <= 0.0 && !anyLam) continue;            // trDet's 1.0 factor
             double ta, tb2;
             if (!m.clipToBounds(oo, dd, 0.0, tMax, ta, tb2)) continue;
             if (!(tb2 - ta > 0.0)) continue;
-            xs[n].sigT = st; xs[n].ta = ta; xs[n].tb = tb2; ++n;
+            xs[n].sigT = st > 0.0 ? st : 0.0; xs[n].ta = ta; xs[n].tb = tb2; xs[n].med = (int)mi;
+            ++n;
         }
+    }
+    // The same transmittance at another wavelength: trDet at `lam` (the intervals are
+    // wavelength-free), for a ray built with anyLam.
+    double atLam(double t, double lam) const {
+        if (slow) return trDet(*scene, o, d, t, lam, *tabs);
+        double Tr = 1.0;
+        for (int i = 0; i < n; ++i) {
+            const double st = scene->media[(size_t)xs[i].med].sigmaT(lam);
+            if (st <= 0.0) continue;                       // trDet's 1.0 factor
+            const double hi = t < xs[i].tb ? t : xs[i].tb;
+            const double L = hi - xs[i].ta;
+            if (!(L > 0.0)) continue;
+            Tr *= std::exp(-st * L);
+            if (Tr <= 0.0) return 0.0;
+        }
+        return Tr;
     }
 
     double at(double t) const {

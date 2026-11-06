@@ -531,7 +531,12 @@ through the ratios rC of `cameraSideSums` (segSumC and segSumM alike) and throug
 neighbour. A Henyey-Greenstein phase has no wavelength, so this matters only for `phase rainbow`,
 whose lobes move with wavelength -- `gallery_rain`'s rain, which mode J renders. Unmeasured: the
 reproduction is a rainbow-phase rain lit by a sun, mode J against mode D per channel (a
-check_jchroma-style rig with the medium's coefficients flat). Proper fix, if it shows: tabulate
+check_jchroma-style rig with the medium's coefficients flat). First look (2026-11-06,
+`scraps/upbpw_rainbow/bow.ftsl`: a sun behind the camera, a bounded `phase rainbow` fog with flat
+coefficients, 64x48, GPU, mode J against mode R at 4x its spp): too noisy to tell -- with 0.1 mm
+droplets and J at 4096 spp the seeds still scatter by 5 % in X over Y and Z over Y (means 0.993 and
+1.011), and 0.5 mm droplets scatter by 10 %. A quieter rig (a wider bow, a larger frame, or the
+weights' partition of unity measured directly) comes first. Proper fix, if it shows: tabulate
 the phase-dependent ratios per bin with the rest (`ChromaMis` / `DChromaRun` already carry rows
 per vertex), so segSumC becomes wavelength-dependent too in such a scene.
 
@@ -1854,7 +1859,11 @@ whether JSPEC is on, the scene has anything chromatic, or `FTRACE_JSPEC=0`. At 0
 kernel (MAXV 11) and about 16 KB on the deep one (MAXV 67, `max_bounce` over 8). The driver
 reserves local memory for every resident thread (196 608 on an RTX 4090, see the VRAM preflight),
 so that is roughly 0.5 GB and 3.2 GB of VRAM. The wavefront queue's `DWfSeg` carries one too: 128
-of its 400 bytes, about 134 MB at `segCap`.
+of its 400 bytes, about 134 MB at `segCap`. Since 0.434.19 the merge kernel also keeps
+UPBP-W-CHROMATIC's scratch (`DChromaRun`, the segment's `cbuf`, about 1.3 KB a thread with the
+inlined bin arrays, some 260 MB at that residency), chromatic scene or not; mode D's kernel holds
+none since 0.434.20 (`DChromaRunNone`). The same template parameter would size it to nothing in
+an achromatic mode-J render.
 
 **Proper fix.** Make the carrier cost nothing where it is off, then make it smaller where it is on:
 (1) a `JSPEC` template parameter on the merge kernels, with the carrier arrays sized 1 when the
@@ -1906,10 +1915,13 @@ membership is any occupancy above 0, on both devices (`Medium::meshWeight`, the 
 `dMeshWeight`, read by the density and membership tests alike). The ramp never exceeds 1, so the
 field's peak stays a valid majorant. In 0.434.18 (review of 0.434.16-17) the ramp starts on the
 silhouette's own voxels, so the trilinear sample leaks nothing past the mesh, and a feather
-under one voxel leaves the lattice binary and `boundRamp` off. `tools/check_feather.py` renders
-a feathered cube of absorbing fog against a sky in mode R and holds its optical-depth profile to
-the ramp within 0.08 on each device, and a sub-voxel feather to the unfeathered image byte for
-byte; 0.434.16 read the band up to 0.84 short. The rest of this entry is how it stood.
+under one voxel leaves the lattice binary and `boundRamp` off. That start costs a thin body its
+density -- a sheet a voxel or two thick keeps none -- so since 0.434.20 the loader warns when a
+feather leaves a mesh bound under half its density (`featherGrid`'s `kept`).
+`tools/check_feather.py` renders a feathered cube of absorbing fog against a sky in mode R and
+holds its optical-depth profile to the ramp within 0.08 on each device, a sub-voxel feather to the
+unfeathered image byte for byte, and a thin sheet to the warning; 0.434.16 read the band up to
+0.84 short. The rest of this entry is how it stood.
 
 Found while checking host/device media agreement for RAIN-J-VS-D. The loader's comment (ftsl.h, `feather <metres>`) says
 the density "ramps from 0 at the mesh surface to full only that far INSIDE it". But both host
@@ -4126,6 +4138,11 @@ share; the GPU's agree to 0.5%. It is not the lens code: J's one lens-specific t
 first camera segment's merge weight, BeamMergeWeight::lensCam) moves CPU J by under 0.07% when
 removed, and the terms J shares with D are D's, which matches R on the CPU in this fog.
 tools/check_physlens.py holds CPU J to 3% there for this reason.
+Seen again in colour (2026-11-06, `tools/check_jchroma.py`'s scene, a heterogeneous fog absorbing
+more toward blue, mode J 3 x 2048 spp against mode R on each device): the CPU's J reads X over Y
+0.971 without UPBP-W-CHROMATIC's weights and 0.990 with them, where the GPU's reads 0.984 and
+1.002 -- the fix moves both devices alike, and the CPU sits about 1.3 % lower in X either way.
+check_jchroma holds its CPU variant to 1.5 % for this reason.
 To find it: FTRACE_J_HALF splits the estimator, and the CPU/GPU difference per half on
 `scenes/_realcam_fog.ftsl` should name the technique.
 

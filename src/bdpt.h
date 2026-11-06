@@ -3982,13 +3982,13 @@ inline double connectBDPT(const Scene& scene, const Camera& cam, const Renderer&
 // walk continued on: pdfRev(y_{s-1}), the pair at x, and pdfRev(eye[k]). Everything else is
 // what the two walks already stored, which is why the accumulators are legal at all.
 //
-// SPECTRAL MISMATCH (documented approximation). The beam carries its own wavelength and the
-// camera path another; a weight built from both is not a function of one path in one
-// spectrum. Camera-side quantities use the camera's lambda, light-side ones the beam's, and
-// the phase value at x — computed once by the gather — is used for both densities there.
-// This is the standard spectral-photon-mapping fudge (mode M and mode U's merges make the
-// same one); it perturbs the weight, never the estimator's support, so it costs quality and
-// not unbiasedness in the achromatic case, and see known-issues.md for the chromatic one.
+// WAVELENGTH. The beam carries its own wavelength and the camera path another, and the weight
+// must be a function of one path at one: the beam's, which the light side was written at. The
+// camera side is free of wavelength but for its beam etas' sigma_t * Tr, which a medium whose
+// extinction varies with wavelength makes differ; there they are read at the beam's wavelength
+// (chromaM, ChromaMis), elsewhere at the camera's, which is then the same number. The phase
+// value at x -- computed once by the gather -- serves both densities there. A rainbow phase's
+// densities on the camera side stay at the camera's (known-issues UPBP-W-RAINBOW).
 //
 // A DELTA LIGHT-SIDE DENSITY RETURNS 0, i.e. drops the merge. If the light walk left
 // y_{s-1} by a SPECULAR bounce then p_L(x) is a Dirac and `lm->pdfDir` is 0 (randomWalk
@@ -4148,7 +4148,7 @@ struct BeamMergeWeight {
         const double lamW = chromaM ? (double)b.lambda : lamCam;
         const double sigT = scene->media[b.med].sigmaT(lamW) * dens;
         if (!(sigT > 0.0)) return 0.0;
-        const double trC = chromaM ? trDet(*scene, sg->o, sg->d, tc, lamW, *tabs)
+        const double trC = chromaM ? camTr->atLam(tc, lamW)
                                    : camTr->at(tc);                   // Tr~(x -> eye[k])
         if (!(trC > 0.0)) return 0.0;
         const double etaKCoefW = chromaM ? specBinAt(chromaK, lamW) : etaKCoef;
@@ -4853,7 +4853,10 @@ struct BdptRenderer {
                         // knows neither.
                         const double lamCam = hb.lam[0];
                         const PatTables tabs = scene.patTables();
-                        if (mk.any()) cameraSideSums(scene, eye, nE, mk, lamCam, segSumC, segSumM);
+                        // With the merge half binned (chroma), the camera-wavelength one goes unread.
+                        if (mk.any())
+                            cameraSideSums(scene, eye, nE, chroma.on ? MergeK{} : mk, lamCam,
+                                           segSumC, segSumM);
                         if (chroma.on)
                             cameraSideSumsChroma(scene, tabs, eye, nE, mk, chroma, chromaM,
                                                  chromaE1);
@@ -4893,7 +4896,7 @@ struct BdptRenderer {
                             // unconditionally so `w1.camTr` is never null — cheap (one clip
                             // per medium) and the alternative is a dangling read the day the
                             // `mergeKappa == 0 => misOf() is null` coupling stops holding.
-                            camTr.build(scene, sg.o, sg.d, sg.tMax, lamCam, tabs);
+                            camTr.build(scene, sg.o, sg.d, sg.tMax, lamCam, tabs, chroma.on);
                             w1.camTr = &camTr;
                             if (mk.any()) {
                                 const size_t k = (size_t)sg.vert;

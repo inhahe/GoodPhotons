@@ -8682,17 +8682,32 @@ private:
                         const int nmx = std::max(occ.nx, std::max(occ.ny, occ.nz));
                         const double vh = std::max({ex.x, ex.y, ex.z}) / std::max(1, nmx - 1);
                         const double fv = (vh > 0.0) ? feath / vh : 0.0;
-                        feathered = meshvox::featherGrid(occ, fv);
-                        if (!feathered)
+                        double kept = 1.0;
+                        feathered = meshvox::featherGrid(occ, fv, &kept);
+                        // A false at a feather of a voxel or more is a stop during the load,
+                        // which is about to end it.
+                        if (!feathered && fv < 1.0)
                             std::fprintf(stderr,
                                 "[medium] NOTE: mesh bound \"%s\" feather %.3g m is %.2f voxel(s) "
                                 "at `voxels %d` — below one voxel it cannot resolve a ramp, so the "
                                 "edge stays hard; raise `voxels` or `feather`.\n",
                                 onm.c_str(), feath, fv, vres);
-                        else
+                        if (feathered) {
                             std::fprintf(stderr,
                                 "[medium] mesh bound \"%s\": feathered %.3g m (%.1f voxels) inward\n",
                                 onm.c_str(), feath, fv);
+                            // The ramp starts on the silhouette's own voxels, so a body a voxel
+                            // or two thick keeps nothing, and one thinner than about twice the
+                            // feather never reaches full density.
+                            if (kept < 0.5)
+                                std::fprintf(stderr,
+                                    "[medium] WARNING: mesh bound \"%s\" keeps %.0f%% of its "
+                                    "density after the feather — the mesh is %s for a feather of "
+                                    "%.1f voxels; lower `feather` or raise `voxels`.\n",
+                                    onm.c_str(), 100.0 * kept,
+                                    kept > 0.0 ? "mostly thinner than twice that" : "too thin",
+                                    fv);
+                        }
                     }
                     // A mesh that voxelizes to nothing would silently render as no fog at
                     // all, which reads as "the medium block did nothing" rather than as a

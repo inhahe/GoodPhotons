@@ -18401,15 +18401,20 @@ static void warnHazeOnlyNearScene(const Scene& scene, const std::vector<char>& m
     const char* kept = scene.envIndex >= 0
         ? "Mode R lights all of it (modes D and J refuse a sky)."
         : "Modes R, D and J light all of it.";
+    // Mode M without -beams renders no medium at all: only its surfaces are touched.
+    const char* mNote = (which.find('M') != std::string::npos && !g_beamGather)
+        ? " (Mode M without -beams renders no haze at all; there it is the surfaces that are "
+          "underlit.)"
+        : "";
     std::fprintf(stderr,
                  "[%s] warning: a medium with no bounds, lit by the sun or the sky. %s that light "
                  "in through a disc the size of the scene, so %s the haze only near the scene: "
                  "haze farther off -- toward the horizon -- renders dark (on a test scene, 0.15 "
                  "of mode R's), and surfaces lose the light it would scatter onto them (that "
-                 "scene's floor, 0.9). %s Give the medium `bounds` to make the modes agree "
+                 "scene's floor, 0.9).%s %s Give the medium `bounds` to make the modes agree "
                  "(known-issues HAZE-SUN-B).\n",
                  label.c_str(), one ? "This mode sends" : "These modes send",
-                 one ? "it lights" : "they light", kept);
+                 one ? "it lights" : "they light", mNote, kept);
 }
 
 // CPU counterpart of the GPU gpuSppChunks helper: render `sppTarget` samples-per-pixel

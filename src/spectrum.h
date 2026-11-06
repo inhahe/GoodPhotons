@@ -300,6 +300,10 @@ inline bool spectrumKnots(const Spectrum& s, std::vector<double>& x, std::vector
 // The spectral carriers' bin count (JSpec::K, SpecThr::K), and so the wavelengths at which the
 // question "does this vary over the band?" is asked.
 constexpr int kBandProbeBins = 24;
+// Bin k's centre on that grid (JSpec::lamOf, the mode-J merge weights' tables).
+inline double bandBinLambda(int k) {
+    return LAMBDA_MIN + (k + 0.5) * (LAMBDA_MAX - LAMBDA_MIN) / (double)kBandProbeBins;
+}
 
 // --- Emission importance sampling ------------------------------------------
 // Precomputes a CDF over [LAMBDA_MIN, LAMBDA_MAX] to sample lambda ~ SPD, and
