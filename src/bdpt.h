@@ -53,6 +53,7 @@
 #include "hero.h"     // kHeroC / kHeroMax — hero-wavelength bundle sizes
 #include "render.h"   // sampleGlossy, Renderer material primitives, clamp01, PI
 #include "bsdf_eval.h"    // bsdfF / bsdfPdf — the evaluable half, shared with backward.h
+#include "workcount.h"    // JWork: the CPU refresh's work counts
 #include "photonbeams.h"  // BeamMap — mode J (UPBP) merges camera rays against photon beams
 #include "surfmerge.h"    // SurfMap — mode J's OTHER merge kind, the point x point (VCM's VM)
 #include "beamgather.h"   // gatherPhotonBeamsW — the Beam x Ray estimator, with a MIS hook
@@ -94,32 +95,6 @@ inline bool jSpecEnabled() {
     }();
     return on;
 }
-// WORK COUNTS for mode J's light-side refresh on the CPU (J-CPU-NONDET). An epoch of a fixed -spp
-// render there lasts as many camera samples as keep its light side's rebuild near -beamrefresh's
-// share of the time -- the rule the clock applies elsewhere -- but measured in counts, which a
-// machine's speed cannot change, so the render repeats exactly. One unit: a vertex traced (a
-// light subpath's or a camera sample's), a connection evaluated, a beam or photon a merge weighs;
-// a rebuild adds kJWorkRebuildFixed, and its beam map kJWorkPerBeamLog for each beam times the log
-// of the map's size. Both sides accumulate per thread and add once per pass.
-struct JWork {
-    std::atomic<long long> light{0};   // the light passes' (main.cpp adds each beam map's build)
-    std::atomic<long long> cam{0};     // the camera passes'
-};
-inline JWork& jWork() { static JWork w; return w; }
-// Fitted against the clock (FTRACE_JWORK=1, the CPU at 32 threads) on hetmed's small map, a map of
-// 100 000 beams and _fog_cornell's of 10 million, whose rebuilds took 0.11 s, 0.26-0.5 s and 1.8 s:
-// a rebuild costs about 0.1 s of fixed start-up (its passes' threads, the BVH builder) plus the
-// beam build, against a camera unit's 0.6-2 e-7 s. Off by up to 2-3x on any one scene -- the
-// camera units' own cost moves that much with the medium -- which moves the light side's share
-// between about 5 and 20 % at the default -beamrefresh 0.10.
-constexpr long long kJWorkRebuildFixed = 500000;
-// A beam map's build in JWork units: its sort and SAH BVH, n log n in the beams.
-constexpr double kJWorkPerBeamLog = 0.17;
-inline long long jWorkBeamBuild(size_t nBeams) {
-    return nBeams ? (long long)(kJWorkPerBeamLog * (double)nBeams * std::log2((double)nBeams + 1.0))
-                  : 0;
-}
-
 // FTRACE_JCHROMA=0 reads a mode-J merge weight's camera half at the camera's wavelength even in a
 // medium whose extinction varies with wavelength (ChromaMis), for A/B runs. Both devices.
 inline bool jChromaEnabled() {

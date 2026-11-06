@@ -2191,7 +2191,13 @@ million beams and are good to 2-3x on any one scene (the camera units' own cost 
 with the medium), so the light side lands at 5-20 % of the time instead of 10 %. Counts are
 sums over the frame, so the image is the same at any `-t`; `tools/check_jdeterminism.py` holds
 it. `FTRACE_JWORK=1` prints each epoch's units and seconds. A `-time`/`-noise`/`-forever` budget
-and the device keep the clock.
+and the device keep the clock. **Mode M's CPU loop does the same since 0.434.23**
+(MODEM-CPU-NONDET; the counters live in `workcount.h`): its light units are the photon paths and
+each grid's or map's build, its camera units the rays, the beams weighed and a sixteenth of each
+photon-map query candidate (thread-local, flushed per pass, the candidates divided once over the
+whole span). Its camera pass also stratifies wavelengths by absolute sample index over the frame's
+`-spp` (`renderPhotonCamera`'s `sppTotal`, as the device does) rather than within each
+clock-sized call.
 
 **MODE `J`'S SURFACE LIGHT SIDE RUNS ON THE DEVICE, PER CHUNK (0.272.0).** `-jsurf`'s surface
 photon map is traced by `kJSurfLightT` — the device twin of the deposit in `traceLightBeamPass` —

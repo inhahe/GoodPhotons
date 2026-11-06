@@ -2069,7 +2069,7 @@ inline Film renderPhotonCamera(const Scene& scene, const Camera& cam, int resX, 
                                bool diffraction, int maxBounce = 32,
                                unsigned long long sampleBase = 0, int fgRays = 0,
                                const BeamMap* bm = nullptr,
-                               const PhotonMap* pmC = nullptr) {
+                               const PhotonMap* pmC = nullptr, long long sppTotal = 0) {
     if (nThreads < 1) nThreads = 1;
     Film out; out.resX = resX; out.resY = resY; out.alloc();
     std::vector<Film> bands(nThreads);
@@ -2080,6 +2080,7 @@ inline Film renderPhotonCamera(const Scene& scene, const Camera& cam, int resX, 
     const bool perSample = cam.timed() && cam.moves() && g_passMotionU < 0.0;
     auto worker = [&](int tid) {
         const MotionTimeScope passAt(g_passMotionU);
+        const bdpt::CamWorkFlush workFlush;   // this thread's photon and beam gathers, at the end
         PosedCamera posed(cam, perSample);
         Film& f = bands[tid]; f.resX = resX; f.resY = resY; f.alloc();
         int y0 = resY * tid / nThreads, y1 = resY * (tid + 1) / nThreads;
@@ -2098,21 +2099,26 @@ inline Film renderPhotonCamera(const Scene& scene, const Camera& cam, int resX, 
                 if (ft::stopRequested()) return;
                 const uint64_t pixIdx = (uint64_t)py * (uint64_t)resX + (uint64_t)px;
                 for (long long s = 0; s < spp; ++s) {
+                    ++bdpt::tlWork();   // the camera ray
                     Pcg32 rng;
                     const uint64_t unit = (sampleBase + (uint64_t)s) * nPix + pixIdx;
                     seedUnit(rng, unit, 0xA24BAED4963EE407ULL);
                     const Camera& c = perSample ? posed.at(cam.shutterTime(unitTime(unit, 0x5851F42D4C957F2DULL)))
                                                 : cam;
                     Ray ray = c.genRay(px, py, rng.uniform(), rng.uniform());
-                    // STRATIFIED hero wavelength over this chunk's samples (0.314.0; device twin
-                    // and the reasoning: kGather in render_cuda.cu). Per chunk rather than over
-                    // the whole render because the chunk is all this call can see, and a chunk
-                    // stratified over [0,1) is unbiased on its own; the jitter draw stands in for
-                    // the draw photonGather would otherwise have made.
+                    // STRATIFIED hero wavelength (0.314.0; device twin and the reasoning: kGather
+                    // in render_cuda.cu): over the frame's `sppTotal` samples by their absolute
+                    // index, as the device does, so no split of the frame into calls moves it
+                    // (MODEM-CPU-NONDET: the calls' sizes follow the clock); or, where the caller
+                    // knows no total (0), over this call's own samples, which is unbiased on its
+                    // own. The jitter draw stands in for the draw photonGather would otherwise
+                    // have made.
                     double lambdaU = -1.0;
-                    if (spp > 1) {
+                    const long long sTot = sppTotal > 0 ? sppTotal : spp;
+                    const long long sIdx = sppTotal > 0 ? (long long)sampleBase + s : s;
+                    if (sTot > 1 && sIdx < sTot) {
                         Pcg32 rrot; seedUnit(rrot, pixIdx, 0x9E3779B97F4A7C15ULL);
-                        double u = rrot.uniform() + ((double)s + rng.uniform()) / (double)spp;
+                        double u = rrot.uniform() + ((double)sIdx + rng.uniform()) / (double)sTot;
                         u -= std::floor(u);
                         lambdaU = (u < 1.0) ? u : 0.999999999;
                     }

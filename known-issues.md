@@ -555,7 +555,21 @@ the two estimates' difference paired on one seed with the camera side read at ea
 the phase-dependent ratios per bin with the rest (`ChromaMis` / `DChromaRun` already carry rows
 per vertex), so segSumC becomes wavelength-dependent too in such a scene.
 
-## OPEN (2026-11-06, 0.434.22; found in review of 50d767b..db23c6e): MODEM-CPU-NONDET — CPU mode M's light-side refresh still ends its epochs on the clock
+## FIXED (2026-11-06, 0.434.23; opened 0.434.22, found in review of 50d767b..db23c6e): MODEM-CPU-NONDET — CPU mode M's light-side refresh still ends its epochs on the clock
+
+**Fixed in 0.434.23**, as mode J's: at a fixed `-spp` mode M's loop ends its epochs on work counts
+(`workcount.h`: the light side's photon paths, the photon and caustic grids' sorts and the beam
+map's build; the camera side's rays, the beams `BeamWeightOne` weighs and the photon-map query
+candidates, a sixteenth each, counted per thread and added as the pass ends). Fitting
+(`FTRACE_JWORK=1`) found a candidate (one distance test) some 18x cheaper than a light unit on
+scenes/cornell.ftsl, hence the sixteenth; `_fog_cornell -beams` balanced as it was (the light side
+about 9 %). It had a **second cause**: the CPU camera pass stratified its hero wavelengths within
+each call's samples, and `cpuSppChunks` sizes the calls by the clock, so even a one-epoch render
+moved with the machine's speed and thread count (cornell at 256 spp: `-t 1` against 32,
+rel-RMS 0.47). It now stratifies by a sample's absolute index over the frame's `-spp`, as the
+device always has (`renderPhotonCamera`'s `sppTotal`). `tools/check_jdeterminism.py` holds mode M
+too (0.434.22 fails it); cornell at 256 spp is identical at `-t 1`, 7 and 32. The rest of this
+entry is how it stood.
 
 Mode J's half of this was J-CPU-NONDET (below). Mode M has the same refresh rule in its own loop
 (main.cpp, the mode-M epoch loop: an epoch lasts its rebuild time over `-beamrefresh`'s share), so

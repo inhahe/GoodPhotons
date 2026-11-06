@@ -29,6 +29,7 @@
 #include "gatherplane.h"   // onGatherSurface: which photons a gather keeps
 #include "color.h"
 #include "allocreport.h"   // OOM that names the buffer, its size and the flag that sizes it
+#include "workcount.h"    // tlWork: a query's candidates, for the CPU refresh (MODEM-CPU-NONDET)
 
 // ---- Caustic split: the one tunable of the FOCUS/SCATTER classification ---------------
 // Mode M partitions its deposits into a global map and a caustic map by the classic L·S⁺·D
@@ -460,6 +461,7 @@ struct PhotonMap {
                     // ~85% of the candidates in this 3x3x3 box fail the test, and for those
                     // the fat payload record is never touched at all.
                     const Vec3* __restrict pp = pos.data();
+                    bdpt::tlCandidates() += cellStart[c + 1] - cellStart[c];   // a gather's cost
                     for (int k = cellStart[c]; k < cellStart[c + 1]; ++k) {
                         Vec3 d = p - pp[k];
                         double d2 = dot(d, d);
@@ -523,6 +525,7 @@ struct PhotonMap {
                 for (int dx = -1; dx <= 1; ++dx) {
                     const int c = (int)cellIndex(ix + dx, cy, cz);
                     const Vec3* __restrict pp = pos.data();
+                    bdpt::tlCandidates() += cellStart[c + 1] - cellStart[c];   // a gather's cost
                     for (int k = cellStart[c]; k < cellStart[c + 1]; ++k) {
                         Vec3 d = p - pp[k];
                         const double d2 = dot(d, d);

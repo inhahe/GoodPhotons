@@ -33,6 +33,7 @@
 #include "render.h"
 #include "photonbeams.h"
 #include "volcache.h"   // VOLCACHE prototype (flag-gated; unused unless FTRACE_VOLCACHE)
+#include "workcount.h"  // tlWork: a beam weighed, for the CPU refresh
 
 // --- Mode J's camera-side spectral carrier (JSPEC, 0.386.1) ----------------------------
 //
@@ -264,7 +265,10 @@ struct BeamWeightOne {
     // and the dielectric the segment runs through, null outside one.
     const JSpec*    spec  = nullptr;
     const Material* glass = nullptr;
-    double operator()(const BeamHit&, const PhotonBeam&, double, double) const { return 1.0; }
+    double operator()(const BeamHit&, const PhotonBeam&, double, double) const {
+        ++bdpt::tlWork();   // a beam weighed (MODEM-CPU-NONDET)
+        return 1.0;
+    }
     const JSpec* camSpec() const { return spec; }
     const Material* glassCam() const { return glass; }
 };

@@ -120,8 +120,9 @@ Each names the section its line is in.
 16. ~~**J-CPU-NONDET** (4.4) — CPU mode J renders a heterogeneous medium differently run to run
     (found validating UPBP-W-CHROMATIC); the CPU is the validation baseline.~~ Its epochs ended on
     the clock; they end on work counts since 0.434.21 (the user's option b).
-17. **MODEM-CPU-NONDET** (4.4) — CPU mode M's refresh still ends on the clock; mode J's work
-    counts, for its loop (found in review of 0.434.21).
+17. ~~**MODEM-CPU-NONDET** (4.4) — CPU mode M's refresh still ends on the clock; mode J's work
+    counts, for its loop (found in review of 0.434.21).~~ Done, 0.434.23 (and its camera pass's
+    per-call wavelength strata, a second clock dependence).
 18. **HAZE-BLUR-DOMAIN** (4.2) — under a blur, modes D and J weigh together strategies that take
     different haze for a mover outside the instant's sphere. Measure first; one fix needs the
     user's word.
@@ -338,7 +339,8 @@ Then the rest of 4.2-4.6 in their order, 4.7's bookkeeping alongside whatever to
   outside `#ifdef HAVE_CUDA`). The two device headers are included in every build now.
 - [x] **J-CPU-NONDET** (0.434.21) — CPU mode J rendered a heterogeneous medium 2 % differently run
   to run: its epochs ended on the clock; they end on work counts now.
-- [ ] **MODEM-CPU-NONDET** — CPU mode M's light-side refresh still ends on the clock.
+- [x] **MODEM-CPU-NONDET** (0.434.23) — CPU mode M's light-side refresh ended on the clock, and its
+  camera pass stratified wavelengths per clock-sized call; both deterministic now.
 - [ ] **GLOSSY-SAMPLE-SITES** — the interference factor is applied by hand at every glossy sampler.
 - [ ] **REMAP0-IMPOSSIBLE** — the MIS sums read a zero density as a delta's, whatever made it zero
   (only the sun's is special-cased).

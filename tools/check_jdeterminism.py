@@ -1,4 +1,4 @@
-"""Regression check: CPU mode J at a fixed -spp renders the same image every time.
+"""Regression check: CPU modes J and M at a fixed -spp render the same image every time.
 
     python tools/check_jdeterminism.py [--out png/check_jdeterminism] [--exe ftrace.exe]
 
@@ -6,15 +6,18 @@
 render into light-side epochs, each drawing a new beam map; on the CPU at a fixed -spp an epoch
 ends on work counts (bdpt.h JWork: vertices traced, connections, beams and photons weighed, the
 beam map's build), not on the clock, which made which samples met which map depend on the
-machine's speed (known-issues J-CPU-NONDET). The scene is scraps/jspec2/hetmed's -- a
-heterogeneous fog, whose transmittance estimates draw from the camera's stream, so a sample that
-meets another map takes other draws -- rendered at 32x32, 256 spp, beam merges only:
+machine's speed (known-issues J-CPU-NONDET). Mode M's loop does the same (MODEM-CPU-NONDET), and
+its camera pass stratifies its wavelengths by a sample's absolute index rather than within each
+call, whose size also followed the clock. The scene is scraps/jspec2/hetmed's -- a heterogeneous
+fog, whose transmittance estimates draw from the camera's stream, so a sample that meets another
+map takes other draws -- rendered at 32x32 in mode J (256 spp, beam merges only) and in mode M
+(-beams, 64 spp, -beamrefresh 0.5), each:
 
   - twice, byte for byte the same;
   - and at one thread, the same again: the counts are sums over the frame, which no division of
     it among threads changes.
 
-It needs more than one epoch to mean anything, and says how many it got.
+Each needs more than one epoch to mean anything, and says how many it got.
 
 Exits 1 on any failure.
 """
@@ -62,31 +65,35 @@ def main():
         f.write(SCENE)
     fails = []
 
-    def render(tag, extra=()):
-        png = os.path.join(d, tag + ".png")
-        cmd = [exe, "-in", ftsl, "-mode", "J", "-device", "cpu", "-max-bounce", "8", "-no-meter",
-               "-hdr", "-seed", "1", "-spp", "256", "-beamcount", "100000", "-beamk", "2",
-               "-nojsurf", "-o", png] + list(extra)
+    CASES = {"J": ["-mode", "J", "-spp", "256", "-beamcount", "100000", "-beamk", "2", "-nojsurf"],
+             "M": ["-mode", "M", "-beams", "-n", "20000", "-spp", "64", "-beamrefresh", "0.5"]}
+
+    def render(mode, tag, extra=()):
+        png = os.path.join(d, "%s_%s.png" % (mode, tag))
+        cmd = [exe, "-in", ftsl, "-device", "cpu", "-max-bounce", "8", "-no-meter", "-hdr",
+               "-seed", "1", "-o", png] + CASES[mode] + list(extra)
         p = subprocess.run(cmd, cwd=d, capture_output=True, text=True, encoding="utf-8",
                            errors="replace")
         if p.returncode != 0:
             print((p.stdout + p.stderr)[-1500:])
             raise SystemExit("render failed: " + " ".join(cmd))
-        m = re.search(r"\[jstats\] (\d+) epochs", p.stdout + p.stderr)
+        m = re.search(r"\[jstats\] (\d+) epochs|averaged (\d+) independent light-side",
+                      p.stdout + p.stderr)
         with open(png[:-4] + ".pfm", "rb") as f:
-            return f.read(), int(m.group(1)) if m else 0
+            return f.read(), int(m.group(1) or m.group(2)) if m else 0
 
     def check(name, ok, detail=""):
-        print("%-52s %s  %s" % (name, "ok  " if ok else "FAIL", detail))
+        print("%-58s %s  %s" % (name, "ok  " if ok else "FAIL", detail))
         if not ok:
             fails.append(name)
 
-    first, epochs = render("run1")
-    check("the render has more than one light-side epoch", epochs > 1, "%d epochs" % epochs)
-    second, _ = render("run2")
-    check("a second run is byte for byte the first", second == first)
-    single, _ = render("t1", ("-t", "1"))
-    check("so is a run at one thread", single == first)
+    for mode in CASES:
+        first, epochs = render(mode, "run1")
+        check("mode %s: more than one light-side epoch" % mode, epochs > 1, "%d epochs" % epochs)
+        second, _ = render(mode, "run2")
+        check("mode %s: a second run is byte for byte the first" % mode, second == first)
+        single, _ = render(mode, "t1", ("-t", "1"))
+        check("mode %s: so is a run at one thread" % mode, single == first)
     if fails:
         print("FAILED: " + ", ".join(fails))
         return 1

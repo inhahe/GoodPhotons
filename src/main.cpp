@@ -21023,8 +21023,16 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
                              /*quiet*/!first, &scene, 1.0, &beamPin);
             }
         };
+        // The light side's rebuild in bdpt::JWork units (MODEM-CPU-NONDET): its photon paths, and
+        // each map's build -- the photon and caustic grids' sorts, the beam map's sort and BVH.
+        auto lightWorkM = [&]() -> long long {
+            return bdpt::kJWorkRebuildFixed + pm.nEmitted + bdpt::jWorkBeamBuild(pm.photons.size()) +
+                   bdpt::jWorkBeamBuild(pmC.photons.size()) +
+                   (wantBeams ? bdpt::jWorkBeamBuild(bmap.beams.size()) : 0);
+        };
         atEpoch(0);
         buildLightSide(0);
+        const long long build0WorkM = lightWorkM();
         double buildSec = std::chrono::duration<double>(std::chrono::steady_clock::now() - tp0).count();
         std::printf("mode M: deposited %zu photons from %lld emitted in %s; "
                     "grid %dx%dx%d. Gathering camera pass at %dx%d ...\n",
@@ -21033,13 +21041,16 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
         if (pm.photons.empty())
             std::fprintf(stderr, "[mode M] warning: 0 photons deposited — no diffuse "
                                  "surfaces reached? The image will be black.\n");
+        // The frame's samples, over which the camera pass stratifies its wavelengths by absolute
+        // index (renderPhotonCamera); 0 under a budget, which has no total.
+        const long long sppTotalM = (timeBudgetSec > 0.0 || noiseTarget > 0.0 || runForever) ? 0 : spp;
         auto renderEpoch = [&](long long sppTarget, const SppProgress* p) -> Film {
             return cpuSppChunks(sppTarget, p, res, resY,
                 [&](long long c, unsigned long long off) {
                     return renderPhotonCamera(scene, camEpoch, res, resY, pm, c, nThreads,
                                               diffraction, effMaxBounce(), off, g_pmFinalGather,
                                               wantBeams ? &bmap : nullptr,
-                                              g_pmCaustics ? &pmC : nullptr);
+                                              g_pmCaustics ? &pmC : nullptr, sppTotalM);
                 });
         };
         // ---------------------------------------------------------------------------------
@@ -21070,13 +21081,34 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
             sizer.keepNeighbours(kGatherC);
             long long nNext = N, nUsed = N;
             if (blurEpochs) epochSaltOff = prog ? (uint64_t)prog->sampleBase : 0ull;
+            // MODEM-CPU-NONDET: at a fixed -spp the refresh rule runs in work counts (bdpt::JWork)
+            // instead of seconds, as mode J's does on the CPU (J-CPU-NONDET), so the render repeats
+            // exactly: epoch 0's first sample prices a sample, epoch 0 runs on to its own build's
+            // share, and each later epoch as many samples as keep its rebuild at -beamrefresh's.
+            const bool countEpochsM = !blurEpochs && !(timeBudgetSec > 0.0 || noiseTarget > 0.0 ||
+                                                       runForever);
+            long long lightWorkJ = 0, camWorkJ = 0, camSppJ = 0;
+            const auto countedLen = [&](long long units) -> long long {
+                const long long left = sppTarget - sppAll;
+                if (camSppJ <= 0 || camWorkJ <= 0) return std::min(1LL, left);
+                const double q = (double)units / (g_beamRefreshFrac * (double)camWorkJ / (double)camSppJ);
+                if (!(q < (double)left)) return left;
+                return std::max(1LL, (long long)std::ceil(q));
+            };
+            long long extend0 = 0;      // epoch 0's samples still to render on its own maps
+            uint64_t nRealM = 1;        // realizations drawn (epoch 0's)
             for (; !stopAll && sppAll < sppTarget && !ft::stopRequested(); ++epoch) {
                 double rebuildSec = 0.0;
-                if (epoch > 0 || (blurEpochs && epochSaltOff)) {
+                const bool continuing = extend0 > 0;   // this iteration carries on epoch 0
+                if ((epoch > 0 && !continuing) || (blurEpochs && epochSaltOff)) {
                     auto tr = clk::now();
                     atEpoch(epoch);
                     nUsed = sizeEpochs ? nNext : N;
-                    buildLightSide(epoch, prog ? (uint64_t)prog->sampleBase : 0ull, nUsed);
+                    // Numbered by realization, not iteration: epoch 0's continuation draws none.
+                    buildLightSide(countEpochsM ? nRealM : epoch,
+                                   prog ? (uint64_t)prog->sampleBase : 0ull, nUsed);
+                    ++nRealM;
+                    lightWorkJ = lightWorkM();
                     rebuildSec = std::chrono::duration<double>(clk::now() - tr).count();
                     if (sizeEpochs) sizer.add(nUsed, rebuildSec);
                     // A refresh that came back empty would leave the gather pointing at empty
@@ -21108,12 +21140,14 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
                                     "light side at a new time in the shutter, drawing the photons "
                                     "its rebuild can afford against its %lld samples' gather: "
                                     "%lld of %lld now ...\n", blurEpochSpp, nUsed, N);
-                    else if (epoch == 1)
+                    else if (countEpochsM ? nRealM == 2 : epoch == 1)   // the first redraw
                         std::printf("mode M: light-side refresh — redrawing %lld photons under "
-                                    "a fresh salt every ~%.0f%% of the wall clock and averaging "
+                                    "a fresh salt every ~%.0f%% of the %s and averaging "
                                     "the realizations, so the MAP noise falls with the render "
                                     "too (-beamfreeze to opt out; -beamrefresh to retune) ...\n",
-                                    N, 100.0 * g_beamRefreshFrac);
+                                    N, 100.0 * g_beamRefreshFrac,
+                                    countEpochsM ? "render's work (counted, so it repeats itself)"
+                                                 : "wall clock");
                 }
                 const auto tEpoch = clk::now();
                 // How long this epoch should run. Measuring the real gap — rebuild, plus
@@ -21141,10 +21175,39 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
                     // Not a stop — just the end of this epoch, so the next one draws new maps (at
                     // its own time, under a blur, once this one has its share of the samples).
                     if (blurEpochs) return sppDone >= blurEpochSpp;
+                    if (countEpochsM) return false;   // the epoch runs its whole share
                     return std::chrono::duration<double>(clk::now() - tEpoch).count() >= epochSec;
                 };
-                Film f = renderEpoch(blurEpochs ? std::min(sppTarget - sppAll, blurEpochSpp) : sppTarget - sppAll,
+                long long countLen = 0;
+                if (countEpochsM)
+                    countLen = continuing ? extend0
+                             : (epoch == 0) ? std::min(1LL, sppTarget - sppAll)   // the pricing sample
+                             : countedLen(lightWorkJ);
+                extend0 = 0;
+                const long long cw0 = bdpt::jWork().cam.load(std::memory_order_relaxed);
+                const long long cc0 = bdpt::jWork().camCand.load(std::memory_order_relaxed);
+                Film f = renderEpoch(blurEpochs ? std::min(sppTarget - sppAll, blurEpochSpp)
+                                     : countEpochsM ? countLen : sppTarget - sppAll,
                                      &inner);
+                if (countEpochsM && epochSpp > 0) {
+                    const long long cw = bdpt::jWork().camSince(cw0, cc0);
+                    camWorkJ += cw;
+                    camSppJ  += epochSpp;
+                    if (epoch == 0 && !continuing) {
+                        const long long l0 = countedLen(build0WorkM);
+                        if (l0 > 1 && sppAll + epochSpp < sppTarget)
+                            extend0 = std::min(l0 - 1, sppTarget - sppAll - epochSpp);
+                    }
+                    // FTRACE_JWORK=1: each side's units and seconds (bdpt::JWork's constants).
+                    static const bool jworkDiagM = std::getenv("FTRACE_JWORK") != nullptr;
+                    if (jworkDiagM)
+                        std::printf("[jwork] mode M epoch %llu: rebuild %lld units %.4fs, %lld spp "
+                                    "%lld units %.4fs\n", (unsigned long long)epoch,
+                                    epoch == 0 ? build0WorkM : (continuing ? 0LL : lightWorkJ),
+                                    epoch == 0 ? buildSec : (continuing ? 0.0 : rebuildSec),
+                                    epochSpp, cw,
+                                    std::chrono::duration<double>(clk::now() - tEpoch).count());
+                }
                 if (epochSpp <= 0) break;      // produced nothing; refreshing again cannot help
                 acc.merge(f);
                 sppAll += epochSpp;
@@ -21154,10 +21217,11 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
                     nNext = sizer.next(nUsed, rebuildSec, gatherSec);
                 }
             }
-            if (epoch > 1)
+            const unsigned long long nReal = countEpochsM ? nRealM : (unsigned long long)epoch;
+            if (nReal > 1)
                 std::printf("mode M: averaged %llu independent light-side realizations "
                             "(%lld spp total) — the map noise fell with the render, not just "
-                            "the gather noise\n", (unsigned long long)epoch, sppAll);
+                            "the gather noise\n", nReal, sppAll);
             return acc;
         };
         {   // The phase split VOLCACHE asks for (`FTRACE_MSTATS=1`): surface estimate against
