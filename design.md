@@ -2182,9 +2182,11 @@ validation device, did not repeat itself in a heterogeneous medium (its transmit
 draw from the camera's stream). `bdpt::JWork` counts both sides instead: the light pass's
 vertices and each beam map's build (`kJWorkPerBeamLog` per beam times log n, plus
 `kJWorkRebuildFixed` a rebuild), and the camera pass's vertices, connections and the beams and
-photons its merge weights weigh. Epoch 0 renders one sample, which prices a sample; each later
-epoch runs `ceil(rebuild units / (-beamrefresh * units per sample))` samples, whole, never cut by
-the clock. The constants were fitted against the clock on three maps from 12 thousand to 10
+photons its merge weights weigh (a surface photon grid's build is priced as a beam map's). Epoch
+0's first sample prices a sample, and epoch 0 then runs on, on the same map, to its own build's
+share; each later epoch runs `ceil(rebuild units / (-beamrefresh * units per sample))` samples,
+whole, never cut by the clock. A flight frame's one-realization-per-sample cap (`jAutoEpochs`,
+which weighs only ratios) takes the same counts on the CPU. The constants were fitted against the clock on three maps from 12 thousand to 10
 million beams and are good to 2-3x on any one scene (the camera units' own cost moves that much
 with the medium), so the light side lands at 5-20 % of the time instead of 10 %. Counts are
 sums over the frame, so the image is the same at any `-t`; `tools/check_jdeterminism.py` holds

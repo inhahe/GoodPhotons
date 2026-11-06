@@ -22,6 +22,11 @@ a few samples:
            height by mesh_instance (its interpolated normals turned across its faces' planes),
            lit from above and from below;
   shapes   curve tubes and an isosurface under a pattern.
+And one scene with modes of its own (SCENE_MODES):
+  fog      a heterogeneous coloured fog in a grey box, CPU mode J only, at 256 spp and
+           -beamrefresh 0.5: several light-side epochs, whose layout on the CPU follows work
+           counts (bdpt.h JWork), with the merges' transmittance estimates drawing from the
+           camera's stream -- the case a single sample cannot show.
 
 `compare` prints, per case, "identical", or how it differs: the pixels that changed, the
 largest change relative to the pixel, and the change of the image's mean. --tol <rel> passes
@@ -58,6 +63,12 @@ MODES = [  # (tag, ftrace arguments)
     ("S_cpu", ["-mode", "S", "-spp", "2", "-device", "cpu"]),
     ("S_gpu", ["-mode", "S", "-spp", "2", "-device", "gpu"]),
 ]
+# Scenes rendered in modes of their own rather than in MODES.
+SCENE_MODES = {
+    "fog": [("J_cpu", ["-mode", "J", "-spp", "256", "-device", "cpu", "-nojsurf",
+                       "-beamcount", "100000", "-beamk", "2", "-beamrefresh", "0.5",
+                       "-max-bounce", "8"])],
+}
 # GPU modes M and S deposit their photons through atomics, so their order -- and the last bits of
 # every sum over them -- varies from run to run: one build differs from itself there by up to a
 # few 1e-5 of a pixel. Those cases are judged at this relative floor, in the determinism pass too.
@@ -159,6 +170,18 @@ def scenes(out):
             'curve { material tube  basis linear  radius 0.06  point -1.2 0.1 0  point -0.6 1.2 -0.4  point 0 0.3 -0.8 }\n'
             'curve { material tube  basis linear  radius 0.04  point 0.2 0.1 0.6  point 0.8 1.0 0.2 }\n'
             'isosurface { material iso  sphere { center 0.9 0.5 -0.6  radius 0.45 } }\n') + room + lamp + cam,
+        "fog": (
+            'scene { units meters  spectral 360 830 1 }\n'
+            'material "grey" { type diffuse reflect 0.6 }\n'
+            'quad { origin 0 0 0   u 1 0 0   v 0 0 1   material grey }\n'
+            'quad { origin 0 1 0   u 0 0 1   v 1 0 0   material grey }\n'
+            'quad { origin 0 0 0   u 0 1 0   v 1 0 0   material grey }\n'
+            'quad { origin 0 0 0   u 0 0 1   v 0 1 0   material grey }\n'
+            'quad { origin 1 0 0   u 0 1 0   v 0 0 1   material grey }\n'
+            'medium { sigma_a rgb 0.15 0.45 0.9  sigma_s 0.5  g 0.0  bounds { min 0 0 0  max 1 1 1 }\n'
+            '  density "0.4 + 0.6*saturate(1.2 - 2.0*sqrt((x-0.5)^2 + (y-0.5)^2 + (z-0.5)^2))" }\n'
+            'light area { origin 0.35 0.999 0.35  u 0.3 0 0  v 0 0 0.3  normal 0 -1 0  spd preset:bb6500 }\n'
+            'camera "cam" { eye 0.5 0.5 2.7  look_at 0.5 0.5 0.5  up 0 1 0  fov_y 40  film { res 32 32 } }\n'),
     }
     paths = {}
     for name, t in text.items():
@@ -172,7 +195,7 @@ def render_all(exe, out, label, paths, log):
     os.makedirs(dest, exist_ok=True)
     ok = True
     for name, scene in paths.items():
-        for tag, args in MODES:
+        for tag, args in SCENE_MODES.get(name, MODES):
             png = os.path.join(dest, "%s_%s.png" % (name, tag))
             for stale in (png, png[:-4] + ".pfm"):
                 if os.path.exists(stale):

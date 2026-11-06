@@ -543,6 +543,17 @@ the two estimates' difference paired on one seed with the camera side read at ea
 the phase-dependent ratios per bin with the rest (`ChromaMis` / `DChromaRun` already carry rows
 per vertex), so segSumC becomes wavelength-dependent too in such a scene.
 
+## OPEN (2026-11-06, 0.434.22; found in review of 50d767b..db23c6e): MODEM-CPU-NONDET — CPU mode M's light-side refresh still ends its epochs on the clock
+
+Mode J's half of this was J-CPU-NONDET (below). Mode M has the same refresh rule in its own loop
+(main.cpp, the mode-M epoch loop: an epoch lasts its rebuild time over `-beamrefresh`'s share), so
+a CPU mode-M render long enough for more than one epoch differs run to run, and at another `-t`.
+check_bitid's M_cpu renders 2 spp, one epoch, and never sees it. Proper fix: the same as mode J's
+(the user's option b there) -- count mode M's photon and beam passes and its gather in
+`bdpt::JWork`-style units, fit the constants against the clock with an FTRACE_JWORK-style
+diagnostic, and end the CPU's epochs on them at a fixed `-spp`; then a multi-epoch M_cpu scene in
+check_bitid.
+
 ## FIXED (2026-11-06, 0.434.21; opened 0.434.18): J-CPU-NONDET — CPU mode J renders a heterogeneous medium differently run to run
 
 **Fixed in 0.434.21, the user's option (b):** on the CPU at a fixed `-spp` (no `-beamepochs`, no
@@ -551,8 +562,13 @@ the CPU at a fixed -spp"): epoch 0 renders one sample, each later epoch
 `ceil(rebuild units / (-beamrefresh * units per sample))`. The command below now renders
 byte-identically run to run, and at `-t 1` as at 32; `tools/check_jdeterminism.py` holds both
 (0.434.20 fails both). The constants were fitted against the clock (`FTRACE_JWORK=1`): the light
-side then took 16 % of hetmed's render at 512 spp and 12 % of `_fog_cornell`'s at 64, against the
-clock's 37 % and 3 %, both counting the first build's one-time pilot. The rest of this entry is
+side then took 16.2 % of hetmed's render at 512 spp (4 epochs) and 11.9 % of `_fog_cornell`'s at 64
+(6 epochs), against the clock's 16.5 % (3) and 7.4 % (4), all counting the first build's one-time
+pilot. In 0.434.22 (review of 0.434.21) epoch 0 runs on after its pricing sample to its own build's
+share instead of rebuilding at once (a short render no longer pays a rebuild after one sample), a
+flight frame's per-sample cap (`jAutoEpochs`) takes the counts on the CPU too, a surface photon
+grid's build is counted, and check_bitid gains a fog scene rendered in CPU mode J over several
+epochs. CPU mode M's refresh is still on the clock: MODEM-CPU-NONDET. The rest of this entry is
 how it stood.
 
 `-device cpu` is meant to be deterministic (it is the reference and validation baseline, and

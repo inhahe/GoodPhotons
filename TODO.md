@@ -84,7 +84,7 @@ Each names the section its line is in.
    its radius: a table top gathers the floor's light.~~ Done, 0.431.0.
 2. ~~**HAZE-SUN-B** (4.2) — mode B lights an unbounded sunlit haze at 0.16 of mode R.~~ Decided
    (2026-11-05): R, D and J stay, and the modes whose haze comes from forward photons warn. Done,
-   0.434.15 (A, B, C) and 0.434.16-18 (P, V, M); its blur half is HAZE-BLUR-DOMAIN (17).
+   0.434.15 (A, B, C) and 0.434.16-18 (P, V, M); its blur half is HAZE-BLUR-DOMAIN (18).
 3. ~~**VCM-SPEC** and **SPPM-SPECTRAL** (4.2) — modes U and S merge at the camera's wavelength, so
    a coloured surface seen before a merge washes out (the fix mode J got in 0.386.1, JSPEC).~~ Done:
    mode S 0.432.0, mode U 0.433.0.
@@ -120,17 +120,19 @@ Each names the section its line is in.
 16. ~~**J-CPU-NONDET** (4.4) — CPU mode J renders a heterogeneous medium differently run to run
     (found validating UPBP-W-CHROMATIC); the CPU is the validation baseline.~~ Its epochs ended on
     the clock; they end on work counts since 0.434.21 (the user's option b).
-17. **HAZE-BLUR-DOMAIN** (4.2) — under a blur, modes D and J weigh together strategies that take
+17. **MODEM-CPU-NONDET** (4.4) — CPU mode M's refresh still ends on the clock; mode J's work
+    counts, for its loop (found in review of 0.434.21).
+18. **HAZE-BLUR-DOMAIN** (4.2) — under a blur, modes D and J weigh together strategies that take
     different haze for a mover outside the instant's sphere. Measure first; one fix needs the
     user's word.
-18. **GLOSSY-SAMPLE-SITES** (4.4) — the interference factor applied by hand at two dozen sites.
-19. **JSPEC-CARRIER-SIZE** (4.5) — every mode-J GPU thread reserves the spectral carrier.
-20. **RADCACHE-BATCHES** (4.5) — `-radcache`'s fixed batches outlast `-stop` and the interval.
-21. **P-HEROSPLIT-FIRST**, **ROUGH-IRID-AIR** (4.3) — narrow estimator gaps.
-22. **REMAP0-IMPOSSIBLE** (4.4) — the MIS sums read every zero density as a delta's.
-23. **BEAMEPOCHS-CHUNK-PIN** (4.5) — `-beamepochs` pins cheap scenes' GPU chunks to 1 spp.
-24. **DEFORM-LIMITS**, **MOTION-LIGHT-RIGID**, **PER-OBJECT-MODES** (4.6) — what is left of them.
-25. **BLACK-PIXELS-ONCE** (4.2) — one render's black pixels, never reproduced.
+19. **GLOSSY-SAMPLE-SITES** (4.4) — the interference factor applied by hand at two dozen sites.
+20. **JSPEC-CARRIER-SIZE** (4.5) — every mode-J GPU thread reserves the spectral carrier.
+21. **RADCACHE-BATCHES** (4.5) — `-radcache`'s fixed batches outlast `-stop` and the interval.
+22. **P-HEROSPLIT-FIRST**, **ROUGH-IRID-AIR** (4.3) — narrow estimator gaps.
+23. **REMAP0-IMPOSSIBLE** (4.4) — the MIS sums read every zero density as a delta's.
+24. **BEAMEPOCHS-CHUNK-PIN** (4.5) — `-beamepochs` pins cheap scenes' GPU chunks to 1 spp.
+25. **DEFORM-LIMITS**, **MOTION-LIGHT-RIGID**, **PER-OBJECT-MODES** (4.6) — what is left of them.
+26. **BLACK-PIXELS-ONCE** (4.2) — one render's black pixels, never reproduced.
 
 Then the rest of 4.2-4.6 in their order, 4.7's bookkeeping alongside whatever touches its entries.
 
@@ -336,6 +338,7 @@ Then the rest of 4.2-4.6 in their order, 4.7's bookkeeping alongside whatever to
   outside `#ifdef HAVE_CUDA`). The two device headers are included in every build now.
 - [x] **J-CPU-NONDET** (0.434.21) — CPU mode J rendered a heterogeneous medium 2 % differently run
   to run: its epochs ended on the clock; they end on work counts now.
+- [ ] **MODEM-CPU-NONDET** — CPU mode M's light-side refresh still ends on the clock.
 - [ ] **GLOSSY-SAMPLE-SITES** — the interference factor is applied by hand at every glossy sampler.
 - [ ] **REMAP0-IMPOSSIBLE** — the MIS sums read a zero density as a delta's, whatever made it zero
   (only the sun's is special-cased).
