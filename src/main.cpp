@@ -16011,7 +16011,7 @@ static Film renderBackward(const Scene& scene, const Camera& cam, int resX, int 
                            long long spp, int nThreads, bool diffraction = true,
                            unsigned long long sampleBase = 0, bool forceWhitted = false,
                            Film* into = nullptr, int rowBegin = 0, int rowEnd = -1,
-                           Film* specFirst = nullptr) {
+                           Film* specFirst = nullptr, bool abandonOnStop = false) {
     Film out;
     if (!into) { out.resX = resX; out.resY = resY; out.alloc(); }
     Film& film = into ? *into : out;
@@ -16152,6 +16152,7 @@ static Film renderBackward(const Scene& scene, const Camera& cam, int resX, int 
     auto worker = [&](int tid) {
         BackwardRenderer br = makeBr();
         br.specFirstFilm = specFirst;   // mode P's blurred split (BackwardRenderer::specFirstFilm)
+        br.abandonOnStop = abandonOnStop;
         if (rcOn) br.radBank = &rcBanks[tid];
         int y0 = bandLo + bandN * tid / nThreads, y1 = bandLo + bandN * (tid + 1) / nThreads;
         br.renderRows(scene, cam, film, y0, y1, spp, sampleBase);
@@ -18481,7 +18482,10 @@ static Film cpuSppChunks(long long sppTarget, const SppProgress* prog, int resX,
     // clock-free schedule. `g_radCache` (not `rcOn`) deliberately -- when the cache is set
     // but inert (-whitted / -direct-only) the two schedules give the same film anyway, so
     // the broader condition costs nothing and cannot drift out of sync with the read site.
-    const bool fixedSchedule = g_radCache;
+    // Not under a -time/-noise/-forever budget, whose target (kUnboundedSpp) has no total to
+    // split -- the even batches would each be millions of samples, so neither the budget nor a
+    // stop would ever land -- and whose end the clock decides anyway (mode P's twin agrees).
+    const bool fixedSchedule = g_radCache && sppTarget < kUnboundedSpp;
     // Chunk count to aim for under the fixed schedule. 64 is the measured-good neighbourhood
     // (the timed rule settles on ~65 here); the cache wants many update rounds, and the
     // per-chunk thread-spawn overhead is negligible next to a 200^2 x 16 spp chunk.
@@ -19765,7 +19769,9 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
 #endif
             return cpuSppChunks(sppTarget, p, res, resY,
                 [&](long long c, unsigned long long off) {
-                    return renderBackward(scene, cam, res, resY, c, nThreads, diffraction, off);
+                    // cpuSppChunks drops a stopped chunk, so it may be abandoned part-way.
+                    return renderBackward(scene, cam, res, resY, c, nThreads, diffraction, off,
+                                          false, nullptr, 0, -1, nullptr, /*abandonOnStop*/true);
                 });
         };
         // Disk resume/checkpoint (like A/B/C): a budgeted or -checkpoint render writes a

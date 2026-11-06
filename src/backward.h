@@ -53,6 +53,7 @@
 #include "fur_volume.h"   // -fur-volume: the aggregate far-tier fur medium
 #include "radcache.h" // -radcache: biased early termination into a world-space irradiance cache
 #include "bsdf_eval.h" // bdpt::bsdfF / bsdfPdf — the evaluable BSDF, for glossy NEE
+#include "parallel.h"  // ft::stopRequested, for abandonOnStop
 
 struct BackwardRenderer {
     // How far a shadow ray from `p` to emitter `em`, `dist` long, crosses media: the whole way,
@@ -392,6 +393,10 @@ struct BackwardRenderer {
     // runs to full length -- so the audit measures the cache's per-read systematic error
     // against an exact reference in the same run, with the pixel noise cancelling out.
     bool   radAudit = false;
+    // renderRows returns at the next pixel once a clean stop is requested, leaving its film
+    // partial: only for a caller that then drops the whole call (cpuSppChunks), which a long
+    // fixed -radcache batch needs for `-stop` to land in time (RADCACHE-BATCHES).
+    bool   abandonOnStop = false;
     // -radcache-validate: fraction of readable vertices that trace their tail to full length
     // instead of terminating, and report (offer, tail) back to the cell they would have read.
     // This is the one measurement the update pass CANNOT make, because it is taken through the
@@ -4124,6 +4129,7 @@ struct BackwardRenderer {
         };
         for (int py = y0; py < y1; ++py) {
             for (int px = 0; px < film.resX; ++px) {
+                if (abandonOnStop && ft::stopRequested()) return;
                 const uint64_t pixIdx = (uint64_t)py * (uint64_t)film.resX + (uint64_t)px;
                 double tPhase = 0.5;
                 if (blur && !whitted) {

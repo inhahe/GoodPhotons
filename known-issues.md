@@ -391,7 +391,30 @@ and a glossy child (mode B alone agreed with R). Found by check_motion's new blu
 which saw the same excess. `forwardScale` now takes the ratio of the films' sums, which has no
 such term; mode V's comparison reports its scale the same way.
 
-## OPEN (2026-11-04, 0.429.1): RADCACHE-BATCHES — under -radcache a fixed budget's CPU batches follow its samples, not the clock
+## OPEN (2026-11-04, 0.429.1; narrowed 0.434.27): RADCACHE-BATCHES — under -radcache a fixed budget's CPU batches follow its samples, not the clock
+
+**0.434.27 fixed two parts of it.** A **budget hung**: mode R's `cpuSppChunks` took the
+fixed schedule under `-time`/`-noise`/`-forever` as well, whose target is `kUnboundedSpp`, so the
+third batch was about 16 million samples, and neither the budget nor a stop landed. `-mode R
+-radcache -time 8` on cornell was still running at 50 s; its `-stop` waited out the 120 s and
+failed. Mode P's twin already excluded a budget. Mode R now takes the clock schedule there too.
+And mode R's camera pass now **abandons a stopped batch** at the next pixel
+(`BackwardRenderer::abandonOnStop`, set only by cpuSppChunks, which drops a stopped chunk and
+writes the samples before it), so `-stop` lands within a pixel's time, however long the batch.
+`tools/check_radcache_stop.py` holds both: the budget ends at 7.8 s of 6, and a stop inside a
+40 s batch of `-spp 200000` lands in 2.3 s with the 10 spp before it (0.434.26 took 28.1 s).
+
+**Still open:** `-interval` writes, window repaints and the status line still land only at
+batch ends, and a resume draws its own schedule. The proper fix the entry proposed (advance the
+cache at absolute sample boundaries, whatever the calls) is **not enough by itself**.
+`RadianceCache::mergeMarks` inserts each thread's marks in the order they were made, and a key's
+first mark sets its cell's geometry. A thread's marks come pixel by pixel, all of a call's
+samples at each pixel, so splitting a batch into two calls reorders them. The per-thread
+dedup filter (`RadCacheBank::seen`) then keeps a different first mark for a key. Batching would
+still move the image unless the merge is made canonical too: every mark kept and deduplicated by
+a fixed rule (key, then position), the verification records summed in a fixed order, and the
+pending deposits checkpointed beside the table. That would also make the cache independent of
+the thread count, which it is not now.
 
 The CPU's radiance cache (`-radcache`) advances at the end of each backward call, merging the
 call's deposits, so where the calls are cut is part of the realization. Mode R's `cpuSppChunks`

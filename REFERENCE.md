@@ -1577,7 +1577,12 @@ invocations therefore disagreed (40.1 % vs 41.4 % of consults terminated, 0.45 %
 apart), quietly voiding the `-device cpu` determinism guarantee for precisely the renders
 someone would check against a reference. With `-radcache` the chunk schedule is now derived
 from the sample target instead of the clock, and repeat runs are bit-identical. Renders
-*without* the flag are unaffected — same schedule, same images as before.
+*without* the flag are unaffected — same schedule, same images as before. A batch of that
+schedule can run long (48 spp of a 3000-spp 1080p frame), and the periodic writes wait for it,
+but `-stop` does not (since 0.434.27): the batch in flight is dropped and the image holds the
+samples before it. Under `-time`, `-noise` or `-forever` there is no target to split, so the clock
+sets the chunks as it does without the cache (since 0.434.27; before, such a render never
+ended).
 
 The chunk count matters more than it looks, because it *is* the number of update passes the
 table receives: at 65 chunks the cache terminates ~36 % of consults, at 16 it manages 2.3 %,
