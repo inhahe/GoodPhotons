@@ -4,10 +4,11 @@
                                       [--no-gpu] [--only still_D_cpu,...]
 
 A white ball of radius 1 under `light sun` in `medium { sigma_t 0.04  albedo 0.5 }` with no
-bounds, beside a 2x2 floor. Mode R's NEE leg dims the sun by the haze out to the instant's sphere
-(Scene::mediaExitDistance: |centre - p| + sceneRadius); a light subpath of modes D and J walks it
-from the entry disc's plane, never as far. Before the subpaths took the NEE leg's haze
-(Scene::sunLegDepth, the user's option (a)), D read the ball 1.75 % bright with the scene still,
+bounds, beside a 2x2 floor; and, held still, the same with a bounded cloud the sun's first leg
+crosses, and with the haze a density field instead. Mode R's NEE leg dims the sun by the haze out
+to the instant's sphere (Scene::mediaExitDistance: |centre - p| + sceneRadius); a light subpath
+of modes D and J walks it from the entry disc's plane, never as far. Before the subpaths took the
+NEE leg's haze (sunLegFactor, the user's option (a)), D read the ball 1.75 % bright still,
 0.3 % with the ball held by a shutter at x = 6.4 outside the instant's sphere, and 2.75 % at
 x = 32. Each case renders mode R and the mode under test, two seeds each, and requires the ball's
 mean and the haze's (the top corners) to agree within 0.6 % (D) or 1.5 % (J, whose beam
@@ -27,7 +28,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 NL = chr(10)
 
 
-def scene(still, keys=8.0, at=6.4):
+def scene(still, keys=8.0, at=6.4, medium="medium { sigma_t 0.04  albedo 0.5 }", extra=""):
     move = ("sphere { center %g 1 0  radius 1  material w }" % at) if still else (
         "group { motion { key { translate %g 0 0 } key { translate %g 0 0 } }  "
         "sphere { center 0 1 0  radius 1  material w } }" % (-keys, keys))
@@ -36,9 +37,9 @@ def scene(still, keys=8.0, at=6.4):
         "scene { units meters%s }" % ("" if still else "  motion_interval -0.5 0.5"),
         'material "w" { type diffuse reflect 0.6 }',
         "light sun { dir 0.3 1 0.2  angle 0.53  spd preset:d65 }",
-        "medium { sigma_t 0.04  albedo 0.5 }",
+        medium,
         "quad { origin -1 0 -1  u 0 0 2  v 2 0 0  material w }",
-        move,
+        move] + ([extra] if extra else []) + [
         'camera "c" { eye %g 1.5 6  look_at %g 1 0  up 0 1 0  fov_y 30  %sfilm { res 96 72 } }'
         % (at, at, shutter)]) + NL
 
@@ -61,7 +62,14 @@ def main():
     a = ap.parse_args()
     exe, d = os.path.abspath(a.exe), os.path.abspath(a.out)
     os.makedirs(d, exist_ok=True)
-    scenes = {"still": scene(True), "near": scene(False), "far": scene(False, 40.0, 32.0)}
+    scenes = {"still": scene(True), "near": scene(False), "far": scene(False, 40.0, 32.0),
+              # a bounded cloud the sun's first leg crosses inside the haze: its beams are clipped
+              # to the cloud, the leg having begun outside it (BeamMis::leadIn)
+              "cloud": scene(True, extra="medium { sigma_t 0.6  albedo 0.9  "
+                                         "bounds { min 5.4 2.6 -1  max 7.4 3.4 1 } }"),
+              # a density field with no bounds: the factor drawn by the medium's own estimator
+              "field": scene(True, medium='medium { sigma_t 0.06  albedo 0.5  '
+                                          'density "0.3 + 0.7*saturate(1.0 - y/8.0)"  density_max 1 }')}
     for name, text in scenes.items():
         with open(os.path.join(d, name + ".ftsl"), "w", encoding="utf-8", newline="") as f:
             f.write(text)
@@ -71,6 +79,8 @@ def main():
         tag = "%s_%s_%s_s%d" % (name, mode, dev, seed)
         png = os.path.join(d, tag + ".png")
         spp = {"R": "512", "D": "512", "J": "1024"}[mode]
+        if name == "field" and mode == "J":
+            spp = "32"   # mode J in an unbounded density field runs ~8 s a sample here (J-FIELD-SLOW)
         for stale in (png, png[:-4] + ".pfm"):   # a render that writes nothing must not pass
             if os.path.exists(stale):
                 os.remove(stale)

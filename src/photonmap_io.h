@@ -313,7 +313,7 @@ inline bool loadPhotonMap(const char* path, PhotonMap& pm,
                 // An FTPMP08 file has the same width, but its tail bytes predate chord provenance
                 // (0.312.0): say "unknown" rather than trust whatever the old writer left there.
                 if (rok && !v9)
-                    for (auto& b : bm->beams) { b.srcEm = -1; b.surf = 255; b.flags = 0; }
+                    for (auto& b : bm->beams) { b.srcEm = -1; b.surf = 255; b.pad2 = 0; }
             } else {
                 // Widen an older file in place. Read into the frozen old layout a chunk at a
                 // time rather than allocating a second full array: the beam map is routinely
@@ -350,7 +350,7 @@ inline bool loadPhotonMap(const char* path, PhotonMap& pm,
                     // is the right answer: the beam re-gathers exactly as the file was traced.
                     b.emIdx = -1;
                     // v9 added chord provenance (0.312.0). Nothing older recorded it: unknown.
-                    b.srcEm = -1; b.surf = 255; b.flags = 0;
+                    b.srcEm = -1; b.surf = 255; b.pad2 = 0;
                     // v8 added the bundle's per-member weights. Every pre-v8 bundle was an
                     // EQUAL-weight one by construction, so 1 is exact rather than merely safe.
                     for (int k = 0; k < kBeamSecMax; ++k) b.wS[k] = 1.0f;

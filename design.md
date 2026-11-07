@@ -3269,11 +3269,12 @@ holding a glass ball), and on the device `-rgb`, mode S and every one of those.
   2026-11-05). D and J's own sun subpaths walk the haze only from the entry disc's plane,
   `R + (y - centre) . dir` to a vertex y, where the NEE leg counts `|centre - y| + R`; since MIS
   weighs the two together, a sun subpath takes the NEE leg's haze instead (HAZE-BLUR-DOMAIN, the
-  user's option (a), 0.434.29): every vertex from the first on is weighed by `exp(-sunLegDepth)`,
-  the optical depth of the unbounded media over the stretch the two legs differ by, and the
-  first leg's own beams take it at each merge point (`PhotonBeam` `kBeamSunLeg`, stored from the
-  walk's start with `s0` at the medium's bound). Device twins `dSunLegDepth` in
-  `dGenLightSubpath` and the beam gather. The per-mode table in main.cpp names the modes whose haze comes from forward
+  user's option (a), 0.434.29-30): every vertex from the first on is weighed by `sunLegFactor`
+  (beamgather.h), the unbounded media's transmittance over the stretch the two legs differ by,
+  drawn by the medium's own estimator (its inverse, by the deterministic quadrature, where a
+  blur's walk began further out than the NEE leg reaches), and the first leg's own beams take it
+  at each merge point (`BeamMis::sunLeg`, the leg having begun `leadIn` before the beam's
+  origin). Device twin `dSunLegFactor`, in `dGenLightSubpath` and the beam gather. The per-mode table in main.cpp names the modes whose haze comes from forward
   photons (`modeLightsHazeOnlyNearScene`: A, B, C, P, V, and M, whose photons light its
   surfaces through the haze even without `-beams`), and once every camera's mode is resolved
   and the run is one that traces light (not `-raster`/`-explore` or a diagnostic report),

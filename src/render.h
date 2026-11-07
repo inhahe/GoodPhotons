@@ -1121,7 +1121,7 @@ struct Renderer {
                    const double* lamS = nullptr, int nSec = 0,
                    const Vec3* achroCie = nullptr, int foldEmIdx = -1,
                    const double* specW = nullptr, int srcEm = -1, int surf = -1,
-                   bool sunLeg = false, double farRadius = 0.0) const {
+                   double farRadius = 0.0) const {
         if (!beamDeposit || !(beta > 0.0)) return;
         // Bound an escape-to-infinity crossing so an unbounded medium cannot produce a
         // 1e30-long box (see kBeamFarScale).
@@ -1162,16 +1162,13 @@ struct Renderer {
             // Power at the beam's stored origin: the photon's throughput carried forward
             // through the glass absorption and the media extinction it crossed to get there.
             double p = beta / ((keep < 1.0) ? keep : 1.0);
-            // A sun's first leg (PhotonBeam kBeamSunLeg) keeps its origin and power at the walk's
-            // start, so a merge can measure the NEE leg's haze against it; the gather's own
-            // transmittance from `o` then covers the stretch to the bound too.
-            if (aGlass > 0.0 && ta > 0.0 && !sunLeg) p *= std::exp(-aGlass * ta);
+            if (aGlass > 0.0 && ta > 0.0) p *= std::exp(-aGlass * ta);
             // MedStraight: charge only the media that were themselves crossed straight. A
             // GRIN medium overlapping this fog is transported ANALOG, so its extinction is
             // already carried by the deposition probability — the caller clips this crossing
             // at the analog collision, so the chance a beam covers depth s is exactly the
             // GRIN transmittance to s. Applying it here as well would count it twice.
-            if (ta > 0.0 && !sunLeg) p *= mediaTransmittance(scene, o, dir, ta, lambda, rng, offFilt);
+            if (ta > 0.0) p *= mediaTransmittance(scene, o, dir, ta, lambda, rng, offFilt);
             if (!(p > 0.0)) continue;
             // ACHROMATIC-PATH FOLD, decided per DEPOSITED BEAM, because its two halves live in
             // different places: the PATH being wavelength-independent is a property of the
@@ -1201,10 +1198,9 @@ struct Renderer {
             if (foldDiagOn() && i < 16)
                 g_foldKillHist[i][achroCie ? FK_None : g_foldKill].fetch_add(
                     1, std::memory_order_relaxed);
-            beamDeposit->push(sunLeg ? o : o + dir * ta, dir, tb - ta, p, lambda, aGlass, i, order,
+            beamDeposit->push(o + dir * ta, dir, tb - ta, p, lambda, aGlass, i, order,
                               lamS, nSec, (useAchro || bowEm >= 0) ? ca : nullptr, bowEm,
-                              specW, srcEm, surf, sunLeg ? ta : 0.0,
-                              sunLeg ? kBeamSunLeg : (unsigned char)0);
+                              specW, srcEm, surf);
         }
     }
 

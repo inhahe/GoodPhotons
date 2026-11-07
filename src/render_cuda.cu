@@ -7986,28 +7986,26 @@ __device__ static double dTrDetMedium(const DMedium& m, const DVec3& o, const DV
         tau += dMedDensityAt(m, o + dir * (Real)(ta + ((double)i + 0.5) * dt), env);
     return exp(-stBase * tau * dt);
 }
-// Twin of Scene::sunLegDepth (scene.h, where the reasoning is): the optical depth at `lambda`
-// that the NEE leg crosses to `y` beyond what a sun light subpath walking from `from` along
-// `dir` did (HAZE-BLUR-DOMAIN), over the unbounded media; exactly 0 where there are none.
-__device__ static double dSunLegDepth(const DScene& sc, const DVec3& from, const DVec3& dir,
-                                      const DVec3& y, Real lambda) {
+// Twin of sunLegFactor (beamgather.h, where the reasoning is): what brings a sun light subpath's
+// unbounded haze, walked from `from` along `dir`, to the NEE leg's at `y` (HAZE-BLUR-DOMAIN);
+// exactly 1 where there is none.
+__device__ static double dSunLegFactor(const DScene& sc, const DVec3& from, const DVec3& dir,
+                                       const DVec3& y, Real lambda, DRng& rng) {
     const double dl = dMediaExitDistance(sc, y) - (double)dot(y - from, dir);
-    if (dl == 0.0) return 0.0;
-    double tau = 0.0;
+    if (dl == 0.0) return 1.0;
+    const DPatEnv env = dPatEnvOf(sc);
+    double F = 1.0;
     for (int i = 0; i < sc.mediaN; ++i) {
         const DMedium& m = sc.media[i];
         if (m.bounded) continue;
-        const double st = (double)medSigmaT(m, lambda);
-        if (!(st > 0.0)) continue;
-        if (!m.heterogeneous) { tau += st * dl; continue; }
-        const int kSteps = 16;               // host sunLegDepth's -- keep the two in step
-        const DPatEnv env = dPatEnvOf(sc);
-        double sum = 0.0;
-        for (int k = 0; k < kSteps; ++k)
-            sum += dMedDensityAt(m, from - dir * (Real)(dl * (((double)k + 0.5) / kSteps)), env);
-        tau += st * dl * sum / kSteps;
+        if (dl > 0.0) {
+            F *= (double)dMedTransmittance(m, from - dir * (Real)dl, dir, (Real)dl, lambda, rng, env);
+        } else {
+            const double T = dTrDetMedium(m, from, dir, -dl, lambda, env);
+            if (T > 0.0) F /= T;
+        }
     }
-    return tau;
+    return F;
 }
 // dTrDetMedium's optical depth with sigma_t's wavelength part left out (host twin
 // trDetDepthMedium): the density integrated over the medium's part of the segment by the same
@@ -8476,7 +8474,7 @@ struct DBeamRec {
     // exact for every consumer; the visible band 360..830 nm maps to 0..47000, inside u16.
     unsigned short lamS[3];
     unsigned char  nSec;     // 0 = classic monochromatic beam; <= kBeamSecMax
-    unsigned char  pad;      // PhotonBeam::flags (kBeamSunLeg)
+    unsigned char  pad;
     // power / (nEmitted * nLam) * wS[k], WITHOUT the CIE fold — the per-secondary constant a
     // member needs, since it supplies its own CIE triple. Unused when nSec == 0.
     //
@@ -8518,6 +8516,7 @@ struct DBeamMis {
     float  etaPrevS;      // the POINT merge AT y_{s-1}, complete but for its kappaS; 0 off a
                           // storable surface site
     float  leadIn;        // distance from y_{s-1} to THIS beam's clipped origin
+    int    sunLeg;        // a sun's first leg in an unbounded haze (host twin BeamMis::sunLeg)
     int    gateC1;        // is "connect x to y_{s-1}" a legal strategy? (y_{s-1} not delta)
     int    vert;          // the light subpath vertex index j of y_{s-1} (so s = j+1) — the
                           // depth cap needs it, and nothing else does
@@ -8856,9 +8855,13 @@ __device__ static void dBeamHitEval(const DScene& sc, const DBeamMap& bm, const 
                 w *= (double)dMediaTransmittance(sc, b.o, b.d, s, lam, rng);
             }
         }
-        // A sun's first leg: the NEE leg's haze to this point, not the walk's (host twin
-        // beamgather.h; PhotonBeam kBeamSunLeg, carried here in `pad`).
-        if (b.pad & kBeamSunLeg) w *= exp(-dSunLegDepth(sc, b.o, b.d, b.o + b.d * s, lam));
+        // A sun's first leg (DBeamMis::sunLeg; host twin beamgather.h): the NEE leg's haze to
+        // this point, not the walk's, the leg having begun `leadIn` before the clipped origin.
+        if (mw) {
+            const DBeamMis* lm = bm.misOf(beamIdx);
+            if (lm && lm->sunLeg)
+                w *= dSunLegFactor(sc, b.o - b.d * (Real)lm->leadIn, b.d, b.o + b.d * s, lam, rng);
+        }
         if (t > (Real)0 && w > 0.0) w *= (double)dMediaTransmittance(sc, oc, dc, t, lam, rng);
         if (!(w > 0.0)) return;
         // A folded beam takes its colour from the bow table (already divided by the phase it
@@ -18465,7 +18468,7 @@ __device__ static int dGenLightSubpath(const DScene& sc, const DCamera& cam, int
             path[1].pdfFwd = pdf;
             // HAZE-BLUR-DOMAIN (a), host twin deltaLightSubpath (where the reasoning is): every
             // vertex from the first on carries the NEE leg's unbounded haze, not the walk's.
-            const double F = exp(-dSunLegDepth(sc, walkFrom, dir, path[1].p, lambda));
+            const double F = dSunLegFactor(sc, walkFrom, dir, path[1].p, lambda, rng);
             if (F != 1.0)
                 for (int k = 1; k < nD; ++k) {
                     path[k].beta *= F;
@@ -26286,7 +26289,7 @@ static void uploadBeamMapCuda(const Scene& scene, const BeamMap* bmap, DUpload& 
         r.emIdx = (b.achro == 2) ? (short)b.emIdx : (flatFold ? (short)b.srcEm : (short)-1);
         r.achro = (short)b.achro;
         r.lambda = b.lambda; r.absorb = b.absorb; r.med = b.med;
-        r.nSec = (unsigned char)b.nSec; r.pad = b.flags;
+        r.nSec = (unsigned char)b.nSec; r.pad = 0;
         for (int k = 0; k < 3; ++k) {
             // The same shared constant, minus the CIE fold, times this member's relative
             // spectral throughput. `wS` is 1 for every member of a bundle whose path never
@@ -26347,7 +26350,7 @@ static void uploadBeamMapCuda(const Scene& scene, const BeamMap* bmap, DUpload& 
         // Every BeamMis field is copied below; see the SurfMis upload for why these trip.
         static_assert(sizeof(BeamMis) == 56, "BeamMis changed: copy the new field into DBeamMis "
                                              "here, then update this size");
-        static_assert(sizeof(gpu::DBeamMis) == 56, "DBeamMis changed: fill the new field from "
+        static_assert(sizeof(gpu::DBeamMis) == 64, "DBeamMis changed: fill the new field from "
                                                    "BeamMis here, then update this size");
         std::vector<gpu::DBeamMis> dm(bmap->mis.size());
         for (size_t i = 0; i < dm.size(); ++i) {
@@ -26359,6 +26362,7 @@ static void uploadBeamMapCuda(const Scene& scene, const BeamMap* bmap, DUpload& 
             d.sumC = s.sumC; d.sumM = s.sumMb; d.sumMs = s.sumMs;
             d.pdfDir = s.pdfDir; d.pdfPlanar = s.pdfPlanar; d.rCoef = s.rCoef;
             d.etaPrev = s.etaPrev; d.etaPrevS = s.etaPrevS; d.leadIn = s.leadIn;
+            d.sunLeg = s.sunLeg;
             d.gateC1 = (int)s.gateC1; d.vert = (int)s.vert;
         }
         nMis = dm.size();
@@ -28140,7 +28144,7 @@ std::vector<Film> renderPhotonMapSharedCuda(const Scene& scene, const std::vecto
                 b.srcEm = (d.srcEm >= 0 && d.srcEm <= 32767) ? (short)d.srcEm : (short)-1;
                 b.surf  = (d.surf < 0) ? (unsigned char)255
                                        : (d.surf > 254 ? (unsigned char)254 : (unsigned char)d.surf);
-                b.flags = 0;
+                b.pad2  = 0;
             }
         }
         bmap->nEmitted   = pm.nEmitted;      // same pass, same normalisation

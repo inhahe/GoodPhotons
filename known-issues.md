@@ -673,6 +673,19 @@ with a K from the sample count), which is deterministic but no longer adapts to 
 light side is. Then add a heterogeneous medium at more than one sample to check_bitid's mode-J
 scenes.
 
+## OPEN (2026-11-07, 0.434.30, performance): J-FIELD-SLOW — mode J in an unbounded density field runs ~8 s a sample at 96x72
+
+check_haze_domain's `field` scene (a 2x2 floor and a ball under a sun in `medium { sigma_t 0.06
+albedo 0.5  density "0.3 + 0.7*saturate(1.0 - y/8.0)"  density_max 1 }`, no bounds) renders in
+mode J at 27 s for 2 spp on the CPU, 0.434.28 and 0.434.30 alike, and a 1024-spp render took about
+two hours on either device, where mode D takes seconds. Suspect: an unbounded density field gets
+no majorant grid (the global `density_max` instead), so every beam merge's transmittance along
+the beam and the camera ray ratio-tracks the whole way with a pattern-VM density evaluation per
+step, over beams up to 8 scene radii long. To confirm: FTRACE_MSTATS-style split of the gather's
+time, and the same scene bounded (to the scene's sphere) for comparison. Proper fix, if so: a
+majorant grid over the region the paths can reach (the scene's sphere) for an unbounded field,
+with the global majorant outside it.
+
 ## DONE (2026-11-07, 0.434.29): J-BEAM-FARLIMIT — under a blur, mode J cut its beams in an unbounded haze at the instant's sphere
 
 `Renderer::emitBeams` clamps a beam in an unbounded medium to `kBeamFarScale` (8) times the
@@ -699,13 +712,16 @@ reports the samples it has as final, so they are written.
 
 ## FIXED (2026-11-07, 0.434.29; opened 2026-11-05, 0.434.16, widened 2026-11-06): HAZE-BLUR-DOMAIN — modes D and J's sun subpaths take less unbounded haze than their NEE leg: 1-2 % bright in a still scene, more for a mover far out under a blur
 
-**Fixed in 0.434.29, the user's option (a):** a sun subpath takes the NEE leg's haze. Every vertex
-from the first on is weighed by `exp(-Scene::sunLegDepth)`, the optical depth of the unbounded
-media over the stretch the walk and the NEE leg differ by (exact for a homogeneous haze, midpoint
-quadrature for a density field). The first leg's own beams take it at each merge point: mode J
-stores them from the walk's start (`PhotonBeam::flags` `kBeamSunLeg`, `s0` at the medium's bound,
-power at the start), and both gathers apply it. Device twins: `dSunLegDepth` in
-`dGenLightSubpath` and the beam gather. `tools/check_haze_domain.py` holds modes D and J to mode
+**Fixed in 0.434.29, the user's option (a), reworked in 0.434.30 after review:** a sun subpath
+takes the NEE leg's haze. Every vertex from the first on is weighed by `sunLegFactor`
+(beamgather.h), the unbounded media's transmittance over the stretch the walk and the NEE leg
+differ by, drawn by each medium's own unbiased estimator. The first leg's own beams take it at
+each merge point (`BeamMis::sunLeg`; the leg began `leadIn` before the beam's clipped origin),
+whether or not the leg left a vertex. Device twin: `dSunLegFactor` in `dGenLightSubpath` and the
+beam gather. One case remains approximate: where a blur's walk began further out than the NEE
+leg reaches (an entry outside the instant's disc), the factor is the inverse of a transmittance,
+which no estimator draws unbiased -- exact for a homogeneous haze, the deterministic quadrature
+(trDetMedium) for a density field. `tools/check_haze_domain.py` holds modes D and J to mode
 R on the scenes below, both devices: D within 0.4 % everywhere (it read 1.0175, 1.0030 and
 1.0275), J within 0.4 % but for the far ball's 0.991 (J's 3.3 m merge kernel round a 1 m ball).
 Testing J found two older bugs on the far scene, fixed in the same version (J-BEAM-FARLIMIT,

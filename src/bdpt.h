@@ -718,7 +718,7 @@ struct PathSeg {
                           // needs its absorption at another wavelength (JSPEC)
     int vert = 0;         // index in the subpath of the vertex this segment leaves
     // A sun's first leg under an unbounded haze (deltaLightSubpath): `o` is where the walk
-    // began, and its beams take the NEE leg's haze at each merge point (kBeamSunLeg).
+    // began, and its beams take the NEE leg's haze at each merge point (BeamMis::sunLeg).
     bool sunLeg = false;
     // Solid-angle density of `d` at the vertex this segment leaves. The merge weight needs
     // it on BOTH sides and cannot recover it from the vertex list: a merge point x is not a
@@ -2031,13 +2031,14 @@ inline int deltaLightSubpath(const Scene& scene, const Camera& cam, const Render
     // HAZE-BLUR-DOMAIN, the user's option (a): the walk crossed an unbounded haze from
     // `walkFrom`, but the NEE leg -- mode R's, and these modes' own -- counts it out to
     // mediaExitDistance, and MIS weighs the two together. So everything from the first vertex
-    // on carries the NEE leg's haze to that vertex (Scene::sunLegDepth), and the first leg's
-    // own beams take it point by point (PathSeg::sunLeg). One factor serves every wavelength
-    // the path carries: a bundle exists only where extinction is achromatic (mediaKeepBundle,
-    // beamSpecC), and then the factor is the same at all of them.
-    if (isSun && path.size() > 1 && scene.unboundedHaze()) {
-        const double tau = scene.sunLegDepth(walkFrom, dir, path[1].p, lambda);
-        const double F = std::exp(-tau);
+    // on carries the NEE leg's haze to that vertex (sunLegFactor), and the first leg's own
+    // beams take it point by point (PathSeg::sunLeg) -- a leg that leaves no vertex, escaping
+    // the scene, deposits beams too. One factor serves every wavelength the path carries: a
+    // bundle exists only where extinction is achromatic (mediaKeepBundle, beamSpecC), and then
+    // the factor is the same at all of them.
+    if (isSun && scene.unboundedHaze()) {
+        const double F = path.size() > 1
+                       ? sunLegFactor(scene, walkFrom, dir, path[1].p, lambda, rng) : 1.0;
         for (size_t k = 1; k < path.size(); ++k) {
             path[k].beta *= F;
             for (double& b : path[k].betaSec) b *= F;
@@ -2802,7 +2803,7 @@ inline void traceLightBeamPass(const Scene& scene, const Camera& cam, long long 
                                kBeamOrderUnknown,
                                Renderer::MedAll, lamS, nSec, cie, dEm,
                                nSec > 0 ? wsBuf : nullptr, bs.ok ? bs.emIdx : -1, -1,
-                               sg.sunLeg, scene.lightRadius());
+                               scene.lightRadius());
             };
 
             // --- The light half of every merge weight this subpath can take part in -------
@@ -2976,6 +2977,7 @@ inline void traceLightBeamPass(const Scene& scene, const Camera& cam, long long 
                     // y_{s-1}; this is the difference the gather adds back to recover the full
                     // y_{s-1} -> x distance the light-side density is expressed over.
                     mm.leadIn = (float)dot(banks[(size_t)tid].beams[bi].o - sg.o, sg.d);
+                    mm.sunLeg = sg.sunLeg ? 1 : 0;
                     misBank.push_back(mm);
                 }
             }

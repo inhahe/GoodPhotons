@@ -310,6 +310,34 @@ inline double trDetMedium(const Medium& med, const Vec3& o, const Vec3& dir, dou
     return std::exp(-stBase * tau * dt);
 }
 
+// HAZE-BLUR-DOMAIN, the user's option (a): the factor that brings a sun light subpath's haze to
+// the NEE leg's at `y`. The walk crossed the unbounded media from `from` along `dir`; the NEE leg
+// (mode R's, and modes D and J's own) counts them out to Scene::mediaExitDistance(y). The two lie
+// on one line and differ by the stretch between `from` and from - dir * dl. Where the NEE leg
+// reaches further (dl > 0: every still scene, and a blur's entry through the instant's disc) the
+// factor is that stretch's transmittance, drawn by the medium's own unbiased estimator. Where the
+// walk began further out (a blur's entry outside the instant's disc) it is the inverse of the
+// stretch the walk crossed beyond the NEE leg, which no estimator draws unbiased: exact for a
+// homogeneous haze, the deterministic quadrature for a density field. Bounded media lie inside
+// the scene's sphere (their bounds are part of it), which both legs cross whole.
+inline double sunLegFactor(const Scene& scene, const Vec3& from, const Vec3& dir, const Vec3& y,
+                           double lambda, Pcg32& rng) {
+    const double dl = scene.mediaExitDistance(y) - dot(y - from, dir);
+    if (dl == 0.0) return 1.0;
+    const PatTables tabs = scene.patTables();
+    double F = 1.0;
+    for (const Medium& m : scene.media) {
+        if (m.bounded) continue;
+        if (dl > 0.0) {
+            F *= Renderer::mediumTransmittance(m, from - dir * dl, dir, dl, lambda, rng, &tabs);
+        } else {
+            const double T = trDetMedium(m, from, dir, -dl, lambda, &tabs);
+            if (T > 0.0) F /= T;
+        }
+    }
+    return F;
+}
+
 // trDetMedium's optical depth with sigma_t's wavelength part left out: a medium's extinction is
 // sigma_t(lambda) * density(x), so over a fixed segment trDetMedium is exp(-sigma_t(lambda) * L)
 // with L this, the density integrated over the medium's part of the segment by the same clip and
@@ -996,9 +1024,11 @@ inline Vec3 gatherPhotonBeamsW(const Scene& scene, const Renderer& mats, const B
         }
         if (bh.sBeam > 0.0)  w *= mats.mediaTransmittance(scene, b.o, b.d, bh.sBeam, lam, rng);
         if (bh.tCam  > 0.0)  w *= mats.mediaTransmittance(scene, oc, dc, bh.tCam, lam, rng);
-        // A sun's first leg: the NEE leg's haze to this point, not the walk's (kBeamSunLeg).
-        if (b.flags & kBeamSunLeg)
-            w *= std::exp(-scene.sunLegDepth(b.o, b.d, b.o + b.d * bh.sBeam, lam));
+        // A sun's first leg (BeamMis::sunLeg): the NEE leg's haze to this point, not the walk's,
+        // the leg having begun `leadIn` before the beam's clipped origin.
+        if (const BeamMis* lm = bm.misOf(bh.idx); lm && lm->sunLeg)
+            w *= sunLegFactor(scene, b.o - b.d * (double)lm->leadIn, b.d, b.o + b.d * bh.sBeam,
+                              lam, rng);
         if (!(w > 0.0)) { beamDiag().bump(beamDiag().rejTr); return; }
         if (beamDiag().on) {
             beamDiag().wAll.fetch_add(w, std::memory_order_relaxed);
