@@ -996,6 +996,9 @@ inline Vec3 gatherPhotonBeamsW(const Scene& scene, const Renderer& mats, const B
         }
         if (bh.sBeam > 0.0)  w *= mats.mediaTransmittance(scene, b.o, b.d, bh.sBeam, lam, rng);
         if (bh.tCam  > 0.0)  w *= mats.mediaTransmittance(scene, oc, dc, bh.tCam, lam, rng);
+        // A sun's first leg: the NEE leg's haze to this point, not the walk's (kBeamSunLeg).
+        if (b.flags & kBeamSunLeg)
+            w *= std::exp(-scene.sunLegDepth(b.o, b.d, b.o + b.d * bh.sBeam, lam));
         if (!(w > 0.0)) { beamDiag().bump(beamDiag().rejTr); return; }
         if (beamDiag().on) {
             beamDiag().wAll.fetch_add(w, std::memory_order_relaxed);

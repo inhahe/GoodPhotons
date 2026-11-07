@@ -124,9 +124,9 @@ Each names the section its line is in.
     counts, for its loop (found in review of 0.434.21).~~ Done, 0.434.23 (and its camera pass's
     per-call wavelength strata, a second clock dependence); its review's follow-ups 0.434.24 (a
     golden-ratio wavelength sequence in place of the strata, a resume's fresh first light side).
-18. **HAZE-BLUR-DOMAIN** (4.2) — modes D and J weigh together strategies that take different
-    unbounded haze (first found under a blur, for a mover outside the instant's sphere). Measured 2026-11-06: not only a
-    blur's, 1-2 % in any unbounded sunlit haze; blocked on the user's choice of domain (4.1).
+18. ~~**HAZE-BLUR-DOMAIN** (4.2) — modes D and J weigh together strategies that take different
+    unbounded haze (first found under a blur, for a mover outside the instant's sphere).~~ Done
+    0.434.29, the user's option (a); with it J-BEAM-FARLIMIT and REFRESH-EMPTY-STOP.
 19. ~~**GLOSSY-SAMPLE-SITES** (4.4) — the interference factor applied by hand at two dozen sites.~~
     Done 2026-11-06: `drawGlossy` / `dDrawGlossy` return the direction with its factor.
 20. **JSPEC-CARRIER-SIZE** (4.5) — every mode-J GPU thread reserves the spectral carrier.
@@ -143,7 +143,8 @@ Then the rest of 4.2-4.6 in their order, 4.7's bookkeeping alongside whatever to
 
 ### 4.1 Decisions the user owes (each blocks its fix)
 
-- [ ] **HAZE-BLUR-DOMAIN** (measured 2026-11-06 on 0.434.24) — in an unbounded sunlit haze, modes
+- [x] **HAZE-BLUR-DOMAIN** — decided 2026-11-06: (a), done in 0.434.29 (`tools/check_haze_domain.py`).
+  (Measured on 0.434.24.) In an unbounded sunlit haze, modes
   D and J's sun subpaths walk the haze from the entry disc's plane while their NEE legs, and mode
   R's, count it out to `|centre - p| + sceneRadius`. So D reads 1-2 % brighter than R in a still
   scene (1.0175 on a sunlit ball, 1.011 on the haze), and more for a mover far past the instant's
@@ -195,9 +196,8 @@ Then the rest of 4.2-4.6 in their order, 4.7's bookkeeping alongside whatever to
 - [x] **HAZE-SUN-B** (0.434.15, 0.434.16) — mode B lights an unbounded sunlit haze at 0.163 of
   mode R, its floor 0.846; the modes whose haze comes from forward photons (A, B, C, P, V,
   M) say so (the user's choice, 4.1).
-- [ ] **HAZE-BLUR-DOMAIN** — in an unbounded sunlit haze modes D and J's sun subpaths walk less
-  haze than their NEE leg counts: 1-2 % bright in a still scene, more for a mover far past the
-  instant's sphere under a blur. Blocked on the user's choice of domain (4.1).
+- [x] **HAZE-BLUR-DOMAIN** (0.434.29) — in an unbounded sunlit haze modes D and J's sun subpaths
+  walked less haze than their NEE leg counts; they take the NEE leg's now (option (a)).
 - [x] **VCM-SPEC** (0.433.0) — mode U's camera walk carries mode J's spectral carrier, and each
   merge reads it at the light vertex's wavelengths.
 - [ ] **MODEM-GPU-CORNER**, what is left — the corner was noise (0.433.2); GPU mode M reads

@@ -673,7 +673,46 @@ with a K from the sample count), which is deterministic but no longer adapts to 
 light side is. Then add a heterogeneous medium at more than one sample to check_bitid's mode-J
 scenes.
 
-## OPEN (2026-11-05, 0.434.16; found in review of 51eb7ef..af7de14; widened 2026-11-06): HAZE-BLUR-DOMAIN — modes D and J's sun subpaths take less unbounded haze than their NEE leg: 1-2 % bright in a still scene, more for a mover far out under a blur
+## DONE (2026-11-07, 0.434.29): J-BEAM-FARLIMIT — under a blur, mode J cut its beams in an unbounded haze at the instant's sphere
+
+`Renderer::emitBeams` clamps a beam in an unbounded medium to `kBeamFarScale` (8) times the
+scene's radius, so an escaping chord does not become a 1e30-long box. Mode J's light subpaths,
+under a blur, enter through the swept disc (Scene::lightRadius), tens of metres out for a mover
+far outside the instant's sphere, and their beams ended before reaching it, while the MIS
+weights still counted merges there: J read 0.71 of mode R on such a ball and 0.34 on the haze
+round it (check_haze_domain's far case, both devices). Mode J now scales its beams' limit with
+the light's radius (`emitBeams`' `farRadius`); a still scene's is the scene's, as before. Mode
+M keeps the instant's: its forward photons light the haze only near the scene by design
+(HAZE-SUN-B), and a blur must not widen it.
+
+## DONE (2026-11-07, 0.434.29): REFRESH-EMPTY-STOP — modes J and M stopped a render on an empty but ordinary light-side refresh, and then wrote no image
+
+Each light-side refresh draws its map afresh, so a map that held a handful of entries (mode J's
+surface photons on check_haze_domain's far scene: 4 to 7 a realization) comes back empty now and
+then, which the average takes like any other realization. Both refresh loops treated every empty
+map as a failure ("cannot happen if epoch 0 was non-empty") and stopped, and the stop wrote no
+image: runSppProgressive writes what the renderer reports, and the loop broke without a final
+report, leaving whatever an earlier render had left on disk (which is how a stale image passed
+for a fresh one in the first run of check_haze_domain). An empty map now stops a render only where
+epoch 0's held kEmptyImplausible (32) or more, a Poisson zero once in e^32 draws, and the stop
+reports the samples it has as final, so they are written.
+
+## FIXED (2026-11-07, 0.434.29; opened 2026-11-05, 0.434.16, widened 2026-11-06): HAZE-BLUR-DOMAIN — modes D and J's sun subpaths take less unbounded haze than their NEE leg: 1-2 % bright in a still scene, more for a mover far out under a blur
+
+**Fixed in 0.434.29, the user's option (a):** a sun subpath takes the NEE leg's haze. Every vertex
+from the first on is weighed by `exp(-Scene::sunLegDepth)`, the optical depth of the unbounded
+media over the stretch the walk and the NEE leg differ by (exact for a homogeneous haze, midpoint
+quadrature for a density field). The first leg's own beams take it at each merge point: mode J
+stores them from the walk's start (`PhotonBeam::flags` `kBeamSunLeg`, `s0` at the medium's bound,
+power at the start), and both gathers apply it. Device twins: `dSunLegDepth` in
+`dGenLightSubpath` and the beam gather. `tools/check_haze_domain.py` holds modes D and J to mode
+R on the scenes below, both devices: D within 0.4 % everywhere (it read 1.0175, 1.0030 and
+1.0275), J within 0.4 % but for the far ball's 0.991 (J's 3.3 m merge kernel round a 1 m ball).
+Testing J found two older bugs on the far scene, fixed in the same version (J-BEAM-FARLIMIT,
+REFRESH-EMPTY-STOP, above); 0.434.28 read J at 1.04 near and 0.71 / 0.34 far. Scenes without an
+unbounded haze render as before (check_bitid). The rest of this entry is how it stood.
+
+### How it stood: modes D and J's sun subpaths take less unbounded haze than their NEE leg: 1-2 % bright in a still scene, more for a mover far out under a blur
 
 Split from HAZE-SUN-B, whose decision (keep mode R's domain for an unbounded haze) leaves it
 standing. In a scene with motion, a path with a time draws a sun's or a sky's light through the

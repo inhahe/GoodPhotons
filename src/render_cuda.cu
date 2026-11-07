@@ -7986,6 +7986,29 @@ __device__ static double dTrDetMedium(const DMedium& m, const DVec3& o, const DV
         tau += dMedDensityAt(m, o + dir * (Real)(ta + ((double)i + 0.5) * dt), env);
     return exp(-stBase * tau * dt);
 }
+// Twin of Scene::sunLegDepth (scene.h, where the reasoning is): the optical depth at `lambda`
+// that the NEE leg crosses to `y` beyond what a sun light subpath walking from `from` along
+// `dir` did (HAZE-BLUR-DOMAIN), over the unbounded media; exactly 0 where there are none.
+__device__ static double dSunLegDepth(const DScene& sc, const DVec3& from, const DVec3& dir,
+                                      const DVec3& y, Real lambda) {
+    const double dl = dMediaExitDistance(sc, y) - (double)dot(y - from, dir);
+    if (dl == 0.0) return 0.0;
+    double tau = 0.0;
+    for (int i = 0; i < sc.mediaN; ++i) {
+        const DMedium& m = sc.media[i];
+        if (m.bounded) continue;
+        const double st = (double)medSigmaT(m, lambda);
+        if (!(st > 0.0)) continue;
+        if (!m.heterogeneous) { tau += st * dl; continue; }
+        const int kSteps = 16;               // host sunLegDepth's -- keep the two in step
+        const DPatEnv env = dPatEnvOf(sc);
+        double sum = 0.0;
+        for (int k = 0; k < kSteps; ++k)
+            sum += dMedDensityAt(m, from - dir * (Real)(dl * (((double)k + 0.5) / kSteps)), env);
+        tau += st * dl * sum / kSteps;
+    }
+    return tau;
+}
 // dTrDetMedium's optical depth with sigma_t's wavelength part left out (host twin
 // trDetDepthMedium): the density integrated over the medium's part of the segment by the same
 // clip and quadrature, so the segment's transmittance at any wavelength is exp(-sigma_t * this).
@@ -8453,7 +8476,7 @@ struct DBeamRec {
     // exact for every consumer; the visible band 360..830 nm maps to 0..47000, inside u16.
     unsigned short lamS[3];
     unsigned char  nSec;     // 0 = classic monochromatic beam; <= kBeamSecMax
-    unsigned char  pad;
+    unsigned char  pad;      // PhotonBeam::flags (kBeamSunLeg)
     // power / (nEmitted * nLam) * wS[k], WITHOUT the CIE fold — the per-secondary constant a
     // member needs, since it supplies its own CIE triple. Unused when nSec == 0.
     //
@@ -8833,6 +8856,9 @@ __device__ static void dBeamHitEval(const DScene& sc, const DBeamMap& bm, const 
                 w *= (double)dMediaTransmittance(sc, b.o, b.d, s, lam, rng);
             }
         }
+        // A sun's first leg: the NEE leg's haze to this point, not the walk's (host twin
+        // beamgather.h; PhotonBeam kBeamSunLeg, carried here in `pad`).
+        if (b.pad & kBeamSunLeg) w *= exp(-dSunLegDepth(sc, b.o, b.d, b.o + b.d * s, lam));
         if (t > (Real)0 && w > 0.0) w *= (double)dMediaTransmittance(sc, oc, dc, t, lam, rng);
         if (!(w > 0.0)) return;
         // A folded beam takes its colour from the bow table (already divided by the phase it
@@ -18437,6 +18463,14 @@ __device__ static int dGenLightSubpath(const DScene& sc, const DCamera& cam, int
             double pdf = pdfPosD;
             if (dOnSurface(path[1])) pdf *= fabs(ddot(path[1].ns, dir));
             path[1].pdfFwd = pdf;
+            // HAZE-BLUR-DOMAIN (a), host twin deltaLightSubpath (where the reasoning is): every
+            // vertex from the first on carries the NEE leg's unbounded haze, not the walk's.
+            const double F = exp(-dSunLegDepth(sc, walkFrom, dir, path[1].p, lambda));
+            if (F != 1.0)
+                for (int k = 1; k < nD; ++k) {
+                    path[k].beta *= F;
+                    for (int i = 0; i + 1 < hb.C; ++i) pathSec[k * secStride + i] *= F;
+                }
         }
         return nD;
     }
@@ -26252,7 +26286,7 @@ static void uploadBeamMapCuda(const Scene& scene, const BeamMap* bmap, DUpload& 
         r.emIdx = (b.achro == 2) ? (short)b.emIdx : (flatFold ? (short)b.srcEm : (short)-1);
         r.achro = (short)b.achro;
         r.lambda = b.lambda; r.absorb = b.absorb; r.med = b.med;
-        r.nSec = (unsigned char)b.nSec; r.pad = 0;
+        r.nSec = (unsigned char)b.nSec; r.pad = b.flags;
         for (int k = 0; k < 3; ++k) {
             // The same shared constant, minus the CIE fold, times this member's relative
             // spectral throughput. `wS` is 1 for every member of a bundle whose path never
@@ -28106,7 +28140,7 @@ std::vector<Film> renderPhotonMapSharedCuda(const Scene& scene, const std::vecto
                 b.srcEm = (d.srcEm >= 0 && d.srcEm <= 32767) ? (short)d.srcEm : (short)-1;
                 b.surf  = (d.surf < 0) ? (unsigned char)255
                                        : (d.surf > 254 ? (unsigned char)254 : (unsigned char)d.surf);
-                b.pad2  = 0;
+                b.flags = 0;
             }
         }
         bmap->nEmitted   = pm.nEmitted;      // same pass, same normalisation

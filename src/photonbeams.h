@@ -416,7 +416,12 @@ struct PhotonBeam {
     // loader resets to "unknown", and unknown provenance makes `-sunnee` refuse the map.
     short         srcEm;
     unsigned char surf;
-    unsigned char pad2;
+    // kBeamSunLeg: a sun's first leg in mode J under an unbounded haze, whose `o` is where the
+    // light subpath's walk began (not clipped to the medium: the first sub-segment starts `s0`
+    // in, at the bound) and whose power is the walk's there. A merge on it weighs the NEE leg's
+    // haze at its own point (Scene::sunLegDepth), since that varies along the beam. In the
+    // record's tail padding, like srcEm / surf; 0 in every saved map.
+    unsigned char flags;
 
     // nSec is 0 for both a classic monochromatic beam and an achromatic-path one, so this is
     // the plain nSec+1 it always was; the achromatic beam carries the full chord power.
@@ -424,6 +429,8 @@ struct PhotonBeam {
     Vec3 begin() const { return o + d * (double)s0; }
     Vec3 end()   const { return o + d * ((double)s0 + (double)len); }
 };
+
+constexpr unsigned char kBeamSunLeg = 1;   // PhotonBeam::flags
 
 // A per-thread beam bank, appended to during the photon pass and concatenated into the
 // BeamMap afterwards. Mirrors PhotonBank's role for surface deposits.
@@ -485,7 +492,7 @@ struct BeamBank {
               double lambda, double absorb, int med, int order,
               const double* lamS = nullptr, int nSec = 0, const double* cieA = nullptr,
               int emIdx = -1, const double* wS = nullptr,
-              int srcEm = -1, int surf = -1) {
+              int srcEm = -1, int surf = -1, double s0 = 0.0, unsigned char flags = 0) {
         // `-beams-minorder` filter: drop this chord entirely rather than store it.
         if (pbeams::gOrderMin > 0 && order >= 0 &&
             order < pbeams::gOrderMin && order < (int)kBeamOrderUnknown) return;
@@ -501,14 +508,14 @@ struct BeamBank {
         b.order = (order < 0 || order >= (int)kBeamOrderUnknown)
                       ? kBeamOrderUnknown : (unsigned char)order;
         b.o = o; b.d = d;
-        b.s0 = 0.0f; b.len = (float)len; b.power = (float)power;
+        b.s0 = (float)s0; b.len = (float)len; b.power = (float)power;
         b.lambda = (float)lambda; b.absorb = (float)absorb; b.med = med;
         b.achro = cieA ? (emIdx >= 0 ? 2 : 1) : 0;
         b.emIdx = (b.achro == 2) ? (short)emIdx : (short)-1;
         // Provenance (0.312.0): out-of-range means "unknown", never the nearest real value.
         b.srcEm = (srcEm >= 0 && srcEm <= 32767) ? (short)srcEm : (short)-1;
         b.surf  = (surf < 0) ? (unsigned char)255 : (surf > 254 ? (unsigned char)254 : (unsigned char)surf);
-        b.pad2  = 0;
+        b.flags = flags;
         for (int i = 0; i < 3; ++i) b.cieA[i] = cieA ? (float)cieA[i] : 0.0f;
         if (nSec > kBeamSecMax) nSec = kBeamSecMax;
         b.nSec = (lamS && nSec > 0 && !cieA) ? nSec : 0;

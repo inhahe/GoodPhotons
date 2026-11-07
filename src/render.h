@@ -1120,7 +1120,8 @@ struct Renderer {
                    MedFilter offFilt = MedStraight,
                    const double* lamS = nullptr, int nSec = 0,
                    const Vec3* achroCie = nullptr, int foldEmIdx = -1,
-                   const double* specW = nullptr, int srcEm = -1, int surf = -1) const {
+                   const double* specW = nullptr, int srcEm = -1, int surf = -1,
+                   bool sunLeg = false, double farRadius = 0.0) const {
         if (!beamDeposit || !(beta > 0.0)) return;
         // Bound an escape-to-infinity crossing so an unbounded medium cannot produce a
         // 1e30-long box (see kBeamFarScale).
@@ -1134,7 +1135,11 @@ struct Renderer {
         // truncated every beam to a stub. Clamping the whole call up front also meant one
         // unbounded haze could shorten the beams of an unrelated bounded cloud it happened to
         // overlap. (Device twin: dEmitBeams in render_cuda.cu.)
-        const double farLimit = kBeamFarScale * std::max(scene.sceneRadius, 1e-3);
+        // `farRadius` (0: the scene's) is the sphere the caller's paths live in: mode J's light
+        // subpaths, under a blur, enter through the swept one (Scene::lightRadius), and a beam cut
+        // at the instant's would end short of a mover outside it, where its merges are counted.
+        const double farLimit = kBeamFarScale * std::max(farRadius > 0.0 ? farRadius : scene.sceneRadius,
+                                                         1e-3);
         if (!(dLen > 0.0)) return;
         const double keep = beamDeposit->keepProb;
         for (int i = 0; i < (int)scene.media.size(); ++i) {
@@ -1157,13 +1162,16 @@ struct Renderer {
             // Power at the beam's stored origin: the photon's throughput carried forward
             // through the glass absorption and the media extinction it crossed to get there.
             double p = beta / ((keep < 1.0) ? keep : 1.0);
-            if (aGlass > 0.0 && ta > 0.0) p *= std::exp(-aGlass * ta);
+            // A sun's first leg (PhotonBeam kBeamSunLeg) keeps its origin and power at the walk's
+            // start, so a merge can measure the NEE leg's haze against it; the gather's own
+            // transmittance from `o` then covers the stretch to the bound too.
+            if (aGlass > 0.0 && ta > 0.0 && !sunLeg) p *= std::exp(-aGlass * ta);
             // MedStraight: charge only the media that were themselves crossed straight. A
             // GRIN medium overlapping this fog is transported ANALOG, so its extinction is
             // already carried by the deposition probability — the caller clips this crossing
             // at the analog collision, so the chance a beam covers depth s is exactly the
             // GRIN transmittance to s. Applying it here as well would count it twice.
-            if (ta > 0.0) p *= mediaTransmittance(scene, o, dir, ta, lambda, rng, offFilt);
+            if (ta > 0.0 && !sunLeg) p *= mediaTransmittance(scene, o, dir, ta, lambda, rng, offFilt);
             if (!(p > 0.0)) continue;
             // ACHROMATIC-PATH FOLD, decided per DEPOSITED BEAM, because its two halves live in
             // different places: the PATH being wavelength-independent is a property of the
@@ -1193,9 +1201,10 @@ struct Renderer {
             if (foldDiagOn() && i < 16)
                 g_foldKillHist[i][achroCie ? FK_None : g_foldKill].fetch_add(
                     1, std::memory_order_relaxed);
-            beamDeposit->push(o + dir * ta, dir, tb - ta, p, lambda, aGlass, i, order,
+            beamDeposit->push(sunLeg ? o : o + dir * ta, dir, tb - ta, p, lambda, aGlass, i, order,
                               lamS, nSec, (useAchro || bowEm >= 0) ? ca : nullptr, bowEm,
-                              specW, srcEm, surf);
+                              specW, srcEm, surf, sunLeg ? ta : 0.0,
+                              sunLeg ? kBeamSunLeg : (unsigned char)0);
         }
     }
 

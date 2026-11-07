@@ -3266,7 +3266,14 @@ holding a glass ball), and on the device `-rgb`, mode S and every one of those.
   light it along every camera ray out to the horizon, the sun's light dimmed only by the haze
   inside the scene's sphere (`mediaExitDistance`). An endless haze has no physical answer (it
   would let no sunlight through), and the backward modes' is the one kept (HAZE-SUN-B, decided
-  2026-11-05). The per-mode table in main.cpp names the modes whose haze comes from forward
+  2026-11-05). D and J's own sun subpaths walk the haze only from the entry disc's plane,
+  `R + (y - centre) . dir` to a vertex y, where the NEE leg counts `|centre - y| + R`; since MIS
+  weighs the two together, a sun subpath takes the NEE leg's haze instead (HAZE-BLUR-DOMAIN, the
+  user's option (a), 0.434.29): every vertex from the first on is weighed by `exp(-sunLegDepth)`,
+  the optical depth of the unbounded media over the stretch the two legs differ by, and the
+  first leg's own beams take it at each merge point (`PhotonBeam` `kBeamSunLeg`, stored from the
+  walk's start with `s0` at the medium's bound). Device twins `dSunLegDepth` in
+  `dGenLightSubpath` and the beam gather. The per-mode table in main.cpp names the modes whose haze comes from forward
   photons (`modeLightsHazeOnlyNearScene`: A, B, C, P, V, and M, whose photons light its
   surfaces through the haze even without `-beams`), and once every camera's mode is resolved
   and the run is one that traces light (not `-raster`/`-explore` or a diagnostic report),

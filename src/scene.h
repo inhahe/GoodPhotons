@@ -2779,6 +2779,40 @@ struct Scene {
     // bounding sphere at every time, since no medium moves -- integrating an unbounded haze out
     // to a mover's sweep would dim the whole frame the moment a shutter opens.
     double mediaExitDistance(const Vec3& p) const { return length(sceneCenter - p) + sceneRadius; }
+    // Whether any medium is unbounded and attenuates: the media sunLegDepth counts.
+    bool unboundedHaze() const {
+        for (const Medium& m : media)
+            if (!m.bounded && m.attenuates()) return true;
+        return false;
+    }
+    // The optical depth, at `lambda`, that a sun's light crosses to reach `y` by the NEE leg's
+    // rule (mediaExitDistance: out to |centre - y| + sceneRadius) beyond what a light subpath of
+    // modes D and J crossed walking from `from` along `dir` to `y`. Signed: negative where the
+    // walk began further out than the NEE leg reaches (a blur's entry outside the instant's
+    // disc). A subpath weighs its first leg by exp(-this), so that every strategy MIS weighs
+    // together takes the NEE leg's haze (HAZE-BLUR-DOMAIN, the user's option (a)). The two legs
+    // lie on one line, so they differ by the stretch between `from` and from - dir * dl. Only
+    // unbounded media count: a bounded one lies inside the scene's sphere (its bounds are
+    // part of it), which both legs cross whole. A density field is integrated by midpoint
+    // quadrature, as trDetMedium does for MIS weights; a homogeneous haze exactly.
+    double sunLegDepth(const Vec3& from, const Vec3& dir, const Vec3& y, double lambda) const {
+        const double dl = mediaExitDistance(y) - dot(y - from, dir);
+        if (dl == 0.0) return 0.0;
+        double tau = 0.0;
+        for (const Medium& m : media) {
+            if (m.bounded) continue;
+            const double st = m.sigmaT(lambda);
+            if (!(st > 0.0)) continue;
+            if (!m.heterogeneous()) { tau += st * dl; continue; }
+            constexpr int kSteps = 16;
+            const PatTables tabs = patTables();
+            double sum = 0.0;
+            for (int k = 0; k < kSteps; ++k)
+                sum += m.densityAt(from - dir * (dl * ((k + 0.5) / kSteps)), &tabs);
+            tau += st * dl * sum / kSteps;
+        }
+        return tau;
+    }
     Vec3 envXYZ{0, 0, 0};
     std::shared_ptr<EnvMap> envMap;   // image-based env (null => constant env)
     // Number of EmitterShape::Sun emitters, recounted by finalizeEmitters(). Every
