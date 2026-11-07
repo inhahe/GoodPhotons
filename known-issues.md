@@ -708,9 +708,15 @@ then, which the average takes like any other realization. Both refresh loops tre
 map as a failure ("cannot happen if epoch 0 was non-empty") and stopped, and the stop wrote no
 image: runSppProgressive writes what the renderer reports, and the loop broke without a final
 report, leaving whatever an earlier render had left on disk (which is how a stale image passed
-for a fresh one in the first run of check_haze_domain). An empty map now stops a render only where
-epoch 0's held kEmptyImplausible (32) or more, a Poisson zero once in e^32 draws, and the stop
-reports the samples it has as final, so they are written.
+for a fresh one in the first run of check_haze_domain). A refresh now stops a render only where it
+traced or emitted nothing (`nEmitted == 0`, and not because a stop cut the pass short): an empty
+map from a pass that traced subpaths is an ordinary realization, the merges' kappa counting the
+subpaths, not what they stored. The stop reports the samples it has as final, so they are
+written, and marks the render failed (SppProgress::failed): the finish reason says so and the
+exit code is 1, so a batch does not take a short frame for a finished one. (0.434.29 used a
+threshold on epoch 0's entry count instead, which counted sub-beams and photon clusters rather
+than independent draws, and broke under a blur's fixed epochs; replaced in 0.434.31 after
+review.)
 
 ## FIXED (2026-11-07, 0.434.29; opened 2026-11-05, 0.434.16, widened 2026-11-06): HAZE-BLUR-DOMAIN — modes D and J's sun subpaths take less unbounded haze than their NEE leg: 1-2 % bright in a still scene, more for a mover far out under a blur
 

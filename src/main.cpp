@@ -15126,10 +15126,6 @@ static void printDeviceGpu(bool wantAuto, const char* suffix = "") {
 // total, only a cap that keeps pixel * sppTotal seed indices well inside int64. A renderer that
 // splits its target into parts asks for it, since a share of it is no share of the render.
 static constexpr long long kUnboundedSpp = 1'000'000'000LL;
-// An empty light-side map is an ordinary realization of one that held a handful of entries, and a
-// sign that something broke past this many: a Poisson count of mean 32 is 0 once in e^32 (8e13)
-// draws (modes J's and M's refresh loops).
-static constexpr size_t kEmptyImplausible = 32;
 // Whether mode `m` carries motion blur: each of its paths, or photons, is one time in the
 // shutter. Any other mode renders the frame's instant (run closes the shutter for it).
 static bool modeSeesMotion(char m) { return m != 0 && std::strchr("RDABCMSUJP", m) != nullptr; }
@@ -18626,6 +18622,8 @@ static int runSppProgressive(
     SppProgress prog;
     prog.sampleBase = baseSpp;   // bias fresh seeds past the loaded samples
     prog.clockEnds = clockEnds;
+    bool failed = false;         // a refresh traced nothing and the render stopped short
+    prog.failed = &failed;
     long long lightEpochs = haveBase ? base.lightEpochs : 0;   // mode J's, kept through the resume
     prog.lightEpochs = &lightEpochs;
     TrailingRate sppMeter;
@@ -18723,7 +18721,8 @@ static int runSppProgressive(
 #ifdef SIGBREAK
     std::signal(SIGBREAK, prevBrk);
 #endif
-    noteFinishReason(g_stopRequested ? "stopped early"
+    noteFinishReason(failed          ? "stopped short: a light-side refresh traced nothing"
+                   : g_stopRequested ? "stopped early"
                    : metNoise        ? "noise target met"
                    : metTime         ? "time budget reached"
                    : runForever      ? "stopped"
@@ -18744,7 +18743,7 @@ static int runSppProgressive(
                     checkpointPath(outPath).c_str(), finalSpp);
     reportRadCache();
     reportRayStats();
-    return writeOk ? 0 : 1;
+    return (writeOk && !failed) ? 0 : 1;
 }
 
 // Progressive driver for mode P (forward + camera-side composite). Grows BOTH the forward
@@ -20671,8 +20670,6 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
             // rebuild at -beamrefresh's share. The device, and any render under a
             // -time/-noise/-forever budget, keeps the clock.
             const bool countEpochs = !useGpu && !budgetedJ && !nFixed && !blurEpochsJ;
-            // Epoch 0's map sizes: what makes an empty refresh plausible or not (see its test).
-            const size_t n0B = curB ? curB->beams.size() : 0, n0S = curS ? curS->pts.size() : 0;
             long long lightWorkJ = 0;   // the last rebuild's light-side units
             bdpt::CountedEpochs counted;
             counted.target = sppTarget;
@@ -20697,32 +20694,30 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
                     ++nRealized;
                     drew = true;
                     keepLightEpochs();
-                    // A refresh that came back empty: an ordinary realization where epoch 0's
-                    // map held few entries, or in a sized clock epoch (each refresh draws its
-                    // count afresh, so a map of a handful empties now and then, and the average
-                    // takes it like any other), but past kEmptyImplausible the chance of that is
-                    // nil, and an empty map means something broke -- the gather would point at
-                    // nothing and silently turn the rest of the render into mode D.
+                    // A refresh that traced no subpaths: something broke, and the gather would
+                    // point at nothing and silently turn the rest of the render into mode D. An
+                    // EMPTY map from a refresh that traced some is an ordinary realization (the
+                    // merges' kappa counts the subpaths, not what they stored), which the
+                    // average takes like any other.
                     //
                     // Note what `break` does then and what it does NOT do: the previous
                     // realization is already gone (buildLightSide drops it before redrawing),
                     // so there is nothing to fall back ONTO. What is salvaged is `acc`, which
                     // holds every completed epoch — a correct, correctly-normalised render of
-                    // `sppAll` spp, reported as final so it is written. Each map is checked
-                    // only if this render is using it: with `-jsurf` on a media-free scene the
-                    // beam map is legitimately empty every epoch.
-                    const bool lostB = !sizeEpochsJ && beamsPtr && curB->empty() && n0B >= kEmptyImplausible;
-                    const bool lostS = !sizeEpochsJ && photonsPtr && curS->empty() && n0S >= kEmptyImplausible;
-                    if (lostB || lostS) {
+                    // `sppAll` spp, reported as final so it is written, and the render reported
+                    // failed. A stop that cut the pass short is not this: the loop ends on it.
+                    const bool lostB = beamsPtr && curB->nEmitted == 0;
+                    const bool lostS = photonsPtr && curS->nEmitted == 0;
+                    if ((lostB || lostS) && !ft::stopRequested()) {
                         --nRealized;         // a realization the film lacks
                         keepLightEpochs();
-                        std::fprintf(stderr, "[mode J] light-side refresh produced an empty "
-                                             "%s map, where epoch 0's held %zu; stopping here "
-                                             "with the %lld spp already averaged over %llu "
-                                             "realization(s).\n",
-                                     lostB ? "beam" : "surface photon", lostB ? n0B : n0S,
+                        std::fprintf(stderr, "[mode J] light-side refresh traced no subpaths for "
+                                             "its %s map; stopping here with the %lld spp already "
+                                             "averaged over %llu realization(s).\n",
+                                     lostB ? "beam" : "surface photon",
                                      sppAll, (unsigned long long)nRealized);
                         if (sppAll > 0) prog->report(acc, sppAll, /*final*/true);
+                        if (prog->failed) *prog->failed = true;
                         break;
                     }
                 }
@@ -21133,8 +21128,6 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
             counted.build0 = build0WorkM;
             // The realizations drawn, numbering each one's salt: epoch 0's, then one per rebuild.
             uint64_t nRealM = 1;
-            // Epoch 0's map sizes: what makes an empty refresh plausible or not (see its test).
-            const size_t n0P = pm.photons.size(), n0Beams = wantBeams ? bmap.beams.size() : 0;
             for (; !stopAll && sppAll < sppTarget && !ft::stopRequested(); ++epoch) {
                 double rebuildSec = 0.0;
                 const bool continuing = counted.continuing();   // on epoch 0's maps
@@ -21152,23 +21145,23 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
                     rebuildWork = lightWorkM();
                     rebuildSec = std::chrono::duration<double>(clk::now() - tr).count();
                     if (sizeEpochs) sizer.add(nUsed, rebuildSec);
-                    // A refresh that came back empty: an ordinary realization where epoch 0's
-                    // map held few entries (mode J's rule, where the reasoning is), but past
-                    // kEmptyImplausible a sign that something broke -- the gather would point at
-                    // nothing and silently turn the rest of the render black (or, for the beam
-                    // map alone, delete every participating medium from it). Then `acc`, every
-                    // completed epoch, is reported as final, so it is written.
-                    const bool lostP = !sizeEpochs && pm.photons.empty() && n0P >= kEmptyImplausible;
-                    const bool lostB = !sizeEpochs && wantBeams && bmap.empty() && n0Beams >= kEmptyImplausible;
-                    if (lostP || lostB) {
+                    // A refresh that emitted no photons: something broke (mode J's rule, where
+                    // the reasoning is), and the gather would point at nothing and silently turn
+                    // the rest of the render black (or, for the beam map alone, delete every
+                    // participating medium from it). An empty map from a pass that emitted some
+                    // is an ordinary realization. Then `acc`, every completed epoch, is reported
+                    // as final, so it is written, and the render reported failed.
+                    const bool lostP = pm.nEmitted == 0;
+                    const bool lostB = wantBeams && bmap.nEmitted == 0;
+                    if ((lostP || lostB) && !ft::stopRequested()) {
                         if (drew) --nRealM;
-                        std::fprintf(stderr, "[mode M] light-side refresh produced an empty "
-                                             "%s, where epoch 0's held %zu; stopping here with "
-                                             "the %lld spp already averaged over %llu "
-                                             "realization(s).\n",
-                                     lostP ? "photon map" : "beam map", lostP ? n0P : n0Beams,
+                        std::fprintf(stderr, "[mode M] light-side refresh emitted no photons for "
+                                             "its %s; stopping here with the %lld spp already "
+                                             "averaged over %llu realization(s).\n",
+                                     lostP ? "photon map" : "beam map",
                                      sppAll, (unsigned long long)(epoch == 0 ? 0 : nRealM));
                         if (sppAll > 0 && prog && prog->report) prog->report(acc, sppAll, /*final*/true);
+                        if (prog && prog->failed) *prog->failed = true;
                         break;
                     }
                     if (epoch == 1 && sizeEpochs)

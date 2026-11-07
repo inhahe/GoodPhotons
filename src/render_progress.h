@@ -48,6 +48,11 @@ struct SppProgress {
     // it has no total to split: cpuSppChunks then sizes its chunks by the clock even under
     // -radcache, whose fixed schedule needs one.
     bool clockEnds = false;
+
+    // Set by a light-side refresh loop (modes J and M) that stopped short because a refresh
+    // traced nothing: the caller then reports a failed render, not a finished one. Null: no one
+    // asks.
+    bool* failed = nullptr;
 };
 
 // Progress through a phase that has NO pixels yet.

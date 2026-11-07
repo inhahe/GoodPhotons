@@ -10507,8 +10507,10 @@ sees the instant, exactly as a static scene with those transforms would show it.
   (`keepNeighbours`). Epoch 0's build holds one-time work (the radius searches, mode J's budget
   pilot), so the count is sized from epoch 1's measurements on, and mode J's ceiling is the count
   epoch 0 settled on, recorded once (each pass overwrites the budget's `pathsUsed` with its own).
-  A sized epoch whose few photons store nothing is an empty realization, which the average takes
-  like any other; the refresh stops on an empty map only unsized. The CPU's mode M passes the count to
+  A refresh whose photons store nothing is an empty realization, which the average takes like any
+  other, sized or not; the refresh loops (modes J and M) stop only on one that traced or emitted
+  nothing (`nEmitted == 0`, not under a stop), report the samples they have as final, and mark the
+  render failed (SppProgress::failed: exit code 1). The CPU's mode M passes the count to
   `buildLightSide(epoch, salt, nEpoch)`; the device loop's `nPassM` reads the device's own light-side
   time (`PmRadiiPin::lightSec`); mode J's `nBlurJ` caps `Nepoch`. Each map divides by its own
   nEmitted and is binned at epoch 0's radii (mode J's shrink on the epoch index, as before), so
