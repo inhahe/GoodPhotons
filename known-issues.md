@@ -693,8 +693,10 @@ scene's radius, so an escaping chord does not become a 1e30-long box. Mode J's l
 under a blur, enter through the swept disc (Scene::lightRadius), tens of metres out for a mover
 far outside the instant's sphere, and their beams ended before reaching it, while the MIS
 weights still counted merges there: J read 0.71 of mode R on such a ball and 0.34 on the haze
-round it (check_haze_domain's far case, both devices). Mode J now scales its beams' limit with
-the light's radius (`emitBeams`' `farRadius`); a still scene's is the scene's, as before. Mode
+round it (check_haze_domain's far case, both devices). Mode J's beams now reach at least as far
+as everything the path could meet (`emitBeams`' `farToExit`: Scene::exitDistance, the far side
+of the swept sphere; 0.434.31, after review -- 0.434.29 took 8 times the swept radius, cutting
+the map's BVH up for haze far outside anything seen); a still scene's limit is as before. Mode
 M keeps the instant's: its forward photons light the haze only near the scene by design
 (HAZE-SUN-B), and a blur must not widen it.
 

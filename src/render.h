@@ -1121,7 +1121,7 @@ struct Renderer {
                    const double* lamS = nullptr, int nSec = 0,
                    const Vec3* achroCie = nullptr, int foldEmIdx = -1,
                    const double* specW = nullptr, int srcEm = -1, int surf = -1,
-                   double farRadius = 0.0) const {
+                   bool farToExit = false) const {
         if (!beamDeposit || !(beta > 0.0)) return;
         // Bound an escape-to-infinity crossing so an unbounded medium cannot produce a
         // 1e30-long box (see kBeamFarScale).
@@ -1135,11 +1135,14 @@ struct Renderer {
         // truncated every beam to a stub. Clamping the whole call up front also meant one
         // unbounded haze could shorten the beams of an unrelated bounded cloud it happened to
         // overlap. (Device twin: dEmitBeams in render_cuda.cu.)
-        // `farRadius` (0: the scene's) is the sphere the caller's paths live in: mode J's light
-        // subpaths, under a blur, enter through the swept one (Scene::lightRadius), and a beam cut
-        // at the instant's would end short of a mover outside it, where its merges are counted.
-        const double farLimit = kBeamFarScale * std::max(farRadius > 0.0 ? farRadius : scene.sceneRadius,
-                                                         1e-3);
+        // `farToExit`: at least as far as everything the path could meet (Scene::exitDistance --
+        // under a blur, the far side of the swept sphere). Mode J's light subpaths then enter
+        // through the swept disc, tens of metres out for a mover far outside the instant's
+        // sphere, and a beam cut at the instant's limit would end short of the mover, where its
+        // merges are counted. A still scene's exit lies well inside the limit, so it is unmoved.
+        const double farLimit = farToExit
+            ? std::max(kBeamFarScale * std::max(scene.sceneRadius, 1e-3), scene.exitDistance(o))
+            : kBeamFarScale * std::max(scene.sceneRadius, 1e-3);
         if (!(dLen > 0.0)) return;
         const double keep = beamDeposit->keepProb;
         for (int i = 0; i < (int)scene.media.size(); ++i) {

@@ -2803,7 +2803,7 @@ inline void traceLightBeamPass(const Scene& scene, const Camera& cam, long long 
                                kBeamOrderUnknown,
                                Renderer::MedAll, lamS, nSec, cie, dEm,
                                nSec > 0 ? wsBuf : nullptr, bs.ok ? bs.emIdx : -1, -1,
-                               scene.lightRadius());
+                               /*farToExit*/true);
             };
 
             // --- The light half of every merge weight this subpath can take part in -------
