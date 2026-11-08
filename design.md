@@ -10508,7 +10508,9 @@ sees the instant, exactly as a static scene with those transforms would show it.
   pilot), so the count is sized from epoch 1's measurements on, and mode J's ceiling is the count
   epoch 0 settled on, recorded once (each pass overwrites the budget's `pathsUsed` with its own).
   A refresh whose photons store nothing is an empty realization, which the average takes like any
-  other, sized or not; the refresh loops (modes J and M) stop only on one that traced or emitted
+  other, sized or not -- its merge technique still on, with its kappa (renderRows' `mergeOn` /
+  `surfOn`, the device's `mergeKappa` / `kappaS`), gathering nothing, or the epoch's connections
+  would be weighed up and the average biased bright; the refresh loops (modes J and M) stop only on one that traced or emitted
   nothing (`nEmitted == 0`, not under a stop), report the samples they have as final, and mark the
   render failed (SppProgress::failed: exit code 1). The CPU's mode M passes the count to
   `buildLightSide(epoch, salt, nEpoch)`; the device loop's `nPassM` reads the device's own light-side

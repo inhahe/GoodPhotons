@@ -7971,7 +7971,7 @@ __device__ static inline Real dPmAdaptiveRadius(const DPhotonMap& pm, const DVec
 // medium (the common case, and the validation case), a fixed 4-point midpoint quadrature of
 // the optical depth for a heterogeneous one. The quadrature's only cost is weight QUALITY.
 __device__ static double dTrDetMedium(const DMedium& m, const DVec3& o, const DVec3& dir,
-                                      double dist, Real lambda, const DPatEnv& env) {
+                                      double dist, Real lambda, const DPatEnv& env, int kN = 4) {
     const double stBase = (double)medSigmaT(m, lambda);
     if (stBase <= 0.0) return 1.0;
     double ta, tb;
@@ -7979,7 +7979,8 @@ __device__ static double dTrDetMedium(const DMedium& m, const DVec3& o, const DV
     const double L = tb - ta;
     if (!(L > 0.0)) return 1.0;
     if (!m.heterogeneous) return exp(-stBase * L);
-    const int kN = 4;                       // host trDetMedium's kN — keep the two in step
+    // `kN` midpoints: 4 for a weight (host trDetMedium's -- keep the two in step), more where
+    // an estimator must take it (dSunLegFactor).
     const double dt = L / (double)kN;
     double tau = 0.0;
     for (int i = 0; i < kN; ++i)
@@ -7989,6 +7990,7 @@ __device__ static double dTrDetMedium(const DMedium& m, const DVec3& o, const DV
 // Twin of sunLegFactor (beamgather.h, where the reasoning is): what brings a sun light subpath's
 // unbounded haze, walked from `from` along `dir`, to the NEE leg's at `y` (HAZE-BLUR-DOMAIN);
 // exactly 1 where there is none.
+static constexpr int kSunLegSteps = 32;   // host twin sunLegFactor's
 __device__ static double dSunLegFactor(const DScene& sc, const DVec3& from, const DVec3& dir,
                                        const DVec3& y, Real lambda, DRng& rng) {
     const double dl = dMediaExitDistance(sc, y) - (double)dot(y - from, dir);
@@ -8001,7 +8003,7 @@ __device__ static double dSunLegFactor(const DScene& sc, const DVec3& from, cons
         if (dl > 0.0) {
             F *= (double)dMedTransmittance(m, from - dir * (Real)dl, dir, (Real)dl, lambda, rng, env);
         } else {
-            const double T = dTrDetMedium(m, from, dir, -dl, lambda, env);
+            const double T = dTrDetMedium(m, from, dir, -dl, lambda, env, kSunLegSteps);
             if (T > 0.0) F /= T;
         }
     }
@@ -8516,8 +8518,8 @@ struct DBeamMis {
     float  etaPrevS;      // the POINT merge AT y_{s-1}, complete but for its kappaS; 0 off a
                           // storable surface site
     float  leadIn;        // distance from y_{s-1} to THIS beam's clipped origin
-    int    sunLeg;        // a sun's first leg in an unbounded haze (host twin BeamMis::sunLeg)
-    int    gateC1;        // is "connect x to y_{s-1}" a legal strategy? (y_{s-1} not delta)
+    short  gateC1;        // is "connect x to y_{s-1}" a legal strategy? (y_{s-1} not delta)
+    short  sunLeg;        // a sun's first leg in an unbounded haze (host twin BeamMis::sunLeg)
     int    vert;          // the light subpath vertex index j of y_{s-1} (so s = j+1) — the
                           // depth cap needs it, and nothing else does
 };
@@ -8857,7 +8859,7 @@ __device__ static void dBeamHitEval(const DScene& sc, const DBeamMap& bm, const 
         }
         // A sun's first leg (DBeamMis::sunLeg; host twin beamgather.h): the NEE leg's haze to
         // this point, not the walk's, the leg having begun `leadIn` before the clipped origin.
-        if (mw) {
+        if (mw && w > 0.0) {
             const DBeamMis* lm = bm.misOf(beamIdx);
             if (lm && lm->sunLeg)
                 w *= dSunLegFactor(sc, b.o - b.d * (Real)lm->leadIn, b.d, b.o + b.d * s, lam, rng);
@@ -19290,10 +19292,12 @@ kBdptT(DScene sc, const __grid_constant__ DCamera cam, double* camFilm, double* 
     D_MOTION_CLEAR();   // this thread's time: the launch's (passU) until a path sets one
     enum { SECN = (NS > 0 ? NS : 1), MAXV = BDPT_MAXV_OF(MAXD),
            SEGN = (MERGE ? BDPT_MAXV_OF(MAXD) : 1) };
-    // `bm.beams == nullptr` is the dispatcher's own "-nobeams / empty map" signal, so this
-    // single test is the whole gate — with it false the camera walk is not even asked to
-    // record its segments and the render is mode D down to the RNG stream (gate 1).
-    const bool mergeOn = MERGE && bm.beams != nullptr && bm.nNodes > 0;
+    // A zero kappa is the dispatcher's "-nobeams" signal, so this single test is the whole
+    // gate -- with it false the camera walk is not even asked to record its segments and the
+    // render is mode D down to the RNG stream (gate 1). A map that drew empty keeps its kappa
+    // (host twin renderRows, where the why is) and gathers nothing (`beamsHere`).
+    const bool mergeOn = MERGE && bm.mergeKappa > 0.0;
+    const bool beamsHere = mergeOn && bm.beams != nullptr && bm.nNodes > 0;
     // The merge technique's constant, n_m * 2r, travelling with the map so no call site can
     // forget it. Zero unless the map actually carries MIS partials, and that zero is what
     // makes every merge term inside dMisWeight disappear. Weighted and unweighted merges
@@ -19303,7 +19307,8 @@ kBdptT(DScene sc, const __grid_constant__ DCamera cam, double* camFilm, double* 
     // The point x point kind's constant. Zero unless `-jsurf` filled a surface map, and that
     // zero is what makes every surface term in the weight vanish -- the same gate mergeKappa is
     // for the beams.
-    const double kappaSurf = (sm.nPts > 0) ? sm.kappaS : 0.0;
+    // Its map may have drawn empty (nPts 0), which keeps the constant and gathers nothing.
+    const double kappaSurf = sm.kappaS;
     // JSPEC: the camera walk carries its spectral factors on a grid so each merge can read them
     // at its beam's or photon's own wavelength (DJSpec). A beam merge reads it off the recorded
     // segment it lies on (DPathSeg::spec), a point merge off the eye vertex it merges at (vspec).
@@ -19598,7 +19603,7 @@ kBdptT(DScene sc, const __grid_constant__ DCamera cam, double* camFilm, double* 
                     segSumM[k] = fiberK ? 0.0 : eK + carryM;
                 }
             }
-            for (int i = 0; mergeOn && i < nSegs; ++i) {
+            for (int i = 0; beamsHere && i < nSegs; ++i) {
                 const DPathSeg& sg = segs[i];
                 if (!(sg.beta > 0.0)) continue;
                 if (sg.vert >= maxDepth) continue;   // every merge past the depth cap (host twin)
@@ -25941,7 +25946,11 @@ static void buildJSurfMapDevice(JSurfDev& d, const gpu::DScene& sc, const gpu::D
     // were skipped, not wrapped. Clamp and remember, so the ceiling is reportable rather than
     // a silent thinning of the map (which would darken the merges by an unknown factor).
     if (n > (int)cap) { d.dropped += (long long)n - (long long)cap; n = (int)cap; }
-    if (n <= 0) return;
+    if (n <= 0) {   // drew empty: the merge keeps its constant (kBdptT's kappaSurf), no points
+        dsm.radius = (gpu::Real)radius;
+        dsm.kappaS = (double)nPaths * PI * radius * radius;
+        return;
+    }
     d.stored = n;
 
     // --- the grid. surfmerge.h SurfMap::build's geometry, vcmSessionPass's machinery. ---
@@ -26142,7 +26151,12 @@ static void compareJSurfMaps(const bdpt::SurfMap& host, const JSurfDev& dev) {
 // allocations. An empty or absent map leaves `dsm.nPts == 0`, which every gather reads as "no
 // surface merges" -- the two-technique estimator, unchanged.
 static void uploadSurfMapCuda(const bdpt::SurfMap* smap, DUpload& up, gpu::DSurfMap& dsm) {
-    if (!smap || smap->pts.empty() || smap->cellStart.empty() || smap->nEmitted <= 0) return;
+    if (!smap || smap->nEmitted <= 0 || !(smap->radius > 0.0)) return;
+    if (smap->pts.empty() || smap->cellStart.empty()) {   // drew empty: the constant, no points
+        dsm.radius = (gpu::Real)smap->radius;
+        dsm.kappaS = (double)smap->nEmitted * PI * (double)smap->radius * (double)smap->radius;
+        return;
+    }
     const size_t n = smap->pts.size();
     std::vector<gpu::DSurfPhoton> pts(n);
     for (size_t i = 0; i < n; ++i) {
@@ -26232,7 +26246,13 @@ static void uploadBeamMapCuda(const Scene& scene, const BeamMap* bmap, DUpload& 
     // `lbvh` means the host deliberately skipped its tree because a device one is coming, so an
     // empty `bvh.nodes` is expected rather than a malformed map. Without that distinction the
     // guard below would silently drop a perfectly good beam set and the volume would vanish.
-    if (!bmap || bmap->beams.empty() || bmap->nEmitted <= 0) return;
+    if (!bmap || bmap->nEmitted <= 0) return;
+    // A map that drew empty: no beams to upload, but the merge technique stays the render's
+    // (kBdptT's mergeOn), with its constant.
+    if (bmap->beams.empty()) {
+        if (withMis) dbm.mergeKappa = (double)bmap->nEmitted * 2.0 * bmap->radRef();
+        return;
+    }
     if (!lbvh && bmap->bvh.nodes.empty()) return;
     const double invN = 1.0 / (double)bmap->nEmitted;
     const size_t nb = bmap->beams.size();
@@ -26348,9 +26368,9 @@ static void uploadBeamMapCuda(const Scene& scene, const BeamMap* bmap, DUpload& 
     size_t nMis = 0;
     if (withMis && !bmap->mis.empty()) {
         // Every BeamMis field is copied below; see the SurfMis upload for why these trip.
-        static_assert(sizeof(BeamMis) == 56, "BeamMis changed: copy the new field into DBeamMis "
+        static_assert(sizeof(BeamMis) == 64, "BeamMis changed: copy the new field into DBeamMis "
                                              "here, then update this size");
-        static_assert(sizeof(gpu::DBeamMis) == 64, "DBeamMis changed: fill the new field from "
+        static_assert(sizeof(gpu::DBeamMis) == 56, "DBeamMis changed: fill the new field from "
                                                    "BeamMis here, then update this size");
         std::vector<gpu::DBeamMis> dm(bmap->mis.size());
         for (size_t i = 0; i < dm.size(); ++i) {
@@ -26615,13 +26635,14 @@ Film renderBdptCuda(const Scene& scene, const Camera& cam, int resX, int resY,
         CUDA_CHECK(cudaMemcpyToSymbol(gpu::c_dbgOnlyT, &ot, sizeof(int)));
         if (os >= 0 || ot >= 0) std::printf("[diag] FTRACE_ONLY_ST: strategy s=%d t=%d only\n", os, ot);
     }
-    const bool mergeOn = (dbm.nNodes > 0);
+    const bool mergeOn = dbm.mergeKappa > 0.0;   // a map that drew empty keeps it (kBdptT)
     // WAVEFRONT gather queue (UPBP-CONV): sized for one wave of camera paths; the chunk is run
     // as consecutive waves. FTRACE_NOWAVEFRONT=1 forces the inline gather (the A/B control).
     DWfQueue wq{};
     int* d_wfCounters = nullptr;
     long long waveSamples = 0;
-    if (mergeOn && !(std::getenv("FTRACE_NOWAVEFRONT") && std::atoi(std::getenv("FTRACE_NOWAVEFRONT")) != 0)) {
+    if (mergeOn && dbm.nNodes > 0 &&
+        !(std::getenv("FTRACE_NOWAVEFRONT") && std::atoi(std::getenv("FTRACE_NOWAVEFRONT")) != 0)) {
         const int segCap = 1 << 20;          // 424 B each (~445 MB), 128 of them JSPEC's
         const int hitCap = 1 << 25;          // 16 B each  (512 MB): a dense map yields thousands of
                                              // candidates per segment (_fog_cornell: ~2000), and a
@@ -26699,7 +26720,7 @@ Film renderBdptCuda(const Scene& scene, const Camera& cam, int resX, int resY,
         g_wfProfileResX = resX; g_wfProfileResY = resY; g_wfProfileDepth = maxDepth;
     }
     std::vector<WfBand>& wfProfilePrev = g_wfProfile;
-    const bool mergeAny = mergeOn || dsm.nPts > 0;   // either kind wants MERGE=true
+    const bool mergeAny = mergeOn || dsm.kappaS > 0.0;   // either kind wants MERGE=true
     std::vector<WfBand> wfProfileCur;
     auto launch = [&](long long cAll, long long baseAll) {
       // ONE LIGHT-SIDE REALIZATION PER SUB-LAUNCH (FTRACE_JDEVLIGHT=3, FTRACE_JSPLIT=k).

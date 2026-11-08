@@ -292,7 +292,7 @@ struct BeamWeightOne {
 // case), and a fixed midpoint quadrature of the optical depth for a heterogeneous one,
 // where the only cost of the approximation is weight quality.
 inline double trDetMedium(const Medium& med, const Vec3& o, const Vec3& dir, double dist,
-                          double lambda, const PatTables* tabs) {
+                          double lambda, const PatTables* tabs, int kN = 4) {
     const double stBase = med.sigmaT(lambda);
     if (stBase <= 0.0) return 1.0;
     double ta, tb;
@@ -300,9 +300,9 @@ inline double trDetMedium(const Medium& med, const Vec3& o, const Vec3& dir, dou
     const double L = tb - ta;
     if (!(L > 0.0)) return 1.0;
     if (!med.heterogeneous()) return std::exp(-stBase * L);
-    // Midpoint rule. Four samples is enough to track the large-scale shape of a cloud,
-    // which is all a weight needs; it is not integrating radiance.
-    constexpr int kN = 4;
+    // Midpoint rule. Four samples (`kN`'s default) is enough to track the large-scale shape of
+    // a cloud, which is all a weight needs; an estimator that must take it asks for more
+    // (sunLegFactor).
     const double dt = L / (double)kN;
     double tau = 0.0;
     for (int i = 0; i < kN; ++i)
@@ -318,8 +318,9 @@ inline double trDetMedium(const Medium& med, const Vec3& o, const Vec3& dir, dou
 // factor is that stretch's transmittance, drawn by the medium's own unbiased estimator. Where the
 // walk began further out (a blur's entry outside the instant's disc) it is the inverse of the
 // stretch the walk crossed beyond the NEE leg, which no estimator draws unbiased: exact for a
-// homogeneous haze, the deterministic quadrature for a density field. Bounded media lie inside
-// the scene's sphere (their bounds are part of it), which both legs cross whole.
+// homogeneous haze, a fine deterministic quadrature (kSunLegSteps) for a density field. Bounded
+// media lie inside the scene's sphere (their bounds are part of it), which both legs cross whole.
+constexpr int kSunLegSteps = 32;   // device twin dSunLegFactor's
 inline double sunLegFactor(const Scene& scene, const Vec3& from, const Vec3& dir, const Vec3& y,
                            double lambda, Pcg32& rng) {
     const double dl = scene.mediaExitDistance(y) - dot(y - from, dir);
@@ -331,7 +332,7 @@ inline double sunLegFactor(const Scene& scene, const Vec3& from, const Vec3& dir
         if (dl > 0.0) {
             F *= Renderer::mediumTransmittance(m, from - dir * dl, dir, dl, lambda, rng, &tabs);
         } else {
-            const double T = trDetMedium(m, from, dir, -dl, lambda, &tabs);
+            const double T = trDetMedium(m, from, dir, -dl, lambda, &tabs, kSunLegSteps);
             if (T > 0.0) F /= T;
         }
     }
@@ -1026,7 +1027,7 @@ inline Vec3 gatherPhotonBeamsW(const Scene& scene, const Renderer& mats, const B
         if (bh.tCam  > 0.0)  w *= mats.mediaTransmittance(scene, oc, dc, bh.tCam, lam, rng);
         // A sun's first leg (BeamMis::sunLeg): the NEE leg's haze to this point, not the walk's,
         // the leg having begun `leadIn` before the beam's clipped origin.
-        if (const BeamMis* lm = bm.misOf(bh.idx); lm && lm->sunLeg)
+        if (const BeamMis* lm = (w > 0.0) ? bm.misOf(bh.idx) : nullptr; lm && lm->sunLeg)
             w *= sunLegFactor(scene, b.o - b.d * (double)lm->leadIn, b.d, b.o + b.d * bh.sBeam,
                               lam, rng);
         if (!(w > 0.0)) { beamDiag().bump(beamDiag().rejTr); return; }

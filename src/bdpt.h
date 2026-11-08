@@ -1023,8 +1023,8 @@ inline void randomWalk(const Scene& scene, const Camera& cam, const Renderer& ma
         // IMPORTANCE walk's are the spans that get deposited AS beams. `dSurf` is 1e30 on
         // an escaping ray — which the camera side hands to a BVH gather that clips it to
         // the beams that actually exist, and the light side hands to emitBeams, which
-        // clamps it to kBeamFarScale * sceneRadius. So neither needs a special case for a
-        // ray that leaves the scene through a medium.
+        // clamps it (mode J's: to everything the path could meet, `farToExit`). So neither
+        // needs a special case for a ray that leaves the scene through a medium.
         if (segs) {
             PathSeg sg;
             sg.o = ray.o; sg.d = ray.d; sg.tMax = dSurf;
@@ -4537,11 +4537,20 @@ struct BdptRenderer {
         // ...and for the camera walk's segments, which the fires' s = 0 points lie on, when there
         // is a fire.
         const bool hasFire = !scene.emissiveVolumes.empty();
-        // Mode J. `beams` is null in mode D, and an empty map is passed as null by the
-        // dispatcher rather than as an empty map, so this single test is the whole gate:
-        // when it is false the camera walk is not even asked to record its segments and the
-        // render is mode D down to the RNG stream (validation gate 1).
-        const bool mergeOn = beams && !beams->empty() && beams->nEmitted > 0;
+        // Mode J. `beams` is null in mode D (and under -nobeams), so this single test is the
+        // whole gate: when it is false the camera walk is not even asked to record its segments
+        // and the render is mode D down to the RNG stream (validation gate 1).
+        //
+        // A merge technique is the RENDER's, not one realization's: a light-side refresh whose
+        // subpaths stored nothing is an empty realization of it, which keeps its kappa and
+        // gathers nothing. Dropping the technique for that epoch would weigh its connections up
+        // to the whole path, and the average would come out bright by the chance of an empty
+        // map times the merges' share. Where no light subpath can reach a vertex its merge
+        // terms are 0 in every weight anyway, so a technique left on costs nothing there. A
+        // map that is empty and could be nothing else (no scattering medium for beams) stays
+        // off, as before.
+        const bool mergeOn = beams && beams->nEmitted > 0 &&
+                             (!beams->empty() || scene.hasScatteringMedia());
         // The merge technique's constant: its sample count (one beam map per frame, built
         // from `nEmitted` light subpaths) times the 1D kernel's full width. Zero unless the
         // map actually carries MIS partials, and that zero is what makes every merge term
@@ -4550,7 +4559,7 @@ struct BdptRenderer {
         // while the merges are still raw would darken the volume as surely as the reverse
         // brightens it, so ONE flag gates both.
         MergeK mk;
-        if (mergeOn && !beams->mis.empty())
+        if (mergeOn && (beams->empty() || !beams->mis.empty()))
             mk.beam = (double)beams->nEmitted * 2.0 * beams->radRef();
         // ...and the SURFACE merge kind's, when a photon map was built alongside the beams.
         // Both constants are shared by every weight in the frame, and both must be visible to
@@ -4561,7 +4570,7 @@ struct BdptRenderer {
         // sum and double-count every path it touches. No weights, no point merges — and then
         // `mk.surf` must stay 0 too, or every other technique's denominator would carry terms
         // for a strategy that is not running.
-        const bool surfOn = photons && !photons->empty() && !photons->mis.empty() &&
+        const bool surfOn = photons && (photons->empty() || !photons->mis.empty()) &&
                             photons->nEmitted > 0 && photons->radius > 0.0;
         if (surfOn)
             mk.surf = (double)photons->nEmitted * PI * photons->radius * photons->radius;

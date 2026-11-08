@@ -21151,14 +21151,12 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
                     // participating medium from it). An empty map from a pass that emitted some
                     // is an ordinary realization. Then `acc`, every completed epoch, is reported
                     // as final, so it is written, and the render reported failed.
-                    const bool lostP = pm.nEmitted == 0;
-                    const bool lostB = wantBeams && bmap.nEmitted == 0;
-                    if ((lostP || lostB) && !ft::stopRequested()) {
+                    // (The beam map is drawn by the same pass, and takes its count.)
+                    if (pm.nEmitted == 0 && !ft::stopRequested()) {
                         if (drew) --nRealM;
-                        std::fprintf(stderr, "[mode M] light-side refresh emitted no photons for "
-                                             "its %s; stopping here with the %lld spp already "
-                                             "averaged over %llu realization(s).\n",
-                                     lostP ? "photon map" : "beam map",
+                        std::fprintf(stderr, "[mode M] light-side refresh emitted no photons; "
+                                             "stopping here with the %lld spp already averaged "
+                                             "over %llu realization(s).\n",
                                      sppAll, (unsigned long long)(epoch == 0 ? 0 : nRealM));
                         if (sppAll > 0 && prog && prog->report) prog->report(acc, sppAll, /*final*/true);
                         if (prog && prog->failed) *prog->failed = true;

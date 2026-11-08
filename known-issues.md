@@ -677,8 +677,11 @@ scenes.
 
 check_haze_domain's `field` scene (a 2x2 floor and a ball under a sun in `medium { sigma_t 0.06
 albedo 0.5  density "0.3 + 0.7*saturate(1.0 - y/8.0)"  density_max 1 }`, no bounds) renders in
-mode J at 27 s for 2 spp on the CPU, 0.434.28 and 0.434.30 alike, and a 1024-spp render took about
-two hours on either device, where mode D takes seconds. Suspect: an unbounded density field gets
+mode J at 27 s for 2 spp on the CPU, 0.434.28 and 0.434.30 alike, and on the GPU at about **10
+minutes a sample** (0.434.31 and 0.434.32 alike: 632 and 645 s for 1 spp, 1798 s for 3) -- some 60
+times the CPU, where mode D takes seconds. (A 1024-spp GPU run that seemed to take two hours had in
+fact stopped early under 0.434.29-30's empty-map rule.) check_haze_domain renders the case on the
+CPU only, at 32 spp. Suspect: an unbounded density field gets
 no majorant grid (the global `density_max` instead), so every beam merge's transmittance along
 the beam and the camera ray ratio-tracks the whole way with a pattern-VM density evaluation per
 step, over beams up to 8 scene radii long. To confirm: FTRACE_MSTATS-style split of the gather's
@@ -716,7 +719,16 @@ written, and marks the render failed (SppProgress::failed): the finish reason sa
 exit code is 1, so a batch does not take a short frame for a finished one. (0.434.29 used a
 threshold on epoch 0's entry count instead, which counted sub-beams and photon clusters rather
 than independent draws, and broke under a blur's fixed epochs; replaced in 0.434.31 after
-review.)
+review.) **And an empty realization must keep its merges (0.434.32, review of 476cd70..7ffef79):**
+renderRows switched an epoch's merges off when its map was empty (`mergeOn` needed beams,
+`surfOn` photons), and the device did the same (the upload skipped an empty map; `kappaSurf`
+read 0 without points, and `buildJSurfMapDevice`'s empty chunk left it 0). That epoch's
+connections were then weighed up to the whole path, and the average came out bright by the
+chance of an empty map times the merges' share -- since 0.434.29 kept such epochs, and on the
+device's per-chunk surface maps always. A merge technique is now the render's: an empty map keeps
+its kappa (`nEmitted` and the radius) and gathers nothing. Where no light subpath can reach a
+vertex its merge terms are 0 anyway, so a technique left on costs nothing there; a map empty for
+want of any scattering medium stays off, as before.
 
 ## FIXED (2026-11-07, 0.434.29; opened 2026-11-05, 0.434.16, widened 2026-11-06): HAZE-BLUR-DOMAIN — modes D and J's sun subpaths take less unbounded haze than their NEE leg: 1-2 % bright in a still scene, more for a mover far out under a blur
 

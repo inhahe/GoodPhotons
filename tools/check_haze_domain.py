@@ -5,7 +5,7 @@
 
 A white ball of radius 1 under `light sun` in `medium { sigma_t 0.04  albedo 0.5 }` with no
 bounds, beside a 2x2 floor; and, held still, the same with a bounded cloud the sun's first leg
-crosses, and with the haze a density field instead. Mode R's NEE leg dims the sun by the haze out
+crosses, and with the haze a density field instead (that also held 32 m out, in mode D). Mode R's NEE leg dims the sun by the haze out
 to the instant's sphere (Scene::mediaExitDistance: |centre - p| + sceneRadius); a light subpath
 of modes D and J walks it from the entry disc's plane, never as far. Before the subpaths took the
 NEE leg's haze (sunLegFactor, the user's option (a)), D read the ball 1.75 % bright still,
@@ -26,6 +26,8 @@ import numpy as np
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 NL = chr(10)
+FIELD = ('medium { sigma_t 0.06  albedo 0.5  density "0.3 + 0.7*saturate(1.0 - y/8.0)"  '
+         'density_max 1 }')
 
 
 def scene(still, keys=8.0, at=6.4, medium="medium { sigma_t 0.04  albedo 0.5 }", extra=""):
@@ -68,8 +70,10 @@ def main():
               "cloud": scene(True, extra="medium { sigma_t 0.6  albedo 0.9  "
                                          "bounds { min 5.4 2.6 -1  max 7.4 3.4 1 } }"),
               # a density field with no bounds: the factor drawn by the medium's own estimator
-              "field": scene(True, medium='medium { sigma_t 0.06  albedo 0.5  '
-                                          'density "0.3 + 0.7*saturate(1.0 - y/8.0)"  density_max 1 }')}
+              "field": scene(True, medium=FIELD),
+              # ...and held 32 m out under a blur, where the walk began further out than the NEE
+              # leg reaches: the factor's inverse, by quadrature (mode D only: J-FIELD-SLOW)
+              "farfield": scene(False, 40.0, 32.0, medium=FIELD)}
     for name, text in scenes.items():
         with open(os.path.join(d, name + ".ftsl"), "w", encoding="utf-8", newline="") as f:
             f.write(text)
@@ -101,6 +105,10 @@ def main():
                 case = "%s_%s_%s" % (name, mode, dev)
                 if only and case not in only:
                     continue
+                if name == "farfield" and mode == "J":
+                    continue
+                if name == "field" and mode == "J" and dev == "gpu":
+                    continue   # ~10 min a sample on the GPU (J-FIELD-SLOW)
                 key = (name, dev)
                 if key not in refs:
                     refs[key] = [render(name, "R", dev, s) for s in (1, 2)]

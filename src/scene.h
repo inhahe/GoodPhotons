@@ -2779,6 +2779,16 @@ struct Scene {
     // bounding sphere at every time, since no medium moves -- integrating an unbounded haze out
     // to a mover's sweep would dim the whole frame the moment a shutter opens.
     double mediaExitDistance(const Vec3& p) const { return length(sceneCenter - p) + sceneRadius; }
+    // Whether any medium can hold a photon beam: one that scatters somewhere in the rendered band
+    // and is not a gradient-index region (emitBeams stores no chord through one, its photons bending).
+    bool hasScatteringMedia() const {
+        for (const Medium& m : media) {
+            if (m.grin()) continue;
+            for (double l = 360.0; l <= 830.0; l += 5.0)
+                if (m.sigma_s(l) > 0.0) return true;
+        }
+        return false;
+    }
     // Whether any medium is unbounded and attenuates: the media sunLegFactor (beamgather.h) counts.
     bool unboundedHaze() const {
         for (const Medium& m : media)

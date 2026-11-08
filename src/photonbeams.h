@@ -585,7 +585,9 @@ struct BeamMis {
                             // its n_m*pi r_s^2; 0 unless y_{s-1} is a stored-photon site.
                             // Mutually exclusive with etaPrev: a vertex is in a medium or on
                             // a surface, and this is the surface case (a beam leaving a wall)
-    float  leadIn = 0.0f;   // distance from y_{s-1} to THIS beam's clipped origin `o`, so
+    float  leadIn = 0.0f;   // distance from the segment's origin to THIS beam's clipped origin
+                            // `o` -- from y_{s-1}, but for a sun's first leg from where its walk
+                            // began (skyEntryPastHaze), which sunLegFactor reads it back as; so
                             // the gather can turn BeamHit::sBeam into the full y_{s-1}->x
                             // distance the light-side density is measured over
     unsigned char gateC1 = 0;  // is "connect x to y_{s-1}" a legal strategy? (y_{s-1} not
@@ -593,15 +595,17 @@ struct BeamMis {
     // Explicit padding (with padV_), so the struct has none implicitly: uploadBeamMapCuda copies
     // every field to gpu::DBeamMis and asserts this struct's size, and a field added into
     // implicit padding would pass that assert without being copied. A new field grows the struct.
-    // This beam lies on a sun's first leg in an unbounded haze (PathSeg::sunLeg): a merge on
-    // it weighs the NEE leg's haze at its own point, the leg having begun `leadIn` before `o`.
-    unsigned char sunLeg = 0;
+    unsigned char padG_ = 0;
     unsigned short vert = 0;   // the light subpath vertex index j of y_{s-1} (so s = j+1).
                                // Needed ONLY for the depth cap: merging light vertex j with
                                // camera vertex k builds a path of depth j + k + 1, and the
                                // connection loop refuses depth > maxDepth, so the merge must
                                // refuse it too or mode J renders paths mode D never builds.
     unsigned int  padV_ = 0;   // explicit padding to the 8-byte alignment; see padG_
+    // This beam lies on a sun's first leg in an unbounded haze (PathSeg::sunLeg): a merge on it
+    // weighs the NEE leg's haze at its own point, the leg having begun `leadIn` before `o`.
+    unsigned char sunLeg = 0;
+    unsigned char padS_[7] = {0, 0, 0, 0, 0, 0, 0};   // explicit padding; see padG_
 };
 
 // ---- Diagnostic tallies for the beam x ray query (FTRACE_BEAM_DIAG=1) ---------------------
