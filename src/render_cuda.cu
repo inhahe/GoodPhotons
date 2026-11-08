@@ -26767,7 +26767,8 @@ Film renderBdptCuda(const Scene& scene, const Camera& cam, int resX, int resY,
             // wave buys a schedule that never spills on a stationary scene.
             // The FIRST wave is small: a dense map yields thousands of candidates per segment,
             // and a segment-sized first wave would spill millions of them into the divergent
-            // on-the-spot path before any measurement exists. The adaptive rule then grows the
+            // on-the-spot path before any measurement exists (64 paths: 1024 overflowed it with an
+            // unbounded density field's 1.6e5 hits a path). The adaptive rule then grows the
             // wave, up to the segment-sized ceiling. Each wave advances by the range it actually
             // ran (b0 = b1) -- NOT by the wave size, which changes inside the loop.
             // A wave's size is an estimate of its hits from what is known: the last wave (bands
@@ -26778,7 +26779,7 @@ Film renderBdptCuda(const Scene& scene, const Camera& cam, int resX, int resY,
             // So a band gets the size its own density allows, and the two jumps the last wave
             // cannot see -- the chunk boundary (bottom band -> top band) and the light's edge
             // inside every chunk -- are simply entries in the profile. The render's first wave
-            // is 1024 paths: 4096 already overflowed the hit queue on _fog_cornell. Under
+            // is 64 paths (above). Under
             // FTRACE_WFSTRAT=1 the index space is padded to whole runs of the power-of-two
             // domain, and the profile, keyed by slot, sees stationary waves -- harmless.
             const long long waveTotal = (wq.runMul != 0u) ? ((long long)wq.runMask + 1) * 32 * c : totalSamples;
@@ -26790,7 +26791,11 @@ Film renderBdptCuda(const Scene& scene, const Camera& cam, int resX, int resY,
                     const double bySegs = 0.9 * (double)wq.segCap / segsPerPath;
                     n = (long long)((byHits < bySegs) ? byHits : bySegs);
                 }
-                if (n < 256) n = 256;
+                // As low as a wave can usefully go: a map dense enough to yield ~10^5 hits a path
+                // (an unbounded density field's fat beams, J-FIELD-SLOW) fills the queue with a
+                // few hundred paths, and a floor above that spills the rest into the divergent
+                // on-the-spot path, ~20x slower a hit.
+                if (n < 16) n = 16;
                 if (n > waveSamples) n = waveSamples;   // the segment-sized wave is the ceiling
                 return n;
             };
@@ -26811,7 +26816,7 @@ Film renderBdptCuda(const Scene& scene, const Camera& cam, int resX, int resY,
                 return cand;
             };
             long long wave = !wq.segs ? waveTotal
-                           : profiled(0, wfProfilePrev.empty() ? ((waveSamples < 1024) ? waveSamples : 1024) : waveSamples, 0.0, 0.0);
+                           : profiled(0, wfProfilePrev.empty() ? ((waveSamples < 64) ? waveSamples : 64) : waveSamples, 0.0, 0.0);
             for (long long b0 = 0; b0 < waveTotal; ) {
                 const long long b1 = (b0 + wave < waveTotal) ? b0 + wave : waveTotal;
                 // A REALIZATION PER BAND (FTRACE_JBAND). Salted by the band's first path slot as

@@ -673,7 +673,28 @@ with a K from the sample count), which is deterministic but no longer adapts to 
 light side is. Then add a heterogeneous medium at more than one sample to check_bitid's mode-J
 scenes.
 
-## OPEN (2026-11-07, 0.434.30, performance): J-FIELD-SLOW — mode J in an unbounded density field runs ~8 s a sample at 96x72
+## OPEN (2026-11-07, 0.434.30, performance; narrowed 0.434.33): J-FIELD-SLOW — mode J in an unbounded density field runs ~8 s a sample at 96x72
+
+**Diagnosed 2026-11-08; half fixed in 0.434.33.** Not the density field itself: at 32x24 and 1 spp on
+the GPU, the field took 61 s against the homogeneous haze's 3 s, but 2 s with `-beamk 8` or with
+`-beamcount 200000`, and 53 s with the host SAH tree in place of the device's LBVH. The GPU's
+wavefront log said why. The field's map (1M chords, -beamcount-bound below a pilot knee of 1.87M,
+the `-beamk` floor then raising the radii 3.5x to 1.43 m) yielded about 1.6e5 beam hits a camera
+path, 123M in all for 1734 segments, 4.4 times the homogeneous scene's. The wave rule's floor of
+256 paths (and the render's first wave of 1024) then overfilled the 2^25-hit queue, and 89M hits
+went to the divergent on-the-spot path, ~20x slower a hit. **0.434.33** lets a wave shrink to 16
+paths and starts the render with 64: no hit spills, and 2 spp of the field take 46 s instead of
+126 s, the homogeneous scene unchanged (10 s against 11).
+
+**Still open: the budget's probes do not measure what the camera gathers.** `probeGatherCount`
+draws chords between random points of the beams' bounding box. Each gathers 32 beams by
+construction, but a real camera segment gathered about 16K in the homogeneous scene and 71K in the
+field. In an unbounded haze the box is huge and mostly sparse, and the camera's rays run through
+the dense core near the scene, so the knee overshoots, the floor fattens every beam, and the
+gather pays for it. Proper fix, to measure before it lands (it moves every unbounded-haze scene's
+map, `_fog_cornell`'s included): probes drawn as the camera draws its rays, or at least within the
+scene's box, and the knee and floor re-measured against error and time on the reference scenes.
+
 
 check_haze_domain's `field` scene (a 2x2 floor and a ball under a sun in `medium { sigma_t 0.06
 albedo 0.5  density "0.3 + 0.7*saturate(1.0 - y/8.0)"  density_max 1 }`, no bounds) renders in
