@@ -1843,14 +1843,16 @@ machine varied 18.5 s / 25.8 s / 27.2 s.
   question; the render reports its queue use in a `[gpu] mode J wavefront gather:` line and where its
   seconds went — GPU time of the walk, the beam-hit search and the hit evaluation, and the host gaps
   between waves — in a `[gpu] mode J wave loop:` line. `FTRACE_WAVE_DEBUG=1` prints one `[wave]` line per
-  wave (paths, segments, hits, spills, and the three kernel times) for finer diagnosis.
+  wave (paths, segments, segments gathered inline, hits, resume passes, and the three kernel
+  times) for finer diagnosis. `FTRACE_WFHITCAP=<n>` shrinks the hit queue (default 2^25 hits) so an
+  ordinary scene takes resume passes; `tools/check_wf_resume.py` uses it to show they change nothing.
 - **`FTRACE_WFSTRAT=1` (diagnostic, mode `J` on the GPU).** Orders the wavefront gather’s waves as
   stratified samples of the whole image (32-pixel runs permuted by a golden-ratio stride) instead of
   horizontal bands. It makes the adaptive wave size exact — on `_fog_cornell` it cuts the
-  on-the-spot spill from 59 M to 8.4 M hits at 256² / 60 s — but it costs about 7 % of the paths on
+  hits that overflow the queue from 59 M to 8.4 M at 256² / 60 s — but it costs about 7 % of the paths on
   `_fog_thick`, because a stratified wave is as heterogeneous as the image allows and the beam-tree
-  walk diverges across a warp; a spilled candidate is evaluated in place and costs nothing
-  measurable, so bands are the default. The image is the same either way (per-pixel sample streams
+  walk diverges across a warp, while an overflowing band costs only a resume pass, so bands
+  are the default. The image is the same either way (per-pixel sample streams
   are seeded by pixel); this is the A/B for the ordering itself.
 - **`FTRACE_ONLY_ST="s,t"` (GPU modes `D`/`J`, diagnostic, 0.385.0).** Accumulates only the one
   BDPT connection strategy `(s,t)` — its MIS-weighted contribution — so two builds or two

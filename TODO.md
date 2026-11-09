@@ -129,6 +129,9 @@ Each names the section its line is in.
     0.434.29, the user's option (a); with it J-BEAM-FARLIMIT and REFRESH-EMPTY-STOP.
 19. ~~**GLOSSY-SAMPLE-SITES** (4.4) — the interference factor applied by hand at two dozen sites.~~
     Done 2026-11-06: `drawGlossy` / `dDrawGlossy` return the direction with its factor.
+19a. **J-FIELD-SLOW** (4.5) — mode J in an unbounded density field (found in HAZE-BLUR-DOMAIN's
+    check). Its GPU hit queue no longer spills (0.434.33-34, 126 s -> 39 s for the check's 2 spp);
+    left: the beam budget's probes overshoot the knee, and fattened beams make every walk long.
 20. **JSPEC-CARRIER-SIZE** (4.5) — every mode-J GPU thread reserves the spectral carrier.
 21. **RADCACHE-BATCHES** (4.5) — `-radcache`'s fixed batches outlast `-stop` and the interval.
     0.434.27: a budget no longer hangs in them and `-stop` lands mid-batch (modes R and P); the
@@ -391,6 +394,10 @@ Then the rest of 4.2-4.6 in their order, 4.7's bookkeeping alongside whatever to
 - [x] **BLUR-EPOCH-COST** (0.434.12) — a blurred clock epoch of mode M or J rebuilt its whole
   light side every 4 samples; it draws what its light side can afford against its gather now, the
   caustic neighbour count scaled with it.
+- [ ] **J-FIELD-SLOW** — mode J in an unbounded density field: `probeGatherCount`'s random chords
+  of the beams' box gather 32 beams where the camera's segments gather 10^4-10^5, so the knee
+  overshoots and the `-beamk` floor fattens the beams. The GPU wavefront no longer spills on it
+  (0.434.33 shrinking waves, 0.434.34 resume passes); the walk is still one thread a segment.
 - [ ] **JSPEC-CARRIER-SIZE** — every mode-J GPU thread reserves a 120-byte spectral carrier per
   segment and per eye vertex, chromatic scene or not.
 - [ ] **RADCACHE-BATCHES** — under `-radcache` a fixed budget's CPU batches follow its samples, not

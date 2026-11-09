@@ -8517,7 +8517,9 @@ struct DBeamMis {
     float  etaPrev;       // the BEAM merge AT y_{s-1}, still missing only its Tr; 0 off a medium
     float  etaPrevS;      // the POINT merge AT y_{s-1}, complete but for its kappaS; 0 off a
                           // storable surface site
-    float  leadIn;        // distance from y_{s-1} to THIS beam's clipped origin
+    float  leadIn;        // distance from the segment's origin to THIS beam's clipped origin:
+                          // from y_{s-1}, but for a sun's first leg from where its walk began
+                          // (host twin BeamMis::leadIn)
     short  gateC1;        // is "connect x to y_{s-1}" a legal strategy? (y_{s-1} not delta)
     short  sunLeg;        // a sun's first leg in an unbounded haze (host twin BeamMis::sunLeg)
     int    vert;          // the light subpath vertex index j of y_{s-1} (so s = j+1) — the
@@ -8526,7 +8528,8 @@ struct DBeamMis {
 
 // The uploaded BeamMap: the host's BVH over kernel-inflated per-sub-beam AABBs (photonbeams.h)
 // plus the records it indexes. `nNodes == 0` means "no volume gather" and every entry point
-// tests for it, so a media-less scene pays nothing.
+// tests for it, so a media-less scene pays nothing. (Mode J's merge WEIGHTS key on `mergeKappa`
+// instead: a realization that drew empty gathers nothing but keeps its technique's share.)
 // VOLCACHE on the device (0.310.0). One SH fluence/radiance grid per medium, uploaded from
 // the host's VolCache (volcache.h) once the host has SPLIT the beam map -- the order >= 2
 // chords those grids were built from are erased from the uploaded map and this march adds
@@ -9178,8 +9181,8 @@ __device__ static void dGatherPhotonBeams(const DScene& sc, const DBeamMap& bm,
 // function the inline path calls -- and accumulates into the film. Each phase is uniform work.
 //
 // Nothing is dropped on overflow: a segment that does not fit the queue is gathered inline by
-// kBdptT exactly as before, and a candidate that does not fit the hit queue is evaluated on the
-// spot by kWfBeamHits. The result is the same estimator summed in a different order (per-hit
+// kBdptT exactly as before, and a segment whose candidates overflow the hit queue is resumed in a
+// further pass of kWfBeamHits. The result is the same estimator summed in a different order (per-hit
 // atomics, and a per-hit RNG stream for the stochastic transmittance of heterogeneous media),
 // so it is validated statistically: parity against the inline path (FTRACE_NOWAVEFRONT=1).
 // ---- mode J's SECOND merge kind on the device: point x point surface merges (`-jsurf`) ------
@@ -9249,20 +9252,21 @@ struct DWfQueue {
     DWfSeg* segs;  int* nSegs; int segCap;
     double* chroma;     // 2*DJSPEC_K per segment slot (DBeamMergeW::chroma), or null when off
     DWfHit* hits;  int* nHits; int hitCap;
-    int*    overflow;   // [0] segments gathered inline (queue full), [1] hits evaluated on the spot
+    int*    resume;     // per segment slot: candidates already queued when the hit queue filled, or -1
+    int*    overflow;   // [0] segments gathered inline (queue full), [1] segments deferred this pass
     // WAVE ORDER (0.261.1). runMul == 0 -- the default, and every non-wavefront launch -- makes a
     // wave a contiguous range of pixels, i.e. a horizontal band. FTRACE_WFSTRAT=1 sets runMul
     // to an odd golden-ratio multiplier on a power-of-two run domain (runMask + 1 >= nRuns):
     // the kernel then enumerates the chunk's pixels in 32-pixel runs permuted by
     // (run * runMul) & runMask -- a bijection with no division -- so every wave covers the
     // whole image like a Fibonacci lattice and is a sample of the same distribution. That makes
-    // the adaptive wave size exact (on _fog_cornell it cut the on-the-spot spill from 59 M to
-    // 8.4 M hits at 256^2 / 60 s), but it costs 7 % of _fog_thick's paths (4430 against 4765
+    // the adaptive wave size exact (on _fog_cornell it cut the hits that overflowed the queue
+    // from 59 M to 8.4 M at 256^2 / 60 s), but it costs 7 % of _fog_thick's paths (4430 against 4765
     // spp / 60 s through the same code): the segment queue is filled by grid-wide atomics, so a
     // kWfBeamHits warp holds 32 segments from random paths OF THE WAVE, and a band's paths are
     // alike while a stratified wave's are as unalike as the image allows -- warp divergence in
-    // the beam-tree walk. A spilled candidate is evaluated in place and costs nothing
-    // measurable, so the band order is the default, and the jumps its last-wave estimate cannot
+    // the beam-tree walk. An overfull wave costs only a resume pass (kWfBeamHits), so the band
+    // order is the default, and the jumps its last-wave estimate cannot
     // see -- the chunk boundary (bottom band to top band) and the doubling at a light's edge --
     // are sized from the previous chunk's per-band PROFILE instead (see the wave loop).
     // Under FTRACE_WFSTRAT=1 the index space is padded to whole runs of the power-of-two
@@ -9294,23 +9298,19 @@ __global__ void kBeamTr0(DScene sc, const DBeamRec* beams, float* tr0, const int
     }
 }
 
-// The hit-queue-overflow path of kWfBeamHits, kept OUT of line: inlined, dBeamHitEval's body sat in
-// the BVH loop's register and stack budget for a branch most hits never take (0.386.0, -6 % on
-// _fog_cornell, which overflows 12.8 M hits a frame, when the body grew by the tr0 branch).
-__device__ __noinline__ static void dBeamHitEvalSpill(const DScene& sc, const DBeamMap& bm,
-        const DBeamRec& b, int bi, const DVec3& oc, const DVec3& dc, Real t, Real s, Real cosT,
-        Real den, double x2, double aGlass, DRng& rng, const DBeamMergeW* mw, const DTrRay* tr,
-        const DPatEnv& env, double& fX, double& fY, double& fZ, const DJSpec* js, int glassMat,
-        const DCamera* cam) {
-    dBeamHitEval(sc, bm, b, bi, oc, dc, t, s, cosT, den, x2, aGlass, rng, mw, tr, env, fX, fY, fZ, js,
-                 glassMat, cam);
-}
-
-__global__ void kWfBeamHits(DScene sc, DBeamMap bm, DWfQueue q, double* camFilm, int resX, DCamera cam) {
+// One thread per queued segment: walk the beam tree and queue every candidate (closest approach
+// inside the beam's radius) for kWfBeamEval. A segment the full hit queue turns away stops there
+// and records in q.resume how many candidates it had queued; `resumePass` != 0 walks only those
+// segments, skipping their queued candidates. The walk's order is fixed by the tree, so the
+// skipped candidates are exactly the ones queued before, and every candidate is evaluated once,
+// in kWfBeamEval, with the random numbers its (segment, beam) pair keys whichever pass queued it.
+__global__ void kWfBeamHits(DScene sc, DBeamMap bm, DWfQueue q, int resumePass) {
     D_MOTION_CLEAR();   // this thread's time: the launch's (passU) until a path sets one
     const int nS = min(*q.nSegs, q.segCap);
-    const DPatEnv env = dPatEnvOf(sc);
     for (int si = blockIdx.x * blockDim.x + threadIdx.x; si < nS; si += gridDim.x * blockDim.x) {
+        const int skip = resumePass ? q.resume[si] : 0;
+        q.resume[si] = -1;
+        if (skip < 0) continue;
         const DWfSeg& sg = q.segs[si];
         const DVec3 oc = sg.o, dc = sg.d;
         const Real tMax = (Real)sg.tMax;
@@ -9321,9 +9321,9 @@ __global__ void kWfBeamHits(DScene sc, DBeamMap bm, DWfQueue q, double* camFilm,
         int stack[64]; int sp = 0; stack[sp++] = 0;
         int stopPoll = 0;
         const int routeMedJ = sg.routeMedJ;   // once, not per candidate (q.hits aliases q.segs)
-        DRng rng; rng.seedUnit(sg.seed, 0x9E3779B97F4A7C15ull);   // on-the-spot fallback only
-        double fX = 0.0, fY = 0.0, fZ = 0.0;
-        while (sp) {
+        int e = 0;           // candidates met so far, in walk order
+        bool full = false;   // the hit queue turned this segment away: resume it next pass
+        while (sp && !full) {
             if ((++stopPoll & 63) == 0 && dGatherStopped()) break;
             const DNode& n = bm.nodes[stack[--sp]];
             if (n.count > 0) {
@@ -9345,26 +9345,22 @@ __global__ void kWfBeamHits(DScene sc, DBeamMap bm, DWfQueue q, double* camFilm,
                     const double x2 = (double)d2 * (double)b.invRad * (double)b.invRad;
                     if (!(x2 < 1.0)) continue;
                     if (routeMedJ && dRouteOfMed(sc, b.med) != 1) continue;   // D-routed merge
+                    if (e < skip) { ++e; continue; }   // queued by an earlier pass
                     const int h = atomicAdd(q.nHits, 1);
-                    if (h < q.hitCap) {
-                        q.hits[h] = DWfHit{si, bi, (float)t, (float)s};
-                    } else {
+                    if (h >= q.hitCap) {
+                        q.resume[si] = e;
                         atomicAdd(&q.overflow[1], 1);
-                        dBeamHitEvalSpill(sc, bm, b, bi, oc, dc, t, s, cosT, den, x2, sg.aGlass, rng,
-                                          &sg.mw, &sg.tr, env, fX, fY, fZ, &sg.spec, sg.glassMat, &cam);
+                        full = true;
+                        break;
                     }
+                    q.hits[h] = DWfHit{si, bi, (float)t, (float)s};
+                    ++e;
                 }
             } else {
                 Real tc;
                 if (boxHit(bm.nodes[n.left],  oc, invD, (Real)0, tMax, tc)) stack[sp++] = n.left;
                 if (boxHit(bm.nodes[n.right], oc, invD, (Real)0, tMax, tc)) stack[sp++] = n.right;
             }
-        }
-        if (fX != 0.0 || fY != 0.0 || fZ != 0.0) {
-            const size_t o = ((size_t)sg.py * resX + sg.px) * 3;
-            atomicAdd(&camFilm[o + 0], fX * sg.beta);
-            atomicAdd(&camFilm[o + 1], fY * sg.beta);
-            atomicAdd(&camFilm[o + 2], fZ * sg.beta);
         }
     }
 }
@@ -19296,8 +19292,10 @@ kBdptT(DScene sc, const __grid_constant__ DCamera cam, double* camFilm, double* 
     // gate -- with it false the camera walk is not even asked to record its segments and the
     // render is mode D down to the RNG stream (gate 1). A map that drew empty keeps its kappa
     // (host twin renderRows, where the why is) and gathers nothing (`beamsHere`).
-    const bool mergeOn = MERGE && bm.mergeKappa > 0.0;
-    const bool beamsHere = mergeOn && bm.beams != nullptr && bm.nNodes > 0;
+    const bool beamsHere = MERGE && bm.beams != nullptr && bm.nNodes > 0;
+    // A map without MIS partials (kappa 0) still gathers, at weight 1 (mode M's estimator,
+    // over-bright but a picture -- the host twin's fallback).
+    const bool mergeOn = MERGE && (bm.mergeKappa > 0.0 || beamsHere);
     // The merge technique's constant, n_m * 2r, travelling with the map so no call site can
     // forget it. Zero unless the map actually carries MIS partials, and that zero is what
     // makes every merge term inside dMisWeight disappear. Weighted and unweighted merges
@@ -26148,15 +26146,17 @@ static void compareJSurfMaps(const bdpt::SurfMap& host, const JSurfDev& dev) {
 // term inside dMisWeight. Uploading one without the other would double-count or under-count.
 // Upload of the surface photon map (`-jsurf`). Mirrors uploadBeamMapCuda's shape: convert the
 // host vectors into device layouts, hand the pointers over in a DSurfMap, and let `up` own the
-// allocations. An empty or absent map leaves `dsm.nPts == 0`, which every gather reads as "no
-// surface merges" -- the two-technique estimator, unchanged.
+// allocations. An absent map leaves `dsm.kappaS == 0`: no surface merges, the two-technique
+// estimator unchanged. A map that drew empty keeps its kappaS with `nPts == 0`: the technique
+// stays in every weight and gathers nothing, as on the host.
 static void uploadSurfMapCuda(const bdpt::SurfMap* smap, DUpload& up, gpu::DSurfMap& dsm) {
     if (!smap || smap->nEmitted <= 0 || !(smap->radius > 0.0)) return;
-    if (smap->pts.empty() || smap->cellStart.empty()) {   // drew empty: the constant, no points
+    if (smap->pts.empty()) {   // drew empty: the constant, no points
         dsm.radius = (gpu::Real)smap->radius;
         dsm.kappaS = (double)smap->nEmitted * PI * (double)smap->radius * (double)smap->radius;
         return;
     }
+    if (smap->cellStart.empty()) return;   // points but no grid (radiusOnly): nothing to gather
     const size_t n = smap->pts.size();
     std::vector<gpu::DSurfPhoton> pts(n);
     for (size_t i = 0; i < n; ++i) {
@@ -26368,7 +26368,7 @@ static void uploadBeamMapCuda(const Scene& scene, const BeamMap* bmap, DUpload& 
     size_t nMis = 0;
     if (withMis && !bmap->mis.empty()) {
         // Every BeamMis field is copied below; see the SurfMis upload for why these trip.
-        static_assert(sizeof(BeamMis) == 64, "BeamMis changed: copy the new field into DBeamMis "
+        static_assert(sizeof(BeamMis) == 56, "BeamMis changed: copy the new field into DBeamMis "
                                              "here, then update this size");
         static_assert(sizeof(gpu::DBeamMis) == 56, "DBeamMis changed: fill the new field from "
                                                    "BeamMis here, then update this size");
@@ -26473,8 +26473,9 @@ Film renderBdptCuda(const Scene& scene, const Camera& cam, int resX, int resY,
                             camH[3 * i + 2] + splatH[3 * i + 2]);
     };
     // Mode J: the beam map, and with it the merge half of the estimator. Uploaded here and
-    // freed with the rest of `up`. A null/empty map leaves `dbm.nNodes == 0`, which the
-    // MERGE=true kernel reads as "no merges" — so `-nobeams` degenerates to mode D exactly.
+    // freed with the rest of `up`. A null map leaves `mergeKappa == 0` and `nNodes == 0`, which
+    // the kernel reads as "no merges" — so `-nobeams` degenerates to mode D exactly. A refresh
+    // that drew empty keeps its `mergeKappa` and gathers nothing (uploadBeamMapCuda).
     DBeamMap dbm{};
     // Default on (0.272.3). Must agree EXACTLY with main.cpp's jSkipHostBvh(): if the host
     // skipped its tree and this said no, the map would arrive with no tree at all and the
@@ -26635,7 +26636,8 @@ Film renderBdptCuda(const Scene& scene, const Camera& cam, int resX, int resY,
         CUDA_CHECK(cudaMemcpyToSymbol(gpu::c_dbgOnlyT, &ot, sizeof(int)));
         if (os >= 0 || ot >= 0) std::printf("[diag] FTRACE_ONLY_ST: strategy s=%d t=%d only\n", os, ot);
     }
-    const bool mergeOn = dbm.mergeKappa > 0.0;   // a map that drew empty keeps it (kBdptT)
+    // A map that drew empty keeps its kappa; one without MIS partials still gathers (kBdptT).
+    const bool mergeOn = dbm.mergeKappa > 0.0 || dbm.nNodes > 0;
     // WAVEFRONT gather queue (UPBP-CONV): sized for one wave of camera paths; the chunk is run
     // as consecutive waves. FTRACE_NOWAVEFRONT=1 forces the inline gather (the A/B control).
     DWfQueue wq{};
@@ -26644,11 +26646,19 @@ Film renderBdptCuda(const Scene& scene, const Camera& cam, int resX, int resY,
     if (mergeOn && dbm.nNodes > 0 &&
         !(std::getenv("FTRACE_NOWAVEFRONT") && std::atoi(std::getenv("FTRACE_NOWAVEFRONT")) != 0)) {
         const int segCap = 1 << 20;          // 424 B each (~445 MB), 128 of them JSPEC's
-        const int hitCap = 1 << 25;          // 16 B each  (512 MB): a dense map yields thousands of
-                                             // candidates per segment (_fog_cornell: ~2000), and a
-                                             // spilled candidate is evaluated divergently, on the spot
+        int hitCap = 1 << 25;                // 16 B each  (512 MB): a dense map yields thousands of
+                                             // candidates per segment (_fog_cornell: ~2000), and what
+                                             // does not fit costs a resume pass (kWfBeamHits)
+        // FTRACE_WFHITCAP=<n> (diagnostic) shrinks the hit queue, so an ordinary scene takes
+        // resume passes: tools/check_wf_resume.py renders with and without it and requires the
+        // same image.
+        if (const char* e = std::getenv("FTRACE_WFHITCAP")) {
+            const int v = std::atoi(e);
+            if (v >= 256 && v < hitCap) hitCap = v;
+        }
         CUDA_CHECK(cudaMalloc(&wq.segs, (size_t)segCap * sizeof(DWfSeg)));
         CUDA_CHECK(cudaMalloc(&wq.hits, (size_t)hitCap * sizeof(DWfHit)));
+        CUDA_CHECK(cudaMalloc(&wq.resume, (size_t)segCap * sizeof(int)));
         // ...and, where the merge weights read their camera half at the beam's wavelength
         // (UPBP-W-CHROMATIC), that half's two bin tables per slot: 384 B each (~400 MB). Only
         // with room to spare: without the table a chromatic segment is gathered inline in the
@@ -26682,7 +26692,8 @@ Film renderBdptCuda(const Scene& scene, const Camera& cam, int resX, int resY,
         // and exactly 1 in a plain one, so that ceiling ran its camera walk 3x slower than the
         // same kernel launched once per chunk. The waves are sized from the MEASURED segments
         // and hits per path (sizeFor, and the previous chunk's per-band profile), and a wave
-        // that outruns its estimate loses nothing: what does not fit is gathered inline.
+        // that outruns its estimate loses nothing: segments that do not fit are gathered inline,
+        // hits that do not fit wait for a resume pass.
         waveSamples = (long long)segCap;
         (void)maxDepth;
         // wave order (see DWfQueue): bands by default; FTRACE_WFSTRAT=1 = stratified, 32-pixel
@@ -26697,7 +26708,8 @@ Film renderBdptCuda(const Scene& scene, const Camera& cam, int resX, int resY,
             wq.runMul = (e && std::atoi(e) != 0) ? ((unsigned)(0.6180339887498949 * (double)dom) | 1u) : 0u;
         }
     }
-    long long wfWaves = 0, wfSpillSegs = 0, wfSpillHits = 0;
+    long long wfWaves = 0, wfInlineSegs = 0, wfResumes = 0, wfDeferred = 0, wfLastHits = 0;
+    int wfLastSegs = 0;
     // Where a mode-J render's seconds go: CUDA-event time of the three wave kernels and the wall
     // time around each wave (the wave already syncs on the counter copy, so the elapsed-time
     // queries are free). Reported with the queue use at the end of the render.
@@ -26764,12 +26776,11 @@ Film renderBdptCuda(const Scene& scene, const Camera& cam, int resX, int resY,
             // ADAPTIVE WAVES: the first wave is sized by segments alone; every later wave is sized
             // so that the previous wave's observed hits-per-segment would fill ~70% of the hit
             // queue, and never more than the segment queue allows. One synchronous 4-int copy per
-            // wave buys a schedule that never spills on a stationary scene.
-            // The FIRST wave is small: a dense map yields thousands of candidates per segment,
-            // and a segment-sized first wave would spill millions of them into the divergent
-            // on-the-spot path before any measurement exists (64 paths: 1024 overflowed it with an
-            // unbounded density field's 1.6e5 hits a path). The adaptive rule then grows the
-            // wave, up to the segment-sized ceiling. Each wave advances by the range it actually
+            // wave buys a schedule that rarely needs a resume pass on a stationary scene.
+            // The FIRST wave is small (1024 paths): a dense map yields thousands of candidates
+            // per segment, and a segment-sized first wave would take dozens of resume passes
+            // before any measurement exists. The adaptive rule then grows the wave, up to the
+            // segment-sized ceiling. Each wave advances by the range it actually
             // ran (b0 = b1) -- NOT by the wave size, which changes inside the loop.
             // A wave's size is an estimate of its hits from what is known: the last wave (bands
             // are neighbours), and from the second chunk on the previous chunk's PROFILE -- the
@@ -26778,9 +26789,7 @@ Film renderBdptCuda(const Scene& scene, const Camera& cam, int resX, int resY,
             // smaller wave reaches fewer bands), reached by shrinking from the last-wave size.
             // So a band gets the size its own density allows, and the two jumps the last wave
             // cannot see -- the chunk boundary (bottom band -> top band) and the light's edge
-            // inside every chunk -- are simply entries in the profile. The render's first wave
-            // is 64 paths (above). Under
-            // FTRACE_WFSTRAT=1 the index space is padded to whole runs of the power-of-two
+            // inside every chunk -- are simply entries in the profile. Under FTRACE_WFSTRAT=1 the index space is padded to whole runs of the power-of-two
             // domain, and the profile, keyed by slot, sees stationary waves -- harmless.
             const long long waveTotal = (wq.runMul != 0u) ? ((long long)wq.runMask + 1) * 32 * c : totalSamples;
             wfProfileCur.clear();
@@ -26791,11 +26800,10 @@ Film renderBdptCuda(const Scene& scene, const Camera& cam, int resX, int resY,
                     const double bySegs = 0.9 * (double)wq.segCap / segsPerPath;
                     n = (long long)((byHits < bySegs) ? byHits : bySegs);
                 }
-                // As low as a wave can usefully go: a map dense enough to yield ~10^5 hits a path
-                // (an unbounded density field's fat beams, J-FIELD-SLOW) fills the queue with a
-                // few hundred paths, and a floor above that spills the rest into the divergent
-                // on-the-spot path, ~20x slower a hit.
-                if (n < 16) n = 16;
+                // Below a few hundred paths a wave leaves the device idle while its longest walk
+                // finishes; a map dense enough to fill the queue with fewer (an unbounded density
+                // field's ~10^5 hits a path, J-FIELD-SLOW) gets its remainder by resume passes.
+                if (n < 256) n = 256;
                 if (n > waveSamples) n = waveSamples;   // the segment-sized wave is the ceiling
                 return n;
             };
@@ -26851,34 +26859,52 @@ Film renderBdptCuda(const Scene& scene, const Camera& cam, int resX, int resY,
                 if (wq.segs) {
                     cudaCheckKernel("bdpt");
                     CUDA_CHECK(cudaEventRecord(wfEv[1]));
-                    kWfBeamHits<<<2048, 128>>>(up.sc, dbm, wq, d_cam, resX, up.dc);
-                    cudaCheckKernel("wf-hits");
-                    CUDA_CHECK(cudaEventRecord(wfEv[2]));
-                    kWfBeamEval<<<4096, 128>>>(up.sc, dbm, wq, d_cam, resX, up.dc);
-                    cudaCheckKernel("wf-eval");
-                    CUDA_CHECK(cudaEventRecord(wfEv[3]));
-                    ++wfWaves;
+                    // Queue and evaluate the wave's hits, pass after pass while the hit queue turns
+                    // segments away (kWfBeamHits). Every pass queues at least one hit, so it ends;
+                    // a stop ends it at once (the walk polls the stop only every 64 nodes, so a
+                    // segment can be turned away before it sees one).
                     int cnt[4] = {0, 0, 0, 0};
-                    CUDA_CHECK(cudaMemcpy(cnt, d_wfCounters, sizeof cnt, cudaMemcpyDeviceToHost));
-                    {
+                    long long waveHits = 0;
+                    int passes = 0;
+                    float msWalk = 0.f, msHits = 0.f, msEval = 0.f;
+                    for (;;) {
+                        kWfBeamHits<<<2048, 128>>>(up.sc, dbm, wq, passes);
+                        cudaCheckKernel("wf-hits");
+                        CUDA_CHECK(cudaEventRecord(wfEv[2]));
+                        kWfBeamEval<<<4096, 128>>>(up.sc, dbm, wq, d_cam, resX, up.dc);
+                        cudaCheckKernel("wf-eval");
+                        CUDA_CHECK(cudaEventRecord(wfEv[3]));
+                        CUDA_CHECK(cudaMemcpy(cnt, d_wfCounters, sizeof cnt, cudaMemcpyDeviceToHost));
                         float ms = 0.f;
-                        CUDA_CHECK(cudaEventElapsedTime(&ms, wfEv[0], wfEv[1])); wfMsWalk += ms;
-                        CUDA_CHECK(cudaEventElapsedTime(&ms, wfEv[1], wfEv[2])); wfMsHits += ms;
-                        CUDA_CHECK(cudaEventElapsedTime(&ms, wfEv[2], wfEv[3])); wfMsEval += ms;
-                        const double wallMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - wfT0).count();
-                        wfMsWall += wallMs;
-                        static const bool waveDebug = std::getenv("FTRACE_WAVE_DEBUG") != nullptr;   // per-wave diagnostic
-                        if (waveDebug) {
-                            float w0 = 0.f, w1 = 0.f, w2 = 0.f;
-                            cudaEventElapsedTime(&w0, wfEv[0], wfEv[1]); cudaEventElapsedTime(&w1, wfEv[1], wfEv[2]); cudaEventElapsedTime(&w2, wfEv[2], wfEv[3]);
-                            std::fprintf(stderr, "[wave] c=%lld paths %lld..%lld (%lld) segs %d hits %d spill %d/%d walk %.2f hits %.2f eval %.2f wall %.2f ms\n",
-                                         c, b0, b1, b1 - b0, cnt[0], cnt[1], cnt[2], cnt[3], w0, w1, w2, wallMs);
-                        }
+                        if (passes == 0) { CUDA_CHECK(cudaEventElapsedTime(&ms, wfEv[0], wfEv[1])); msWalk = ms; }
+                        CUDA_CHECK(cudaEventElapsedTime(&ms, wfEv[1], wfEv[2])); msHits += ms;
+                        CUDA_CHECK(cudaEventElapsedTime(&ms, wfEv[2], wfEv[3])); msEval += ms;
+                        waveHits += (cnt[1] < wq.hitCap) ? cnt[1] : wq.hitCap;
+                        ++passes;
+                        if (cnt[3] == 0 || ft::stopRequested()) break;
+                        wfDeferred += cnt[3];
+                        ++wfResumes;
+                        CUDA_CHECK(cudaMemsetAsync(wq.nHits, 0, sizeof(int)));       // an empty hit queue
+                        CUDA_CHECK(cudaMemsetAsync(wq.overflow + 1, 0, sizeof(int))); // and a fresh count
+                        CUDA_CHECK(cudaEventRecord(wfEv[1]));
                     }
-                    wfSpillSegs += cnt[2]; wfSpillHits += cnt[3];
+                    ++wfWaves;
+                    wfMsWalk += msWalk; wfMsHits += msHits; wfMsEval += msEval;
+                    const double wallMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - wfT0).count();
+                    wfMsWall += wallMs;
+                    static const bool waveDebug = std::getenv("FTRACE_WAVE_DEBUG") != nullptr;   // per-wave diagnostic
+                    if (waveDebug)
+                        std::fprintf(stderr, "[wave] c=%lld paths %lld..%lld (%lld) segs %d (%d inline) hits %lld "
+                                     "in %d pass%s walk %.2f hits %.2f eval %.2f wall %.2f ms\n",
+                                     c, b0, b1, b1 - b0, cnt[0], cnt[2], waveHits, passes,
+                                     passes == 1 ? "" : "es", msWalk, msHits, msEval, wallMs);
+                    wfInlineSegs += cnt[2];
+                    wfLastSegs = (cnt[0] < wq.segCap) ? cnt[0] : wq.segCap;
+                    wfLastHits = waveHits;
                     const long long paths = b1 - b0;
                     const double segsPerPath = (paths > 0) ? (double)cnt[0] / (double)paths : (double)(maxDepth + 3);
-                    const double hitsPerSeg  = (cnt[0] > 0) ? ((double)cnt[1] + (double)cnt[3]) / (double)cnt[0] : 0.0;
+                    // per QUEUED segment: those gathered inline (cnt[2]) left no hits in the queue
+                    const double hitsPerSeg  = (wfLastSegs > 0) ? (double)waveHits / (double)wfLastSegs : 0.0;
                     const double hitsPerPath = hitsPerSeg * segsPerPath;
                     wfProfileCur.push_back(WfBand{b0 / c, (b1 + c - 1) / c, hitsPerPath, segsPerPath});
                     wave = profiled(b1, sizeFor(hitsPerPath, segsPerPath), hitsPerPath, segsPerPath);
@@ -26910,22 +26936,19 @@ Film renderBdptCuda(const Scene& scene, const Camera& cam, int resX, int resY,
 
     freeUpload(up);
     if (wq.segs) {
-        int ov[4] = {0, 0, 0, 0};
-        cudaMemcpy(ov, d_wfCounters, sizeof ov, cudaMemcpyDeviceToHost);
         // Once per frame, not once per light-side epoch (see g_gpuQuietRebuild): one realization
         // per sample would otherwise print it 64 times a frame.
-        if (!g_gpuQuietRebuild) std::fprintf(stderr, "[gpu] mode J wavefront gather: %lld waves (first up to %lld paths, adaptive after); "
-                             "last wave %d segments / %d hits; spilled over the whole render: %lld segments "
-                             "gathered inline, %lld hits evaluated on the spot (FTRACE_NOWAVEFRONT=1 forces "
-                             "the inline path)\n"
+        if (!g_gpuQuietRebuild) std::fprintf(stderr, "[gpu] mode J wavefront gather: %lld waves (at most %lld paths, adaptive); "
+                             "last wave %d segments / %lld hits; over the whole render: %lld segments "
+                             "gathered inline (segment queue full), %lld resume passes for %lld segments "
+                             "the hit queue turned away (FTRACE_NOWAVEFRONT=1 forces the inline path)\n"
                              "[gpu] mode J wave loop: GPU time walk %.1f s, beam hits %.1f s, hit eval %.1f s; "
                              "wall %.1f s (host gaps %.1f s)\n",
-                     wfWaves, waveSamples, ov[0] < wq.segCap ? ov[0] : wq.segCap,
-                     ov[1] < wq.hitCap ? ov[1] : wq.hitCap, wfSpillSegs, wfSpillHits,
+                     wfWaves, waveSamples, wfLastSegs, wfLastHits, wfInlineSegs, wfResumes, wfDeferred,
                      wfMsWalk / 1e3, wfMsHits / 1e3, wfMsEval / 1e3, wfMsWall / 1e3,
                      (wfMsWall - wfMsWalk - wfMsHits - wfMsEval) / 1e3);
         for (auto& e : wfEv) cudaEventDestroy(e);
-        cudaFree(wq.segs); cudaFree(wq.hits); cudaFree(d_wfCounters);
+        cudaFree(wq.segs); cudaFree(wq.hits); cudaFree(wq.resume); cudaFree(d_wfCounters);
         if (wq.chroma) cudaFree(wq.chroma);
     }
     cudaFree(d_cam); cudaFree(d_splat);

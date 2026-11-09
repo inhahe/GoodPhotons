@@ -594,18 +594,18 @@ struct BeamMis {
                                // delta) — the reference technique of the whole ratio
     // Explicit padding (with padV_), so the struct has none implicitly: uploadBeamMapCuda copies
     // every field to gpu::DBeamMis and asserts this struct's size, and a field added into
-    // implicit padding would pass that assert without being copied. A new field grows the struct.
-    unsigned char padG_ = 0;
+    // implicit padding would pass that assert without being copied. A new field grows the struct
+    // -- but for `sunLeg`, which took this byte, the one that was explicit padding (a beam map
+    // runs to millions of these, and every kept epoch holds one); uploadBeamMapCuda copies it.
+    // This beam lies on a sun's first leg in an unbounded haze (PathSeg::sunLeg): a merge on it
+    // weighs the NEE leg's haze at its own point, the leg having begun `leadIn` before `o`.
+    unsigned char sunLeg = 0;
     unsigned short vert = 0;   // the light subpath vertex index j of y_{s-1} (so s = j+1).
                                // Needed ONLY for the depth cap: merging light vertex j with
                                // camera vertex k builds a path of depth j + k + 1, and the
                                // connection loop refuses depth > maxDepth, so the merge must
                                // refuse it too or mode J renders paths mode D never builds.
-    unsigned int  padV_ = 0;   // explicit padding to the 8-byte alignment; see padG_
-    // This beam lies on a sun's first leg in an unbounded haze (PathSeg::sunLeg): a merge on it
-    // weighs the NEE leg's haze at its own point, the leg having begun `leadIn` before `o`.
-    unsigned char sunLeg = 0;
-    unsigned char padS_[7] = {0, 0, 0, 0, 0, 0, 0};   // explicit padding; see padG_
+    unsigned int  padV_ = 0;   // explicit padding to the 8-byte alignment; see sunLeg
 };
 
 // ---- Diagnostic tallies for the beam x ray query (FTRACE_BEAM_DIAG=1) ---------------------
@@ -1192,7 +1192,9 @@ struct BeamMap {
         lastSplitSec = std::chrono::duration<double>(tSplit1 - tSplit0).count();
         lastAllocSec = std::chrono::duration<double>(tAlloc1 - tSplit1).count();
         lastBoxSec   = std::chrono::duration<double>(tBox1 - tAlloc1).count();
-        if (!skipBvh) bvh.build(boxes);
+        // A map of one sub-beam is built here even under `skipBvh`: the device LBVH refuses it
+        // (it has no internal node), and without a tree that beam would never be gathered.
+        if (!skipBvh || boxes.size() <= 1) bvh.build(boxes);
     }
 
     // Per-medium statistics of the RAW (pre-split) beam set: how many chords each medium

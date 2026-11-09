@@ -72,6 +72,23 @@ closed entries, where the cost is a broken historical link rather than a blocked
 Three references — `scenes/_gr_fly0.ftsl`, `scenes/silver_sphere_xenon.ftsl`, `scenes/x.ftsl` —
 name files that no longer exist at all, all in closed entries.
 
+## OPEN (2026-11-08, 0.434.34): GATHER-STOP-DANGLING — the device's stop flag outlives mode M's gather, and mode J never sets one
+
+`renderPhotonMapSharedCuda` (render_cuda.cu) allocates a mapped pinned int, publishes its device
+address in the `__device__` global `g_dGatherStop`, and frees it on the way out
+(`GatherStopGuard`) without clearing the global; `g_dGatherDone` likewise. Every later kernel
+that polls `dGatherStopped()` in the same process -- mode J's `kWfBeamHits` and the inline beam
+gather, mode M's camera walk -- then reads freed host memory: an illegal-address fault that kills
+the CUDA context, wherever one process runs mode M's gather and then such a kernel (a camera list
+mixing modes, the viewer switching modes). Not reproduced yet; found by reading the code while a
+mode J render ignored `-stop`. That is the other half: `renderBdptCuda` never installs the flag,
+so mode J's device walk cannot see a stop at all, and a pass loop that never drained (a
+deliberately broken build, check_wf_resume.py's proof) ignored `ftrace -stop` for good -- it had
+to be unstuck by zeroing the wave queue's `segCap` from cdb. 0.434.34's pass loop also checks
+`ft::stopRequested()` on the host. Proper fix: one owner for the flag -- installed, polled from
+`ft::stopRequested()` and cleared (the global reset to null before the memory is freed) by an
+RAII helper both renderers use.
+
 ## DONE (2026-11-05, 0.434.2): STOP-STALE-PID — `ftrace -stop` listed a crashed render under the unrelated process that inherited its pid
 
 Seen after GPU-PHOTON-LAUNCH-FAIL: the render that died on the failed launch never unregistered, and
@@ -673,7 +690,7 @@ with a K from the sample count), which is deterministic but no longer adapts to 
 light side is. Then add a heterogeneous medium at more than one sample to check_bitid's mode-J
 scenes.
 
-## OPEN (2026-11-07, 0.434.30, performance; narrowed 0.434.33): J-FIELD-SLOW — mode J in an unbounded density field runs ~8 s a sample at 96x72
+## OPEN (2026-11-07, 0.434.30, performance; narrowed 0.434.33-34): J-FIELD-SLOW — mode J in an unbounded density field runs ~8 s a sample at 96x72
 
 **Diagnosed 2026-11-08; half fixed in 0.434.33.** Not the density field itself: at 32x24 and 1 spp on
 the GPU, the field took 61 s against the homogeneous haze's 3 s, but 2 s with `-beamk 8` or with
@@ -684,7 +701,15 @@ path, 123M in all for 1734 segments, 4.4 times the homogeneous scene's. The wave
 256 paths (and the render's first wave of 1024) then overfilled the 2^25-hit queue, and 89M hits
 went to the divergent on-the-spot path, ~20x slower a hit. **0.434.33** lets a wave shrink to 16
 paths and starts the render with 64: no hit spills, and 2 spp of the field take 46 s instead of
-126 s, the homogeneous scene unchanged (10 s against 11).
+126 s, the homogeneous scene unchanged (10 s against 11). **0.434.34** (review of 0.434.33) removed
+the on-the-spot path instead: a segment the full hit queue turns away records how many candidates
+it queued and is walked again in a resume pass once the queue is drained, and the wave floor and
+first wave went back to 256 and 1024 paths. The field's 2 spp at 32x24 took 39.1 s against
+0.434.33's 50.5 s (same session; 6 resume passes for 1507 segments, none gathered inline), the
+homogeneous haze 3.7 s on both. What is left is the beam-hit walk itself, 35 of the 39 s: one
+thread a segment walks its ~10^5 candidates serially, so a wave of a few hundred dense paths leaves
+the device nearly idle. Splitting a segment's walk across a warp would attack that directly; the
+fatter-than-needed beams below are the cause.
 
 **Still open: the budget's probes do not measure what the camera gathers.** `probeGatherCount`
 draws chords between random points of the beams' bounding box. Each gathers 32 beams by
@@ -696,19 +721,13 @@ map, `_fog_cornell`'s included): probes drawn as the camera draws its rays, or a
 scene's box, and the knee and floor re-measured against error and time on the reference scenes.
 
 
-check_haze_domain's `field` scene (a 2x2 floor and a ball under a sun in `medium { sigma_t 0.06
-albedo 0.5  density "0.3 + 0.7*saturate(1.0 - y/8.0)"  density_max 1 }`, no bounds) renders in
-mode J at 27 s for 2 spp on the CPU, 0.434.28 and 0.434.30 alike, and on the GPU at about **10
-minutes a sample** (0.434.31 and 0.434.32 alike: 632 and 645 s for 1 spp, 1798 s for 3) -- some 60
-times the CPU, where mode D takes seconds. (A 1024-spp GPU run that seemed to take two hours had in
-fact stopped early under 0.434.29-30's empty-map rule.) check_haze_domain renders the case on the
-CPU only, at 32 spp. Suspect: an unbounded density field gets
-no majorant grid (the global `density_max` instead), so every beam merge's transmittance along
-the beam and the camera ray ratio-tracks the whole way with a pattern-VM density evaluation per
-step, over beams up to 8 scene radii long. To confirm: FTRACE_MSTATS-style split of the gather's
-time, and the same scene bounded (to the scene's sphere) for comparison. Proper fix, if so: a
-majorant grid over the region the paths can reach (the scene's sphere) for an unbounded field,
-with the global majorant outside it.
+The report: check_haze_domain's `field` scene (a 2x2 floor and a ball under a sun in
+`medium { sigma_t 0.06  albedo 0.5  density "0.3 + 0.7*saturate(1.0 - y/8.0)"  density_max 1 }`,
+no bounds) rendered in mode J at 27 s for 2 spp on the CPU, and on the GPU at about **10 minutes a
+sample** (0.434.31-32: 632 and 645 s for 1 spp). The first suspect, ratio tracking through a field
+with no majorant grid, was ruled out by the diagnosis above (`-beamk 8` alone made it 30x faster).
+check_haze_domain renders the case at 32 spp on the CPU, and on the GPU at 32x24 and 4 spp
+(`fieldlo`, ~80 s a seed), where it exercises the resume passes.
 
 ## DONE (2026-11-07, 0.434.29): J-BEAM-FARLIMIT — under a blur, mode J cut its beams in an unbounded haze at the instant's sphere
 
@@ -748,8 +767,14 @@ connections were then weighed up to the whole path, and the average came out bri
 chance of an empty map times the merges' share -- since 0.434.29 kept such epochs, and on the
 device's per-chunk surface maps always. A merge technique is now the render's: an empty map keeps
 its kappa (`nEmitted` and the radius) and gathers nothing. Where no light subpath can reach a
-vertex its merge terms are 0 anyway, so a technique left on costs nothing there; a map empty for
-want of any scattering medium stays off, as before.
+vertex its merge terms are 0 anyway, so a technique left on costs nothing there. **0.434.34 (review
+of 7ffef79..a44d07f) finished it:** an empty refresh's beam map had kept the build's default radius
+(0.02 m, no chords to measure a mean free path from), so its kappa was some 70 times too small under
+the automatic radius; it now takes the last measured map's radii, scaled to its place in the shrink
+schedule. Epoch 0 drawing empty still leaves the beams off for the render (plain mode D, unbiased):
+no map has measured a radius for it to borrow. On the device a map of one sub-beam has a tree again
+(the host builds it, the LBVH refusing one primitive), and a map without MIS partials gathers at
+weight 1 again, as on the host, rather than not at all.
 
 ## FIXED (2026-11-07, 0.434.29; opened 2026-11-05, 0.434.16, widened 2026-11-06): HAZE-BLUR-DOMAIN — modes D and J's sun subpaths take less unbounded haze than their NEE leg: 1-2 % bright in a still scene, more for a mover far out under a blur
 

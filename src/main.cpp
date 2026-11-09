@@ -20141,6 +20141,10 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
         long long nBlurJ = 0;        // the subpaths a clock blur's epoch draws (0: Nepoch's own)
         long long lastNepochJ = 0;   // the subpaths the last light side drew
         long long nAllJ = 0;         // the subpaths epoch 0 settled on, every refresh's ceiling
+        // The last beam map that measured its radii (one with chords), and its place in the
+        // radii's shrink schedule: what a refresh whose map draws empty takes for its own.
+        std::vector<float> beamRadMedSeen;
+        double beamRadSeen = 0.0, beamRadScaleSeen = 1.0;
         auto buildLightSide = [&](uint64_t epoch, uint64_t saltOff = 0) {
             RngSaltScope saltScope(epoch + saltOff);
             const bool first = (epoch == 0);
@@ -20323,6 +20327,22 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
                 buildBeamMap(bmap, "mode J:",
                              (double)res * (double)resY * (double)(spp > 0 ? spp : 16),
                              /*quiet*/!first, &scene, beamRadScaleFor(epoch + lsEpochBase));
+                // A refresh whose map drew empty measured no radius (the build had no chords to
+                // take a mean free path from), but its merges keep their kappa (renderRows), which
+                // reads the radius: take the last measured map's, scaled to this epoch's place in
+                // the shrink schedule. Epoch 0 has none to take; the dispatcher leaves the beams
+                // off if it draws empty (see beamsPtr).
+                const double rScale = beamRadScaleFor(epoch + lsEpochBase);
+                if (!bmap.beams.empty()) {
+                    beamRadMedSeen = bmap.radMed;
+                    beamRadSeen = bmap.radius;
+                    beamRadScaleSeen = rScale;
+                } else if (beamRadSeen > 0.0) {
+                    const double f = rScale / beamRadScaleSeen;
+                    bmap.radMed = beamRadMedSeen;
+                    for (float& r : bmap.radMed) r = (float)((double)r * f);
+                    bmap.radius = beamRadSeen * f;
+                }
                 bdpt::jWork().light.fetch_add(bdpt::jWorkBeamBuild(bmap.beams.size()),
                                               std::memory_order_relaxed);
             }
@@ -20457,7 +20477,10 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
         // per-ray but never entered — which is what makes gate (1)'s "bit-identical to mode D"
         // a property of the code rather than of floating-point luck. Same for the photons.
         // Whether each is there is settled by epoch 0; which realization they point at moves
-        // with the epoch (realize).
+        // with the epoch (realize). A later refresh that draws empty is passed as it is, and
+        // keeps its merges' kappa (renderRows). Epoch 0 drawing empty leaves the beams off for
+        // the render -- plain mode D, unbiased -- because no map has measured a radius yet for
+        // an empty one to borrow (realize).
         const BeamMap* beamsPtr = (wantBeams && !curB->empty()) ? curB : nullptr;
         const bdpt::SurfMap* photonsPtr =
             (wantSurf && !curS->empty() && curS->nEmitted > 0) ? curS : nullptr;

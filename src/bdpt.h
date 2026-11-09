@@ -4546,11 +4546,9 @@ struct BdptRenderer {
         // gathers nothing. Dropping the technique for that epoch would weigh its connections up
         // to the whole path, and the average would come out bright by the chance of an empty
         // map times the merges' share. Where no light subpath can reach a vertex its merge
-        // terms are 0 in every weight anyway, so a technique left on costs nothing there. A
-        // map that is empty and could be nothing else (no scattering medium for beams) stays
-        // off, as before.
-        const bool mergeOn = beams && beams->nEmitted > 0 &&
-                             (!beams->empty() || scene.hasScatteringMedia());
+        // terms are 0 in every weight anyway, so a technique left on costs nothing there. The
+        // dispatcher passes a map only where the render has the technique (main.cpp beamsPtr).
+        const bool mergeOn = beams && beams->nEmitted > 0;
         // The merge technique's constant: its sample count (one beam map per frame, built
         // from `nEmitted` light subpaths) times the 1D kernel's full width. Zero unless the
         // map actually carries MIS partials, and that zero is what makes every merge term

@@ -5,8 +5,8 @@
 
 A white ball of radius 1 under `light sun` in `medium { sigma_t 0.04  albedo 0.5 }` with no
 bounds, beside a 2x2 floor; and, held still, the same with a bounded cloud the sun's first leg
-crosses, and with the haze a density field instead (that also held 32 m out, in mode D). Mode R's NEE leg dims the sun by the haze out
-to the instant's sphere (Scene::mediaExitDistance: |centre - p| + sceneRadius); a light subpath
+crosses, and with the haze a density field instead (that also held 32 m out, in mode D, and at
+32x24 for mode J on the GPU). Mode R's NEE leg dims the sun by the haze out to the instant's sphere (Scene::mediaExitDistance: |centre - p| + sceneRadius); a light subpath
 of modes D and J walks it from the entry disc's plane, never as far. Before the subpaths took the
 NEE leg's haze (sunLegFactor, the user's option (a)), D read the ball 1.75 % bright still,
 0.3 % with the ball held by a shutter at x = 6.4 outside the instant's sphere, and 2.75 % at
@@ -26,11 +26,13 @@ import numpy as np
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 NL = chr(10)
+FIELDLO_GPU_J_SPP = 4   # fieldlo, GPU mode J: ~80 s a seed
 FIELD = ('medium { sigma_t 0.06  albedo 0.5  density "0.3 + 0.7*saturate(1.0 - y/8.0)"  '
          'density_max 1 }')
 
 
-def scene(still, keys=8.0, at=6.4, medium="medium { sigma_t 0.04  albedo 0.5 }", extra=""):
+def scene(still, keys=8.0, at=6.4, medium="medium { sigma_t 0.04  albedo 0.5 }", extra="",
+          res=(96, 72)):
     move = ("sphere { center %g 1 0  radius 1  material w }" % at) if still else (
         "group { motion { key { translate %g 0 0 } key { translate %g 0 0 } }  "
         "sphere { center 0 1 0  radius 1  material w } }" % (-keys, keys))
@@ -42,8 +44,8 @@ def scene(still, keys=8.0, at=6.4, medium="medium { sigma_t 0.04  albedo 0.5 }",
         medium,
         "quad { origin -1 0 -1  u 0 0 2  v 2 0 0  material w }",
         move] + ([extra] if extra else []) + [
-        'camera "c" { eye %g 1.5 6  look_at %g 1 0  up 0 1 0  fov_y 30  %sfilm { res 96 72 } }'
-        % (at, at, shutter)]) + NL
+        'camera "c" { eye %g 1.5 6  look_at %g 1 0  up 0 1 0  fov_y 30  %sfilm { res %d %d } }'
+        % (at, at, shutter, res[0], res[1])]) + NL
 
 
 def load(p):
@@ -71,6 +73,9 @@ def main():
                                          "bounds { min 5.4 2.6 -1  max 7.4 3.4 1 } }"),
               # a density field with no bounds: the factor drawn by the medium's own estimator
               "field": scene(True, medium=FIELD),
+              # ...the same at 32x24, for mode J on the GPU: its map yields ~1e5 hits a camera
+              # path, which overfills the wavefront's hit queue and exercises the resume passes
+              "fieldlo": scene(True, medium=FIELD, res=(32, 24)),
               # ...and held 32 m out under a blur, where the walk began further out than the NEE
               # leg reaches: the factor's inverse, by quadrature (mode D only: J-FIELD-SLOW)
               "farfield": scene(False, 40.0, 32.0, medium=FIELD)}
@@ -79,12 +84,24 @@ def main():
             f.write(text)
     fails = []
 
+    def spp_for(name, mode, dev):
+        """Samples per pixel for one case, or None to skip it. Mode J in an unbounded density
+        field is slow (J-FIELD-SLOW): ~14 s a sample at 96x72 on the CPU, and on the GPU ~20 s a
+        sample at 32x24 (0.434.34), so the CPU renders `field` and the GPU `fieldlo`."""
+        if mode == "R":
+            return 512
+        if name == "farfield" and mode == "J":
+            return None
+        if name == "field" and mode == "J":
+            return 32 if dev == "cpu" else None
+        if name == "fieldlo":
+            return FIELDLO_GPU_J_SPP if (mode == "J" and dev == "gpu") else None
+        return 512 if mode == "D" else 1024
+
     def render(name, mode, dev, seed):
         tag = "%s_%s_%s_s%d" % (name, mode, dev, seed)
         png = os.path.join(d, tag + ".png")
-        spp = {"R": "512", "D": "512", "J": "1024"}[mode]
-        if name == "field" and mode == "J":
-            spp = "32"   # mode J in an unbounded density field runs ~8 s a sample here (J-FIELD-SLOW)
+        spp = str(spp_for(name, mode, dev))
         for stale in (png, png[:-4] + ".pfm"):   # a render that writes nothing must not pass
             if os.path.exists(stale):
                 os.remove(stale)
@@ -103,12 +120,8 @@ def main():
         for dev in devs:
             for mode in ("D", "J"):
                 case = "%s_%s_%s" % (name, mode, dev)
-                if only and case not in only:
+                if (only and case not in only) or spp_for(name, mode, dev) is None:
                     continue
-                if name == "farfield" and mode == "J":
-                    continue
-                if name == "field" and mode == "J" and dev == "gpu":
-                    continue   # ~10 min a sample on the GPU (J-FIELD-SLOW)
                 key = (name, dev)
                 if key not in refs:
                     refs[key] = [render(name, "R", dev, s) for s in (1, 2)]
