@@ -623,13 +623,16 @@ Four consequences worth knowing:
     many it queued (`DWfQueue::resume`) and is walked again in a **resume pass** after
     `kWfBeamEval` has drained the queue, skipping those — the tree fixes the walk's order, so
     every candidate is queued exactly once, and a pass always queues at least one, so the passes
-    end. A stop ends them early. **A GPU mode D/J chunk can be cut short:** it renders into
-    scratch films, folded into the totals (`kFilmFold`) only once it has landed whole, and the
-    kernels -- `kBdptT` every 8 paths, the inline beam gather, `kWfBeamHits` every 64 nodes -- read
-    the device stop flag `renderBdptCuda` owns for a chunked render (`DeviceStopFlag`, which mode M's
-    gather owns the same way); a chunk a stop cut short is dropped and `gpuSppChunks` flushes the
-    whole chunks before it as final (the `abandoned` contract `cpuSppChunks` keeps;
-    `tools/check_gpu_stop.py`). (Until 0.434.34 overflowing hits were evaluated on the spot inside `kWfBeamHits`, one
+    end. A stop ends them early. **A GPU mode D/J chunk can be cut short.** The device keeps its
+    own copy of the stop flag -- one int of mapped pinned host memory for the life of the process
+    (`deviceStopFlag`), written by whoever raises or clears the stop (`main.cpp` `raiseStop` /
+    `clearStop`, through `ft::stopMirrorSlot`). Its pointer is published to the kernels only inside
+    a `DeviceStopScope`, which a chunked `renderBdptCuda` and mode M's gather open: `kBdptT` reads it
+    every 8 paths, the inline beam gather every 64 nodes, `kWfBeamHits` every ~1 ms of clock. A
+    chunk a stop cut short is dropped -- its partial sums are never downloaded, the films freed
+    unread -- and `gpuSppChunks` flushes the whole chunks before it as final (the `abandoned`
+    contract `cpuSppChunks` keeps); an epoch loop whose epoch thus produced nothing flushes the
+    epochs before it (`tools/check_gpu_stop.py`). (Until 0.434.34 overflowing hits were evaluated on the spot inside `kWfBeamHits`, one
     thread a segment: harmless at `_fog_cornell`'s rate, ~20× slower a hit with an unbounded
     density field's ~10⁵ hits a path, J-FIELD-SLOW.) The wave floor is 256 paths.
     `tools/check_wf_resume.py` renders a fog with the hit queue shrunk (`FTRACE_WFHITCAP`) and

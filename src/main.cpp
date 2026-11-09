@@ -14236,7 +14236,8 @@ static bool jSkipHostBvh() {
 struct BeamRadiiPin {
     std::vector<float> radMed;   // per medium (BeamMap::radMed)
     double radius = 0.0;         // the scalar beyond them; 0 = not recorded yet
-    double floorNeed = 0.0;      // the recorded map's BeamMap::floorNeed
+    double floorNeed = 0.0;      // the recorded map's BeamMap::floorNeed,
+    double slackScale = 1.0;     // ...its BeamMap::slackScale,
     long long n = 0;             // ...and the subpaths it was drawn from (BeamMap::nEmitted)
     bool recorded() const { return radius > 0.0; }
     // `bm`'s radii divided by `scale`: the radius-shrink factor it was built at, so that
@@ -14246,16 +14247,23 @@ struct BeamRadiiPin {
         for (float& r : radMed) r = (float)((double)r / scale);
         radius = bm.radius / scale;
         floorNeed = bm.floorNeed;
+        slackScale = bm.slackScale;
         n = bm.nEmitted;
     }
     // The recorded radii at `scale`. `nTo` > 0: for a map drawn from that many subpaths, as its
-    // own build would have chosen them -- the -beamk floor, which raised the recorded radii by
-    // max(1, floorNeed), raises these by max(1, floorNeed * n / nTo), a gathered count being
-    // proportional to the subpaths (a clock blur's epochs draw fewer than epoch 0).
+    // own build would have chosen them (a clock blur's epochs draw fewer than epoch 0). The -beamk
+    // floor, which raised the recorded radii by max(1, floorNeed), raises these by
+    // max(1, floorNeed * n / nTo), a gathered count being proportional to the subpaths; and where
+    // the -beamareaslack ceiling capped the recorded radii (slackScale < 1) it caps these at the
+    // same radius, its bound being a per-beam area ratio, whatever the count. Equal counts give
+    // the recorded radii exactly.
     void applyTo(BeamMap& bm, double scale = 1.0, long long nTo = 0) const {
         double f = scale;
-        if (nTo > 0 && n > 0 && floorNeed > 0.0)
-            f *= std::max(1.0, floorNeed * (double)n / (double)nTo) / std::max(1.0, floorNeed);
+        if (nTo > 0 && n > 0 && floorNeed > 0.0) {
+            double w = std::max(1.0, floorNeed * ((double)n / (double)nTo)) / std::max(1.0, floorNeed);
+            if (slackScale < 1.0) w = std::min(w / slackScale, 1.0);
+            f *= w;
+        }
         bm.radMed = radMed;
         for (float& r : bm.radMed) r = (float)((double)r * f);
         bm.radius = radius * f;
@@ -16497,12 +16505,23 @@ static void compareFilms(const Film& fwd, long long Nfwd, const Film& ref, long 
 // and returns -- while a second Ctrl-C restores the default handler and force-quits.
 // A sig_atomic_t flag is the only state a signal handler may touch portably.
 static volatile std::sig_atomic_t g_stopRequested = 0;
+// Raise and clear the stop: the host flag, then the device's copy of it (ft::stopMirrorSlot),
+// so GPU kernels see it too. Every stop goes through these; a plain store each, so a signal
+// handler may call them.
+static void raiseStop() {
+    g_stopRequested = 1;
+    if (volatile int* m = ft::stopMirrorSlot().load(std::memory_order_relaxed)) *m = 1;
+}
+static void clearStop() {
+    g_stopRequested = 0;
+    if (volatile int* m = ft::stopMirrorSlot().load(std::memory_order_relaxed)) *m = 0;
+}
 // -stop-exit <code>: the exit code of a render ended early by -stop or Ctrl-C (0: the usual 0),
 // so a driver can tell a part-rendered image from a finished one (loom's render_range).
 static int g_stopExitCode = 0;
 static void onInterrupt(int sig) {
     if (g_stopRequested) { std::signal(sig, SIG_DFL); std::raise(sig); return; }
-    g_stopRequested = 1;
+    raiseStop();
 }
 
 // --- External graceful stop (`ftrace -stop [<pid>|all]`) -----------------------
@@ -16624,7 +16643,7 @@ static void stopChannelStart(const std::string& what) {
                             "(any render in progress writes its image + checkpoint first).\n");
                 std::fflush(stdout);
                 g_extStopRequested.store(true);
-                g_stopRequested = 1;   // the one flag every render loop already polls
+                raiseStop();   // the one flag every render loop already polls
                 return;                // one-shot: never re-arm behind a later frame
             }
             std::this_thread::sleep_for(std::chrono::milliseconds(250));
@@ -17074,7 +17093,7 @@ static void liveWindowUpdate(const Film& f, double N, double expComp, bool absol
     if (!g_showWindow || N <= 0.0) return;
     if (!final && g_liveWin && g_liveWin->minimized()) {
         setLiveTitle(status ? std::string(status) : std::string());
-        if (g_liveWin->closed()) g_stopRequested = 1;
+        if (g_liveWin->closed()) raiseStop();
         g_lastWindowPaint = std::chrono::steady_clock::now();
         static const bool dbgMin = [] { const char* e = std::getenv("FTRACE_WINDOW_DEBUG");
                                         return e && *e && std::strcmp(e, "0"); }();
@@ -17112,7 +17131,7 @@ static void liveWindowUpdate(const Film& f, double N, double expComp, bool absol
         st = st.empty() ? std::string(note) : st + "  \xC2\xB7  " + note;
     }
     setLiveTitle(st);   // cached for the DONE prefix
-    if (g_liveWin->closed()) g_stopRequested = 1;
+    if (g_liveWin->closed()) raiseStop();
     g_lastWindowPaint = std::chrono::steady_clock::now();
     const double cost = std::chrono::duration<double>(g_lastWindowPaint - tPaint).count();
     // The first repaint still runs cold — lazy spectral tables, an untouched framebuffer —
@@ -20279,6 +20298,7 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
                                 (!useGpu && !budgetedJ && !blurEpochsJ)
                                     ? "render's work (counted, so the CPU repeats itself)"
                                     : "wall clock");
+                if (firstRedraw) std::fflush(stdout);   // a log watcher's sign that epoch 0 landed
             }
             // A media-free `-jsurf` run gets its OWN sentence rather than the beam one, because
             // the beam sentence would be a lie there in the specific way that matters: it names
@@ -20885,6 +20905,10 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
                 }
                 if (epochSpp <= 0) {           // produced nothing; refreshing again cannot help
                     if (drew) { --nRealized; keepLightEpochs(); }   // a realization the film lacks
+                    // A stop that dropped the epoch's first chunk left it no report, so the
+                    // epochs before it are flushed here, as the final image and checkpoint.
+                    if (ft::stopRequested() && sppAll > 0 && prog && prog->report)
+                        prog->report(acc, sppAll, /*final*/true);
                     break;
                 }
                 acc.merge(f);
@@ -21272,6 +21296,10 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
                 }
                 if (epochSpp <= 0) {           // produced nothing; refreshing again cannot help
                     if (drew) --nRealM;        // a realization the film lacks
+                    // A stop that dropped the epoch's first chunk left it no report, so the
+                    // epochs before it are flushed here, as the final image and checkpoint.
+                    if (ft::stopRequested() && sppAll > 0 && prog && prog->report)
+                        prog->report(acc, sppAll, /*final*/true);
                     break;
                 }
                 acc.merge(f);
@@ -25781,7 +25809,7 @@ static int run(int argc, char** argv) {
             const int  kmn = adaptive ? std::min(N, kMeterMin) : N;
             MeterConverge conv(kmn, kmx, kMeterTolStops);
             for (const auto& mc : cams) {
-                if (g_liveWin && g_liveWin->closed()) { g_stopRequested = 1; break; }
+                if (g_liveWin && g_liveWin->closed()) { raiseStop(); break; }
                 double a = 0.0;
                 std::vector<uint8_t> mimg =
                     rasterOne(mc.cam, mc.res, mc.resY, /*exposure*/1.0, /*autoExpose*/true, &a);
@@ -25860,7 +25888,7 @@ static int run(int argc, char** argv) {
                     g_liveWin->update(W, H, img);
                     tail.push_back(std::chrono::duration<double, std::milli>(
                                        std::chrono::steady_clock::now() - t1).count());
-                    if (g_liveWin->closed()) g_stopRequested = 1;
+                    if (g_liveWin->closed()) raiseStop();
                 }
             }
 #ifdef HAVE_CUDA
@@ -25888,7 +25916,7 @@ static int run(int argc, char** argv) {
                     if (!ok) { zc.clear(); break; }   // no interop here: report it, don't fake it
                     zc.push_back(std::chrono::duration<double, std::milli>(
                                      std::chrono::steady_clock::now() - t0).count());
-                    if (g_liveWin->closed()) g_stopRequested = 1;
+                    if (g_liveWin->closed()) raiseStop();
                 }
             }
             raster_cuda::Prof profZc = raster_cuda::profTake();     // phase 2's per-pass tally
@@ -25995,7 +26023,7 @@ static int run(int argc, char** argv) {
                 g_liveWin->update(W, H, img);
                 g_windowFrame = frameLabel(rc, (size_t)frame + 1, toRender.size());
                 setLiveTitle("");
-                if (g_liveWin->closed()) g_stopRequested = 1;
+                if (g_liveWin->closed()) raiseStop();
             }
             if (toRender.size() > 1) {
                 if (frame % 15 == 0 || frame + 1 == (int)toRender.size())
@@ -28117,7 +28145,7 @@ static int run(int argc, char** argv) {
 #ifdef HAVE_CUDA
             if (traceSess) backwardRGBSessionEnd(traceSess);   // free the resident preview session
 #endif
-            g_stopRequested = 1;   // window closed → done
+            raiseStop();   // window closed → done
         }
 #ifdef HAVE_CUDA
         raster_cuda::destroy(gpuRaster);
@@ -29954,7 +29982,7 @@ static int runServe(int argc, char** argv, int inValPos) {
         // An EXTERNAL stop (-stop) means "shut this process down", not "abandon this
         // frame", so it must not be cleared and re-entered like a per-frame Ctrl-C.
         if (g_extStopRequested.load()) break;
-        g_stopRequested = 0;   // clear any prior clean-stop request before the new frame
+        clearStop();   // clear any prior clean-stop request before the new frame
         try {
             rc = run(argc, argv);
         } catch (const std::exception& e) {

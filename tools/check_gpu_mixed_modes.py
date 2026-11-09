@@ -2,11 +2,11 @@
 
     python tools/check_gpu_mixed_modes.py [--out png/check_gpu_mixed_modes] [--exe ftrace.exe]
 
-Mode M's GPU gather publishes a mapped host flag in the device global `g_dGatherStop`, which the
-gather's kernels poll for `-stop`, and frees the flag when it returns. Kernels of other modes
-read the same global (dGatherStopped). Until 0.434.35 the global was left pointing at the freed
-mapping, so the next mode J camera of the same run faulted in its first wavefront launch ("wf-hits
-kernel failed: an illegal memory access was encountered") -- GATHER-STOP-DANGLING. The scene is
+Mode M's GPU gather publishes device globals its kernels read -- the stop flag
+(`g_dGatherStop`, DeviceStopScope) and its progress counter (`g_dGatherDone`) -- and kernels of
+other modes read the same globals. One left pointing at memory freed when the gather returned
+makes the next mode J camera of the run fault in its first wavefront launch ("wf-hits kernel
+failed: an illegal memory access was encountered"; GATHER-STOP-DANGLING). The scene is
 fogbox.py's box under a homogeneous fog with two cameras, `m` in mode M (with -beams) and then
 `j` in mode J; the run must exit 0 and write both images, and mode J must report its wavefront
 gather.

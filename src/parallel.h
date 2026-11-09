@@ -56,6 +56,17 @@ inline bool stopRequested() {
     return p && p();
 }
 
+// The DEVICE's copy of the stop flag: an int in mapped pinned host memory that GPU kernels
+// read (render_cuda.cu, deviceStopFlag), registered once by the CUDA backend and unregistered
+// before its context is torn down. Whoever raises or clears the stop (main.cpp's raiseStop /
+// clearStop, a signal handler among them) writes it too, with a plain store, so the
+// kernels see a stop the moment it is raised. Null when no device has asked for it.
+inline std::atomic<volatile int*>& stopMirrorSlot() {
+    static std::atomic<volatile int*> p{nullptr};
+    return p;
+}
+inline void setStopMirror(volatile int* m) { stopMirrorSlot().store(m); }
+
 // Run fn(i) for i in [0, n), in parallel when that is worth the thread setup.
 // `grain` is the chunk size handed to a worker at a time AND the serial cutoff: fewer
 // than 2*grain items runs inline. fn must be safe to call concurrently for distinct i.

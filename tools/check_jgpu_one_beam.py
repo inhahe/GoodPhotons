@@ -3,14 +3,14 @@
     python tools/check_jgpu_one_beam.py [--out png/check_jgpu_one_beam] [--exe ftrace.exe]
 
 GPU mode J builds its beam tree on the device (an LBVH; the host skips its own). An LBVH of one
-primitive has no internal node, and until 0.434.36 such a map reached the device with no tree:
-its merges kept their weight and gathered nothing, the realization silently dark by their
-share. Since 0.434.37 buildBeamLbvhDevice makes the one leaf the root, and renderBdptCuda ends
-the process on a map with beams and no tree, so a regression fails this check loudly. The scene
-is fogbox.py's box filled by a homogeneous fog, so its light lies inside the medium: with one
-light subpath a realization (-n 1), no bounce after the first (-max-bounce 1) and no splitting
-(-beamsplit 1000), every realization is exactly one chord, whatever the random numbers. Sixteen
-of them (-beamepochs spp). The render must exit 0, build the one-leaf LBVH, and write its image.
+primitive has no internal node: its one leaf must be the root, or the map reaches the device with
+no tree, its merges keeping their weight and gathering nothing -- the realization silently dark
+by their share. renderBdptCuda ends the process on a map with beams and no tree, so such a
+regression fails this check loudly. The scene is fogbox.py's box filled by a homogeneous fog, so
+its light lies inside the medium: with one light subpath a realization (-n 1), no bounce after
+the first (-max-bounce 1) and no splitting (-beamsplit 1000), every realization is exactly one
+chord, whatever the random numbers. Sixteen of them (-beamepochs spp). The render must exit 0,
+build the one-leaf LBVH, and write its image.
 
 Exits 1 on any failure.
 """

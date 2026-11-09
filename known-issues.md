@@ -72,6 +72,31 @@ closed entries, where the cost is a broken historical link rather than a blocked
 Three references — `scenes/_gr_fly0.ftsl`, `scenes/silver_sphere_xenon.ftsl`, `scenes/x.ftsl` —
 name files that no longer exist at all, all in closed entries.
 
+## NOTED (2026-11-09, the machine, not ftrace): BUGCHECK-INTSTEER — a blue screen during a CPU mode J render was corrupted Windows kernel memory
+
+At ~08:19:40 on 2026-11-09 the machine bugchecked (0x1E KMODE_EXCEPTION_NOT_HANDLED) while
+check_haze_domain rendered `near_J_cpu_s2` (CPU mode J, live window minimized; the GPU idle for an
+hour). Analysed from the minidump with the kernel's own symbols (ntkrnlmp.pdb
+B661C6FE72991D160FE37C48B8BC54701, Windows 11 build 26300, an Insider build): the fault is in
+`nt!KeIntSteerSnapPerf+0x15f`, Windows' interrupt steering, unlinking an entry from a kernel list
+whose back-pointer had its upper 32 bits overwritten (`0x0080a6243e796230` where the neighbour is
+`ffffc0813e796220`). The routine is the victim: something else had written over that memory.
+`ftrace.exe` is only the thread that happened to be on the CPU (the render held all 32 cores), and
+a user-mode process cannot write kernel memory. No WHEA errors in 60 days, and a 32-bit overwrite
+is not a bit flip, so a driver (or the preview kernel) is likelier than RAM. Of the third-party
+drivers loaded, two Google Drive file-system drivers ran at once (3.2452 and a stale 3.1931).
+Process Lasso was ruled out: no kernel driver, no affinity rules, its IRQControl never used (the
+only interrupt policies are Windows' defaults for the storage controllers). The minidump holds no
+kernel pool, so the owner of the damaged block is unknown.
+
+**Machine settings applied the same day (take effect after a reboot):** TDR as on the other machine
+(`TdrLevel=3`, `TdrDelay=60`, `TdrDdiDelay=60`; see the July entry below), and crash dumps switched
+to automatic memory dumps (`CrashControl\CrashDumpEnabled=7`, `C:\Windows\MEMORY.DMP`) so a
+recurrence names the driver from its pool tag. To read a dump: copy it out elevated, then
+`cdb -z <dmp> -i C:/Windows/System32 -y C:\symbols;srv*C:\symbols*https://msdl.microsoft.com/download/symbols`
+(backslashes in the `srv*` store: with forward slashes the symbol download silently fails; the
+`-i` image path gives the debugger the kernel's PDB identity, which a minidump lacks).
+
 ## FIXED (2026-11-08, 0.434.35; opened 0.434.34): GATHER-STOP-DANGLING — a GPU run that rendered a mode M camera and then a mode J camera crashed
 
 `renderPhotonMapSharedCuda` (render_cuda.cu) allocates a mapped pinned int, publishes its device
@@ -90,11 +115,16 @@ queue's `segCap` from cdb). 0.434.35 left that half alone, as `gpuSppChunks` kep
 launched (a gather a stop cut short would have been kept, dark). **0.434.37 (review of
 f6f9981..d1882f8)** made the GPU's mode D/J chunks abortable instead -- a chunk is not always
 short: under `-beamepochs` they are pinned to 1 spp, which on J-FIELD-SLOW's field at 96x72 takes
-minutes. A chunked `renderBdptCuda` owns the device stop flag through `DeviceStopFlag` (an RAII
-owner that restores the previous pointer before freeing, mode M's gather now its other user), its
-kernels poll it, the chunk renders into scratch films folded only when it lands whole, and one a
-stop cut short is dropped: `gpuSppChunks` flushes the whole chunks before it as final and marks
-the frame `abandoned`, as `cpuSppChunks` does.
+minutes. A chunked `renderBdptCuda` publishes the device stop flag, its kernels poll it, and a
+chunk a stop cut short is dropped: `gpuSppChunks` flushes the whole chunks before it as final and
+marks the frame `abandoned`, as `cpuSppChunks` does. **0.434.38 (review of 283a9b5)** settled the
+flag's ownership: one mapped int for the life of the process (`deviceStopFlag`), written where
+the stop is raised or cleared (`raiseStop` / `clearStop`, through `ft::stopMirrorSlot`) and only
+published inside a `DeviceStopScope`, so there is no per-call allocation or poller thread and
+nothing to free, and no published pointer can dangle. The scratch films 0.434.37 rendered chunks
+into went too: a dropped chunk's partial sums are never downloaded. And an epoch loop (modes J
+and M, either device) whose epoch a stop left empty -- its first chunk dropped, so no report --
+now flushes the epochs before it as the final image; before, it left without writing one.
 
 ## DONE (2026-11-05, 0.434.2): STOP-STALE-PID — `ftrace -stop` listed a crashed render under the unrelated process that inherited its pid
 
@@ -799,6 +829,9 @@ keeps no special case; and an empty epoch's radii are those its own build would 
 derived from epoch 0's: under a clock blur an epoch draws fewer subpaths than epoch 0, and the
 `-beamk` floor would have widened its radii by epoch 0's floor need times the ratio of the counts
 (`BeamMap::floorNeed`, `BeamRadiiPin::applyTo`), where plain epoch 0 radii left its kappa small.
+0.434.38 (review of 283a9b5): the floor need recorded is the factor actually applied when the
+floor bound (a probe that gathered nothing at the raw radii recorded none), and where the
+`-beamareaslack` ceiling capped epoch 0's radii an empty epoch is capped at the same radius.
 
 ## FIXED (2026-11-07, 0.434.29; opened 2026-11-05, 0.434.16, widened 2026-11-06): HAZE-BLUR-DOMAIN — modes D and J's sun subpaths take less unbounded haze than their NEE leg: 1-2 % bright in a still scene, more for a mover far out under a blur
 

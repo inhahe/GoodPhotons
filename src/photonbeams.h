@@ -745,12 +745,15 @@ struct BeamMap {
     // header note: the radius is derived from each medium's own measured mean free path, so a
     // dense cloud and a sparse rain curtain in the same scene get their own blur scale.
     std::vector<float> radMed;
-    // What buildAuto's `-beamk` floor asked of these radii: the floor over the count a probe
-    // gathered at the raw (blur x mfp) radii, so the floor raised them by max(1, floorNeed). 0 when
-    // unmeasured (an explicit or pinned radius, an empty map). A gathered count being
-    // proportional to the subpaths, this is what lets a map drawn from another count be given
-    // the radii its own build would have chosen (main.cpp BeamRadiiPin::applyTo).
+    // What buildAuto's two corrections did to the raw (blur x mfp) radii, so that a map drawn from
+    // another subpath count can be given the radii its own build would have chosen (main.cpp
+    // BeamRadiiPin::applyTo; a gathered count is proportional to the subpaths). `floorNeed`: the
+    // factor the `-beamk` floor raised them by when it bound, else how far it was from binding
+    // (the floor over the raw probe count, < 1); 0 when unmeasured (an explicit or pinned radius,
+    // an empty map, a floor of 0). `slackScale`: the `-beamareaslack` ceiling's factor, applied
+    // after the floor (< 1 when it capped them).
     double floorNeed = 0.0;
+    double slackScale = 1.0;
     // Mode J (UPBP) only, empty otherwise: the light half of every merge's MIS weight.
     // `mis` is indexed by the ORIGINAL (pre-split) beam; `misIdx` maps a current beam to
     // its entry and is filled by the first split. See BeamMis.
@@ -1375,7 +1378,6 @@ struct BeamMap {
         // re-measures, so three rounds cover 4096x — far beyond any real shortfall.
         info.probeK0 = probeGatherCount(bb);
         info.probeK  = info.probeK0;
-        floorNeed = (targetK > 0.0 && info.probeK0 > 0.0) ? targetK / info.probeK0 : 0.0;
         if (targetK > 0.0) {
             for (int round = 0; round < 3 && info.probeK < targetK; ++round) {
                 const double meas = std::max(info.probeK, 0.25);
@@ -1400,6 +1402,9 @@ struct BeamMap {
             }
         }
 
+        floorNeed = (info.floorScale > 1.0) ? info.floorScale
+                  : (targetK > 0.0 && info.probeK0 > 0.0) ? targetK / info.probeK0 : 0.0;
+        slackScale = info.slackScale;
         info.med  = st;
         info.rMin = info.rMax = st.empty() ? 0.0 : st[0].r;
         for (const MedStat& s : st) { info.rMin = std::min(info.rMin, s.r); info.rMax = std::max(info.rMax, s.r); }

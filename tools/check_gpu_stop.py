@@ -2,17 +2,20 @@
 
     python tools/check_gpu_stop.py [--out png/check_gpu_stop] [--exe ftrace.exe]
 
-Since 0.434.37 renderBdptCuda's chunks are abortable: the kernels read the device stop flag
-(DeviceStopFlag), each chunk renders into scratch films folded into the totals only once it has
-landed whole, and a chunk a stop cut short is dropped, gpuSppChunks flushing the whole chunks
-before it as final. Before, a chunk ran whole however long it took. The scene is
-check_haze_domain's density field at 48x36 under -beamepochs spp, which pins every GPU chunk to
-one sample, tens of seconds each (J-FIELD-SLOW). The check waits for the first sample to land,
-times it, asks the render to stop during the second, and requires:
+renderBdptCuda's chunks are abortable: inside a DeviceStopScope the kernels read the device
+stop flag, and a chunk a stop cut short is dropped, gpuSppChunks flushing the whole chunks
+before it as final. A build that runs a chunk whole before it stops fails here, as does one that
+keeps a cut chunk. The scene is check_haze_domain's density field at 48x36 under -beamepochs spp,
+which pins every GPU chunk to one sample, tens of seconds each (J-FIELD-SLOW) -- and makes each
+sample its own light-side epoch, so the stop cuts an epoch's first and only chunk. The check
+waits for the first sample to land (the refresh that opens the second epoch), times it, asks the
+render to stop during the second, and requires:
 
   - the process to be gone in under a third of a sample's time, which only a chunk cut short
     allows;
-  - the final status line to count the whole samples, 1, and the image to be written.
+  - the final status line to count the whole samples, 1, and the image to be written. With
+    -interval longer than the render no periodic write happens, so the image is the stop's own
+    final flush: an epoch loop that left without one writes none.
 
 Never kills the render: one that ignores the stop is reported, and left running.
 Exits 1 on any failure.
@@ -44,7 +47,8 @@ def main():
             os.remove(stale)
     logf = os.path.join(d, "field.log")
     cmd = [exe, "-in", ftsl, "-mode", "J", "-device", "gpu", "-spp", "8", "-seed", "1",
-           "-beamepochs", "spp", "-interval", "1", "-hdr", "-no-meter", "-window-min", "-o", png]
+           "-beamepochs", "spp", "-interval", "3600", "-hdr", "-no-meter", "-window-min",
+           "-o", png]
     check = fogbox.Checks(56)
     with open(logf, "w", encoding="utf-8") as lf:
         t0 = time.monotonic()
@@ -54,10 +58,10 @@ def main():
             with open(logf, encoding="utf-8", errors="replace") as f:
                 return f.read()
 
-        # The first sample: its status line, with the time it took from the start.
+        # The first sample: the refresh that opens the second epoch, timed from the start.
         t1 = None
         while p.poll() is None and time.monotonic() - t0 < 900:
-            if re.search(r"\[spp\] 1 / 8", log()):
+            if "light-side refresh" in log():
                 t1 = time.monotonic()
                 break
             time.sleep(0.25)
@@ -69,7 +73,8 @@ def main():
         sample = t1 - t0
         time.sleep(min(5.0, sample * 0.1))   # into the second sample
         ts = time.monotonic()
-        s = subprocess.run([exe, "-stop", str(p.pid)], capture_output=True, text=True)
+        s = subprocess.run([exe, "-stop", str(p.pid)], capture_output=True, text=True,
+                           encoding="utf-8", errors="replace")
         if s.returncode != 0:
             raise SystemExit("FAILED: pid %d ignored -stop (%s); left running"
                              % (p.pid, (s.stdout + s.stderr).strip()[-200:]))

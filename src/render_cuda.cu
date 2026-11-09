@@ -56,7 +56,7 @@
 #include <mutex>
 #include <condition_variable>
 #include <type_traits>           // kBdptT's per-MERGE scratch (DChromaRunNone)
-#include <memory>                // renderBdptCuda's DeviceStopFlag
+#include <memory>                // renderBdptCuda's DeviceStopScope
 #include <math.h>
 #include <float.h>
 
@@ -9313,7 +9313,9 @@ __global__ void kBeamTr0(DScene sc, const DBeamRec* beams, float* tr0, const int
 // segments, skipping their queued candidates. The walk's order is fixed by the tree, so the
 // skipped candidates are exactly the ones queued before, and every candidate is evaluated once,
 // in kWfBeamEval, with the random numbers its (segment, beam) pair keys whichever pass queued it.
-// A stop ends the walk (every 64 nodes) and defers nothing: renderBdptCuda drops the chunk.
+// A stop ends the walk and defers nothing: renderBdptCuda drops the chunk. Polled by elapsed
+// clock (~1 ms), not by node count: the flag is mapped host memory, a round trip over PCIe that a
+// dense map's few, long walks (J-FIELD-SLOW) could not hide every few dozen nodes.
 __global__ void kWfBeamHits(DScene sc, DBeamMap bm, DWfQueue q, int resumePass) {
     D_MOTION_CLEAR();   // this thread's time: the launch's (passU) until a path sets one
     const int nS = min(*q.nSegs, q.segCap);
@@ -9329,12 +9331,15 @@ __global__ void kWfBeamHits(DScene sc, DBeamMap bm, DWfQueue q, int resumePass) 
         Real tRoot;
         if (!boxHit(bm.nodes[0], oc, invD, (Real)0, tMax, tRoot)) continue;
         int stack[64]; int sp = 0; stack[sp++] = 0;
-        int stopPoll = 0;
+        long long nextPoll = clock64() + (1ll << 21);
         const int routeMedJ = sg.routeMedJ;   // once, not per candidate (q.hits aliases q.segs)
         int e = 0;           // candidates met so far, in walk order
         bool full = false;   // the hit queue turned this segment away: resume it next pass
         while (sp && !full) {
-            if ((++stopPoll & 63) == 0 && dGatherStopped()) break;
+            if (clock64() > nextPoll) {
+                if (dGatherStopped()) break;
+                nextPoll = clock64() + (1ll << 21);
+            }
             const DNode& n = bm.nodes[stack[--sp]];
             if (n.count > 0) {
                 for (int i = 0; i < n.count; ++i) {
@@ -19324,7 +19329,7 @@ kBdptT(DScene sc, const __grid_constant__ DCamera cam, double* camFilm, double* 
     const int C = (NS > 0) ? heroC : 1;
     // [idxBegin, idxEnd) is the wave the host is running (the whole chunk when the
     // wavefront gather is off); idxEnd <= totalSamples.
-    int stopPoll = 0;   // a stop ends the launch; its chunk is dropped (DeviceStopFlag)
+    int stopPoll = 0;   // a stop ends the launch; its chunk is dropped (DeviceStopScope)
     for (long long idx = idxBegin + g; idx < idxEnd; idx += G) {
         if ((stopPoll++ & 7) == 0 && dGatherStopped()) return;
         const long long slot = idx / chunkSpp;   // pixel slot (padded to whole runs when stratified)
@@ -23172,47 +23177,42 @@ __global__ void kDeviceProbe(unsigned long long* sizes, double* math, const doub
 
 // ============================ host: bake + launch ============================
 
-// THE DEVICE'S VIEW OF `-stop`, with one owner. A kernel cannot ask ft::stopRequested(), and the
-// thread that launched it is parked in a synchronize and can issue no CUDA call, so the flag
-// lives in MAPPED PINNED host memory: raised by a plain store from a poller thread, read by
-// gpu::dGatherStopped through the device global gpu::g_dGatherStop. A renderer owns one for the
-// span of its launches: published on construction, and on destruction unpublished -- the
-// previous owner's pointer put back, null outside every owner -- BEFORE the memory is freed, as
-// every mode's kernels read that one global and a pointer left at a freed mapping is an
-// illegal-address fault in the next of them (GATHER-STOP-DANGLING,
-// tools/check_gpu_mixed_modes.py). Only a renderer that drops a launch the stop cut short may
-// own one: one that kept it would keep a gather stopped part-way, dark.
-class DeviceStopFlag {
+// THE DEVICE'S VIEW OF `-stop`. A kernel cannot ask ft::stopRequested(), and the thread that
+// launched it is parked in a synchronize and can issue no CUDA call, so the device keeps its own
+// copy of the flag: one int of MAPPED PINNED host memory, allocated once and kept for the life of
+// the process (until cudaGracefulShutdown), which whoever raises or clears the stop writes too
+// (ft::stopMirrorSlot; main.cpp raiseStop / clearStop). Kernels read it through the device global
+// gpu::g_dGatherStop (dGatherStopped), which is published only inside a DeviceStopScope -- null
+// elsewhere, so a renderer that keeps whatever a launch wrote never sees a stop cut a gather short.
+// The memory being never freed, a published pointer cannot dangle (GATHER-STOP-DANGLING).
+static int* deviceStopFlag() {
+    static int* d = [] {
+        int* h = nullptr;
+        CUDA_CHECK(cudaHostAlloc((void**)&h, sizeof(int), cudaHostAllocMapped));
+        *h = 0;
+        ft::setStopMirror(h);              // from here on every raise or clear writes it...
+        if (ft::stopRequested()) *h = 1;   // ...and a stop raised before then is copied in
+        int* dp = nullptr;
+        CUDA_CHECK(cudaHostGetDevicePointer((void**)&dp, h, 0));
+        return dp;
+    }();
+    return d;
+}
+// While one lives, the kernels launched honour -stop (the previous scope's pointer is put back
+// when it ends, so scopes nest). Only for a renderer that drops a launch a stop cut short: one
+// that kept it would keep a gather stopped part-way, dark.
+class DeviceStopScope {
 public:
-    DeviceStopFlag() {
-        CUDA_CHECK(cudaHostAlloc((void**)&h_, sizeof(int), cudaHostAllocMapped));
-        *h_ = 0;
-        int* d = nullptr;
-        CUDA_CHECK(cudaHostGetDevicePointer((void**)&d, h_, 0));
+    DeviceStopScope() {
+        int* d = deviceStopFlag();
         CUDA_CHECK(cudaMemcpyFromSymbol(&prev_, gpu::g_dGatherStop, sizeof(int*)));
         CUDA_CHECK(cudaMemcpyToSymbol(gpu::g_dGatherStop, &d, sizeof(int*)));
-        poller_ = std::thread([this] {
-            while (!quit_.load(std::memory_order_relaxed)) {
-                if (ft::stopRequested()) { *(volatile int*)h_ = 1; return; }
-                std::this_thread::sleep_for(std::chrono::milliseconds(20));
-            }
-        });
     }
-    ~DeviceStopFlag() {
-        quit_.store(true, std::memory_order_relaxed);
-        if (poller_.joinable()) poller_.join();
-        cudaMemcpyToSymbol(gpu::g_dGatherStop, &prev_, sizeof(int*));   // no throw in teardown
-        cudaFreeHost(h_);
-    }
-    // Has a stop reached the device's kernels since this flag was published?
-    bool raised() const { return *(volatile const int*)h_ != 0; }
-    DeviceStopFlag(const DeviceStopFlag&) = delete;
-    DeviceStopFlag& operator=(const DeviceStopFlag&) = delete;
+    ~DeviceStopScope() { cudaMemcpyToSymbol(gpu::g_dGatherStop, &prev_, sizeof(int*)); }   // no throw
+    DeviceStopScope(const DeviceStopScope&) = delete;
+    DeviceStopScope& operator=(const DeviceStopScope&) = delete;
 private:
-    int* h_ = nullptr;
     int* prev_ = nullptr;
-    std::atomic<bool> quit_{false};
-    std::thread poller_;
 };
 
 static bool g_queried = false, g_available = false;
@@ -23428,6 +23428,7 @@ void cudaGracefulShutdown(bool force) {
     teardownLog("cuda: cudaDeviceSynchronize enter");
     cudaDeviceSynchronize();
     teardownLog("cuda: cudaDeviceSynchronize returned");
+    ft::setStopMirror(nullptr);   // the reset frees deviceStopFlag's memory: no stop may write it
     teardownLog("cuda: cudaDeviceReset enter");
     cudaDeviceReset();
     teardownLog("cuda: cudaDeviceReset returned");
@@ -25660,7 +25661,7 @@ static void gpuSppChunks(long long spp, const SppProgress& prog, Film& out,
     // A kernel launch is synchronous from here (cudaCheckKernel synchronizes), so while one
     // chunk is in flight this thread is parked in cuCtxSynchronize and CANNOT report, write
     // the -interval image or honour -time; a -stop reaches the chunk only where its kernels read
-    // the device stop flag and its launch drops it (renderBdptCuda: DeviceStopFlag). Normally
+    // the device stop flag and its launch drops it (renderBdptCuda: DeviceStopScope). Normally
     // that is fine: chunks are
     // retargeted to ~0.15 s. But if ANOTHER process on the machine is saturating the GPU,
     // even the minimum 1-spp chunk can take minutes-to-hours, and the render becomes
@@ -25823,30 +25824,19 @@ struct JBeamDev {
     JBeamDev& operator=(const JBeamDev&) = delete;
 };
 
-// Build an LBVH over `n` sub-beams already resident as `DBeamRec`s, and point `dbm` at it.
+// Build an LBVH over `n` >= 1 sub-beams already resident as `DBeamRec`s, and point `dbm` at it.
+// One sub-beam makes a one-node tree, its leaf the root (no internal node to build or refit).
 // `lo`/`hi` are the map's world bounds -- taken from the host BVH's root box, which is exactly
 // the same set of primitives, so no device reduction is needed for them.
-static bool buildBeamLbvhDevice(JBeamDev& d, const gpu::DBeamRec* beams, int n,
+static void buildBeamLbvhDevice(JBeamDev& d, const gpu::DBeamRec* beams, int n,
                                 const Aabb& bounds, double radMax, gpu::DBeamMap& dbm) {
-    if (n < 1) return false;
-    if (n == 1) {   // the one leaf is the root: no internal node to build or refit
-        ensureDevCap(d.order, d.orderCap, (size_t)1);
-        ensureDevCap(d.nodes, d.nodesCap, (size_t)1);
-        CUDA_CHECK(cudaMemset(d.order, 0, sizeof(int)));
-        gpu::kLbvhLeaves<<<1, 32>>>(beams, d.order, 1, (float)radMax, d.nodes);
-        cudaCheckKernel("lbvh-leaves");
-        dbm.nodes = d.nodes;
-        dbm.primIdx = d.order;
-        dbm.nNodes = 1;
-        return true;
-    }
     const size_t nNodes = (size_t)(2 * n - 1);
     ensureDevCap(d.code, d.codeCap, (size_t)n);
     ensureDevCap(d.order, d.orderCap, (size_t)n);
     ensureDevCap(d.parent, d.parentCap, nNodes);
     ensureDevCap(d.visited, d.visitedCap, (size_t)(n - 1));
     ensureDevCap(d.nodes, d.nodesCap, nNodes);
-    CUDA_CHECK(cudaMemset(d.visited, 0, (size_t)(n - 1) * sizeof(int)));
+    if (n > 1) CUDA_CHECK(cudaMemset(d.visited, 0, (size_t)(n - 1) * sizeof(int)));
 
     const gpu::DVec3 lo((gpu::Real)bounds.lo.x, (gpu::Real)bounds.lo.y, (gpu::Real)bounds.lo.z);
     auto inv = [](double e) { return (e > 0.0) ? 1.0 / e : 0.0; };
@@ -25876,7 +25866,6 @@ static bool buildBeamLbvhDevice(JBeamDev& d, const gpu::DBeamRec* beams, int n,
     dbm.nodes = d.nodes;
     dbm.primIdx = d.order;
     dbm.nNodes = (int)nNodes;
-    return true;
 }
 
 // ---- mode J's surface photon map, TRACED AND GRIDDED ON THE DEVICE -------------------
@@ -26529,20 +26518,16 @@ Film renderBdptCuda(const Scene& scene, const Camera& cam, int resX, int resY,
     double* d_splat = nullptr; CUDA_CHECK(cudaMalloc(&d_splat, npix * 3 * sizeof(double)));
     CUDA_CHECK(cudaMemset(d_cam,   0, npix * 3 * sizeof(double)));
     CUDA_CHECK(cudaMemset(d_splat, 0, npix * 3 * sizeof(double)));
-    // A CHUNKED render (gpuSppChunks) stops part-way: its kernels read the device stop flag, and a
-    // chunk the stop cut short is dropped -- so each chunk accumulates into scratch films, folded
-    // into the totals only once it has landed whole (mode M's kFilmFold). A single-shot render
-    // owns no flag and runs whole.
+    // A CHUNKED render (gpuSppChunks) stops part-way: its kernels honour the device stop flag
+    // (DeviceStopScope), and a chunk the stop cut short is dropped. Its partial sums in d_cam /
+    // d_splat need no undoing: gpuSppChunks downloads nothing after a dropped chunk, and the films
+    // are freed unread. A single-shot render honours no stop and runs whole.
     const bool abortable = prog && prog->report;
-    std::unique_ptr<DeviceStopFlag> stopFlag;
-    double* s_cam = nullptr;
-    double* s_splat = nullptr;
-    if (abortable) {
-        stopFlag = std::make_unique<DeviceStopFlag>();
-        CUDA_CHECK(cudaMalloc(&s_cam,   npix * 3 * sizeof(double)));
-        CUDA_CHECK(cudaMalloc(&s_splat, npix * 3 * sizeof(double)));
-    }
-    auto stopped = [&] { return abortable && stopFlag->raised(); };
+    std::unique_ptr<DeviceStopScope> stopScope;
+    if (abortable) stopScope = std::make_unique<DeviceStopScope>();
+    // The host's own flag, raised before the device's copy (main.cpp raiseStop): a launch whose
+    // kernels saw the stop always reads true here.
+    auto stopped = [&] { return abortable && ft::stopRequested(); };
     // Resume (mode D disk resume): fresh samples carry ABSOLUTE indices
     // [sppBase, sppBase + spp), so the kernel's stride is the FINAL total (see
     // renderBackwardCuda for why). The loaded sample count is also mixed into the seed
@@ -26836,14 +26821,6 @@ Film renderBdptCuda(const Scene& scene, const Camera& cam, int resX, int resY,
     // Returns whether the chunk landed whole (it is folded into the totals) or a stop cut it
     // short (dropped).
     auto launch = [&](long long cAll, long long baseAll) -> bool {
-      double* camT = d_cam;
-      double* splatT = d_splat;
-      if (abortable) {
-          CUDA_CHECK(cudaMemset(s_cam,   0, npix * 3 * sizeof(double)));
-          CUDA_CHECK(cudaMemset(s_splat, 0, npix * 3 * sizeof(double)));
-          camT = s_cam;
-          splatT = s_splat;
-      }
       // ONE LIGHT-SIDE REALIZATION PER SUB-LAUNCH (FTRACE_JDEVLIGHT=3, FTRACE_JSPLIT=k).
       //
       // `base` is the ABSOLUTE sample index this sub-batch starts at, so it advances every
@@ -26954,16 +26931,16 @@ Film renderBdptCuda(const Scene& scene, const Camera& cam, int resX, int resY,
                     CUDA_CHECK(cudaEventRecord(wfEv[0]));
                 }
                 if (deep && wq.runMul != 0u)
-                    kBdptT<0, BDPT_DEEPDEPTH, true, true><<<2048, 128>>>(up.sc, up.dc, camT, splatT, totalSamples, c, sppTotal, base,
+                    kBdptT<0, BDPT_DEEPDEPTH, true, true><<<2048, 128>>>(up.sc, up.dc, d_cam, d_splat, totalSamples, c, sppTotal, base,
                                                                          resX, maxDepth, diffraction ? 1 : 0, seed, 1, dbm, dsm, wq, b0, b1);
                 else if (deep)
-                    kBdptT<0, BDPT_DEEPDEPTH, true, false><<<2048, 128>>>(up.sc, up.dc, camT, splatT, totalSamples, c, sppTotal, base,
+                    kBdptT<0, BDPT_DEEPDEPTH, true, false><<<2048, 128>>>(up.sc, up.dc, d_cam, d_splat, totalSamples, c, sppTotal, base,
                                                                           resX, maxDepth, diffraction ? 1 : 0, seed, 1, dbm, dsm, wq, b0, b1);
                 else if (wq.runMul != 0u)
-                    kBdptT<0, BDPT_MAXDEPTH, true, true><<<2048, 128>>>(up.sc, up.dc, camT, splatT, totalSamples, c, sppTotal, base,
+                    kBdptT<0, BDPT_MAXDEPTH, true, true><<<2048, 128>>>(up.sc, up.dc, d_cam, d_splat, totalSamples, c, sppTotal, base,
                                                                         resX, maxDepth, diffraction ? 1 : 0, seed, 1, dbm, dsm, wq, b0, b1);
                 else
-                    kBdptT<0, BDPT_MAXDEPTH, true, false><<<2048, 128>>>(up.sc, up.dc, camT, splatT, totalSamples, c, sppTotal, base,
+                    kBdptT<0, BDPT_MAXDEPTH, true, false><<<2048, 128>>>(up.sc, up.dc, d_cam, d_splat, totalSamples, c, sppTotal, base,
                                                                          resX, maxDepth, diffraction ? 1 : 0, seed, 1, dbm, dsm, wq, b0, b1);
                 if (wq.segs) {
                     cudaCheckKernel("bdpt");
@@ -26979,7 +26956,7 @@ Film renderBdptCuda(const Scene& scene, const Camera& cam, int resX, int resY,
                         kWfBeamHits<<<2048, 128>>>(up.sc, dbm, wq, passes);
                         cudaCheckKernel("wf-hits");
                         CUDA_CHECK(cudaEventRecord(wfEv[2]));
-                        kWfBeamEval<<<4096, 128>>>(up.sc, dbm, wq, camT, resX, up.dc);
+                        kWfBeamEval<<<4096, 128>>>(up.sc, dbm, wq, d_cam, resX, up.dc);
                         cudaCheckKernel("wf-eval");
                         CUDA_CHECK(cudaEventRecord(wfEv[3]));
                         CUDA_CHECK(cudaMemcpy(cnt, d_wfCounters, sizeof cnt, cudaMemcpyDeviceToHost));
@@ -27019,28 +26996,24 @@ Film renderBdptCuda(const Scene& scene, const Camera& cam, int resX, int resY,
                 }
                 b0 = b1;
             }
-            if (wq.segs && !wfProfileCur.empty()) wfProfilePrev.swap(wfProfileCur);   // this chunk's bands size the next
+            // This chunk's bands size the next -- unless a stop cut its waves short.
+            if (wq.segs && !wfProfileCur.empty() && !stopped()) wfProfilePrev.swap(wfProfileCur);
         }
         else if (useHero && deep)
-            kBdptT<BDPT_NSEC, BDPT_DEEPDEPTH, false, false><<<2048, 128>>>(up.sc, up.dc, camT, splatT, totalSamples, c, sppTotal, base,
+            kBdptT<BDPT_NSEC, BDPT_DEEPDEPTH, false, false><<<2048, 128>>>(up.sc, up.dc, d_cam, d_splat, totalSamples, c, sppTotal, base,
                                                              resX, maxDepth, diffraction ? 1 : 0, seed, C, dbm, dsm, DWfQueue{}, 0, totalSamples);
         else if (useHero)
-            kBdptT<BDPT_NSEC, BDPT_MAXDEPTH, false, false><<<2048, 128>>>(up.sc, up.dc, camT, splatT, totalSamples, c, sppTotal, base,
+            kBdptT<BDPT_NSEC, BDPT_MAXDEPTH, false, false><<<2048, 128>>>(up.sc, up.dc, d_cam, d_splat, totalSamples, c, sppTotal, base,
                                                             resX, maxDepth, diffraction ? 1 : 0, seed, C, dbm, dsm, DWfQueue{}, 0, totalSamples);
         else if (deep)
-            kBdptT<0, BDPT_DEEPDEPTH, false, false><<<2048, 128>>>(up.sc, up.dc, camT, splatT, totalSamples, c, sppTotal, base,
+            kBdptT<0, BDPT_DEEPDEPTH, false, false><<<2048, 128>>>(up.sc, up.dc, d_cam, d_splat, totalSamples, c, sppTotal, base,
                                                      resX, maxDepth, diffraction ? 1 : 0, seed, 1, dbm, dsm, DWfQueue{}, 0, totalSamples);
         else
-            kBdptT<0, BDPT_MAXDEPTH, false, false><<<2048, 128>>>(up.sc, up.dc, camT, splatT, totalSamples, c, sppTotal, base,
+            kBdptT<0, BDPT_MAXDEPTH, false, false><<<2048, 128>>>(up.sc, up.dc, d_cam, d_splat, totalSamples, c, sppTotal, base,
                                                     resX, maxDepth, diffraction ? 1 : 0, seed, 1, dbm, dsm, DWfQueue{}, 0, totalSamples);
         cudaCheckKernel("bdpt");
       }
-      if (!abortable) return true;
-      if (stopped()) return false;
-      kFilmFold<<<256, 128>>>(d_cam, nullptr, s_cam, nullptr, (long long)npix);
-      kFilmFold<<<256, 128>>>(d_splat, nullptr, s_splat, nullptr, (long long)npix);
-      cudaCheckKernel("bdpt-fold");
-      return true;
+      return !stopped();
     };
 
     const auto tCall1 = std::chrono::steady_clock::now();
@@ -27066,8 +27039,6 @@ Film renderBdptCuda(const Scene& scene, const Camera& cam, int resX, int resY,
         if (wq.chroma) cudaFree(wq.chroma);
     }
     cudaFree(d_cam); cudaFree(d_splat);
-    if (s_cam) cudaFree(s_cam);
-    if (s_splat) cudaFree(s_splat);
     g_lastBdptOverheadSec =
         std::chrono::duration<double>((tCall1 - tCall0) +
                                       (std::chrono::steady_clock::now() - tCall2)).count();
@@ -28462,8 +28433,8 @@ std::vector<Film> renderPhotonMapSharedCuda(const Scene& scene, const std::vecto
     auto lastReport = std::chrono::steady_clock::now();
     bool stopped = false;
     // ---- the gather's cancellation flag (see kGather's poll for why it must exist) ----
-    // A chunk it cuts short is dropped, not folded (kFilmFold), as DeviceStopFlag requires.
-    DeviceStopFlag stopFlag;
+    // A chunk it cuts short is dropped, not folded (kFilmFold), as DeviceStopScope requires.
+    DeviceStopScope stopScope;
     // ---- and the gather's PROGRESS counter, the same mechanism pointed the other way ----
     //
     // kGather counts retired samples into this; the poller below reads it while the launching
@@ -28490,7 +28461,7 @@ std::vector<Film> renderPhotonMapSharedCuda(const Scene& scene, const std::vecto
     std::atomic<bool> pollQuit{false};
     std::thread pollThread([&, h_gatherDone] {
         while (!pollQuit.load(std::memory_order_relaxed)) {
-            if (ft::stopRequested()) return;   // the stop itself is DeviceStopFlag's
+            if (ft::stopRequested()) return;   // the kernels see the stop itself (DeviceStopScope)
             // reportLive, not report: this is progress from INSIDE a launch that has not
             // returned, where the retirement curve is convex and no honest rate exists — and
             // feeding those samples to the trailing window would wreck the rate for the
@@ -28510,7 +28481,7 @@ std::vector<Film> renderPhotonMapSharedCuda(const Scene& scene, const std::vecto
     // which are numerous below and would otherwise leak a detached thread into a dead context.
     // The device global is reset to null BEFORE the memory goes: dGatherRetire runs in other
     // modes' kernels too, and a pointer left at a freed mapping is an illegal-address fault in
-    // the next of them this process launches (as DeviceStopFlag's is).
+    // the next of them this process launches.
     struct GatherProgressGuard {
         std::atomic<bool>& quit; std::thread& th; unsigned long long* mem;
         ~GatherProgressGuard() {
