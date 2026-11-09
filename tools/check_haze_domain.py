@@ -11,7 +11,7 @@ sphere (Scene::mediaExitDistance: |centre - p| + sceneRadius); a light subpath o
 walks it from the entry disc's plane, never as far. Before the subpaths took the NEE leg's haze
 (sunLegFactor, the user's option (a)), D read the ball 1.75 % bright still, 0.3 % with the ball
 held by a shutter at x = 6.4 outside the instant's sphere, and 2.75 % at x = 32. Each case
-renders mode R and the mode under test, two seeds each (six for `fieldlo`'s noisy J), and
+renders mode R and the mode under test, two seeds each (six for the noisy `fieldlo`), and
 requires the ball's mean and the haze's (the top corners) to agree within 0.6 % (D) or 1.5 %
 (J, whose beam merges are noisier), or within four of their standard errors from the seeds'
 spread (five with six seeds), whichever is wider.
@@ -27,8 +27,8 @@ import numpy as np
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 NL = chr(10)
-FIELDLO_GPU_J_SPP = 4   # fieldlo, GPU mode J: ~80 s a seed...
-FIELDLO_GPU_J_SEEDS = 6   # ...and six of them: its noise is above the tolerance (see main)
+FIELDLO_GPU_J_SPP = 4     # fieldlo, GPU mode J: ~50 s a seed (0.434.36)...
+FIELDLO_GPU_J_SEEDS = 6   # ...and six of them, of R too: its noise is above the tolerance
 FIELD = ('medium { sigma_t 0.06  albedo 0.5  density "0.3 + 0.7*saturate(1.0 - y/8.0)"  '
          'density_max 1 }')
 
@@ -88,8 +88,8 @@ def main():
 
     def spp_for(name, mode, dev):
         """Samples per pixel for one case, or None to skip it. Mode J in an unbounded density
-        field is slow (J-FIELD-SLOW): ~14 s a sample at 96x72 on the CPU, and on the GPU ~20 s a
-        sample at 32x24 (0.434.34), so the CPU renders `field` and the GPU `fieldlo`."""
+        field is slow (J-FIELD-SLOW): ~14 s a sample at 96x72 on the CPU, and on the GPU ~13 s a
+        sample at 32x24 (0.434.36), so the CPU renders `field` and the GPU `fieldlo`."""
         if mode == "R":
             return 512
         if name == "farfield" and mode == "J":
@@ -125,10 +125,10 @@ def main():
                 if (only and case not in only) or spp_for(name, mode, dev) is None:
                     continue
                 key = (name, dev)
-                if key not in refs:
-                    refs[key] = [render(name, "R", dev, s) for s in (1, 2)]
-                R = refs[key]
                 k = FIELDLO_GPU_J_SEEDS if name == "fieldlo" else 2
+                if key not in refs:
+                    refs[key] = [render(name, "R", dev, s) for s in range(1, k + 1)]
+                R = refs[key]
                 X = [render(name, mode, dev, s) for s in range(1, k + 1)]
                 h, w = R[0].shape
                 yy, xx = np.mgrid[0:h, 0:w]
@@ -143,8 +143,9 @@ def main():
                     # degree of freedom, a statistic as heavy-tailed as Cauchy's: harmless where
                     # the noise is under the tolerance, which then decides, but where it is over
                     # (fieldlo's 4 spp at 32x24) four of them would fail a correct binary one
-                    # run in six. So a noisy case takes more seeds and a bound for their dof:
-                    # 5 at five, P(|t5| > 5) = 0.4 %.
+                    # run in six. So a noisy case takes six seeds of each mode, the mode under
+                    # test's and R's, and a bound of 5: under P(|t5| > 5) = 0.4 % a region (their
+                    # pooled dof is between 5 and 10), so under 1 % for the case's two.
                     se = np.hypot(np.std(v, ddof=1) / np.sqrt(len(v)) / np.mean(v),
                                   np.std(r, ddof=1) / np.sqrt(len(r)) / np.mean(r))
                     q = 4.0 if len(v) <= 2 else 5.0

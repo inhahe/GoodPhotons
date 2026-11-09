@@ -14236,6 +14236,8 @@ static bool jSkipHostBvh() {
 struct BeamRadiiPin {
     std::vector<float> radMed;   // per medium (BeamMap::radMed)
     double radius = 0.0;         // the scalar beyond them; 0 = not recorded yet
+    double floorNeed = 0.0;      // the recorded map's BeamMap::floorNeed
+    long long n = 0;             // ...and the subpaths it was drawn from (BeamMap::nEmitted)
     bool recorded() const { return radius > 0.0; }
     // `bm`'s radii divided by `scale`: the radius-shrink factor it was built at, so that
     // applyTo can hand them to a map at another point of the schedule.
@@ -14243,11 +14245,20 @@ struct BeamRadiiPin {
         radMed = bm.radMed;
         for (float& r : radMed) r = (float)((double)r / scale);
         radius = bm.radius / scale;
+        floorNeed = bm.floorNeed;
+        n = bm.nEmitted;
     }
-    void applyTo(BeamMap& bm, double scale = 1.0) const {
+    // The recorded radii at `scale`. `nTo` > 0: for a map drawn from that many subpaths, as its
+    // own build would have chosen them -- the -beamk floor, which raised the recorded radii by
+    // max(1, floorNeed), raises these by max(1, floorNeed * n / nTo), a gathered count being
+    // proportional to the subpaths (a clock blur's epochs draw fewer than epoch 0).
+    void applyTo(BeamMap& bm, double scale = 1.0, long long nTo = 0) const {
+        double f = scale;
+        if (nTo > 0 && n > 0 && floorNeed > 0.0)
+            f *= std::max(1.0, floorNeed * (double)n / (double)nTo) / std::max(1.0, floorNeed);
         bm.radMed = radMed;
-        for (float& r : bm.radMed) r = (float)((double)r * scale);
-        bm.radius = radius * scale;
+        for (float& r : bm.radMed) r = (float)((double)r * f);
+        bm.radius = radius * f;
     }
 };
 // `pin`, when given: an empty one records the radii the map is built at, a recorded one builds
@@ -20151,10 +20162,12 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
         long long nBlurJ = 0;        // the subpaths a clock blur's epoch draws (0: Nepoch's own)
         long long lastNepochJ = 0;   // the subpaths the last light side drew
         long long nAllJ = 0;         // the subpaths epoch 0 settled on, every refresh's ceiling
-        // Epoch 0's beam radii at scale 1 (recorded by realize, built or kept): what a refresh
-        // whose map draws empty takes, at its own place in the shrink schedule. Epoch 0's and
-        // not the last measured map's, so that a resumed or batch-shared render, which reaches
-        // its epochs by other routes, gives every empty one the same radii.
+        // Epoch 0's beam radii at scale 1 (recorded by realize, built or kept), from which a
+        // refresh whose map draws empty takes the radii its own build would have chosen: at its
+        // place in the shrink schedule, for its own subpath count (a clock blur's epochs draw
+        // fewer). Derived from epoch 0, not the last measured map, so that a resumed or
+        // batch-shared render, which reaches its epochs by other routes, gives every empty one
+        // the same radii.
         BeamRadiiPin beamPin0J;
         auto buildLightSide = [&](uint64_t epoch, uint64_t saltOff = 0) {
             RngSaltScope saltScope(epoch + saltOff);
@@ -20340,10 +20353,11 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
                              /*quiet*/!first, &scene, beamRadScaleFor(epoch + lsEpochBase));
                 // A refresh whose map drew empty measured no radius (the build had no chords to
                 // take a mean free path from), but its merges keep their kappa (renderRows), which
-                // reads the radius: take epoch 0's (beamPin0J). Epoch 0 has none to take; the
-                // dispatcher leaves the beams off if it draws empty (see beamsPtr).
+                // reads the radius: take the radii epoch 0's build would have chosen for this
+                // map's subpaths (beamPin0J). Epoch 0 has none to take; the dispatcher leaves the
+                // beams off if it draws empty (see beamsPtr).
                 if (bmap.beams.empty() && beamPin0J.recorded())
-                    beamPin0J.applyTo(bmap, beamRadScaleFor(epoch + lsEpochBase));
+                    beamPin0J.applyTo(bmap, beamRadScaleFor(epoch + lsEpochBase), bmap.nEmitted);
                 bdpt::jWork().light.fetch_add(bdpt::jWorkBeamBuild(bmap.beams.size()),
                                               std::memory_order_relaxed);
             }

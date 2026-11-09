@@ -86,11 +86,15 @@ renders that scene and fails on 0.434.34.
 
 Found by reading the code while a mode J render ignored `-stop` (a deliberately broken build whose
 resume passes never drained, check_wf_resume.py's proof; it had to be unstuck by zeroing the wave
-queue's `segCap` from cdb). That half is by design and stays: mode J publishes no device flag,
-because `gpuSppChunks` keeps every chunk it launches, so a gather cut short by a stop would be kept,
-dark; a chunk in flight runs whole (~0.15 s). `kWfBeamHits` lost its stop poll, which only ever
-read null or the dangling pointer, and 0.434.34's host-side stop test in the resume-pass loop is
-gone for the same reason (correct passes always end: each queues at least one hit).
+queue's `segCap` from cdb). 0.434.35 left that half alone, as `gpuSppChunks` kept every chunk it
+launched (a gather a stop cut short would have been kept, dark). **0.434.37 (review of
+f6f9981..d1882f8)** made the GPU's mode D/J chunks abortable instead -- a chunk is not always
+short: under `-beamepochs` they are pinned to 1 spp, which on J-FIELD-SLOW's field at 96x72 takes
+minutes. A chunked `renderBdptCuda` owns the device stop flag through `DeviceStopFlag` (an RAII
+owner that restores the previous pointer before freeing, mode M's gather now its other user), its
+kernels poll it, the chunk renders into scratch films folded only when it lands whole, and one a
+stop cut short is dropped: `gpuSppChunks` flushes the whole chunks before it as final and marks
+the frame `abandoned`, as `cpuSppChunks` does.
 
 ## DONE (2026-11-05, 0.434.2): STOP-STALE-PID — `ftrace -stop` listed a crashed render under the unrelated process that inherited its pid
 
@@ -790,6 +794,11 @@ an empty epoch at 0.02 m, and a resumed fixed-epoch render reaches its epochs by
 a straight one. And a one-sub-beam map has a tree on the device: the host kept one (the LBVH refusing
 a single primitive) but the upload converted no host nodes whenever the LBVH was wanted;
 renderBdptCuda now refuses a map with beams and no tree (`tools/check_jgpu_one_beam.py`).
+**0.434.37 (review of f6f9981..d1882f8):** the LBVH builds a one-leaf tree itself, so the host
+keeps no special case; and an empty epoch's radii are those its own build would have chosen,
+derived from epoch 0's: under a clock blur an epoch draws fewer subpaths than epoch 0, and the
+`-beamk` floor would have widened its radii by epoch 0's floor need times the ratio of the counts
+(`BeamMap::floorNeed`, `BeamRadiiPin::applyTo`), where plain epoch 0 radii left its kappa small.
 
 ## FIXED (2026-11-07, 0.434.29; opened 2026-11-05, 0.434.16, widened 2026-11-06): HAZE-BLUR-DOMAIN — modes D and J's sun subpaths take less unbounded haze than their NEE leg: 1-2 % bright in a still scene, more for a mover far out under a blur
 

@@ -11,7 +11,7 @@ queue shrunk to --cap (FTRACE_WFHITCAP), which forces resume passes on every wav
 4096, most segments resumed again and again), must match the default image up to that order.
 A candidate skipped or queued twice would move the merges.
 
-The scene is a heterogeneous fog in a closed box (its transmittance estimates draw from each
+The scene is fogbox.py's heterogeneous fog (its transmittance estimates draw from each
 candidate's keyed stream) under one light-side realization (-beamfreeze: on the device the
 refresh otherwise ends on the clock, and the slower capped run would meet other maps). The
 default render is made twice, as the control that the comparison can hold at all; each render
@@ -32,28 +32,8 @@ import numpy as np
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 NL = chr(10)
-
-SCENE = NL.join([
-    "scene { units meters }",
-    'material "grey" { type diffuse reflect 0.6 }',
-    "quad { origin 0 0 0   u 1 0 0   v 0 0 1   material grey }",
-    "quad { origin 0 1 0   u 0 0 1   v 1 0 0   material grey }",
-    "quad { origin 0 0 0   u 0 1 0   v 1 0 0   material grey }",
-    "quad { origin 0 0 0   u 0 0 1   v 0 1 0   material grey }",
-    "quad { origin 1 0 0   u 0 1 0   v 0 0 1   material grey }",
-    "medium {",
-    "    sigma_a 0.3   sigma_s 1.2   g 0.3",
-    "    bounds { min 0 0 0   max 1 1 1 }",
-    '    density "0.4 + 0.6*saturate(1.2 - 2.0*sqrt((x-0.5)^2 + (y-0.5)^2 + (z-0.5)^2))"',
-    "}",
-    "light area {",
-    "    origin 0.35 0.999 0.35   u 0.3 0 0   v 0 0 0.3   normal 0 -1 0",
-    "    spd preset:bb6500",
-    "}",
-    'camera "cam" {',
-    "    eye 0.5 0.5 2.7   look_at 0.5 0.5 0.5   up 0 1 0   fov_y 40",
-    "    film { res 48 48 }",
-    "}"]) + NL
+sys.path.insert(0, os.path.join(ROOT, "tools"))
+import fogbox  # noqa: E402
 
 
 def load(p):
@@ -74,15 +54,8 @@ def main():
     a = ap.parse_args()
     exe, d = os.path.abspath(a.exe), os.path.abspath(a.out)
     os.makedirs(d, exist_ok=True)
-    ftsl = os.path.join(d, "fog.ftsl")
-    with open(ftsl, "w", encoding="utf-8", newline="") as f:
-        f.write(SCENE)
-    fails = []
-
-    def check(name, ok, detail=""):
-        print("%-56s %s  %s" % (name, "ok  " if ok else "FAIL", detail))
-        if not ok:
-            fails.append(name)
+    ftsl = fogbox.write(d, "fog.ftsl", fogbox.scene())
+    check = fogbox.Checks()
 
     def render(tag, cap=None):
         png = os.path.join(d, tag + ".png")
@@ -141,11 +114,7 @@ def main():
     check("the capped render agrees with the default", rel < 1e-5,
           "largest change %.2g of the pixel, %d values differ; mean ratio %.6f"
           % (rel, n, b.mean() / a1.mean()))
-    if fails:
-        print("FAILED: " + ", ".join(fails))
-        return 1
-    print("PASS")
-    return 0
+    return check.verdict()
 
 
 if __name__ == "__main__":

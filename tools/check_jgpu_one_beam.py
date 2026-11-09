@@ -2,16 +2,15 @@
 
     python tools/check_jgpu_one_beam.py [--out png/check_jgpu_one_beam] [--exe ftrace.exe]
 
-GPU mode J builds its beam tree on the device (an LBVH) and the host skips its own, but an LBVH
-of one primitive has no internal node, so `buildBeamLbvhDevice` refuses it; BeamMap::build then
-keeps the host tree, and uploadBeamMapCuda must upload it. Until 0.434.36 the upload converted
-no host nodes whenever the LBVH was wanted, so a one-sub-beam map reached the device with no
-tree: its merges kept their weight and gathered nothing, the realization silently dark by their
-share. renderBdptCuda now refuses a map with beams and no tree (std::logic_error), so the old
-upload fails this check loudly. The scene is a closed box lit from above with a 5 cm medium in
-a corner, traced with 64 light subpaths a realization and no beam splitting (-beamsplit 1000):
-at seed 1 epoch 0's map is one chord, and of the 16 realizations (-beamepochs spp) many hold one
-or none. The render must exit 0 and say it kept the host tree for a one-sub-beam map.
+GPU mode J builds its beam tree on the device (an LBVH; the host skips its own). An LBVH of one
+primitive has no internal node, and until 0.434.36 such a map reached the device with no tree:
+its merges kept their weight and gathered nothing, the realization silently dark by their
+share. Since 0.434.37 buildBeamLbvhDevice makes the one leaf the root, and renderBdptCuda ends
+the process on a map with beams and no tree, so a regression fails this check loudly. The scene
+is fogbox.py's box filled by a homogeneous fog, so its light lies inside the medium: with one
+light subpath a realization (-n 1), no bounce after the first (-max-bounce 1) and no splitting
+(-beamsplit 1000), every realization is exactly one chord, whatever the random numbers. Sixteen
+of them (-beamepochs spp). The render must exit 0, build the one-leaf LBVH, and write its image.
 
 Exits 1 on any failure.
 """
@@ -23,24 +22,8 @@ import sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 NL = chr(10)
-
-SCENE = NL.join([
-    "scene { units meters }",
-    'material "grey" { type diffuse reflect 0.6 }',
-    "quad { origin 0 0 0   u 1 0 0   v 0 0 1   material grey }",
-    "quad { origin 0 1 0   u 0 0 1   v 1 0 0   material grey }",
-    "quad { origin 0 0 0   u 0 1 0   v 1 0 0   material grey }",
-    "quad { origin 0 0 0   u 0 0 1   v 0 1 0   material grey }",
-    "quad { origin 1 0 0   u 0 1 0   v 0 0 1   material grey }",
-    "medium { sigma_a 0.2   sigma_s 2.0   bounds { min 0.1 0.1 0.1   max 0.15 0.15 0.15 } }",
-    "light area {",
-    "    origin 0.35 0.999 0.35   u 0.3 0 0   v 0 0 0.3   normal 0 -1 0",
-    "    spd preset:bb6500",
-    "}",
-    'camera "cam" {',
-    "    eye 0.5 0.5 2.7   look_at 0.5 0.5 0.5   up 0 1 0   fov_y 40",
-    "    film { res 48 48 }",
-    "}"]) + NL
+sys.path.insert(0, os.path.join(ROOT, "tools"))
+import fogbox  # noqa: E402
 
 
 def main():
@@ -49,43 +32,29 @@ def main():
     ap.add_argument("--exe", default=os.path.join(ROOT, "ftrace.exe"))
     a = ap.parse_args()
     exe, d = os.path.abspath(a.exe), os.path.abspath(a.out)
-    os.makedirs(d, exist_ok=True)
-    ftsl = os.path.join(d, "tiny.ftsl")
-    with open(ftsl, "w", encoding="utf-8", newline="") as f:
-        f.write(SCENE)
-    png = os.path.join(d, "tiny.png")
+    medium = "medium { sigma_a 0.2   sigma_s 2.0   bounds { min 0 0 0   max 1 1 1 } }"
+    ftsl = fogbox.write(d, "one.ftsl", fogbox.scene(medium))
+    png = os.path.join(d, "one.png")
     if os.path.exists(png):   # a render that writes nothing must not pass
         os.remove(png)
     cmd = [exe, "-in", ftsl, "-mode", "J", "-device", "gpu", "-spp", "16", "-seed", "1",
-           "-n", "64", "-beamsplit", "1000", "-beamepochs", "spp", "-no-meter", "-window-min",
-           "-o", png]
+           "-n", "1", "-max-bounce", "1", "-beamsplit", "1000", "-beamepochs", "spp",
+           "-no-meter", "-window-min", "-o", png]
     p = subprocess.run(cmd, cwd=d, capture_output=True, text=True, encoding="utf-8",
                        errors="replace")
     log = p.stdout + p.stderr
-    with open(os.path.join(d, "tiny.log"), "w", encoding="utf-8") as f:
+    with open(os.path.join(d, "one.log"), "w", encoding="utf-8") as f:
         f.write(log)
-    fails = []
-
-    def check(name, ok, detail=""):
-        print("%-50s %s  %s" % (name, "ok  " if ok else "FAIL", detail))
-        if not ok:
-            fails.append(name)
-
+    check = fogbox.Checks(50)
     m = re.search(r"mode J: (\d+) beams from (\d+) light subpaths", log)
     check("epoch 0's map is one chord", m is not None and m.group(1) == "1",
           "%s beams" % (m.group(1) if m else "?"))
     check("the render exits 0", p.returncode == 0, "rc %d" % p.returncode)
     check("no map reached the device without a tree", "without a tree" not in log)
-    check("a one-sub-beam map kept the host tree",
-          re.search(r"\[jlbvh\] a map of 1 sub-beam\(s\): no LBVH; keeping the host tree "
-                    r"\(1 node\(s\)\)", log) is not None)
+    check("the LBVH over one sub-beam is its leaf",
+          re.search(r"\[jlbvh\] device LBVH over 1 sub-beams .*LBVH has 1\)", log) is not None)
     check("the image was written", os.path.exists(png))
-    if fails:
-        print(log[-1500:])
-        print("FAILED: " + ", ".join(fails))
-        return 1
-    print("PASS")
-    return 0
+    return check.verdict(log[-1500:])
 
 
 if __name__ == "__main__":

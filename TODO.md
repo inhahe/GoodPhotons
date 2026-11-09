@@ -130,7 +130,7 @@ Each names the section its line is in.
 19. ~~**GLOSSY-SAMPLE-SITES** (4.4) — the interference factor applied by hand at two dozen sites.~~
     Done 2026-11-06: `drawGlossy` / `dDrawGlossy` return the direction with its factor.
 19a. **J-FIELD-SLOW** (4.5) — mode J in an unbounded density field (found in HAZE-BLUR-DOMAIN's
-    check). Its GPU hit queue no longer spills (0.434.33-34, 126 s -> 26 s for the check's 2 spp);
+    check). Its GPU hit queue no longer spills (0.434.33-36: 2 spp of the field at 32x24, 126 s -> 26 s);
     left: the beam budget's probes overshoot the knee, and fattened beams make every walk long.
 20. **JSPEC-CARRIER-SIZE** (4.5) — every mode-J GPU thread reserves the spectral carrier.
 21. **RADCACHE-BATCHES** (4.5) — `-radcache`'s fixed batches outlast `-stop` and the interval.

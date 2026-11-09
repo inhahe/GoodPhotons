@@ -745,6 +745,12 @@ struct BeamMap {
     // header note: the radius is derived from each medium's own measured mean free path, so a
     // dense cloud and a sparse rain curtain in the same scene get their own blur scale.
     std::vector<float> radMed;
+    // What buildAuto's `-beamk` floor asked of these radii: the floor over the count a probe
+    // gathered at the raw (blur x mfp) radii, so the floor raised them by max(1, floorNeed). 0 when
+    // unmeasured (an explicit or pinned radius, an empty map). A gathered count being
+    // proportional to the subpaths, this is what lets a map drawn from another count be given
+    // the radii its own build would have chosen (main.cpp BeamRadiiPin::applyTo).
+    double floorNeed = 0.0;
     // Mode J (UPBP) only, empty otherwise: the light half of every merge's MIS weight.
     // `mis` is indexed by the ORIGINAL (pre-split) beam; `misIdx` maps a current beam to
     // its entry and is filled by the first split. See BeamMis.
@@ -1192,9 +1198,7 @@ struct BeamMap {
         lastSplitSec = std::chrono::duration<double>(tSplit1 - tSplit0).count();
         lastAllocSec = std::chrono::duration<double>(tAlloc1 - tSplit1).count();
         lastBoxSec   = std::chrono::duration<double>(tBox1 - tAlloc1).count();
-        // A map of one sub-beam is built here even under `skipBvh`: the device LBVH refuses it
-        // (it has no internal node), and without a tree that beam would never be gathered.
-        if (!skipBvh || boxes.size() <= 1) bvh.build(boxes);
+        if (!skipBvh) bvh.build(boxes);
     }
 
     // Per-medium statistics of the RAW (pre-split) beam set: how many chords each medium
@@ -1371,6 +1375,7 @@ struct BeamMap {
         // re-measures, so three rounds cover 4096x — far beyond any real shortfall.
         info.probeK0 = probeGatherCount(bb);
         info.probeK  = info.probeK0;
+        floorNeed = (targetK > 0.0 && info.probeK0 > 0.0) ? targetK / info.probeK0 : 0.0;
         if (targetK > 0.0) {
             for (int round = 0; round < 3 && info.probeK < targetK; ++round) {
                 const double meas = std::max(info.probeK, 0.25);

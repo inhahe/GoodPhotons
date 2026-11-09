@@ -414,9 +414,12 @@ Everything else follows from that one field.
   `nullptr`, so the merge path is never *entered*, rather than entered and skipped per-ray. That is
   what makes the degenerate-reduction test (below) a property of the code instead of of
   floating-point luck. But once a render has the technique, a refresh that draws empty is passed
-  as it is and keeps its merge kappa (`n·2r` from epoch 0's radii, `beamPin0J`, scaled to its own
-  place in the shrink schedule -- epoch 0's because every render realizes it first, a resumed or
-  batch-shared one included, so every route to an epoch gives it the same radii): the technique belongs to the render, not to one realization, and an
+  as it is and keeps its merge kappa: `n·2r` at the radii its own build would have chosen,
+  derived from epoch 0's (`BeamRadiiPin`, `beamPin0J`) -- scaled to its place in the shrink
+  schedule, and widened by the `-beamk` floor as epoch 0's floor would have been for its own
+  subpath count (`BeamMap::floorNeed`; a clock blur's epochs draw fewer). Epoch 0's because
+  every render realizes it first, a resumed or batch-shared one included, so every route to an
+  epoch gives it the same radii. The technique belongs to the render, not to one realization, and an
   epoch that dropped it would weigh its connections up and read bright by P(empty) × the merge
   share. The device does the same: `uploadBeamMapCuda` sets `mergeKappa` for an empty map, and a
   non-empty map with no MIS partials still gathers, at weight 1, as the host does.
@@ -620,8 +623,13 @@ Four consequences worth knowing:
     many it queued (`DWfQueue::resume`) and is walked again in a **resume pass** after
     `kWfBeamEval` has drained the queue, skipping those — the tree fixes the walk's order, so
     every candidate is queued exactly once, and a pass always queues at least one, so the passes
-    end. A stop waits for them: a mode J chunk runs whole (`gpuSppChunks` keeps what it launches),
-    so neither the walk nor the pass loop polls for one. (Until 0.434.34 overflowing hits were evaluated on the spot inside `kWfBeamHits`, one
+    end. A stop ends them early. **A GPU mode D/J chunk can be cut short:** it renders into
+    scratch films, folded into the totals (`kFilmFold`) only once it has landed whole, and the
+    kernels -- `kBdptT` every 8 paths, the inline beam gather, `kWfBeamHits` every 64 nodes -- read
+    the device stop flag `renderBdptCuda` owns for a chunked render (`DeviceStopFlag`, which mode M's
+    gather owns the same way); a chunk a stop cut short is dropped and `gpuSppChunks` flushes the
+    whole chunks before it as final (the `abandoned` contract `cpuSppChunks` keeps;
+    `tools/check_gpu_stop.py`). (Until 0.434.34 overflowing hits were evaluated on the spot inside `kWfBeamHits`, one
     thread a segment: harmless at `_fog_cornell`'s rate, ~20× slower a hit with an unbounded
     density field's ~10⁵ hits a path, J-FIELD-SLOW.) The wave floor is 256 paths.
     `tools/check_wf_resume.py` renders a fog with the hit queue shrunk (`FTRACE_WFHITCAP`) and

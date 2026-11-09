@@ -56,6 +56,7 @@
 #include <mutex>
 #include <condition_variable>
 #include <type_traits>           // kBdptT's per-MERGE scratch (DChromaRunNone)
+#include <memory>                // renderBdptCuda's DeviceStopFlag
 #include <math.h>
 #include <float.h>
 
@@ -9312,8 +9313,7 @@ __global__ void kBeamTr0(DScene sc, const DBeamRec* beams, float* tr0, const int
 // segments, skipping their queued candidates. The walk's order is fixed by the tree, so the
 // skipped candidates are exactly the ones queued before, and every candidate is evaluated once,
 // in kWfBeamEval, with the random numbers its (segment, beam) pair keys whichever pass queued it.
-// No stop poll: a mode J chunk runs whole (gpuSppChunks keeps what it launches), so a walk cut
-// short would be kept, dark.
+// A stop ends the walk (every 64 nodes) and defers nothing: renderBdptCuda drops the chunk.
 __global__ void kWfBeamHits(DScene sc, DBeamMap bm, DWfQueue q, int resumePass) {
     D_MOTION_CLEAR();   // this thread's time: the launch's (passU) until a path sets one
     const int nS = min(*q.nSegs, q.segCap);
@@ -9329,10 +9329,12 @@ __global__ void kWfBeamHits(DScene sc, DBeamMap bm, DWfQueue q, int resumePass) 
         Real tRoot;
         if (!boxHit(bm.nodes[0], oc, invD, (Real)0, tMax, tRoot)) continue;
         int stack[64]; int sp = 0; stack[sp++] = 0;
+        int stopPoll = 0;
         const int routeMedJ = sg.routeMedJ;   // once, not per candidate (q.hits aliases q.segs)
         int e = 0;           // candidates met so far, in walk order
         bool full = false;   // the hit queue turned this segment away: resume it next pass
         while (sp && !full) {
+            if ((++stopPoll & 63) == 0 && dGatherStopped()) break;
             const DNode& n = bm.nodes[stack[--sp]];
             if (n.count > 0) {
                 for (int i = 0; i < n.count; ++i) {
@@ -19322,7 +19324,9 @@ kBdptT(DScene sc, const __grid_constant__ DCamera cam, double* camFilm, double* 
     const int C = (NS > 0) ? heroC : 1;
     // [idxBegin, idxEnd) is the wave the host is running (the whole chunk when the
     // wavefront gather is off); idxEnd <= totalSamples.
+    int stopPoll = 0;   // a stop ends the launch; its chunk is dropped (DeviceStopFlag)
     for (long long idx = idxBegin + g; idx < idxEnd; idx += G) {
+        if ((stopPoll++ & 7) == 0 && dGatherStopped()) return;
         const long long slot = idx / chunkSpp;   // pixel slot (padded to whole runs when stratified)
         long long pix = slot;
         if (STRAT) {                             // stratified waves: see DWfQueue (compile-time:
@@ -23168,6 +23172,49 @@ __global__ void kDeviceProbe(unsigned long long* sizes, double* math, const doub
 
 // ============================ host: bake + launch ============================
 
+// THE DEVICE'S VIEW OF `-stop`, with one owner. A kernel cannot ask ft::stopRequested(), and the
+// thread that launched it is parked in a synchronize and can issue no CUDA call, so the flag
+// lives in MAPPED PINNED host memory: raised by a plain store from a poller thread, read by
+// gpu::dGatherStopped through the device global gpu::g_dGatherStop. A renderer owns one for the
+// span of its launches: published on construction, and on destruction unpublished -- the
+// previous owner's pointer put back, null outside every owner -- BEFORE the memory is freed, as
+// every mode's kernels read that one global and a pointer left at a freed mapping is an
+// illegal-address fault in the next of them (GATHER-STOP-DANGLING,
+// tools/check_gpu_mixed_modes.py). Only a renderer that drops a launch the stop cut short may
+// own one: one that kept it would keep a gather stopped part-way, dark.
+class DeviceStopFlag {
+public:
+    DeviceStopFlag() {
+        CUDA_CHECK(cudaHostAlloc((void**)&h_, sizeof(int), cudaHostAllocMapped));
+        *h_ = 0;
+        int* d = nullptr;
+        CUDA_CHECK(cudaHostGetDevicePointer((void**)&d, h_, 0));
+        CUDA_CHECK(cudaMemcpyFromSymbol(&prev_, gpu::g_dGatherStop, sizeof(int*)));
+        CUDA_CHECK(cudaMemcpyToSymbol(gpu::g_dGatherStop, &d, sizeof(int*)));
+        poller_ = std::thread([this] {
+            while (!quit_.load(std::memory_order_relaxed)) {
+                if (ft::stopRequested()) { *(volatile int*)h_ = 1; return; }
+                std::this_thread::sleep_for(std::chrono::milliseconds(20));
+            }
+        });
+    }
+    ~DeviceStopFlag() {
+        quit_.store(true, std::memory_order_relaxed);
+        if (poller_.joinable()) poller_.join();
+        cudaMemcpyToSymbol(gpu::g_dGatherStop, &prev_, sizeof(int*));   // no throw in teardown
+        cudaFreeHost(h_);
+    }
+    // Has a stop reached the device's kernels since this flag was published?
+    bool raised() const { return *(volatile const int*)h_ != 0; }
+    DeviceStopFlag(const DeviceStopFlag&) = delete;
+    DeviceStopFlag& operator=(const DeviceStopFlag&) = delete;
+private:
+    int* h_ = nullptr;
+    int* prev_ = nullptr;
+    std::atomic<bool> quit_{false};
+    std::thread poller_;
+};
+
 static bool g_queried = false, g_available = false;
 static char g_devName[256] = "none";
 
@@ -25612,7 +25659,9 @@ static void gpuSppChunks(long long spp, const SppProgress& prog, Film& out,
     // ---- stall watchdog ------------------------------------------------------------
     // A kernel launch is synchronous from here (cudaCheckKernel synchronizes), so while one
     // chunk is in flight this thread is parked in cuCtxSynchronize and CANNOT report, write
-    // the -interval image, honour -time, or answer -stop. Normally that is fine: chunks are
+    // the -interval image or honour -time; a -stop reaches the chunk only where its kernels read
+    // the device stop flag and its launch drops it (renderBdptCuda: DeviceStopFlag). Normally
+    // that is fine: chunks are
     // retargeted to ~0.15 s. But if ANOTHER process on the machine is saturating the GPU,
     // even the minimum 1-spp chunk can take minutes-to-hours, and the render becomes
     // indistinguishable from a deadlock — silent, unwritable and unkillable except by
@@ -25651,7 +25700,8 @@ static void gpuSppChunks(long long spp, const SppProgress& prog, Film& out,
                     "\n[gpu-stall] one %lld-spp chunk has been running on the GPU for %s "
                     "(target is 0.15 s).\n"
                     "[gpu-stall] The render is NOT hung, but until this chunk returns it "
-                    "cannot write the -interval image, end on -time, or answer -stop.\n"
+                    "cannot write the -interval image or end on -time (in modes D and J a "
+                    "-stop drops it).\n"
                     "[gpu-stall] The usual cause is another process saturating the GPU: check "
                     "`nvidia-smi` for a second CUDA program. Run with -device cpu to sidestep "
                     "it, or free the card.\n",
@@ -25676,8 +25726,21 @@ static void gpuSppChunks(long long spp, const SppProgress& prog, Film& out,
         auto t0 = clk::now();
         launchSpp.store(c, std::memory_order_relaxed);
         launchStartMs.store(nowMs(), std::memory_order_relaxed);
-        launch(c, prog.sampleBase + done);
+        // A launch that returns false was cut short by a stop and dropped (renderBdptCuda): `out`
+        // still holds the `done` spp downloaded before it, which is flushed once more as final
+        // (skipped at done == 0, which has no image), and the frame is `abandoned` -- the
+        // contract cpuSppChunks keeps. A launch returning nothing always lands whole.
+        bool whole = true;
+        if constexpr (std::is_same_v<decltype(launch(c, prog.sampleBase + done)), bool>)
+            whole = launch(c, prog.sampleBase + done);
+        else
+            launch(c, prog.sampleBase + done);
         launchStartMs.store(0, std::memory_order_relaxed);
+        if (!whole) {
+            if (done > 0) prog.report(out, done, /*final*/true);
+            out.abandoned = true;
+            break;
+        }
         done += c;
         double dt = std::chrono::duration<double>(clk::now() - t0).count();
         if (chunkDebug)
@@ -25765,7 +25828,18 @@ struct JBeamDev {
 // the same set of primitives, so no device reduction is needed for them.
 static bool buildBeamLbvhDevice(JBeamDev& d, const gpu::DBeamRec* beams, int n,
                                 const Aabb& bounds, double radMax, gpu::DBeamMap& dbm) {
-    if (n <= 1) return false;                 // a 1-primitive LBVH has no internal node
+    if (n < 1) return false;
+    if (n == 1) {   // the one leaf is the root: no internal node to build or refit
+        ensureDevCap(d.order, d.orderCap, (size_t)1);
+        ensureDevCap(d.nodes, d.nodesCap, (size_t)1);
+        CUDA_CHECK(cudaMemset(d.order, 0, sizeof(int)));
+        gpu::kLbvhLeaves<<<1, 32>>>(beams, d.order, 1, (float)radMax, d.nodes);
+        cudaCheckKernel("lbvh-leaves");
+        dbm.nodes = d.nodes;
+        dbm.primIdx = d.order;
+        dbm.nNodes = 1;
+        return true;
+    }
     const size_t nNodes = (size_t)(2 * n - 1);
     ensureDevCap(d.code, d.codeCap, (size_t)n);
     ensureDevCap(d.order, d.orderCap, (size_t)n);
@@ -26324,11 +26398,8 @@ static void uploadBeamMapCuda(const Scene& scene, const BeamMap* bmap, DUpload& 
         const double rm = bmap->radOf(b.med);
         r.invRad = (float)(rm > 0.0 ? 1.0 / rm : 0.0);
     }
-    // With `lbvh` there is no host tree to convert; the device builds one straight after --
-    // except over one sub-beam, which the LBVH refuses (it has no internal node) and for which
-    // BeamMap::build keeps the host tree, uploaded here.
-    const bool hostTree = !lbvh || bmap->beams.size() <= 1;
-    std::vector<gpu::DNode> bnodes(hostTree ? bmap->bvh.nodes.size() : 0);
+    // With `lbvh` there is no host tree to convert; the device builds one straight after.
+    std::vector<gpu::DNode> bnodes(lbvh ? 0 : bmap->bvh.nodes.size());
     for (size_t i = 0; i < bnodes.size(); ++i) {
         if ((i & 0xFFFFF) == 0 && ft::stopRequested()) break;
         const BvhNode& s = bmap->bvh.nodes[i]; gpu::DNode& d = bnodes[i];
@@ -26458,6 +26529,20 @@ Film renderBdptCuda(const Scene& scene, const Camera& cam, int resX, int resY,
     double* d_splat = nullptr; CUDA_CHECK(cudaMalloc(&d_splat, npix * 3 * sizeof(double)));
     CUDA_CHECK(cudaMemset(d_cam,   0, npix * 3 * sizeof(double)));
     CUDA_CHECK(cudaMemset(d_splat, 0, npix * 3 * sizeof(double)));
+    // A CHUNKED render (gpuSppChunks) stops part-way: its kernels read the device stop flag, and a
+    // chunk the stop cut short is dropped -- so each chunk accumulates into scratch films, folded
+    // into the totals only once it has landed whole (mode M's kFilmFold). A single-shot render
+    // owns no flag and runs whole.
+    const bool abortable = prog && prog->report;
+    std::unique_ptr<DeviceStopFlag> stopFlag;
+    double* s_cam = nullptr;
+    double* s_splat = nullptr;
+    if (abortable) {
+        stopFlag = std::make_unique<DeviceStopFlag>();
+        CUDA_CHECK(cudaMalloc(&s_cam,   npix * 3 * sizeof(double)));
+        CUDA_CHECK(cudaMalloc(&s_splat, npix * 3 * sizeof(double)));
+    }
+    auto stopped = [&] { return abortable && stopFlag->raised(); };
     // Resume (mode D disk resume): fresh samples carry ABSOLUTE indices
     // [sppBase, sppBase + spp), so the kernel's stride is the FINAL total (see
     // renderBackwardCuda for why). The loaded sample count is also mixed into the seed
@@ -26500,28 +26585,27 @@ Film renderBdptCuda(const Scene& scene, const Camera& cam, int resX, int resY,
     if (dbm.beams && bmap && !bmap->beams.empty() && wantLbvh) {
         const int nb = (int)bmap->beams.size();
         const auto t0 = std::chrono::steady_clock::now();
-        const bool ok = buildBeamLbvhDevice(jbvh, dbm.beams, nb, bmap->worldBounds,
-                                            bmap->radius, dbm);
+        buildBeamLbvhDevice(jbvh, dbm.beams, nb, bmap->worldBounds, bmap->radius, dbm);
         CUDA_CHECK(cudaDeviceSynchronize());
         const double ms = std::chrono::duration<double, std::milli>(
                               std::chrono::steady_clock::now() - t0).count();
-        static bool said = false, saidRefused = false;
-        if (ok && !said) {
+        static bool said = false;
+        if (!said) {
             said = true;
             std::printf("[jlbvh] device LBVH over %d sub-beams in %.1f ms (host SAH tree had %zu "
                         "nodes; LBVH has %d)\n", nb, ms, bmap->bvh.nodes.size(), dbm.nNodes);
-        } else if (!ok && !saidRefused) {
-            saidRefused = true;
-            std::printf("[jlbvh] a map of %d sub-beam(s): no LBVH; keeping the host tree "
-                        "(%d node(s))\n", nb, dbm.nNodes);
         }
     }
     // A map with beams always reaches the device with a tree: without one its merges would keep
     // their weight (mergeKappa) and gather nothing -- the image dark by the merges' share, silently.
-    if (bmap && dbm.beams && dbm.nNodes == 0 && !ft::stopRequested())
-        throw std::logic_error("renderBdptCuda: a beam map of " +
-                               std::to_string(bmap->beams.size()) +
-                               " sub-beam(s) reached the device without a tree");
+    // An internal error, so it ends the process as CUDA_CHECK does: thrown, it would leak this
+    // call's device allocations into a -serve loop that carries on.
+    if (bmap && dbm.beams && dbm.nNodes == 0 && !ft::stopRequested()) {
+        std::fprintf(stderr, "[gpu] internal error: a beam map of %zu sub-beam(s) reached the "
+                             "device without a tree\n", bmap->beams.size());
+        std::fflush(stderr);
+        std::exit(EXIT_FAILURE);
+    }
     // `-jsurf`'s map. (The "increment 1: ... an uploaded map changes nothing yet" this comment
     // used to carry was true for one version. The gather landed in 0.263.1 -- see `mergeAny`
     // below, which launches the MERGE kernel for a surface map with no beams, and
@@ -26749,7 +26833,17 @@ Film renderBdptCuda(const Scene& scene, const Camera& cam, int resX, int resY,
     std::vector<WfBand>& wfProfilePrev = g_wfProfile;
     const bool mergeAny = mergeOn || dsm.kappaS > 0.0;   // either kind wants MERGE=true
     std::vector<WfBand> wfProfileCur;
-    auto launch = [&](long long cAll, long long baseAll) {
+    // Returns whether the chunk landed whole (it is folded into the totals) or a stop cut it
+    // short (dropped).
+    auto launch = [&](long long cAll, long long baseAll) -> bool {
+      double* camT = d_cam;
+      double* splatT = d_splat;
+      if (abortable) {
+          CUDA_CHECK(cudaMemset(s_cam,   0, npix * 3 * sizeof(double)));
+          CUDA_CHECK(cudaMemset(s_splat, 0, npix * 3 * sizeof(double)));
+          camT = s_cam;
+          splatT = s_splat;
+      }
       // ONE LIGHT-SIDE REALIZATION PER SUB-LAUNCH (FTRACE_JDEVLIGHT=3, FTRACE_JSPLIT=k).
       //
       // `base` is the ABSOLUTE sample index this sub-batch starts at, so it advances every
@@ -26767,7 +26861,7 @@ Film renderBdptCuda(const Scene& scene, const Camera& cam, int resX, int resY,
       // map, accumulating into the same device film exactly as consecutive chunks already do.
       // `kappaS` is unchanged across them (same nPaths, same radius), so the MIS weights stay
       // consistent within and between sub-launches.
-      for (int jsp = 0; jsp < jSplitN; ++jsp) {
+      for (int jsp = 0; jsp < jSplitN && !stopped(); ++jsp) {
         const long long cLo = cAll * jsp / jSplitN, cHi = cAll * (jsp + 1) / jSplitN;
         const long long c = cHi - cLo;
         if (c <= 0) continue;
@@ -26840,7 +26934,7 @@ Film renderBdptCuda(const Scene& scene, const Camera& cam, int resX, int resY,
             };
             long long wave = !wq.segs ? waveTotal
                            : profiled(0, wfProfilePrev.empty() ? ((waveSamples < 1024) ? waveSamples : 1024) : waveSamples, 0.0, 0.0);
-            for (long long b0 = 0; b0 < waveTotal; ) {
+            for (long long b0 = 0; b0 < waveTotal && !stopped(); ) {
                 const long long b1 = (b0 + wave < waveTotal) ? b0 + wave : waveTotal;
                 // A REALIZATION PER BAND (FTRACE_JBAND). Salted by the band's first path slot as
                 // well as by `base`, so two bands of one chunk draw different maps and two
@@ -26860,23 +26954,23 @@ Film renderBdptCuda(const Scene& scene, const Camera& cam, int resX, int resY,
                     CUDA_CHECK(cudaEventRecord(wfEv[0]));
                 }
                 if (deep && wq.runMul != 0u)
-                    kBdptT<0, BDPT_DEEPDEPTH, true, true><<<2048, 128>>>(up.sc, up.dc, d_cam, d_splat, totalSamples, c, sppTotal, base,
+                    kBdptT<0, BDPT_DEEPDEPTH, true, true><<<2048, 128>>>(up.sc, up.dc, camT, splatT, totalSamples, c, sppTotal, base,
                                                                          resX, maxDepth, diffraction ? 1 : 0, seed, 1, dbm, dsm, wq, b0, b1);
                 else if (deep)
-                    kBdptT<0, BDPT_DEEPDEPTH, true, false><<<2048, 128>>>(up.sc, up.dc, d_cam, d_splat, totalSamples, c, sppTotal, base,
+                    kBdptT<0, BDPT_DEEPDEPTH, true, false><<<2048, 128>>>(up.sc, up.dc, camT, splatT, totalSamples, c, sppTotal, base,
                                                                           resX, maxDepth, diffraction ? 1 : 0, seed, 1, dbm, dsm, wq, b0, b1);
                 else if (wq.runMul != 0u)
-                    kBdptT<0, BDPT_MAXDEPTH, true, true><<<2048, 128>>>(up.sc, up.dc, d_cam, d_splat, totalSamples, c, sppTotal, base,
+                    kBdptT<0, BDPT_MAXDEPTH, true, true><<<2048, 128>>>(up.sc, up.dc, camT, splatT, totalSamples, c, sppTotal, base,
                                                                         resX, maxDepth, diffraction ? 1 : 0, seed, 1, dbm, dsm, wq, b0, b1);
                 else
-                    kBdptT<0, BDPT_MAXDEPTH, true, false><<<2048, 128>>>(up.sc, up.dc, d_cam, d_splat, totalSamples, c, sppTotal, base,
+                    kBdptT<0, BDPT_MAXDEPTH, true, false><<<2048, 128>>>(up.sc, up.dc, camT, splatT, totalSamples, c, sppTotal, base,
                                                                          resX, maxDepth, diffraction ? 1 : 0, seed, 1, dbm, dsm, wq, b0, b1);
                 if (wq.segs) {
                     cudaCheckKernel("bdpt");
                     CUDA_CHECK(cudaEventRecord(wfEv[1]));
                     // Queue and evaluate the wave's hits, pass after pass while the hit queue turns
                     // segments away (kWfBeamHits). Every pass queues at least one hit, so the
-                    // passes end; a stop waits for them, the chunk being kept whole.
+                    // passes end; a stop ends them sooner, the chunk being dropped.
                     int cnt[4] = {0, 0, 0, 0};
                     long long waveHits = 0;
                     int passes = 0;
@@ -26885,7 +26979,7 @@ Film renderBdptCuda(const Scene& scene, const Camera& cam, int resX, int resY,
                         kWfBeamHits<<<2048, 128>>>(up.sc, dbm, wq, passes);
                         cudaCheckKernel("wf-hits");
                         CUDA_CHECK(cudaEventRecord(wfEv[2]));
-                        kWfBeamEval<<<4096, 128>>>(up.sc, dbm, wq, d_cam, resX, up.dc);
+                        kWfBeamEval<<<4096, 128>>>(up.sc, dbm, wq, camT, resX, up.dc);
                         cudaCheckKernel("wf-eval");
                         CUDA_CHECK(cudaEventRecord(wfEv[3]));
                         CUDA_CHECK(cudaMemcpy(cnt, d_wfCounters, sizeof cnt, cudaMemcpyDeviceToHost));
@@ -26895,7 +26989,7 @@ Film renderBdptCuda(const Scene& scene, const Camera& cam, int resX, int resY,
                         CUDA_CHECK(cudaEventElapsedTime(&ms, wfEv[2], wfEv[3])); msEval += ms;
                         waveHits += (cnt[1] < wq.hitCap) ? cnt[1] : wq.hitCap;
                         ++passes;
-                        if (cnt[3] == 0) break;
+                        if (cnt[3] == 0 || stopped()) break;
                         wfDeferred += cnt[3];
                         ++wfResumes;
                         CUDA_CHECK(cudaMemsetAsync(wq.nHits, 0, sizeof(int)));       // an empty hit queue
@@ -26928,19 +27022,25 @@ Film renderBdptCuda(const Scene& scene, const Camera& cam, int resX, int resY,
             if (wq.segs && !wfProfileCur.empty()) wfProfilePrev.swap(wfProfileCur);   // this chunk's bands size the next
         }
         else if (useHero && deep)
-            kBdptT<BDPT_NSEC, BDPT_DEEPDEPTH, false, false><<<2048, 128>>>(up.sc, up.dc, d_cam, d_splat, totalSamples, c, sppTotal, base,
+            kBdptT<BDPT_NSEC, BDPT_DEEPDEPTH, false, false><<<2048, 128>>>(up.sc, up.dc, camT, splatT, totalSamples, c, sppTotal, base,
                                                              resX, maxDepth, diffraction ? 1 : 0, seed, C, dbm, dsm, DWfQueue{}, 0, totalSamples);
         else if (useHero)
-            kBdptT<BDPT_NSEC, BDPT_MAXDEPTH, false, false><<<2048, 128>>>(up.sc, up.dc, d_cam, d_splat, totalSamples, c, sppTotal, base,
+            kBdptT<BDPT_NSEC, BDPT_MAXDEPTH, false, false><<<2048, 128>>>(up.sc, up.dc, camT, splatT, totalSamples, c, sppTotal, base,
                                                             resX, maxDepth, diffraction ? 1 : 0, seed, C, dbm, dsm, DWfQueue{}, 0, totalSamples);
         else if (deep)
-            kBdptT<0, BDPT_DEEPDEPTH, false, false><<<2048, 128>>>(up.sc, up.dc, d_cam, d_splat, totalSamples, c, sppTotal, base,
+            kBdptT<0, BDPT_DEEPDEPTH, false, false><<<2048, 128>>>(up.sc, up.dc, camT, splatT, totalSamples, c, sppTotal, base,
                                                      resX, maxDepth, diffraction ? 1 : 0, seed, 1, dbm, dsm, DWfQueue{}, 0, totalSamples);
         else
-            kBdptT<0, BDPT_MAXDEPTH, false, false><<<2048, 128>>>(up.sc, up.dc, d_cam, d_splat, totalSamples, c, sppTotal, base,
+            kBdptT<0, BDPT_MAXDEPTH, false, false><<<2048, 128>>>(up.sc, up.dc, camT, splatT, totalSamples, c, sppTotal, base,
                                                     resX, maxDepth, diffraction ? 1 : 0, seed, 1, dbm, dsm, DWfQueue{}, 0, totalSamples);
         cudaCheckKernel("bdpt");
       }
+      if (!abortable) return true;
+      if (stopped()) return false;
+      kFilmFold<<<256, 128>>>(d_cam, nullptr, s_cam, nullptr, (long long)npix);
+      kFilmFold<<<256, 128>>>(d_splat, nullptr, s_splat, nullptr, (long long)npix);
+      cudaCheckKernel("bdpt-fold");
+      return true;
     };
 
     const auto tCall1 = std::chrono::steady_clock::now();
@@ -26966,6 +27066,8 @@ Film renderBdptCuda(const Scene& scene, const Camera& cam, int resX, int resY,
         if (wq.chroma) cudaFree(wq.chroma);
     }
     cudaFree(d_cam); cudaFree(d_splat);
+    if (s_cam) cudaFree(s_cam);
+    if (s_splat) cudaFree(s_splat);
     g_lastBdptOverheadSec =
         std::chrono::duration<double>((tCall1 - tCall0) +
                                       (std::chrono::steady_clock::now() - tCall2)).count();
@@ -28360,20 +28462,8 @@ std::vector<Film> renderPhotonMapSharedCuda(const Scene& scene, const std::vecto
     auto lastReport = std::chrono::steady_clock::now();
     bool stopped = false;
     // ---- the gather's cancellation flag (see kGather's poll for why it must exist) ----
-    //
-    // It lives in MAPPED PINNED host memory deliberately. The thread that launches kGather is
-    // parked inside cudaDeviceSynchronize for the whole launch and cannot issue any CUDA call,
-    // so a flag that needed a cudaMemcpy to raise would be unreachable at precisely the moment
-    // it is needed. A mapped allocation is raised by a plain store, from any thread.
-    int* h_gatherStop = nullptr;
-    int* d_gatherStop = nullptr;
-    CUDA_CHECK(cudaHostAlloc((void**)&h_gatherStop, sizeof(int), cudaHostAllocMapped));
-    *h_gatherStop = 0;
-    CUDA_CHECK(cudaHostGetDevicePointer((void**)&d_gatherStop, h_gatherStop, 0));
-    // Publish it to the device global the deep callees read. Done here, with no kernel in
-    // flight, so it is an ordinary synchronous copy rather than something that would have to
-    // race a running gather.
-    CUDA_CHECK(cudaMemcpyToSymbol(g_dGatherStop, &d_gatherStop, sizeof(int*)));
+    // A chunk it cuts short is dropped, not folded (kFilmFold), as DeviceStopFlag requires.
+    DeviceStopFlag stopFlag;
     // ---- and the gather's PROGRESS counter, the same mechanism pointed the other way ----
     //
     // kGather counts retired samples into this; the poller below reads it while the launching
@@ -28398,9 +28488,9 @@ std::vector<Film> renderPhotonMapSharedCuda(const Scene& scene, const std::vecto
     // launch cannot overlap a report the poller is still inside.
     std::mutex reportMu;
     std::atomic<bool> pollQuit{false};
-    std::thread pollThread([&, h_gatherStop, h_gatherDone] {
+    std::thread pollThread([&, h_gatherDone] {
         while (!pollQuit.load(std::memory_order_relaxed)) {
-            if (ft::stopRequested()) { *(volatile int*)h_gatherStop = 1; return; }
+            if (ft::stopRequested()) return;   // the stop itself is DeviceStopFlag's
             // reportLive, not report: this is progress from INSIDE a launch that has not
             // returned, where the retirement curve is convex and no honest rate exists — and
             // feeding those samples to the trailing window would wreck the rate for the
@@ -28418,23 +28508,19 @@ std::vector<Film> renderPhotonMapSharedCuda(const Scene& scene, const std::vecto
     });
     // Joined and freed however this function leaves — including the CUDA_CHECK throw paths,
     // which are numerous below and would otherwise leak a detached thread into a dead context.
-    // The device globals are reset to null BEFORE the memory goes: other modes' kernels read
-    // them too (dGatherStopped, dGatherRetire), and one left pointing at a freed mapping is an
-    // illegal-address fault in the next of them this process launches
-    // (tools/check_gpu_mixed_modes.py).
-    struct GatherStopGuard {
-        std::atomic<bool>& quit; std::thread& th; int* mem; unsigned long long* mem2;
-        ~GatherStopGuard() {
+    // The device global is reset to null BEFORE the memory goes: dGatherRetire runs in other
+    // modes' kernels too, and a pointer left at a freed mapping is an illegal-address fault in
+    // the next of them this process launches (as DeviceStopFlag's is).
+    struct GatherProgressGuard {
+        std::atomic<bool>& quit; std::thread& th; unsigned long long* mem;
+        ~GatherProgressGuard() {
             quit.store(true, std::memory_order_relaxed);
             if (th.joinable()) th.join();
-            int* noStop = nullptr;
             unsigned long long* noDone = nullptr;
-            cudaMemcpyToSymbol(g_dGatherStop, &noStop, sizeof noStop);
             cudaMemcpyToSymbol(g_dGatherDone, &noDone, sizeof noDone);
-            if (mem)  cudaFreeHost(mem);
-            if (mem2) cudaFreeHost(mem2);
+            if (mem) cudaFreeHost(mem);
         }
-    } gatherStopGuard{pollQuit, pollThread, h_gatherStop, h_gatherDone};
+    } gatherProgressGuard{pollQuit, pollThread, h_gatherDone};
     // Learned sub-chunk slice (flat (pixel, sample) units), carried ACROSS cameras: on a
     // flythrough consecutive frames cost almost the same, so re-probing 600 times would be
     // 600 needlessly small launches for nothing. Re-clamped to the camera's own npix below.
