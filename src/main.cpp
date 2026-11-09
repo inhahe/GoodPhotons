@@ -14232,9 +14232,23 @@ static bool jSkipHostBvh() {
 // The beam kernel radii a light-side refresh rebuilds at: epoch 0's, recorded by buildBeamMap
 // (the photon map's rule, rebuildPhotonMapAt: every epoch the same estimator, and no epoch's
 // beam count moving its -beamk floor -- a blurred clock epoch's is smaller, BLUR-EPOCH-COST).
+// Mode J keeps one too, for a refresh whose map draws empty and so measures no radii (realize).
 struct BeamRadiiPin {
     std::vector<float> radMed;   // per medium (BeamMap::radMed)
     double radius = 0.0;         // the scalar beyond them; 0 = not recorded yet
+    bool recorded() const { return radius > 0.0; }
+    // `bm`'s radii divided by `scale`: the radius-shrink factor it was built at, so that
+    // applyTo can hand them to a map at another point of the schedule.
+    void record(const BeamMap& bm, double scale = 1.0) {
+        radMed = bm.radMed;
+        for (float& r : radMed) r = (float)((double)r / scale);
+        radius = bm.radius / scale;
+    }
+    void applyTo(BeamMap& bm, double scale = 1.0) const {
+        bm.radMed = radMed;
+        for (float& r : bm.radMed) r = (float)((double)r * scale);
+        bm.radius = radius * scale;
+    }
 };
 // `pin`, when given: an empty one records the radii the map is built at, a recorded one builds
 // the map at them instead of choosing its own.
@@ -14391,9 +14405,8 @@ static double buildBeamMap(BeamMap& bm, const char* tag, double work, bool quiet
     };
     const size_t splitBudget = g_beamSplitMax > 0 ? (size_t)g_beamSplitMax : 0;
     bm.sinMin = g_beamSinMin;   // UPBP-CONV (3): the 1/sin(theta) bound, on both build paths
-    if (pin && pin->radius > 0.0) {
-        bm.radMed = pin->radMed;
-        bm.radius = pin->radius;
+    if (pin && pin->recorded()) {
+        pin->applyTo(bm);
         double meanSplit = 0.0;
         bm.build(g_beamSplitLen, splitBudget, work, &meanSplit, /*skipBvh*/ jSkipHostBvh());
         r = bm.radius;
@@ -14561,10 +14574,7 @@ static double buildBeamMap(BeamMap& bm, const char* tag, double work, bool quiet
         std::fprintf(stderr, "[beams] warning: 0 beams stored — no photon crossed a "
                              "scattering medium; the volume will be invisible.\n");
     // Recorded from a map that holds beams: an empty one's radius is BeamMap's default, no medium's.
-    if (pin && !(pin->radius > 0.0) && bm.radius > 0.0 && !bm.beams.empty()) {
-        pin->radMed = bm.radMed;
-        pin->radius = bm.radius;
-    }
+    if (pin && !pin->recorded() && bm.radius > 0.0 && !bm.beams.empty()) pin->record(bm);
     return r;
 }
 
@@ -20141,10 +20151,11 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
         long long nBlurJ = 0;        // the subpaths a clock blur's epoch draws (0: Nepoch's own)
         long long lastNepochJ = 0;   // the subpaths the last light side drew
         long long nAllJ = 0;         // the subpaths epoch 0 settled on, every refresh's ceiling
-        // The last beam map that measured its radii (one with chords), and its place in the
-        // radii's shrink schedule: what a refresh whose map draws empty takes for its own.
-        std::vector<float> beamRadMedSeen;
-        double beamRadSeen = 0.0, beamRadScaleSeen = 1.0;
+        // Epoch 0's beam radii at scale 1 (recorded by realize, built or kept): what a refresh
+        // whose map draws empty takes, at its own place in the shrink schedule. Epoch 0's and
+        // not the last measured map's, so that a resumed or batch-shared render, which reaches
+        // its epochs by other routes, gives every empty one the same radii.
+        BeamRadiiPin beamPin0J;
         auto buildLightSide = [&](uint64_t epoch, uint64_t saltOff = 0) {
             RngSaltScope saltScope(epoch + saltOff);
             const bool first = (epoch == 0);
@@ -20329,20 +20340,10 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
                              /*quiet*/!first, &scene, beamRadScaleFor(epoch + lsEpochBase));
                 // A refresh whose map drew empty measured no radius (the build had no chords to
                 // take a mean free path from), but its merges keep their kappa (renderRows), which
-                // reads the radius: take the last measured map's, scaled to this epoch's place in
-                // the shrink schedule. Epoch 0 has none to take; the dispatcher leaves the beams
-                // off if it draws empty (see beamsPtr).
-                const double rScale = beamRadScaleFor(epoch + lsEpochBase);
-                if (!bmap.beams.empty()) {
-                    beamRadMedSeen = bmap.radMed;
-                    beamRadSeen = bmap.radius;
-                    beamRadScaleSeen = rScale;
-                } else if (beamRadSeen > 0.0) {
-                    const double f = rScale / beamRadScaleSeen;
-                    bmap.radMed = beamRadMedSeen;
-                    for (float& r : bmap.radMed) r = (float)((double)r * f);
-                    bmap.radius = beamRadSeen * f;
-                }
+                // reads the radius: take epoch 0's (beamPin0J). Epoch 0 has none to take; the
+                // dispatcher leaves the beams off if it draws empty (see beamsPtr).
+                if (bmap.beams.empty() && beamPin0J.recorded())
+                    beamPin0J.applyTo(bmap, beamRadScaleFor(epoch + lsEpochBase));
                 bdpt::jWork().light.fetch_add(bdpt::jWorkBeamBuild(bmap.beams.size()),
                                               std::memory_order_relaxed);
             }
@@ -20412,10 +20413,17 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
         // the working maps -- and kept for the batch's other frames when it fits. Only a fixed
         // epoch's realization is kept (saltOff 0): the wall-clock refresh's are drawn once.
         // Returns what the build cost, 0 for a kept one.
+        // Epoch 0's radii are pinned however it became current (beamPin0J). Every render
+        // realizes epoch 0 first, a resumed or batch-shared one included.
+        auto pinEpoch0 = [&](uint64_t e) {
+            if (e == 0 && !beamPin0J.recorded() && !curB->beams.empty() && curB->radius > 0.0)
+                beamPin0J.record(*curB, beamRadScaleFor(lsEpochBase));
+        };
         auto realize = [&](uint64_t e, uint64_t saltOff) -> double {
             if (shareEpochs && saltOff == 0) {
                 if (const BatchCache::Realization* r = jlc.epochAt(e)) {
                     curB = &r->bmap; curS = &r->smap; ++lsReused;
+                    pinEpoch0(e);
                     return 0.0;
                 }
             }
@@ -20428,6 +20436,7 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
                 if (const BatchCache::Realization* r = jlc.keepEpoch(e, bmap, smap)) {
                     curB = &r->bmap; curS = &r->smap;
                 }
+            pinEpoch0(e);
             return sec;
         };
         if (wantBeams || wantSurf) {

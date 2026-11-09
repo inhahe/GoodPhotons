@@ -414,8 +414,9 @@ Everything else follows from that one field.
   `nullptr`, so the merge path is never *entered*, rather than entered and skipped per-ray. That is
   what makes the degenerate-reduction test (below) a property of the code instead of of
   floating-point luck. But once a render has the technique, a refresh that draws empty is passed
-  as it is and keeps its merge kappa (`n·2r` from the last non-empty realization's radii, scaled
-  as that epoch's would be): the technique belongs to the render, not to one realization, and an
+  as it is and keeps its merge kappa (`n·2r` from epoch 0's radii, `beamPin0J`, scaled to its own
+  place in the shrink schedule -- epoch 0's because every render realizes it first, a resumed or
+  batch-shared one included, so every route to an epoch gives it the same radii): the technique belongs to the render, not to one realization, and an
   epoch that dropped it would weigh its connections up and read bright by P(empty) × the merge
   share. The device does the same: `uploadBeamMapCuda` sets `mergeKappa` for an empty map, and a
   non-empty map with no MIS partials still gathers, at weight 1, as the host does.

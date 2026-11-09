@@ -6,14 +6,15 @@
 A white ball of radius 1 under `light sun` in `medium { sigma_t 0.04  albedo 0.5 }` with no
 bounds, beside a 2x2 floor; and, held still, the same with a bounded cloud the sun's first leg
 crosses, and with the haze a density field instead (that also held 32 m out, in mode D, and at
-32x24 for mode J on the GPU). Mode R's NEE leg dims the sun by the haze out to the instant's sphere (Scene::mediaExitDistance: |centre - p| + sceneRadius); a light subpath
-of modes D and J walks it from the entry disc's plane, never as far. Before the subpaths took the
-NEE leg's haze (sunLegFactor, the user's option (a)), D read the ball 1.75 % bright still,
-0.3 % with the ball held by a shutter at x = 6.4 outside the instant's sphere, and 2.75 % at
-x = 32. Each case renders mode R and the mode under test, two seeds each, and requires the ball's
-mean and the haze's (the top corners) to agree within 0.6 % (D) or 1.5 % (J, whose beam
-merges are noisier), and within four of their standard errors from the seeds' spread, whichever
-is wider.
+32x24 for mode J on the GPU). Mode R's NEE leg dims the sun by the haze out to the instant's
+sphere (Scene::mediaExitDistance: |centre - p| + sceneRadius); a light subpath of modes D and J
+walks it from the entry disc's plane, never as far. Before the subpaths took the NEE leg's haze
+(sunLegFactor, the user's option (a)), D read the ball 1.75 % bright still, 0.3 % with the ball
+held by a shutter at x = 6.4 outside the instant's sphere, and 2.75 % at x = 32. Each case
+renders mode R and the mode under test, two seeds each (six for `fieldlo`'s noisy J), and
+requires the ball's mean and the haze's (the top corners) to agree within 0.6 % (D) or 1.5 %
+(J, whose beam merges are noisier), or within four of their standard errors from the seeds'
+spread (five with six seeds), whichever is wider.
 
 Exits 1 on any failure.
 """
@@ -26,7 +27,8 @@ import numpy as np
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 NL = chr(10)
-FIELDLO_GPU_J_SPP = 4   # fieldlo, GPU mode J: ~80 s a seed
+FIELDLO_GPU_J_SPP = 4   # fieldlo, GPU mode J: ~80 s a seed...
+FIELDLO_GPU_J_SEEDS = 6   # ...and six of them: its noise is above the tolerance (see main)
 FIELD = ('medium { sigma_t 0.06  albedo 0.5  density "0.3 + 0.7*saturate(1.0 - y/8.0)"  '
          'density_max 1 }')
 
@@ -126,7 +128,8 @@ def main():
                 if key not in refs:
                     refs[key] = [render(name, "R", dev, s) for s in (1, 2)]
                 R = refs[key]
-                X = [render(name, mode, dev, s) for s in (1, 2)]
+                k = FIELDLO_GPU_J_SEEDS if name == "fieldlo" else 2
+                X = [render(name, mode, dev, s) for s in range(1, k + 1)]
                 h, w = R[0].shape
                 yy, xx = np.mgrid[0:h, 0:w]
                 ball = (yy - h * 0.5) ** 2 + (xx - w * 0.5) ** 2 < (0.25 * h) ** 2
@@ -136,9 +139,16 @@ def main():
                     r = [x[m].mean() for x in R]
                     v = [x[m].mean() for x in X]
                     ratio = np.mean(v) / np.mean(r)
-                    # the ratio's standard error from the two seeds of each
-                    se = np.hypot(abs(v[1] - v[0]) / 2 / np.mean(v), abs(r[1] - r[0]) / 2 / np.mean(r))
-                    ok = abs(ratio - 1.0) < max(tol, 4.0 * se)
+                    # The ratio's standard error from the seeds' spread. Two seeds give it one
+                    # degree of freedom, a statistic as heavy-tailed as Cauchy's: harmless where
+                    # the noise is under the tolerance, which then decides, but where it is over
+                    # (fieldlo's 4 spp at 32x24) four of them would fail a correct binary one
+                    # run in six. So a noisy case takes more seeds and a bound for their dof:
+                    # 5 at five, P(|t5| > 5) = 0.4 %.
+                    se = np.hypot(np.std(v, ddof=1) / np.sqrt(len(v)) / np.mean(v),
+                                  np.std(r, ddof=1) / np.sqrt(len(r)) / np.mean(r))
+                    q = 4.0 if len(v) <= 2 else 5.0
+                    ok = abs(ratio - 1.0) < max(tol, q * se)
                     print("%-22s %-5s %s/R %.4f (+-%.4f)  %s" % (case, region, mode, ratio, se,
                                                               "ok" if ok else "FAIL"))
                     if not ok:

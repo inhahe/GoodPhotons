@@ -8584,6 +8584,14 @@ struct DBeamMap {
         const int j = misIdx ? misIdx[i] : i;
         return (j >= 0 && j < nMis) ? &mis[j] : nullptr;
     }
+    // Is there anything to gather: beams with a tree.
+    __host__ __device__ bool gathers() const { return beams != nullptr && nNodes > 0; }
+    // Does mode J run its beam merges? A zero kappa with nothing to gather is the dispatcher's
+    // "no beams" (-nobeams: mode D down to the RNG stream). A map that drew empty keeps its
+    // kappa and gathers nothing (host twin renderRows, where the why is); one without MIS
+    // partials (kappa 0) still gathers, at weight 1 -- mode M's estimator, over-bright but a
+    // picture, as the host falls back. Read by kBdptT and by renderBdptCuda's launch choice.
+    __host__ __device__ bool mergeOn() const { return mergeKappa > 0.0 || gathers(); }
 };
 
 // The per-CAMERA-SEGMENT constants of a merge weight — device twin of the camera-side half
@@ -19288,14 +19296,10 @@ kBdptT(DScene sc, const __grid_constant__ DCamera cam, double* camFilm, double* 
     D_MOTION_CLEAR();   // this thread's time: the launch's (passU) until a path sets one
     enum { SECN = (NS > 0 ? NS : 1), MAXV = BDPT_MAXV_OF(MAXD),
            SEGN = (MERGE ? BDPT_MAXV_OF(MAXD) : 1) };
-    // A zero kappa is the dispatcher's "-nobeams" signal, so this single test is the whole
-    // gate -- with it false the camera walk is not even asked to record its segments and the
-    // render is mode D down to the RNG stream (gate 1). A map that drew empty keeps its kappa
-    // (host twin renderRows, where the why is) and gathers nothing (`beamsHere`).
-    const bool beamsHere = MERGE && bm.beams != nullptr && bm.nNodes > 0;
-    // A map without MIS partials (kappa 0) still gathers, at weight 1 (mode M's estimator,
-    // over-bright but a picture -- the host twin's fallback).
-    const bool mergeOn = MERGE && (bm.mergeKappa > 0.0 || beamsHere);
+    // DBeamMap::mergeOn is the whole gate: with it false the camera walk is not even asked to
+    // record its segments and the render is mode D down to the RNG stream (gate 1).
+    const bool beamsHere = MERGE && bm.gathers();
+    const bool mergeOn = MERGE && bm.mergeOn();
     // The merge technique's constant, n_m * 2r, travelling with the map so no call site can
     // forget it. Zero unless the map actually carries MIS partials, and that zero is what
     // makes every merge term inside dMisWeight disappear. Weighted and unweighted merges
@@ -26320,8 +26324,11 @@ static void uploadBeamMapCuda(const Scene& scene, const BeamMap* bmap, DUpload& 
         const double rm = bmap->radOf(b.med);
         r.invRad = (float)(rm > 0.0 ? 1.0 / rm : 0.0);
     }
-    // With `lbvh` there is no host tree to convert; the device builds one straight after.
-    std::vector<gpu::DNode> bnodes(lbvh ? 0 : bmap->bvh.nodes.size());
+    // With `lbvh` there is no host tree to convert; the device builds one straight after --
+    // except over one sub-beam, which the LBVH refuses (it has no internal node) and for which
+    // BeamMap::build keeps the host tree, uploaded here.
+    const bool hostTree = !lbvh || bmap->beams.size() <= 1;
+    std::vector<gpu::DNode> bnodes(hostTree ? bmap->bvh.nodes.size() : 0);
     for (size_t i = 0; i < bnodes.size(); ++i) {
         if ((i & 0xFFFFF) == 0 && ft::stopRequested()) break;
         const BvhNode& s = bmap->bvh.nodes[i]; gpu::DNode& d = bnodes[i];
@@ -26498,14 +26505,23 @@ Film renderBdptCuda(const Scene& scene, const Camera& cam, int resX, int resY,
         CUDA_CHECK(cudaDeviceSynchronize());
         const double ms = std::chrono::duration<double, std::milli>(
                               std::chrono::steady_clock::now() - t0).count();
-        static bool said = false;
-        if (!said) {
+        static bool said = false, saidRefused = false;
+        if (ok && !said) {
             said = true;
             std::printf("[jlbvh] device LBVH over %d sub-beams in %.1f ms (host SAH tree had %zu "
-                        "nodes; LBVH has %d)%s\n", nb, ms, bmap->bvh.nodes.size(), dbm.nNodes,
-                        ok ? "" : " -- REFUSED, too few beams; keeping the host tree");
+                        "nodes; LBVH has %d)\n", nb, ms, bmap->bvh.nodes.size(), dbm.nNodes);
+        } else if (!ok && !saidRefused) {
+            saidRefused = true;
+            std::printf("[jlbvh] a map of %d sub-beam(s): no LBVH; keeping the host tree "
+                        "(%d node(s))\n", nb, dbm.nNodes);
         }
     }
+    // A map with beams always reaches the device with a tree: without one its merges would keep
+    // their weight (mergeKappa) and gather nothing -- the image dark by the merges' share, silently.
+    if (bmap && dbm.beams && dbm.nNodes == 0 && !ft::stopRequested())
+        throw std::logic_error("renderBdptCuda: a beam map of " +
+                               std::to_string(bmap->beams.size()) +
+                               " sub-beam(s) reached the device without a tree");
     // `-jsurf`'s map. (The "increment 1: ... an uploaded map changes nothing yet" this comment
     // used to carry was true for one version. The gather landed in 0.263.1 -- see `mergeAny`
     // below, which launches the MERGE kernel for a surface map with no beams, and
@@ -26636,14 +26652,13 @@ Film renderBdptCuda(const Scene& scene, const Camera& cam, int resX, int resY,
         CUDA_CHECK(cudaMemcpyToSymbol(gpu::c_dbgOnlyT, &ot, sizeof(int)));
         if (os >= 0 || ot >= 0) std::printf("[diag] FTRACE_ONLY_ST: strategy s=%d t=%d only\n", os, ot);
     }
-    // A map that drew empty keeps its kappa; one without MIS partials still gathers (kBdptT).
-    const bool mergeOn = dbm.mergeKappa > 0.0 || dbm.nNodes > 0;
+    const bool mergeOn = dbm.mergeOn();
     // WAVEFRONT gather queue (UPBP-CONV): sized for one wave of camera paths; the chunk is run
     // as consecutive waves. FTRACE_NOWAVEFRONT=1 forces the inline gather (the A/B control).
     DWfQueue wq{};
     int* d_wfCounters = nullptr;
     long long waveSamples = 0;
-    if (mergeOn && dbm.nNodes > 0 &&
+    if (dbm.gathers() &&
         !(std::getenv("FTRACE_NOWAVEFRONT") && std::atoi(std::getenv("FTRACE_NOWAVEFRONT")) != 0)) {
         const int segCap = 1 << 20;          // 424 B each (~445 MB), 128 of them JSPEC's
         int hitCap = 1 << 25;                // 16 B each  (512 MB): a dense map yields thousands of
@@ -26824,7 +26839,7 @@ Film renderBdptCuda(const Scene& scene, const Camera& cam, int resX, int resY,
                 return cand;
             };
             long long wave = !wq.segs ? waveTotal
-                           : profiled(0, wfProfilePrev.empty() ? ((waveSamples < 64) ? waveSamples : 64) : waveSamples, 0.0, 0.0);
+                           : profiled(0, wfProfilePrev.empty() ? ((waveSamples < 1024) ? waveSamples : 1024) : waveSamples, 0.0, 0.0);
             for (long long b0 = 0; b0 < waveTotal; ) {
                 const long long b1 = (b0 + wave < waveTotal) ? b0 + wave : waveTotal;
                 // A REALIZATION PER BAND (FTRACE_JBAND). Salted by the band's first path slot as

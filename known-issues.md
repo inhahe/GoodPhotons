@@ -707,12 +707,19 @@ paths and starts the render with 64: no hit spills, and 2 spp of the field take 
 126 s, the homogeneous scene unchanged (10 s against 11). **0.434.34** (review of 0.434.33) removed
 the on-the-spot path instead: a segment the full hit queue turns away records how many candidates
 it queued and is walked again in a resume pass once the queue is drained, and the wave floor and
-first wave went back to 256 and 1024 paths. The field's 2 spp at 32x24 took 39.1 s against
-0.434.33's 50.5 s (same session; 6 resume passes for 1507 segments, none gathered inline), the
-homogeneous haze 3.7 s on both. What is left is the beam-hit walk itself, 35 of the 39 s: one
-thread a segment walks its ~10^5 candidates serially, so a wave of a few hundred dense paths leaves
-the device nearly idle. Splitting a segment's walk across a warp would attack that directly; the
-fatter-than-needed beams below are the cause.
+first wave went back to 256 and 1024 paths (the latter only in 0.434.36: 0.434.34-35 still opened
+with 64). The field's 2 spp at 32x24: 25.8 s on 0.434.36, against 0.434.33's 50.5 s and
+0.434.32's 126 s; the homogeneous haze 3.7 s throughout. What is left is the beam-hit walk
+itself, 22 of the 26 s: one thread a segment walks its ~10^5 candidates serially.
+
+**A resume pass re-walks its segments from the root** (review of f6f9981), skipping what they
+queued: ~0.8 s a pass on the field (6 passes 22.7 s, 30 passes 42.1 s, 125 passes 118.7 s of
+beam-hit time under FTRACE_WFHITCAP). At 96x72 every one of the field's 51 waves overflowed
+once (54 resume passes, ~1/6 of the 266 s): at ~1.6e5 hits a path the 256-path wave floor alone
+exceeds the 2^25-hit queue. Saving each deferred segment's traversal stack in a double-buffered
+side store (with the re-walk as the fallback when it fills) would remove that; whether it is
+worth its code depends on the fix below, which should make such maps rare -- measure overflow on
+the reference scenes after it, and build the saved-stack resume if any still overflow.
 
 **Still open: the budget's probes do not measure what the camera gathers.** `probeGatherCount`
 draws chords between random points of the beams' bounding box. Each gathers 32 beams by
@@ -773,11 +780,16 @@ its kappa (`nEmitted` and the radius) and gathers nothing. Where no light subpat
 vertex its merge terms are 0 anyway, so a technique left on costs nothing there. **0.434.34 (review
 of 7ffef79..a44d07f) finished it:** an empty refresh's beam map had kept the build's default radius
 (0.02 m, no chords to measure a mean free path from), so its kappa was some 70 times too small under
-the automatic radius; it now takes the last measured map's radii, scaled to its place in the shrink
-schedule. Epoch 0 drawing empty still leaves the beams off for the render (plain mode D, unbiased):
-no map has measured a radius for it to borrow. On the device a map of one sub-beam has a tree again
-(the host builds it, the LBVH refusing one primitive), and a map without MIS partials gathers at
-weight 1 again, as on the host, rather than not at all.
+the automatic radius; it now takes measured radii, scaled to its place in the shrink schedule.
+Epoch 0 drawing empty still leaves the beams off for the render (plain mode D, unbiased): no map
+has measured a radius for it to borrow. A map without MIS partials gathers at weight 1 again on the
+device, as on the host, rather than not at all. **0.434.36 (review of f6f9981):** the radii are
+epoch 0's (`beamPin0J`), not the last measured map's, recorded however epoch 0 became current: a
+batch-shared render takes it from the batch's cache, where the old rule never saw a build and left
+an empty epoch at 0.02 m, and a resumed fixed-epoch render reaches its epochs by another route than
+a straight one. And a one-sub-beam map has a tree on the device: the host kept one (the LBVH refusing
+a single primitive) but the upload converted no host nodes whenever the LBVH was wanted;
+renderBdptCuda now refuses a map with beams and no tree (`tools/check_jgpu_one_beam.py`).
 
 ## FIXED (2026-11-07, 0.434.29; opened 2026-11-05, 0.434.16, widened 2026-11-06): HAZE-BLUR-DOMAIN — modes D and J's sun subpaths take less unbounded haze than their NEE leg: 1-2 % bright in a still scene, more for a mover far out under a blur
 
