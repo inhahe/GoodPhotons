@@ -72,22 +72,25 @@ closed entries, where the cost is a broken historical link rather than a blocked
 Three references — `scenes/_gr_fly0.ftsl`, `scenes/silver_sphere_xenon.ftsl`, `scenes/x.ftsl` —
 name files that no longer exist at all, all in closed entries.
 
-## OPEN (2026-11-08, 0.434.34): GATHER-STOP-DANGLING — the device's stop flag outlives mode M's gather, and mode J never sets one
+## FIXED (2026-11-08, 0.434.35; opened 0.434.34): GATHER-STOP-DANGLING — a GPU run that rendered a mode M camera and then a mode J camera crashed
 
 `renderPhotonMapSharedCuda` (render_cuda.cu) allocates a mapped pinned int, publishes its device
-address in the `__device__` global `g_dGatherStop`, and frees it on the way out
-(`GatherStopGuard`) without clearing the global; `g_dGatherDone` likewise. Every later kernel
-that polls `dGatherStopped()` in the same process -- mode J's `kWfBeamHits` and the inline beam
-gather, mode M's camera walk -- then reads freed host memory: an illegal-address fault that kills
-the CUDA context, wherever one process runs mode M's gather and then such a kernel (a camera list
-mixing modes, the viewer switching modes). Not reproduced yet; found by reading the code while a
-mode J render ignored `-stop`. That is the other half: `renderBdptCuda` never installs the flag,
-so mode J's device walk cannot see a stop at all, and a pass loop that never drained (a
-deliberately broken build, check_wf_resume.py's proof) ignored `ftrace -stop` for good -- it had
-to be unstuck by zeroing the wave queue's `segCap` from cdb. 0.434.34's pass loop also checks
-`ft::stopRequested()` on the host. Proper fix: one owner for the flag -- installed, polled from
-`ft::stopRequested()` and cleared (the global reset to null before the memory is freed) by an
-RAII helper both renderers use.
+address in the `__device__` global `g_dGatherStop`, which its kernels poll for `-stop`
+(`dGatherStopped`), and freed it on the way out (`GatherStopGuard`) without clearing the global;
+`g_dGatherDone`, its progress counter, likewise. Kernels of other modes read the same globals, so
+the next one the process launched read a freed mapping. Reproduced: a fog box with camera `m`
+in mode M and camera `j` in mode J, rendered on the GPU in one run, died in the J camera's first
+wavefront launch ("wf-hits kernel failed: an illegal memory access was encountered").
+`GatherStopGuard` now resets both globals to null before freeing. `tools/check_gpu_mixed_modes.py`
+renders that scene and fails on 0.434.34.
+
+Found by reading the code while a mode J render ignored `-stop` (a deliberately broken build whose
+resume passes never drained, check_wf_resume.py's proof; it had to be unstuck by zeroing the wave
+queue's `segCap` from cdb). That half is by design and stays: mode J publishes no device flag,
+because `gpuSppChunks` keeps every chunk it launches, so a gather cut short by a stop would be kept,
+dark; a chunk in flight runs whole (~0.15 s). `kWfBeamHits` lost its stop poll, which only ever
+read null or the dangling pointer, and 0.434.34's host-side stop test in the resume-pass loop is
+gone for the same reason (correct passes always end: each queues at least one hit).
 
 ## DONE (2026-11-05, 0.434.2): STOP-STALE-PID — `ftrace -stop` listed a crashed render under the unrelated process that inherited its pid
 

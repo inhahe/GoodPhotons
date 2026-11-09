@@ -619,7 +619,8 @@ Four consequences worth knowing:
     many it queued (`DWfQueue::resume`) and is walked again in a **resume pass** after
     `kWfBeamEval` has drained the queue, skipping those — the tree fixes the walk's order, so
     every candidate is queued exactly once, and a pass always queues at least one, so the passes
-    end. (Until 0.434.34 overflowing hits were evaluated on the spot inside `kWfBeamHits`, one
+    end. A stop waits for them: a mode J chunk runs whole (`gpuSppChunks` keeps what it launches),
+    so neither the walk nor the pass loop polls for one. (Until 0.434.34 overflowing hits were evaluated on the spot inside `kWfBeamHits`, one
     thread a segment: harmless at `_fog_cornell`'s rate, ~20× slower a hit with an unbounded
     density field's ~10⁵ hits a path, J-FIELD-SLOW.) The wave floor is 256 paths.
     `tools/check_wf_resume.py` renders a fog with the hit queue shrunk (`FTRACE_WFHITCAP`) and

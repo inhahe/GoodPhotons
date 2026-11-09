@@ -16,8 +16,9 @@ candidate's keyed stream) under one light-side realization (-beamfreeze: on the 
 refresh otherwise ends on the clock, and the slower capped run would meet other maps). The
 default render is made twice, as the control that the comparison can hold at all; each render
 must report how many resume passes it took: none by default, some under the cap. A render that
-outruns --limit is stopped (`ftrace -stop`) and fails the check: passes that re-queued what
-they should skip would never drain the queue.
+outruns --limit fails the check: passes that re-queued what they should skip would never drain
+the queue. It is asked to stop (`ftrace -stop`), which a chunk in flight does not answer, so
+such a render is left running, and its pid reported.
 
 Exits 1 on any failure.
 """
@@ -102,11 +103,15 @@ def main():
             try:
                 rc = p.wait(timeout=a.limit)
             except subprocess.TimeoutExpired:
-                # Never killed: a CUDA process killed mid-kernel can wedge the driver.
-                subprocess.run([exe, "-stop", str(p.pid)], capture_output=True)
-                p.wait()
-                raise SystemExit("FAILED: %s ran past %d s (passes that never drain the queue?)"
-                                 % (tag, a.limit))
+                # Never killed: a CUDA process killed mid-kernel can wedge the driver. A chunk
+                # in flight does not answer -stop (gpuSppChunks), so passes that never drain
+                # leave the process running; say so rather than wait on it.
+                s = subprocess.run([exe, "-stop", str(p.pid)], capture_output=True)
+                if s.returncode == 0:
+                    p.wait()
+                raise SystemExit("FAILED: %s ran past %d s (passes that never drain the queue?)%s"
+                                 % (tag, a.limit, "" if s.returncode == 0 else
+                                    "; pid %d ignores -stop, mid-chunk" % p.pid))
         with open(logf, encoding="utf-8", errors="replace") as lf:
             log = lf.read()
         if rc != 0:

@@ -9304,6 +9304,8 @@ __global__ void kBeamTr0(DScene sc, const DBeamRec* beams, float* tr0, const int
 // segments, skipping their queued candidates. The walk's order is fixed by the tree, so the
 // skipped candidates are exactly the ones queued before, and every candidate is evaluated once,
 // in kWfBeamEval, with the random numbers its (segment, beam) pair keys whichever pass queued it.
+// No stop poll: a mode J chunk runs whole (gpuSppChunks keeps what it launches), so a walk cut
+// short would be kept, dark.
 __global__ void kWfBeamHits(DScene sc, DBeamMap bm, DWfQueue q, int resumePass) {
     D_MOTION_CLEAR();   // this thread's time: the launch's (passU) until a path sets one
     const int nS = min(*q.nSegs, q.segCap);
@@ -9319,12 +9321,10 @@ __global__ void kWfBeamHits(DScene sc, DBeamMap bm, DWfQueue q, int resumePass) 
         Real tRoot;
         if (!boxHit(bm.nodes[0], oc, invD, (Real)0, tMax, tRoot)) continue;
         int stack[64]; int sp = 0; stack[sp++] = 0;
-        int stopPoll = 0;
         const int routeMedJ = sg.routeMedJ;   // once, not per candidate (q.hits aliases q.segs)
         int e = 0;           // candidates met so far, in walk order
         bool full = false;   // the hit queue turned this segment away: resume it next pass
         while (sp && !full) {
-            if ((++stopPoll & 63) == 0 && dGatherStopped()) break;
             const DNode& n = bm.nodes[stack[--sp]];
             if (n.count > 0) {
                 for (int i = 0; i < n.count; ++i) {
@@ -26860,9 +26860,8 @@ Film renderBdptCuda(const Scene& scene, const Camera& cam, int resX, int resY,
                     cudaCheckKernel("bdpt");
                     CUDA_CHECK(cudaEventRecord(wfEv[1]));
                     // Queue and evaluate the wave's hits, pass after pass while the hit queue turns
-                    // segments away (kWfBeamHits). Every pass queues at least one hit, so it ends;
-                    // a stop ends it at once (the walk polls the stop only every 64 nodes, so a
-                    // segment can be turned away before it sees one).
+                    // segments away (kWfBeamHits). Every pass queues at least one hit, so the
+                    // passes end; a stop waits for them, the chunk being kept whole.
                     int cnt[4] = {0, 0, 0, 0};
                     long long waveHits = 0;
                     int passes = 0;
@@ -26881,7 +26880,7 @@ Film renderBdptCuda(const Scene& scene, const Camera& cam, int resX, int resY,
                         CUDA_CHECK(cudaEventElapsedTime(&ms, wfEv[2], wfEv[3])); msEval += ms;
                         waveHits += (cnt[1] < wq.hitCap) ? cnt[1] : wq.hitCap;
                         ++passes;
-                        if (cnt[3] == 0 || ft::stopRequested()) break;
+                        if (cnt[3] == 0) break;
                         wfDeferred += cnt[3];
                         ++wfResumes;
                         CUDA_CHECK(cudaMemsetAsync(wq.nHits, 0, sizeof(int)));       // an empty hit queue
@@ -28404,11 +28403,19 @@ std::vector<Film> renderPhotonMapSharedCuda(const Scene& scene, const std::vecto
     });
     // Joined and freed however this function leaves — including the CUDA_CHECK throw paths,
     // which are numerous below and would otherwise leak a detached thread into a dead context.
+    // The device globals are reset to null BEFORE the memory goes: other modes' kernels read
+    // them too (dGatherStopped, dGatherRetire), and one left pointing at a freed mapping is an
+    // illegal-address fault in the next of them this process launches
+    // (tools/check_gpu_mixed_modes.py).
     struct GatherStopGuard {
         std::atomic<bool>& quit; std::thread& th; int* mem; unsigned long long* mem2;
         ~GatherStopGuard() {
             quit.store(true, std::memory_order_relaxed);
             if (th.joinable()) th.join();
+            int* noStop = nullptr;
+            unsigned long long* noDone = nullptr;
+            cudaMemcpyToSymbol(g_dGatherStop, &noStop, sizeof noStop);
+            cudaMemcpyToSymbol(g_dGatherDone, &noDone, sizeof noDone);
             if (mem)  cudaFreeHost(mem);
             if (mem2) cudaFreeHost(mem2);
         }
