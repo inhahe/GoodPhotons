@@ -372,6 +372,11 @@ size_t cudaSceneHoldBytes(const CudaSceneHold* held);
 // map's photon count, emission count and radius, so the host need not grid it
 // (bdpt::SurfMap::radiusOnly).
 bool cudaJSurfOnDevice();
+// ...and whether it needs nothing of the host's map but its count and radius: not under the
+// diagnostic arms that compare the host map with the device's (FTRACE_JDEVLIGHT=2 or 4), which
+// need the host to have traced and stored it. Mode J's device-drawn surface map
+// (BeamBudgetReq::hostSurf) asks this.
+bool cudaJSurfHostless();
 
 // The fixed cost of the last renderBdptCuda call, in seconds: everything but its chunks (the
 // setup before the first launch and the teardown after the last). Mode J's epoch loop reads

@@ -25970,6 +25970,7 @@ static int jDevLightLevel() {
     return level;
 }
 bool cudaJSurfOnDevice() { return jDevLightLevel() != 0; }
+bool cudaJSurfHostless() { const int l = jDevLightLevel(); return l == 1 || l == 3; }
 // Per-object render modes (0.386.0): see gpu::c_routeOn. Set by runRender before a D/J render.
 static int g_routeOn = 0, g_routeDefault = 1, g_routeAnyMedJ = 0;
 static double g_routeSppD = 1.0, g_routeSppJ = 1.0;

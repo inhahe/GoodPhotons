@@ -436,11 +436,17 @@ Everything else follows from that one field.
   count (`nEmitted`), and so does each merge constant (`MergeK`: n_beam 2r_b and n_surf pi r_s^2;
   the device's `mergeKappa` and `kappaS`), so the subset is the same estimator with fewer beam
   samples. With the beams off the pass deposits none (`beamPaths` 0) and runs no beam budget.
-  On the GPU the device draws the surface map itself (`cudaJSurfOnDevice`), so the host pass
+  On the GPU, with a fixed map or the beams off (and no `-n`), the device draws the surface map
+  itself (`cudaJSurfHostless`: not under the host-vs-device comparison arms), so the host pass
   stores no surface photons and traces only the beams' subpaths, none with the beams off
   (`BeamBudgetReq::hostSurf`); the map carries the device's count and photon slots
   (`SurfMap::devPaths`/`devCap`, from the pilot's photons a subpath), and the batch cache keeps
-  epoch 0's counts (`BatchCache::nAll0`...) for a frame that reuses epoch 0 (0.436.0). A scene
+  epoch 0's counts (`BatchCache::nAll0`...) for a frame that reuses epoch 0 (0.436.0). The knee
+  rule's GPU pass still stores host photons the device redraws (TODO AUTO-HOST-SURF). The
+  `-jsurf-count` ceiling lowers the surface map's subpaths -- the first `surfStore` of the pass
+  store photons, or the device draws fewer -- never the pass the beams are sized on. A fixed
+  map's pilot is sequential: rounds of `kPilotMin` subpaths until it has seen `kPilotBeams` (256)
+  beams or `kPilotMax` subpaths. A scene
   names its own rule with `render { jbeams }` (`g_jBeamsScene`; `jBeamsResolve`: below the
   command line's `-jbeams` and `-nobeams`, above the `-beamk`/`-beamcount`/`-n` that pick `auto`
   only where no rule is named; one grammar, `ftsl::parseJBeams`), and `checkpointGuard` mixes
