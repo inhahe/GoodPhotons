@@ -37,6 +37,11 @@ FIELD = ('medium { sigma_t 0.06  albedo 0.5  density "0.3 + 0.7*saturate(1.0 - y
 # Per-case environment, and the case whose mode R renders stand for its own (R ignores ENV).
 ENV = {"stilldom": {"FTRACE_JBEAMDOMAIN": "0.5"}}
 REF_OF = {"stilldom": "still"}
+# Seeds of each mode a case renders, and how many of the ratio's standard errors it may stray. Two
+# seeds give the error one degree of freedom, a statistic as heavy-tailed as Cauchy's: harmless
+# while every case's noise is under the tolerance, which then decides. A case noisier than that
+# needs more seeds and a bound to match (six and 5: P(|t5| > 5) = 0.4 % a region).
+SEEDS, Q = 2, 4.0
 
 
 def scene(still, keys=8.0, at=6.4, medium="medium { sigma_t 0.04  albedo 0.5 }", extra="",
@@ -130,11 +135,10 @@ def main():
                 if (only and case not in only) or spp_for(name, mode, dev) is None:
                     continue
                 key = (REF_OF.get(name, name), dev)
-                k = 2
                 if key not in refs:
-                    refs[key] = [render(name, "R", dev, s) for s in range(1, k + 1)]
+                    refs[key] = [render(name, "R", dev, s) for s in range(1, SEEDS + 1)]
                 R = refs[key]
-                X = [render(name, mode, dev, s) for s in range(1, k + 1)]
+                X = [render(name, mode, dev, s) for s in range(1, SEEDS + 1)]
                 h, w = R[0].shape
                 yy, xx = np.mgrid[0:h, 0:w]
                 ball = (yy - h * 0.5) ** 2 + (xx - w * 0.5) ** 2 < (0.25 * h) ** 2
@@ -144,15 +148,10 @@ def main():
                     r = [x[m].mean() for x in R]
                     v = [x[m].mean() for x in X]
                     ratio = np.mean(v) / np.mean(r)
-                    # The ratio's standard error from the seeds' spread. Two seeds give it one
-                    # degree of freedom, a statistic as heavy-tailed as Cauchy's: harmless while
-                    # every case's noise is under the tolerance, which then decides. A case whose
-                    # noise is over it needs more seeds of both modes and a bound to match (0.434.36
-                    # used six and 5 for a 4-spp case: under P(|t5| > 5) = 0.4 % a region).
+                    # The ratio's standard error from the seeds' spread (SEEDS, Q).
                     se = np.hypot(np.std(v, ddof=1) / np.sqrt(len(v)) / np.mean(v),
                                   np.std(r, ddof=1) / np.sqrt(len(r)) / np.mean(r))
-                    q = 4.0
-                    ok = abs(ratio - 1.0) < max(tol, q * se)
+                    ok = abs(ratio - 1.0) < max(tol, Q * se)
                     print("%-22s %-5s %s/R %.4f (+-%.4f)  %s" % (case, region, mode, ratio, se,
                                                               "ok" if ok else "FAIL"))
                     if not ok:

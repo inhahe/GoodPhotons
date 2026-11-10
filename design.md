@@ -2054,12 +2054,16 @@ J-BEAM-FARLIMIT).** A clamp on a beam's length was a bias as well as a cost: the
 count a merge at every medium vertex of a path, so wherever a beam ended short of one they gave
 the missing merge its share of that path, and the image lost it there. Mode `J` therefore clips
 an unbounded medium's beams to one sphere, the scene's **beam domain** (`Scene::jBeamMerges`:
-about `sceneCenter`, `kJBeamDomainScale` 8 × `sweptReach`, which under a blur holds every mover's
-sweep), and every beam-merge term of the weights (`mergeEtaPrimeBeam`, a beam's `etaPrev`,
-`ChromaMis::beamEta1`, the camera side's `etaKCoef`; device `dJBeamMerges` in the same four)
-counts a merge in an unbounded medium only inside it. Outside it the connections render the
-haze alone, as in mode `D`. Since the region is fixed — the same at every time, for the light
-side and the camera side — its size moves the noise and the cost, never the expectation.
+about `sceneCenter`, `kJBeamDomainScale` 8 × `sceneRadius`, widened to `sweptReach` where a
+blur's movers stray further, 0.434.41), and every beam-merge term of the weights
+(`mergeEtaPrimeBeam`, a beam's `etaPrev`, `ChromaMis::beamEta1`, the camera side's `etaKCoef`;
+on the device `dJBeamMerges` in `dMergeEtaPrime`, `dChromaBeamEta1` and the wavefront's
+`etaKCoef`, `etaPrev` coming from the host) counts a merge in an unbounded medium only inside it.
+Outside it the connections render the haze alone, as in mode `D`. Since the region is fixed —
+the same at every time, for the light side and the camera side — its size moves the noise and
+the cost, and the expectation only within a merge radius of its surface, where a merge at a
+point inside may need a beam clipped outside: the kernel's own O(r) blur, which the radius's
+shrink removes with the rest.
 Mode `M` keeps the length clamp: it has no weights to disagree with.
 
 ### Gate (2) — a second MIS weight, and a flag that breaks it on purpose (0.217.0)

@@ -760,10 +760,13 @@ check_haze_domain renders `field` in mode J on both devices at 1024 and dropped 
 `_fog_cornell`'s defaults at 128x96 / 60 s: 1.12 M sub-beams (0.434.39 7.0 M), 288-332 spp (15),
 relRMSE 0.63 (2.90). That is still far behind `-nobeams`' 0.137 and a 500-beam map's 0.174 (both
 measured on 0.434.39, below), so the budget question stands; the measurements below predate the
-domain and are to be redone against it. A blur's domain holds the movers' sweep, so check_haze_domain's
-farfield (a mover 32 m out) still builds long beams: ~0.6 s a sample at 96x72 on the GPU. The
-domain's scale (`FTRACE_JBEAMDOMAIN`, 8) is now an efficiency choice alone, to measure with the
-budget.
+domain and are to be redone against it. Under a blur 0.434.40's domain was 8 x the radius holding
+the movers' sweep, ~456 m for check_haze_domain's farfield (a mover 32 m out), whose beams stayed
+long (~0.6 s a sample at 96x72 on the GPU); since 0.434.41 it is 8 x the scene's own radius,
+widened only as far as the sweep reaches. The domain's scale (`FTRACE_JBEAMDOMAIN`, 8) is an
+efficiency choice, to measure with the budget -- and with it whether the domain should hold the
+camera: about small geometry seen from more than 8 scene radii away, the haze before the camera
+lies outside it and gets no merges (review of 0.434.40).
 
 **Diagnosed 2026-11-08; half fixed in 0.434.33.** Not the density field itself: at 32x24 and 1 spp on
 the GPU, the field took 61 s against the homogeneous haze's 3 s, but 2 s with `-beamk 8` or with
@@ -805,6 +808,12 @@ default depth 8 and read 5 % brighter on `_fog_cornell`, 8x on `_fog_thick`), tw
 | still haze | **0.012** | 0.014 | 0.014 | 0.016 | 0.022 | 0.031 | 0.046 | 0.116 | 0.424 | 0.384 |
 | density field | **0.019** | 0.020 | 0.020 | 0.021 | 0.027 | 0.040 | 0.065 | 0.166 | 0.586 | 1.15 |
 | `_slab_ss` | **0.022** | 0.040 | 0.040 | 0.040 | 0.049 | 0.052 | 0.078 | 0.127 | 0.253 | 0.063 |
+
+**Read the small columns with care (found 2026-11-10):** the light pass never traces fewer than
+`kPathsMin` = 256 subpaths, so every arm whose N fell below 256 subpaths' worth of beams built the
+SAME map: 250 and 500 everywhere, 1000 too on `_fog_cornell`, `_fog_thick` and `_slab_ss` (24-36 K
+sub-beams; the field and the still haze reach ~12 K), and at depth 32 even 2000. Their
+differences above are seed noise, and nothing smaller than that floor map was ever measured.
 
 The defaults build 7-8 M sub-beams on the unbounded hazes (the floor and knee read through the
 skewed probe below), which cut the samples a minute 100-3000 fold: 8 spp in 60 s on the still haze
@@ -866,8 +875,8 @@ The report: check_haze_domain's `field` scene (a 2x2 floor and a ball under a su
 no bounds) rendered in mode J at 27 s for 2 spp on the CPU, and on the GPU at about **10 minutes a
 sample** (0.434.31-32: 632 and 645 s for 1 spp). The first suspect, ratio tracking through a field
 with no majorant grid, was ruled out by the diagnosis above (`-beamk 8` alone made it 30x faster).
-check_haze_domain renders the case at 32 spp on the CPU, and on the GPU at 32x24 and 4 spp
-(`fieldlo`, ~80 s a seed), where it exercises the resume passes.
+check_haze_domain renders the case in mode J on both devices at 1024 spp since 0.434.40, the
+beam domain having made it fast (`fieldlo`, its 32x24 GPU stand-in, went then).
 
 ## DONE (2026-11-07, 0.434.29): J-BEAM-FARLIMIT — under a blur, mode J cut its beams in an unbounded haze at the instant's sphere
 
@@ -904,13 +913,17 @@ weights still gave the missing merge its share, and the image there lost it. exi
 was generous enough to hide it on that scene, at the price of the ratchet; every length limit is
 biased somewhere while the weights ignore it. Now mode J clips an unbounded medium's beams to one
 fixed sphere, the scene's **beam domain** (`Scene::jBeamMerges`: about the scene's centre, 8 x
-`sweptReach`, which under a blur holds every mover's sweep), and every beam-merge term of the MIS
+the scene's radius, widened to `sweptReach` where a blur's movers stray further -- 0.434.40 took 8 x
+`sweptReach`, ~456 m on farfield, until its review), and every beam-merge term of the MIS
 weights -- `mergeEtaPrimeBeam`, a beam's `etaPrev`, `ChromaMis::beamEta1` and the camera side's
 `etaKCoef`, and their device twins `dMergeEtaPrime`, `dChromaBeamEta1` and the wavefront's
 `etaKCoef` -- counts a merge in an unbounded medium only inside it. Outside, the connections render
 the haze alone, as in mode D. The region is the same at every time and on both sides of a merge,
-so its size changes the noise, never the expectation (`FTRACE_JBEAMDOMAIN=<scale>` overrides the
-8). Bounded media are untouched (check_bitid: identical), as is mode M, which has no MIS.
+so its size changes the noise and the cost, and the expectation only within a merge radius of its
+surface, where a merge at a point inside may need a beam clipped outside: the kernel's own O(r)
+blur, which the radius's shrink removes with the rest (`FTRACE_JBEAMDOMAIN=<scale>` overrides the
+8, and says so when it cannot read the value). Bounded media are untouched (check_bitid:
+identical), as is mode M, which has no MIS.
 check_haze_domain's far case reads haze J/R 1.0043 (CPU) and 1.0056 (GPU); its new `stilldom` case
 shrinks the domain to half the scene's radius, the ball and nearly all the haze outside it, and
 holds mode J to mode R there too (ball 0.991 / 1.009, haze 1.000 / 1.002).

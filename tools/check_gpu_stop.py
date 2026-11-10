@@ -8,10 +8,11 @@ before it as final. A build that runs a chunk whole before it stops fails here, 
 keeps a cut chunk. The scene is check_haze_domain's density field at 960x720 under -beamepochs
 spp, which pins every GPU chunk to one sample and makes each sample its own light-side epoch, so
 the stop cuts an epoch's first and only chunk. `-n 30000` fixes the map at ~1.2 M beams (the
-budget off, so `-jbeams` leaves it alone too), ~1 500 hits a camera segment: ~20 s a sample on
-an RTX 4090 (0.434.40). The check waits for the first sample to land (the refresh that opens the
-second epoch), times it, asks the render to stop a quarter of a sample later -- inside the second
-sample's GPU chunk, its light side rebuilt in a fraction of a second -- and requires:
+budget off, so the map is that size whatever sizes the default one), ~1 500 hits a camera
+segment: ~20 s a sample on an RTX 4090 (0.434.40). The check waits for the first sample to land
+(the refresh that opens the second epoch), times it, asks the render to stop a quarter of a
+sample later -- inside the second sample's GPU chunk, its light side rebuilt in a fraction of a
+second -- and requires:
 
   - the process to be gone in under a third of a sample's time, which only a chunk cut short
     allows;

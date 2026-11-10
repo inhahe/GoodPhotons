@@ -2750,14 +2750,17 @@ struct Scene {
     // past the end do not exist. The MIS weights must know that, or they give a merge that cannot
     // happen its share of every path through that haze, and the image is dark there by that share.
     // So the end is a region, not a length: a sphere about sceneCenter, kJBeamDomainScale times
-    // sweptReach (the radius that holds everything a path at any time may meet). Mode J clips an
-    // unbounded medium's beams to it (Renderer::emitBeams, `jDomain`), and its weights count a
-    // beam merge in an unbounded medium only inside it (jBeamMerges; device twin dJBeamMerges).
-    // One fixed region, the same at every time and on both sides of the merge, so its size is a
-    // matter of speed alone: outside it the connections render the haze, as mode D does.
-    // (A length along each beam could not be both: a limit by distance from the beam's origin
-    // grew with every step a subpath wandered outward, and one measured along the beam ended
-    // beams the weights still counted merges on.) FTRACE_JBEAMDOMAIN=<scale> overrides the scale.
+    // sceneRadius, widened where movers stray further to sweptReach (the radius that holds
+    // everything a path at any time may meet). Mode J clips an unbounded medium's beams to it
+    // (Renderer::emitBeams, `jDomain`), and its weights count a beam merge in an unbounded medium
+    // only inside it (jBeamMerges; device twin dJBeamMerges). One fixed region, the same at every
+    // time and on both sides of the merge, so outside it the connections render the haze, as mode
+    // D does, and its size moves the noise and the cost -- the expectation only within a merge
+    // radius of its surface, where a merge at a point inside may need a beam clipped outside: the
+    // kernel's own O(r) blur, which the radius's shrink removes with the rest. A region because
+    // the weights see points, not beams: a limit on each beam's length ends beams wherever its
+    // origin and heading put the end, and no point-wise weight can follow that.
+    // FTRACE_JBEAMDOMAIN=<scale> overrides the scale.
     static constexpr double kJBeamDomainScale = 8.0;
     double jBeamDomainR2 = 0.0;   // the domain's radius, squared (build())
     // Can a mode J beam merge happen at p, a scattering point in medium `md`? Everywhere in a
@@ -4247,9 +4250,23 @@ struct Scene {
         }
         {
             double k = kJBeamDomainScale;
-            if (const char* e = std::getenv("FTRACE_JBEAMDOMAIN"))
-                if (std::atof(e) > 0.0) k = std::atof(e);
-            const double r = k * std::max({sweptReach, sceneRadius, 1e-3});
+            if (const char* e = std::getenv("FTRACE_JBEAMDOMAIN")) {
+                char* end = nullptr;
+                const double v = std::strtod(e, &end);
+                if (end != e && *end == '\0' && v > 0.0) k = v;
+                else {
+                    static bool said = false;
+                    if (!said) {
+                        said = true;
+                        std::fprintf(stderr, "[jbeams] FTRACE_JBEAMDOMAIN='%s' ignored: it wants a "
+                                             "scale > 0; using %g\n", e, k);
+                    }
+                }
+            }
+            // Widened only where movers leave the scene's sphere: a still scene's sweptReach is its
+            // sceneRadius, and the scale may be below 1 (check_haze_domain's `stilldom`).
+            double r = k * std::max(sceneRadius, 1e-3);
+            if (sweptReach > sceneRadius) r = std::max(r, sweptReach);
             jBeamDomainR2 = r * r;
         }
         // Distant suns are sized by the same bounding sphere: a photon is born on a

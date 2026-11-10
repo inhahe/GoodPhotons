@@ -348,7 +348,10 @@ Then the rest of 4.2-4.6 in their order, 4.7's bookkeeping alongside whatever to
   exp(tau) = E[e^lambda * prod_{i<=K} tau_i / lambda] with K ~ Poisson(lambda) and tau_i
   independent unbiased estimates of the optical depth (each >= 0 here, so the estimate stays
   positive), is unbiased, its variance moderate for lambda near tau. Host `sunLegFactor` and
-  device `dSunLegFactor`; check_haze_domain's `farfield` (mode D) is the test.
+  device `dSunLegFactor`; check_haze_domain's `farfield` is the test. Watch: on 0.434.41, six GPU
+  seeds each, farfield's haze read mode D 0.9976 +- 0.0031 of R but mode J 0.9895 +- 0.0058 (the
+  ball 0.999 and 0.997) -- within J's noise, but recheck J there with more seeds when this is
+  worked.
 
 - [ ] **BDPT-MIS-TR** — mode D's MIS weights take every connection edge's transmittance as 1 in a
   medium.
