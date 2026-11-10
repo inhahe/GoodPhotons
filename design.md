@@ -669,7 +669,7 @@ Four consequences worth knowing:
     (`deviceStopFlag`), written by whoever raises or clears the stop (`main.cpp` `raiseStop` /
     `clearStop`, through `ft::stopMirrorSlot`). Its pointer is published to the kernels only inside
     a `DeviceStopScope`, which a chunked `renderBdptCuda` and mode M's gather open (and which starts
-    the device's copy equal to the host flag): `kBdptT` reads it every 8 paths, the beam walks
+    the device's copy equal to the host flag): `kBdptT` before each sample (clock-gated, below), the beam walks
     (`kWfBeamHits`, the inline gather) every ~1 ms of clock (`DStopPoll`). A kernel that sees it
     records so (`g_dStopSeen`), and a chunk so cut short is dropped -- its partial sums never
     downloaded, the films freed unread -- and `gpuSppChunks` flushes the whole chunks before it as
@@ -686,7 +686,14 @@ Four consequences worth knowing:
     render's first sample is never cut (there would be no image), and the render says so.
     `renderBdptCuda`'s `stopped()` reads the device flag as well, so a cut launches no further
     waves, and `gpuSppChunks` puts the flag back to the host's on the way out
-    (`tools/check_gpu_time.py`). Launches that cannot be dropped (mode R's) are not cut. (Until 0.434.34 overflowing hits were evaluated on the spot inside `kWfBeamHits`, one
+    (`tools/check_gpu_time.py`). Launches that cannot be dropped (mode R's) are not cut. A chunk
+    counts as dropped only when a stop made it skip work -- a kernel's own record (`seen`), or a
+    split, wave or resume-pass loop that left with work to do -- not merely because the flag is up:
+    a cut raised after the last wave finished keeps the sample. `kBdptT` asks before every sample
+    a thread starts, reading the mapped flag at most once ~1 ms of clock (at a frame's worth of
+    threads each runs only two or three samples, so a poll every eighth was a poll at the start).
+    Mode J's epoch loop draws no realization past the deadline once the film holds a sample, and a
+    cut of an epoch's first chunk un-counts its realization before the checkpoint is written. (Until 0.434.34 overflowing hits were evaluated on the spot inside `kWfBeamHits`, one
     thread a segment: harmless at `_fog_cornell`'s rate, ~20× slower a hit with an unbounded
     density field's ~10⁵ hits a path, J-FIELD-SLOW.) The wave floor is 256 paths.
     `tools/check_wf_resume.py` renders a fog with the hit queue shrunk (`FTRACE_WFHITCAP`) and
@@ -3393,9 +3400,12 @@ holding a glass ball), and on the device `-rgb`, mode S and every one of those.
   user's option (a), 0.434.29-30): every vertex from the first on is weighed by `sunLegFactor`
   (beamgather.h), the unbounded media's transmittance over the stretch the two legs differ by,
   drawn by the medium's own estimator (its inverse, exp(+tau), by the Poisson estimator --
-  e^lam prod_{i<=K} tau_i/lam, K ~ Poisson(lam), lam a quadrature of tau, each tau_i a jittered
-  stratified estimate; `invTransmittancePoisson`, 0.436.4 -- where a blur's walk began further
-  out than the NEE leg reaches), and the first leg's own beams take it
+  e^lam prod_{i<=K} tau_i/lam, K ~ Poisson(lam), each tau_i a jittered stratified estimate;
+  `invTransmittancePoisson`, 0.436.4 -- where a blur's walk began further out than the NEE leg
+  reaches; its relative variance is about exp((lam - tau)^2 / lam) - 1, so lam is a 32-point
+  midpoint sum of tau floored at min(the majorant's optical depth, 1), which bounds what a
+  quadrature that misses thin features costs, and a stretch past lam 700 gives 0 rather than
+  overflow, 0.436.7), and the first leg's own beams take it
   at each merge point (`BeamMis::sunLeg`, the leg having begun `leadIn` before the beam's
   origin). Device twin `dSunLegFactor`, in `dGenLightSubpath` and the beam gather. The per-mode table in main.cpp names the modes whose haze comes from forward
   photons (`modeLightsHazeOnlyNearScene`: A, B, C, P, V, and M, whose photons light its

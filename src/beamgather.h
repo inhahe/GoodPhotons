@@ -301,8 +301,8 @@ inline double trDetMedium(const Medium& med, const Vec3& o, const Vec3& dir, dou
     if (!(L > 0.0)) return 1.0;
     if (!med.heterogeneous()) return std::exp(-stBase * L);
     // Midpoint rule. Four samples (`kN`'s default) is enough to track the large-scale shape of
-    // a cloud, which is all a weight needs; an estimator that must take it asks for more
-    // (sunLegFactor).
+    // a cloud, which is all a weight needs (-checksunleg asks for more, to show how far a
+    // quadrature of exp(+tau) is from the Poisson estimator's).
     const double dt = L / (double)kN;
     double tau = 0.0;
     for (int i = 0; i < kN; ++i)
@@ -326,9 +326,14 @@ constexpr int kSunLegStrata = 8;   // ...and the jittered strata of each of its 
 // exp(+tau) over medium `m`'s part of [o, o + dir * dist], tau = sigma_t * the density's integral,
 // unbiased: the Poisson estimator, e^lam * prod_{i<=K} tau_i / lam with K ~ Poisson(lam) and tau_i
 // independent unbiased estimates of tau, whose mean is sum_k e^-lam lam^k/k! (tau/lam)^k e^lam
-// = e^tau. Here lam is a quadrature of tau (the estimator's variance is least near lam = tau) and
-// each tau_i averages kSunLegStrata jittered strata of the segment, so it is never negative and its
-// spread small. Device twin dInvTransmittancePoisson.
+// = e^tau. Each tau_i averages a point in each of kSunLegStrata strata of the segment, so it is
+// never negative and its spread small. The relative variance is exp(lam + E[tau_i^2]/lam - 2 tau)
+// - 1, with exact tau_i exp((lam - tau)^2 / lam) - 1: least at lam = tau, mild above it, and
+// explosive below, which is why lam is a midpoint quadrature of tau floored at min(the majorant's
+// optical depth, 1) -- 32 midpoints can miss a feature thinner than L/32, and with the floor a
+// miss of up to one optical depth costs at most a factor e. Where e^lam would overflow
+// (lam > 700) the walk crossed a stretch it could not have survived, and the factor is 0. Device
+// twin dInvTransmittancePoisson.
 inline double invTransmittancePoisson(const Medium& m, const Vec3& o, const Vec3& dir, double dist,
                                       double lambda, Pcg32& rng, const PatTables* tabs) {
     const double st = m.sigmaT(lambda);
@@ -338,18 +343,25 @@ inline double invTransmittancePoisson(const Medium& m, const Vec3& o, const Vec3
     const double L = tb - ta;
     if (!(L > 0.0)) return 1.0;
     if (!m.heterogeneous()) return std::exp(st * L);
-    const double Tq = trDetMedium(m, o, dir, dist, lambda, tabs, kSunLegSteps);
-    const double lam = (Tq > 0.0) ? std::max(-std::log(Tq), 1e-6) : 1e-6;
+    double q = 0.0;
+    for (int i = 0; i < kSunLegSteps; ++i)
+        q += m.densityAt(o + dir * (ta + L * (((double)i + 0.5) / (double)kSunLegSteps)), tabs);
+    const double tauQ = st * L * q / (double)kSunLegSteps;
+    const double lam = std::max({tauQ, std::min(st * L * m.densityMax, 1.0), 1e-6});
+    if (lam > 700.0) return 0.0;
     const double u = rng.uniform();
     double p = std::exp(-lam), c = p;
     int K = 0;
     while (u > c && K < 4096) { ++K; p *= lam / (double)K; c += p; }
     double F = std::exp(lam);
     for (int i = 0; i < K; ++i) {
-        const double jit = rng.uniform();
+        // A point of its own in each stratum: one jitter shared by all would put the points a
+        // whole stratum apart, and a density periodic in a stratum's length (or a divisor of it)
+        // would then be read all at one phase.
         double s = 0.0;
         for (int j = 0; j < kSunLegStrata; ++j)
-            s += m.densityAt(o + dir * (ta + L * (((double)j + jit) / (double)kSunLegStrata)), tabs);
+            s += m.densityAt(o + dir * (ta + L * (((double)j + rng.uniform()) /
+                                                   (double)kSunLegStrata)), tabs);
         F *= (st * L * s / (double)kSunLegStrata) / lam;
     }
     return F;

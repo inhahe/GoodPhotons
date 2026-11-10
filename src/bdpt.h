@@ -4883,7 +4883,10 @@ struct BdptRenderer {
                                                    jSpecOn ? &jsw : nullptr);
                     int nL = generateLightSubpath(scene, cam, mats, hb,
                                                   maxDepth + 1, rng, light);
-                    if (mk.beam > 0.0)
+                    // Only where this sub-sample draws mode J's paths: a D-routed connection weighs
+                    // no merge. Where they are not drawn the weights get null, not the last sample's.
+                    const bool geoNow = mk.beam > 0.0 && allowJ;
+                    if (geoNow)
                         mergeGeoOfSubpaths(scene, eye, nE, light, nL, hb.lam[0], geoE, geoL);
                     // Per-object render modes (see routeOfEye). Inert unless the scene tags one.
                     int routeR = ROUTE_J, fIdx = nE;
@@ -4954,7 +4957,8 @@ struct BdptRenderer {
                             }
                             double c = connectBDPT(scene, cam, mats, lightS, eye, s, t, hb,
                                                    rng, spx, spy, isSplat, Lsec, nUpConn,
-                                                   mkST, geoE.data(), geoL.data());
+                                                   mkST, geoNow ? geoE.data() : nullptr,
+                                                   geoNow ? geoL.data() : nullptr);
                             if (wST != 1.0) { c *= wST; for (int i = 0; i + 1 < nUpConn; ++i) Lsec[i] *= wST; }
                             if (nUpConn <= 0) continue;
                             double mx = c;
@@ -5119,7 +5123,7 @@ struct BdptRenderer {
                         // With the merge half binned (chroma), the camera-wavelength one goes unread.
                         if (mk.any())
                             cameraSideSums(scene, eye, nE, chroma.on ? MergeK{} : mk, lamCam,
-                                           segSumC, segSumM, geoE.data());
+                                           segSumC, segSumM, geoNow ? geoE.data() : nullptr);
                         if (chroma.on)
                             cameraSideSumsChroma(scene, tabs, eye, nE, mk, chroma, chromaM,
                                                  chromaE1);
@@ -5273,7 +5277,7 @@ struct BdptRenderer {
                                 // because BOTH of eye[k-1]'s neighbours are known: the merge
                                 // site is eye[k] itself, so there is no per-photon geometry.
                                 sw.etaKm1Coef   = (k >= 2)
-                                    ? mergeEtaScaled(scene, geoE.empty() ? nullptr : &geoE[(size_t)k - 1],
+                                    ? mergeEtaScaled(scene, geoNow ? &geoE[(size_t)k - 1] : nullptr,
                                                      vk.p, vp, eye[(size_t)k - 2].p, 1.0, lamCam, mk)
                                     : 0.0;
                                 sw.segSumC      = segSumC[(size_t)k - 1];

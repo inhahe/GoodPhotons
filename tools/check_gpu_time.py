@@ -117,8 +117,11 @@ def main():
         if name == "resume":
             check("resume: the checkpoint's sample was loaded", "1 spp accumulated so far" in out)
         check("%s: the cut sample is dropped" % name, spp == 1, "spp %s" % spp)
+        # The status line's elapsed is humanDur's: tenths of a second below a minute, whole
+        # seconds above, so it may read up to that much under the budget it reached.
+        res = 0.5 if el is not None and el >= 60.0 else 0.05
         check("%s: ends within a fifth of a sample of -time" % name,
-              el is not None and budget <= el < budget + 0.2 * s1,
+              el is not None and budget - res <= el < budget + 0.2 * s1,
               "%s s against %.1f s (a sample %.1f s; wall %.1f s)"
               % ("?" if el is None else "%.1f" % el, budget, s1, wall))
         check("%s: the image was written" % name, os.path.exists(png[:-4] + ".pfm"))

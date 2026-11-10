@@ -9754,56 +9754,85 @@ static int checkCurv() {
 //      profile would disagree with the one emission-on-hit reads and MIS would bias.
 //  §10 the lazy fill in patCtxFromHit caches (one probe per shading point, not one
 //      per pattern context) and does nothing at all when the gate is off.
-// -checksunleg: sunLegFactor's inverse branch (HAZE-BLUR-INVERSE-TR) is unbiased. In a haze whose
-// density, 0.5 + 0.5 sin(40 x), a 32-step midpoint rule aliases badly, a sun walk that began 20 m
-// further out than the NEE leg reaches takes exp(+tau) over that stretch: the mean of 400 000 draws
-// must match tau from 200 000 midpoints within four standard errors, where the quadrature alone is
-// off by tens of percent (it is printed alongside).
+// -checksunleg: sunLegFactor's inverse branch (HAZE-BLUR-INVERSE-TR) is unbiased, and its spread
+// bounded where the quadrature that sets its Poisson rate misses what is there. A sun walk that
+// began 20 m further out than the NEE leg reaches takes exp(+tau) over that stretch; the mean of
+// 400 000 draws must match tau from 200 000 midpoints within four standard errors, in two hazes:
+//   smooth  density 0.5 + 0.5 sin(40 x), which a 32-step midpoint rule aliases badly (the
+//           quadrature alone is printed alongside, tens of percent off);
+//   layers  thin dense layers centred halfway between the 32 midpoints, about 0.8 of optical depth
+//           the quadrature cannot see. A Poisson rate from it alone (~0.002) makes a draw's spread
+//           ~12x the mean and, now and then, one draw of ~1e5; floored at min(the majorant's
+//           optical depth, 1) it is ~1.1x, and the draws' standard deviation must stay under 3x.
 static int checkSunLeg() {
-    const std::string src =
+    const std::string head =
         "scene { units meters  spectral 360 830 1 }\n"
         "material \"grey\" { type diffuse reflect 0.5 }\n"
         "quad { origin -1 0 -1   u 2 0 0   v 0 0 2   material grey }\n"
-        "medium { sigma_t 0.1  albedo 0.5  density \"0.5 + 0.5*sin(x*40.0)\"  density_max 1 }\n"
-        "light sun { dir 1 0.2 0  angle 0.53  spd preset:d65 }\n"
+        "light sun { dir 1 0.2 0  angle 0.53  spd preset:d65  intensity 1e-13 }\n"
         "camera \"c\" { eye 0 2 6  look_at 0 0 0  up 0 1 0  fov_y 40  film { res 8 8 } }\n";
-    ftsl::Loaded L;
-    std::string err;
-    if (!ftsl::loadSource(src, "<checksunleg>", L, err) || L.scene.media.size() != 1 ||
-        L.scene.media[0].bounded || !L.scene.media[0].heterogeneous()) {
-        std::printf("[checksunleg] the scene did not load as written %s FAIL\n", err.c_str());
-        return 1;
-    }
-    const Scene& sc = L.scene;
-    const Medium& m = sc.media[0];
     const double lambda = 550.0;
-    const PatTables tabs = sc.patTables();
     const Vec3 dir = normalize(Vec3{-1.0, -0.2, 0.0});          // the sun's light travels -dir_sun
     const Vec3 y{0.1, 0.3, 0.05};
     const double extra = 20.0;                                   // the walk began this much further out
-    const Vec3 from = y - dir * (sc.mediaExitDistance(y) + extra);
-    // The stretch the factor inverts: [from, from + dir * extra].
-    const int nFine = 200000;
-    double tau = 0.0;
-    for (int i = 0; i < nFine; ++i)
-        tau += m.densityAt(from + dir * (extra * ((i + 0.5) / nFine)), &tabs);
-    tau *= m.sigmaT(lambda) * extra / nFine;
-    const double exact = std::exp(tau);
-    const double quad = 1.0 / trDetMedium(m, from, dir, extra, lambda, &tabs, kSunLegSteps);
-    Pcg32 rng; seedUnit(rng, 0x5ULL, 0x9e3779b97f4a7c15ULL);
-    const int nDraw = 400000;
-    double s1 = 0.0, s2 = 0.0;
-    for (int i = 0; i < nDraw; ++i) {
-        const double f = sunLegFactor(sc, from, dir, y, lambda, rng);
-        s1 += f; s2 += f * f;
-    }
-    const double mean = s1 / nDraw;
-    const double se = std::sqrt(std::max(0.0, s2 / nDraw - mean * mean) / nDraw);
-    const bool ok = std::fabs(mean - exact) <= 4.0 * se + 1e-9 * exact;
-    std::printf("[checksunleg] tau %.4f, exp(tau) %.5f: mean of %d draws %.5f +- %.5f (%+.3f%%); "
-                "a 32-step quadrature alone %.5f (%+.2f%%)  %s\n", tau, exact, nDraw, mean, se,
-                100.0 * (mean / exact - 1.0), quad, 100.0 * (quad / exact - 1.0), ok ? "PASS" : "FAIL");
-    return ok ? 0 : 1;
+    bool allOk = true;
+    double fromX = 0.0;                                          // the stretch's start, from `smooth`
+    // `maxRelSd` 0: no bound on the draws' spread.
+    auto run = [&](const char* name, const std::string& medium, double maxRelSd) {
+        ftsl::Loaded L;
+        std::string err;
+        if (!ftsl::loadSource(head + medium, "<checksunleg>", L, err) || L.scene.media.size() != 1 ||
+            L.scene.media[0].bounded || !L.scene.media[0].heterogeneous()) {
+            std::printf("[checksunleg] %s: the scene did not load as written %s FAIL\n", name,
+                        err.c_str());
+            allOk = false;
+            return;
+        }
+        const Scene& sc = L.scene;
+        const Medium& m = sc.media[0];
+        const PatTables tabs = sc.patTables();
+        const Vec3 from = y - dir * (sc.mediaExitDistance(y) + extra);
+        fromX = from.x;
+        // The stretch the factor inverts: [from, from + dir * extra].
+        const int nFine = 200000;
+        double tau = 0.0;
+        for (int i = 0; i < nFine; ++i)
+            tau += m.densityAt(from + dir * (extra * ((i + 0.5) / nFine)), &tabs);
+        tau *= m.sigmaT(lambda) * extra / nFine;
+        const double exact = std::exp(tau);
+        const double quad = 1.0 / trDetMedium(m, from, dir, extra, lambda, &tabs, kSunLegSteps);
+        Pcg32 rng; seedUnit(rng, 0x5ULL, 0x9e3779b97f4a7c15ULL);
+        const int nDraw = 400000;
+        double s1 = 0.0, s2 = 0.0;
+        for (int i = 0; i < nDraw; ++i) {
+            const double f = sunLegFactor(sc, from, dir, y, lambda, rng);
+            s1 += f; s2 += f * f;
+        }
+        const double mean = s1 / nDraw;
+        const double sd = std::sqrt(std::max(0.0, s2 / nDraw - mean * mean));
+        const double se = sd / std::sqrt((double)nDraw);
+        const bool okMean = std::fabs(mean - exact) <= 4.0 * se + 1e-9 * exact;
+        const bool okSd = maxRelSd <= 0.0 || (mean > 0.0 && sd <= maxRelSd * mean);
+        std::printf("[checksunleg] %s: tau %.4f, exp(tau) %.5f: mean of %d draws %.5f +- %.5f "
+                    "(%+.3f%%), a draw's spread %.2fx the mean; a 32-step quadrature alone %.5f "
+                    "(%+.2f%%)  %s\n", name, tau, exact, nDraw, mean, se,
+                    100.0 * (mean / exact - 1.0), mean > 0.0 ? sd / mean : 0.0, quad,
+                    100.0 * (quad / exact - 1.0), okMean && okSd ? "PASS" : "FAIL");
+        if (!(okMean && okSd)) allOk = false;
+    };
+    run("smooth", "medium { sigma_t 0.1  albedo 0.5  density \"0.5 + 0.5*sin(x*40.0)\"  "
+                  "density_max 1 }\n", 0.0);
+    if (!allOk) return 1;
+    // u counts the stretch's 32 midpoint intervals along x (dir.x < 0, so x falls as the walk
+    // goes): the midpoints sit at u = i + 1/2, and a layer 0.1 wide at every integer u.
+    const double perU = 1.0 / ((extra / kSunLegSteps) * -dir.x);
+    char layers[320];
+    std::snprintf(layers, sizeof layers,
+                  "medium { sigma_t 0.1  albedo 0.5  density \"0.001 + 4.0*saturate((0.05 - "
+                  "abs(((((%.17g - x) * %.17g) + 0.5) %% 1.0) - 0.5)) * 10000.0)\"  "
+                  "density_max 4.001 }\n", fromX, perU);
+    run("layers", layers, 3.0);
+    return allOk ? 0 : 1;
 }
 
 static int checkCavity() {
@@ -18784,8 +18813,10 @@ static int runSppProgressive(
     prog.sampleBase = baseSpp;   // bias fresh seeds past the loaded samples
     prog.clockEnds = clockEnds;
     // The report below ends the render on this same instant, so a renderer that cuts its chunk
-    // here (gpuSppChunks) is always answered with the stop and the final write.
-    if (!runForever && timeBudgetSec > 0.0)
+    // here (gpuSppChunks) is always answered with the stop and the final write. A budget past
+    // ~30 years (or inf) never runs out, as the old double comparison had it, rather than
+    // overflowing the clock's tick count.
+    if (!runForever && timeBudgetSec > 0.0 && timeBudgetSec < 1e9)
         prog.deadline = t0 + std::chrono::duration_cast<clk::duration>(
                                  std::chrono::duration<double>(timeBudgetSec));
     bool failed = false;         // a refresh traced nothing and the render stopped short
@@ -20980,7 +21011,15 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
             counted.target = sppTarget;
             counted.share  = g_beamRefreshFrac;
             counted.build0 = build0WorkJ;
-            for (; !stopAll && sppAll < sppTarget && !ft::stopRequested(); ++epoch) {
+            // -time's end between epochs: no realization is drawn past it once the film holds a
+            // sample (the first is finished, as gpuSppChunks finishes it), and the flush after the
+            // loop writes the end.
+            const auto pastDeadline = [&] {
+                return prog->deadline != clk::time_point{} && clk::now() >= prog->deadline &&
+                       prog->sampleBase + sppAll > 0;
+            };
+            for (; !stopAll && sppAll < sppTarget && !ft::stopRequested() && !pastDeadline();
+                 ++epoch) {
                 double rebuildSec = 0.0;
                 const bool continuing = counted.continuing();   // on epoch 0's map
                 const uint64_t want = nFixed ? (uint64_t)((base + sppAll) / epLen) : epoch;
@@ -21079,6 +21118,9 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
                         if (epochSec < 0.1) epochSec = 0.1;
                     }
                     epochSpp = sppDone;
+                    // -time's cut of this epoch's first chunk: the realization it drew is not in
+                    // the film, and the report below may write the checkpoint that counts them.
+                    if (sppDone == 0 && drew) { drew = false; --nRealized; keepLightEpochs(); }
                     Film comb = f; comb.merge(acc);
                     const long long tot = sppAll + sppDone;
                     const auto tRep = clk::now();
@@ -21199,9 +21241,11 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
             // A stop that ended the loop without a report of its own -- one that dropped an
             // epoch's first chunk, or was raised between epochs -- would leave the last periodic
             // write behind: the epochs rendered are flushed as the final image and checkpoint. (A
-            // stop a report saw, or a finished target, has written its own final report.)
-            if (!stopAll && ft::stopRequested() && sppAll > 0 && sppAll < sppTarget && prog &&
-                prog->report)
+            // stop a report saw, or a finished target, has written its own final report.) So would
+            // -time's end between epochs, whose report sees the budget spent; there a resumed
+            // checkpoint stands in for the epochs (pastDeadline asks that the film hold a sample).
+            if (!stopAll && (ft::stopRequested() ? sppAll > 0 : pastDeadline()) &&
+                sppAll < sppTarget && prog && prog->report)
                 prog->report(acc, sppAll, /*final*/true);
             if (nRealized > 1)
                 std::printf("mode J: averaged %llu independent light-side realizations "

@@ -7974,7 +7974,7 @@ __device__ static inline Real dPmAdaptiveRadius(const DPhotonMap& pm, const DVec
 // medium (the common case, and the validation case), a fixed 4-point midpoint quadrature of
 // the optical depth for a heterogeneous one. The quadrature's only cost is weight QUALITY.
 __device__ static double dTrDetMedium(const DMedium& m, const DVec3& o, const DVec3& dir,
-                                      double dist, Real lambda, const DPatEnv& env, int kN = 4) {
+                                      double dist, Real lambda, const DPatEnv& env) {
     const double stBase = (double)medSigmaT(m, lambda);
     if (stBase <= 0.0) return 1.0;
     double ta, tb;
@@ -7982,8 +7982,8 @@ __device__ static double dTrDetMedium(const DMedium& m, const DVec3& o, const DV
     const double L = tb - ta;
     if (!(L > 0.0)) return 1.0;
     if (!m.heterogeneous) return exp(-stBase * L);
-    // `kN` midpoints: 4 for a weight (host trDetMedium's -- keep the two in step), more where
-    // an estimator must take it (dSunLegFactor).
+    // 4 midpoints, as host trDetMedium's default -- keep the two in step.
+    constexpr int kN = 4;
     const double dt = L / (double)kN;
     double tau = 0.0;
     for (int i = 0; i < kN; ++i)
@@ -8007,18 +8007,22 @@ __device__ static double dInvTransmittancePoisson(const DMedium& m, const DVec3&
     const double L = tb - ta;
     if (!(L > 0.0)) return 1.0;
     if (!m.heterogeneous) return exp(st * L);
-    const double Tq = dTrDetMedium(m, o, dir, dist, lambda, env, kSunLegSteps);
-    const double lam = (Tq > 0.0) ? fmax(-log(Tq), 1e-6) : 1e-6;
+    double q = 0.0;
+    for (int i = 0; i < kSunLegSteps; ++i)
+        q += (double)dMedDensityAt(m, o + dir * (Real)(ta + L * (((double)i + 0.5) / (double)kSunLegSteps)), env);
+    const double tauQ = st * L * q / (double)kSunLegSteps;
+    const double lam = fmax(fmax(tauQ, fmin(st * L * m.densityMax, 1.0)), 1e-6);
+    if (lam > 700.0) return 0.0;
     const double u = (double)rng.uniform();
     double p = exp(-lam), c = p;
     int K = 0;
     while (u > c && K < 4096) { ++K; p *= lam / (double)K; c += p; }
     double F = exp(lam);
     for (int i = 0; i < K; ++i) {
-        const double jit = (double)rng.uniform();
-        double s = 0.0;
+        double s = 0.0;   // a point of its own in each stratum (host twin's note)
         for (int j = 0; j < kSunLegStrata; ++j)
-            s += (double)dMedDensityAt(m, o + dir * (Real)(ta + L * (((double)j + jit) / (double)kSunLegStrata)), env);
+            s += (double)dMedDensityAt(m, o + dir * (Real)(ta + L * (((double)j + (double)rng.uniform()) /
+                                                               (double)kSunLegStrata)), env);
         F *= (st * L * s / (double)kSunLegStrata) / lam;
     }
     return F;
@@ -18649,8 +18653,9 @@ __device__ static int dGenLightSubpath(const DScene& sc, const DCamera& cam, int
 // t == 1 picks up `sampled`; light[s-1] is QsP; eye[t-1].pdfRev is the a4 override ptPdfRev.
 // Accumulated in a SEPARATE double: kappa is ~n_m*2r ~ 1e3, and sumRi/ri are float here.
 // geoE[k] / geoL[i]: the beam merge's factors at eye[k] between eye[k+1] and eye[k-1], and at
-// light[i] between light[i-1] and light[i+1] (DMergeGeo), for every interior vertex; read wherever
-// mergeKappa > 0. The two merges whose neighbour is the connection's other end are computed here.
+// light[i] between light[i-1] and light[i+1] (DMergeGeo), for every interior vertex, or null to
+// compute them here (as the host twin does). The two merges whose neighbour is the connection's
+// other end are computed here whatever is passed.
 __device__ static double dMisWeight(const DScene& sc, const DCamera& cam,
                                     const DVertex* light, const DVertex* eye,
                                     const DVertex& sampled, int s, int t, Real lambda,
@@ -18708,7 +18713,9 @@ __device__ static double dMisWeight(const DScene& sc, const DCamera& cam,
             // eye[i-1]'s light-side neighbour is eye[i], whose flag is `dl` (0 at pt).
             const double pRev = dMergeLightDensity((i - 1 == tMi) ? (double)ptMPdfRev
                                                                   : (double)eye[i - 1].pdfRev, dl != 0);
-            const double e = (mergeKappa > 0.0) ? dMergeEtaAt(geoE[i - 1], pRev) : 0.0;
+            const double e = !(mergeKappa > 0.0) ? 0.0
+                           : geoE ? dMergeEtaAt(geoE[i - 1], pRev)
+                           : dMergeEtaPrime(sc, eye[i].p, eye[i - 1], eye[i - 2].p, pRev, lambda, env);
             // ...and the POINT merge at the same vertex. A vertex is a medium point or a
             // surface, never both, so at most one of these is non-zero -- but BOTH have to be
             // here, or a connection keeps a weight that ignores a technique competing for its
@@ -18736,9 +18743,11 @@ __device__ static double dMisWeight(const DScene& sc, const DCamera& cam,
         if (!dl && !deltaPrev) sumRi += ri;
         if (merges && i >= 1 && t > 0) {             // merge at light[i]
             const double plI = dMergeLightDensity((double)light[i].pdfFwd, light[i - 1].delta != 0);
+            const bool inner = i + 1 <= s - 1;   // its camera-side neighbour on the subpath
             const double e = !(mergeKappa > 0.0) ? 0.0
-                           : (i + 1 <= s - 1) ? dMergeEtaAt(geoL[i], plI)
-                           : dMergeEtaPrime(sc, light[i - 1].p, light[i], PtP->p, plI, lambda, env);
+                           : (inner && geoL) ? dMergeEtaAt(geoL[i], plI)
+                           : dMergeEtaPrime(sc, light[i - 1].p, light[i],
+                                            inner ? light[i + 1].p : PtP->p, plI, lambda, env);
             const double eS = (kappaSurf > 0.0) ? dMergeEtaSurf(dSurfMergeSite(sc, light[i]), plI) : 0.0;
             if (e > 0.0 || eS > 0.0) sumMg += (double)ri * (e * mergeKappa + eS * kappaSurf);
         }
@@ -19416,9 +19425,17 @@ kBdptT(DScene sc, const __grid_constant__ DCamera cam, double* camFilm, double* 
     const int C = (NS > 0) ? heroC : 1;
     // [idxBegin, idxEnd) is the wave the host is running (the whole chunk when the
     // wavefront gather is off); idxEnd <= totalSamples.
-    int stopPoll = 0;   // a stop ends the launch; its chunk is dropped (DeviceStopScope)
+    // A stop (or -time's cut) ends the launch; its chunk is dropped (DeviceStopScope). Asked before
+    // every sample the thread starts -- at a frame's worth of threads each runs only two or three,
+    // and they can take seconds -- but the flag, mapped host memory a bus round trip away, is read
+    // only on the first and then once ~1 ms of clock (2^21 cycles) has passed.
+    long long stopNext = 0;
     for (long long idx = idxBegin + g; idx < idxEnd; idx += G) {
-        if ((stopPoll++ & 7) == 0 && dGatherStopped()) return;
+        const long long cyc = clock64();
+        if (cyc >= stopNext) {
+            if (dGatherStopped()) return;
+            stopNext = cyc + (1ll << 21);
+        }
         const long long slot = idx / chunkSpp;   // pixel slot (padded to whole runs when stratified)
         long long pix = slot;
         if (STRAT) {                             // stratified waves: see DWfQueue (compile-time:
@@ -19506,9 +19523,10 @@ kBdptT(DScene sc, const __grid_constant__ DCamera cam, double* camFilm, double* 
                                    (jSpecOn && kappaSurf > 0.0) ? vspec : nullptr);
         int nL = dGenLightSubpath(sc, camS, diffraction, hb, maxDepth + 1, rng, light, lightSec, NS, MAXV);
         // The beam merge's factors at every interior vertex, between its subpath neighbours: each
-        // connection's weight reads them (dMisWeight), as do the camera-side sums below.
+        // connection's weight reads them (dMisWeight), as do the camera-side sums below -- only
+        // where this sub-sample draws mode J's paths (a D-routed connection weighs no merge).
         DMergeGeo geoE[MERGE ? MAXV : 1], geoL[MERGE ? MAXV : 1];
-        if (MERGE && mergeKappa > 0.0) {
+        if (MERGE && mergeKappa > 0.0 && allowJ) {
             const DPatEnv envG = dPatEnvOf(sc);
             for (int k = 1; k + 1 < nE; ++k)
                 geoE[k] = dMergeGeo(sc, eye[k + 1].p, eye[k], eye[k - 1].p, lambda, envG);
@@ -26996,6 +27014,10 @@ Film renderBdptCuda(const Scene& scene, const Camera& cam, int resX, int resY,
     // short (dropped).
     auto launch = [&](long long cAll, long long baseAll) -> bool {
       if (abortable) DeviceStopScope::clearSeen();
+      // Whether a stop made this chunk skip work: a loop below that left with some to do. With
+      // the kernels' own record (seen) it is all that drops a chunk -- not the flag itself, which
+      // -time's cut can raise after the last wave has already finished.
+      bool leftEarly = false;
       // ONE LIGHT-SIDE REALIZATION PER SUB-LAUNCH (FTRACE_JDEVLIGHT=3, FTRACE_JSPLIT=k).
       //
       // `base` is the ABSOLUTE sample index this sub-batch starts at, so it advances every
@@ -27013,7 +27035,8 @@ Film renderBdptCuda(const Scene& scene, const Camera& cam, int resX, int resY,
       // map, accumulating into the same device film exactly as consecutive chunks already do.
       // `kappaS` is unchanged across them (same nPaths, same radius), so the MIS weights stay
       // consistent within and between sub-launches.
-      for (int jsp = 0; jsp < jSplitN && !stopped(); ++jsp) {
+      for (int jsp = 0; jsp < jSplitN; ++jsp) {
+        if (stopped()) { leftEarly = true; break; }
         const long long cLo = cAll * jsp / jSplitN, cHi = cAll * (jsp + 1) / jSplitN;
         const long long c = cHi - cLo;
         if (c <= 0) continue;
@@ -27086,7 +27109,8 @@ Film renderBdptCuda(const Scene& scene, const Camera& cam, int resX, int resY,
             };
             long long wave = !wq.segs ? waveTotal
                            : profiled(0, wfProfilePrev.empty() ? ((waveSamples < 1024) ? waveSamples : 1024) : waveSamples, 0.0, 0.0);
-            for (long long b0 = 0; b0 < waveTotal && !stopped(); ) {
+            for (long long b0 = 0; b0 < waveTotal; ) {
+                if (stopped()) { leftEarly = true; break; }
                 const long long b1 = (b0 + wave < waveTotal) ? b0 + wave : waveTotal;
                 // A REALIZATION PER BAND (FTRACE_JBAND). Salted by the band's first path slot as
                 // well as by `base`, so two bands of one chunk draw different maps and two
@@ -27141,7 +27165,8 @@ Film renderBdptCuda(const Scene& scene, const Camera& cam, int resX, int resY,
                         CUDA_CHECK(cudaEventElapsedTime(&ms, wfEv[2], wfEv[3])); msEval += ms;
                         waveHits += (cnt[1] < wq.hitCap) ? cnt[1] : wq.hitCap;
                         ++passes;
-                        if (cnt[3] == 0 || stopped()) break;
+                        if (cnt[3] == 0) break;
+                        if (stopped()) { leftEarly = true; break; }
                         wfDeferred += cnt[3];
                         ++wfResumes;
                         CUDA_CHECK(cudaMemsetAsync(wq.nHits, 0, sizeof(int)));       // an empty hit queue
@@ -27190,7 +27215,7 @@ Film renderBdptCuda(const Scene& scene, const Camera& cam, int resX, int resY,
       }
       // Dropped if a kernel saw the stop (its own record, DeviceStopScope::seen) or the host
       // stopped launching waves.
-      return !(abortable && (DeviceStopScope::seen() || stopped()));
+      return !(abortable && (DeviceStopScope::seen() || leftEarly));
     };
 
     const auto tCall1 = std::chrono::steady_clock::now();
