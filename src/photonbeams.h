@@ -1342,9 +1342,12 @@ struct BeamMap {
     // gathered on the device?), and a member would let two maps in one render disagree.
     // `medBlur` (optional): per-medium overrides of `blur`, indexed by medium id; an entry
     // <= 0 means "use the global". This is the scene's `beam_blur` in a medium block.
+    // `probe` false: skip the gather probe where nothing needs it -- no -beamk floor to hold
+    // (targetK 0, mode J's fixed map) and no line to print it in (a quiet refresh). It is 8192
+    // probe rays against the whole map, per build.
     AutoInfo buildAuto(double blur, double targetK, double areaSlack, size_t splitBudget = 0,
                        double explicitSplitLen = 0.0, double work = 0.0, bool skipBvh = false,
-                       const std::vector<double>* medBlur = nullptr) {
+                       const std::vector<double>* medBlur = nullptr, bool probe = true) {
         AutoInfo info;
         info.blur     = blur;
         info.targetK  = targetK;
@@ -1378,7 +1381,8 @@ struct BeamMap {
         // gathered count is linear in r, but the probe measures 0 when the radii are far too
         // small and a ratio against 0 is meaningless. Each round scales by at most 16x and
         // re-measures, so three rounds cover 4096x — far beyond any real shortfall.
-        info.probeK0 = probeGatherCount(bb);
+        const bool measure = probe || targetK > 0.0;
+        info.probeK0 = measure ? probeGatherCount(bb) : 0.0;
         info.probeK  = info.probeK0;
         if (targetK > 0.0) {
             for (int round = 0; round < 3 && info.probeK < targetK; ++round) {
@@ -1402,7 +1406,7 @@ struct BeamMap {
                 info.slackScale = s;
                 for (MedStat& m : st) m.r *= s;
                 push();
-                info.probeK = probeGatherCount(bb);
+                if (measure) info.probeK = probeGatherCount(bb);
             }
         }
 

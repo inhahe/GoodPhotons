@@ -765,6 +765,13 @@ fixed maps exact since 0.435.0, `BeamBudgetReq::exact`, so the small arms differ
 | `_fog_thick`, depth 32 | 0.770 | 0.797 | 0.686 | **0.546** | 0.615 | 0.648 |
 | `_fog_cornell`, depth 32 | 0.474 | 0.509 | 0.510 | **0.466** | 0.539 | 0.829 |
 
+**0.435.1 sized the surface map on its own** (one subpath per pixel; it had been the beams' few
+hundred), so its fixed arms and `off` were re-measured (`TAG=b scraps/probe/sweep4.sh`): `_fog_cornell`
+no beams 0.127, 250 0.167, 1000 0.168, 4000 0.214; `_fog_thick` 0.406 / 0.577 / 0.520 / 0.479; at
+depth 32 0.770 / 0.705 / 0.650 / 0.581. Two 60-second seeds move an arm ~10 % between runs (depth
+32's 1000 read 0.546 above), so 1000 and 4000 are alike at depth 32, where both beat no beams, and
+4000 halves the samples at depth 8 on `_fog_cornell`.
+
 1000 beams is within 15 % of the best map at depth 8 and the best arm at depth 32. At depth 8 no
 beams still wins everywhere; much of that is a fixed cost, not the map's: `_slab_ss` renders 28 K
 samples a minute with no beams and 9 K with any map, 64 beams that almost never merge included,
@@ -874,7 +881,10 @@ should stay on; what is wrong is the budget: small maps (~500-2000 raw beams) ar
 in every scene at both depths, the defaults far above it. **Per sample** (256 spp, 128x96, depth
 8, `perspp.py`): the beams barely lower the error at depth 8 (relMAE on `_fog_thick` 0.221 without,
 0.20 with 8000 beams, 0.29-0.33 with 2000 beams, which also read 5-8 % bright across kernel widths
--- shared seeds, so possibly correlated firefly noise; to be checked).
+-- shared seeds, so possibly correlated firefly noise; to be checked). **Checked 2026-11-10: noise,
+not bias.** Eight seeds an arm, disjoint across arms, 1024 spp (`scraps/probe/biascheck.py`,
+0.435.1): `_fog_thick`'s mean against the reference is 0.998 +- 0.018 at 250 beams, 0.990 +- 0.007
+at 1000, 0.994 +- 0.013 at 2000, 1.000 +- 0.011 at 4000, 0.990 +- 0.008 under the knee rule.
 
 **Part of it is a regression since v0.389.4** (the last published release): the same `_fog_cornell`
 defaults at 128x96 / 60 s give v0.389.4 a 264 880-beam knee, 6.1 M sub-beams, the floor not binding

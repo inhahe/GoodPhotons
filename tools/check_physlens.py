@@ -277,7 +277,9 @@ def check_fog(exe, scenes, devices):
         # 4x the samples -- noise, which 1% caught one run in a few. 4x the samples would cost
         # half an hour a run.
         jtol = 0.015 if dev == 'gpu' else 0.03
-        jargs = ['-mode', 'J', '-spp', '1024', '-device', dev] + deep
+        # -jbeams auto: the knee-sized map these tolerances were set against; mode J's sparse
+        # fixed default (0.435.0) gives the merges under test a far smaller share.
+        jargs = ['-mode', 'J', '-spp', '1024', '-device', dev, '-jbeams', 'auto'] + deep
         front = render(exe, scenes['fog'], f'fog_Jfront_{dev}', jargs, env={'FTRACE_LENS_FRONT': '1'})
         img = render(exe, scenes['fog'], f'fog_J_{dev}', jargs)
         allok = (img is not None and front is not None and

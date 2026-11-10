@@ -428,12 +428,22 @@ Everything else follows from that one field.
   N beams with no knee (`BeamBudgetReq::targetK` 0) and no `kPathsMin` floor under the subpaths
   (`BeamBudgetReq::exact`: the knee rule never traces fewer than 256, which on most scenes is
   already 1-2 K raw beams), and `buildBeamMap` builds them at the plain
-  `-beamblur` radii with no `-beamk` floor (its `floorK` 0). `auto` is the knee rule (*The beam budget*, below: the
+  `-beamblur` radii with no `-beamk` floor (its `floorK` 0). The beams come from the pass's first
+  subpaths only (`BeamBudgetReq::beamPaths`, settled by epoch 0 and carried to every refresh),
+  while the `-jsurf` surface map keeps its own count, one subpath per pixel as on a media-free
+  scene (0.435.1): one pass feeds both maps, and before that a 1000-beam map left the photons
+  behind a caustic seen through glass a few hundred subpaths. Each map normalises by its own
+  count (`nEmitted`), and so does each merge constant (`MergeK`: n_beam 2r_b and n_surf pi r_s^2;
+  the device's `mergeKappa` and `kappaS`), so the subset is the same estimator with fewer beam
+  samples. With the beams off the pass deposits none (`beamPaths` 0) and runs no beam budget.
+  A scene names its own rule with `render { jbeams }` (`g_jBeamsScene`, below the command line's
+  flags in `jBeamsChoice`), and `checkpointGuard` mixes in any rule but the knee's, so a sidecar
+  written before 0.435.0 still resumes under `auto` and is refused under another. `auto` is the knee rule (*The beam budget*, below: the
   budget sized by the probe's knee up to `-beamcount`, radii widened by the floor), and giving
   `-beamk`, `-beamcount` or `-n` selects it, so an older command line naming any of them renders
   as it did; `off` is `-nobeams`. Why the default moved: measured on the GPU against mode D at
   equal time (known-issues J-FIELD-SLOW, 2026-11-10, with 0.434.40's beam domain), the knee rule
-  trailed a 1000-beam map by 2-4x on five fog scenes, its probe — random chords of the beams' box —
+  trailed a 1000-beam map by 1.5-3.5x on five fog scenes, its probe — random chords of the beams' box —
   misreading what the camera's segments gather; 1000 beams was within 15 % of the best map at
   depth 8 (where no beams wins) and the best arm at depth 32. The knee rule still wins where dense
   bounded media want dense maps (`gallery_rain`'s rain and cloud, whose render scripts pass
@@ -1998,7 +2008,7 @@ them for a log line, and `kIsoPreview`'s primary ray passes `camHide`. Lighting 
 ### The beam budget — sizing the map from the scene's own knee (0.242.0)
 
 *Since 0.435.0 this is mode `J`'s `-jbeams auto`, chosen by `-jbeams auto`, `-beamk`,
-`-beamcount` or `-n`; the default is a fixed 500-beam map at the plain `-beamblur` radii (see the mode `J`
+`-beamcount` or `-n`; the default is a fixed 1000-beam map at the plain `-beamblur` radii (see the mode `J`
 section's "The map's size"). The budget was only ever mode `J`'s; the `-beamk` floor still widens
 every other mode's beam map as below.*
 

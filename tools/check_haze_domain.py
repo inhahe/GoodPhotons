@@ -116,7 +116,11 @@ def main():
         for stale in (png, png[:-4] + ".pfm"):   # a render that writes nothing must not pass
             if os.path.exists(stale):
                 os.remove(stale)
+        # Mode J at -jbeams auto: the knee-sized map, whose merges carry the haze -- the sparse
+        # fixed default (0.435.0) would leave the merge weights under test a small share
+        # (`stilldom`'s proof, 0.434.40, was made at this map). Modes R and D ignore it.
         cmd = [exe, "-in", os.path.join(d, name + ".ftsl"), "-mode", mode, "-device", dev,
+               "-jbeams", "auto",
                "-spp", spp, "-seed", str(seed), "-hdr", "-no-meter", "-window-min", "-o", png]
         p = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace",
                            env=dict(os.environ, **ENV.get(name, {})))

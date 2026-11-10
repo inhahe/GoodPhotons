@@ -1,19 +1,25 @@
-"""Regression check: `-jbeams off | auto | <N>` picks mode J's beam map as documented (0.435.0).
+"""Regression check: `-jbeams off | auto | <N>` picks mode J's beam map as documented (0.435.0-1).
 
     python tools/check_jbeams.py [--out png/check_jbeams] [--exe ftrace.exe]
 
 Renders check_haze_domain's still haze (an unbounded sunlit medium round a ball) in CPU mode J at
-32x24 and 1 spp under each way of choosing the map, and reads what the log says it built:
+32x24 and 1 spp under each way of choosing the map, and reads what the log says was BUILT:
 
-  - `-jbeams 64` builds a fixed map of exactly 64 raw beams, from FEWER than 256 subpaths: a
-    fixed map has no kPathsMin floor (BeamBudgetReq::exact), which the knee rule keeps and which
-    on this scene alone is ~450 raw beams;
-  - no flag builds the default fixed map, 1000 beams;
+  - `-jbeams 64` deposits about 64 raw beams (the chords the build counts, within 2x: the pilot's
+    rate is an average), from FEWER than 256 subpaths -- a fixed map has no kPathsMin floor
+    (BeamBudgetReq::exact), which the knee rule keeps and which on this scene alone is ~450
+    beams -- builds them with no -beamk floor, and leaves the -jsurf surface map its own count,
+    one subpath per pixel (768), not the beams' few dozen (0.435.1);
+  - no flag builds the default fixed map, about 1000 beams;
   - `-jbeams auto`, `-beamk 32` and `-beamcount 200000` each select the knee rule (the budget
     line), and `-n 3000` too, its budget off: exactly 3000 subpaths, no pilot;
-  - an explicit `-jbeams` wins over `-nobeams` and `-beamk`, whichever comes first;
-  - `-jbeams off` renders the same image as `-nobeams`, bit for bit, and says the beams are off;
-  - `-jbeams 0` and `-jbeams many` are refused with exit code 2.
+  - an explicit `-jbeams` wins over `-nobeams`, `-beamk` and `-n`, which then only caps the pass;
+  - `-jbeams off` renders `-nobeams`' image bit for bit, deposits no beams, runs no beam budget,
+    sizes its pass for the surface map, and each names the flag that turned the beams off;
+  - a scene's `render { jbeams auto }` selects the knee rule, and a command-line -jbeams beats it;
+  - a checkpoint written under the fixed map refuses to resume under `auto`, and resumes under
+    the same map;
+  - `-jbeams 0`, `many`, `inf` and `1e30` are refused with exit code 2.
 
 Exits 1 on any failure.
 """
@@ -30,9 +36,12 @@ import fogbox  # noqa: E402
 from check_haze_domain import scene  # noqa: E402
 
 FIXED = re.compile(r"mode J: beam map: pilot of \d+ subpaths measured [\d.]+ raw beams/subpath "
-                   r"-> (\d+) beams from (\d+) subpaths \(fixed, -jbeams\)")
+                   r"-> (\d+) beams from (\d+) subpaths of the pass's (\d+) \(fixed, -jbeams\)")
 KNEE = re.compile(r"mode J: beam budget: pilot of \d+ subpaths")
+CHORDS = re.compile(r"mode J: photon beams: medium \d+: (\d+) chords")
+FLOOR0 = re.compile(r"-beamk floor 0\)")
 TRACED = re.compile(r"mode J: \d+ beams from (\d+) light subpaths")
+SURF = re.compile(r"mode J: \d+ surface photons from (\d+) subpaths")
 
 
 def main():
@@ -42,35 +51,48 @@ def main():
     a = ap.parse_args()
     exe, d = os.path.abspath(a.exe), os.path.abspath(a.out)
     ftsl = fogbox.write(d, "still.ftsl", scene(True, res=(32, 24)))
-    check = fogbox.Checks(60)
+    pixels = 32 * 24
+    # The same scene asking for the knee rule itself.
+    text = open(ftsl, encoding="utf-8").read()
+    ftsl_auto = fogbox.write(d, "still_auto.ftsl", text + NL + "render { jbeams auto }" + NL)
+    check = fogbox.Checks(64)
     logs = []
 
-    def run(tag, extra):
-        png = os.path.join(d, tag + ".png")
-        for stale in (png, png[:-4] + ".pfm"):   # a render that writes nothing must not pass
-            if os.path.exists(stale):
-                os.remove(stale)
-        cmd = [exe, "-in", ftsl, "-mode", "J", "-device", "cpu", "-spp", "1", "-seed", "1",
+    def run(tag, extra, scene_path=ftsl, out=None, clean=True):
+        png = out or os.path.join(d, tag + ".png")
+        if clean:
+            for stale in (png, png[:-4] + ".pfm", png + ".ftbuf"):
+                if os.path.exists(stale):
+                    os.remove(stale)
+        cmd = [exe, "-in", scene_path, "-mode", "J", "-device", "cpu", "-spp", "1", "-seed", "1",
                "-hdr", "-no-meter", "-o", png] + extra
         # From the repo root: the scene's presets resolve from there.
         p = subprocess.run(cmd, cwd=ROOT, capture_output=True, text=True, encoding="utf-8",
                            errors="replace")
         log = p.stdout + p.stderr
-        logs.append("--- " + tag + NL + log[-600:])
+        logs.append("--- " + tag + NL + log[-700:])
         pfm = png[:-4] + ".pfm"
         return p.returncode, log, (open(pfm, "rb").read() if os.path.exists(pfm) else None)
 
+    def chords(log):
+        return sum(int(c) for c in CHORDS.findall(log))
+
     rc, log, _ = run("fixed64", ["-jbeams", "64"])
-    m = FIXED.search(log)
-    check("-jbeams 64: a fixed map of exactly 64 beams", rc == 0 and m is not None and m.group(1) == "64",
-          m.group(0)[-50:] if m else "no fixed-map line (rc %d)" % rc)
+    m, s = FIXED.search(log), SURF.search(log)
+    c = chords(log)
+    check("-jbeams 64: a fixed map of about 64 beams", rc == 0 and m is not None and 32 <= c <= 128,
+          "%d chords (rc %d)" % (c, rc))
     check("...from fewer than 256 subpaths (no kPathsMin floor)",
           m is not None and int(m.group(2)) < 256, "%s subpaths" % (m.group(2) if m else "?"))
+    check("...built with no -beamk floor", FLOOR0.search(log) is not None)
+    check("...while the surface map keeps one subpath per pixel",
+          m is not None and s is not None and int(s.group(1)) == pixels == int(m.group(3)),
+          "surface %s, pass %s" % (s.group(1) if s else "?", m.group(3) if m else "?"))
 
     rc, log, _ = run("default", [])
-    m = FIXED.search(log)
-    check("no flag: the default fixed map of 1000 beams", rc == 0 and m is not None and m.group(1) == "1000",
-          m.group(0)[-50:] if m else "no fixed-map line (rc %d)" % rc)
+    c = chords(log)
+    check("no flag: the default fixed map, about 1000 beams",
+          rc == 0 and FIXED.search(log) is not None and 500 <= c <= 2000, "%d chords" % c)
 
     for tag, extra in (("auto", ["-jbeams", "auto"]), ("beamk", ["-beamk", "32"]),
                        ("beamcount", ["-beamcount", "200000"])):
@@ -86,21 +108,45 @@ def main():
           and m.group(1) == "3000", "%s subpaths" % (m.group(1) if m else "?"))
 
     for tag, extra in (("over_nobeams", ["-nobeams", "-jbeams", "64"]),
-                       ("over_beamk", ["-jbeams", "64", "-beamk", "32"])):
+                       ("over_beamk", ["-jbeams", "64", "-beamk", "32"]),
+                       ("over_n", ["-jbeams", "64", "-n", "500"])):
         rc, log, _ = run(tag, extra)
         m = FIXED.search(log)
-        check("%s: -jbeams wins" % " ".join(extra), rc == 0 and m is not None and m.group(1) == "64",
-              "rc %d" % rc)
+        check("%s: -jbeams wins" % " ".join(extra), rc == 0 and m is not None, "rc %d" % rc)
+        if tag == "over_n":
+            check("...-n only capping the pass", m is not None and int(m.group(3)) <= 500,
+                  "pass %s" % (m.group(3) if m else "?"))
 
     rc1, log1, img1 = run("off", ["-jbeams", "off"])
-    rc2, _, img2 = run("nobeams", ["-nobeams"])
-    check("-jbeams off: the beams are off, and it says so",
-          rc1 == 0 and "the beams are off (-jbeams off)" in log1, "rc %d" % rc1)
+    rc2, log2, img2 = run("nobeams", ["-nobeams"])
+    check("-jbeams off: says so, by that flag", rc1 == 0 and "the beams are off (-jbeams off)" in log1)
+    check("-nobeams: says so, by that flag", rc2 == 0 and "the beams are off (-nobeams)" in log2)
+    check("-jbeams off: no beams, no beam budget, a pass sized for the surface map",
+          chords(log1) == 0 and KNEE.search(log1) is None
+          and "the beams are off, so the light pass is sized for the SURFACE map" in log1)
     check("-jbeams off renders -nobeams' image bit for bit",
-          rc2 == 0 and img1 is not None and img1 == img2,
-          "same" if img1 is not None and img1 == img2 else "differ")
+          img1 is not None and img1 == img2, "same" if img1 is not None and img1 == img2 else "differ")
 
-    for bad in ("0", "many"):
+    rc, log, _ = run("scene_auto", [], scene_path=ftsl_auto)
+    check("render { jbeams auto }: the knee rule, and it says so",
+          rc == 0 and KNEE.search(log) is not None and "[scene] mode J beam map: -jbeams auto" in log,
+          "rc %d" % rc)
+    rc, log, _ = run("scene_auto_cli", ["-jbeams", "64"], scene_path=ftsl_auto)
+    check("...a command-line -jbeams beats it", rc == 0 and FIXED.search(log) is not None)
+
+    ck = os.path.join(d, "ck.png")
+    run("ck_write", ["-jbeams", "64", "-checkpoint"], out=ck)
+    rc, log, _ = run("ck_auto", ["-jbeams", "auto", "-checkpoint", "-resume", "-spp", "2"],
+                     out=ck, clean=False)
+    check("a fixed map's checkpoint refuses to resume under auto",
+          "does not match this render" in log, "rc %d" % rc)
+    run("ck_write2", ["-jbeams", "64", "-checkpoint"], out=ck)
+    rc, log, _ = run("ck_same", ["-jbeams", "64", "-checkpoint", "-resume", "-spp", "2"],
+                     out=ck, clean=False)
+    check("...and resumes under the same map",
+          "does not match" not in log and "[resume] loaded" in log, "rc %d" % rc)
+
+    for bad in ("0", "many", "inf", "1e30"):
         rc, log, _ = run("bad_" + bad, ["-jbeams", bad])
         check("-jbeams %s is refused (exit 2)" % bad,
               rc == 2 and "-jbeams wants off, auto or a beam count" in log, "rc %d" % rc)

@@ -133,10 +133,9 @@ Each names the section its line is in.
     check).~~ Done: the GPU hit queue no longer spills (0.434.33-36), 0.434.40's beam domain ended
     the outward ratchet of 0.434.31's beam limit (J-BEAM-FARLIMIT) and made the field fast, and
     0.435.0's `-jbeams` made a fixed 1000-beam map the default. Left: J-AUTO-PROBE (4.5).
-19b. **J-FIELD-SLOW's open ends** (4.3, 4.5), found measuring it 2026-11-09/10: 2 000-beam maps read
-    `_fog_thick` 5-8 % bright (a possible bias, or correlated noise from shared seeds: check it
-    first); a `-time` budget cannot end a GPU mode D/J chunk; and a wavefront resume pass re-walks
-    its segments from the root.
+19b. **J-FIELD-SLOW's open ends** (4.5), found measuring it 2026-11-09/10: a `-time` budget cannot
+    end a GPU mode D/J chunk; and a wavefront resume pass re-walks its segments from the root.
+    (The 2 000-beam brightness it also found was the shared seeds' noise: 4.3.)
 20. **JSPEC-CARRIER-SIZE** (4.5) — every mode-J GPU thread reserves the spectral carrier. Measured
     2026-11-10: with any beam map the GPU camera pass costs ~3x a sample on a cheap scene.
 21. **RADCACHE-BATCHES** (4.5) — `-radcache`'s fixed batches outlast `-stop` and the interval.
@@ -334,11 +333,11 @@ Then the rest of 4.2-4.6 in their order, 4.7's bookkeeping alongside whatever to
 - [ ] **P-HEROSPLIT-FIRST** — blurred mode P under `-herosplit` files a sample by the hero's first
   event alone.
 - [ ] **ROUGH-IRID-AIR** — a rough interference reflector always interferes against air.
-- [ ] **J-FIELD-SLOW's 2 000-beam brightness** — at 256 spp, 128x96, depth 8 (`scraps/probe/perspp.py`),
-  maps of 2 000 raw beams read `_fog_thick` 5-8 % brighter than the mode D reference at every
-  kernel width tried, where 8 000 beams and no beams do not. The seeds were shared between arms, so
-  it may be correlated firefly noise; rerun with independent seeds per arm and more of them, and if
-  it holds, find what a small map biases.
+- [x] **J-FIELD-SLOW's 2 000-beam brightness** — not a bias: with eight seeds an arm, disjoint
+  across arms (`scraps/probe/biascheck.py`, 0.435.1, 1024 spp), `_fog_thick`'s mean against the
+  mode D reference is 0.998 +- 0.018 at 250 beams, 0.990 +- 0.007 at 1000, 0.994 +- 0.013 at
+  2000, 1.000 +- 0.011 at 4000, 0.990 +- 0.008 under the knee rule and 0.999 +- 0.002 with no
+  beams. The 0.434.39 reading shared its seeds between arms.
 - [ ] **HAZE-BLUR-INVERSE-TR** — HAZE-BLUR-DOMAIN's remaining approximation: where a blur's sun
   subpath begins further out than the NEE leg reaches (a mover outside the instant's disc), the
   first leg's factor is the INVERSE of a transmittance, exact in a homogeneous haze but taken by
@@ -426,7 +425,7 @@ Then the rest of 4.2-4.6 in their order, 4.7's bookkeeping alongside whatever to
   caustic neighbour count scaled with it.
 - [x] **J-FIELD-SLOW** (0.434.33-0.435.0) — mode J in an unbounded density field: the wavefront
   no longer spills, the beams end at the scene's beam domain, and the default map is a fixed 1000
-  beams (`-jbeams`), the knee rule trailing it 2-4x on the fog scenes.
+  beams (`-jbeams`), the knee rule trailing it 1.5-3.5x on the fog scenes.
 - [ ] **J-AUTO-PROBE** — what is left of J-FIELD-SLOW under `-jbeams auto`: `probeGatherCount`'s
   random chords of the beams' box gather 32 beams where a camera segment in an unbounded haze
   gathers far more, so the knee overshoots. A probe drawn as the camera draws its rays would say

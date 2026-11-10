@@ -982,6 +982,11 @@ struct Loaded {
     // render { jsurf_radius <len> } (0.386.0): mode J's starting surface-merge radius, when the scene
     // knows the default (-pmradiusfrac of the scene radius) is wrong for it; <= 0 = not specified.
     double jsurfRadius = -1.0;
+    // render { jbeams off|auto|<N> } (0.435.1): mode J's beam map, when the scene knows it wants
+    // other than the fixed default (gallery_rain's dense rain wants `auto`, the knee-sized map its
+    // flyby is tuned with); empty = not specified. The command line's -jbeams, -nobeams, -beamk,
+    // -beamcount or -n still win.
+    std::string jbeams;
     std::string device;          // empty = not specified
     std::string out;             // empty = not specified
     // Keys no builder read (see collectUnusedKeys). Carried on Loaded rather than
@@ -10779,6 +10784,17 @@ private:
             const double v = jr->val.words.empty() ? 0.0 : num(jr->val.words[0]);
             if (!(v > 0.0)) { fail("render: jsurf_radius must be > 0"); return false; }
             L.jsurfRadius = v * L_;
+        }
+        if (find(b, "jbeams")) {
+            const std::string v = strOf(b, "jbeams");
+            char* end = nullptr;
+            const double n = v.empty() ? 0.0 : std::strtod(v.c_str(), &end);
+            const bool count = end && end != v.c_str() && *end == 0 && n >= 1.0 && n <= 1e12;
+            if (!(v == "off" || v == "auto" || count)) {
+                fail("render: jbeams takes off, auto or a beam count from 1 to 1e12 (got '" + v + "')");
+                return false;
+            }
+            L.jbeams = v;
         }
         // `mode_spp D=1 J=0.5`: per-mode sample multipliers (FTSL.md 16.1). key=val words, so they
         // continue one statement (1.1).

@@ -60,9 +60,11 @@ _SCENES = {
     "inside": (3.0, 3.0, None),
     "gel":    (3.0, 3.0, None),
 }
+# Mode J at -jbeams auto: the knee-sized map these tolerances were set against; the sparse fixed
+# default (0.435.0) gives the merges under test a far smaller share.
 _ARMS = {
-    "J-gpu": ["-mode", "J", "-device", "gpu", "-spp", "512", "-beamepochs", "32"],
-    "J-cpu": ["-mode", "J", "-device", "cpu", "-spp", "128", "-beamepochs", "16"],
+    "J-gpu": ["-mode", "J", "-device", "gpu", "-spp", "512", "-beamepochs", "32", "-jbeams", "auto"],
+    "J-cpu": ["-mode", "J", "-device", "cpu", "-spp", "128", "-beamepochs", "16", "-jbeams", "auto"],
     "M-gpu": ["-mode", "M", "-beams", "-device", "gpu", "-n", "20000000", "-spp", "64"],
     "M-cpu": ["-mode", "M", "-beams", "-device", "cpu", "-n", "4000000", "-spp", "8"],
 }

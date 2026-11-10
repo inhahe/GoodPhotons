@@ -2453,6 +2453,7 @@ struct BeamBudgetInfo {
     long long kneeBeams    = 0;      // ... and where it put the -beamk knee (0 = not measured)
     long long pathsAsked   = 0;      // `-n`, or mode J's default
     long long pathsUsed    = 0;      // what the budget allowed
+    long long beamPaths    = -1;     // how many of them deposit beams (the first ones; -1 all)
     long long budget       = 0;      // the beam ceiling actually enforced
     bool      kneeBound    = false;  // was the knee the binding half, or the resource ceiling?
     bool      applied      = false;  // did it bite at all, or was `-n` already smaller?
@@ -2473,8 +2474,16 @@ struct BeamBudgetReq {
     double    safety   = 1.0;    // scale on the measured knee; 1.0 = aim AT it (see the note below)
     // A fixed map (-jbeams <N>): `maxBeams` is the beam count asked for, with no knee (targetK 0)
     // and no kPathsMin floor under the subpaths it takes -- a few hundred raw beams can be fewer
-    // than 256 subpaths deposit, and the map asked for is the map built.
+    // than 256 subpaths deposit, and the map asked for is the map built. Its beams come from the
+    // pass's first subpaths only (`beamPaths`), so a surface map can keep the count `surfPaths`
+    // names rather than shrink to the beams'.
     bool      exact    = false;
+    // How many of the pass's subpaths deposit beams: the first `beamPaths` (-1 every one, 0
+    // none: the beams are off and only the surface map is wanted). An input for a refresh, which
+    // re-traces epoch 0's count with no pilot; a fixed map's epoch 0 sets it (BeamBudgetInfo).
+    // The two maps normalise by their own counts (BeamMap / SurfMap::nEmitted), as their merge
+    // constants do, so the subset is the same estimator with fewer beam samples.
+    long long beamPaths = -1;
     // --- THE SURFACE MAP'S HALF (-jsurf, 0.258.0) ---------------------------------------
     // One subpath count feeds TWO maps, so both get a say, and they say different kinds of
     // thing. The beam side names a *beam* ceiling because its radius adapts: undershoot the
@@ -2631,7 +2640,11 @@ inline void traceLightBeamPass(const Scene& scene, const Camera& cam, long long 
     std::vector<SurfBank> sbanks((size_t)nThreads);
     const bool wantSurf = (smOut != nullptr);
     std::vector<long long> emitted((size_t)nThreads, 0);
+    std::vector<long long> emittedB((size_t)nThreads, 0);   // ...of them, the beam-depositing ones
     std::atomic<long long> tracedTotal{0};
+    // The first `beamPaths` subpaths deposit beams (-1 all): BeamBudgetReq::beamPaths, or what
+    // a fixed map's budget below settles on.
+    long long beamPaths = req.beamPaths;
 
     // `pilot` shares the deposit path with the real pass and skips only the MIS bookkeeping,
     // which is deliberate: what the pilot has to predict is how many beams `emitBeams` makes,
@@ -2665,7 +2678,7 @@ inline void traceLightBeamPass(const Scene& scene, const Camera& cam, long long 
         const PatTables tabs = scene.patTables();
         long long workLight = 0;                       // JWork: this thread's vertices
         const long long lo = total * tid / nThreads, hi = total * (tid + 1) / nThreads;
-        long long done = 0;
+        long long done = 0, doneB = 0;
         for (long long i = lo; i < hi; ++i) {
             // Cooperative `-stop` / Ctrl-C on the same 4096-path cadence as the photon pass.
             if ((done & 0xFFF) == 0) {
@@ -2675,6 +2688,9 @@ inline void traceLightBeamPass(const Scene& scene, const Camera& cam, long long 
             // Seeded by ABSOLUTE path index, so the map is identical for any thread count.
             seedUnit(rng, salt + (uint64_t)i, 0xD1B54A32D192ED03ULL);
             ++done;
+            // Counted as an attempt, like `done`, before anything can skip the subpath.
+            const bool beamsHere = pilot || beamPaths < 0 || i < beamPaths;
+            if (beamsHere) ++doneB;
             // Single-λ, always. The hero bundle exists to share one ray path across C
             // wavelengths, and a scene with media has a per-λ free flight — renderRows
             // gates hero off for exactly that reason, and this pass only ever runs when
@@ -2905,7 +2921,7 @@ inline void traceLightBeamPass(const Scene& scene, const Camera& cam, long long 
                 accMs[u] = rL * (accMs[u - 1] + eL.surf);
             }
 
-            for (const PathSeg& sg : segs) {
+            if (beamsHere) for (const PathSeg& sg : segs) {
                 if (!(sg.beta > 0.0)) continue;
                 const size_t before = banks[(size_t)tid].beams.size();
                 depositSeg(sg);
@@ -2996,6 +3012,7 @@ inline void traceLightBeamPass(const Scene& scene, const Camera& cam, long long 
         // Count what was actually emitted, not what was asked for: an early `-stop` that
         // reported the full share would scale the whole map down and darken the merges.
         emitted[(size_t)tid] = done;
+        emittedB[(size_t)tid] = doneB;
     };
 
     // --- THE SURFACE MAP'S SUBPATH TARGET, which needs no measurement --------------------
@@ -3014,7 +3031,8 @@ inline void traceLightBeamPass(const Scene& scene, const Camera& cam, long long 
     // A surface-photon ceiling is the SECOND thing that can require a pilot, and it can do so
     // on a scene with no media at all (where `maxBeams` measures nothing) — hence the `||`
     // rather than a beams-only gate.
-    if ((req.maxBeams > 0 || (smOut && req.maxSurfPhotons > 0)) && nPaths > 4 * kPilotMin) {
+    if ((req.maxBeams > 0 || (smOut && req.maxSurfPhotons > 0)) &&
+        ((req.exact && req.maxBeams > 0) || nPaths > 4 * kPilotMin)) {
         const auto tPilot0 = std::chrono::steady_clock::now();
         // FTRACE_JPILOT overrides the size, for the sweep that decides whether `/32` is
         // buying anything. The sizing is off the REQUESTED nPaths, which on a knee-bound scene
@@ -3023,7 +3041,8 @@ inline void traceLightBeamPass(const Scene& scene, const Camera& cam, long long 
         // rate is stable at kPilotMin and that 64k is "far past the point of usefulness", so
         // the `/32` term may be paying 30x for nothing -- but that is a claim to measure, not
         // to assume, and this hook is how.
-        long long nPilot = std::clamp(nPaths / 32, kPilotMin, kPilotMax);
+        // A fixed map needs only the rate (no knee), which kPilotMin already measures well.
+        long long nPilot = req.exact ? kPilotMin : std::clamp(nPaths / 32, kPilotMin, kPilotMax);
         if (const char* e = std::getenv("FTRACE_JPILOT")) {
             const long long v = std::atoll(e);
             if (v > 0) nPilot = v;
@@ -3114,6 +3133,11 @@ inline void traceLightBeamPass(const Scene& scene, const Camera& cam, long long 
         if (req.maxBeams > 0 && perPath > 0.0) {
             const long long fit = (long long)(effBudget / perPath);
             nPaths = std::clamp(fit, req.exact ? 1LL : kPathsMin, nPathsAsked);
+            if (req.exact) {
+                beamPaths = nPaths;
+                if (smOut && req.surfPaths > 0)
+                    nPaths = std::clamp(std::max(nPaths, req.surfPaths), 1LL, nPathsAsked);
+            }
         }
         // THE SURFACE CEILING, applied AFTER the beam knee and only ever downward. It is a
         // memory bound, not a quality target: the point-merge radius is fixed, so a bigger
@@ -3157,6 +3181,7 @@ inline void traceLightBeamPass(const Scene& scene, const Camera& cam, long long 
     if (budgetOut) {
         budgetOut->pathsAsked = nPathsAsked;
         budgetOut->pathsUsed  = nPaths;
+        budgetOut->beamPaths  = beamPaths;
     }
     std::vector<std::thread> pool;
     for (int t = 0; t < nThreads; ++t)
@@ -3189,7 +3214,7 @@ inline void traceLightBeamPass(const Scene& scene, const Camera& cam, long long 
         bm.beams.insert(bm.beams.end(), banks[(size_t)t].beams.begin(),
                         banks[(size_t)t].beams.end());
         bm.mis.insert(bm.mis.end(), misBanks[(size_t)t].begin(), misBanks[(size_t)t].end());
-        bm.nEmitted += emitted[(size_t)t];
+        bm.nEmitted += emittedB[(size_t)t];
     }
     // The two arrays are built one push apart and can only disagree through a bug; if they
     // ever do, drop the MIS data rather than index it wrongly — BeamMap::misOf then returns
@@ -3199,11 +3224,13 @@ inline void traceLightBeamPass(const Scene& scene, const Camera& cam, long long 
     bm.nDeposited = bm.beams.size();
 
     // --- The SECOND output: the surface photon map (mode J's point merges) -----------
-    // Merged from the same banks the beams came from, and given the SAME nEmitted, because
-    // the beams and the photons are two views of ONE set of light subpaths. Every weight
-    // that mentions both kinds (SurfMis::sumMb / BeamMis::sumMs, and the camera-side
-    // segSumM which is scaled by both kappas) assumes a single n_m; two passes would give
-    // them two, and every cross term would be wrong by that ratio.
+    // From the same subpaths as the beams, so a photon and a beam carry one walk's
+    // pdfFwd/pdfRev bookkeeping. Its count is the pass's, every subpath's; the beams' is
+    // theirs alone (`beamPaths`). Every weight that mentions both kinds (SurfMis::sumMb /
+    // BeamMis::sumMs, and the camera side's segSumM) keeps them primed and scales each by its
+    // own map's constant -- n_beam * 2 r_b and n_surf * pi r_s^2 (MergeK; the device's
+    // mergeKappa and kappaS) -- so the counts need not be equal, each being its technique's
+    // sample count in the balance heuristic.
     if (smOut) {
         size_t np = 0;
         for (const SurfBank& sb : sbanks) np += sb.size();
@@ -3212,7 +3239,8 @@ inline void traceLightBeamPass(const Scene& scene, const Camera& cam, long long 
         ftalloc::reserve(smOut->pts, np, "mode J's surface photon map", "-n (which sizes it)");
         ftalloc::reserve(smOut->mis, np, "mode J's per-photon MIS partials",
                          "-n (which sizes it)");
-        smOut->nEmitted = bm.nEmitted;
+        smOut->nEmitted = 0;
+        for (long long e : emitted) smOut->nEmitted += e;
         for (int t = 0; t < nThreads; ++t) {
             SurfBank& sb = sbanks[(size_t)t];
             // `misIdx` is BANK-LOCAL (each worker numbered from 0 into its own `sb.mis`), so
