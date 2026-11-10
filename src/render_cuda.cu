@@ -13893,32 +13893,49 @@ __device__ static inline double dMergeEtaSurf(bool site, double pLight) {
     if (!site) return 0.0;
     return (pLight > 0.0) ? pLight : 0.0;   // callers pass dMergeLightDensity (0.387.0)
 }
-__device__ static double dMergeEtaPrime(const DScene& sc, const DVec3& pPrev, const DVertex& v,
-                                        const DVec3& pNext, double pLight, Real lambda,
-                                        const DPatEnv& env) {
-    if (v.type != BV_MEDIUM) return 0.0;
-    if (v.mediumId < 0 || v.mediumId >= sc.mediaN) return 0.0;
-    if (!(pLight > 0.0)) return 0.0;                 // callers pass dMergeLightDensity (0.387.0)
-    if (!dJBeamMerges(sc, sc.media[v.mediumId], v.p)) return 0.0;   // past the beam domain
+// The beam merge's eta' at medium vertex v between its neighbours pPrev (light side) and pNext
+// (camera side) is sin * pLight / (sigma_t * Tr): every factor but pLight is fixed by the three
+// points. A subpath's interior vertices keep both neighbours in every connection that weighs a
+// merge at them, so kBdptT computes these once a sample (geoE / geoL) and dMisWeight reads them:
+// a transmittance per vertex a sample, not one per vertex per connection (host twin MergeGeo).
+// `den` is 0 where no beam merge can happen; dMergeEtaAt multiplies in dMergeEtaPrime's order, so
+// the two agree bit for bit.
+struct DMergeGeo { double sq, den; };
+__device__ static DMergeGeo dMergeGeo(const DScene& sc, const DVec3& pPrev, const DVertex& v,
+                                      const DVec3& pNext, Real lambda, const DPatEnv& env) {
+    const DMergeGeo none{0.0, 0.0};
+    if (v.type != BV_MEDIUM) return none;
+    if (v.mediumId < 0 || v.mediumId >= sc.mediaN) return none;
+    if (!dJBeamMerges(sc, sc.media[v.mediumId], v.p)) return none;   // past the beam domain
     DVec3 din = v.p - pPrev;
     const double dl = sqrt(ddot(din, din));
-    if (!(dl > 0.0)) return 0.0;
+    if (!(dl > 0.0)) return none;
     din = din * (Real)(1.0 / dl);
     DVec3 dout = pNext - v.p;
     const double dn = sqrt(ddot(dout, dout));
-    if (!(dn > 0.0)) return 0.0;
+    if (!(dn > 0.0)) return none;
     dout = dout * (Real)(1.0 / dn);
     // sin of the angle between the beam and the camera ray. The camera ray runs the other
     // way (-dout), but |sin| is unchanged by the flip.
     const double c = ddot(din, dout);
     const double s2 = 1.0 - c * c;
-    if (!(s2 > 0.0)) return 0.0;                 // exactly collinear: no acceptance volume
+    if (!(s2 > 0.0)) return none;                // exactly collinear: no acceptance volume
     const DMedium& md = sc.media[v.mediumId];
     const double sigT = (double)medSigmaT(md, lambda) * dMedDensityAt(md, v.p, env);
-    if (!(sigT > 0.0)) return 0.0;
+    if (!(sigT > 0.0)) return none;
     const double tr = dTrDet(sc, v.p, dout, dn, lambda, env);
-    if (!(tr > 0.0)) return 0.0;
-    return sqrt(s2) * pLight / (sigT * tr);
+    if (!(tr > 0.0)) return none;
+    return DMergeGeo{sqrt(s2), sigT * tr};
+}
+__device__ static inline double dMergeEtaAt(const DMergeGeo& g, double pLight) {
+    if (!(g.den > 0.0) || !(pLight > 0.0)) return 0.0;   // pLight: dMergeLightDensity (0.387.0)
+    return g.sq * pLight / g.den;
+}
+__device__ static double dMergeEtaPrime(const DScene& sc, const DVec3& pPrev, const DVertex& v,
+                                        const DVec3& pNext, double pLight, Real lambda,
+                                        const DPatEnv& env) {
+    if (!(pLight > 0.0)) return 0.0;
+    return dMergeEtaAt(dMergeGeo(sc, pPrev, v, pNext, lambda, env), pLight);
 }
 __device__ static bool dVertConnectible(const DScene& sc, const DVertex& v) {
     if (v.type == BV_CAMERA) return true;
@@ -18631,10 +18648,15 @@ __device__ static int dGenLightSubpath(const DScene& sc, const DCamera& cam, int
 // is the a5 override at i-1 == tMi (i-1 == ti is unreachable, i <= t-1); eye[t-1] is PtP so
 // t == 1 picks up `sampled`; light[s-1] is QsP; eye[t-1].pdfRev is the a4 override ptPdfRev.
 // Accumulated in a SEPARATE double: kappa is ~n_m*2r ~ 1e3, and sumRi/ri are float here.
+// geoE[k] / geoL[i]: the beam merge's factors at eye[k] between eye[k+1] and eye[k-1], and at
+// light[i] between light[i-1] and light[i+1] (DMergeGeo), for every interior vertex; read wherever
+// mergeKappa > 0. The two merges whose neighbour is the connection's other end are computed here.
 __device__ static double dMisWeight(const DScene& sc, const DCamera& cam,
                                     const DVertex* light, const DVertex* eye,
                                     const DVertex& sampled, int s, int t, Real lambda,
-                                    double mergeKappa = 0.0, double kappaSurf = 0.0) {
+                                    double mergeKappa = 0.0, double kappaSurf = 0.0,
+                                    const DMergeGeo* geoE = nullptr,
+                                    const DMergeGeo* geoL = nullptr) {
     if (s + t == 2) return 1.0;
     const int si = s - 1, ti = t - 1, sMi = s - 2, tMi = t - 2;
     const bool merges = mergeKappa > 0.0 || kappaSurf > 0.0;
@@ -18686,8 +18708,7 @@ __device__ static double dMisWeight(const DScene& sc, const DCamera& cam,
             // eye[i-1]'s light-side neighbour is eye[i], whose flag is `dl` (0 at pt).
             const double pRev = dMergeLightDensity((i - 1 == tMi) ? (double)ptMPdfRev
                                                                   : (double)eye[i - 1].pdfRev, dl != 0);
-            const double e = dMergeEtaPrime(sc, eye[i].p, eye[i - 1], eye[i - 2].p,
-                                            pRev, lambda, env);
+            const double e = (mergeKappa > 0.0) ? dMergeEtaAt(geoE[i - 1], pRev) : 0.0;
             // ...and the POINT merge at the same vertex. A vertex is a medium point or a
             // surface, never both, so at most one of these is non-zero -- but BOTH have to be
             // here, or a connection keeps a weight that ignores a technique competing for its
@@ -18714,9 +18735,10 @@ __device__ static double dMisWeight(const DScene& sc, const DCamera& cam,
                                  : dIsDeltaLightVertex(sc, (si == 0) ? *QsP : light[0]);
         if (!dl && !deltaPrev) sumRi += ri;
         if (merges && i >= 1 && t > 0) {             // merge at light[i]
-            const DVec3 pNext = (i + 1 <= s - 1) ? light[i + 1].p : PtP->p;
             const double plI = dMergeLightDensity((double)light[i].pdfFwd, light[i - 1].delta != 0);
-            const double e = dMergeEtaPrime(sc, light[i - 1].p, light[i], pNext, plI, lambda, env);
+            const double e = !(mergeKappa > 0.0) ? 0.0
+                           : (i + 1 <= s - 1) ? dMergeEtaAt(geoL[i], plI)
+                           : dMergeEtaPrime(sc, light[i - 1].p, light[i], PtP->p, plI, lambda, env);
             const double eS = (kappaSurf > 0.0) ? dMergeEtaSurf(dSurfMergeSite(sc, light[i]), plI) : 0.0;
             if (e > 0.0 || eS > 0.0) sumMg += (double)ri * (e * mergeKappa + eS * kappaSurf);
         }
@@ -18724,8 +18746,9 @@ __device__ static double dMisWeight(const DScene& sc, const DCamera& cam,
     // The merge at the connection vertex pt itself. Its own connection strategy IS this one,
     // so the ratio multiplying it is exactly 1.
     if (merges && s >= 1 && t >= 2) {
-        const double e = dMergeEtaPrime(sc, QsP->p, *PtP, eye[tMi].p,
-                                        (double)ptPdfRev, lambda, env);
+        const double e = (mergeKappa > 0.0) ? dMergeEtaPrime(sc, QsP->p, *PtP, eye[tMi].p,
+                                                             (double)ptPdfRev, lambda, env)
+                                            : 0.0;
         const double eS = (kappaSurf > 0.0) ? dMergeEtaSurf(dSurfMergeSite(sc, *PtP), (double)ptPdfRev)
                                             : 0.0;
         if (e > 0.0 || eS > 0.0) sumMg += e * mergeKappa + eS * kappaSurf;
@@ -18749,7 +18772,8 @@ __device__ static double dConnectBDPT(const DScene& sc, const DCamera& cam,
                                       int s, int t, const DHeroBundle& hb, DRng& rng,
                                       int& outPx, int& outPy, int& isSplat,
                                       double* Lsec, int& nUpConn, double mergeKappa = 0.0,
-                                      double kappaSurf = 0.0) {
+                                      double kappaSurf = 0.0, const DMergeGeo* geoE = nullptr,
+                                      const DMergeGeo* geoL = nullptr) {
     const Real lambda = hb.lam[0];
     const double invPdfLambda = hb.invPdf[0];
     isSplat = 0;
@@ -19134,7 +19158,8 @@ __device__ static double dConnectBDPT(const DScene& sc, const DCamera& cam,
     double mx = L;
     for (int i = 0; i + 1 < nUp; ++i) if (Lsec[i] > mx) mx = Lsec[i];
     if (!(mx > 0.0)) return 0.0;
-    const double mis = dMisWeight(sc, cam, light, eye, sampled, s, t, lambda, mergeKappa, kappaSurf);
+    const double mis = dMisWeight(sc, cam, light, eye, sampled, s, t, lambda, mergeKappa, kappaSurf,
+                                  geoE, geoL);
     for (int i = 0; i + 1 < nUp; ++i) Lsec[i] *= mis;
     nUpConn = nUp;
     return L * mis;
@@ -19480,6 +19505,16 @@ kBdptT(DScene sc, const __grid_constant__ DCamera cam, double* camFilm, double* 
                                    wantSegs ? (int)SEGN : 0, jSpecOn ? &jrun : nullptr,
                                    (jSpecOn && kappaSurf > 0.0) ? vspec : nullptr);
         int nL = dGenLightSubpath(sc, camS, diffraction, hb, maxDepth + 1, rng, light, lightSec, NS, MAXV);
+        // The beam merge's factors at every interior vertex, between its subpath neighbours: each
+        // connection's weight reads them (dMisWeight), as do the camera-side sums below.
+        DMergeGeo geoE[MERGE ? MAXV : 1], geoL[MERGE ? MAXV : 1];
+        if (MERGE && mergeKappa > 0.0) {
+            const DPatEnv envG = dPatEnvOf(sc);
+            for (int k = 1; k + 1 < nE; ++k)
+                geoE[k] = dMergeGeo(sc, eye[k + 1].p, eye[k], eye[k - 1].p, lambda, envG);
+            for (int i = 1; i + 1 < nL; ++i)
+                geoL[i] = dMergeGeo(sc, light[i - 1].p, light[i], light[i + 1].p, lambda, envG);
+        }
 
         // PER-OBJECT ROUTE (0.386.0; see c_routeOn). routeR: the route of every path this camera
         // subpath makes with t >= 2, which all share its leading chain eye[1..fIdx]. prefJ bit k
@@ -19562,7 +19597,7 @@ kBdptT(DScene sc, const __grid_constant__ DCamera cam, double* camFilm, double* 
                 }
                 double c = (c_jHalf == 2) ? 0.0 : dConnectBDPT(sc, camS, light, eye, lightSec, eyeSec, NS,
                                         s, t, hb, rng, spx, spy, isSplat, Lsec, nUpConn,
-                                        mkST, ksST);
+                                        mkST, ksST, geoE, geoL);
                 if (wST != 1.0) { c *= wST; for (int i = 0; i + 1 < nUpConn; ++i) Lsec[i] *= wST; }
                 if (nUpConn <= 0) continue;
                 // Reject a non-positive — and, critically, a NON-FINITE — contribution before
@@ -19654,8 +19689,7 @@ kBdptT(DScene sc, const __grid_constant__ DCamera cam, double* camFilm, double* 
                     if (k >= 2 && !chromaOn) {
                         const double plK = dMergeLightDensity((double)eye[k - 1].pdfRev,
                                                               eye[k].delta != 0);
-                        eK = mergeKappa * dMergeEtaPrime(sc, eye[k].p, eye[k - 1], eye[k - 2].p,
-                                                         plK, lambda, dPatEnvOf(sc));
+                        if (mergeKappa > 0.0) eK = mergeKappa * dMergeEtaAt(geoE[k - 1], plK);
                         if (kappaSurf > 0.0)
                             eK += kappaSurf * dMergeEtaSurf(dSurfMergeSite(sc, eye[k - 1]), plK);
                     }
@@ -19821,8 +19855,7 @@ kBdptT(DScene sc, const __grid_constant__ DCamera cam, double* camFilm, double* 
                     // is eye[k] itself, so there is no per-photon geometry.
                     sw.etaKm1Coef   = 0.0;
                     if (k >= 2) {
-                        sw.etaKm1Coef = mergeKappa * dMergeEtaPrime(sc, vk.p, vp, eye[k - 2].p,
-                                                                    1.0, lambda, dPatEnvOf(sc));
+                        if (mergeKappa > 0.0) sw.etaKm1Coef = mergeKappa * dMergeEtaAt(geoE[k - 1], 1.0);
                         if (dSurfMergeSite(sc, vp)) sw.etaKm1Coef += kappaSurf;
                     }
                     sw.segSumC      = (k - 1 < (int)SEGN) ? segSumC[k - 1] : 0.0;

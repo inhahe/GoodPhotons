@@ -136,8 +136,9 @@ Each names the section its line is in.
 19b. **J-FIELD-SLOW's open ends** (4.5), found measuring it 2026-11-09/10: a `-time` budget cannot
     end a GPU mode D/J chunk. (The 2 000-beam brightness it also found was the shared seeds' noise,
     4.3; the resume passes' re-walk no longer costs anything measurable, 4.5.)
-20. **JSPEC-CARRIER-SIZE** (4.5) — every mode-J GPU thread reserves the spectral carrier. Measured
-    2026-11-10: with any beam map the GPU camera pass costs ~3x a sample on a cheap scene.
+20. **JSPEC-CARRIER-SIZE** (4.5) — every mode-J GPU thread reserves the spectral carrier: VRAM, the
+    operator's call against build time. (The ~3x camera pass measured against it was the MIS
+    weights' transmittances, 0.436.5.)
 21. **RADCACHE-BATCHES** (4.5) — `-radcache`'s fixed batches outlast `-stop` and the interval.
     0.434.27: a budget no longer hangs in them and `-stop` lands mid-batch (modes R and P); the
     interval writes and a resume's schedule need a canonical cache merge first (known-issues).
@@ -433,9 +434,11 @@ Then the rest of 4.2-4.6 in their order, 4.7's bookkeeping alongside whatever to
   whether `auto` can land where the fixed map does; measure with the beam domain's scale (and
   whether the domain should hold the camera), on `scraps/probe/sweep4.sh`'s scenes.
 - [ ] **JSPEC-CARRIER-SIZE** — every mode-J GPU thread reserves a 120-byte spectral carrier per
-  segment and per eye vertex, chromatic scene or not. Measured 2026-11-10: on `_slab_ss` a 64-beam
-  map (no merges to speak of) renders a third of the samples `-jbeams off` does, wavefront or
-  inline, the light side 8 % of it; profile the merge kernel's occupancy first.
+  segment and per eye vertex, chromatic scene or not: VRAM (~0.5 GB, ~3.2 GB on the deep kernel),
+  not speed. The slow camera pass measured against it was the MIS weights' per-connection
+  transmittances, computed once a sample since 0.436.5 (known-issues). Left: the template
+  parameter that sizes the carrier to nothing in an achromatic render costs two more variants of
+  the largest kernel -- build time against VRAM, the operator's call.
 - [ ] **RADCACHE-BATCHES** — under `-radcache` a fixed budget's CPU batches follow its samples, not
   the clock: the periodic writes wait, and a resume reschedules. (0.434.27: `-stop` lands
   mid-batch, and a `-time`/`-noise`/`-forever` budget takes the clock instead of hanging.)

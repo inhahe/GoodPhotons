@@ -2360,12 +2360,19 @@ says which. Copy the scene into `scenes/` before working on it.
 
 ## OPEN (2026-10-21): JSPEC-CARRIER-SIZE — every mode-J GPU thread reserves room for a 120-byte spectral carrier per segment and per eye vertex, chromatic scene or not
 
-**What it may cost, measured 2026-11-10 (0.435.0, RTX 4090):** `_slab_ss` at 128x96, 30 s, GPU mode J
-with a 64-beam map (`-jbeams 64`, about zero beam hits a camera segment) renders 4 619 samples
-through the wavefront gather and 5 162 inline (`FTRACE_NOWAVEFRONT=1`), against 14 320 with the beams
-off (`-jbeams off`, mode D's kernel): the beam-capable camera pass costs ~3x a sample on a cheap
-scene whatever the map, the light side only 8 % of it (`[jstats]`). This carrier and the merge
-kernel's other per-thread state are the first suspects (occupancy); a profile would say.
+**Not what made mode J's camera pass slow (measured 2026-11-10, 0.436.5).** `_slab_ss` at 128x96,
+30 s, GPU mode J with a 64-beam map (`-jbeams 64`, about zero beam hits a camera segment) rendered
+4 619 samples against 14 320 with the beams off (`-jbeams off`, mode D's kernel), which this entry
+blamed on the carrier. It was not the carrier: `FTRACE_JSPEC=0` changes no timing (an achromatic
+scene's carrier does no work), and its reservation is never touched. At 128x96 a frame is less than
+one wave of the GPU, so a chunk's fixed costs weigh: `-beamfreeze` alone took back ~40 % of the gap.
+At 640x480 the gap was ~1.5x, and most of it was the MIS weights computing every beam merge's
+transmittance at every vertex of every connection, which 0.436.5 computes once a sample (design.md,
+"The beam terms' factors are computed once a sample"). Kernel `kBdptT`'s time a sample, Nsight
+Systems, 640x480: `_slab_ss` 64-beam 91.6 -> 80.0 ms against mode D's 64.4 -> 54.7; `_fog_cornell`
+167.1 -> 149.6 against 159.0 -> 154.7. What is left of this entry is the VRAM below. (Nsight Compute
+would say more -- occupancy, local-memory traffic -- but it needs the GPU performance counters,
+which Windows keeps for administrators unless the NVIDIA control panel opens them to all users.)
 
 Found by the Opus review of 0.385-0.388. `DJSpec` (render_cuda.cu) is JSPEC's camera carrier: 24
 float bins, a log scale, two flags and the window's wavelength. One rides on every recorded

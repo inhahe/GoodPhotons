@@ -2268,34 +2268,64 @@ inline double mergeLightDensity(double pLight, bool fromDelta) {
 //
 // It sits HERE, above the light pass, because both halves of mode J need it: the light pass
 // below folds it into each beam's stored accumulator (BeamMis::sumM), and misWeight further
-// down calls it per hypothetical strategy.
-inline double mergeEtaPrimeBeam(const Scene& scene, const Vec3& pPrev, const Vertex& v,
-                                const Vec3& pNext, double pLight, double lambda) {
-    if (v.type != VType::Medium) return 0.0;
-    if (v.mediumId < 0 || v.mediumId >= (int)scene.media.size()) return 0.0;
-    if (!(pLight > 0.0)) return 0.0;                 // callers pass mergeLightDensity (0.387.0)
+// down weighs it into every hypothetical strategy.
+//
+// Every factor but pLight is fixed by the three points, and a subpath's interior vertex keeps
+// both its neighbours in every connection that weighs a merge at it, so renderRows computes them
+// once a sample (MergeGeo, mergeGeoOfSubpaths) and misWeight reads them: a transmittance per
+// vertex a sample, not one per vertex per connection. `den` is 0 where no beam merge can happen;
+// mergeEtaAt multiplies in this function's order, so the two agree bit for bit.
+struct MergeGeo { double sq = 0.0, den = 0.0; };
+inline MergeGeo mergeGeo(const Scene& scene, const Vec3& pPrev, const Vertex& v, const Vec3& pNext,
+                         double lambda) {
+    if (v.type != VType::Medium) return {};
+    if (v.mediumId < 0 || v.mediumId >= (int)scene.media.size()) return {};
     // No beam reaches past the scene's beam domain in an unbounded medium, so no merge either.
-    if (!scene.jBeamMerges(scene.media[v.mediumId], v.p)) return 0.0;
+    if (!scene.jBeamMerges(scene.media[v.mediumId], v.p)) return {};
     Vec3 din = v.p - pPrev;
     const double dl = std::sqrt(dot(din, din));
-    if (!(dl > 0.0)) return 0.0;
+    if (!(dl > 0.0)) return {};
     din = din * (1.0 / dl);
     Vec3 dout = pNext - v.p;
     const double dn = std::sqrt(dot(dout, dout));
-    if (!(dn > 0.0)) return 0.0;
+    if (!(dn > 0.0)) return {};
     dout = dout * (1.0 / dn);
     // sin of the angle between the beam and the camera ray. The camera ray runs x_{i+1}->x_i,
     // i.e. -dout, but |sin| is unchanged by the flip.
     const double c = dot(din, dout);
     const double s2 = 1.0 - c * c;
-    if (!(s2 > 0.0)) return 0.0;                 // exactly collinear: no acceptance volume
+    if (!(s2 > 0.0)) return {};                  // exactly collinear: no acceptance volume
     const Medium& md = scene.media[v.mediumId];
     const PatTables tabs = scene.patTables();
     const double sigT = md.sigmaT(lambda) * md.densityAt(v.p, &tabs);
-    if (!(sigT > 0.0)) return 0.0;
+    if (!(sigT > 0.0)) return {};
     const double tr = trDet(scene, v.p, dout, dn, lambda, tabs);
-    if (!(tr > 0.0)) return 0.0;
-    return std::sqrt(s2) * pLight / (sigT * tr);
+    if (!(tr > 0.0)) return {};
+    return MergeGeo{std::sqrt(s2), sigT * tr};
+}
+inline double mergeEtaAt(const MergeGeo& g, double pLight) {
+    if (!(g.den > 0.0) || !(pLight > 0.0)) return 0.0;   // pLight: mergeLightDensity (0.387.0)
+    return g.sq * pLight / g.den;
+}
+inline double mergeEtaPrimeBeam(const Scene& scene, const Vec3& pPrev, const Vertex& v,
+                                const Vec3& pNext, double pLight, double lambda) {
+    if (!(pLight > 0.0)) return 0.0;
+    return mergeEtaAt(mergeGeo(scene, pPrev, v, pNext, lambda), pLight);
+}
+// MergeGeo at every interior vertex of both subpaths, between its subpath neighbours: geoE[k] at
+// eye[k] (light side eye[k+1], camera side eye[k-1]), geoL[i] at light[i] (light[i-1],
+// light[i+1]). Both are resized to their subpath; the end vertices' entries are empty.
+inline void mergeGeoOfSubpaths(const Scene& scene, const std::vector<Vertex>& eye, int nE,
+                               const std::vector<Vertex>& light, int nL, double lambda,
+                               std::vector<MergeGeo>& geoE, std::vector<MergeGeo>& geoL) {
+    geoE.assign((size_t)(nE > 0 ? nE : 0), MergeGeo{});
+    geoL.assign((size_t)(nL > 0 ? nL : 0), MergeGeo{});
+    for (int k = 1; k + 1 < nE; ++k)
+        geoE[(size_t)k] = mergeGeo(scene, eye[(size_t)k + 1].p, eye[(size_t)k], eye[(size_t)k - 1].p,
+                                   lambda);
+    for (int i = 1; i + 1 < nL; ++i)
+        geoL[(size_t)i] = mergeGeo(scene, light[(size_t)i - 1].p, light[(size_t)i],
+                                   light[(size_t)i + 1].p, lambda);
 }
 
 // --- The SECOND merge kind: point x point on a surface (UPBP's P-P, VCM's VM) ----------
@@ -2395,6 +2425,21 @@ inline MergeEta mergeEtaPrime(const Scene& scene, const Vec3& pPrev, const Verte
     else
         e.surf = mergeEtaPrimeSurf(v, pLight);
     return e;
+}
+// mergeEtaPrime(...).scale(mk) at a vertex whose beam factors are `g` (null: computed from pPrev
+// and pNext). The beam's only where mk.beam > 0, so a surface-only map pays no transmittance.
+inline double mergeEtaScaled(const Scene& scene, const MergeGeo* g, const Vec3& pPrev,
+                             const Vertex& v, const Vec3& pNext, double pLight, double lambda,
+                             const MergeK& mk) {
+    MergeEta e;
+    if (v.type == VType::Medium) {
+        if (mk.beam > 0.0)
+            e.beam = g ? mergeEtaAt(*g, pLight)
+                       : mergeEtaPrimeBeam(scene, pPrev, v, pNext, pLight, lambda);
+    } else {
+        e.surf = mergeEtaPrimeSurf(v, pLight);
+    }
+    return e.scale(mk);
 }
 
 // --- Mode J's own light-subpath / photon-beam pass (UPBP phase 3a) -------------------
@@ -3571,10 +3616,14 @@ inline double misWeightReference(const Scene& scene, const std::vector<Vertex>& 
 //   * strategy j = s (this connection, ratio 1) has vertex x_s = pt, so it too carries a
 //     merge site, added once outside both loops.
 // Gate (2) already validated the first two mappings for the connection terms.
+// geoE / geoL (mergeGeoOfSubpaths; null for none): the beam merge's factors at the subpaths'
+// interior vertices. The two merges whose neighbour is the connection's other end are computed
+// here whatever is passed.
 inline double misWeight(const Scene& scene, const Camera& cam,
                         std::vector<Vertex>& light, std::vector<Vertex>& eye,
                         Vertex& sampled, int s, int t, double lambda,
-                        const MergeK& mk = MergeK{}) {
+                        const MergeK& mk = MergeK{}, const MergeGeo* geoE = nullptr,
+                        const MergeGeo* geoL = nullptr) {
     if (s + t == 2) return 1.0;
     auto remap0 = [](double f) { return f != 0.0 ? f : 1.0; };
     Vertex* qs  = s > 0 ? &light[s - 1] : nullptr;
@@ -3627,9 +3676,10 @@ inline double misWeight(const Scene& scene, const Camera& cam,
         if (!eye[i].delta && !eye[i - 1].delta) sumRi += ri;
         if (merges && i >= 2) {                      // merge at eye[i-1] (see header note)
             // eye[i-1]'s light-side neighbour is eye[i] (pt's flag is scoped false above).
-            const double e = mergeEtaPrime(scene, eye[i].p, eye[i - 1], eye[i - 2].p,
-                                           mergeLightDensity(eye[i - 1].pdfRev, eye[i].delta),
-                                           lambda).scale(mk);
+            const double e = mergeEtaScaled(scene, geoE ? &geoE[i - 1] : nullptr, eye[i].p,
+                                            eye[i - 1], eye[i - 2].p,
+                                            mergeLightDensity(eye[i - 1].pdfRev, eye[i].delta),
+                                            lambda, mk);
             if (e > 0.0) sumRi += ri * e;
         }
     }
@@ -3643,18 +3693,20 @@ inline double misWeight(const Scene& scene, const Camera& cam,
         bool deltaPrev = (i > 0) ? light[i - 1].delta : light[0].isDeltaLight();
         if (!light[i].delta && !deltaPrev) sumRi += ri;
         if (merges && i >= 1 && t > 0) {             // merge at light[i]
-            const Vec3& pNext = (i + 1 <= s - 1) ? light[i + 1].p : eye[t - 1].p;
-            const double e = mergeEtaPrime(scene, light[i - 1].p, light[i], pNext,
-                                           mergeLightDensity(light[i].pdfFwd, light[i - 1].delta),
-                                           lambda).scale(mk);
+            const bool inner = i + 1 <= s - 1;       // its camera-side neighbour on the subpath
+            const Vec3& pNext = inner ? light[i + 1].p : eye[t - 1].p;
+            const double e = mergeEtaScaled(scene, (inner && geoL) ? &geoL[i] : nullptr,
+                                            light[i - 1].p, light[i], pNext,
+                                            mergeLightDensity(light[i].pdfFwd, light[i - 1].delta),
+                                            lambda, mk);
             if (e > 0.0) sumRi += ri * e;
         }
     }
     // The merge at the connection vertex pt itself. Its own connection strategy IS this
     // one, so the ratio multiplying it is exactly 1.
     if (merges && s >= 1 && t >= 2) {
-        const double e = mergeEtaPrime(scene, light[s - 1].p, eye[t - 1], eye[t - 2].p,
-                                       eye[t - 1].pdfRev, lambda).scale(mk);
+        const double e = mergeEtaScaled(scene, nullptr, light[s - 1].p, eye[t - 1], eye[t - 2].p,
+                                        eye[t - 1].pdfRev, lambda, mk);
         if (e > 0.0) sumRi += e;
     }
     const double w = 1.0 / (1.0 + sumRi);
@@ -3740,7 +3792,8 @@ inline double connectBDPT(const Scene& scene, const Camera& cam, const Renderer&
                           std::vector<Vertex>& light, std::vector<Vertex>& eye,
                           int s, int t, const HeroBundle& hb,
                           Pcg32& rng, int& outPx, int& outPy, bool& isSplat,
-                          double* Lsec, int& nUpConn, const MergeK& mk = MergeK{}) {
+                          double* Lsec, int& nUpConn, const MergeK& mk = MergeK{},
+                          const MergeGeo* geoE = nullptr, const MergeGeo* geoL = nullptr) {
     const double lambda = hb.lam[0], invPdfLambda = hb.invPdf[0];
     isSplat = false;
     nUpConn = 0;                    // set to the real width only once a contribution exists
@@ -4139,7 +4192,7 @@ inline double connectBDPT(const Scene& scene, const Camera& cam, const Renderer&
     double mx = L;
     for (int i = 0; i + 1 < nUp; ++i) if (Lsec[i] > mx) mx = Lsec[i];
     if (!(mx > 0.0)) return 0.0;        // negated: also rejects NaN (see the mxE/mxL note)
-    const double mis = misWeight(scene, cam, light, eye, sampled, s, t, lambda, mk);
+    const double mis = misWeight(scene, cam, light, eye, sampled, s, t, lambda, mk, geoE, geoL);
     for (int i = 0; i + 1 < nUp; ++i) Lsec[i] *= mis;
     nUpConn = nUp;
     return L * mis;
@@ -4481,10 +4534,12 @@ struct SurfMergeWeight {
 // inward from eye[k], which is the same wherever along the segment the point falls. segSumC[k]
 // sums the connection strategies from eye[k] inward, segSumM[k] the merges (both kinds, scaled
 // by their kappas; all 0 unless `mk` has any). Both are resized to nE; entry 0 is 0. The
-// recurrences mirror the light-side ones in traceLightBeamPass.
+// recurrences mirror the light-side ones in traceLightBeamPass. geoE: the beam merge's factors at
+// eye's interior vertices (mergeGeoOfSubpaths), or null to compute them.
 inline void cameraSideSums(const Scene& scene, const std::vector<Vertex>& eye, int nE,
                            const MergeK& mk, double lamCam,
-                           std::vector<double>& segSumC, std::vector<double>& segSumM) {
+                           std::vector<double>& segSumC, std::vector<double>& segSumM,
+                           const MergeGeo* geoE = nullptr) {
     const bool merges = mk.any();
     segSumC.assign((size_t)nE, 0.0);
     segSumM.assign((size_t)nE, 0.0);
@@ -4494,9 +4549,10 @@ inline void cameraSideSums(const Scene& scene, const std::vector<Vertex>& eye, i
         // pdfRev is the RECORDED one: moving the light-side neighbour of eye[k] along the same
         // ray does not change the direction arriving at eye[k-1].
         const double eK = (merges && k >= 2)
-            ? mergeEtaPrime(scene, eye[(size_t)k].p, eye[(size_t)k - 1], eye[(size_t)k - 2].p,
-                            mergeLightDensity(eye[(size_t)k - 1].pdfRev, eye[(size_t)k].delta),
-                            lamCam).scale(mk)
+            ? mergeEtaScaled(scene, geoE ? &geoE[k - 1] : nullptr, eye[(size_t)k].p,
+                             eye[(size_t)k - 1], eye[(size_t)k - 2].p,
+                             mergeLightDensity(eye[(size_t)k - 1].pdfRev, eye[(size_t)k].delta),
+                             lamCam, mk)
             : 0.0;
         double carry = 0.0, carryM = 0.0;
         if (k >= 2) {
@@ -4665,6 +4721,9 @@ struct BdptRenderer {
         PathSegs segs;
         // Camera-side MIS accumulators, one entry per eye vertex (Phase 3b). Same hoist.
         std::vector<double> segSumC, segSumM;
+        // The beam merge's factors at the subpaths' interior vertices (mergeGeoOfSubpaths), which
+        // every connection's weight reads. Same hoist.
+        std::vector<MergeGeo> geoE, geoL;
         // ...and their wavelength-dependent half at JSpec's bins, where a medium's extinction
         // varies with wavelength (ChromaMis): segSumM and the point merges' eta at eye[k-1] per
         // eye vertex, and one segment's eta at eye[k].
@@ -4824,6 +4883,8 @@ struct BdptRenderer {
                                                    jSpecOn ? &jsw : nullptr);
                     int nL = generateLightSubpath(scene, cam, mats, hb,
                                                   maxDepth + 1, rng, light);
+                    if (mk.beam > 0.0)
+                        mergeGeoOfSubpaths(scene, eye, nE, light, nL, hb.lam[0], geoE, geoL);
                     // Per-object render modes (see routeOfEye). Inert unless the scene tags one.
                     int routeR = ROUTE_J, fIdx = nE;
                     uint64_t prefJ = 0;
@@ -4893,7 +4954,7 @@ struct BdptRenderer {
                             }
                             double c = connectBDPT(scene, cam, mats, lightS, eye, s, t, hb,
                                                    rng, spx, spy, isSplat, Lsec, nUpConn,
-                                                   mkST);
+                                                   mkST, geoE.data(), geoL.data());
                             if (wST != 1.0) { c *= wST; for (int i = 0; i + 1 < nUpConn; ++i) Lsec[i] *= wST; }
                             if (nUpConn <= 0) continue;
                             double mx = c;
@@ -5058,7 +5119,7 @@ struct BdptRenderer {
                         // With the merge half binned (chroma), the camera-wavelength one goes unread.
                         if (mk.any())
                             cameraSideSums(scene, eye, nE, chroma.on ? MergeK{} : mk, lamCam,
-                                           segSumC, segSumM);
+                                           segSumC, segSumM, geoE.data());
                         if (chroma.on)
                             cameraSideSumsChroma(scene, tabs, eye, nE, mk, chroma, chromaM,
                                                  chromaE1);
@@ -5212,8 +5273,8 @@ struct BdptRenderer {
                                 // because BOTH of eye[k-1]'s neighbours are known: the merge
                                 // site is eye[k] itself, so there is no per-photon geometry.
                                 sw.etaKm1Coef   = (k >= 2)
-                                    ? mergeEtaPrime(scene, vk.p, vp, eye[(size_t)k - 2].p,
-                                                    1.0, lamCam).scale(mk)
+                                    ? mergeEtaScaled(scene, geoE.empty() ? nullptr : &geoE[(size_t)k - 1],
+                                                     vk.p, vp, eye[(size_t)k - 2].p, 1.0, lamCam, mk)
                                     : 0.0;
                                 sw.segSumC      = segSumC[(size_t)k - 1];
                                 sw.segSumM      = segSumM[(size_t)k - 1];

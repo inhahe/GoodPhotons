@@ -23,10 +23,12 @@ a few samples:
            lit from above and from below;
   shapes   curve tubes and an isosurface under a pattern.
 And one scene with modes of its own (SCENE_MODES):
-  fog      a heterogeneous coloured fog in a grey box, CPU mode J only, at 256 spp and
+  fog      a heterogeneous coloured fog in a grey box, in mode J only. On the CPU at 256 spp and
            -beamrefresh 0.5: several light-side epochs, whose layout on the CPU follows work
            counts (workcount.h), with the merges' transmittance estimates drawing from the
-           camera's stream -- the case a single sample cannot show.
+           camera's stream -- the case a single sample cannot show. On the GPU at 32 spp, a
+           1000-beam map and the surface merges over 4 fixed epochs: the device's beam merge
+           weights, which no media-free case reaches.
 
 `compare` prints, per case, "identical", or how it differs: the pixels that changed, the
 largest change relative to the pixel, and the change of the image's mean. --tol <rel> passes
@@ -67,7 +69,12 @@ MODES = [  # (tag, ftrace arguments)
 SCENE_MODES = {
     "fog": [("J_cpu", ["-mode", "J", "-spp", "256", "-device", "cpu", "-nojsurf",
                        "-beamcount", "100000", "-beamk", "2", "-beamrefresh", "0.5",
-                       "-max-bounce", "8"])],
+                       "-max-bounce", "8"]),
+            # Both merge kinds on the device, at fixed epochs (and so fixed 1-spp chunks, which
+            # the device's surface map is drawn per): the GPU's beam merge weights, which no
+            # surface-only case reaches.
+            ("J_gpu", ["-mode", "J", "-spp", "32", "-device", "gpu", "-jbeams", "1000",
+                       "-beamepochs", "4", "-max-bounce", "8"])],
 }
 # GPU modes M and S deposit their photons through atomics, so their order -- and the last bits of
 # every sum over them -- varies from run to run: one build differs from itself there by up to a

@@ -2213,6 +2213,23 @@ quadrature for a heterogeneous one.
 merges are actually gathered. `mergeKappa == 0` deletes every merge term and makes both weight
 functions byte-identical to mode `D`'s — which is what keeps gate 1 alive.
 
+**The beam terms' factors are computed once a sample** (0.436.5). A beam merge's
+`eta' = sin * pLight / (sigma_t * Tr)` at a vertex depends, apart from `pLight`, only on the
+vertex and its two neighbours -- and every connection that weighs a merge at a subpath's interior
+vertex keeps both of them, so `mergeGeoOfSubpaths` / `kBdptT` store `sin` and `sigma_t * Tr` per
+interior vertex (`MergeGeo`, `DMergeGeo`) and `misWeight` / `dMisWeight`, `cameraSideSums` and
+the point merges' `etaKm1Coef` read them (`mergeEtaAt`, multiplying in the original order, so the
+image is bit-identical). Only the two merges beside the connection -- at `pt`, whose light-side
+neighbour is `qs`, and at `light[s-1]`, whose camera-side one is `pt` -- are computed per
+connection. Where it was a transmittance at every vertex of every connection, a deep path paid
+O(n^3) of them a sample. The beam half is also skipped outright where `mergeKappa` (`mk.beam`) is
+0: a `-jsurf` map with the beams off paid every one of those transmittances to multiply them by 0.
+In mode `D`'s kernel (`kBdptT<MERGE = false>`) `mergeKappa` is a compile-time zero, so the gate
+compiles the beam terms out of it altogether: its GPU time a sample fell 15 % on `_slab_ss` and 3 %
+on `_fog_cornell` at 640x480 (Nsight Systems). A 64-beam map that gathers almost nothing now costs
+the camera pass about what mode `D`'s does. Measure such changes by kernel time: two builds of the
+same device code differed by 10 % in wall-clock samples under `-time`.
+
 Two approximations are deliberate and documented under **UPBP-W** in `known-issues.md`: one
 scene-wide kernel radius (`BeamMap::radRef`), and a merge dropped when the light-side density is
 delta. Both are weight *quality*, not bias. A weight built from two wavelengths was listed as a
