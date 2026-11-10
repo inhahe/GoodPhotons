@@ -132,6 +132,10 @@ Each names the section its line is in.
 19a. **J-FIELD-SLOW** (4.5) — mode J in an unbounded density field (found in HAZE-BLUR-DOMAIN's
     check). Its GPU hit queue no longer spills (0.434.33-36: 2 spp of the field at 32x24, 126 s -> 26 s);
     left: the beam budget's probes overshoot the knee, and fattened beams make every walk long.
+19b. **J-FIELD-SLOW's open ends** (4.3, 4.5), found measuring it 2026-11-09/10: 2 000-beam maps read
+    `_fog_thick` 5-8 % bright (a possible bias, or correlated noise from shared seeds: check it
+    first); a `-time` budget cannot end a GPU mode D/J chunk; and a wavefront resume pass re-walks
+    its segments from the root.
 20. **JSPEC-CARRIER-SIZE** (4.5) — every mode-J GPU thread reserves the spectral carrier.
 21. **RADCACHE-BATCHES** (4.5) — `-radcache`'s fixed batches outlast `-stop` and the interval.
     0.434.27: a budget no longer hangs in them and `-stop` lands mid-batch (modes R and P); the
@@ -141,6 +145,9 @@ Each names the section its line is in.
 24. **BEAMEPOCHS-CHUNK-PIN** (4.5) — `-beamepochs` pins cheap scenes' GPU chunks to 1 spp.
 25. **DEFORM-LIMITS**, **MOTION-LIGHT-RIGID**, **PER-OBJECT-MODES** (4.6) — what is left of them.
 26. **BLACK-PIXELS-ONCE** (4.2) — one render's black pixels, never reproduced.
+27. **SPPM-LOWPASS-DEVHOST** (4.2) — mode S's device and host differ at low pass counts.
+28. **HAZE-BLUR-INVERSE-TR** (4.3) — a blurred mover far out in a density-field haze: modes D and
+    J weigh its sun subpaths by a quadrature, not an unbiased estimate.
 
 Then the rest of 4.2-4.6 in their order, 4.7's bookkeeping alongside whatever touches its entries.
 
@@ -264,6 +271,10 @@ Then the rest of 4.2-4.6 in their order, 4.7's bookkeeping alongside whatever to
   scale.
 - [ ] **STUBBLE-DEVICE-UNDERSIDE** — mode W on a stubble coat: device and host 9.6 % apart in its
   dark underside (to investigate).
+- [ ] **SPPM-LOWPASS-DEVHOST** — at 16 passes mode S's device read check_coat_modes' coated balls
+  16 % bluer than its host (x1.158, 11.5 sigma); at 256 passes they agree. A gap that shrinks with
+  the passes points at the two backends' radius schedules or first-pass radii. Start: that scene in
+  mode S on both backends at 8, 16, 64 and 256 passes.
 - [ ] **GATHERAREA-TRANSPARENT's remaining limits** — an opaque, photon-holding surface hovering
   within the radius above another; Mix compounds.
 - [ ] **EMISSIVE-VOLUME-SILENT, what is left** — GPU mode D falls back to the CPU on a fire; modes J
@@ -321,6 +332,20 @@ Then the rest of 4.2-4.6 in their order, 4.7's bookkeeping alongside whatever to
 - [ ] **P-HEROSPLIT-FIRST** — blurred mode P under `-herosplit` files a sample by the hero's first
   event alone.
 - [ ] **ROUGH-IRID-AIR** — a rough interference reflector always interferes against air.
+- [ ] **J-FIELD-SLOW's 2 000-beam brightness** — at 256 spp, 128x96, depth 8 (`scraps/probe/perspp.py`),
+  maps of 2 000 raw beams read `_fog_thick` 5-8 % brighter than the mode D reference at every
+  kernel width tried, where 8 000 beams and no beams do not. The seeds were shared between arms, so
+  it may be correlated firefly noise; rerun with independent seeds per arm and more of them, and if
+  it holds, find what a small map biases.
+- [ ] **HAZE-BLUR-INVERSE-TR** — HAZE-BLUR-DOMAIN's remaining approximation: where a blur's sun
+  subpath begins further out than the NEE leg reaches (a mover outside the instant's disc), the
+  first leg's factor is the INVERSE of a transmittance, exact in a homogeneous haze but taken by
+  the deterministic quadrature (trDetMedium) in a density field, so biased by the quadrature's
+  error. Known-issues calls it undrawable unbiased; it is not: the Poisson estimator,
+  exp(tau) = E[e^lambda * prod_{i<=K} tau_i / lambda] with K ~ Poisson(lambda) and tau_i
+  independent unbiased estimates of the optical depth (each >= 0 here, so the estimate stays
+  positive), is unbiased, its variance moderate for lambda near tau. Host `sunLegFactor` and
+  device `dSunLegFactor`; check_haze_domain's `farfield` (mode D) is the test.
 
 - [ ] **BDPT-MIS-TR** — mode D's MIS weights take every connection edge's transmittance as 1 in a
   medium.
@@ -405,6 +430,18 @@ Then the rest of 4.2-4.6 in their order, 4.7's bookkeeping alongside whatever to
   mid-batch, and a `-time`/`-noise`/`-forever` budget takes the clock instead of hanging.)
 - [ ] **BEAMEPOCHS-CHUNK-PIN** — `-beamepochs` pins the GPU chunks to 1 spp, which costs a cheap
   scene.
+- [ ] **J-FIELD-SLOW's "A `-time` budget cannot end a GPU chunk"** — a GPU mode D/J chunk is at least
+  one sample of the whole frame and the budget is read between chunks, so a slow sample overruns it
+  (the field at 512x384 ran one chunk over 55 minutes against `-time 120`); `-stop` cuts a chunk,
+  the clock does not, and the progress line and interval writes wait too. Proper fix: a chunk may be
+  part of a sample (a range of pixel slots, as mode M's gather slices its samples), so the budget
+  and the reports land every fraction of a second whatever a sample costs.
+- [ ] **J-FIELD-SLOW's resume passes re-walk from the root** — a segment the full hit queue turned
+  away is walked again from the beam tree's root in a resume pass (~0.8 s a pass on the field; at
+  96x72 every one of its 51 waves overflowed once). Saving each deferred segment's traversal stack
+  in a double-buffered side store, the re-walk kept as the fallback when it fills, removes that.
+  After the beam-map fixes (0.434.40's domain, 0.435.0's `-jbeams`), measure overflow on the
+  reference scenes and build it if any still overflow.
 
 - [ ] **FIRE-NEE-STRATA-COST** — one fire light sample costs up to 32 traversals.
 - [ ] **Fire births** (EMISSIVE-VOLUME-SILENT's efficiency debt) — drawn uniformly over the box;
@@ -476,7 +513,8 @@ Notes and by-design entries (the GitHub `<video>` NOTE, the p99 anchor BY-DESIGN
 `-gi-clamp`, the CIE side-table "don't retry", the timed-out-shell NOTE), work deliberately not
 done (`PatOp::MatMulAdd`, GPU marching cubes, sweeps as an FTSL primitive), the environment (Nsight's
 admin-locked counters, the one-off `build.bat` failure, the nvlddmkm teardown BSOD — a driver bug,
-mitigated), and data whose entries call it acceptable (the F-series SPDs, the material presets).
+mitigated — and BUGCHECK-INTSTEER, two blue screens from a driver corrupting kernel memory, ftrace
+ruled out; the MediaTek drivers updated and full kernel dumps on, should it recur), and data whose entries call it acceptable (the F-series SPDs, the material presets).
 
 ## 5. The paired-timing rule into `CLAUDE.md`
 
