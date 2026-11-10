@@ -3363,8 +3363,10 @@ holding a glass ball), and on the device `-rgb`, mode S and every one of those.
   weighs the two together, a sun subpath takes the NEE leg's haze instead (HAZE-BLUR-DOMAIN, the
   user's option (a), 0.434.29-30): every vertex from the first on is weighed by `sunLegFactor`
   (beamgather.h), the unbounded media's transmittance over the stretch the two legs differ by,
-  drawn by the medium's own estimator (its inverse, by the deterministic quadrature, where a
-  blur's walk began further out than the NEE leg reaches), and the first leg's own beams take it
+  drawn by the medium's own estimator (its inverse, exp(+tau), by the Poisson estimator --
+  e^lam prod_{i<=K} tau_i/lam, K ~ Poisson(lam), lam a quadrature of tau, each tau_i a jittered
+  stratified estimate; `invTransmittancePoisson`, 0.436.4 -- where a blur's walk began further
+  out than the NEE leg reaches), and the first leg's own beams take it
   at each merge point (`BeamMis::sunLeg`, the leg having begun `leadIn` before the beam's
   origin). Device twin `dSunLegFactor`, in `dGenLightSubpath` and the beam gather. The per-mode table in main.cpp names the modes whose haze comes from forward
   photons (`modeLightsHazeOnlyNearScene`: A, B, C, P, V, and M, whose photons light its

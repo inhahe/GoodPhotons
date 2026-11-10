@@ -316,11 +316,45 @@ inline double trDetMedium(const Medium& med, const Vec3& o, const Vec3& dir, dou
 // on one line and differ by the stretch between `from` and from - dir * dl. Where the NEE leg
 // reaches further (dl > 0: every still scene, and a blur's entry through the instant's disc) the
 // factor is that stretch's transmittance, drawn by the medium's own unbiased estimator. Where the
-// walk began further out (a blur's entry outside the instant's disc) it is the inverse of the
-// stretch the walk crossed beyond the NEE leg, which no estimator draws unbiased: exact for a
-// homogeneous haze, a fine deterministic quadrature (kSunLegSteps) for a density field. Bounded
+// walk began further out (a blur's entry outside the instant's disc) it is the INVERSE of the
+// stretch's transmittance, exp(+tau): exact for a homogeneous haze, and for a density field the
+// Poisson estimator (invTransmittancePoisson), unbiased where a quadrature of tau is not. Bounded
 // media lie inside the scene's sphere (their bounds are part of it), which both legs cross whole.
-constexpr int kSunLegSteps = 32;   // device twin dSunLegFactor's
+constexpr int kSunLegSteps = 32;   // the Poisson estimator's rate, a quadrature of tau (device twin's)
+constexpr int kSunLegStrata = 8;   // ...and the jittered strata of each of its tau estimates
+
+// exp(+tau) over medium `m`'s part of [o, o + dir * dist], tau = sigma_t * the density's integral,
+// unbiased: the Poisson estimator, e^lam * prod_{i<=K} tau_i / lam with K ~ Poisson(lam) and tau_i
+// independent unbiased estimates of tau, whose mean is sum_k e^-lam lam^k/k! (tau/lam)^k e^lam
+// = e^tau. Here lam is a quadrature of tau (the estimator's variance is least near lam = tau) and
+// each tau_i averages kSunLegStrata jittered strata of the segment, so it is never negative and its
+// spread small. Device twin dInvTransmittancePoisson.
+inline double invTransmittancePoisson(const Medium& m, const Vec3& o, const Vec3& dir, double dist,
+                                      double lambda, Pcg32& rng, const PatTables* tabs) {
+    const double st = m.sigmaT(lambda);
+    if (!(st > 0.0)) return 1.0;
+    double ta, tb;
+    if (!m.clipToBounds(o, dir, 0.0, dist, ta, tb)) return 1.0;
+    const double L = tb - ta;
+    if (!(L > 0.0)) return 1.0;
+    if (!m.heterogeneous()) return std::exp(st * L);
+    const double Tq = trDetMedium(m, o, dir, dist, lambda, tabs, kSunLegSteps);
+    const double lam = (Tq > 0.0) ? std::max(-std::log(Tq), 1e-6) : 1e-6;
+    const double u = rng.uniform();
+    double p = std::exp(-lam), c = p;
+    int K = 0;
+    while (u > c && K < 4096) { ++K; p *= lam / (double)K; c += p; }
+    double F = std::exp(lam);
+    for (int i = 0; i < K; ++i) {
+        const double jit = rng.uniform();
+        double s = 0.0;
+        for (int j = 0; j < kSunLegStrata; ++j)
+            s += m.densityAt(o + dir * (ta + L * (((double)j + jit) / (double)kSunLegStrata)), tabs);
+        F *= (st * L * s / (double)kSunLegStrata) / lam;
+    }
+    return F;
+}
+
 inline double sunLegFactor(const Scene& scene, const Vec3& from, const Vec3& dir, const Vec3& y,
                            double lambda, Pcg32& rng) {
     const double dl = scene.mediaExitDistance(y) - dot(y - from, dir);
@@ -332,8 +366,7 @@ inline double sunLegFactor(const Scene& scene, const Vec3& from, const Vec3& dir
         if (dl > 0.0) {
             F *= Renderer::mediumTransmittance(m, from - dir * dl, dir, dl, lambda, rng, &tabs);
         } else {
-            const double T = trDetMedium(m, from, dir, -dl, lambda, &tabs, kSunLegSteps);
-            if (T > 0.0) F /= T;
+            F *= invTransmittancePoisson(m, from, dir, -dl, lambda, rng, &tabs);
         }
     }
     return F;

@@ -9754,6 +9754,58 @@ static int checkCurv() {
 //      profile would disagree with the one emission-on-hit reads and MIS would bias.
 //  §10 the lazy fill in patCtxFromHit caches (one probe per shading point, not one
 //      per pattern context) and does nothing at all when the gate is off.
+// -checksunleg: sunLegFactor's inverse branch (HAZE-BLUR-INVERSE-TR) is unbiased. In a haze whose
+// density, 0.5 + 0.5 sin(40 x), a 32-step midpoint rule aliases badly, a sun walk that began 20 m
+// further out than the NEE leg reaches takes exp(+tau) over that stretch: the mean of 400 000 draws
+// must match tau from 200 000 midpoints within four standard errors, where the quadrature alone is
+// off by tens of percent (it is printed alongside).
+static int checkSunLeg() {
+    const std::string src =
+        "scene { units meters  spectral 360 830 1 }\n"
+        "material \"grey\" { type diffuse reflect 0.5 }\n"
+        "quad { origin -1 0 -1   u 2 0 0   v 0 0 2   material grey }\n"
+        "medium { sigma_t 0.1  albedo 0.5  density \"0.5 + 0.5*sin(x*40.0)\"  density_max 1 }\n"
+        "light sun { dir 1 0.2 0  angle 0.53  spd preset:d65 }\n"
+        "camera \"c\" { eye 0 2 6  look_at 0 0 0  up 0 1 0  fov_y 40  film { res 8 8 } }\n";
+    ftsl::Loaded L;
+    std::string err;
+    if (!ftsl::loadSource(src, "<checksunleg>", L, err) || L.scene.media.size() != 1 ||
+        L.scene.media[0].bounded || !L.scene.media[0].heterogeneous()) {
+        std::printf("[checksunleg] the scene did not load as written %s FAIL\n", err.c_str());
+        return 1;
+    }
+    const Scene& sc = L.scene;
+    const Medium& m = sc.media[0];
+    const double lambda = 550.0;
+    const PatTables tabs = sc.patTables();
+    const Vec3 dir = normalize(Vec3{-1.0, -0.2, 0.0});          // the sun's light travels -dir_sun
+    const Vec3 y{0.1, 0.3, 0.05};
+    const double extra = 20.0;                                   // the walk began this much further out
+    const Vec3 from = y - dir * (sc.mediaExitDistance(y) + extra);
+    // The stretch the factor inverts: [from, from + dir * extra].
+    const int nFine = 200000;
+    double tau = 0.0;
+    for (int i = 0; i < nFine; ++i)
+        tau += m.densityAt(from + dir * (extra * ((i + 0.5) / nFine)), &tabs);
+    tau *= m.sigmaT(lambda) * extra / nFine;
+    const double exact = std::exp(tau);
+    const double quad = 1.0 / trDetMedium(m, from, dir, extra, lambda, &tabs, kSunLegSteps);
+    Pcg32 rng; seedUnit(rng, 0x5ULL, 0x9e3779b97f4a7c15ULL);
+    const int nDraw = 400000;
+    double s1 = 0.0, s2 = 0.0;
+    for (int i = 0; i < nDraw; ++i) {
+        const double f = sunLegFactor(sc, from, dir, y, lambda, rng);
+        s1 += f; s2 += f * f;
+    }
+    const double mean = s1 / nDraw;
+    const double se = std::sqrt(std::max(0.0, s2 / nDraw - mean * mean) / nDraw);
+    const bool ok = std::fabs(mean - exact) <= 4.0 * se + 1e-9 * exact;
+    std::printf("[checksunleg] tau %.4f, exp(tau) %.5f: mean of %d draws %.5f +- %.5f (%+.3f%%); "
+                "a 32-step quadrature alone %.5f (%+.2f%%)  %s\n", tau, exact, nDraw, mean, se,
+                100.0 * (mean / exact - 1.0), quad, 100.0 * (quad / exact - 1.0), ok ? "PASS" : "FAIL");
+    return ok ? 0 : 1;
+}
+
 static int checkCavity() {
     double worst = 0.0;
     bool ok = true;
@@ -22957,6 +23009,7 @@ static int run(int argc, char** argv) {
     bool checkCavityOnly = false;
     bool checkTriNormalOnly = false;
     bool checkSphereQueryOnly = false;
+    bool checkSunLegOnly = false;
     bool checkBvhParallelOnly = false;
     // -roiboxes and its gates. The defaults are deliberately strict: this tool's whole
     // point is that an ROI you cannot trust should not be easy to copy out of its output.
@@ -24061,6 +24114,7 @@ static int run(int argc, char** argv) {
         // segment note at the top of the option table: append to a segment, and start a new
         // one once it nears ~100 links.
         if (!std::strcmp(argv[i], "-checkspherequery")) checkSphereQueryOnly = true;
+        else if (!std::strcmp(argv[i], "-checksunleg")) checkSunLegOnly = true;
         else if (!std::strcmp(argv[i], "-no-modes") || !std::strcmp(argv[i], "-nomodes")) g_noObjectModes = true;
         // Mode J's beam map (JBeams); here because segment 2 is full.
         else if (!std::strcmp(argv[i], "-jbeams") && i + 1 < argc) {
@@ -24389,6 +24443,7 @@ static int run(int argc, char** argv) {
     if (checkCavityOnly)   return checkCavity();   // ditto (`cavity` probe; in-memory scenes only)
     if (checkTriNormalOnly) return checkTriNormal(); // ditto (intersectTri's side/normal convention)
     if (checkSphereQueryOnly) return bvhSphereQuerySelfTest() ? 0 : 1;  // ditto (Bvh::traverseSphere)
+    if (checkSunLegOnly)   return checkSunLeg();   // ditto (sunLegFactor's inverse, HAZE-BLUR-INVERSE-TR)
     if (checkBvhParallelOnly) return bvhParallelSelfTest() ? 0 : 1;     // parallel build == serial build
     if (checkMeshFormatsOnly) return checkMeshFormats(); // ditto (OBJ/PLY/STL agree on the same cube)
     if (checkPreferOnly)   return checkPrefer();   // ditto (prefer{}/else{} resolution semantics)

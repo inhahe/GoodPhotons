@@ -7994,6 +7994,35 @@ __device__ static double dTrDetMedium(const DMedium& m, const DVec3& o, const DV
 // unbounded haze, walked from `from` along `dir`, to the NEE leg's at `y` (HAZE-BLUR-DOMAIN);
 // exactly 1 where there is none.
 static constexpr int kSunLegSteps = 32;   // host twin sunLegFactor's
+static constexpr int kSunLegStrata = 8;   // host twin's
+// exp(+tau) over medium m's part of [o, o + dir * dist], unbiased: the Poisson estimator (host twin
+// invTransmittancePoisson, beamgather.h, where the reasoning is).
+__device__ static double dInvTransmittancePoisson(const DMedium& m, const DVec3& o, const DVec3& dir,
+                                                  double dist, Real lambda, DRng& rng,
+                                                  const DPatEnv& env) {
+    const double st = (double)medSigmaT(m, lambda);
+    if (!(st > 0.0)) return 1.0;
+    double ta, tb;
+    if (!dMedClip(m, o, dir, 0.0, dist, ta, tb)) return 1.0;
+    const double L = tb - ta;
+    if (!(L > 0.0)) return 1.0;
+    if (!m.heterogeneous) return exp(st * L);
+    const double Tq = dTrDetMedium(m, o, dir, dist, lambda, env, kSunLegSteps);
+    const double lam = (Tq > 0.0) ? fmax(-log(Tq), 1e-6) : 1e-6;
+    const double u = (double)rng.uniform();
+    double p = exp(-lam), c = p;
+    int K = 0;
+    while (u > c && K < 4096) { ++K; p *= lam / (double)K; c += p; }
+    double F = exp(lam);
+    for (int i = 0; i < K; ++i) {
+        const double jit = (double)rng.uniform();
+        double s = 0.0;
+        for (int j = 0; j < kSunLegStrata; ++j)
+            s += (double)dMedDensityAt(m, o + dir * (Real)(ta + L * (((double)j + jit) / (double)kSunLegStrata)), env);
+        F *= (st * L * s / (double)kSunLegStrata) / lam;
+    }
+    return F;
+}
 __device__ static double dSunLegFactor(const DScene& sc, const DVec3& from, const DVec3& dir,
                                        const DVec3& y, Real lambda, DRng& rng) {
     const double dl = dMediaExitDistance(sc, y) - (double)dot(y - from, dir);
@@ -8006,8 +8035,7 @@ __device__ static double dSunLegFactor(const DScene& sc, const DVec3& from, cons
         if (dl > 0.0) {
             F *= (double)dMedTransmittance(m, from - dir * (Real)dl, dir, (Real)dl, lambda, rng, env);
         } else {
-            const double T = dTrDetMedium(m, from, dir, -dl, lambda, env, kSunLegSteps);
-            if (T > 0.0) F /= T;
+            F *= dInvTransmittancePoisson(m, from, dir, -dl, lambda, rng, env);
         }
     }
     return F;

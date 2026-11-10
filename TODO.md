@@ -134,8 +134,8 @@ Each names the section its line is in.
     the outward ratchet of 0.434.31's beam limit (J-BEAM-FARLIMIT) and made the field fast, and
     0.435.0's `-jbeams` made a fixed 1000-beam map the default. Left: J-AUTO-PROBE (4.5).
 19b. **J-FIELD-SLOW's open ends** (4.5), found measuring it 2026-11-09/10: a `-time` budget cannot
-    end a GPU mode D/J chunk; and a wavefront resume pass re-walks its segments from the root.
-    (The 2 000-beam brightness it also found was the shared seeds' noise: 4.3.)
+    end a GPU mode D/J chunk. (The 2 000-beam brightness it also found was the shared seeds' noise,
+    4.3; the resume passes' re-walk no longer costs anything measurable, 4.5.)
 20. **JSPEC-CARRIER-SIZE** (4.5) — every mode-J GPU thread reserves the spectral carrier. Measured
     2026-11-10: with any beam map the GPU camera pass costs ~3x a sample on a cheap scene.
 21. **RADCACHE-BATCHES** (4.5) — `-radcache`'s fixed batches outlast `-stop` and the interval.
@@ -147,8 +147,8 @@ Each names the section its line is in.
 25. **DEFORM-LIMITS**, **MOTION-LIGHT-RIGID**, **PER-OBJECT-MODES** (4.6) — what is left of them.
 26. **BLACK-PIXELS-ONCE** (4.2) — one render's black pixels, never reproduced.
 27. **SPPM-LOWPASS-DEVHOST** (4.2) — mode S's device and host differ at low pass counts.
-28. **HAZE-BLUR-INVERSE-TR** (4.3) — a blurred mover far out in a density-field haze: modes D and
-    J weigh its sun subpaths by a quadrature, not an unbiased estimate.
+28. ~~**HAZE-BLUR-INVERSE-TR** (4.3) — a blurred mover far out in a density-field haze: modes D and
+    J weigh its sun subpaths by a quadrature, not an unbiased estimate.~~ Done, 0.436.4.
 
 Then the rest of 4.2-4.6 in their order, 4.7's bookkeeping alongside whatever touches its entries.
 
@@ -338,7 +338,8 @@ Then the rest of 4.2-4.6 in their order, 4.7's bookkeeping alongside whatever to
   mode D reference is 0.998 +- 0.018 at 250 beams, 0.990 +- 0.007 at 1000, 0.994 +- 0.013 at
   2000, 1.000 +- 0.011 at 4000, 0.990 +- 0.008 under the knee rule and 0.999 +- 0.002 with no
   beams. The 0.434.39 reading shared its seeds between arms.
-- [ ] **HAZE-BLUR-INVERSE-TR** — HAZE-BLUR-DOMAIN's remaining approximation: where a blur's sun
+- [x] **HAZE-BLUR-INVERSE-TR** (0.436.4: the Poisson estimator, `invTransmittancePoisson` and its
+  device twin; `-checksunleg`) — HAZE-BLUR-DOMAIN's remaining approximation: where a blur's sun
   subpath begins further out than the NEE leg reaches (a mover outside the instant's disc), the
   first leg's factor is the INVERSE of a transmittance, exact in a homogeneous haze but taken by
   the deterministic quadrature (trDetMedium) in a density field, so biased by the quadrature's
@@ -446,7 +447,12 @@ Then the rest of 4.2-4.6 in their order, 4.7's bookkeeping alongside whatever to
   the clock does not, and the progress line and interval writes wait too. Proper fix: a chunk may be
   part of a sample (a range of pixel slots, as mode M's gather slices its samples), so the budget
   and the reports land every fraction of a second whatever a sample costs.
-- [ ] **J-FIELD-SLOW's resume passes re-walk from the root** — a segment the full hit queue turned
+- [x] **J-FIELD-SLOW's resume passes re-walk from the root** — closed by measurement, 2026-11-10
+  (0.436.3): across `_fog_cornell`, `_fog_thick`, the still haze, the density field and `_slab_ss`,
+  each at 128x96 and 512x384 under the fixed map and the knee rule (20 s each), and `gallery_rain`
+  at 640x360 (120 s), one render took one resume pass (`_fog_cornell`, knee rule, 512x384: 67 942
+  segments, well under a second); the beam domain and the smaller maps ended the overflows, so the
+  saved-stack resume would not repay its code. Was: a segment the full hit queue turned
   away is walked again from the beam tree's root in a resume pass (~0.8 s a pass on the field; at
   96x72 every one of its 51 waves overflowed once). Saving each deferred segment's traversal stack
   in a double-buffered side store, the re-walk kept as the fallback when it fills, removes that.

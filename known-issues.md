@@ -1026,10 +1026,11 @@ takes the NEE leg's haze. Every vertex from the first on is weighed by `sunLegFa
 differ by, drawn by each medium's own unbiased estimator. The first leg's own beams take it at
 each merge point (`BeamMis::sunLeg`; the leg began `leadIn` before the beam's clipped origin),
 whether or not the leg left a vertex. Device twin: `dSunLegFactor` in `dGenLightSubpath` and the
-beam gather. One case remains approximate: where a blur's walk began further out than the NEE
-leg reaches (an entry outside the instant's disc), the factor is the inverse of a transmittance,
-which no estimator draws unbiased -- exact for a homogeneous haze, the deterministic quadrature
-(trDetMedium) for a density field. `tools/check_haze_domain.py` holds modes D and J to mode
+beam gather. Where a blur's walk began further out than the NEE leg reaches (an entry outside
+the instant's disc), the factor is the INVERSE of a transmittance, exp(+tau): exact for a
+homogeneous haze, and for a density field drawn unbiased by the Poisson estimator since 0.436.4
+(`invTransmittancePoisson`; it was a 32-step quadrature until then, which `-checksunleg` shows
+off by tens of percent on a field that aliases it). `tools/check_haze_domain.py` holds modes D and J to mode
 R on the scenes below, both devices: D within 0.4 % everywhere (it read 1.0175, 1.0030 and
 1.0275), J within 0.4 % but for the far ball's 0.991 (J's 3.3 m merge kernel round a 1 m ball).
 Testing J found two older bugs on the far scene, fixed in the same version (J-BEAM-FARLIMIT,
