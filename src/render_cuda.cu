@@ -8642,20 +8642,47 @@ struct DBeamMergeW {
 // legitimate grazing beam into a random huge weight. The cross product has no cancellation
 // there, so the host's 1e-9 rejection threshold stays meaningful at float precision instead
 // of having to be loosened (which would have BIASED the estimate by dropping real samples).
-// ---- device-side cancellation for the mode-M gather ----
+// ---- device-side cancellation (modes M and J; host: deviceStopFlag, DeviceStopScope) ----
 //
-// Holds a pointer to a flag in MAPPED PINNED host memory, published once (cudaMemcpyToSymbol)
-// before the gather starts. A __device__ global rather than a kernel parameter so the deep
-// callees that actually burn the time — this BVH walk and dPhotonGather's bounce loop — can
-// test it without threading a pointer through every signature between them and kGather.
+// Holds a pointer to the device's copy of the stop flag, in MAPPED PINNED host memory, published
+// (cudaMemcpyToSymbol) for the span of a renderer that drops what a stop cuts short; null
+// elsewhere. A __device__ global rather than a kernel parameter so the deep callees that burn the
+// time -- the BVH walks and dPhotonGather's bounce loop -- can test it without threading a
+// pointer through every signature between them and their kernel.
 //
 // Mapped memory specifically: the host thread that launched the kernel is parked inside
 // cudaDeviceSynchronize for the whole launch and can issue no CUDA call, so the flag has to be
 // raisable by a plain store from a different thread.
+//
+// `g_dStopSeen` is set by any thread that sees the flag raised: the launch's own record that a
+// stop cut it short, which the host reads after the launch (renderBdptCuda) rather than infer
+// it from its own flag, which a stop raised against a concurrent clear can leave out of step.
 __device__ int* g_dGatherStop = nullptr;
+__device__ int g_dStopSeen = 0;
 __device__ __forceinline__ bool dGatherStopped() {
-    return g_dGatherStop != nullptr && *(const volatile int*)g_dGatherStop != 0;
+    if (g_dGatherStop == nullptr || *(const volatile int*)g_dGatherStop == 0) return false;
+    g_dStopSeen = 1;
+    return true;
 }
+// A walk's stop poll, at most every ~1 ms of clock (2^21 cycles), and the clock read only every
+// 16 steps: the flag is mapped host memory, a PCIe round trip that a dense map's long walks
+// (J-FIELD-SLOW) cannot hide every few dozen nodes. Kept across a thread's walks, so many short
+// ones still poll; and once it has seen the stop it stays stopped.
+struct DStopPoll {
+    long long next = 0;   // the clock at which to poll; 0 until the first check sets it
+    unsigned steps = 0;
+    bool hit = false;
+    __device__ bool stopped() {
+        if (hit) return true;
+        if ((++steps & 15u) != 0u) return false;
+        const long long now = clock64();
+        if (next == 0) next = now + (1ll << 21);
+        if (now < next) return false;
+        next = now + (1ll << 21);
+        hit = dGatherStopped();
+        return hit;
+    }
+};
 
 // ---- intra-launch PROGRESS for the mode-M gather ----
 //
@@ -9141,11 +9168,11 @@ __device__ static void dGatherPhotonBeams(const DScene& sc, const DBeamMap& bm,
     // thread — 518400 samples over 262144 threads — so a poll up there fires once, at the
     // instant of launch, and never again. That is why the first attempt at device-side
     // cancellation changed nothing: measured 186 s to stop against a ~194 s remaining launch.
-    // Every 64th node keeps the mapped-memory read (a PCIe round trip, necessarily uncached)
-    // far off the hot path while still bounding stop latency to a few nodes' work.
-    int stopPoll = 0;
+    // DStopPoll keeps the mapped-memory read (a PCIe round trip, necessarily uncached) far off
+    // the hot path while still bounding stop latency to about a millisecond.
+    DStopPoll stopPoll;
     while (sp) {
-        if ((++stopPoll & 63) == 0 && dGatherStopped()) return;
+        if (stopPoll.stopped()) return;
         const DNode& n = bm.nodes[stack[--sp]];
         if (n.count > 0) {
             for (int i = 0; i < n.count; ++i) {
@@ -9313,12 +9340,11 @@ __global__ void kBeamTr0(DScene sc, const DBeamRec* beams, float* tr0, const int
 // segments, skipping their queued candidates. The walk's order is fixed by the tree, so the
 // skipped candidates are exactly the ones queued before, and every candidate is evaluated once,
 // in kWfBeamEval, with the random numbers its (segment, beam) pair keys whichever pass queued it.
-// A stop ends the walk and defers nothing: renderBdptCuda drops the chunk. Polled by elapsed
-// clock (~1 ms), not by node count: the flag is mapped host memory, a round trip over PCIe that a
-// dense map's few, long walks (J-FIELD-SLOW) could not hide every few dozen nodes.
+// A stop ends the walk and defers nothing: renderBdptCuda drops the chunk (DStopPoll).
 __global__ void kWfBeamHits(DScene sc, DBeamMap bm, DWfQueue q, int resumePass) {
     D_MOTION_CLEAR();   // this thread's time: the launch's (passU) until a path sets one
     const int nS = min(*q.nSegs, q.segCap);
+    DStopPoll stopPoll;
     for (int si = blockIdx.x * blockDim.x + threadIdx.x; si < nS; si += gridDim.x * blockDim.x) {
         const int skip = resumePass ? q.resume[si] : 0;
         q.resume[si] = -1;
@@ -9331,15 +9357,11 @@ __global__ void kWfBeamHits(DScene sc, DBeamMap bm, DWfQueue q, int resumePass) 
         Real tRoot;
         if (!boxHit(bm.nodes[0], oc, invD, (Real)0, tMax, tRoot)) continue;
         int stack[64]; int sp = 0; stack[sp++] = 0;
-        long long nextPoll = clock64() + (1ll << 21);
         const int routeMedJ = sg.routeMedJ;   // once, not per candidate (q.hits aliases q.segs)
         int e = 0;           // candidates met so far, in walk order
         bool full = false;   // the hit queue turned this segment away: resume it next pass
         while (sp && !full) {
-            if (clock64() > nextPoll) {
-                if (dGatherStopped()) break;
-                nextPoll = clock64() + (1ll << 21);
-            }
+            if (stopPoll.stopped()) break;
             const DNode& n = bm.nodes[stack[--sp]];
             if (n.count > 0) {
                 for (int i = 0; i < n.count; ++i) {
@@ -23185,30 +23207,44 @@ __global__ void kDeviceProbe(unsigned long long* sizes, double* math, const doub
 // gpu::g_dGatherStop (dGatherStopped), which is published only inside a DeviceStopScope -- null
 // elsewhere, so a renderer that keeps whatever a launch wrote never sees a stop cut a gather short.
 // The memory being never freed, a published pointer cannot dangle (GATHER-STOP-DANGLING).
-static int* deviceStopFlag() {
-    static int* d = [] {
-        int* h = nullptr;
-        CUDA_CHECK(cudaHostAlloc((void**)&h, sizeof(int), cudaHostAllocMapped));
-        *h = 0;
-        ft::setStopMirror(h);              // from here on every raise or clear writes it...
-        if (ft::stopRequested()) *h = 1;   // ...and a stop raised before then is copied in
-        int* dp = nullptr;
-        CUDA_CHECK(cudaHostGetDevicePointer((void**)&dp, h, 0));
-        return dp;
+struct DeviceStopFlag { int* host; int* dev; };
+static DeviceStopFlag deviceStopFlag() {
+    static DeviceStopFlag f = [] {
+        DeviceStopFlag r{nullptr, nullptr};
+        CUDA_CHECK(cudaHostAlloc((void**)&r.host, sizeof(int), cudaHostAllocMapped));
+        *r.host = 0;
+        ft::setStopMirror(r.host);              // from here on every raise or clear writes it...
+        if (ft::stopRequested()) *r.host = 1;   // ...and a stop raised before then is copied in
+        CUDA_CHECK(cudaHostGetDevicePointer((void**)&r.dev, r.host, 0));
+        return r;
     }();
-    return d;
+    return f;
 }
 // While one lives, the kernels launched honour -stop (the previous scope's pointer is put back
 // when it ends, so scopes nest). Only for a renderer that drops a launch a stop cut short: one
-// that kept it would keep a gather stopped part-way, dark.
+// that kept it would keep a gather stopped part-way, dark. The device's copy starts equal to the
+// host's flag: a raise racing a clear (a -serve frame's) could have left it raised over a cleared
+// flag, which would cut every launch of the next render.
 class DeviceStopScope {
 public:
     DeviceStopScope() {
-        int* d = deviceStopFlag();
+        const DeviceStopFlag f = deviceStopFlag();
+        *(volatile int*)f.host = ft::stopRequested() ? 1 : 0;
         CUDA_CHECK(cudaMemcpyFromSymbol(&prev_, gpu::g_dGatherStop, sizeof(int*)));
-        CUDA_CHECK(cudaMemcpyToSymbol(gpu::g_dGatherStop, &d, sizeof(int*)));
+        CUDA_CHECK(cudaMemcpyToSymbol(gpu::g_dGatherStop, &f.dev, sizeof(int*)));
     }
     ~DeviceStopScope() { cudaMemcpyToSymbol(gpu::g_dGatherStop, &prev_, sizeof(int*)); }   // no throw
+    // Around a launch: clear the device's record that a kernel saw the stop, then read it once
+    // the launch has completed -- true when the stop cut it short.
+    static void clearSeen() {
+        const int zero = 0;
+        CUDA_CHECK(cudaMemcpyToSymbol(gpu::g_dStopSeen, &zero, sizeof(int)));
+    }
+    static bool seen() {
+        int v = 0;
+        CUDA_CHECK(cudaMemcpyFromSymbol(&v, gpu::g_dStopSeen, sizeof(int)));
+        return v != 0;
+    }
     DeviceStopScope(const DeviceStopScope&) = delete;
     DeviceStopScope& operator=(const DeviceStopScope&) = delete;
 private:
@@ -26525,8 +26561,7 @@ Film renderBdptCuda(const Scene& scene, const Camera& cam, int resX, int resY,
     const bool abortable = prog && prog->report;
     std::unique_ptr<DeviceStopScope> stopScope;
     if (abortable) stopScope = std::make_unique<DeviceStopScope>();
-    // The host's own flag, raised before the device's copy (main.cpp raiseStop): a launch whose
-    // kernels saw the stop always reads true here.
+    // A stop the host has seen: no more waves or passes are launched.
     auto stopped = [&] { return abortable && ft::stopRequested(); };
     // Resume (mode D disk resume): fresh samples carry ABSOLUTE indices
     // [sppBase, sppBase + spp), so the kernel's stride is the FINAL total (see
@@ -26821,6 +26856,7 @@ Film renderBdptCuda(const Scene& scene, const Camera& cam, int resX, int resY,
     // Returns whether the chunk landed whole (it is folded into the totals) or a stop cut it
     // short (dropped).
     auto launch = [&](long long cAll, long long baseAll) -> bool {
+      if (abortable) DeviceStopScope::clearSeen();
       // ONE LIGHT-SIDE REALIZATION PER SUB-LAUNCH (FTRACE_JDEVLIGHT=3, FTRACE_JSPLIT=k).
       //
       // `base` is the ABSOLUTE sample index this sub-batch starts at, so it advances every
@@ -27013,7 +27049,9 @@ Film renderBdptCuda(const Scene& scene, const Camera& cam, int resX, int resY,
                                                     resX, maxDepth, diffraction ? 1 : 0, seed, 1, dbm, dsm, DWfQueue{}, 0, totalSamples);
         cudaCheckKernel("bdpt");
       }
-      return !stopped();
+      // Dropped if a kernel saw the stop (its own record, DeviceStopScope::seen) or the host
+      // stopped launching waves.
+      return !(abortable && (DeviceStopScope::seen() || stopped()));
     };
 
     const auto tCall1 = std::chrono::steady_clock::now();
@@ -28635,6 +28673,7 @@ std::vector<Film> renderPhotonMapSharedCuda(const Scene& scene, const std::vecto
                 *(volatile unsigned long long*)h_gatherDone = 0;
                 progTotal.store(sampTotal, std::memory_order_relaxed);
                 progOffset.store(base * (long long)npix + i, std::memory_order_release);
+                DeviceStopScope::clearSeen();
                 kGather<<<kGatherGrid, kGatherBlock>>>(
                                        up.sc, dpm, dpmC, dbm, hc, s_film, s_hits, i, hi, cs2, spp,
                                        base, resX[c], diffraction ? 1 : 0, fgRays, seed);
@@ -28691,8 +28730,9 @@ std::vector<Film> renderPhotonMapSharedCuda(const Scene& scene, const std::vecto
                 // because the slice was issued whole. Folding that would put exactly the
                 // ~1/spp brightness band across the frame that kFilmFold's comment describes.
                 // So: if a stop is pending, the chunk in flight is partial by definition and
-                // must be discarded, wherever `i` happens to be.
-                if (ft::stopRequested()) { chunkDone = false; break; }
+                // must be discarded, wherever `i` happens to be -- as it must if a kernel saw
+                // the stop, whatever the host's flag says now (DeviceStopScope::seen).
+                if (ft::stopRequested() || DeviceStopScope::seen()) { chunkDone = false; break; }
                 // Never below 1/64 spp (a slice that keeps halving turns the gather into
                 // launch latency), never more than 4x up in one step (one anomalously fast
                 // slice must not produce a minutes-long next one). A slice too fast to time

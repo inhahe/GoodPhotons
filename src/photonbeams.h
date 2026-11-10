@@ -750,10 +750,11 @@ struct BeamMap {
     // BeamRadiiPin::applyTo; a gathered count is proportional to the subpaths). `floorNeed`: the
     // factor the `-beamk` floor raised them by when it bound, else how far it was from binding
     // (the floor over the raw probe count, < 1); 0 when unmeasured (an explicit or pinned radius,
-    // an empty map, a floor of 0). `slackScale`: the `-beamareaslack` ceiling's factor, applied
-    // after the floor (< 1 when it capped them).
+    // an empty map, a floor of 0). `slackScale`: what the `-beamareaslack` ceiling, applied after
+    // the floor, made of them (areaSlackScale) -- below 1 the factor it cut them by, at or above 1
+    // the factor they could still grow before it would bind; 0 with no ceiling, or unmeasured.
     double floorNeed = 0.0;
-    double slackScale = 1.0;
+    double slackScale = 0.0;
     // Mode J (UPBP) only, empty otherwise: the light half of every merge's MIS weight.
     // `mis` is indexed by the ORIGINAL (pre-split) beam; `misIdx` maps a current beam to
     // its entry and is filled by the first split. See BeamMis.
@@ -984,7 +985,8 @@ struct BeamMap {
     //     A(s) = A0 + s * SUM 8 r_m (|dx|+|dy|+|dz|) L  +  s^2 * SUM 24 r_m^2
     //          = A0 + B s + C s^2                      (expand 2(exey+eyez+ezex), q = 2 r s)
     //
-    // Returns >= 1 for "the cap does not bind". This is the CEILING half of the radius rule;
+    // Returns >= 1 for "the cap does not bind": then the factor the radii could still grow by
+    // before it would (BeamMap::slackScale keeps it). This is the CEILING half of the radius rule;
     // `-beamk` is the floor. It exists because the mean-free-path radius is a physical scale
     // with no cost term in it, and a scene can legitimately have a medium whose mfp is a large
     // fraction of its own extent (a thin haze), where 1% of the mfp still inflates every box
@@ -1001,9 +1003,9 @@ struct BeamMap {
             C  += 24.0 * r * r;
         }
         const double budget = slack * A0;
-        if (!(C > 0.0)) return (B > 0.0) ? std::min(1.0, budget / B) : 1.0;
+        if (!(C > 0.0)) return (B > 0.0) ? budget / B : 1.0;
         const double s = (-B + std::sqrt(std::max(0.0, B * B + 4.0 * C * budget))) / (2.0 * C);
-        return (std::isfinite(s) && s > 0.0) ? std::min(1.0, s) : 1.0;
+        return (std::isfinite(s) && s > 0.0) ? s : 1.0;
     }
 
     // Split every beam at its OWN area-optimal length (sahSplitLen), backing off uniformly if
@@ -1392,8 +1394,10 @@ struct BeamMap {
 
         // --- CEILING: -beamareaslack, the cost bound. Applied last, so it wins. --------
         info.areaTight = totalBoxArea(0.0);
+        slackScale = 0.0;
         if (areaSlack > 0.0) {
             const double s = areaSlackScale(areaSlack);
+            slackScale = s;
             if (s < 1.0) {
                 info.slackScale = s;
                 for (MedStat& m : st) m.r *= s;
@@ -1404,7 +1408,6 @@ struct BeamMap {
 
         floorNeed = (info.floorScale > 1.0) ? info.floorScale
                   : (targetK > 0.0 && info.probeK0 > 0.0) ? targetK / info.probeK0 : 0.0;
-        slackScale = info.slackScale;
         info.med  = st;
         info.rMin = info.rMax = st.empty() ? 0.0 : st[0].r;
         for (const MedStat& s : st) { info.rMin = std::min(info.rMin, s.r); info.rMax = std::max(info.rMax, s.r); }

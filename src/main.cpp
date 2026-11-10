@@ -14237,8 +14237,9 @@ struct BeamRadiiPin {
     std::vector<float> radMed;   // per medium (BeamMap::radMed)
     double radius = 0.0;         // the scalar beyond them; 0 = not recorded yet
     double floorNeed = 0.0;      // the recorded map's BeamMap::floorNeed,
-    double slackScale = 1.0;     // ...its BeamMap::slackScale,
-    long long n = 0;             // ...and the subpaths it was drawn from (BeamMap::nEmitted)
+    double slackScale = 0.0;     // ...its BeamMap::slackScale,
+    long long n = 0;             // ...the subpaths it was drawn from (BeamMap::nEmitted),
+    double scale0 = 1.0;         // ...and the radius-shrink factor it was built at
     bool recorded() const { return radius > 0.0; }
     // `bm`'s radii divided by `scale`: the radius-shrink factor it was built at, so that
     // applyTo can hand them to a map at another point of the schedule.
@@ -14249,20 +14250,26 @@ struct BeamRadiiPin {
         floorNeed = bm.floorNeed;
         slackScale = bm.slackScale;
         n = bm.nEmitted;
+        scale0 = scale;
     }
     // The recorded radii at `scale`. `nTo` > 0: for a map drawn from that many subpaths, as its
     // own build would have chosen them (a clock blur's epochs draw fewer than epoch 0). The -beamk
     // floor, which raised the recorded radii by max(1, floorNeed), raises these by
-    // max(1, floorNeed * n / nTo), a gathered count being proportional to the subpaths; and where
-    // the -beamareaslack ceiling capped the recorded radii (slackScale < 1) it caps these at the
-    // same radius, its bound being a per-beam area ratio, whatever the count. Equal counts give
-    // the recorded radii exactly.
+    // max(1, floorNeed * n / nTo), a gathered count being proportional to the subpaths. The
+    // -beamareaslack ceiling bounds them at the radius it bounded the recorded ones at -- an
+    // absolute radius, the bound being a per-beam area ratio whatever the count or the shrink:
+    // the recorded radii times max(1, slackScale), at the recorded map's shrink, which the
+    // uncapped radii are free of by the factor min(1, slackScale) the ceiling cut them by. Equal
+    // counts at the recorded shrink give the recorded radii exactly.
     void applyTo(BeamMap& bm, double scale = 1.0, long long nTo = 0) const {
         double f = scale;
-        if (nTo > 0 && n > 0 && floorNeed > 0.0) {
-            double w = std::max(1.0, floorNeed * ((double)n / (double)nTo)) / std::max(1.0, floorNeed);
-            if (slackScale < 1.0) w = std::min(w / slackScale, 1.0);
-            f *= w;
+        if (nTo > 0) {
+            double w = 1.0;
+            if (n > 0 && floorNeed > 0.0)
+                w = std::max(1.0, floorNeed * ((double)n / (double)nTo)) / std::max(1.0, floorNeed);
+            f = scale * w;
+            if (slackScale > 0.0)
+                f = std::min(f / std::min(1.0, slackScale), scale0 * std::max(1.0, slackScale));
         }
         bm.radMed = radMed;
         for (float& r : bm.radMed) r = (float)((double)r * f);
@@ -20298,7 +20305,9 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
                                 (!useGpu && !budgetedJ && !blurEpochsJ)
                                     ? "render's work (counted, so the CPU repeats itself)"
                                     : "wall clock");
-                if (firstRedraw) std::fflush(stdout);   // a log watcher's sign that epoch 0 landed
+                // Flushed: a log watcher's sign that this run's first refresh began (in a fresh
+                // frame, after epoch 0's samples; tools/check_gpu_stop.py times by it).
+                if (firstRedraw) std::fflush(stdout);
             }
             // A media-free `-jsurf` run gets its OWN sentence rather than the beam one, because
             // the beam sentence would be a lie there in the specific way that matters: it names
@@ -20905,10 +20914,6 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
                 }
                 if (epochSpp <= 0) {           // produced nothing; refreshing again cannot help
                     if (drew) { --nRealized; keepLightEpochs(); }   // a realization the film lacks
-                    // A stop that dropped the epoch's first chunk left it no report, so the
-                    // epochs before it are flushed here, as the final image and checkpoint.
-                    if (ft::stopRequested() && sppAll > 0 && prog && prog->report)
-                        prog->report(acc, sppAll, /*final*/true);
                     break;
                 }
                 acc.merge(f);
@@ -20958,6 +20963,13 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
                     }
                 }
             }
+            // A stop that ended the loop without a report of its own -- one that dropped an
+            // epoch's first chunk, or was raised between epochs -- would leave the last periodic
+            // write behind: the epochs rendered are flushed as the final image and checkpoint. (A
+            // stop a report saw, or a finished target, has written its own final report.)
+            if (!stopAll && ft::stopRequested() && sppAll > 0 && sppAll < sppTarget && prog &&
+                prog->report)
+                prog->report(acc, sppAll, /*final*/true);
             if (nRealized > 1)
                 std::printf("mode J: averaged %llu independent light-side realizations "
                             "(%lld spp total%s) — the merge noise fell with the render, not just "
@@ -21296,10 +21308,6 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
                 }
                 if (epochSpp <= 0) {           // produced nothing; refreshing again cannot help
                     if (drew) --nRealM;        // a realization the film lacks
-                    // A stop that dropped the epoch's first chunk left it no report, so the
-                    // epochs before it are flushed here, as the final image and checkpoint.
-                    if (ft::stopRequested() && sppAll > 0 && prog && prog->report)
-                        prog->report(acc, sppAll, /*final*/true);
                     break;
                 }
                 acc.merge(f);
@@ -21310,6 +21318,13 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
                     nNext = sizer.next(nUsed, rebuildSec, gatherSec);
                 }
             }
+            // A stop that ended the loop without a report of its own -- one that dropped an
+            // epoch's first chunk, or was raised between epochs -- would leave the last periodic
+            // write behind: the epochs rendered are flushed as the final image and checkpoint. (A
+            // stop a report saw, or a finished target, has written its own final report.)
+            if (!stopAll && ft::stopRequested() && sppAll > 0 && sppAll < sppTarget && prog &&
+                prog->report)
+                prog->report(acc, sppAll, /*final*/true);
             if (nRealM > 1)
                 std::printf("mode M: averaged %llu independent light-side realizations "
                             "(%lld spp total) — the map noise fell with the render, not just "

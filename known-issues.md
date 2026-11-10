@@ -72,7 +72,7 @@ closed entries, where the cost is a broken historical link rather than a blocked
 Three references — `scenes/_gr_fly0.ftsl`, `scenes/silver_sphere_xenon.ftsl`, `scenes/x.ftsl` —
 name files that no longer exist at all, all in closed entries.
 
-## NOTED (2026-11-09, the machine, not ftrace): BUGCHECK-INTSTEER — a blue screen during a CPU mode J render was corrupted Windows kernel memory
+## NOTED (2026-11-09, the machine, not ftrace): BUGCHECK-INTSTEER — two blue screens in a day were one driver corrupting Windows kernel memory
 
 At ~08:19:40 on 2026-11-09 the machine bugchecked (0x1E KMODE_EXCEPTION_NOT_HANDLED) while
 check_haze_domain rendered `near_J_cpu_s2` (CPU mode J, live window minimized; the GPU idle for an
@@ -88,6 +88,21 @@ drivers loaded, two Google Drive file-system drivers ran at once (3.2452 and a s
 Process Lasso was ruled out: no kernel driver, no affinity rules, its IRQControl never used (the
 only interrupt policies are Windows' defaults for the storage controllers). The minidump holds no
 kernel pool, so the owner of the damaged block is unknown.
+
+**The second, at ~16:16 the same day** (bugcheck 0x3B SYSTEM_SERVICE_EXCEPTION, before the planned
+restart, so a minidump again): `dllhost.exe` opening a file, Windows' `filecrypt.sys` asking for its
+normalised name, the fault in `nt!ObpLookupObjectName+0x10c0` reading through `0x0080a624e9fb6940`.
+**The same fingerprint as the first:** a kernel pointer loaded from offset +8 of a structure, its
+upper 32 bits replaced by the identical value `0x0080a624` (the original upper halves differed,
+`ffffc081` and `ffffc380`, the boots' address randomisation). A value the same across two boots is
+no random memory error and no address: some code writes that 32-bit value at offset +0xC of memory
+it no longer owns. No loaded driver holds it as a literal, so it is computed. It came ~15 s after a
+GPU mode J render wrote its image (check_haze_domain's `still_J_gpu_s2`), but nothing on the stack
+is ftrace's or the GPU's. The strongest suspect is the MediaTek Wi-Fi 7 MT7927 driver
+(`mtkwecx.sys` 5.7.0.6054, the machine's only live network link, with three stale adapter
+instances from re-detection), a widely reported crash source on AMD boards; not proven. The next
+step that names it: a kernel dump (enabled below) gives the pool tag of the damaged block, or Driver
+Verifier (special pool) on the third-party drivers catches the write itself.
 
 **Machine settings applied the same day (take effect after a reboot):** TDR as on the other machine
 (`TdrLevel=3`, `TdrDelay=60`, `TdrDdiDelay=60`; see the July entry below), and crash dumps switched
@@ -125,6 +140,12 @@ nothing to free, and no published pointer can dangle. The scratch films 0.434.37
 into went too: a dropped chunk's partial sums are never downloaded. And an epoch loop (modes J
 and M, either device) whose epoch a stop left empty -- its first chunk dropped, so no report --
 now flushes the epochs before it as the final image; before, it left without writing one.
+**0.434.39 (review of 7059cda):** that flush moved after the loop, covering a stop raised between
+epochs too (the window closed inside a report, a `-stop` landing in a merge); a chunk is dropped
+when a kernel recorded seeing the stop (`g_dStopSeen`), not on the host flag alone, which a raise
+racing `-serve`'s per-frame clear could leave out of step with the device's copy (each
+`DeviceStopScope` now also starts that copy from the host flag); and both beam walks poll by
+clock, every ~1 ms, one poll state per thread across its walks.
 
 ## DONE (2026-11-05, 0.434.2): STOP-STALE-PID — `ftrace -stop` listed a crashed render under the unrelated process that inherited its pid
 
@@ -832,6 +853,9 @@ derived from epoch 0's: under a clock blur an epoch draws fewer subpaths than ep
 0.434.38 (review of 283a9b5): the floor need recorded is the factor actually applied when the
 floor bound (a probe that gathered nothing at the raw radii recorded none), and where the
 `-beamareaslack` ceiling capped epoch 0's radii an empty epoch is capped at the same radius.
+0.434.39 (review of 7059cda): that cap is an absolute radius, so it is applied after the epoch's
+shrink, not before; and the ceiling's headroom is kept where it did not bind at epoch 0
+(`areaSlackScale` returns the unclamped factor), so a floor-widened empty epoch is capped too.
 
 ## FIXED (2026-11-07, 0.434.29; opened 2026-11-05, 0.434.16, widened 2026-11-06): HAZE-BLUR-DOMAIN — modes D and J's sun subpaths take less unbounded haze than their NEE leg: 1-2 % bright in a still scene, more for a mover far out under a blur
 

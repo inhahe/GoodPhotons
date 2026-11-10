@@ -9,7 +9,8 @@ keeps a cut chunk. The scene is check_haze_domain's density field at 48x36 under
 which pins every GPU chunk to one sample, tens of seconds each (J-FIELD-SLOW) -- and makes each
 sample its own light-side epoch, so the stop cuts an epoch's first and only chunk. The check
 waits for the first sample to land (the refresh that opens the second epoch), times it, asks the
-render to stop during the second, and requires:
+render to stop a quarter of a sample later -- inside the second sample's GPU chunk, its light
+side rebuilt in about a second -- and requires:
 
   - the process to be gone in under a third of a sample's time, which only a chunk cut short
     allows;
@@ -71,7 +72,9 @@ def main():
                              ("exited" if p.poll() is not None else "is still running, pid %d"
                               % p.pid))
         sample = t1 - t0
-        time.sleep(min(5.0, sample * 0.1))   # into the second sample
+        # A quarter of a sample into the second: past its light-side rebuild (~1 s against the
+        # sample's ~25), so inside its GPU chunk, with three quarters of it left to cut.
+        time.sleep(sample * 0.25)
         ts = time.monotonic()
         s = subprocess.run([exe, "-stop", str(p.pid)], capture_output=True, text=True,
                            encoding="utf-8", errors="replace")

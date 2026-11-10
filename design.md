@@ -627,12 +627,13 @@ Four consequences worth knowing:
     own copy of the stop flag -- one int of mapped pinned host memory for the life of the process
     (`deviceStopFlag`), written by whoever raises or clears the stop (`main.cpp` `raiseStop` /
     `clearStop`, through `ft::stopMirrorSlot`). Its pointer is published to the kernels only inside
-    a `DeviceStopScope`, which a chunked `renderBdptCuda` and mode M's gather open: `kBdptT` reads it
-    every 8 paths, the inline beam gather every 64 nodes, `kWfBeamHits` every ~1 ms of clock. A
-    chunk a stop cut short is dropped -- its partial sums are never downloaded, the films freed
-    unread -- and `gpuSppChunks` flushes the whole chunks before it as final (the `abandoned`
-    contract `cpuSppChunks` keeps); an epoch loop whose epoch thus produced nothing flushes the
-    epochs before it (`tools/check_gpu_stop.py`). (Until 0.434.34 overflowing hits were evaluated on the spot inside `kWfBeamHits`, one
+    a `DeviceStopScope`, which a chunked `renderBdptCuda` and mode M's gather open (and which starts
+    the device's copy equal to the host flag): `kBdptT` reads it every 8 paths, the beam walks
+    (`kWfBeamHits`, the inline gather) every ~1 ms of clock (`DStopPoll`). A kernel that sees it
+    records so (`g_dStopSeen`), and a chunk so cut short is dropped -- its partial sums never
+    downloaded, the films freed unread -- and `gpuSppChunks` flushes the whole chunks before it as
+    final (the `abandoned` contract `cpuSppChunks` keeps); an epoch loop a stop ended without a
+    report of its own flushes the epochs it rendered (`tools/check_gpu_stop.py`). (Until 0.434.34 overflowing hits were evaluated on the spot inside `kWfBeamHits`, one
     thread a segment: harmless at `_fog_cornell`'s rate, ~20× slower a hit with an unbounded
     density field's ~10⁵ hits a path, J-FIELD-SLOW.) The wave floor is 256 paths.
     `tools/check_wf_resume.py` renders a fog with the hit queue shrunk (`FTRACE_WFHITCAP`) and
