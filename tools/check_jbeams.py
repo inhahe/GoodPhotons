@@ -27,8 +27,15 @@ was BUILT:
   - a two-frame flight that keeps only epoch 0 (FTRACE_JEPOCHKEEP=1) re-traces its second frame's
     other epochs at the subpath count epoch 0 settled on, not the inert default (0.436.0: the
     counts live with the batch, where a frame that takes epoch 0 from it finds them);
-  - on the GPU, the device draws the surface map from one subpath per pixel and the host traces
-    only the beams' subpaths (BeamBudgetReq::hostSurf, 0.436.0);
+  - a fixed map's pilot is sequential, a few 2048-subpath rounds on this easily reached haze
+    (0.436.1-2: until 256 of its subpaths have laid a beam and 256 stored a surface photon);
+  - `-jsurf-count` under the knee rule lowers the surface map's subpaths, not the beams' pass,
+    and every refresh keeps epoch 0's surface subset (0.436.1-2);
+  - a scene's `jbeams 64` with `-beamcount` keeps the fixed map and says -beamcount does nothing
+    in mode J;
+  - on the GPU, the device draws the surface map -- from one subpath per pixel for a fixed map,
+    the knee's pass under `auto`, `-n`'s subpaths with the beams off -- and the host traces only
+    the beams' subpaths (BeamBudgetReq::hostSurf, measureSurf; 0.436.0-2);
   - `-jbeams 0`, `many`, `inf` and `1e30` are refused with exit code 2.
 
 Exits 1 on any failure.
@@ -72,7 +79,7 @@ def main():
               + NL + "key 0 3 2 9" + NL + "key 1 4 2 9" + NL + "}")
     ftsl_fly = fogbox.write(d, "still_fly.ftsl", text + NL + flight + NL)
     check = fogbox.Checks(66)
-    logs = []
+    logs, logs_by = [], {}
 
     def run(tag, extra, scene_path=ftsl, out=None, clean=True, dev="cpu", env=None):
         png = out or os.path.join(d, tag + ".png")
@@ -87,6 +94,7 @@ def main():
                            errors="replace", env=dict(os.environ, **(env or {})))
         log = p.stdout + p.stderr
         logs.append("--- " + tag + NL + log[-700:])
+        logs_by[tag] = log
         pfm = png[:-4] + ".pfm"
         return p.returncode, log, (open(pfm, "rb").read() if os.path.exists(pfm) else None)
 
@@ -181,30 +189,42 @@ def main():
           rc == 0 and len(redraws) == 2 and redraws[0] == redraws[1] == pixels,
           "redraws %s (rc %d)" % (redraws, rc))
 
-    rc, log, _ = run("pilot64", ["-jbeams", "64"])
-    m = re.search(r"mode J: beam map: pilot of (\d+) subpaths", log)
-    check("a fixed map's pilot is sequential: one round here (256 beams in 2048 subpaths)",
-          rc == 0 and m is not None and m.group(1) == "2048", "pilot %s" % (m.group(1) if m else "?"))
-    rc0, log0, _ = run("ceil_off", ["-jbeams", "auto"])
+    m = re.search(r"mode J: beam map: pilot of (\d+) subpaths", logs_by["fixed64"])
+    check("a fixed map's pilot is sequential: whole rounds, a few of them here",
+          m is not None and int(m.group(1)) % 2048 == 0 and int(m.group(1)) <= 4 * 2048,
+          "pilot %s" % (m.group(1) if m else "?"))
+    log0 = logs_by["auto"]
     rc1, log1, _ = run("ceil_on", ["-jbeams", "auto", "-jsurf-count", "40"])
     t0, t1, s1 = TRACED.search(log0), TRACED.search(log1), SURF.search(log1)
     check("-jsurf-count under auto lowers the surface map, not the beams' pass",
-          rc0 == rc1 == 0 and t0 is not None and t1 is not None and t0.group(1) == t1.group(1)
+          rc1 == 0 and t0 is not None and t1 is not None and t0.group(1) == t1.group(1)
           and s1 is not None and int(s1.group(1)) < int(t1.group(1))
           and "lowered the surface map to" in log1,
           "beams' pass %s / %s, surface %s" % (t0.group(1) if t0 else "?", t1.group(1) if t1 else "?",
                                                s1.group(1) if s1 else "?"))
+    rc, log, _ = run("ceil_refresh", ["-jbeams", "auto", "-jsurf-count", "40", "-spp", "4",
+                                      "-beamepochs", "4"])
+    s, r = SURF.search(log), re.search(r"the first (\d+) of them storing surface photons", log)
+    check("...and every refresh keeps epoch 0's surface subset",
+          rc == 0 and s is not None and r is not None and r.group(1) == s.group(1),
+          "epoch 0 %s, refresh %s" % (s.group(1) if s else "?", r.group(1) if r else "?"))
     ftsl_fix = fogbox.write(d, "still_fix.ftsl", text + NL + "render { jbeams 64 }" + NL)
     rc, log, _ = run("scene_fix_bc", ["-beamcount", "200000"], scene_path=ftsl_fix)
-    check("render { jbeams 64 } with -beamcount: the fixed map, and -beamcount said unused",
-          rc == 0 and FIXED.search(log) is not None and "-beamcount unused" in log, "rc %d" % rc)
+    check("render { jbeams 64 } with -beamcount: the fixed map, and -beamcount said idle in J",
+          rc == 0 and FIXED.search(log) is not None
+          and "-beamcount does nothing in mode J here" in log, "rc %d" % rc)
 
     if not a.no_gpu:
         rc, log, _ = run("gpu_off_n", ["-jbeams", "off", "-n", "20000", "-r", "128", "96"], dev="gpu")
-        s = SURF.search(log)
-        check("GPU -jbeams off -n 20000: the surface merges stay, from -n's subpaths",
-              rc == 0 and s is not None and s.group(1) == "20000" and "Point merges ON" in log
+        g = DEVSURF.search(log)
+        check("GPU -jbeams off -n 20000: the device draws the surface map from -n's subpaths",
+              rc == 0 and g is not None and g.group(1) == "20000" and "Point merges ON" in log
               and "surface photon map is empty" not in log, "rc %d" % rc)
+        rc, log, _ = run("gpu_auto", ["-jbeams", "auto"], dev="gpu")
+        g, t = DEVSURF.search(log), TRACED.search(log)
+        check("GPU -jbeams auto: the device draws the surface map from the knee's pass",
+              rc == 0 and g is not None and t is not None and g.group(1) == t.group(1),
+              "device %s, pass %s" % (g.group(1) if g else "?", t.group(1) if t else "?"))
         rc, log, _ = run("gpu64", ["-jbeams", "64"], dev="gpu")
         m, g = FIXED.search(log), DEVSURF.search(log)
         check("GPU -jbeams 64: the device draws the surface map from one subpath per pixel",

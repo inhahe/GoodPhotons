@@ -19190,7 +19190,7 @@ struct BatchCache {
     // not yet), the first how many lay beams (-1 all), and a device-drawn surface map's subpaths
     // and photon slots (SurfMap::devPaths/devCap; 0 none). Kept with the batch, so a frame that
     // takes epoch 0 from it re-traces an epoch the batch could not keep as epoch 0 traced it.
-    long long nAll0 = -1, beamPaths0 = -1, surfDev0 = 0, surfCap0 = 0;
+    long long nAll0 = -1, beamPaths0 = -1, surfStore0 = -1, surfDev0 = 0, surfCap0 = 0;
     bool epochsSaid = false;     // the batch's epoch note is out
     size_t framesDJ = 0;         // cameras of this batch that render in mode D or J
     size_t framesLeftDJ = 0;     // of them, still to render, the current one included
@@ -19261,7 +19261,7 @@ struct BatchCache {
     long long keepable(size_t bytes) { return bytes ? (long long)(budget() / bytes) : 0; }
     void dropEpochs() {
         epochs.clear(); epochBytes = 0; autoK = 0; epochsSaid = false;
-        nAll0 = -1; beamPaths0 = -1; surfDev0 = 0; surfCap0 = 0;
+        nAll0 = -1; beamPaths0 = -1; surfStore0 = -1; surfDev0 = 0; surfCap0 = 0;
     }
 #ifdef HAVE_CUDA
     // The batch's device copy of `sc`, made on first use and remade if the scene changed under
@@ -20274,13 +20274,11 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
         // The device draws the surface map itself (cudaJSurfHostless), from a count the surface
         // side names, so the host pass is not the surface map's to size: a fixed beam map takes
         // its first subpaths, and with no beams (or no media) the host traces none.
-        // BeamBudgetReq::hostSurf. Only where that count exists -- a fixed map's, or the beams
-        // off without an `-n`, which then sizes a host pass the device redraws as before (the
-        // knee rule's likewise; TODO AUTO-HOST-SURF) -- mirroring jreq.surfPaths below.
+        // BeamBudgetReq::hostSurf, under every rule: epoch 0's pilot measures the photon rate the
+        // device's slots are sized by (measureSurf, where an `-n` leaves it no budget to run for).
         bool devSurfJ = false;
 #ifdef HAVE_CUDA
-        devSurfJ = useGpu && wantSurf && cudaJSurfHostless() &&
-                   ((jBeams == JBeams::Fixed && wantBeams) || (!wantBeams && !g_nFromCli));
+        devSurfJ = useGpu && wantSurf && cudaJSurfHostless();
 #endif
         // Epoch 0's beam radii at scale 1 (recorded by realize, built or kept), from which a
         // refresh whose map draws empty takes the radii its own build would have chosen: at its
@@ -20333,10 +20331,12 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
             jreq.targetK  = (fixedMap || !wantBeams) ? 0.0 : g_beamK;   // a knee only for auto's
             jreq.exact    = fixedMap;
             jreq.hostSurf = !devSurfJ;
+            jreq.measureSurf = first && devSurfJ;
             // The first `beamPaths` subpaths lay beams: none with the beams off (the pass is the
             // surface map's alone), epoch 0's count on a refresh (a fixed map's epoch 0 settles
             // it), every one otherwise.
             jreq.beamPaths = !wantBeams ? 0 : first ? -1 : beamPathsJ;
+            jreq.surfStore = first ? -1 : jlc.surfStore0;   // ...and the photon-storing ones
             // THE SURFACE MAP'S HALF OF THE SAME DECISION (-jsurf). One subpath count feeds two
             // maps, and the arbitration is made HERE because this is where the scene is known:
             //
@@ -20415,6 +20415,9 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
                                 (!useGpu && !budgetedJ && !blurEpochsJ)
                                     ? "render's work (counted, so the CPU repeats itself)"
                                     : "wall clock");
+                if (firstRedraw && jreq.surfStore >= 0 && jreq.surfStore < Nepoch)
+                    std::printf("mode J:   ...the first %lld of them storing surface photons, as "
+                                "epoch 0's did (-jsurf-count)\n", jreq.surfStore);
                 // Flushed: a log watcher's sign that this run's first refresh began (in a fresh
                 // frame, after epoch 0's samples; tools/check_gpu_stop.py times by it).
                 if (firstRedraw) std::fflush(stdout);
@@ -20438,8 +20441,8 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
                             "knee, `-jbeams off` drops it)%s ...\n",
                             res, resY, camWhere.c_str(), nThreads, maxDepth, lightLabel,
                             jreq.maxBeams,
-                            devSurfJ ? ", the device drawing the SURFACE map from one subpath "
-                                       "per pixel"
+                            devSurfJ ? ", the device drawing the SURFACE map (from up to one "
+                                       "subpath per pixel)"
                             : jreq.surfPaths > 0 ? ", from the first of a pass sized for the "
                                                  "SURFACE map (one subpath per pixel)" : "");
             else if (jreq.maxBeams > 0)
@@ -20471,6 +20474,7 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
             if (first) {
                 nAllJ = jbb.pathsUsed;
                 beamPathsJ = jbb.beamPaths;
+                jlc.surfStore0 = jbb.surfStore;
                 jlc.surfDev0 = devSurfJ ? jbb.surfPaths : 0;
                 jlc.surfCap0 = devSurfJ ? (long long)(2.0 * jbb.surfPerPath * (double)jbb.surfPaths)
                                           + 1024 : 0;
@@ -24629,8 +24633,9 @@ static int run(int argc, char** argv) {
                         c.rule == JBeams::Off ? "off" : "auto");
         // The knee rule's knobs pick it only where no rule is named, so here they do nothing.
         if (c.rule != JBeams::Auto && (g_beamKSet || g_beamTargetSet))
-            std::printf("[mode J] %s unused: the scene's render block names a %s, which only "
-                        "-jbeams auto overrides into the knee rule they tune\n",
+            std::printf("[mode J] %s does nothing in mode J here: the scene's render block names "
+                        "a %s, which only -jbeams auto overrides into the knee rule it tunes (other "
+                        "modes still use it)\n",
                         g_beamKSet && g_beamTargetSet ? "-beamk and -beamcount"
                                                       : g_beamKSet ? "-beamk" : "-beamcount",
                         c.rule == JBeams::Off ? "map with no beams" : "fixed beam map");

@@ -431,12 +431,6 @@ Then the rest of 4.2-4.6 in their order, 4.7's bookkeeping alongside whatever to
   gathers far more, so the knee overshoots. A probe drawn as the camera draws its rays would say
   whether `auto` can land where the fixed map does; measure with the beam domain's scale (and
   whether the domain should hold the camera), on `scraps/probe/sweep4.sh`'s scenes.
-- [ ] **AUTO-HOST-SURF** — under `-jbeams auto` (and with an `-n`) on the GPU, mode J's host light
-  pass still stores every surface photon and its MIS record, which the device then redraws and
-  throws away, reading only their count for its slots. A fixed map and the beams off already
-  leave the surface map to the device (BeamBudgetReq::hostSurf, 0.436.0); doing it here too needs
-  the device's slots from the pilot's photons a subpath, which an `-n` pass has no pilot to
-  measure (a small pilot for that alone, or slots from the host's count before it skips them).
 - [ ] **JSPEC-CARRIER-SIZE** — every mode-J GPU thread reserves a 120-byte spectral carrier per
   segment and per eye vertex, chromatic scene or not. Measured 2026-11-10: on `_slab_ss` a 64-beam
   map (no merges to speak of) renders a third of the samples `-jbeams off` does, wavefront or
