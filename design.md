@@ -423,6 +423,22 @@ Everything else follows from that one field.
   epoch that dropped it would weigh its connections up and read bright by P(empty) × the merge
   share. The device does the same: `uploadBeamMapCuda` sets `mergeKappa` for an empty map, and a
   non-empty map with no MIS partials still gathers, at weight 1, as the host does.
+- **The map's size (`-jbeams off | auto | <N>`, 0.435.0; `JBeams`, `jBeamsMode`).** The default is
+  a **fixed** map, N = 1000 raw beams a light-side realization: the pilot's budget request asks for
+  N beams with no knee (`BeamBudgetReq::targetK` 0) and no `kPathsMin` floor under the subpaths
+  (`BeamBudgetReq::exact`: the knee rule never traces fewer than 256, which on most scenes is
+  already 1-2 K raw beams), and `buildBeamMap` builds them at the plain
+  `-beamblur` radii with no `-beamk` floor (its `floorK` 0). `auto` is the knee rule (*The beam budget*, below: the
+  budget sized by the probe's knee up to `-beamcount`, radii widened by the floor), and giving
+  `-beamk`, `-beamcount` or `-n` selects it, so an older command line naming any of them renders
+  as it did; `off` is `-nobeams`. Why the default moved: measured on the GPU against mode D at
+  equal time (known-issues J-FIELD-SLOW, 2026-11-10, with 0.434.40's beam domain), the knee rule
+  trailed a 1000-beam map by 2-4x on five fog scenes, its probe — random chords of the beams' box —
+  misreading what the camera's segments gather; 1000 beams was within 15 % of the best map at
+  depth 8 (where no beams wins) and the best arm at depth 32. The knee rule still wins where dense
+  bounded media want dense maps (`gallery_rain`'s rain and cloud, whose render scripts pass
+  `-jbeams auto`). The probe itself stays as `auto`'s; a camera-shaped probe is the open question
+  of whether `auto` can be made to land where the fixed map does.
 - **Flag polarity is reversed from `A`/`B`/`M`.** They need `-beams` to opt in; mode `J` needs
   `-nobeams` to opt out (`g_noBeams`). A mode-`J` render with no beam map is not a degraded UPBP,
   it is literally mode `D`, so making the interesting half opt-in behind a flag whose absence
@@ -1981,6 +1997,11 @@ them for a log line, and `kIsoPreview`'s primary ray passes `camHide`. Lighting 
 
 ### The beam budget — sizing the map from the scene's own knee (0.242.0)
 
+*Since 0.435.0 this is mode `J`'s `-jbeams auto`, chosen by `-jbeams auto`, `-beamk`,
+`-beamcount` or `-n`; the default is a fixed 500-beam map at the plain `-beamblur` radii (see the mode `J`
+section's "The map's size"). The budget was only ever mode `J`'s; the `-beamk` floor still widens
+every other mode's beam map as below.*
+
 `-n` alone was a cliff, not a tuning wart: at the inherited forward-mode default of `-n 2e6`,
 `_fog_cornell` at 128² deposited so many beams that a 120 s budget produced **no image at
 all**. The fix is a budget, and the measurement that shaped it is the interesting part.
@@ -3092,7 +3113,7 @@ and `_fog_thick` is a 17 %-noise image), and neither scene has a bounded medium,
 Both fog scenes needed `-n` well below the default here: at `-n 200000` and 256² the beam map
 alone is 7.7 M beams and mode `J` cannot finish a single spp inside a two-minute budget. Since
 0.242.0 that is what the beam budget prevents — **leave `-n` off** and the pilot sizes the map
-from the scene's `-beamk` knee. Passing `-n` explicitly still turns the budget off, which is
+(under `-jbeams auto`, since 0.435.0) from the scene's `-beamk` knee. Passing `-n` explicitly still turns the budget off, which is
 why these historical runs reproduce. See **J-BEAMCOST** in `known-issues.md`.
 
 ## Radiance across a refraction (0.378.1)

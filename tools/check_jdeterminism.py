@@ -10,8 +10,8 @@ machine's speed (known-issues J-CPU-NONDET). Mode M's loop does the same (MODEM-
 its camera pass stratifies its wavelengths by a sample's absolute index rather than within each
 call, whose size also followed the clock. The scene is scraps/jspec2/hetmed's -- a heterogeneous
 fog, whose transmittance estimates draw from the camera's stream, so a sample that meets another
-map takes other draws -- rendered at 32x32 in mode J (256 spp, beam merges only) and in mode M
-(-beams, 64 spp, -beamrefresh 0.5), each:
+map takes other draws -- rendered at 32x32 in mode J (256 spp, beam merges only), under the knee rule and under the
+default fixed map, and in mode M (-beams, 64 spp, -beamrefresh 0.5), each:
 
   - twice, byte for byte the same;
   - and at one thread, the same again: the counts are sums over the frame, which no division of
@@ -67,7 +67,9 @@ def main():
         f.write(SCENE)
     fails = []
 
+    # J: the knee rule (-beamcount and -beamk select it); Jfixed: the default fixed map (-jbeams).
     CASES = {"J": ["-mode", "J", "-spp", "256", "-beamcount", "100000", "-beamk", "2", "-nojsurf"],
+             "Jfixed": ["-mode", "J", "-spp", "256", "-nojsurf"],
              "M": ["-mode", "M", "-beams", "-n", "20000", "-spp", "64", "-beamrefresh", "0.5"]}
 
     def render(mode, tag, extra=()):

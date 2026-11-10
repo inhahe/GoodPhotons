@@ -2471,6 +2471,10 @@ struct BeamBudgetReq {
     double    blur     = 0.01;   // -beamblur:  kernel half-width as a fraction of the mfp
     double    targetK  = 32.0;   // -beamk:     the FLOOR whose release marks the knee
     double    safety   = 1.0;    // scale on the measured knee; 1.0 = aim AT it (see the note below)
+    // A fixed map (-jbeams <N>): `maxBeams` is the beam count asked for, with no knee (targetK 0)
+    // and no kPathsMin floor under the subpaths it takes -- a few hundred raw beams can be fewer
+    // than 256 subpaths deposit, and the map asked for is the map built.
+    bool      exact    = false;
     // --- THE SURFACE MAP'S HALF (-jsurf, 0.258.0) ---------------------------------------
     // One subpath count feeds TWO maps, so both get a say, and they say different kinds of
     // thing. The beam side names a *beam* ceiling because its radius adapts: undershoot the
@@ -3109,7 +3113,7 @@ inline void traceLightBeamPass(const Scene& scene, const Camera& cam, long long 
         if (kneeBeams > 0.0) effBudget = std::min(effBudget, req.safety * kneeBeams);
         if (req.maxBeams > 0 && perPath > 0.0) {
             const long long fit = (long long)(effBudget / perPath);
-            nPaths = std::clamp(fit, kPathsMin, nPathsAsked);
+            nPaths = std::clamp(fit, req.exact ? 1LL : kPathsMin, nPathsAsked);
         }
         // THE SURFACE CEILING, applied AFTER the beam knee and only ever downward. It is a
         // memory bound, not a quality target: the point-merge radius is fixed, so a bigger
@@ -3118,7 +3122,9 @@ inline void traceLightBeamPass(const Scene& scene, const Camera& cam, long long 
         bool surfBound = false;
         if (smOut && req.maxSurfPhotons > 0 && surfPerPath > 0.0) {
             const long long fitS = (long long)((double)req.maxSurfPhotons / surfPerPath);
-            const long long capped = std::clamp(fitS, kPathsMin, nPaths);
+            // Floored at kPathsMin only where the beams left at least that many (an exact map
+            // may not have): std::clamp's bounds must not cross.
+            const long long capped = std::clamp(fitS, std::min(kPathsMin, nPaths), nPaths);
             surfBound = (capped < nPaths);
             nPaths = capped;
         }

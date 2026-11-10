@@ -13,7 +13,8 @@ A candidate skipped or queued twice would move the merges.
 
 The scene is fogbox.py's heterogeneous fog (its transmittance estimates draw from each
 candidate's keyed stream) under one light-side realization (-beamfreeze: on the device the
-refresh otherwise ends on the clock, and the slower capped run would meet other maps). The
+refresh otherwise ends on the clock, and the slower capped run would meet other maps) of the
+knee-sized map (-jbeams auto: the fixed default is too sparse to fill the queue). The
 default render is made twice, as the control that the comparison can hold at all; each render
 must report how many resume passes it took: none by default, some under the cap. A render that
 outruns --limit fails the check: passes that re-queued what they should skip would never drain
@@ -68,7 +69,7 @@ def main():
         if cap:
             env["FTRACE_WFHITCAP"] = str(cap)
         cmd = [exe, "-in", ftsl, "-mode", "J", "-device", "gpu", "-spp", "8", "-seed", "1",
-               "-max-bounce", "8", "-beamfreeze", "-nojsurf", "-no-meter", "-hdr",
+               "-max-bounce", "8", "-beamfreeze", "-jbeams", "auto", "-nojsurf", "-no-meter", "-hdr",
                "-window-min", "-o", png]
         logf = png[:-4] + ".log"
         with open(logf, "w", encoding="utf-8") as lf:

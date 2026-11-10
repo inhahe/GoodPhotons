@@ -159,9 +159,11 @@
 #     specular-chain paths.
 #
 # Render (still) — don't pass -mode, the scene's prefer{}/else{} picks it:
-#   ftrace -in scenes/gallery_rain.ftsl -camera cam -noise 2 -beamblur 0.0025 \
+#   ftrace -in scenes/gallery_rain.ftsl -camera cam -jbeams auto -noise 2 -beamblur 0.0025 \
 #          -window-min -keepwindow -interval 15 -checkpoint -o png/gallery_rain.png
-# (add -resume to continue from png/gallery_rain.png.ftbuf). -beamblur 0.0025: a quarter of the
+# (add -resume to continue from png/gallery_rain.png.ftbuf). -jbeams auto: the cloud and the rain
+# want the knee-sized beam map, not mode J's fixed default (0.435.0; about a fifth less noise in
+# them, known-issues.md J-FIELD-SLOW). -beamblur 0.0025: a quarter of the
 # default radius, so a quarter of mode J's beam-blur bias in the media, for ~7 % more time and no
 # extra noise, because mode J's beam budget is knee-bound (known-issues.md, UPBP-BEAM-RADIUS).
 # PER-OBJECT MODES (0.386.0; FTSL.md 16.1). The camera says mode D. The transparent pieces
@@ -199,7 +201,7 @@
 #
 # Render (flyby) — the `fly` curve below, 1208 frames at 1280x720, 30 fps
 # (render_gallery_rain_flyby.bat; 0.392.0):
-#   ftrace -in scenes/gallery_rain.ftsl -camera fly -r 1280 720 -spp 64 -beamepochs 64 \
+#   ftrace -in scenes/gallery_rain.ftsl -camera fly -r 1280 720 -spp 64 -beamepochs 64 -jbeams auto \
 #          -oidn -oidn-write-guides -denoise \
 #          -window-min -keepwindow -interval 15 -checkpoint -o png/gallery_rain.png
 # -> png/gallery_rain_fly/gallery_rain_fly0000.png .. 1207.png. fly0009 (the cloud and the orb

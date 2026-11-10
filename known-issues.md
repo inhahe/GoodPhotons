@@ -748,7 +748,38 @@ with a K from the sample count), which is deterministic but no longer adapts to 
 light side is. Then add a heterogeneous medium at more than one sample to check_bitid's mode-J
 scenes.
 
-## OPEN (2026-11-07, 0.434.30, performance; narrowed 0.434.33-34): J-FIELD-SLOW — mode J in an unbounded density field runs ~8 s a sample at 96x72
+## DONE (2026-11-10, 0.434.40 and 0.435.0; opened 2026-11-07, 0.434.30): J-FIELD-SLOW — mode J in an unbounded density field runs ~8 s a sample at 96x72
+
+**Done: 0.434.40's beam domain made the field fast (below), and 0.435.0's `-jbeams` replaced the
+knee rule as the default with a fixed 1000-beam map.** Measured with both, GPU, 128x96, 60 s, two
+seeds an arm, whole-image relative RMSE against the mode D references (`scraps/probe/sweep4.sh`;
+fixed maps exact since 0.435.0, `BeamBudgetReq::exact`, so the small arms differ now):
+
+| scene | no beams | 64 | 250 | 1000 | 4000 | auto |
+|---|---|---|---|---|---|---|
+| `_fog_cornell` | **0.127** | 0.166 | 0.156 | 0.162 | 0.215 | 0.559 |
+| `_fog_thick` | **0.395** | 0.479 | 0.492 | 0.493 | 0.617 | 0.796 |
+| still haze | **0.0123** | 0.0155 | 0.0140 | 0.0159 | 0.0251 | 0.0280 |
+| density field | **0.0157** | 0.0198 | 0.0192 | 0.0212 | 0.0313 | 0.0364 |
+| `_slab_ss` | **0.0227** | 0.0383 | 0.0387 | 0.0409 | 0.0490 | 0.0632 |
+| `_fog_thick`, depth 32 | 0.770 | 0.797 | 0.686 | **0.546** | 0.615 | 0.648 |
+| `_fog_cornell`, depth 32 | 0.474 | 0.509 | 0.510 | **0.466** | 0.539 | 0.829 |
+
+1000 beams is within 15 % of the best map at depth 8 and the best arm at depth 32. At depth 8 no
+beams still wins everywhere; much of that is a fixed cost, not the map's: `_slab_ss` renders 28 K
+samples a minute with no beams and 9 K with any map, 64 beams that almost never merge included,
+the wavefront gather and the inline one alike (JSPEC-CARRIER-SIZE). **`gallery_rain`**
+(`scraps/probe/rain.py`, 640x360, 120 s, two seeds, noise from the seeds' spread): the cloud and
+rain's median block noise 16.5 % with no beams, 16.3 % at 250 beams, 15.3 % at 1000, 16.4 % at
+4000 and 13.0 % under the knee rule (4.7 M sub-beams), which costs the rest of the frame ~12 %
+(202 against 284 spp). Its flyby's frames each average 64 realizations, and at a fixed 1000 beams
+a realization is ~14x sparser than the knee's, so its rain would break into streaks: its render
+scripts pass `-jbeams auto`. **A blurred scene** (check_haze_domain's `far`, a ball keyed +-40 m;
+`scraps/probe/blurtime.py`, 60 s, four GPU seeds, noise from their spread): ball / haze 2.3 / 2.4 %
+with no beams, 3.8 / 3.7 % at 1000 beams, 8.3 / 4.2 % under the knee rule. At check_haze_domain's
+equal sample counts the fixed map's haze is the noisier, J/R per seed 0.96-1.04 against the knee's
++-0.3 %, and unbiased: 0.9999 +- 0.0124 pooled over six GPU seeds. Left with `-jbeams auto`: its probe, below, still misreads an unbounded
+haze (TODO J-AUTO-PROBE). The rest of this entry is how it stood.
 
 **0.434.40's beam domain (J-BEAM-FARLIMIT) removes most of it.** Light subpaths that wander out into
 the haze no longer lay beams far from the scene, so the beams' box is at most the domain's, the
@@ -2317,6 +2348,13 @@ beam gather. The steep 590-610 nm edge suggests a spectral read with too coarse 
 says which. Copy the scene into `scenes/` before working on it.
 
 ## OPEN (2026-10-21): JSPEC-CARRIER-SIZE — every mode-J GPU thread reserves room for a 120-byte spectral carrier per segment and per eye vertex, chromatic scene or not
+
+**What it may cost, measured 2026-11-10 (0.435.0, RTX 4090):** `_slab_ss` at 128x96, 30 s, GPU mode J
+with a 64-beam map (`-jbeams 64`, about zero beam hits a camera segment) renders 4 619 samples
+through the wavefront gather and 5 162 inline (`FTRACE_NOWAVEFRONT=1`), against 14 320 with the beams
+off (`-jbeams off`, mode D's kernel): the beam-capable camera pass costs ~3x a sample on a cheap
+scene whatever the map, the light side only 8 % of it (`[jstats]`). This carrier and the merge
+kernel's other per-thread state are the first suspects (occupancy); a profile would say.
 
 Found by the Opus review of 0.385-0.388. `DJSpec` (render_cuda.cu) is JSPEC's camera carrier: 24
 float bins, a log scale, two flags and the window's wavelength. One rides on every recorded

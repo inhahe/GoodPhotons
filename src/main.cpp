@@ -14050,7 +14050,25 @@ static size_t volCachePrepareForGather(const Scene& scene, BeamMap& bm) {
     return ready;
 }
 static double    g_beamK         = 32.0;   // FLOOR on the gathered count, not a target
+static bool      g_beamKSet      = false;  // was -beamk given? (mode J's -jbeams then defaults to auto)
 static double    g_beamAreaSlack = 1.0;    // ceiling: allowed box-area growth from the kernel
+// MODE J'S BEAM MAP (-jbeams off | auto | <N>). `off`: no beams, mode D's estimator (-nobeams).
+// `auto`: the map sized by the -beamk knee, its radii widened by the -beamk floor, up to
+// -beamcount (the rule bdpt.h's BeamBudgetReq notes describe). `<N>`: N raw beams a light-side
+// realization at the plain -beamblur radii, neither knee nor floor (nor kPathsMin's floor under
+// the subpaths: BeamBudgetReq::exact) -- the default, at 1000. Measured (known-issues
+// J-FIELD-SLOW, 2026-11-10, GPU, 128x96, error against mode D at equal time, with 0.434.40's beam
+// domain): at the default depth 8 no beams wins every fog scene, 1000 beams trails it by 0-30 %
+// and is within 15 % of the best map, the auto rule by 2-4x; at depth 32 1000 beams is the best
+// arm on both fogs (`_fog_thick` 0.55 against no beams' 0.77). The auto rule still wins in a
+// scene whose bounded media need dense maps -- gallery_rain's cloud and rain, ~20 % less noise
+// there for ~12 % more across the rest of its frame -- whose render scripts ask for it. Giving
+// -beamk, -beamcount or -n selects `auto`, so a command line that names any knob of the old rule
+// renders as it did before 0.435.0.
+enum class JBeams { Off, Auto, Fixed };
+static JBeams    g_jBeams        = JBeams::Fixed;
+static bool      g_jBeamsSet     = false;  // was -jbeams given? (else -nobeams, -beamk, -beamcount, -n decide)
+static long long g_jBeamsFixed   = 1000;   // `-jbeams <N>`: raw beams a realization
 // THE LIGHT-SIDE REFRESH — mode J (0.247.0, the UPBP-THICK fix) and mode M (0.252.0, M-FROZEN).
 //
 // Both modes' error is the sum of a camera-side term that `-spp` averages away and a light-side
@@ -14278,9 +14296,10 @@ struct BeamRadiiPin {
 };
 // `pin`, when given: an empty one records the radii the map is built at, a recorded one builds
 // the map at them instead of choosing its own.
+// `floorK` >= 0: the -beamk floor to build with instead of g_beamK (0: none, mode J's fixed map).
 static double buildBeamMap(BeamMap& bm, const char* tag, double work, bool quiet = false,
                            const Scene* vcScene = nullptr, double radScale = 1.0,
-                           BeamRadiiPin* pin = nullptr) {
+                           BeamRadiiPin* pin = nullptr, double floorK = -1.0) {
     // `quiet` exists for mode J's light-side REFRESH (see g_beamFreeze): that rebuilds this
     // map once per progressive epoch, and re-printing the same four-line map description on
     // every rebuild would bury the render's own status lines under a description that has not
@@ -14475,7 +14494,8 @@ static double buildBeamMap(BeamMap& bm, const char* tag, double work, bool quiet
         std::vector<double> medBlur = g_medBeamBlur;
         for (double& b : medBlur) if (b > 0.0) b *= radScale;
         const BeamMap::AutoInfo ai =
-            bm.buildAuto(g_beamBlur * radScale, g_beamK * radScale, g_beamAreaSlack, splitBudget,
+            bm.buildAuto(g_beamBlur * radScale, (floorK >= 0.0 ? floorK : g_beamK) * radScale,
+                         g_beamAreaSlack, splitBudget,
                          g_beamSplitLen, work, /*skipBvh*/ jSkipHostBvh(),
                          medBlur.empty() ? nullptr : &medBlur);   // scene `beam_blur`
         r = bm.radius;
@@ -15434,6 +15454,15 @@ static bool g_beamGather = false;
 // produces a different mode. So mode J defaults it on, and this flag turns it back off —
 // which is exactly what validation gate (1) needs to assert "J minus beams == D".
 static bool g_noBeams = false;
+// Mode J's beam map for this run (see JBeams): -jbeams when given; else -nobeams turns it off,
+// a -beamk, -beamcount or -n asks for the auto rule they tune (-n by turning its budget off,
+// leaving the -beamk floor on), and otherwise the fixed map.
+static JBeams jBeamsMode() {
+    if (g_jBeamsSet) return g_jBeams;
+    if (g_noBeams) return JBeams::Off;
+    if (g_beamKSet || g_beamTargetSet || g_nFromCli) return JBeams::Auto;
+    return g_jBeams;
+}
 
 // -jsurf / -nojsurf: mode J's SECOND merge kind, the point x point surface merge that mode U
 // (VCM) exists to provide. This is the flag that folds U into J — a mode-J render with it on
@@ -20000,8 +20029,9 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
         // (validation gate 1) rather than a special case.
         //
         // Note the flag polarity, which is the REVERSE of modes A/B/M: they need `-beams` to
-        // opt in, mode J needs `-nobeams` to opt out. See g_noBeams for why.
-        const bool wantBeams = !g_noBeams && !scene.media.empty();
+        // opt in, mode J needs `-jbeams off` (or `-nobeams`) to opt out. See g_noBeams for why.
+        const JBeams jBeams = jBeamsMode();
+        const bool wantBeams = jBeams != JBeams::Off && !scene.media.empty();
         // THE SECOND MERGE KIND (-jsurf): point x point on surfaces, i.e. what mode U does.
         // Independent of the beams in both directions — a media-free scene gets surface merges
         // and no beams, a pure-fog scene beams and no surface photons, and a scene with both
@@ -20057,11 +20087,13 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
         if (!wantBeams && !wantSurf)
             std::printf("mode J: %s, so there is nothing to merge against; "
                         "this render is mode D exactly (-jsurf adds surface merges).\n",
-                        g_noBeams ? "-nobeams was given" : "no participating media");
+                        jBeams == JBeams::Off ? "the beams are off (-jbeams off)"
+                                              : "no participating media");
         else if (!wantBeams)
             std::printf("mode J: %s, so the merge half is surface point merges only "
                         "(-jsurf, r=%.4g shrinking at -vcmalpha %.3g).\n",
-                        g_noBeams ? "-nobeams was given" : "no participating media",
+                        jBeams == JBeams::Off ? "the beams are off (-jbeams off)"
+                                              : "no participating media",
                         surfRadius0, g_vcmAlpha);
         warnBeamsGrinMedia(scene, wantBeams);
         // THE THREE OBJECTS THAT MOVE AS A UNIT (see BatchCache): the beam map, the surface
@@ -20228,11 +20260,15 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
             // that ruled one out -- and bdpt.h's note for why 0.243.0 aims at the knee itself
             // rather than below it.
             bdpt::BeamBudgetReq jreq;
-            jreq.maxBeams = (g_nFromCli || !first) ? 0 : g_beamTarget;
+            // A fixed map (-jbeams <N>) is N beams with no knee; `auto` is -beamcount's ceiling
+            // with the -beamk knee under it.
+            const bool fixedMap = jBeams == JBeams::Fixed;
+            jreq.maxBeams = (g_nFromCli || !first) ? 0 : fixedMap ? g_jBeamsFixed : g_beamTarget;
             // Forwarded, not re-defaulted: the pilot's knee is only the real knee if it is
             // measured at the radii buildBeamMap is about to build with.
             jreq.blur     = g_beamBlur;
-            jreq.targetK  = g_beamK;
+            jreq.targetK  = fixedMap ? 0.0 : g_beamK;
+            jreq.exact    = fixedMap;
             // THE SURFACE MAP'S HALF OF THE SAME DECISION (-jsurf). One subpath count feeds two
             // maps, and the arbitration is made HERE because this is where the scene is known:
             //
@@ -20320,6 +20356,13 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
                             "convention), capped at %lld stored photons (-jsurf-count) ...\n",
                             res, resY, camWhere.c_str(), nThreads, maxDepth, lightLabel,
                             jreq.surfPaths, g_jSurfCount);
+            else if (jreq.maxBeams > 0 && fixedMap)
+                std::printf("mode J: UPBP at %dx%d — camera pass on %s, light pass on %d CPU "
+                            "threads (maxDepth=%d, light=%s) — sizing the light pass to a beam "
+                            "map of %lld beams at the -beamblur radii (-jbeams; `-jbeams auto` "
+                            "sizes it by the -beamk knee, `-jbeams off` drops it) ...\n",
+                            res, resY, camWhere.c_str(), nThreads, maxDepth, lightLabel,
+                            jreq.maxBeams);
             else if (jreq.maxBeams > 0)
                 std::printf("mode J: UPBP at %dx%d — camera pass on %s, light pass on %d CPU "
                             "threads (maxDepth=%d, light=%s) — sizing the light pass to a beam "
@@ -20354,7 +20397,11 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
             // the command line named would be exactly the kind of invisible surprise this whole
             // change is about — and the measured rate and knee are the numbers a user needs in
             // order to override the budget sensibly with `-beamcount`, `-beamk` or `-n`.
-            if (first && jbb.pilotPaths)
+            if (first && jbb.pilotPaths && jBeams == JBeams::Fixed)
+                std::printf("mode J: beam map: pilot of %lld subpaths measured %.2f raw "
+                            "beams/subpath -> %lld beams from %lld subpaths (fixed, -jbeams)\n",
+                            jbb.pilotPaths, jbb.beamsPerPath, jbb.budget, jbb.pathsUsed);
+            else if (first && jbb.pilotPaths)
                 std::printf("mode J: beam budget: pilot of %lld subpaths measured %.2f raw "
                             "beams/subpath, -beamk knee at ~%lld beams -> %lld beams from %lld "
                             "subpaths (%s)%s\n",
@@ -20379,7 +20426,8 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
                 if (first) liveWindowPlaceholder(res, resY, "building beam map\xE2\x80\xA6");
                 buildBeamMap(bmap, "mode J:",
                              (double)res * (double)resY * (double)(spp > 0 ? spp : 16),
-                             /*quiet*/!first, &scene, beamRadScaleFor(epoch + lsEpochBase));
+                             /*quiet*/!first, &scene, beamRadScaleFor(epoch + lsEpochBase),
+                             nullptr, jBeams == JBeams::Fixed ? 0.0 : -1.0);
                 // A refresh whose map drew empty measured no radius (the build had no chords to
                 // take a mean free path from), but its merges keep their kappa (renderRows), which
                 // reads the radius: take the radii epoch 0's build would have chosen for this
@@ -22184,6 +22232,14 @@ static void printHelp(const char* prog) {
 "                        UPBP is connections + beam merges, so the map is the mode\n"
 "  -nobeams|-no-beams    turn the beam map OFF. Only meaningful for mode J, where it is on by\n"
 "                        default; a mode-J render without it is mode D exactly (validation)\n"
+"  -jbeams off|auto|<N>  mode J's beam map. <N> (default 1000): exactly N raw beams a light-side\n"
+"                        realization at the -beamblur radii, no -beamk floor or knee. auto: sized\n"
+"                        by the -beamk knee up to -beamcount, radii widened by the floor (the\n"
+"                        rule before 0.435.0; -beamk, -beamcount or -n picks it). off: no\n"
+"                        beams, as -nobeams. Measured on fog scenes: 1000 beams is within 15 %\n"
+"                        of the best map at depth 8 (no beams beats both there) and the best\n"
+"                        arm at -max-bounce 32; auto trails by 2-4x, but wins in dense bounded\n"
+"                        media such as gallery_rain's rain (known-issues J-FIELD-SLOW)\n"
 "  -beamfreeze           modes J and M (alias -lightfreeze): build the light-side cache ONCE, as\n"
 "                        they did before 0.247.0 / 0.252.0. By default both redraw it under a\n"
 "                        fresh salt every few seconds and average the realizations, because the\n"
@@ -23757,7 +23813,10 @@ static int run(int argc, char** argv) {
             g_jSurfCount = (v > 0.0) ? (long long)v : 0;   // 0 = unbounded, at your own risk
             g_jSurf = true;      // naming the ceiling is asking for the merges
         }
-        else if (!std::strcmp(argv[i], "-beamk") && i + 1 < argc) g_beamK = std::atof(argv[++i]);
+        else if (!std::strcmp(argv[i], "-beamk") && i + 1 < argc) {
+            g_beamK = std::atof(argv[++i]);
+            g_beamKSet = true;
+        }
         else if (!std::strcmp(argv[i], "-beamsinmin") && i + 1 < argc) g_beamSinMin = std::atof(argv[++i]);
         else if (!std::strcmp(argv[i], "-beamblur") && i + 1 < argc) g_beamBlur = std::atof(argv[++i]);
         else if (!std::strcmp(argv[i], "-beamareaslack") && i + 1 < argc) g_beamAreaSlack = std::atof(argv[++i]);
@@ -23876,6 +23935,23 @@ static int run(int argc, char** argv) {
         // one once it nears ~100 links.
         if (!std::strcmp(argv[i], "-checkspherequery")) checkSphereQueryOnly = true;
         else if (!std::strcmp(argv[i], "-no-modes") || !std::strcmp(argv[i], "-nomodes")) g_noObjectModes = true;
+        // Mode J's beam map (JBeams); here because segment 2 is full.
+        else if (!std::strcmp(argv[i], "-jbeams") && i + 1 < argc) {
+            const char* v = argv[++i];
+            g_jBeamsSet = true;
+            if (!std::strcmp(v, "off")) g_jBeams = JBeams::Off;
+            else if (!std::strcmp(v, "auto")) g_jBeams = JBeams::Auto;
+            else {
+                char* end = nullptr;
+                const double n = std::strtod(v, &end);
+                if (end == v || *end != '\0' || !(n >= 1.0)) {
+                    std::fprintf(stderr, "-jbeams wants off, auto or a beam count >= 1, not '%s'\n", v);
+                    return 2;
+                }
+                g_jBeams = JBeams::Fixed;
+                g_jBeamsFixed = (long long)n;
+            }
+        }
         // -beamepochs K: mode J's light-side epochs fixed by sample count (see g_beamEpochs).
         else if ((!std::strcmp(argv[i], "-beamepochs") ||
                   !std::strcmp(argv[i], "-lightepochs")) && i + 1 < argc) {

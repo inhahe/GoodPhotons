@@ -278,12 +278,15 @@ argument for standing a groom in a hall of polished objects.*
   surfaces. Beams are **on by default** here (a UPBP render without them is literally mode
   `D`); `-nobeams` turns them off, which reduces mode `J` to mode `D` bit-for-bit. Mode `J`
   builds its beam map from its **own BDPT light subpaths** (0.216.0), so there `-n` counts
-  light subpaths and `-beamcount` does not apply. (`-beamspec` and `-beamachro` *do* apply,
+  light subpaths and `-beamcount` is only the `auto` rule's ceiling. (`-beamspec` and
+  `-beamachro` apply too,
   since 0.251.0 / 0.250.0; 0.257.0 made the bundle survive a diffuse bounce, taking mode `J`'s
-  rain-curtain coverage from 36 % to 75 %.) **Leave `-n` off** (0.242.0): the map now
-  sizes *itself* from a discarded pilot that measures where this scene's `-beamk` knee is —
-  the beam count past which extra beams stop being free — and passing `-n` disables that.
-  Left to itself it beat every hand-picked `-n` on a thick-medium equal-time test. Its absolute
+  rain-curtain coverage from 36 % to 75 %.) **The map's size is `-jbeams`** (0.435.0): by
+  default a fixed 1000 raw beams a light-side realization, which on fog scenes is within 15 % of
+  the best map at the default depth and the best at `-max-bounce 32`; `-jbeams auto` sizes it
+  instead from a discarded pilot that measures where this scene's `-beamk` knee is (the rule
+  since 0.242.0, which still wins in dense bounded media such as `gallery_rain`'s rain, and
+  which `-beamk`, `-beamcount` or `-n` select); `-jbeams off` drops it. Its absolute
   radiance is validated against **closed-form single scattering** (`tools/slab_ss_ref.py` —
   matching to 0.3 %), not only against mode `D`.
   Since 0.258.0 `-jsurf` folds in a **second merge kind** — the surface point merges mode `U`

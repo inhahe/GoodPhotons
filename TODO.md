@@ -129,17 +129,16 @@ Each names the section its line is in.
     0.434.29, the user's option (a); with it J-BEAM-FARLIMIT and REFRESH-EMPTY-STOP.
 19. ~~**GLOSSY-SAMPLE-SITES** (4.4) — the interference factor applied by hand at two dozen sites.~~
     Done 2026-11-06: `drawGlossy` / `dDrawGlossy` return the direction with its factor.
-19a. **J-FIELD-SLOW** (4.5) — mode J in an unbounded density field (found in HAZE-BLUR-DOMAIN's
-    check). Its GPU hit queue no longer spills (0.434.33-36: 2 spp of the field at 32x24, 126 s -> 26 s);
-    0.434.40's beam domain ended the outward ratchet of 0.434.31's beam limit (J-BEAM-FARLIMIT), and
-    the field now renders in seconds. Left: the default budget still loses to small maps and to no
-    beams in every unbounded haze measured (`-jbeams`, 0.435.0, in progress); the measurements and
-    the domain's scale to redo against the domain.
+19a. ~~**J-FIELD-SLOW** (4.5) — mode J in an unbounded density field (found in HAZE-BLUR-DOMAIN's
+    check).~~ Done: the GPU hit queue no longer spills (0.434.33-36), 0.434.40's beam domain ended
+    the outward ratchet of 0.434.31's beam limit (J-BEAM-FARLIMIT) and made the field fast, and
+    0.435.0's `-jbeams` made a fixed 1000-beam map the default. Left: J-AUTO-PROBE (4.5).
 19b. **J-FIELD-SLOW's open ends** (4.3, 4.5), found measuring it 2026-11-09/10: 2 000-beam maps read
     `_fog_thick` 5-8 % bright (a possible bias, or correlated noise from shared seeds: check it
     first); a `-time` budget cannot end a GPU mode D/J chunk; and a wavefront resume pass re-walks
     its segments from the root.
-20. **JSPEC-CARRIER-SIZE** (4.5) — every mode-J GPU thread reserves the spectral carrier.
+20. **JSPEC-CARRIER-SIZE** (4.5) — every mode-J GPU thread reserves the spectral carrier. Measured
+    2026-11-10: with any beam map the GPU camera pass costs ~3x a sample on a cheap scene.
 21. **RADCACHE-BATCHES** (4.5) — `-radcache`'s fixed batches outlast `-stop` and the interval.
     0.434.27: a budget no longer hangs in them and `-stop` lands mid-batch (modes R and P); the
     interval writes and a resume's schedule need a canonical cache merge first (known-issues).
@@ -425,14 +424,18 @@ Then the rest of 4.2-4.6 in their order, 4.7's bookkeeping alongside whatever to
 - [x] **BLUR-EPOCH-COST** (0.434.12) — a blurred clock epoch of mode M or J rebuilt its whole
   light side every 4 samples; it draws what its light side can afford against its gather now, the
   caustic neighbour count scaled with it.
-- [ ] **J-FIELD-SLOW** — mode J in an unbounded density field: `probeGatherCount`'s random chords
-  of the beams' box gather 32 beams where the camera's segments gather 10^4-10^5, so the knee
-  overshoots and the `-beamk` floor fattens the beams. The GPU wavefront no longer spills on it
-  (0.434.33 shrinking waves, 0.434.34 resume passes), and since 0.434.40 the beams end at the
-  scene's beam domain, so the box is compact and the field fast; but the default budget still
-  loses to small fixed maps and to no beams at equal time (0.435.0's `-jbeams`).
+- [x] **J-FIELD-SLOW** (0.434.33-0.435.0) — mode J in an unbounded density field: the wavefront
+  no longer spills, the beams end at the scene's beam domain, and the default map is a fixed 1000
+  beams (`-jbeams`), the knee rule trailing it 2-4x on the fog scenes.
+- [ ] **J-AUTO-PROBE** — what is left of J-FIELD-SLOW under `-jbeams auto`: `probeGatherCount`'s
+  random chords of the beams' box gather 32 beams where a camera segment in an unbounded haze
+  gathers far more, so the knee overshoots. A probe drawn as the camera draws its rays would say
+  whether `auto` can land where the fixed map does; measure with the beam domain's scale (and
+  whether the domain should hold the camera), on `scraps/probe/sweep4.sh`'s scenes.
 - [ ] **JSPEC-CARRIER-SIZE** — every mode-J GPU thread reserves a 120-byte spectral carrier per
-  segment and per eye vertex, chromatic scene or not.
+  segment and per eye vertex, chromatic scene or not. Measured 2026-11-10: on `_slab_ss` a 64-beam
+  map (no merges to speak of) renders a third of the samples `-jbeams off` does, wavefront or
+  inline, the light side 8 % of it; profile the merge kernel's occupancy first.
 - [ ] **RADCACHE-BATCHES** — under `-radcache` a fixed budget's CPU batches follow its samples, not
   the clock: the periodic writes wait, and a resume reschedules. (0.434.27: `-stop` lands
   mid-batch, and a `-time`/`-noise`/`-forever` budget takes the clock instead of hanging.)
