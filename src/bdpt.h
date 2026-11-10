@@ -2511,10 +2511,11 @@ struct BeamBudgetReq {
     //   what a MIS weight cannot read -- the same reason mode J refuses to trim its beams).
     long long surfPaths      = 0;   // subpath target from the surface side; 0 = no opinion
     long long maxSurfPhotons = 0;   // ceiling on STORED surface photons; 0 = unbounded
-    // false: the device draws the surface map itself (cudaJSurfOnDevice) from `surfPaths`
-    // subpaths, so the host pass stores no surface photons and traces only the beams' subpaths
-    // (none with the beams off); its pilot still measures the photons a subpath stores, for the
-    // device's slots and the -jsurf-count ceiling (BeamBudgetInfo::surfPaths, surfPerPath).
+    // false: the device draws the surface map itself (cudaJSurfHostless) -- from `surfPaths`
+    // subpaths where a target names them, else from as many as the pass -- so the host pass stores
+    // no surface photons and traces only what the beams need (none with them off); epoch 0's pilot
+    // still measures the photons a subpath stores, for the device's slots and the -jsurf-count
+    // ceiling (BeamBudgetInfo::surfPaths, surfPerPath; measureSurf).
     bool      hostSurf       = true;
     // Epoch 0 of a device-drawn map: run the pilot for its photon rate (the device's slots) even
     // where no budget asks for one -- an `-n`, which names the pass itself.
@@ -2640,7 +2641,8 @@ inline void traceLightBeamPass(const Scene& scene, const Camera& cam, long long 
                                BeamBudgetReq req = {}, BeamBudgetInfo* budgetOut = nullptr,
                                SurfMap* smOut = nullptr) {
     if (nThreads < 1) nThreads = 1;
-    if (nPaths < 1) nPaths = 1;
+    // Empty only where nothing is the host's to trace: the beams off, the surface map the device's.
+    if (nPaths < 1) nPaths = (req.beamPaths == 0 && !req.hostSurf) ? 0 : 1;
     const long long nPathsAsked = nPaths;
     // "JUPBPLGT" — a salt of its own, so mode J's light pass cannot alias mode M's photon
     // stream or its own render-time streams however the counts line up.
@@ -2673,7 +2675,9 @@ inline void traceLightBeamPass(const Scene& scene, const Camera& cam, long long 
     // ...and the first `surfStore` store surface photons (-1 all): what the -jsurf-count ceiling
     // leaves of the pass, rather than a pass it lowers (which would starve the beams sized on it).
     long long surfStore = req.surfStore;
-    const bool layPilotBeams = (req.beamPaths != 0);     // the beams off: the pilot lays none
+    // The pilot lays beams only where a beam budget asks for their rate: not with the beams off,
+    // nor under an `-n` it runs for a device-drawn map's photon rate alone (measureSurf).
+    const bool layPilotBeams = (req.beamPaths != 0 && req.maxBeams > 0);
     const bool storeSurf = wantSurf && req.hostSurf;      // ...the device draws its own
     std::vector<long long> pilotSurfN((size_t)nThreads, 0);   // the pilot's surface sites
     // ...and its subpaths that laid a beam / stored a photon: the independent samples its rates
@@ -3101,8 +3105,7 @@ inline void traceLightBeamPass(const Scene& scene, const Camera& cam, long long 
     // rather than a beams-only gate.
     // A fixed map and a device-drawn surface map need their rates whatever the count -- at
     // epoch 0, which alone names them (a refresh re-traces its count with no pilot).
-    const bool devSurfAsk = smOut && !req.hostSurf &&
-                            (req.surfPaths > 0 || req.maxBeams > 0 || req.measureSurf);
+    const bool devSurfAsk = smOut && !req.hostSurf && req.measureSurf;
     if ((req.maxBeams > 0 || (smOut && req.maxSurfPhotons > 0) || devSurfAsk) &&
         ((req.exact && req.maxBeams > 0) || devSurfAsk || nPaths > 4 * kPilotMin)) {
         const auto tPilot0 = std::chrono::steady_clock::now();
@@ -3128,17 +3131,25 @@ inline void traceLightBeamPass(const Scene& scene, const Camera& cam, long long 
         };
         auto bankBeams = [&] { size_t n = 0; for (auto& b : banks) n += b.size(); return n; };
         auto sum = [](const std::vector<long long>& v) { long long n = 0; for (long long x : v) n += x; return n; };
-        const bool wantSurfRate = smOut && (devSurfAsk || req.maxSurfPhotons > 0);
+        // Sequential where one rate decides the whole render: a fixed map's beams, and a
+        // device-drawn map's photon slots. The device's photon rate needs only to clear the
+        // 1024-slot floor (devCap) when its 3-sigma bound puts the map under half of it. Never
+        // more pilot subpaths than the pass may trace (-n).
+        const bool needBeams = req.exact && req.maxBeams > 0;
+        const bool needSurf = devSurfAsk;
+        const long long devCount = surfN > 0 ? surfN : nPathsAsked;
+        const long long pilotCap = std::min(kPilotMax, std::max(kPilotMin, nPathsAsked));
         long long nPilot = 0;
-        if (req.exact && req.maxBeams > 0 && envPilot == 0) {
+        if ((needBeams || (needSurf && req.maxBeams == 0)) && envPilot == 0) {
             for (;;) {
                 runPilot(kPilotMin, pilotSeed + (uint64_t)nPilot);
                 nPilot += kPilotMin;
-                const double rate = (double)bankBeams() / (double)nPilot;
-                const bool beamsKnown = sum(pilotBeamPathN) >= kPilotPaths ||
-                                        (rate > 0.0 && (double)req.maxBeams / rate >= (double)nPathsAsked);
-                const bool surfKnown = !wantSurfRate || sum(pilotSurfPathN) >= kPilotPaths;
-                if ((beamsKnown && surfKnown) || nPilot >= kPilotMax || ft::stopRequested()) break;
+                const double sites = (double)sum(pilotSurfN);
+                const double ubSurf = (sites + 3.0 * std::sqrt(sites) + 3.0) / (double)nPilot *
+                                      (double)devCount;
+                const bool beamsKnown = !needBeams || sum(pilotBeamPathN) >= kPilotPaths;
+                const bool surfKnown = !needSurf || sum(pilotSurfPathN) >= kPilotPaths || ubSurf <= 512.0;
+                if ((beamsKnown && surfKnown) || nPilot >= pilotCap || ft::stopRequested()) break;
             }
         } else {
             nPilot = envPilot > 0 ? envPilot : std::clamp(nPaths / 32, kPilotMin, kPilotMax);
@@ -3156,8 +3167,7 @@ inline void traceLightBeamPass(const Scene& scene, const Camera& cam, long long 
         // The pilot COUNTS its surface photons (pilotSurfN, by the store's own test) and stores
         // none: `smOut->nEmitted` is the real pass's emission count, and a pilot photon in the
         // map would put more flux in it than that divides by.
-        size_t pilotSurf = 0;
-        for (long long c : pilotSurfN) pilotSurf += (size_t)c;
+        const size_t pilotSurf = (size_t)sum(pilotSurfN);
         const double surfPerPath = (double)pilotSurf / (double)nPilot;
         // A pilot that deposited NOTHING says the media are hard to reach, not that they are
         // unreachable — leave `nPaths` alone rather than dividing by zero or inflating it to
@@ -3279,7 +3289,10 @@ inline void traceLightBeamPass(const Scene& scene, const Camera& cam, long long 
     // either way: a refresh epoch re-traces exactly `pathsUsed`, so leaving it 0 on the
     // no-pilot path would make every epoch after the first fall back to the raw `-n` default
     // and quietly trace hundreds of times more than epoch 0 did.
-    // A device-drawn surface map leaves the host only the beams' subpaths: none with them off.
+    // A device-drawn map no target names draws as many as the pass (set above where the pilot
+    // ran, before its ceiling; here wherever it did not). It leaves the host only the beams'
+    // subpaths: none with them off.
+    if (smOut && !req.hostSurf && surfN == 0) surfN = nPaths;
     if (smOut && !req.hostSurf && surfN > 0 && beamPaths >= 0) nPaths = beamPaths;
     if (budgetOut) {
         budgetOut->pathsAsked = nPathsAsked;

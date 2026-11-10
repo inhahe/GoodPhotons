@@ -20252,6 +20252,7 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
         // exist, and read by buildLightSide only for epochs >= 1, which run after that.
         bool fixedEpochsOn = false;
         bool refreshSaid   = false;     // the first redraw has announced the refresh
+        bool surfSubsetSaid = false;    // ...and the surface subset it kept (-jsurf-count)
         // A WALL-CLOCK RENDER RESUMED from its sidecar goes on from the light-side realizations
         // its film holds: each new one sits that far down the merge radii's shrink schedule
         // (`lsEpochBase`), and the first is drawn under a salt past every one the loaded samples
@@ -20415,9 +20416,6 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
                                 (!useGpu && !budgetedJ && !blurEpochsJ)
                                     ? "render's work (counted, so the CPU repeats itself)"
                                     : "wall clock");
-                if (firstRedraw && jreq.surfStore >= 0 && jreq.surfStore < Nepoch)
-                    std::printf("mode J:   ...the first %lld of them storing surface photons, as "
-                                "epoch 0's did (-jsurf-count)\n", jreq.surfStore);
                 // Flushed: a log watcher's sign that this run's first refresh began (in a fresh
                 // frame, after epoch 0's samples; tools/check_gpu_stop.py times by it).
                 if (firstRedraw) std::fflush(stdout);
@@ -20434,6 +20432,14 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
                             res, resY, camWhere.c_str(), nThreads, maxDepth, lightLabel,
                             scene.media.empty() ? "no media" : "the beams are off",
                             jreq.surfPaths, g_jSurfCount);
+            else if (!wantBeams)
+                std::printf("mode J: UPBP at %dx%d — camera pass on %s, light pass on %d CPU "
+                            "threads (maxDepth=%d, light=%s) — %s, so the light pass is the "
+                            "SURFACE map's: %lld subpaths (-n)%s ...\n",
+                            res, resY, camWhere.c_str(), nThreads, maxDepth, lightLabel,
+                            scene.media.empty() ? "no media" : "the beams are off",
+                            devSurfJ ? (long long)N : Nepoch,
+                            devSurfJ ? ", drawn on the device" : "");
             else if (jreq.maxBeams > 0 && fixedMap)
                 std::printf("mode J: UPBP at %dx%d — camera pass on %s, light pass on %d CPU "
                             "threads (maxDepth=%d, light=%s) — a beam map of %lld beams at the "
@@ -20441,7 +20447,7 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
                             "knee, `-jbeams off` drops it)%s ...\n",
                             res, resY, camWhere.c_str(), nThreads, maxDepth, lightLabel,
                             jreq.maxBeams,
-                            devSurfJ ? ", the device drawing the SURFACE map (from up to one "
+                            devSurfJ ? ", the device drawing the SURFACE map (from about one "
                                        "subpath per pixel)"
                             : jreq.surfPaths > 0 ? ", from the first of a pass sized for the "
                                                  "SURFACE map (one subpath per pixel)" : "");
@@ -20471,6 +20477,12 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
             bmap.salt = g_rngSalt;   // this realization's salt (saltScope above), for kBeamTr0
             // The count epoch 0 traced (its budget may have lowered N): every refresh's, recorded
             // once -- the pass overwrites jbb.pathsUsed with whatever it traced, a sized epoch's too.
+            // The first refresh says what the -jsurf-count ceiling left it, as it stored it.
+            if (!first && !surfSubsetSaid && wantSurf && !devSurfJ && jreq.surfStore >= 0) {
+                surfSubsetSaid = true;
+                std::printf("mode J:   ...this refresh stored surface photons from %lld of its %lld "
+                            "subpaths, as epoch 0 did (-jsurf-count)\n", smap.nEmitted, Nepoch);
+            }
             if (first) {
                 nAllJ = jbb.pathsUsed;
                 beamPathsJ = jbb.beamPaths;
@@ -20479,7 +20491,16 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
                 jlc.surfCap0 = devSurfJ ? (long long)(2.0 * jbb.surfPerPath * (double)jbb.surfPaths)
                                           + 1024 : 0;
             }
-            if (wantSurf) { smap.devPaths = jlc.surfDev0; smap.devCap = jlc.surfCap0; }
+            if (wantSurf) {
+                // A clock blur's epoch draws fewer subpaths (nBlurJ): the device's draw follows.
+                long long dp = jlc.surfDev0, dc = jlc.surfCap0;
+                if (!first && dp > 0 && NepochAll > 0 && Nepoch < NepochAll) {
+                    const double f = (double)Nepoch / (double)NepochAll;
+                    dp = std::max(1LL, (long long)((double)dp * f));
+                    dc = (long long)((double)dc * f) + 1024;
+                }
+                smap.devPaths = dp; smap.devCap = dc;
+            }
             const double traceSec =
                 std::chrono::duration<double>(std::chrono::steady_clock::now() - tp0).count();
             lsTraceSec += traceSec;
@@ -24633,12 +24654,14 @@ static int run(int argc, char** argv) {
                         c.rule == JBeams::Off ? "off" : "auto");
         // The knee rule's knobs pick it only where no rule is named, so here they do nothing.
         if (c.rule != JBeams::Auto && (g_beamKSet || g_beamTargetSet))
-            std::printf("[mode J] %s does nothing in mode J here: the scene's render block names "
-                        "a %s, which only -jbeams auto overrides into the knee rule it tunes (other "
-                        "modes still use it)\n",
-                        g_beamKSet && g_beamTargetSet ? "-beamk and -beamcount"
-                                                      : g_beamKSet ? "-beamk" : "-beamcount",
-                        c.rule == JBeams::Off ? "map with no beams" : "fixed beam map");
+            std::printf("[mode J] %s nothing in mode J here: the scene's render block names a "
+                        "%s, which only -jbeams auto overrides into the knee rule %s (other modes "
+                        "still use %s)\n",
+                        g_beamKSet && g_beamTargetSet ? "-beamk and -beamcount do"
+                                                      : g_beamKSet ? "-beamk does" : "-beamcount does",
+                        c.rule == JBeams::Off ? "map with no beams" : "fixed beam map",
+                        g_beamKSet && g_beamTargetSet ? "they tune" : "it tunes",
+                        g_beamKSet && g_beamTargetSet ? "them" : "it");
     }
     if (!g_modeSppCli && (ftslScene.modeSppD > 0.0 || ftslScene.modeSppJ > 0.0)) {
         if (ftslScene.modeSppD > 0.0) g_modeSppD = ftslScene.modeSppD;

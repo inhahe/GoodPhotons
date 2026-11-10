@@ -204,8 +204,8 @@ def main():
                                                s1.group(1) if s1 else "?"))
     rc, log, _ = run("ceil_refresh", ["-jbeams", "auto", "-jsurf-count", "40", "-spp", "4",
                                       "-beamepochs", "4"])
-    s, r = SURF.search(log), re.search(r"the first (\d+) of them storing surface photons", log)
-    check("...and every refresh keeps epoch 0's surface subset",
+    s, r = SURF.search(log), re.search(r"this refresh stored surface photons from (\d+) of its", log)
+    check("...and the refreshes store epoch 0's surface subset",
           rc == 0 and s is not None and r is not None and r.group(1) == s.group(1),
           "epoch 0 %s, refresh %s" % (s.group(1) if s else "?", r.group(1) if r else "?"))
     ftsl_fix = fogbox.write(d, "still_fix.ftsl", text + NL + "render { jbeams 64 }" + NL)
@@ -219,7 +219,9 @@ def main():
         g = DEVSURF.search(log)
         check("GPU -jbeams off -n 20000: the device draws the surface map from -n's subpaths",
               rc == 0 and g is not None and g.group(1) == "20000" and "Point merges ON" in log
-              and "surface photon map is empty" not in log, "rc %d" % rc)
+              and "surface photon map is empty" not in log
+              and "the light pass is the SURFACE map's: 20000 subpaths (-n), drawn on the device" in log
+              and "for the beam map" not in log, "rc %d" % rc)
         rc, log, _ = run("gpu_auto", ["-jbeams", "auto"], dev="gpu")
         g, t = DEVSURF.search(log), TRACED.search(log)
         check("GPU -jbeams auto: the device draws the surface map from the knee's pass",
