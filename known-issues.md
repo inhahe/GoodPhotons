@@ -750,6 +750,21 @@ scenes.
 
 ## OPEN (2026-11-07, 0.434.30, performance; narrowed 0.434.33-34): J-FIELD-SLOW — mode J in an unbounded density field runs ~8 s a sample at 96x72
 
+**0.434.40's beam domain (J-BEAM-FARLIMIT) removes most of it.** Light subpaths that wander out into
+the haze no longer lay beams far from the scene, so the beams' box is at most the domain's, the
+pilot's random chords measure a compact map, and the `-beamk` floor stops fattening it. The field
+at 48x36 under `-beamepochs spp`: 8 samples in 0.52 s, where 0.434.39 took tens of seconds a
+sample (check_gpu_stop had to move to 960x720 and a fixed `-n 30000` map to find a sample slow
+enough to cut). At 96x72 GPU mode J renders 256 samples in 37 s and the CPU 32 in 7 s, so
+check_haze_domain renders `field` in mode J on both devices at 1024 and dropped `fieldlo`.
+`_fog_cornell`'s defaults at 128x96 / 60 s: 1.12 M sub-beams (0.434.39 7.0 M), 288-332 spp (15),
+relRMSE 0.63 (2.90). That is still far behind `-nobeams`' 0.137 and a 500-beam map's 0.174 (both
+measured on 0.434.39, below), so the budget question stands; the measurements below predate the
+domain and are to be redone against it. A blur's domain holds the movers' sweep, so check_haze_domain's
+farfield (a mover 32 m out) still builds long beams: ~0.6 s a sample at 96x72 on the GPU. The
+domain's scale (`FTRACE_JBEAMDOMAIN`, 8) is now an efficiency choice alone, to measure with the
+budget.
+
 **Diagnosed 2026-11-08; half fixed in 0.434.33.** Not the density field itself: at 32x24 and 1 spp on
 the GPU, the field took 61 s against the homogeneous haze's 3 s, but 2 s with `-beamk 8` or with
 `-beamcount 200000`, and 53 s with the host SAH tree in place of the device's LBVH. The GPU's
@@ -775,6 +790,66 @@ exceeds the 2^25-hit queue. Saving each deferred segment's traversal stack in a 
 side store (with the re-walk as the fallback when it fills) would remove that; whether it is
 worth its code depends on the fix below, which should make such maps rare -- measure overflow on
 the reference scenes after it, and build the saved-stack resume if any still overflow.
+
+**Measured 2026-11-09 (0.434.39, GPU): at 128x96 and 60 s, mode J's default beam budget loses to
+every smaller map, and every map loses to no beams at all.** Whole-image relative RMSE against
+10-minute mode D references (mode J's path space and depth; mode R references count paths past J's
+default depth 8 and read 5 % brighter on `_fog_cornell`, 8x on `_fog_thick`), two seeds, each arm
+`-beamk 0 -beamcount N` (N raw beams at the raw `-beamblur` radii) beside the shipped defaults and
+`-nobeams` (scripts in `scraps/probe/`: `sweep.py`, `refsD.sh`, `sweeps.sh`):
+
+| scene | -nobeams | 250 | 500 | 1000 | 2000 | 8000 | 32000 | 128000 | 512000 | default |
+|---|---|---|---|---|---|---|---|---|---|---|
+| `_fog_cornell` | **0.137** | 0.159 | 0.174 | 0.169 | 0.195 | 0.285 | 0.580 | 1.18 | 2.57 | 2.90 |
+| `_fog_thick` | **0.363** | 0.416 | 0.487 | 0.514 | 0.426 | 0.769 | 0.849 | 1.16 | 0.877 | 0.614 |
+| still haze | **0.012** | 0.014 | 0.014 | 0.016 | 0.022 | 0.031 | 0.046 | 0.116 | 0.424 | 0.384 |
+| density field | **0.019** | 0.020 | 0.020 | 0.021 | 0.027 | 0.040 | 0.065 | 0.166 | 0.586 | 1.15 |
+| `_slab_ss` | **0.022** | 0.040 | 0.040 | 0.040 | 0.049 | 0.052 | 0.078 | 0.127 | 0.253 | 0.063 |
+
+The defaults build 7-8 M sub-beams on the unbounded hazes (the floor and knee read through the
+skewed probe below), which cut the samples a minute 100-3000 fold: 8 spp in 60 s on the still haze
+against 15 500 with no beams. Even `_fog_thick`, the scene built to show where beams win, renders
+best without them at this size. Not yet a verdict on the default: at 128x96 the light side, redrawn
+every epoch, is large against the camera pass, which handicaps any map; the same arms are being
+measured at 512x384 / 120 s (refD512, `hires.sh`) before anything changes.
+
+**At 512x384 / 120 s the verdict holds, wider** (refD512, 20-minute mode D references): `-nobeams`
+0.86 / 0.36 / 0.037 on `_fog_thick` / `_fog_cornell` / the field, 500 beams 1.27 / 0.79 / 0.060,
+2000 beams 1.46 / 0.92 / 0.104, the defaults 3.77 / 7.35 / (one sample ran >55 min). **Where a small
+map's time goes** (`_fog_cornell` 512x384, 60 s, `scraps/probe/prof/`): `-nobeams` 472 spp, 500 beams
+85 spp, 0.12 s against 0.68 s a sample. The light side is 5 % of either; the camera walk the same
+(0.7 s for epoch 0's 5 spp); the difference is `kWfBeamHits`, 3.6 s of epoch 0's 4.4 s wave loop
+for ~2.5 hits a camera segment -- the walk enters about a hundred sub-beam boxes for each beam it
+hits (long beams through an unbounded fog, their boxes overlapping along every camera ray). The
+host SAH tree is far worse than the device LBVH there (`FTRACE_JLBVH=0`: 24.5 s, 27 spp), and the
+inline gather worse still (`FTRACE_NOWAVEFRONT=1`: 28 spp).
+
+**But at `-max-bounce 32` the beams pay on the thick medium** (refD32, 10-minute mode D references at
+depth 32; 128x96 / 60 s), as design.md's 0.262.0 measurement (J 3x ahead of D on `_fog_thick` at
+depth 32, 1.4x behind at 8) says they should: `_fog_thick` -nobeams 0.754, 500 beams 0.569, 2000
+beams **0.485**, 8000 0.598, 32000 0.601, defaults 0.674 -- the camera walk dominating a sample at
+that depth, the beams cost little (219 against 257 spp). `_fog_cornell` (thin, unbounded) at depth
+32: -nobeams **0.528**, 500 beams 0.544, 2000 0.643, 32000 0.888, defaults 4.40 (6 spp). So the beams
+should stay on; what is wrong is the budget: small maps (~500-2000 raw beams) are near the optimum
+in every scene at both depths, the defaults far above it. **Per sample** (256 spp, 128x96, depth
+8, `perspp.py`): the beams barely lower the error at depth 8 (relMAE on `_fog_thick` 0.221 without,
+0.20 with 8000 beams, 0.29-0.33 with 2000 beams, which also read 5-8 % bright across kernel widths
+-- shared seeds, so possibly correlated firefly noise; to be checked).
+
+**Part of it is a regression since v0.389.4** (the last published release): the same `_fog_cornell`
+defaults at 128x96 / 60 s give v0.389.4 a 264 880-beam knee, 6.1 M sub-beams, the floor not binding
+(probe 35.1), 46 spp, relMAE 0.18; 0.434.39 a 442 061-beam knee, 7.0 M sub-beams, the floor
+widening the radii (probe 22.1), 15 spp, relMAE 0.32. The beams per subpath are the same (6.01) and
+their tight box area nearly doubled (5.4e6 to 9.8e6 m^2): the beams got longer. Suspect 0.434.29 /
+0.434.31 (J-BEAM-FARLIMIT: a mode J beam in an unbounded medium runs to the far side of the swept
+sphere, not 8 scene radii), being bisected.
+
+**A `-time` budget cannot end a GPU chunk.** A GPU mode D/J chunk is at least one sample of the
+whole frame, and the budget is read between chunks (gpuSppChunks); `-stop` cuts a chunk short
+(DeviceStopScope), the clock does not. With the defaults the field at 512x384 ran one chunk for over
+55 minutes against `-time 120` (stopped by hand). Proper fix, with the budget fix below making such
+chunks rare: let a chunk be part of a sample (a range of pixel slots, as mode M's gather slices
+its samples), so the budget and the progress reports land every ~0.15 s whatever a sample costs.
 
 **Still open: the budget's probes do not measure what the camera gathers.** `probeGatherCount`
 draws chords between random points of the beams' bounding box. Each gathers 32 beams by
@@ -807,6 +882,38 @@ of the swept sphere; 0.434.31, after review -- 0.434.29 took 8 times the swept r
 the map's BVH up for haze far outside anything seen); a still scene's limit is as before. Mode
 M keeps the instant's: its forward photons light the haze only near the scene by design
 (HAZE-SUN-B), and a blur must not widen it.
+
+**That limit was itself a regression, fixed in 0.434.40.** `exitDistance(o)` bounds a beam by its
+origin's distance from the sphere (`|centre - o| + R`), whatever the beam's direction, and in an
+unbounded haze light subpaths wander outward: a vertex far out got a longer limit, its next beam
+reached further, and the map's beams ratcheted outward in every unbounded haze, still or not (the
+commit's "a still scene's exit lies well inside the limit" holds only for vertices near the
+scene; check_bitid has no unbounded haze). Found bisecting J-FIELD-SLOW: on `_fog_cornell`'s
+defaults the beams' tight box area went from 5.4e6 to 9.8e6 m^2 between 0.434.28 and 0.434.31,
+the knee from 264 880 to 442 061 beams, the probe from 35.1 (floor not binding) to 22.1 (floor
+widening every radius), and the render from 77 to 18 spp a minute at 128x96 (relMAE 0.147 to
+0.278).
+
+**So 0.434.40 replaces the length with a region, and tells the MIS weights where it is.** The
+first fix tried, a limit measured along the beam (the distance to leave that sphere heading as the
+beam heads), stopped the ratchet but failed check_haze_domain's far case: the haze there read J/R
+0.978 +- 0.001 on the CPU and 0.980 +- 0.002 on the GPU, the ball passing. That was the cause this
+entry began with, seen from the other side: the weights counted a merge at any medium vertex of a
+path, wherever it lay, while the beams were clamped, so wherever a beam ended short of a vertex the
+weights still gave the missing merge its share, and the image there lost it. exitDistance's limit
+was generous enough to hide it on that scene, at the price of the ratchet; every length limit is
+biased somewhere while the weights ignore it. Now mode J clips an unbounded medium's beams to one
+fixed sphere, the scene's **beam domain** (`Scene::jBeamMerges`: about the scene's centre, 8 x
+`sweptReach`, which under a blur holds every mover's sweep), and every beam-merge term of the MIS
+weights -- `mergeEtaPrimeBeam`, a beam's `etaPrev`, `ChromaMis::beamEta1` and the camera side's
+`etaKCoef`, and their device twins `dMergeEtaPrime`, `dChromaBeamEta1` and the wavefront's
+`etaKCoef` -- counts a merge in an unbounded medium only inside it. Outside, the connections render
+the haze alone, as in mode D. The region is the same at every time and on both sides of a merge,
+so its size changes the noise, never the expectation (`FTRACE_JBEAMDOMAIN=<scale>` overrides the
+8). Bounded media are untouched (check_bitid: identical), as is mode M, which has no MIS.
+check_haze_domain's far case reads haze J/R 1.0043 (CPU) and 1.0056 (GPU); its new `stilldom` case
+shrinks the domain to half the scene's radius, the ball and nearly all the haze outside it, and
+holds mode J to mode R there too (ball 0.991 / 1.009, haze 1.000 / 1.002).
 
 ## DONE (2026-11-07, 0.434.29): REFRESH-EMPTY-STOP — modes J and M stopped a render on an empty but ordinary light-side refresh, and then wrote no image
 

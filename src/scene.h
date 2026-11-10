@@ -2745,6 +2745,39 @@ struct Scene {
         if (sweptQuery()) return length(sweptCenter - p) + sweptRadius;
         return mediaExitDistance(p);
     }
+    // MODE J'S BEAM DOMAIN (J-BEAM-FARLIMIT). A beam in an unbounded medium needs an end -- an
+    // escaping light subpath's would otherwise be 1e30 long -- and wherever it ends, the merges
+    // past the end do not exist. The MIS weights must know that, or they give a merge that cannot
+    // happen its share of every path through that haze, and the image is dark there by that share.
+    // So the end is a region, not a length: a sphere about sceneCenter, kJBeamDomainScale times
+    // sweptReach (the radius that holds everything a path at any time may meet). Mode J clips an
+    // unbounded medium's beams to it (Renderer::emitBeams, `jDomain`), and its weights count a
+    // beam merge in an unbounded medium only inside it (jBeamMerges; device twin dJBeamMerges).
+    // One fixed region, the same at every time and on both sides of the merge, so its size is a
+    // matter of speed alone: outside it the connections render the haze, as mode D does.
+    // (A length along each beam could not be both: a limit by distance from the beam's origin
+    // grew with every step a subpath wandered outward, and one measured along the beam ended
+    // beams the weights still counted merges on.) FTRACE_JBEAMDOMAIN=<scale> overrides the scale.
+    static constexpr double kJBeamDomainScale = 8.0;
+    double jBeamDomainR2 = 0.0;   // the domain's radius, squared (build())
+    // Can a mode J beam merge happen at p, a scattering point in medium `md`? Everywhere in a
+    // bounded medium, whose beams are never clipped; in an unbounded one, inside the domain.
+    bool jBeamMerges(const Medium& md, const Vec3& p) const {
+        if (md.bounded) return true;
+        const Vec3 q = p - sceneCenter;
+        return dot(q, q) <= jBeamDomainR2;
+    }
+    // Clip [ta, tb] of the ray o + t d (d unit) to the domain; false if nothing is left.
+    bool jBeamDomainClip(const Vec3& o, const Vec3& d, double& ta, double& tb) const {
+        const Vec3 q = o - sceneCenter;
+        const double b = dot(q, d), c = dot(q, q) - jBeamDomainR2;
+        const double disc = b * b - c;
+        if (!(disc > 0.0)) return false;
+        const double s = std::sqrt(disc);
+        ta = std::max(ta, -b - s);
+        tb = std::min(tb, -b + s);
+        return tb > ta;
+    }
     // Where a sky or sun photon starting at `origin` on its entry disc, travelling `dir`, starts
     // meeting media; false to drop it. With a time in a moving scene that disc is the swept one
     // (lightRadius()), wider than the instant's and further out, and the haze the still scene's
@@ -4211,6 +4244,13 @@ struct Scene {
                 sceneRadius = 1.0;
                 sweptReach = 1.0;
             }
+        }
+        {
+            double k = kJBeamDomainScale;
+            if (const char* e = std::getenv("FTRACE_JBEAMDOMAIN"))
+                if (std::atof(e) > 0.0) k = std::atof(e);
+            const double r = k * std::max({sweptReach, sceneRadius, 1e-3});
+            jBeamDomainR2 = r * r;
         }
         // Distant suns are sized by the same bounding sphere: a photon is born on a
         // disc of radius R perpendicular to its (cone-sampled) travel direction, so the

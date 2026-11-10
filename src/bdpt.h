@@ -1023,7 +1023,7 @@ inline void randomWalk(const Scene& scene, const Camera& cam, const Renderer& ma
         // IMPORTANCE walk's are the spans that get deposited AS beams. `dSurf` is 1e30 on
         // an escaping ray — which the camera side hands to a BVH gather that clips it to
         // the beams that actually exist, and the light side hands to emitBeams, which
-        // clamps it (mode J's: to everything the path could meet, `farToExit`). So neither
+        // clamps it (mode J's: to the scene's beam domain, Scene::jBeamMerges). So neither
         // needs a special case for a ray that leaves the scene through a medium.
         if (segs) {
             PathSeg sg;
@@ -2274,6 +2274,8 @@ inline double mergeEtaPrimeBeam(const Scene& scene, const Vec3& pPrev, const Ver
     if (v.type != VType::Medium) return 0.0;
     if (v.mediumId < 0 || v.mediumId >= (int)scene.media.size()) return 0.0;
     if (!(pLight > 0.0)) return 0.0;                 // callers pass mergeLightDensity (0.387.0)
+    // No beam reaches past the scene's beam domain in an unbounded medium, so no merge either.
+    if (!scene.jBeamMerges(scene.media[v.mediumId], v.p)) return 0.0;
     Vec3 din = v.p - pPrev;
     const double dl = std::sqrt(dot(din, din));
     if (!(dl > 0.0)) return 0.0;
@@ -2803,7 +2805,7 @@ inline void traceLightBeamPass(const Scene& scene, const Camera& cam, long long 
                                kBeamOrderUnknown,
                                Renderer::MedAll, lamS, nSec, cie, dEm,
                                nSec > 0 ? wsBuf : nullptr, bs.ok ? bs.emIdx : -1, -1,
-                               /*farToExit*/true);
+                               /*jDomain*/true);
             };
 
             // --- The light half of every merge weight this subpath can take part in -------
@@ -2958,7 +2960,7 @@ inline void traceLightBeamPass(const Scene& scene, const Camera& cam, long long 
                                  ? (float)yPl : 0.0f;
                 if (y.type == VType::Medium && j >= 1 && j < np &&
                     y.mediumId >= 0 && y.mediumId < (int)scene.media.size() &&
-                    yPl > 0.0) {
+                    yPl > 0.0 && scene.jBeamMerges(scene.media[y.mediumId], y.p)) {
                     Vec3 din = y.p - path[j - 1].p;
                     const double dl = std::sqrt(dot(din, din));
                     if (dl > 0.0) {
@@ -4400,6 +4402,7 @@ struct ChromaMis {
                   const Vec3& dout, double dn, double* out) const {
         for (int b = 0; b < K; ++b) out[b] = 0.0;
         if (v.type != VType::Medium || v.mediumId < 0 || v.mediumId >= M || !(dn > 0.0)) return;
+        if (!scene.jBeamMerges(scene.media[(size_t)v.mediumId], v.p)) return;
         const double c = dot(a, dout);
         const double s2 = 1.0 - c * c;
         if (!(s2 > 0.0)) return;
@@ -4966,7 +4969,8 @@ struct BdptRenderer {
                                 // here rather than in the per-hit weight.
                                 if (k >= 1 && k < (size_t)nE &&
                                     vk.type == VType::Medium && vk.mediumId >= 0 &&
-                                    vk.mediumId < (int)scene.media.size()) {
+                                    vk.mediumId < (int)scene.media.size() &&
+                                    scene.jBeamMerges(scene.media[vk.mediumId], vk.p)) {
                                     Vec3 dp = eye[k - 1].p - vk.p;
                                     const double dn = std::sqrt(dot(dp, dp));
                                     if (dn > 0.0) {

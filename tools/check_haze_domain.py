@@ -5,16 +5,21 @@
 
 A white ball of radius 1 under `light sun` in `medium { sigma_t 0.04  albedo 0.5 }` with no
 bounds, beside a 2x2 floor; and, held still, the same with a bounded cloud the sun's first leg
-crosses, and with the haze a density field instead (that also held 32 m out, in mode D, and at
-32x24 for mode J on the GPU). Mode R's NEE leg dims the sun by the haze out to the instant's
+crosses, and with the haze a density field instead (that also held 32 m out under a blur). Mode
+R's NEE leg dims the sun by the haze out to the instant's
 sphere (Scene::mediaExitDistance: |centre - p| + sceneRadius); a light subpath of modes D and J
 walks it from the entry disc's plane, never as far. Before the subpaths took the NEE leg's haze
 (sunLegFactor, the user's option (a)), D read the ball 1.75 % bright still, 0.3 % with the ball
-held by a shutter at x = 6.4 outside the instant's sphere, and 2.75 % at x = 32. Each case
-renders mode R and the mode under test, two seeds each (six for the noisy `fieldlo`), and
-requires the ball's mean and the haze's (the top corners) to agree within 0.6 % (D) or 1.5 %
-(J, whose beam merges are noisier), or within four of their standard errors from the seeds'
-spread (five with six seeds), whichever is wider.
+held by a shutter at x = 6.4 outside the instant's sphere, and 2.75 % at x = 32.
+
+`stilldom` is `still` in mode J with its beam domain shrunk to half the scene's radius
+(FTRACE_JBEAMDOMAIN=0.5; Scene::jBeamMerges), the ball and nearly all the haze outside it: the
+beams end there, and the MIS weights must leave the merges out past it, the connections rendering
+the haze alone. A weight that still counted them read dark by their share (J-BEAM-FARLIMIT).
+
+Each case renders mode R and the mode under test, two seeds each, and requires the ball's mean and
+the haze's (the top corners) to agree within 0.6 % (D) or 1.5 % (J, whose beam merges are
+noisier), or within four of their standard errors from the seeds' spread, whichever is wider.
 
 Exits 1 on any failure.
 """
@@ -27,10 +32,11 @@ import numpy as np
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 NL = chr(10)
-FIELDLO_GPU_J_SPP = 4     # fieldlo, GPU mode J: ~50 s a seed (0.434.36)...
-FIELDLO_GPU_J_SEEDS = 6   # ...and six of them, of R too: its noise is above the tolerance
 FIELD = ('medium { sigma_t 0.06  albedo 0.5  density "0.3 + 0.7*saturate(1.0 - y/8.0)"  '
          'density_max 1 }')
+# Per-case environment, and the case whose mode R renders stand for its own (R ignores ENV).
+ENV = {"stilldom": {"FTRACE_JBEAMDOMAIN": "0.5"}}
+REF_OF = {"stilldom": "still"}
 
 
 def scene(still, keys=8.0, at=6.4, medium="medium { sigma_t 0.04  albedo 0.5 }", extra="",
@@ -75,32 +81,30 @@ def main():
                                          "bounds { min 5.4 2.6 -1  max 7.4 3.4 1 } }"),
               # a density field with no bounds: the factor drawn by the medium's own estimator
               "field": scene(True, medium=FIELD),
-              # ...the same at 32x24, for mode J on the GPU: its map yields ~1e5 hits a camera
-              # path, which overfills the wavefront's hit queue and exercises the resume passes
-              "fieldlo": scene(True, medium=FIELD, res=(32, 24)),
               # ...and held 32 m out under a blur, where the walk began further out than the NEE
-              # leg reaches: the factor's inverse, by quadrature (mode D only: J-FIELD-SLOW)
-              "farfield": scene(False, 40.0, 32.0, medium=FIELD)}
+              # leg reaches: the factor's inverse, by quadrature (HAZE-BLUR-INVERSE-TR)
+              "farfield": scene(False, 40.0, 32.0, medium=FIELD),
+              # `still` with mode J's beam domain shrunk inside the scene (ENV); R is still's
+              "stilldom": scene(True)}
     for name, text in scenes.items():
         with open(os.path.join(d, name + ".ftsl"), "w", encoding="utf-8", newline="") as f:
             f.write(text)
     fails = []
 
     def spp_for(name, mode, dev):
-        """Samples per pixel for one case, or None to skip it. Mode J in an unbounded density
-        field is slow (J-FIELD-SLOW): ~14 s a sample at 96x72 on the CPU, and on the GPU ~13 s a
-        sample at 32x24 (0.434.36), so the CPU renders `field` and the GPU `fieldlo`."""
+        """Samples per pixel for one case, or None to skip it. Mode J in the blurred density
+        field, its beam domain holding the 40 m sweep, is the slow one: ~0.6 s a sample on the GPU
+        and 0.5 s on the CPU (0.434.40), so 256. `stilldom` exists for mode J alone."""
         if mode == "R":
             return 512
-        if name == "farfield" and mode == "J":
+        if name == "stilldom" and mode != "J":
             return None
-        if name == "field" and mode == "J":
-            return 32 if dev == "cpu" else None
-        if name == "fieldlo":
-            return FIELDLO_GPU_J_SPP if (mode == "J" and dev == "gpu") else None
+        if name == "farfield" and mode == "J":
+            return 256
         return 512 if mode == "D" else 1024
 
     def render(name, mode, dev, seed):
+        name = REF_OF.get(name, name) if mode == "R" else name   # R ignores ENV: share it
         tag = "%s_%s_%s_s%d" % (name, mode, dev, seed)
         png = os.path.join(d, tag + ".png")
         spp = str(spp_for(name, mode, dev))
@@ -109,7 +113,8 @@ def main():
                 os.remove(stale)
         cmd = [exe, "-in", os.path.join(d, name + ".ftsl"), "-mode", mode, "-device", dev,
                "-spp", spp, "-seed", str(seed), "-hdr", "-no-meter", "-window-min", "-o", png]
-        p = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
+        p = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace",
+                           env=dict(os.environ, **ENV.get(name, {})))
         if p.returncode != 0:
             print((p.stdout + p.stderr)[-1200:])
             raise SystemExit("render failed: " + " ".join(cmd))
@@ -124,8 +129,8 @@ def main():
                 case = "%s_%s_%s" % (name, mode, dev)
                 if (only and case not in only) or spp_for(name, mode, dev) is None:
                     continue
-                key = (name, dev)
-                k = FIELDLO_GPU_J_SEEDS if name == "fieldlo" else 2
+                key = (REF_OF.get(name, name), dev)
+                k = 2
                 if key not in refs:
                     refs[key] = [render(name, "R", dev, s) for s in range(1, k + 1)]
                 R = refs[key]
@@ -140,15 +145,13 @@ def main():
                     v = [x[m].mean() for x in X]
                     ratio = np.mean(v) / np.mean(r)
                     # The ratio's standard error from the seeds' spread. Two seeds give it one
-                    # degree of freedom, a statistic as heavy-tailed as Cauchy's: harmless where
-                    # the noise is under the tolerance, which then decides, but where it is over
-                    # (fieldlo's 4 spp at 32x24) four of them would fail a correct binary one
-                    # run in six. So a noisy case takes six seeds of each mode, the mode under
-                    # test's and R's, and a bound of 5: under P(|t5| > 5) = 0.4 % a region (their
-                    # pooled dof is between 5 and 10), so under 1 % for the case's two.
+                    # degree of freedom, a statistic as heavy-tailed as Cauchy's: harmless while
+                    # every case's noise is under the tolerance, which then decides. A case whose
+                    # noise is over it needs more seeds of both modes and a bound to match (0.434.36
+                    # used six and 5 for a 4-spp case: under P(|t5| > 5) = 0.4 % a region).
                     se = np.hypot(np.std(v, ddof=1) / np.sqrt(len(v)) / np.mean(v),
                                   np.std(r, ddof=1) / np.sqrt(len(r)) / np.mean(r))
-                    q = 4.0 if len(v) <= 2 else 5.0
+                    q = 4.0
                     ok = abs(ratio - 1.0) < max(tol, q * se)
                     print("%-22s %-5s %s/R %.4f (+-%.4f)  %s" % (case, region, mode, ratio, se,
                                                               "ok" if ok else "FAIL"))

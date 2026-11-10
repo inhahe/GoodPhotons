@@ -131,7 +131,10 @@ Each names the section its line is in.
     Done 2026-11-06: `drawGlossy` / `dDrawGlossy` return the direction with its factor.
 19a. **J-FIELD-SLOW** (4.5) — mode J in an unbounded density field (found in HAZE-BLUR-DOMAIN's
     check). Its GPU hit queue no longer spills (0.434.33-36: 2 spp of the field at 32x24, 126 s -> 26 s);
-    left: the beam budget's probes overshoot the knee, and fattened beams make every walk long.
+    0.434.40's beam domain ended the outward ratchet of 0.434.31's beam limit (J-BEAM-FARLIMIT), and
+    the field now renders in seconds. Left: the default budget still loses to small maps and to no
+    beams in every unbounded haze measured (`-jbeams`, 0.435.0, in progress); the measurements and
+    the domain's scale to redo against the domain.
 19b. **J-FIELD-SLOW's open ends** (4.3, 4.5), found measuring it 2026-11-09/10: 2 000-beam maps read
     `_fog_thick` 5-8 % bright (a possible bias, or correlated noise from shared seeds: check it
     first); a `-time` budget cannot end a GPU mode D/J chunk; and a wavefront resume pass re-walks
@@ -422,7 +425,9 @@ Then the rest of 4.2-4.6 in their order, 4.7's bookkeeping alongside whatever to
 - [ ] **J-FIELD-SLOW** — mode J in an unbounded density field: `probeGatherCount`'s random chords
   of the beams' box gather 32 beams where the camera's segments gather 10^4-10^5, so the knee
   overshoots and the `-beamk` floor fattens the beams. The GPU wavefront no longer spills on it
-  (0.434.33 shrinking waves, 0.434.34 resume passes); the walk is still one thread a segment.
+  (0.434.33 shrinking waves, 0.434.34 resume passes), and since 0.434.40 the beams end at the
+  scene's beam domain, so the box is compact and the field fast; but the default budget still
+  loses to small fixed maps and to no beams at equal time (0.435.0's `-jbeams`).
 - [ ] **JSPEC-CARRIER-SIZE** — every mode-J GPU thread reserves a 120-byte spectral carrier per
   segment and per eye vertex, chromatic scene or not.
 - [ ] **RADCACHE-BATCHES** — under `-radcache` a fixed budget's CPU batches follow its samples, not

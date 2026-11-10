@@ -1490,6 +1490,8 @@ struct DScene {
     DVec3  sensorOrigin, sensorUAxis, sensorVAxis;   // model A contact sensor plane
     DVec3  sceneCenter;              // env (shape==3): bounding-sphere center
     double sceneRadius;              // env (shape==3): bounding-sphere radius
+    double jBeamDomR2;               // mode J's beam domain about sceneCenter, radius squared
+                                     // (host twin Scene::jBeamDomainR2; dJBeamMerges)
     // `cavity` pattern variable (O3 stage 2) — twins of Scene::needsCavity /
     // cavityRadius / cavitySamples. needsCavity is the load-time "does any material
     // actually read `cavity`?" gate: it is 0 for essentially every scene, and every
@@ -13850,6 +13852,14 @@ __device__ static inline Real dVertFiberStep(const DScene& sc, const DVertex& v,
     return dVertOnStrand(sc, v) ? dHairChordExit(v.fiberR, v.ns, v.tangent, w) : (Real)0;
 }
 
+// Can a mode J beam merge happen at p, a scattering point in medium md (host twin
+// Scene::jBeamMerges)? Everywhere in a bounded medium; in an unbounded one, only inside the
+// scene's beam domain, the region the host clips that medium's beams to.
+__device__ static inline bool dJBeamMerges(const DScene& sc, const DMedium& md, const DVec3& p) {
+    if (md.bounded) return true;
+    const DVec3 q = p - sc.sceneCenter;
+    return ddot(q, q) <= sc.jBeamDomR2;
+}
 // The POINT merge's eta at a stored-photon site (host mergeEtaPrimeSurf), less its kappaS.
 __device__ static inline double dMergeEtaSurf(bool site, double pLight) {
     if (!site) return 0.0;
@@ -13861,6 +13871,7 @@ __device__ static double dMergeEtaPrime(const DScene& sc, const DVec3& pPrev, co
     if (v.type != BV_MEDIUM) return 0.0;
     if (v.mediumId < 0 || v.mediumId >= sc.mediaN) return 0.0;
     if (!(pLight > 0.0)) return 0.0;                 // callers pass dMergeLightDensity (0.387.0)
+    if (!dJBeamMerges(sc, sc.media[v.mediumId], v.p)) return 0.0;   // past the beam domain
     DVec3 din = v.p - pPrev;
     const double dl = sqrt(ddot(din, din));
     if (!(dl > 0.0)) return 0.0;
@@ -19122,6 +19133,7 @@ __device__ static void dChromaBeamEta1(const DScene& sc, const DVertex& v, const
                                        double* out) {
     for (int b = 0; b < DJSPEC_K; ++b) out[b] = 0.0;
     if (v.type != BV_MEDIUM || v.mediumId < 0 || v.mediumId >= sc.mediaN || !(dn > 0.0)) return;
+    if (!dJBeamMerges(sc, sc.media[v.mediumId], v.p)) return;
     const double c = ddot(a, dout);
     const double s2 = 1.0 - c * c;
     if (!(s2 > 0.0)) return;
@@ -19680,7 +19692,8 @@ kBdptT(DScene sc, const __grid_constant__ DCamera cam, double* camFilm, double* 
                     // whatever x turns out to be, so sin(theta) and the whole coefficient are
                     // merge-point INDEPENDENT and belong here, not in the per-hit weight.
                     if (k >= 1 && vk.type == BV_MEDIUM &&
-                        vk.mediumId >= 0 && vk.mediumId < sc.mediaN) {
+                        vk.mediumId >= 0 && vk.mediumId < sc.mediaN &&
+                        dJBeamMerges(sc, sc.media[vk.mediumId], vk.p)) {
                         DVec3 dp = eye[k - 1].p - vk.p;
                         const double dn = sqrt(ddot(dp, dp));
                         if (dn > 0.0) {
@@ -24931,6 +24944,7 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
     sc.sensorVAxis  = {scene.sensor.vAxis.x,  scene.sensor.vAxis.y,  scene.sensor.vAxis.z};
     sc.sceneCenter = {scene.sceneCenter.x, scene.sceneCenter.y, scene.sceneCenter.z};
     sc.sceneRadius = scene.sceneRadius;
+    sc.jBeamDomR2  = scene.jBeamDomainR2;
     // `cavity` probe settings (O3 stage 2). The host loader has already resolved the
     // radius (explicit `cavity_radius`, else 2% of the scene AABB diagonal) and the
     // gate, so the device just mirrors the resolved values — the two backends must

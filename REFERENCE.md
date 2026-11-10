@@ -1846,6 +1846,12 @@ machine varied 18.5 s / 25.8 s / 27.2 s.
   wave (paths, segments, segments gathered inline, hits, resume passes, and the three kernel
   times) for finer diagnosis. `FTRACE_WFHITCAP=<n>` shrinks the hit queue (default 2^25 hits) so an
   ordinary scene takes resume passes; `tools/check_wf_resume.py` uses it to show they change nothing.
+- **`FTRACE_JBEAMDOMAIN=<scale>` (diagnostic, mode `J`).** Mode `J`'s beams in an unbounded medium
+  end at the scene's *beam domain*, a sphere about the scene's centre of 8 times the radius that
+  holds everything a path at any time may meet (0.434.40), and its MIS weights count a beam merge in
+  such a medium only inside it, leaving the haze outside to the connections, as in mode `D`. This
+  sets the 8. The image's expectation does not depend on it, only its noise and its cost;
+  `tools/check_haze_domain.py` renders a domain of half the scene's radius to show it.
 - **`FTRACE_WFSTRAT=1` (diagnostic, mode `J` on the GPU).** Orders the wavefront gather’s waves as
   stratified samples of the whole image (32-pixel runs permuted by a golden-ratio stride) instead of
   horizontal bands. It makes the adaptive wave size exact — on `_fog_cornell` it cuts the

@@ -2049,6 +2049,19 @@ The escape clamp `kBeamFarScale` was **deliberately left alone**: on `_fog_corne
 ≈ 6.9 m is only 2.8 mfp, so a principled mfp-based clamp would make beams *longer*. Tightening
 it for speed would be a silent accuracy regression buying a cost the budget removes properly.
 
+**Mode `J`'s beams in an unbounded medium end at a region, not a length (0.434.40,
+J-BEAM-FARLIMIT).** A clamp on a beam's length was a bias as well as a cost: the MIS weights
+count a merge at every medium vertex of a path, so wherever a beam ended short of one they gave
+the missing merge its share of that path, and the image lost it there. Mode `J` therefore clips
+an unbounded medium's beams to one sphere, the scene's **beam domain** (`Scene::jBeamMerges`:
+about `sceneCenter`, `kJBeamDomainScale` 8 × `sweptReach`, which under a blur holds every mover's
+sweep), and every beam-merge term of the weights (`mergeEtaPrimeBeam`, a beam's `etaPrev`,
+`ChromaMis::beamEta1`, the camera side's `etaKCoef`; device `dJBeamMerges` in the same four)
+counts a merge in an unbounded medium only inside it. Outside it the connections render the
+haze alone, as in mode `D`. Since the region is fixed — the same at every time, for the light
+side and the camera side — its size moves the noise and the cost, never the expectation.
+Mode `M` keeps the length clamp: it has no weights to disagree with.
+
 ### Gate (2) — a second MIS weight, and a flag that breaks it on purpose (0.217.0)
 
 `misWeight` is PBRT's **relative** form: it never builds a path density, only the ratios

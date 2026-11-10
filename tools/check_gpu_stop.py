@@ -5,12 +5,13 @@
 renderBdptCuda's chunks are abortable: inside a DeviceStopScope the kernels read the device
 stop flag, and a chunk a stop cut short is dropped, gpuSppChunks flushing the whole chunks
 before it as final. A build that runs a chunk whole before it stops fails here, as does one that
-keeps a cut chunk. The scene is check_haze_domain's density field at 48x36 under -beamepochs spp,
-which pins every GPU chunk to one sample, tens of seconds each (J-FIELD-SLOW) -- and makes each
-sample its own light-side epoch, so the stop cuts an epoch's first and only chunk. The check
-waits for the first sample to land (the refresh that opens the second epoch), times it, asks the
-render to stop a quarter of a sample later -- inside the second sample's GPU chunk, its light
-side rebuilt in about a second -- and requires:
+keeps a cut chunk. The scene is check_haze_domain's density field at 960x720 under -beamepochs
+spp, which pins every GPU chunk to one sample and makes each sample its own light-side epoch, so
+the stop cuts an epoch's first and only chunk. `-n 30000` fixes the map at ~1.2 M beams (the
+budget off, so `-jbeams` leaves it alone too), ~1 500 hits a camera segment: ~20 s a sample on
+an RTX 4090 (0.434.40). The check waits for the first sample to land (the refresh that opens the
+second epoch), times it, asks the render to stop a quarter of a sample later -- inside the second
+sample's GPU chunk, its light side rebuilt in a fraction of a second -- and requires:
 
   - the process to be gone in under a third of a sample's time, which only a chunk cut short
     allows;
@@ -41,15 +42,15 @@ def main():
     ap.add_argument("--exe", default=os.path.join(ROOT, "ftrace.exe"))
     a = ap.parse_args()
     exe, d = os.path.abspath(a.exe), os.path.abspath(a.out)
-    ftsl = fogbox.write(d, "field.ftsl", scene(True, medium=FIELD, res=(48, 36)))
+    ftsl = fogbox.write(d, "field.ftsl", scene(True, medium=FIELD, res=(960, 720)))
     png = os.path.join(d, "field.png")
     for stale in (png, png[:-4] + ".pfm"):   # a render that writes nothing must not pass
         if os.path.exists(stale):
             os.remove(stale)
     logf = os.path.join(d, "field.log")
     cmd = [exe, "-in", ftsl, "-mode", "J", "-device", "gpu", "-spp", "8", "-seed", "1",
-           "-beamepochs", "spp", "-interval", "3600", "-hdr", "-no-meter", "-window-min",
-           "-o", png]
+           "-n", "30000", "-beamepochs", "spp", "-interval", "3600", "-hdr", "-no-meter",
+           "-window-min", "-o", png]
     check = fogbox.Checks(56)
     with open(logf, "w", encoding="utf-8") as lf:
         t0 = time.monotonic()
@@ -72,8 +73,8 @@ def main():
                              ("exited" if p.poll() is not None else "is still running, pid %d"
                               % p.pid))
         sample = t1 - t0
-        # A quarter of a sample into the second: past its light-side rebuild (~1 s against the
-        # sample's ~25), so inside its GPU chunk, with three quarters of it left to cut.
+        # A quarter of a sample into the second: past its light-side rebuild (~0.2 s against the
+        # sample's ~20), so inside its GPU chunk, with three quarters of it left to cut.
         time.sleep(sample * 0.25)
         ts = time.monotonic()
         s = subprocess.run([exe, "-stop", str(p.pid)], capture_output=True, text=True,
