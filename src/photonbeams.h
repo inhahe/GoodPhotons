@@ -1229,6 +1229,7 @@ struct BeamMap {
         double rMax       = 0;
         double probeK0    = 0;  // beams a probe ray gathered at the raw mfp radii
         double probeK     = 0;  // ... and after the floor/ceiling corrections
+        double probeCamShare = 0;  // of the beams, those the scene's cameras' rays counted (ProbeSet)
         double targetK    = 0;  // -beamk: the FLOOR on the gathered count (not a target)
         double floorScale = 1;  // >1 if -beamk had to scale the radii up
         double slackScale = 1;  // <1 if -beamareaslack had to scale them back down
@@ -1242,6 +1243,15 @@ struct BeamMap {
                                     // split (i.e. cost is memory-limited, not rule-limited)
     };
 
+    // The rays a probe counts beams along: origin, unit direction, length.
+    struct ProbeRay { Vec3 o, d; double tMax; };
+    // What probeGatherCount measures along beside chords (J-AUTO-PROBE, bdpt::jProbeSet): the
+    // scene's cameras' first segments, each to the first surface it meets (1e30 where it
+    // escapes), for the beams of the media `camMedia` marks (by medium index). Those are the
+    // unbounded ones: their beams fill the beam domain, whose box is mostly sparse while the
+    // camera looks through its dense core, so chords of it put the knee 6-9x too high.
+    struct ProbeSet { std::vector<ProbeRay> rays; std::vector<char> camMedia; };
+
     // Brute-force mean gathered count along random chords of the beam bbox, at the CURRENT
     // per-medium radii. Strided subsample so the cost is bounded regardless of beam count; the
     // measured count is scaled back up by the stride. No BVH needed (and none exists yet at
@@ -1251,9 +1261,59 @@ struct BeamMap {
     // r = K A / (2 pi S) assumes isotropic relative orientation and beams spread evenly through
     // their bounding box, and neither holds in a sunlit rain volume where every beam is
     // near-parallel to the sun — measured, it is off by more than an order of magnitude there.
-    double probeGatherCount(const Aabb& bb) const {
+    //
+    // `probe` (J-AUTO-PROBE): the beams of the media it marks are counted along its rays -- the
+    // scene's cameras' first segments -- and only the rest along chords, of their own box. A
+    // probe whose rays gather none of its media's beams (every ray stopped at a pane of glass,
+    // say) gives way to the chords for them too. Null: chords of `bb` for every beam, as always.
+    double probeGatherCount(const Aabb& bb, const ProbeSet* probe = nullptr,
+                            double* camShare = nullptr) const {
+        if (camShare) *camShare = 0.0;
         if (beams.empty()) return 0.0;
-        if (!probeRays.empty()) return probeCameraCount();
+        // FTRACE_JPROBE=<rays>,<maxTests>: see the chords' note below.
+        size_t kProbeRays = 8192;
+        size_t maxTests   = 1500;
+        if (const char* e = std::getenv("FTRACE_JPROBE")) {
+            long long r = 0, m = 0;
+            if (std::sscanf(e, "%lld,%lld", &r, &m) == 2 && r > 0 && m > 0) {
+                kProbeRays = (size_t)r; maxTests = (size_t)m;
+            }
+        }
+        const size_t stride = std::max<size_t>(1, beams.size() / maxTests);
+        auto camBeam = [&](size_t i) {
+            const size_t m = (size_t)beams[i].med;
+            return m < probe->camMedia.size() && probe->camMedia[m] != 0;
+        };
+        size_t nCam = 0, nAll = 0;
+        if (probe && !probe->rays.empty())
+            for (size_t i = 0; i < beams.size(); i += stride, ++nAll) nCam += camBeam(i) ? 1 : 0;
+        if (nCam == 0) return probeChords(bb, kProbeRays, stride, [](size_t) { return true; });
+        const double kCam = countAlong(probe->rays, stride, camBeam) / (double)probe->rays.size();
+        const bool camGathered = kCam > 0.0;
+        if (camShare) *camShare = camGathered ? (double)nCam / (double)nAll : 0.0;
+        auto chordBeam = [&](size_t i) { return !camGathered || !camBeam(i); };
+        if (camGathered && nCam == nAll) return kCam;
+        Aabb box;
+        for (size_t i = 0; i < beams.size(); ++i)
+            if (chordBeam(i)) { box.expand(beams[i].begin()); box.expand(beams[i].end()); }
+        return (camGathered ? kCam : 0.0) + probeChords(box, kProbeRays, stride, chordBeam);
+    }
+
+    // Beams gathered along `rays`, summed over them, of the strided subsample `keep` admits,
+    // scaled back up by the stride.
+    template <class Keep>
+    double countAlong(const std::vector<ProbeRay>& rays, size_t stride, Keep&& keep) const {
+        double hits = 0.0;
+        BeamHit bh;
+        for (const ProbeRay& q : rays)
+            for (size_t i = 0; i < beams.size(); i += stride)
+                if (keep(i) && closestApproach((int)i, q.o, q.d, q.tMax, bh)) hits += 1.0;
+        return hits * (double)stride;
+    }
+
+    // The mean beams a random chord of `bb` gathers, of the strided subsample `keep` admits.
+    template <class Keep>
+    double probeChords(const Aabb& bb, size_t kProbeRays, size_t stride, Keep&& keep) const {
         const Vec3 ext = bb.hi - bb.lo;
         // FTRACE_JPROBE=<rays>,<maxTests> overrides both, to test J-KNEE-NOISE's two suspects:
         //   * 96 chords is a SMALL sample of a clustered beam set. On a scene whose dielectric
@@ -1297,15 +1357,6 @@ struct BeamMap {
         // It leans much harder on storage-order striding (stride 9 -> 148 on a 222 k-beam map),
         // which is the second suspect named above. Accuracy improved anyway, so that suspect is
         // retired more firmly than the stride-1 test alone retired it.
-        size_t kProbeRays = 8192;
-        size_t maxTests   = 1500;
-        if (const char* e = std::getenv("FTRACE_JPROBE")) {
-            long long r = 0, m = 0;
-            if (std::sscanf(e, "%lld,%lld", &r, &m) == 2 && r > 0 && m > 0) {
-                kProbeRays = (size_t)r; maxTests = (size_t)m;
-            }
-        }
-        const size_t stride     = std::max<size_t>(1, beams.size() / maxTests);
         Pcg32 prng; prng.seed(0x9E3779B97F4A7C15ULL, 0xBF58476D1CE4E5B9ULL);
         auto randPt = [&]() {
             return Vec3(bb.lo.x + ext.x * prng.uniform(),
@@ -1321,34 +1372,9 @@ struct BeamMap {
             dv = dv * (1.0 / L);
             BeamHit bh;
             for (size_t i = 0; i < beams.size(); i += stride)
-                if (closestApproach((int)i, a, dv, L, bh)) hits += 1.0;
+                if (keep(i) && closestApproach((int)i, a, dv, L, bh)) hits += 1.0;
         }
         return hits * (double)stride / (double)kProbeRays;
-    }
-
-    // What the probe draws instead of chords of the beams' box, when the caller gives it any:
-    // the camera's first segments, each from the eye to the first surface it meets (1e30 where it
-    // escapes) -- the segments a camera subpath gathers along first (J-AUTO-PROBE). A chord of the
-    // box measures the map's mean density; in an unbounded haze the box is mostly sparse and the
-    // camera looks through its dense core, so the two can differ by orders of magnitude.
-    struct ProbeRay { Vec3 o, d; double tMax; };
-    std::vector<ProbeRay> probeRays;
-
-    // probeGatherCount over `probeRays`: the mean beams a ray gathers, the same strided
-    // subsample of the beams as the chords' (and the same ~12 M-test budget at 8192 rays).
-    double probeCameraCount() const {
-        size_t maxTests = 1500;
-        if (const char* e = std::getenv("FTRACE_JPROBE")) {
-            long long r = 0, m = 0;
-            if (std::sscanf(e, "%lld,%lld", &r, &m) == 2 && m > 0) maxTests = (size_t)m;
-        }
-        const size_t stride = std::max<size_t>(1, beams.size() / maxTests);
-        double hits = 0.0;
-        BeamHit bh;
-        for (const ProbeRay& q : probeRays)
-            for (size_t i = 0; i < beams.size(); i += stride)
-                if (closestApproach((int)i, q.o, q.d, q.tMax, bh)) hits += 1.0;
-        return hits * (double)stride / (double)probeRays.size();
     }
 
     // Choose each medium's kernel radius from its own measured mean free path, apply the
@@ -1370,10 +1396,12 @@ struct BeamMap {
     // <= 0 means "use the global". This is the scene's `beam_blur` in a medium block.
     // `probe` false: skip the gather probe where nothing needs it -- no -beamk floor to hold
     // (targetK 0, mode J's fixed map) and no line to print it in (a quiet refresh). It is 8192
-    // probe rays against the whole map, per build.
+    // probe rays against the whole map, per build. `probeSet`: what the probe counts along
+    // besides chords (probeGatherCount; mode J's knee rule, J-AUTO-PROBE), null for chords alone.
     AutoInfo buildAuto(double blur, double targetK, double areaSlack, size_t splitBudget = 0,
                        double explicitSplitLen = 0.0, double work = 0.0, bool skipBvh = false,
-                       const std::vector<double>* medBlur = nullptr, bool probe = true) {
+                       const std::vector<double>* medBlur = nullptr, bool probe = true,
+                       const ProbeSet* probeSet = nullptr) {
         AutoInfo info;
         info.blur     = blur;
         info.targetK  = targetK;
@@ -1408,7 +1436,7 @@ struct BeamMap {
         // small and a ratio against 0 is meaningless. Each round scales by at most 16x and
         // re-measures, so three rounds cover 4096x — far beyond any real shortfall.
         const bool measure = probe || targetK > 0.0;
-        info.probeK0 = measure ? probeGatherCount(bb) : 0.0;
+        info.probeK0 = measure ? probeGatherCount(bb, probeSet, &info.probeCamShare) : 0.0;
         info.probeK  = info.probeK0;
         if (targetK > 0.0) {
             for (int round = 0; round < 3 && info.probeK < targetK; ++round) {
@@ -1418,7 +1446,7 @@ struct BeamMap {
                 info.floorScale *= f;
                 for (MedStat& s : st) s.r *= f;
                 push();
-                info.probeK = probeGatherCount(bb);
+                info.probeK = probeGatherCount(bb, probeSet);
             }
         }
 
@@ -1432,7 +1460,7 @@ struct BeamMap {
                 info.slackScale = s;
                 for (MedStat& m : st) m.r *= s;
                 push();
-                if (measure) info.probeK = probeGatherCount(bb);
+                if (measure) info.probeK = probeGatherCount(bb, probeSet);
             }
         }
 

@@ -1,4 +1,4 @@
-"""Regression check: `-jbeams off | auto | <N>` picks mode J's beam map as documented (0.435.0-0.436.0).
+"""Regression check: `-jbeams off | auto | <N>` picks mode J's beam map as documented (0.435.0-0.436.8).
 
     python tools/check_jbeams.py [--out png/check_jbeams] [--exe ftrace.exe] [--no-gpu]
 
@@ -36,6 +36,11 @@ was BUILT:
   - on the GPU, the device draws the surface map -- from one subpath per pixel for a fixed map,
     the knee's pass under `auto`, `-n`'s subpaths with the beams off -- and the host traces only
     the beams' subpaths (BeamBudgetReq::hostSurf, measureSurf; 0.436.0-2);
+  - the knee rule's probe (J-AUTO-PROBE, 0.436.8) counts the unbounded haze's beams along the
+    scene's cameras' rays, the same haze bounded along chords of the beams' box, and a bounded
+    cloud added to the unbounded haze the one way for the haze's beams and the other for the
+    cloud's; FTRACE_JPROBE_CAM=0 and 1 force either; and the flight's two frames, each rendered
+    alone, settle on the same knee, the probe being the scene's cameras' and not the rendering one's;
   - `-jbeams 0`, `many`, `inf` and `1e30` are refused with exit code 2.
 
 Exits 1 on any failure.
@@ -61,6 +66,8 @@ TRACED = re.compile(r"mode J: \d+ beams from (\d+) light subpaths")
 SURF = re.compile(r"mode J: \d+ surface photons from (\d+) subpaths")
 DEVSURF = re.compile(r"mode J: the device draws the surface photon map, from (\d+) subpaths")
 REDRAW = re.compile(r"light-side refresh .{0,4}redrawing (\d+) subpaths")
+PROBE = re.compile(r"mode J: photon beams: .*?a probe ray \((.+?)\) gathers")
+KNEEAT = re.compile(r"-beamk knee at ~(\d+) beams")
 
 
 def main():
@@ -239,6 +246,48 @@ def main():
         check("GPU -jbeams off: the device draws the surface map, no beam budget",
               rc == 0 and g is not None and int(g.group(1)) == 128 * 96 and "beam budget" not in log,
               "rc %d" % rc)
+
+    # J-AUTO-PROBE (0.436.8): the knee's probe counts an unbounded medium's beams along the
+    # scene's cameras' rays and a bounded one's along chords of their box, and depends on the
+    # scene alone, not on the camera rendering.
+    def probe_kind(log):
+        m = PROBE.search(log)
+        return m.group(1) if m else None
+    k = probe_kind(logs_by["auto"])
+    check("auto, an unbounded haze: the knee counts along the cameras' rays",
+          k == "the cameras'", "probe %s" % k)
+    rc, log, _ = run("auto_chords", ["-jbeams", "auto"], env={"FTRACE_JPROBE_CAM": "0"})
+    k = probe_kind(log)
+    check("...FTRACE_JPROBE_CAM=0 forces chords of the beams' box",
+          rc == 0 and k == "a chord of the beams' box", "probe %s" % k)
+    unb = "medium { sigma_t 0.04  albedo 0.5 }"
+    assert unb in text
+    bounded = text.replace(unb, "medium { sigma_t 0.04  albedo 0.5  bounds { min -4 -1 -6  max 12 8 8 } }")
+    ftsl_b = fogbox.write(d, "still_bounded.ftsl", bounded)
+    rc, log, _ = run("auto_bounded", ["-jbeams", "auto"], scene_path=ftsl_b)
+    k = probe_kind(log)
+    check("auto, the haze bounded: chords of the beams' box",
+          rc == 0 and k == "a chord of the beams' box", "probe %s" % k)
+    rc, log, _ = run("auto_bounded_cam", ["-jbeams", "auto"], scene_path=ftsl_b,
+                     env={"FTRACE_JPROBE_CAM": "1"})
+    k = probe_kind(log)
+    check("...FTRACE_JPROBE_CAM=1 forces the cameras' rays", rc == 0 and k == "the cameras'",
+          "probe %s" % k)
+    cloud = "medium { sigma_t 1.0  albedo 0.9  bounds { min 5 2.5 -1  max 7.5 3.5 1 } }"
+    ftsl_m = fogbox.write(d, "still_mixed.ftsl", text + NL + cloud + NL)
+    rc, log, _ = run("auto_mixed", ["-jbeams", "auto"], scene_path=ftsl_m)
+    k = probe_kind(log)
+    check("auto, the haze and a bounded cloud: rays for the haze's beams, chords for the cloud's",
+          rc == 0 and k is not None and k.startswith("the cameras' for the unbounded") and
+          k.endswith("chords for the rest"), "probe %s" % k)
+    knees = []
+    for f in ("0", "1"):
+        rc, log, _ = run("auto_fly%s" % f, ["-jbeams", "auto", "-camera", "fly", "-frames", f, f],
+                         scene_path=ftsl_fly, out=os.path.join(d, "flyknee", "f%s.png" % f))
+        m = KNEEAT.search(log)
+        knees.append(m.group(1) if (rc == 0 and m) else None)
+    check("auto: a flight's frames rendered alone size their maps alike (the scene's cameras)",
+          knees[0] is not None and knees[0] == knees[1], "knees %s" % knees)
 
     for bad in ("0", "many", "inf", "1e30"):
         rc, log, _ = run("bad_" + bad, ["-jbeams", bad])

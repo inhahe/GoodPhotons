@@ -347,7 +347,10 @@ inline double invTransmittancePoisson(const Medium& m, const Vec3& o, const Vec3
     for (int i = 0; i < kSunLegSteps; ++i)
         q += m.densityAt(o + dir * (ta + L * (((double)i + 0.5) / (double)kSunLegSteps)), tabs);
     const double tauQ = st * L * q / (double)kSunLegSteps;
-    const double lam = std::max({tauQ, std::min(st * L * m.densityMax, 1.0), 1e-6});
+    // A NaN quadrature (a density formula NaN at a midpoint) leaves the floor, as the device
+    // twin's fmax does.
+    double lam = std::max(std::min(st * L * m.densityMax, 1.0), 1e-6);
+    if (tauQ > lam) lam = tauQ;
     if (lam > 700.0) return 0.0;
     const double u = rng.uniform();
     double p = std::exp(-lam), c = p;

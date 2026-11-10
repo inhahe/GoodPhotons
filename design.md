@@ -462,19 +462,26 @@ Everything else follows from that one field.
   misreading what the camera's segments gather; 1000 beams was within 15 % of the best map at
   depth 8 (where no beams wins) and the best arm at depth 32. The knee rule still wins where dense
   bounded media want dense maps (`gallery_rain`'s rain and cloud, whose render block says
-  `jbeams auto`). **Since 0.436.8 the probe is the camera's where a medium is unbounded**
-  (J-AUTO-PROBE): `cameraProbeRays` draws 8192 pinhole rays from the eye through a jittered grid,
-  each to its first surface (1e30 where it escapes), and `BeamMap::probeRays` makes
-  `probeGatherCount` count along them, for the pilot's knee and the build's `-beamk` floor alike
-  (`bdpt::jProbeCamera`; `FTRACE_JPROBE_CAM=1/0` forces either). An unbounded medium's beams fill
-  the beam domain, whose box is mostly sparse while the camera looks through the dense core, so
-  chords of it put the knee 6-9x too high; there the camera's rays land `auto` on or past the
-  fixed map (relRMSE at equal time, chords -> camera, 1000 beams for scale: `field` 0.036 -> 0.020
-  (0.019), `still` 0.027 -> 0.015 (0.016), `_fog_cornell` 0.53 -> 0.21 (0.14)). In bounded media
-  the box is the medium and the chords stay, being better there: `_fog_thick` 0.68 against 0.81,
-  `_slab_ss` 0.063 against 0.083, and on `gallery_rain` a 4.7 M-beam map at 235 spp against the
-  camera probe's 7.9 M at 54 (the rest of the frame's median block noise 24 % against 48 %,
-  `scraps/probe/rain.py`).
+  `jbeams auto`). **Since 0.436.8 the probe counts an unbounded medium's beams along the scene's
+  cameras' rays** (J-AUTO-PROBE): `bdpt::jProbeSet` draws about 8192 pinhole rays, spread over
+  every authored camera (every frame of every flight, whatever a run renders of them,
+  `bdpt::g_probeCameras`) and each camera's through a jittered grid of its frame, to the first
+  surface each meets (1e30 where it escapes), once a render; `BeamBudgetReq::probe` and
+  `buildBeamMap` hand the same `BeamMap::ProbeSet` to the pilot's knee and every build's `-beamk`
+  floor, and `probeGatherCount` counts each beam along its own medium's probe -- the rays for
+  the unbounded media's beams, chords of their own box for the bounded ones', so a rain volume
+  under a thin haze keeps the chords -- and gives the unbounded media's beams to the chords too
+  where the rays gathered none of them (every ray stopped at a pane of glass, say).
+  `FTRACE_JPROBE_CAM=1/0` sends every medium to either. It is the scene's cameras and not the
+  one rendering because the light side must not depend on the camera: a flight's frame
+  re-rendered alone draws the realizations its neighbours did. An unbounded medium's beams fill
+  the beam domain, whose box is mostly sparse while the cameras look through its dense core, so
+  chords of it put the knee 6-9x too high; the rays land `auto` on or past the fixed map
+  (relRMSE at equal time, chords -> rays, 1000 beams for scale: `field` 0.036 -> 0.020 (0.019),
+  `still` 0.027 -> 0.015 (0.016), `_fog_cornell` 0.53 -> 0.21 (0.14)). In bounded media the box
+  is the medium and the chords are better: `_fog_thick` 0.68 against the rays' 0.81, `_slab_ss`
+  0.063 against 0.083, and on `gallery_rain` a 4.7 M-beam map at 235 spp against the rays' 7.9 M
+  at 54 (the rest of the frame's median block noise 24 % against 48 %, `scraps/probe/rain.py`).
 - **Flag polarity is reversed from `A`/`B`/`M`.** They need `-beams` to opt in; mode `J` needs
   `-nobeams` to opt out (`g_noBeams`). A mode-`J` render with no beam map is not a degraded UPBP,
   it is literally mode `D`, so making the interesting half opt-in behind a flag whose absence

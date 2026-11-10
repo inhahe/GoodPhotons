@@ -14383,7 +14383,8 @@ struct BeamRadiiPin {
 // `floorK` >= 0: the -beamk floor to build with instead of g_beamK (0: none, mode J's fixed map).
 static double buildBeamMap(BeamMap& bm, const char* tag, double work, bool quiet = false,
                            const Scene* vcScene = nullptr, double radScale = 1.0,
-                           BeamRadiiPin* pin = nullptr, double floorK = -1.0) {
+                           BeamRadiiPin* pin = nullptr, double floorK = -1.0,
+                           const BeamMap::ProbeSet* probeSet = nullptr) {
     // `quiet` exists for mode J's light-side REFRESH (see g_beamFreeze): that rebuilds this
     // map once per progressive epoch, and re-printing the same four-line map description on
     // every rebuild would bury the render's own status lines under a description that has not
@@ -14582,7 +14583,7 @@ static double buildBeamMap(BeamMap& bm, const char* tag, double work, bool quiet
                          g_beamAreaSlack, splitBudget,
                          g_beamSplitLen, work, /*skipBvh*/ jSkipHostBvh(),
                          medBlur.empty() ? nullptr : &medBlur,    // scene `beam_blur`
-                         /*probe*/ !quiet);
+                         /*probe*/ !quiet, probeSet);
         r = bm.radius;
         // One line PER MEDIUM: the radius is per medium now, so a single number would hide
         // exactly the thing that makes a two-medium scene work. mfp is the measured mean stored
@@ -14624,7 +14625,9 @@ static double buildBeamMap(BeamMap& bm, const char* tag, double work, bool quiet
                     "beams (%.1f at the raw mfp radii; -beamk floor %.0f)%s%s, mean split %.4g, "
                     "box area %.4g -> %.4g m^2 (%.3fx)%s, BVH in %s\n",
                     tag, ai.rawBeams, ai.outBeams,
-                    bm.probeRays.empty() ? "a chord of the beams' box" : "the camera's",
+                    ai.probeCamShare <= 0.0 ? "a chord of the beams' box"
+                    : ai.probeCamShare >= 1.0 ? "the cameras'"
+                    : "the cameras' for the unbounded media's beams, chords for the rest",
                     ai.probeK, ai.probeK0, ai.targetK,
                     ai.floorScale > 1.0001 ? " [floor raised the radii]" : "",
                     ai.slackScale < 0.9999 ? " [-beamareaslack capped them]" : "",
@@ -18815,9 +18818,9 @@ static int runSppProgressive(
     prog.sampleBase = baseSpp;   // bias fresh seeds past the loaded samples
     prog.clockEnds = clockEnds;
     // The report below ends the render on this same instant, so a renderer that cuts its chunk
-    // here (gpuSppChunks) is always answered with the stop and the final write. A budget past
-    // ~30 years (or inf) never runs out, as the old double comparison had it, rather than
-    // overflowing the clock's tick count.
+    // here (gpuSppChunks) is always answered with the stop and the final write. A budget of 1e9 s
+    // (~30 years) or more, or inf, sets none and so never runs out: the clock's tick count would
+    // overflow.
     if (!runForever && timeBudgetSec > 0.0 && timeBudgetSec < 1e9)
         prog.deadline = t0 + std::chrono::duration_cast<clk::duration>(
                                  std::chrono::duration<double>(timeBudgetSec));
@@ -20378,6 +20381,10 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
         // batch-shared render, which reaches its epochs by other routes, gives every empty one
         // the same radii.
         BeamRadiiPin beamPin0J;
+        // `-jbeams auto`'s probe set (J-AUTO-PROBE): drawn once, from the scene's cameras rather
+        // than this one, and read by the pilot's knee and every build's -beamk floor alike.
+        std::unique_ptr<BeamMap::ProbeSet> jProbe;
+        bool jProbeDrawn = false;
         auto buildLightSide = [&](uint64_t epoch, uint64_t saltOff = 0) {
             RngSaltScope saltScope(epoch + saltOff);
             const bool first = (epoch == 0);
@@ -20421,6 +20428,11 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
             jreq.blur     = g_beamBlur;
             jreq.targetK  = (fixedMap || !wantBeams) ? 0.0 : g_beamK;   // a knee only for auto's
             jreq.exact    = fixedMap;
+            if (!fixedMap && wantBeams && !jProbeDrawn) {
+                jProbe = bdpt::jProbeSet(scene, cam);
+                jProbeDrawn = true;
+            }
+            jreq.probe    = fixedMap ? nullptr : jProbe.get();
             jreq.hostSurf = !devSurfJ;
             jreq.measureSurf = first && devSurfJ;
             // The first `beamPaths` subpaths lay beams: none with the beams off (the pass is the
@@ -20629,15 +20641,11 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
             // gone wrong, when the correct reading is that this scene has no volume to beam.
             if (wantBeams) {
                 if (first) liveWindowPlaceholder(res, resY, "building beam map\xE2\x80\xA6");
-                // The knee rule's -beamk floor measures what the pilot's knee did (J-AUTO-PROBE),
-                // and only for this build: a kept realization does not carry the rays.
-                if (!fixedMap && bdpt::jProbeCamera(scene))
-                    bmap.probeRays = bdpt::cameraProbeRays(scene, camEpochJ);
+                // The knee rule's -beamk floor measures along what the pilot's knee did.
                 buildBeamMap(bmap, "mode J:",
                              (double)res * (double)resY * (double)(spp > 0 ? spp : 16),
                              /*quiet*/!first, &scene, beamRadScaleFor(epoch + lsEpochBase),
-                             nullptr, fixedMap ? 0.0 : -1.0);
-                bmap.probeRays.clear(); bmap.probeRays.shrink_to_fit();
+                             nullptr, fixedMap ? 0.0 : -1.0, jreq.probe);
                 // A refresh whose map drew empty measured no radius (the build had no chords to
                 // take a mean free path from), but its merges keep their kappa (renderRows), which
                 // reads the radius: take the radii epoch 0's build would have chosen for this
@@ -21025,6 +21033,7 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
                 return prog->deadline != clk::time_point{} && clk::now() >= prog->deadline &&
                        prog->sampleBase + sppAll > 0;
             };
+            bool finalReported = false;   // a refresh that traced nothing wrote the end itself
             for (; !stopAll && sppAll < sppTarget && !ft::stopRequested() && !pastDeadline();
                  ++epoch) {
                 double rebuildSec = 0.0;
@@ -21069,6 +21078,7 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
                                      sppAll, (unsigned long long)nRealized);
                         if (sppAll > 0) prog->report(acc, sppAll, /*final*/true);
                         if (prog->failed) *prog->failed = true;
+                        finalReported = true;
                         break;
                     }
                 }
@@ -21125,9 +21135,15 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
                         if (epochSec < 0.1) epochSec = 0.1;
                     }
                     epochSpp = sppDone;
-                    // -time's cut of this epoch's first chunk: the realization it drew is not in
-                    // the film, and the report below may write the checkpoint that counts them.
-                    if (sppDone == 0 && drew) { drew = false; --nRealized; keepLightEpochs(); }
+                    // -time's cut of this epoch's first chunk: the realization it renders against
+                    // -- its own draw, or epoch 0's -- is not in the film, and the report below
+                    // may write the checkpoint that counts them; with no sample rendered at all,
+                    // the film's are the loaded ones.
+                    if (sppDone == 0) {
+                        if (drew || epoch == 0) { drew = false; --nRealized; }
+                        keepLightEpochs();
+                        if (sppAll == 0 && prog->lightEpochs) *prog->lightEpochs = loadedEpochs;
+                    }
                     Film comb = f; comb.merge(acc);
                     const long long tot = sppAll + sppDone;
                     const auto tRep = clk::now();
@@ -21251,9 +21267,13 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
             // stop a report saw, or a finished target, has written its own final report.) So would
             // -time's end between epochs, whose report sees the budget spent; there a resumed
             // checkpoint stands in for the epochs (pastDeadline asks that the film hold a sample).
-            if (!stopAll && (ft::stopRequested() ? sppAll > 0 : pastDeadline()) &&
-                sppAll < sppTarget && prog && prog->report)
+            if (!stopAll && !finalReported && (ft::stopRequested() ? sppAll > 0 : pastDeadline()) &&
+                sppAll < sppTarget && prog && prog->report) {
+                // Nothing rendered (the deadline passed during epoch 0's build): the film's
+                // realizations are the loaded ones.
+                if (sppAll == 0 && prog->lightEpochs) *prog->lightEpochs = loadedEpochs;
                 prog->report(acc, sppAll, /*final*/true);
+            }
             if (nRealized > 1)
                 std::printf("mode J: averaged %llu independent light-side realizations "
                             "(%lld spp total%s) — the merge noise fell with the render, not just "
@@ -25375,6 +25395,17 @@ static int run(int argc, char** argv) {
         std::vector<int> flightLen(ftslScene.cameras.size(), 0);
         for (const auto& c : ftslScene.cameras)
             if (c.pathGroup >= 0 && c.pathGroup < (int)flightLen.size()) ++flightLen[(size_t)c.pathGroup];
+        // Mode J's knee probe looks along every authored camera, every frame of every flight,
+        // whatever -camera and -frames select, framed as each would render (bdpt::jProbeSet).
+        bdpt::g_probeCameras.clear();
+        for (const auto& s : ftslScene.cameras) {
+            const int px = resFromCli ? res : (s.res > 0 ? s.res : res);
+            const int py = resFromCli ? (resYCli > 0 ? resYCli : res) : (s.resY > 0 ? s.resY : px);
+            Camera p;
+            p.lookAt(s.eye, s.look, s.up, s.fov, px, py);
+            p.setProjection(s.projection);
+            bdpt::g_probeCameras.push_back(std::move(p));
+        }
         for (size_t si = 0; si < sel.size(); ++si) {
             const ftsl::CamSpec* cs = sel[si];
             int cresX = resFromCli ? res : (cs->res  > 0 ? cs->res  : res);
@@ -25503,6 +25534,7 @@ static int run(int argc, char** argv) {
     } else {
         // Built-in scene: one camera. Every image-forming mode (A/B/C/P/D/M/S/U/ref)
         // uses the same camera frame; only the old contact-sensor diagnostic did not.
+        bdpt::g_probeCameras.clear();   // mode J's knee probe takes the one camera rendering
         const bool useCamera = (mode == 'A' || mode == 'B' || mode == 'C' ||
                                 mode == 'P' || mode == 'D' || mode == 'J' || mode == 'M' ||
                                 mode == 'S' || mode == 'U' || refMode);

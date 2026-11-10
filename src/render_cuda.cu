@@ -27197,7 +27197,7 @@ Film renderBdptCuda(const Scene& scene, const Camera& cam, int resX, int resY,
                 b0 = b1;
             }
             // This chunk's bands size the next -- unless a stop cut its waves short.
-            if (wq.segs && !wfProfileCur.empty() && !stopped()) wfProfilePrev.swap(wfProfileCur);
+            if (wq.segs && !wfProfileCur.empty() && !leftEarly) wfProfilePrev.swap(wfProfileCur);
         }
         else if (useHero && deep)
             kBdptT<BDPT_NSEC, BDPT_DEEPDEPTH, false, false><<<2048, 128>>>(up.sc, up.dc, d_cam, d_splat, totalSamples, c, sppTotal, base,

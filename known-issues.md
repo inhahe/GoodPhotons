@@ -913,8 +913,10 @@ mattered.** `probeGatherCount` drew chords between random points of the beams' b
 gathered 32 beams by construction, but a real camera segment gathered about 16K in the homogeneous
 scene and 71K in the field: in an unbounded haze the box is huge and mostly sparse, and the
 camera's rays run through the dense core near the scene, so the knee overshot, the floor fattened
-every beam, and the gather paid for it. Where a medium is unbounded the probe now counts along
-8192 of the camera's own first segments (design.md, "Since 0.436.8 the probe is the camera's").
+every beam, and the gather paid for it. An unbounded medium's beams are now counted along about
+8192 first segments of the scene's cameras -- all of them, so the light side still depends on the
+scene alone -- and a bounded one's along chords of their own box (design.md, "Since 0.436.8 the
+probe counts an unbounded medium's beams along the scene's cameras' rays").
 Measured (`scraps/probe/sweep6.sh`, 0.436.6 with `FTRACE_JPROBE_CAM`; GPU, 128x96, 60 s, two
 seeds, relRMSE against the depth-8 mode D references; `gallery_rain` by `rain.py`, 640x360, 120 s):
 
