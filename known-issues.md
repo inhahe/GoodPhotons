@@ -908,14 +908,28 @@ showing one would mean a split film with per-pixel counts through all of them --
 of a first sample longer than the budget. The progress line and the `-interval` image still wait for
 a chunk; the film changes only when one lands, and the stall watchdog speaks after 30 s.
 
-**Still open: the budget's probes do not measure what the camera gathers.** `probeGatherCount`
-draws chords between random points of the beams' bounding box. Each gathers 32 beams by
-construction, but a real camera segment gathered about 16K in the homogeneous scene and 71K in the
-field. In an unbounded haze the box is huge and mostly sparse, and the camera's rays run through
-the dense core near the scene, so the knee overshoots, the floor fattens every beam, and the
-gather pays for it. Proper fix, to measure before it lands (it moves every unbounded-haze scene's
-map, `_fog_cornell`'s included): probes drawn as the camera draws its rays, or at least within the
-scene's box, and the knee and floor re-measured against error and time on the reference scenes.
+**DONE (0.436.8, J-AUTO-PROBE): the budget's probes measure what the camera gathers where it
+mattered.** `probeGatherCount` drew chords between random points of the beams' bounding box. Each
+gathered 32 beams by construction, but a real camera segment gathered about 16K in the homogeneous
+scene and 71K in the field: in an unbounded haze the box is huge and mostly sparse, and the
+camera's rays run through the dense core near the scene, so the knee overshot, the floor fattened
+every beam, and the gather paid for it. Where a medium is unbounded the probe now counts along
+8192 of the camera's own first segments (design.md, "Since 0.436.8 the probe is the camera's").
+Measured (`scraps/probe/sweep6.sh`, 0.436.6 with `FTRACE_JPROBE_CAM`; GPU, 128x96, 60 s, two
+seeds, relRMSE against the depth-8 mode D references; `gallery_rain` by `rain.py`, 640x360, 120 s):
+
+| scene (media) | no beams | 1000 beams | auto, chords | auto, camera rays |
+|---|---|---|---|---|
+| `field` (unbounded) | 0.0130 | 0.0191 | 0.0357 (125 k beams) | 0.0198 (19 k) |
+| `still` (unbounded) | 0.0125 | 0.0160 | 0.0269 (125 k) | 0.0150 (19 k) |
+| `_fog_cornell` (unbounded) | 0.117 | 0.144 | 0.529 (1.09 M) | 0.212 (96 k) |
+| `_fog_thick` (bounded) | 0.332 | 0.369 | 0.680 (260 k) | 0.810 (587 k) |
+| `_slab_ss` (bounded) | 0.0247 | 0.0322 | 0.0626 (291 k) | 0.0826 (899 k) |
+| `gallery_rain`, media p50 / rest p50 | 14.8 % / 20.4 % | 14.8 / 20.7 | 13.1 / 24.1 (4.7 M) | 13.5 / 48.5 (7.9 M) |
+
+So the camera's rays for unbounded media, the chords for bounded ones, where the box is the
+medium. What is left between `auto` and the fixed map elsewhere is `-beamk`'s 32 itself: the
+best arms gather 1-20 beams a camera segment, and the floor asks for 32 along every probe.
 
 
 The report: check_haze_domain's `field` scene (a 2x2 floor and a ball under a sun in

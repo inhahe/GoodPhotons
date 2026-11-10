@@ -14620,10 +14620,12 @@ static double buildBeamMap(BeamMap& bm, const char* tag, double work, bool quiet
         // count — which measurement showed IS the gather's cost, far more than the number of
         // beams it actually gathers — is proportional to it. Printing before/after is what
         // makes a change to the split rule verifiable instead of asserted.
-        say("%s photon beams: %zu stored -> %zu after split, a probe ray gathers %.1f "
+        say("%s photon beams: %zu stored -> %zu after split, a probe ray (%s) gathers %.1f "
                     "beams (%.1f at the raw mfp radii; -beamk floor %.0f)%s%s, mean split %.4g, "
                     "box area %.4g -> %.4g m^2 (%.3fx)%s, BVH in %s\n",
-                    tag, ai.rawBeams, ai.outBeams, ai.probeK, ai.probeK0, ai.targetK,
+                    tag, ai.rawBeams, ai.outBeams,
+                    bm.probeRays.empty() ? "a chord of the beams' box" : "the camera's",
+                    ai.probeK, ai.probeK0, ai.targetK,
                     ai.floorScale > 1.0001 ? " [floor raised the radii]" : "",
                     ai.slackScale < 0.9999 ? " [-beamareaslack capped them]" : "",
                     ai.splitLen, ai.areaBefore, ai.areaAfter,
@@ -20627,10 +20629,15 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
             // gone wrong, when the correct reading is that this scene has no volume to beam.
             if (wantBeams) {
                 if (first) liveWindowPlaceholder(res, resY, "building beam map\xE2\x80\xA6");
+                // The knee rule's -beamk floor measures what the pilot's knee did (J-AUTO-PROBE),
+                // and only for this build: a kept realization does not carry the rays.
+                if (!fixedMap && bdpt::jProbeCamera(scene))
+                    bmap.probeRays = bdpt::cameraProbeRays(scene, camEpochJ);
                 buildBeamMap(bmap, "mode J:",
                              (double)res * (double)resY * (double)(spp > 0 ? spp : 16),
                              /*quiet*/!first, &scene, beamRadScaleFor(epoch + lsEpochBase),
                              nullptr, fixedMap ? 0.0 : -1.0);
+                bmap.probeRays.clear(); bmap.probeRays.shrink_to_fit();
                 // A refresh whose map drew empty measured no radius (the build had no chords to
                 // take a mean free path from), but its merges keep their kappa (renderRows), which
                 // reads the radius: take the radii epoch 0's build would have chosen for this

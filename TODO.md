@@ -132,7 +132,8 @@ Each names the section its line is in.
 19a. ~~**J-FIELD-SLOW** (4.5) — mode J in an unbounded density field (found in HAZE-BLUR-DOMAIN's
     check).~~ Done: the GPU hit queue no longer spills (0.434.33-36), 0.434.40's beam domain ended
     the outward ratchet of 0.434.31's beam limit (J-BEAM-FARLIMIT) and made the field fast, and
-    0.435.0's `-jbeams` made a fixed 1000-beam map the default. Left: J-AUTO-PROBE (4.5).
+    0.435.0's `-jbeams` made a fixed 1000-beam map the default, and 0.436.8's camera probe
+    (J-AUTO-PROBE) put `auto` on it in unbounded hazes.
 19b. ~~**J-FIELD-SLOW's open ends** (4.5), found measuring it 2026-11-09/10: a `-time` budget cannot
     end a GPU mode D/J chunk.~~ Done, 0.436.6. (The 2 000-beam brightness it also found was the
     shared seeds' noise, 4.3; the resume passes' re-walk no longer costs anything measurable, 4.5.)
@@ -428,11 +429,20 @@ Then the rest of 4.2-4.6 in their order, 4.7's bookkeeping alongside whatever to
 - [x] **J-FIELD-SLOW** (0.434.33-0.435.0) — mode J in an unbounded density field: the wavefront
   no longer spills, the beams end at the scene's beam domain, and the default map is a fixed 1000
   beams (`-jbeams`), the knee rule trailing it 1.5-3.5x on the fog scenes.
-- [ ] **J-AUTO-PROBE** — what is left of J-FIELD-SLOW under `-jbeams auto`: `probeGatherCount`'s
+- [x] **J-AUTO-PROBE** (done, 0.436.8: camera rays where a medium is unbounded, which lands an
+  unbounded haze's `auto` on the fixed map; known-issues has the measurements) — what is left of
+  J-FIELD-SLOW under `-jbeams auto`: `probeGatherCount`'s
   random chords of the beams' box gather 32 beams where a camera segment in an unbounded haze
   gathers far more, so the knee overshoots. A probe drawn as the camera draws its rays would say
   whether `auto` can land where the fixed map does; measure with the beam domain's scale (and
-  whether the domain should hold the camera), on `scraps/probe/sweep4.sh`'s scenes.
+  whether the domain should hold the camera), on `scraps/probe/sweep4.sh`'s scenes. (Every
+  campaign scene's camera sits inside its domain, so that last question did not arise.)
+- [ ] **AUTO-BEAMK** — what J-AUTO-PROBE left between `-jbeams auto` and the fixed map: the knee
+  is where a probe gathers `-beamk` beams, 32 by default, but the best arms of every campaign
+  scene gather 1-20 a camera segment, and in bounded media `auto` still trails 1000 beams by
+  ~2x. Sweep `-beamk` (4, 8, 16) under each scene's probe with `scraps/probe/sweep6.sh`'s scenes
+  and `gallery_rain` (whose cloud and rain are what `auto` is for), and move the default if one
+  target serves them all.
 - [ ] **JSPEC-CARRIER-SIZE** — every mode-J GPU thread reserves a 120-byte spectral carrier per
   segment and per eye vertex, chromatic scene or not: VRAM (~0.5 GB, ~3.2 GB on the deep kernel),
   not speed. The slow camera pass measured against it was the MIS weights' per-connection

@@ -1253,6 +1253,7 @@ struct BeamMap {
     // near-parallel to the sun — measured, it is off by more than an order of magnitude there.
     double probeGatherCount(const Aabb& bb) const {
         if (beams.empty()) return 0.0;
+        if (!probeRays.empty()) return probeCameraCount();
         const Vec3 ext = bb.hi - bb.lo;
         // FTRACE_JPROBE=<rays>,<maxTests> overrides both, to test J-KNEE-NOISE's two suspects:
         //   * 96 chords is a SMALL sample of a clustered beam set. On a scene whose dielectric
@@ -1323,6 +1324,31 @@ struct BeamMap {
                 if (closestApproach((int)i, a, dv, L, bh)) hits += 1.0;
         }
         return hits * (double)stride / (double)kProbeRays;
+    }
+
+    // What the probe draws instead of chords of the beams' box, when the caller gives it any:
+    // the camera's first segments, each from the eye to the first surface it meets (1e30 where it
+    // escapes) -- the segments a camera subpath gathers along first (J-AUTO-PROBE). A chord of the
+    // box measures the map's mean density; in an unbounded haze the box is mostly sparse and the
+    // camera looks through its dense core, so the two can differ by orders of magnitude.
+    struct ProbeRay { Vec3 o, d; double tMax; };
+    std::vector<ProbeRay> probeRays;
+
+    // probeGatherCount over `probeRays`: the mean beams a ray gathers, the same strided
+    // subsample of the beams as the chords' (and the same ~12 M-test budget at 8192 rays).
+    double probeCameraCount() const {
+        size_t maxTests = 1500;
+        if (const char* e = std::getenv("FTRACE_JPROBE")) {
+            long long r = 0, m = 0;
+            if (std::sscanf(e, "%lld,%lld", &r, &m) == 2 && m > 0) maxTests = (size_t)m;
+        }
+        const size_t stride = std::max<size_t>(1, beams.size() / maxTests);
+        double hits = 0.0;
+        BeamHit bh;
+        for (const ProbeRay& q : probeRays)
+            for (size_t i = 0; i < beams.size(); i += stride)
+                if (closestApproach((int)i, q.o, q.d, q.tMax, bh)) hits += 1.0;
+        return hits * (double)stride / (double)probeRays.size();
     }
 
     // Choose each medium's kernel radius from its own measured mean free path, apply the

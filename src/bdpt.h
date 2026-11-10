@@ -2511,6 +2511,46 @@ struct BeamBudgetInfo {
     double    pilotSec     = 0.0;    // what the pilot cost, a one-time part of epoch 0's build
 };
 
+// The knee rule's gather probe drawn as the camera draws (J-AUTO-PROBE): `n` rays from the eye
+// through a jittered grid over the frame, each to the first surface it meets (1e30 where it
+// escapes), i.e. the first segment of every camera subpath, which is the one that gathers the
+// most of an unbounded haze. A pinhole ray even for a lens camera: a probe needs where the
+// camera looks, not its blur. The same rays every call (a fixed seed), so the pilot's knee and
+// the build's -beamk floor measure one thing.
+//
+// Drawn where a medium is unbounded: its beams' box is then the beam domain's, mostly sparse,
+// while the camera looks through the dense core round the scene, and chords of it put the knee
+// 6-9x too high. In bounded media the box is the medium and the chords do better. Measured
+// (0.436.6, scraps/probe/sweep6.sh: 128x96, 60 s, relRMSE against mode D, chords -> camera rays,
+// with the fixed 1000-beam map for scale): unbounded field 0.036 -> 0.020 (1000: 0.019), still
+// 0.027 -> 0.015 (0.016), _fog_cornell 0.53 -> 0.21 (0.14); bounded _fog_thick 0.68 -> 0.81,
+// _slab_ss 0.063 -> 0.083. FTRACE_JPROBE_CAM=1 or 0 forces either.
+inline bool jProbeCamera(const Scene& scene) {
+    if (const char* e = std::getenv("FTRACE_JPROBE_CAM"); e && *e) return std::strcmp(e, "0") != 0;
+    for (const Medium& m : scene.media)
+        if (!m.bounded) return true;
+    return false;
+}
+inline std::vector<BeamMap::ProbeRay> cameraProbeRays(const Scene& scene, const Camera& cam,
+                                                      int n = 8192) {
+    std::vector<BeamMap::ProbeRay> out;
+    const int W = cam.film.resX > 0 ? cam.film.resX : 1, H = cam.film.resY > 0 ? cam.film.resY : 1;
+    const int gx = std::max(1, (int)std::lround(std::sqrt((double)n * W / H)));
+    const int gy = std::max(1, (n + gx - 1) / gx);
+    out.reserve((size_t)gx * gy);
+    Pcg32 rng; rng.seed(0x4A50524F42454341ULL, 0x6D65726152617973ULL);   // "JPROBECA", "meraRays"
+    for (int j = 0; j < gy; ++j)
+        for (int i = 0; i < gx; ++i) {
+            const double fx = (i + rng.uniform()) / gx * W, fy = (j + rng.uniform()) / gy * H;
+            const int px = std::min((int)fx, W - 1), py = std::min((int)fy, H - 1);
+            const Ray r = cam.genRay(px, py, fx - px, fy - py);
+            const Hit h = scene.closestHit(r, 1e-6, nullptr, /*skipHair=*/false,
+                                           /*skipCamHidden=*/true);
+            out.push_back({r.o, r.d, h.valid ? h.t : 1e30});
+        }
+    return out;
+}
+
 // What the caller wants of the map. A struct rather than three more parameters because `blur`
 // and `targetK` MUST be the same values the subsequent buildAuto() is given -- the knee is only
 // meaningful at the radii the real build will use -- so they are forwarded from the one place
@@ -3256,6 +3296,7 @@ inline void traceLightBeamPass(const Scene& scene, const Camera& cam, long long 
             pm.radMed.resize(st.size());
             for (size_t m = 0; m < st.size(); ++m)
                 pm.radMed[m] = (float)(st[m].r > 0.0 ? st[m].r : rSeen);
+            if (jProbeCamera(scene)) pm.probeRays = cameraProbeRays(scene, cam);
             const double k0 = pm.probeGatherCount(pm.bounds());
             if (k0 > 1e-6) kneeBeams = (double)pilotBeams * (req.targetK / k0);
         }
