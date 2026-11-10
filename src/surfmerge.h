@@ -166,6 +166,12 @@ struct SurfMap {
     long long nEmitted = 0;    // light subpaths this map was built from — the merge
                                // technique's sample count n_m in the balance heuristic
     double radius = 0.0;       // gather radius r_s (the acceptance disc's)
+    // A map the device draws itself (cudaJSurfOnDevice) from other subpaths than the host
+    // traced -- mode J's fixed beam map or its beams off (BeamBudgetReq::hostSurf): how many it
+    // draws, and the photon slots it reserves (from the pilot's photons a subpath). 0: this map's
+    // own nEmitted, and twice its size.
+    long long devPaths = 0;
+    long long devCap = 0;
 
     Vec3 lo{0, 0, 0};
     double cell = 1.0;

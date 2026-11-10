@@ -3525,7 +3525,7 @@ render { photons 1000000  device gpu  mode R  out png/out.png  res 900  max_boun
 | `max_bounce` | path-depth cap (≥ 1); same meaning as `-max-bounce` |
 | `mode_spp` | per-mode sample multipliers for per-object render modes, `mode_spp D=1 J=0.5` (§16.1); same meaning as `-mode-spp` |
 | `jsurf_radius` | mode J's starting surface-merge radius (authored length, > 0); same meaning as `-jsurf-radius`. The default is a fraction of the scene's radius (`-pmradiusfrac`, 2 %), which an open scene makes far too wide for the caustics the merges are for: `gallery_rain`'s 33 m hall gets 0.65 m, slow and visibly blurred, so it says `jsurf_radius 0.01` |
-| `jbeams` | mode J's beam map: `off`, `auto` or a beam count; same meaning as `-jbeams` (0.435.1). For a scene that knows the fixed default (1000 beams) is wrong for it: `gallery_rain`'s dense rain and cloud want the knee-sized map, `jbeams auto`. The command line's `-jbeams`, `-nobeams`, `-beamk`, `-beamcount` or `-n` still win |
+| `jbeams` | mode J's beam map: `off`, `auto` or a beam count; same meaning as `-jbeams` (0.435.1). For a scene that knows the fixed default (1000 beams) is wrong for it: `gallery_rain`'s dense rain and cloud want the knee-sized map, `jbeams auto`. The command line's `-jbeams` or `-nobeams` still win; `-beamk`, `-beamcount` and `-n`, which pick `auto` only where nothing else names a rule, do not override it (`-n` then caps a fixed map's pass) |
 
 Any of these are overridden by the matching CLI flag.
 

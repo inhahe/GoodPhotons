@@ -781,7 +781,7 @@ rain's median block noise 16.5 % with no beams, 16.3 % at 250 beams, 15.3 % at 1
 4000 and 13.0 % under the knee rule (4.7 M sub-beams), which costs the rest of the frame ~12 %
 (202 against 284 spp). Its flyby's frames each average 64 realizations, and at a fixed 1000 beams
 a realization is ~14x sparser than the knee's, so its rain would break into streaks: its render
-scripts pass `-jbeams auto`. **A blurred scene** (check_haze_domain's `far`, a ball keyed +-40 m;
+block says `jbeams auto` (0.435.1). **A blurred scene** (check_haze_domain's `far`, a ball keyed +-40 m;
 `scraps/probe/blurtime.py`, 60 s, four GPU seeds, noise from their spread): ball / haze 2.3 / 2.4 %
 with no beams, 3.8 / 3.7 % at 1000 beams, 8.3 / 4.2 % under the knee rule. At check_haze_domain's
 equal sample counts the fixed map's haze is the noisier, J/R per seed 0.96-1.04 against the knee's

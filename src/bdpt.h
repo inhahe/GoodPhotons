@@ -2454,6 +2454,8 @@ struct BeamBudgetInfo {
     long long pathsAsked   = 0;      // `-n`, or mode J's default
     long long pathsUsed    = 0;      // what the budget allowed
     long long beamPaths    = -1;     // how many of them deposit beams (the first ones; -1 all)
+    long long surfPaths    = 0;      // the surface map's subpath count when the device draws it
+                                     // (BeamBudgetReq::hostSurf false), after the ceiling
     long long budget       = 0;      // the beam ceiling actually enforced
     bool      kneeBound    = false;  // was the knee the binding half, or the resource ceiling?
     bool      applied      = false;  // did it bite at all, or was `-n` already smaller?
@@ -2491,11 +2493,12 @@ struct BeamBudgetReq {
     // surface side has a FIXED radius (-jsurf-radius), so more photons is only ever more
     // quality for more cost -- never a different estimator. Its two knobs reflect that:
     //
-    //   `surfPaths` -- a subpath TARGET, applied only when the caller knows the beams have no
-    //   opinion (a media-free scene). Mode U's convention, one light subpath per pixel per
-    //   pass, is what makes "-mode J -jsurf against -mode U" a comparison of estimators; and
-    //   without it a media-free mode-J render inherits the inert `-n 2000000` default and
-    //   tries to store ~7 M photons for a 64x64 image.
+    //   `surfPaths` -- a subpath TARGET, set when the beams do not size the pass: a media-free
+    //   scene, the beams off, or a fixed map, whose beams take the pass's first `beamPaths`
+    //   subpaths while the surface map takes this many. Mode U's convention, one light subpath
+    //   per pixel per pass, is what makes "-mode J -jsurf against -mode U" a comparison of
+    //   estimators; and without it a media-free mode-J render inherits the inert `-n 2000000`
+    //   default and tries to store ~7 M photons for a 64x64 image.
     //
     //   `maxSurfPhotons` -- a pure MEMORY ceiling, applied always. A SurfPhoton + its SurfMis
     //   is 112 B, so an unbounded map is the one way this feature can take the process down;
@@ -2503,6 +2506,11 @@ struct BeamBudgetReq {
     //   what a MIS weight cannot read -- the same reason mode J refuses to trim its beams).
     long long surfPaths      = 0;   // subpath target from the surface side; 0 = no opinion
     long long maxSurfPhotons = 0;   // ceiling on STORED surface photons; 0 = unbounded
+    // false: the device draws the surface map itself (cudaJSurfOnDevice) from `surfPaths`
+    // subpaths, so the host pass stores no surface photons and traces only the beams' subpaths
+    // (none with the beams off); its pilot still measures the photons a subpath stores, for the
+    // device's slots and the -jsurf-count ceiling (BeamBudgetInfo::surfPaths, surfPerPath).
+    bool      hostSurf       = true;
 };
 // WHY `safety` DEFAULTS TO 1.0, AND NOT TO SOMETHING SAFELY BELOW THE KNEE.
 //
@@ -2609,9 +2617,11 @@ inline constexpr long long kPathsMin = 256;
 // these SAME subpaths, for exactly the reason this function exists at all: a merge weight is
 // a ratio against the connections `renderRows` makes, and only a photon carrying this pass's
 // own pdfFwd/pdfRev bookkeeping is a ratio between comparable things. It is a second output
-// rather than a second pass because a second pass would be a second set of subpaths — the
-// beams and the photons would then have different n_m, and every weight that mentions both
-// (which is every weight in a scene with media AND surfaces) would be wrong.
+// rather than a second pass because the subpaths are the dear part and both maps want them.
+// The two need not count the same subpaths -- a fixed beam map takes the first `beamPaths`
+// (BeamBudgetReq), the surface map all of them -- because each map normalises by its own count
+// and each merge constant reads its own map's (MergeK: n_beam 2 r_b, n_surf pi r_s^2), every
+// weight that mentions both kinds scaling each kind by its own.
 inline void traceLightBeamPass(const Scene& scene, const Camera& cam, long long nPaths,
                                int nThreads, int maxDepth, bool diffraction,
                                BeamMap& bm, StageProgress* stage = nullptr,
@@ -2645,6 +2655,9 @@ inline void traceLightBeamPass(const Scene& scene, const Camera& cam, long long 
     // The first `beamPaths` subpaths deposit beams (-1 all): BeamBudgetReq::beamPaths, or what
     // a fixed map's budget below settles on.
     long long beamPaths = req.beamPaths;
+    const bool layPilotBeams = (req.beamPaths != 0);     // the beams off: the pilot lays none
+    const bool storeSurf = wantSurf && req.hostSurf;      // ...the device draws its own
+    std::vector<long long> pilotSurfN((size_t)nThreads, 0);   // the pilot's surface sites
 
     // `pilot` shares the deposit path with the real pass and skips only the MIS bookkeeping,
     // which is deliberate: what the pilot has to predict is how many beams `emitBeams` makes,
@@ -2678,7 +2691,7 @@ inline void traceLightBeamPass(const Scene& scene, const Camera& cam, long long 
         const PatTables tabs = scene.patTables();
         long long workLight = 0;                       // JWork: this thread's vertices
         const long long lo = total * tid / nThreads, hi = total * (tid + 1) / nThreads;
-        long long done = 0, doneB = 0;
+        long long done = 0, doneB = 0, surfCount = 0;
         for (long long i = lo; i < hi; ++i) {
             // Cooperative `-stop` / Ctrl-C on the same 4096-path cadence as the photon pass.
             if ((done & 0xFFF) == 0) {
@@ -2845,11 +2858,26 @@ inline void traceLightBeamPass(const Scene& scene, const Camera& cam, long long 
             // camera pass scales each by its own kappa. Folding them together here would be
             // an unrecoverable loss — the ratio between the kinds varies per site.
             const size_t np = path.size();
+            // A stored-photon site: the store below, and the pilot's count of them.
+            auto compoundAt = [&](size_t u) {
+                return path[u].compoundMergeW > 0.0 && path[u].type == VType::Surface &&
+                       !(path[u].hit.fiberRadius > 0.0);
+            };
+            auto storesAt = [&](size_t u) {
+                return (surfMergeSite(path[u]) || compoundAt(u)) && path[u].beta > 0.0 &&
+                       mergeLightDensity(path[u].pdfFwd, path[u - 1].delta) > 0.0;
+            };
             if (pilot) {
                 // Count only. The pilot's beams are thrown away with the bank it fills, so
-                // the merge-weight prefixes below would be computed for nothing.
-                for (const PathSeg& sg : segs)
-                    if (sg.beta > 0.0) depositSeg(sg);
+                // the merge-weight prefixes below would be computed for nothing; with the
+                // beams off it lays none. Its surface photons are counted, not stored: the
+                // rate the -jsurf-count ceiling and a device-drawn map's slots are sized by.
+                if (layPilotBeams)
+                    for (const PathSeg& sg : segs)
+                        if (sg.beta > 0.0) depositSeg(sg);
+                if (wantSurf)
+                    for (size_t u = 1; u < np; ++u)
+                        if (storesAt(u)) ++surfCount;
                 continue;
             }
             accC.assign(np, 0.0);
@@ -2876,10 +2904,8 @@ inline void traceLightBeamPass(const Scene& scene, const Camera& cam, long long 
                 const double plU = mergeLightDensity(path[u].pdfFwd, path[u - 1].delta);
                 // A compound's merge vertex is a photon whatever lobe the light's pick took there
                 // (Vertex::compoundMergeW), off a curve like any other.
-                const bool compoundSite = path[u].compoundMergeW > 0.0 && path[u].type == VType::Surface &&
-                                          !(path[u].hit.fiberRadius > 0.0);
-                if (wantSurf && (surfMergeSite(path[u]) || compoundSite) && plU > 0.0 &&
-                    path[u].beta > 0.0) {
+                const bool compoundSite = compoundAt(u);
+                if (storeSurf && storesAt(u)) {
                     // The merged path scatters at y_u through the camera's lobe, never a delta, so
                     // a connection to y_u needs only y_{u-1} not to be one (SurfMis::gateC1); `gate`
                     // reads y_u's own lobe, the light's.
@@ -3013,15 +3039,20 @@ inline void traceLightBeamPass(const Scene& scene, const Camera& cam, long long 
         // reported the full share would scale the whole map down and darken the merges.
         emitted[(size_t)tid] = done;
         emittedB[(size_t)tid] = doneB;
+        if (pilot) pilotSurfN[(size_t)tid] = surfCount;
     };
 
     // --- THE SURFACE MAP'S SUBPATH TARGET, which needs no measurement --------------------
     // Applied before the pilot so the pilot is sized against the count that will actually be
-    // traced. The caller sets this only when it knows the beams have no opinion (see
-    // BeamBudgetReq::surfPaths), so there is no arbitration to do here: whichever side is
-    // speaking is the only side speaking.
-    if (smOut && req.surfPaths > 0)
-        nPaths = std::clamp(req.surfPaths, kPathsMin, nPathsAsked);
+    // traced. The caller sets it when the beams do not size the pass (BeamBudgetReq::surfPaths):
+    // then it is the pass's count, but for a fixed map's beams, which may want more (below),
+    // and a device-drawn map, which the host does not trace at all. Floored at kPathsMin where
+    // `-n` allows that many: the bounds of std::clamp must not cross.
+    long long surfN = 0;
+    if (smOut && req.surfPaths > 0) {
+        surfN = std::clamp(req.surfPaths, std::min(kPathsMin, nPathsAsked), nPathsAsked);
+        nPaths = surfN;
+    }
 
     // --- PILOT: how many beams does one subpath actually deposit in THIS scene? ----------
     // Sized as a fraction of the request with a hard ceiling, so it is a rounding error on a
@@ -3031,8 +3062,9 @@ inline void traceLightBeamPass(const Scene& scene, const Camera& cam, long long 
     // A surface-photon ceiling is the SECOND thing that can require a pilot, and it can do so
     // on a scene with no media at all (where `maxBeams` measures nothing) — hence the `||`
     // rather than a beams-only gate.
-    if ((req.maxBeams > 0 || (smOut && req.maxSurfPhotons > 0)) &&
-        ((req.exact && req.maxBeams > 0) || nPaths > 4 * kPilotMin)) {
+    // A fixed map and a device-drawn surface map need their rates whatever the count.
+    if ((req.maxBeams > 0 || (smOut && (req.maxSurfPhotons > 0 || !req.hostSurf))) &&
+        ((req.exact && req.maxBeams > 0) || (smOut && !req.hostSurf) || nPaths > 4 * kPilotMin)) {
         const auto tPilot0 = std::chrono::steady_clock::now();
         // FTRACE_JPILOT overrides the size, for the sweep that decides whether `/32` is
         // buying anything. The sizing is off the REQUESTED nPaths, which on a knee-bound scene
@@ -3041,8 +3073,10 @@ inline void traceLightBeamPass(const Scene& scene, const Camera& cam, long long 
         // rate is stable at kPilotMin and that 64k is "far past the point of usefulness", so
         // the `/32` term may be paying 30x for nothing -- but that is a claim to measure, not
         // to assume, and this hook is how.
-        // A fixed map needs only the rate (no knee), which kPilotMin already measures well.
-        long long nPilot = req.exact ? kPilotMin : std::clamp(nPaths / 32, kPilotMin, kPilotMax);
+        // A fixed map's is sized by the request, not by the (surface-sized) pass: its one rate
+        // fixes `beamPaths` for the whole render, and media few subpaths reach need thousands
+        // of them to measure it at all.
+        long long nPilot = std::clamp((req.exact ? nPathsAsked : nPaths) / 32, kPilotMin, kPilotMax);
         if (const char* e = std::getenv("FTRACE_JPILOT")) {
             const long long v = std::atoll(e);
             if (v > 0) nPilot = v;
@@ -3061,13 +3095,12 @@ inline void traceLightBeamPass(const Scene& scene, const Camera& cam, long long 
             pm.beams.insert(pm.beams.end(), b.beams.begin(), b.beams.end());
             b.beams.clear(); b.beams.shrink_to_fit();
         }
-        // THE SURFACE BANKS MUST BE EMPTIED HERE TOO, and this is not symmetry for its own
-        // sake: the pilot's subpaths are thrown away, but `smOut->nEmitted` is set from the
-        // REAL pass's emission count. Leaving the pilot's photons in the banks would put
-        // ~3 % more flux in the map than the normalisation divides by, i.e. a silent
-        // brightening of every surface merge that scales with the pilot fraction.
+        // The pilot COUNTS its surface photons (pilotSurfN, by the store's own test) and stores
+        // none: `smOut->nEmitted` is the real pass's emission count, and a pilot photon left
+        // in the map would put ~3 % more flux in it than that divides by -- a silent
+        // brightening of every surface merge. The banks are cleared regardless.
         size_t pilotSurf = 0;
-        for (SurfBank& sb : sbanks) pilotSurf += sb.size();
+        for (long long c : pilotSurfN) pilotSurf += (size_t)c;
         for (SurfBank& sb : sbanks) {
             sb.pts.clear(); sb.pts.shrink_to_fit();
             sb.mis.clear(); sb.mis.shrink_to_fit();
@@ -3135,8 +3168,7 @@ inline void traceLightBeamPass(const Scene& scene, const Camera& cam, long long 
             nPaths = std::clamp(fit, req.exact ? 1LL : kPathsMin, nPathsAsked);
             if (req.exact) {
                 beamPaths = nPaths;
-                if (smOut && req.surfPaths > 0)
-                    nPaths = std::clamp(std::max(nPaths, req.surfPaths), 1LL, nPathsAsked);
+                if (surfN > 0 && req.hostSurf) nPaths = std::max(nPaths, surfN);
             }
         }
         // THE SURFACE CEILING, applied AFTER the beam knee and only ever downward. It is a
@@ -3146,12 +3178,19 @@ inline void traceLightBeamPass(const Scene& scene, const Camera& cam, long long 
         bool surfBound = false;
         if (smOut && req.maxSurfPhotons > 0 && surfPerPath > 0.0) {
             const long long fitS = (long long)((double)req.maxSurfPhotons / surfPerPath);
-            // Floored at kPathsMin only where the beams left at least that many (an exact map
-            // may not have): std::clamp's bounds must not cross.
-            const long long capped = std::clamp(fitS, std::min(kPathsMin, nPaths), nPaths);
-            surfBound = (capped < nPaths);
-            nPaths = capped;
+            if (req.hostSurf) {
+                // Floored at kPathsMin only where the beams left at least that many (an exact
+                // map may not have): std::clamp's bounds must not cross.
+                const long long capped = std::clamp(fitS, std::min(kPathsMin, nPaths), nPaths);
+                surfBound = (capped < nPaths);
+                nPaths = capped;
+            } else if (fitS < surfN) {   // the device's count, the host's untouched
+                surfBound = true;
+                surfN = std::max(fitS, 1LL);
+            }
         }
+        // A beam subset is a subset of the pass, which the ceiling may have lowered.
+        if (beamPaths > nPaths) beamPaths = nPaths;
         if (budgetOut) {
             budgetOut->pilotPaths   = nPilot;
             budgetOut->beamsPerPath = perPath;
@@ -3178,10 +3217,13 @@ inline void traceLightBeamPass(const Scene& scene, const Camera& cam, long long 
     // either way: a refresh epoch re-traces exactly `pathsUsed`, so leaving it 0 on the
     // no-pilot path would make every epoch after the first fall back to the raw `-n` default
     // and quietly trace hundreds of times more than epoch 0 did.
+    // A device-drawn surface map leaves the host only the beams' subpaths: none with them off.
+    if (smOut && !req.hostSurf && surfN > 0 && beamPaths >= 0) nPaths = beamPaths;
     if (budgetOut) {
         budgetOut->pathsAsked = nPathsAsked;
         budgetOut->pathsUsed  = nPaths;
         budgetOut->beamPaths  = beamPaths;
+        budgetOut->surfPaths  = (smOut && !req.hostSurf) ? surfN : 0;
     }
     std::vector<std::thread> pool;
     for (int t = 0; t < nThreads; ++t)

@@ -436,9 +436,15 @@ Everything else follows from that one field.
   count (`nEmitted`), and so does each merge constant (`MergeK`: n_beam 2r_b and n_surf pi r_s^2;
   the device's `mergeKappa` and `kappaS`), so the subset is the same estimator with fewer beam
   samples. With the beams off the pass deposits none (`beamPaths` 0) and runs no beam budget.
-  A scene names its own rule with `render { jbeams }` (`g_jBeamsScene`, below the command line's
-  flags in `jBeamsChoice`), and `checkpointGuard` mixes in any rule but the knee's, so a sidecar
-  written before 0.435.0 still resumes under `auto` and is refused under another. `auto` is the knee rule (*The beam budget*, below: the
+  On the GPU the device draws the surface map itself (`cudaJSurfOnDevice`), so the host pass
+  stores no surface photons and traces only the beams' subpaths, none with the beams off
+  (`BeamBudgetReq::hostSurf`); the map carries the device's count and photon slots
+  (`SurfMap::devPaths`/`devCap`, from the pilot's photons a subpath), and the batch cache keeps
+  epoch 0's counts (`BatchCache::nAll0`...) for a frame that reuses epoch 0 (0.436.0). A scene
+  names its own rule with `render { jbeams }` (`g_jBeamsScene`; `jBeamsResolve`: below the
+  command line's `-jbeams` and `-nobeams`, above the `-beamk`/`-beamcount`/`-n` that pick `auto`
+  only where no rule is named; one grammar, `ftsl::parseJBeams`), and `checkpointGuard` mixes
+  in a fixed map, the one rule a sidecar from before 0.435.0 cannot hold. `auto` is the knee rule (*The beam budget*, below: the
   budget sized by the probe's knee up to `-beamcount`, radii widened by the floor), and giving
   `-beamk`, `-beamcount` or `-n` selects it, so an older command line naming any of them renders
   as it did; `off` is `-nobeams`. Why the default moved: measured on the GPU against mode D at
@@ -446,8 +452,8 @@ Everything else follows from that one field.
   trailed a 1000-beam map by 1.5-3.5x on five fog scenes, its probe — random chords of the beams' box —
   misreading what the camera's segments gather; 1000 beams was within 15 % of the best map at
   depth 8 (where no beams wins) and the best arm at depth 32. The knee rule still wins where dense
-  bounded media want dense maps (`gallery_rain`'s rain and cloud, whose render scripts pass
-  `-jbeams auto`). The probe itself stays as `auto`'s; a camera-shaped probe is the open question
+  bounded media want dense maps (`gallery_rain`'s rain and cloud, whose render block says
+  `jbeams auto`). The probe itself stays as `auto`'s; a camera-shaped probe is the open question
   of whether `auto` can be made to land where the fixed map does.
 - **Flag polarity is reversed from `A`/`B`/`M`.** They need `-beams` to opt in; mode `J` needs
   `-nobeams` to opt out (`g_noBeams`). A mode-`J` render with no beam map is not a degraded UPBP,

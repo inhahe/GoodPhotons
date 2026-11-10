@@ -89,6 +89,25 @@
 
 namespace ftsl {
 
+// MODE J'S BEAM MAP (-jbeams, `render { jbeams }`; main.cpp's g_jBeamsCli / g_jBeamsScene and
+// jBeamsResolve). Here, beside the scene's own key, so the command line and the scene read one
+// grammar: `off`, `auto` or a beam count from 1 to 1e12 (never an out-of-range long long).
+enum class JBeams { Off, Auto, Fixed };
+inline constexpr long long kJBeamsDefault = 1000;   // the default fixed map's raw beams
+struct JBeamsChoice {
+    JBeams    rule = JBeams::Fixed;
+    long long n    = kJBeamsDefault;   // a fixed map's raw beams a realization
+};
+inline bool parseJBeams(const char* v, JBeamsChoice& out) {
+    if (!std::strcmp(v, "off"))  { out = {JBeams::Off, 0};  return true; }
+    if (!std::strcmp(v, "auto")) { out = {JBeams::Auto, 0}; return true; }
+    char* end = nullptr;
+    const double n = std::strtod(v, &end);
+    if (end == v || *end != '\0' || !(n >= 1.0 && n <= 1e12)) return false;
+    out = {JBeams::Fixed, (long long)n};
+    return true;
+}
+
 // A token is a number iff strtod consumes all of it (handles -1, 0.999, 1e30).
 inline bool isNumber(const std::string& s) {
     if (s.empty()) return false;
@@ -984,9 +1003,9 @@ struct Loaded {
     double jsurfRadius = -1.0;
     // render { jbeams off|auto|<N> } (0.435.1): mode J's beam map, when the scene knows it wants
     // other than the fixed default (gallery_rain's dense rain wants `auto`, the knee-sized map its
-    // flyby is tuned with); empty = not specified. The command line's -jbeams, -nobeams, -beamk,
-    // -beamcount or -n still win.
-    std::string jbeams;
+    // flyby is tuned with); empty = not specified. The command line's -jbeams or -nobeams still
+    // win; -beamk, -beamcount and -n, which pick `auto` only where nothing else does, do not.
+    std::optional<JBeamsChoice> jbeams;
     std::string device;          // empty = not specified
     std::string out;             // empty = not specified
     // Keys no builder read (see collectUnusedKeys). Carried on Loaded rather than
@@ -10787,14 +10806,12 @@ private:
         }
         if (find(b, "jbeams")) {
             const std::string v = strOf(b, "jbeams");
-            char* end = nullptr;
-            const double n = v.empty() ? 0.0 : std::strtod(v.c_str(), &end);
-            const bool count = end && end != v.c_str() && *end == 0 && n >= 1.0 && n <= 1e12;
-            if (!(v == "off" || v == "auto" || count)) {
+            JBeamsChoice c;
+            if (!parseJBeams(v.c_str(), c)) {
                 fail("render: jbeams takes off, auto or a beam count from 1 to 1e12 (got '" + v + "')");
                 return false;
             }
-            L.jbeams = v;
+            L.jbeams = c;
         }
         // `mode_spp D=1 J=0.5`: per-mode sample multipliers (FTSL.md 16.1). key=val words, so they
         // continue one statement (1.1).

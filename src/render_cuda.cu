@@ -26669,7 +26669,13 @@ Film renderBdptCuda(const Scene& scene, const Camera& cam, int resX, int resY,
     // doing at all: `buildJSurfMapDevice` opens with `dsm = gpu::DSurfMap{}`, so on the device
     // path every byte `uploadSurfMapCuda` converts and ships is overwritten a few lines later.
     const int jdevLevel = jDevLightLevel();
-    const bool jDevLight = smap && smap->nEmitted > 0 && jdevLevel != 0;
+    // The subpaths the device draws its surface map from, and the photon slots it reserves: the
+    // host map's own count and twice its size, or what the host sized for a device-drawn map
+    // whose host pass traced only the beams' subpaths (SurfMap::devPaths, mode J's fixed map).
+    const long long jDevPaths = smap ? (smap->devPaths > 0 ? smap->devPaths : smap->nEmitted) : 0;
+    const long long jDevCap   = smap ? (smap->devCap > 0 ? smap->devCap
+                                                         : (long long)smap->pts.size() * 2 + 1024) : 0;
+    const bool jDevLight = smap && jDevPaths > 0 && jdevLevel != 0;
 
     DSurfMap dsm{};
     // Skip the host map's upload when the device is about to build its own over the top. The
@@ -26677,8 +26683,8 @@ Film renderBdptCuda(const Scene& scene, const Camera& cam, int resX, int resY,
     // every surface photon on one core to widen it into the device layout.
     if (smap && !jDevLight) uploadSurfMapCuda(smap, up, dsm);
     if (jDevLight) {
-        buildJSurfMapDevice(jdev, up.sc, up.dc, diffraction, maxDepth, smap->nEmitted,
-                            smap->radius, (long long)smap->pts.size() * 2 + 1024,
+        buildJSurfMapDevice(jdev, up.sc, up.dc, diffraction, maxDepth, jDevPaths,
+                            smap->radius, jDevCap,
                             jSurfSalt(prog), dsm);
         // ONCE. A refreshing render rebuilds this every epoch -- 126 of them in 90 s -- and a
         // line each would bury the -interval status lines that carry the actual progress.
@@ -26686,7 +26692,7 @@ Film renderBdptCuda(const Scene& scene, const Camera& cam, int resX, int resY,
         if (!jdevSaid || jdev.dropped) {
             jdevSaid = true;
             std::printf("[jdevlight] device light pass: %lld subpaths -> %lld surface photons "
-                        "(host traced %zu)%s\n", (long long)smap->nEmitted, jdev.stored,
+                        "(host traced %zu)%s\n", jDevPaths, jdev.stored,
                         smap->pts.size(),
                         jdev.dropped ? "  [CAP BOUND: some photons dropped]" : "");
         }
@@ -26745,9 +26751,9 @@ Film renderBdptCuda(const Scene& scene, const Camera& cam, int resX, int resY,
                         "realizations; unbiased per pixel, but the realization is no longer "
                         "shared across the image\n");
     }
-    const long long jPaths = jDevLight ? (long long)smap->nEmitted : 0;
+    const long long jPaths = jDevLight ? jDevPaths : 0;
     const double    jRad   = jDevLight ? smap->radius : 0.0;
-    const long long jCap   = jDevLight ? ((long long)smap->pts.size() * 2 + 1024) : 0;
+    const long long jCap   = jDevLight ? jDevCap : 0;
     // Mode J's switches, as the host settled them for this render (cudaSetJSwitches).
     CUDA_CHECK(cudaMemcpyToSymbol(gpu::c_jHalf, &g_jHalfHost, sizeof(int)));
     CUDA_CHECK(cudaMemcpyToSymbol(gpu::c_jSpecOn, &g_jSpecHost, sizeof(int)));
