@@ -133,9 +133,9 @@ Each names the section its line is in.
     check).~~ Done: the GPU hit queue no longer spills (0.434.33-36), 0.434.40's beam domain ended
     the outward ratchet of 0.434.31's beam limit (J-BEAM-FARLIMIT) and made the field fast, and
     0.435.0's `-jbeams` made a fixed 1000-beam map the default. Left: J-AUTO-PROBE (4.5).
-19b. **J-FIELD-SLOW's open ends** (4.5), found measuring it 2026-11-09/10: a `-time` budget cannot
-    end a GPU mode D/J chunk. (The 2 000-beam brightness it also found was the shared seeds' noise,
-    4.3; the resume passes' re-walk no longer costs anything measurable, 4.5.)
+19b. ~~**J-FIELD-SLOW's open ends** (4.5), found measuring it 2026-11-09/10: a `-time` budget cannot
+    end a GPU mode D/J chunk.~~ Done, 0.436.6. (The 2 000-beam brightness it also found was the
+    shared seeds' noise, 4.3; the resume passes' re-walk no longer costs anything measurable, 4.5.)
 20. **JSPEC-CARRIER-SIZE** (4.5) — every mode-J GPU thread reserves the spectral carrier: VRAM, the
     operator's call against build time. (The ~3x camera pass measured against it was the MIS
     weights' transmittances, 0.436.5.)
@@ -444,12 +444,11 @@ Then the rest of 4.2-4.6 in their order, 4.7's bookkeeping alongside whatever to
   mid-batch, and a `-time`/`-noise`/`-forever` budget takes the clock instead of hanging.)
 - [ ] **BEAMEPOCHS-CHUNK-PIN** — `-beamepochs` pins the GPU chunks to 1 spp, which costs a cheap
   scene.
-- [ ] **J-FIELD-SLOW's "A `-time` budget cannot end a GPU chunk"** — a GPU mode D/J chunk is at least
-  one sample of the whole frame and the budget is read between chunks, so a slow sample overruns it
-  (the field at 512x384 ran one chunk over 55 minutes against `-time 120`); `-stop` cuts a chunk,
-  the clock does not, and the progress line and interval writes wait too. Proper fix: a chunk may be
-  part of a sample (a range of pixel slots, as mode M's gather slices its samples), so the budget
-  and the reports land every fraction of a second whatever a sample costs.
+- [x] **J-FIELD-SLOW's "A `-time` budget cannot end a GPU chunk"** — a GPU mode D/J chunk is at least
+  one sample of the whole frame and the budget is read between chunks, so a slow sample overran it
+  (the field at 512x384 ran one chunk over 55 minutes against `-time 120`). Done, 0.436.6: the
+  budget's deadline cuts the chunk in flight once the film holds a sample (known-issues says why
+  the part-sample chunk proposed here was not the fix).
 - [x] **J-FIELD-SLOW's resume passes re-walk from the root** — closed by measurement, 2026-11-10
   (0.436.3): across `_fog_cornell`, `_fog_thick`, the still haze, the density field and `_slab_ss`,
   each at 128x96 and 512x384 under the fixed map and the knee rule (20 s each), and `gallery_rain`

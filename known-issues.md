@@ -894,12 +894,19 @@ their tight box area nearly doubled (5.4e6 to 9.8e6 m^2): the beams got longer. 
 0.434.31 (J-BEAM-FARLIMIT: a mode J beam in an unbounded medium runs to the far side of the swept
 sphere, not 8 scene radii), being bisected.
 
-**A `-time` budget cannot end a GPU chunk.** A GPU mode D/J chunk is at least one sample of the
-whole frame, and the budget is read between chunks (gpuSppChunks); `-stop` cuts a chunk short
-(DeviceStopScope), the clock does not. With the defaults the field at 512x384 ran one chunk for over
-55 minutes against `-time 120` (stopped by hand). Proper fix, with the budget fix below making such
-chunks rare: let a chunk be part of a sample (a range of pixel slots, as mode M's gather slices
-its samples), so the budget and the progress reports land every ~0.15 s whatever a sample costs.
+**DONE (0.436.6): a `-time` budget ends a GPU chunk.** A GPU mode D/J chunk is at least one sample
+of the whole frame, and the budget was read only between chunks (gpuSppChunks); `-stop` cut a chunk
+short (DeviceStopScope), the clock did not. With the defaults the field at 512x384 ran one chunk for
+over 55 minutes against `-time 120` (stopped by hand). Now `SppProgress::deadline` carries the
+budget's instant and gpuSppChunks cuts the chunk in flight through the device's stop flag once the
+film holds a sample, dropping it as a stop does (design.md, "A GPU mode D/J chunk can be cut
+short"; `tools/check_gpu_time.py`). The render's first sample still runs to its end, and says so.
+The fix proposed here, a chunk that is part of a sample, was not needed for the budget and would not
+have bought much else: the host's film, its reports, the checkpoint and the resume all carry one
+sample count for every pixel, and a part-sample's light-tracing splats land all over the frame, so
+showing one would mean a split film with per-pixel counts through all of them -- for a partial image
+of a first sample longer than the budget. The progress line and the `-interval` image still wait for
+a chunk; the film changes only when one lands, and the stall watchdog speaks after 30 s.
 
 **Still open: the budget's probes do not measure what the camera gathers.** `probeGatherCount`
 draws chords between random points of the beams' bounding box. Each gathers 32 beams by

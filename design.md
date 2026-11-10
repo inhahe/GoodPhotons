@@ -674,7 +674,19 @@ Four consequences worth knowing:
     records so (`g_dStopSeen`), and a chunk so cut short is dropped -- its partial sums never
     downloaded, the films freed unread -- and `gpuSppChunks` flushes the whole chunks before it as
     final (the `abandoned` contract `cpuSppChunks` keeps); an epoch loop a stop ended without a
-    report of its own flushes the epochs it rendered (`tools/check_gpu_stop.py`). (Until 0.434.34 overflowing hits were evaluated on the spot inside `kWfBeamHits`, one
+    report of its own flushes the epochs it rendered (`tools/check_gpu_stop.py`). **`-time`'s
+    end cuts a chunk the same way** (0.436.6): a chunk is at least one sample of the whole frame
+    and the budget is asked only between chunks, so `SppProgress::deadline` carries the budget's
+    instant (`runSppProgressive`, whose report ends the render on that same instant; a mode J
+    epoch passes its caller's on). `gpuSppChunks`' watchdog wakes on it and raises the device's
+    flag alone -- not the host's stop -- over a launch in flight once the caller's film holds a
+    sample (`sampleBase`, i.e. a resumed checkpoint or an earlier epoch, or this call's own); the
+    main thread skips a launch the deadline has already passed; the report after the dropped
+    chunk sees the budget spent and writes the end, as a cut and not an abandoned frame. A
+    render's first sample is never cut (there would be no image), and the render says so.
+    `renderBdptCuda`'s `stopped()` reads the device flag as well, so a cut launches no further
+    waves, and `gpuSppChunks` puts the flag back to the host's on the way out
+    (`tools/check_gpu_time.py`). Launches that cannot be dropped (mode R's) are not cut. (Until 0.434.34 overflowing hits were evaluated on the spot inside `kWfBeamHits`, one
     thread a segment: harmless at `_fog_cornell`'s rate, ~20× slower a hit with an unbounded
     density field's ~10⁵ hits a path, J-FIELD-SLOW.) The wave floor is 256 paths.
     `tools/check_wf_resume.py` renders a fog with the hit queue shrunk (`FTRACE_WFHITCAP`) and

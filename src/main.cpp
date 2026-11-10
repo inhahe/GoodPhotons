@@ -18783,6 +18783,11 @@ static int runSppProgressive(
     SppProgress prog;
     prog.sampleBase = baseSpp;   // bias fresh seeds past the loaded samples
     prog.clockEnds = clockEnds;
+    // The report below ends the render on this same instant, so a renderer that cuts its chunk
+    // here (gpuSppChunks) is always answered with the stop and the final write.
+    if (!runForever && timeBudgetSec > 0.0)
+        prog.deadline = t0 + std::chrono::duration_cast<clk::duration>(
+                                 std::chrono::duration<double>(timeBudgetSec));
     bool failed = false;         // a refresh traced nothing and the render stopped short
     prog.failed = &failed;
     long long lightEpochs = haveBase ? base.lightEpochs : 0;   // mode J's, kept through the resume
@@ -18805,7 +18810,7 @@ static int runSppProgressive(
         if (g_whitted) std::snprintf(nz, sizeof nz, "deterministic");
         else           std::snprintf(nz, sizeof nz, "~%.2f%% noise", noisePct);
         bool stopped  = g_stopRequested != 0;
-        bool timeUp   = (!runForever && timeBudgetSec > 0.0 && elapsed >= timeBudgetSec);
+        bool timeUp   = prog.deadline != clk::time_point{} && clk::now() >= prog.deadline;
         bool noiseMet = (!g_whitted && noiseTarget > 0.0 && totalSpp > 0 && noisePct <= noiseTarget);
         if (noiseMet) metNoise = true;
         if (timeUp)   metTime  = true;
@@ -21033,6 +21038,9 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
                 double reportSec = 0.0;      // spent in the reports below (writing images, the window)
                 SppProgress inner;
                 inner.sampleBase = prog->sampleBase + sppAll;
+                // -time's end may cut this epoch's first chunk: its report then brings sppDone 0,
+                // and `acc` is the image.
+                inner.deadline = prog->deadline;
                 inner.report = [&](const Film& f, long long sppDone, bool final) -> bool {
                     if (epochSec <= 0.0) {
                         const double setupSec =

@@ -25768,6 +25768,31 @@ static void gpuSppChunks(long long spp, const SppProgress& prog, Film& out,
                                  return e && *e && std::strcmp(e, "0"); }();
     long long done = 0, chunk = (forcedChunk > 0) ? forcedChunk : 1;
 
+    // ---- the -time deadline (SppProgress::deadline) ----------------------------------
+    // Only a launch that can be dropped -- one returning whether it landed whole, whose kernels
+    // read the device stop flag (renderBdptCuda) -- can be cut. The watchdog below raises that
+    // flag when the deadline passes with a chunk in flight and the caller's film holds a sample
+    // (`filmSpp`: prog.sampleBase, then this call's chunks as they land); the launch is dropped
+    // and the report after it sees the budget spent. The flag is the one -stop raises, put back
+    // to the host's own on the way out (CutRestore), so a cut never reaches the next render.
+    constexpr bool droppable = std::is_same_v<decltype(launch((long long)1, (long long)0)), bool>;
+    const bool hasDeadline = droppable && prog.deadline != clk::time_point{};
+    std::atomic<long long> filmSpp{prog.sampleBase};
+    std::atomic<bool> cut{false};
+    struct CutRestore {   // declared before the watchdog, so it runs after the join
+        std::atomic<bool>& cut;
+        ~CutRestore() {
+            if (cut.load()) *(volatile int*)deviceStopFlag().host = ft::stopRequested() ? 1 : 0;
+        }
+    } cutRestore{cut};
+    std::atomic<bool> firstNoted{false};
+    auto noteFirst = [&] {   // from whichever thread sees it first
+        if (firstNoted.exchange(true)) return;
+        std::printf("\n[time] the budget ran out inside the render's first sample, which runs on "
+                    "so there is an image to write (-stop ends it now, writing none).\n");
+        std::fflush(stdout);
+    };
+
     // ---- stall watchdog ------------------------------------------------------------
     // A kernel launch is synchronous from here (cudaCheckKernel synchronizes), so while one
     // chunk is in flight this thread is parked in cuCtxSynchronize and CANNOT report, write
@@ -25798,12 +25823,26 @@ static void gpuSppChunks(long long spp, const SppProgress& prog, Film& out,
     std::thread watchdog([&] {
         bool warned = false;
         double nextWarn = 30.0;                 // first complaint after 30 s in one chunk
+        bool spent = false;                     // the deadline has been dealt with
         for (;;) {
             std::unique_lock<std::mutex> lk(wmx);
-            wcv.wait_for(lk, std::chrono::seconds(2), [&] { return watchQuit; });
+            // Woken AT the deadline, not up to 2 s after it.
+            const auto wake = clk::now() + std::chrono::seconds(2);
+            wcv.wait_until(lk, (hasDeadline && !spent && prog.deadline < wake) ? prog.deadline : wake,
+                           [&] { return watchQuit; });
             if (watchQuit) return;
             lk.unlock();
             const long long t0 = launchStartMs.load(std::memory_order_relaxed);
+            // Between chunks (t0 == 0) the main thread's own test before its next launch acts.
+            if (hasDeadline && !spent && clk::now() >= prog.deadline) {
+                spent = true;
+                if (t0 && filmSpp.load() > 0) {
+                    cut.store(true);
+                    *(volatile int*)deviceStopFlag().host = 1;
+                } else if (t0) {
+                    noteFirst();
+                }
+            }
             if (!t0) { warned = false; nextWarn = 30.0; continue; }   // between chunks: reset
             const double el = (nowMs() - t0) / 1000.0;
             if (el < nextWarn) continue;
@@ -25812,8 +25851,8 @@ static void gpuSppChunks(long long spp, const SppProgress& prog, Film& out,
                     "\n[gpu-stall] one %lld-spp chunk has been running on the GPU for %s "
                     "(target is 0.15 s).\n"
                     "[gpu-stall] The render is NOT hung, but until this chunk returns it "
-                    "cannot write the -interval image or end on -time (in modes D and J a "
-                    "-stop drops it).\n"
+                    "cannot write the -interval image (in modes D and J a -stop drops it, and "
+                    "so does -time's end once the image holds a sample).\n"
                     "[gpu-stall] The usual cause is another process saturating the GPU: check "
                     "`nvidia-smi` for a second CUDA program. Run with -device cpu to sidestep "
                     "it, or free the card.\n",
@@ -25838,22 +25877,37 @@ static void gpuSppChunks(long long spp, const SppProgress& prog, Film& out,
         auto t0 = clk::now();
         launchSpp.store(c, std::memory_order_relaxed);
         launchStartMs.store(nowMs(), std::memory_order_relaxed);
+        // Published before this test, so a deadline the watchdog found between chunks is this
+        // test's (it reads the clock later), and one it finds after is a launch's to cut.
+        if (hasDeadline && clk::now() >= prog.deadline) {
+            if (filmSpp.load() > 0) {   // the report sees the budget spent and writes the end
+                launchStartMs.store(0, std::memory_order_relaxed);
+                prog.report(out, done, false);
+                break;
+            }
+            noteFirst();
+        }
         // A launch that returns false was cut short by a stop and dropped (renderBdptCuda): `out`
         // still holds the `done` spp downloaded before it, which is flushed once more as final
         // (skipped at done == 0, which has no image), and the frame is `abandoned` -- the
         // contract cpuSppChunks keeps. A launch returning nothing always lands whole.
         bool whole = true;
-        if constexpr (std::is_same_v<decltype(launch(c, prog.sampleBase + done)), bool>)
+        if constexpr (droppable)
             whole = launch(c, prog.sampleBase + done);
         else
             launch(c, prog.sampleBase + done);
         launchStartMs.store(0, std::memory_order_relaxed);
         if (!whole) {
+            // The deadline's cut is the budget's end, not an abandoned frame: the film holds what
+            // was rendered before it, the report writes it, and its caller's earlier epochs or
+            // checkpoint stand in for a `done` of 0.
+            if (cut.load() && !ft::stopRequested()) { prog.report(out, done, false); break; }
             if (done > 0) prog.report(out, done, /*final*/true);
             out.abandoned = true;
             break;
         }
         done += c;
+        filmSpp.store(prog.sampleBase + done);
         double dt = std::chrono::duration<double>(clk::now() - t0).count();
         if (chunkDebug)
             std::fprintf(stderr, "[chunk] gpu %lld spp in %.3f s (%.1f spp/s), %lld/%lld done\n",
@@ -26637,8 +26691,11 @@ Film renderBdptCuda(const Scene& scene, const Camera& cam, int resX, int resY,
     const bool abortable = prog && prog->report;
     std::unique_ptr<DeviceStopScope> stopScope;
     if (abortable) stopScope = std::make_unique<DeviceStopScope>();
-    // A stop the host has seen: no more waves or passes are launched.
-    auto stopped = [&] { return abortable && ft::stopRequested(); };
+    // A stop the host has seen, or -time's end cutting the chunk (gpuSppChunks raises the device's
+    // flag alone): no more waves or passes are launched.
+    auto stopped = [&] {
+        return abortable && (ft::stopRequested() || *(volatile int*)deviceStopFlag().host != 0);
+    };
     // Resume (mode D disk resume): fresh samples carry ABSOLUTE indices
     // [sppBase, sppBase + spp), so the kernel's stride is the FINAL total (see
     // renderBackwardCuda for why). The loaded sample count is also mixed into the seed

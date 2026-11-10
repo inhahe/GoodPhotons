@@ -14,6 +14,7 @@
 // A null SppProgress (or one with no report) means "render all spp in a single shot",
 // which is the historical, bit-identical path.
 #pragma once
+#include <chrono>
 #include <functional>
 #include "scene_film.h"
 
@@ -53,6 +54,14 @@ struct SppProgress {
     // traced nothing: the caller then reports a failed render, not a finished one. Null: no one
     // asks.
     bool* failed = nullptr;
+
+    // When the -time budget runs out; the clock's epoch (the default) for no budget. `report`
+    // still decides every stop, but it is asked only between chunks, and a GPU mode D/J chunk is
+    // at least one sample of the whole frame -- minutes, on a costly scene. So gpuSppChunks cuts
+    // the chunk in flight at this moment and drops it, as a -stop does, once the film the caller
+    // writes holds a sample (`sampleBase` or this call's own); the first sample of a render is
+    // finished, or there would be no image. A refresh loop's epochs pass on their caller's.
+    std::chrono::steady_clock::time_point deadline{};
 };
 
 // Progress through a phase that has NO pixels yet.
