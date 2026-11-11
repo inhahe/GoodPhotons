@@ -6983,8 +6983,8 @@ alone can't restore, so they are not disk-resumable.
 `-checkcavity`, `-checktrinormal`, `-checkmesh`, `-checkprefer`, `-checkpaths`,
 `-checksdf`, `-checksun`, `-checkbind`, `-checkprop`, `-checkhair`,
 `-checkarray`, `-checklattice`, `-checknd`, `-checkpatops`, `-checkdevhits`. Each runs deterministically without a scene and prints
-`PASS`/`FAIL`. (`-misaudit` / `-misaudit-poison`, described at the end of this section, are
-also diagnostics but need a scene — they instrument a live render's MIS weights.)
+`PASS`/`FAIL`. (`-misaudit` / `-misaudit-poison` and `-checkjsurfw`, described at the end of
+this section, are also diagnostics but need a scene — they instrument a live render's MIS weights.)
 
 `-checkpatops` guards **the pattern VM against itself**. The VM is implemented three
 times — `patternEval` on the host, the fp64 device template `dPatternEval`, and
@@ -7152,6 +7152,18 @@ time. **`-misaudit-poison`** is the negative control: it breaks the reference on
 against the unified path's direction), so the run **must** report disagreements — if it
 does not, the audit is vacuous and ftrace says so in as many words. Run it whenever you
 have reason to doubt that the clean runs mean anything.
+
+**`-checkjsurfw`** also instruments a real render: mode `J` on the GPU with `-jsurf`. It holds
+**the device's point-merge MIS weights to the CPU's**, including the per-wavelength tables a
+weight carries where a medium's extinction varies with wavelength. The render's first call
+records the camera subpaths of its first 4096 samples, and the weight's camera half at every
+point-merge site on them. The CPU then rebuilds the same halves from those same vertices with
+its own code and requires every field, every table bin, which vertices are merge sites, and the
+weight itself at a spread of photon states and wavelengths to agree (to `1e-4`: the GPU traces
+in fp32). Its negative control is built in: read one bin off, the CPU's weight must move away
+from the GPU's somewhere, or the scene had nothing chromatic to hold, and the run fails. It
+prints its verdict at the end, as `-misaudit` does, and a run that never reached a mode-`J`
+device call fails too. `tools/check_jsurfw.py` runs it on two scenes.
 
 **Scene front end:** the shared grammar parses every `.ftsl`, with no flag to
 configure. `-legacy-parser` and `-validate-grammar` were retired in 0.79.0; they are

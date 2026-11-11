@@ -36,7 +36,8 @@ streams draws again.
 whose weights read the same tables: SurfMergeWeight, DSurfMergeW) and `cpu` (the host's
 ChromaMis; beam merges), each against mode R on its own device, about 25 minutes apiece. In this
 scene the point merges carry about 1e-5 of the frame, so `gpu-jsurf` reads what `gpu` does to the
-fourth digit and does not hold their weights (known-issues JCHROMA-JSURF-WEAK). The CPU's
+fourth digit and does not hold their weights: tools/check_jsurfw.py holds those directly,
+device against host (known-issues JCHROMA-JSURF-WEAK). The CPU's
 mode J reads X over Y about 1.3 % lower than the GPU's here with the fix on or off -- a CPU-only
 bias of its own (known-issues J-FOG-REALCAM) -- so `cpu` is held to 1.5 %: with the fix it reads
 0.990 / 1.003, without 0.971 / 1.019 (the GPU at the defaults: 0.998 / 0.997 and 0.981 / 1.011).
@@ -151,7 +152,7 @@ def main():
         j = [sum(m[c] for m in per) / len(per) for c in range(3)]
         if tag == "gpu-jsurf":
             print("gpu-jsurf: the point merges carry ~1e-5 of this frame, so this holds no more "
-                  "than `gpu` does (known-issues JCHROMA-JSURF-WEAK)")
+                  "than `gpu` does; tools/check_jsurfw.py holds their weights")
 
         def of(m, c):   # J channel means m against R: X or Z over Y, or Y itself
             r = [m[k] / ref[k] for k in range(3)]

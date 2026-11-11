@@ -363,7 +363,18 @@ work units fitted for the device as `FTRACE_JWORK=1` fitted the CPU's -- every f
 then repeats, at the cost of the clock's free measurement of what an epoch costs on this machine;
 or (b) keep the clock and pin `-beamepochs` in each check, as check_jchroma now does.
 
-## OPEN (2026-11-11, found fixing JCHROMA-CLOCK): JCHROMA-JSURF-WEAK — check_jchroma's `gpu-jsurf` variant does not hold the point merges' chromatic weights
+## DONE (2026-11-11, 0.439.0; found fixing JCHROMA-CLOCK): JCHROMA-JSURF-WEAK — check_jchroma's `gpu-jsurf` variant does not hold the point merges' chromatic weights
+
+**Fixed by a probe, the user's word given:** `ftrace -checkjsurfw` (design.md, "The point
+merges' tables are held directly") holds the device's point-merge weights to the host's from the
+device's own camera subpaths -- the scalar fields, the chromatic bins (DChromaRun against
+cameraSideSumsChroma), the merge sites, the wiring (the bins are read through the weight's own
+pointers) and DSurfMergeW against SurfMergeWeight at drawn photon states and wavelengths -- with
+a built-in negative control. `tools/check_jsurfw.py` runs it on check_jchroma's box and the box
+around a glass ball: bins within 2.4e-5, weights within 2.5e-7, about 900 of 50 000 weights moved
+by a one-bin shift; with the inline wiring swapped it fails (bins 1.0, weights 0.81). The queued
+gather's copy of the bins is held to the inline gather by check_surf_wavefront. The rest of this
+entry is how it stood.
 
 In check_jchroma's box of chromatic fog the point merges carry about 1e-5 of the frame: pinned to
 the same epochs, `gpu` and `gpu-jsurf` read the same J/R to the fourth digit on every seed (their

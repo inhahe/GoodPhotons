@@ -687,6 +687,21 @@ std::vector<uint8_t> renderIsoPreviewCuda(const Scene& scene, const Camera& cam,
 // fails; the caller then reports the device half as SKIPPED rather than failed.
 #include "lattice_probe.h"
 bool cudaLatticeProbe(const unsigned long long* idx, int n, double* out);
+
+// `-checkjsurfw` (jsurf_tap.h): mode J's point-merge weights, held against the host's.
+// Arm: the next renderBdptCuda call records its first `n` samples (absolute indices below `n`):
+// each one's camera subpath and the camera half of every point merge's weight it built on it.
+// Take: hands the record back and disarms -- per sample its vertices (kJSurfTapMaxV apart), their
+// count (0: not recorded) and its camera wavelength, and per vertex the half (camVert 0 where
+// none was built). False if nothing was armed or there is no device.
+#include "jsurf_tap.h"
+void cudaJSurfTapArm(int n);
+bool cudaJSurfTapTake(std::vector<JSurfTapVertex>& eye, std::vector<int>& nE,
+                      std::vector<double>& lam, std::vector<JSurfTapHalf>& halves);
+// The device's own weight (DSurfMergeW, its bins read by dSpecBinAt) of each state against the
+// half it names: out[i] for states[i]. False if there is no device or the launch failed.
+bool cudaJSurfWEval(const std::vector<JSurfTapHalf>& halves,
+                    const std::vector<JSurfTapState>& states, std::vector<double>& out);
 // `-rainbow-selftest`'s device half (rainbow::RainbowPhase::samplerFit): `n` draws of the device's
 // rainbow phase sampler (dMedPhaseSample) about +z at `lambda`, mu = cos theta histogrammed one bin
 // per table cell into `counts`. False if there is no device, or it failed.

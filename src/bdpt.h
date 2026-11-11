@@ -4738,6 +4738,46 @@ inline void cameraSideSumsChroma(const Scene& scene, const PatTables& tabs,
     }
 }
 
+// The camera half of a point merge's weight at eye[k] (k >= 1, eye[k] a merge site, eye[k-1]
+// at squared distance d2 along the unit `woCam`): what renderRows' point merges weigh their
+// photons with, and what -checkjsurfw rebuilds from the device's vertices (main.cpp). segSumC and
+// segSumM are cameraSideSums' for the subpath, geoE its MergeGeo (null to compute what is needed),
+// and chromaM / chromaE1 cameraSideSumsChroma's, read where `cm` is on.
+inline SurfMergeWeight surfMergeWeightAt(const Scene& scene, const std::vector<Vertex>& eye, int k,
+                                         const MergeK& mk, const std::vector<double>& segSumC,
+                                         const std::vector<double>& segSumM, const MergeGeo* geoE,
+                                         double lamCam, const ChromaMis& cm,
+                                         const std::vector<double>& chromaM,
+                                         const std::vector<double>& chromaE1, int maxDepth,
+                                         const Vec3& woCam, double d2) {
+    const Vertex& vk = eye[(size_t)k];
+    const Vertex& vp = eye[(size_t)k - 1];
+    SurfMergeWeight sw;
+    sw.kappaB       = mk.beam;
+    sw.kappaS       = mk.surf;
+    sw.invPdfFwdK   = 1.0 / misRemap0(vk.pdfFwd);
+    sw.gateD1       = vp.delta ? 0.0 : 1.0;
+    sw.cosPrev      = vp.onSurface() ? std::fabs(dot(vp.ns, woCam)) : 1.0;
+    sw.invDistPrev2 = 1.0 / d2;
+    sw.invPdfFwdKm1 = 1.0 / misRemap0(vp.pdfFwd);
+    // The merge AT eye[k-1], less its pdfRev. Passing pLight = 1 is what turns `mergeEtaPrime`'s
+    // primed eta into the bare coefficient -- legitimate here (and not in the beam gather) because
+    // BOTH of eye[k-1]'s neighbours are known: the merge site is eye[k] itself, so there is no
+    // per-photon geometry.
+    sw.etaKm1Coef   = (k >= 2) ? mergeEtaScaled(scene, geoE ? &geoE[(size_t)k - 1] : nullptr, vk.p,
+                                                vp, eye[(size_t)k - 2].p, 1.0, lamCam, mk)
+                               : 0.0;
+    sw.segSumC      = segSumC[(size_t)k - 1];
+    sw.segSumM      = segSumM[(size_t)k - 1];
+    if (cm.on) {
+        sw.chromaM   = &chromaM[((size_t)k - 1) * ChromaMis::K];
+        sw.chromaKm1 = &chromaE1[(size_t)k * ChromaMis::K];
+    }
+    sw.camVert      = k;
+    sw.maxDepth     = maxDepth;
+    return sw;
+}
+
 // --- Renderer --------------------------------------------------------------------
 // Renders pixel rows [y0,y1). t>=2 (camera-image) contributions land on the current
 // pixel in `camFilm`; t==1 (light-image) splats land on `splatFilm` at the projected
@@ -5324,33 +5364,11 @@ struct BdptRenderer {
                                 const double d2 = dot(woCam, woCam);
                                 if (!(d2 > 0.0)) continue;
                                 woCam = woCam * (1.0 / std::sqrt(d2));
-                                SurfMergeWeight sw;
-                                sw.work         = &workCam;
-                                sw.kappaB       = mk.beam;
-                                sw.kappaS       = mk.surf;
-                                sw.invPdfFwdK   = 1.0 / misRemap0(vk.pdfFwd);
-                                sw.gateD1       = vp.delta ? 0.0 : 1.0;
-                                sw.cosPrev      = vp.onSurface()
-                                                ? std::fabs(dot(vp.ns, woCam)) : 1.0;
-                                sw.invDistPrev2 = 1.0 / d2;
-                                sw.invPdfFwdKm1 = 1.0 / misRemap0(vp.pdfFwd);
-                                // The merge AT eye[k-1], less its pdfRev. Passing pLight = 1
-                                // is what turns `mergeEtaPrime`'s primed eta into the bare
-                                // coefficient — legitimate here (and not in the beam gather)
-                                // because BOTH of eye[k-1]'s neighbours are known: the merge
-                                // site is eye[k] itself, so there is no per-photon geometry.
-                                sw.etaKm1Coef   = (k >= 2)
-                                    ? mergeEtaScaled(scene, geoNow ? &geoE[(size_t)k - 1] : nullptr,
-                                                     vk.p, vp, eye[(size_t)k - 2].p, 1.0, lamCam, mk)
-                                    : 0.0;
-                                sw.segSumC      = segSumC[(size_t)k - 1];
-                                sw.segSumM      = segSumM[(size_t)k - 1];
-                                if (chroma.on) {
-                                    sw.chromaM   = &chromaM[((size_t)k - 1) * ChromaMis::K];
-                                    sw.chromaKm1 = &chromaE1[(size_t)k * ChromaMis::K];
-                                }
-                                sw.camVert      = k;
-                                sw.maxDepth     = maxDepth;
+                                SurfMergeWeight sw = surfMergeWeightAt(
+                                    scene, eye, k, mk, segSumC, segSumM,
+                                    geoNow ? geoE.data() : nullptr, lamCam, chroma, chromaM,
+                                    chromaE1, maxDepth, woCam, d2);
+                                sw.work = &workCam;
                                 const Vec3 ngo = vertexGeoN(vk);
                                 const bool vkTwoSided = isTwoSidedMat(*vk.mat);   // mergeFromBehind
                                 const JSpec* vkSpec =

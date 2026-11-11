@@ -3074,6 +3074,27 @@ by 8x8 block; Z over Y went from 1.023 to 0.999 and X over Y from 0.987 to 1.005
 recomputed every camera-side term at the beam's exact wavelength for each hit.
 `tools/check_jchroma.py` holds the tilt within 0.8 % on the GPU and fails under `FTRACE_JCHROMA=0`.
 
+**The point merges' tables are held directly, device against host (`-checkjsurfw`, 0.439.0).** No
+image can hold them: they matter where beams and point merges compete for one path, and there
+the point merges carry well under a seed's scatter of the frame (JCHROMA-JSURF-WEAK). So a mode-J
+GPU render under `-checkjsurfw` arms a tap (`jsurf_tap.h`, `DSurfTap`): kBdptT records the camera
+subpaths of its first call's first 4096 samples and, at every point-merge site, the camera half
+of the weight as it built it, its bins read through the weight's own pointers so the wiring is
+held too. The host (`checkJSurfTap`) turns the device's vertices into its own, rebuilds each half
+with the code `renderRows` uses (`cameraSideSums`, `cameraSideSumsChroma`, `surfMergeWeightAt`),
+and requires the fields, the bins, the set of merge sites and the weight itself -- DSurfMergeW in
+a kernel of its own (`kJSurfWEval`) against SurfMergeWeight, at 8 photon states a half drawn over
+six decades of density and past both ends of JSpec's grid -- to agree to 1e-4 (the device's
+positions are fp32). `etaKm1Coef` is held to 1e-3: it is `sigma_t * Tr` at the camera's own
+wavelength, which the device reads off its tabulated spectra in fp32 (`specLookup`), some 1e-4
+below the host's exact one, while the bins' `sigma_t` is the host's own, uploaded per bin. The
+negative control is built in: read one bin (19.6 nm) off, the host's weight must move from the
+device's somewhere, or the run had nothing chromatic to hold and fails. Measured on
+check_jchroma's box and the box around a glass ball (`tools/check_jsurfw.py`): ~6000 halves and
+~50 000 weights each, bins within 2.4e-5 of their row, weights within 2.5e-7, and the one-bin
+shift moving about 900 weights by more than 1e-3. With the inline wiring swapped
+(`chromaM` <-> `chromaKm1`) the bins disagree outright and the weights by up to 0.81.
+
 ### Mode `J` merges through glass, and the aimed sun (MODE-J-SDS, 0.387.0)
 
 **The gap.** A path light → glass → diffuse → glass → camera (a caustic seen *through* glass) has

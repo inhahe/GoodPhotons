@@ -15624,6 +15624,251 @@ static long long g_jSurfCount = 4000000;
 // rendering option — it never changes a pixel, only what gets printed at the end.
 static bool g_misAudit = false;
 
+// `-checkjsurfw` (jsurf_tap.h, known-issues JCHROMA-JSURF-WEAK): mode J's first device call
+// records its first samples' point-merge weights (cudaJSurfTapArm), checkJSurfTap holds them
+// against the host's, and the verdict is printed at the end like -misaudit's. -2: not asked;
+// -1: asked, not run (no mode-J device call, or nothing recorded); else the number of failures.
+static int g_checkJSurfWRc = -2;
+static constexpr int kCheckJSurfWSamples = 4096;   // samples recorded: absolute indices below
+
+#ifdef HAVE_CUDA
+// The device's halves against the host's, rebuilt from the device's own vertices: the scalar
+// fields, the chromatic bins (DChromaRun against cameraSideSumsChroma), which vertices are merge
+// sites, and the weight itself (DSurfMergeW against SurfMergeWeight) at photon states and
+// wavelengths drawn here. The device's positions are fp32 (Real), so they agree to kTol, not to
+// the bit. And a negative control: the host's weight read at a wavelength one bin off must
+// disagree with the device's somewhere, or the scene held nothing chromatic and the run proves
+// nothing. Returns the number of failures (each printed).
+static int checkJSurfTap(const Scene& scene, int maxDepth) {
+    using namespace bdpt;
+    static_assert(kJSurfTapK == ChromaMis::K, "the tap's bins are JSpec's");
+    constexpr double kTol = 1e-4;     // relative, for fields, bins and weights
+    constexpr double kShift = 1e-3;   // a weight the one-bin shift moves by more than this
+    std::vector<JSurfTapVertex> tv;
+    std::vector<int> tn;
+    std::vector<double> tl;
+    std::vector<JSurfTapHalf> th;
+    if (!cudaJSurfTapTake(tv, tn, tl, th)) {
+        std::printf("[checkjsurfw] the device recorded nothing  BAD\n");
+        return 1;
+    }
+    ChromaMis cm;
+    cm.build(scene);
+    const PatTables tabs = scene.patTables();
+    // The call's constants: every half carries them.
+    MergeK mk;
+    for (const JSurfTapHalf& h : th)
+        if (h.camVert > 0) { mk.beam = h.kappaB; mk.surf = h.kappaS; break; }
+    const auto rel = [](double a, double b) {
+        const double m = std::max(std::fabs(a), std::fabs(b));
+        return m > 0.0 ? std::fabs(a - b) / m : 0.0;
+    };
+    // splitmix64: the photon states, the same every run.
+    unsigned long long rs = 0x243F6A8885A308D3ULL;
+    const auto uni = [&rs]() {
+        unsigned long long z = (rs += 0x9E3779B97F4A7C15ULL);
+        z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ULL;
+        z = (z ^ (z >> 27)) * 0x94D049BB133111EBULL;
+        z ^= z >> 31;
+        return (double)(z >> 11) * (1.0 / 9007199254740992.0);
+    };
+    const auto logU = [&uni](double lo, double hi) { return std::pow(10.0, lo + (hi - lo) * uni()); };
+    const double binW = JSpec::lamOf(1) - JSpec::lamOf(0);
+    const double lamLo = JSpec::lamOf(0) - binW, lamHi = JSpec::lamOf(JSpec::K - 1) + binW;
+
+    long long nPaths = 0, nSkipped = 0, nHalves = 0, nChroma = 0, nSiteBad = 0, nChromaBad = 0;
+    long long nFieldBad = 0, nBinBad = 0;
+    double worstField = 0.0, worstBin = 0.0;
+    const char* worstFieldName = "";
+    std::vector<JSurfTapHalf> evalH;
+    std::vector<JSurfTapState> states;
+    std::vector<double> hostW, shiftW;
+    std::vector<Vertex> eye;
+    std::vector<double> segSumC, segSumM, chromaM, chromaE1;
+    std::vector<MergeGeo> geoE, geoL;
+    const std::vector<Vertex> noLight;
+    for (size_t i = 0; i < tn.size(); ++i) {
+        const int nE = tn[i];
+        if (nE <= 0) continue;
+        // The device's vertices as the host's: a material the host does not index (a layered
+        // material's synthetic lobe) has no host twin, and its path is left out.
+        eye.assign((size_t)nE, Vertex{});
+        bool mapped = true;
+        for (int v = 0; v < nE; ++v) {
+            const JSurfTapVertex& t = tv[i * kJSurfTapMaxV + (size_t)v];
+            Vertex& e = eye[(size_t)v];
+            e.type = (VType)t.type;
+            e.p = Vec3{t.p[0], t.p[1], t.p[2]};
+            e.ns = Vec3{t.ns[0], t.ns[1], t.ns[2]};
+            e.ng = Vec3{t.ng[0], t.ng[1], t.ng[2]};
+            e.pdfFwd = t.pdfFwd; e.pdfRev = t.pdfRev; e.beta = t.beta;
+            e.delta = t.delta != 0;
+            e.mediumId = t.mediumId;
+            e.matId = t.matId;
+            e.hit.fiberRadius = t.fiberR;
+            if (t.matId >= 0) {
+                if ((size_t)t.matId >= scene.mats.size()) { mapped = false; break; }
+                e.mat = &scene.mats[(size_t)t.matId];
+            }
+        }
+        if (!mapped) { ++nSkipped; continue; }
+        ++nPaths;
+        const double lamCam = tl[i];
+        const bool geoNow = mk.beam > 0.0;
+        if (geoNow) mergeGeoOfSubpaths(scene, eye, nE, noLight, 0, lamCam, geoE, geoL);
+        if (mk.any())
+            cameraSideSums(scene, eye, nE, cm.on ? MergeK{} : mk, lamCam, segSumC, segSumM,
+                           geoNow ? geoE.data() : nullptr);
+        if (cm.on) cameraSideSumsChroma(scene, tabs, eye, nE, mk, cm, chromaM, chromaE1);
+        const int kEnd = std::min(nE, maxDepth + 1);
+        for (int k = 1; k < kEnd; ++k) {
+            const Vertex& vk = eye[(size_t)k];
+            const Vertex& vp = eye[(size_t)k - 1];
+            Vec3 woCam = vp.p - vk.p;
+            const double d2 = dot(woCam, woCam);
+            const bool site = surfMergeSite(vk) && vk.beta > 0.0 && vk.mat && d2 > 0.0;
+            const JSurfTapHalf& dh = th[i * kJSurfTapMaxV + (size_t)k];
+            if (site != (dh.camVert == k)) {
+                if (nSiteBad++ < 5)
+                    std::printf("[checkjsurfw] sample %zu vertex %d: a merge site on the %s only\n",
+                                i, k, site ? "host" : "device");
+                continue;
+            }
+            if (!site) continue;
+            ++nHalves;
+            woCam = woCam * (1.0 / std::sqrt(d2));
+            const SurfMergeWeight hw = surfMergeWeightAt(scene, eye, k, mk, segSumC, segSumM,
+                                                         geoNow ? geoE.data() : nullptr, lamCam,
+                                                         cm, chromaM, chromaE1, maxDepth, woCam, d2);
+            // etaKm1Coef holds sigma_t * Tr at the CAMERA's wavelength (dMergeGeo), which the
+            // device reads off its tabulated spectra in fp32 (specLookup): some 1e-4 from the
+            // host's exact sigma_t, all one way. (Unread where the bins are on; the bins' own
+            // sigma_t is the host's, uploaded per bin, chromaSig.)
+            const struct { const char* name; double d, h, tol; } fields[] = {
+                {"kappaB", dh.kappaB, hw.kappaB, kTol}, {"kappaS", dh.kappaS, hw.kappaS, kTol},
+                {"invPdfFwdK", dh.invPdfFwdK, hw.invPdfFwdK, kTol},
+                {"gateD1", dh.gateD1, hw.gateD1, kTol}, {"cosPrev", dh.cosPrev, hw.cosPrev, kTol},
+                {"invDistPrev2", dh.invDistPrev2, hw.invDistPrev2, kTol},
+                {"invPdfFwdKm1", dh.invPdfFwdKm1, hw.invPdfFwdKm1, kTol},
+                {"etaKm1Coef", dh.etaKm1Coef, hw.etaKm1Coef, 1e-3},
+                {"segSumC", dh.segSumC, hw.segSumC, kTol}, {"segSumM", dh.segSumM, hw.segSumM, kTol},
+                {"camVert", (double)dh.camVert, (double)hw.camVert, 0.0},
+                {"maxDepth", (double)dh.maxDepth, (double)hw.maxDepth, 0.0}};
+            bool fieldBad = false;
+            for (const auto& f : fields) {
+                const double r = rel(f.d, f.h);
+                if (r > worstField) { worstField = r; worstFieldName = f.name; }
+                if (!(r <= f.tol)) {
+                    fieldBad = true;
+                    if (nFieldBad < 5)
+                        std::printf("[checkjsurfw] sample %zu vertex %d: %s device %.9g, host %.9g\n",
+                                    i, k, f.name, f.d, f.h);
+                }
+            }
+            if (fieldBad) ++nFieldBad;
+            if ((dh.chroma != 0) != cm.on) {
+                if (nChromaBad++ < 5)
+                    std::printf("[checkjsurfw] sample %zu vertex %d: chromatic bins on the %s only\n",
+                                i, k, cm.on ? "host" : "device");
+                continue;
+            }
+            if (cm.on) {
+                ++nChroma;
+                // Each row against its own largest bin: a bin far below the row's scale is
+                // noise in the fp32 geometry, not a weight.
+                const double* hm = &chromaM[((size_t)k - 1) * ChromaMis::K];
+                const double* he = &chromaE1[(size_t)k * ChromaMis::K];
+                const struct { const char* name; const double* d; const double* h; } rows[] = {
+                    {"mPrev (segSumM at k-1)", dh.mPrev, hm}, {"e1 (the merge at eye[k-1])", dh.e1, he}};
+                for (const auto& r : rows) {
+                    double scale = 0.0;
+                    for (int b = 0; b < ChromaMis::K; ++b)
+                        scale = std::max({scale, std::fabs(r.d[b]), std::fabs(r.h[b])});
+                    for (int b = 0; b < ChromaMis::K; ++b) {
+                        const double e = scale > 0.0 ? std::fabs(r.d[b] - r.h[b]) / scale : 0.0;
+                        worstBin = std::max(worstBin, e);
+                        if (!(e <= kTol) && nBinBad++ < 5)
+                            std::printf("[checkjsurfw] sample %zu vertex %d: %s bin %d device %.9g, "
+                                        "host %.9g\n", i, k, r.name, b, r.d[b], r.h[b]);
+                    }
+                }
+            }
+            // The weight at photon states that reach every term: depths on both sides of the
+            // cap, densities over six decades, and wavelengths over JSpec's grid and past its ends.
+            const int half = (int)evalH.size();
+            evalH.push_back(dh);
+            for (int m = 0; m < 8; ++m) {
+                JSurfTapState st{};
+                st.sumC = uni() < 0.2 ? 0.0 : logU(-2, 2);
+                st.sumMb = uni() < 0.2 ? 0.0 : logU(-2, 2);
+                st.sumMs = uni() < 0.2 ? 0.0 : logU(-2, 2);
+                st.pdfFwdA = logU(-3, 3);
+                st.rCoef = (float)logU(-2, 2);
+                st.gateC1 = uni() < 0.8 ? 1 : 0;
+                st.vert = 1 + (int)(uni() * 3.0);
+                st.pdfDirRev = logU(-2, 2);
+                st.pdfDirFwd = logU(-2, 2);
+                st.lam = lamLo + (lamHi - lamLo) * uni();
+                st.half = half;
+                SurfMis lm;
+                lm.sumC = st.sumC; lm.sumMb = st.sumMb; lm.sumMs = st.sumMs; lm.pdfFwdA = st.pdfFwdA;
+                lm.rCoef = st.rCoef; lm.gateC1 = (unsigned char)st.gateC1;
+                lm.vert = (unsigned short)st.vert;
+                hostW.push_back(hw(lm, st.pdfDirRev, st.pdfDirFwd, st.lam));
+                const double lamS = st.lam + (st.lam + binW <= lamHi ? binW : -binW);
+                shiftW.push_back(hw(lm, st.pdfDirRev, st.pdfDirFwd, lamS));
+                states.push_back(st);
+            }
+        }
+    }
+    std::vector<double> devW;
+    const bool evaluated = !states.empty() && cudaJSurfWEval(evalH, states, devW);
+    long long nWBad = 0, nShifted = 0;
+    double worstW = 0.0, maxShift = 0.0;
+    if (evaluated)
+        for (size_t s = 0; s < states.size(); ++s) {
+            const double e = std::fabs(devW[s] - hostW[s]);
+            worstW = std::max(worstW, e);
+            if (!(e <= kTol) && nWBad++ < 5)
+                std::printf("[checkjsurfw] weight %zu (lambda %.2f nm): device %.9g, host %.9g\n", s,
+                            states[s].lam, devW[s], hostW[s]);
+            const double sh = std::fabs(shiftW[s] - devW[s]);
+            maxShift = std::max(maxShift, sh);
+            if (sh > kShift) ++nShifted;
+        }
+    std::printf("[checkjsurfw] %lld camera paths (%lld left out: a material the host does not "
+                "index), %lld point-merge halves, %lld of them chromatic; %zu weights.\n",
+                nPaths, nSkipped, nHalves, nChroma, states.size());
+    std::printf("[checkjsurfw] worst relative difference: fields %.3g (%s), bins %.3g (of their "
+                "row), weights %.3g; tolerance %.0e (etaKm1Coef 1e-3).\n",
+                worstField, worstFieldName, worstBin, worstW, kTol);
+    std::printf("[checkjsurfw] negative control: read one bin (%.1f nm) off, the host's weight "
+                "moves %lld of %zu weights by more than %.0e (at most %.3g) from the device's.\n",
+                binW, nShifted, states.size(), kShift, maxShift);
+    int fails = 0;
+    const auto fail = [&fails](bool bad, const char* what) {
+        if (!bad) return;
+        ++fails;
+        std::printf("[checkjsurfw] FAILED: %s\n", what);
+    };
+    fail(nHalves == 0, "no point-merge half was recorded: the scene needs -jsurf and surfaces "
+                       "the camera reaches");
+    fail(!cm.on, "the scene's extinction is the same at every wavelength, so there are no "
+                 "chromatic bins to hold");
+    fail(nSiteBad > 0, "the two halves disagree on which vertices are merge sites");
+    fail(nChromaBad > 0, "the two halves disagree on whether the bins are on");
+    fail(nFieldBad > 0, "a half's scalar fields disagree");
+    fail(nBinBad > 0, "a half's chromatic bins disagree");
+    fail(!evaluated && !states.empty(), "the device did not evaluate the weights");
+    fail(nWBad > 0, "the weights disagree");
+    fail(nChroma > 0 && nShifted == 0, "the negative control moved nothing: the bins do not vary "
+                                       "enough across a bin for this check to see a wrong one");
+    std::printf("[checkjsurfw] %s\n", fails ? "FAILED" : "PASS");
+    std::fflush(stdout);
+    return fails;
+}
+#endif
+
 #ifdef _WIN32
 // The console's ORIGINAL output code page, kept so it can be put back. The setting is
 // process-wide but the CONSOLE OUTLIVES THE PROCESS, so leaving it switched would quietly
@@ -20854,9 +21099,16 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
             // `dMisWeight` takes `mergeKappa` AND `kappaSurf`, and there is no such gate (nor
             // was there one at the time this was written -- `g_jSurfExplicit` was never read).
             // `photonsPtr` below is what carries the surface map to the device.
-            if (useGpu) return renderBdptCuda(scene, camEpochJ, res, resY, sppTarget, maxDepth,
-                                              diffraction, p, g_heroC, beamsPtr, &stageProg,
-                                              photonsPtr, held);
+            if (useGpu) {
+                // -checkjsurfw: the first call records, and its record is held at once.
+                const bool tap = g_checkJSurfWRc == -1;
+                if (tap) cudaJSurfTapArm(kCheckJSurfWSamples);
+                Film f = renderBdptCuda(scene, camEpochJ, res, resY, sppTarget, maxDepth,
+                                        diffraction, p, g_heroC, beamsPtr, &stageProg,
+                                        photonsPtr, held);
+                if (tap) g_checkJSurfWRc = checkJSurfTap(scene, maxDepth);
+                return f;
+            }
 #endif
             return cpuSppChunks(sppTarget, p, res, resY,
                 [&](long long c, unsigned long long off) {
@@ -23950,6 +24202,7 @@ static int run(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "-checkpatops")) checkPatOpsOnly = true;
         else if (!std::strcmp(argv[i], "-checkndgpu")) checkNdGpuOnly = true;
         else if (!std::strcmp(argv[i], "-checkdevhits")) checkDevHitsOnly = true;
+        else if (!std::strcmp(argv[i], "-checkjsurfw")) g_checkJSurfWRc = -1;
         else handled = false;
 
         // ---- segment 2 (see the nesting note at the top of the loop) ----------------
@@ -31183,6 +31436,15 @@ int main(int argc, char** argv) {
             std::printf("[misaudit] FAILED: the poisoned reference agreed anyway, so the audit "
                         "is vacuous and its clean runs prove nothing. Fix the harness.\n");
         std::fflush(stdout);
+    }
+    // -checkjsurfw's verdict (checkJSurfTap printed its own): a run that never reached mode J's
+    // device call fails rather than passing on nothing.
+    if (g_checkJSurfWRc == -1) {
+        std::printf("[checkjsurfw] NOTHING WAS CHECKED -- it needs -mode J -device gpu with -jsurf "
+                    "on a scene the device can render.\n");
+        rc = 1;
+    } else if (g_checkJSurfWRc > 0) {
+        rc = 1;
     }
     // Say so in the title bar. Rendering is over the moment run() returns, whether the
     // window is about to be torn down or (with -keepwindow) held open for inspection —
