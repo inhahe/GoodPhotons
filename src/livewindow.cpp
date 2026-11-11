@@ -525,6 +525,7 @@ static const int kPanelH = 92;              // control-strip height (px) WITHOUT
 #define WM_MKBINDROW    (WM_APP + 3)        // build + reveal the loom bind row (params staged in Impl)
 #define WM_MKNDPANEL    (WM_APP + 4)        // build/rebuild the N-D slider bank (params staged in Impl)
 #define WM_SETNDSTATE   (WM_APP + 5)        // push slider positions + status text (staged in Impl)
+#define WM_SETTITLE     (WM_APP + 6)        // apply the title setTitle staged (titleNext)
 
 struct LiveWindow::Impl {
     std::thread          ui;
@@ -559,6 +560,9 @@ struct LiveWindow::Impl {
     // layout is exactly what it always was.
     int px(int v) const { return MulDiv(v, dpiNow.load(std::memory_order_relaxed), 96); }
     std::wstring         title;
+    // setTitle's latest text, applied by the UI thread on WM_SETTITLE (titleMtx guards both).
+    std::mutex           titleMtx;
+    std::wstring         titleNext;
     HANDLE               readyEvent = nullptr;
     // ---- Fly-camera input state (guarded by inMtx unless noted) ----
     std::mutex           inMtx;                     // guards the look/wheel accumulators + one-shots
@@ -1498,6 +1502,13 @@ LRESULT CALLBACK LiveWindow::Impl::WndProc(HWND h, UINT msg, WPARAM wp, LPARAM l
         case WM_SETNDSTATE:
             if (self) self->applyNdState(h);          // push slider positions + status (UI thread)
             return 0;
+        case WM_SETTITLE:
+            if (self) {
+                std::wstring t;
+                { std::lock_guard<std::mutex> lk(self->titleMtx); t = self->titleNext; }
+                SetWindowTextW(h, t.c_str());
+            }
+            return 0;
         case WM_SIZE:
             if (self) {
                 self->layoutPanel(h);                // reflow the control strip to the new width
@@ -2085,12 +2096,17 @@ bool LiveWindow::renderShared(int w, int h, const std::function<bool(void*, void
 void LiveWindow::setTitle(const std::string& utf8) {
     HWND hw = impl_ ? impl_->hwnd.load() : nullptr;
     if (!hw) return;
-    // SetWindowTextW marshals a WM_SETTEXT to the window's own thread, so this is safe
-    // to call from the render thread. Skip the OS call when the text is unchanged.
+    // Staged and posted, not sent: SetWindowTextW from this thread would wait on the window's
+    // thread (a WM_SETTEXT, and the taskbar button's update behind it), and the render calls
+    // this from its progress reports, inside passes that join on them. Skip it when unchanged.
     std::wstring w = utf8ToWide(utf8);
-    if (w == impl_->title) return;
-    impl_->title = w;
-    SetWindowTextW(hw, impl_->title.c_str());
+    {
+        std::lock_guard<std::mutex> lk(impl_->titleMtx);
+        if (w == impl_->title) return;
+        impl_->title = w;
+        impl_->titleNext = std::move(w);
+    }
+    PostMessageW(hw, WM_SETTITLE, 0, 0);
 }
 
 bool LiveWindow::closed() const { return impl_ && impl_->closedFlag.load(); }

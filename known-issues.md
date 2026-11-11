@@ -285,6 +285,16 @@ mode R on each backend (CPU 0.96 / 1.20 / 0.77, GPU 0.89 / 1.08 / 0.88: within i
 a red sphere's small green and blue). Found checking the coat coin's fix against mode R (Opus review
 of 90e0486..bea7be1).
 
+## DONE (2026-11-11, 0.437.4; found fixing GPU-J-CLOCK): WINDOW-TITLE-BLOCK — a minimized live window made a render up to 3.6x slower
+
+**Fixed in 0.437.4.** `LiveWindow::setTitle` called `SetWindowTextW` from the render's threads,
+which sends a WM_SETTEXT to the window's own thread and waits for it (and for the taskbar
+button's update behind it). The progress reports re-title the window on nearly every call -- a
+minimized window's every chunk, the light pass's monitor every report -- so the render waited
+on the UI: `_fog_cornell` at 640x480, 16 spp, GPU mode J took 49.8 s with `-window-min` against
+13.8 s without, its light trace 14.4 s against 0.05 s. `setTitle` now stages the text and posts
+`WM_SETTITLE`, which the window's thread applies: 13.9 s with the window, 13.8 s without.
+
 ## OPEN (2026-11-11, found in review of c7c4aa7): GPU-J-CLOCK — GPU mode J at a fixed -spp renders differently run to run, and eight checks inherit it
 
 The device ends mode J's light-side epochs on the clock unless `-beamepochs` pins them (design.md,
