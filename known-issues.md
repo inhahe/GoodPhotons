@@ -285,20 +285,36 @@ mode R on each backend (CPU 0.96 / 1.20 / 0.77, GPU 0.89 / 1.08 / 0.88: within i
 a red sphere's small green and blue). Found checking the coat coin's fix against mode R (Opus review
 of 90e0486..bea7be1).
 
-## OPEN (2026-11-10, 0.437.1): JCHROMA-CLOCK — check_jchroma's GPU verdict moves with the machine's speed
+## OPEN (2026-11-11, found fixing JCHROMA-CLOCK): JCHROMA-JSURF-WEAK — check_jchroma's `gpu-jsurf` variant does not hold the point merges' chromatic weights
 
-`tools/check_jchroma.py` renders mode J on the GPU at a fixed `-spp` without `-beamepochs`, and
+In check_jchroma's box of chromatic fog the point merges carry about 1e-5 of the frame: pinned to
+the same epochs, `gpu` and `gpu-jsurf` read the same J/R to the fourth digit on every seed (their
+pixels differ by 2-3 %, their means by 1e-5). So a regression in DSurfMergeW's chromatic bins
+(`chromaM`/`chromaKm1`, SurfMergeWeight's host twin) passes it. check_surf_wavefront's chroma case
+holds only that the queue gathers those weights as the inline gather does, not that they are
+right. Proper fix: a scene where point merges carry a real share of the frame in a chromatic
+medium -- a caustic (a glass ball under the light) on a diffuse floor in the fog, seen directly,
+the light large enough that mode R can still reference it in minutes -- measured for the share
+first (`FTRACE_J_HALF`), then a `gpu-jsurf` variant on it that fails under `FTRACE_JCHROMA=0`.
+
+## DONE (2026-11-11; opened 2026-11-10, 0.437.1): JCHROMA-CLOCK — check_jchroma's GPU verdict moved with the machine's speed
+
+**Fixed in the check:** its GPU J renders pin their light-side epochs (`--epochs 256`, about what
+the clock chose at 2048 spp: 234-329 in four runs), so a binary's verdict is the same every run.
+It prints each seed's X and Z over Y and the seeds' standard error, and says when a ratio lies
+within two of them of the tolerance. Pinned, 0.437.3 passes (X/Y 0.998, Z/Y 0.997 over seeds 1-3)
+and fails under `FTRACE_JCHROMA=0` (0.981, 1.011). Measured on the way: a seed's ratios scatter
+by 0.5-1 %, and that is the camera side's noise -- 256 epochs, 1024 epochs and 1024 with the radii
+held still (`-vcmalpha 1`) give each seed nearly the same ratios (seed 1: X/Y 1.001 / 0.991 /
+0.992), so neither the epoch count nor the shrinking radii add a chromatic bias here. Only more
+samples (seeds) narrow it. The rest of this entry is how it stood.
+
+`tools/check_jchroma.py` rendered mode J on the GPU at a fixed `-spp` without `-beamepochs`, and
 the device ends mode J's light-side epochs on the clock (design.md, "On the CPU at a fixed -spp":
-a budget "and the device keep the clock"). The epoch count sets the merge noise and, through the
-radii that shrink epoch by epoch (UPBP-BEAM-RADIUS, the point merges' `-vcmalpha` schedule), the
-blur bias, so one binary's colour ratios move between runs. 0.437.0 passed it; 0.437.1, which
-renders this scene byte for byte as the earlier binary does at a pinned `-beamepochs 4` (point
-merges on and off), failed it: `gpu` Z/Y 0.9948 -> 0.9907, `gpu-jsurf` X/Y 0.9946 -> 1.0139,
-against 0.008. All three seeds of the failing `gpu-jsurf` read high (1.015, 1.010, 1.016): a
-shift the run shares, not seed noise. Two runs of one 256-spp command differ too
-(`scraps/_jc_det1.pfm`, `_jc_det2.pfm`). Fix: pin the epochs in the check, and measure how far the
-colour ratios move with the epoch count -- a chromatic bias that depends on it would be a finding
-of its own.
+a budget "and the device keep the clock"), so one binary's colour ratios moved between runs.
+0.437.0 passed it; 0.437.1, which renders this scene byte for byte as the earlier binary does at
+a pinned `-beamepochs 4` (point merges on and off), failed it: `gpu` Z/Y 0.9948 -> 0.9907,
+`gpu-jsurf` X/Y 0.9946 -> 1.0139, against 0.008. Two runs of one 256-spp command differed too.
 
 ## OPEN (2026-11-11, 0.437.3; found in review): TOOLS-PFM-READERS — about twenty scripts in tools/ each parse PFM themselves
 
