@@ -29000,9 +29000,9 @@ std::vector<Film> renderPhotonMapSharedCuda(const Scene& scene, const std::vecto
     // reentrant. Disarming happens UNDER this lock, so the main thread's own reports after a
     // launch cannot overlap a report the poller is still inside.
     std::mutex reportMu;
-    std::atomic<bool> pollQuit{false};
+    PollStop pollQuit;
     std::thread pollThread([&, h_gatherDone] {
-        while (!pollQuit.load(std::memory_order_relaxed)) {
+        do {
             if (ft::stopRequested()) return;   // the kernels see the stop itself (DeviceStopScope)
             // reportLive, not report: this is progress from INSIDE a launch that has not
             // returned, where the retirement curve is convex and no honest rate exists — and
@@ -29016,8 +29016,7 @@ std::vector<Film> renderPhotonMapSharedCuda(const Scene& scene, const std::vecto
                     stage->reportLive(progText, off + d,
                                       progTotal.load(std::memory_order_relaxed));
             }
-            std::this_thread::sleep_for(std::chrono::milliseconds(50));
-        }
+        } while (!pollQuit.wait(std::chrono::milliseconds(50)));
     });
     // Joined and freed however this function leaves — including the CUDA_CHECK throw paths,
     // which are numerous below and would otherwise leak a detached thread into a dead context.
@@ -29025,9 +29024,9 @@ std::vector<Film> renderPhotonMapSharedCuda(const Scene& scene, const std::vecto
     // modes' kernels too, and a pointer left at a freed mapping is an illegal-address fault in
     // the next of them this process launches.
     struct GatherProgressGuard {
-        std::atomic<bool>& quit; std::thread& th; unsigned long long* mem;
+        PollStop& quit; std::thread& th; unsigned long long* mem;
         ~GatherProgressGuard() {
-            quit.store(true, std::memory_order_relaxed);
+            quit.stop();
             if (th.joinable()) th.join();
             unsigned long long* noDone = nullptr;
             cudaMemcpyToSymbol(g_dGatherDone, &noDone, sizeof noDone);

@@ -3415,21 +3415,19 @@ inline void traceLightBeamPass(const Scene& scene, const Camera& cam, long long 
     std::vector<std::thread> pool;
     for (int t = 0; t < nThreads; ++t)
         pool.emplace_back(worker, t, nPaths, seedBase, /*pilot*/false);
-    std::atomic<bool> monitorStop{false};
+    PollStop monitorStop;
     std::thread monitor;
     if (stage && stage->report) {
         monitor = std::thread([&] {
-            while (!monitorStop.load(std::memory_order_relaxed)) {
+            do {
                 stage->report("tracing light subpaths",
                               tracedTotal.load(std::memory_order_relaxed), nPaths,
                               nullptr, 0.0);
-                for (int i = 0; i < 20 && !monitorStop.load(std::memory_order_relaxed); ++i)
-                    std::this_thread::sleep_for(std::chrono::milliseconds(10));
-            }
+            } while (!monitorStop.wait(std::chrono::milliseconds(200)));
         });
     }
     for (auto& th : pool) th.join();
-    if (monitor.joinable()) { monitorStop.store(true, std::memory_order_relaxed); monitor.join(); }
+    if (monitor.joinable()) { monitorStop.stop(); monitor.join(); }
 
     size_t nb = 0;
     for (auto& b : banks) nb += b.size();

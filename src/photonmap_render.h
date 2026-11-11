@@ -945,18 +945,16 @@ inline void tracePhotonPass(const Scene& scene, long long N, int nThreads,
     // The deposit is a join-and-wait, so progress has to be sampled from OUTSIDE it: a
     // monitor thread polls the published count while the workers run. It is only started
     // when someone asked for progress, so a headless render spawns nothing extra.
-    std::atomic<bool> monitorStop{false};
+    PollStop monitorStop;
     std::thread monitor;
     if (stage && stage->report) {
         const long long nTotal = N + nAimed;
         monitor = std::thread([&, nTotal] {
-            while (!monitorStop.load(std::memory_order_relaxed)) {
+            do {
                 stage->report("tracing photons",
                               tracedTotal.load(std::memory_order_relaxed), nTotal,
                               nullptr, 0.0);
-                for (int i = 0; i < 20 && !monitorStop.load(std::memory_order_relaxed); ++i)
-                    std::this_thread::sleep_for(std::chrono::milliseconds(10));
-            }
+            } while (!monitorStop.wait(std::chrono::milliseconds(200)));
         });
     }
     for (auto& th : pool) th.join();
@@ -969,7 +967,7 @@ inline void tracePhotonPass(const Scene& scene, long long N, int nThreads,
         for (int t = 0; t < nThreads; ++t) apool.emplace_back(worker, t, true);
         for (auto& th : apool) th.join();
     }
-    if (monitor.joinable()) { monitorStop.store(true, std::memory_order_relaxed); monitor.join(); }
+    if (monitor.joinable()) { monitorStop.stop(); monitor.join(); }
 
     size_t total = 0;
     for (auto& b : banks) total += b.size();

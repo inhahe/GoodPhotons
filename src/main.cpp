@@ -17617,9 +17617,16 @@ static StageProgress makeStageProgress(int w, int h, double expComp = 1.0,
         }
         emit(b, wantWin, wantLog, partial, divisor, now);
     };
-    // Re-base the clock AND clear both throttles, so the phase that just started gets its
-    // first window title and its first log line immediately rather than up to 30 s in.
-    sp.reset = [tk]() { *tk = Ticker{}; };
+    // Re-base the clock and the rate, and clear the window's throttle, so the phase that just
+    // started gets its first window title immediately. Not the log's: a phase that repeats (mode
+    // J's refresh resets for every epoch's upload) would print its line every epoch -- hundreds
+    // of lines, each flushed, and a flush to a redirected file has cost 0.1-0.5 s, inside the
+    // light pass's join (POLL-JOIN-STALL). A new phase logs at the log's own 30 s cadence.
+    sp.reset = [tk]() {
+        const auto lastLog = tk->lastLog;
+        *tk = Ticker{};
+        tk->lastLog = lastLog;
+    };
     return sp;
 }
 

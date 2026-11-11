@@ -15,8 +15,33 @@
 // which is the historical, bit-identical path.
 #pragma once
 #include <chrono>
+#include <condition_variable>
 #include <functional>
+#include <mutex>
 #include "scene_film.h"
+
+// A progress poller's pause between reports, which its owner ends at once: wait() sleeps up to
+// `d` and returns whether stop() was called, and stop() wakes it. The join that ends a pass waits
+// on the poller, so a sleep it could only poll out of would add its own length to every pass
+// (mode J's refresh runs hundreds of light passes a render).
+struct PollStop {
+    bool wait(std::chrono::milliseconds d) {
+        std::unique_lock<std::mutex> lk(m_);
+        return cv_.wait_for(lk, d, [this] { return stopped_; });
+    }
+    void stop() {
+        { std::lock_guard<std::mutex> lk(m_); stopped_ = true; }
+        cv_.notify_all();
+    }
+    bool stopped() {
+        std::lock_guard<std::mutex> lk(m_);
+        return stopped_;
+    }
+private:
+    std::mutex m_;
+    std::condition_variable cv_;
+    bool stopped_ = false;
+};
 
 struct SppProgress {
     // report(sumFilm, sppDone, final) -> stop?

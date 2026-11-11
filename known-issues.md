@@ -295,6 +295,21 @@ on the UI: `_fog_cornell` at 640x480, 16 spp, GPU mode J took 49.8 s with `-wind
 13.8 s without, its light trace 14.4 s against 0.05 s. `setTitle` now stages the text and posts
 `WM_SETTITLE`, which the window's thread applies: 13.9 s with the window, 13.8 s without.
 
+## DONE (2026-11-11, 0.437.5; found fixing GPU-J-CLOCK): POLL-JOIN-STALL — a light-side rebuild waited up to seconds on a progress line
+
+**Fixed in 0.437.5.** Mode J's light pass (bdpt.h) runs a monitor thread that reports progress,
+and the pass joins it after its workers. Timed per rebuild on `_fog_cornell` (160x120, 64 spp,
+GPU mode J, output redirected to a file): the workers' join took 1-3 ms and the monitor's 0.1-8.9
+s. The monitor sat in `stage->report`, printing and flushing one `[camera] tracing light
+subpaths` line, and a flush to the redirected file took 0.1-0.5 s, sometimes seconds; the render
+took 7.0 s to a file against 2.9 s to NUL. It printed every epoch because each device call's
+upload resets the stage (`StageProgress::reset`), and the reset cleared the log's 30 s throttle
+as well as the window's. The clock-ended refresh hid it, a slow rebuild lengthening its epochs;
+counted epochs paid it outright. Now the reset keeps the log's throttle (a new phase logs at
+the log's own cadence), and the pollers here, in mode M's photon pass and in the GPU mode-M
+gather wait on `PollStop` (render_progress.h), which the owner notifies, instead of polling a
+flag between 10-50 ms sleeps that every join paid.
+
 ## OPEN (2026-11-11, found in review of c7c4aa7): GPU-J-CLOCK — GPU mode J at a fixed -spp renders differently run to run, and eight checks inherit it
 
 The device ends mode J's light-side epochs on the clock unless `-beamepochs` pins them (design.md,
