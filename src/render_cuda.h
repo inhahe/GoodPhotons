@@ -338,11 +338,6 @@ constexpr int kSunAimMaxTargets = 64;
 // whatever a chunk draws (mode J's device surface photons, salted by the chunk's first sample)
 // lands on the same samples in every render. Set by mode J under `-beamepochs`, cleared after.
 void cudaSetFixedChunks(bool on);
-// Size mode J's spp-progressive GPU chunks by the device's work count (cudaLastBdptWork's units)
-// instead of timing, so the chunk boundaries -- and the device surface photons each chunk draws --
-// fall where the counts put them, the same on every run (GPU-J-CLOCK). Set by mode J's counted
-// refresh (a fixed -spp, no -beamepochs), cleared after; cudaSetFixedChunks wins where both are.
-void cudaSetCountedChunks(bool on);
 // JSPEC's dispersive window (0.386.2, bdpt g_jDispWinNm / g_jDispAll): its full width in nm, and
 // whether dispersive refraction and a real lens open it as a grating's non-zero order does.
 void cudaSetJDisp(double winNm, int all);

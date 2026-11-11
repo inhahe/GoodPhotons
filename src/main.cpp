@@ -17092,8 +17092,8 @@ static std::string liveTitle(const std::string& rest) {
 // Serialises the title state. Almost every caller is the main thread, but tracePhotonPass's
 // deposit monitor is NOT — the whole point of that thread is to report progress while the
 // main thread is blocked joining the photon workers — and g_windowRest is a std::string that
-// would otherwise be written from two threads at once. SetWindowTextW itself is already
-// cross-thread safe (it marshals a WM_SETTEXT to the window's own thread).
+// would otherwise be written from two threads at once. The re-title itself is posted to the
+// window's thread (LiveWindow::setTitle), so no caller waits on the UI.
 static std::mutex g_titleMu;
 static void setLiveTitle(const std::string& rest) {
     std::lock_guard<std::mutex> lk(g_titleMu);
@@ -17617,16 +17617,10 @@ static StageProgress makeStageProgress(int w, int h, double expComp = 1.0,
         }
         emit(b, wantWin, wantLog, partial, divisor, now);
     };
-    // Re-base the clock and the rate, and clear the window's throttle, so the phase that just
-    // started gets its first window title immediately. Not the log's: a phase that repeats (mode
-    // J's refresh resets for every epoch's upload) would print its line every epoch -- hundreds
-    // of lines, each flushed, and a flush to a redirected file has cost 0.1-0.5 s, inside the
-    // light pass's join (POLL-JOIN-STALL). A new phase logs at the log's own 30 s cadence.
-    sp.reset = [tk]() {
-        const auto lastLog = tk->lastLog;
-        *tk = Ticker{};
-        tk->lastLog = lastLog;
-    };
+    // Re-base the clock AND clear both throttles, so the phase that just started gets its
+    // first window title and its first log line immediately rather than up to 30 s in. (Mode J's
+    // refresh epochs do not reset: each would print its line, POLL-JOIN-STALL.)
+    sp.reset = [tk]() { *tk = Ticker{}; };
     return sp;
 }
 
@@ -20664,7 +20658,10 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
                 // beams off if it draws empty (see beamsPtr).
                 if (bmap.beams.empty() && beamPin0J.recorded())
                     beamPin0J.applyTo(bmap, beamRadScaleFor(epoch + lsEpochBase), bmap.nEmitted);
-                bdpt::jWork().light.fetch_add(bdpt::jWorkBeamBuild(bmap.beams.size()),
+                // The host builds the SAH tree only where the device does not (jSkipHostBvh);
+                // the device's LBVH and the map's upload cost a unit or so a beam.
+                bdpt::jWork().light.fetch_add(jSkipHostBvh() ? bdpt::jWorkBeamBuildDevice(bmap.beams.size())
+                                                             : bdpt::jWorkBeamBuild(bmap.beams.size()),
                                               std::memory_order_relaxed);
             }
             const double buildSec =
@@ -20912,13 +20909,6 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
             explicit FixedChunkScope(bool v) : on(v) { if (on) cudaSetFixedChunks(true); }
             ~FixedChunkScope() { if (on) cudaSetFixedChunks(false); }
         } fixedChunkScope(fixedEpochs && useGpu);
-        // Without -beamepochs, a fixed -spp's chunks are sized by the device's work counts rather
-        // than timed, for the same reason: each draws its own surface photons (GPU-J-CLOCK).
-        struct CountedChunkScope {
-            bool on;
-            explicit CountedChunkScope(bool v) : on(v) { if (on) cudaSetCountedChunks(true); }
-            ~CountedChunkScope() { if (on) cudaSetCountedChunks(false); }
-        } countedChunkScope(useGpu && !fixedEpochs && !budgetedJ);
 #endif
         auto renderChunked = [&](long long sppTarget, const SppProgress* prog) -> Film {
             // Nothing to decorrelate (no map => mode D exactly, and gate 1a requires that path
@@ -20961,8 +20951,8 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
             // draws the light-side realizations a straight render of it would -- the ones every
             // other frame of the flyby uses. (Its pixels are not bit-identical: the camera seed and
             // the device's per-chunk surface photons are keyed to where each call starts, and the
-            // beam split to the run's spp.) Otherwise an epoch ends on the clock -- or, on the CPU at
-            // a fixed -spp, on work counts (countEpochs, below).
+            // beam split to the run's spp.) Otherwise an epoch ends on work counts at a fixed -spp
+            // (countEpochs, below), on the clock under a budget.
             const long long base   = prog ? prog->sampleBase : 0;
             const long long total  = base + sppTarget;
             // K: as given; or one per sample, capped once for the batch (jAutoEpochs) from what
@@ -21216,7 +21206,8 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
                                     "build) %.4fs (%.3g s/unit), %lld spp %lld units %.4fs "
                                     "(%.3g s/unit)\n",
                                     (unsigned long long)epoch, epoch == 0 ? build0WorkJ : lightWorkJ,
-                                    curB ? bdpt::jWorkBeamBuild(curB->beams.size()) : 0LL,
+                                    curB ? (jSkipHostBvh() ? bdpt::jWorkBeamBuildDevice(curB->beams.size())
+                                                           : bdpt::jWorkBeamBuild(curB->beams.size())) : 0LL,
                                     epoch == 0 ? build0Sec : rebuildSec,
                                     (epoch == 0 ? build0WorkJ : lightWorkJ)
                                         ? (epoch == 0 ? build0Sec : rebuildSec) /

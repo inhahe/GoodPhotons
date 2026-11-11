@@ -308,7 +308,10 @@ as well as the window's. The clock-ended refresh hid it, a slow rebuild lengthen
 counted epochs paid it outright. Now the reset keeps the log's throttle (a new phase logs at
 the log's own cadence), and the pollers here, in mode M's photon pass and in the GPU mode-M
 gather wait on `PollStop` (render_progress.h), which the owner notifies, instead of polling a
-flag between 10-50 ms sleeps that every join paid.
+flag between 10-50 ms sleeps that every join paid. **0.438.1 (review):** the reset is the old one
+again, a new phase logging at once, and the beam upload skips it in mode J's refresh epochs
+(`g_gpuQuietRebuild`), the one caller that repeated a phase every epoch; gpuSppChunks' watchdog
+waits on `PollStop` too.
 
 ## DONE (2026-11-11, 0.438.0; found in review of c7c4aa7): GPU-J-CLOCK — GPU mode J at a fixed -spp rendered differently run to run, and eight checks inherited it
 
@@ -317,11 +320,17 @@ device counts too"). Its camera pass adds its work to device counters (`g_dWork`
 `cudaLastBdptWork`: a vertex, a connection it could evaluate, a photon a point merge weighs, a
 vertex of the device surface-light pass, and the beam hits the waves evaluate), weighed by
 `kJWorkDeviceUnit` against the CPU's light units, each call charging `kJWorkDeviceCall` to the
-light side; the flight cap counts too; and under `-jsurf`, whose GPU chunks each draw their own
-surface photons, the chunks are sized by the counts (`cudaSetCountedChunks`). The constants were
-fitted with `FTRACE_JWORK=1` on five scenes (`scraps/_jwork_fit.py`). check_jdeterminism holds GPU
-mode J, with and without `-jsurf`, to repeat itself twice and at one thread; with the device put
-back on the clock it fails. The rest of this entry is how it stood.
+light side; the flight cap counts too. The constants were fitted with `FTRACE_JWORK=1` on five
+scenes (`scraps/_jwork_fit.py`). check_jdeterminism holds GPU mode J, with and without `-jsurf`,
+to repeat itself twice and at one thread; with the device put back on the clock it fails.
+**0.438.1 (review of 0.438.0):** a beam segment the full queue turned away -- which ones, a race --
+was gathered inline from the camera's random stream, uncounted, so the image and the counts still
+moved with the race: it now draws each hit from the stream the queue gives it, and counts it
+(check_jdeterminism: the all-inline render is the queued one). Under `-jsurf` the device surface
+realizations, which 0.438.0 kept repeatable by sizing the chunks by the counts, cover blocks of
+samples the counts set instead, the clock sizing the chunks again. And the GPU path no longer
+charges the light side the host's SAH tree, which it does not build. The rest of this entry is
+how it stood.
 
 The device ended mode J's light-side epochs on the clock unless `-beamepochs` pinned them (design.md,
 "On the CPU at a fixed -spp": "a -time/-noise/-forever budget and the device keep the clock";
@@ -345,12 +354,24 @@ the same epochs, `gpu` and `gpu-jsurf` read the same J/R to the fourth digit on 
 pixels differ by 2-3 %, their means by 1e-5). So a regression in DSurfMergeW's chromatic bins
 (`chromaM`/`chromaKm1`, SurfMergeWeight's host twin) passes it. check_surf_wavefront's chroma case
 holds only that the queue gathers those weights as the inline gather does, not that they are
-right. Proper fix: a scene where point merges carry a real share of the frame in a chromatic
-medium -- a caustic (a glass ball under the light) on a diffuse floor in the fog, seen directly,
-the light large enough that mode R can still reference it in minutes -- measured for the share
-first (`FTRACE_J_HALF`), then a `gpu-jsurf` variant on it that fails under `FTRACE_JCHROMA=0`.
-Waiting on the user's word to spend the GPU hours a caustic's mode-R reference and the seeds
-take; until then check_jchroma's `gpu-jsurf` says, when it runs, that it holds nothing extra.
+right.
+
+**The scene the entry proposed cannot hold them (measured 2026-11-11).** The bins carry the
+*beam* terms of a point merge's weight -- `segSumM` and the merge at eye[k-1], read at the
+photon's wavelength -- so they matter only where beams and point merges compete for one path.
+In check_jchroma's box with a glass ball (r 0.2) under the light, the caustic on the floor:
+with beams off the point merges carried 7.7 % of the frame's Y and `FTRACE_JCHROMA` 0 against 1
+changed it by nothing at all (byte-identical: no beam terms, nothing for the bins to hold); with
+beams on, the merges carried 12.3 % of it, the beams alone 11.8 % -- the point merges about 0.5 %,
+a caustic seen directly being what light tracing (t = 1) already does well. A wrong bin moves
+that half-per-cent share by a fraction, under the check's 0.5-1 % seed scatter: no frame-level
+colour check can see it. scraps/_jsw/ holds the scene and runs. Proper fix: a direct test of the
+weights -- a device probe (as `-checklattice` is) evaluating DSurfMergeW's chromatic weight on
+camera-side states and photons the host's SurfMergeWeight evaluates too, at chosen wavelengths,
+required to agree. It holds the bins' contents and their wavelength lookup; their wiring in
+kBdptT (`crun.mPrev`, `crun.e1`) it reaches only if the probe's states come from a traced path.
+Waiting on the user's word: a new probe harness, not a scene. Until then check_jchroma's
+`gpu-jsurf` says, when it runs, that it holds nothing extra.
 
 ## DONE (2026-11-11; opened 2026-11-10, 0.437.1): JCHROMA-CLOCK — check_jchroma's GPU verdict moved with the machine's speed
 

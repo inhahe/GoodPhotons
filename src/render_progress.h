@@ -29,13 +29,14 @@ struct PollStop {
         std::unique_lock<std::mutex> lk(m_);
         return cv_.wait_for(lk, d, [this] { return stopped_; });
     }
+    // ...or up to a time point (the steady clock's).
+    bool waitUntil(std::chrono::steady_clock::time_point t) {
+        std::unique_lock<std::mutex> lk(m_);
+        return cv_.wait_until(lk, t, [this] { return stopped_; });
+    }
     void stop() {
         { std::lock_guard<std::mutex> lk(m_); stopped_ = true; }
         cv_.notify_all();
-    }
-    bool stopped() {
-        std::lock_guard<std::mutex> lk(m_);
-        return stopped_;
     }
 private:
     std::mutex m_;

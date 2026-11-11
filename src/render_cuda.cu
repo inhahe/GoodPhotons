@@ -57,7 +57,6 @@
 #include <condition_variable>
 #include <type_traits>           // kBdptT's per-MERGE scratch (DChromaRunNone)
 #include <memory>                // renderBdptCuda's DeviceStopScope
-#include <functional>            // gpuSppChunks' work count
 #include <math.h>
 #include <float.h>
 
@@ -9189,6 +9188,9 @@ __device__ static inline int dRouteOfMed(const DScene& sc, int medId) {
     return (r >= 0) ? r : c_routeDefault;
 }
 
+// `segSeed` (mode J): each hit draws from the stream kWfBeamEval gives it -- the beam's index under
+// the segment's seed -- not from `rng`, so a segment gathered here estimates what the queue would
+// have, and leaves the camera's stream as the queue does; `nHits` (if any) gets the hits weighed.
 __device__ static void dGatherPhotonBeams(const DScene& sc, const DBeamMap& bm,
                                           const DVec3& oc, const DVec3& dc, Real tMax,
                                           double aGlassCam, DRng& rng,
@@ -9197,7 +9199,9 @@ __device__ static void dGatherPhotonBeams(const DScene& sc, const DBeamMap& bm,
                                           const DTrRay* camTr = nullptr,
                                           int routeMedJ = 0,
                                           const DJSpec* js = nullptr, int glassMatCam = -1,
-                                          const DCamera* cam = nullptr) {
+                                          const DCamera* cam = nullptr,
+                                          const unsigned long long* segSeed = nullptr,
+                                          unsigned long long* nHits = nullptr) {
     oX = oY = oZ = 0.0;
     // The cache's share first: it is additive and independent of the beam traversal, and it
     // must run even when the split left no beams at all (nNodes == 0). Under a carrier, atC()
@@ -9243,8 +9247,17 @@ __device__ static void dGatherPhotonBeams(const DScene& sc, const DBeamMap& bm,
                 const double x2 = (double)d2 * (double)b.invRad * (double)b.invRad;
                 if (!(x2 < 1.0)) continue;
                 if (routeMedJ && dRouteOfMed(sc, b.med) != 1) continue;   // D-routed merge (0.386.0)
-                dBeamHitEval(sc, bm, b, bm.primIdx[n.first + i], oc, dc, t, s, cosT, den, x2,
-                             aGlassCam, rng, mw, camTr, env, oX, oY, oZ, js, glassMatCam, cam, &fc);
+                const int bi = bm.primIdx[n.first + i];
+                if (nHits) ++*nHits;
+                if (segSeed) {
+                    DRng hr;
+                    hr.seedUnit((unsigned long long)bi, *segSeed);
+                    dBeamHitEval(sc, bm, b, bi, oc, dc, t, s, cosT, den, x2,
+                                 aGlassCam, hr, mw, camTr, env, oX, oY, oZ, js, glassMatCam, cam, &fc);
+                } else {
+                    dBeamHitEval(sc, bm, b, bi, oc, dc, t, s, cosT, den, x2,
+                                 aGlassCam, rng, mw, camTr, env, oX, oY, oZ, js, glassMatCam, cam, &fc);
+                }
             }
         } else {
             Real tc;
@@ -19927,8 +19940,15 @@ kBdptT(DScene sc, const __grid_constant__ DCamera cam, double* camFilm, double* 
                 }
                 // WAVEFRONT (UPBP-CONV): hand the segment -- and the weight state just built for
                 // it -- to the queue; kWfBeamHits / kWfBeamEval do the gather after this kernel.
-                // A full queue means this segment is gathered inline, right here, as before, and
-                // so does a chromatic one when the queue has no table for its bins.
+                // A full queue means this segment is gathered inline, right here, and so does a
+                // chromatic one when the queue has no table for its bins -- each hit from the
+                // stream the queue would give it (`segSeed`), so which segments the queue took,
+                // a race, moves only the order of the film's sums.
+                // The segment's own stream: its sample and its index along the walk, under the
+                // kernel's seed (which carries -seed), so it is the same however the queue's slots
+                // were handed out.
+                const unsigned long long segSeed =
+                    ((unsigned long long)gidx * 1315423911ull + (unsigned long long)i * 2654435761ull) ^ seedBase;
                 bool queued = false;
                 if (wq.segs && (!mw.chroma || wq.chroma)) {
                     const int si = atomicAdd(wq.nSegs, 1);
@@ -19945,11 +19965,7 @@ kBdptT(DScene sc, const __grid_constant__ DCamera cam, double* camFilm, double* 
                         }
                         ws.spec = sg.spec;   // JSPEC (any == 0 when the carrier is off)
                         ws.glassMat = sg.glassMat;
-                        // The segment's own stream: its sample and its index along the walk, under
-                        // the kernel's seed (which carries -seed), so it is the same however the
-                        // queue's slots were handed out.
-                        ws.seed = ((unsigned long long)gidx * 1315423911ull + (unsigned long long)i * 2654435761ull)
-                                  ^ seedBase;
+                        ws.seed = segSeed;
                         queued = true;
                     } else {
                         atomicAdd(&wq.overflow[0], 1);
@@ -19958,7 +19974,8 @@ kBdptT(DScene sc, const __grid_constant__ DCamera cam, double* camFilm, double* 
                 if (!queued) {
                     double mX = 0.0, mY = 0.0, mZ = 0.0;
                     dGatherPhotonBeams(sc, bm, sg.o, sg.d, (Real)sg.tMax, sg.aGlass, rng,
-                                       mX, mY, mZ, &mw, &camTr, routeMedJ, &sg.spec, sg.glassMat, &cam);
+                                       mX, mY, mZ, &mw, &camTr, routeMedJ, &sg.spec, sg.glassMat, &cam,
+                                       &segSeed, &work);
                     if (mX != 0.0 || mY != 0.0 || mZ != 0.0) {
                         size_t o = ((size_t)py * resX + px) * 3;
                         const double bJ = sg.spec.beta(sg.beta) * wJ;   // JSPEC scale
@@ -25948,17 +25965,9 @@ bool cudaBdptSupported(const Scene& scene) {
 // timing put them (main.cpp `-beamepochs`).
 static bool g_fixedChunks = false;
 void cudaSetFixedChunks(bool on) { g_fixedChunks = on; }
-// cudaSetCountedChunks(true) sizes the chunks by a launch's device work count (`work`, the units
-// so far; renderBdptCuda passes one only where its chunks draw surface photons) rather than its
-// seconds: kChunkDeviceUnits a chunk. The 0.15 s the clock aims at was 0.1-9 M units on an RTX
-// 4090 (a heterogeneous medium's vertices cost the most), so a counted chunk takes 0.03-2.5 s.
-static bool g_countedChunks = false;
-void cudaSetCountedChunks(bool on) { g_countedChunks = on; }
-constexpr double kChunkDeviceUnits = 2.0e6;
 template <class LaunchFn, class DownloadFn>
 static void gpuSppChunks(long long spp, const SppProgress& prog, Film& out,
-                         LaunchFn&& launch, DownloadFn&& download,
-                         const std::function<long long()>& work = {}) {
+                         LaunchFn&& launch, DownloadFn&& download) {
     using clk = std::chrono::steady_clock;
     // Same two diagnostic levers cpuSppChunks has, and for the same reason: when a render
     // appears to hang, the first question is always "how big did the chunk get, and how long
@@ -25972,8 +25981,6 @@ static void gpuSppChunks(long long spp, const SppProgress& prog, Film& out,
     const bool chunkDebug = [] { const char* e = std::getenv("FTRACE_CHUNK_DEBUG");
                                  return e && *e && std::strcmp(e, "0"); }();
     long long done = 0, chunk = (forcedChunk > 0) ? forcedChunk : 1;
-    const bool counted = g_countedChunks && work && forcedChunk <= 0;
-    long long work0 = counted ? work() : 0;
 
     // ---- the -time deadline (SppProgress::deadline) ----------------------------------
     // Only a launch that can be dropped -- one returning whether it landed whole, whose kernels
@@ -26018,9 +26025,7 @@ static void gpuSppChunks(long long spp, const SppProgress& prog, Film& out,
     // kernel come back sooner, but it converts an apparent hang into an accurate diagnosis,
     // which is the whole difference between "ftrace is broken" and "something else is using
     // your GPU".
-    std::mutex wmx;
-    std::condition_variable wcv;
-    bool watchQuit = false;
+    PollStop watchQuit;
     std::atomic<long long> launchStartMs{0};    // 0 = nothing in flight
     std::atomic<long long> launchSpp{0};
     auto nowMs = [] {
@@ -26032,13 +26037,10 @@ static void gpuSppChunks(long long spp, const SppProgress& prog, Film& out,
         double nextWarn = 30.0;                 // first complaint after 30 s in one chunk
         bool spent = false;                     // the deadline has been dealt with
         for (;;) {
-            std::unique_lock<std::mutex> lk(wmx);
             // Woken AT the deadline, not up to 2 s after it.
             const auto wake = clk::now() + std::chrono::seconds(2);
-            wcv.wait_until(lk, (hasDeadline && !spent && prog.deadline < wake) ? prog.deadline : wake,
-                           [&] { return watchQuit; });
-            if (watchQuit) return;
-            lk.unlock();
+            if (watchQuit.waitUntil((hasDeadline && !spent && prog.deadline < wake) ? prog.deadline : wake))
+                return;
             // The clock first, then the launch: the main thread publishes a launch before it reads
             // the clock (below), so a deadline seen here with no launch published is one the main
             // thread's own test will see before it launches, and one seen with a launch published
@@ -26079,10 +26081,9 @@ static void gpuSppChunks(long long spp, const SppProgress& prog, Film& out,
         }
     });
     struct WatchdogJoin {                        // join on every exit path, including a throw
-        std::mutex& m; std::condition_variable& cv; bool& q; std::thread& t;
-        ~WatchdogJoin() { { std::lock_guard<std::mutex> lk(m); q = true; } cv.notify_all();
-                          if (t.joinable()) t.join(); }
-    } wjoin{wmx, wcv, watchQuit, watchdog};
+        PollStop& q; std::thread& t;
+        ~WatchdogJoin() { q.stop(); if (t.joinable()) t.join(); }
+    } wjoin{watchQuit, watchdog};
 
     while (done < spp) {
         long long c = chunk; if (c > spp - done) c = spp - done;
@@ -26125,17 +26126,8 @@ static void gpuSppChunks(long long spp, const SppProgress& prog, Film& out,
         if (chunkDebug)
             std::fprintf(stderr, "[chunk] gpu %lld spp in %.3f s (%.1f spp/s), %lld/%lld done\n",
                          c, dt, dt > 0 ? c / dt : 0.0, done, spp);
-        // Retarget ~0.15 s per chunk: on the clock, or in the device's units when counted.
-        double scale = 0.0;
-        if (counted) {
-            const long long w = work();
-            if (w > work0) scale = kChunkDeviceUnits / (double)(w - work0);
-            work0 = w;
-        } else if (forcedChunk <= 0 && dt > 1e-4) {
-            scale = 0.15 / dt;
-        }
-        if (scale > 0.0) {
-            long long next = (long long)((double)c * scale);
+        if (forcedChunk <= 0 && dt > 1e-4) {               // retarget ~0.15 s per chunk
+            long long next = (long long)((double)c * (0.15 / dt));
             if (next < 1)          next = 1;
             if (next > c * 8 + 1)  next = c * 8 + 1;        // ramp up, but not explosively
             chunk = next;
@@ -26713,8 +26705,10 @@ static void uploadBeamMapCuda(const Scene& scene, const BeamMap* bmap, DUpload& 
     const size_t nb = bmap->beams.size();
     // The fourth and last silent stretch: converting millions of sub-beams and millions of
     // BVH nodes into their device layouts, on one host thread, before the line at the bottom
-    // of this block finally says anything. Name it and make it interruptible.
-    if (stage && stage->reset)  stage->reset();
+    // of this block finally says anything. Name it and make it interruptible. Not a new phase in
+    // mode J's refresh epochs (g_gpuQuietRebuild): a reset there would restart the log's 30 s
+    // throttle every epoch, a line each, flushed inside the light pass's join (POLL-JOIN-STALL).
+    if (stage && stage->reset && !g_gpuQuietRebuild) stage->reset();
     if (stage && stage->report) stage->report("uploading photon beams", 0, (long long)nb,
                                               nullptr, 0.0);
     std::vector<gpu::DBeamRec> recs(nb);
@@ -26883,6 +26877,14 @@ Film renderBdptCuda(const Scene& scene, const Camera& cam, int resX, int resY,
         CUDA_CHECK(cudaMemcpyToSymbol(g_dWork, zero, sizeof zero));
     }
     long long wfHitsCall = 0;
+    // The call's camera work so far: the kernels' count, and the beam hits the waves evaluated.
+    const auto workSoFar = [&]() -> long long {
+        unsigned long long w[kDWorkSlots] = {};
+        CUDA_CHECK(cudaMemcpyFromSymbol(w, g_dWork, sizeof w));
+        long long sum = wfHitsCall;
+        for (unsigned long long x : w) sum += (long long)x;
+        return sum;
+    };
     // Two kernel variants: the default shallow stack, and a deep one for scenes that need
     // it. Anything past BDPT_DEEPDEPTH still clamps — going deeper would need another
     // instantiation, and the local-memory footprint is already ~13 KB/thread there.
@@ -27031,10 +27033,18 @@ Film renderBdptCuda(const Scene& scene, const Camera& cam, int resX, int resY,
     // cost is not the PCIe transfer but the two staging vectors built ahead of it, which walk
     // every surface photon on one core to widen it into the device layout.
     if (smap && !jDevLight) uploadSurfMapCuda(smap, up, dsm);
+    // Level 3 redraws per block of samples (surfBlock, below): remember what the rebuild needs,
+    // since the launch lambda has no `smap` of its own and must not reach for one that may be freed.
+    const bool jPerChunk   = jDevLight && jdevLevel >= 3;
+    long long startLight = 0;   // the map built here, in device units (the count is zero before it)
     if (jDevLight) {
+        // Per block, this is block 0's realization (its salt, below), which the first chunk keeps.
         buildJSurfMapDevice(jdev, up.sc, up.dc, diffraction, maxDepth, jDevPaths,
                             smap->radius, jDevCap,
-                            jSurfSalt(prog), dsm);
+                            jPerChunk ? jSurfSalt(prog) ^ ((unsigned long long)sppBase * 0xD1B54A32D192ED03ULL)
+                                      : jSurfSalt(prog),
+                            dsm);
+        startLight = workSoFar();
         // ONCE. A refreshing render rebuilds this every epoch -- 126 of them in 90 s -- and a
         // line each would bury the -interval status lines that carry the actual progress.
         static bool jdevSaid = false;
@@ -27063,27 +27073,27 @@ Film renderBdptCuda(const Scene& scene, const Camera& cam, int resX, int resY,
         // seed, in one process image are the only ones that answer a throughput question here.
         if (jdevLevel == 2 || jdevLevel == 4) compareJSurfMaps(*smap, jdev);
     }
-    // Level 3 redraws per chunk (see the note above): remember what the rebuild needs, since the
-    // launch lambda has no `smap` of its own and must not reach for one that may be freed.
-    const bool jPerChunk   = jDevLight && jdevLevel >= 3;
-    // How many light-side realizations to draw INSIDE one chunk (FTRACE_JSPLIT). 1 = off.
-    // Inert without jPerChunk: splitting a chunk that reuses one map buys nothing and costs
-    // a kernel launch per split.
-    // DEFAULT 4, the measured optimum: 0.390x whole-frame variance against k=1 for 8.6 % of the
-    // samples, where k=16 costs 53 % of them and comes back out at 0.503x. The two terms trade,
-    // so this knob has an interior optimum and 4 is where it sits on the scene it was measured
-    // on. Inert where the chunk is already 1 spp (an expensive media frame), which is exactly
-    // where a split would have bought nothing.
-    int jSplitN = 4;
+    // ONE SURFACE REALIZATION A BLOCK OF SAMPLES (jPerChunk, the device drawing the surface map).
+    // Realization k covers the call's samples [callBase + kB, callBase + (k+1)B) and is salted by
+    // its first, so which samples meet which map is set by the device's counts, never by the
+    // chunks, whose sizes the clock sets (GPU-J-CLOCK). B (`surfBlock`, spp) is decided after the
+    // call's first chunk (1 spp) from its counts: as many samples as keep a realization's light
+    // pass at kSurfShare of their camera work -- about where four realizations a chunk measured
+    // best (0.390x whole-frame variance against one, for 8.6 % of the samples; sixteen cost 53 %
+    // and came out at 0.503x). A chunk is split at the blocks' edges, and a block's map is drawn
+    // once, however many chunks it spans.
+    // Pinned chunks (-beamepochs, cudaSetFixedChunks) keep one realization a sample: the layout
+    // every frame of a flight shares, which counts taken from each frame would not.
+    constexpr double kSurfShare = 0.1;
+    long long surfBlock = g_fixedChunks ? 1 : 0;   // 0 until the first chunk has priced a sample
+    long long surfDrawn = jPerChunk ? 0 : -1;  // the block whose map dsm holds
+    long long surfLightUnits = startLight;     // its light pass, in device units
     if (jPerChunk) {
-        if (const char* e = std::getenv("FTRACE_JSPLIT")) jSplitN = std::atoi(e);
-        if (jSplitN < 1)    jSplitN = 1;
-        if (jSplitN > 1024) jSplitN = 1024;
-        static bool jSaidSplit = false;
-        if (jSplitN > 1 && !jSaidSplit) {
-            jSaidSplit = true;
-            std::printf("mode J: light side on the DEVICE, redrawn %d times per chunk "
-                        "(-jhostlight for the pre-0.272.0 host pass)\n", jSplitN);
+        static bool said = false;
+        if (!said) {
+            said = true;
+            std::printf("mode J: light side on the DEVICE, its surface photons redrawn every few "
+                        "samples (-jhostlight for the pre-0.272.0 host pass)\n");
         }
     }
     // FTRACE_JBAND=1: redraw per WAVEFRONT BAND instead of (only) per chunk. The band loop
@@ -27366,18 +27376,17 @@ Film renderBdptCuda(const Scene& scene, const Camera& cam, int resX, int resY,
     };
     // Returns whether the chunk landed whole (it is folded into the totals) or a stop cut it
     // short (dropped).
+    const long long callBase = sppBase;   // the call's first sample, where its blocks count from
     auto launch = [&](long long cAll, long long baseAll) -> bool {
       if (abortable) DeviceStopScope::clearSeen();
       // Whether a stop made this chunk skip work: a loop below that left with some to do. With
       // the kernels' own record (seen) it is all that drops a chunk -- not the flag itself, which
       // -time's cut can raise after the last wave has already finished.
       bool leftEarly = false;
-      // ONE LIGHT-SIDE REALIZATION PER SUB-LAUNCH (FTRACE_JDEVLIGHT=3, FTRACE_JSPLIT=k).
-      //
-      // `base` is the ABSOLUTE sample index this sub-batch starts at, so it advances every
-      // sub-launch and never repeats across a resume -- which makes it the right thing to salt
-      // with, and the same quantity the camera side already uses to stay decorrelated across
-      // epoch boundaries.
+      // ONE SURFACE REALIZATION A BLOCK OF SAMPLES (jPerChunk; surfBlock above): the chunk is
+      // split at the blocks' edges, each sub-launch against its block's map, salted by the
+      // block's first ABSOLUTE sample -- which advances block by block and never repeats across
+      // a resume or an epoch, as the camera side's samples do not.
       //
       // WHY THE SPLIT IS INSIDE `launch` RATHER THAN A SMALLER CHUNK. Measured: at
       // FTRACE_CHUNK_SPP=1 the render manages 665 / 713 / 672 spp in 20 s at JDEVLIGHT 0 / 1 / 3
@@ -27389,17 +27398,28 @@ Film renderBdptCuda(const Scene& scene, const Camera& cam, int resX, int resY,
       // map, accumulating into the same device film exactly as consecutive chunks already do.
       // `kappaS` is unchanged across them (same nPaths, same radius), so the MIS weights stay
       // consistent within and between sub-launches.
-      for (int jsp = 0; jsp < jSplitN; ++jsp) {
+      const long long chunkWork0 = jPerChunk && surfBlock == 0 ? workSoFar() : 0;
+      long long chunkLight = 0;   // the maps drawn in this chunk, left out of its camera work
+      for (long long pos = baseAll, endAll = baseAll + cAll; pos < endAll; ) {
         if (stopped()) { leftEarly = true; break; }
-        const long long cLo = cAll * jsp / jSplitN, cHi = cAll * (jsp + 1) / jSplitN;
-        const long long c = cHi - cLo;
-        if (c <= 0) continue;
-        const long long base = baseAll + cLo;
-        if (jPerChunk)
-            buildJSurfMapDevice(jdev, up.sc, up.dc, diffraction, maxDepth, jPaths, jRad, jCap,
-                                jSurfSalt(prog) ^ ((unsigned long long)base *
-                                                   0xD1B54A32D192ED03ULL),
-                                dsm);
+        long long subEnd = endAll;
+        if (jPerChunk) {
+            const long long blk = surfBlock > 0 ? (pos - callBase) / surfBlock : 0;
+            if (surfBlock > 0) subEnd = std::min(endAll, callBase + (blk + 1) * surfBlock);
+            if (blk != surfDrawn) {
+                const long long w0 = workSoFar();
+                buildJSurfMapDevice(jdev, up.sc, up.dc, diffraction, maxDepth, jPaths, jRad, jCap,
+                                    jSurfSalt(prog) ^ ((unsigned long long)(callBase + blk * surfBlock) *
+                                                       0xD1B54A32D192ED03ULL),
+                                    dsm);
+                surfLightUnits = workSoFar() - w0;
+                chunkLight += surfLightUnits;
+                surfDrawn = blk;
+            }
+        }
+        const long long c = subEnd - pos;
+        const long long base = pos;
+        pos = subEnd;
 
         long long totalSamples = (long long)npix * c;
         // Mode J only ever instantiates the scalar (NS == 0) kernel: `useHero` is already
@@ -27591,25 +27611,23 @@ Film renderBdptCuda(const Scene& scene, const Camera& cam, int resX, int resY,
                                                     resX, maxDepth, diffraction ? 1 : 0, seed, 1, dbm, dsm, DWfQueue{}, 0, totalSamples, DSurfQueue{});
         cudaCheckKernel("bdpt");
       }
+      // The call's first chunk has priced a sample: the block, from its counts (surfBlock above),
+      // and no shorter than that chunk, which drew one map.
+      if (jPerChunk && surfBlock == 0 && !leftEarly) {
+          const double camPerSpp = (double)(workSoFar() - chunkWork0 - chunkLight) /
+                                   (double)std::max(1LL, cAll);
+          const double b = camPerSpp > 0.0
+                               ? std::ceil((double)surfLightUnits / (kSurfShare * camPerSpp)) : 1.0;
+          surfBlock = std::max(cAll, (long long)std::min(b, 1e12));
+      }
       // Dropped if a kernel saw the stop (its own record, DeviceStopScope::seen) or the host
       // stopped launching waves.
       return !(abortable && (DeviceStopScope::seen() || leftEarly));
     };
-    // The call's camera work so far (cudaLastBdptWork), which counted chunks are sized by.
-    const std::function<long long()> workSoFar = [&]() -> long long {
-        unsigned long long w[kDWorkSlots] = {};
-        CUDA_CHECK(cudaMemcpyFromSymbol(w, g_dWork, sizeof w));
-        long long sum = wfHitsCall;
-        for (unsigned long long x : w) sum += (long long)x;
-        return sum;
-    };
 
     const auto tCall1 = std::chrono::steady_clock::now();
     if (!prog || !prog->report) { launch(spp, sppBase); download(out); }   // single-shot
-    // Counted chunks (cudaSetCountedChunks) only where a chunk draws its own surface photons: the
-    // chunk boundaries reach the image there alone, and the clock keeps chunks nearer 0.15 s.
-    else gpuSppChunks(spp, *prog, out, launch, download,
-                      jPerChunk ? workSoFar : std::function<long long()>{});
+    else gpuSppChunks(spp, *prog, out, launch, download);
     const auto tCall2 = std::chrono::steady_clock::now();
 
     freeUpload(up);

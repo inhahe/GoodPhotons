@@ -1,10 +1,10 @@
-// workcount.h -- deterministic work counts for the CPU's light-side refresh (modes J and M).
+// workcount.h -- deterministic work counts for the light-side refresh (modes J and M; mode J's on
+// the device too, which counts its camera pass itself: cudaLastBdptWork).
 //
-// An epoch of a fixed -spp render on the CPU lasts as many camera samples as keep its light side's
-// rebuild near -beamrefresh's share of the time -- the rule the clock applies on the device and
-// under a -time/-noise/-forever budget -- but measured in counts, which a machine's speed cannot
-// change, so the render repeats exactly, at any thread count (known-issues J-CPU-NONDET,
-// MODEM-CPU-NONDET). One unit: a vertex traced (a light subpath's or a camera sample's), a
+// An epoch of a fixed -spp render lasts as many camera samples as keep its light side's rebuild
+// near -beamrefresh's share of the time -- the rule the clock applies under a -time/-noise/-forever
+// budget -- but measured in counts, which a machine's speed cannot change, so the render repeats
+// exactly, at any thread count (known-issues J-CPU-NONDET, MODEM-CPU-NONDET, GPU-J-CLOCK). One unit: a vertex traced (a light subpath's or a camera sample's), a
 // segment of a mode-M camera path traced, a connection evaluated, a beam or photon a camera-side
 // gather weighs; a photon-map query's candidate is a sixteenth of one (tlCandidates). A rebuild
 // adds kJWorkRebuildFixed, and each map it builds kJWorkPerBeamLog per item times the log of the
@@ -78,6 +78,9 @@ inline long long jWorkBeamBuild(size_t nBeams) {
     return nBeams ? (long long)(kJWorkPerBeamLog * (double)nBeams * std::log2((double)nBeams + 1.0))
                   : 0;
 }
+// ...and where the device builds the tree (an LBVH: 7.7 M sub-beams in 28 ms on an RTX 4090,
+// some 0.4 units a beam) and the host only converts and uploads the map: a unit a beam.
+inline long long jWorkBeamBuildDevice(size_t nBeams) { return (long long)nBeams; }
 
 // The counted refresh rule: how many samples each render call of a counted refresh loop takes.
 // A light side of `units` buys the samples whose camera work keeps it at -beamrefresh's share of

@@ -2402,13 +2402,18 @@ in any order. A device unit weighs `kJWorkDeviceUnit` (2.0) of the CPU's and eac
 `kJWorkDeviceCall` (5e5) on the light side, both fitted with `FTRACE_JWORK=1`
 (`scraps/_jwork_fit.py`, whose scenes spread them 0.93-6.8 and 0.8-15e5: a heterogeneous
 medium's vertex costs more than its count). The flight cap (`jAutoEpochs`) counts on the device
-too. And since a GPU chunk draws its own surface photons under `-jsurf` (salted by its first
-sample), the chunk boundaries reach the image: there the chunks are sized by the counts as well
-(`cudaSetCountedChunks`, `kChunkDeviceUnits` 2e6 a chunk, 0.03-2.5 s where the clock aims at
-0.15 s); elsewhere the clock keeps sizing them, the boundaries touching nothing but the order of the
-film's sums. `-beamepochs` still pins chunks to 1 spp, a flight's frames sharing their per-chunk
-photons by sample. check_jdeterminism holds GPU mode J, with and without `-jsurf`, to repeat
-itself (to `pfm.ORDER_TOL`, the film's atomic sums landing in any order). **Mode M's CPU loop
+too, and the device's tree is charged as built there (`jWorkBeamBuildDevice`, a unit a beam),
+not as the host's SAH. Under `-jsurf` each device surface realization covers a block of the
+call's samples (`surfBlock`, salted by its first), as long as keeps its light pass at a tenth of
+their camera work (`kSurfShare`), counted on the call's first sample (the map the call builds
+for its constants is block 0's): the chunks, which the clock still sizes, no longer reach the
+image. `-beamepochs` pins chunks to 1 spp and keeps one
+realization a sample, the layout a flight's frames share. And a beam segment the full queue
+turns away (which ones, a race) is gathered inline from the streams the queue would give its hits
+(`dGatherPhotonBeams`' `segSeed`), its hits counted, so a queue's overflow moves only the order of
+the film's sums. check_jdeterminism holds GPU mode J, with and without `-jsurf`, to repeat itself,
+and the inline gather (`FTRACE_NOWAVEFRONT=1`) to render the queued image (to `pfm.ORDER_TOL`,
+the film's atomic sums landing in any order). **Mode M's CPU loop
 does the same since 0.434.23**
 (MODEM-CPU-NONDET; the counters live in `workcount.h`): its light units are the photon paths and
 each grid's or map's build, its camera units the rays, the beams weighed and a sixteenth of each
@@ -10025,10 +10030,12 @@ as the one at fault.
     deposit — before this there was none.
   - The monitor thread is why `setLiveTitle()` now takes a **mutex**: it re-titles from a
     non-main thread while the main thread is inside the joins, and `g_windowRest` is a
-    `std::string` that would otherwise be written from two threads at once. `SetWindowTextW`
-    itself is already cross-thread safe (it marshals a `WM_SETTEXT`), but *creating* the
-    window is not, so `liveWindowPlaceholder` compares against a recorded `g_mainThreadId` and
-    off-thread callers only re-title.
+    `std::string` that would otherwise be written from two threads at once. The re-title itself
+    is posted to the window's own thread (`LiveWindow::setTitle` stages the text and posts
+    `WM_SETTITLE`; a `SetWindowTextW` from the render's thread would wait on the UI,
+    WINDOW-TITLE-BLOCK), but *creating* the window is not cross-thread, so
+    `liveWindowPlaceholder` compares against a recorded `g_mainThreadId` and off-thread callers
+    only re-title.
 - Repaint granularity is bounded below by the renderer's chunk size, not by this timer:
   `gpuSppChunks` / `cpuSppChunks` retarget ~0.15 s per chunk with a 1 spp floor, so a 480²
   `-mode W -spp 8` frame gets one repaint per spp and the first complete image lands after

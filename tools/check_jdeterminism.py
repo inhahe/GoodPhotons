@@ -19,11 +19,14 @@ default fixed map, and in mode M (-beams, 64 spp, -beamrefresh 0.5), each:
   - and at one thread, the same again: the counts are sums over the frame, which no division of
     it among threads changes.
 
-On the GPU (GPU-J-CLOCK) mode J's camera pass counts its own work (cudaLastBdptWork) and its
-chunks, which each draw their own device surface photons under -jsurf, are sized by those counts
-rather than timed. Mode J on the GPU, under the knee rule with and without -jsurf, must repeat
-itself twice and at one thread too -- to ORDER_TOL rather than byte for byte, the film's
-atomic sums landing in any order; an epoch or chunk laid by the clock moves pixels by per cent.
+On the GPU (GPU-J-CLOCK) mode J's camera pass counts its own work (cudaLastBdptWork), and under
+-jsurf each device surface realization covers a block of samples the counts set, not a chunk the
+clock sizes. Mode J on the GPU, under the knee rule with and without -jsurf, must repeat itself
+twice and at one thread too; and the beams' render with every segment gathered inline
+(FTRACE_NOWAVEFRONT=1) must be the queued one, since a segment the full queue turns away (which
+ones, a race) draws each hit from the stream the queue would have given it. All to
+pfm.ORDER_TOL rather than byte for byte, the film's atomic sums landing in any order; an epoch or
+a realization laid by the clock moves pixels by per cent.
 
 Each needs more than one epoch to mean anything, and says how many it got. And mode M resumed
 from a checkpoint draws its light side under salts of its own, not the first session's, at the
@@ -88,14 +91,14 @@ def main():
              "Jgpu": ["-device", "gpu", "-window-min"] + KNEE + ["-nojsurf"],
              "Jgpu-jsurf": ["-device", "gpu", "-window-min"] + KNEE + ["-jsurf"]}
 
-    def render(mode, tag, extra=()):
+    def render(mode, tag, extra=(), env=None):
         png = os.path.join(d, "%s_%s.png" % (mode, tag))
         if os.path.exists(png[:-4] + ".pfm"):
             os.remove(png[:-4] + ".pfm")
         cmd = [exe, "-in", ftsl, "-max-bounce", "8", "-no-meter", "-hdr",
                "-seed", "1", "-o", png] + CASES[mode] + list(extra)
         p = subprocess.run(cmd, cwd=d, capture_output=True, text=True, encoding="utf-8",
-                           errors="replace")
+                           errors="replace", env=dict(os.environ, **(env or {})))
         log = p.stdout + p.stderr
         if p.returncode != 0 or "[stop] interrupted" in log or not os.path.exists(png[:-4] + ".pfm"):
             print(log[-1500:])
@@ -129,6 +132,12 @@ def main():
         check(*same(mode, "run2", first, second))
         single, _ = render(mode, "t1", ("-t", "1"))
         check(*same(mode, "t1", first, single))
+        if mode == "Jgpu":
+            # Every segment gathered inline (FTRACE_NOWAVEFRONT=1): each hit drawn from the stream
+            # the queue gives it, so a segment the full queue turns away -- which ones is a race --
+            # renders as the queue would have.
+            inline, _ = render(mode, "inline", (), {"FTRACE_NOWAVEFRONT": "1"})
+            check(*same(mode, "inline", first, inline))
 
     # A resumed mode M render must not gather from a light side the checkpoint already averaged,
     # so it draws its own under salts past the loaded samples'; but at the radii they were
