@@ -3084,16 +3084,20 @@ held too. The host (`checkJSurfTap`) turns the device's vertices into its own, r
 with the code `renderRows` uses (`cameraSideSums`, `cameraSideSumsChroma`, `surfMergeWeightAt`),
 and requires the fields, the bins, the set of merge sites and the weight itself -- DSurfMergeW in
 a kernel of its own (`kJSurfWEval`) against SurfMergeWeight, at 8 photon states a half drawn over
-six decades of density and past both ends of JSpec's grid -- to agree to 1e-4 (the device's
-positions are fp32). `etaKm1Coef` is held to 1e-3: it is `sigma_t * Tr` at the camera's own
-wavelength, which the device reads off its tabulated spectra in fp32 (`specLookup`), some 1e-4
-below the host's exact one, while the bins' `sigma_t` is the host's own, uploaded per bin. The
-negative control is built in: read one bin (19.6 nm) off, the host's weight must move from the
-device's somewhere, or the run had nothing chromatic to hold and fails. Measured on
-check_jchroma's box and the box around a glass ball (`tools/check_jsurfw.py`): ~6000 halves and
-~50 000 weights each, bins within 2.4e-5 of their row, weights within 2.5e-7, and the one-bin
-shift moving about 900 weights by more than 1e-3. With the inline wiring swapped
-(`chromaM` <-> `chromaKm1`) the bins disagree outright and the weights by up to 0.81.
+six decades of density and past both ends of JSpec's grid -- to agree to 1e-4 of themselves (the
+device's positions are fp32; a NaN or infinity on either side fails). The merge constants are
+the host's, from the call's own maps. `etaKm1Coef` is held to 1e-3: it is `sigma_t * Tr` at the
+camera's own wavelength, which the device reads off its tabulated spectra in fp32
+(`specLookup`), some 1e-4 below the host's exact one, while the bins' `sigma_t` is the host's own,
+uploaded per bin. Where the bins are on the negative control is built in: read one bin (19.6 nm)
+off, the host's weight must move from the device's somewhere, or the run had nothing chromatic
+to hold and fails. A scene of flat extinction holds the weight's scalar terms instead
+(`etaKm1Coef`, `segSumM`, which the bins replace elsewhere). The tap keeps a walk's depth + 3
+vertices a sample. Measured (`tools/check_jsurfw.py`) on check_jchroma's box, the box around a
+glass ball and the box in a grey fog: ~6000 halves and ~50 000 weights each, bins within 2.4e-5
+of their row, and the one-bin shift moving about 900 weights by more than 1e-3 of themselves. With
+the inline wiring swapped (`chromaM` <-> `chromaKm1`) the bins disagree outright and the weights
+by up to 0.81.
 
 ### Mode `J` merges through glass, and the aimed sun (MODE-J-SDS, 0.387.0)
 

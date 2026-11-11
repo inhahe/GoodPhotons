@@ -370,11 +370,11 @@ merges' tables are held directly") holds the device's point-merge weights to the
 device's own camera subpaths -- the scalar fields, the chromatic bins (DChromaRun against
 cameraSideSumsChroma), the merge sites, the wiring (the bins are read through the weight's own
 pointers) and DSurfMergeW against SurfMergeWeight at drawn photon states and wavelengths -- with
-a built-in negative control. `tools/check_jsurfw.py` runs it on check_jchroma's box and the box
-around a glass ball: bins within 2.4e-5, weights within 2.5e-7, about 900 of 50 000 weights moved
-by a one-bin shift; with the inline wiring swapped it fails (bins 1.0, weights 0.81). The queued
-gather's copy of the bins is held to the inline gather by check_surf_wavefront. The rest of this
-entry is how it stood.
+a built-in negative control. `tools/check_jsurfw.py` runs it on check_jchroma's box, the box
+around a glass ball and the box in a grey fog (the scalar terms): bins within 2.4e-5, about 900
+of 50 000 weights moved by a one-bin shift; with the inline wiring swapped it fails (bins 1.0,
+weights 0.81). The queued gather's copy of the bins is held to the inline gather by
+check_surf_wavefront. The rest of this entry is how it stood.
 
 In check_jchroma's box of chromatic fog the point merges carry about 1e-5 of the frame: pinned to
 the same epochs, `gpu` and `gpu-jsurf` read the same J/R to the fourth digit on every seed (their

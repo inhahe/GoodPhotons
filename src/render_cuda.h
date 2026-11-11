@@ -690,14 +690,15 @@ bool cudaLatticeProbe(const unsigned long long* idx, int n, double* out);
 
 // `-checkjsurfw` (jsurf_tap.h): mode J's point-merge weights, held against the host's.
 // Arm: the next renderBdptCuda call records its first `n` samples (absolute indices below `n`):
-// each one's camera subpath and the camera half of every point merge's weight it built on it.
-// Take: hands the record back and disarms -- per sample its vertices (kJSurfTapMaxV apart), their
+// each one's camera subpath, up to `stride` vertices (at most kJSurfTapMaxV; its walk holds its
+// depth + 3), and the camera half of every point merge's weight it built on it.
+// Take: hands the record back and disarms -- per sample its vertices (`stride` apart), their
 // count (0: not recorded) and its camera wavelength, and per vertex the half (camVert 0 where
 // none was built). False if nothing was armed or there is no device.
 #include "jsurf_tap.h"
-void cudaJSurfTapArm(int n);
+void cudaJSurfTapArm(int n, int stride);
 bool cudaJSurfTapTake(std::vector<JSurfTapVertex>& eye, std::vector<int>& nE,
-                      std::vector<double>& lam, std::vector<JSurfTapHalf>& halves);
+                      std::vector<double>& lam, std::vector<JSurfTapHalf>& halves, int& stride);
 // The device's own weight (DSurfMergeW, its bins read by dSpecBinAt) of each state against the
 // half it names: out[i] for states[i]. False if there is no device or the launch failed.
 bool cudaJSurfWEval(const std::vector<JSurfTapHalf>& halves,

@@ -15639,39 +15639,46 @@ static constexpr int kCheckJSurfWSamples = 4096;   // samples recorded: absolute
 // the bit. And a negative control: the host's weight read at a wavelength one bin off must
 // disagree with the device's somewhere, or the scene held nothing chromatic and the run proves
 // nothing. Returns the number of failures (each printed).
-static int checkJSurfTap(const Scene& scene, int maxDepth) {
+// `maxDepth` is the depth the device rendered at (clamped as renderBdptCuda clamps it); `beams`
+// and `photons` the maps the call merged against, from which the host derives the merge
+// constants itself.
+static int checkJSurfTap(const Scene& scene, int maxDepth, const BeamMap* beams,
+                         const bdpt::SurfMap* photons) {
     using namespace bdpt;
     static_assert(kJSurfTapK == ChromaMis::K, "the tap's bins are JSpec's");
     constexpr double kTol = 1e-4;     // relative, for fields, bins and weights
-    constexpr double kShift = 1e-3;   // a weight the one-bin shift moves by more than this
+    constexpr double kShift = 1e-3;   // a weight the one-bin shift moves by more than this, relatively
     std::vector<JSurfTapVertex> tv;
     std::vector<int> tn;
     std::vector<double> tl;
     std::vector<JSurfTapHalf> th;
-    if (!cudaJSurfTapTake(tv, tn, tl, th)) {
+    int stride = 0;
+    if (!cudaJSurfTapTake(tv, tn, tl, th, stride)) {
         std::printf("[checkjsurfw] the device recorded nothing  BAD\n");
         return 1;
     }
     ChromaMis cm;
     cm.build(scene);
     const PatTables tabs = scene.patTables();
-    // The call's constants: every half carries them.
+    // The merge constants, the host's own: renderRows' (BdptRenderer) for the beams; for the
+    // surface map its count of paths, which the device draws itself where it holds them (devPaths).
     MergeK mk;
-    for (const JSurfTapHalf& h : th)
-        if (h.camVert > 0) { mk.beam = h.kappaB; mk.surf = h.kappaS; break; }
+    if (beams && (beams->empty() || !beams->mis.empty()))
+        mk.beam = (double)beams->nEmitted * 2.0 * beams->radRef();
+    if (photons && photons->radius > 0.0) {
+        const long long n = photons->devPaths > 0 ? photons->devPaths : photons->nEmitted;
+        mk.surf = (double)n * PI * photons->radius * photons->radius;
+    }
+    // The relative difference, and infinite where either side is NaN or infinite and they differ.
     const auto rel = [](double a, double b) {
+        if (!std::isfinite(a) || !std::isfinite(b)) return a == b ? 0.0 : HUGE_VAL;
         const double m = std::max(std::fabs(a), std::fabs(b));
         return m > 0.0 ? std::fabs(a - b) / m : 0.0;
     };
-    // splitmix64: the photon states, the same every run.
-    unsigned long long rs = 0x243F6A8885A308D3ULL;
-    const auto uni = [&rs]() {
-        unsigned long long z = (rs += 0x9E3779B97F4A7C15ULL);
-        z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ULL;
-        z = (z ^ (z >> 27)) * 0x94D049BB133111EBULL;
-        z ^= z >> 31;
-        return (double)(z >> 11) * (1.0 / 9007199254740992.0);
-    };
+    // The photon states, the same every run.
+    Pcg32 rng;
+    rng.seed(0x6A535746ULL, 0x243F6A8885A308D3ULL);
+    const auto uni = [&rng]() { return rng.uniform(); };
     const auto logU = [&uni](double lo, double hi) { return std::pow(10.0, lo + (hi - lo) * uni()); };
     const double binW = JSpec::lamOf(1) - JSpec::lamOf(0);
     const double lamLo = JSpec::lamOf(0) - binW, lamHi = JSpec::lamOf(JSpec::K - 1) + binW;
@@ -15695,7 +15702,7 @@ static int checkJSurfTap(const Scene& scene, int maxDepth) {
         eye.assign((size_t)nE, Vertex{});
         bool mapped = true;
         for (int v = 0; v < nE; ++v) {
-            const JSurfTapVertex& t = tv[i * kJSurfTapMaxV + (size_t)v];
+            const JSurfTapVertex& t = tv[i * (size_t)stride + (size_t)v];
             Vertex& e = eye[(size_t)v];
             e.type = (VType)t.type;
             e.p = Vec3{t.p[0], t.p[1], t.p[2]};
@@ -15727,7 +15734,7 @@ static int checkJSurfTap(const Scene& scene, int maxDepth) {
             Vec3 woCam = vp.p - vk.p;
             const double d2 = dot(woCam, woCam);
             const bool site = surfMergeSite(vk) && vk.beta > 0.0 && vk.mat && d2 > 0.0;
-            const JSurfTapHalf& dh = th[i * kJSurfTapMaxV + (size_t)k];
+            const JSurfTapHalf& dh = th[i * (size_t)stride + (size_t)k];
             if (site != (dh.camVert == k)) {
                 if (nSiteBad++ < 5)
                     std::printf("[checkjsurfw] sample %zu vertex %d: a merge site on the %s only\n",
@@ -15785,7 +15792,9 @@ static int checkJSurfTap(const Scene& scene, int maxDepth) {
                     for (int b = 0; b < ChromaMis::K; ++b)
                         scale = std::max({scale, std::fabs(r.d[b]), std::fabs(r.h[b])});
                     for (int b = 0; b < ChromaMis::K; ++b) {
-                        const double e = scale > 0.0 ? std::fabs(r.d[b] - r.h[b]) / scale : 0.0;
+                        const double e = !(std::isfinite(r.d[b]) && std::isfinite(r.h[b]))
+                                             ? HUGE_VAL
+                                         : scale > 0.0 ? std::fabs(r.d[b] - r.h[b]) / scale : 0.0;
                         worstBin = std::max(worstBin, e);
                         if (!(e <= kTol) && nBinBad++ < 5)
                             std::printf("[checkjsurfw] sample %zu vertex %d: %s bin %d device %.9g, "
@@ -15827,12 +15836,12 @@ static int checkJSurfTap(const Scene& scene, int maxDepth) {
     double worstW = 0.0, maxShift = 0.0;
     if (evaluated)
         for (size_t s = 0; s < states.size(); ++s) {
-            const double e = std::fabs(devW[s] - hostW[s]);
+            const double e = rel(devW[s], hostW[s]);
             worstW = std::max(worstW, e);
             if (!(e <= kTol) && nWBad++ < 5)
                 std::printf("[checkjsurfw] weight %zu (lambda %.2f nm): device %.9g, host %.9g\n", s,
                             states[s].lam, devW[s], hostW[s]);
-            const double sh = std::fabs(shiftW[s] - devW[s]);
+            const double sh = rel(shiftW[s], devW[s]);
             maxShift = std::max(maxShift, sh);
             if (sh > kShift) ++nShifted;
         }
@@ -15842,9 +15851,13 @@ static int checkJSurfTap(const Scene& scene, int maxDepth) {
     std::printf("[checkjsurfw] worst relative difference: fields %.3g (%s), bins %.3g (of their "
                 "row), weights %.3g; tolerance %.0e (etaKm1Coef 1e-3).\n",
                 worstField, worstFieldName, worstBin, worstW, kTol);
-    std::printf("[checkjsurfw] negative control: read one bin (%.1f nm) off, the host's weight "
-                "moves %lld of %zu weights by more than %.0e (at most %.3g) from the device's.\n",
-                binW, nShifted, states.size(), kShift, maxShift);
+    if (cm.on)
+        std::printf("[checkjsurfw] negative control: read one bin (%.1f nm) off, the host's weight "
+                    "moves %lld of %zu weights by more than %.0e of themselves (at most %.3g) from "
+                    "the device's.\n", binW, nShifted, states.size(), kShift, maxShift);
+    else
+        std::printf("[checkjsurfw] no medium's extinction varies with wavelength here: the bins are "
+                    "off, and the weights read etaKm1Coef and segSumM at the camera's.\n");
     int fails = 0;
     const auto fail = [&fails](bool bad, const char* what) {
         if (!bad) return;
@@ -15853,8 +15866,6 @@ static int checkJSurfTap(const Scene& scene, int maxDepth) {
     };
     fail(nHalves == 0, "no point-merge half was recorded: the scene needs -jsurf and surfaces "
                        "the camera reaches");
-    fail(!cm.on, "the scene's extinction is the same at every wavelength, so there are no "
-                 "chromatic bins to hold");
     fail(nSiteBad > 0, "the two halves disagree on which vertices are merge sites");
     fail(nChromaBad > 0, "the two halves disagree on whether the bins are on");
     fail(nFieldBad > 0, "a half's scalar fields disagree");
@@ -21102,11 +21113,14 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
             if (useGpu) {
                 // -checkjsurfw: the first call records, and its record is held at once.
                 const bool tap = g_checkJSurfWRc == -1;
-                if (tap) cudaJSurfTapArm(kCheckJSurfWSamples);
+                // The device's walk holds its depth + 3 vertices, its depth clamped to the deep
+                // kernel's (kJSurfTapMaxV is that kernel's MAXV; render_cuda.cu asserts it).
+                const int devDepth = std::min(maxDepth, kJSurfTapMaxV - 3);
+                if (tap) cudaJSurfTapArm(kCheckJSurfWSamples, devDepth + 3);
                 Film f = renderBdptCuda(scene, camEpochJ, res, resY, sppTarget, maxDepth,
                                         diffraction, p, g_heroC, beamsPtr, &stageProg,
                                         photonsPtr, held);
-                if (tap) g_checkJSurfWRc = checkJSurfTap(scene, maxDepth);
+                if (tap) g_checkJSurfWRc = checkJSurfTap(scene, devDepth, beamsPtr, photonsPtr);
                 return f;
             }
 #endif

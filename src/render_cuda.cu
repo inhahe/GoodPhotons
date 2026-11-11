@@ -19339,18 +19339,19 @@ struct DSurfMergeW {
 // merge's weight it builds on them, for the host to rebuild from the same vertices.
 struct DSurfTap {
     int n;
-    JSurfTapVertex* eye;     // [n * kJSurfTapMaxV]
+    int stride;              // vertices kept a sample (<= kJSurfTapMaxV)
+    JSurfTapVertex* eye;     // [n * stride]
     int* nE;                 // [n]
     double* lam;             // [n]: the camera wavelength
-    JSurfTapHalf* halves;    // [n * kJSurfTapMaxV], by camera vertex
+    JSurfTapHalf* halves;    // [n * stride], by camera vertex
 };
-__constant__ DSurfTap c_surfTap = {0, nullptr, nullptr, nullptr, nullptr};
+__constant__ DSurfTap c_surfTap = {0, 0, nullptr, nullptr, nullptr, nullptr};
 static_assert(kJSurfTapK == DJSPEC_K, "the tap's bins are DJSpec's");
 static_assert(kJSurfTapMaxV == BDPT_MAXV_OF(BDPT_DEEPDEPTH), "the tap keeps a deep walk whole");
 
 __device__ static void dSurfTapPath(long long gidx, const DVertex* eye, int nE, double lam) {
-    const int n = nE < kJSurfTapMaxV ? nE : kJSurfTapMaxV;
-    JSurfTapVertex* o = c_surfTap.eye + gidx * kJSurfTapMaxV;
+    const int n = nE < c_surfTap.stride ? nE : c_surfTap.stride;
+    JSurfTapVertex* o = c_surfTap.eye + gidx * c_surfTap.stride;
     for (int i = 0; i < n; ++i) {
         const DVertex& v = eye[i];
         JSurfTapVertex& t = o[i];
@@ -19366,10 +19367,10 @@ __device__ static void dSurfTapPath(long long gidx, const DVertex* eye, int nE, 
 // The bins are read through the half's own pointers, as its weight reads them, so a row wired
 // to the wrong one shows.
 __device__ static void dSurfTapHalf(long long gidx, int k, const DSurfMergeW& sw) {
-    if (k >= kJSurfTapMaxV) return;
+    if (k >= c_surfTap.stride) return;
     const double* mPrev = sw.chromaM;
     const double* e1 = sw.chromaKm1;
-    JSurfTapHalf& h = c_surfTap.halves[gidx * kJSurfTapMaxV + k];
+    JSurfTapHalf& h = c_surfTap.halves[gidx * c_surfTap.stride + k];
     h.kappaB = sw.kappaB; h.kappaS = sw.kappaS;
     h.invPdfFwdK = sw.invPdfFwdK; h.gateD1 = sw.gateD1; h.cosPrev = sw.cosPrev;
     h.invDistPrev2 = sw.invDistPrev2; h.invPdfFwdKm1 = sw.invPdfFwdKm1;
@@ -23713,19 +23714,20 @@ bool cudaPatOpProbe(const PatNode* prog, const int* off, const int* len, int nPr
 }
 
 // ---- -checkjsurfw: the tap's buffers (jsurf_tap.h) ------------------------------------------
-static gpu::DSurfTap g_surfTapHost = {0, nullptr, nullptr, nullptr, nullptr};
+static gpu::DSurfTap g_surfTapHost = {0, 0, nullptr, nullptr, nullptr, nullptr};
 static void surfTapFree() {
     cudaFree(g_surfTapHost.eye); cudaFree(g_surfTapHost.nE); cudaFree(g_surfTapHost.lam);
     cudaFree(g_surfTapHost.halves);
-    g_surfTapHost = gpu::DSurfTap{0, nullptr, nullptr, nullptr, nullptr};
+    g_surfTapHost = gpu::DSurfTap{0, 0, nullptr, nullptr, nullptr, nullptr};
     cudaMemcpyToSymbol(gpu::c_surfTap, &g_surfTapHost, sizeof g_surfTapHost);
 }
-void cudaJSurfTapArm(int n) {
+void cudaJSurfTapArm(int n, int stride) {
     if (!cudaAvailable()) return;
     surfTapFree();
     if (n <= 0) return;
-    gpu::DSurfTap t{n, nullptr, nullptr, nullptr, nullptr};
-    const size_t nv = (size_t)n * kJSurfTapMaxV;
+    stride = std::min(std::max(stride, 1), kJSurfTapMaxV);
+    gpu::DSurfTap t{n, stride, nullptr, nullptr, nullptr, nullptr};
+    const size_t nv = (size_t)n * (size_t)stride;
     bool ok = cudaMalloc(&t.eye, nv * sizeof(JSurfTapVertex)) == cudaSuccess &&
               cudaMalloc(&t.nE, (size_t)n * sizeof(int)) == cudaSuccess &&
               cudaMalloc(&t.lam, (size_t)n * sizeof(double)) == cudaSuccess &&
@@ -23737,10 +23739,11 @@ void cudaJSurfTapArm(int n) {
     cudaMemcpyToSymbol(gpu::c_surfTap, &t, sizeof t);
 }
 bool cudaJSurfTapTake(std::vector<JSurfTapVertex>& eye, std::vector<int>& nE,
-                      std::vector<double>& lam, std::vector<JSurfTapHalf>& halves) {
+                      std::vector<double>& lam, std::vector<JSurfTapHalf>& halves, int& stride) {
     const gpu::DSurfTap t = g_surfTapHost;
     if (!cudaAvailable() || t.n <= 0) return false;
-    const size_t nv = (size_t)t.n * kJSurfTapMaxV;
+    stride = t.stride;
+    const size_t nv = (size_t)t.n * (size_t)t.stride;
     eye.resize(nv); nE.resize((size_t)t.n); lam.resize((size_t)t.n); halves.resize(nv);
     const bool ok =
         cudaMemcpy(eye.data(), t.eye, nv * sizeof(JSurfTapVertex), cudaMemcpyDeviceToHost) == cudaSuccess &&
@@ -23765,7 +23768,8 @@ bool cudaJSurfWEval(const std::vector<JSurfTapHalf>& halves,
     if (ok) {
         gpu::kJSurfWEval<<<(n + 127) / 128, 128>>>(dH, dS, n, dO);
         out.resize(states.size());
-        ok = cudaDeviceSynchronize() == cudaSuccess &&
+        // A launch's own error, taken here so the render's next kernel check does not report it.
+        ok = cudaGetLastError() == cudaSuccess && cudaDeviceSynchronize() == cudaSuccess &&
              cudaMemcpy(out.data(), dO, states.size() * sizeof(double),
                         cudaMemcpyDeviceToHost) == cudaSuccess;
     }

@@ -7159,11 +7159,13 @@ weight carries where a medium's extinction varies with wavelength. The render's 
 records the camera subpaths of its first 4096 samples, and the weight's camera half at every
 point-merge site on them. The CPU then rebuilds the same halves from those same vertices with
 its own code and requires every field, every table bin, which vertices are merge sites, and the
-weight itself at a spread of photon states and wavelengths to agree (to `1e-4`: the GPU traces
-in fp32). Its negative control is built in: read one bin off, the CPU's weight must move away
-from the GPU's somewhere, or the scene had nothing chromatic to hold, and the run fails. It
-prints its verdict at the end, as `-misaudit` does, and a run that never reached a mode-`J`
-device call fails too. `tools/check_jsurfw.py` runs it on two scenes.
+weight itself at a spread of photon states and wavelengths to agree (to `1e-4` of themselves: the
+GPU traces in fp32). The merge constants it derives from the render's own maps. Where the tables
+are on, its negative control is built in: read one bin off, the CPU's weight must move away
+from the GPU's somewhere, or the scene had nothing chromatic to hold, and the run fails; a scene
+whose extinction is flat holds the weight's single-wavelength terms instead. It prints its
+verdict at the end, as `-misaudit` does, and a run that never reached a mode-`J` device call
+fails too. `tools/check_jsurfw.py` runs it on three scenes.
 
 **Scene front end:** the shared grammar parses every `.ftsl`, with no flag to
 configure. `-legacy-parser` and `-validate-grammar` were retired in 0.79.0; they are
