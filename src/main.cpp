@@ -19889,7 +19889,11 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
             const size_t film   = (size_t)res * resY * 3 * sizeof(double) * 2 +
                                   ((gpuForwardMode && cam.seesMotion(scene) && cam.moves())
                                        ? cudaForwardPosedCameraBytes(scene, wavefront, g_heroC, N) : 0);
-            const size_t needAll = needLocal - reused + film + (size_t)256 * 1024 * 1024;
+            // Mode J's wavefront queues, allocated beside the kernel once the render starts.
+            const size_t queues = (mode == 'J')
+                ? cudaModeJQueueBytes(jBeamsChoice().rule != JBeams::Off && !scene.media.empty(), g_jSurf)
+                : 0;
+            const size_t needAll = needLocal - reused + film + queues + (size_t)256 * 1024 * 1024;
             const double toGB = 1.0 / (1024.0 * 1024.0 * 1024.0);
             // Always say what the card looks like. This one line is what turns "the render
             // is mysteriously hung" into "something else is holding 20 of my 24 GB", which
@@ -19897,7 +19901,7 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
             // 100% busy either way, and per-process VRAM is N/A under WDDM).
             std::printf("[vram] %.2f GB free of %.2f GB on %s; mode-%c kernel wants "
                         "%.2f GB local (%.2f GB of it already reserved by this process) + "
-                        "%.2f GB film/scene/context\n",
+                        "%.2f GB film/scene/queues/context\n",
                         freeB * toGB, totalB * toGB, cudaDeviceName(), mode,
                         needLocal * toGB, reused * toGB, (needAll - (needLocal - reused)) * toGB);
             // Fall back on either signal: the explicit budget, or a card so nearly full
@@ -19918,7 +19922,7 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
                 std::fprintf(stderr,
                     "[device] NOT ENOUGH FREE VRAM for the GPU path (%s): the mode-%c "
                     "megakernel reserves %.2f GB of per-thread local memory (%.2f GB of it "
-                    "already this process's, +%.2f GB film/scene/context) but only %.2f GB of "
+                    "already this process's, +%.2f GB film/scene/queues/context) but only %.2f GB of "
                     "%.2f GB is free on %s.\n"
                     "[device] Some other process on this machine is holding the card. Running "
                     "on the GPU anyway would spill that local memory to host RAM over PCIe and "

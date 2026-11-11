@@ -1864,7 +1864,7 @@ machine varied 18.5 s / 25.8 s / 27.2 s.
   spp at equal time on `_fog_thick`). Both paths are the same estimator summed in a different
   order. Setting this forces the old inline gather, which is the A/B control for any parity
   question; the render reports its queue use in a `[gpu] mode J wavefront gather:` line and where its
-  seconds went — GPU time of the walk, the beam-hit search and the hit evaluation, and the host gaps
+  seconds went — GPU time of the walk, the beam-hit search, the hit evaluation and the point merges' gather, and the host gaps
   between waves — in a `[gpu] mode J wave loop:` line. `FTRACE_WAVE_DEBUG=1` prints one `[wave]` line per
   wave (paths, segments, segments gathered inline, hits, resume passes, and the three kernel
   times) for finer diagnosis. `FTRACE_WFHITCAP=<n>` shrinks the hit queue (default 2^25 hits) so an
@@ -1872,12 +1872,13 @@ machine varied 18.5 s / 25.8 s / 27.2 s.
 - **`FTRACE_NOSURFWF=1` (diagnostic, mode `J` on the GPU).** Since 0.437.0 the surface point merges
   (`-jsurf`) are queued too: each camera vertex's gather goes to a kernel that gathers it with a whole
   warp, its photons across the lanes, instead of one thread per path doing it inline -- where a warp
-  kept 2.3 of its 32 threads busy. A pixel's gathers reach the film in a fixed order, so the image is
-  the inline gather's to float precision and the same every run. Measured on `_fog_cornell`'s
-  surface merges at 640x480: 378 -> 219 ms of GPU time a sample (1.7x). Setting this forces the
-  inline gather (the A/B control). The render reports its use in a `[gpu] mode J point merges:`
-  line. `FTRACE_SURFWFCAP=<n>` shrinks the queue so sites overflow to the inline gather;
-  `tools/check_surf_wavefront.py` uses it, and requires the same image every way.
+  kept 2.3 of its 32 threads busy. The film gets the same terms as from the inline gather, summed in
+  another order. Measured on `_fog_cornell`'s surface merges at 640x480: 378 -> 219 ms of GPU time
+  a sample (1.7x). Setting this forces the inline gather (the A/B control). The render reports the
+  queue's use and the gather's GPU time in a `[gpu] mode J point merges:` line, and with beams the
+  gather's time in the `[gpu] mode J wave loop:` line too. `FTRACE_SURFWFCAP=<n>` shrinks the queue
+  so sites overflow to the inline gather; `tools/check_surf_wavefront.py` uses it, and requires
+  the same image every way.
 - **`FTRACE_JEPOCHKEEP=<k>` (diagnostic, mode `J` flights).** Keeps at most `k` of a batch's
   `-beamepochs` realizations, so its later frames re-trace the rest as a batch too large to keep
   them would; `tools/check_jbeams.py` uses it to show such an epoch is traced as epoch 0 was.

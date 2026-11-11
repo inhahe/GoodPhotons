@@ -43,6 +43,11 @@ bool cudaMemInfo(size_t* freeB, size_t* totalB);
 // Returns 0 for "unknown" (no device, or a mode with no megakernel).
 size_t cudaMegakernelLocalBytes(char mode, int maxDepth, int heroC);
 
+// Device memory mode J's wavefront queues take at most, beside the kernel's local memory: the
+// beam queue where `beams` gather, the point merges' where a surface map does (`points`). Read
+// after cudaSetJSwitches, which sizes a point-merge request.
+size_t cudaModeJQueueBytes(bool beams, bool points);
+
 // The local-memory reservation this process's context holds now: its per-thread stack limit
 // (which the driver raises to the largest kernel launched so far) times the threads the card
 // holds resident. A kernel launched later reuses it. 0 if unknown.

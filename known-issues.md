@@ -285,6 +285,21 @@ mode R on each backend (CPU 0.96 / 1.20 / 0.77, GPU 0.89 / 1.08 / 0.88: within i
 a red sphere's small green and blue). Found checking the coat coin's fix against mode R (Opus review
 of 90e0486..bea7be1).
 
+## OPEN (2026-11-10, 0.437.1): JCHROMA-CLOCK — check_jchroma's GPU verdict moves with the machine's speed
+
+`tools/check_jchroma.py` renders mode J on the GPU at a fixed `-spp` without `-beamepochs`, and
+the device ends mode J's light-side epochs on the clock (design.md, "On the CPU at a fixed -spp":
+a budget "and the device keep the clock"). The epoch count sets the merge noise and, through the
+radii that shrink epoch by epoch (UPBP-BEAM-RADIUS, the point merges' `-vcmalpha` schedule), the
+blur bias, so one binary's colour ratios move between runs. 0.437.0 passed it; 0.437.1, which
+renders this scene byte for byte as the earlier binary does at a pinned `-beamepochs 4` (point
+merges on and off), failed it: `gpu` Z/Y 0.9948 -> 0.9907, `gpu-jsurf` X/Y 0.9946 -> 1.0139,
+against 0.008. All three seeds of the failing `gpu-jsurf` read high (1.015, 1.010, 1.016): a
+shift the run shares, not seed noise. Two runs of one 256-spp command differ too
+(`scraps/_jc_det1.pfm`, `_jc_det2.pfm`). Fix: pin the epochs in the check, and measure how far the
+colour ratios move with the epoch count -- a chromatic bias that depends on it would be a finding
+of its own.
+
 ## OPEN (2026-11-10, 0.436.10): GPU-BDPT-LOCALMEM — the GPU camera pass of modes D and J is bound by its threads' local memory, and mode J's surface merges by divergence
 
 Measured with Nsight Compute (`scraps/_ncu.sh`, summary `scraps/_ncu_sum.py`: one whole-sample
@@ -315,7 +330,10 @@ back to mode D's 155 ms, the gather 31 ms a warp a site. Tried alongside and not
 stored in cell order so a warp's reads are contiguous (no change in the queued gather, 1.6 %
 inline), and `__launch_bounds__(128, 4)` on the gather (no change; it runs at 255 registers and
 16.7 % occupancy, bound by the latency of its scattered loads -- a photon's position, its MIS
-record, the BSDF's spectral tables -- with no one line above 10 % of its stalls). (A cell of 2r and
+record, the BSDF's spectral tables -- with no one line above 10 % of its stalls). 0.437.1 adds a
+site to the film from the gather kernel by atomics, as the inline gather did, instead of through
+per-path slot tables and a fold kernel, at the same speed (379 -> 219 ms; `gallery_rain` 760 ms
+either way). (A cell of 2r and
 an 8-cell walk, proposed here, visits 64 r^3 against the 27-cell walk's 27 r^3: more photons, not
 fewer.) The build already carries `-lineinfo`; `scraps/_ncu_lines.py` lists a report's hottest
 source lines.

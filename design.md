@@ -724,7 +724,7 @@ Four consequences worth knowing:
     The per-hit RNG stream is derived from the segment seed and beam index, so heterogeneous
     transmittance stays stochastic and unbiased. `FTRACE_NOWAVEFRONT=1` is the A/B control. The
     render reports its queue use (`[gpu] mode J wavefront gather:`) and where its seconds went —
-    CUDA-event time of the walk, the beam-hit search and the hit evaluation, and the host gaps
+    CUDA-event time of the walk, the beam-hit search, the hit evaluation and the point merges' gather, and the host gaps
     between waves (`[gpu] mode J wave loop:`; the wave already syncs, so the events are free).
     Measured: `_fog_thick` 128² at `-beamk 32`, 60 s: 380 → 4905 spp (**12.9×**).
   - **The point merges are queued too (0.437.0, SURF-WAVEFRONT).** Each camera vertex's surface
@@ -732,22 +732,27 @@ Four consequences worth knowing:
     the warp's other paths were at other depths -- Nsight Compute measured 2.3 of 32 lanes busy there
     on `_fog_cornell`, the gather half the camera kernel's time. `kBdptT` now writes the site
     (`DSurfReq`: the vertex, the weight's camera half `DSurfMergeW`, the direction, the scale; the
-    JSPEC carrier and the chromatic bins in side tables) to a `DSurfQueue`, and after the wave
-    `kWfSurfGather` gathers each with a whole warp -- the lanes take a cell's photons in turn, the
-    per-photon work is `dSurfMergePhoton`, shared with the inline `dSurfMergeAt` -- and sums its
-    lanes in a fixed order into the request's own slot. `kWfSurfFold` then adds each pixel's sites
-    to the film, a thread a pixel slot, in path, sub-sample and site order (`siteSlot` records which
-    slot holds which), so the image is deterministic and equal to the inline gather's to float
-    precision. Per-object routes are carried (`DSurfQueue::subs`, a route's sub-samples). A wave
-    holds at most 512 K paths and as many as the requests (up to 1 M, or a quarter of free memory)
-    hold at the last wave's sites a path; a site the full queue turns away, or one needing a table
-    the queue lacks, is gathered inline. Both kernels are launched sized to the wave's sites: a dense
-    beam map's waves are a few thousand paths, and a fixed grid idled through each (measured on
-    `gallery_rain`: 188 ms a sample of idle warps, 9 ms sized). Measured at 640x480 (GPU time a
+    JSPEC carrier and the chromatic bins in side tables; the film offset) to a `DSurfQueue`, and
+    after the wave `kWfSurfGather` gathers each with a whole warp -- the lanes take a cell's photons
+    in turn, the per-photon work is `dSurfMergePhoton`, shared with the inline `dSurfMergeAt` --
+    and lane 0 adds the warp's sum to the film by atomics, as the inline gather and the beam
+    queue's evaluations do: the same terms in another order. (0.437.0 summed each pixel's sites in a
+    fixed order through per-path slot tables and a fold kernel; the rest of the film is summed by
+    atomics anyway, so 0.437.1 dropped them, and with them the tables' memory and the route
+    sub-sample bound.) A wave holds no more paths than the requests (up to 1 M, or an eighth of
+    the memory left beside the camera kernel's local reservation) hold at the last wave's sites a
+    path -- `g_sqSitesPerPath`, kept across calls like the beam profile, so an epoch's first wave
+    is sized by the last epoch's; it clamps that wave alone, the beam queue's wave size untouched.
+    A site the full queue turns away, or one needing a table the queue lacks, is gathered inline
+    and counted. The gather is launched sized to the wave's sites: a dense beam map's waves are a
+    few thousand paths, and a fixed grid idled through each (measured on `gallery_rain`: 188 ms a
+    sample of idle warps, 9 ms sized). Its GPU time joins the wave-loop report. The VRAM
+    preflight counts both mode-J queues (`cudaModeJQueueBytes`). Measured at 640x480 (GPU time a
     sample): `_fog_cornell`'s surface merges 378 -> 219 ms, the camera kernel back to mode D's
     155; `gallery_rain` unchanged (751), its surface gather small. `FTRACE_NOSURFWF=1` is the A/B
-    control; `tools/check_surf_wavefront.py` requires the inline gather's image, with the queue
-    shrunk to overflow (`FTRACE_SURFWFCAP`) too, and the same bytes twice.
+    control; `tools/check_surf_wavefront.py` requires the inline gather's image on
+    `_fog_cornell`, with the queue shrunk to overflow (`FTRACE_SURFWFCAP`) too, and in a box of
+    chromatic fog whose sites fill the carrier and chromatic tables.
   - **Weighted bundles, and one shared surface rule (0.257.0 — `UPBP-BOWFOLD`).** Both claims used
     to die at the **first surface interaction of any kind**, which is what capped mode `J` at
     36.2 % bundled / 47.0 % folded: a subpath that so much as grazed a diffuse wall deposited the
