@@ -313,6 +313,8 @@ right. Proper fix: a scene where point merges carry a real share of the frame in
 medium -- a caustic (a glass ball under the light) on a diffuse floor in the fog, seen directly,
 the light large enough that mode R can still reference it in minutes -- measured for the share
 first (`FTRACE_J_HALF`), then a `gpu-jsurf` variant on it that fails under `FTRACE_JCHROMA=0`.
+Waiting on the user's word to spend the GPU hours a caustic's mode-R reference and the seeds
+take; until then check_jchroma's `gpu-jsurf` says, when it runs, that it holds nothing extra.
 
 ## DONE (2026-11-11; opened 2026-11-10, 0.437.1): JCHROMA-CLOCK — check_jchroma's GPU verdict moved with the machine's speed
 
