@@ -92,6 +92,14 @@ struct SppProgress {
     // Of `sampleBase`, the samples this session has already put in the caller's film -- a
     // refresh loop's earlier epochs -- as against a resumed checkpoint's.
     long long sessionSpp = 0;
+
+    // A call that learns its length from its first chunk: mode J's epoch 0, which prices a sample
+    // on it before it knows how many to render, so the samples it then runs on to need no second
+    // call (on the device, another upload of every map). Asked by the chunkers after each chunk
+    // lands, before `report`, with the samples the call holds; returns how many it renders in all,
+    // held between those and the call's spp. The first chunk is one sample (FTRACE_CHUNK_SPP's,
+    // where that is set). Null: all of them.
+    std::function<long long(long long sppDone)> span;
 };
 
 // Progress through a phase that has NO pixels yet.

@@ -49,6 +49,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <vector>
+#include <algorithm>             // gpuSppChunks' std::clamp
 #include <map>                   // DUpload::knots
 #include <chrono>
 #include <thread>                // gpuSppChunks' stall watchdog
@@ -9249,15 +9250,10 @@ __device__ static void dGatherPhotonBeams(const DScene& sc, const DBeamMap& bm,
                 if (routeMedJ && dRouteOfMed(sc, b.med) != 1) continue;   // D-routed merge (0.386.0)
                 const int bi = bm.primIdx[n.first + i];
                 if (nHits) ++*nHits;
-                if (segSeed) {
-                    DRng hr;
-                    hr.seedUnit((unsigned long long)bi, *segSeed);
-                    dBeamHitEval(sc, bm, b, bi, oc, dc, t, s, cosT, den, x2,
-                                 aGlassCam, hr, mw, camTr, env, oX, oY, oZ, js, glassMatCam, cam, &fc);
-                } else {
-                    dBeamHitEval(sc, bm, b, bi, oc, dc, t, s, cosT, den, x2,
-                                 aGlassCam, rng, mw, camTr, env, oX, oY, oZ, js, glassMatCam, cam, &fc);
-                }
+                DRng hr;
+                if (segSeed) hr.seedUnit((unsigned long long)bi, *segSeed);
+                dBeamHitEval(sc, bm, b, bi, oc, dc, t, s, cosT, den, x2, aGlassCam,
+                             segSeed ? hr : rng, mw, camTr, env, oX, oY, oZ, js, glassMatCam, cam, &fc);
             }
         } else {
             Real tc;
@@ -25439,8 +25435,12 @@ static void sceneOrHeld(const Scene& scene, const CudaSceneHold* held, DUpload& 
 }
 static double g_lastBdptOverheadSec = 0.0;
 double cudaLastBdptOverheadSec() { return g_lastBdptOverheadSec; }
-static long long g_lastBdptWork = 0;
+static long long g_lastBdptWork = 0, g_lastBdptSetupWork = 0;
 long long cudaLastBdptWork() { return g_lastBdptWork; }
+long long cudaLastBdptSetupWork() { return g_lastBdptSetupWork; }
+// The running call's count (renderBdptCuda's workSoFar), set for the call's length.
+static std::function<long long()> g_bdptWorkSoFar;
+long long cudaBdptCallWork() { return g_bdptWorkSoFar ? g_bdptWorkSoFar() : 0; }
 CudaSceneHold* cudaHoldScene(const Scene& scene) {
     if (!cudaAvailable()) return nullptr;
     // FTRACE_NOHOLD=1: hold nothing, so every call uploads the scene itself -- the A/B arm for
@@ -25959,12 +25959,11 @@ bool cudaBdptSupported(const Scene& scene) {
 // samples {0,1,2} ∪ {0..4} instead of {0..7} — measurably different from a plain 8 spp
 // (max channel difference 163/255 on the loom jumping_jack frame that found this).
 //
-// cudaSetFixedChunks(true) pins every chunk to 1 spp, so the chunk boundaries -- and with them
-// anything a launch draws per chunk, as mode J's device surface-photon map is, salted by the
-// chunk's first sample -- fall on the same samples in every render rather than wherever the
-// timing put them (main.cpp `-beamepochs`).
-static bool g_fixedChunks = false;
-void cudaSetFixedChunks(bool on) { g_fixedChunks = on; }
+// cudaSetSurfPerSample(true): mode J's device surface photons are redrawn every sample (blocks of
+// one, renderBdptCuda's surfBlock), salted by the sample's absolute index, so every frame of a
+// flight draws them for the same samples (main.cpp `-beamepochs`), whatever its chunks.
+static bool g_surfPerSample = false;
+void cudaSetSurfPerSample(bool on) { g_surfPerSample = on; }
 template <class LaunchFn, class DownloadFn>
 static void gpuSppChunks(long long spp, const SppProgress& prog, Film& out,
                          LaunchFn&& launch, DownloadFn&& download) {
@@ -25976,11 +25975,12 @@ static void gpuSppChunks(long long spp, const SppProgress& prog, Film& out,
     //   FTRACE_CHUNK_DEBUG=1 log each chunk's size and wall time
     // The GPU chunker went without these, which is exactly why a 320x180 4-spp frame that
     // would not finish in 7 minutes could not be told apart from a deadlock without a debugger.
-    long long forcedChunk = g_fixedChunks ? 1 : 0;
+    long long forcedChunk = 0;
     if (const char* e = std::getenv("FTRACE_CHUNK_SPP")) forcedChunk = std::atoll(e);
     const bool chunkDebug = [] { const char* e = std::getenv("FTRACE_CHUNK_DEBUG");
                                  return e && *e && std::strcmp(e, "0"); }();
     long long done = 0, chunk = (forcedChunk > 0) ? forcedChunk : 1;
+    long long end = spp;   // the call's samples, which prog.span may cut
 
     // ---- the -time deadline (SppProgress::deadline) ----------------------------------
     // Only a launch that can be dropped -- one returning whether it landed whole, whose kernels
@@ -26085,8 +26085,8 @@ static void gpuSppChunks(long long spp, const SppProgress& prog, Film& out,
         ~WatchdogJoin() { q.stop(); if (t.joinable()) t.join(); }
     } wjoin{watchQuit, watchdog};
 
-    while (done < spp) {
-        long long c = chunk; if (c > spp - done) c = spp - done;
+    while (done < end) {
+        long long c = chunk; if (c > end - done) c = end - done;
         auto t0 = clk::now();
         launchSpp.store(c, std::memory_order_relaxed);
         launchStartMs.store(nowMs(), std::memory_order_seq_cst);
@@ -26132,8 +26132,9 @@ static void gpuSppChunks(long long spp, const SppProgress& prog, Film& out,
             if (next > c * 8 + 1)  next = c * 8 + 1;        // ramp up, but not explosively
             chunk = next;
         }
+        if (prog.span) end = std::clamp(prog.span(done), done, spp);
         download(out);
-        if (prog.report(out, done, done >= spp)) break;
+        if (prog.report(out, done, done >= end)) break;
     }
 }
 
@@ -26705,10 +26706,8 @@ static void uploadBeamMapCuda(const Scene& scene, const BeamMap* bmap, DUpload& 
     const size_t nb = bmap->beams.size();
     // The fourth and last silent stretch: converting millions of sub-beams and millions of
     // BVH nodes into their device layouts, on one host thread, before the line at the bottom
-    // of this block finally says anything. Name it and make it interruptible. Not a new phase in
-    // mode J's refresh epochs (g_gpuQuietRebuild): a reset there would restart the log's 30 s
-    // throttle every epoch, a line each, flushed inside the light pass's join (POLL-JOIN-STALL).
-    if (stage && stage->reset && !g_gpuQuietRebuild) stage->reset();
+    // of this block finally says anything. Name it and make it interruptible.
+    if (stage && stage->reset) stage->reset();
     if (stage && stage->report) stage->report("uploading photon beams", 0, (long long)nb,
                                               nullptr, 0.0);
     std::vector<gpu::DBeamRec> recs(nb);
@@ -26866,6 +26865,7 @@ Film renderBdptCuda(const Scene& scene, const Camera& cam, int resX, int resY,
     using namespace gpu;
     Film out; out.resX = resX; out.resY = resY; out.alloc();
     g_lastBdptWork = 0;
+    g_lastBdptSetupWork = 0;
     if (!cudaAvailable() || !cudaBdptSupported(scene)) return out;
     // Everything but the chunks is this call's fixed cost (cudaLastBdptOverheadSec): what a
     // mode-J epoch pays on top of its samples.
@@ -26885,6 +26885,10 @@ Film renderBdptCuda(const Scene& scene, const Camera& cam, int resX, int resY,
         for (unsigned long long x : w) sum += (long long)x;
         return sum;
     };
+    struct WorkSoFarScope {   // cudaBdptCallWork, for this call's length
+        explicit WorkSoFarScope(std::function<long long()> f) { g_bdptWorkSoFar = std::move(f); }
+        ~WorkSoFarScope() { g_bdptWorkSoFar = nullptr; }
+    } workScope{workSoFar};
     // Two kernel variants: the default shallow stack, and a deep one for scenes that need
     // it. Anything past BDPT_DEEPDEPTH still clamps — going deeper would need another
     // instantiation, and the local-memory footprint is already ~13 KB/thread there.
@@ -27000,7 +27004,7 @@ Film renderBdptCuda(const Scene& scene, const Camera& cam, int resX, int resY,
     // clean A/B of WHERE the light side runs. It cannot be bit-identical -- the two walks draw
     // from different RNG streams -- so the acceptance test is statistical, per ROI.
     JSurfDev jdev;
-    // DEFAULT 3 -- the device light pass, redrawn per chunk. `-jhostlight` turns it off;
+    // DEFAULT 3 -- the device light pass, redrawn every block of samples (surfBlock). `-jhostlight` turns it off;
     // FTRACE_JDEVLIGHT still overrides both, because level 1 (device map, once per epoch) and
     // level 2 (that plus the host-vs-device map dump) are the two arms every measurement in
     // known-issues was taken with and they have to stay reachable.
@@ -27010,7 +27014,7 @@ Film renderBdptCuda(const Scene& scene, const Camera& cam, int resX, int resY,
     //     0  host light pass (`-jhostlight`)
     //     1  device map, rebuilt once per epoch
     //     2  = 1 plus the host-vs-device map dump
-    //     3  device map, redrawn per chunk          <- the default
+    //     3  device map, redrawn every few samples  <- the default
     //     4  = 3 plus the dump  (for timing the dump against 3 inside one binary)
     // Getting this wrong is what JDEVCMP-DEFAULT was: the dump's gate read `>= 2`, which was
     // right while the default was 1 and silently swept the default into the diagnostic arm the
@@ -27045,6 +27049,7 @@ Film renderBdptCuda(const Scene& scene, const Camera& cam, int resX, int resY,
                                       : jSurfSalt(prog),
                             dsm);
         startLight = workSoFar();
+        g_lastBdptSetupWork = startLight;
         // ONCE. A refreshing render rebuilds this every epoch -- 126 of them in 90 s -- and a
         // line each would bury the -interval status lines that carry the actual progress.
         static bool jdevSaid = false;
@@ -27082,10 +27087,10 @@ Film renderBdptCuda(const Scene& scene, const Camera& cam, int resX, int resY,
     // best (0.390x whole-frame variance against one, for 8.6 % of the samples; sixteen cost 53 %
     // and came out at 0.503x). A chunk is split at the blocks' edges, and a block's map is drawn
     // once, however many chunks it spans.
-    // Pinned chunks (-beamepochs, cudaSetFixedChunks) keep one realization a sample: the layout
-    // every frame of a flight shares, which counts taken from each frame would not.
+    // Under -beamepochs (cudaSetSurfPerSample) one realization a sample: the layout every frame of
+    // a flight shares, which counts taken from each frame would not.
     constexpr double kSurfShare = 0.1;
-    long long surfBlock = g_fixedChunks ? 1 : 0;   // 0 until the first chunk has priced a sample
+    long long surfBlock = g_surfPerSample ? 1 : 0;   // 0 until the first chunk has priced a sample
     long long surfDrawn = jPerChunk ? 0 : -1;  // the block whose map dsm holds
     long long surfLightUnits = startLight;     // its light pass, in device units
     if (jPerChunk) {
@@ -27096,11 +27101,12 @@ Film renderBdptCuda(const Scene& scene, const Camera& cam, int resX, int resY,
                         "samples (-jhostlight for the pre-0.272.0 host pass)\n");
         }
     }
-    // FTRACE_JBAND=1: redraw per WAVEFRONT BAND instead of (only) per chunk. The band loop
+    // FTRACE_JBAND=1: redraw per WAVEFRONT BAND as well as per block. The band loop
     // subdivides a chunk by PIXEL, which is the only axis left once the chunk is down to 1 spp
     // -- the case an expensive media scene is always in. A band is a wave, which the beam queue
     // and the point merges' queue both cut (so FTRACE_NOSURFWF=1 changes the bands too); without
-    // either queue there is one band per chunk, and this reduces to the per-chunk redraw.
+    // either queue there is one band per chunk. Its bands follow the chunks, which the clock
+    // sizes: a diagnostic, it does not repeat run to run.
     bool jPerBand = false;
     if (jPerChunk) {
         const char* e = std::getenv("FTRACE_JBAND");
@@ -27662,6 +27668,7 @@ Film renderBdptCuda(const Scene& scene, const Camera& cam, int resX, int resY,
     }
     cudaFree(d_cam); cudaFree(d_splat);
     g_lastBdptWork = workSoFar();
+    g_lastBdptSetupWork = startLight;
     g_lastBdptOverheadSec =
         std::chrono::duration<double>((tCall1 - tCall0) +
                                       (std::chrono::steady_clock::now() - tCall2)).count();

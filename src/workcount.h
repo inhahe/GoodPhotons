@@ -84,46 +84,44 @@ inline long long jWorkBeamBuildDevice(size_t nBeams) { return (long long)nBeams;
 
 // The counted refresh rule: how many samples each render call of a counted refresh loop takes.
 // A light side of `units` buys the samples whose camera work keeps it at -beamrefresh's share of
-// the two, a sample priced at the camera work of every sample rendered so far. The first call
-// renders one sample, which prices a sample; epoch 0 then runs on, on the same maps, to its own
-// build's share (`build0`), as the clock would let it; each later epoch runs its rebuild's share.
-// A loop asks next() before each call, and tells rendered() what the call did.
+// the two, a sample priced at the camera work of every sample rendered so far. Epoch 0's call is
+// asked for every sample left; its first chunk, one sample (SppProgress::span), prices a sample,
+// and first() cuts the call to its own build's share (`build0`), as the clock would let it run on
+// its maps -- in one call, not a second that would set the maps up again. Each later epoch runs its
+// rebuild's share. A loop asks next() before each call, first() from the unpriced call's span,
+// and tells rendered() what each call did.
 struct CountedEpochs {
     long long target = 0;   // the frame's samples
     double share = 0.1;     // -beamrefresh
-    long long build0 = 0;   // epoch 0's light side, in units (0: epoch 0 does not run on)
+    long long build0 = 0;   // epoch 0's light side, in units (0: epoch 0 stops at its first chunk)
 
-    // Whether the next call carries on epoch 0, on its maps, rather than following a rebuild.
-    bool continuing() const { return rest0 > 0; }
+    // Whether a sample has been priced. Until then the next call is epoch 0's, which prices one.
+    bool priced() const { return camSpp > 0; }
     // The next call's samples, `done` of the target rendered and `rebuild` the units of the light
-    // side drawn for it (unread for epoch 0's calls).
+    // side drawn for it (unread for epoch 0's call, which may take every sample left).
     long long next(long long rebuild, long long done) const {
-        if (rest0 > 0) return rest0;
-        return camSpp > 0 ? lenFor(rebuild, done) : std::min(1LL, target - done);
+        return priced() ? lenFor(rebuild, done, camWork, camSpp) : target - done;
     }
-    // A call rendered `spp` samples (none: the loop ends) for `units` of camera work, `done` of
-    // the target rendered before it.
-    void rendered(long long units, long long spp, long long done) {
-        const bool priced = camSpp > 0;
-        rest0 = 0;
+    // Epoch 0's call, `done` of the target rendered before it, has rendered its first `spp`
+    // samples for `units` of camera work: the samples it renders in all, those at least.
+    long long first(long long units, long long spp, long long done) const {
+        return std::max(spp, lenFor(build0, done, units, spp));
+    }
+    // A call rendered `spp` samples (none: the loop ends) for `units` of camera work.
+    void rendered(long long units, long long spp) {
         if (spp <= 0) return;
         camWork += units;
         camSpp  += spp;
-        if (!priced && build0 > 0) {
-            const long long l0 = lenFor(build0, done);
-            if (l0 > 1 && done + spp < target) rest0 = std::min(l0 - 1, target - done - spp);
-        }
     }
 
 private:
     long long camWork = 0, camSpp = 0;   // camera units so far, and the samples they bought
-    long long rest0 = 0;                 // epoch 0's samples still to render on its own maps
-    // The samples `units` of light side buy, at least one and at most what is left: clamped as a
-    // double, since a tiny share makes the quotient huge.
-    long long lenFor(long long units, long long done) const {
+    // The samples `units` of light side buy, `work` the camera units of `spp` samples: at least
+    // one and at most what is left, clamped as a double, since a tiny share makes the quotient huge.
+    long long lenFor(long long units, long long done, long long work, long long spp) const {
         const long long left = target - done;
-        if (camSpp <= 0 || camWork <= 0) return std::min(1LL, left);
-        const double q = (double)units / (share * (double)camWork / (double)camSpp);
+        if (spp <= 0 || work <= 0) return std::min(1LL, left);
+        const double q = (double)units / (share * (double)work / (double)spp);
         if (!(q < (double)left)) return left;
         return std::max(1LL, (long long)std::ceil(q));
     }

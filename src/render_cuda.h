@@ -323,9 +323,9 @@ std::vector<Film> renderPhotonMapSharedCuda(const Scene& scene, const std::vecto
 // cylinder Lambertian emitters (no spot/env/collimated) — the BDPT scope. When false, the
 // caller must use the CPU BDPT renderer.
 // `-jhostlight`: keep mode J's surface light side on the HOST, redrawn once per epoch, which is
-// what it did before 0.272.0. The default is the device pass redrawn per chunk -- 11.2x less
-// whole-frame variance at equal wall clock on a surfaces-only scene, and inert where a frame is
-// already down to one sample per chunk. This is the switch for reproducing pre-0.272.0 output.
+// what it did before 0.272.0. The default is the device pass redrawn every few samples -- 11.2x less
+// whole-frame variance at equal wall clock on a surfaces-only scene. This is the switch for
+// reproducing pre-0.272.0 output.
 void cudaSetJHostLight(bool on);
 // Per-object render modes (0.386.0, Material::route / Medium::route): routing on, the camera's
 // mode (ROUTE_D / ROUTE_J), whether any medium routes J, and each mode's sample multiplier
@@ -334,10 +334,10 @@ void cudaSetRouting(int on, int routeDefault, int anyMedJ, double sppD, double s
 // The aimed sun's target capacity on the device (its constant arrays). The host clusters the
 // targets to bdpt::SunAim::kMaxTargets, which main.cpp asserts equals this.
 constexpr int kSunAimMaxTargets = 64;
-// Pin the spp-progressive GPU renders' chunks to 1 spp instead of sizing them by timing, so
-// whatever a chunk draws (mode J's device surface photons, salted by the chunk's first sample)
-// lands on the same samples in every render. Set by mode J under `-beamepochs`, cleared after.
-void cudaSetFixedChunks(bool on);
+// Redraw mode J's device surface photons every sample (salted by its absolute index) instead of
+// every block of samples the device's counts size, so every frame of a flight draws them for the
+// same samples. Set by mode J under `-beamepochs`, cleared after.
+void cudaSetSurfPerSample(bool on);
 // JSPEC's dispersive window (0.386.2, bdpt g_jDispWinNm / g_jDispAll): its full width in nm, and
 // whether dispersive refraction and a real lens open it as a grating's non-zero order does.
 void cudaSetJDisp(double winNm, int all);
@@ -391,6 +391,13 @@ double cudaLastBdptOverheadSec();
 // its merges weighed). Deterministic: mode J's counted refresh reads it, weighed by
 // bdpt::kJWorkDeviceUnit, where the CPU reads bdpt::jWork().cam (GPU-J-CLOCK).
 long long cudaLastBdptWork();
+// ...of which the call's own surface map, drawn for its setup (one a call, whatever its samples):
+// the light side's, which the counted refresh charges there. Set once that map is drawn, so a
+// call's own SppProgress callbacks read it too.
+long long cudaLastBdptSetupWork();
+// cudaLastBdptWork's count so far, from inside a renderBdptCuda call -- its SppProgress
+// callbacks, between chunks: mode J's epoch 0 prices a sample on its first chunk. 0 outside one.
+long long cudaBdptCallWork();
 
 // GPU bidirectional path trace (mode D). Renders `spp` samples per pixel at the given
 // resolution and returns the film accumulated as a SUM over spp (display divides by

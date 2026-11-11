@@ -525,7 +525,7 @@ static const int kPanelH = 92;              // control-strip height (px) WITHOUT
 #define WM_MKBINDROW    (WM_APP + 3)        // build + reveal the loom bind row (params staged in Impl)
 #define WM_MKNDPANEL    (WM_APP + 4)        // build/rebuild the N-D slider bank (params staged in Impl)
 #define WM_SETNDSTATE   (WM_APP + 5)        // push slider positions + status text (staged in Impl)
-#define WM_SETTITLE     (WM_APP + 6)        // apply the title setTitle staged (titleNext)
+#define WM_SETTITLE     (WM_APP + 6)        // apply the title setTitle stored (title)
 
 struct LiveWindow::Impl {
     std::thread          ui;
@@ -559,10 +559,12 @@ struct LiveWindow::Impl {
     // A 96-dpi length in this window's pixels. The identity for an unaware window, so its
     // layout is exactly what it always was.
     int px(int v) const { return MulDiv(v, dpiNow.load(std::memory_order_relaxed), 96); }
+    // The caption: set before the window exists, then by setTitle, which the UI thread applies
+    // on WM_SETTITLE (titleMtx guards it once the window is up). titlePosted: a WM_SETTITLE is
+    // queued and not yet handled, so a burst of setTitle calls queues one message, not one each.
     std::wstring         title;
-    // setTitle's latest text, applied by the UI thread on WM_SETTITLE (titleMtx guards both).
     std::mutex           titleMtx;
-    std::wstring         titleNext;
+    std::atomic<bool>    titlePosted{false};
     HANDLE               readyEvent = nullptr;
     // ---- Fly-camera input state (guarded by inMtx unless noted) ----
     std::mutex           inMtx;                     // guards the look/wheel accumulators + one-shots
@@ -1504,8 +1506,10 @@ LRESULT CALLBACK LiveWindow::Impl::WndProc(HWND h, UINT msg, WPARAM wp, LPARAM l
             return 0;
         case WM_SETTITLE:
             if (self) {
+                // Cleared before the read: a setTitle after it posts again, so none is lost.
+                self->titlePosted.store(false);
                 std::wstring t;
-                { std::lock_guard<std::mutex> lk(self->titleMtx); t = self->titleNext; }
+                { std::lock_guard<std::mutex> lk(self->titleMtx); t = self->title; }
                 SetWindowTextW(h, t.c_str());
             }
             return 0;
@@ -2103,10 +2107,10 @@ void LiveWindow::setTitle(const std::string& utf8) {
     {
         std::lock_guard<std::mutex> lk(impl_->titleMtx);
         if (w == impl_->title) return;
-        impl_->title = w;
-        impl_->titleNext = std::move(w);
+        impl_->title = std::move(w);
     }
-    PostMessageW(hw, WM_SETTITLE, 0, 0);
+    if (!impl_->titlePosted.exchange(true) && !PostMessageW(hw, WM_SETTITLE, 0, 0))
+        impl_->titlePosted.store(false);
 }
 
 bool LiveWindow::closed() const { return impl_ && impl_->closedFlag.load(); }

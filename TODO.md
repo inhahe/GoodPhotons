@@ -145,7 +145,8 @@ Each names the section its line is in.
     interval writes and a resume's schedule need a canonical cache merge first (known-issues).
 22. **P-HEROSPLIT-FIRST**, **ROUGH-IRID-AIR** (4.3) — narrow estimator gaps.
 23. **REMAP0-IMPOSSIBLE** (4.4) — the MIS sums read every zero density as a delta's.
-24. **BEAMEPOCHS-CHUNK-PIN** (4.5) — `-beamepochs` pins cheap scenes' GPU chunks to 1 spp.
+24. ~~**BEAMEPOCHS-CHUNK-PIN** (4.5) — `-beamepochs` pins cheap scenes' GPU chunks to 1 spp.~~ Done,
+    0.438.2.
 25. **DEFORM-LIMITS**, **MOTION-LIGHT-RIGID**, **PER-OBJECT-MODES** (4.6) — what is left of them.
 26. **BLACK-PIXELS-ONCE** (4.2) — one render's black pixels, never reproduced.
 27. **SPPM-LOWPASS-DEVHOST** (4.2) — mode S's device and host differ at low pass counts.
@@ -458,8 +459,9 @@ Then the rest of 4.2-4.6 in their order, 4.7's bookkeeping alongside whatever to
 - [ ] **RADCACHE-BATCHES** — under `-radcache` a fixed budget's CPU batches follow its samples, not
   the clock: the periodic writes wait, and a resume reschedules. (0.434.27: `-stop` lands
   mid-batch, and a `-time`/`-noise`/`-forever` budget takes the clock instead of hanging.)
-- [ ] **BEAMEPOCHS-CHUNK-PIN** — `-beamepochs` pins the GPU chunks to 1 spp, which costs a cheap
-  scene.
+- [x] **BEAMEPOCHS-CHUNK-PIN** — `-beamepochs` pinned the GPU chunks to 1 spp, which cost a cheap
+  scene. Done, 0.438.2: the surface realizations follow sample blocks, one a sample under the flag,
+  and the chunks stay on the clock.
 - [x] **J-FIELD-SLOW's "A `-time` budget cannot end a GPU chunk"** — a GPU mode D/J chunk is at least
   one sample of the whole frame and the budget is read between chunks, so a slow sample overran it
   (the field at 512x384 ran one chunk over 55 minutes against `-time 120`). Done, 0.436.6: the

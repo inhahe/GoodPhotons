@@ -311,7 +311,10 @@ gather wait on `PollStop` (render_progress.h), which the owner notifies, instead
 flag between 10-50 ms sleeps that every join paid. **0.438.1 (review):** the reset is the old one
 again, a new phase logging at once, and the beam upload skips it in mode J's refresh epochs
 (`g_gpuQuietRebuild`), the one caller that repeated a phase every epoch; gpuSppChunks' watchdog
-waits on `PollStop` too.
+waits on `PollStop` too. **0.438.2 (review):** that skip also left the phase's clock running from
+epoch 0, and missed mode M's device resets; the reset itself now keeps the log's throttle while
+`g_gpuQuietRebuild` is set, re-basing the clock everywhere. And `LiveWindow::setTitle` queues one
+`WM_SETTITLE` at a time (`titlePosted`), which reads the latest title when it is handled.
 
 ## DONE (2026-11-11, 0.438.0; found in review of c7c4aa7): GPU-J-CLOCK — GPU mode J at a fixed -spp rendered differently run to run, and eight checks inherited it
 
@@ -329,8 +332,14 @@ moved with the race: it now draws each hit from the stream the queue gives it, a
 (check_jdeterminism: the all-inline render is the queued one). Under `-jsurf` the device surface
 realizations, which 0.438.0 kept repeatable by sizing the chunks by the counts, cover blocks of
 samples the counts set instead, the clock sizing the chunks again. And the GPU path no longer
-charges the light side the host's SAH tree, which it does not build. The rest of this entry is
-how it stood.
+charges the light side the host's SAH tree, which it does not build. **0.438.2 (Fable's review
+of 0.438.1):** the surface map a device call draws for its setup, counted with its camera pass,
+is the light side's (`cudaLastBdptSetupWork`): a dear surface pass made the epochs shorter, where
+the clock made them longer. Epoch 0 prices a sample on its call's first chunk and runs on in that
+call (`SppProgress::span`) -- the flight cap's K settled there too -- where a one-sample call and
+a second one had uploaded the beam map, built its tree and drawn a surface map twice. And
+`-beamepochs` keys the device's surface realizations to single samples instead of pinning the
+chunks to 1 spp (BEAMEPOCHS-CHUNK-PIN). The rest of this entry is how it stood.
 
 The device ended mode J's light-side epochs on the clock unless `-beamepochs` pinned them (design.md,
 "On the CPU at a fixed -spp": "a -time/-noise/-forever budget and the device keep the clock";
@@ -410,7 +419,12 @@ scripts that carried their own are on it, as is `_pfm.Linear` (the caustic rigs'
 Each old reader, run from git against its new call on colour, grey and commented PFMs
 (`scraps/_pfm_equiv.py`), reads the same values; check_fire_modes's mean is now taken in float64
 (1e-8 apart, against its 1e-3 tolerances). Every script imports, and the four that run at import
-ran on sample images. The rest of this entry is how it stood.
+ran on sample images. **0.438.2 (Fable's review):** three of those scripts are also modules others
+import a reader from (check_motion: check_deform, check_aovs, check_object_frames and more;
+grade_hdr; check_glossy_nee_media), whose readers had flipped rows or repeated a grey channel,
+and on pfm.py's bottom-up default those importers sliced the wrong rows -- check_deform's mirror
+verdict passed vacuously. Each keeps a wrapper with its old meaning, and `top_down` is now
+required, so a caller states its rows' order. The rest of this entry is how it stood.
 
 `read_pfm`, `readpfm`, `load` and kin in check_bitid, check_jchroma, check_motion,
 check_hero_spectral, check_physlens, check_pattern_seam, pfmstat, pfmcmp, roi_score, grade_hdr and
@@ -2135,7 +2149,7 @@ each `-interval`; guides for all of them at once cost 2 x 24 B a pixel per camer
 frames at 960x540), so it wants them rendered at the final write only, or cached on disk beside
 each frame.
 
-## OPEN (2026-10-20, 0.391.0): BEAMEPOCHS-CHUNK-PIN — `-beamepochs` pins the GPU chunks to 1 spp
+## DONE (2026-11-11, 0.438.2): BEAMEPOCHS-CHUNK-PIN — `-beamepochs` pinned the GPU chunks to 1 spp
 
 The device redraws mode J's surface-photon map per CHUNK, salted by the chunk's first sample
 (`render_cuda.cu`, `jPerChunk` / `jSurfSalt`), and the chunk size adapts to timing. For the
@@ -2150,6 +2164,11 @@ redrawn once per sample instead of four times per adaptive chunk.
 sample index crosses a fixed block boundary (split a chunk at the boundaries it spans), as the
 light side's epochs already are under `-beamepochs`. Then the chunker can keep adapting and the
 pin and its global switch go. (Both reviewers of 0.391.0 suggested this or a fixed chunk size.)
+
+**Done:** 0.438.0 keyed each device surface realization to a block of samples whose size the
+counts set (`surfBlock`, GPU-J-CLOCK), not to the chunks; 0.438.2 replaced the pin with
+`cudaSetSurfPerSample`, which sets that block to one sample under `-beamepochs` and leaves the
+chunker on the clock. check_jdeterminism's GPU cases hold the block layout to repeat itself.
 
 ## DONE (2026-10-21, 0.392.1): REVIEW-0392 — what the Opus review of 0.392.0 found
 

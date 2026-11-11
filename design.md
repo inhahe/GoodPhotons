@@ -2383,7 +2383,9 @@ vertices and each beam map's build (`kJWorkPerBeamLog` per beam times log n, plu
 `kJWorkRebuildFixed` a rebuild), and the camera pass's vertices, connections and the beams and
 photons its merge weights weigh (a surface photon grid's build is priced as a beam map's). Epoch
 0's first sample prices a sample, and epoch 0 then runs on, on the same map, to its own build's
-share; each later epoch runs `ceil(rebuild units / (-beamrefresh * units per sample))` samples,
+share -- in the same call (`SppProgress::span`, asked after each chunk, cuts it; both chunkers
+start at one sample), not a second one that would upload the maps again (0.438.2; the flight
+cap's K is settled there too); each later epoch runs `ceil(rebuild units / (-beamrefresh * units per sample))` samples,
 whole, never cut by the clock. A flight frame's one-realization-per-sample cap (`jAutoEpochs`,
 which weighs only ratios) takes the same counts on the CPU. The constants were fitted against the clock on three maps from 12 thousand to 10
 million beams and are good to 2-3x on any one scene (the camera units' own cost moves that much
@@ -2407,8 +2409,7 @@ not as the host's SAH. Under `-jsurf` each device surface realization covers a b
 call's samples (`surfBlock`, salted by its first), as long as keeps its light pass at a tenth of
 their camera work (`kSurfShare`), counted on the call's first sample (the map the call builds
 for its constants is block 0's): the chunks, which the clock still sizes, no longer reach the
-image. `-beamepochs` pins chunks to 1 spp and keeps one
-realization a sample, the layout a flight's frames share. And a beam segment the full queue
+image. `-beamepochs` keeps one realization a sample, the layout a flight's frames share. And a beam segment the full queue
 turns away (which ones, a race) is gathered inline from the streams the queue would give its hits
 (`dGatherPhotonBeams`' `segSeed`), its hits counted, so a queue's overflow moves only the order of
 the film's sums. check_jdeterminism holds GPU mode J, with and without `-jsurf`, to repeat itself,
@@ -2426,11 +2427,12 @@ averaged; its first build still runs under salt 0, whose radii the loaded sample
 at, and is redrawn at them before the first sample, since an average over two radii would converge
 to neither estimator.
 
-**MODE `J`'S SURFACE LIGHT SIDE RUNS ON THE DEVICE, PER CHUNK (0.272.0).** `-jsurf`'s surface
+**MODE `J`'S SURFACE LIGHT SIDE RUNS ON THE DEVICE, REDRAWN EVERY FEW SAMPLES (0.272.0).** `-jsurf`'s surface
 photon map is traced by `kJSurfLightT` — the device twin of the deposit in `traceLightBeamPass` —
 and gridded on the device with the machinery `vcmSessionPass` already used (bbox reduce, cell
 key, stable sort, `lower_bound`). `buildJSurfMapDevice` is called from inside `launch()`, which
-`gpuSppChunks` invokes once per chunk, and the chunk is further split four ways, so a render
+`gpuSppChunks` invokes once per chunk, and the chunk is split at the edges of the blocks of
+samples each realization covers (`surfBlock`, above; until 0.438.0 four ways a chunk), so a render
 draws a fresh light-side realization every sub-launch instead of once per refresh epoch.
 
 **The reason is frequency, not speed, and that distinction decides the design.** The light pass
@@ -2502,9 +2504,9 @@ realizations as a straight render (measured with one-sample epochs, stopped at 1
 resumed: 0.9 % mean film difference, against 10^-17 between two straight runs; the likely residue,
 not yet isolated, is the beam split, which `buildBeamMap` sizes from the run's spp). Two more
 details keep it exact:
-the device's surface-photon map is redrawn per *chunk* salted by the chunk's first sample, so
-the GPU chunks are pinned to 1 spp (`cudaSetFixedChunks`) and fall on the same samples in every
-frame; and it needs a fixed `-spp` — a `-time`/`-noise` budget has no total to split.
+the device's surface-photon map is redrawn every sample, salted by the sample's absolute index
+(`cudaSetSurfPerSample`; until 0.438.2 by pinning the GPU chunks to 1 spp), so it falls on the
+same samples in every frame; and it needs a fixed `-spp` — a `-time`/`-noise` budget has no total to split.
 
 **K wants to be the spp, and the scene stays on the device so that it can be (0.392.0).** A
 realization is one knee-sized beam map (`-beamk`; ~14 000 beams on `gallery_rain`), so a frame

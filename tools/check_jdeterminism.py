@@ -26,9 +26,13 @@ twice and at one thread too; and the beams' render with every segment gathered i
 (FTRACE_NOWAVEFRONT=1) must be the queued one, since a segment the full queue turns away (which
 ones, a race) draws each hit from the stream the queue would have given it. All to
 pfm.ORDER_TOL rather than byte for byte, the film's atomic sums landing in any order; an epoch or
-a realization laid by the clock moves pixels by per cent.
+a realization laid by the clock moves pixels by per cent. With no CUDA device (or a build without
+CUDA) the GPU cases are skipped, and say so.
 
-Each needs more than one epoch to mean anything, and says how many it got. And mode M resumed
+Each needs more than one epoch to mean anything, and says how many it got; and renders each in
+one call (FTRACE_JWORK=1 prints a line a call), epoch 0 included: its first sample prices a
+sample and the call runs on (SppProgress::span), where a one-sample call and a second one had set
+the device's maps up twice. And mode M resumed
 from a checkpoint draws its light side under salts of its own, not the first session's, at the
 first session's radii, and the same way each time.
 
@@ -81,8 +85,8 @@ def main():
     fails = []
 
     # J: the knee rule (-beamcount and -beamk select it); Jfixed: the default fixed map (-jbeams).
-    # Jgpu: the knee rule on the GPU; Jgpu-jsurf: with point merges, whose surface photons each
-    # GPU chunk draws.
+    # Jgpu: the knee rule on the GPU; Jgpu-jsurf: with point merges, whose surface photons the
+    # device redraws every block of samples.
     KNEE = ["-mode", "J", "-spp", "256", "-beamcount", "100000", "-beamk", "2"]
     CASES = {"J": ["-device", "cpu"] + KNEE + ["-nojsurf"],
              "Jfixed": ["-device", "cpu", "-mode", "J", "-spp", "256", "-nojsurf"],
@@ -92,6 +96,8 @@ def main():
              "Jgpu-jsurf": ["-device", "gpu", "-window-min"] + KNEE + ["-jsurf"]}
 
     def render(mode, tag, extra=(), env=None):
+        """The render's PFM bytes, its light-side epoch count and its render calls (a line each
+        under FTRACE_JWORK); (None, 0, 0) for a GPU case where there is no GPU to run it."""
         png = os.path.join(d, "%s_%s.png" % (mode, tag))
         if os.path.exists(png[:-4] + ".pfm"):
             os.remove(png[:-4] + ".pfm")
@@ -100,15 +106,19 @@ def main():
         p = subprocess.run(cmd, cwd=d, capture_output=True, text=True, encoding="utf-8",
                            errors="replace", env=dict(os.environ, **(env or {})))
         log = p.stdout + p.stderr
+        on_gpu = "gpu" in CASES[mode]
+        if on_gpu and ("no CUDA device" in log or "built without CUDA" in log):
+            return None, 0, 0
         if p.returncode != 0 or "[stop] interrupted" in log or not os.path.exists(png[:-4] + ".pfm"):
             print(log[-1500:])
             raise SystemExit("render failed: " + " ".join(cmd))
-        if "-device" in CASES[mode] and "gpu" in CASES[mode] and "on GPU" not in log:
+        if on_gpu and "on GPU" not in log:
             print(log[-1500:])
             raise SystemExit("mode %s did not run on the GPU" % mode)
         m = re.search(r"\[jstats\] (\d+) epochs|averaged (\d+) independent light-side", log)
+        calls = len(re.findall(r"^\[jwork\] (?:mode M )?epoch \d+:", log, re.M))
         with open(png[:-4] + ".pfm", "rb") as f:
-            return f.read(), int(m.group(1) or m.group(2)) if m else 0
+            return f.read(), int(m.group(1) or m.group(2)) if m else 0, calls
 
     def check(name, ok, detail=""):
         print("%-58s %s  %s" % (name, "ok  " if ok else "FAIL", detail))
@@ -126,17 +136,22 @@ def main():
                 r < ORDER_TOL, "largest change %.2g, %d values differ" % (r, n))
 
     for mode in CASES:
-        first, epochs = render(mode, "run1")
+        first, epochs, calls = render(mode, "run1", (), {"FTRACE_JWORK": "1"})
+        if first is None:
+            print("(no GPU here: mode %s is skipped)" % mode)
+            continue
         check("mode %s: more than one light-side epoch" % mode, epochs > 1, "%d epochs" % epochs)
-        second, _ = render(mode, "run2")
+        check("mode %s: ...each in one render call" % mode, calls == epochs,
+              "%d calls for %d epochs" % (calls, epochs))
+        second, _, _ = render(mode, "run2")
         check(*same(mode, "run2", first, second))
-        single, _ = render(mode, "t1", ("-t", "1"))
+        single, _, _ = render(mode, "t1", ("-t", "1"))
         check(*same(mode, "t1", first, single))
         if mode == "Jgpu":
             # Every segment gathered inline (FTRACE_NOWAVEFRONT=1): each hit drawn from the stream
             # the queue gives it, so a segment the full queue turns away -- which ones is a race --
             # renders as the queue would have.
-            inline, _ = render(mode, "inline", (), {"FTRACE_NOWAVEFRONT": "1"})
+            inline, _, _ = render(mode, "inline", (), {"FTRACE_NOWAVEFRONT": "1"})
             check(*same(mode, "inline", first, inline))
 
     # A resumed mode M render must not gather from a light side the checkpoint already averaged,
