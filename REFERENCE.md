@@ -1876,7 +1876,8 @@ machine varied 18.5 s / 25.8 s / 27.2 s.
   another order. Measured on `_fog_cornell`'s surface merges at 640x480: 378 -> 219 ms of GPU time
   a sample (1.7x). Setting this forces the inline gather (the A/B control). The render reports the
   queue's use and the gather's GPU time in a `[gpu] mode J point merges:` line, and with beams the
-  gather's time in the `[gpu] mode J wave loop:` line too. `FTRACE_SURFWFCAP=<n>` shrinks the queue
+  gather's time in the `[gpu] mode J wave loop:` line too; like the wavefront gather's lines, they
+  cover the frame's first light-side epoch. `FTRACE_SURFWFCAP=<n>` shrinks the queue
   so sites overflow to the inline gather; `tools/check_surf_wavefront.py` uses it, and requires
   the same image every way.
 - **`FTRACE_JEPOCHKEEP=<k>` (diagnostic, mode `J` flights).** Keeps at most `k` of a batch's

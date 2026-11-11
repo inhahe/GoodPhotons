@@ -19889,10 +19889,10 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
             const size_t film   = (size_t)res * resY * 3 * sizeof(double) * 2 +
                                   ((gpuForwardMode && cam.seesMotion(scene) && cam.moves())
                                        ? cudaForwardPosedCameraBytes(scene, wavefront, g_heroC, N) : 0);
-            // Mode J's wavefront queues, allocated beside the kernel once the render starts.
-            const size_t queues = (mode == 'J')
-                ? cudaModeJQueueBytes(jBeamsChoice().rule != JBeams::Off && !scene.media.empty(), g_jSurf)
-                : 0;
+            // Mode J's beam queue, allocated beside the kernel once the render starts.
+            const size_t queues =
+                (mode == 'J' && jBeamsChoice().rule != JBeams::Off && !scene.media.empty())
+                    ? cudaModeJBeamQueueBytes() : 0;
             const size_t needAll = needLocal - reused + film + queues + (size_t)256 * 1024 * 1024;
             const double toGB = 1.0 / (1024.0 * 1024.0 * 1024.0);
             // Always say what the card looks like. This one line is what turns "the render

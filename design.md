@@ -733,21 +733,28 @@ Four consequences worth knowing:
     on `_fog_cornell`, the gather half the camera kernel's time. `kBdptT` now writes the site
     (`DSurfReq`: the vertex, the weight's camera half `DSurfMergeW`, the direction, the scale; the
     JSPEC carrier and the chromatic bins in side tables; the film offset) to a `DSurfQueue`, and
-    after the wave `kWfSurfGather` gathers each with a whole warp -- the lanes take a cell's photons
-    in turn, the per-photon work is `dSurfMergePhoton`, shared with the inline `dSurfMergeAt` --
-    and lane 0 adds the warp's sum to the film by atomics, as the inline gather and the beam
-    queue's evaluations do: the same terms in another order. (0.437.0 summed each pixel's sites in a
-    fixed order through per-path slot tables and a fold kernel; the rest of the film is summed by
-    atomics anyway, so 0.437.1 dropped them, and with them the tables' memory and the route
-    sub-sample bound.) A wave holds no more paths than the requests (up to 1 M, or an eighth of
-    the memory left beside the camera kernel's local reservation) hold at the last wave's sites a
-    path -- `g_sqSitesPerPath`, kept across calls like the beam profile, so an epoch's first wave
-    is sized by the last epoch's; it clamps that wave alone, the beam queue's wave size untouched.
-    A site the full queue turns away, or one needing a table the queue lacks, is gathered inline
-    and counted. The gather is launched sized to the wave's sites: a dense beam map's waves are a
-    few thousand paths, and a fixed grid idled through each (measured on `gallery_rain`: 188 ms a
-    sample of idle warps, 9 ms sized). Its GPU time joins the wave-loop report. The VRAM
-    preflight counts both mode-J queues (`cudaModeJQueueBytes`). Measured at 640x480 (GPU time a
+    after the wave `kWfSurfGather` gathers each with a whole warp -- the lanes take the site's
+    photons in turn, its 27 cells as one list (a lane a cell's photon would idle most lanes on
+    sparse cells), the per-photon work is `dSurfMergePhoton`, shared with the inline
+    `dSurfMergeAt` -- and lane 0 adds the warp's sum to the film by atomics, as the inline gather
+    and the beam queue's evaluations do: the same terms in another order. (0.437.0 summed each
+    pixel's sites in a fixed order through per-path slot tables and a fold kernel; the rest of the
+    film is summed by atomics anyway, so 0.437.1 dropped them, and with them the tables' memory and
+    the route sub-sample bound.) The queue holds up to 1 M requests, or what an eighth of the
+    memory left beside the camera kernel's local reservation holds. A wave holds no more paths
+    than the requests do at the most sites a path it would queue: the last wave's, and the
+    previous chunk's bands it would cover, which the beam queue's per-band PROFILE carries
+    (`WfBand::sitesPerPath`, kept across calls, so an epoch's first wave is sized by the last
+    epoch's, and the sky rows above a room do not size the room's wave). That clamps the wave
+    alone, the beam queue's size untouched, and never below the threads the device holds
+    resident: a smaller wave idles the camera kernel, which costs more than gathering the excess
+    inline. A site the full queue turns away is gathered inline and counted (the JSPEC carrier
+    and chromatic tables are allocated exactly when kBdptT's switches need them, and a guard
+    counts a site that found one missing). The gather is launched sized to the wave's sites: a
+    dense beam map's waves are a few thousand paths, and a fixed grid idled through each (measured
+    on `gallery_rain`: 188 ms a sample of idle warps, 9 ms sized). Its GPU time joins the wave-loop
+    report. The VRAM preflight counts the beam queue (`cudaModeJBeamQueueBytes`), which is fixed;
+    the point merges' queue takes what room is left. Measured at 640x480 (GPU time a
     sample): `_fog_cornell`'s surface merges 378 -> 219 ms, the camera kernel back to mode D's
     155; `gallery_rain` unchanged (751), its surface gather small. `FTRACE_NOSURFWF=1` is the A/B
     control; `tools/check_surf_wavefront.py` requires the inline gather's image on

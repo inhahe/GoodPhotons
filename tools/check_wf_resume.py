@@ -29,21 +29,10 @@ import re
 import subprocess
 import sys
 
-import numpy as np
-
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 NL = chr(10)
 sys.path.insert(0, os.path.join(ROOT, "tools"))
 import fogbox  # noqa: E402
-
-
-def load(p):
-    with open(p, "rb") as f:
-        f.readline()
-        w, h = (int(x) for x in f.readline().split())
-        s = float(f.readline())
-        return np.frombuffer(f.read(w * h * 12), dtype="<f4" if s < 0 else ">f4") \
-                 .reshape(h, w, 3).astype(float)
 
 
 def main():
@@ -95,7 +84,7 @@ def main():
         if not m:
             print(log[-1500:])
             raise SystemExit("no wavefront report in the log: is mode J gathering on the GPU?")
-        return load(png[:-4] + ".pfm"), int(m.group(1)), int(m.group(2))
+        return fogbox.load_pfm(png[:-4] + ".pfm"), int(m.group(1)), int(m.group(2))
 
     a1, r1, _ = render("default1")
     a2, _, _ = render("default2")
@@ -104,15 +93,11 @@ def main():
     check("the capped one takes some", rb > 0, "%d passes, %d segments" % (rb, sb))
     check("the image is not empty", a1.mean() > 0.0, "mean %.4g" % a1.mean())
 
-    def diff(x, y):
-        rel = np.abs(x - y) / np.maximum(np.maximum(np.abs(x), np.abs(y)), 1e-12)
-        return rel.max(), int((x != y).sum())
-
-    c_rel, c_n = diff(a1, a2)
-    check("two default renders agree (the control)", c_rel < 1e-5,
+    c_rel, c_n = fogbox.image_diff(a1, a2)
+    check("two default renders agree (the control)", c_rel < fogbox.ORDER_TOL,
           "largest change %.2g of the pixel, %d values differ" % (c_rel, c_n))
-    rel, n = diff(a1, b)
-    check("the capped render agrees with the default", rel < 1e-5,
+    rel, n = fogbox.image_diff(a1, b)
+    check("the capped render agrees with the default", rel < fogbox.ORDER_TOL,
           "largest change %.2g of the pixel, %d values differ; mean ratio %.6f"
           % (rel, n, b.mean() / a1.mean()))
     return check.verdict()

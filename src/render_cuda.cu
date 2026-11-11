@@ -9314,13 +9314,12 @@ static_assert(sizeof(DWfSeg) == 424, "DWfSeg changed size: update renderBdptCuda
 #endif
 struct DWfHit { int seg; int beam; float t, s; };
 // One band of the wave-schedule PROFILE (see renderBdptCuda): what the paths of pixel slots
-// [px0, px1) produced. Kept across calls, so the first chunk of every epoch is sized right.
-struct WfBand { long long px0, px1; double hitsPerPath, segsPerPath; };
+// [px0, px1) produced -- beam hits and segments for the beam queue, point-merge sites (those
+// turned away included) for DSurfQueue. Kept across calls, so the first chunk of every epoch is
+// sized right.
+struct WfBand { long long px0, px1; double hitsPerPath, segsPerPath, sitesPerPath; };
 static std::vector<WfBand> g_wfProfile;
 static int g_wfProfileResX = -1, g_wfProfileResY = -1, g_wfProfileDepth = -1;
-// The point merges' queue's twin of the profile (DSurfQueue): the sites a path queued in the
-// last wave, a little high, which sizes the next -- kept, and reset, with the profile.
-static double g_sqSitesPerPath = 2.0;
 struct DWfQueue {
     DWfSeg* segs;  int* nSegs; int segCap;
     double* chroma;     // 2*DJSPEC_K per segment slot (DBeamMergeW::chroma), or null when off
@@ -19316,7 +19315,7 @@ struct DSurfMergeW {
 // therefore queues the site (DSurfReq), and after the wave kWfSurfGather gathers it with a whole
 // warp, its photons across the lanes, and adds it to the film by atomics, as the beam queue's
 // evaluations do: the same terms as the inline gather's, summed in another order. A site the full
-// queue turns away, or one needing a table the queue lacks, is gathered inline and counted.
+// queue turns away is gathered inline and counted.
 struct DSurfReq {
     DVertex     vk;          // the eye vertex gathered at
     DSurfMergeW sw;          // the weight's camera half; chromaM/chromaKm1 are the queue's
@@ -19403,13 +19402,13 @@ __device__ static void dSurfMergeAt(const DScene& sc, const DSurfMap& sm, const 
     }
 }
 
-// The queued sites (DSurfQueue), a warp each: the lanes take a cell's photons in turn, and lane 0
-// adds the warp's sum to the film. A stop ends it early; its chunk is dropped (DeviceStopScope).
-__global__ void kWfSurfGather(DScene sc, DSurfMap sm, DSurfQueue sq, double* camFilm) {
+// The first `n` queued sites (DSurfQueue), a warp each: the lanes take the site's photons in turn,
+// across its cells as one list, and lane 0 adds the warp's sum to the film. A stop ends it early;
+// its chunk is dropped (DeviceStopScope).
+__global__ void kWfSurfGather(DScene sc, DSurfMap sm, DSurfQueue sq, int n, double* camFilm) {
     D_MOTION_CLEAR();   // this thread's time: the launch's (passU)
     const int lane = threadIdx.x & 31;
     const int warps = (int)((gridDim.x * blockDim.x) >> 5);
-    const int n = min(*sq.nReqs, sq.cap);
     long long stopNext = 0;   // the stop flag is a bus round trip: read it once ~1 ms (kBdptT's rule)
     for (int r = (int)((blockIdx.x * blockDim.x + threadIdx.x) >> 5); r < n; r += warps) {
         // Decided for the warp, whose lanes the shuffles below wait on: lane 0's clock and read.
@@ -19427,12 +19426,23 @@ __global__ void kWfSurfGather(DScene sc, DSurfMap sm, DSurfQueue sq, double* cam
         const DJSpec* js = (rq.flags & 1) ? &sq.spec[r] : nullptr;
         const DSurfSite site(sc, sm, rq.vk);
         double gX = 0.0, gY = 0.0, gZ = 0.0;
-        for (int c27 = 0; c27 < 27; ++c27) {
-            const long long c = site.cell(sm, c27);
-            if (c < 0) continue;
-            const int q1 = sm.cellStart[c + 1];
-            for (int q = sm.cellStart[c] + lane; q < q1; q += 32)
-                dSurfMergePhoton(sc, sm, rq.vk, site, rq.woCam, sw, q, gX, gY, gZ, js);
+        // The site's photons as one list, its cells in walk order: the g-th is lane (g mod 32)'s,
+        // so the warp spends ceil(photons / 32) rounds on the site, not a round or more a cell.
+        // A lane keeps its place in the list as a cell (`next`, the walk's next) and a photon
+        // `q` in [q, qEnd), and passes `skip` photons over to reach its next one.
+        int next = 0, q = 0, qEnd = 0, skip = lane;
+        for (;;) {
+            while (qEnd - q <= skip && next < 27) {
+                skip -= qEnd - q;
+                const long long c = site.cell(sm, next++);
+                q = qEnd = 0;
+                if (c >= 0) { q = sm.cellStart[c]; qEnd = sm.cellStart[c + 1]; }
+            }
+            if (qEnd - q <= skip) break;   // the list ends before this lane's next photon
+            q += skip;
+            dSurfMergePhoton(sc, sm, rq.vk, site, rq.woCam, sw, q, gX, gY, gZ, js);
+            ++q;
+            skip = 31;
         }
         for (int off = 16; off > 0; off >>= 1) {
             gX += __shfl_down_sync(0xffffffffu, gX, off);
@@ -19981,10 +19991,13 @@ kBdptT(DScene sc, const __grid_constant__ DCamera cam, double* camFilm, double* 
                     const DJSpec* vks = (jSpecOn && vspec[k].on()) ? &vspec[k] : nullptr;
                     const double f = (vks ? vks->beta(vk.beta) : vk.beta) * vmNorm * wJ;   // JSPEC scale
                     const size_t o = ((size_t)py * resX + px) * 3;
-                    // Queued for kWfSurfGather (DSurfQueue). Gathered inline, and counted in
-                    // `overflow`, where the queue is full or lacks the table a chromatic weight
-                    // or a JSPEC carrier needs. nReqs counts the sites turned away as well (they
-                    // size the next wave), so past 2^31 of them it wraps negative: qslot >= 0.
+                    // Queued for kWfSurfGather (DSurfQueue); gathered inline, and counted in
+                    // `overflow`, where the queue is full. renderBdptCuda allocates the JSPEC
+                    // carrier and chromatic tables exactly when c_jSpecOn and chromaOn's switches
+                    // call for them: `tables` holds that out loud, a site it turned away being
+                    // counted, which check_surf_wavefront fails. nReqs counts the sites turned
+                    // away as well (they size the next wave), so past 2^31 of them it wraps
+                    // negative: qslot >= 0.
                     if (MERGE && sq.reqs) {
                         const bool tables = (!chromaOn || sq.chroma) && (!vks || sq.spec);
                         const int qslot = tables ? atomicAdd(sq.nReqs, 1) : -1;
@@ -24087,11 +24100,12 @@ static void uploadMotion(const Scene& scene, DUpload& up) {
 static int g_jSpecHost = 1, g_jTrSpecHost = 0, g_jDeltaMergeHost = 1, g_jHalfHost = 0;
 static int g_jChromaHost = 1;
 
-// Mode J's wavefront queues: their capacities, which renderBdptCuda allocates and the VRAM
-// preflight budgets (cudaModeJQueueBytes).
+// Mode J's wavefront queues' capacities. The VRAM preflight budgets the beam queue's
+// (cudaModeJBeamQueueBytes); the point merges' queue takes what room is left.
 static constexpr int       kWfSegCap   = 1 << 20;    // beam segments (gpu::DWfSeg)
 static constexpr int       kWfHitCap   = 1 << 25;    // beam hits (gpu::DWfHit)
 static constexpr long long kSurfReqCap = 1LL << 20;  // point-merge sites (gpu::DSurfReq)
+static size_t residentThreads();   // the device-memory preflight's, below
 // One point-merge request's bytes: the request, and the JSPEC carrier and chromatic weights'
 // bins where those are on.
 static size_t surfReqBytes() {
@@ -27130,10 +27144,8 @@ Film renderBdptCuda(const Scene& scene, const Camera& cam, int resX, int resY,
     // THE POINT MERGES' QUEUE (DSurfQueue, SURF-WAVEFRONT): wherever a surface map gathers.
     // FTRACE_NOSURFWF=1 gathers them inline in the camera kernel (the A/B control). Up to
     // kSurfReqCap requests (surfReqBytes each), or what an eighth of the memory left beside the
-    // camera kernel's local memory holds. A wave holds no more paths than the requests do at the
-    // sites a path queued in the last one (g_sqSitesPerPath, kept across calls as the beam profile
-    // is, so an epoch's first wave is sized by the last epoch's); a site past them is gathered
-    // inline.
+    // camera kernel's local memory holds. Its waves are sized by surfWave, below; a site past the
+    // requests is gathered inline.
     DSurfQueue sq{};
     int* d_sqCounters = nullptr;
     cudaEvent_t sqEv[2] = {nullptr, nullptr};
@@ -27175,34 +27187,8 @@ Film renderBdptCuda(const Scene& scene, const Camera& cam, int resX, int resY,
             }
         }
     }
-    // The next wave's paths, at the requests a path queued in the last one.
-    auto surfWave = [&]() -> long long {
-        return std::max(1024LL, (long long)((double)sq.cap / g_sqSitesPerPath));
-    };
     long long sqSites = 0, sqPaths = 0;
     double sqMsGather = 0.0;
-    // Gathers the sites a wave of `paths` paths queued, after kBdptT, and sizes the next wave by
-    // them. Returns the sites gathered (at most the queue's capacity).
-    auto surfGather = [&](long long paths) -> long long {
-        int nq = 0;
-        CUDA_CHECK(cudaMemcpy(&nq, sq.nReqs, sizeof(int), cudaMemcpyDeviceToHost));
-        // Counts the sites turned away too, so it can wrap past 2^31 of them.
-        const long long demand = (nq < 0) ? (1LL << 31) : (long long)nq;
-        const long long inQ = std::min<long long>(demand, sq.cap);
-        if (inQ > 0) {
-            const int gBlocks = (int)std::min(4096LL, (inQ * 32 + 127) / 128);   // a warp a site
-            CUDA_CHECK(cudaEventRecord(sqEv[0]));
-            kWfSurfGather<<<gBlocks, 128>>>(up.sc, dsm, sq, d_cam);
-            CUDA_CHECK(cudaEventRecord(sqEv[1]));
-            cudaCheckKernel("wf-surf-gather");
-            float ms = 0.f;
-            CUDA_CHECK(cudaEventElapsedTime(&ms, sqEv[0], sqEv[1]));
-            sqMsGather += ms;
-        }
-        sqSites += inQ; sqPaths += paths;
-        if (paths > 0) g_sqSitesPerPath = std::max(0.05, 1.25 * (double)demand / (double)paths);
-        return inQ;
-    };
     long long wfWaves = 0, wfInlineSegs = 0, wfResumes = 0, wfDeferred = 0, wfLastHits = 0;
     int wfLastSegs = 0;
     // Where a mode-J render's seconds go: CUDA-event time of the three wave kernels and the wall
@@ -27211,8 +27197,9 @@ Film renderBdptCuda(const Scene& scene, const Camera& cam, int resX, int resY,
     cudaEvent_t wfEv[4] = {nullptr, nullptr, nullptr, nullptr};
     double wfMsWalk = 0.0, wfMsHits = 0.0, wfMsEval = 0.0, wfMsWall = 0.0;
     if (wq.segs) for (auto& e : wfEv) CUDA_CHECK(cudaEventCreate(&e));
-    // The PROFILE: what every band of the previous chunk produced, in hits per path and segments
-    // per path, keyed by pixel slot so chunks of different spp line up. Stationary across chunks
+    // The PROFILE: what every band of the previous chunk produced, in hits, segments and
+    // point-merge sites per path, keyed by pixel slot so chunks of different spp line up. A stop
+    // that cut the chunk short leaves it as it was. Stationary across chunks
     // (same map, same camera), so it is the right estimate for a wave about to cover those
     // bands -- including the top band a new chunk starts on, and the doubling at the light's
     // edge that the last wave cannot see coming (_fog_cornell spilled 94.6 M hits at 256^2 /
@@ -27224,12 +27211,55 @@ Film renderBdptCuda(const Scene& scene, const Camera& cam, int resX, int resY,
     // 0.261.0 schedule, all of it in the extra map rebuilds. Reset when the frame changes shape.
     if (g_wfProfileResX != resX || g_wfProfileResY != resY || g_wfProfileDepth != maxDepth) {
         g_wfProfile.clear();
-        g_sqSitesPerPath = 2.0;
         g_wfProfileResX = resX; g_wfProfileResY = resY; g_wfProfileDepth = maxDepth;
     }
     std::vector<WfBand>& wfProfilePrev = g_wfProfile;
     const bool mergeAny = mergeOn || dsm.kappaS > 0.0;   // either kind wants MERGE=true
     std::vector<WfBand> wfProfileCur;
+    // A point-merge wave's paths from path `from` on, at most `cand` (DSurfQueue): as many as the
+    // requests hold at the most sites a path the wave would queue -- the last wave's (`sqLast`, a
+    // quarter high) and the previous chunk's, from the PROFILE's bands the wave would cover, which
+    // the last wave cannot see coming (sky rows above a room). A fixed point, as `profiled` is.
+    // Never fewer than the device holds resident: a smaller wave idles the camera kernel, which
+    // costs more than gathering the excess inline. Before any measurement, 2 sites a path.
+    double sqLast = -1.0;
+    auto surfWave = [&](long long from, long long cand, long long c) -> long long {
+        const long long least = std::max<long long>(1024, (long long)residentThreads());
+        for (int it = 0; it < 8 && cand > least; ++it) {
+            const long long p0 = from / c, p1 = (from + cand + c - 1) / c;
+            double s = sqLast;
+            for (const WfBand& w : wfProfilePrev)
+                if (w.px1 > p0 && w.px0 < p1) s = std::max(s, 1.25 * w.sitesPerPath);
+            if (s < 0.0) s = 2.5;
+            const long long n = std::max(least, (long long)((double)sq.cap / std::max(s, 0.05)));
+            if (n >= cand) return cand;
+            cand = n;
+        }
+        return cand;
+    };
+    // Gathers the sites a wave of `paths` paths queued, after kBdptT. Returns the sites a path
+    // queued, those the full queue turned away included; `gathered` gets the sites gathered.
+    auto surfGather = [&](long long paths, long long& gathered) -> double {
+        int nq = 0;
+        CUDA_CHECK(cudaMemcpy(&nq, sq.nReqs, sizeof(int), cudaMemcpyDeviceToHost));
+        // Counts the sites turned away too, so it can wrap past 2^31 of them.
+        const long long demand = (nq < 0) ? (1LL << 31) : (long long)nq;
+        gathered = std::min<long long>(demand, sq.cap);
+        if (gathered > 0) {
+            const int gBlocks = (int)std::min(4096LL, (gathered * 32 + 127) / 128);   // a warp a site
+            CUDA_CHECK(cudaEventRecord(sqEv[0]));
+            kWfSurfGather<<<gBlocks, 128>>>(up.sc, dsm, sq, (int)gathered, d_cam);
+            CUDA_CHECK(cudaEventRecord(sqEv[1]));
+            cudaCheckKernel("wf-surf-gather");
+            float ms = 0.f;
+            CUDA_CHECK(cudaEventElapsedTime(&ms, sqEv[0], sqEv[1]));
+            sqMsGather += ms;
+        }
+        sqSites += gathered; sqPaths += paths;
+        const double perPath = (paths > 0) ? (double)demand / (double)paths : 0.0;
+        sqLast = 1.25 * perPath;
+        return perPath;
+    };
     // Returns whether the chunk landed whole (it is folded into the totals) or a stop cut it
     // short (dropped).
     auto launch = [&](long long cAll, long long baseAll) -> bool {
@@ -27331,9 +27361,9 @@ Film renderBdptCuda(const Scene& scene, const Camera& cam, int resX, int resY,
                            : profiled(0, wfProfilePrev.empty() ? ((waveSamples < 1024) ? waveSamples : 1024) : waveSamples, 0.0, 0.0);
             for (long long b0 = 0; b0 < waveTotal; ) {
                 if (stopped()) { leftEarly = true; break; }
-                // No more paths than the point merges' queue holds at the sites a path last
-                // queued. A clamp of this wave only: `wave` stays the beam queue's size.
-                const long long waveNow = sq.reqs ? std::min(wave, surfWave()) : wave;
+                // No more paths than the point merges' queue holds (surfWave). A clamp of this
+                // wave only: `wave` stays the beam queue's size.
+                const long long waveNow = sq.reqs ? surfWave(b0, wave, c) : wave;
                 const long long b1 = (b0 + waveNow < waveTotal) ? b0 + waveNow : waveTotal;
                 // A REALIZATION PER BAND (FTRACE_JBAND). Salted by the band's first path slot as
                 // well as by `base`, so two bands of one chunk draw different maps and two
@@ -27399,7 +27429,8 @@ Film renderBdptCuda(const Scene& scene, const Camera& cam, int resX, int resY,
                     }
                     // The wave's point merges, while its time is still the wave's.
                     const double sqMs0 = sqMsGather;
-                    const long long sites = (sq.reqs && !leftEarly) ? surfGather(b1 - b0) : 0;
+                    long long sites = 0;
+                    const double sitesPerPath = (sq.reqs && !leftEarly) ? surfGather(b1 - b0, sites) : 0.0;
                     ++wfWaves;
                     wfMsWalk += msWalk; wfMsHits += msHits; wfMsEval += msEval;
                     const double wallMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - wfT0).count();
@@ -27420,18 +27451,20 @@ Film renderBdptCuda(const Scene& scene, const Camera& cam, int resX, int resY,
                     // per QUEUED segment: those gathered inline (cnt[2]) left no hits in the queue
                     const double hitsPerSeg  = (wfLastSegs > 0) ? (double)waveHits / (double)wfLastSegs : 0.0;
                     const double hitsPerPath = hitsPerSeg * segsPerPath;
-                    wfProfileCur.push_back(WfBand{b0 / c, (b1 + c - 1) / c, hitsPerPath, segsPerPath});
+                    wfProfileCur.push_back(WfBand{b0 / c, (b1 + c - 1) / c, hitsPerPath, segsPerPath, sitesPerPath});
                     wave = profiled(b1, sizeFor(hitsPerPath, segsPerPath), hitsPerPath, segsPerPath);
                 } else if (sq.reqs) {
                     cudaCheckKernel("bdpt");
-                    surfGather(b1 - b0);
+                    long long sites = 0;
+                    const double sitesPerPath = surfGather(b1 - b0, sites);
+                    wfProfileCur.push_back(WfBand{b0 / c, (b1 + c - 1) / c, 0.0, 0.0, sitesPerPath});
                 }
                 b0 = b1;
             }
             // This chunk's bands size the next -- unless a stop cut its waves short, by leaving
             // some unlaunched or by ending a launched one's kernels early (the chunk is dropped
             // either way, and its bands are an under-count).
-            if (wq.segs && !wfProfileCur.empty() && !leftEarly &&
+            if ((wq.segs || sq.reqs) && !wfProfileCur.empty() && !leftEarly &&
                 !(abortable && DeviceStopScope::seen()))
                 wfProfilePrev.swap(wfProfileCur);
         }
@@ -27605,14 +27638,10 @@ size_t cudaMegakernelLocalBytes(char mode, int maxDepth, int heroC) {
     return (size_t)fa.localSizeBytes * residentThreads();
 }
 
-size_t cudaModeJQueueBytes(bool beams, bool points) {
+size_t cudaModeJBeamQueueBytes() {
     using namespace gpu;
-    size_t b = 0;
-    // The beam queue's chromatic table is left out: it is allocated only with room to spare.
-    if (beams)
-        b += (size_t)kWfSegCap * (sizeof(DWfSeg) + sizeof(int)) + (size_t)kWfHitCap * sizeof(DWfHit);
-    if (points) b += (size_t)kSurfReqCap * surfReqBytes();
-    return b;
+    // Its chromatic table is left out: it is allocated only with room to spare.
+    return (size_t)kWfSegCap * (sizeof(DWfSeg) + sizeof(int)) + (size_t)kWfHitCap * sizeof(DWfHit);
 }
 
 // --------------------- backward reference (mode R) host ----------------------
