@@ -300,6 +300,19 @@ shift the run shares, not seed noise. Two runs of one 256-spp command differ too
 colour ratios move with the epoch count -- a chromatic bias that depends on it would be a finding
 of its own.
 
+## OPEN (2026-11-11, 0.437.3; found in review): TOOLS-PFM-READERS — about twenty scripts in tools/ each parse PFM themselves
+
+`read_pfm`, `readpfm`, `load` and kin in check_bitid, check_jchroma, check_motion,
+check_hero_spectral, check_physlens, check_pattern_seam, pfmstat, pfmcmp, roi_score, grade_hdr and
+a dozen more: some return numpy arrays, some (w, h, channels, tuple), some only channel means;
+some honour `Pf` and comment lines, some do not. A fix to one (a header variant, NaN handling)
+reaches none of the others. `fogbox.load_pfm` (and `image_diff`, `ORDER_TOL`) serves the GPU
+mode-J checks since 0.437.2; the two wavefront checks use it. Proper fix: one module (`tools/pfm.py`:
+read to an (h, w, c) array, write, compare), every script on it, each check re-run once to show it
+reads its images as before -- several are hour-long GPU validations. Waiting on the user's word
+that a tools-wide module is wanted: pfmstat, pfmcmp and roi_score are standalone utilities that
+may be meant to run copied out of the tree.
+
 ## OPEN (2026-11-10, 0.436.10): GPU-BDPT-LOCALMEM — the GPU camera pass of modes D and J is bound by its threads' local memory, and mode J's surface merges by divergence
 
 Measured with Nsight Compute (`scraps/_ncu.sh`, summary `scraps/_ncu_sum.py`: one whole-sample
@@ -332,8 +345,9 @@ inline), and `__launch_bounds__(128, 4)` on the gather (no change; it runs at 25
 16.7 % occupancy, bound by the latency of its scattered loads -- a photon's position, its MIS
 record, the BSDF's spectral tables -- with no one line above 10 % of its stalls). 0.437.1 adds a
 site to the film from the gather kernel by atomics, as the inline gather did, instead of through
-per-path slot tables and a fold kernel, at the same speed (379 -> 219 ms; `gallery_rain` 760 ms
-either way). (A cell of 2r and
+per-path slot tables and a fold kernel, at the same speed (379 -> 219 ms); 0.437.2 walks a
+site's photons as one list across its cells (217). `gallery_rain` is neutral: 679 ms queued against
+667-678 inline at 32 spp over 16 pinned epochs. (A cell of 2r and
 an 8-cell walk, proposed here, visits 64 r^3 against the 27-cell walk's 27 r^3: more photons, not
 fewer.) The build already carries `-lineinfo`; `scraps/_ncu_lines.py` lists a report's hottest
 source lines.

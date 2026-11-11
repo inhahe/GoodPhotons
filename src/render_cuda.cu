@@ -9315,8 +9315,8 @@ static_assert(sizeof(DWfSeg) == 424, "DWfSeg changed size: update renderBdptCuda
 struct DWfHit { int seg; int beam; float t, s; };
 // One band of the wave-schedule PROFILE (see renderBdptCuda): what the paths of pixel slots
 // [px0, px1) produced -- beam hits and segments for the beam queue, point-merge sites (those
-// turned away included) for DSurfQueue. Kept across calls, so the first chunk of every epoch is
-// sized right.
+// turned away included) for DSurfQueue; -1 where the call ran without that queue. Kept across
+// calls, so the first chunk of every epoch is sized right.
 struct WfBand { long long px0, px1; double hitsPerPath, segsPerPath, sitesPerPath; };
 static std::vector<WfBand> g_wfProfile;
 static int g_wfProfileResX = -1, g_wfProfileResY = -1, g_wfProfileDepth = -1;
@@ -27161,11 +27161,12 @@ Film renderBdptCuda(const Scene& scene, const Camera& cam, int resX, int resY,
         const size_t perReq = surfReqBytes();
         long long cap = std::min(kSurfReqCap, (long long)(room / 8 / perReq));
         long long capMin = 65536;
-        // FTRACE_SURFWFCAP=<n> (diagnostic) shrinks the queue so that every wave turns sites away:
-        // tools/check_surf_wavefront.py requires the same image.
+        // FTRACE_SURFWFCAP=<n> (diagnostic) shrinks the queue to n requests (at least 16), so a
+        // small frame takes several waves, or with a tiny n turns sites away every wave:
+        // tools/check_surf_wavefront.py requires the waves' sizes and the same image.
         if (const char* e = std::getenv("FTRACE_SURFWFCAP")) {
             const long long v = std::atoll(e);
-            if (v >= 256 && v < cap) { cap = v; capMin = 256; }
+            if (v >= 16 && v < cap) { cap = v; capMin = 16; }
         }
         if (cap >= capMin) {
             sq.cap = (int)cap;
@@ -27216,34 +27217,81 @@ Film renderBdptCuda(const Scene& scene, const Camera& cam, int resX, int resY,
     std::vector<WfBand>& wfProfilePrev = g_wfProfile;
     const bool mergeAny = mergeOn || dsm.kappaS > 0.0;   // either kind wants MERGE=true
     std::vector<WfBand> wfProfileCur;
-    // A point-merge wave's paths from path `from` on, at most `cand` (DSurfQueue): as many as the
-    // requests hold at the most sites a path the wave would queue -- the last wave's (`sqLast`, a
-    // quarter high) and the previous chunk's, from the PROFILE's bands the wave would cover, which
-    // the last wave cannot see coming (sky rows above a room). A fixed point, as `profiled` is.
-    // Never fewer than the device holds resident: a smaller wave idles the camera kernel, which
-    // costs more than gathering the excess inline. Before any measurement, 2 sites a path.
-    double sqLast = -1.0;
-    auto surfWave = [&](long long from, long long cand, long long c) -> long long {
-        const long long least = std::max<long long>(1024, (long long)residentThreads());
-        for (int it = 0; it < 8 && cand > least; ++it) {
-            const long long p0 = from / c, p1 = (from + cand + c - 1) / c;
-            double s = sqLast;
-            for (const WfBand& w : wfProfilePrev)
-                if (w.px1 > p0 && w.px0 < p1) s = std::max(s, 1.25 * w.sitesPerPath);
-            if (s < 0.0) s = 2.5;
-            const long long n = std::max(least, (long long)((double)sq.cap / std::max(s, 0.05)));
-            if (n >= cand) return cand;
-            cand = n;
+    // Whether the PROFILE measured a queue's field: a chunk's bands share their call's queues,
+    // so the first band speaks for all of them.
+    auto beamProfiled = [&] { return !wfProfilePrev.empty() && wfProfilePrev.front().segsPerPath >= 0.0; };
+    auto surfProfiled = [&] { return !wfProfilePrev.empty() && wfProfilePrev.front().sitesPerPath >= 0.0; };
+    static const bool waveDebug = std::getenv("FTRACE_WAVE_DEBUG") != nullptr;   // a line a wave
+    // The fewest paths a point-merge wave holds: the camera kernel's resident threads, below
+    // which a wave idles it, and that costs more than gathering the excess inline. Under
+    // FTRACE_SURFWFCAP (diagnostic) 256, so a small frame's waves are sized by the bands.
+    long long surfLeast = 1024;
+    if (sq.reqs && std::getenv("FTRACE_SURFWFCAP")) {
+        surfLeast = 256;
+    } else if (sq.reqs) {
+        static int occ[2] = {0, 0};   // kBdptT's blocks an SM, at BDPT_MAXDEPTH and DEEPDEPTH
+        int& o = occ[deep ? 1 : 0];
+        if (o == 0) {
+            const void* fn = deep ? (const void*)kBdptT<0, BDPT_DEEPDEPTH, true, false>
+                                  : (const void*)kBdptT<0, BDPT_MAXDEPTH, true, false>;
+            if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(&o, fn, 128, 0) != cudaSuccess || o <= 0) {
+                (void)cudaGetLastError();
+                o = -1;
+            }
         }
-        return cand;
+        int dev = 0, sms = 0;
+        if (o > 0 && cudaGetDevice(&dev) == cudaSuccess &&
+            cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev) == cudaSuccess)
+            surfLeast = std::max<long long>(surfLeast, (long long)o * 128 * sms);
+        else
+            (void)cudaGetLastError();
+    }
+    // A point-merge wave's paths from path `from` on, at most `cand` (DSurfQueue): the largest
+    // n whose sites fit the requests, n * S(n) <= cap, where S(n) is the most sites a path, a
+    // quarter high, of the last wave (`sqLast`) and of the PROFILE's bands within
+    // [from, from + n) -- found by walking the bands in order, so a sparse wave is sized by its
+    // own bands and not by a dense one further on, and the last wave cannot hide the next band
+    // (sky rows above a room). Without a profile, at least 2 sites a path: a wave of sky must not
+    // size the room below it. Never fewer than surfLeast paths, and where `cand` takes several
+    // waves, waves of one size.
+    double sqLast = -1.0;   // the last wave's sites a path, a quarter high; < 0 before one
+    auto surfWave = [&](long long from, long long cand, long long c) -> long long {
+        if (cand <= surfLeast) return cand;
+        const double cap = (double)sq.cap;
+        double s = std::max(sqLast, 0.0);
+        long long n = cand;
+        bool walked = false;
+        if (!surfProfiled()) {
+            s = std::max(s, 2.5);
+        } else {
+            for (const WfBand& w : wfProfilePrev) {   // in path order
+                const long long o0 = w.px0 * c - from, o1 = w.px1 * c - from;   // from `from` on
+                if (o1 <= 0) continue;
+                if (o0 >= n) break;
+                walked = true;
+                const double s2 = std::max(s, 1.25 * w.sitesPerPath);
+                const long long lim = (long long)(cap / std::max(s2, 0.05));
+                // The wave ends in this band, or at its start if it cannot enter it.
+                if (lim < o1) { n = std::min(n, std::max(o0, lim)); break; }
+                s = s2;
+            }
+        }
+        if (!walked) n = std::min(n, (long long)(cap / std::max(s, 0.05)));
+        n = std::max(n, surfLeast);
+        if (n >= cand) return cand;
+        // Waves of equal size: a split that left a remainder smaller than the rest would run it
+        // on a part of the device, through the longest path's tail. Smaller, so it still fits.
+        const long long k = (cand + n - 1) / n;
+        return std::max(surfLeast, (cand + k - 1) / k);
     };
     // Gathers the sites a wave of `paths` paths queued, after kBdptT. Returns the sites a path
-    // queued, those the full queue turned away included; `gathered` gets the sites gathered.
-    auto surfGather = [&](long long paths, long long& gathered) -> double {
+    // queued, those the full queue turned away included (`demand` of them in all); `gathered`
+    // gets the sites gathered.
+    auto surfGather = [&](long long paths, long long& gathered, long long& demand) -> double {
         int nq = 0;
         CUDA_CHECK(cudaMemcpy(&nq, sq.nReqs, sizeof(int), cudaMemcpyDeviceToHost));
         // Counts the sites turned away too, so it can wrap past 2^31 of them.
-        const long long demand = (nq < 0) ? (1LL << 31) : (long long)nq;
+        demand = (nq < 0) ? (1LL << 31) : (long long)nq;
         gathered = std::min<long long>(demand, sq.cap);
         if (gathered > 0) {
             const int gBlocks = (int)std::min(4096LL, (gathered * 32 + 127) / 128);   // a warp a site
@@ -27342,7 +27390,7 @@ Film renderBdptCuda(const Scene& scene, const Camera& cam, int resX, int resY,
                 return n;
             };
             auto profiled = [&](long long from, long long cand, double hpp, double spp) -> long long {
-                if (wfProfilePrev.empty()) return cand;
+                if (!beamProfiled()) return cand;
                 for (int it = 0; it < 8; ++it) {
                     const long long p0 = from / c, p1 = (from + cand + c - 1) / c;   // slots the wave would cover
                     double h = hpp, sg = spp;
@@ -27358,12 +27406,13 @@ Film renderBdptCuda(const Scene& scene, const Camera& cam, int resX, int resY,
                 return cand;
             };
             long long wave = !wq.segs ? waveTotal
-                           : profiled(0, wfProfilePrev.empty() ? ((waveSamples < 1024) ? waveSamples : 1024) : waveSamples, 0.0, 0.0);
+                           : profiled(0, !beamProfiled() ? ((waveSamples < 1024) ? waveSamples : 1024) : waveSamples, 0.0, 0.0);
             for (long long b0 = 0; b0 < waveTotal; ) {
                 if (stopped()) { leftEarly = true; break; }
                 // No more paths than the point merges' queue holds (surfWave). A clamp of this
                 // wave only: `wave` stays the beam queue's size.
-                const long long waveNow = sq.reqs ? surfWave(b0, wave, c) : wave;
+                const long long waveNow =
+                    sq.reqs ? surfWave(b0, std::min(wave, waveTotal - b0), c) : wave;
                 const long long b1 = (b0 + waveNow < waveTotal) ? b0 + waveNow : waveTotal;
                 // A REALIZATION PER BAND (FTRACE_JBAND). Salted by the band's first path slot as
                 // well as by `base`, so two bands of one chunk draw different maps and two
@@ -27429,20 +27478,20 @@ Film renderBdptCuda(const Scene& scene, const Camera& cam, int resX, int resY,
                     }
                     // The wave's point merges, while its time is still the wave's.
                     const double sqMs0 = sqMsGather;
-                    long long sites = 0;
-                    const double sitesPerPath = (sq.reqs && !leftEarly) ? surfGather(b1 - b0, sites) : 0.0;
+                    long long sites = 0, demand = 0;
+                    const double sitesPerPath =
+                        (sq.reqs && !leftEarly) ? surfGather(b1 - b0, sites, demand) : -1.0;
                     ++wfWaves;
                     wfMsWalk += msWalk; wfMsHits += msHits; wfMsEval += msEval;
                     const double wallMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - wfT0).count();
                     wfMsWall += wallMs;
-                    static const bool waveDebug = std::getenv("FTRACE_WAVE_DEBUG") != nullptr;   // per-wave diagnostic
                     if (waveDebug)
                         std::fprintf(stderr, "[wave] c=%lld paths %lld..%lld (%lld) segs %d (%d inline) hits %lld "
-                                     "in %d pass%s, %lld point-merge sites; walk %.2f hits %.2f eval %.2f "
-                                     "point merges %.2f wall %.2f ms\n",
+                                     "in %d pass%s, %lld point-merge sites (%lld turned away); walk %.2f "
+                                     "hits %.2f eval %.2f point merges %.2f wall %.2f ms\n",
                                      c, b0, b1, b1 - b0, cnt[0], cnt[2], waveHits, passes,
-                                     passes == 1 ? "" : "es", sites, msWalk, msHits, msEval,
-                                     sqMsGather - sqMs0, wallMs);
+                                     passes == 1 ? "" : "es", sites, demand - sites, msWalk, msHits,
+                                     msEval, sqMsGather - sqMs0, wallMs);
                     wfInlineSegs += cnt[2];
                     wfLastSegs = (cnt[0] < wq.segCap) ? cnt[0] : wq.segCap;
                     wfLastHits = waveHits;
@@ -27455,9 +27504,12 @@ Film renderBdptCuda(const Scene& scene, const Camera& cam, int resX, int resY,
                     wave = profiled(b1, sizeFor(hitsPerPath, segsPerPath), hitsPerPath, segsPerPath);
                 } else if (sq.reqs) {
                     cudaCheckKernel("bdpt");
-                    long long sites = 0;
-                    const double sitesPerPath = surfGather(b1 - b0, sites);
-                    wfProfileCur.push_back(WfBand{b0 / c, (b1 + c - 1) / c, 0.0, 0.0, sitesPerPath});
+                    long long sites = 0, demand = 0;
+                    const double sitesPerPath = surfGather(b1 - b0, sites, demand);
+                    wfProfileCur.push_back(WfBand{b0 / c, (b1 + c - 1) / c, -1.0, -1.0, sitesPerPath});
+                    if (waveDebug)
+                        std::fprintf(stderr, "[wave] c=%lld paths %lld..%lld (%lld), %lld point-merge sites "
+                                     "(%lld turned away)\n", c, b0, b1, b1 - b0, sites, demand - sites);
                 }
                 b0 = b1;
             }

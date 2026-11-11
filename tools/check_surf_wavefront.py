@@ -1,4 +1,5 @@
-"""Regression check: GPU mode J's queued point merges render what the inline gather renders.
+"""Regression check: GPU mode J's queued point merges render what the inline gather renders, in
+waves the queue holds.
 
     python tools/check_surf_wavefront.py [--out png/check_surf_wavefront] [--exe ftrace.exe]
 
@@ -11,14 +12,18 @@ the film's atomic sums differs, which moves a float32 pixel by a rounding at mos
   - on _fog_cornell's surface merges (`-jbeams off`, 4 spp at 160x120): every site through the
     queue (the run's point-merge line, none inline) and the inline gather's image; the inline run
     itself printing no point-merge line, i.e. bypassing the queue;
-  - the same image with the queue shrunk to 4096 requests (FTRACE_SURFWFCAP), which turns sites
-    away to the inline gather;
+  - the same image with the queue shrunk to 32 requests (FTRACE_SURFWFCAP), which turns sites
+    away to the inline gather every wave;
   - in tools/check_jchroma.py's box of chromatic fog (beams and point merges, 8 spp at 64x64),
     where a site carries a JSPEC carrier and chromatic weights' bins in the queue's side tables:
     every site through the queue -- a site whose table the queue lacked would be counted inline --
     and the inline gather's image.
 
-One light-side epoch (`-beamepochs 1`): the point-merge line reports the frame's first epoch.
+These render one light-side epoch (`-beamepochs 1`): the point-merge line reports the frame's
+first. And the waves' sizes (renderBdptCuda's surfWave): with the queue shrunk to 2048 requests
+and FTRACE_WAVE_DEBUG's line a wave, over two epochs, the chunks split into several waves, and no
+wave past the first chunk turns a site away -- each is sized by the band profile the chunk before
+left, the next epoch's first chunk by the last epoch's. Only the first chunk, with no profile, may.
 
 Exits 1 on any failure.
 """
@@ -36,6 +41,8 @@ from check_jchroma import SCENE as CHROMA_SCENE  # noqa: E402
 
 LINE = re.compile(r"mode J point merges: (\d+) sites gathered a warp each \(([\d.]+) a path\) "
                   r"in [\d.]+ s of GPU time, (\d+) inline")
+WAVE = re.compile(r"\[wave\] c=\d+ paths (\d+)\.\.(\d+) \(\d+\), (\d+) point-merge sites "
+                  r"\((\d+) turned away\)")
 
 
 def main():
@@ -54,14 +61,14 @@ def main():
     check = fogbox.Checks(62)
     logs = []
 
-    def run(tag, args, env):
+    def run(tag, args, env, epochs=1):
         png = os.path.join(d, tag + ".png")
         for stale in (png, png[:-4] + ".pfm"):
             if os.path.exists(stale):
                 os.remove(stale)
         cmd = [exe, "-in"] + args + ["-mode", "J", "-device", "gpu", "-seed", "3",
-                                     "-beamepochs", "1", "-hdr", "-no-meter", "-window-min",
-                                     "-o", png]
+                                     "-beamepochs", str(epochs), "-hdr", "-no-meter",
+                                     "-window-min", "-o", png]
         p = subprocess.run(cmd, cwd=ROOT, capture_output=True, text=True, encoding="utf-8",
                            errors="replace", env=dict(os.environ, **env))
         log = p.stdout + p.stderr
@@ -88,15 +95,30 @@ def main():
         return inline
 
     inline = pair("fog", FOG)
-    rc2, log2, small = run("fog_small", FOG, {"FTRACE_SURFWFCAP": "4096"})
+    rc2, log2, tiny = run("fog_tiny", FOG, {"FTRACE_SURFWFCAP": "32"})
     m2 = LINE.search(log2)
-    check("fog: a 4096-request queue turns sites away inline",
+    check("fog: a 32-request queue turns sites away inline",
           rc2 == 0 and m2 is not None and int(m2.group(3)) > 0,
           ("%s sites, %s inline" % (m2.group(1), m2.group(3))) if m2 else "rc %d" % rc2)
-    if inline is not None and small is not None:
-        r, n = fogbox.image_diff(inline, small)
+    if inline is not None and tiny is not None:
+        r, n = fogbox.image_diff(inline, tiny)
         check("fog: ...and renders the same image", r < fogbox.ORDER_TOL,
               "largest change %.2g of the pixel, %d values differ" % (r, n))
+
+    rc3, log3, _ = run("fog_sized", FOG, {"FTRACE_SURFWFCAP": "2048", "FTRACE_WAVE_DEBUG": "1"},
+                       epochs=2)
+    waves = [tuple(int(g) for g in m.groups()) for m in WAVE.finditer(log3)]
+    starts = [i for i, w in enumerate(waves) if w[0] == 0]   # a chunk's first wave
+    later = waves[starts[1]:] if len(starts) > 1 else []
+    check("fog: a 2048-request queue splits the chunks into waves",
+          rc3 == 0 and len(starts) >= 2 and len(waves) >= 2 * len(starts),
+          "rc %d, %d waves in %d chunks" % (rc3, len(waves), len(starts)))
+    away = sum(w[3] for w in later)
+    check("...none past the first chunk turning a site away",
+          len(later) > 0 and away == 0,
+          "%d sites turned away in %d waves (the first chunk: %d)"
+          % (away, len(later), sum(w[3] for w in waves[:len(waves) - len(later)])))
+
     pair("chroma", CHROMA)
     return check.verdict(NL.join(logs[-3:]))
 

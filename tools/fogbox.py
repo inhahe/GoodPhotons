@@ -84,13 +84,20 @@ ORDER_TOL = 1e-5
 
 
 def load_pfm(path):
-    """A colour PFM (ftrace's -hdr output) as an (h, w, 3) float64 array."""
+    """A PFM (ftrace's -hdr output) as an (h, w, channels) float64 array: 3 channels for `PF`,
+    1 for `Pf`. Rows stay in the file's order (PFM's bottom-up)."""
     with open(path, "rb") as f:
-        f.readline()
-        w, h = (int(x) for x in f.readline().split())
+        kind = f.readline().strip()
+        if kind not in (b"PF", b"Pf"):
+            raise ValueError("%s: not a PFM (%r)" % (path, kind))
+        nc = 3 if kind == b"PF" else 1
+        line = f.readline()
+        while line.startswith(b"#"):
+            line = f.readline()
+        w, h = (int(x) for x in line.split())
         s = float(f.readline())
-        data = np.frombuffer(f.read(w * h * 12), dtype="<f4" if s < 0 else ">f4")
-        return data.reshape(h, w, 3).astype(np.float64)
+        data = np.frombuffer(f.read(w * h * nc * 4), dtype="<f4" if s < 0 else ">f4")
+        return data.reshape(h, w, nc).astype(np.float64)
 
 
 def image_diff(x, y):

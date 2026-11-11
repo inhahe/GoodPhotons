@@ -1877,9 +1877,12 @@ machine varied 18.5 s / 25.8 s / 27.2 s.
   a sample (1.7x). Setting this forces the inline gather (the A/B control). The render reports the
   queue's use and the gather's GPU time in a `[gpu] mode J point merges:` line, and with beams the
   gather's time in the `[gpu] mode J wave loop:` line too; like the wavefront gather's lines, they
-  cover the frame's first light-side epoch. `FTRACE_SURFWFCAP=<n>` shrinks the queue
-  so sites overflow to the inline gather; `tools/check_surf_wavefront.py` uses it, and requires
-  the same image every way.
+  cover the frame's first light-side epoch. `FTRACE_WAVE_DEBUG=1` prints a `[wave]` line a wave
+  with its point-merge sites and how many the full queue turned away, with or without beams.
+  `FTRACE_SURFWFCAP=<n>` shrinks the queue to `n` requests (at least 16) and lets a wave go down
+  to 256 paths, so a small frame takes several waves, or with a tiny `n` turns sites away to the
+  inline gather; `tools/check_surf_wavefront.py` uses both, and requires the same image every way
+  and waves the queue holds.
 - **`FTRACE_JEPOCHKEEP=<k>` (diagnostic, mode `J` flights).** Keeps at most `k` of a batch's
   `-beamepochs` realizations, so its later frames re-trace the rest as a batch too large to keep
   them would; `tools/check_jbeams.py` uses it to show such an epoch is traced as epoch 0 was.

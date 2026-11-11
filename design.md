@@ -741,14 +741,22 @@ Four consequences worth knowing:
     pixel's sites in a fixed order through per-path slot tables and a fold kernel; the rest of the
     film is summed by atomics anyway, so 0.437.1 dropped them, and with them the tables' memory and
     the route sub-sample bound.) The queue holds up to 1 M requests, or what an eighth of the
-    memory left beside the camera kernel's local reservation holds. A wave holds no more paths
-    than the requests do at the most sites a path it would queue: the last wave's, and the
-    previous chunk's bands it would cover, which the beam queue's per-band PROFILE carries
+    memory left beside the camera kernel's local reservation holds -- less in a process's first
+    call, before the kernel's first launch has reserved it (on `gallery_rain`, ~390 K requests
+    there and 1 M after). A wave holds the most paths
+    n whose sites fit the requests at the most sites a path (a quarter high) of the last wave and
+    of the previous chunk's bands within the wave, found by walking the bands in order -- so a
+    sparse wave is sized by its own bands, not a dense one further on, and the sky rows above a
+    room do not size the room's wave. The bands are the beam queue's per-band PROFILE
     (`WfBand::sitesPerPath`, kept across calls, so an epoch's first wave is sized by the last
-    epoch's, and the sky rows above a room do not size the room's wave). That clamps the wave
-    alone, the beam queue's size untouched, and never below the threads the device holds
-    resident: a smaller wave idles the camera kernel, which costs more than gathering the excess
-    inline. A site the full queue turns away is gathered inline and counted (the JSPEC carrier
+    epoch's; a field a call's queues did not measure is -1, and neither queue reads another's
+    zeros). Without a profile a wave assumes at least 2 sites a path. That clamps the wave alone,
+    the beam queue's size untouched, and never below the camera kernel's resident threads
+    (`cudaOccupancyMaxActiveBlocksPerMultiprocessor`; 49 152 on an RTX 4090, its launch bounds
+    holding 3 blocks an SM): a smaller wave idles it, which costs more than gathering the excess
+    inline. A chunk that takes k waves takes k of one size, not k-1 full ones and a remainder:
+    on `gallery_rain` a 307 200-path chunk split 281 387 + 25 813, and the remainder ran on a
+    part of the device through its deepest path's tail (16 ms a sample). A site the full queue turns away is gathered inline and counted (the JSPEC carrier
     and chromatic tables are allocated exactly when kBdptT's switches need them, and a guard
     counts a site that found one missing). The gather is launched sized to the wave's sites: a
     dense beam map's waves are a few thousand paths, and a fixed grid idled through each (measured
@@ -756,10 +764,14 @@ Four consequences worth knowing:
     report. The VRAM preflight counts the beam queue (`cudaModeJBeamQueueBytes`), which is fixed;
     the point merges' queue takes what room is left. Measured at 640x480 (GPU time a
     sample): `_fog_cornell`'s surface merges 378 -> 219 ms, the camera kernel back to mode D's
-    155; `gallery_rain` unchanged (751), its surface gather small. `FTRACE_NOSURFWF=1` is the A/B
+    155; `gallery_rain` neutral (679 against 667-678 inline at 32 spp over 16 pinned epochs: an
+    unpinned or short render's numbers move with its clock-ended epochs), its gather small.
+    `FTRACE_NOSURFWF=1` is the A/B
     control; `tools/check_surf_wavefront.py` requires the inline gather's image on
     `_fog_cornell`, with the queue shrunk to overflow (`FTRACE_SURFWFCAP`) too, and in a box of
-    chromatic fog whose sites fill the carrier and chromatic tables.
+    chromatic fog whose sites fill the carrier and chromatic tables; and, through
+    `FTRACE_WAVE_DEBUG`'s line a wave, that a shrunk queue splits chunks into waves of which none
+    past the first chunk turns a site away.
   - **Weighted bundles, and one shared surface rule (0.257.0 — `UPBP-BOWFOLD`).** Both claims used
     to die at the **first surface interaction of any kind**, which is what capped mode `J` at
     36.2 % bundled / 47.0 % folded: a subpath that so much as grazed a diffuse wall deposited the
