@@ -2390,7 +2390,26 @@ million beams and are good to 2-3x on any one scene (the camera units' own cost 
 with the medium), so the light side lands at 5-20 % of the time instead of 10 %. Counts are
 sums over the frame, so the image is the same at any `-t`; `tools/check_jdeterminism.py` holds
 it. `FTRACE_JWORK=1` prints each epoch's units and seconds. A `-time`/`-noise`/`-forever` budget
-and the device keep the clock. **Mode M's CPU loop does the same since 0.434.23**
+keeps the clock.
+
+**The device counts too since 0.438.0 (GPU-J-CLOCK).** On the clock a GPU render varied from run
+to run as the CPU's had, and eight GPU checks inherited it (check_jchroma's verdict flipped). Its
+camera pass counts its own work into device counters (`g_dWork`, spread over 64 slots by block
+against contention, summed per call: `cudaLastBdptWork`): kBdptT a vertex and a connection it
+could evaluate, the point merges a photon in a site's cells (queued or inline), the device
+surface-light pass a vertex, and the host a beam hit its waves evaluate -- integer sums, the same
+in any order. A device unit weighs `kJWorkDeviceUnit` (2.0) of the CPU's and each call
+`kJWorkDeviceCall` (5e5) on the light side, both fitted with `FTRACE_JWORK=1`
+(`scraps/_jwork_fit.py`, whose scenes spread them 0.93-6.8 and 0.8-15e5: a heterogeneous
+medium's vertex costs more than its count). The flight cap (`jAutoEpochs`) counts on the device
+too. And since a GPU chunk draws its own surface photons under `-jsurf` (salted by its first
+sample), the chunk boundaries reach the image: there the chunks are sized by the counts as well
+(`cudaSetCountedChunks`, `kChunkDeviceUnits` 2e6 a chunk, 0.03-2.5 s where the clock aims at
+0.15 s); elsewhere the clock keeps sizing them, the boundaries touching nothing but the order of the
+film's sums. `-beamepochs` still pins chunks to 1 spp, a flight's frames sharing their per-chunk
+photons by sample. check_jdeterminism holds GPU mode J, with and without `-jsurf`, to repeat
+itself (to `fogbox.ORDER_TOL`, the film's atomic sums landing in any order). **Mode M's CPU loop
+does the same since 0.434.23**
 (MODEM-CPU-NONDET; the counters live in `workcount.h`): its light units are the photon paths and
 each grid's or map's build, its camera units the rays, the beams weighed and a sixteenth of each
 photon-map query candidate (thread-local, flushed per pass, the candidates divided once over the

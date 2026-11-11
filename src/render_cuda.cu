@@ -57,6 +57,7 @@
 #include <condition_variable>
 #include <type_traits>           // kBdptT's per-MERGE scratch (DChromaRunNone)
 #include <memory>                // renderBdptCuda's DeviceStopScope
+#include <functional>            // gpuSppChunks' work count
 #include <math.h>
 #include <float.h>
 
@@ -8745,6 +8746,20 @@ __device__ __forceinline__ void dGatherRetire() {
 #else
     atomicAdd(g_dGatherDone, 1ull);
 #endif
+}
+
+// ---- mode J's camera WORK COUNT on the device (GPU-J-CLOCK) ----
+//
+// The light-side refresh of a fixed -spp render ends its epochs on deterministic work counts
+// (bdpt::JWork, bdpt::CountedEpochs), so a render repeats whatever the machine's speed. The
+// device's camera pass counts its own here: a vertex traced, a connection evaluated, a photon a
+// point merge weighs (the host adds the beam hits its waves evaluate). Integer sums, so the total
+// is the same in any order. Spread over kDWorkSlots counters by block, against contention;
+// renderBdptCuda zeroes them per call and sums them after.
+constexpr int kDWorkSlots = 64;
+__device__ unsigned long long g_dWork[kDWorkSlots];
+__device__ __forceinline__ void dAddWork(unsigned long long n) {
+    if (n) atomicAdd(&g_dWork[blockIdx.x & (kDWorkSlots - 1)], n);
 }
 
 // --- The merge weight itself (mode J) --------------------------------------------------
@@ -19388,18 +19403,21 @@ __device__ static inline void dSurfMergePhoton(const DScene& sc, const DSurfMap&
     gX += (double)ph.cx * cf; gY += (double)ph.cy * cf; gZ += (double)ph.cz * cf;
 }
 // One camera vertex's gather, by the thread that reached it (the inline path; kWfSurfGather is the
-// wavefront's, a warp a site).
-__device__ static void dSurfMergeAt(const DScene& sc, const DSurfMap& sm, const DVertex& vk,
-                                    const DVec3& woCam, const DSurfMergeW& sw,
-                                    double& gX, double& gY, double& gZ,
-                                    const DJSpec* js = nullptr) {
+// wavefront's, a warp a site). Returns the photons it weighed (g_dWork's count).
+__device__ static int dSurfMergeAt(const DScene& sc, const DSurfMap& sm, const DVertex& vk,
+                                   const DVec3& woCam, const DSurfMergeW& sw,
+                                   double& gX, double& gY, double& gZ,
+                                   const DJSpec* js = nullptr) {
     const DSurfSite site(sc, sm, vk);
-    for (int n = 0; n < 27; ++n) {
-        const long long c = site.cell(sm, n);
+    int n = 0;
+    for (int c27 = 0; c27 < 27; ++c27) {
+        const long long c = site.cell(sm, c27);
         if (c < 0) continue;
         for (int q = sm.cellStart[c]; q < sm.cellStart[c + 1]; ++q)
             dSurfMergePhoton(sc, sm, vk, site, woCam, sw, q, gX, gY, gZ, js);
+        n += sm.cellStart[c + 1] - sm.cellStart[c];
     }
+    return n;
 }
 
 // The first `n` queued sites (DSurfQueue), a warp each: the lanes take the site's photons in turn,
@@ -19430,13 +19448,14 @@ __global__ void kWfSurfGather(DScene sc, DSurfMap sm, DSurfQueue sq, int n, doub
         // so the warp spends ceil(photons / 32) rounds on the site, not a round or more a cell.
         // A lane keeps its place in the list as a cell (`next`, the walk's next) and a photon
         // `q` in [q, qEnd), and passes `skip` photons over to reach its next one.
-        int next = 0, q = 0, qEnd = 0, skip = lane;
+        // Every lane walks all 27 cells, so each counts the site's photons (`total`).
+        int next = 0, q = 0, qEnd = 0, skip = lane, total = 0;
         for (;;) {
             while (qEnd - q <= skip && next < 27) {
                 skip -= qEnd - q;
                 const long long c = site.cell(sm, next++);
                 q = qEnd = 0;
-                if (c >= 0) { q = sm.cellStart[c]; qEnd = sm.cellStart[c + 1]; }
+                if (c >= 0) { q = sm.cellStart[c]; qEnd = sm.cellStart[c + 1]; total += qEnd - q; }
             }
             if (qEnd - q <= skip) break;   // the list ends before this lane's next photon
             q += skip;
@@ -19444,6 +19463,7 @@ __global__ void kWfSurfGather(DScene sc, DSurfMap sm, DSurfQueue sq, int n, doub
             ++q;
             skip = 31;
         }
+        if (lane == 0) dAddWork((unsigned long long)total);
         for (int off = 16; off > 0; off >>= 1) {
             gX += __shfl_down_sync(0xffffffffu, gX, off);
             gY += __shfl_down_sync(0xffffffffu, gY, off);
@@ -19534,6 +19554,7 @@ kBdptT(DScene sc, const __grid_constant__ DCamera cam, double* camFilm, double* 
     // and they can take seconds -- but the flag, mapped host memory a bus round trip away, is read
     // only on the first and then once ~1 ms of clock (2^21 cycles) has passed.
     long long stopNext = 0;
+    unsigned long long work = 0;   // mode J's camera work count (g_dWork), added as the thread ends
     for (long long idx = idxBegin + g; idx < idxEnd; idx += G) {
         const long long cyc = clock64();
         if (cyc >= stopNext) {
@@ -19626,6 +19647,8 @@ kBdptT(DScene sc, const __grid_constant__ DCamera cam, double* camFilm, double* 
                                    wantSegs ? (int)SEGN : 0, jSpecOn ? &jrun : nullptr,
                                    (jSpecOn && kappaSurf > 0.0) ? vspec : nullptr);
         int nL = dGenLightSubpath(sc, camS, diffraction, hb, maxDepth + 1, rng, light, lightSec, NS, MAXV);
+        // Its vertices and the connections the loop below can evaluate.
+        if (MERGE) work += (unsigned long long)(nE + nL + nE * ((nL > 0 ? nL : 1) + 1));
         // The beam merge's factors at every interior vertex, between its subpath neighbours: each
         // connection's weight reads them (dMisWeight), as do the camera-side sums below -- only
         // where this sub-sample draws mode J's paths (a D-routed connection weighs no merge).
@@ -20024,7 +20047,7 @@ kBdptT(DScene sc, const __grid_constant__ DCamera cam, double* camFilm, double* 
                         atomicAdd(sq.overflow, 1);
                     }
                     double gX = 0.0, gY = 0.0, gZ = 0.0;
-                    dSurfMergeAt(sc, sm, vk, woCam, sw, gX, gY, gZ, vks);
+                    work += (unsigned long long)dSurfMergeAt(sc, sm, vk, woCam, sw, gX, gY, gZ, vks);
                     if (gX != 0.0 || gY != 0.0 || gZ != 0.0) {
                         atomicAdd(&camFilm[o + 0], gX * f);
                         atomicAdd(&camFilm[o + 1], gY * f);
@@ -20035,6 +20058,7 @@ kBdptT(DScene sc, const __grid_constant__ DCamera cam, double* camFilm, double* 
         }
         }   // sub-samples (per-mode sample counts)
     }
+    if (MERGE) dAddWork(work);
 }
 
 // ----------------------- final-gather sub-ray (mode M, -pmfg) ----------------
@@ -23286,6 +23310,7 @@ kJSurfLightT(DScene sc, DCamera cam, int diffraction, int maxDepth,
     const DPatEnv env = dPatEnvOf(sc);
     const long long g = (long long)blockIdx.x * blockDim.x + threadIdx.x;
     const long long G = (long long)gridDim.x * blockDim.x;
+    unsigned long long work = 0;   // the vertices traced, mode J's camera-side count (g_dWork)
     for (long long i = g; i < nPaths; i += G) {
         // Seeded by ABSOLUTE subpath index, exactly as the host pass is ("so the map is
         // identical for any thread count"), so the realization depends on (index, salt) and
@@ -23305,6 +23330,7 @@ kJSurfLightT(DScene sc, DCamera cam, int diffraction, int maxDepth,
         const int np = dGenLightSubpath(sc, cam, diffraction, hb, maxDepth + 1, rng,
                                         path, pathSec, 0, MAXV, compoundMergeW);
         if (np <= 0) continue;
+        work += (unsigned long long)np;
         const Real cx = cieX(lambda), cy = cieY(lambda), cz = cieZ(lambda);
         // The recurrence, carried as scalars at index u-1 (see the note above).
         double accC = 0.0, accMb = 0.0, accMs = 0.0;
@@ -23369,6 +23395,7 @@ kJSurfLightT(DScene sc, DCamera cam, int diffraction, int maxDepth,
             accMs = rL * (msPrev + eSurf);
         }
     }
+    dAddWork(work);
 }
 
 // Forced instantiation of both depth variants (BDPT_MAXDEPTH / BDPT_DEEPDEPTH, the same pair
@@ -25395,6 +25422,8 @@ static void sceneOrHeld(const Scene& scene, const CudaSceneHold* held, DUpload& 
 }
 static double g_lastBdptOverheadSec = 0.0;
 double cudaLastBdptOverheadSec() { return g_lastBdptOverheadSec; }
+static long long g_lastBdptWork = 0;
+long long cudaLastBdptWork() { return g_lastBdptWork; }
 CudaSceneHold* cudaHoldScene(const Scene& scene) {
     if (!cudaAvailable()) return nullptr;
     // FTRACE_NOHOLD=1: hold nothing, so every call uploads the scene itself -- the A/B arm for
@@ -25919,9 +25948,17 @@ bool cudaBdptSupported(const Scene& scene) {
 // timing put them (main.cpp `-beamepochs`).
 static bool g_fixedChunks = false;
 void cudaSetFixedChunks(bool on) { g_fixedChunks = on; }
+// cudaSetCountedChunks(true) sizes the chunks by a launch's device work count (`work`, the units
+// so far; renderBdptCuda passes one only where its chunks draw surface photons) rather than its
+// seconds: kChunkDeviceUnits a chunk. The 0.15 s the clock aims at was 0.1-9 M units on an RTX
+// 4090 (a heterogeneous medium's vertices cost the most), so a counted chunk takes 0.03-2.5 s.
+static bool g_countedChunks = false;
+void cudaSetCountedChunks(bool on) { g_countedChunks = on; }
+constexpr double kChunkDeviceUnits = 2.0e6;
 template <class LaunchFn, class DownloadFn>
 static void gpuSppChunks(long long spp, const SppProgress& prog, Film& out,
-                         LaunchFn&& launch, DownloadFn&& download) {
+                         LaunchFn&& launch, DownloadFn&& download,
+                         const std::function<long long()>& work = {}) {
     using clk = std::chrono::steady_clock;
     // Same two diagnostic levers cpuSppChunks has, and for the same reason: when a render
     // appears to hang, the first question is always "how big did the chunk get, and how long
@@ -25935,6 +25972,8 @@ static void gpuSppChunks(long long spp, const SppProgress& prog, Film& out,
     const bool chunkDebug = [] { const char* e = std::getenv("FTRACE_CHUNK_DEBUG");
                                  return e && *e && std::strcmp(e, "0"); }();
     long long done = 0, chunk = (forcedChunk > 0) ? forcedChunk : 1;
+    const bool counted = g_countedChunks && work && forcedChunk <= 0;
+    long long work0 = counted ? work() : 0;
 
     // ---- the -time deadline (SppProgress::deadline) ----------------------------------
     // Only a launch that can be dropped -- one returning whether it landed whole, whose kernels
@@ -26086,8 +26125,17 @@ static void gpuSppChunks(long long spp, const SppProgress& prog, Film& out,
         if (chunkDebug)
             std::fprintf(stderr, "[chunk] gpu %lld spp in %.3f s (%.1f spp/s), %lld/%lld done\n",
                          c, dt, dt > 0 ? c / dt : 0.0, done, spp);
-        if (forcedChunk <= 0 && dt > 1e-4) {               // retarget ~0.15 s per chunk
-            long long next = (long long)((double)c * (0.15 / dt));
+        // Retarget ~0.15 s per chunk: on the clock, or in the device's units when counted.
+        double scale = 0.0;
+        if (counted) {
+            const long long w = work();
+            if (w > work0) scale = kChunkDeviceUnits / (double)(w - work0);
+            work0 = w;
+        } else if (forcedChunk <= 0 && dt > 1e-4) {
+            scale = 0.15 / dt;
+        }
+        if (scale > 0.0) {
+            long long next = (long long)((double)c * scale);
             if (next < 1)          next = 1;
             if (next > c * 8 + 1)  next = c * 8 + 1;        // ramp up, but not explosively
             chunk = next;
@@ -26823,10 +26871,18 @@ Film renderBdptCuda(const Scene& scene, const Camera& cam, int resX, int resY,
                     const bdpt::SurfMap* smap, const CudaSceneHold* held) {
     using namespace gpu;
     Film out; out.resX = resX; out.resY = resY; out.alloc();
+    g_lastBdptWork = 0;
     if (!cudaAvailable() || !cudaBdptSupported(scene)) return out;
     // Everything but the chunks is this call's fixed cost (cudaLastBdptOverheadSec): what a
     // mode-J epoch pays on top of its samples.
     const auto tCall0 = std::chrono::steady_clock::now();
+    // The call's camera work (cudaLastBdptWork): the kernels' count, and the beam hits the
+    // waves evaluate.
+    {
+        const unsigned long long zero[kDWorkSlots] = {};
+        CUDA_CHECK(cudaMemcpyToSymbol(g_dWork, zero, sizeof zero));
+    }
+    long long wfHitsCall = 0;
     // Two kernel variants: the default shallow stack, and a deep one for scenes that need
     // it. Anything past BDPT_DEEPDEPTH still clamps — going deeper would need another
     // instantiation, and the local-memory footprint is already ~13 KB/thread there.
@@ -27495,6 +27551,7 @@ Film renderBdptCuda(const Scene& scene, const Camera& cam, int resX, int resY,
                     wfInlineSegs += cnt[2];
                     wfLastSegs = (cnt[0] < wq.segCap) ? cnt[0] : wq.segCap;
                     wfLastHits = waveHits;
+                    wfHitsCall += waveHits;   // each hit is a beam weighed (g_dWork's count)
                     const long long paths = b1 - b0;
                     const double segsPerPath = (paths > 0) ? (double)cnt[0] / (double)paths : (double)(maxDepth + 3);
                     // per QUEUED segment: those gathered inline (cnt[2]) left no hits in the queue
@@ -27538,10 +27595,21 @@ Film renderBdptCuda(const Scene& scene, const Camera& cam, int resX, int resY,
       // stopped launching waves.
       return !(abortable && (DeviceStopScope::seen() || leftEarly));
     };
+    // The call's camera work so far (cudaLastBdptWork), which counted chunks are sized by.
+    const std::function<long long()> workSoFar = [&]() -> long long {
+        unsigned long long w[kDWorkSlots] = {};
+        CUDA_CHECK(cudaMemcpyFromSymbol(w, g_dWork, sizeof w));
+        long long sum = wfHitsCall;
+        for (unsigned long long x : w) sum += (long long)x;
+        return sum;
+    };
 
     const auto tCall1 = std::chrono::steady_clock::now();
     if (!prog || !prog->report) { launch(spp, sppBase); download(out); }   // single-shot
-    else gpuSppChunks(spp, *prog, out, launch, download);
+    // Counted chunks (cudaSetCountedChunks) only where a chunk draws its own surface photons: the
+    // chunk boundaries reach the image there alone, and the clock keeps chunks nearer 0.15 s.
+    else gpuSppChunks(spp, *prog, out, launch, download,
+                      jPerChunk ? workSoFar : std::function<long long()>{});
     const auto tCall2 = std::chrono::steady_clock::now();
 
     freeUpload(up);
@@ -27575,6 +27643,7 @@ Film renderBdptCuda(const Scene& scene, const Camera& cam, int resX, int resY,
         if (sq.chroma) cudaFree(sq.chroma);
     }
     cudaFree(d_cam); cudaFree(d_splat);
+    g_lastBdptWork = workSoFar();
     g_lastBdptOverheadSec =
         std::chrono::duration<double>((tCall1 - tCall0) +
                                       (std::chrono::steady_clock::now() - tCall2)).count();

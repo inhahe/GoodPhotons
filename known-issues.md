@@ -310,9 +310,20 @@ the log's own cadence), and the pollers here, in mode M's photon pass and in the
 gather wait on `PollStop` (render_progress.h), which the owner notifies, instead of polling a
 flag between 10-50 ms sleeps that every join paid.
 
-## OPEN (2026-11-11, found in review of c7c4aa7): GPU-J-CLOCK — GPU mode J at a fixed -spp renders differently run to run, and eight checks inherit it
+## DONE (2026-11-11, 0.438.0; found in review of c7c4aa7): GPU-J-CLOCK — GPU mode J at a fixed -spp rendered differently run to run, and eight checks inherited it
 
-The device ends mode J's light-side epochs on the clock unless `-beamepochs` pins them (design.md,
+**Fixed in 0.438.0, option (a), the user's choice:** the device counts too (design.md, "The
+device counts too"). Its camera pass adds its work to device counters (`g_dWork`,
+`cudaLastBdptWork`: a vertex, a connection it could evaluate, a photon a point merge weighs, a
+vertex of the device surface-light pass, and the beam hits the waves evaluate), weighed by
+`kJWorkDeviceUnit` against the CPU's light units, each call charging `kJWorkDeviceCall` to the
+light side; the flight cap counts too; and under `-jsurf`, whose GPU chunks each draw their own
+surface photons, the chunks are sized by the counts (`cudaSetCountedChunks`). The constants were
+fitted with `FTRACE_JWORK=1` on five scenes (`scraps/_jwork_fit.py`). check_jdeterminism holds GPU
+mode J, with and without `-jsurf`, to repeat itself twice and at one thread; with the device put
+back on the clock it fails. The rest of this entry is how it stood.
+
+The device ended mode J's light-side epochs on the clock unless `-beamepochs` pinned them (design.md,
 "On the CPU at a fixed -spp": "a -time/-noise/-forever budget and the device keep the clock";
 J-CPU-NONDET moved only the CPU onto counted epochs). So which camera samples meet which light-side
 realization, and how many realizations there are, follow the machine's speed: two runs of one

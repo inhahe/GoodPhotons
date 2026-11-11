@@ -1,8 +1,10 @@
-"""Regression check: CPU modes J and M at a fixed -spp render the same image every time.
+"""Regression check: modes J (CPU and GPU) and M (CPU) at a fixed -spp render the same image every
+time.
 
     python tools/check_jdeterminism.py [--out png/check_jdeterminism] [--exe ftrace.exe]
 
-`-device cpu` is the reference and validation device, so it must repeat itself. Mode J splits a
+`-device cpu` is the reference and validation device, so it must repeat itself, and so must the
+GPU, whose renders the checks hold to tolerances a run-to-run scatter would eat. Mode J splits a
 render into light-side epochs, each drawing a new beam map; on the CPU at a fixed -spp an epoch
 ends on work counts (workcount.h: vertices traced, connections, beams and photons weighed, the
 beam map's build), not on the clock, which made which samples met which map depend on the
@@ -16,6 +18,12 @@ default fixed map, and in mode M (-beams, 64 spp, -beamrefresh 0.5), each:
   - twice, byte for byte the same;
   - and at one thread, the same again: the counts are sums over the frame, which no division of
     it among threads changes.
+
+On the GPU (GPU-J-CLOCK) mode J's camera pass counts its own work (cudaLastBdptWork) and its
+chunks, which each draw their own device surface photons under -jsurf, are sized by those counts
+rather than timed. Mode J on the GPU, under the knee rule with and without -jsurf, must repeat
+itself twice and at one thread too -- to fogbox.ORDER_TOL rather than byte for byte, the film's
+atomic sums landing in any order; an epoch or chunk laid by the clock moves pixels by per cent.
 
 Each needs more than one epoch to mean anything, and says how many it got. And mode M resumed
 from a checkpoint draws its light side under salts of its own, not the first session's, at the
@@ -31,6 +39,8 @@ import sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 NL = chr(10)
+sys.path.insert(0, os.path.join(ROOT, "tools"))
+import fogbox  # noqa: E402
 
 SCENE = NL.join([
     "scene { units meters  spectral 360 830 1 }",
@@ -68,21 +78,32 @@ def main():
     fails = []
 
     # J: the knee rule (-beamcount and -beamk select it); Jfixed: the default fixed map (-jbeams).
-    CASES = {"J": ["-mode", "J", "-spp", "256", "-beamcount", "100000", "-beamk", "2", "-nojsurf"],
-             "Jfixed": ["-mode", "J", "-spp", "256", "-nojsurf"],
-             "M": ["-mode", "M", "-beams", "-n", "20000", "-spp", "64", "-beamrefresh", "0.5"]}
+    # Jgpu: the knee rule on the GPU; Jgpu-jsurf: with point merges, whose surface photons each
+    # GPU chunk draws.
+    KNEE = ["-mode", "J", "-spp", "256", "-beamcount", "100000", "-beamk", "2"]
+    CASES = {"J": ["-device", "cpu"] + KNEE + ["-nojsurf"],
+             "Jfixed": ["-device", "cpu", "-mode", "J", "-spp", "256", "-nojsurf"],
+             "M": ["-device", "cpu", "-mode", "M", "-beams", "-n", "20000", "-spp", "64",
+                   "-beamrefresh", "0.5"],
+             "Jgpu": ["-device", "gpu", "-window-min"] + KNEE + ["-nojsurf"],
+             "Jgpu-jsurf": ["-device", "gpu", "-window-min"] + KNEE + ["-jsurf"]}
 
     def render(mode, tag, extra=()):
         png = os.path.join(d, "%s_%s.png" % (mode, tag))
-        cmd = [exe, "-in", ftsl, "-device", "cpu", "-max-bounce", "8", "-no-meter", "-hdr",
+        if os.path.exists(png[:-4] + ".pfm"):
+            os.remove(png[:-4] + ".pfm")
+        cmd = [exe, "-in", ftsl, "-max-bounce", "8", "-no-meter", "-hdr",
                "-seed", "1", "-o", png] + CASES[mode] + list(extra)
         p = subprocess.run(cmd, cwd=d, capture_output=True, text=True, encoding="utf-8",
                            errors="replace")
-        if p.returncode != 0:
-            print((p.stdout + p.stderr)[-1500:])
+        log = p.stdout + p.stderr
+        if p.returncode != 0 or "[stop] interrupted" in log or not os.path.exists(png[:-4] + ".pfm"):
+            print(log[-1500:])
             raise SystemExit("render failed: " + " ".join(cmd))
-        m = re.search(r"\[jstats\] (\d+) epochs|averaged (\d+) independent light-side",
-                      p.stdout + p.stderr)
+        if "-device" in CASES[mode] and "gpu" in CASES[mode] and "on GPU" not in log:
+            print(log[-1500:])
+            raise SystemExit("mode %s did not run on the GPU" % mode)
+        m = re.search(r"\[jstats\] (\d+) epochs|averaged (\d+) independent light-side", log)
         with open(png[:-4] + ".pfm", "rb") as f:
             return f.read(), int(m.group(1) or m.group(2)) if m else 0
 
@@ -91,13 +112,23 @@ def main():
         if not ok:
             fails.append(name)
 
+    def same(mode, tag, a, b):
+        """Byte for byte on the CPU; on the GPU to fogbox.ORDER_TOL (atomic sums). Returns the
+        check's name and verdict and its detail."""
+        if "gpu" not in CASES[mode]:
+            return "mode %s: %s byte for byte the first" % (mode, tag), a == b, ""
+        pa, pb = (os.path.join(d, "%s_%s.pfm" % (mode, t)) for t in ("run1", tag))
+        r, n = fogbox.image_diff(fogbox.load_pfm(pa), fogbox.load_pfm(pb))
+        return ("mode %s: %s the first, to %g of a pixel" % (mode, tag, fogbox.ORDER_TOL),
+                r < fogbox.ORDER_TOL, "largest change %.2g, %d values differ" % (r, n))
+
     for mode in CASES:
         first, epochs = render(mode, "run1")
         check("mode %s: more than one light-side epoch" % mode, epochs > 1, "%d epochs" % epochs)
         second, _ = render(mode, "run2")
-        check("mode %s: a second run is byte for byte the first" % mode, second == first)
+        check(*same(mode, "run2", first, second))
         single, _ = render(mode, "t1", ("-t", "1"))
-        check("mode %s: so is a run at one thread" % mode, single == first)
+        check(*same(mode, "t1", first, single))
 
     # A resumed mode M render must not gather from a light side the checkpoint already averaged,
     # so it draws its own under salts past the loaded samples'; but at the radii they were

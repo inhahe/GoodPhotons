@@ -338,6 +338,11 @@ constexpr int kSunAimMaxTargets = 64;
 // whatever a chunk draws (mode J's device surface photons, salted by the chunk's first sample)
 // lands on the same samples in every render. Set by mode J under `-beamepochs`, cleared after.
 void cudaSetFixedChunks(bool on);
+// Size mode J's spp-progressive GPU chunks by the device's work count (cudaLastBdptWork's units)
+// instead of timing, so the chunk boundaries -- and the device surface photons each chunk draws --
+// fall where the counts put them, the same on every run (GPU-J-CLOCK). Set by mode J's counted
+// refresh (a fixed -spp, no -beamepochs), cleared after; cudaSetFixedChunks wins where both are.
+void cudaSetCountedChunks(bool on);
 // JSPEC's dispersive window (0.386.2, bdpt g_jDispWinNm / g_jDispAll): its full width in nm, and
 // whether dispersive refraction and a real lens open it as a grating's non-zero order does.
 void cudaSetJDisp(double winNm, int all);
@@ -386,6 +391,11 @@ bool cudaJSurfHostless();
 // setup before the first launch and the teardown after the last). Mode J's epoch loop reads
 // it to weigh one light-side realization per sample against the samples themselves.
 double cudaLastBdptOverheadSec();
+// The camera-side work of the last renderBdptCuda call, in device units (render_cuda.cu
+// g_dWork: the vertices it traced, the connections it could evaluate, the photons and beam hits
+// its merges weighed). Deterministic: mode J's counted refresh reads it, weighed by
+// bdpt::kJWorkDeviceUnit, where the CPU reads bdpt::jWork().cam (GPU-J-CLOCK).
+long long cudaLastBdptWork();
 
 // GPU bidirectional path trace (mode D). Renders `spp` samples per pixel at the given
 // resolution and returns the film accumulated as a SUM over spp (display divides by

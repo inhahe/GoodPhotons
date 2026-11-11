@@ -23,9 +23,11 @@ and cancels there; the frame's Y must agree within 1.5 %. About 25 minutes on th
 defaults: run it after a change to mode J's weights.
 
 On the GPU a J render's light-side epochs are pinned (--epochs, `-beamepochs`; by default
---jspp / 8, about what the clock chose: 234-329 at 2048 spp): the device ends them on the clock
-otherwise, so the verdict moved with the machine's speed -- one binary failed one run and passed
-another (known-issues JCHROMA-CLOCK). Pinned, a binary's verdict is the same every run. It is
+--jspp / 8, about what the clock chose: 234-329 at 2048 spp). Until 0.438.0 the device ended them
+on the clock, and the verdict moved with the machine's speed -- one binary failed one run and
+passed another (known-issues JCHROMA-CLOCK); it counts them now (GPU-J-CLOCK), and the pin keeps
+the verdict where it is should those counts' constants be refitted. Pinned, a binary's verdict is
+the same every run. It is
 still a sample: a render's X and Z over Y scatter by 0.5-1 %, from its camera samples and its
 light-side realizations alike (one seed's ratios move by up to 2 % between 64, 256 and 1024
 epochs, in no consistent direction; holding the radii still, `-vcmalpha 1`, moves them by 0.1 %).

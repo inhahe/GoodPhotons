@@ -60,6 +60,18 @@ struct CamWorkFlush {
 // camera units' own cost moves that much with the medium -- which moves the light side's share
 // between about 5 and 20 % at the default -beamrefresh 0.10.
 constexpr long long kJWorkRebuildFixed = 500000;
+// The device's camera pass in these units (GPU-J-CLOCK): a device unit (cudaLastBdptWork: a vertex,
+// a connection it could evaluate, a photon or beam hit a merge weighs) weighs kJWorkDeviceUnit of
+// the CPU's, and each renderBdptCuda call -- one an epoch -- adds kJWorkDeviceCall to the light
+// side, its fixed cost (the maps' upload and grid, the queues). Fitted like the CPU's
+// (FTRACE_JWORK=1, scraps/_jwork_fit.py), on an RTX 4090 against 32 CPU threads: a device unit
+// against a light unit read 1.7 (_fog_cornell), 2.9 (_fog_thick), 0.93 (gallery_rain) and 6.8
+// (check_jchroma's heterogeneous fog, whose vertices cost more than their count), a call's setup
+// 10-52 ms, 0.8-15e5 light units -- geometric means taken, so the light side lands within a few
+// times of its share, as on the CPU. A card faster or slower against its CPU moves the share,
+// never the repeatability.
+constexpr double    kJWorkDeviceUnit = 2.0;
+constexpr long long kJWorkDeviceCall = 500000;
 // A map's build in JWork units: its sort (and a beam map's SAH BVH), n log n in its items.
 constexpr double kJWorkPerBeamLog = 0.17;
 inline long long jWorkBeamBuild(size_t nBeams) {
