@@ -334,10 +334,6 @@ void cudaSetRouting(int on, int routeDefault, int anyMedJ, double sppD, double s
 // The aimed sun's target capacity on the device (its constant arrays). The host clusters the
 // targets to bdpt::SunAim::kMaxTargets, which main.cpp asserts equals this.
 constexpr int kSunAimMaxTargets = 64;
-// Redraw mode J's device surface photons every sample (salted by its absolute index) instead of
-// every block of samples the device's counts size, so every frame of a flight draws them for the
-// same samples. Set by mode J under `-beamepochs`, cleared after.
-void cudaSetSurfPerSample(bool on);
 // JSPEC's dispersive window (0.386.2, bdpt g_jDispWinNm / g_jDispAll): its full width in nm, and
 // whether dispersive refraction and a real lens open it as a grating's non-zero order does.
 void cudaSetJDisp(double winNm, int all);

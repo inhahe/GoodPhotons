@@ -18721,7 +18721,8 @@ static Film cpuSppChunks(long long sppTarget, const SppProgress* prog, int resX,
         if (settledChunk < 1) settledChunk = 1;
     }
     while (done < end) {
-        long long c = chunk; if (c > end - done) c = end - done;
+        long long c = (done == 0 && prog->span) ? 1 : chunk;   // a span prices one sample
+        if (c > end - done) c = end - done;
         auto t0 = clk::now();
         Film f = renderOne(c, seedBias + (unsigned long long)done);
         // A renderer may ABANDON its chunk part-way when `-stop` / Ctrl-C arrives (the camera
@@ -20902,7 +20903,7 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
                         "noise holds still from frame to frame%s%s\n",
                         g_beamEpochs, nEp, nEp,
                         nEp < g_beamEpochs ? " (as many as epochs of whole samples allow)" : "",
-                        useGpu ? " (the device's surface photons redrawn every sample)" : "");
+                        devSurfJ ? " (the device's surface photons redrawn every sample)" : "");
             // FLYBY-BEAM-STREAKS: what a low K looks like across a flyby.
             if (inFlight && nEp < spp)
                 std::printf("[mode J] note: that is %lld samples per realization. A realization "
@@ -20913,13 +20914,6 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
                             jbb.budget > 0 ? jbb.budget : (long long)curB->beams.size());
         }
         fixedEpochsOn = fixedEpochs;
-#ifdef HAVE_CUDA
-        struct SurfPerSampleScope {
-            bool on;
-            explicit SurfPerSampleScope(bool v) : on(v) { if (on) cudaSetSurfPerSample(true); }
-            ~SurfPerSampleScope() { if (on) cudaSetSurfPerSample(false); }
-        } surfPerSampleScope(fixedEpochs && useGpu);
-#endif
         auto renderChunked = [&](long long sppTarget, const SppProgress* prog) -> Film {
             // Nothing to decorrelate (no map => mode D exactly, and gate 1a requires that path
             // stay bit-identical), or the user asked for the historical single map.
@@ -21011,7 +21005,7 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
                                                 "refresh)" : " (-beamepochs spp)",
                             shareEpochs ? "; each is traced once and kept for the batch while "
                                           "an eighth of memory holds them" : "",
-                            useGpu ? " (the device's surface photons redrawn every sample)" : "");
+                            devSurfJ ? " (the device's surface photons redrawn every sample)" : "");
             }
             uint64_t lsEpoch = 0;                    // whose realization the maps hold now
             uint64_t nRealized = 1;                  // realizations this frame drew (epoch 0's)
@@ -21043,6 +21037,9 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
             const bool countEpochs = !budgetedJ && !nFixed && !blurEpochsJ;
             long long lightWorkJ = 0;   // the last rebuild's light-side units
             long long lastSetupJ = 0;   // the last device call's own surface map, in those units
+            // Of the light sides the rule is charged, the device's part (each call's fixed cost and
+            // its own surface map): the last rebuild's, and epoch 0's call's map.
+            long long lightDevJ = 0, setup0J = 0;
             bdpt::CountedEpochs counted;
             counted.target = sppTarget;
             counted.share  = g_beamRefreshFrac;
@@ -21070,17 +21067,17 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
                 return prog->deadline != clk::time_point{} && clk::now() >= prog->deadline &&
                        prog->sessionSpp + sppAll > 0;
             };
-            // Epoch 0's first sample has priced a sample (`cam` work units for `spp` samples, the
-            // call's own surface map `setup` of them): settle K for the batch. Epoch 0's call then
-            // runs on to the end of its epoch, one sample if K is one a sample.
-            const auto settleK = [&](long long cam, long long spp, long long setup) {
+            // Epoch 0's first sample has priced a sample (`cam` work units for `spp` samples): settle
+            // K for the batch. Epoch 0's call then runs on to the end of its epoch, one sample if K
+            // is one a sample.
+            const auto settleK = [&](long long cam, long long spp) {
                 decideK = false;
                 // What later epochs pay: the call's fixed cost, a sample, and a build without
                 // epoch 0's one-time budget pilot -- in work counts (bdpt::JWork), not
                 // seconds, so K and the image repeat (J-CPU-NONDET, GPU-J-CLOCK); jAutoEpochs
                 // weighs only their ratios. On the device each epoch's call costs
-                // kJWorkDeviceCall, which build0WorkJ carries once, and its own surface map.
-                const double tSetup = useGpu ? (double)(bdpt::kJWorkDeviceCall + setup) : 0.0;
+                // kJWorkDeviceCall, which build0WorkJ carries once.
+                const double tSetup = useGpu ? (double)bdpt::kJWorkDeviceCall : 0.0;
                 const double tSpp = std::max((double)cam, 1.0) / (double)spp;
                 const double tBuild = std::max(
                     (double)build0WorkJ - (useGpu ? (double)bdpt::kJWorkDeviceCall : 0.0), 0.0);
@@ -21119,9 +21116,9 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
                     // Numbered by realization (one an epoch after the first).
                     rebuildSec = nFixed ? realize(want, 0)
                                         : realize(nRealized, prog ? (uint64_t)prog->sampleBase : 0ull);
+                    lightDevJ = (useGpu ? bdpt::kJWorkDeviceCall : 0) + lastSetupJ;
                     lightWorkJ = bdpt::jWork().light.load(std::memory_order_relaxed) - lw0 +
-                                 bdpt::kJWorkRebuildFixed + (useGpu ? bdpt::kJWorkDeviceCall : 0) +
-                                 lastSetupJ;
+                                 bdpt::kJWorkRebuildFixed + lightDevJ;
                     if (beamsPtr)   beamsPtr   = curB;
                     if (photonsPtr) photonsPtr = curS;
                     lsEpoch = want;
@@ -21171,6 +21168,7 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
                 // its samples: its report then brings sppDone 0, and `acc` is the image.
                 inner.deadline = prog->deadline;
                 inner.sessionSpp = prog->sessionSpp + sppAll;
+                inner.surfPerSample = fixedEpochs && useGpu;
                 inner.report = [&](const Film& f, long long sppDone, bool final) -> bool {
                     if (epochSec <= 0.0) {
                         const double setupSec =
@@ -21245,13 +21243,16 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
                         long long setup = 0;
                         const long long cam = callWorkJ(cw0, /*during*/true, &setup);
                         if (decideK) {
-                            settleK(cam, sppDone, setup);
+                            // Under -beamepochs, which decideK needs, the device draws a surface
+                            // map every sample (surfPerSample), its setup one sample 0's: a
+                            // sample's cost, however many epochs.
+                            settleK(cam + setup, sppDone);
                             len0 = std::min<long long>(epLen, total) - (base + sppAll);
                         } else {
                             // The call's own surface map, one a call, is the light side's: epoch
-                            // 0's build is charged it here, every later rebuild in lightWorkJ.
-                            counted.build0 += setup;
-                            len0 = counted.first(cam, sppDone, sppAll);
+                            // 0's here, every later rebuild's in lightWorkJ.
+                            setup0J = setup;
+                            len0 = counted.first(cam, sppDone, sppAll, setup);
                         }
                         return len0;
                     };
@@ -21272,26 +21273,32 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
                     static const bool jworkDiag = std::getenv("FTRACE_JWORK") != nullptr;
 #ifdef HAVE_CUDA
                     if (jworkDiag && useGpu) {
-                        // The device's raw units and the call's fixed seconds, for fitting
+                        // The device's raw units in its chunks and the call's fixed seconds
+                        // (its surface map for its setup among them), for fitting
                         // bdpt::kJWorkDeviceUnit and kJWorkDeviceCall.
-                        const long long devWork = cudaLastBdptWork();
+                        const long long setupDev = cudaLastBdptSetupWork();
+                        const long long devWork = cudaLastBdptWork() - setupDev;
                         const double setup = std::min(callSec, cudaLastBdptOverheadSec());
                         std::printf("[jwork] device: %lld units in %.4fs of chunks (%.3g s/unit), "
-                                    "call setup %.4fs\n",
+                                    "call setup %.4fs (its surface map %lld units)\n",
                                     devWork, callSec - setup,
-                                    devWork ? (callSec - setup) / (double)devWork : 0.0, setup);
+                                    devWork ? (callSec - setup) / (double)devWork : 0.0, setup,
+                                    setupDev);
                     }
 #endif
+                    // The rebuild's units are what the rule charged; its seconds, the host's
+                    // build, are the host's units' (the device's part is timed in its call).
+                    const long long rebJ = epoch == 0 ? build0WorkJ + setup0J : lightWorkJ;
+                    const long long rebDevJ = epoch == 0
+                        ? (useGpu ? bdpt::kJWorkDeviceCall : 0) + setup0J : lightDevJ;
+                    const double rebSec = epoch == 0 ? build0Sec : rebuildSec;
                     if (jworkDiag)
                         std::printf("[jwork] epoch %llu: rebuild %lld units (%lld of them the beam "
-                                    "build) %.4fs (%.3g s/unit), %lld spp %lld units %.4fs "
-                                    "(%.3g s/unit)\n",
-                                    (unsigned long long)epoch, epoch == 0 ? build0WorkJ : lightWorkJ,
-                                    curB ? jWorkBeamMap(curB->beams.size()) : 0LL,
-                                    epoch == 0 ? build0Sec : rebuildSec,
-                                    (epoch == 0 ? build0WorkJ : lightWorkJ)
-                                        ? (epoch == 0 ? build0Sec : rebuildSec) /
-                                          (double)(epoch == 0 ? build0WorkJ : lightWorkJ) : 0.0,
+                                    "build, %lld the device's) %.4fs (%.3g s/unit of the host's), "
+                                    "%lld spp %lld units %.4fs (%.3g s/unit)\n",
+                                    (unsigned long long)epoch, rebJ,
+                                    curB ? jWorkBeamMap(curB->beams.size()) : 0LL, rebDevJ, rebSec,
+                                    rebJ > rebDevJ ? rebSec / (double)(rebJ - rebDevJ) : 0.0,
                                     epochSpp, cw, callSec, cw ? callSec / (double)cw : 0.0);
                 }
                 lsGatherSec += callSec;
@@ -21650,7 +21657,7 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
                 if (countEpochsM && !counted.priced())
                     inner.span = [&, cw0, cc0](long long sppDone) {
                         if (len0 < 0)
-                            len0 = counted.first(bdpt::jWork().camSince(cw0, cc0), sppDone, sppAll);
+                            len0 = counted.first(bdpt::jWork().camSince(cw0, cc0), sppDone, sppAll, 0);
                         return len0;
                     };
                 Film f = renderEpoch(blurEpochs ? std::min(sppTarget - sppAll, blurEpochSpp)

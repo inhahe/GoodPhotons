@@ -2406,8 +2406,8 @@ in any order. A device unit weighs `kJWorkDeviceUnit` (2.0) of the CPU's and eac
 medium's vertex costs more than its count). The flight cap (`jAutoEpochs`) counts on the device
 too, and the device's tree is charged as built there (`jWorkBeamBuildDevice`, a unit a beam),
 not as the host's SAH. Under `-jsurf` each device surface realization covers a block of the
-call's samples (`surfBlock`, salted by its first), as long as keeps its light pass at a tenth of
-their camera work (`kSurfShare`), counted on the call's first sample (the map the call builds
+call's samples (`surfBlock`, salted by its first sample's absolute index alone), as many as keep
+its light pass at a tenth of their camera work (`kSurfShare`), counted on the call's first sample (the map the call builds
 for its constants is block 0's): the chunks, which the clock still sizes, no longer reach the
 image. `-beamepochs` keeps one realization a sample, the layout a flight's frames share. And a beam segment the full queue
 turns away (which ones, a race) is gathered inline from the streams the queue would give its hits
@@ -2505,7 +2505,7 @@ resumed: 0.9 % mean film difference, against 10^-17 between two straight runs; t
 not yet isolated, is the beam split, which `buildBeamMap` sizes from the run's spp). Two more
 details keep it exact:
 the device's surface-photon map is redrawn every sample, salted by the sample's absolute index
-(`cudaSetSurfPerSample`; until 0.438.2 by pinning the GPU chunks to 1 spp), so it falls on the
+(`SppProgress::surfPerSample`; until 0.438.2 by pinning the GPU chunks to 1 spp), so it falls on the
 same samples in every frame; and it needs a fixed `-spp` — a `-time`/`-noise` budget has no total to split.
 
 **K wants to be the spp, and the scene stays on the device so that it can be (0.392.0).** A

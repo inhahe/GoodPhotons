@@ -25959,11 +25959,6 @@ bool cudaBdptSupported(const Scene& scene) {
 // samples {0,1,2} ∪ {0..4} instead of {0..7} — measurably different from a plain 8 spp
 // (max channel difference 163/255 on the loom jumping_jack frame that found this).
 //
-// cudaSetSurfPerSample(true): mode J's device surface photons are redrawn every sample (blocks of
-// one, renderBdptCuda's surfBlock), salted by the sample's absolute index, so every frame of a
-// flight draws them for the same samples (main.cpp `-beamepochs`), whatever its chunks.
-static bool g_surfPerSample = false;
-void cudaSetSurfPerSample(bool on) { g_surfPerSample = on; }
 template <class LaunchFn, class DownloadFn>
 static void gpuSppChunks(long long spp, const SppProgress& prog, Film& out,
                          LaunchFn&& launch, DownloadFn&& download) {
@@ -26086,7 +26081,8 @@ static void gpuSppChunks(long long spp, const SppProgress& prog, Film& out,
     } wjoin{watchQuit, watchdog};
 
     while (done < end) {
-        long long c = chunk; if (c > end - done) c = end - done;
+        long long c = (done == 0 && prog.span) ? 1 : chunk;   // a span prices one sample
+        if (c > end - done) c = end - done;
         auto t0 = clk::now();
         launchSpp.store(c, std::memory_order_relaxed);
         launchStartMs.store(nowMs(), std::memory_order_seq_cst);
@@ -26125,7 +26121,7 @@ static void gpuSppChunks(long long spp, const SppProgress& prog, Film& out,
         double dt = std::chrono::duration<double>(clk::now() - t0).count();
         if (chunkDebug)
             std::fprintf(stderr, "[chunk] gpu %lld spp in %.3f s (%.1f spp/s), %lld/%lld done\n",
-                         c, dt, dt > 0 ? c / dt : 0.0, done, spp);
+                         c, dt, dt > 0 ? c / dt : 0.0, done, end);
         if (forcedChunk <= 0 && dt > 1e-4) {               // retarget ~0.15 s per chunk
             long long next = (long long)((double)c * (0.15 / dt));
             if (next < 1)          next = 1;
@@ -26352,6 +26348,12 @@ static void uploadSunAim() {
 static unsigned long long jSurfSalt(const SppProgress* prog) {
     const unsigned long long base = (unsigned long long)(prog ? prog->sampleBase : 0);
     return 0x4A5355524644454CULL ^ g_rngSalt ^ (base * 0x9E3779B97F4A7C15ULL);
+}
+// The realization of a block of samples (renderBdptCuda's surfBlock), `first` the block's first
+// sample's absolute index: that index alone (and -seed), not where its call started, so a block
+// starting at a sample draws the same map in every call, frame and resumed session.
+static unsigned long long jSurfBlockSalt(long long first) {
+    return 0x4A5355524644454CULL ^ g_rngSalt ^ ((unsigned long long)first * 0xD1B54A32D192ED03ULL);
 }
 
 static void buildJSurfMapDevice(JSurfDev& d, const gpu::DScene& sc, const gpu::DCamera& cam,
@@ -27045,8 +27047,7 @@ Film renderBdptCuda(const Scene& scene, const Camera& cam, int resX, int resY,
         // Per block, this is block 0's realization (its salt, below), which the first chunk keeps.
         buildJSurfMapDevice(jdev, up.sc, up.dc, diffraction, maxDepth, jDevPaths,
                             smap->radius, jDevCap,
-                            jPerChunk ? jSurfSalt(prog) ^ ((unsigned long long)sppBase * 0xD1B54A32D192ED03ULL)
-                                      : jSurfSalt(prog),
+                            jPerChunk ? jSurfBlockSalt(sppBase) : jSurfSalt(prog),
                             dsm);
         startLight = workSoFar();
         g_lastBdptSetupWork = startLight;
@@ -27081,16 +27082,17 @@ Film renderBdptCuda(const Scene& scene, const Camera& cam, int resX, int resY,
     // ONE SURFACE REALIZATION A BLOCK OF SAMPLES (jPerChunk, the device drawing the surface map).
     // Realization k covers the call's samples [callBase + kB, callBase + (k+1)B) and is salted by
     // its first, so which samples meet which map is set by the device's counts, never by the
-    // chunks, whose sizes the clock sets (GPU-J-CLOCK). B (`surfBlock`, spp) is decided after the
-    // call's first chunk (1 spp) from its counts: as many samples as keep a realization's light
+    // chunks, whose sizes the clock sets (GPU-J-CLOCK). B (`surfBlock`, spp) is decided from the
+    // counts of the call's first sample, launched alone whatever its chunk (FTRACE_CHUNK_SPP's
+    // too): as many samples as keep a realization's light
     // pass at kSurfShare of their camera work -- about where four realizations a chunk measured
     // best (0.390x whole-frame variance against one, for 8.6 % of the samples; sixteen cost 53 %
     // and came out at 0.503x). A chunk is split at the blocks' edges, and a block's map is drawn
     // once, however many chunks it spans.
-    // Under -beamepochs (cudaSetSurfPerSample) one realization a sample: the layout every frame of
-    // a flight shares, which counts taken from each frame would not.
+    // Under -beamepochs (SppProgress::surfPerSample) one realization a sample: the layout every
+    // frame of a flight shares, which counts taken from each frame would not.
     constexpr double kSurfShare = 0.1;
-    long long surfBlock = g_surfPerSample ? 1 : 0;   // 0 until the first chunk has priced a sample
+    long long surfBlock = (prog && prog->surfPerSample) ? 1 : 0;   // 0: until the first sample prices one
     long long surfDrawn = jPerChunk ? 0 : -1;  // the block whose map dsm holds
     long long surfLightUnits = startLight;     // its light pass, in device units
     if (jPerChunk) {
@@ -27404,22 +27406,32 @@ Film renderBdptCuda(const Scene& scene, const Camera& cam, int resX, int resY,
       // map, accumulating into the same device film exactly as consecutive chunks already do.
       // `kappaS` is unchanged across them (same nPaths, same radius), so the MIS weights stay
       // consistent within and between sub-launches.
-      const long long chunkWork0 = jPerChunk && surfBlock == 0 ? workSoFar() : 0;
-      long long chunkLight = 0;   // the maps drawn in this chunk, left out of its camera work
+      // The call's first sample, a sub-launch of its own, prices the block (surfBlock above):
+      // `priceW0`, the work before it, until the next sub-launch or the chunk's end settles it.
+      long long priceW0 = -1;
+      const auto settleBlock = [&] {
+          if (priceW0 < 0) return;
+          const double camPerSpp = (double)(workSoFar() - priceW0);
+          const double b = camPerSpp > 0.0
+                               ? std::ceil((double)surfLightUnits / (kSurfShare * camPerSpp)) : 1.0;
+          surfBlock = std::max(1LL, (long long)std::min(b, 1e12));
+          priceW0 = -1;
+      };
       for (long long pos = baseAll, endAll = baseAll + cAll; pos < endAll; ) {
         if (stopped()) { leftEarly = true; break; }
+        settleBlock();
         long long subEnd = endAll;
-        if (jPerChunk) {
-            const long long blk = surfBlock > 0 ? (pos - callBase) / surfBlock : 0;
-            if (surfBlock > 0) subEnd = std::min(endAll, callBase + (blk + 1) * surfBlock);
+        if (jPerChunk && surfBlock == 0) {   // the call's first sample, on block 0's map
+            subEnd = pos + 1;
+            priceW0 = workSoFar();
+        } else if (jPerChunk) {
+            const long long blk = (pos - callBase) / surfBlock;
+            subEnd = std::min(endAll, callBase + (blk + 1) * surfBlock);
             if (blk != surfDrawn) {
                 const long long w0 = workSoFar();
                 buildJSurfMapDevice(jdev, up.sc, up.dc, diffraction, maxDepth, jPaths, jRad, jCap,
-                                    jSurfSalt(prog) ^ ((unsigned long long)(callBase + blk * surfBlock) *
-                                                       0xD1B54A32D192ED03ULL),
-                                    dsm);
+                                    jSurfBlockSalt(callBase + blk * surfBlock), dsm);
                 surfLightUnits = workSoFar() - w0;
-                chunkLight += surfLightUnits;
                 surfDrawn = blk;
             }
         }
@@ -27617,15 +27629,7 @@ Film renderBdptCuda(const Scene& scene, const Camera& cam, int resX, int resY,
                                                     resX, maxDepth, diffraction ? 1 : 0, seed, 1, dbm, dsm, DWfQueue{}, 0, totalSamples, DSurfQueue{});
         cudaCheckKernel("bdpt");
       }
-      // The call's first chunk has priced a sample: the block, from its counts (surfBlock above),
-      // and no shorter than that chunk, which drew one map.
-      if (jPerChunk && surfBlock == 0 && !leftEarly) {
-          const double camPerSpp = (double)(workSoFar() - chunkWork0 - chunkLight) /
-                                   (double)std::max(1LL, cAll);
-          const double b = camPerSpp > 0.0
-                               ? std::ceil((double)surfLightUnits / (kSurfShare * camPerSpp)) : 1.0;
-          surfBlock = std::max(cAll, (long long)std::min(b, 1e12));
-      }
+      if (!leftEarly) settleBlock();   // a chunk of one sample
       // Dropped if a kernel saw the stop (its own record, DeviceStopScope::seen) or the host
       // stopped launching waves.
       return !(abortable && (DeviceStopScope::seen() || leftEarly));
@@ -27668,7 +27672,6 @@ Film renderBdptCuda(const Scene& scene, const Camera& cam, int resX, int resY,
     }
     cudaFree(d_cam); cudaFree(d_splat);
     g_lastBdptWork = workSoFar();
-    g_lastBdptSetupWork = startLight;
     g_lastBdptOverheadSec =
         std::chrono::duration<double>((tCall1 - tCall0) +
                                       (std::chrono::steady_clock::now() - tCall2)).count();

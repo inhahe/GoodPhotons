@@ -103,9 +103,11 @@ struct CountedEpochs {
         return priced() ? lenFor(rebuild, done, camWork, camSpp) : target - done;
     }
     // Epoch 0's call, `done` of the target rendered before it, has rendered its first `spp`
-    // samples for `units` of camera work: the samples it renders in all, those at least.
-    long long first(long long units, long long spp, long long done) const {
-        return std::max(spp, lenFor(build0, done, units, spp));
+    // samples for `units` of camera work, and drawn `light` units of light side of its own (the
+    // device's surface map for its setup), which epoch 0 is charged with build0: the samples it
+    // renders in all, those at least.
+    long long first(long long units, long long spp, long long done, long long light) const {
+        return std::max(spp, lenFor(build0 + light, done, units, spp));
     }
     // A call rendered `spp` samples (none: the loop ends) for `units` of camera work.
     void rendered(long long units, long long spp) {

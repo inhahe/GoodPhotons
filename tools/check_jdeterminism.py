@@ -32,7 +32,8 @@ CUDA) the GPU cases are skipped, and say so.
 Each needs more than one epoch to mean anything, and says how many it got; and renders each in
 one call (FTRACE_JWORK=1 prints a line a call), epoch 0 included: its first sample prices a
 sample and the call runs on (SppProgress::span), where a one-sample call and a second one had set
-the device's maps up twice. And mode M resumed
+the device's maps up twice. Its first chunk is one sample whatever FTRACE_CHUNK_SPP says, so
+chunks of half the frame, longer than epoch 0, render the same image. And mode M resumed
 from a checkpoint draws its light side under salts of its own, not the first session's, at the
 first session's radii, and the same way each time.
 
@@ -126,9 +127,9 @@ def main():
             fails.append(name)
 
     def same(mode, tag, a, b):
-        """Byte for byte on the CPU; on the GPU to ORDER_TOL (atomic sums). Returns the
-        check's name and verdict and its detail."""
-        if "gpu" not in CASES[mode]:
+        """Byte for byte on the CPU; on the GPU, or in other chunks (summed in another order), to
+        ORDER_TOL. Returns the check's name and verdict and its detail."""
+        if "gpu" not in CASES[mode] and tag != "chunk":
             return "mode %s: %s byte for byte the first" % (mode, tag), a == b, ""
         pa, pb = (os.path.join(d, "%s_%s.pfm" % (mode, t)) for t in ("run1", tag))
         r, n = image_diff(read_pfm(pa, top_down=False), read_pfm(pb, top_down=False))
@@ -147,6 +148,9 @@ def main():
         check(*same(mode, "run2", first, second))
         single, _, _ = render(mode, "t1", ("-t", "1"))
         check(*same(mode, "t1", first, single))
+        spp = int(CASES[mode][CASES[mode].index("-spp") + 1])
+        chunked, _, _ = render(mode, "chunk", (), {"FTRACE_CHUNK_SPP": str(spp // 2)})
+        check(*same(mode, "chunk", first, chunked))
         if mode == "Jgpu":
             # Every segment gathered inline (FTRACE_NOWAVEFRONT=1): each hit drawn from the stream
             # the queue gives it, so a segment the full queue turns away -- which ones is a race --

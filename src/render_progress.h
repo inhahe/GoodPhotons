@@ -97,9 +97,15 @@ struct SppProgress {
     // on it before it knows how many to render, so the samples it then runs on to need no second
     // call (on the device, another upload of every map). Asked by the chunkers after each chunk
     // lands, before `report`, with the samples the call holds; returns how many it renders in all,
-    // held between those and the call's spp. The first chunk is one sample (FTRACE_CHUNK_SPP's,
-    // where that is set). Null: all of them.
+    // held between those and the call's spp. A call with a span renders one sample first, whatever
+    // FTRACE_CHUNK_SPP says, so its length never depends on the chunking. Null: all of them.
     std::function<long long(long long sppDone)> span;
+
+    // Mode J on the device under -beamepochs: one surface-photon realization a sample, each salted
+    // by the sample's absolute index alone (renderBdptCuda's surfBlock), so every frame of a
+    // flight draws them for the same samples, however its calls and chunks fall. Off: a
+    // realization covers the block of samples the device's counts size.
+    bool surfPerSample = false;
 };
 
 // Progress through a phase that has NO pixels yet.

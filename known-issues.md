@@ -339,7 +339,14 @@ the clock made them longer. Epoch 0 prices a sample on its call's first chunk an
 call (`SppProgress::span`) -- the flight cap's K settled there too -- where a one-sample call and
 a second one had uploaded the beam map, built its tree and drawn a surface map twice. And
 `-beamepochs` keys the device's surface realizations to single samples instead of pinning the
-chunks to 1 spp (BEAMEPOCHS-CHUNK-PIN). The rest of this entry is how it stood.
+chunks to 1 spp (BEAMEPOCHS-CHUNK-PIN). **0.438.3 (Opus's review of 0.438.2):** the flight
+cap's K had taken the setup surface map as an epoch's cost, where under `-beamepochs` the device
+draws one every sample; `FTRACE_CHUNK_SPP`, a triage aid, moved the image twice -- epoch 0's
+priced length (a call with a span now renders one sample first) and the device's block size
+(priced on the call's first sample, a sub-launch of its own); a block's salt also took its
+call's start (now its first sample's absolute index alone); and the per-sample switch was a
+process global (now `SppProgress::surfPerSample`). check_jdeterminism renders every case again
+with chunks of half the frame. The rest of this entry is how it stood.
 
 The device ended mode J's light-side epochs on the clock unless `-beamepochs` pinned them (design.md,
 "On the CPU at a fixed -spp": "a -time/-noise/-forever budget and the device keep the clock";
@@ -2167,7 +2174,7 @@ pin and its global switch go. (Both reviewers of 0.391.0 suggested this or a fix
 
 **Done:** 0.438.0 keyed each device surface realization to a block of samples whose size the
 counts set (`surfBlock`, GPU-J-CLOCK), not to the chunks; 0.438.2 replaced the pin with
-`cudaSetSurfPerSample`, which sets that block to one sample under `-beamepochs` and leaves the
+`SppProgress::surfPerSample`, which sets that block to one sample under `-beamepochs` and leaves the
 chunker on the clock. check_jdeterminism's GPU cases hold the block layout to repeat itself.
 
 ## DONE (2026-10-21, 0.392.1): REVIEW-0392 — what the Opus review of 0.392.0 found
