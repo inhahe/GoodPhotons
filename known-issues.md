@@ -285,6 +285,38 @@ mode R on each backend (CPU 0.96 / 1.20 / 0.77, GPU 0.89 / 1.08 / 0.88: within i
 a red sphere's small green and blue). Found checking the coat coin's fix against mode R (Opus review
 of 90e0486..bea7be1).
 
+## OPEN (2026-11-10, 0.436.10): GPU-BDPT-LOCALMEM — the GPU camera pass of modes D and J is bound by its threads' local memory, and mode J's surface merges by divergence
+
+Measured with Nsight Compute (`scraps/_ncu.sh`, summary `scraps/_ncu_sum.py`: one whole-sample
+`kBdptT` launch, `FTRACE_NOWAVEFRONT=1`, 640x480, RTX 4090; the GPU performance counters need the
+NVIDIA Control Panel's Developer > Manage GPU Performance Counters set to all users):
+
+| one sample | `_slab_ss` D / 64 beams / -jsurf | `_fog_cornell` D / 64 beams / -jsurf |
+|---|---|---|
+| duration (ms) | 53.6 / 98.5 / 62.2 | 141 / 233 / 336 |
+| instructions (G) | 2.50 / 4.60 / 2.71 | 9.0 / 13.8 / 31.8 |
+| local-memory requests (M) | 38.5 / 76.0 / 44.1 | 143 / 220 / 1464 |
+| active threads a warp (of 32) | 6.2 / 5.3 / 6.1 | 5.0 / 4.3 / 2.3 |
+| instructions a cycle | 0.15 / 0.15 / 0.14 | 0.20 / 0.19 / 0.32 |
+
+Every arm runs at 168 registers a thread (`__launch_bounds__(128, 3)`): 25 % theoretical
+occupancy, ~22 % achieved. Local memory is 94 % of the L1 traffic, three quarters of its loads miss
+L1 for L2, and only ~6 % of it is register spill: the rest is the per-thread arrays -- the eye and
+light vertex stacks (`DVertex[MAXV]` each, ~1 KB), and in the merging kernel the segment records
+and spectral carriers (stack 27.9 KB against mode D's 21.1 KB). A warp keeps 5-6 of its 32 threads
+busy, since one thread walks one whole path pair and pairs end at different depths. And mode J's
+surface merges (`dSurfMergeAt`, a 3x3x3 cell walk with a BSDF, two pdfs and a weight a photon) run
+at 2.3 active threads a warp on `_fog_cornell` with 3.5x mode D's instructions and 10x its local
+traffic: their cost is the gather, not the MIS weights 0.436.5 cut.
+
+Proper fix, in order of what it is worth: (1) the surface gather in a wavefront of its own, as the
+beam gather has -- queue (eye vertex, photon cell) work and evaluate it with full
+warps -- and a cell of 2r so the walk visits 8 cells, not 27; (2) a smaller vertex record (the
+fields float where the host's double is not needed) and the vertex stacks in a structure-of-arrays
+layout, so the connection loop's loads coalesce; (3) re-measure `__launch_bounds__` (2 and 4
+blocks) once (2) has cut the local traffic. A build with `-lineinfo` would map these counters to
+source lines; it costs no speed and should come first.
+
 ## OPEN (2026-11-04, 0.433.11): SPPM-LOWPASS-DEVHOST — at 16 passes mode S's device reads check_coat_modes' coated balls 16 % bluer than its host
 
 Seen once, running tools/check_coat_modes.py at `--spp 16` (a smoke test; the check's budget is
