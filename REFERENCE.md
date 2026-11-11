@@ -1869,6 +1869,15 @@ machine varied 18.5 s / 25.8 s / 27.2 s.
   wave (paths, segments, segments gathered inline, hits, resume passes, and the three kernel
   times) for finer diagnosis. `FTRACE_WFHITCAP=<n>` shrinks the hit queue (default 2^25 hits) so an
   ordinary scene takes resume passes; `tools/check_wf_resume.py` uses it to show they change nothing.
+- **`FTRACE_NOSURFWF=1` (diagnostic, mode `J` on the GPU).** Since 0.437.0 the surface point merges
+  (`-jsurf`) are queued too: each camera vertex's gather goes to a kernel that gathers it with a whole
+  warp, its photons across the lanes, instead of one thread per path doing it inline -- where a warp
+  kept 2.3 of its 32 threads busy. A pixel's gathers reach the film in a fixed order, so the image is
+  the inline gather's to float precision and the same every run. Measured on `_fog_cornell`'s
+  surface merges at 640x480: 378 -> 219 ms of GPU time a sample (1.7x). Setting this forces the
+  inline gather (the A/B control). The render reports its use in a `[gpu] mode J point merges:`
+  line. `FTRACE_SURFWFCAP=<n>` shrinks the queue so sites overflow to the inline gather;
+  `tools/check_surf_wavefront.py` uses it, and requires the same image every way.
 - **`FTRACE_JEPOCHKEEP=<k>` (diagnostic, mode `J` flights).** Keeps at most `k` of a batch's
   `-beamepochs` realizations, so its later frames re-trace the rest as a batch too large to keep
   them would; `tools/check_jbeams.py` uses it to show such an epoch is traced as epoch 0 was.

@@ -727,6 +727,27 @@ Four consequences worth knowing:
     CUDA-event time of the walk, the beam-hit search and the hit evaluation, and the host gaps
     between waves (`[gpu] mode J wave loop:`; the wave already syncs, so the events are free).
     Measured: `_fog_thick` 128² at `-beamk 32`, 60 s: 380 → 4905 spp (**12.9×**).
+  - **The point merges are queued too (0.437.0, SURF-WAVEFRONT).** Each camera vertex's surface
+    gather (`-jsurf`) was the thread's own: 27 cells of photons, a BSDF and two pdfs a photon, while
+    the warp's other paths were at other depths -- Nsight Compute measured 2.3 of 32 lanes busy there
+    on `_fog_cornell`, the gather half the camera kernel's time. `kBdptT` now writes the site
+    (`DSurfReq`: the vertex, the weight's camera half `DSurfMergeW`, the direction, the scale; the
+    JSPEC carrier and the chromatic bins in side tables) to a `DSurfQueue`, and after the wave
+    `kWfSurfGather` gathers each with a whole warp -- the lanes take a cell's photons in turn, the
+    per-photon work is `dSurfMergePhoton`, shared with the inline `dSurfMergeAt` -- and sums its
+    lanes in a fixed order into the request's own slot. `kWfSurfFold` then adds each pixel's sites
+    to the film, a thread a pixel slot, in path, sub-sample and site order (`siteSlot` records which
+    slot holds which), so the image is deterministic and equal to the inline gather's to float
+    precision. Per-object routes are carried (`DSurfQueue::subs`, a route's sub-samples). A wave
+    holds at most 512 K paths and as many as the requests (up to 1 M, or a quarter of free memory)
+    hold at the last wave's sites a path; a site the full queue turns away, or one needing a table
+    the queue lacks, is gathered inline. Both kernels are launched sized to the wave's sites: a dense
+    beam map's waves are a few thousand paths, and a fixed grid idled through each (measured on
+    `gallery_rain`: 188 ms a sample of idle warps, 9 ms sized). Measured at 640x480 (GPU time a
+    sample): `_fog_cornell`'s surface merges 378 -> 219 ms, the camera kernel back to mode D's
+    155; `gallery_rain` unchanged (751), its surface gather small. `FTRACE_NOSURFWF=1` is the A/B
+    control; `tools/check_surf_wavefront.py` requires the inline gather's image, with the queue
+    shrunk to overflow (`FTRACE_SURFWFCAP`) too, and the same bytes twice.
   - **Weighted bundles, and one shared surface rule (0.257.0 — `UPBP-BOWFOLD`).** Both claims used
     to die at the **first surface interaction of any kind**, which is what capped mode `J` at
     36.2 % bundled / 47.0 % folded: a subpath that so much as grazed a diffuse wall deposited the

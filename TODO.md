@@ -446,8 +446,9 @@ Then the rest of 4.2-4.6 in their order, 4.7's bookkeeping alongside whatever to
 - [ ] **GPU-BDPT-LOCALMEM** — Nsight Compute (2026-11-10): the GPU camera pass of modes D and J is
   bound by its threads' local memory (94 % of L1 traffic, mostly the vertex stacks, not spills; 5-6
   of 32 threads busy a warp), and mode J's surface merges by divergence (2.3 of 32 on
-  `_fog_cornell`, 3.5x mode D's instructions). In order: a `-lineinfo` build, the surface gather in a
-  wavefront of its own with 2r cells, a smaller SoA vertex record, then `__launch_bounds__` again.
+  `_fog_cornell`, 3.5x mode D's instructions). The surface gather is queued since 0.437.0 (1.7x
+  on `_fog_cornell`'s surface merges). Left: a smaller SoA vertex record, then `__launch_bounds__`
+  again.
 - [ ] **JSPEC-CARRIER-SIZE** — every mode-J GPU thread reserves a 120-byte spectral carrier per
   segment and per eye vertex, chromatic scene or not: VRAM (~0.5 GB, ~3.2 GB on the deep kernel),
   not speed. The slow camera pass measured against it was the MIS weights' per-connection

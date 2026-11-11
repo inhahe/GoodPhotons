@@ -309,13 +309,21 @@ surface merges (`dSurfMergeAt`, a 3x3x3 cell walk with a BSDF, two pdfs and a we
 at 2.3 active threads a warp on `_fog_cornell` with 3.5x mode D's instructions and 10x its local
 traffic: their cost is the gather, not the MIS weights 0.436.5 cut.
 
-Proper fix, in order of what it is worth: (1) the surface gather in a wavefront of its own, as the
-beam gather has -- queue (eye vertex, photon cell) work and evaluate it with full
-warps -- and a cell of 2r so the walk visits 8 cells, not 27; (2) a smaller vertex record (the
-fields float where the host's double is not needed) and the vertex stacks in a structure-of-arrays
-layout, so the connection loop's loads coalesce; (3) re-measure `__launch_bounds__` (2 and 4
-blocks) once (2) has cut the local traffic. A build with `-lineinfo` would map these counters to
-source lines; it costs no speed and should come first.
+**Done (0.437.0): the surface gather in a queue of its own** (design.md, "The point merges are
+queued too"): `_fog_cornell`'s surface merges 378 -> 219 ms of GPU time a sample, the camera kernel
+back to mode D's 155 ms, the gather 31 ms a warp a site. Tried alongside and not kept: the photons
+stored in cell order so a warp's reads are contiguous (no change in the queued gather, 1.6 %
+inline), and `__launch_bounds__(128, 4)` on the gather (no change; it runs at 255 registers and
+16.7 % occupancy, bound by the latency of its scattered loads -- a photon's position, its MIS
+record, the BSDF's spectral tables -- with no one line above 10 % of its stalls). (A cell of 2r and
+an 8-cell walk, proposed here, visits 64 r^3 against the 27-cell walk's 27 r^3: more photons, not
+fewer.) The build already carries `-lineinfo`; `scraps/_ncu_lines.py` lists a report's hottest
+source lines.
+
+Still open, in order of what it is worth: (1) a smaller vertex record (the fields float where the
+host's double is not needed) and the vertex stacks in a structure-of-arrays layout, so the
+connection loop's loads coalesce -- what bounds mode D's kernel and the rest of mode J's;
+(2) re-measure `__launch_bounds__` (2 and 4 blocks) once (1) has cut the local traffic.
 
 ## OPEN (2026-11-04, 0.433.11): SPPM-LOWPASS-DEVHOST — at 16 passes mode S's device reads check_coat_modes' coated balls 16 % bluer than its host
 
