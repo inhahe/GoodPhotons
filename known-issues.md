@@ -900,7 +900,7 @@ short (DeviceStopScope), the clock did not. With the defaults the field at 512x3
 over 55 minutes against `-time 120` (stopped by hand). Now `SppProgress::deadline` carries the
 budget's instant and gpuSppChunks cuts the chunk in flight through the device's stop flag once the
 film holds a sample, dropping it as a stop does (design.md, "A GPU mode D/J chunk can be cut
-short"; `tools/check_gpu_time.py`). The render's first sample still runs to its end, and says so.
+short"; `tools/check_gpu_time.py`). A session's first sample still runs to its end (a resumed session's too, or one sliced shorter than a sample would never add one), and says so.
 The fix proposed here, a chunk that is part of a sample, was not needed for the budget and would not
 have bought much else: the host's film, its reports, the checkpoint and the resume all carry one
 sample count for every pixel, and a part-sample's light-tracing splats land all over the frame, so

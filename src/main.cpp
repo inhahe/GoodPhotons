@@ -9754,87 +9754,6 @@ static int checkCurv() {
 //      profile would disagree with the one emission-on-hit reads and MIS would bias.
 //  §10 the lazy fill in patCtxFromHit caches (one probe per shading point, not one
 //      per pattern context) and does nothing at all when the gate is off.
-// -checksunleg: sunLegFactor's inverse branch (HAZE-BLUR-INVERSE-TR) is unbiased, and its spread
-// bounded where the quadrature that sets its Poisson rate misses what is there. A sun walk that
-// began 20 m further out than the NEE leg reaches takes exp(+tau) over that stretch; the mean of
-// 400 000 draws must match tau from 200 000 midpoints within four standard errors, in two hazes:
-//   smooth  density 0.5 + 0.5 sin(40 x), which a 32-step midpoint rule aliases badly (the
-//           quadrature alone is printed alongside, tens of percent off);
-//   layers  thin dense layers centred halfway between the 32 midpoints, about 0.8 of optical depth
-//           the quadrature cannot see. A Poisson rate from it alone (~0.002) makes a draw's spread
-//           ~12x the mean and, now and then, one draw of ~1e5; floored at min(the majorant's
-//           optical depth, 1) it is ~1.1x, and the draws' standard deviation must stay under 3x.
-static int checkSunLeg() {
-    const std::string head =
-        "scene { units meters  spectral 360 830 1 }\n"
-        "material \"grey\" { type diffuse reflect 0.5 }\n"
-        "quad { origin -1 0 -1   u 2 0 0   v 0 0 2   material grey }\n"
-        "light sun { dir 1 0.2 0  angle 0.53  spd preset:d65  intensity 1e-13 }\n"
-        "camera \"c\" { eye 0 2 6  look_at 0 0 0  up 0 1 0  fov_y 40  film { res 8 8 } }\n";
-    const double lambda = 550.0;
-    const Vec3 dir = normalize(Vec3{-1.0, -0.2, 0.0});          // the sun's light travels -dir_sun
-    const Vec3 y{0.1, 0.3, 0.05};
-    const double extra = 20.0;                                   // the walk began this much further out
-    bool allOk = true;
-    double fromX = 0.0;                                          // the stretch's start, from `smooth`
-    // `maxRelSd` 0: no bound on the draws' spread.
-    auto run = [&](const char* name, const std::string& medium, double maxRelSd) {
-        ftsl::Loaded L;
-        std::string err;
-        if (!ftsl::loadSource(head + medium, "<checksunleg>", L, err) || L.scene.media.size() != 1 ||
-            L.scene.media[0].bounded || !L.scene.media[0].heterogeneous()) {
-            std::printf("[checksunleg] %s: the scene did not load as written %s FAIL\n", name,
-                        err.c_str());
-            allOk = false;
-            return;
-        }
-        const Scene& sc = L.scene;
-        const Medium& m = sc.media[0];
-        const PatTables tabs = sc.patTables();
-        const Vec3 from = y - dir * (sc.mediaExitDistance(y) + extra);
-        fromX = from.x;
-        // The stretch the factor inverts: [from, from + dir * extra].
-        const int nFine = 200000;
-        double tau = 0.0;
-        for (int i = 0; i < nFine; ++i)
-            tau += m.densityAt(from + dir * (extra * ((i + 0.5) / nFine)), &tabs);
-        tau *= m.sigmaT(lambda) * extra / nFine;
-        const double exact = std::exp(tau);
-        const double quad = 1.0 / trDetMedium(m, from, dir, extra, lambda, &tabs, kSunLegSteps);
-        Pcg32 rng; seedUnit(rng, 0x5ULL, 0x9e3779b97f4a7c15ULL);
-        const int nDraw = 400000;
-        double s1 = 0.0, s2 = 0.0;
-        for (int i = 0; i < nDraw; ++i) {
-            const double f = sunLegFactor(sc, from, dir, y, lambda, rng);
-            s1 += f; s2 += f * f;
-        }
-        const double mean = s1 / nDraw;
-        const double sd = std::sqrt(std::max(0.0, s2 / nDraw - mean * mean));
-        const double se = sd / std::sqrt((double)nDraw);
-        const bool okMean = std::fabs(mean - exact) <= 4.0 * se + 1e-9 * exact;
-        const bool okSd = maxRelSd <= 0.0 || (mean > 0.0 && sd <= maxRelSd * mean);
-        std::printf("[checksunleg] %s: tau %.4f, exp(tau) %.5f: mean of %d draws %.5f +- %.5f "
-                    "(%+.3f%%), a draw's spread %.2fx the mean; a 32-step quadrature alone %.5f "
-                    "(%+.2f%%)  %s\n", name, tau, exact, nDraw, mean, se,
-                    100.0 * (mean / exact - 1.0), mean > 0.0 ? sd / mean : 0.0, quad,
-                    100.0 * (quad / exact - 1.0), okMean && okSd ? "PASS" : "FAIL");
-        if (!(okMean && okSd)) allOk = false;
-    };
-    run("smooth", "medium { sigma_t 0.1  albedo 0.5  density \"0.5 + 0.5*sin(x*40.0)\"  "
-                  "density_max 1 }\n", 0.0);
-    if (!allOk) return 1;
-    // u counts the stretch's 32 midpoint intervals along x (dir.x < 0, so x falls as the walk
-    // goes): the midpoints sit at u = i + 1/2, and a layer 0.1 wide at every integer u.
-    const double perU = 1.0 / ((extra / kSunLegSteps) * -dir.x);
-    char layers[320];
-    std::snprintf(layers, sizeof layers,
-                  "medium { sigma_t 0.1  albedo 0.5  density \"0.001 + 4.0*saturate((0.05 - "
-                  "abs(((((%.17g - x) * %.17g) + 0.5) %% 1.0) - 0.5)) * 10000.0)\"  "
-                  "density_max 4.001 }\n", fromX, perU);
-    run("layers", layers, 3.0);
-    return allOk ? 0 : 1;
-}
-
 static int checkCavity() {
     double worst = 0.0;
     bool ok = true;
@@ -10259,6 +10178,87 @@ static int checkCavity() {
     std::printf("[checkcavity] worst absolute error = %.3g\n", worst);
     std::printf("[checkcavity] %s\n", ok ? "PASS" : "FAIL");
     return ok ? 0 : 1;
+}
+
+// -checksunleg: sunLegFactor's inverse branch (HAZE-BLUR-INVERSE-TR) is unbiased, and its spread
+// bounded where the quadrature that sets its Poisson rate misses what is there. A sun walk that
+// began 20 m further out than the NEE leg reaches takes exp(+tau) over that stretch; the mean of
+// 400 000 draws must match tau from 200 000 midpoints within four standard errors, in two hazes:
+//   smooth  density 0.5 + 0.5 sin(40 x), which a 32-step midpoint rule aliases badly (the
+//           quadrature alone is printed alongside, tens of percent off);
+//   layers  thin dense layers centred halfway between the 32 midpoints, about 0.8 of optical depth
+//           the quadrature cannot see. A Poisson rate from it alone (~0.002) makes a draw's spread
+//           ~12x the mean and, now and then, one draw of ~1e5; floored at min(the majorant's
+//           optical depth, 1) it is ~1.1x, and the draws' standard deviation must stay under 3x.
+static int checkSunLeg() {
+    const std::string head =
+        "scene { units meters  spectral 360 830 1 }\n"
+        "material \"grey\" { type diffuse reflect 0.5 }\n"
+        "quad { origin -1 0 -1   u 2 0 0   v 0 0 2   material grey }\n"
+        "light sun { dir 1 0.2 0  angle 0.53  spd preset:d65  intensity 1e-13 }\n"
+        "camera \"c\" { eye 0 2 6  look_at 0 0 0  up 0 1 0  fov_y 40  film { res 8 8 } }\n";
+    const double lambda = 550.0;
+    const Vec3 dir = normalize(Vec3{-1.0, -0.2, 0.0});          // the sun's light travels -dir_sun
+    const Vec3 y{0.1, 0.3, 0.05};
+    const double extra = 20.0;                                   // the walk began this much further out
+    bool allOk = true;
+    double fromX = 0.0;                                          // the stretch's start, from `smooth`
+    // `maxRelSd` 0: no bound on the draws' spread.
+    auto run = [&](const char* name, const std::string& medium, double maxRelSd) {
+        ftsl::Loaded L;
+        std::string err;
+        if (!ftsl::loadSource(head + medium, "<checksunleg>", L, err) || L.scene.media.size() != 1 ||
+            L.scene.media[0].bounded || !L.scene.media[0].heterogeneous()) {
+            std::printf("[checksunleg] %s: the scene did not load as written %s FAIL\n", name,
+                        err.c_str());
+            allOk = false;
+            return;
+        }
+        const Scene& sc = L.scene;
+        const Medium& m = sc.media[0];
+        const PatTables tabs = sc.patTables();
+        const Vec3 from = y - dir * (sc.mediaExitDistance(y) + extra);
+        fromX = from.x;
+        // The stretch the factor inverts: [from, from + dir * extra].
+        const int nFine = 200000;
+        double tau = 0.0;
+        for (int i = 0; i < nFine; ++i)
+            tau += m.densityAt(from + dir * (extra * ((i + 0.5) / nFine)), &tabs);
+        tau *= m.sigmaT(lambda) * extra / nFine;
+        const double exact = std::exp(tau);
+        const double quad = 1.0 / trDetMedium(m, from, dir, extra, lambda, &tabs, kSunLegSteps);
+        Pcg32 rng; seedUnit(rng, 0x5ULL, 0x9e3779b97f4a7c15ULL);
+        const int nDraw = 400000;
+        double s1 = 0.0, s2 = 0.0;
+        for (int i = 0; i < nDraw; ++i) {
+            const double f = sunLegFactor(sc, from, dir, y, lambda, rng);
+            s1 += f; s2 += f * f;
+        }
+        const double mean = s1 / nDraw;
+        const double sd = std::sqrt(std::max(0.0, s2 / nDraw - mean * mean));
+        const double se = sd / std::sqrt((double)nDraw);
+        const bool okMean = std::fabs(mean - exact) <= 4.0 * se + 1e-9 * exact;
+        const bool okSd = maxRelSd <= 0.0 || (mean > 0.0 && sd <= maxRelSd * mean);
+        std::printf("[checksunleg] %s: tau %.4f, exp(tau) %.5f: mean of %d draws %.5f +- %.5f "
+                    "(%+.3f%%), a draw's spread %.2fx the mean; a 32-step quadrature alone %.5f "
+                    "(%+.2f%%)  %s\n", name, tau, exact, nDraw, mean, se,
+                    100.0 * (mean / exact - 1.0), mean > 0.0 ? sd / mean : 0.0, quad,
+                    100.0 * (quad / exact - 1.0), okMean && okSd ? "PASS" : "FAIL");
+        if (!(okMean && okSd)) allOk = false;
+    };
+    run("smooth", "medium { sigma_t 0.1  albedo 0.5  density \"0.5 + 0.5*sin(x*40.0)\"  "
+                  "density_max 1 }\n", 0.0);
+    if (!allOk) return 1;
+    // u counts the stretch's 32 midpoint intervals along x (dir.x < 0, so x falls as the walk
+    // goes): the midpoints sit at u = i + 1/2, and a layer 0.1 wide at every integer u.
+    const double perU = 1.0 / ((extra / kSunLegSteps) * -dir.x);
+    char layers[320];
+    std::snprintf(layers, sizeof layers,
+                  "medium { sigma_t 0.1  albedo 0.5  density \"0.001 + 4.0*saturate((0.05 - "
+                  "abs(((((%.17g - x) * %.17g) + 0.5) %% 1.0) - 0.5)) * 10000.0)\"  "
+                  "density_max 4.001 }\n", fromX, perU);
+    run("layers", layers, 3.0);
+    return allOk ? 0 : 1;
 }
 
 // Triangle NORMAL-ORIENTATION self-test (`-checktrinormal`): pins the convention
@@ -21026,12 +21026,12 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
             counted.target = sppTarget;
             counted.share  = g_beamRefreshFrac;
             counted.build0 = build0WorkJ;
-            // -time's end between epochs: no realization is drawn past it once the film holds a
-            // sample (the first is finished, as gpuSppChunks finishes it), and the flush after the
-            // loop writes the end.
+            // -time's end between epochs: no realization is drawn past it once the session has a
+            // sample of its own (its first is finished, as gpuSppChunks finishes it), and the
+            // flush after the loop writes the end.
             const auto pastDeadline = [&] {
                 return prog->deadline != clk::time_point{} && clk::now() >= prog->deadline &&
-                       prog->sampleBase + sppAll > 0;
+                       prog->sessionSpp + sppAll > 0;
             };
             bool finalReported = false;   // a refresh that traced nothing wrote the end itself
             for (; !stopAll && sppAll < sppTarget && !ft::stopRequested() && !pastDeadline();
@@ -21094,9 +21094,10 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
                 double reportSec = 0.0;      // spent in the reports below (writing images, the window)
                 SppProgress inner;
                 inner.sampleBase = prog->sampleBase + sppAll;
-                // -time's end may cut this epoch's first chunk: its report then brings sppDone 0,
-                // and `acc` is the image.
+                // -time's end may cut this epoch's first chunk, the session's earlier epochs being
+                // its samples: its report then brings sppDone 0, and `acc` is the image.
                 inner.deadline = prog->deadline;
+                inner.sessionSpp = prog->sessionSpp + sppAll;
                 inner.report = [&](const Film& f, long long sppDone, bool final) -> bool {
                     if (epochSec <= 0.0) {
                         const double setupSec =
@@ -21135,15 +21136,10 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
                         if (epochSec < 0.1) epochSec = 0.1;
                     }
                     epochSpp = sppDone;
-                    // -time's cut of this epoch's first chunk: the realization it renders against
-                    // -- its own draw, or epoch 0's -- is not in the film, and the report below
-                    // may write the checkpoint that counts them; with no sample rendered at all,
-                    // the film's are the loaded ones.
-                    if (sppDone == 0) {
-                        if (drew || epoch == 0) { drew = false; --nRealized; }
-                        keepLightEpochs();
-                        if (sppAll == 0 && prog->lightEpochs) *prog->lightEpochs = loadedEpochs;
-                    }
+                    // -time's cut of this epoch's first chunk (never epoch 0's: the session has no
+                    // sample of its own then): the realization it drew is not in the film, and
+                    // the report below may write the checkpoint that counts them.
+                    if (sppDone == 0 && drew) { drew = false; --nRealized; keepLightEpochs(); }
                     Film comb = f; comb.merge(acc);
                     const long long tot = sppAll + sppDone;
                     const auto tRep = clk::now();
@@ -21265,15 +21261,10 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
             // epoch's first chunk, or was raised between epochs -- would leave the last periodic
             // write behind: the epochs rendered are flushed as the final image and checkpoint. (A
             // stop a report saw, or a finished target, has written its own final report.) So would
-            // -time's end between epochs, whose report sees the budget spent; there a resumed
-            // checkpoint stands in for the epochs (pastDeadline asks that the film hold a sample).
+            // -time's end between epochs, whose report sees the budget spent.
             if (!stopAll && !finalReported && (ft::stopRequested() ? sppAll > 0 : pastDeadline()) &&
-                sppAll < sppTarget && prog && prog->report) {
-                // Nothing rendered (the deadline passed during epoch 0's build): the film's
-                // realizations are the loaded ones.
-                if (sppAll == 0 && prog->lightEpochs) *prog->lightEpochs = loadedEpochs;
+                sppAll < sppTarget && prog && prog->report)
                 prog->report(acc, sppAll, /*final*/true);
-            }
             if (nRealized > 1)
                 std::printf("mode J: averaged %llu independent light-side realizations "
                             "(%lld spp total%s) — the merge noise fell with the render, not just "
@@ -25395,26 +25386,29 @@ static int run(int argc, char** argv) {
         std::vector<int> flightLen(ftslScene.cameras.size(), 0);
         for (const auto& c : ftslScene.cameras)
             if (c.pathGroup >= 0 && c.pathGroup < (int)flightLen.size()) ++flightLen[(size_t)c.pathGroup];
+        // A camera block's frame and pose as the render loop builds them: -r's resolution where
+        // the command line gives one, else the block's own film, then the raster preview's
+        // upscale (a no-op for real renders); its eye, aim, field and projection (rectilinear by
+        // default, or a fisheye/panoramic lens). Mode J's knee probe takes the same.
+        auto camSpecFramed = [&](const ftsl::CamSpec& spec) {
+            int rx = resFromCli ? res : (spec.res > 0 ? spec.res : res);
+            int ry = resFromCli ? (resYCli > 0 ? resYCli : res) : (spec.resY > 0 ? spec.resY : rx);
+            previewUpscale(rx, ry);
+            Camera framed;
+            framed.lookAt(spec.eye, spec.look, spec.up, spec.fov, rx, ry);
+            framed.setProjection(spec.projection);
+            return framed;
+        };
         // Mode J's knee probe looks along every authored camera, every frame of every flight,
-        // whatever -camera and -frames select, framed as each would render (bdpt::jProbeSet).
-        bdpt::g_probeCameras.clear();
-        for (const auto& s : ftslScene.cameras) {
-            const int px = resFromCli ? res : (s.res > 0 ? s.res : res);
-            const int py = resFromCli ? (resYCli > 0 ? resYCli : res) : (s.resY > 0 ? s.resY : px);
-            Camera p;
-            p.lookAt(s.eye, s.look, s.up, s.fov, px, py);
-            p.setProjection(s.projection);
-            bdpt::g_probeCameras.push_back(std::move(p));
-        }
+        // whatever -camera and -frames select (bdpt::jProbeSet). A camera's motion, stereo eye and
+        // physical lens are its render's: the probe needs only where it looks.
+        std::vector<Camera> probeCams;
+        for (const auto& spec : ftslScene.cameras) probeCams.push_back(camSpecFramed(spec));
+        bdpt::setProbeCameras(&scene, std::move(probeCams));
         for (size_t si = 0; si < sel.size(); ++si) {
             const ftsl::CamSpec* cs = sel[si];
-            int cresX = resFromCli ? res : (cs->res  > 0 ? cs->res  : res);
-            int cresY = resFromCli ? (resYCli > 0 ? resYCli : res)
-                                   : (cs->resY > 0 ? cs->resY : cresX);
-            previewUpscale(cresX, cresY);   // big, readable raster preview (no-op for real renders)
-            Camera c;
-            c.lookAt(cs->eye, cs->look, cs->up, cs->fov, cresX, cresY);
-            c.setProjection(cs->projection);   // rectilinear (default) or a fisheye/panoramic lens
+            Camera c = camSpecFramed(*cs);
+            const int cresX = c.film.resX, cresY = c.film.resY;
             c.shutterOpen = cs->shutterOpen; c.shutterClose = cs->shutterClose;
             c.motion = cs->motion;
             c.frameNeighbours = cs->frameNeighbours;
@@ -25534,7 +25528,7 @@ static int run(int argc, char** argv) {
     } else {
         // Built-in scene: one camera. Every image-forming mode (A/B/C/P/D/M/S/U/ref)
         // uses the same camera frame; only the old contact-sensor diagnostic did not.
-        bdpt::g_probeCameras.clear();   // mode J's knee probe takes the one camera rendering
+        bdpt::setProbeCameras(&scene, {});   // mode J's knee probe takes the one camera rendering
         const bool useCamera = (mode == 'A' || mode == 'B' || mode == 'C' ||
                                 mode == 'P' || mode == 'D' || mode == 'J' || mode == 'M' ||
                                 mode == 'S' || mode == 'U' || refMode);

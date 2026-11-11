@@ -2513,9 +2513,15 @@ struct BeamBudgetInfo {
 };
 
 // The scene's cameras -- every authored one, every frame of every flight -- whatever a run
-// renders of them: what mode J's knee probe looks along (jProbeSet). Set by main once it has the
-// scene's cameras; empty (a built-in scene's one camera) the camera rendering stands in.
-inline std::vector<Camera> g_probeCameras;
+// renders of them: what mode J's knee probe looks along (jProbeSet). Set by main for the scene
+// they belong to (setProbeCameras) and read for that scene alone, so a render of any other never
+// takes them; with none for the scene (a built-in scene's one camera) the camera rendering
+// stands in.
+struct ProbeCameras { const Scene* scene = nullptr; std::vector<Camera> cams; };
+inline ProbeCameras& probeCameras() { static ProbeCameras p; return p; }
+inline void setProbeCameras(const Scene* scene, std::vector<Camera> cams) {
+    probeCameras() = ProbeCameras{scene, std::move(cams)};
+}
 
 // The knee rule's probe set (J-AUTO-PROBE, BeamMap::ProbeSet): about `n` pinhole rays spread over
 // the scene's cameras, each camera's through a jittered grid of its frame, to the first surface
@@ -2542,12 +2548,15 @@ inline std::unique_ptr<BeamMap::ProbeSet> jProbeSet(const Scene& scene, const Ca
         any = any || set->camMedia[m];
     }
     if (!any) return nullptr;
+    const ProbeCameras& pc = probeCameras();
     const std::vector<Camera> one{fallback};
-    const std::vector<Camera>& cams = g_probeCameras.empty() ? one : g_probeCameras;
+    const std::vector<Camera>& all = (pc.scene == &scene && !pc.cams.empty()) ? pc.cams : one;
+    // More cameras than rays (a flight of thousands of frames): an evenly spaced `n` of them.
+    const size_t nCam = std::min(all.size(), (size_t)n);
     Pcg32 rng; rng.seed(0x4A50524F42454341ULL, 0x6D65726152617973ULL);   // "JPROBECA", "meraRays"
-    for (size_t c = 0; c < cams.size(); ++c) {
-        const Camera& cam = cams[c];
-        const int m = std::max(1, (int)(((size_t)n * (c + 1)) / cams.size() - ((size_t)n * c) / cams.size()));
+    for (size_t c = 0; c < nCam; ++c) {
+        const Camera& cam = all[c * all.size() / nCam];
+        const int m = std::max(1, (int)(((size_t)n * (c + 1)) / nCam - ((size_t)n * c) / nCam));
         const int W = cam.film.resX > 0 ? cam.film.resX : 1, H = cam.film.resY > 0 ? cam.film.resY : 1;
         const int gx = std::max(1, (int)std::lround(std::sqrt((double)m * W / H)));
         const int gy = std::max(1, (m + gx - 1) / gx);

@@ -465,13 +465,15 @@ Everything else follows from that one field.
   `jbeams auto`). **Since 0.436.8 the probe counts an unbounded medium's beams along the scene's
   cameras' rays** (J-AUTO-PROBE): `bdpt::jProbeSet` draws about 8192 pinhole rays, spread over
   every authored camera (every frame of every flight, whatever a run renders of them,
-  `bdpt::g_probeCameras`) and each camera's through a jittered grid of its frame, to the first
+  `bdpt::setProbeCameras`, kept with the scene they belong to) and each camera's through a jittered grid of its frame, to the first
   surface each meets (1e30 where it escapes), once a render; `BeamBudgetReq::probe` and
   `buildBeamMap` hand the same `BeamMap::ProbeSet` to the pilot's knee and every build's `-beamk`
   floor, and `probeGatherCount` counts each beam along its own medium's probe -- the rays for
   the unbounded media's beams, chords of their own box for the bounded ones', so a rain volume
-  under a thin haze keeps the chords -- and gives the unbounded media's beams to the chords too
-  where the rays gathered none of them (every ray stopped at a pane of glass, say).
+  under a thin haze keeps the chords -- unless the rays gathered fewer than 64 of the strided
+  beams at the render's first count (every ray stopped at a pane of glass, say, where a stray
+  hit would put the knee at `-beamcount`'s ceiling), when every beam takes chords; decided once
+  and kept on the set (`ProbeSet::useRays`), so the knee and every floor measure one thing.
   `FTRACE_JPROBE_CAM=1/0` sends every medium to either. It is the scene's cameras and not the
   one rendering because the light side must not depend on the camera: a flight's frame
   re-rendered alone draws the realizations its neighbours did. An unbounded medium's beams fill
@@ -697,11 +699,14 @@ Four consequences worth knowing:
     and the budget is asked only between chunks, so `SppProgress::deadline` carries the budget's
     instant (`runSppProgressive`, whose report ends the render on that same instant; a mode J
     epoch passes its caller's on). `gpuSppChunks`' watchdog wakes on it and raises the device's
-    flag alone -- not the host's stop -- over a launch in flight once the caller's film holds a
-    sample (`sampleBase`, i.e. a resumed checkpoint or an earlier epoch, or this call's own); the
-    main thread skips a launch the deadline has already passed; the report after the dropped
-    chunk sees the budget spent and writes the end, as a cut and not an abandoned frame. A
-    render's first sample is never cut (there would be no image), and the render says so.
+    flag alone -- not the host's stop -- over a launch in flight once the session has a sample of
+    its own in the film (`SppProgress::sessionSpp`, an earlier epoch's, or this call's; a resumed
+    checkpoint's do not count); the main thread skips a launch the deadline has already passed;
+    the report after the dropped chunk sees the budget spent and writes the end, as a cut and not
+    an abandoned frame. A session's first sample is never cut -- a render would have no image,
+    and a resumed one sliced shorter than a sample would never add one -- and it says so. The
+    watchdog reads the clock before the launch it would cut, and the main thread publishes a
+    launch before it reads the clock (both fenced), so a deadline either thread sees is acted on.
     `renderBdptCuda`'s `stopped()` reads the device flag as well, so a cut launches no further
     waves, and `gpuSppChunks` puts the flag back to the host's on the way out
     (`tools/check_gpu_time.py`). Launches that cannot be dropped (mode R's) are not cut. A chunk
@@ -710,8 +715,8 @@ Four consequences worth knowing:
     a cut raised after the last wave finished keeps the sample. `kBdptT` asks before every sample
     a thread starts, reading the mapped flag at most once ~1 ms of clock (at a frame's worth of
     threads each runs only two or three samples, so a poll every eighth was a poll at the start).
-    Mode J's epoch loop draws no realization past the deadline once the film holds a sample, and a
-    cut of an epoch's first chunk un-counts its realization before the checkpoint is written. (Until 0.434.34 overflowing hits were evaluated on the spot inside `kWfBeamHits`, one
+    Mode J's epoch loop draws no realization past the deadline once the session has a sample, and
+    a cut of an epoch's first chunk un-counts its realization before the checkpoint is written. (Until 0.434.34 overflowing hits were evaluated on the spot inside `kWfBeamHits`, one
     thread a segment: harmless at `_fog_cornell`'s rate, ~20× slower a hit with an unbounded
     density field's ~10⁵ hits a path, J-FIELD-SLOW.) The wave floor is 256 paths.
     `tools/check_wf_resume.py` renders a fog with the hit queue shrunk (`FTRACE_WFHITCAP`) and

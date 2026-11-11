@@ -1250,7 +1250,17 @@ struct BeamMap {
     // escapes), for the beams of the media `camMedia` marks (by medium index). Those are the
     // unbounded ones: their beams fill the beam domain, whose box is mostly sparse while the
     // camera looks through its dense core, so chords of it put the knee 6-9x too high.
-    struct ProbeSet { std::vector<ProbeRay> rays; std::vector<char> camMedia; };
+    // `useRays`: whether the rays are read at all, decided by the first count along them and
+    // kept, so the pilot's knee, the build's floor and every refresh measure one thing: 1 where
+    // they gathered at least kProbeMinHits of the strided beams, 0 (chords for every beam) where
+    // they gathered fewer -- every ray stopped at a pane of glass, say, where a stray hit or two
+    // would put the knee at -beamcount's ceiling and have the floor widen the radii 4096x.
+    struct ProbeSet {
+        std::vector<ProbeRay> rays;
+        std::vector<char> camMedia;
+        mutable int useRays = -1;   // -1 until the first count
+    };
+    static constexpr double kProbeMinHits = 64.0;
 
     // Brute-force mean gathered count along random chords of the beam bbox, at the CURRENT
     // per-medium radii. Strided subsample so the cost is bounded regardless of beam count; the
@@ -1263,9 +1273,10 @@ struct BeamMap {
     // near-parallel to the sun — measured, it is off by more than an order of magnitude there.
     //
     // `probe` (J-AUTO-PROBE): the beams of the media it marks are counted along its rays -- the
-    // scene's cameras' first segments -- and only the rest along chords, of their own box. A
-    // probe whose rays gather none of its media's beams (every ray stopped at a pane of glass,
-    // say) gives way to the chords for them too. Null: chords of `bb` for every beam, as always.
+    // scene's cameras' first segments -- and only the rest along chords, of their own box; unless
+    // its rays were found to gather too little (ProbeSet::useRays), when every beam takes chords
+    // of `bb`. Null: chords of `bb` for every beam, as always. `camShare`: the share of the
+    // (strided) beams counted along the rays.
     double probeGatherCount(const Aabb& bb, const ProbeSet* probe = nullptr,
                             double* camShare = nullptr) const {
         if (camShare) *camShare = 0.0;
@@ -1287,20 +1298,23 @@ struct BeamMap {
         size_t nCam = 0, nAll = 0;
         if (probe && !probe->rays.empty())
             for (size_t i = 0; i < beams.size(); i += stride, ++nAll) nCam += camBeam(i) ? 1 : 0;
-        if (nCam == 0) return probeChords(bb, kProbeRays, stride, [](size_t) { return true; });
-        const double kCam = countAlong(probe->rays, stride, camBeam) / (double)probe->rays.size();
-        const bool camGathered = kCam > 0.0;
-        if (camShare) *camShare = camGathered ? (double)nCam / (double)nAll : 0.0;
-        auto chordBeam = [&](size_t i) { return !camGathered || !camBeam(i); };
-        if (camGathered && nCam == nAll) return kCam;
+        auto all = [](size_t) { return true; };
+        if (nCam == 0 || probe->useRays == 0) return probeChords(bb, kProbeRays, stride, all);
+        const double raw = countAlong(probe->rays, stride, camBeam);
+        if (probe->useRays < 0) probe->useRays = (raw >= kProbeMinHits) ? 1 : 0;
+        if (probe->useRays == 0) return probeChords(bb, kProbeRays, stride, all);
+        if (camShare) *camShare = (double)nCam / (double)nAll;
+        const double kCam = raw * (double)stride / (double)probe->rays.size();
+        if (nCam == nAll) return kCam;
+        auto chordBeam = [&](size_t i) { return !camBeam(i); };
         Aabb box;
         for (size_t i = 0; i < beams.size(); ++i)
             if (chordBeam(i)) { box.expand(beams[i].begin()); box.expand(beams[i].end()); }
-        return (camGathered ? kCam : 0.0) + probeChords(box, kProbeRays, stride, chordBeam);
+        return kCam + probeChords(box, kProbeRays, stride, chordBeam);
     }
 
-    // Beams gathered along `rays`, summed over them, of the strided subsample `keep` admits,
-    // scaled back up by the stride.
+    // Beams gathered along `rays`, summed over them, of the strided subsample `keep` admits (not
+    // scaled up by the stride).
     template <class Keep>
     double countAlong(const std::vector<ProbeRay>& rays, size_t stride, Keep&& keep) const {
         double hits = 0.0;
@@ -1308,7 +1322,7 @@ struct BeamMap {
         for (const ProbeRay& q : rays)
             for (size_t i = 0; i < beams.size(); i += stride)
                 if (keep(i) && closestApproach((int)i, q.o, q.d, q.tMax, bh)) hits += 1.0;
-        return hits * (double)stride;
+        return hits;
     }
 
     // The mean beams a random chord of `bb` gathers, of the strided subsample `keep` admits.

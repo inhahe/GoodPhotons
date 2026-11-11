@@ -19526,7 +19526,8 @@ kBdptT(DScene sc, const __grid_constant__ DCamera cam, double* camFilm, double* 
         // connection's weight reads them (dMisWeight), as do the camera-side sums below -- only
         // where this sub-sample draws mode J's paths (a D-routed connection weighs no merge).
         DMergeGeo geoE[MERGE ? MAXV : 1], geoL[MERGE ? MAXV : 1];
-        if (MERGE && mergeKappa > 0.0 && allowJ) {
+        const bool geoNow = MERGE && mergeKappa > 0.0 && allowJ;   // else the weights get null
+        if (geoNow) {
             const DPatEnv envG = dPatEnvOf(sc);
             for (int k = 1; k + 1 < nE; ++k)
                 geoE[k] = dMergeGeo(sc, eye[k + 1].p, eye[k], eye[k - 1].p, lambda, envG);
@@ -19615,7 +19616,7 @@ kBdptT(DScene sc, const __grid_constant__ DCamera cam, double* camFilm, double* 
                 }
                 double c = (c_jHalf == 2) ? 0.0 : dConnectBDPT(sc, camS, light, eye, lightSec, eyeSec, NS,
                                         s, t, hb, rng, spx, spy, isSplat, Lsec, nUpConn,
-                                        mkST, ksST, geoE, geoL);
+                                        mkST, ksST, geoNow ? geoE : nullptr, geoNow ? geoL : nullptr);
                 if (wST != 1.0) { c *= wST; for (int i = 0; i + 1 < nUpConn; ++i) Lsec[i] *= wST; }
                 if (nUpConn <= 0) continue;
                 // Reject a non-positive — and, critically, a NON-FINITE — contribution before
@@ -25789,13 +25790,13 @@ static void gpuSppChunks(long long spp, const SppProgress& prog, Film& out,
     // ---- the -time deadline (SppProgress::deadline) ----------------------------------
     // Only a launch that can be dropped -- one returning whether it landed whole, whose kernels
     // read the device stop flag (renderBdptCuda) -- can be cut. The watchdog below raises that
-    // flag when the deadline passes with a chunk in flight and the caller's film holds a sample
-    // (`filmSpp`: prog.sampleBase, then this call's chunks as they land); the launch is dropped
+    // flag when the deadline passes with a chunk in flight and the session has a sample of its own
+    // (`filmSpp`: prog.sessionSpp, then this call's chunks as they land); the launch is dropped
     // and the report after it sees the budget spent. The flag is the one -stop raises, put back
     // to the host's own on the way out (CutRestore), so a cut never reaches the next render.
     constexpr bool droppable = std::is_same_v<decltype(launch((long long)1, (long long)0)), bool>;
     const bool hasDeadline = droppable && prog.deadline != clk::time_point{};
-    std::atomic<long long> filmSpp{prog.sampleBase};
+    std::atomic<long long> filmSpp{prog.sessionSpp};
     std::atomic<bool> cut{false};
     struct CutRestore {   // declared before the watchdog, so it runs after the join
         std::atomic<bool>& cut;
@@ -25806,8 +25807,8 @@ static void gpuSppChunks(long long spp, const SppProgress& prog, Film& out,
     std::atomic<bool> firstNoted{false};
     auto noteFirst = [&] {   // from whichever thread sees it first
         if (firstNoted.exchange(true)) return;
-        std::printf("\n[time] the budget ran out inside the render's first sample, which runs on "
-                    "so there is an image to write (-stop ends it now, writing none).\n");
+        std::printf("\n[time] the budget ran out inside this session's first sample, which runs "
+                    "on so the session adds one (-stop ends it now, adding none).\n");
         std::fflush(stdout);
     };
 
@@ -25850,9 +25851,14 @@ static void gpuSppChunks(long long spp, const SppProgress& prog, Film& out,
                            [&] { return watchQuit; });
             if (watchQuit) return;
             lk.unlock();
-            const long long t0 = launchStartMs.load(std::memory_order_relaxed);
-            // Between chunks (t0 == 0) the main thread's own test before its next launch acts.
-            if (hasDeadline && !spent && clk::now() >= prog.deadline) {
+            // The clock first, then the launch: the main thread publishes a launch before it reads
+            // the clock (below), so a deadline seen here with no launch published is one the main
+            // thread's own test will see before it launches, and one seen with a launch published
+            // is that launch's to cut.
+            const bool pastDl = hasDeadline && !spent && clk::now() >= prog.deadline;
+            std::atomic_thread_fence(std::memory_order_seq_cst);
+            const long long t0 = launchStartMs.load(std::memory_order_seq_cst);
+            if (pastDl) {
                 spent = true;
                 if (t0 && filmSpp.load() > 0) {
                     cut.store(true);
@@ -25870,7 +25876,7 @@ static void gpuSppChunks(long long spp, const SppProgress& prog, Film& out,
                     "(target is 0.15 s).\n"
                     "[gpu-stall] The render is NOT hung, but until this chunk returns it "
                     "cannot write the -interval image (in modes D and J a -stop drops it, and "
-                    "so does -time's end once the image holds a sample).\n"
+                    "so does -time's end once the session has a sample).\n"
                     "[gpu-stall] The usual cause is another process saturating the GPU: check "
                     "`nvidia-smi` for a second CUDA program. Run with -device cpu to sidestep "
                     "it, or free the card.\n",
@@ -25894,9 +25900,10 @@ static void gpuSppChunks(long long spp, const SppProgress& prog, Film& out,
         long long c = chunk; if (c > spp - done) c = spp - done;
         auto t0 = clk::now();
         launchSpp.store(c, std::memory_order_relaxed);
-        launchStartMs.store(nowMs(), std::memory_order_relaxed);
-        // Published before this test, so a deadline the watchdog found between chunks is this
-        // test's (it reads the clock later), and one it finds after is a launch's to cut.
+        launchStartMs.store(nowMs(), std::memory_order_seq_cst);
+        // Published before this test reads the clock (the watchdog reads the clock before it
+        // reads the launch), so a deadline that is not this test's is a launch's to cut.
+        std::atomic_thread_fence(std::memory_order_seq_cst);
         if (hasDeadline && clk::now() >= prog.deadline) {
             if (filmSpp.load() > 0) {   // the report sees the budget spent and writes the end
                 launchStartMs.store(0, std::memory_order_relaxed);
@@ -25917,15 +25924,15 @@ static void gpuSppChunks(long long spp, const SppProgress& prog, Film& out,
         launchStartMs.store(0, std::memory_order_relaxed);
         if (!whole) {
             // The deadline's cut is the budget's end, not an abandoned frame: the film holds what
-            // was rendered before it, the report writes it, and its caller's earlier epochs or
-            // checkpoint stand in for a `done` of 0.
+            // was rendered before it, the report writes it, and the caller's earlier epochs stand
+            // in for a `done` of 0.
             if (cut.load() && !ft::stopRequested()) { prog.report(out, done, false); break; }
             if (done > 0) prog.report(out, done, /*final*/true);
             out.abandoned = true;
             break;
         }
         done += c;
-        filmSpp.store(prog.sampleBase + done);
+        filmSpp.store(prog.sessionSpp + done);
         double dt = std::chrono::duration<double>(clk::now() - t0).count();
         if (chunkDebug)
             std::fprintf(stderr, "[chunk] gpu %lld spp in %.3f s (%.1f spp/s), %lld/%lld done\n",
@@ -27196,8 +27203,12 @@ Film renderBdptCuda(const Scene& scene, const Camera& cam, int resX, int resY,
                 }
                 b0 = b1;
             }
-            // This chunk's bands size the next -- unless a stop cut its waves short.
-            if (wq.segs && !wfProfileCur.empty() && !leftEarly) wfProfilePrev.swap(wfProfileCur);
+            // This chunk's bands size the next -- unless a stop cut its waves short, by leaving
+            // some unlaunched or by ending a launched one's kernels early (the chunk is dropped
+            // either way, and its bands are an under-count).
+            if (wq.segs && !wfProfileCur.empty() && !leftEarly &&
+                !(abortable && DeviceStopScope::seen()))
+                wfProfilePrev.swap(wfProfileCur);
         }
         else if (useHero && deep)
             kBdptT<BDPT_NSEC, BDPT_DEEPDEPTH, false, false><<<2048, 128>>>(up.sc, up.dc, d_cam, d_splat, totalSamples, c, sppTotal, base,

@@ -4,9 +4,10 @@
 
 A GPU mode D/J chunk is at least one sample of the whole frame, and the budget's own test runs
 between chunks; gpuSppChunks therefore cuts the chunk in flight when SppProgress::deadline
-passes, through the device stop flag a -stop raises, and drops it -- once the film already holds
-a sample, so the first sample of a render is never cut. The scene is check_gpu_stop's: the
-density-field haze at 960x720 with a fixed `-n 30000` map, ~10-20 s a sample on an RTX 4090.
+passes, through the device stop flag a -stop raises, and drops it -- once the session has a
+sample of its own, so the first sample a session renders is never cut. The scene is
+check_gpu_stop's: the density-field haze at 960x720 with a fixed map of `-n` subpaths, 30 000 to
+begin with (~20 s a sample on an RTX 4090), doubled or more until a sample takes at least 6 s.
 
   first   -time far inside the first sample: the sample runs on (an image needs one), the
           render says so, and ends with 1 spp at elapsed E1, the sample's own S1 of it
@@ -17,11 +18,12 @@ density-field haze at 960x720 with a fixed `-n 30000` map, ~10-20 s a sample on 
           E1 with 2.
   epochs  -beamrefresh 100, the same budget: an epoch ends at its first report, so every sample
           is its own light-side epoch (-beamepochs splits only a fixed -spp) and the deadline
-          lands in the second epoch's FIRST chunk; the earlier epoch's sample is the film's
-          (SppProgress::sampleBase), and the cut is answered with that image.
+          lands in the second epoch's FIRST chunk; the earlier epoch's sample is the session's
+          (SppProgress::sessionSpp), and the cut is answered with that image.
   resume  -resume from first's checkpoint, -time E1 - S1/2 (its setup and half a sample): the
-          deadline lands in this session's first chunk, the loaded sample is the film's, and the
-          render ends with the 1 spp it loaded.
+          deadline lands in this session's first sample, which is NOT cut -- a session sliced
+          shorter than a sample would otherwise never add one -- so it ends with 2 spp, the
+          loaded one and its own, about a sample after the budget, and says so.
 
 Each case requires exit 0, the image written, the final status line's spp, and its elapsed time.
 Exits 1 on any failure.
@@ -39,6 +41,9 @@ sys.path.insert(0, os.path.join(ROOT, "tools"))
 import fogbox  # noqa: E402
 from check_haze_domain import FIELD, scene  # noqa: E402
 
+FIRST_NOTE = "budget ran out inside this session's first sample"
+
+
 def seconds(text):
     """humanDur's '31.2s' / '1:02' / '1:00:02' (duration.h) back to seconds."""
     text = text.strip()
@@ -50,13 +55,13 @@ def seconds(text):
     return float(total)
 
 
-def render(exe, d, ftsl, name, budget, extra):
+def render(exe, d, ftsl, name, budget, n, extra):
     png = os.path.join(d, name + ".png")
     for stale in (png, png[:-4] + ".pfm"):   # a render that writes nothing must not pass
         if os.path.exists(stale):
             os.remove(stale)
     cmd = [exe, "-in", ftsl, "-mode", "J", "-device", "gpu", "-time", "%.2f" % budget,
-           "-seed", "1", "-n", "30000", "-interval", "3600", "-hdr", "-no-meter",
+           "-seed", "1", "-n", str(n), "-interval", "3600", "-hdr", "-no-meter",
            "-window-min", "-o", png] + extra
     logf = os.path.join(d, name + ".log")
     env = dict(os.environ, FTRACE_CHUNK_DEBUG="1")   # each chunk's GPU time
@@ -86,17 +91,23 @@ def main():
     check = fogbox.Checks(60)
     tails = []
 
-    rc, out, e1, spp, png = render(exe, d, ftsl, "first", 2.0, ["-beamfreeze"])
+    # A sample long enough to cut in, on whatever GPU this runs on: the map grows (the gather's
+    # cost with it) until the first sample takes 6 s.
+    n, s1 = 30000, 0.0
+    for _ in range(4):
+        rc, out, e1, spp, png = render(exe, d, ftsl, "first", 2.0, n, ["-beamfreeze"])
+        chunks = chunk_secs(out)
+        s1 = chunks[0] if chunks else 0.0   # the sample's own time; e1 adds the setup before it
+        if rc != 0 or s1 >= 6.0:
+            break
+        n = int(n * max(2.0, 8.0 / max(s1, 0.5)))
     tails.append(out[-800:])
-    chunks = chunk_secs(out)
-    s1 = chunks[0] if chunks else 0.0     # the sample's own time; e1 adds the setup before it
     check("first: exits 0", rc == 0, "rc %d" % rc)
     check("first: one whole sample", spp == 1, "spp %s" % spp)
-    check("first: says the first sample runs on",
-          "budget ran out inside the render's first sample" in out)
+    check("first: says the first sample runs on", FIRST_NOTE in out)
     check("first: the image was written", os.path.exists(png[:-4] + ".pfm"))
     ok = e1 is not None and s1 >= 6.0
-    check("first: a sample long enough to cut", ok, "sample %.1f s, E1 %s" % (s1, e1))
+    check("first: a sample long enough to cut", ok, "sample %.1f s at -n %d, E1 %s" % (s1, n, e1))
     if not ok:
         return check.verdict(NL.join(tails))
 
@@ -108,22 +119,28 @@ def main():
              ("resume", "first", e1 - 0.5 * s1, ["-beamfreeze", "-resume"]))
     for name, out_name, budget, extra in cases:
         t0 = time.monotonic()
-        rc, out, el, spp, png = render(exe, d, ftsl, out_name, budget, extra)
+        rc, out, el, spp, png = render(exe, d, ftsl, out_name, budget, n, extra)
         wall = time.monotonic() - t0
         tails.append(out[-800:])
         check("%s: exits 0" % name, rc == 0, "rc %d" % rc)
-        if name == "epochs":
-            check("epochs: the second sample is a refresh's", "light-side refresh" in out)
-        if name == "resume":
-            check("resume: the checkpoint's sample was loaded", "1 spp accumulated so far" in out)
-        check("%s: the cut sample is dropped" % name, spp == 1, "spp %s" % spp)
         # The status line's elapsed is humanDur's: tenths of a second below a minute, whole
         # seconds above, so it may read up to that much under the budget it reached.
         res = 0.5 if el is not None and el >= 60.0 else 0.05
-        check("%s: ends within a fifth of a sample of -time" % name,
-              el is not None and budget - res <= el < budget + 0.2 * s1,
-              "%s s against %.1f s (a sample %.1f s; wall %.1f s)"
-              % ("?" if el is None else "%.1f" % el, budget, s1, wall))
+        elText = "?" if el is None else "%.1f" % el
+        if name == "resume":
+            check("resume: the checkpoint's sample was loaded", "1 spp accumulated so far" in out)
+            check("resume: the session's first sample runs on, and says so",
+                  spp == 2 and FIRST_NOTE in out, "spp %s" % spp)
+            check("resume: it ends when that sample does",
+                  el is not None and budget - res <= el < budget + 0.75 * s1 + 0.2 * s1,
+                  "%s s against %.1f s (a sample %.1f s; wall %.1f s)" % (elText, budget, s1, wall))
+        else:
+            if name == "epochs":
+                check("epochs: the second sample is a refresh's", "light-side refresh" in out)
+            check("%s: the cut sample is dropped" % name, spp == 1, "spp %s" % spp)
+            check("%s: ends within a fifth of a sample of -time" % name,
+                  el is not None and budget - res <= el < budget + 0.2 * s1,
+                  "%s s against %.1f s (a sample %.1f s; wall %.1f s)" % (elText, budget, s1, wall))
         check("%s: the image was written" % name, os.path.exists(png[:-4] + ".pfm"))
     return check.verdict(NL.join(tails))
 
