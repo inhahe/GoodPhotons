@@ -80,7 +80,7 @@ def render(exe, out, name, text, args):
         raise SystemExit("render failed (exit %d): %s" % (p.returncode, " ".join(cmd)))
     if "gpu" in args and not any(t in p.stdout + p.stderr for t in GPU_TOKENS):
         raise SystemExit("did not run on the GPU: " + " ".join(cmd))
-    img = read_pfm(pfm).astype(np.float64).sum(-1)
+    img = read_pfm(pfm, top_down=False).sum(-1)
     h, w = img.shape
     y, x = np.mgrid[0:h, 0:w]
     return float(img[(x + 0.5 - w / 2) ** 2 + (y + 0.5 - h / 2) ** 2 < 64].sum())

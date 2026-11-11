@@ -233,7 +233,7 @@ def compare(out, a, b, tol, log):
         if open(pa, "rb").read() == open(pb, "rb").read():
             log("  %-22s identical" % n[:-4])
             continue
-        x, y = read_pfm(pa).astype(np.float64), read_pfm(pb).astype(np.float64)
+        x, y = read_pfm(pa, top_down=False), read_pfm(pb, top_down=False)
         if x.shape != y.shape:
             log("  %-22s differs in size FAIL" % n[:-4])
             ok = False

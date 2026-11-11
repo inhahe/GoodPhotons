@@ -180,7 +180,7 @@ def main():
         if r.returncode != 0 or not os.path.exists(png[:-4] + ".pfm"):
             print("  %s %s %s: render failed%s%s" % (name, side, tag, NL, (r.stdout + r.stderr)[-400:]))
             return None
-        return read_pfm(png[:-4] + ".pfm").mean(axis=-1)
+        return read_pfm(png[:-4] + ".pfm", top_down=False).mean(axis=-1)
 
     for tag, args in MODES:
         for name in ("mapped", "tipped", "smooth"):

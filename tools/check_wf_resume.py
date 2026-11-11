@@ -85,7 +85,7 @@ def main():
         if not m:
             print(log[-1500:])
             raise SystemExit("no wavefront report in the log: is mode J gathering on the GPU?")
-        return read_pfm(png[:-4] + ".pfm"), int(m.group(1)), int(m.group(2))
+        return read_pfm(png[:-4] + ".pfm", top_down=False), int(m.group(1)), int(m.group(2))
 
     a1, r1, _ = render("default1")
     a2, _, _ = render("default2")

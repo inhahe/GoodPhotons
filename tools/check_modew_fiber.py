@@ -80,7 +80,7 @@ def main():
         if r.returncode != 0 or not os.path.exists(pfm):
             print(r.stdout[-1500:], r.stderr[-1500:])
             raise SystemExit("render failed: " + " ".join(cmd))
-        m = read_pfm(pfm).reshape(-1, 3).mean(axis=0)
+        m = read_pfm(pfm, top_down=False).reshape(-1, 3).mean(axis=0)
         chroma[spp] = m / m.sum()
     d = np.abs(chroma[1] - chroma[64])[[0, 2]].max()
     ok = d < 0.05
@@ -100,7 +100,7 @@ def main():
             if r.returncode != 0 or not os.path.exists(pfm):
                 print(r.stdout[-1500:], r.stderr[-1500:])
                 raise SystemExit("render failed: " + " ".join(cmd))
-            img[dev] = read_pfm(pfm).sum(-1)
+            img[dev] = read_pfm(pfm, top_down=False).sum(-1)
         h, w = img["cpu"].shape
         t = {k: np.array([[v[h * i // 4:h * (i + 1) // 4, w * j // 4:w * (j + 1) // 4].mean()
                            for j in range(4)] for i in range(4)]) for k, v in img.items()}

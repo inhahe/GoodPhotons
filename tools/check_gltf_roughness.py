@@ -26,6 +26,7 @@ import subprocess
 import sys
 
 import numpy as np
+from pfm import read_pfm  # noqa: E402
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 NL = chr(10)
@@ -118,9 +119,7 @@ def main():
             print((p.stdout + p.stderr)[-2000:])
             raise SystemExit("render failed: " + " ".join(cmd))
         raw = open(pfm, "rb").read()
-        h = raw.split(b"\n", 3)
-        img = np.frombuffer(h[3], dtype="<f4" if float(h[2]) < 0 else ">f4")
-        return raw, img.astype(np.float64)
+        return raw, read_pfm(pfm, top_down=False).ravel()
 
     fails = []
 

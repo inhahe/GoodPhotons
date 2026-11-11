@@ -29,7 +29,7 @@ import subprocess
 import sys
 
 import numpy as np
-from pfm import read_pfm  # noqa: E402
+from pfm import read_pfm as _read_pfm  # noqa: E402
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 NL = chr(10)
@@ -78,6 +78,12 @@ SCENES = {
 # the forward modes), `[gpu]` lines (mode M), and the device modes U and S name (`VCM/UPS on`,
 # `SPPM on`). One list, so every check asks the same question.
 GPU_TOKENS = ("-> GPU", "[gpu]", "VCM/UPS on ", "SPPM on ")
+
+
+def read_pfm(path):
+    """A PFM as h x w x 3 float64, rows as the file stores them (what this module's
+    importers read)."""
+    return _read_pfm(path, top_down=False)
 
 
 def render_seeds(exe, cwd, scene, tag, args, device="cpu", spp=256, seeds=(1, 2), rgb=False):

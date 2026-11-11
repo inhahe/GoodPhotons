@@ -1,12 +1,13 @@
 """PFM images: the one reader tools/ shares (known-issues TOOLS-PFM-READERS).
 
     from pfm import read_pfm          # tools/ is on sys.path for a script run from it
-    img = read_pfm(path)              # (h, w, c) float64: c 3 for "PF", 1 for "Pf"
-    img = read_pfm(path, top_down=True)   # row 0 the image's top (a PFM stores rows bottom-up)
+    img = read_pfm(path, top_down=True)    # (h, w, c) float64, row 0 the image's top
+    img = read_pfm(path, top_down=False)   # rows as the file stores them, bottom-up
 
 ftrace's -hdr output is scene-linear XYZ, before any tone map. The reader skips comment lines and
-refuses a file that is not a PFM. Import the names, not the module: many scripts call a path
-`pfm`.
+refuses a file that is not a PFM. Its rows' order is always the caller's to say: a reader that
+flipped and one that did not are both in tools/, and a default would pass either off as the other.
+Import the names, not the module: many scripts call a path `pfm`.
 """
 import numpy as np
 
@@ -15,9 +16,9 @@ import numpy as np
 ORDER_TOL = 1e-5
 
 
-def read_pfm(path, top_down=False):
-    """The image at `path` as an (h, w, channels) float64 array, its rows in the file's order
-    (bottom-up) unless `top_down`."""
+def read_pfm(path, *, top_down):
+    """The image at `path` as an (h, w, channels) float64 array: row 0 the image's top if
+    `top_down`, else rows in the file's order (bottom-up)."""
     with open(path, "rb") as f:
         kind = f.readline().strip()
         if kind not in (b"PF", b"Pf"):
@@ -35,7 +36,7 @@ def read_pfm(path, top_down=False):
 
 def read_pfm_flat(path):
     """(w, h, channels, values): the values in the file's order, a pixel's channels together."""
-    img = read_pfm(path)
+    img = read_pfm(path, top_down=False)
     h, w, nc = img.shape
     return w, h, nc, img.ravel()
 

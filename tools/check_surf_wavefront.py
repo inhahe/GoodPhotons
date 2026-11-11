@@ -75,7 +75,7 @@ def main():
         log = p.stdout + p.stderr
         logs.append("--- " + tag + NL + log[-600:])
         pfm = png[:-4] + ".pfm"
-        return p.returncode, log, (read_pfm(pfm) if os.path.exists(pfm) else None)
+        return p.returncode, log, (read_pfm(pfm, top_down=False) if os.path.exists(pfm) else None)
 
     def pair(name, args):
         """The inline gather's image and the queue's; checks both ran as asked. Returns them."""

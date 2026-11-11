@@ -56,9 +56,16 @@ import sys
 import zlib
 
 import numpy as np
-from pfm import read_pfm  # noqa: E402
+from pfm import read_pfm as _read_pfm  # noqa: E402
 
 ABS_EXPOSURE_GAIN = 6.0          # main.cpp: constexpr double ABS_EXPOSURE_GAIN
+
+
+def read_pfm(path):
+    """A PFM as h x w x 3 float64, row 0 the image's top, a grey one widened to three
+    channels (what this module's importers read)."""
+    img = _read_pfm(path, top_down=True)
+    return np.repeat(img, 3, axis=2) if img.shape[2] == 1 else img
 
 
 def srgb_gamma(c):
@@ -156,9 +163,7 @@ def main(argv=None):
 
     held = args.anchor if args.anchor > 0 else 0.0
     for path in files:
-        lin = read_pfm(path, top_down=True)
-        if lin.shape[2] == 1:
-            lin = np.repeat(lin, 3, axis=2)
+        lin = read_pfm(path)
         idx = frame_index(path)
         if args.absolute:
             base = ABS_EXPOSURE_GAIN * (args.exp_comp if args.exp_comp > 0 else 1.0)

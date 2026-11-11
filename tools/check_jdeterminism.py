@@ -121,7 +121,7 @@ def main():
         if "gpu" not in CASES[mode]:
             return "mode %s: %s byte for byte the first" % (mode, tag), a == b, ""
         pa, pb = (os.path.join(d, "%s_%s.pfm" % (mode, t)) for t in ("run1", tag))
-        r, n = image_diff(read_pfm(pa), read_pfm(pb))
+        r, n = image_diff(read_pfm(pa, top_down=False), read_pfm(pb, top_down=False))
         return ("mode %s: %s the first, to %g of a pixel" % (mode, tag, ORDER_TOL),
                 r < ORDER_TOL, "largest change %.2g, %d values differ" % (r, n))
 

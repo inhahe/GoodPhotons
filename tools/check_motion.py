@@ -104,7 +104,7 @@ import sys
 import time
 
 import numpy as np
-from pfm import read_pfm  # noqa: E402
+from pfm import read_pfm as _read_pfm  # noqa: E402
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 NL = chr(10)
@@ -145,6 +145,11 @@ KINDS = [dict(translate=(-0.5, 0.5, 0.0), rotate=(0, -40, 0), scale=(0.8, 0.8, 0
 # A dark ball sweeping across an open sky: the forward modes add the sky they see directly by a
 # camera-side pass of their own, which must see the ball where each time in the shutter has it.
 SWEEP = [dict(translate=(-0.9, 0.9, 0)), dict(translate=(0.9, 0.9, 0))]
+
+
+def read_pfm(path):
+    """A PFM as h x w x 3 float64, top row first (what this module's importers read)."""
+    return _read_pfm(path, top_down=True)
 
 
 def at(keys, u):
@@ -645,7 +650,7 @@ def render(exe, out, path, tag, args, seed=1, want_gpu=False):
         raise SystemExit("did not run on the GPU: " + " ".join(cmd))
     with open(pfm, "rb") as f:
         raw = f.read()
-    return read_pfm(pfm, top_down=True), raw, log
+    return read_pfm(pfm), raw, log
 
 
 def lum(img):
@@ -1000,7 +1005,7 @@ def main():
             print(log[-2000:])
             raise SystemExit("render failed: " + multi)
         for c in "acd":
-            imgs.setdefault(c, []).append(lum(read_pfm(png[:-4] + "_%s.pfm" % c, top_down=True)))
+            imgs.setdefault(c, []).append(lum(read_pfm(png[:-4] + "_%s.pfm" % c)))
     for c in "cd":
         mm = blocks((imgs[c][0] + imgs[c][1]) / 2)
         err = np.hypot(block_err(lb[0], lb[1]), block_err(imgs[c][0], imgs[c][1]))
@@ -1817,7 +1822,7 @@ def camera_tests(exe, out, verdict, devices):
         if rc != 0:
             print(log[-2000:])
             raise SystemExit("render failed: " + mixed)
-        km.append(lum(read_pfm(png[:-4] + "_k.pfm", top_down=True)))
+        km.append(lum(read_pfm(png[:-4] + "_k.pfm")))
         ka2.append(lum(render(exe, out, alone, "cam_alone_s%d" % sd, ["-mode", "B", "-device", "cpu", "-n",
                                                                       "40000000"], seed=sd)[0]))
     good, detail = agree(km, ka2, 0.05)

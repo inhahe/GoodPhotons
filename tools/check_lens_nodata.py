@@ -21,6 +21,7 @@ import sys
 import tempfile
 
 import numpy as np
+from pfm import read_pfm  # noqa: E402
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 NL = chr(10)
@@ -51,11 +52,7 @@ def main():
             print(p.stdout[-1500:], p.stderr[-1500:])
             print("FAILED: render failed (exit %d)" % p.returncode)
             return 1
-        with open(pfm, "rb") as f:
-            f.readline()
-            f.readline()
-            scale = float(f.readline())
-            img = np.frombuffer(f.read(), dtype="<f4" if scale < 0 else ">f4")
+        img = read_pfm(pfm, top_down=False)
         finite = bool(np.isfinite(img).all())
         mean = float(img.mean()) if finite else float("nan")
         ok = finite and mean > 0.0

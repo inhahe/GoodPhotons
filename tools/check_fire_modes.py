@@ -60,7 +60,7 @@ NL = chr(10)
 
 
 def _pfm_mean(path):
-    return float(read_pfm(path).mean())
+    return float(read_pfm(path, top_down=False).mean())
 
 
 def main():
