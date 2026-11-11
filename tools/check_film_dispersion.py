@@ -26,6 +26,7 @@ import subprocess
 import sys
 
 import numpy as np
+from pfm import read_pfm  # noqa: E402
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 NL = chr(10)
@@ -62,14 +63,6 @@ def scene(film, ior, lam0):
         "  spd gaussian center=%d sigma=1  power 50 }" % lam0,
         'camera "c" { eye 0 1.0 3.0  look_at 0 0.5 0  up 0 1 0  fov_y 40  film { res 64 48 } }',
     ]) + NL
-
-
-def read_pfm(path):
-    with open(path, "rb") as f:
-        assert f.readline().strip() == b"PF"
-        w, h = (int(x) for x in f.readline().split())
-        scale = float(f.readline())
-        return np.frombuffer(f.read(), dtype="<f4" if scale < 0 else ">f4").reshape(h, w, 3)
 
 
 def render(exe, out, name, text, args):

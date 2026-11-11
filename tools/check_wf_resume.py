@@ -33,6 +33,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 NL = chr(10)
 sys.path.insert(0, os.path.join(ROOT, "tools"))
 import fogbox  # noqa: E402
+from pfm import ORDER_TOL, image_diff, read_pfm  # noqa: E402
 
 
 def main():
@@ -84,7 +85,7 @@ def main():
         if not m:
             print(log[-1500:])
             raise SystemExit("no wavefront report in the log: is mode J gathering on the GPU?")
-        return fogbox.load_pfm(png[:-4] + ".pfm"), int(m.group(1)), int(m.group(2))
+        return read_pfm(png[:-4] + ".pfm"), int(m.group(1)), int(m.group(2))
 
     a1, r1, _ = render("default1")
     a2, _, _ = render("default2")
@@ -93,11 +94,11 @@ def main():
     check("the capped one takes some", rb > 0, "%d passes, %d segments" % (rb, sb))
     check("the image is not empty", a1.mean() > 0.0, "mean %.4g" % a1.mean())
 
-    c_rel, c_n = fogbox.image_diff(a1, a2)
-    check("two default renders agree (the control)", c_rel < fogbox.ORDER_TOL,
+    c_rel, c_n = image_diff(a1, a2)
+    check("two default renders agree (the control)", c_rel < ORDER_TOL,
           "largest change %.2g of the pixel, %d values differ" % (c_rel, c_n))
-    rel, n = fogbox.image_diff(a1, b)
-    check("the capped render agrees with the default", rel < fogbox.ORDER_TOL,
+    rel, n = image_diff(a1, b)
+    check("the capped render agrees with the default", rel < ORDER_TOL,
           "largest change %.2g of the pixel, %d values differ; mean ratio %.6f"
           % (rel, n, b.mean() / a1.mean()))
     return check.verdict()

@@ -37,19 +37,7 @@ INTERLEAVED by seed, never blocked by arm -- blocked runs of one such comparison
 """
 import argparse, io, os, re, sys
 import numpy as np
-
-
-def readpfm(p):
-    with open(p, 'rb') as f:
-        hdr = f.readline().strip()
-        nc = 3 if hdr == b'PF' else 1
-        line = f.readline()
-        while line.startswith(b'#'):
-            line = f.readline()
-        w, h = map(int, line.split())
-        sc = float(f.readline())
-        d = np.frombuffer(f.read(w * h * nc * 4), dtype='<f4' if sc < 0 else '>f4')
-        return d.reshape(h, w, nc)[::-1].astype(np.float64)
+from pfm import read_pfm  # noqa: E402
 
 
 def lum(a):
@@ -106,7 +94,7 @@ def maskbands(path, want, H, W):
     mean anything: the population is "the pixels showing material X" in both, rather than
     a box here and the whole frame there.
     """
-    mid = lum(readpfm(path))
+    mid = lum(read_pfm(path, top_down=True))
     if mid.shape != (H, W):
         sys.exit(f'mask is {mid.shape[1]}x{mid.shape[0]} but the renders are {W}x{H} -- '
                  f'regenerate it with the same -r as the renders')
@@ -152,7 +140,7 @@ def main():
         fs = [f for f in fs if os.path.exists(f)]
         if not fs:
             sys.exit(f'no renders for arm {arm} in {a.dir}')
-        ims[arm] = np.stack([lum(readpfm(f)) for f in fs])
+        ims[arm] = np.stack([lum(read_pfm(f, top_down=True)) for f in fs])
     H, W = ims[arms[0]].shape[1:]
 
     # TRAP 4 -- THE ARMS ARE THE SAME IMAGE.

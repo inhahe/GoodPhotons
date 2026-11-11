@@ -3,12 +3,9 @@
 An open-fronted unit box -- floor, ceiling, back and two side walls, grey -- with a 0.3 m square
 area light just under the ceiling, a medium given by the caller, and cameras looking in through
 the open side from z = 2.7. check_wf_resume, check_gpu_mixed_modes and check_jgpu_one_beam build
-theirs from it. Also an HDR image reader and the comparison the wavefront checks hold their
-images to.
+theirs from it. (Their images are read with tools/pfm.py.)
 """
 import os
-
-import numpy as np
 
 NL = chr(10)
 
@@ -76,32 +73,3 @@ class Checks:
             return 1
         print("PASS")
         return 0
-
-
-# Two images that differ only in the order of the film's atomic sums agree to about float32's
-# 1.2e-7 of a pixel: a sum in another order can round the other way.
-ORDER_TOL = 1e-5
-
-
-def load_pfm(path):
-    """A PFM (ftrace's -hdr output) as an (h, w, channels) float64 array: 3 channels for `PF`,
-    1 for `Pf`. Rows stay in the file's order (PFM's bottom-up)."""
-    with open(path, "rb") as f:
-        kind = f.readline().strip()
-        if kind not in (b"PF", b"Pf"):
-            raise ValueError("%s: not a PFM (%r)" % (path, kind))
-        nc = 3 if kind == b"PF" else 1
-        line = f.readline()
-        while line.startswith(b"#"):
-            line = f.readline()
-        w, h = (int(x) for x in line.split())
-        s = float(f.readline())
-        data = np.frombuffer(f.read(w * h * nc * 4), dtype="<f4" if s < 0 else ">f4")
-        return data.reshape(h, w, nc).astype(np.float64)
-
-
-def image_diff(x, y):
-    """The largest difference between two images as a share of the pixel, and how many values
-    differ. A NaN in either makes the first NaN, which fails any `<` test."""
-    rel = np.abs(x - y) / np.maximum(np.maximum(np.abs(x), np.abs(y)), 1e-12)
-    return float(rel.max()), int((x != y).sum())

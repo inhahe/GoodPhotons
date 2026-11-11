@@ -51,6 +51,7 @@ import subprocess
 import sys
 
 import numpy as np
+from pfm import read_pfm, luma  # noqa: E402
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 RES = 64
@@ -126,16 +127,6 @@ SIDE_CROSSES = {'floor': False, 'cross': True, 'mixed': True, 'child': True}
 SIDE_NAMES = tuple(f'side_{m}' for m in SIDE_CROSSES)
 
 
-def read_pfm(p):
-    with open(p, 'rb') as f:
-        ch = 3 if f.readline().strip() == b'PF' else 1
-        w, h = map(int, f.readline().split())
-        scale = float(f.readline())
-        a = np.fromfile(f, '<f4' if scale < 0 else '>f4').reshape(h, w, ch)
-    a = np.flipud(a).astype(np.float64)
-    return a[..., 0] * 0.2126 + a[..., 1] * 0.7152 + a[..., 2] * 0.0722 if ch == 3 else a[..., 0]
-
-
 def write(path, text):
     with open(path, 'w', encoding='utf-8', newline='\n') as f:
         f.write(text)
@@ -195,7 +186,7 @@ def render(exe, out, scene, name, dev, mode='R'):
     if dev == 'gpu' and '-> GPU' not in r.stdout + r.stderr:
         print(f'  did not run on the GPU: {" ".join(cmd)}')
         return None
-    return read_pfm(pfm)
+    return luma(read_pfm(pfm, top_down=True))
 
 
 def render_raster(exe, out, scene, name, dev):

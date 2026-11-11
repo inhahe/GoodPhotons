@@ -46,6 +46,7 @@ import subprocess
 import sys
 
 import numpy as np
+from pfm import read_pfm  # noqa: E402
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 NL = chr(10)
@@ -208,15 +209,6 @@ EXTRA = {"fogcli": ["-fog", "1.5"]}
 SPP_SCALE = {"hairhalf": 4}
 
 
-def read_pfm(path):
-    with open(path, "rb") as f:
-        assert f.readline().strip() == b"PF"
-        w, h = (int(x) for x in f.readline().split())
-        scale = float(f.readline())
-        data = np.frombuffer(f.read(), dtype="<f4" if scale < 0 else ">f4").reshape(h, w, 3)
-    return data[::-1].astype(np.float64)     # PFM rows run bottom to top
-
-
 def render(exe, scene, out, mode, heroc, seed, spp, device="cpu"):
     png = os.path.join(out, "%s_%s%s_c%d_s%d_n%d.png" % (
         os.path.splitext(os.path.basename(scene))[0], mode, "g" if device == "gpu" else "", heroc,
@@ -224,7 +216,7 @@ def render(exe, scene, out, mode, heroc, seed, spp, device="cpu"):
     pfm = png[:-4] + ".pfm"
     if os.path.exists(pfm) and os.path.getmtime(pfm) > os.path.getmtime(scene) and \
             os.path.getmtime(pfm) > os.path.getmtime(exe):
-        return read_pfm(pfm)
+        return read_pfm(pfm, top_down=True)
     if os.path.exists(pfm):
         os.remove(pfm)                       # never score an earlier run's image
     cmd = [exe, "-in", scene, "-mode", mode, "-device", device, "-spp", str(spp), "-heroc", str(heroc),
@@ -237,7 +229,7 @@ def render(exe, scene, out, mode, heroc, seed, spp, device="cpu"):
     if device == "gpu" and "-> GPU" not in r.stdout + r.stderr:
         os.remove(pfm)                       # or the next run would score the CPU's image as the GPU's
         raise SystemExit("did not run on the GPU: " + " ".join(cmd))
-    return read_pfm(pfm)
+    return read_pfm(pfm, top_down=True)
 
 
 def compare(x1, x2, y1, y2):

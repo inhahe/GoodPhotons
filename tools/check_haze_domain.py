@@ -29,6 +29,7 @@ import subprocess
 import sys
 
 import numpy as np
+from pfm import read_pfm  # noqa: E402
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 NL = chr(10)
@@ -59,15 +60,6 @@ def scene(still, keys=8.0, at=6.4, medium="medium { sigma_t 0.04  albedo 0.5 }",
         move] + ([extra] if extra else []) + [
         'camera "c" { eye %g 1.5 6  look_at %g 1 0  up 0 1 0  fov_y 30  %sfilm { res %d %d } }'
         % (at, at, shutter, res[0], res[1])]) + NL
-
-
-def load(p):
-    with open(p, "rb") as f:
-        f.readline()
-        w, h = (int(x) for x in f.readline().split())
-        s = float(f.readline())
-        return np.frombuffer(f.read(w * h * 12), dtype="<f4" if s < 0 else ">f4") \
-                 .reshape(h, w, 3)[::-1].astype(float)
 
 
 def main():
@@ -127,7 +119,7 @@ def main():
         if p.returncode != 0:
             print((p.stdout + p.stderr)[-1200:])
             raise SystemExit("render failed: " + " ".join(cmd))
-        return load(png[:-4] + ".pfm")[..., 1]
+        return read_pfm(png[:-4] + ".pfm", top_down=True)[..., 1]
 
     devs = ["cpu"] + ([] if a.no_gpu else ["gpu"])
     only = set(x for x in a.only.split(",") if x)

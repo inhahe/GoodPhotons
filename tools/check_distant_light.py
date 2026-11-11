@@ -46,9 +46,9 @@ from __future__ import annotations
 
 import argparse
 import os
-import struct
 import subprocess
 import sys
+from pfm import read_pfm_flat  # noqa: E402
 
 _REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _FTRACE = os.path.join(_REPO, "ftrace.exe")
@@ -60,23 +60,6 @@ _PAIR = (
     ("_distant_light_near", "near      (~632 units)",   "control: same image, smaller floats"),
     ("_distant_geometry",   "far geometry (|p|~5000)",  "the regime GPU-ORIGIN-EPS broke, twice"),
 )
-
-
-def read_pfm(path):
-    """Minimal PFM reader. The repo writes scene-linear XYZ, pre-tone-map."""
-    with open(path, "rb") as f:
-        hdr = f.readline().strip()
-        if hdr not in (b"PF", b"Pf"):
-            raise ValueError("not a PFM: %r" % hdr)
-        nc = 3 if hdr == b"PF" else 1
-        line = f.readline()
-        while line.startswith(b"#"):
-            line = f.readline()
-        w, h = (int(x) for x in line.split())
-        scale = float(f.readline().strip())
-        n = w * h * nc
-        data = struct.unpack("%s%df" % ("<" if scale < 0 else ">", n), f.read(4 * n))
-    return w, h, nc, data
 
 
 def luminance(data, nc):
@@ -100,8 +83,8 @@ def render(scene, device, mode, secs):
 
 
 def median_ratio(ref_pfm, test_pfm):
-    wr, hr, cr, dr = read_pfm(ref_pfm)
-    wt, ht, ct, dt = read_pfm(test_pfm)
+    wr, hr, cr, dr = read_pfm_flat(ref_pfm)
+    wt, ht, ct, dt = read_pfm_flat(test_pfm)
     if (wr, hr) != (wt, ht):
         raise SystemExit("size mismatch: %dx%d vs %dx%d" % (wr, hr, wt, ht))
     yr, yt = luminance(dr, cr), luminance(dt, ct)

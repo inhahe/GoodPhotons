@@ -7,7 +7,7 @@ kBdptT queues each camera vertex's surface gather (DSurfQueue) for kWfSurfGather
 site with a whole warp and adds it to the film (render_cuda.cu, SURF-WAVEFRONT). The photons,
 their weights and the film's terms are the inline gather's (FTRACE_NOSURFWF=1); only the order of
 the film's atomic sums differs, which moves a float32 pixel by a rounding at most
-(fogbox.ORDER_TOL). So it requires, against the inline gather's image of the same scene:
+(ORDER_TOL). So it requires, against the inline gather's image of the same scene:
 
   - on _fog_cornell's surface merges (`-jbeams off`, 4 spp at 160x120): every site through the
     queue (the run's point-merge line, none inline) and the inline gather's image; the inline run
@@ -37,6 +37,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 NL = chr(10)
 sys.path.insert(0, os.path.join(ROOT, "tools"))
 import fogbox  # noqa: E402
+from pfm import ORDER_TOL, image_diff, read_pfm  # noqa: E402
 from check_jchroma import SCENE as CHROMA_SCENE  # noqa: E402
 
 LINE = re.compile(r"mode J point merges: (\d+) sites gathered a warp each \(([\d.]+) a path\) "
@@ -74,7 +75,7 @@ def main():
         log = p.stdout + p.stderr
         logs.append("--- " + tag + NL + log[-600:])
         pfm = png[:-4] + ".pfm"
-        return p.returncode, log, (fogbox.load_pfm(pfm) if os.path.exists(pfm) else None)
+        return p.returncode, log, (read_pfm(pfm) if os.path.exists(pfm) else None)
 
     def pair(name, args):
         """The inline gather's image and the queue's; checks both ran as asked. Returns them."""
@@ -89,8 +90,8 @@ def main():
               and m.group(3) == "0",
               ("%s sites, %s a path, %s inline" % m.groups()) if m else "rc %d, no point-merge line" % rc1)
         if inline is not None and queued is not None:
-            r, n = fogbox.image_diff(inline, queued)
-            check(name + ": ...the image the inline gather's", r < fogbox.ORDER_TOL,
+            r, n = image_diff(inline, queued)
+            check(name + ": ...the image the inline gather's", r < ORDER_TOL,
                   "largest change %.2g of the pixel, %d values differ" % (r, n))
         return inline
 
@@ -101,8 +102,8 @@ def main():
           rc2 == 0 and m2 is not None and int(m2.group(3)) > 0,
           ("%s sites, %s inline" % (m2.group(1), m2.group(3))) if m2 else "rc %d" % rc2)
     if inline is not None and tiny is not None:
-        r, n = fogbox.image_diff(inline, tiny)
-        check("fog: ...and renders the same image", r < fogbox.ORDER_TOL,
+        r, n = image_diff(inline, tiny)
+        check("fog: ...and renders the same image", r < ORDER_TOL,
               "largest change %.2g of the pixel, %d values differ" % (r, n))
 
     rc3, log3, _ = run("fog_sized", FOG, {"FTRACE_SURFWFCAP": "2048", "FTRACE_WAVE_DEBUG": "1"},

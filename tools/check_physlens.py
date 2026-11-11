@@ -44,7 +44,7 @@ import os
 import subprocess
 import sys
 
-import numpy as np
+from pfm import read_pfm, luma  # noqa: E402
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 OUT = os.path.join(ROOT, 'scraps', '_physlens')
@@ -62,17 +62,6 @@ TOL = 0.01
 SECTIONS = ('achromat', 'singlet', 'dg8', 'published', 'dgp', 'fog', 'sky', 'panel')
 
 
-def read_pfm(p):
-    with open(p, 'rb') as f:
-        hdr = f.readline().strip()
-        ch = 3 if hdr == b'PF' else 1
-        w, h = map(int, f.readline().split())
-        scale = float(f.readline())
-        a = np.fromfile(f, '<f4' if scale < 0 else '>f4').reshape(h, w, ch)
-    a = np.flipud(a).astype(np.float64)
-    return a[..., 0] * 0.2126 + a[..., 1] * 0.7152 + a[..., 2] * 0.0722 if ch == 3 else a[..., 0]
-
-
 def render(exe, scene, name, args, res=(W, H), env=None):
     out = os.path.join(OUT, name + '.png')
     cmd = [exe, '-in', scene, '-r', str(res[0]), str(res[1]), '-hdr', '-no-meter', '-seed', '3',
@@ -83,7 +72,7 @@ def render(exe, scene, name, args, res=(W, H), env=None):
     if r.returncode != 0 or not os.path.exists(pfm):
         print(f'  render failed: {" ".join(cmd)}\n{r.stdout[-800:]}{r.stderr[-800:]}')
         return None
-    return read_pfm(pfm)
+    return luma(read_pfm(pfm, top_down=True))
 
 
 def write_scenes():

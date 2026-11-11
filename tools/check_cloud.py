@@ -12,21 +12,7 @@
 # stay dark enough to serve as the bow's backdrop, so the number that decides whether the
 # retune is acceptable is base brightness, and crown/base ratio, not total energy.
 import sys, numpy as np
-
-
-def readpfm(path):
-    with open(path, "rb") as f:
-        hdr = f.readline().strip()
-        assert hdr in (b"PF", b"Pf"), hdr
-        ch = 3 if hdr == b"PF" else 1
-        while True:
-            l = f.readline().strip()
-            if l and not l.startswith(b"#"):
-                break
-        w, h = map(int, l.split())
-        sc = float(f.readline().strip())
-        d = np.fromfile(f, "<f4" if sc < 0 else ">f4", w * h * ch)
-    return d.reshape(h, w, ch)[::-1]
+from pfm import read_pfm  # noqa: E402
 
 
 def lum(im):
@@ -34,7 +20,7 @@ def lum(im):
 
 
 paths = sys.argv[1:]
-imgs = [(p, readpfm(p)) for p in paths]
+imgs = [(p, read_pfm(p, top_down=True)) for p in paths]
 h, w, _ = imgs[0][1].shape
 
 # Cloud box, in fractions of the frame (read off a coarse luminance grid of the 480x270

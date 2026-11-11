@@ -33,9 +33,9 @@ import argparse
 import math
 import os
 import re
-import struct
 import subprocess
 import sys
+from pfm import read_pfm_flat  # noqa: E402
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 NL = chr(10)
@@ -76,20 +76,6 @@ def scene_text(obj, feather=FEATHER, res=RES):
         'medium { sigma_t %g  albedo 0  bounds { object "box"  voxels 320%s } }' % (SIGMA, fk),
         'camera "c" { eye 0 0 %g  look_at 0 0 0  up 0 1 0  fov_y %g  film { res %d %d } }'
         % (EYE, FOV, res, res)]) + NL
-
-
-def read_pfm(path):
-    with open(path, "rb") as f:
-        hdr = f.readline().strip()
-        nc = 3 if hdr == b"PF" else 1
-        line = f.readline()
-        while line.startswith(b"#"):
-            line = f.readline()
-        w, h = (int(x) for x in line.split())
-        scale = float(f.readline().strip())
-        n = w * h * nc
-        data = struct.unpack("%s%df" % ("<" if scale < 0 else ">", n), f.read(4 * n))
-    return w, h, nc, data
 
 
 def smoothstep(u):
@@ -153,7 +139,7 @@ def main():
             check("gpu: the render ran on the GPU", False, "the log does not say so")
             continue
         voxel = float(m.group(1)) / float(m.group(2))
-        w, h, nc, data = read_pfm(png[:-4] + ".pfm")
+        w, h, nc, data = read_pfm_flat(png[:-4] + ".pfm")
         rows = [r for r in range(h) if abs((2.0 * (r + 0.5) / h - 1.0) * half_w) < 0.4]
 
         def lum(r, c):

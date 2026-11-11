@@ -8,21 +8,10 @@ the ratio to the reference, so `mode M -beams` vs `mode D` is a single number.
 Usage:  python scraps/_ms_ball.py ref.pfm a.pfm [b.pfm ...]
 """
 import numpy as np, sys
+from pfm import read_pfm  # noqa: E402
 
 
-def read_pfm(path):
-    with open(path, "rb") as f:
-        hdr = f.readline().strip()
-        assert hdr in (b"PF", b"Pf"), hdr
-        ch = 3 if hdr == b"PF" else 1
-        w, h = map(int, f.readline().split())
-        scale = float(f.readline().strip())
-        data = np.frombuffer(f.read(w * h * ch * 4),
-                             dtype="<f4" if scale < 0 else ">f4")
-        return np.flipud(data.reshape(h, w, ch)).astype(np.float64)
-
-
-imgs = [(p, read_pfm(p)) for p in sys.argv[1:]]
+imgs = [(p, read_pfm(p, top_down=True)) for p in sys.argv[1:]]
 h, w, _ = imgs[0][1].shape
 # Ball at (0.5,0.42,0.5) r=0.30; eye (0.5,0.5,2.7) -> look_at (0.5,0.5,0.5); fov_y 40.
 yy, xx = np.mgrid[0:h, 0:w]

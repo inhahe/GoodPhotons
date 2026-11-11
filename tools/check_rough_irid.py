@@ -57,6 +57,7 @@ import subprocess
 import sys
 
 import numpy as np
+from pfm import read_pfm  # noqa: E402
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 NL = chr(10)
@@ -138,16 +139,6 @@ CASES = [   # the A cases render SCENE_A, through the lens
     ("D1_gpu", ["-mode", "D", "-device", "gpu", "-spp", "512", "-heroc", "1"]),
 ]
 GPU_TOKENS = ("-> GPU", "[gpu]", "VCM/UPS on ", "SPPM on ")
-
-
-def read_pfm(path):
-    """A PFM as h x w x 3, top row first."""
-    with open(path, "rb") as f:
-        assert f.readline().strip() == b"PF"
-        w, h = (int(x) for x in f.readline().split())
-        scale = float(f.readline())
-        data = np.frombuffer(f.read(), dtype="<f4" if scale < 0 else ">f4").reshape(h, w, 3)
-    return data[::-1].astype(np.float64)
 
 
 def frame():
@@ -271,7 +262,7 @@ def render(exe, out, scene, tag, args, seeds=(1, 2)):
             raise SystemExit("render failed (exit %d): %s" % (p.returncode, " ".join(cmd)))
         if "gpu" in args and not any(t in p.stdout + p.stderr for t in GPU_TOKENS):
             raise SystemExit("did not run on the GPU: " + " ".join(cmd))
-        imgs.append(read_pfm(pfm))
+        imgs.append(read_pfm(pfm, top_down=True))
     return imgs
 
 

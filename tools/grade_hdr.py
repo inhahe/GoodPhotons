@@ -56,26 +56,9 @@ import sys
 import zlib
 
 import numpy as np
+from pfm import read_pfm  # noqa: E402
 
 ABS_EXPOSURE_GAIN = 6.0          # main.cpp: constexpr double ABS_EXPOSURE_GAIN
-
-
-def read_pfm(path):
-    """Read a binary PFM. Returns float64 [H,W,3], row 0 = image top."""
-    with open(path, "rb") as f:
-        magic = f.readline().strip()
-        if magic not in (b"PF", b"Pf"):
-            raise ValueError("%s is not a binary PFM (magic %r)" % (path, magic))
-        ch = 3 if magic == b"PF" else 1
-        dims = f.readline().split()
-        w, h = int(dims[0]), int(dims[1])
-        scale = float(f.readline())
-        data = np.frombuffer(f.read(w * h * ch * 4),
-                             dtype="<f4" if scale < 0 else ">f4")
-    img = data.reshape(h, w, ch).astype(np.float64)
-    if ch == 1:
-        img = np.repeat(img, 3, axis=2)
-    return img[::-1]                      # PFM rows run bottom-to-top
 
 
 def srgb_gamma(c):
@@ -173,7 +156,9 @@ def main(argv=None):
 
     held = args.anchor if args.anchor > 0 else 0.0
     for path in files:
-        lin = read_pfm(path)
+        lin = read_pfm(path, top_down=True)
+        if lin.shape[2] == 1:
+            lin = np.repeat(lin, 3, axis=2)
         idx = frame_index(path)
         if args.absolute:
             base = ABS_EXPOSURE_GAIN * (args.exp_comp if args.exp_comp > 0 else 1.0)

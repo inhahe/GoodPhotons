@@ -51,9 +51,9 @@ Exits 1 on any failure.
 import argparse
 import os
 import statistics
-import struct
 import subprocess
 import sys
+from pfm import read_pfm_flat  # noqa: E402
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 NL = chr(10)
@@ -81,22 +81,8 @@ SCENE = NL.join([
     "}"]) + NL
 
 
-def read_pfm(path):
-    with open(path, "rb") as f:
-        hdr = f.readline().strip()
-        nc = 3 if hdr == b"PF" else 1
-        line = f.readline()
-        while line.startswith(b"#"):
-            line = f.readline()
-        w, h = (int(x) for x in line.split())
-        scale = float(f.readline().strip())
-        n = w * h * nc
-        data = struct.unpack("%s%df" % ("<" if scale < 0 else ">", n), f.read(4 * n))
-    return w, h, nc, data
-
-
 def channel_means(path):
-    w, h, nc, data = read_pfm(path)
+    w, h, nc, data = read_pfm_flat(path)
     return [sum(data[c::nc]) / (w * h) for c in range(nc)]
 
 

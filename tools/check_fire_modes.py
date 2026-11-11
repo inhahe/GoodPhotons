@@ -54,16 +54,13 @@ import numpy as np
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "tools", "loom"))
 from loom.vdbio import VolumeGrid, write_vdb  # noqa: E402
+from pfm import read_pfm  # noqa: E402
 
 NL = chr(10)
 
 
-def read_pfm_mean(path):
-    with open(path, "rb") as f:
-        f.readline()
-        w, h = (int(x) for x in f.readline().split())
-        scale = float(f.readline())
-        return float(np.frombuffer(f.read(), dtype="<f4" if scale < 0 else ">f4").mean())
+def _pfm_mean(path):
+    return float(read_pfm(path).mean())
 
 
 def main():
@@ -157,7 +154,7 @@ def main():
                             "-hdr", "-o", tag + ".png"] + ([] if meter else ["-no-meter"]) + args,
                            cwd=d, capture_output=True, text=True, encoding="utf-8", errors="replace")
         pfm = png[:-4] + ".pfm"
-        mean = read_pfm_mean(pfm) if os.path.exists(pfm) else None
+        mean = _pfm_mean(pfm) if os.path.exists(pfm) else None
         return r.returncode, r.stdout + r.stderr, mean
 
     ok = True
@@ -216,8 +213,8 @@ def main():
         if os.path.exists(stale):
             os.remove(stale)
         rc, log, _ = run(tag, ["-on-unsupported", "strip"], scene=scene, out=tag + "_f")
-        mf = read_pfm_mean(os.path.join(d, tag + "_f.pfm")) if rc == 0 else None
-        md = read_pfm_mean(os.path.join(d, tag + "_d.pfm")) if rc == 0 else None
+        mf = _pfm_mean(os.path.join(d, tag + "_f.pfm")) if rc == 0 else None
+        md = _pfm_mean(os.path.join(d, tag + "_d.pfm")) if rc == 0 else None
         good = (rc == 0 and "stripped" not in log and mf is not None and md is not None and
                 mf > 0.0 and md > 0.0)
         ok &= good
@@ -242,7 +239,7 @@ def main():
         os.remove(pm)
     rc, log, ma = run("stripother", ["-on-unsupported", "strip"], scene="firestrip.ftsl",
                       out="stripother_a")
-    mm = read_pfm_mean(pm) if rc == 0 and os.path.exists(pm) else None
+    mm = _pfm_mean(pm) if rc == 0 and os.path.exists(pm) else None
     good = (rc == 0 and "camera 'a': cannot strip" in log and "camera 'm': cannot strip" in log and
             log.count("-> mode B") == 2 and "stripped" not in log and
             ma is not None and mm is not None and ma > 0.0 and mm > 0.0)

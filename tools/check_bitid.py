@@ -46,6 +46,7 @@ import subprocess
 import sys
 
 import numpy as np
+from pfm import read_pfm  # noqa: E402
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 NL = chr(10)
@@ -214,14 +215,6 @@ def render_all(exe, out, label, paths, log):
                                                              (r.stdout + r.stderr)[-500:]))
                 ok = False
     return ok
-
-
-def read_pfm(path):
-    with open(path, "rb") as f:
-        ch = 3 if f.readline().strip() == b"PF" else 1
-        w, h = map(int, f.readline().split())
-        scale = float(f.readline())
-        return np.fromfile(f, "<f4" if scale < 0 else ">f4").reshape(h, w, ch)
 
 
 def compare(out, a, b, tol, log):

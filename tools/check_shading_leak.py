@@ -42,6 +42,7 @@ import subprocess
 import sys
 
 import numpy as np
+from pfm import read_pfm  # noqa: E402
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 NL = chr(10)
@@ -158,15 +159,6 @@ def scenes(out):
     return paths
 
 
-def read_pfm(path):
-    with open(path, "rb") as f:
-        ch = 3 if f.readline().strip() == b"PF" else 1
-        w, h = map(int, f.readline().split())
-        scale = float(f.readline())
-        a = np.fromfile(f, "<f4" if scale < 0 else ">f4").reshape(h, w, ch).astype(np.float64)
-    return a.mean(axis=-1)
-
-
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split(NL)[0])
     ap.add_argument("--out", default=os.path.join(ROOT, "png", "check_shading_leak"))
@@ -188,7 +180,7 @@ def main():
         if r.returncode != 0 or not os.path.exists(png[:-4] + ".pfm"):
             print("  %s %s %s: render failed%s%s" % (name, side, tag, NL, (r.stdout + r.stderr)[-400:]))
             return None
-        return read_pfm(png[:-4] + ".pfm")
+        return read_pfm(png[:-4] + ".pfm").mean(axis=-1)
 
     for tag, args in MODES:
         for name in ("mapped", "tipped", "smooth"):

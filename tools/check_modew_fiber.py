@@ -26,6 +26,7 @@ import subprocess
 import sys
 
 import numpy as np
+from pfm import read_pfm  # noqa: E402
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 NL = chr(10)
@@ -55,15 +56,6 @@ SEE_THROUGH = [
     'sphere "ball" { center 0 0.28 1.5  radius 0.02  material core }',
     'fur "coat" { on "ball"  material fur  count 6000  length 0.25  length_jitter 0.2  radius 0.0015  droop 0.0  jitter 0.25  seed 3 }',
 ]
-
-
-def read_pfm(path):
-    with open(path, "rb") as f:
-        assert f.readline().strip() == b"PF"
-        w, h = (int(x) for x in f.readline().split())
-        scale = float(f.readline())
-        data = np.frombuffer(f.read(), dtype="<f4" if scale < 0 else ">f4").reshape(h, w, 3)
-    return data.astype(np.float64)
 
 
 def main():

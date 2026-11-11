@@ -61,6 +61,7 @@ Usage:  python tools/slab_ss_ref.py png/slab_r.pfm [png/slab_d.pfm ...]
 import sys
 
 import numpy as np
+from pfm import read_pfm  # noqa: E402
 
 # ---- scene parameters: must match scenes/_slab_ss.ftsl -------------------------------
 BOX_MIN = np.array([-1.0, -1.0, -1.0])
@@ -75,18 +76,6 @@ FOV_Y = 30.0
 RES = 96
 
 NQUAD = 4096  # Simpson intervals along each camera ray (see convergence note at the bottom)
-
-
-def read_pfm(path):
-    with open(path, "rb") as f:
-        hdr = f.readline().strip()
-        assert hdr in (b"PF", b"Pf"), hdr
-        ch = 3 if hdr == b"PF" else 1
-        w, h = map(int, f.readline().split())
-        scale = float(f.readline().strip())
-        data = np.frombuffer(f.read(w * h * ch * 4),
-                             dtype="<f4" if scale < 0 else ">f4")
-        return np.flipud(data.reshape(h, w, ch)).astype(np.float64)
 
 
 def slab_span(o, d, tmax=None):
@@ -218,7 +207,7 @@ def main():
           f"{'noise rms':>10s}")
     base = None
     for p in paths:
-        im = read_pfm(p)
+        im = read_pfm(p, top_down=True)
         assert im.shape[0] == RES and im.shape[1] == RES, (p, im.shape)
         L = im.mean(axis=2)
         good = inside & np.isfinite(L)

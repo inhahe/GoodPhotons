@@ -380,7 +380,16 @@ a budget "and the device keep the clock"), so one binary's colour ratios moved b
 a pinned `-beamepochs 4` (point merges on and off), failed it: `gpu` Z/Y 0.9948 -> 0.9907,
 `gpu-jsurf` X/Y 0.9946 -> 1.0139, against 0.008. Two runs of one 256-spp command differed too.
 
-## OPEN (2026-11-11, 0.437.3; found in review): TOOLS-PFM-READERS — about twenty scripts in tools/ each parse PFM themselves
+## DONE (2026-11-11; opened 0.437.3, found in review): TOOLS-PFM-READERS — about twenty scripts in tools/ each parsed PFM themselves
+
+**Fixed (the user's word given):** `tools/pfm.py` is the one reader -- `read_pfm` to an (h, w, c)
+float64 array (rows as stored, or `top_down`), `read_pfm_flat` for the four scripts that wanted
+`(w, h, c, values)`, `luma`, and `image_diff` / `ORDER_TOL` (moved from fogbox) -- and the 22
+scripts that carried their own are on it, as is `_pfm.Linear` (the caustic rigs' per-pixel view).
+Each old reader, run from git against its new call on colour, grey and commented PFMs
+(`scraps/_pfm_equiv.py`), reads the same values; check_fire_modes's mean is now taken in float64
+(1e-8 apart, against its 1e-3 tolerances). Every script imports, and the four that run at import
+ran on sample images. The rest of this entry is how it stood.
 
 `read_pfm`, `readpfm`, `load` and kin in check_bitid, check_jchroma, check_motion,
 check_hero_spectral, check_physlens, check_pattern_seam, pfmstat, pfmcmp, roi_score, grade_hdr and

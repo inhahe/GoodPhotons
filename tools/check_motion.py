@@ -104,6 +104,7 @@ import sys
 import time
 
 import numpy as np
+from pfm import read_pfm  # noqa: E402
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 NL = chr(10)
@@ -616,16 +617,6 @@ def run(cmd):
     return p.returncode, p.stdout + p.stderr
 
 
-def read_pfm(path):
-    """A PFM as h x w x 3, top row first."""
-    with open(path, "rb") as f:
-        assert f.readline().strip() == b"PF"
-        w, h = (int(x) for x in f.readline().split())
-        scale = float(f.readline())
-        data = np.frombuffer(f.read(), dtype="<f4" if scale < 0 else ">f4").reshape(h, w, 3)
-    return data[::-1].astype(np.float64)
-
-
 def remove(f):
     """Delete `f` if it exists, waiting out another process (a scanner, an indexer) that holds it
     open for a moment: the run's last render of that name must not be read in place of the next."""
@@ -654,7 +645,7 @@ def render(exe, out, path, tag, args, seed=1, want_gpu=False):
         raise SystemExit("did not run on the GPU: " + " ".join(cmd))
     with open(pfm, "rb") as f:
         raw = f.read()
-    return read_pfm(pfm), raw, log
+    return read_pfm(pfm, top_down=True), raw, log
 
 
 def lum(img):
@@ -1009,7 +1000,7 @@ def main():
             print(log[-2000:])
             raise SystemExit("render failed: " + multi)
         for c in "acd":
-            imgs.setdefault(c, []).append(lum(read_pfm(png[:-4] + "_%s.pfm" % c)))
+            imgs.setdefault(c, []).append(lum(read_pfm(png[:-4] + "_%s.pfm" % c, top_down=True)))
     for c in "cd":
         mm = blocks((imgs[c][0] + imgs[c][1]) / 2)
         err = np.hypot(block_err(lb[0], lb[1]), block_err(imgs[c][0], imgs[c][1]))
@@ -1826,7 +1817,7 @@ def camera_tests(exe, out, verdict, devices):
         if rc != 0:
             print(log[-2000:])
             raise SystemExit("render failed: " + mixed)
-        km.append(lum(read_pfm(png[:-4] + "_k.pfm")))
+        km.append(lum(read_pfm(png[:-4] + "_k.pfm", top_down=True)))
         ka2.append(lum(render(exe, out, alone, "cam_alone_s%d" % sd, ["-mode", "B", "-device", "cpu", "-n",
                                                                       "40000000"], seed=sd)[0]))
     good, detail = agree(km, ka2, 0.05)

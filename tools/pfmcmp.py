@@ -1,21 +1,8 @@
 """HDR compare two .pfm renders: overall energy bias + relative RMS after an NxN
 box downsample (so per-pixel Monte-Carlo noise averages out and what is left is
 structure). Usage: rcstat.py ref.pfm test.pfm [box=8]"""
-import sys, struct
-
-
-def readpfm(p):
-    f = open(p, 'rb')
-    h = f.readline().strip()
-    while True:
-        l = f.readline()
-        if not l.startswith(b'#'):
-            break
-    w, hh = map(int, l.split())
-    sc = float(f.readline())
-    n = w * hh * (3 if h == b'PF' else 1)
-    d = struct.unpack(('<' if sc < 0 else '>') + str(n) + 'f', f.read(4 * n))
-    return w, hh, (3 if h == b'PF' else 1), d
+import sys
+from pfm import read_pfm_flat  # noqa: E402
 
 
 def lum(w, h, c, d):
@@ -37,8 +24,8 @@ def down(w, h, a, B):
 
 
 B = int(sys.argv[3]) if len(sys.argv) > 3 else 8
-w, h, c, a = readpfm(sys.argv[1])
-_, _, c2, b = readpfm(sys.argv[2])
+w, h, c, a = read_pfm_flat(sys.argv[1])
+_, _, c2, b = read_pfm_flat(sys.argv[2])
 A, Bl = lum(w, h, c, a), lum(w, h, c2, b)
 mA = sum(A) / len(A)
 mB = sum(Bl) / len(Bl)

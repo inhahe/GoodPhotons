@@ -1,4 +1,4 @@
-"""Read a render as scene-linear RGB floats -- shared by `_gemsweep.py` and `_capchroma.py`.
+"""A render as scene-linear RGB floats, per pixel (its PFM read by pfm.py) -- shared by the caustic rigs.
 
 WHY THIS EXISTS.  Both rigs measure caustics, and a caustic is by definition the brightest
 thing in frame, so metering one off a PNG measures the tone map instead of the render: 8-bit
@@ -13,7 +13,10 @@ expected to say so out loud.
 """
 import array
 import math
-import sys
+
+import numpy as np
+
+from pfm import read_pfm
 
 
 def srgb_to_lin(v):
@@ -37,20 +40,14 @@ class Linear:
                                          for y in range(self.h)
                                          for x in range(self.w) for k in range(3)))
             return
-        with open(path, 'rb') as f:
-            if f.readline().strip() != b'PF':
-                raise ValueError(f'{path} is not a colour PFM')
-            self.w, self.h = (int(v) for v in f.readline().split())
-            scale = float(f.readline())
-            self.buf = array.array('f')
-            self.buf.frombytes(f.read(self.w * self.h * 12))
-        if (scale < 0) != (sys.byteorder == 'little'):
-            self.buf.byteswap()
-        # PFM rasters run BOTTOM-to-top; flip to image order so (x, y) means the same thing
-        # here as it does for a PNG and for the camera projection.
-        row = self.w * 3
-        self.buf = array.array('f', (v for y in range(self.h - 1, -1, -1)
-                                     for v in self.buf[y * row:(y + 1) * row]))
+        # The one PFM reader (pfm.py), top row first so (x, y) means the same thing here as it
+        # does for a PNG and for the camera projection.
+        img = read_pfm(path, top_down=True)
+        if img.shape[2] != 3:
+            raise ValueError(f'{path} is not a colour PFM')
+        self.h, self.w = img.shape[0], img.shape[1]
+        self.buf = array.array('f')
+        self.buf.frombytes(img.astype(np.float32).tobytes())
 
     def at(self, x, y):
         i = (y * self.w + x) * 3

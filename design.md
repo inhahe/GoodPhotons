@@ -2408,7 +2408,7 @@ sample), the chunk boundaries reach the image: there the chunks are sized by the
 0.15 s); elsewhere the clock keeps sizing them, the boundaries touching nothing but the order of the
 film's sums. `-beamepochs` still pins chunks to 1 spp, a flight's frames sharing their per-chunk
 photons by sample. check_jdeterminism holds GPU mode J, with and without `-jsurf`, to repeat
-itself (to `fogbox.ORDER_TOL`, the film's atomic sums landing in any order). **Mode M's CPU loop
+itself (to `pfm.ORDER_TOL`, the film's atomic sums landing in any order). **Mode M's CPU loop
 does the same since 0.434.23**
 (MODEM-CPU-NONDET; the counters live in `workcount.h`): its light units are the photon paths and
 each grid's or map's build, its camera units the rays, the beams weighed and a sixteenth of each

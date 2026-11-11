@@ -29,6 +29,7 @@ import subprocess
 import sys
 
 import numpy as np
+from pfm import read_pfm  # noqa: E402
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 NL = chr(10)
@@ -71,15 +72,6 @@ SCENES = {
         'light area { origin -0.5 1.468 2.266  u 1.0 0 0  v 0 -0.536 0.268  normal 0 -0.447 -0.894  power 300  spd preset:d65 }',
     ],
 }
-
-
-def read_pfm(path):
-    with open(path, "rb") as f:
-        assert f.readline().strip() == b"PF"
-        w, h = (int(x) for x in f.readline().split())
-        scale = float(f.readline())
-        data = np.frombuffer(f.read(), dtype="<f4" if scale < 0 else ">f4").reshape(h, w, 3)
-    return data.astype(np.float64)
 
 
 # What a device render prints to say where it ran: the `-> GPU` device line (modes R, W, D, J and

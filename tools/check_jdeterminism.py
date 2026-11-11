@@ -22,7 +22,7 @@ default fixed map, and in mode M (-beams, 64 spp, -beamrefresh 0.5), each:
 On the GPU (GPU-J-CLOCK) mode J's camera pass counts its own work (cudaLastBdptWork) and its
 chunks, which each draw their own device surface photons under -jsurf, are sized by those counts
 rather than timed. Mode J on the GPU, under the knee rule with and without -jsurf, must repeat
-itself twice and at one thread too -- to fogbox.ORDER_TOL rather than byte for byte, the film's
+itself twice and at one thread too -- to ORDER_TOL rather than byte for byte, the film's
 atomic sums landing in any order; an epoch or chunk laid by the clock moves pixels by per cent.
 
 Each needs more than one epoch to mean anything, and says how many it got. And mode M resumed
@@ -40,7 +40,7 @@ import sys
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 NL = chr(10)
 sys.path.insert(0, os.path.join(ROOT, "tools"))
-import fogbox  # noqa: E402
+from pfm import ORDER_TOL, image_diff, read_pfm  # noqa: E402
 
 SCENE = NL.join([
     "scene { units meters  spectral 360 830 1 }",
@@ -113,14 +113,14 @@ def main():
             fails.append(name)
 
     def same(mode, tag, a, b):
-        """Byte for byte on the CPU; on the GPU to fogbox.ORDER_TOL (atomic sums). Returns the
+        """Byte for byte on the CPU; on the GPU to ORDER_TOL (atomic sums). Returns the
         check's name and verdict and its detail."""
         if "gpu" not in CASES[mode]:
             return "mode %s: %s byte for byte the first" % (mode, tag), a == b, ""
         pa, pb = (os.path.join(d, "%s_%s.pfm" % (mode, t)) for t in ("run1", tag))
-        r, n = fogbox.image_diff(fogbox.load_pfm(pa), fogbox.load_pfm(pb))
-        return ("mode %s: %s the first, to %g of a pixel" % (mode, tag, fogbox.ORDER_TOL),
-                r < fogbox.ORDER_TOL, "largest change %.2g, %d values differ" % (r, n))
+        r, n = image_diff(read_pfm(pa), read_pfm(pb))
+        return ("mode %s: %s the first, to %g of a pixel" % (mode, tag, ORDER_TOL),
+                r < ORDER_TOL, "largest change %.2g, %d values differ" % (r, n))
 
     for mode in CASES:
         first, epochs = render(mode, "run1")
