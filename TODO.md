@@ -100,8 +100,9 @@ Each names the section its line is in.
 7. ~~**MODEM-BEAM-CARRIER**~~ (0.433.5), ~~**JSPEC-GAPS**' support~~ (0.433.11) and
    ~~**MODEM-REDPASS**~~ (not reproduced) (4.2) — mode M's beams, and mode J's last camera-side
    factors, at the camera's wavelength. Done.
-8. ~~**UPBP-BEAM-RADIUS**~~ (0.434.0) with **J-FOG-REALCAM** (4.3) — mode J's beam kernel shrinks
-   per epoch now; J-FOG-REALCAM's CPU-only extra deficit is what is left.
+8. ~~**UPBP-BEAM-RADIUS**~~ (0.434.0) with ~~**J-FOG-REALCAM**~~ (4.3) — mode J's beam kernel shrinks
+   per epoch now; J-FOG-REALCAM's CPU-only extra deficit was the CPU's fewer counted epochs
+   (closed 2026-11-12: at equal epochs the devices agree).
 9. ~~**GLTF-ROUGHNESS-MAP**~~ (0.434.4) and ~~**GLTF-MAP-MEAN-GUTTERS**~~ (0.434.7) (4.2) — glTF
    imports rougher than glTF means, and their mean metalness and roughness counting the atlas
    gutters. Done.
@@ -329,7 +330,8 @@ Then the rest of 4.2-4.6 in their order, 4.7's bookkeeping alongside whatever to
 
 - [x] **UPBP-BEAM-RADIUS** (0.434.0) — mode J's beam kernel shrinks per light-side epoch under
   -vcmalpha (_fog_cornell -0.70 % of mode D fixed, -0.43 % at 256 epochs, -0.07 % per sample).
-- [ ] **J-FOG-REALCAM**, what is left — CPU mode J reads realcam's fog up to 2.8 % below GPU mode J.
+- [x] **J-FOG-REALCAM**, what is left — CPU mode J read realcam's fog below GPU mode J: its counted
+  epochs are a third of the GPU's, its kernel shrinks less; at equal epochs they agree (2026-11-12).
 - [x] **UPBP-W-CHROMATIC** (0.434.19) — in a chromatic medium a beam merge's weight mixed two
   wavelengths and the frame tilted in colour (`tools/check_jchroma.py`).
 - [x] **UPBP-W-RAINBOW** — the same mix in a rainbow-phase medium, through the camera side's phase

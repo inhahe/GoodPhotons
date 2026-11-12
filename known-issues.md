@@ -4925,7 +4925,27 @@ the film's corner): fixed by the rectangle, by building each bin over points 15%
 and by re-verifying until a whole uniform batch finds nothing outside. `-checklens` gates
 coverage, the density, and aimed-vs-uniform agreement; `tools/check_physlens.py` the images.
 
-## OPEN (2026-10-23): J-FOG-REALCAM — mode J reads realcam's scene in fog 2-4% low, lens or none: the beam kernel's blur
+## DONE (2026-11-12, explained; opened 2026-10-23): J-FOG-REALCAM — mode J reads realcam's scene in fog 2-4% low, lens or none: the beam kernel's blur
+
+**The CPU-only part is the light-side epoch count, not a technique.** On 0.439.2,
+`scenes/_realcam_fog.ftsl` at 96x64, J 4096 spp against GPU mode D 16384: under the work counts
+CPU J read Y 0.992-0.993 of D and GPU J 0.996, a 0.4 % gap (1.4 % in two blocks). The halves
+(FTRACE_J_HALF) do not compare across devices -- connections 0.76, merges 1.02 CPU over GPU,
+their sum 0.996 -- since the two devices' weights partition the techniques differently; the
+light sides did not: one beam map on both (23 119 beams from 215 subpaths), but 425 epochs on the
+CPU against 1504 on the GPU. The beam kernel shrinks per epoch (UPBP-BEAM-RADIUS), and the counts
+price the CPU's light side dearer against its camera pass, so it draws a third as many
+realizations and keeps more of the kernel's blur, which reads dark. At `-beamepochs 1024` on both,
+six seeds each: X 0.9913 +- 0.0014 (CPU) / 0.9916 +- 0.0010 (GPU), Y 0.9924 +- 0.0003 /
+0.9936 +- 0.0006, Z 0.9916 +- 0.0010 / 0.9920 +- 0.0008 of D -- within 0.3, 1.8 and 0.3 standard
+errors. What is left on both is the kernel's residual at 1024 epochs (-0.7 %), which a consistent
+estimator's shrink leaves at finite epochs and the epochs remove. check_physlens and
+check_jchroma's `cpu` variant, which held CPU J looser for this "bias" (3 % and 1.5 %), pin its
+epochs as they pin the GPU's and hold it alike (1.5 % and 0.8 %): check_physlens reads CPU J aimed
+against unaimed 0.995-1.002, and check_jchroma's `cpu` -- at six seeds, its three's interval
+holding the tolerance -- X over Y 0.9954, Z over Y 1.0052. On that chromatic scene the two
+devices' mode J at equal epochs agree too (six seeds each, no reference between: X over Y
+0.995 +- 0.005 CPU over GPU, Z over Y 1.001, Y 1.001). The rest of this entry is how it stood.
 
 Found by `tools/check_physlens.py`'s fog case. `scenes/realcam.ftsl` (pinhole, `fov_y 27`) inside
 `medium { sigma_t 0.15 albedo 0.8 g 0.0 }`, everything at `-max-bounce 8`, GPU, 128x86, R 8192 spp

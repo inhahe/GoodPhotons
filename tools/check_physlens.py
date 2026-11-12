@@ -248,27 +248,27 @@ def check_fog(exe, scenes, devices):
     for dev in devices:
         img = render(exe, scenes['fog'], f'fog_D_{dev}', ['-mode', 'D', '-spp', '4096', '-device', dev] + deep)
         allok = (img is not None and compare(f'D on the {dev.upper()}', ref, img, REGIONS, TOL)) and allok
-        # Mode J is held to itself rather than to R: its merges read this fog 3-4% low with no
-        # lens at all (known-issues.md J-FOG-REALCAM), which would hide anything the lens adds.
+        # Mode J is held to itself rather than to R: its merges read this fog low with no lens at
+        # all, their kernel's blur (about 0.7% at 1024 epochs, more at fewer; known-issues.md
+        # J-FOG-REALCAM), which would hide anything the lens adds.
         # With the pupil table turned off (FTRACE_LENS_FRONT) the light image samples the whole
         # front element and lensAimRatio is 1 everywhere, so the two renders differ only by what
         # aiming changes -- in J, the merges' weighing of it on the camera's first segment.
         # The two J renders weigh their techniques differently (aiming changes the light image's
-        # density), so a bias in any one technique moves their totals apart. The CPU's J carries
-        # one the GPU's does not -- with no lens at all CPU J reads this fog up to 2.8% off GPU J
-        # (known-issues.md J-FOG-REALCAM) -- and aimed and unaimed CPU J differ by ~1.7%, the same
-        # every run; the GPU's agree to 0.5%. It is not the lens code: J's one lens-specific term
-        # (BeamMergeWeight::lensCam) moves CPU J by under 0.07% when removed, and the terms J
-        # shares with D are D's, which matches R on the CPU in this fog. Hence 3% on the CPU until
-        # the CPU J's own bias is fixed. On the GPU the bound is 1.5%: at these
-        # 1024 spp a region of J's swings by up to 0.9% from build to build (the floor read
-        # 0.9911, 1.0067, 0.9946 in three), and a 1.09% blue region at 0.399.1 came back 0.50% at
-        # 4x the samples -- noise, which 1% caught one run in a few. 4x the samples would cost
-        # half an hour a run.
-        jtol = 0.015 if dev == 'gpu' else 0.03
+        # density), so a bias in any one technique moves their totals apart -- and the merges
+        # carry one, their shrinking kernel's blur, the larger the fewer light-side epochs a
+        # render draws. Their epochs are pinned (-beamepochs), so both renders, on either device,
+        # draw as many: under the work counts the CPU drew about a third of the GPU's, and its
+        # aimed and unaimed J differed by ~1.7% against the GPU's 0.5% (known-issues.md
+        # J-FOG-REALCAM, closed as that). The bound is 1.5%: at these 1024 spp a region of J's
+        # swings by up to 0.9% from build to build (the floor read 0.9911, 1.0067, 0.9946 in
+        # three), and a 1.09% blue region at 0.399.1 came back 0.50% at 4x the samples -- noise,
+        # which 1% caught one run in a few. 4x the samples would cost half an hour a run.
+        jtol = 0.015
         # -jbeams auto: the knee-sized map these tolerances were set against; mode J's sparse
         # fixed default (0.435.0) gives the merges under test a far smaller share.
-        jargs = ['-mode', 'J', '-spp', '1024', '-device', dev, '-jbeams', 'auto'] + deep
+        jargs = ['-mode', 'J', '-spp', '1024', '-device', dev, '-jbeams', 'auto',
+                 '-beamepochs', '256'] + deep
         front = render(exe, scenes['fog'], f'fog_Jfront_{dev}', jargs, env={'FTRACE_LENS_FRONT': '1'})
         img = render(exe, scenes['fog'], f'fog_J_{dev}', jargs)
         allok = (img is not None and front is not None and

@@ -22,10 +22,12 @@ Mode J's own small bias (about -0.4 %, J-FOGCORNELL's kernel blur) is shared by 
 and cancels there; the frame's Y must agree within 1.5 %. About 25 minutes on the GPU at the
 defaults: run it after a change to mode J's weights.
 
-On the GPU a J render's light-side epochs are pinned (--epochs, `-beamepochs`; by default
---jspp / 8, about what the clock chose: 234-329 at 2048 spp), so a binary's verdict is the same
-every run and stays where it is should the device's work-count constants be refitted, which would
-move the epochs the counts lay (known-issues JCHROMA-CLOCK, GPU-J-CLOCK). It is
+A J render's light-side epochs are pinned on either device (--epochs, `-beamepochs`; by
+default --jspp / 8, about what the clock chose: 234-329 at 2048 spp), so a binary's verdict is the
+same every run and stays where it is should the work-count constants be refitted, which would move
+the epochs the counts lay (known-issues JCHROMA-CLOCK, GPU-J-CLOCK); and so the two devices draw
+as many realizations, their beam kernels shrinking alike (J-FOG-REALCAM: under the counts the CPU
+draws a third as many and reads its fog darker, which was taken for a CPU-only bias). It is
 still a sample: a render's X and Z over Y scatter by 0.5-1 %, from its camera samples and its
 light-side realizations alike (one seed's ratios move by up to 2 % between 64, 256 and 1024
 epochs, in no consistent direction; holding the radii still, `-vcmalpha 1`, moves them by 0.1 %).
@@ -34,13 +36,14 @@ inside the seeds' 95 % interval: more --seeds decide, since a change that moves 
 streams draws again.
 --variants picks what is held: `gpu` (the default; beam merges), `gpu-jsurf` (point merges too,
 whose weights read the same tables: SurfMergeWeight, DSurfMergeW) and `cpu` (the host's
-ChromaMis; beam merges), each against mode R on its own device, about 25 minutes apiece. In this
+ChromaMis; beam merges), each against mode R on its own device and held alike, about 25 minutes
+apiece. In this
 scene the point merges carry about 1e-5 of the frame, so `gpu-jsurf` reads what `gpu` does to the
 fourth digit and does not hold their weights: tools/check_jsurfw.py holds those directly,
-device against host (known-issues JCHROMA-JSURF-WEAK). The CPU's
-mode J reads X over Y about 1.3 % lower than the GPU's here with the fix on or off -- a CPU-only
-bias of its own (known-issues J-FOG-REALCAM) -- so `cpu` is held to 1.5 %: with the fix it reads
-0.990 / 1.003, without 0.971 / 1.019 (the GPU at the defaults: 0.998 / 0.997 and 0.981 / 1.011).
+device against host (known-issues JCHROMA-JSURF-WEAK). The GPU at the defaults reads X and Z
+over Y 0.998 / 0.997 with the fix and 0.981 / 1.011 without. `cpu` takes six seeds at least: its
+three read X over Y 0.991, the tolerance inside their 95 % interval; mode J on the two devices at
+equal epochs reads this scene alike (six seeds each: X over Y 0.995 +- 0.005 CPU over GPU).
 `--reuse-ref` keeps the references from an earlier run in --out, so a second run -- with
 FTRACE_JCHROMA=0 in the environment, say, which reads the weights at the camera's wavelength as
 before the fix and fails -- renders only mode J.
@@ -129,9 +132,9 @@ def main():
         print("%s: mode %s seed %d done" % (tag, mode, seed), flush=True)
         return channel_means(png[:-4] + ".pfm")
 
-    # device, mode-J flags, colour tolerance (the CPU's: J-FOG-REALCAM, above)
+    # device, mode-J flags, colour tolerance
     VARIANTS = {"gpu": ("gpu", ("-nojsurf",), a.tol), "gpu-jsurf": ("gpu", ("-jsurf",), a.tol),
-                "cpu": ("cpu", ("-nojsurf",), max(a.tol, 0.015))}
+                "cpu": ("cpu", ("-nojsurf",), a.tol)}
     # Two-sided 95 % t quantiles by degrees of freedom (the seeds less one), for the standard
     # error of a handful of seeds.
     T95 = {1: 12.71, 2: 4.30, 3: 3.18, 4: 2.78, 5: 2.57, 6: 2.45, 7: 2.36, 8: 2.31, 9: 2.26}
@@ -144,11 +147,11 @@ def main():
             refs[dev] = (channel_means(ref_pfm) if a.reuse_ref and os.path.exists(ref_pfm)
                          else render(dev, dev, "R", 1, a.rspp))
         ref = refs[dev]
-        # The device ends mode J's epochs on the clock unless they are pinned (JCHROMA-CLOCK).
-        epochs = ("-beamepochs", str(a.epochs)) if dev == "gpu" else ()
+        # Pinned on both devices: the same realizations' count, the same kernel (above).
+        epochs = ("-beamepochs", str(a.epochs))
         per = [render(dev, tag, "J", sd, a.jspp,
                       ("-beamcount", "100000", "-beamk", "2") + jflags + epochs)
-               for sd in range(1, a.seeds + 1)]
+               for sd in range(1, (max(a.seeds, 6) if dev == "cpu" else a.seeds) + 1)]
         j = [sum(m[c] for m in per) / len(per) for c in range(3)]
         if tag == "gpu-jsurf":
             print("gpu-jsurf: the point merges carry ~1e-5 of this frame, so this holds no more "
