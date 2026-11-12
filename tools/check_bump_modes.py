@@ -32,10 +32,12 @@ A fourth carries the map on glossy walls (roughness 0.4), every mode held to R w
 mode R to itself with glossy NEE off. The terminator's softening belongs to the vertex next to the
 light, whichever strategy reaches it, so the light the lobe's own sample reaches takes it as the
 light sampling does (contSoftening): an unsoftened lobe read R 1.044 of itself with its lobe alone,
-device mode S 1.043. A fifth, the diffuse room open to a sky (no ceiling, no lamp), holds modes M
-and S to R (D, J and U render no environment light, and mode B reads such walls ~1 % bright flat or
-bumped, B-ENV-WALLS in known-issues.md) and R to itself with sky NEE off (FTRACE_ENV_NEE=0, host): the sky reached by a diffuse
-vertex's escape takes the vertex's softening too, where without it the escape alone read 1.022.
+device mode S 1.043. A fifth, the diffuse room open to a sky (no ceiling, no lamp), holds modes B,
+M and S to R (D, J and U render no environment light) and R to itself with sky NEE off
+(FTRACE_ENV_NEE=0, host): the sky reached by a diffuse vertex's escape takes the vertex's softening
+too, where without it the escape alone read 1.022. Mode B read it 1.007 until 0.440.11: it drew
+the sky it sees directly with one ray through each pixel's centre, so the pixels along the back
+wall's top edge took all of the sky or none (B-ENV-WALLS).
 A sixth, the diffuse room with a normal-mapped translucent panel standing in it, holds every mode
 to R: a translucent lobe pair is lit by light from above ns on the light's own side, in its reflect
 lobe on the camera's geometric side and its transmit lobe on the far one, and in neither between the
@@ -77,6 +79,9 @@ MODE_ARGS = {"J": ["-jsurf-radius", "0.02"]}
 # The fluorescent room's mode R splits the hero bundle at each wall vertex, into 7 sub-paths of 8.
 SPLIT = ["-herosplit", "-heroc", "8"]
 TOL = 0.01
+# Mode B's frame is precise to about 0.03 % over three seeds, so it is held to 0.5 %: at 1 % the sky
+# room's B-ENV-WALLS (1.0097 on the host) passed.
+TOL_MODE = {"B": 0.005}
 
 
 def ripple(path, amp, w=64):
@@ -189,7 +194,7 @@ def main():
                     break
                 if layered and mode not in ("M", "S"):
                     continue
-                if kind == "sky" and mode not in ("M", "S"):   # D, J, U take no sky; B: B-ENV-WALLS
+                if kind == "sky" and mode not in ("B", "M", "S"):   # D, J and U take no sky
                     continue
                 depth = DEPTH.get(mode, 8)
                 if depth not in refs:
@@ -200,7 +205,8 @@ def main():
                 m, se = np.mean(v), np.std(v, ddof=1) / np.sqrt(len(v))
                 ratio = m / rm
                 err = np.hypot(se / rm, m * rse / rm ** 2)
-                good = abs(ratio - 1.0) <= (2 * TOL if layered else TOL)
+                tol = TOL_MODE.get(mode, TOL)
+                good = abs(ratio - 1.0) <= (2 * tol if layered else tol)
                 print("%s: %-6s mode %s on the %s: %.4f of mode R (+-%.4f)"
                       % ("ok" if good else "FAIL", name, mode, "host" if dev == "cpu" else "device",
                          ratio, err), flush=True)

@@ -16059,40 +16059,48 @@ static void thinFilmSwatch(double n1, double n2) {
                 n1, n2, dMin, dMax);
 }
 
-// Add the directly-viewed environment background to a forward (model-B) film. For
-// each pixel whose pixel-center camera ray escapes all geometry, deposit N times the
-// escape direction's env XYZ (constant for a flat env, the lat-long map colour for
-// an image env), so that after writeFilm's 1/(N*cieYIntegral) normalisation the pixel
-// shows the environment radiance in XYZ — matching the backward tracer's ray-miss
-// term (which adds L_env(dir)*invPdfLambda). Forward photons carry the env *illumination* of
-// surfaces; this pass supplies the *direct view* of the sky behind the geometry.
-// No-op unless the scene has an env light. Silhouette pixels are classified by the
-// pixel center (a sub-pixel edge approximation, like mode P's classifier).
-// A distant `sun` light is handled here too: a forward photon fired into the solar
-// cone never travels *toward* the camera (the disc is at infinity), so the direct
-// view of the solar disc — like the sky behind the geometry — is a pure camera-ray
-// term. `sunXYZForDir` returns 0 outside every sun's cone, so this costs nothing
-// for a scene without one.
-// The same pass through a PHYSICAL lens. A pinhole sees one sky direction per pixel; a lens
-// sees the sky over its pupil -- blurred where it is out of focus, darkened toward the corners,
-// dispersed by the glass -- and at the lens image's irradiance scale (genLensRay's weight),
-// which is what the forward lens splat deposits for everything else. So each pixel averages
-// camera rays over its area, the pupil and the visible band, each MONOCHROMATIC since the
-// glass bends every wavelength its own way:
+// Add the directly-viewed environment background to a forward (model-B) film: forward photons carry
+// the env's *illumination* of surfaces, and this pass supplies the *direct view* of the sky behind
+// the geometry, as mode R's ray-miss term does (L_env(dir) * invPdfLambda). A distant `sun` too: a
+// photon fired into the solar cone never travels toward the camera (the disc is at infinity), so
+// the view of the solar disc is a camera-ray term as well (`sunXYZForDir` is 0 outside every sun's
+// cone). No-op unless the scene has either.
+//
+// Each pixel averages camera rays over its AREA, as mode R's pixel does and as the photon splats
+// fill it, so a pixel the sky's edge crosses takes the sky's share of it (B-ENV-WALLS: one ray
+// through the pixel's centre gave such a pixel all of the sky or none, and the band along a wall's
+// top edge against the sky read 8 % bright). Deposited as N times the mean so writeFilm's
+// 1/(N*cieYIntegral) leaves the radiance in XYZ.
+//   A pinhole: K = 64 points over the pixel, a Halton (2,3) lattice rotated per pixel, each the
+// escape direction's env and sun XYZ (deterministic per direction, so K only has to resolve the
+// edges).
+//   A PHYSICAL lens sees the sky over its pupil -- blurred where it is out of focus, darkened toward
+// the corners, dispersed by the glass -- at the lens image's irradiance scale (genLensRay's weight),
+// which is what the forward lens splat deposits for everything else. So each sample is also a
+// pupil point and a MONOCHROMATIC wavelength, since the glass bends each its own way:
 //   (1/K) sum_k cie(lambda_k) * L_sky(d_k, lambda_k) * wLens_k * (830 - 360).
 // That is mode R's estimator, with mode R's variance per sample, so a fixed handful of samples
 // would leave a grainy sky over a converged scene. The count grows with the render instead:
-// K = photons per pixel / 4, between 64 and 4096, added to a running sum each time a write
-// asks for more (the wavelengths follow a per-pixel van der Corput sequence, so they stay
-// stratified at any K). The sums are kept for the last four cameras that asked (least
-// recently used evicted), since a render adds the sky to every interval write and a
-// multi-camera render writes its cameras in turn.
-static void addEnvBackgroundLens(Film& film, const Scene& scene, const Camera& cam, long long N) {
+// K = photons per pixel / 4, between 64 and 4096, added to a running sum each time a write asks for
+// more (the wavelengths follow a per-pixel van der Corput sequence, so they stay stratified at any
+// K).
+// The sums are kept for the last four cameras that asked (least recently used evicted), since a
+// render adds the sky to every interval write and a multi-camera render writes its cameras in turn
+// -- keyed on everything a ray depends on: the scene (its generation and builds), the pose, the
+// projection, the lens and the film.
+static void addEnvBackground(Film& film, const Scene& scene, const Camera& cam, long long N) {
+    const bool haveEnv = scene.envIndex >= 0, haveSun = scene.sunCount > 0;
+    if (!haveEnv && !haveSun) return;
+    // Under a blur the forward pass drew it into the film already, batch by batch, each sample at
+    // a time of its own (addBlurredSkyRows).
+    if (cam.seesMotion(scene)) return;
     constexpr double kLo = 360.0, kHi = 830.0;
     struct Cache {
+        uint64_t gen = 0, builds = 0;
         const LensSystem* lens = nullptr;
-        Vec3 eye, w, u;
-        int rx = 0, ry = 0;
+        Vec3 eye, w, u, v;
+        double tanX = 0, tanY = 0, shiftX = 0, rEdge = 0;
+        int proj = 0, rx = 0, ry = 0;
         long long K = 0;                 // samples per pixel in `sum`
         unsigned long long used = 0;     // last use, for eviction
         std::vector<Vec3> sum;
@@ -16103,11 +16111,12 @@ static void addEnvBackgroundLens(Film& film, const Scene& scene, const Camera& c
     static unsigned long long clock = 0;
     std::lock_guard<std::mutex> lock(mtx);
     const int rx = film.resX, ry = film.resY;
+    const auto eq = [](const Vec3& a, const Vec3& b) { return a.x == b.x && a.y == b.y && a.z == b.z; };
     auto same = [&](const Cache& c) {
-        return c.lens == cam.lens.get() && c.rx == rx && c.ry == ry &&
-               c.eye.x == cam.eye.x && c.eye.y == cam.eye.y && c.eye.z == cam.eye.z &&
-               c.w.x == cam.w.x && c.w.y == cam.w.y && c.w.z == cam.w.z &&
-               c.u.x == cam.u.x && c.u.y == cam.u.y && c.u.z == cam.u.z;
+        return c.gen == scene.generation && c.builds == scene.buildCount && c.lens == cam.lens.get() &&
+               c.rx == rx && c.ry == ry && eq(c.eye, cam.eye) && eq(c.w, cam.w) && eq(c.u, cam.u) &&
+               eq(c.v, cam.v) && c.tanX == cam.tanHalfX && c.tanY == cam.tanHalfY &&
+               c.shiftX == cam.frustumShiftX && c.rEdge == cam.rEdge && c.proj == cam.projection;
     };
     Cache* hit = nullptr;
     for (Cache& c : slots) if (same(c)) { hit = &c; break; }
@@ -16115,34 +16124,58 @@ static void addEnvBackgroundLens(Film& film, const Scene& scene, const Camera& c
         if (slots.size() < kSlots) slots.emplace_back();
         hit = &slots[0];
         for (Cache& c : slots) if (c.used < hit->used) hit = &c;   // an empty slot has used == 0
-        hit->lens = cam.lens.get(); hit->rx = rx; hit->ry = ry;
-        hit->eye = cam.eye; hit->w = cam.w; hit->u = cam.u;
+        hit->gen = scene.generation; hit->builds = scene.buildCount; hit->lens = cam.lens.get();
+        hit->rx = rx; hit->ry = ry;
+        hit->eye = cam.eye; hit->w = cam.w; hit->u = cam.u; hit->v = cam.v;
+        hit->tanX = cam.tanHalfX; hit->tanY = cam.tanHalfY; hit->shiftX = cam.frustumShiftX;
+        hit->rEdge = cam.rEdge; hit->proj = cam.projection;
         hit->K = 0;
         hit->sum.assign((size_t)rx * (size_t)ry, Vec3{0, 0, 0});
     }
     hit->used = ++clock;
     Cache& cache = *hit;
+    const bool lensed = cam.hasLens();
     const double perPixel = (double)N / ((double)rx * (double)ry);
-    const long long want = std::max(64LL, std::min(4096LL, (long long)(perPixel / 4.0)));
+    const long long want = lensed ? std::max(64LL, std::min(4096LL, (long long)(perPixel / 4.0))) : 64LL;
+    // The radical inverse of `k` in `base`: a van der Corput point, in [0, 1).
+    const auto radInv = [](long long k, int base) {
+        double r = 0.0, f = 1.0 / base;
+        for (; k > 0; k /= base, f /= base) r += f * (double)(k % base);
+        return r;
+    };
+    // Each sample is a function of its pixel and its index k alone, and is added to the pixel's
+    // running sum in k order, so the sums are the same however the writes that asked for them
+    // split the samples into batches: a live window's refreshes, which fall where the clock puts
+    // them, do not move the image.
     if (cache.K < want) {
         const long long k0 = cache.K, k1 = want;
-        const bool haveEnv = scene.envIndex >= 0, haveSun = scene.sunCount > 0;
-        std::vector<Vec3> add((size_t)rx * (size_t)ry, Vec3{0, 0, 0});
+        std::vector<Vec3> add = cache.sum;
         const bool done = ft::parallelFor((size_t)ry, 1, [&](size_t py) {
             for (int px = 0; px < rx; ++px) {
                 const uint64_t pix = (uint64_t)py * (uint64_t)rx + (uint64_t)px;
                 Pcg32 rot;
                 seedUnit(rot, pix, 0x5EC7A11E5C0FFEEULL);
                 const double off = rot.uniform();
-                Pcg32 rng;
-                seedUnit(rng, pix, 0xB6C0FFEEULL ^ ((uint64_t)k0 * 0x9E3779B97F4A7C15ULL));
-                Vec3 acc{0, 0, 0};
-                for (long long k = k0; k < k1; ++k) {
-                    double u = off;              // van der Corput in base 2, rotated per pixel
-                    for (double f = 0.5, kk = (double)k; kk >= 1.0; f *= 0.5) {
-                        const double bit = std::fmod(kk, 2.0);
-                        u += f * bit; kk = std::floor(kk / 2.0);
+                Vec3 acc = add[pix];
+                if (!lensed) {
+                    const double offY = rot.uniform();
+                    for (long long k = k0; k < k1; ++k) {
+                        double jx = off + radInv(k, 2), jy = offY + radInv(k, 3);
+                        jx -= std::floor(jx); jy -= std::floor(jy);
+                        const Ray r = cam.genRay(px, (int)py, jx, jy);
+                        // A CAMERA ray, so a `hide_camera` flat lets the sky through (Material::hideCamera).
+                        if (scene.closestHit(r, 1e-6, nullptr, /*skipHair=*/false,
+                                             /*skipCamHidden=*/true).valid) continue;
+                        if (haveEnv) acc += scene.envXYZForDir(r.d);
+                        if (haveSun) acc += scene.sunXYZForDir(r.d);
                     }
+                    add[pix] = acc;
+                    continue;
+                }
+                for (long long k = k0; k < k1; ++k) {
+                    Pcg32 rng;                   // the pupil and pixel point: sample k's own
+                    seedUnit(rng, pix, 0xB6C0FFEEULL ^ ((uint64_t)k * 0x9E3779B97F4A7C15ULL));
+                    double u = off + radInv(k, 2);   // van der Corput in base 2, rotated per pixel
                     u -= std::floor(u);
                     const double lambda = kLo + (kHi - kLo) * u;
                     Ray r; double wLens = 0.0;
@@ -16161,7 +16194,7 @@ static void addEnvBackgroundLens(Film& film, const Scene& scene, const Camera& c
             }
         });
         if (done) {                       // a stop part-way leaves the sums as they were
-            for (size_t i = 0; i < add.size(); ++i) cache.sum[i] += add[i];
+            cache.sum.swap(add);
             cache.K = k1;
         }
     }
@@ -16171,29 +16204,6 @@ static void addEnvBackgroundLens(Film& film, const Scene& scene, const Camera& c
         for (int px = 0; px < rx; ++px) {
             const Vec3& b = cache.sum[(size_t)py * rx + px];
             if (b.x != 0.0 || b.y != 0.0 || b.z != 0.0) film.add(px, py, b * scale);
-        }
-}
-
-static void addEnvBackground(Film& film, const Scene& scene, const Camera& cam, long long N) {
-    const bool haveEnv = scene.envIndex >= 0, haveSun = scene.sunCount > 0;
-    if (!haveEnv && !haveSun) return;
-    // Under a blur the forward pass drew it into the film already, batch by batch, each sample at
-    // a time of its own (addBlurredSkyRows).
-    if (cam.seesMotion(scene)) return;
-    if (cam.hasLens()) { addEnvBackgroundLens(film, scene, cam, N); return; }
-    for (int py = 0; py < film.resY; ++py)
-        for (int px = 0; px < film.resX; ++px) {
-            Ray r = cam.genRay(px, py, 0.5, 0.5);
-            // A pixel-centre CAMERA ray, so a `hide_camera` flat must not stand between
-            // the lens and the sky it is meant to let through (Material::hideCamera).
-            Hit h = scene.closestHit(r, 1e-6, nullptr, /*skipHair=*/false,
-                                     /*skipCamHidden=*/true);
-            if (!h.valid) {
-                Vec3 bg{0, 0, 0};
-                if (haveEnv) bg += scene.envXYZForDir(r.d);
-                if (haveSun) bg += scene.sunXYZForDir(r.d);
-                film.add(px, py, bg * (double)N);
-            }
         }
 }
 

@@ -7302,7 +7302,7 @@ as the one at fault.
     adaptive waves). Every
     camera ray keeps the invariant importance x lensPdfDir = cosF A_front / A_film, which
     `-checklens` asserts for all of them. Users: modes R (the lens camera's default), D and J's
-    camera subpaths, M/S/U through R, and `addEnvBackgroundLens`. Device twins:
+    camera subpaths, M/S/U through R, and `addEnvBackground`'s lens branch. Device twins:
     `dLensExitClassify`, the table branches of `dGenLensRay` and `dLensPdfDir`, and
     `dLensRearDir` / `dLensRearDensity` / `dLensFilmDensity` (`DLensSystem::exit*`); on the
     entrance side `dLensFrontLeg` / `dLensEntryDensity`. Users of the light-tracing functions: the forward splats of modes A/B
@@ -7313,8 +7313,8 @@ as the one at fault.
     type, DVec3 for the camera and D3 for light. The device lens lives in device memory
     (`DLensSystem::surf` / `iorAll`, uploaded by bakeCamera), so a prescription has no surface
     limit. The forward modes' directly seen sky goes through the lens too
-    (`addEnvBackgroundLens`): monochromatic camera rays averaged per pixel, their count growing
-    with photons per pixel, kept in a running sum for the last camera. `-checklens` pins it all
+    (`addEnvBackground`): monochromatic camera rays averaged per pixel, their count growing
+    with photons per pixel, kept in a running sum for the last four cameras. `-checklens` pins it all
     on a planar-rear achromat, a curved-rear singlet, pbrt's double Gauss at f/8 and the
     published telephoto, wide-angle and fisheye as published (the test cone, and the spread of
     its off-axis points, scale with each lens's field, up to 89 degrees for the fisheye): the
@@ -10840,7 +10840,14 @@ sees the instant, exactly as a static scene with those transforms would show it.
   at its reference face's corners at the path's time, boxed by its keys' boxes about it -- and
   since parts can coincide, each claims a connection only when the eye-side hit is on its own
   faces (`Scene::mirrorClaims`, `mirrorDeformPart`). The sky a forward mode
-  sees directly is a camera-side pass of its own (`addEnvBackground`, at each write). Under a
+  sees directly is a camera-side pass of its own (`addEnvBackground`, at each write): each pixel
+  averages camera rays over its area, as mode R's pixel does and the photon splats fill it -- a
+  pinhole's 64 points of a per-pixel rotated Halton (2,3) lattice, a lens's monochromatic rays over
+  the pupil and the band as many as photons per pixel ask for -- summed once per scene build and
+  camera and kept for the last four (0.440.11; one ray through each pixel's centre gave an edge
+  pixel all of the sky or none, B-ENV-WALLS). Each sample is a function of its pixel and its
+  index alone, added in index order, so the sums do not depend on how the writes that asked for
+  them split the samples (a live window's refreshes fall on the clock). Under a
   blur that pass skips the camera: each forward thread draws its band of the sky into its own
   batch film instead (`addBlurredSkyRows`), K samples a pixel at times of their own (rotated per
   pixel and batch), K a sixteenth of a photon per pixel per camera sharing the batch, at most 64;

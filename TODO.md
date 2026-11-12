@@ -170,7 +170,8 @@ Each names the section its line is in.
     the cure is a reciprocal lobe, which needs a decision.
 23h. ~~**S-GPU-GLOSSY-BUMP** (4.3) — device mode S reads normal-mapped glossy walls 1.043 of R (host
     0.997); see BUMP-MODES.~~ Done, 0.440.6: R's own glossy strategies disagreed (contSoftening).
-23l. **B-ENV-WALLS** (4.2) — mode B reads walls lit by a sky about 1 % bright, flat or bumped.
+23l. ~~**B-ENV-WALLS** (4.2) — mode B reads walls lit by a sky about 1 % bright, flat or bumped.~~
+    Done, 0.440.11: the sky it sees directly took one ray per pixel's centre.
 23c. ~~**B-GPU-MAXBOUNCE** (4.2) — GPU mode B ignores `-max-bounce` (its kernels get a literal 32).~~
     Done, 0.439.9.
 24. ~~**BEAMEPOCHS-CHUNK-PIN** (4.5) — `-beamepochs` pins cheap scenes' GPU chunks to 1 spp.~~ Done,
@@ -248,7 +249,8 @@ Then the rest of 4.2-4.6 in their order, 4.7's bookkeeping alongside whatever to
   coat's coin is non-reciprocal); decision owed.
 - [x] **S-GPU-GLOSSY-BUMP** (0.440.6) — device mode S read normal-mapped glossy walls 1.043 of R:
   R's own lobe and light sampling weighed different integrands (contSoftening).
-- [ ] **B-ENV-WALLS** — mode B reads walls lit by a sky about 1 % bright, flat or bumped.
+- [x] **B-ENV-WALLS** (0.440.11) — mode B read walls lit by a sky about 1 % bright: the sky the
+  forward modes see directly took one ray through each pixel's centre.
 - [ ] **THIN-GAP-GATHER** — mode M at a forced large radius gathers a lit surface millimetres behind.
 - [ ] **GLOSSY-ADJ-VARIANCE** — the glossy lobe's adjoint is unbounded at grazing arrival; decision
   owed (a reciprocal glossy lobe).

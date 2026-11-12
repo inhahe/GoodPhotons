@@ -2677,7 +2677,7 @@ Not changed:
   would still be called at every site. The omissions are what check_bump_modes' R self-checks (glossy
   lobe alone, sky escape alone, the split's sub-paths) and its M and S rooms catch.
 
-## OPEN (2026-11-12, 0.440.6): B-ENV-WALLS — mode B reads walls lit by a sky about 1 % bright
+## DONE (2026-11-12, 0.440.11): B-ENV-WALLS — mode B read walls lit by a sky about 1 % bright
 
 Found adding check_bump_modes' sky room: five diffuse walls (reflect 0.8) open to a constant sky (no
 ceiling), `light env { spd preset:bb6500 }`, mode B against R at -max-bounce 8, host: the frame
@@ -2685,7 +2685,24 @@ ceiling), `light env { spd preset:bb6500 }`, mode B against R at -max-bounce 8, 
 opening's edge), 1.010 under the slope-2 normal map (device 1.011). Modes M and S, which emit the
 same sky photons and gather them, read 0.997 - 1.000 there, so it is B's own path: its camera splat
 of a sky photon (render.h tracePhoton's first bounce from an infinite light) or the environment's
-emission density as B weighs it. Not yet looked into.
+emission density as B weighs it.
+
+**Fixed in 0.440.11: neither -- the sky B sees directly.** Per tile the frame matched R everywhere
+but one band, +8 %: the back wall's top edge against the sky. The forward modes draw the sky they
+see directly in a camera-side pass (main.cpp `addEnvBackground`), and a pinhole's took one ray
+through each pixel's centre, so a pixel the edge crosses took all of the sky or none, where mode R
+and the photon splats average the pixel's area; `-spp` did not move it. Now every pixel averages
+64 points of a per-pixel rotated Halton (2,3) lattice (a lens camera already averaged its rays),
+summed once per scene build and camera, the cache now keyed on the scene's generation and builds
+and the whole projection, where the lens's was keyed on the pose alone. And a lens camera's sky
+did not repeat: its samples' random streams were seeded per batch, and the batches fall where the
+writes that ask for more samples fall -- a live window's refreshes, on the clock -- so the same
+render with and without `-window` differed in its sky by a few per cent a pixel. Each sample is now
+a function of its pixel and its index alone, added to the pixel's sum in index order, so any split
+gives the one sum: new `tools/check_sky_repeat.py` writes a lens camera's sky room at two cadences
+and requires the two images byte-identical (0.440.9: 363 of 3072 pixels differ). check_bump_modes' sky room holds mode B too, now within 0.5 % (B is precise to
+0.03 %; at 1 % the host's 1.0097 passed): 0.440.9 read 1.0097 / 1.0110 (host / device), 0.440.11
+0.9994 / 1.0008.
 
 ## OPEN (2026-11-12, 0.440.5): THIN-GAP-GATHER — mode M at a large radius gathers the lit inner face of a surface a few millimetres behind
 
