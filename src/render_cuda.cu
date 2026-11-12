@@ -6206,11 +6206,11 @@ __device__ static bool dLambertArrival(const DHit& h, const DVec3& ngo, const DV
     soften = firstBounce ? dShadowTerminatorG(wi, h.n, ngo) : (Real)1;
     return true;
 }
-__device__ static inline bool dIsPlanarMirrorMat(const DMaterial& m);
-// Host twin render.h glossyArrival: a glossy lobe's first bounce softened toward the emitter,
-// unless it is a delta.
+// Host twin render.h glossyArrival: a glossy lobe's first bounce softened toward the emitter, a
+// roughness-0 one too.
 __device__ static Real dGlossyArrival(const DMaterial& lobe, const DHit& h, const DVec3& wi, bool firstBounce) {
-    if (!firstBounce || dIsPlanarMirrorMat(lobe)) return (Real)1;
+    (void)lobe;
+    if (!firstBounce) return (Real)1;
     return dShadowTerminatorG(wi, h.n, dShadedNg(h));
 }
 // Host twin glossyCameraSide (render.h, where the why is): a glossy lobe met along `rd` reflects only
@@ -7742,10 +7742,8 @@ __device__ static Real dCompoundDepositWeight(const DScene& sc, const DMaterial&
 }
 // Host twin bdpt.h compoundMergeSoftening (where the why is): the factor a compound's first-bounce
 // merge copy's weight takes -- its gathering lobes' softening over the vertex's own.
-__device__ static double dCompoundMergeSoftening(const DScene& sc, const DMaterial& compound,
-                                                 const DVec3& toEm, const DVec3& ns, const DVec3& ngo,
+__device__ static double dCompoundMergeSoftening(const DVec3& toEm, const DVec3& ns, const DVec3& ngo,
                                                  double vertexSoftening) {
-    (void)sc; (void)compound;
     if (!(vertexSoftening > 0.0)) return 0.0;
     return (double)dShadowTerminatorG(toEm, ns, ngo) / vertexSoftening;
 }
@@ -16199,10 +16197,13 @@ __device__ __noinline__ static bool bkInteractHair(const DScene& sc, const DMate
 // Host twin BackwardRenderer::tailPassesStrand (where the why is): at a capped path's tail, a strand
 // passes the ray with probability 1 - opacity, weight 1 -- no vertex, so the tail goes on past it,
 // moved as bkInteractHair moves a pass-through.
-__device__ static bool bkTailPassesStrand(const DScene& sc, const DMaterial& m, const DHit& h, Real lambda,
-                                          DVec3& ro, DVec3& rd, DRng& rng, Real* curveTminOut) {
-    const DHairShade hs = dHairShadeAt(sc, m, h, lambda, rd * (Real)(-1));
-    if (!((double)hs.b.opacity < 1.0) || rng.uniform() >= 1.0 - (double)hs.b.opacity) return false;
+// __noinline__, as bkInteractHair: its DHairShade must not join the tracer's frame.
+__device__ __noinline__ static bool bkTailPassesStrand(const DScene& sc, const DMaterial& m, const DHit& h,
+                                                       Real lambda, DVec3& ro, DVec3& rd, DRng& rng,
+                                                       Real* curveTminOut) {
+    const double op = dHairOpacityAt(sc, m, h);
+    if (!(op < 1.0) || rng.uniform() >= 1.0 - op) return false;
+    const DHairShade hs = dHairShadeAt(sc, m, h, lambda, rd * (Real)(-1));   // its exit offset
     const Real exitOff = dHairExitOffset(hs, h.n, rd);
     if (curveTminOut) *curveTminOut = exitOff;
     ro = curveTminOut ? dOffsetPoint(h.p, rd) : (h.p + rd * exitOff);
@@ -16995,7 +16996,7 @@ __device__ static void bkRadianceHeroLoop(const DScene& sc, int diffraction,
         // ...and put back after a hair pass-through, which is no bounce (host twin).
         const DGlossyMis gmisIn = gmis;
         gmis.clear();
-        const int bSw = b;   // a refunded pass-through (b moved back) lends nothing new
+        bool nullHereH = false;   // a coverage pass-through is no vertex: it lends nothing new
 
         switch (mp->type) {
             case D_DIFFUSETRANSMIT: {
@@ -17150,7 +17151,7 @@ __device__ static void bkRadianceHeroLoop(const DScene& sc, int diffraction,
                                                  specularArrival, curveTmin, rng);
                     if (r == 0) return;
                     if (r == 2) {               // a coverage pass-through is no vertex
-                        gmis = gmisIn;
+                        gmis = gmisIn; nullHereH = true;
                         if (nullStepsH < 256) { --b; ++nullStepsH; }
                         dUnnoteFirst(firstHere);  // ...and not the first event
                     }
@@ -17236,7 +17237,7 @@ __device__ static void bkRadianceHeroLoop(const DScene& sc, int diffraction,
                                            lam[0], invPdf[0], thr[0], L[0], specularArrival,
                                            contBsdfPdf, stk, rng, gi, nullptr, &heroNull, &curveTmin))
                         return;
-                    if (heroNull) gmis = gmisIn;
+                    if (heroNull) { gmis = gmisIn; nullHereH = true; }
                     if (heroNull && nullStepsH < 256) { --b; ++nullStepsH; }
                     if (heroNull) dUnnoteFirst(firstHere);
                     break;
@@ -17262,7 +17263,7 @@ __device__ static void bkRadianceHeroLoop(const DScene& sc, int diffraction,
                                        invPdf[0], thr[0], L[0], specularArrival, contBsdfPdf, stk,
                                        rng, gi, nullptr, &heroNull2, &curveTmin))
                     return;
-                if (heroNull2) gmis = gmisIn;
+                if (heroNull2) { gmis = gmisIn; nullHereH = true; }
                 if (heroNull2 && nullStepsH < 256) { --b; ++nullStepsH; }
                 if (heroNull2) dUnnoteFirst(firstHere);
                 break;
@@ -17306,7 +17307,7 @@ __device__ static void bkRadianceHeroLoop(const DScene& sc, int diffraction,
                 if (!dContinueAlong(h, wOut, DL_REFLECT, ro, rd)) return; specularArrival = false; break;
             }
         }
-        if (b == bSw) contSoft = dContSoftening(*mp, h, rd);   // what this vertex lends
+        if (!nullHereH) contSoft = dContSoftening(*mp, h, rd);   // what this vertex lends
     }
 }
 
@@ -18370,9 +18371,7 @@ __device__ static void dRandomWalk(const DScene& sc, const DCamera& cam, int dif
         const DMaterial* mp = &sc.mats[h.matId];
         int matId = h.matId;
         double storeP = 0.0;      // COMPOUND-MERGE-PICK (compoundMergeW)
-        const DMaterial* compound = nullptr;   // the compound a merge copy here belongs to
         if (dIsCompound(mp->type)) {
-            compound = mp;
             int coatPick = -1; double coatR = 0.0, coatCos = 1.0, coatU = 0.0; Real coatTh = (Real)0;
             int child = dResolveCompound(sc, *mp, h, rd, lambda, rng,     // honours per-hit blend mask
                                          &coatPick, &coatR, &coatCos, &coatTh, &coatU);
@@ -18692,20 +18691,6 @@ __device__ static void dRandomWalk(const DScene& sc, const DCamera& cam, int dif
 
         beta *= betaFactor;
         for (int i = 0; i + 1 < nUp; ++i) betaSec[i] *= secChromatic ? secF[i] : betaFactor;
-        // A compound's merge copy at the first bounce (host twin compoundMergeSoftening): its merge
-        // weight takes the gathering lobes' softening over the one dSoftenFirstBounce gives the vertex.
-        if (importance && cur == 1 && compound && compoundMergeW && compoundMergeW[cur] > 0.0f) {
-            const DVec3 d = path[0].p - path[cur].p;
-            const double l2 = (double)ddot(d, d);
-            if (l2 > 0.0) {
-                const DVec3 toEm = d * (Real)(1.0 / sqrt(l2));
-                const DVec3 ngo = dVertexGeoN(path[cur]);
-                const double vs = (delta || mp->type == D_HAIR)       // dEmitterSoftening's (arrival side)
-                                ? 1.0 : (double)dShadowTerminatorG(toEm, path[cur].ns, ngo);
-                compoundMergeW[cur] *= (float)dCompoundMergeSoftening(sc, *compound, toEm, path[cur].ns,
-                                                                      ngo, vs);
-            }
-        }
         // Veach adjoint shading-normal correction on the LIGHT subpath only (1 when
         // ns==ng). wo = toward previous (light-side) vertex; wi = sampled continuation.
         if (importance && !delta) {
@@ -18826,15 +18811,18 @@ __device__ static double dEmitterSoftening(const DScene& sc, const DVertex& v, c
     // A translucent vertex softens on the emitter's side (host twin, dSideSoftening).
     return dSideSoftening(toEmitter, v.ns, dVertexGeoN(v), sc.mats[v.matId].type == D_DIFFUSETRANSMIT);
 }
-// Host twin softenFirstBounce: path[1] on (and its C - 1 secondaries), softened toward path[0]. (A
-// compound's merge copy where the pick went delta: dRandomWalk, host twin mergeCopySoftening.)
+// Host twin softenFirstBounce: path[1] on (and its C - 1 secondaries), softened toward path[0]; and a
+// compound's merge copy there (`compoundMergeW`, may be null) by its own (dCompoundMergeSoftening).
 __device__ static void dSoftenFirstBounce(const DScene& sc, DVertex* path, double* pathSec,
-                                          int secStride, int n, int C) {
+                                          int secStride, int n, int C, float* compoundMergeW) {
     if (n < 2) return;
     const DVec3 d = path[0].p - path[1].p;
     const double l2 = (double)ddot(d, d);
     if (!(l2 > 0.0)) return;
-    const double f = dEmitterSoftening(sc, path[1], d * (Real)(1.0 / sqrt(l2)));
+    const DVec3 toEm = d * (Real)(1.0 / sqrt(l2));
+    const double f = dEmitterSoftening(sc, path[1], toEm);
+    if (compoundMergeW && compoundMergeW[1] > 0.0f)
+        compoundMergeW[1] *= (float)dCompoundMergeSoftening(toEm, path[1].ns, dVertexGeoN(path[1]), f);
     if (f == 1.0) return;
     for (int k = 1; k < n; ++k) {
         path[k].beta *= f;
@@ -18923,7 +18911,7 @@ __device__ static int dGenLightSubpath(const DScene& sc, const DCamera& cam, int
         dRandomWalk(sc, cam, diffraction, walkFrom, dir, betaWalkD, pdfDirD, hb, maxDepth - 1, rng,
                     path, pathSec, secStride, maxV, nD, true, betaWalkSecD, hb.C,
                     nullptr, nullptr, nullptr, 0, nullptr, nullptr, compoundMergeW);
-        dSoftenFirstBounce(sc, path, pathSec, secStride, nD, hb.C);
+        dSoftenFirstBounce(sc, path, pathSec, secStride, nD, hb.C, compoundMergeW);
         // Infinite-light density patch (PBRT): the first scene vertex was given a
         // solid-angle density converted with 1/dist^2 from the fictitious disc point, but
         // the reverse direction (dVertexPdfLightF) reports the planar pdfPos. Rewrite
@@ -18997,7 +18985,7 @@ __device__ static int dGenLightSubpath(const DScene& sc, const DCamera& cam, int
     dRandomWalk(sc, cam, diffraction, ro, dir, betaWalk, pdfDir, hb, maxDepth - 1, rng,
                 path, pathSec, secStride, maxV, n, true, betaWalkSec, hb.C,
                 nullptr, nullptr, nullptr, 0, nullptr, nullptr, compoundMergeW);
-    dSoftenFirstBounce(sc, path, pathSec, secStride, n, hb.C);
+    dSoftenFirstBounce(sc, path, pathSec, secStride, n, hb.C, compoundMergeW);
     return n;
 }
 
@@ -20523,6 +20511,7 @@ __device__ static void dPhotonGatherSub(const DScene& sc, const DPhotonMap& pm,
     const Real r2C = (Real)((double)pmC.radius * (double)pmC.radius);
     const int maxBounce = 32;
     Real curveTmin = (Real)0;   // a fiber's exit clearance for the next hop, curve prims only
+    int nullSteps = 0;          // coverage pass-throughs refunded (host twin)
     for (int b = 0; b <= maxBounce; ++b) {                     // the tail (host twin)
         const bool tail = (b == maxBounce);
         if (sc.hasGrin) {                                // final-gather rays bend too
@@ -20578,7 +20567,12 @@ __device__ static void dPhotonGatherSub(const DScene& sc, const DPhotonMap& pm,
                 oX += (double)cieX(lambda) * e; oY += (double)cieY(lambda) * e; oZ += (double)cieZ(lambda) * e;
             }
         }
-        if (tail) return;                               // the light it reached, and no more
+        if (tail) {                                     // the light it reached, and no more --
+            // past a strand it passes, which is no vertex (host twin; bkTailPassesStrand)
+            if (m.type == D_HAIR && nullSteps < 256 &&
+                bkTailPassesStrand(sc, m, h, lambda, ro, rd, rng, &curveTmin)) { --b; ++nullSteps; continue; }
+            return;
+        }
 
         const bool hairArrivalIn = hairArrival, specularSeenIn = specularSeen;   // a hair pass-through puts these back
         const double contSoftIn = contSoft;
@@ -20717,7 +20711,10 @@ __device__ static void dPhotonGatherSub(const DScene& sc, const DPhotonMap& pm,
                 // A coverage pass-through (exactly -wo) is no vertex: the last real one's
                 // emitter-hit bookkeeping stands (host twin photonGatherSub).
                 if (hsv.b.opacity < 1.0 && wl.x == -hsv.woLocal.x && wl.y == -hsv.woLocal.y &&
-                    wl.z == -hsv.woLocal.z) { nullHere = true; hairArrival = hairArrivalIn; contSoft = contSoftIn; }
+                    wl.z == -hsv.woLocal.z) {
+                    nullHere = true; hairArrival = hairArrivalIn; contSoft = contSoftIn;
+                    if (nullSteps < 256) { --b; ++nullSteps; }   // ...and its bounce refunded
+                }
                 const DVec3 wOut = dhair::toWorld(hsv.fr, wl);
                 // Clear the strand by skipping curves within its exit distance on the next
                 // trace, from a ULP-moved origin (see interactHair): moving the origin out by
@@ -21107,6 +21104,7 @@ __device__ static void dPhotonGather(const DScene& sc, const DPhotonMap& pm,
 
     Real curveTmin = (Real)0;   // a fiber's exit clearance for the next hop, curve prims only
     double contSoft = 1.0;   // what the last vertex lends what it reaches (dContSoftening)
+    int nullSteps = 0;       // coverage pass-throughs refunded (host twin)
     // The tail (b == maxBounce), in-scattering along it skipped: host twin photonGather.
     for (int b = 0; b <= maxBounce; ++b) {
         const bool tail = (b == maxBounce);
@@ -21258,7 +21256,12 @@ __device__ static void dPhotonGather(const DScene& sc, const DPhotonMap& pm,
                 oZ += (double)cieZ(lambda) * e;
             }
         }
-        if (tail) return;                               // the light it reached, and no more
+        if (tail) {                                     // the light it reached, and no more --
+            // past a strand it passes, which is no vertex (host twin; bkTailPassesStrand)
+            if (m.type == D_HAIR && nullSteps < 256 &&
+                bkTailPassesStrand(sc, m, h, lambda, ro, rd, rng, &curveTmin)) { --b; ++nullSteps; continue; }
+            return;
+        }
 
         const bool hairArrivalIn = hairArrival;   // ...and this (host twin)
         hairArrival = false;
@@ -21515,7 +21518,10 @@ __device__ static void dPhotonGather(const DScene& sc, const DPhotonMap& pm,
                 double wCam = fv * cosLong / pdfH; wCam = wCam < 0.0 ? 0.0 : (wCam > 1.0 ? 1.0 : wCam);
                 thr *= wCam;
                 // ...and no vertex: the last real one's emitter-hit bookkeeping stands (host twin).
-                if (passedThru) { hairArrival = hairArrivalIn; gmis = gmisIn; contSoft = contSoftIn; }
+                if (passedThru) {   // ...and its bounce refunded (host twin)
+                    hairArrival = hairArrivalIn; gmis = gmisIn; contSoft = contSoftIn;
+                    if (nullSteps < 256) { --b; ++nullSteps; }
+                }
                 if (!passedThru) {   // each bin folded from the sample's angular half (dHairFoldFCos)
                     const double den = m.hairSigmaAFromReflect ? dhair::sigmaADenominator(m.hairBetaN) : -1.0;   // hoisted: three pow() per bin otherwise
                     const double specPat = dHairSpecPatAt(sc, m, h);   // hoisted: the pattern is the same at every bin
@@ -22614,17 +22620,15 @@ __global__ void kVcmLightT(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx,
             const bool connectible = dLvConnects(mp->type);
             // The first bounce softens toward the emitter it came from, in the throughput every
             // later vertex inherits (host twin vcm.h; dEmitterSoftening).
+            const double sL = (edges == 1 && connectible) ? (double)dShadowTerminatorG(wo, h.n, ngo) : 1.0;
             if (edges == 1 && connectible) {   // a translucent one too, on its arrival side
-                const double sL = (double)dShadowTerminatorG(wo, h.n, ngo);
                 beta *= sL;
                 for (int k = 0; k + 1 < nUp; ++k) betaSec[k] *= sL;
             }
             // ...and a compound's merge copy: its gathering lobes' softening in its merge weight,
-            // over the vertex's own above (host twin vcm.h, dCompoundMergeSoftening).
+            // over the vertex's own, sL (host twin vcm.h, dCompoundMergeSoftening).
             const double mergeSoft = (edges == 1 && storeP > 0.0)
-                ? dCompoundMergeSoftening(sc, sc.mats[h.matId], wo, h.n, ngo,
-                                          connectible ? (double)dShadowTerminatorG(wo, h.n, ngo) : 1.0)
-                : 1.0;
+                ? dCompoundMergeSoftening(wo, h.n, ngo, sL) : 1.0;
             if (connectible || storeP > 0.0) {
                 if (stored < vcmCap) {
                     DVcmLV lv;

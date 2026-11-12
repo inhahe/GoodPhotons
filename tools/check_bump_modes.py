@@ -42,6 +42,10 @@ lobe on the camera's geometric side and its transmit lobe on the far one, and in
 planes (bsdf_eval.h translucentLobe), softened on the light's side. 0.440.7 read it D 1.090, J 1.091,
 U 1.090, B 1.082, M 1.026 and S 1.021 of R on the host. Mode J runs at a pinned merge radius
 (MODE_ARGS, where the why is).
+A seventh, the sky room with fluorescent walls, holds mode R to itself with sky NEE off (host) at
+`-herosplit -heroc 8`: a fluorescent vertex splits the bundle into one sub-path per wavelength, and
+each must start with the vertex's softening, as the hero does. 0.440.8 started them unsoftened, and
+read the room 1.011 of itself with sky NEE off at -heroc 4.
 Exits 1 on any failure.
 """
 import argparse
@@ -65,6 +69,8 @@ DEPTH = {"M": 32, "S": 32}   # -max-bounce: the photon deposits' own depth; 8 fo
 # radius leaves at +0.7 % of R on the translucent room (+0.4 % at 0.04, -0.15 % at 0.01; J without
 # them 0.999): pinned where that floor is ~0.1 %, so the check reads J's integrand, not its radius.
 MODE_ARGS = {"J": ["-jsurf-radius", "0.02"]}
+# The fluorescent room's mode R splits the hero bundle at each wall vertex, into 7 sub-paths of 8.
+SPLIT = ["-herosplit", "-heroc", "8"]
 TOL = 0.01
 
 
@@ -87,6 +93,13 @@ def room(d, amp, kind="diffuse"):
         lines = [l for l in lines if not l.startswith("quad { origin -2 3 -2") and not l.startswith("light area")]
         lines.insert(1, "light env { spd preset:bb6500 }")
         return NL.join(lines) + NL
+    if kind == "fluoro":   # the sky room with fluorescent walls under the same map
+        txt = room(d, amp, "sky")
+        old = 'material "w" { type diffuse reflect 0.8  normal_map texture:rip }'
+        assert txt.count(old) == 1
+        return txt.replace(old, 'material "w" { type fluorescent reflect 0.6  absorb shortpass edge=480 '
+                                'slope=0.2 amp=1  emit gaussian center=560 sigma=25 amp=1  yield 0.9  '
+                                'normal_map texture:rip }')
     if kind == "translucent":   # the diffuse room with a normal-mapped translucent panel standing in it
         lines = room(d, amp, "diffuse").rstrip(NL).split(NL)
         lines.insert(3, 'material "t" { type translucent reflect 0.4  transmit 0.4  normal_map texture:rip }')
@@ -121,14 +134,15 @@ def main():
     ap.add_argument("--no-gpu", action="store_true")
     ap.add_argument("--modes", default="D,J,U,B,M,S")
     ap.add_argument("--seeds", type=int, default=3)
-    ap.add_argument("--rooms", default="flat,bumped,layered,glossy,sky,translucent")
+    ap.add_argument("--rooms", default="flat,bumped,layered,glossy,sky,translucent,fluoro")
     a = ap.parse_args()
     exe, out = os.path.abspath(a.exe), os.path.abspath(a.out)
     seeds = list(range(1, a.seeds + 1))
     fails = []
     for name, amp, kind in (("flat", 0.0, "diffuse"), ("bumped", 2.0, "diffuse"),
                             ("layered", 2.0, "layered"), ("glossy", 2.0, "glossy"),
-                            ("sky", 2.0, "sky"), ("translucent", 2.0, "translucent")):
+                            ("sky", 2.0, "sky"), ("translucent", 2.0, "translucent"),
+                            ("fluoro", 2.0, "fluoro")):
         if name not in a.rooms.split(","):
             continue
         layered = kind == "layered"
@@ -159,6 +173,8 @@ def main():
         for dev in ["cpu"] + ([] if a.no_gpu else ["gpu"]):
             refs = {}                                # mode R at each depth asked for
             for mode in a.modes.split(","):
+                if kind == "fluoro":                    # R against itself alone (below)
+                    break
                 if layered and mode not in ("M", "S"):
                     continue
                 if kind == "sky" and mode not in ("M", "S"):   # D, J, U take no sky; B: B-ENV-WALLS
@@ -179,15 +195,19 @@ def main():
                 if not good:
                     fails.append("%s %s %s" % (name, mode, dev))
             # R's two strategies for the same light, one integrand: its lobe (or sky escape) alone
-            if kind in ("glossy", "sky") and (kind == "glossy" or dev == "cpu"):
+            if kind in ("glossy", "sky", "fluoro") and (kind == "glossy" or dev == "cpu"):
                 rm, rse = refs.get(8) or (None, None)
-                if rm is None:
+                if kind == "fluoro":                     # both halves through the split's sub-paths
+                    r = [frame("R", dev, s, 8, SPLIT, "split") for s in seeds]
+                    rm = np.mean(r)
+                elif rm is None:
                     r = [frame("R", dev, s, 8) for s in seeds]
                     rm, rse = np.mean(r), np.std(r, ddof=1) / np.sqrt(len(r))
                 if kind == "glossy":
                     v = [frame("R", dev, s, 8, ["-no-glossy-nee"], "lobe") for s in seeds]
                 else:
-                    v = [frame("R", dev, s, 8, (), "esc", {"FTRACE_ENV_NEE": "0"})
+                    v = [frame("R", dev, s, 8, SPLIT if kind == "fluoro" else (),
+                               "splitesc" if kind == "fluoro" else "esc", {"FTRACE_ENV_NEE": "0"})
                          for s in seeds]
                 ratio = np.mean(v) / rm
                 good = abs(ratio - 1.0) <= TOL

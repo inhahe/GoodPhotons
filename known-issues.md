@@ -2618,6 +2618,65 @@ Not changed: on the tail, a chromatic layered coat still splits into sub-paths t
 segment for its body's emission -- at most C - 1 traces, once per capped path that ends on such a
 coat; not worth a separate per-wavelength tail path.
 
+## DONE (2026-11-12, 0.440.9): REVIEW-4407 — what the Opus review of 0.440.6-0.440.7 found
+
+`/code-review xhigh` (Opus) of fe35bae..2b15ab4 (the camera walks' `contSoftening` and REVIEW-4405's
+follow-ups): 14 findings, each checked against the code. Fixed in 0.440.9:
+
+* **The host's split at a dispersive vertex started each sub-path unsoftened** (radianceHeroLoop's
+  `contSoft0` left at 1): a fluorescent vertex's sub-paths read the light their continuation reached
+  without the vertex's softening, while its light sampling took it. They now start with
+  `contSoftening` of the vertex -- the last real one's after a coverage pass-through -- as the
+  device's do. check_bump_modes' seventh room holds mode R to itself there, sky light sampling off against on
+  at `-herosplit -heroc 8`: 0.440.8 read 1.0125, 0.440.9 0.9999.
+* **Mode S's visible-point walk forgot the last real vertex at a coverage pass-through**: the strand
+  reset its glossy MIS record, its softening and its strand mark, so a glossy floor's lamp seen
+  through see-through fur was counted by the lobe at full weight on top of the light sampling's
+  share. They are put back, as modes R and M do (the device's mode S takes no hair). With that fixed
+  the same scene read 0.973 of the bare one: modes S and M (host and device) also spent a bounce on
+  every strand a ray passes, where mode R refunds it, and a ray through a dense coat crosses a
+  hundred; and at the cap's tail they ended on a strand instead of passing it. Both are now as in
+  mode R (refund capped at 256; `tailPassesStrand`, `bkTailPassesStrand`). check_fur_null gains the
+  case, a rough glossy floor reflecting a lamp through a ball of opacity-0 fur, mode S fur against
+  bare: 0.440.8 read 1.359, 0.440.9 1.002.
+* **A compound's merge copy took its softening only when the light walk went on from its first
+  bounce**: a walk that ended there (the cap, an absorbed or wrong-side draw) kept the weight it was
+  stored with, which differed where its pick went delta. The correction now sits where the first
+  bounce's own softening is taken, after the walk (bdpt.h `softenFirstBounce`, device
+  `dSoftenFirstBounce`), from `emitterSoftening`'s own value; vcm.h and its device twin hand over the
+  first bounce's `sL` instead of recomputing it; `compoundMergeSoftening` lost the arguments it no
+  longer read; and the four hand copies of `emitterSoftening`'s exclusions the review counted are
+  gone.
+* **A roughness-0 glossy lobe's first photon bounce went unsoftened** (`glossyArrival` took it as a
+  delta), while mode R and the bidirectional walks treat it as the narrowest finite lobe, light
+  sampling and softening included. The photon tracers now soften it too. The review proposed the
+  other way round (`contSoftening` 1 there), which would leave R's two strategies on different
+  integrands, since its glossy light sampling softens. No check: on the bumped room with roughness-0
+  walls M and S read 1.004 and 1.003 of R before the change, inside the noise band.
+* **The tail's strand coin built a whole HairShade to read the coverage**: it reads `hairOpacityAt`
+  first and shades only a pass; the device's `bkTailPassesStrand` is `__noinline__`, as
+  bkInteractHair is, so its DHairShade stays out of the tracer's frame.
+* **The device hero loop inferred a pass-through from `b == bSw`**, which fails past the 256-step
+  refund cap: it now marks one (`nullHereH`), as the host does.
+* A layered coat's softening, copied three times with a dead fallback, is one helper
+  (`coatContSoftening`, asserting the coat finalizeLayeredCoats gives every layered material).
+* Stale names: design.md's `onGatherSurface` / `dOnGatherSurface` and its account of the merge copy,
+  and the device comment naming `mergeCopySoftening`; check_fur_null's renders now put the minimized
+  live preview up.
+
+Already done in 0.440.8: `contSoftening` at a translucent vertex (R's two strategies weighed
+different integrands there), and the bdpt.h comment saying R softens no two-sided response.
+
+Not changed:
+* `-radcache`'s update rays carry no softening into the tails they cache. A cell has one normal, an
+  average of shading normals, and no geometric one, so no ns/ng pair's softening matches every
+  reader; the cache is the documented biased approximation, and its per-cell validation (`corr`)
+  measures exactly such a structural gap.
+* The softening as a factor at each arrival site, which the review called an altitude problem: each
+  arrival already carries its own MIS weight, computed differently per site, so a per-walk helper
+  would still be called at every site. The omissions are what check_bump_modes' R self-checks (glossy
+  lobe alone, sky escape alone, the split's sub-paths) and its M and S rooms catch.
+
 ## OPEN (2026-11-12, 0.440.6): B-ENV-WALLS — mode B reads walls lit by a sky about 1 % bright
 
 Found adding check_bump_modes' sky room: five diffuse walls (reflect 0.8) open to a constant sky (no

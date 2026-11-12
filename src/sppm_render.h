@@ -102,6 +102,9 @@ inline void sppmVisiblePoint(const Scene& scene, Ray ray, Pcg32& rng, bool diffr
     bool strandArrival = false;
     double contSoft = 1.0;   // the softening the last vertex lends what it reaches (contSoftening)
 
+    // A coverage pass-through is no vertex: its bounce is refunded (capped: 256 is far above
+    // anything real fur hands back), as backward.h's walks refund it.
+    int nullSteps = 0;
     // The tail (b == maxBounce): the ray the last vertex sampled, for the light it reaches and
     // nothing past it -- no visible point either (backward.h radianceLoop, GLOSSY-DEPTH-CAP).
     for (int b = 0; b <= maxBounce; ++b) {
@@ -181,12 +184,21 @@ inline void sppmVisiblePoint(const Scene& scene, Ray ray, Pcg32& rng, bool diffr
             // a body, which is shaded below like any surface (mode M's gather does the same).
             if (m.reflectsNothing) return;
         }
-        if (tail) return;                                // the light it reached, and no more
+        if (tail) {                                      // the light it reached, and no more --
+            // past a strand it passes, which is no vertex (BackwardRenderer::tailPassesStrand)
+            if (m.type == MatType::Hair && nullSteps < 256 &&
+                bwNee.tailPassesStrand(scene, m, h, lambda, ray, rng)) { --b; ++nullSteps; continue; }
+            return;
+        }
 
         // GLOSSY-NEE: cleared HERE, after the two sites that read it and before the branch that
         // writes it -- a clear at the loop top would erase the previous bounce's value a few
         // lines before its only consumer, leaving the connection with no compensating weight.
         // See the twin note in backward.h.
+        // ...each put back after a coverage pass-through, which is no vertex (the Hair case).
+        const BackwardRenderer::GlossyMis gmisIn = gmis;
+        const bool strandArrivalIn = strandArrival;
+        const double contSoftIn = contSoft;
         gmis.clear();
         strandArrival = false;
         contSoft = 1.0;   // a specular vertex lends nothing; the glossy case sets its own
@@ -324,6 +336,10 @@ inline void sppmVisiblePoint(const Scene& scene, Ray ray, Pcg32& rng, bool diffr
                 // coverage pass-through (exactly -wo) is achromatic and folds nothing.
                 const bool passedThru = (hs.b.opacity < 1.0) && wl.x == -hs.woLocal.x &&
                                         wl.y == -hs.woLocal.y && wl.z == -hs.woLocal.z;
+                if (passedThru) {   // no vertex: the last real one's record stands, its bounce refunded
+                    gmis = gmisIn; strandArrival = strandArrivalIn; contSoft = contSoftIn;
+                    if (nullSteps < 256) { --b; ++nullSteps; }
+                }
                 if (!passedThru) {
                     const double* bins = hairSigmaBins<SpecThr::K, &SpecThr::lamOf>(scene, m, h);
                     sthr.mul([&](double lamK) {

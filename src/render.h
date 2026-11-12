@@ -15,6 +15,7 @@
 // only. Model-B splats are side-channel measurements and are intentionally NOT
 // counted as energy sinks, so the conservation test stays valid in both modes.
 #pragma once
+#include <cassert>
 #include <cstdint>
 #include <cstdlib>
 #include <atomic>
@@ -411,6 +412,14 @@ inline bool glossyCameraSide(const Vec3& rayDir, const Vec3& ns) { return dot(ra
 // vertex, 1 at a specular, two-sided or fiber one. Exactly 1 where ns == ng. Device twin
 // dContSoftening.
 inline double sideSoftening(const Vec3& w, const Vec3& ns, const Vec3& ngo, bool twoSided);
+inline double contSoftening(const Material& m, const Hit& h, const Vec3& d);
+// The softening a layered material's coat sheen lends what it reaches along `d`: its glossy coat's
+// (contSoftening). finalizeLayeredCoats gives every layered material its coat.
+inline double coatContSoftening(const Scene& scene, const Material& layered, const Hit& h,
+                                const Vec3& d) {
+    assert(layered.coatChild >= 0 && layered.coatChild < (int)scene.mats.size());
+    return contSoftening(scene.mats[(size_t)layered.coatChild], h, d);
+}
 inline double contSoftening(const Material& m, const Hit& h, const Vec3& d) {
     if (m.type == MatType::DiffuseTransmit) return sideSoftening(d, h.n, orientedGeoN(h), true);
     if (m.type != MatType::Diffuse && m.type != MatType::Fluorescent && m.type != MatType::Glossy)
@@ -1338,11 +1347,13 @@ struct Renderer {
         return true;
     }
     // A glossy lobe's first bounce (`firstBounce`, arriving along -`wi`) softens toward the
-    // emitter, as mode R's light sampling softens it and every bidirectional mode's first bounce
-    // (bdpt.h emitterSoftening); 1 after, and for a lobe with no finite value (isPlanarMirrorMat:
-    // a delta, which R never connects). Device twin dGlossyArrival.
+    // emitter, as mode R's light sampling and its continuation soften it (contSoftening) and every
+    // bidirectional mode's first bounce (bdpt.h emitterSoftening); 1 after. A roughness-0 lobe
+    // (isPlanarMirrorMat) too: R and the walks take it as the narrowest finite lobe, NEE and all,
+    // so it is softened there -- only a `mirror` is a delta. Device twin dGlossyArrival.
     static double glossyArrival(const Material& lobe, const Hit& h, const Vec3& wi, bool firstBounce) {
-        if (!firstBounce || isPlanarMirrorMat(lobe)) return 1.0;
+        (void)lobe;
+        if (!firstBounce) return 1.0;
         return shadowTerminatorG(wi, h.n, orientedGeoN(h));
     }
     // A photon's glossy continuation from its arrival (`wIn`, toward the light) into `o`: the lobe's

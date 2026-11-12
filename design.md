@@ -1337,9 +1337,13 @@ Alice's strands rendered 30 % darker than mode D's while the molded base matched
 case has always connected to the lights at every fiber vertex with the BCSDF (`neeLight` with
 `hs`, rho == 1 because the colour lives in sigma_a) and, having done so, does not count an
 emitter its continuation then hits; both mode-M walks now take the same split (`hairArrival`,
-cleared with `gmis`). A coverage pass-through is no vertex, so it restores `hairArrival`, `gmis`
-and (in the gather sub-walk) `specularSeen` to what the last real vertex left -- the split covers
-light the fiber SCATTERED, not light seen straight through it. The photon map is untouched -- fibers are never deposited on, and light
+cleared with `gmis`). A coverage pass-through is no vertex, so it restores `hairArrival`, `gmis`,
+the softening (`contSoft`) and (in the gather sub-walk) `specularSeen` to what the last real vertex
+left -- the split covers light the fiber SCATTERED, not light seen straight through it -- and
+(0.440.9) is refunded its bounce, capped at 256 as mode R's walks cap it, and passed at the cap's
+tail (`tailPassesStrand`; device `bkTailPassesStrand`); mode S's visible-point walk does all of
+it too, where it once reset all three and spent a bounce per strand, so a glossy floor's lamp seen
+through opacity-0 fur read 1.36 of the bare scene. The photon map is untouched -- fibers are never deposited on, and light
 that scatters off fibers onto a surface is in the map already -- so nothing is counted twice.
 Environment escapes stay with the continuation. `FTRACE_HAIR_NEE=0` turns it off for A/B.
 
@@ -3724,15 +3728,18 @@ holding a glass ball), and on the device `-rgb`, mode S and every one of those.
       device, scalar and hero (0.440.3): `lambertArrival` (lit? and the first bounce's
       softening) at a Diffuse, Fluorescent or translucent vertex and at a compound's own
       deposit, which a compound makes before its lobe pick and which then takes the arrival
-      adjoint too (`compoundDepositWeight`); `glossyArrival` (the first bounce's softening) at a glossy
+      adjoint too (`compoundDepositWeight`); `glossyArrival` (the first bounce's softening; a
+      roughness-0 lobe's too, which R and the walks take as the narrowest finite lobe) at a glossy
       vertex and at a layered coat's lobe (on the coat's own material), splat and continuation
       alike; and at a glossy continuation the shading-normal adjoint `shadingAdjointCorr` beside
       the lobe's own adjoint (`glossyPhotonAdjoint`), as bdpt.h's light walk takes it. Each
       softening and adjoint is booked in the photon's energy ledger (what it removes as
       absorbed, what it adds as negative absorption), so the ledger still balances. A compound's
       merge copy at a first bounce takes its gathering lobes' softening, diffuse or translucent,
-      in the copy's merge weight over the vertex's own (`compoundMergeSoftening`; vcm.h's light
-      walk) -- other than 1 only where the pick went delta. The camera side mirrors it
+      in the copy's merge weight over the vertex's own (`compoundMergeSoftening`, taken where the
+      first bounce's softening is: bdpt.h's `softenFirstBounce`, after the walk, so a walk that ends
+      at its first bounce takes it too, and vcm.h's light walk) -- other than 1 only where the pick
+      went delta. The camera side mirrors it
       (0.440.6): the softening is the integrand's, at the vertex next to the light whichever
       strategy reaches it, so every light a camera walk's own continuation reaches -- an emitter
       hit after a glossy bounce, the sky after a diffuse or glossy one, the sun, a fire along the
@@ -6256,10 +6263,10 @@ as the one at fault.
   measured at the final radius would misprice every earlier one.
 
   **Which photons a gather keeps** (0.431.0, MERGE-PROXIMITY; `gatherplane.h`, whose scalar rules
-  the device's `dOnGatherSurface` calls too). A gather takes the photons in a ball, so a second
+  the device's `dOnGatherSurfaceSided` calls too). A gather takes the photons in a ball, so a second
   surface inside it -- the floor under a table top, once mode M's adaptive radius outgrows the
   table's height -- lent its light to the first (a sheet lit only from below read 21x its top lit
-  from above). A mode-M or mode-S gather (`onGatherSurface`) keeps a photon only if it faces the
+  from above). A mode-M or mode-S gather (`onGatherSurfaceSided`) keeps a photon only if it faces the
   gather point's way (within 60 degrees) and lies near its tangent plane: off it by at most
   (0.1 + sin theta) times its distance d, theta the angle between the two normals, plus a rounding
   slack of a thousandth of the map's radius (`PhotonMap::gatherSlack`, one value for the adaptive

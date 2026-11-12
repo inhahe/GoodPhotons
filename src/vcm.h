@@ -799,17 +799,15 @@ inline void traceLightSubpath(const Scene& scene, const Camera& cam, const Rende
         bool connectible = isConnectibleMat(*mp) && !isFiberMat(*mp);
         // The first bounce softens toward the emitter it came from, in the throughput every
         // later vertex inherits (bdpt.h emitterSoftening, where the why is).
+        const double sL = (edges == 1 && connectible) ? shadowTerminatorG(wo, h.n, ngo) : 1.0;
         if (edges == 1 && connectible) {   // a translucent one too, on the side it arrived from
-            const double sL = shadowTerminatorG(wo, h.n, ngo);
             beta *= sL;
             for (int i = 0; i + 1 < nUp; ++i) betaSec[i] *= sL;
         }
         // ...and a compound's merge copy: the merges evaluate its gathering lobes, whose softening
-        // its merge weight takes over the vertex's own above (bdpt.h compoundMergeSoftening).
+        // its merge weight takes over the vertex's own, sL (bdpt.h compoundMergeSoftening).
         const double mergeSoft = (edges == 1 && storeP > 0.0)
-            ? bdpt::compoundMergeSoftening(scene, scene.mats[h.matId], wo, h.n, ngo,
-                                     connectible ? shadowTerminatorG(wo, h.n, ngo) : 1.0)
-            : 1.0;
+            ? bdpt::compoundMergeSoftening(wo, h.n, ngo, sL) : 1.0;
         if (connectible || storeP > 0.0) {
             LightVertex lv;
             lv.p = h.p; lv.ns = h.n; lv.ng = h.ng; lv.wo = wo;

@@ -1,4 +1,4 @@
-"""Regression check: fur at `opacity 0` is invisible to light reaching a medium (mode R).
+"""Regression check: fur at `opacity 0` is invisible -- to mode R's light in a medium and at a cap, to mode S.
 
     D:/python314/python.exe -u tools/check_fur_null.py [--out <dir>] [--exe ftrace.exe] [--spp N]
                                                        [--device cpu|gpu]
@@ -19,8 +19,14 @@ And the same null at a bounce cap, under a sky: a floor with a furred ball low o
 constant sky alone, mode R at -max-bounce 1. The floor's sky reaches it by its light sampling and by
 its own escape, MIS-weighted, and the escape at the cap is the tail of the walk; a strand it meets
 there is a coverage pass-through (no vertex) and must be passed, as everywhere else in the walk, or
-see-through fur darkens the floor under it (BackwardRenderer::tailPassesStrand). Exits 1 on any
-failure.
+see-through fur darkens the floor under it (BackwardRenderer::tailPassesStrand).
+
+And mode S's camera walk through the same null: a rough glossy floor reflecting an area lamp, the
+furred ball on the reflected path. The light the floor's lobe reaches through the fur is weighed by
+that glossy vertex's MIS record against its light sampling, and softened by it; a strand the lobe
+passes is no vertex and must keep both, or the lamp's reflection is counted twice behind the fur
+(0.440.8 read it 1.359 of the bare scene); nor may it spend a bounce, for a ray crosses about a
+hundred strands of this coat (keeping the record alone read 0.973). Exits 1 on any failure.
 """
 import argparse
 import os
@@ -52,6 +58,17 @@ SKY = [l for l in BASE if not l.startswith(("light area", "medium", "sphere"))] 
     'sphere "ball" { center 0 0.35 0.5  radius 0.05  material core }',
 ]
 SKY_FUR = 'fur "coat" { on "ball"  material fur  count 60000  length 0.3  length_jitter 0.3  radius 0.001  droop 0.0  jitter 0.25  seed 7 }'
+# Mode S's case: no fog, a rough glossy floor, the lamp ahead, the ball on its reflection's way.
+GLOSSY = [
+    'scene { units meters }',
+    'camera "c" { eye 0 0.8 -2.4  look_at 0 0.2 0.5  up 0 1 0  fov_y 40  film { res 96 64 } }',
+    'material "floor" { type glossy  reflect 0.8  roughness 0.25 }',
+    'material "core"  { type diffuse  reflect 0.3 }',
+    'material "fur"   { type hair  reflect rgb 0.8 0.6 0.4  beta_m 0.3  beta_n 0.3  opacity 0 }',
+    'quad { origin -3 0 -3   u 0 0 6   v 6 0 0   material floor }',
+    'light area { origin -0.6 2.0 2.2  u 1.2 0 0  v 0 0 0.6  normal 0 -1 0  power 300  spd preset:d65 }',
+    'sphere "ball" { center 0 1.0 0.75  radius 0.05  material core }',
+]
 
 
 def main():
@@ -64,23 +81,27 @@ def main():
     a.exe = os.path.abspath(a.exe)
     out = os.path.abspath(a.out)
     os.makedirs(out, exist_ok=True)
-    for name, lines in (("fur", BASE + [FUR]), ("bare", BASE), ("skyfur", SKY + [SKY_FUR]), ("skybare", SKY)):
+    for name, lines in (("fur", BASE + [FUR]), ("bare", BASE), ("skyfur", SKY + [SKY_FUR]), ("skybare", SKY),
+                        ("glossyfur", GLOSSY + [SKY_FUR]), ("glossybare", GLOSSY)):
         with open(os.path.join(out, name + ".ftsl"), "w", encoding="utf-8", newline="") as f:
             f.write(NL.join(lines) + NL)
     ok = True
-    for heroc, pre, extra in ((1, "", []), (4, "", []), (1, "sky", ["-max-bounce", "1"]),
-                              (4, "sky", ["-max-bounce", "1"])):
+    for mode, heroc, pre, extra in (("R", 1, "", []), ("R", 4, "", []), ("R", 1, "sky", ["-max-bounce", "1"]),
+                                    ("R", 4, "sky", ["-max-bounce", "1"]),
+                                    ("S", 1, "glossy", ["-n", "100000"])):
+        if mode == "S" and a.device == "gpu":
+            continue   # the device's mode S takes no hair (cudaSppmSupported): it would run the host's
         stats = {}
         for name in (pre + "fur", pre + "bare"):
             imgs = []
             for seed in (1, 2):
-                png = os.path.join(out, "%s_c%d_s%d_n%d.png" % (name, heroc, seed, a.spp))
+                png = os.path.join(out, "%s_%s_c%d_s%d_n%d.png" % (name, mode, heroc, seed, a.spp))
                 for f in (png, png[:-4] + ".pfm"):          # never score an earlier run's image
                     if os.path.exists(f):
                         os.remove(f)
-                cmd = [a.exe, "-in", os.path.join(out, name + ".ftsl"), "-mode", "R", "-device", a.device,
+                cmd = [a.exe, "-in", os.path.join(out, name + ".ftsl"), "-mode", mode, "-device", a.device,
                        "-spp", str(a.spp), "-heroc", str(heroc), "-seed", str(seed), "-hdr",
-                       "-no-meter", "-o", png] + extra
+                       "-no-meter", "-window-min", "-o", png] + extra
                 r = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
                 pfm = png[:-4] + ".pfm"
                 if r.returncode != 0 or not os.path.exists(pfm):
@@ -97,9 +118,10 @@ def main():
         ok &= good
         zl = np.where(live, z, 0.0)
         i, j = np.unravel_index(int(np.argmax(zl)), zl.shape)
-        print("%s: %sheroc %d: opacity-0 fur / no fur, frame x%.4f; worst tile x%.4f (%.1f sigma)" % (
-            "ok" if good else "FAIL", "sky at -max-bounce 1, " if pre else "", heroc, m1.sum() / m0.sum(),
-            ratio[i, j], zl[i, j]), flush=True)
+        where = {"": "", "sky": "sky at -max-bounce 1, ", "glossy": "a glossy floor's lamp, "}[pre]
+        print("%s: mode %s, %sheroc %d: opacity-0 fur / no fur, frame x%.4f; worst tile x%.4f (%.1f sigma)" % (
+            "ok" if good else "FAIL", mode, where, heroc, m1.sum() / m0.sum(), ratio[i, j], zl[i, j]),
+            flush=True)
     print("PASS" if ok else "FAILED")
     return 0 if ok else 1
 

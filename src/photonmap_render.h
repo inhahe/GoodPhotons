@@ -1304,6 +1304,9 @@ inline Vec3 photonGatherSub(const Scene& scene, const PhotonMap& pm, Ray ray, Pc
     // The softening the last vertex lends what it reaches (contSoftening): first the visible point's.
     double contSoft = contSoftening(visMat, visHit, ray.d);
 
+    // A coverage pass-through is no vertex: its bounce is refunded (capped: 256 is far above
+    // anything real fur hands back), as backward.h's walks refund it.
+    int nullSteps = 0;
     // The tail (b == maxBounce): the ray the last vertex sampled, for the light it reaches and
     // nothing past it (backward.h radianceLoop, GLOSSY-DEPTH-CAP).
     for (int b = 0; b <= maxBounce; ++b) {
@@ -1374,7 +1377,12 @@ inline Vec3 photonGatherSub(const Scene& scene, const PhotonMap& pm, Ray ray, Pc
             L += Vec3(cieX(lambda), cieY(lambda), cieZ(lambda))
                  * (thr * rhoV * emitSlot(scene, m, h, lambda, ray.d * -1.0) * invPdfL * wMis * contSoft);
         }
-        if (tail) return L;                              // the light it reached, and no more
+        if (tail) {                                      // the light it reached, and no more --
+            // past a strand it passes, which is no vertex (BackwardRenderer::tailPassesStrand)
+            if (m.type == MatType::Hair && nullSteps < 256 &&
+                bwNee.tailPassesStrand(scene, m, h, lambda, ray, rng)) { --b; ++nullSteps; continue; }
+            return L;
+        }
 
         // GLOSSY-NEE: cleared HERE and not at the top of the loop. `gmis` is written by the
         // PREVIOUS bounce's glossy branch and read by THIS bounce's emitter/sun sites above, so
@@ -1536,6 +1544,7 @@ inline Vec3 photonGatherSub(const Scene& scene, const PhotonMap& pm, Ray ray, Pc
                 if (hs.b.opacity < 1.0 && wl.x == -hs.woLocal.x && wl.y == -hs.woLocal.y &&
                     wl.z == -hs.woLocal.z) {
                     nullHere = true; hairArrival = hairArrivalIn; gmis = gmisIn; contSoft = contSoftIn;
+                    if (nullSteps < 256) { --b; ++nullSteps; }   // ...and its bounce refunded
                 }
                 const Vec3 wo = hair::toWorld(hs.fr, wl);
                 ray = Ray{h.p + wo * 1e-6, wo, hairExitOffset(hs, h.n, wo)};
@@ -1629,6 +1638,9 @@ inline Vec3 photonGather(const Scene& scene, const PhotonMap& pm, Ray ray, doubl
                                  glass >= 0 ? &scene.mats[glass] : nullptr) *
                (jsOn ? js.beta(thr) : thr);
     };
+    // A coverage pass-through is no vertex: its bounce is refunded (capped: 256 is far above
+    // anything real fur hands back), as backward.h's walks refund it.
+    int nullSteps = 0;
     // The tail (b == maxBounce): the ray the last vertex sampled, for the light it reaches --
     // the volume's in-scattering along it is a vertex past the cap -- and nothing past it
     // (backward.h radianceLoop, GLOSSY-DEPTH-CAP).
@@ -1765,7 +1777,12 @@ inline Vec3 photonGather(const Scene& scene, const PhotonMap& pm, Ray ray, doubl
             L += Vec3(cieX(lambda), cieY(lambda), cieZ(lambda))
                  * (thr * emitSlot(scene, m, h, lambda, ray.d * -1.0) * invPdfL * wMis * contSoft);
         }
-        if (tail) return L;                              // the light it reached, and no more
+        if (tail) {                                      // the light it reached, and no more --
+            // past a strand it passes, which is no vertex (BackwardRenderer::tailPassesStrand)
+            if (m.type == MatType::Hair && nullSteps < 256 &&
+                bwNee.tailPassesStrand(scene, m, h, lambda, ray, rng)) { --b; ++nullSteps; continue; }
+            return L;
+        }
 
         // GLOSSY-NEE: cleared HERE and not at the top of the loop. `gmis` is written by the
         // PREVIOUS bounce's glossy branch and read by THIS bounce's emitter/sun sites above, so
@@ -2029,7 +2046,10 @@ inline Vec3 photonGather(const Scene& scene, const PhotonMap& pm, Ray ray, doubl
                 // ...and no vertex: the last real one's emitter-hit bookkeeping stands (as in the
                 // gather sub-walk), so light seen straight through the fiber is counted as it
                 // would weigh it.
-                if (passedThru) { hairArrival = hairArrivalIn; gmis = gmisIn; contSoft = contSoftIn; }
+                if (passedThru) {   // ...and its bounce refunded
+                    hairArrival = hairArrivalIn; gmis = gmisIn; contSoft = contSoftIn;
+                    if (nullSteps < 256) { --b; ++nullSteps; }
+                }
                 // SPECGATHER (0.333.0): the fiber's transmission is the most coloured factor a
                 // camera walk meets -- a blonde fiber absorbs blue and green -- and until now the
                 // walk folded it in at the camera's wavelength ALONE, so every photon of every
