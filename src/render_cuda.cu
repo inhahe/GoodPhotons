@@ -9874,6 +9874,9 @@ __device__ static void camSplatEmissionAll(const DScene& sc, const DCamSet& cs, 
 struct DSpecVtx {
     bool   volume;
     D3     np;                 // surface normal (surface vertices)
+    D3     ng;                 // geometric normal on np's side (surface vertices)
+    D3     wl;                 // toward the light-side vertex (surface vertices; host twin)
+    bool   hasWl = false;
     D3     wIn;                // incoming photon direction (volume vertices)
     double g;                  // HG asymmetry (volume vertices)
     double weight;             // surface: Lambertian rho ; volume: single-scatter albedo
@@ -9891,13 +9894,25 @@ struct DSpecVtx {
     // medium uses its tabulated Airy phase; HG media use the analytic lobe.
     __device__ double term(const D3& wP) const {
         if (volume) return weight * (double)dMedPhase(*med, (Real)d3dot(wIn, wP), lambda);
-        if (glossy) {
-            const double c = d3dot(np, wP);
-            return c <= 0.0 ? -1.0 : (double)glossy->f(wP.toR(), lambda) * c;
-        }
         if (gated && d3dot(plane, wP) <= 0.0) return -1.0;
-        double cosSurf = d3dot(np, wP);
-        return cosSurf <= 0.0 ? -1.0 : (weight / DPI) * cosSurf;
+        double cosSurf;
+        if (!camSide(wP, cosSurf)) return -1.0;
+        cosSurf *= adjoint(wP);
+        if (glossy) return (double)glossy->f(wP.toR(), lambda) * cosSurf;
+        return (weight / DPI) * cosSurf;
+    }
+    // The direct splat's shading-normal adjoint (host twin SpecVtx::adjoint).
+    __device__ double adjoint(const D3& wP) const {
+        return hasWl ? (double)dShadingAdjointCorr(wl.toR(), wP.toR(), np.toR(), ng.toR()) : 1.0;
+    }
+    // A surface vertex's camera side, as a direct splat takes it (host twin SpecVtx::term,
+    // dCamSideOk): the geometric front, either side of np for a Lambertian vertex, above it
+    // for a glossy one; `cosSurf` its projected cosine.
+    __device__ bool camSide(const D3& wP, double& cosSurf) const {
+        const double c = d3dot(np, wP);
+        if (c == 0.0 || !(d3dot(ng, wP) > 0.0) || (glossy && c < 0.0)) return false;
+        cosSurf = c < 0.0 ? -c : c;
+        return true;
     }
     // The WAVELENGTH-INDEPENDENT half of term(): everything but `weight` (the per-λ
     // albedo). The mirror connectors solve ONE shared geometry for a whole hero bundle —
@@ -9911,8 +9926,9 @@ struct DSpecVtx {
     __device__ double shape(const D3& wP) const {
         if (volume) return (double)dMedPhase(*med, (Real)d3dot(wIn, wP), lambda);
         if (gated && d3dot(plane, wP) <= 0.0) return -1.0;
-        double cosSurf = d3dot(np, wP);
-        return cosSurf <= 0.0 ? -1.0 : cosSurf / DPI;
+        double cosSurf;
+        if (!camSide(wP, cosSurf)) return -1.0;
+        return cosSurf * adjoint(wP) / DPI;
     }
 };
 
@@ -10720,10 +10736,11 @@ __device__ static void camSpecularSplatAllVtx(const DScene& sc, const DCamSet& c
 // Surface vertex: refract the Lambertian reflection of p through every glass sphere, and
 // reflect it in every mirror.
 __device__ static void camSpecularSplatAll(const DScene& sc, const DCamSet& cs, int camMode,
-                                           const DVec3& p, const DVec3& n, Real lambda,
-                                           Real beta, Real rho, DRng& rng,
-                                           const DVec3* plane = nullptr) {
-    DSpecVtx vt; vt.volume = false; vt.np = D3(n); vt.weight = (double)rho; vt.g = 0;
+                                           const DVec3& p, const DVec3& n, const DVec3& ng,
+                                           const DVec3* wi, Real lambda, Real beta, Real rho,
+                                           DRng& rng, const DVec3* plane = nullptr) {
+    DSpecVtx vt; vt.volume = false; vt.np = D3(n); vt.ng = D3(ng); vt.weight = (double)rho; vt.g = 0;
+    if (wi) { vt.wl = D3(*wi); vt.hasWl = true; }
     vt.med = nullptr; vt.lambda = lambda;
     if (plane) { vt.gated = true; vt.plane = D3(*plane); }               // see DSpecVtx
     camSpecularSplatAllVtx(sc, cs, camMode, D3(p), vt, lambda, beta, rng);
@@ -10731,10 +10748,11 @@ __device__ static void camSpecularSplatAll(const DScene& sc, const DCamSet& cs, 
 // Glossy vertex: the rough lobe seen in a mirror or through a glass sphere (host twin
 // Renderer::camSpecularSplatAllGlossy).
 __device__ static void camSpecularSplatAllGlossy(const DScene& sc, const DCamSet& cs, int camMode,
-                                                 const DVec3& p, const DVec3& n, const Real* lam,
-                                                 const Real* beta, int nUp, const DGlossySplat& gs,
-                                                 DRng& rng) {
-    DSpecVtx vt; vt.volume = false; vt.np = D3(n); vt.weight = 0.0; vt.g = 0;
+                                                 const DVec3& p, const DVec3& n, const DVec3& ng,
+                                                 const DVec3& wi, const Real* lam, const Real* beta,
+                                                 int nUp, const DGlossySplat& gs, DRng& rng) {
+    DSpecVtx vt; vt.volume = false; vt.np = D3(n); vt.ng = D3(ng); vt.weight = 0.0; vt.g = 0;
+    vt.wl = D3(wi); vt.hasWl = true;
     vt.med = nullptr; vt.lambda = lam[0]; vt.glossy = &gs;
     const Real w[hero::kHeroMax] = {};   // a glossy vertex's weight is in its lobe
     camSpecularSplatAllVtxN(sc, cs, camMode, D3(p), vt, lam, beta, w, nUp, rng);
@@ -12313,7 +12331,7 @@ __device__ static bool genPhoton(const DScene& sc, const DCamSet& cs,
         const DVec3 face = em.normalTilted ? dAimFaceNow(sc, em) : DVec3{0, 0, 0};
         const DVec3* plane = em.normalTilted ? &face : nullptr;
         splatSurfaceAll(sc, cs, camMode, origin, emitN, emitN, emitN, lambda, beta, rhoE, rng, plane);
-        camSpecularSplatAll(sc, cs, camMode, origin, emitN, lambda, beta, rhoE, rng, plane);
+        camSpecularSplatAll(sc, cs, camMode, origin, emitN, emitN, nullptr, lambda, beta, rhoE, rng, plane);
     }
 
     ro = dOffsetAlong(origin, emitN, dir); rd = dir;
@@ -12426,7 +12444,7 @@ __device__ static int interactSpecular(const DScene& sc, const DCamSet& cs, int 
             const DGlossySplat gsp{&sc, &m, &h, h.n, wl};
             splatSurfaceAll(sc, cs, camMode, h.p, h.n, dShadedNg(h), wl, lambda, beta, (Real)0, rng,
                             nullptr, &gsp);
-            camSpecularSplatAllGlossy(sc, cs, camMode, h.p, h.n, &lambda, &beta, 1, gsp, rng);
+            camSpecularSplatAllGlossy(sc, cs, camMode, h.p, h.n, dShadedNg(h), wl, &lambda, &beta, 1, gsp, rng);
         }
         Real r = clamp01(dReflectSlot(sc, m, h, lambda));
         if (rng.uniform() >= r) { eAbsorbed += beta; return WF_TERMINATE; }
@@ -12859,7 +12877,7 @@ __device__ static int shadeStep(const DScene& sc, const DCamSet& cs,
         Real bS = beta * dGlossyArrival(sc.mats[mptr->coatChild], h, wl, firstHit);   // host twin
         splatSurfaceAll(sc, cs, camMode, h.p, h.n, dShadedNg(h), wl, lambda, bS, (Real)0, rng,
                         nullptr, &gsp);
-        camSpecularSplatAllGlossy(sc, cs, camMode, h.p, h.n, &lambda, &bS, 1, gsp, rng);
+        camSpecularSplatAllGlossy(sc, cs, camMode, h.p, h.n, dShadedNg(h), wl, &lambda, &bS, 1, gsp, rng);
     }
     // Stochastic mix: resolve to a child lobe (or absorb) before dispatch.
     if (dIsCompound(mptr->type)) {
@@ -12912,8 +12930,8 @@ __device__ static int shadeStep(const DScene& sc, const DCamSet& cs,
         // so h.n / ngo serve the transmit lobe too (nb = -h.n is used only for the splat side).
         splatSurfaceAll(sc, cs, camMode, h.p, h.n, ngo, wiPrev, lambda, beta, rhoR, rng);
         splatSurfaceAll(sc, cs, camMode, h.p, nb,  ngo * (Real)(-1), wiPrev, lambda, beta, rhoT, rng);
-        camSpecularSplatAll(sc, cs, camMode, h.p, h.n, lambda, beta, rhoR, rng);
-        camSpecularSplatAll(sc, cs, camMode, h.p, nb,  lambda, beta, rhoT, rng);
+        camSpecularSplatAll(sc, cs, camMode, h.p, h.n, ngo, &wiPrev, lambda, beta, rhoR, rng);
+        camSpecularSplatAll(sc, cs, camMode, h.p, nb,  ngo * (Real)(-1), &wiPrev, lambda, beta, rhoT, rng);
         // Analog scatter: reflect (prob rhoR), transmit (prob rhoT), else absorb — beta
         // unchanged on a scatter (like the diffuse case), plus the adjoint correction.
         Real u = rng.uniform();
@@ -12938,7 +12956,7 @@ __device__ static int shadeStep(const DScene& sc, const DCamSet& cs,
                           dPathIsCaustic(pathC), dPathCausticW(pathC));
         if (pathC) pathC->bits |= PV_BIT_SCATTER;   // past here it is diffuse indirect light
         splatSurfaceAll(sc, cs, camMode, h.p, h.n, ngo, wiPrev, lambda, beta, rho, rng);
-        camSpecularSplatAll(sc, cs, camMode, h.p, h.n, lambda, beta, rho, rng);
+        camSpecularSplatAll(sc, cs, camMode, h.p, h.n, ngo, &wiPrev, lambda, beta, rho, rng);
         if (rng.uniform() >= rho) { eAbsorbed += beta; return WF_TERMINATE; }
         { DVec3 wo;
           beta *= dDiffuseContinuation(h, ngo, wiPrev, rng, wo);
@@ -13055,9 +13073,10 @@ __device__ static void splatSurfaceAllHero(const DScene& sc, const DCamSet& cs, 
 // achromatic, so its geometry IS shared across the bundle and only the reflectance varies
 // per λ. Draws no RNG (mode B only inside).
 __device__ static void camSpecularSplatAllHero(const DScene& sc, const DCamSet& cs, int camMode,
-        const DVec3& p, const DVec3& n, const Real* lam, const Real* beta, const Real* rho,
-        int nUp, DRng& rng, const DVec3* plane = nullptr) {
-    DSpecVtx vt; vt.volume = false; vt.np = D3(n); vt.weight = (double)rho[0]; vt.g = 0;
+        const DVec3& p, const DVec3& n, const DVec3& ng, const DVec3* wi, const Real* lam,
+        const Real* beta, const Real* rho, int nUp, DRng& rng, const DVec3* plane = nullptr) {
+    DSpecVtx vt; vt.volume = false; vt.np = D3(n); vt.ng = D3(ng); vt.weight = (double)rho[0]; vt.g = 0;
+    if (wi) { vt.wl = D3(*wi); vt.hasWl = true; }
     vt.med = nullptr; vt.lambda = lam[0];
     if (plane) { vt.gated = true; vt.plane = D3(*plane); }               // see DSpecVtx
     camSpecularSplatAllVtxN(sc, cs, camMode, D3(p), vt, lam, beta, rho, nUp, rng);
@@ -13188,7 +13207,7 @@ __device__ static bool genPhotonHero(const DScene& sc, const DCamSet& cs, int ca
         Real rhoOne[hero::kHeroMax]; for (int i = 0; i < nUp; ++i) rhoOne[i] = rhoE;
         splatSurfaceAllHero(sc, cs, camMode, origin, emitN, emitN, emitN, lam, beta, rhoOne, nUp, rng,
                             plane);
-        camSpecularSplatAllHero(sc, cs, camMode, origin, emitN, lam, beta, rhoOne, nUp, rng, plane);
+        camSpecularSplatAllHero(sc, cs, camMode, origin, emitN, emitN, nullptr, lam, beta, rhoOne, nUp, rng, plane);
     }
 
     ro = dOffsetAlong(origin, emitN, dir); rd = dir;
@@ -13290,7 +13309,7 @@ __device__ static int shadeStepHero(const DScene& sc, const DCamSet& cs, int cam
         for (int i = 0; i < nUp; ++i) bS[i] = beta[i] * sC;
         splatSurfaceAllHero(sc, cs, camMode, h.p, h.n, dShadedNg(h), wl, lam, bS, unused, nUp, rng,
                             nullptr, &gsp);
-        camSpecularSplatAllGlossy(sc, cs, camMode, h.p, h.n, lam, bS, nUp, gsp, rng);
+        camSpecularSplatAllGlossy(sc, cs, camMode, h.p, h.n, dShadedNg(h), wl, lam, bS, nUp, gsp, rng);
     }
     if (dIsCompound(mptr->type)) {
         int cpF = -1; double cRF = 0.0, cCosF = 1.0, cUF = 0.0; Real cThF = (Real)0;
@@ -13341,8 +13360,8 @@ __device__ static int shadeStepHero(const DScene& sc, const DCamSet& cs, int cam
         if (camMode == CAM_A || camMode == CAM_B) {
             splatSurfaceAllHero(sc, cs, camMode, h.p, h.n, ngo, wiPrev, lam, beta, rhoR, nUp, rng);
             splatSurfaceAllHero(sc, cs, camMode, h.p, nb, ngo * (Real)(-1), wiPrev, lam, beta, rhoT, nUp, rng);
-            camSpecularSplatAllHero(sc, cs, camMode, h.p, h.n, lam, beta, rhoR, nUp, rng);
-            camSpecularSplatAllHero(sc, cs, camMode, h.p, nb, lam, beta, rhoT, nUp, rng);
+            camSpecularSplatAllHero(sc, cs, camMode, h.p, h.n, ngo, &wiPrev, lam, beta, rhoR, nUp, rng);
+            camSpecularSplatAllHero(sc, cs, camMode, h.p, nb, ngo * (Real)(-1), &wiPrev, lam, beta, rhoT, nUp, rng);
         }
         // Lobe pick + RR over the whole bundle (see the diffuse tail): the reflect/transmit
         // probabilities are the per-lobe MAX over live λ, so no secondary is ever amplified.
@@ -13406,7 +13425,7 @@ __device__ static int shadeStepHero(const DScene& sc, const DCamSet& cs, int cam
             Real unused[hero::kHeroMax] = {};
             splatSurfaceAllHero(sc, cs, camMode, h.p, h.n, dShadedNg(h), wl, lam, beta, unused, nUp,
                                 rng, nullptr, &gsp);
-            camSpecularSplatAllGlossy(sc, cs, camMode, h.p, h.n, lam, beta, nUp, gsp, rng);
+            camSpecularSplatAllGlossy(sc, cs, camMode, h.p, h.n, dShadedNg(h), wl, lam, beta, nUp, gsp, rng);
         }
         Real c[hero::kHeroMax];
         Real q = (Real)0;
@@ -13490,7 +13509,7 @@ __device__ static int shadeStepHero(const DScene& sc, const DCamSet& cs, int cam
       if (pathC) pathC->bits |= PV_BIT_SCATTER; }   // past here: diffuse indirect light
     if (camMode == CAM_A || camMode == CAM_B) {
         splatSurfaceAllHero(sc, cs, camMode, h.p, h.n, ngo, wiPrev, lam, beta, rho, nUp, rng);
-        camSpecularSplatAllHero(sc, cs, camMode, h.p, h.n, lam, beta, rho, nUp, rng);
+        camSpecularSplatAllHero(sc, cs, camMode, h.p, h.n, ngo, &wiPrev, lam, beta, rho, nUp, rng);
     }
     // Continuation RR over the WHOLE bundle: the survival probability is max_i rho_i, not the
     // hero's own albedo, and every live λ reweights by rho_i/q <= 1. Rolling the coin on the

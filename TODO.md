@@ -149,10 +149,10 @@ Each names the section its line is in.
 22. ~~**P-HEROSPLIT-FIRST**~~ (0.439.4), ~~**ROUGH-IRID-AIR**~~ (0.439.6) (4.3) — narrow estimator gaps.
 23. ~~**REMAP0-IMPOSSIBLE** (4.4) — the MIS sums read every zero density as a delta's.~~ Done,
     0.439.7 (which also counts a glow at full weight in D and J, GLOW-LIGHT-MODES).
-23b. **BUMP-MODES** (4.2) — on a normal-mapped surface U reads 16 % under R, M 12 % over, D/J/B
-    1-2 %: one inconsistency at a vertex below its shading hemisphere, fixed in three stages
+23b. ~~**BUMP-MODES** (4.2) — on a normal-mapped surface U reads 16 % under R, M 12 % over, D/J/B
+    1-2 %: one inconsistency at a vertex below its shading hemisphere.~~ Done in three stages
     (D, J and U in 0.439.9; the photon modes in 0.439.10; glossy and sky 0.440.6, translucent
-    0.440.8). Left: the analytic mirror / glass-sphere splat's camera side (SpecVtx).
+    0.440.8, the analytic mirror / glass-sphere splat 0.440.10).
 23d. ~~**TRANSLUCENT-MS** (4.2) — modes M and S read a backlit translucent panel 10 % dark: their
     gathers drop the light it transmits.~~ Done, 0.440.1.
 23e. ~~**GLOSSY-FLAT-DJU** (4.3) — D, J and U read a flat glossy room about 1 % bright.~~ Done,
@@ -234,10 +234,10 @@ Then the rest of 4.2-4.6 in their order, 4.7's bookkeeping alongside whatever to
 
 ### 4.2 Wrong, missing or silent output
 
-- [ ] **BUMP-MODES** — on a strongly normal-mapped room mode U reads 0.844 of R, M 1.148, D/J/B 1-2 %
-  off: a vertex below its shading hemisphere is lit in R and not consistently elsewhere. Diffuse done
-  (0.439.9, 0.439.10); glossy and sky done (0.440.2 - 0.440.6); translucent done (0.440.8: D/J/U/B
-  read a bumped translucent panel 8-9 % bright); the mirror / glass-sphere splat's camera side left.
+- [x] **BUMP-MODES** (0.440.10) — on a strongly normal-mapped room mode U read 0.844 of R, M 1.148,
+  D/J/B 1-2 % off: a vertex below its shading hemisphere was lit in R and not consistently elsewhere.
+  Diffuse (0.439.9, 0.439.10), glossy and sky (0.440.2 - 0.440.6), translucent (0.440.8), the mirror /
+  glass-sphere splat's camera side (0.440.10).
 - [x] **TRANSLUCENT-MS** (0.440.1) — modes M and S read a backlit translucent panel 10 % dark (the
   gathers dropped its transmitted light).
 - [x] **GLOSSY-FLAT-DJU** (0.440.2) — modes D, J and U read a flat glossy room about 1 % bright (a

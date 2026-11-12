@@ -3720,7 +3720,8 @@ holding a glass ball), and on the device `-rgb`, mode S and every one of those.
       reaches a diffuse vertex from below `ns` is absorbed (no deposit, no splat); a photon's
       first bounce softens toward its emitter; a camera splat asks only the geometric front of
       its camera side and is unsoftened (`camSideOk`; a glossy splat keeps its lobe's `ns`
-      test); a deposit carries the arrival half of Veach's adjoint, |cos(wi,ns)| / |cos(wi,ng)|
+      test), and so does mode B's analytic connection through a mirror or a glass sphere,
+      with the direct splat's shading-normal adjoint (`SpecVtx`, 0.440.10); a deposit carries the arrival half of Veach's adjoint, |cos(wi,ns)| / |cos(wi,ng)|
       (`arrivalAdjoint`), since a photon's flux per GEOMETRIC area is what the gather estimates
       while R shades with the shading cosine; and where `ns` tilts the continuation is drawn
       about the geometric normal with that same weight (`diffuseContinuation`), so a direction

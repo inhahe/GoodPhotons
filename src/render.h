@@ -1878,6 +1878,11 @@ struct Renderer {
     struct SpecVtx {
         bool  volume = false;
         Vec3  np;                 // surface normal (surface vertices)
+        Vec3  ng;                 // geometric normal on np's side (surface vertices)
+        // Toward the photon's light-side vertex (surface vertices), for Veach's shading-normal
+        // adjoint, which the direct splat takes too (connectGeom); unset at an emitter's own point.
+        Vec3  wl;
+        bool  hasWl = false;
         Vec3  wIn;                // incoming photon direction (volume vertices)
         double g = 0;             // HG asymmetry (volume vertices)
         double weight = 0;        // surface: Lambertian rho ; volume: single-scatter albedo
@@ -1891,17 +1896,22 @@ struct Renderer {
         const GlossySplat* glossy = nullptr;
         double lambda = 0.0;
         // Throughput at the vertex for a connection leaving toward `wP` (unit, toward
-        // the sphere). Returns <0 to signal "reject" (camera-side behind a surface).
+        // the sphere). Returns <0 to signal "reject" (camera-side behind a surface). A
+        // surface vertex takes its camera side as a direct splat does (camSideOk): the
+        // geometric front, on either side of np for a Lambertian vertex, above it for a
+        // glossy one.
         double term(const Vec3& wP) const {
             if (volume) return weight * hgPhase(dot(wIn, wP), g);
-            if (glossy) {
-                const double c = dot(np, wP);
-                return c <= 0.0 ? -1.0 : glossy->f(wP, lambda) * c;
-            }
             if (gated && dot(plane, wP) <= 0.0) return -1.0;
-            double cosSurf = dot(np, wP);
-            return cosSurf <= 0.0 ? -1.0 : (weight / PI) * cosSurf;
+            double cosSurf;
+            if (!camSideOk(np, ng, wP, glossy != nullptr, cosSurf)) return -1.0;
+            cosSurf *= adjoint(wP);
+            if (glossy) return glossy->f(wP, lambda) * cosSurf;
+            return (weight / PI) * cosSurf;
         }
+        // The direct splat's shading-normal adjoint for leaving toward `wP` (connectGeom): exactly
+        // 1 where ns == ng, or where the vertex has no arrival.
+        double adjoint(const Vec3& wP) const { return hasWl ? shadingAdjointCorr(wl, wP, np, ng) : 1.0; }
         // The WAVELENGTH-INDEPENDENT half of term(): everything but `weight` (which is
         // the per-λ albedo). The mirror connectors solve one shared geometry for the
         // whole hero bundle — a flat/metallic reflection does not disperse — so they
@@ -1911,8 +1921,9 @@ struct Renderer {
         double shape(const Vec3& wP) const {
             if (volume) return hgPhase(dot(wIn, wP), g);
             if (gated && dot(plane, wP) <= 0.0) return -1.0;
-            double cosSurf = dot(np, wP);
-            return cosSurf <= 0.0 ? -1.0 : cosSurf / PI;
+            double cosSurf;
+            if (!camSideOk(np, ng, wP, glossy != nullptr, cosSurf)) return -1.0;
+            return cosSurf * adjoint(wP) / PI;
         }
     };
 
@@ -2590,11 +2601,15 @@ struct Renderer {
         camSpecularSplatAllVtxN(scene, cams, nCam, p, vt, &lambda, &beta, &w, 1, rng);
     }
     // Surface vertex: refract the Lambertian reflection of p through every glass sphere,
-    // and reflect it in every mirror.
+    // and reflect it in every mirror. `n`, `ng`, `wi`: its shading and geometric normals on the
+    // side it lights and the direction toward its light-side vertex, as camSplatAll takes them
+    // (`wi` null at an emitter's own point, which has no arrival).
     void camSpecularSplatAll(const Scene& scene, const CamTarget* cams, int nCam,
-                             const Vec3& p, const Vec3& n, double lambda, double beta,
-                             double rho, Pcg32& rng, const Vec3* plane = nullptr) const {
-        SpecVtx vt; vt.volume = false; vt.np = n; vt.weight = rho;
+                             const Vec3& p, const Vec3& n, const Vec3& ng, const Vec3* wi,
+                             double lambda, double beta, double rho, Pcg32& rng,
+                             const Vec3* plane = nullptr) const {
+        SpecVtx vt; vt.volume = false; vt.np = n; vt.ng = ng; vt.weight = rho;
+        if (wi) { vt.wl = *wi; vt.hasWl = true; }
         if (plane) { vt.gated = true; vt.plane = *plane; }                 // see SpecVtx
         camSpecularSplatAllVtx(scene, cams, nCam, p, vt, lambda, beta, rng);
     }
@@ -2603,10 +2618,11 @@ struct Renderer {
     // replaces the Lambertian rho/pi, at each of the `nUp` wavelengths (an iridescent lobe's colour
     // turns with the direction, so it is evaluated per wavelength, not shared).
     void camSpecularSplatAllGlossy(const Scene& scene, const CamTarget* cams, int nCam,
-                                   const Vec3& p, const Vec3& n, const double* lam,
-                                   const double* beta, int nUp, const GlossySplat& gs,
-                                   Pcg32& rng) const {
-        SpecVtx vt; vt.volume = false; vt.np = n; vt.weight = 0.0; vt.glossy = &gs;
+                                   const Vec3& p, const Vec3& n, const Vec3& ng, const Vec3& wi,
+                                   const double* lam, const double* beta, int nUp,
+                                   const GlossySplat& gs, Pcg32& rng) const {
+        SpecVtx vt; vt.volume = false; vt.np = n; vt.ng = ng; vt.weight = 0.0; vt.glossy = &gs;
+        vt.wl = wi; vt.hasWl = true;
         const double w[hero::kHeroMax] = {};   // a glossy vertex's weight is in its lobe
         camSpecularSplatAllVtxN(scene, cams, nCam, p, vt, lam, beta, w, nUp, rng);
     }
@@ -2616,10 +2632,11 @@ struct Renderer {
     // mirror is achromatic, so its geometry IS shared and only the reflectance varies.
     // Draws no RNG (mode B), so the bundle leaves the stream untouched.
     void camSpecularSplatAllHero(const Scene& scene, const CamTarget* cams, int nCam,
-                                 const Vec3& p, const Vec3& n, const double* lam,
-                                 const double* beta, const double* rho, int nUp,
-                                 Pcg32& rng, const Vec3* plane = nullptr) const {
-        SpecVtx vt; vt.volume = false; vt.np = n; vt.weight = rho[0];
+                                 const Vec3& p, const Vec3& n, const Vec3& ng, const Vec3* wi,
+                                 const double* lam, const double* beta, const double* rho,
+                                 int nUp, Pcg32& rng, const Vec3* plane = nullptr) const {
+        SpecVtx vt; vt.volume = false; vt.np = n; vt.ng = ng; vt.weight = rho[0];
+        if (wi) { vt.wl = *wi; vt.hasWl = true; }
         if (plane) { vt.gated = true; vt.plane = *plane; }                 // see SpecVtx
         camSpecularSplatAllVtxN(scene, cams, nCam, p, vt, lam, beta, rho, nUp, rng);
     }
@@ -3154,7 +3171,7 @@ struct Renderer {
             const Vec3 face = em.normalTilted ? scene.aimFaceNow(em) : Vec3{0, 0, 0};
             const Vec3* plane = em.normalTilted ? &face : nullptr;
             camSplatAll(scene, cams, nCam, origin, emitN, emitN, emitN, lambda, beta, rhoE, rng, plane);
-            camSpecularSplatAll(scene, cams, nCam, origin, emitN, lambda, beta, rhoE, rng, plane);
+            camSpecularSplatAll(scene, cams, nCam, origin, emitN, emitN, nullptr, lambda, beta, rhoE, rng, plane);
         }
         }   // end emitter-birth branch
 
@@ -3667,7 +3684,7 @@ struct Renderer {
                     double bS = beta * glossyArrival(scene.mats[(size_t)cm.coatChild], h, wl, bounce == 0);
                     camSplatAll(scene, cams, nCam, h.p, h.n, orientedGeoN(h), wl, lambda, bS,
                                 0.0, rng, nullptr, &gsp);
-                    camSpecularSplatAllGlossy(scene, cams, nCam, h.p, h.n, &lambda, &bS, 1, gsp, rng);
+                    camSpecularSplatAllGlossy(scene, cams, nCam, h.p, h.n, orientedGeoN(h), wl, &lambda, &bS, 1, gsp, rng);
                 }
                 double R = layeredCoatReflectance(scene, cm, h, ray.d, lambda);
                 if (rng.uniform() < R) {                    // coat reflection
@@ -3767,7 +3784,7 @@ struct Renderer {
                         const GlossySplat gsp{&scene, &m, &h, h.n, wl};
                         camSplatAll(scene, cams, nCam, h.p, h.n, orientedGeoN(h), wl, lambda, beta,
                                     0.0, rng, nullptr, &gsp);
-                        camSpecularSplatAllGlossy(scene, cams, nCam, h.p, h.n, &lambda, &beta, 1, gsp, rng);
+                        camSpecularSplatAllGlossy(scene, cams, nCam, h.p, h.n, orientedGeoN(h), wl, &lambda, &beta, 1, gsp, rng);
                     }
                     if (!interactPhotonSpecular(scene, cams, nCam, m, h, ray, beta, lambda, stk, rng, e,
                                                 bounce == 0))
@@ -3888,8 +3905,8 @@ struct Renderer {
                     if (nCam > 0 && !forwardCatch) {
                         camSplatAll(scene, cams, nCam, h.p,  h.n,  ngo, wi, lambda, beta, rhoR, rng);
                         camSplatAll(scene, cams, nCam, h.p, -h.n, -ngo, wi, lambda, beta, rhoT, rng);
-                        camSpecularSplatAll(scene, cams, nCam, h.p,  h.n, lambda, beta, rhoR, rng);
-                        camSpecularSplatAll(scene, cams, nCam, h.p, -h.n, lambda, beta, rhoT, rng);
+                        camSpecularSplatAll(scene, cams, nCam, h.p,  h.n,  ngo, &wi, lambda, beta, rhoR, rng);
+                        camSpecularSplatAll(scene, cams, nCam, h.p, -h.n, -ngo, &wi, lambda, beta, rhoT, rng);
                     }
                     // Analog scatter: reflect (prob rhoR), transmit (prob rhoT), else
                     // absorb — throughput unchanged on a scatter (bar the Veach adjoint
@@ -3965,7 +3982,7 @@ struct Renderer {
                     sawScatter = true;   // whatever leaves this vertex is diffuse indirect light
                     if (nCam > 0 && !forwardCatch) {
                         camSplatAll(scene, cams, nCam, h.p, h.n, ngo, wi, lambda, beta, rho, rng);
-                        camSpecularSplatAll(scene, cams, nCam, h.p, h.n, lambda, beta, rho, rng);
+                        camSpecularSplatAll(scene, cams, nCam, h.p, h.n, ngo, &wi, lambda, beta, rho, rng);
                     }
                     // Russian roulette: absorb with prob (1-rho), else scatter
                     // with beta unchanged. Unbiased; average path length ~1/(1-rho)
@@ -4103,7 +4120,7 @@ struct Renderer {
             double rhoOne[hero::kHeroMax]; for (int i = 0; i < C; ++i) rhoOne[i] = rhoE;
             camSplatAllHero(scene, cams, nCam, origin, emitN, emitN, emitN, lam, beta, rhoOne, C, rng,
                             plane);
-            camSpecularSplatAllHero(scene, cams, nCam, origin, emitN, lam, beta, rhoOne, C, rng, plane);
+            camSpecularSplatAllHero(scene, cams, nCam, origin, emitN, emitN, nullptr, lam, beta, rhoOne, C, rng, plane);
         }
 
         Ray ray{origin + dir * 1e-6, dir};
@@ -4266,7 +4283,7 @@ struct Renderer {
                     for (int i = 0; i < nUp; ++i) bS[i] = beta[i] * sC;
                     camSplatAllHero(scene, cams, nCam, h.p, h.n, orientedGeoN(h), wl, lam, bS,
                                     unused, nUp, rng, nullptr, &gsp);
-                    camSpecularSplatAllGlossy(scene, cams, nCam, h.p, h.n, lam, bS, nUp, gsp, rng);
+                    camSpecularSplatAllGlossy(scene, cams, nCam, h.p, h.n, orientedGeoN(h), wl, lam, bS, nUp, gsp, rng);
                 }
                 double Rl[hero::kHeroMax];
                 for (int i = 0; i < nUp; ++i)
@@ -4334,8 +4351,8 @@ struct Renderer {
                     if (nCam > 0 && !forwardCatch) {
                         camSplatAllHero(scene, cams, nCam, h.p,  h.n,  ngo, wi, lam, beta, rhoR, nUp, rng);
                         camSplatAllHero(scene, cams, nCam, h.p, -h.n, -ngo, wi, lam, beta, rhoT, nUp, rng);
-                        camSpecularSplatAllHero(scene, cams, nCam, h.p,  h.n, lam, beta, rhoR, nUp, rng);
-                        camSpecularSplatAllHero(scene, cams, nCam, h.p, -h.n, lam, beta, rhoT, nUp, rng);
+                        camSpecularSplatAllHero(scene, cams, nCam, h.p,  h.n,  ngo, &wi, lam, beta, rhoR, nUp, rng);
+                        camSpecularSplatAllHero(scene, cams, nCam, h.p, -h.n, -ngo, &wi, lam, beta, rhoT, nUp, rng);
                     }
                     // Lobe pick + RR over the whole bundle (see the Diffuse case): the
                     // reflect/transmit probabilities are the per-lobe MAX over live λ, so no
@@ -4399,7 +4416,7 @@ struct Renderer {
                         double unused[hero::kHeroMax] = {};
                         camSplatAllHero(scene, cams, nCam, h.p, h.n, orientedGeoN(h), wl, lam, beta,
                                         unused, nUp, rng, nullptr, &gsp);
-                        camSpecularSplatAllGlossy(scene, cams, nCam, h.p, h.n, lam, beta, nUp, gsp, rng);
+                        camSpecularSplatAllGlossy(scene, cams, nCam, h.p, h.n, orientedGeoN(h), wl, lam, beta, nUp, gsp, rng);
                     }
                     double c[hero::kHeroMax];
                     for (int i = 0; i < nUp; ++i)
@@ -4522,7 +4539,7 @@ struct Renderer {
                     }
                     if (nCam > 0 && !forwardCatch) {
                         camSplatAllHero(scene, cams, nCam, h.p, h.n, ngo, wi, lam, beta, rho, nUp, rng);
-                        camSpecularSplatAllHero(scene, cams, nCam, h.p, h.n, lam, beta, rho, nUp, rng);
+                        camSpecularSplatAllHero(scene, cams, nCam, h.p, h.n, ngo, &wi, lam, beta, rho, nUp, rng);
                     }
                     // Continuation RR over the WHOLE bundle: the survival probability is
                     // max_i rho_i, not the hero's own albedo, and every live λ reweights by

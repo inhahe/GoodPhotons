@@ -46,6 +46,11 @@ A seventh, the sky room with fluorescent walls, holds mode R to itself with sky 
 `-herosplit -heroc 8`: a fluorescent vertex splits the bundle into one sub-path per wavelength, and
 each must start with the vertex's softening, as the hero does. 0.440.8 started them unsoftened, and
 read the room 1.011 of itself with sky NEE off at -heroc 4.
+An eighth, the diffuse room with its right wall a flat mirror, holds every mode to R: mode B
+images the bumped walls in the mirror by its analytic connection (render.h SpecVtx), whose camera
+side and shading-normal adjoint are the direct splat's (camSideOk, connectGeom). 0.440.9 tested
+its camera side against ns alone and took no adjoint, and read the room 0.970 of R; with the
+camera side alone fixed, 0.982.
 Exits 1 on any failure.
 """
 import argparse
@@ -100,6 +105,13 @@ def room(d, amp, kind="diffuse"):
         return txt.replace(old, 'material "w" { type fluorescent reflect 0.6  absorb shortpass edge=480 '
                                 'slope=0.2 amp=1  emit gaussian center=560 sigma=25 amp=1  yield 0.9  '
                                 'normal_map texture:rip }')
+    if kind == "mirror":   # the diffuse room with its right wall a flat mirror
+        txt = room(d, amp, "diffuse")
+        old = "quad { origin 2 0 -2  u 0 0 4  v 0 3 0  material w }"
+        assert txt.count(old) == 1
+        txt = txt.replace(old, old.replace("material w", "material mir"))
+        return txt.replace("scene { units meters }",
+                           'scene { units meters }' + NL + 'material "mir" { type mirror reflect 0.9 }')
     if kind == "translucent":   # the diffuse room with a normal-mapped translucent panel standing in it
         lines = room(d, amp, "diffuse").rstrip(NL).split(NL)
         lines.insert(3, 'material "t" { type translucent reflect 0.4  transmit 0.4  normal_map texture:rip }')
@@ -134,7 +146,7 @@ def main():
     ap.add_argument("--no-gpu", action="store_true")
     ap.add_argument("--modes", default="D,J,U,B,M,S")
     ap.add_argument("--seeds", type=int, default=3)
-    ap.add_argument("--rooms", default="flat,bumped,layered,glossy,sky,translucent,fluoro")
+    ap.add_argument("--rooms", default="flat,bumped,layered,glossy,sky,translucent,fluoro,mirror")
     a = ap.parse_args()
     exe, out = os.path.abspath(a.exe), os.path.abspath(a.out)
     seeds = list(range(1, a.seeds + 1))
@@ -142,7 +154,7 @@ def main():
     for name, amp, kind in (("flat", 0.0, "diffuse"), ("bumped", 2.0, "diffuse"),
                             ("layered", 2.0, "layered"), ("glossy", 2.0, "glossy"),
                             ("sky", 2.0, "sky"), ("translucent", 2.0, "translucent"),
-                            ("fluoro", 2.0, "fluoro")):
+                            ("fluoro", 2.0, "fluoro"), ("mirror", 2.0, "mirror")):
         if name not in a.rooms.split(","):
             continue
         layered = kind == "layered"

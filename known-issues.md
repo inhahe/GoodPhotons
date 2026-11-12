@@ -2812,7 +2812,7 @@ the MIS pair agree on the selection probability) and its lobe sampling make the 
 bidirectional modes evaluate with bsdfF / bsdfPdf, and what a Phong lobe's part below the horizon
 does on each side.
 
-## OPEN (2026-11-12, 0.439.7): BUMP-MODES — on a normal-mapped surface most modes disagree with mode R, mode U by 16 %
+## DONE (2026-11-12, 0.440.10): BUMP-MODES — on a normal-mapped surface most modes disagreed with mode R, mode U by 16 %
 
 `scraps/_bump_vs_r.py`: a closed room whose five walls carry one ripple normal map (`AMP`, its
 tangent-space slope: 2 tilts the normal up to 63 deg, 0 is flat), lit at a grazing angle by a
@@ -2917,9 +2917,20 @@ it, host / device against R (0.440.7 in brackets): D 0.9998 / 0.9997 (1.090 / 1.
 `-jsurf-radius 0.02`: its point merges' O(r^2) bias over the ripples is +0.7 % of R at the default
 starting radius, +0.4 % at 0.04 and -0.15 % at 0.01 (J without them 0.9986), a radius floor that
 shrinks with the epochs, not an integrand. check_bitid's `mapped` scene
-moves 0.5-0.8 % darker in every mode; every other CPU render is byte-identical to 0.440.7. What
-stage (3) has left is the analytic mirror and glass-sphere splat (render.h `SpecVtx`), which tests
-its camera side against the shading normal alone.
+moves 0.5-0.8 % darker in every mode; every other CPU render is byte-identical to 0.440.7.
+
+**Stage (3), the analytic splat: done in 0.440.10.** Mode B images a diffuse or glossy vertex in a
+flat mirror, a spherical one or a glass sphere by an analytic connection (render.h `SpecVtx`, device
+`DSpecVtx`), whose camera side tested the shading normal alone -- the direct splat's (`camSideOk`,
+0.439.10) takes the geometric front, on either side of ns for a Lambertian vertex -- and which took
+no shading-normal adjoint, where the direct splat takes Veach's (`connectGeom`'s
+`shadingAdjointCorr`). It takes both now, a translucent vertex's transmit lobe through its far
+side's normals; an emitter's own point, with no arrival, takes no adjoint. check_bump_modes' eighth
+room, the bumped diffuse room with its right wall a flat mirror, mode B against R, host / device:
+0.440.9 read 0.970 / 0.969, the camera side alone 0.982 / 0.982, both 1.0015 / 1.0006; every other
+mode already passed there. That closes
+BUMP-MODES: every mode shares mode R's integrand on a tilted shading normal, and check_bump_modes
+holds them to it in eight rooms.
 
 ## DONE (2026-11-12, 0.439.9): B-GPU-MAXBOUNCE — GPU mode B ignored `-max-bounce`
 
