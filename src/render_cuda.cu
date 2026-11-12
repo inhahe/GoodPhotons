@@ -6164,6 +6164,18 @@ __device__ static Real dShadingAdjointCorr(const DVec3& wi, const DVec3& wo,
 // terminator instead of facet slivers. EXACTLY 1 when ns==ng (flat tris, analytic spheres),
 // so every flat/analytic GPU scene stays bit-identical. `wi` = direction toward the
 // light/connection, `ns` = shading normal, `ng` = geo normal oriented onto the shading side.
+// Host twin render.h diffuseContinuation, where the why is: a photon's continuation from a lit
+// Lambertian vertex, drawn about the geometric normal where the shading one tilts (weight
+// |cos(wi,ns)| / |cos(wi,ng)|), about ns with the adjoint factor where they agree.
+__device__ static Real dDiffuseContinuation(const DHit& h, const DVec3& ngo, const DVec3& wi,
+                                            DRng& rng, DVec3& wo);
+// Host twin render.h arrivalAdjoint: |cos(wi,ns)| / |cos(wi,ng)| at a Lambertian vertex reached
+// along -wi -- a deposit's and the continuation's weight; exactly 1 where ns == ng.
+__device__ static Real dArrivalAdjoint(const DHit& h, const DVec3& ngo, const DVec3& wi) {
+    if (dot(h.n, ngo) >= (Real)(1.0 - 1e-7)) return (Real)1;
+    const Real cg = fabs(dot(wi, ngo));
+    return cg > (Real)0 ? fabs(dot(wi, h.n)) / cg : (Real)0;
+}
 __device__ static Real dShadowTerminatorG(const DVec3& wi, const DVec3& ns, const DVec3& ng) {
     Real cosNgNs = dot(ng, ns);
     // Exact no-op when ns==ng (flat tris, analytic spheres): the cubic would otherwise drift
@@ -6296,6 +6308,17 @@ __device__ static inline bool dCoatSplats(const DMaterial& coat) {
 }
 
 // `gs` (optional): a glossy vertex, whose f replaces rho/pi toward the camera (DGlossySplat).
+// Host twin render.h camSideOk, where the why is: the camera side of a forward connection from a
+// surface vertex -- its geometric front, either side of the shading normal for a Lambertian vertex,
+// above it for a glossy one (`glossy`), never softened. False where it may not connect, else true
+// and `cosSurf` its projected cosine.
+__device__ static inline bool dCamSideOk(const DVec3& n, const DVec3& ng, const DVec3& wdir,
+                                         bool glossy, Real& cosSurf) {
+    const Real c = dot(n, wdir);
+    if (c == (Real)0 || !(dot(ng, wdir) > (Real)0) || (glossy && c < (Real)0)) return false;
+    cosSurf = c < (Real)0 ? -c : c;
+    return true;
+}
 __device__ static void connect(const DScene& sc, const DCamera& cam, double* film, double* hits,
                                const DVec3& p, const DVec3& n, const DVec3& ng, const DVec3& wi,
                                Real lambda, Real beta, Real rho, DRng& rng,
@@ -6303,15 +6326,8 @@ __device__ static void connect(const DScene& sc, const DCamera& cam, double* fil
     DVec3 toCam = cam.eye - p;
     Real dist = length(toCam);
     DVec3 wdir = toCam / dist;
-    Real cosSurf = dot(n, wdir);
-    // Reject below the shading horizon; soften across the GEOMETRIC horizon (ng = geo normal
-    // on the shading side): a smoothed shading normal must not splat a vertex whose true
-    // geometry faces away from the camera, but a hard cutoff facets the terminator, so ramp
-    // it smoothly (Chiang 2019). No-op for flat tris / analytic spheres (ng == n, stG == 1).
-    // Matches CPU render.h.
-    if (cosSurf <= 0) return;
-    Real stG = dShadowTerminatorG(wdir, n, ng);
-    if (stG <= (Real)0) return;
+    Real cosSurf;
+    if (!dCamSideOk(n, ng, wdir, gs != nullptr, cosSurf)) return;   // the camera side
     int px, py; Real cosCam, dist2;
     if (!cam.project(p, px, py, cosCam, dist2)) return;
     if (occludedTo(sc, dOffsetAlong(p, ng, wdir), p + wdir * dist, 2 * RAY_EPS, RAY_EPS, /*camLeg=*/true)) return;  // camera leg: hide_camera applies (Scene::occluded / DMaterial::hideCamera)
@@ -6322,7 +6338,7 @@ __device__ static void connect(const DScene& sc, const DCamera& cam, double* fil
     // corr is the Veach adjoint shading-normal factor (1 when ns==ng).
     Real corr = dShadingAdjointCorr(wi, wdir, n, ng);
     double solidAngle = cam.pixelSolidAngle(cosCam);
-    Real contrib = beta * f * cosSurf * corr / (Real)((double)dist2 * solidAngle) * stG;
+    Real contrib = beta * f * cosSurf * corr / (Real)((double)dist2 * solidAngle);
     if (sc.mediaN > 0) contrib *= dMediaTransmittance(sc, p, wdir, dist, lambda, rng);
     filmAdd(film, hits, cam.resX, px, py, lambda, contrib);
 }
@@ -6371,16 +6387,14 @@ __device__ static void connectLensPhysical(const DScene& sc, const DCamera& cam,
     // The tests that need only the entry come before the trace through the glass.
     if (plane && ddot(*plane, le.Y - p) <= 0.0) return;
     const DVec3 wdir = le.wdir;
-    const Real cosSurf = dot(n, wdir);
-    if (cosSurf <= 0) return;
-    const Real stG = dShadowTerminatorG(wdir, n, ng);
-    if (stG <= (Real)0) return;
+    Real cosSurf;
+    if (!dCamSideOk(n, ng, wdir, gs != nullptr, cosSurf)) return;   // the camera side
     int px, py; double wgt;
     if (!dLensEntryImage(cam, le, lambda, px, py, wgt)) return;
     if (occludedTo(sc, dOffsetAlong(p, ng, wdir), le.Y, 2 * RAY_EPS, RAY_EPS, /*camLeg=*/true)) return;
     const Real corr = dShadingAdjointCorr(wi, wdir, n, ng);
     Real contrib = (Real)((double)beta * (gs ? (double)gs->f(wdir, lambda) : (double)rho / DPI) *
-                          (double)cosSurf * (double)corr * wgt * (double)stG);
+                          (double)cosSurf * (double)corr * wgt);
     if (sc.mediaN > 0) contrib *= dMediaTransmittance(sc, p, wdir, (Real)le.dist, lambda, rng);
     filmAdd(film, hits, cam.resX, px, py, lambda, contrib);
 }
@@ -6414,10 +6428,8 @@ __device__ static void connectLensHeroPhysical(const DScene& sc, const DCamera& 
     if (plane && ddot(*plane, le.Y - p) <= 0.0) return;
     const DVec3 wdir = le.wdir;
     const double dist = le.dist;
-    const Real cosSurf = dot(n, wdir);
-    if (cosSurf <= 0) return;
-    const Real stG = dShadowTerminatorG(wdir, n, ng);
-    if (stG <= (Real)0) return;
+    Real cosSurf;
+    if (!dCamSideOk(n, ng, wdir, gs != nullptr, cosSurf)) return;   // the camera side
     int px[hero::kHeroMax], py[hero::kHeroMax];
     double wg[hero::kHeroMax];
     bool ok[hero::kHeroMax], any = false;
@@ -6432,7 +6444,7 @@ __device__ static void connectLensHeroPhysical(const DScene& sc, const DCamera& 
         if (!ok[i]) continue;
         Real contrib = (Real)((double)beta[i] *
                               (gs ? (double)gs->f(wdir, lam[i]) : (double)rho[i] / DPI) *
-                              (double)cosSurf * (double)corr * wg[i] * (double)stG);
+                              (double)cosSurf * (double)corr * wg[i]);
         if (sc.mediaN > 0) contrib *= dMediaTransmittance(sc, p, wdir, (Real)dist, lam[i], rng);
         filmAdd(film, hits, cam.resX, px[i], py[i], lam[i], contrib);
     }
@@ -6452,12 +6464,8 @@ __device__ static void connectLens(const DScene& sc, const DCamera& cam, double*
     Real dist = length(toA);
     if (dist < (Real)1e-9) return;
     DVec3 wdir = toA / dist;
-    Real cosSurf = dot(n, wdir);
-    // Below the shading horizon reject; soften across the geometric horizon (see connect()):
-    // no-op for flat/sphere (stG == 1).
-    if (cosSurf <= 0) return;                        // pupil behind the shading surface
-    Real stG = dShadowTerminatorG(wdir, n, ng);
-    if (stG <= (Real)0) return;                      // pupil behind true geometry: hard cutoff
+    Real cosSurf;
+    if (!dCamSideOk(n, ng, wdir, gs != nullptr, cosSurf)) return;   // the pupil on the camera side
     Real cosLens = -dot(wdir, cam.w);                // cosine at the lens (w faces scene)
     if (cosLens <= (Real)1e-6) return;               // not heading toward the film
     int px, py;
@@ -6465,7 +6473,7 @@ __device__ static void connectLens(const DScene& sc, const DCamera& cam, double*
     if (occludedTo(sc, dOffsetAlong(p, ng, wdir), p + wdir * dist, 2 * RAY_EPS, RAY_EPS, /*camLeg=*/true)) return;  // camera leg: hide_camera applies (Scene::occluded / DMaterial::hideCamera)
     Real corr = dShadingAdjointCorr(wi, wdir, n, ng);   // Veach adjoint (1 when ns==ng)
     Real contrib = beta * (gs ? (Real)DPI * gs->f(wdir, lambda) : rho) * cosSurf * corr * cosLens *
-                   (R * R) / (dist * dist) * stG;
+                   (R * R) / (dist * dist);
     // ABSOLUTE-SCALE NORMALISER (A/C <-> B unification) — CPU twin: render.h connectLens.
     // Divide the pupil FLUX deposited in the cell by the physical cell area
     // A_cell = pixelPlaneArea()*filmDist^2 to turn it into film IRRADIANCE, matching
@@ -12290,7 +12298,7 @@ __device__ __noinline__ static int interactHair(const DScene& sc, const DCamSet&
 __device__ static int interactSpecular(const DScene& sc, const DCamSet& cs, int camMode,
         int diffraction, const DMaterial& m, int matIndex, const DHit& h,
         DVec3& ro, DVec3& rd, Real& beta, Real& lambda, DRng& rng, double& eAbsorbed,
-        DMediumStack& stk, Real* curveTminOut = nullptr) {
+        DMediumStack& stk, Real* curveTminOut = nullptr, bool firstHit = false) {
     if (m.type == D_DIELECTRIC || m.type == D_THINFILM || m.type == D_MULTILAYER) {
         // A dielectric body's surface, plain or coated. A photon carries flux: no radiance scale.
         DVec3 nro, nrd;
@@ -12358,6 +12366,9 @@ __device__ static int interactSpecular(const DScene& sc, const DCamSet& cs, int 
         // so a multi-camera model-B pass stays bit-identical. Skipped for model C.
         DVec3 ngo = dShadedNg(h);   // geo normal on shading side
         DVec3 wiPrev = -rd;                                             // toward previous (light-side)
+        // A Lambertian lobe (host twin render.h): lit only from above ns, softened at the first bounce.
+        if (!(dot(wiPrev, h.n) > (Real)0)) { eAbsorbed += beta; return WF_TERMINATE; }
+        if (firstHit) beta *= dShadowTerminatorG(wiPrev, h.n, ngo);
         if (camMode == CAM_A || camMode == CAM_B) {
             splatSurfaceAll(sc, cs, camMode, h.p, h.n, ngo, wiPrev, lambda, beta, rho, rng);
             if (canGlow) {
@@ -12376,8 +12387,8 @@ __device__ static int interactSpecular(const DScene& sc, const DCamSet& cs, int 
         } else {
             eAbsorbed += beta; return WF_TERMINATE;
         }
-        { DVec3 wo = cosineHemisphere(h.n, rng);
-          beta *= dShadingAdjointCorr(wiPrev, wo, h.n, ngo);   // Veach adjoint (1 when ns==ng)
+        { DVec3 wo;
+          beta *= dDiffuseContinuation(h, ngo, wiPrev, rng, wo);
           if (!dContinueAlong(h, wo, DL_REFLECT, ro, rd)) { eAbsorbed += beta; return WF_TERMINATE; } return WF_CONTINUE; }
     } else if (m.type == D_HAIR) {
         // Split out (__noinline__) so its fat double-precision frame is only paid on an
@@ -12474,7 +12485,7 @@ __device__ static int shadeStep(const DScene& sc, const DCamSet& cs,
                                 int* beamScat = nullptr, DPathCaustic* pathC = nullptr,
                                 DBeamSpec* spec = nullptr,
                                 int srcEm = -1, int* nSurf = nullptr,
-                                Real* curveTminOut = nullptr) {
+                                Real* curveTminOut = nullptr, bool firstHit = false) {
     Real dSurf = h.valid ? h.t : BIG;
 
     // Dielectric Beer-Lambert over the marched arc (the block further down only covers the
@@ -12772,7 +12783,7 @@ __device__ static int shadeStep(const DScene& sc, const DCamSet& cs,
         // the hero tracer also calls) leaves exactly one definition of the rule.
         if (pathC) pathC->bits |= dPhotonVertexBit(sc, m, h);
         return interactSpecular(sc, cs, camMode, diffraction, m, matIndex, h,
-                                ro, rd, beta, lambda, rng, eAbsorbed, stk, curveTminOut);
+                                ro, rd, beta, lambda, rng, eAbsorbed, stk, curveTminOut, firstHit);
     } else if (m.type == D_DIFFUSETRANSMIT) {
         // Two-lobe Lambertian (device twin of render.h DiffuseTransmit): `reflect` into
         // the front (+n) hemisphere, `transmit` into the back (-n) hemisphere. Splat BOTH
@@ -12808,18 +12819,33 @@ __device__ static int shadeStep(const DScene& sc, const DCamSet& cs,
         Real rho = dDiffuseRho(sc, m, h, lambda);
         DVec3 ngo = dShadedNg(h);   // geo normal on shading side
         DVec3 wiPrev = -rd;                                             // toward previous (light-side)
+        // Light arriving below the shading normal lights nothing: no deposit, no splat; the first
+        // bounce softens toward the emitter it came from (host twin render.h tracePhoton).
+        if (!(dot(wiPrev, h.n) > (Real)0)) { eAbsorbed += beta; return WF_TERMINATE; }
+        if (firstHit) beta *= dShadowTerminatorG(wiPrev, h.n, ngo);
         // photon-map deposit (mode M), routed to the caustic map on an L.S+.D path; not on a strand,
         // where no gather takes it (CURVE-GATHER, host twin render.h)
         if (!compoundDeposit && !dGatherlessStrand(m, h))   // nor where the compound took it (above)
-            depositPhoton(cs, h.p, ngo, beta, lambda, dPathIsCaustic(pathC), dPathCausticW(pathC));
+            depositPhoton(cs, h.p, ngo, beta * dArrivalAdjoint(h, ngo, wiPrev), lambda,
+                          dPathIsCaustic(pathC), dPathCausticW(pathC));
         if (pathC) pathC->bits |= PV_BIT_SCATTER;   // past here it is diffuse indirect light
         splatSurfaceAll(sc, cs, camMode, h.p, h.n, ngo, wiPrev, lambda, beta, rho, rng);
         camSpecularSplatAll(sc, cs, camMode, h.p, h.n, lambda, beta, rho, rng);
         if (rng.uniform() >= rho) { eAbsorbed += beta; return WF_TERMINATE; }
-        { DVec3 wo = cosineHemisphere(h.n, rng);
-          beta *= dShadingAdjointCorr(wiPrev, wo, h.n, ngo);   // Veach adjoint (1 when ns==ng)
+        { DVec3 wo;
+          beta *= dDiffuseContinuation(h, ngo, wiPrev, rng, wo);
           if (!dContinueAlong(h, wo, DL_REFLECT, ro, rd)) { eAbsorbed += beta; return WF_TERMINATE; } return WF_CONTINUE; }
     }
+}
+
+__device__ static Real dDiffuseContinuation(const DHit& h, const DVec3& ngo, const DVec3& wi,
+                                            DRng& rng, DVec3& wo) {
+    if (dot(h.n, ngo) >= (Real)(1.0 - 1e-7)) {
+        wo = cosineHemisphere(h.n, rng);
+        return dShadingAdjointCorr(wi, wo, h.n, ngo);
+    }
+    wo = cosineHemisphere(ngo, rng);
+    return dArrivalAdjoint(h, ngo, wi);
 }
 
 // ==================== hero-wavelength forward tracer (device) ================
@@ -12841,16 +12867,14 @@ __device__ static void connectHero(const DScene& sc, const DCamera& cam, double*
     DVec3 toCam = cam.eye - p;
     Real dist = length(toCam);
     DVec3 wdir = toCam / dist;
-    Real cosSurf = dot(n, wdir);
-    if (cosSurf <= 0) return;
-    Real stG = dShadowTerminatorG(wdir, n, ng);
-    if (stG <= (Real)0) return;
+    Real cosSurf;
+    if (!dCamSideOk(n, ng, wdir, gs != nullptr, cosSurf)) return;   // the camera side
     int px, py; Real cosCam, dist2;
     if (!cam.project(p, px, py, cosCam, dist2)) return;
     if (occludedTo(sc, dOffsetAlong(p, ng, wdir), p + wdir * dist, 2 * RAY_EPS, RAY_EPS, /*camLeg=*/true)) return;  // camera leg: hide_camera applies (Scene::occluded / DMaterial::hideCamera)
     Real corr = dShadingAdjointCorr(wi, wdir, n, ng);
     double solidAngle = cam.pixelSolidAngle(cosCam);
-    Real geo = cosSurf * corr / (Real)((double)dist2 * solidAngle) * stG;
+    Real geo = cosSurf * corr / (Real)((double)dist2 * solidAngle);
     for (int i = 0; i < nUp; ++i) {
         Real contrib = beta[i] * (gs ? gs->f(wdir, lam[i]) : rho[i] / (Real)DPI) * geo;
         if (sc.mediaN > 0) contrib *= dMediaTransmittance(sc, p, wdir, dist, lam[i], rng);
@@ -12880,10 +12904,8 @@ __device__ static void connectLensHero(const DScene& sc, const DCamera& cam, dou
     Real dist = length(toA);
     if (dist < (Real)1e-9) return;
     DVec3 wdir = toA / dist;
-    Real cosSurf = dot(n, wdir);
-    if (cosSurf <= 0) return;
-    Real stG = dShadowTerminatorG(wdir, n, ng);
-    if (stG <= (Real)0) return;
+    Real cosSurf;
+    if (!dCamSideOk(n, ng, wdir, gs != nullptr, cosSurf)) return;   // the camera side
     Real cosLens = -dot(wdir, cam.w);
     if (cosLens <= (Real)1e-6) return;
     int px, py;
@@ -12891,7 +12913,7 @@ __device__ static void connectLensHero(const DScene& sc, const DCamera& cam, dou
     if (occludedTo(sc, dOffsetAlong(p, ng, wdir), p + wdir * dist, 2 * RAY_EPS, RAY_EPS, /*camLeg=*/true)) return;  // camera leg: hide_camera applies (Scene::occluded / DMaterial::hideCamera)
     Real corr = dShadingAdjointCorr(wi, wdir, n, ng);
     Real cellNorm = (Real)1 / (Real)(cam.pixelPlaneArea() * cam.filmDist * cam.filmDist);
-    Real geo = cosSurf * corr * cosLens * (R * R) / (dist * dist) * stG * cellNorm;
+    Real geo = cosSurf * corr * cosLens * (R * R) / (dist * dist) * cellNorm;
     for (int i = 0; i < nUp; ++i) {
         Real contrib = beta[i] * (gs ? (Real)DPI * gs->f(wdir, lam[i]) : rho[i]) * geo;
         if (sc.mediaN > 0) contrib *= dMediaTransmittance(sc, p, wdir, dist, lam[i], rng);
@@ -13076,7 +13098,8 @@ __device__ static bool genPhotonHero(const DScene& sc, const DCamSet& cs, int ca
 __device__ static int shadeStepHero(const DScene& sc, const DCamSet& cs, int camMode,
         int diffraction, int C, const DHit& h, DVec3& ro, DVec3& rd, Real* lam, Real* beta,
         bool& secAlive, DRng& rng, double& eAbsorbed, double& eSensor, double& eEscaped,
-        DMediumStack& stk, DPathCaustic* pathC = nullptr, Real* curveTminOut = nullptr) {
+        DMediumStack& stk, DPathCaustic* pathC = nullptr, Real* curveTminOut = nullptr,
+        bool firstHit = false) {
     int nUp = C;   // drops to 1 if a coat's coin de-heroes the bundle (below)
     Real dEvent = h.valid ? h.t : BIG;
 
@@ -13312,7 +13335,7 @@ __device__ static int shadeStepHero(const DScene& sc, const DCamSet& cs, int cam
         if (nUp > 1) beta[0] *= (Real)C;   // not twice: a coat's coin may have de-heroed already
         secAlive = false;
         return interactSpecular(sc, cs, camMode, diffraction, m, matIndex, h,
-                                ro, rd, beta[0], lam[0], rng, eAbsorbed, stk, curveTminOut);
+                                ro, rd, beta[0], lam[0], rng, eAbsorbed, stk, curveTminOut, firstHit);
     }
 
     // Diffuse (texture-sampled reflectance when the material binds a texture).
@@ -13320,12 +13343,22 @@ __device__ static int shadeStepHero(const DScene& sc, const DCamSet& cs, int cam
     for (int i = 0; i < nUp; ++i) rho[i] = clamp01(dDiffuseRho(sc, m, h, lam[i]));
     DVec3 ngo = dShadedNg(h);
     DVec3 wiPrev = -rd;
+    // Lit only from above ns; the first bounce softened (as shadeStep).
+    if (!(dot(wiPrev, h.n) > (Real)0)) {
+        for (int i = 0; i < nUp; ++i) eAbsorbed += (double)beta[i];
+        return WF_TERMINATE;
+    }
+    if (firstHit) {
+        const Real sEm = dShadowTerminatorG(wiPrev, h.n, ngo);
+        for (int i = 0; i < nUp; ++i) beta[i] *= sEm;
+    }
     { const bool caus = dPathIsCaustic(pathC);
       // ...with the aimed caustic pass's MIS weight, as the scalar deposits carry it; not on a
       // strand (CURVE-GATHER).
       const Real cw = dPathCausticW(pathC);
       if (!compoundDeposit && !dGatherlessStrand(m, h))   // nor where the compound took it (above)
-          for (int i = 0; i < nUp; ++i) depositPhoton(cs, h.p, ngo, beta[i], lam[i], caus, cw);
+          for (int i = 0; i < nUp; ++i)
+              depositPhoton(cs, h.p, ngo, beta[i] * dArrivalAdjoint(h, ngo, wiPrev), lam[i], caus, cw);
       if (pathC) pathC->bits |= PV_BIT_SCATTER; }   // past here: diffuse indirect light
     if (camMode == CAM_A || camMode == CAM_B) {
         splatSurfaceAllHero(sc, cs, camMode, h.p, h.n, ngo, wiPrev, lam, beta, rho, nUp, rng);
@@ -13344,8 +13377,8 @@ __device__ static int shadeStepHero(const DScene& sc, const DCamSet& cs, int cam
         eAbsorbed += (double)beta[i] * (double)((Real)1 - w);    // deterministic absorption
         beta[i] *= w;
     }
-    DVec3 wo = cosineHemisphere(h.n, rng);
-    Real corr = dShadingAdjointCorr(wiPrev, wo, h.n, ngo);
+    DVec3 wo;
+    const Real corr = dDiffuseContinuation(h, ngo, wiPrev, rng, wo);
     for (int i = 0; i < nUp; ++i) beta[i] *= corr;
     if (!dContinueAlong(h, wo, DL_REFLECT, ro, rd)) { for (int i = 0; i < nUp; ++i) eAbsorbed += (double)beta[i]; return WF_TERMINATE; } return WF_CONTINUE;
 }
@@ -13382,11 +13415,11 @@ __device__ static void traceHeroPhoton(const DScene& sc, const DCamSet& cs, int 
         int r;
         if (secAlive)
             r = shadeStepHero(sc, cs, camMode, diffraction, C, h, ro, rd, lam, beta, secAlive, rng,
-                              eAbsorbed, eSensor, eEscaped, stk, &pathC, &curveTmin);
+                              eAbsorbed, eSensor, eEscaped, stk, &pathC, &curveTmin, bounce == 0);
         else
             r = shadeStep(sc, cs, camMode, diffraction, h, ro, rd, beta[0], lam[0], rng,
                           eAbsorbed, eSensor, eEscaped, stk, nullptr, -1, 0, nullptr, &pathC,
-                          nullptr, -1, nullptr, &curveTmin);
+                          nullptr, -1, nullptr, &curveTmin, bounce == 0);
         if (r == WF_TERMINATE) done = true;
     }
     if (!done) {
@@ -13468,7 +13501,7 @@ __global__ void kTrace(DScene sc, DCamSet cs, double* energy,
             if (shadeStep(sc, cs, camMode, diffraction, h, ro, rd, beta, lambda, rng,
                           eAbsorbed, eSensor, eEscaped, stk, cs.beamsOn() ? &crng : nullptr,
                           gm.hit ? gm.which : -1, gm.arc, &beamScat,
-                          &pathC, &spec, srcEm, &nSurf, &curveTmin) == WF_TERMINATE) done = true;
+                          &pathC, &spec, srcEm, &nSurf, &curveTmin, bounce == 0) == WF_TERMINATE) done = true;
         }
         if (!done) eResidual += beta;
     }
@@ -13641,7 +13674,8 @@ __global__ void kWfShade(DScene sc, DCamSet cs, double* energy,
     int res = shadeStep(sc, cs, camMode, diffraction, h, ro, rd, beta, lambda, rng,
                         eAbs, eSen, eEsc, stk, nullptr,
                         st.gmMed[slot], st.gmArc[slot],   // GRIN pre-pass, from kWfExtend
-                        nullptr, &pathC, nullptr, -1, nullptr, &curveTmin);
+                        nullptr, &pathC, nullptr, -1, nullptr, &curveTmin,
+                        st.bounce[slot] == 0);
     int bounce = st.bounce[slot] + 1;
     bool pathDone = (res == WF_TERMINATE);
     // Bounce cap: the photon survived maxBounce shadeStep calls without terminating —

@@ -1209,16 +1209,16 @@ struct Renderer {
     }
 
     // Wavelength-INDEPENDENT part of the mode-B pinhole connection: project the surface
-    // vertex to the film, reject/soften across the horizons, and occlusion-test the
+    // vertex to the film, test its camera side (camSideOk), and occlusion-test the
     // shadow ray. On success returns true and fills `g` with the pixel and the geometry
     // factors, from which the caller forms the per-λ contribution as
-    //   beta * (rho/PI) * cosSurf * corr / denom * stG  (× media transmittance).
+    //   beta * (rho/PI) * cosSurf * corr / denom  (× media transmittance).
     // Sharing this across the C hero wavelengths (one BVH occlusion test, one projection)
     // is the whole point of hero splatting; the scalar connect() below reuses it too so
     // its float ordering — and thus mode B — stays bit-identical.
     struct ConnGeom {
         int px = 0, py = 0;
-        double cosSurf = 0, corr = 0, denom = 0, stG = 0, dist = 0;
+        double cosSurf = 0, corr = 0, denom = 0, dist = 0;
         Vec3 wdir;
     };
     // A FIBER vertex connects differently, in three ways that all live down here rather
@@ -1233,14 +1233,52 @@ struct Renderer {
     // `shadowTerminatorG` and the Veach shading-normal adjoint are both corrections for
     // an interpolated surface normal used as a projection axis; the fiber does not use its
     // normal that way, so both are exactly 1 here rather than approximately so.
+    // The camera side of a forward camera connection from a surface vertex (shading normal `n`,
+    // geometric `ng` on its shaded side) along `wdir`: false where it may not connect, else true and
+    // `cosSurf` its projected cosine. As mode R's integrand has it (bdpt::lambertLit): a Lambertian
+    // vertex lights a camera anywhere on its geometric front, on either side of n; a glossy one
+    // (`glossy`) only above n, as its lobe asks (bsdfF). Never softened: the terminator's softening
+    // belongs to the light side, at the emitter (bdpt.h emitterSoftening). Where n == ng this is the
+    // plain n.wdir > 0.
+    static bool camSideOk(const Vec3& n, const Vec3& ng, const Vec3& wdir, bool glossy,
+                          double& cosSurf) {
+        const double c = dot(n, wdir);
+        if (c == 0.0 || !(dot(ng, wdir) > 0.0) || (glossy && c < 0.0)) return false;
+        cosSurf = std::fabs(c);
+        return true;
+    }
+    // A photon's continuation from a Lambertian vertex it reached along -`wi` (lit: wi above the
+    // shading normal), into `wo`, returning the throughput factor beyond the albedo. Where the
+    // shading normal tilts it is drawn about the GEOMETRIC one, so every direction mode R lights is
+    // reachable -- one below the shading normal too (bdpt::lambertLit) -- weighted by Veach's
+    // adjoint for that density, |cos(wi,ns)| / |cos(wi,ng)|. Where ns == ng it is the plain cosine
+    // draw about ns, with the adjoint factor that is then exactly 1 (bit-identical).
+    static double diffuseContinuation(const Hit& h, const Vec3& ngo, const Vec3& wi, Pcg32& rng,
+                                      Vec3& wo) {
+        if (dot(h.n, ngo) >= 1.0 - 1e-7) {
+            wo = cosineHemisphere(h.n, rng);
+            return shadingAdjointCorr(wi, wo, h.n, ngo);
+        }
+        wo = cosineHemisphere(ngo, rng);
+        return arrivalAdjoint(h, ngo, wi);
+    }
+    // The arrival half of Veach's adjoint at a Lambertian vertex reached along -`wi`:
+    // |cos(wi,ns)| / |cos(wi,ng)|, the shading normal's cosine where the photon's flux per unit of
+    // GEOMETRIC area carries the geometric one -- what turns a deposit's density estimate into the
+    // irradiance mode R shades with, and the continuation's weight above. Exactly 1 where ns == ng.
+    static double arrivalAdjoint(const Hit& h, const Vec3& ngo, const Vec3& wi) {
+        if (dot(h.n, ngo) >= 1.0 - 1e-7) return 1.0;
+        const double cg = std::fabs(dot(wi, ngo));
+        return cg > 0.0 ? std::fabs(dot(wi, h.n)) / cg : 0.0;
+    }
     bool connectGeom(const Scene& scene, const Camera& cam, const Vec3& p, const Vec3& n,
                      const Vec3& ng, const Vec3& wi, ConnGeom& g,
-                     const HairShade* hs = nullptr) const {
+                     const HairShade* hs = nullptr, bool glossy = false) const {
         Vec3 toCam = cam.eye - p;
         g.dist = length(toCam);
         g.wdir = toCam / g.dist;
         if (hs) {
-            g.cosSurf = 1.0; g.corr = 1.0; g.stG = 1.0;
+            g.cosSurf = 1.0; g.corr = 1.0;
             double cosCamH, dist2H;
             if (!cam.project(p, g.px, g.py, cosCamH, dist2H)) return false;
             const double off = hairExitOffset(*hs, n, g.wdir);
@@ -1250,16 +1288,8 @@ struct Renderer {
             g.denom = dist2H * cam.pixelSolidAngle(cosCamH);
             return true;
         }
-        g.cosSurf = dot(n, g.wdir);
-        // Reject connections below the shading horizon; soften across the GEOMETRIC
-        // horizon (`ng` is the geometric normal on the shading side). A smoothed shading
-        // normal must not splat a vertex whose true geometry faces away from the camera,
-        // but a hard cutoff there carves facet slivers at the terminator, so ramp it
-        // smoothly (Chiang 2019). No-op for flat tris / analytic spheres, where ng == n
-        // (stG == 1), so those scenes stay bit-identical.
-        if (g.cosSurf <= 0) return false;               // camera behind shading surface
-        g.stG = shadowTerminatorG(g.wdir, n, ng);
-        if (g.stG <= 0.0) return false;                 // camera behind true geometry: hard cutoff
+        // The camera side (camSideOk): never behind the true geometry, never softened.
+        if (!camSideOk(n, ng, g.wdir, glossy, g.cosSurf)) return false;
         double cosCam, dist2;
         if (!cam.project(p, g.px, g.py, cosCam, dist2)) return false;
         if (scene.occluded(p + ng * 1e-6, g.wdir, g.dist - 2e-6, 1e-6, /*camLeg=*/true)) return false;
@@ -1285,11 +1315,11 @@ struct Renderer {
                  double lambda, double beta, double rho, Pcg32& rng,
                  const HairShade* hs = nullptr, const GlossySplat* gs = nullptr) const {
         ConnGeom g;
-        if (!connectGeom(scene, cam, p, n, ng, wi, g, hs)) return;
+        if (!connectGeom(scene, cam, p, n, ng, wi, g, hs, gs != nullptr)) return;
         // For a fiber, `hairFCos` IS f*projection (hair_shade.h); cosSurf is 1 so the
         // arithmetic below stays one shared expression instead of two near-copies.
         double f = hs ? hairFCos(*hs, g.wdir) : gs ? gs->f(g.wdir, lambda) : rho / PI;
-        double contrib = beta * f * g.cosSurf * g.corr / g.denom * g.stG;
+        double contrib = beta * f * g.cosSurf * g.corr / g.denom;
         // Attenuation of the shadow ray through the fog (Beer-Lambert; ratio tracking
         // for a heterogeneous medium, exact exp for a homogeneous one; product over media).
         if (!scene.media.empty())
@@ -1305,10 +1335,10 @@ struct Renderer {
                      const double* lam, const double* beta, const double* rho, int nUp,
                      Pcg32& rng, const GlossySplat* gs = nullptr) const {   // see connect
         ConnGeom g;
-        if (!connectGeom(scene, cam, p, n, ng, wi, g)) return;
+        if (!connectGeom(scene, cam, p, n, ng, wi, g, nullptr, gs != nullptr)) return;
         for (int i = 0; i < nUp; ++i) {
             double f = gs ? gs->f(g.wdir, lam[i]) : rho[i] / PI;
-            double contrib = beta[i] * f * g.cosSurf * g.corr / g.denom * g.stG;
+            double contrib = beta[i] * f * g.cosSurf * g.corr / g.denom;
             if (!scene.media.empty())
                 contrib *= mediaTransmittance(scene, p, g.wdir, g.dist, lam[i], rng);
             film.add(g.px, g.py, Vec3(cieX(lam[i]), cieY(lam[i]), cieZ(lam[i])) * contrib);
@@ -1360,13 +1390,8 @@ struct Renderer {
         // The tests that need only the entry come before the trace through the glass.
         if (plane && dot(*plane, le.Y - p) <= 0.0) return;
         const Vec3& wdir = le.wdir;
-        const double cosSurf = dot(n, wdir);
-        double stG = 1.0;                                   // see connectLens
-        if (!hs) {
-            if (cosSurf <= 0) return;
-            stG = shadowTerminatorG(wdir, n, ng);
-            if (stG <= 0.0) return;
-        }
+        double cosSurf = dot(n, wdir);
+        if (!hs && !camSideOk(n, ng, wdir, gs != nullptr, cosSurf)) return;   // see connectLens
         const double off = hs ? hairExitOffset(*hs, n, wdir) : 1e-6;
         if (off >= le.dist) return;
         int px, py; double wgt;
@@ -1376,7 +1401,7 @@ struct Renderer {
         const double corr = hs ? 1.0 : shadingAdjointCorr(wi, wdir, n, ng);
         const double fcos = hs ? hairFCos(*hs, wdir)
                                : (gs ? gs->f(wdir, lambda) : rho / PI) * cosSurf;
-        double contrib = beta * fcos * corr * wgt * stG;
+        double contrib = beta * fcos * corr * wgt;
         if (!scene.media.empty())
             contrib *= mediaTransmittance(scene, p, wdir, le.dist, lambda, rng);
         film.add(px, py, Vec3(cieX(lambda), cieY(lambda), cieZ(lambda)) * contrib);
@@ -1396,10 +1421,8 @@ struct Renderer {
         if (!cam.lensEntry(p, u1, u2, le)) return;
         if (plane && dot(*plane, le.Y - p) <= 0.0) return;
         const Vec3& wdir = le.wdir;
-        const double cosSurf = dot(n, wdir);
-        if (cosSurf <= 0) return;
-        const double stG = shadowTerminatorG(wdir, n, ng);
-        if (stG <= 0.0) return;
+        double cosSurf;
+        if (!camSideOk(n, ng, wdir, gs != nullptr, cosSurf)) return;
         int px[hero::kHeroMax], py[hero::kHeroMax];
         double wgt[hero::kHeroMax];
         bool ok[hero::kHeroMax] = {}, any = false;
@@ -1413,7 +1436,7 @@ struct Renderer {
         for (int i = 0; i < nUp; ++i) {
             if (!ok[i]) continue;
             double contrib = beta[i] * (gs ? gs->f(wdir, lam[i]) : rho[i] / PI) * cosSurf * corr *
-                             wgt[i] * stG;
+                             wgt[i];
             if (!scene.media.empty())
                 contrib *= mediaTransmittance(scene, p, wdir, le.dist, lam[i], rng);
             film.add(px[i], py[i], Vec3(cieX(lam[i]), cieY(lam[i]), cieZ(lam[i])) * contrib);
@@ -1475,16 +1498,10 @@ struct Renderer {
         if (dist < 1e-9) return;
         Vec3 wdir = toA / dist;
         double cosSurf = dot(n, wdir);
-        // Below the shading horizon reject; soften across the geometric horizon (see
-        // connect()): no-op for flat/sphere (stG == 1). A FIBER skips both — its
-        // transmitted lobe legitimately exits the far side, and its projection is
-        // longitudinal rather than normal-relative (see hair_shade.h / connectGeom).
-        double stG = 1.0;
-        if (!hs) {
-            if (cosSurf <= 0) return;                    // pupil behind the shading surface
-            stG = shadowTerminatorG(wdir, n, ng);
-            if (stG <= 0.0) return;                      // pupil behind true geometry: hard cutoff
-        }
+        // The pupil on the camera side (camSideOk; see connect()). A FIBER skips it -- its
+        // transmitted lobe legitimately exits the far side, and its projection is longitudinal
+        // rather than normal-relative (see hair_shade.h / connectGeom).
+        if (!hs && !camSideOk(n, ng, wdir, gs != nullptr, cosSurf)) return;
         double cosLens = -dot(wdir, cam.w);              // cosine at the lens (w faces the scene)
         if (cosLens <= 1e-6) return;                     // not heading toward the film
         int px, py;
@@ -1501,7 +1518,7 @@ struct Renderer {
         double corr = hs ? 1.0 : shadingAdjointCorr(wi, wdir, n, ng);
         double fcos = hs ? PI * hairFCos(*hs, wdir)
                          : (gs ? PI * gs->f(wdir, lambda) : rho) * cosSurf;
-        double contrib = beta * fcos * corr * cosLens * (R * R) / (dist * dist) * stG;
+        double contrib = beta * fcos * corr * cosLens * (R * R) / (dist * dist);
         // ABSOLUTE-SCALE NORMALISER (A/C <-> B unification). The line above deposits
         // radiant FLUX through the pupil into the film CELL (it carries the pupil area
         // R^2 but no 1/cell-area), whereas mode B's connect() deposits RADIANCE (it
@@ -1545,10 +1562,8 @@ struct Renderer {
         double dist = length(toA);
         if (dist < 1e-9) return;
         Vec3 wdir = toA / dist;
-        double cosSurf = dot(n, wdir);
-        if (cosSurf <= 0) return;                        // pupil behind the shading surface
-        double stG = shadowTerminatorG(wdir, n, ng);
-        if (stG <= 0.0) return;                          // pupil behind true geometry
+        double cosSurf;
+        if (!camSideOk(n, ng, wdir, gs != nullptr, cosSurf)) return;   // the pupil (connect())
         double cosLens = -dot(wdir, cam.w);
         if (cosLens <= 1e-6) return;                     // not heading toward the film
         int px, py;
@@ -1558,7 +1573,7 @@ struct Renderer {
         double cellNorm = 1.0 / (cam.pixelPlaneArea() * cam.filmDist * cam.filmDist);
         for (int i = 0; i < nUp; ++i) {
             double contrib = beta[i] * (gs ? PI * gs->f(wdir, lam[i]) : rho[i]) * cosSurf * corr *
-                             cosLens * (R * R) / (dist * dist) * stG;
+                             cosLens * (R * R) / (dist * dist);
             contrib *= cellNorm;
             if (!scene.media.empty())
                 contrib *= mediaTransmittance(scene, p, wdir, dist, lam[i], rng);
@@ -2538,7 +2553,7 @@ struct Renderer {
     bool interactPhotonSpecular(const Scene& scene, const CamTarget* cams, int nCam,
                                 const Material& m, const Hit& h, Ray& ray, double& beta,
                                 double& lambda, MediumStack& stk, Pcg32& rng,
-                                EnergyReport& e) const {
+                                EnergyReport& e, bool firstHit = false) const {
         switch (m.type) {
             case MatType::Dielectric:
             case MatType::ThinFilm:
@@ -2616,6 +2631,10 @@ struct Renderer {
                 double rho, aEff; fluoroWeights(m, lambda, rho, aEff);
                 Vec3 ngo = orientedGeoN(h);
                 Vec3 wi = Vec3{-ray.d.x, -ray.d.y, -ray.d.z};   // toward the previous (light-side) vertex
+                // A Lambertian lobe, as Diffuse's (tracePhoton): lit only from above ns, softened
+                // at the first bounce.
+                if (!(dot(wi, h.n) > 0.0)) { e.absorbed += beta; return false; }
+                if (firstHit) beta *= shadowTerminatorG(wi, h.n, ngo);
                 // Model-B connections: the elastic channel splats at the
                 // incoming lambda; the fluorescent channel samples one
                 // lambda' ~ M and splats the glow (albedo aEff*Q) with the
@@ -2630,8 +2649,8 @@ struct Renderer {
                 FluoroResult fr = fluoroInteract(m, lambda, rng);
                 if (fr.event == FluoroEvent::Absorb) { e.absorbed += beta; return false; }
                 lambda = fr.lambdaOut;              // Stokes-shifted on Reemit
-                Vec3 wo = cosineHemisphere(h.n, rng);
-                beta *= shadingAdjointCorr(wi, wo, h.n, ngo);   // Veach adjoint (1 when Ns==Ng)
+                Vec3 wo;
+                beta *= diffuseContinuation(h, ngo, wi, rng, wo);
                 if (!continueAlong(h, wo, Lobe::Reflect, ray)) { e.absorbed += beta; return false; }
                 return true;                        // beta otherwise unchanged (see above)
             }
@@ -3616,7 +3635,8 @@ struct Renderer {
                                     0.0, rng, nullptr, &gsp);
                         camSpecularSplatAllGlossy(scene, cams, nCam, h.p, h.n, &lambda, &beta, 1, gsp, rng);
                     }
-                    if (!interactPhotonSpecular(scene, cams, nCam, m, h, ray, beta, lambda, stk, rng, e))
+                    if (!interactPhotonSpecular(scene, cams, nCam, m, h, ray, beta, lambda, stk, rng, e,
+                                                bounce == 0))
                         return;
                     if (gFold) {
                         const double rH = clamp01(reflectSlot(scene, m, h, lambda));
@@ -3659,7 +3679,8 @@ struct Renderer {
                     // is the textbook wavelength-DIVERGENT vertex, the one case no per-member
                     // weight could ever rescue.
                     retireSpectral(FK_Specular);
-                    if (!interactPhotonSpecular(scene, cams, nCam, m, h, ray, beta, lambda, stk, rng, e))
+                    if (!interactPhotonSpecular(scene, cams, nCam, m, h, ray, beta, lambda, stk, rng, e,
+                                                bounce == 0))
                         return;
                     continue;
                 }
@@ -3783,13 +3804,19 @@ struct Renderer {
                     }
                     Vec3 ngo = orientedGeoN(h);
                     Vec3 wi = Vec3{-ray.d.x, -ray.d.y, -ray.d.z};   // toward the previous (light-side) vertex
+                    // Light arriving below the shading normal lights nothing (bdpt::lambertLit):
+                    // no deposit, no splat; and the first bounce softens toward the emitter it
+                    // came from (bdpt.h emitterSoftening). Both 1 / no-ops where ns == ng.
+                    if (!(dot(wi, h.n) > 0.0)) { e.absorbed += beta; return; }
+                    if (bounce == 0) beta *= shadowTerminatorG(wi, h.n, ngo);
                     // Photon-map deposit: incident flux at this diffuse vertex. Stored
                     // BEFORE the Russian-roulette reflect/absorb so the record captures
                     // the arriving power (direct on the first hit, indirect thereafter).
                     // Not on a strand, where no gather takes it (CURVE-GATHER), nor where the
                     // compound it was picked from took it (above).
                     if (!compoundDeposit && !gatherlessStrand(m, h.fiberRadius))
-                        depositPhoton(h.p, ngo, lambda, beta, sawFocus && !sawScatter);
+                        depositPhoton(h.p, ngo, lambda, beta * arrivalAdjoint(h, ngo, wi),
+                                      sawFocus && !sawScatter);
                     sawScatter = true;   // whatever leaves this vertex is diffuse indirect light
                     if (nCam > 0 && !forwardCatch) {
                         camSplatAll(scene, cams, nCam, h.p, h.n, ngo, wi, lambda, beta, rho, rng);
@@ -3803,8 +3830,8 @@ struct Renderer {
                         if (rho > 0.0) foldApply(rho, foldRho, foldK, foldS);
                         else retireSpectral(FK_ZeroWeight);
                     }
-                    Vec3 wo = cosineHemisphere(h.n, rng);
-                    beta *= shadingAdjointCorr(wi, wo, h.n, ngo);   // Veach adjoint (1 when Ns==Ng)
+                    Vec3 wo;
+                    beta *= diffuseContinuation(h, ngo, wi, rng, wo);
                     if (!continueAlong(h, wo, Lobe::Reflect, ray)) { e.absorbed += beta; return; }
                     continue;
                 }
@@ -4281,7 +4308,7 @@ struct Renderer {
                             MediumStack cstk = stk;         // sub-paths diverge from here on
                             Ray cray = ray;
                             if (interactPhotonSpecular(scene, cams, nCam, m, h, cray, cb[0],
-                                                       cl[0], cstk, rng, e))
+                                                       cl[0], cstk, rng, e, bounce == 0))
                                 tracePhotonHeroLoop(scene, cams, nCam, sensorFilm, cray, cstk,
                                                     cl, cb, /*secAlive=*/false, bounce + 1,
                                                     rng, e, sawFocus, sawScatter);
@@ -4289,14 +4316,15 @@ struct Renderer {
                         }
                         secAlive = false;                   // hero carries on alone, UNBOOSTED
                         if (!interactPhotonSpecular(scene, cams, nCam, m, h, ray, beta[0],
-                                                    lam[0], stk, rng, e))
+                                                    lam[0], stk, rng, e, bounce == 0))
                             return;
                         continue;
                     }
                     // Default policy: terminate secondaries, then run the shared scalar
                     // interaction on the (boosted) hero channel.
                     deHero();
-                    if (!interactPhotonSpecular(scene, cams, nCam, m, h, ray, beta[0], lam[0], stk, rng, e))
+                    if (!interactPhotonSpecular(scene, cams, nCam, m, h, ray, beta[0], lam[0], stk, rng, e,
+                                                bounce == 0))
                         return;
                     continue;
                 }
@@ -4307,6 +4335,13 @@ struct Renderer {
                         rho[i] = clamp01(diffuseReflectance(scene, m, h, lam[i]));
                     Vec3 ngo = orientedGeoN(h);
                     Vec3 wi = Vec3{-ray.d.x, -ray.d.y, -ray.d.z};
+                    // Below the shading normal: nothing lit; the first bounce softened (as in
+                    // tracePhoton).
+                    if (!(dot(wi, h.n) > 0.0)) { e.absorbed += activeSum(); return; }
+                    if (bounce == 0) {
+                        const double sEm = shadowTerminatorG(wi, h.n, ngo);
+                        for (int i = 0; i < nUp; ++i) beta[i] *= sEm;
+                    }
                     // Photon-map deposit: store EVERY live wavelength as its own per-λ
                     // photon record (the gather keys off each photon's own λ). C records
                     // of base/C sum to base, and nEmitted counts PATHS, so the estimator
@@ -4316,7 +4351,7 @@ struct Renderer {
                         // not on a strand (CURVE-GATHER), nor where the compound took it (above)
                         if (!compoundDeposit && !gatherlessStrand(m, h.fiberRadius))
                             for (int i = 0; i < nUp; ++i)
-                                depositPhoton(h.p, ngo, lam[i], beta[i], caus);
+                                depositPhoton(h.p, ngo, lam[i], beta[i] * arrivalAdjoint(h, ngo, wi), caus);
                         sawScatter = true;   // past a diffuse vertex it is indirect light
                     }
                     if (nCam > 0 && !forwardCatch) {
@@ -4336,8 +4371,8 @@ struct Renderer {
                         e.absorbed += beta[i] * (1.0 - w);   // deterministic part of the absorption
                         beta[i] *= w;
                     }
-                    Vec3 wo = cosineHemisphere(h.n, rng);
-                    double corr = shadingAdjointCorr(wi, wo, h.n, ngo);
+                    Vec3 wo;
+                    const double corr = diffuseContinuation(h, ngo, wi, rng, wo);
                     for (int i = 0; i < nUp; ++i) beta[i] *= corr;
                     if (!continueAlong(h, wo, Lobe::Reflect, ray)) { e.absorbed += activeSum(); return; }
                     continue;

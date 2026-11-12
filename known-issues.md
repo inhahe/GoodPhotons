@@ -2488,12 +2488,21 @@ landing, and a light subpath's first bounce, in its throughput). With all four, 
 room above: D 0.9991 / 0.9999, J 1.0052 / 1.0031, U 1.0014 / 1.0007 (host / device), the flat room
 within 0.2 % (`tools/check_bump_modes.py`; 0.439.8 fails it). check_bitid's `mapped` scene (a
 normal-mapped wall and translucent panel, grazing light) at equal depth: D 1.019 to 1.0075, J 1.024
-to 1.0045, U 1.020 to 1.008 of R -- the rest is the translucent panel's lobe, stage (3). (2) The photon modes A, B, C, M, S, P and V: a photon that arrives below ns lights nothing --
-no deposit, no splat, absorbed -- and, so that every outgoing direction R lights is reachable, its
-diffuse continuation is drawn about the geometric normal, weighted by |cos(wi,ns)| / |cos(wi,ng)|
-(Veach's adjoint with that density; exactly 1 where ns == ng). (3) DiffuseTransmit and Glossy: the
-same question asked of their lobes (R picks a translucent's lobe by the side of ns the light is on,
-not by the pair's). A gate in tools/ from this script, every mode against R, flat and bumped.
+to 1.0045, U 1.020 to 1.008 of R -- the rest is the translucent panel's lobe, stage (3). (2) The
+photon modes A, B, C, M, S, P and V, **done in 0.439.10**: a photon that arrives below ns lights
+nothing -- no deposit, no splat, absorbed; its first bounce softens toward the emitter; a camera
+splat asks of its camera side only the geometric front, unsoftened (`camSideOk`); a deposit carries
+|cos(wi,ns)| / |cos(wi,ng)| (`arrivalAdjoint`: the gather estimates flux per geometric area, R
+shades with the shading cosine); and, so that every outgoing direction R lights is reachable, the
+diffuse continuation is drawn about the geometric normal with that weight. Against R on the room
+above (the photon modes at -max-bounce 32, their deposits' depth; S at 256 passes), host / device:
+B 1.0002 / 1.0002 (0.439.9: 1.0077 / 1.0084), M 1.0031 / 0.9998 (1.144 / 1.135), S 0.9962 / 0.9977
+(1.127 / 1.138). On check_bitid's mapped scene with its translucent panel removed, B 1.033 to
+1.0001, M 1.031 to 0.9995, S 1.033 to 1.0017 of R; with the panel, M and S read 0.978 and 0.980 --
+the panel's lobe, which the wall's error had hidden. (3) DiffuseTransmit and Glossy: the same
+question asked of their lobes (R picks a translucent's lobe by the side of ns the light is on, not
+by the pair's), and the analytic glass-sphere splat (render.h SpecVtx), which tests its camera side
+against the shading normal alone.
 
 ## DONE (2026-11-12, 0.439.8): B-GPU-MAXBOUNCE — GPU mode B ignored `-max-bounce`
 

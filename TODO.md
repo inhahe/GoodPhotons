@@ -151,7 +151,7 @@ Each names the section its line is in.
     0.439.7 (which also counts a glow at full weight in D and J, GLOW-LIGHT-MODES).
 23b. **BUMP-MODES** (4.2) — on a normal-mapped surface U reads 16 % under R, M 12 % over, D/J/B
     1-2 %: one inconsistency at a vertex below its shading hemisphere, fixed in three stages
-    (D, J and U in 0.439.9).
+    (D, J and U in 0.439.9; the photon modes in 0.439.10).
 23c. ~~**B-GPU-MAXBOUNCE** (4.2) — GPU mode B ignores `-max-bounce` (its kernels get a literal 32).~~
     Done, 0.439.8.
 24. ~~**BEAMEPOCHS-CHUNK-PIN** (4.5) — `-beamepochs` pins cheap scenes' GPU chunks to 1 spp.~~ Done,

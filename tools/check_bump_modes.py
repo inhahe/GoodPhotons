@@ -1,14 +1,15 @@
 """Regression check: the modes agree with mode R on a normal-mapped surface (BUMP-MODES).
 
     python tools/check_bump_modes.py [--out png/check_bump_modes] [--exe ftrace.exe] [--no-gpu]
-                                     [--modes D,J,U] [--seeds 3]
+                                     [--modes D,J,U,B,M,S] [--seeds 3]
 
 A shading normal can tilt so far that a ray meets the surface from the geometric front but below
 it (ns.wo <= 0 < ng.wo). Mode R lights such a point: its integrand is a Lambertian lobe lit by
 light from above ns, whichever side of ns the camera side lies on (bsdf_eval.h lambertLit). Every
 other mode has to share that integrand, or it renders a bumped surface brighter or darker than R.
 Before 0.439.9 mode U read the room below at 0.844 of R, D 0.959 (0.989 once 0.439.7 stopped its
-weights counting strategies that cannot happen), J 0.964 (0.983).
+weights counting strategies that cannot happen), J 0.964 (0.983); before 0.439.10 mode M 1.148, B
+1.008.
 
 The room: five walls under one ripple normal map, a tangent-space slope of 2 (the normal tilted up
 to 63 deg), lit at a grazing angle by a tilted panel, 64x48. The same room with a flat map is the
@@ -16,7 +17,9 @@ control: any mode that misses it there is wrong for another reason. Every mode r
 (mode R's default is 32, the bidirectional modes' 8, and an albedo-0.8 room keeps a lot of light in
 its long paths). Each mode's frame mean over `--seeds` seeds must be within 1 % of mode R's on the
 same device, in both rooms (the seeds spread about 0.1 %; three of them are too few to let a
-standard error widen the band). Exits 1 on any failure.
+standard error widen the band). Modes M and S deposit photons over 32 bounces whatever
+-max-bounce says (photonMaxBounce), so they and their mode-R reference run at -max-bounce 32; at 8
+they read the flat room 2 % bright. Exits 1 on any failure.
 """
 import argparse
 import os
@@ -30,7 +33,11 @@ NL = chr(10)
 sys.path.insert(0, os.path.join(ROOT, "tools"))
 from pfm import read_pfm  # noqa: E402
 
-SPP = {"R": 2048, "D": 512, "J": 256, "U": 512}   # per CPU run; the GPU takes four times as many
+SPP = {"R": 2048, "D": 512, "J": 256, "U": 512, "B": 1, "M": 64, "S": 256}   # CPU; the GPU takes 4x
+# (mode S: passes, and progressive photon mapping's bias shrinks with them: on the CPU the flat
+# room reads 0.991 of R at 64, 0.997 at 256)
+NPHOT = {"B": 40000000, "M": 2000000, "S": 100000}   # photons (mode S's per pass)
+DEPTH = {"M": 32, "S": 32}   # -max-bounce: the photon deposits' own depth; 8 for the rest
 TOL = 0.01
 
 
@@ -70,7 +77,7 @@ def main():
     ap.add_argument("--out", default=os.path.join(ROOT, "png", "check_bump_modes"))
     ap.add_argument("--exe", default=os.path.join(ROOT, "ftrace.exe"))
     ap.add_argument("--no-gpu", action="store_true")
-    ap.add_argument("--modes", default="D,J,U")
+    ap.add_argument("--modes", default="D,J,U,B,M,S")
     ap.add_argument("--seeds", type=int, default=3)
     a = ap.parse_args()
     exe, out = os.path.abspath(a.exe), os.path.abspath(a.out)
@@ -83,11 +90,12 @@ def main():
         with open(scene, "w", encoding="utf-8", newline="") as f:
             f.write(room(d, amp))
 
-        def frame(mode, dev, seed):
-            png = os.path.join(d, "%s_%s_%d.png" % (mode, dev, seed))
+        def frame(mode, dev, seed, depth):
+            png = os.path.join(d, "%s_%s_%d_%d.png" % (mode, dev, depth, seed))
             cmd = [exe, "-in", scene, "-mode", mode, "-device", dev,
-                   "-spp", str(SPP[mode] * (4 if dev == "gpu" else 1)), "-n", "200000",
-                   "-max-bounce", "8", "-seed", str(seed), "-hdr", "-no-meter", "-window-min",
+                   "-spp", str(SPP[mode] * (4 if dev == "gpu" else 1)),
+                   "-n", str(NPHOT.get(mode, 200000)),
+                   "-max-bounce", str(depth), "-seed", str(seed), "-hdr", "-no-meter", "-window-min",
                    "-o", png]
             p = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8",
                                errors="replace")
@@ -98,10 +106,14 @@ def main():
             return float(read_pfm(pfm, top_down=True).sum(-1).mean())
 
         for dev in ["cpu"] + ([] if a.no_gpu else ["gpu"]):
-            ref = [frame("R", dev, s) for s in seeds]
-            rm, rse = np.mean(ref), np.std(ref, ddof=1) / np.sqrt(len(ref))
+            refs = {}                                # mode R at each depth asked for
             for mode in a.modes.split(","):
-                v = [frame(mode, dev, s) for s in seeds]
+                depth = DEPTH.get(mode, 8)
+                if depth not in refs:
+                    r = [frame("R", dev, s, depth) for s in seeds]
+                    refs[depth] = (np.mean(r), np.std(r, ddof=1) / np.sqrt(len(r)))
+                rm, rse = refs[depth]
+                v = [frame(mode, dev, s, depth) for s in seeds]
                 m, se = np.mean(v), np.std(v, ddof=1) / np.sqrt(len(v))
                 ratio = m / rm
                 err = np.hypot(se / rm, m * rse / rm ** 2)

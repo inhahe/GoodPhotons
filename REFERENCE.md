@@ -3726,9 +3726,12 @@ mode, as Cycles does; modes `J` and `U` merge no photon from the far side, and m
 under a strongly tilted normal map, and a mirror seen at a grazing angle showed what lay
 behind it; the cost is the energy of those few grazing samples) -- and the terminator where
 light grazes off is softened (Chiang et al. 2019) so low-poly smooth meshes show a smooth shadow gradient
-instead of hard facet slivers — applied uniformly to every mode including `R`. Flat
-meshes are unaffected — both the correction and the softening are exactly a no-op when
-the shading and geometric normals coincide.)
+instead of hard facet slivers — applied where a surface sees its light directly, as mode `R`'s light
+sampling does, in every mode. A point that a camera ray meets below its tilted shading normal (still
+on the geometric front) is lit as mode `R` lights it, in every mode; before 0.439.9 (`D`, `J`, `U`)
+and 0.439.10 (the photon modes) a strongly normal-mapped room read up to 16 % off mode `R` in
+them. Flat meshes are unaffected — the correction, the softening and the rest are exactly a no-op
+when the shading and geometric normals coincide.)
 **`.ftmesh`** is ftrace's own compact binary mesh: a 24-byte header followed by
 little-endian `f32` positions (plus optional normals and UVs) and `u32` triangle
 indices. It exists for the **loom live viewer**, which re-derives and reloads a mesh

@@ -3712,7 +3712,17 @@ holding a glass ball), and on the device `-rgb`, mode S and every one of those.
       emitter; and the softening sits at the vertex next to the emitter alone
       (`emitterSoftening`: s = 1, the vertex before an s = 0 landing, a light subpath's first
       bounce in its throughput). Each part is a no-op where `ns == ng`.
-      `tools/check_bump_modes.py` holds D, J and U to R on such a room and its flat twin.
+      The photon modes (0.439.10) follow the same rule from the light's side: a photon that
+      reaches a diffuse vertex from below `ns` is absorbed (no deposit, no splat); a photon's
+      first bounce softens toward its emitter; a camera splat asks only the geometric front of
+      its camera side and is unsoftened (`camSideOk`; a glossy splat keeps its lobe's `ns`
+      test); a deposit carries the arrival half of Veach's adjoint, |cos(wi,ns)| / |cos(wi,ng)|
+      (`arrivalAdjoint`), since a photon's flux per GEOMETRIC area is what the gather estimates
+      while R shades with the shading cosine; and where `ns` tilts the continuation is drawn
+      about the geometric normal with that same weight (`diffuseContinuation`), so a direction
+      below `ns` that R lights stays reachable. `tools/check_bump_modes.py` holds D, J, U, B,
+      M and S to R on such a room and its flat twin (M and S at -max-bounce 32: they deposit
+      over 32 bounces whatever the flag says).
 - **`curve.h`** — the **curve / fiber** primitive (hair, fur, grass, wire, thread),
   added 0.150.0 for TODO §P1. A `curve` is control points + a radius; the loader
   **flattens it at load time** into a chain of `CurveSeg` **round cones** (the convex
