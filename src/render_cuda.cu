@@ -14073,6 +14073,11 @@ __device__ static inline void dDiffuseTransmitAlbedos(const DScene& sc, const DM
     if (sum > 1.0) { rhoR /= sum; rhoT /= sum; }
 }
 
+// Host twin bsdf_eval.h lambertLit, where the why is: a Lambertian lobe on a shading normal is lit
+// by light from above ns (cos(ns, wi) > 0, wi the light-side direction) whichever side of ns the
+// camera side lies on, and a light walk that arrives below ns stops there.
+__device__ __host__ static inline bool dLambertLit(double cosWi) { return cosWi > 0.0; }
+
 // BSDF value f(wo->wi) at a surface vertex (double, for the connection radiance L).
 // Takes the full DVertex so textured/patterned/record-driven albedo & roughness are
 // evaluated per-hit (M9) — the reconstructed DHit feeds dDiffuseRho / dReflectSlot /
@@ -14083,7 +14088,7 @@ __device__ static double dBsdfF(const DScene& sc, const DVertex& vt,
     const DVec3& ns = vt.ns;
     double cosWi = ddot(wi, ns), cosWo = ddot(wo, ns);
     if (m.type == D_DIFFUSE || m.type == D_FLUORESCENT) {
-        if (cosWi <= 0 || cosWo <= 0) return 0.0;
+        if (!dLambertLit(cosWi)) return 0.0;          // from either side of ns (dLambertLit)
         DHit h = dVertHit(vt);
         double rho = clamp01(dDiffuseRho(sc, m, h, lambda));
         return rho / DPI;
@@ -14115,7 +14120,7 @@ __device__ static double dBsdfPdf(const DScene& sc, const DVertex& vt,
     const DVec3& ns = vt.ns;
     double cosWi = ddot(wi, ns), cosWo = ddot(wo, ns);
     if (m.type == D_DIFFUSE || m.type == D_FLUORESCENT) {
-        if (cosWi <= 0 || cosWo <= 0) return 0.0;
+        if (!dLambertLit(cosWi)) return 0.0;          // from either side of ns (dLambertLit)
         return cosWi / DPI;
     } else if (m.type == D_GLOSSY) {
         if (cosWi <= 0 || cosWo <= 0) return 0.0;
@@ -18292,6 +18297,8 @@ __device__ static void dRandomWalk(const DScene& sc, const DCamera& cam, int dif
             }
             case D_DIFFUSE:
             case D_FLUORESCENT: {
+                // Light arriving below the shading normal lights nothing (dLambertLit).
+                if (importance && !dLambertLit(ddot(wo, path[cur].ns))) { terminate = true; break; }
                 wi = cosineHemisphere(path[cur].ns, rng);
                 if (dot(wi, path[cur].ns) <= 0) { terminate = true; break; }
                 double rho = clamp01(dDiffuseRho(sc, *mp, h, lambda, jrun ? &jbS : nullptr));   // per-hit (tex/pat/record)
@@ -18562,6 +18569,29 @@ __device__ static int dGenCameraSubpath(const DScene& sc, const DCamera& cam, in
     return n;
 }
 // Sample a light subpath. path[0] is the light endpoint (beta = Le).
+// Host twin bdpt.h emitterSoftening, where the why is: the terminator's softening belongs to the one
+// vertex whose light-side neighbour is the emitter itself -- the light sampling's (s = 1), the vertex
+// before an eye path lands on the emitter (s = 0), a light subpath's first bounce -- and to no other.
+__device__ static double dEmitterSoftening(const DScene& sc, const DVertex& v, const DVec3& toEmitter) {
+    if (v.type != BV_SURFACE || v.delta || v.matId < 0 || dTwoSidedType(sc.mats[v.matId].type))
+        return 1.0;
+    return (double)dShadowTerminatorG(toEmitter, v.ns, dVertexGeoN(v));
+}
+// Host twin softenFirstBounce: path[1] on (and its C - 1 secondaries), softened toward path[0].
+__device__ static void dSoftenFirstBounce(const DScene& sc, DVertex* path, double* pathSec,
+                                          int secStride, int n, int C) {
+    if (n < 2) return;
+    const DVec3 d = path[0].p - path[1].p;
+    const double l2 = (double)ddot(d, d);
+    if (!(l2 > 0.0)) return;
+    const double f = dEmitterSoftening(sc, path[1], d * (Real)(1.0 / sqrt(l2)));
+    if (f == 1.0) return;
+    for (int k = 1; k < n; ++k) {
+        path[k].beta *= f;
+        for (int i = 0; i + 1 < C; ++i) pathSec[k * secStride + i] *= f;
+    }
+}
+
 __device__ static int dGenLightSubpath(const DScene& sc, const DCamera& cam, int diffraction,
                                        const DHeroBundle& hb, int maxDepth,
                                        DRng& rng, DVertex* path, double* pathSec, int secStride,
@@ -18643,6 +18673,7 @@ __device__ static int dGenLightSubpath(const DScene& sc, const DCamera& cam, int
         dRandomWalk(sc, cam, diffraction, walkFrom, dir, betaWalkD, pdfDirD, hb, maxDepth - 1, rng,
                     path, pathSec, secStride, maxV, nD, true, betaWalkSecD, hb.C,
                     nullptr, nullptr, nullptr, 0, nullptr, nullptr, compoundMergeW);
+        dSoftenFirstBounce(sc, path, pathSec, secStride, nD, hb.C);
         // Infinite-light density patch (PBRT): the first scene vertex was given a
         // solid-angle density converted with 1/dist^2 from the fictitious disc point, but
         // the reverse direction (dVertexPdfLightF) reports the planar pdfPos. Rewrite
@@ -18716,6 +18747,7 @@ __device__ static int dGenLightSubpath(const DScene& sc, const DCamera& cam, int
     dRandomWalk(sc, cam, diffraction, ro, dir, betaWalk, pdfDir, hb, maxDepth - 1, rng,
                 path, pathSec, secStride, maxV, n, true, betaWalkSec, hb.C,
                 nullptr, nullptr, nullptr, 0, nullptr, nullptr, compoundMergeW);
+    dSoftenFirstBounce(sc, path, pathSec, secStride, n, hb.C);
     return n;
 }
 
@@ -18916,8 +18948,10 @@ __device__ static double dConnectBDPT(const DScene& sc, const DCamera& cam,
             if (LeSec[i] > mxLe) mxLe = LeSec[i];
         }
         if (!(mxLe > 0.0)) return 0.0;
-        L = pt.beta * Le;
-        for (int i = 0; i + 1 < nUp; ++i) Lsec[i] = eyeSec[(t - 1) * secStride + i] * LeSec[i];
+        // The vertex before the emitter softens toward it (dEmitterSoftening; 1 at t == 2).
+        const double sE = (t >= 3) ? dEmitterSoftening(sc, eye[t - 2], wo * (Real)-1) : 1.0;
+        L = pt.beta * Le * sE;
+        for (int i = 0; i + 1 < nUp; ++i) Lsec[i] = eyeSec[(t - 1) * secStride + i] * LeSec[i] * sE;
     } else if (t == 1) {
         // Light image. A pinhole projects the vertex onto the sensor; a physical lens is
         // reached by tracing light INTO it, through a sampled front-element point that
@@ -18955,20 +18989,16 @@ __device__ static double dConnectBDPT(const DScene& sc, const DCamera& cam,
             // vertex may connect on either side (transmit lobe), so gate on dBsdfF and use
             // |cosSurf| in G (mirrors CPU bdpt.h connectBDPT).
             bool twoSided = dTwoSidedType(sc.mats[qs.matId].type);
-            if (cosSurf == 0.0 || (!twoSided && cosSurf < 0.0)) return 0.0;
-            // Geometric-hemisphere softening (matches CPU bdpt.h): the camera must lie on the
-            // geometric front side too, else a smoothed shading normal leaks light through the
-            // back face; ramp smoothly instead of a hard cutoff (Chiang 2019). No-op when ns==ng
-            // (stG==1); skipped for two-sided (transmissive) materials.
+            // The camera side: the geometric front, either side of ns, unsoftened (bdpt.h's t = 1
+            // and emitterSoftening).
             DVec3 ngoQ = dVertexGeoN(qs);
-            double stG = twoSided ? 1.0 : (double)dShadowTerminatorG(wcam, qs.ns, ngoQ);
-            if (stG <= 0.0) return 0.0;
+            if (cosSurf == 0.0 || (!twoSided && !(ddot(ngoQ, wcam) > 0.0))) return 0.0;
             f = dBsdfFAdjoint(sc, qs, wo, wcam, lambda);   // ADJOINT: qs is a particle vertex
             // Adjoint correction on the LIGHT-subpath vertex qs (particle side, outgoing
             // toward camera). 1 when ns==ng. wo = toward previous (light-side) vertex.
             // |cos| inside dShadingAdjointCorr makes it lobe-agnostic (serves the transmit lobe).
             // Purely geometric, so the same factor serves every wavelength.
-            const double adj = (double)dShadingAdjointCorr(wo, wcam, qs.ns, ngoQ) * stG;
+            const double adj = (double)dShadingAdjointCorr(wo, wcam, qs.ns, ngoQ);
             f *= adj;
             for (int i = 0; i + 1 < nUp; ++i)
                 fSec[i] = dBsdfFAdjoint(sc, qs, wo, wcam, hb.lam[i + 1]) * adj;
@@ -19171,7 +19201,7 @@ __device__ static double dConnectBDPT(const DScene& sc, const DCamera& cam,
         // BSDF/phase evals (texture fetches, lobe math) are deferred until the connection
         // is known unoccluded. occluded() consumes no RNG and the evals are deterministic,
         // so the reorder is bit-identical — it only skips work for shadowed connections.
-        double cosE, cosL, stGE = 1.0, stGL = 1.0; DVec3 o, ngoQ;
+        double cosE, cosL; DVec3 o, ngoQ;
         if (pt.type == BV_MEDIUM) {
             cosE = 1.0; o = pt.p;
         } else {
@@ -19180,29 +19210,18 @@ __device__ static double dConnectBDPT(const DScene& sc, const DCamera& cam,
             // gate on dBsdfF, use |cosE| in G (mirrors CPU bdpt.h).
             bool twoSidedE = dTwoSidedType(sc.mats[pt.matId].type);
             if (cosE == 0.0 || (!twoSidedE && cosE < 0.0)) return 0.0;
-            // Geometric-hemisphere softening on the eye endpoint (connection dir w): ramp
-            // smoothly instead of a hard cutoff (Chiang 2019). No-op ns==ng (stGE==1);
-            // skipped for two-sided (transmissive) materials.
-            if (!twoSidedE) {
-                DVec3 ngoE = dVertexGeoN(pt);
-                stGE = (double)dShadowTerminatorG(w, pt.ns, ngoE);
-                if (stGE <= 0.0) return 0.0;
-            }
+            // Not behind the true geometry, and unsoftened: qs is no emitter (emitterSoftening).
+            if (!twoSidedE && !(ddot(dVertexGeoN(pt), w) > 0.0)) return 0.0;
                         o = dVertConnOrigin(sc, pt, w);   // a strand's far side starts along w (bdpt.h connOrigin)
         }
         if (qs.type != BV_MEDIUM) {
             cosL = ddot(qs.ns, w * (Real)-1);
             // Two-sided light endpoint may connect on its back hemisphere (transmit lobe).
             bool twoSidedL = dTwoSidedType(sc.mats[qs.matId].type);
-            if (cosL == 0.0 || (!twoSidedL && cosL < 0.0)) return 0.0;
-            // Geometric-hemisphere softening on the light endpoint (connection dir -w): ramp
-            // smoothly instead of a hard cutoff (Chiang 2019). No-op ns==ng (stGL==1);
-            // skipped for two-sided (transmissive) materials.
+            // The camera side of the light endpoint: the geometric front, either side of ns,
+            // unsoftened (as at t = 1).
             ngoQ = dVertexGeoN(qs);
-            if (!twoSidedL) {
-                stGL = (double)dShadowTerminatorG(w * (Real)-1, qs.ns, ngoQ);
-                if (stGL <= 0.0) return 0.0;
-            }
+            if (cosL == 0.0 || (!twoSidedL && !(ddot(ngoQ, w * (Real)-1) > 0.0))) return 0.0;
         } else {
             cosL = 1.0;
         }
@@ -19223,16 +19242,16 @@ __device__ static double dConnectBDPT(const DScene& sc, const DCamera& cam,
             for (int i = 0; i + 1 < nUp; ++i)
                 fESec[i] = dMediumScatterF(sc, pt, woE, w, hb.lam[i + 1]);
         } else {
-            fE = dBsdfF(sc, pt, woE, w, lambda) * stGE;
+            fE = dBsdfF(sc, pt, woE, w, lambda);
             for (int i = 0; i + 1 < nUp; ++i)
-                fESec[i] = dBsdfF(sc, pt, woE, w, hb.lam[i + 1]) * stGE;
+                fESec[i] = dBsdfF(sc, pt, woE, w, hb.lam[i + 1]);
         }
         if (qs.type == BV_MEDIUM) {
             fL = dMediumScatterF(sc, qs, woL, w * (Real)-1, lambda);
             for (int i = 0; i + 1 < nUp; ++i)
                 fLSec[i] = dMediumScatterF(sc, qs, woL, w * (Real)-1, hb.lam[i + 1]);
         } else {
-            fL = dBsdfFAdjoint(sc, qs, woL, w * (Real)-1, lambda) * stGL;   // ADJOINT (qs)
+            fL = dBsdfFAdjoint(sc, qs, woL, w * (Real)-1, lambda);   // ADJOINT (qs)
             // Adjoint correction on the LIGHT-subpath endpoint qs only (particle side,
             // outgoing = -w toward the eye vertex). fE is the Radiance side — no correction.
             // |cos| inside dShadingAdjointCorr makes it lobe-agnostic (serves the transmit lobe).
@@ -19240,8 +19259,7 @@ __device__ static double dConnectBDPT(const DScene& sc, const DCamera& cam,
             const double adjL = (double)dShadingAdjointCorr(woL, w * (Real)-1, qs.ns, ngoQ);
             fL *= adjL;
             for (int i = 0; i + 1 < nUp; ++i)
-                fLSec[i] = dBsdfFAdjoint(sc, qs, woL, w * (Real)-1, hb.lam[i + 1])
-                           * stGL * adjL;
+                fLSec[i] = dBsdfFAdjoint(sc, qs, woL, w * (Real)-1, hb.lam[i + 1]) * adjL;
         }
         {   // max over live wavelengths on each side (identical to the scalar tests at nUp==1)
             double mxE = fE, mxL = fL;
@@ -21877,6 +21895,7 @@ __device__ static inline DVertex dVertFromLV(const DVcmLV& lv) {
 __device__ static void dVcmScatter(const DScene& sc, const DMaterial& m, const DHit& h,
                                    const DVec3& rd, Real lambda, DRng& rng, int matId,
                                    DMediumStack& stk, double* radianceScale, int diffraction,
+                                   bool importance,
                                    DVec3& wi, double& betaFactor, double& pdfW, double& pdfRevW,
                                    double& cosThetaOut, bool& delta, bool& terminate,
                                    const Real* lamAll = nullptr, int nUp = 1,
@@ -21908,6 +21927,8 @@ __device__ static void dVcmScatter(const DScene& sc, const DMaterial& m, const D
     switch (m.type) {
         case D_DIFFUSE:
         case D_FLUORESCENT: {
+            // Light arriving below the shading normal lights nothing (dLambertLit).
+            if (importance && !dLambertLit(ddot(wo, ns))) { terminate = true; break; }
             wi = cosineHemisphere(ns, rng);
             if (dot(wi, ns) <= 0) { terminate = true; break; }
             double rho = clamp01(dDiffuseRho(sc, m, h, lambda, jr ? &jbS : nullptr));
@@ -22320,6 +22341,13 @@ __global__ void kVcmLightT(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx,
             // stored whatever lobe the pick took (storeP), for the merges alone where that lobe
             // does not connect (host twin).
             const bool connectible = dLvConnects(mp->type);
+            // The first bounce softens toward the emitter it came from, in the throughput every
+            // later vertex inherits (host twin vcm.h; dEmitterSoftening).
+            if (edges == 1 && connectible && !dTwoSidedType(mp->type)) {
+                const double sL = (double)dShadowTerminatorG(wo, h.n, ngo);
+                beta *= sL;
+                for (int k = 0; k + 1 < nUp; ++k) betaSec[k] *= sL;
+            }
             if (connectible || storeP > 0.0) {
                 if (stored < vcmCap) {
                     DVcmLV lv;
@@ -22350,8 +22378,8 @@ __global__ void kVcmLightT(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx,
                         DVec3 wcam = toCam * (Real)(1.0 / distc);
                         double cosToCamera = ddot(h.n, wcam);
                         bool twoSided = dTwoSidedType(mp->type);
-                        double stG = twoSided ? 1.0 : (double)dShadowTerminatorG(wcam, h.n, ngo);
-                        bool sideOk = twoSided ? (cosToCamera != 0.0) : (cosToCamera > 0.0 && stG > 0.0);
+                        // The geometric front, either side of ns, unsoftened (host twin vcm.h).
+                        bool sideOk = (cosToCamera != 0.0) && (twoSided || ddot(ngo, wcam) > 0.0);
                         double cosAtCamera = ddot(cam.w, wcam * (Real)-1);
                         if (sideOk && cosAtCamera > 1e-9) {
                             int px, py; Real cc, d2c;
@@ -22364,7 +22392,7 @@ __global__ void kVcmLightT(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx,
                                     DVertex vt = dVertFromHit(h, matId);
                                     // The adjoint correction and shadow-terminator G are purely
                                     // geometric, so they scale every λ the same way.
-                                    double geo = (double)dShadingAdjointCorr(wo, wcam, h.n, ngo) * stG;
+                                    double geo = (double)dShadingAdjointCorr(wo, wcam, h.n, ngo);
                                     double f = dBsdfFAdjoint(sc, vt, wo, wcam, lambda) * geo;
                                     double fSec[SECN], mxf = f;
                                     for (int k = 0; k + 1 < nUp; ++k) {
@@ -22413,6 +22441,7 @@ __global__ void kVcmLightT(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx,
             DVec3 wi; double betaFactor, pdfW, pdfRevW, cosThetaOut; bool delta, terminate;
             double secF[SECN]; bool secChromatic = false, keepBundle = false;
             dVcmScatter(sc, *mp, h, rdCur, lambda, rng, matId, stk, /*flux*/ nullptr, diffraction,
+                        /*importance*/ true,
                         wi, betaFactor, pdfW, pdfRevW, cosThetaOut, delta, terminate,
                         lamAll, nUp, secF, &secChromatic, &keepBundle);
             // Kill the walk only when EVERY live λ is dead (nUp == 1 -> mxF == betaFactor).
@@ -22537,6 +22566,9 @@ __global__ void kVcmCameraT(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx
         // vertices before it.
         bool camAllDelta = true;
         const bool hasSun = sc.sunCount > 0;
+        // The vertex just left, should the walk land on an emitter next (host twin vcm.h).
+        DVec3 softN, softNg;
+        bool softOn = false;
         Real curveTmin = (Real)0;   // far-side fiber clearance for the NEXT hop (see the continuation)
         Real nextTmin = (Real)-1;   // >= 0: the next hop leaves a strand (dStrandStart) -- its tmin
 
@@ -22654,10 +22686,12 @@ __global__ void kVcmCameraT(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx
                             double wCamera = directPdfA * dVCM + emissionPdfW * dVC;
                             misW = 1.0 / (1.0 + wCamera);
                         }
-                        double e = beta * Le * misW;
+                        // ...softened at the vertex before, toward the emitter (dEmitterSoftening).
+                        const double sE = softOn ? (double)dShadowTerminatorG(rd, softN, softNg) : 1.0;
+                        double e = beta * Le * misW * sE;
                         double ax = cieCx * e, ay = cieCy * e, az = cieCz * e;
                         for (int k = 0; k + 1 < nUp; ++k) {
-                            double ek = betaSec[k] * LeSec[k] * misW;
+                            double ek = betaSec[k] * LeSec[k] * misW * sE;
                             ax += cieSx[k] * ek; ay += cieSy[k] * ek; az += cieSz[k] * ek;
                         }
                         if (nUp > 1) { double inv = 1.0 / nUp; ax *= inv; ay *= inv; az *= inv; }
@@ -22859,10 +22893,10 @@ __global__ void kVcmCameraT(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx
                     double cosLit = ddot(lv.ns, w * (Real)-1);
                     DVec3 ngoLit = dLvGeoN(lv);
                     bool twoSidedLit = dTwoSidedType(sc.mats[lv.matId].type);
-                    double stGCam = twoSidedCam ? 1.0 : (double)dShadowTerminatorG(w, h.n, ngoCam);
-                    double stGLit = twoSidedLit ? 1.0 : (double)dShadowTerminatorG(w * (Real)-1, lv.ns, ngoLit);
-                    bool camSide = twoSidedCam ? (cosCam != 0.0) : (cosCam > 0.0 && stGCam > 0.0);
-                    bool litSide = twoSidedLit ? (cosLit != 0.0) : (cosLit > 0.0 && stGLit > 0.0);
+                    // Unsoftened at both ends, each on the other's geometric front; the light end's
+                    // camera side on either side of its shading normal (host twin vcm.h).
+                    bool camSide = twoSidedCam ? (cosCam != 0.0) : (cosCam > 0.0 && ddot(ngoCam, w) > 0.0);
+                    bool litSide = (cosLit != 0.0) && (twoSidedLit || ddot(ngoLit, w * (Real)-1) > 0.0);
                     if (!camSide || !litSide) continue;
                     // Occlusion FIRST: the shadow ray kills most connections in a
                     // typical scene, and it is far cheaper than the 2x dBsdfF +
@@ -22887,8 +22921,8 @@ __global__ void kVcmCameraT(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx
                     if (occludedTo(sc, cst.o, h.p + w * (Real)(distc - (double)lvStep), 2e-6, cst.tmin, false,
                                    cst.curveTmin)) continue;
                     DVertex lvt = dVertFromLV(lv);
-                    double adjLit = (double)dShadingAdjointCorr(lv.wo, w * (Real)-1, lv.ns, ngoLit) * stGLit;
-                    double fCam = dBsdfF(sc, vt, wo, w, lambda) * stGCam;
+                    double adjLit = (double)dShadingAdjointCorr(lv.wo, w * (Real)-1, lv.ns, ngoLit);
+                    double fCam = dBsdfF(sc, vt, wo, w, lambda);
                     double fLit = dBsdfFAdjoint(sc, lvt, lv.wo, w * (Real)-1, lambda);
                     fLit *= adjLit;
                     // The camera path and the stored light path share this pass's bundle (same
@@ -22899,7 +22933,7 @@ __global__ void kVcmCameraT(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx
                     double fProdSec[SECN], mxProd = fCam * fLit;
                     const DVcmSec* lsRow = ((NS > 0) && lvSec) ? (lvSec + (size_t)j * secStride) : nullptr;
                     for (int k = 0; k + 1 < nUpConn; ++k) {
-                        double fc = dBsdfF(sc, vt, wo, w, lamAll[k + 1]) * stGCam;
+                        double fc = dBsdfF(sc, vt, wo, w, lamAll[k + 1]);
                         double fl = dBsdfFAdjoint(sc, lvt, lv.wo, w * (Real)-1,
                                                   lamAll[k + 1]) * adjLit;
                         fProdSec[k] = fc * fl;
@@ -23027,6 +23061,7 @@ __global__ void kVcmCameraT(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx
             double secF[SECN]; bool secChromatic = false, keepBundle = false;
             double radianceScale = 1.0;
             dVcmScatter(sc, *mp, h, rdCur, lambda, rng, matId, stk, &radianceScale, diffraction,
+                        /*importance*/ false,
                         wi, betaFactor, pdfW, pdfRevW, cosThetaOut, delta, terminate,
                         lamAll, nUp, secF, &secChromatic, &keepBundle, jOn ? &jrun : nullptr,
                         invPdfLambda);
@@ -23055,6 +23090,9 @@ __global__ void kVcmCameraT(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx
             if (!delta) camAllDelta = false;               // disqualifies the escaped-sun strategy
             if (delta && !keepBundle) nUp = 1;             // λ-dependent direction change
             prevP = h.p;
+            softOn = !delta && dLvConnects(mp->type) && !dTwoSidedType(mp->type);
+            softN = h.n;
+            softNg = dShadedNg(h);
             // A fiber scattering out its far side steps clear of its own tube (vcm.h fiberStep): the
             // clearance is closestHit's curve-only tmin and the origin an ULP nudge along the ray --
             // RAY_EPS is 1e-4 in FP32, a whole strand, and would skip the neighbour too.

@@ -100,6 +100,20 @@ inline void diffuseTransmitAlbedos(const Material& m, double lambda, const Scene
     if (sum > 1.0) { rhoR /= sum; rhoT /= sum; }
 }
 
+// THE LAMBERTIAN LOBE ON A SHADING NORMAL (Diffuse, a Fluorescent's elastic base). It is lit by
+// light from above the shading normal ns -- cos(ns, wi) > 0, wi the light-side direction --
+// whichever side of ns the camera side lies on. That is mode R's integrand (backward.h: neeLight
+// takes rho/PI, the continuation draws a cosine about ns, neither asks where the ray came from),
+// and every strategy must share it: a camera ray can meet a bumped or smooth-normalled surface from
+// the geometric front but below ns (ns.wo <= 0 < ng.wo), and R lights that point. So bsdfF and
+// bsdfPdf ask only about wi -- a walk draws its cosine about ns from either side -- and a LIGHT walk
+// that arrives below ns stops there, since its light is worth nothing to any camera direction
+// (randomWalk's and scatterSample's Importance side, and their device twins). A connection's light
+// end, accordingly, asks of its camera side only the geometric front; and the terminator's
+// softening belongs to the vertex next to an emitter alone (bdpt.h emitterSoftening). Together
+// these give modes D, J and U mode R's integrand on a normal-mapped surface (BUMP-MODES).
+inline bool lambertLit(double cosWi) { return cosWi > 0.0; }
+
 // Evaluate the BSDF value f at a surface vertex for the pair (wo, wi), both unit
 // world directions pointing AWAY from the surface. `wo` is toward where the subpath
 // came from; `wi` is the connection/continuation direction. Returns 0 for a delta
@@ -111,7 +125,11 @@ inline double bsdfF(const Material& m, const Vec3& ns, const Vec3& wo, const Vec
     double cosWi = dot(wi, ns), cosWo = dot(wo, ns);
     switch (m.type) {
         case MatType::Diffuse: {
-            if (cosWi <= 0 || cosWo <= 0) return 0.0;   // same-hemisphere reflection only
+            // Light from above the shading hemisphere, wherever the camera side sits: mode R's
+            // integrand (backward.h neeLight's rho/PI, its continuation's cosine about ns), so a
+            // camera ray that meets a bumped surface below its shading normal is lit as there.
+            // See lambertLit.
+            if (!lambertLit(cosWi)) return 0.0;
             double rho = hitForTex ? clamp01(diffuseReflectance(scene, m, *hitForTex, lambda))
                                    : clamp01(m.reflect(lambda));
             return rho / PI;
@@ -119,7 +137,7 @@ inline double bsdfF(const Material& m, const Vec3& ns, const Vec3& wo, const Vec
         case MatType::Fluorescent: {
             // Only the elastic (wavelength-preserving) diffuse base connects; the
             // Stokes-shifted re-emission is a wavelength change we don't connect.
-            if (cosWi <= 0 || cosWo <= 0) return 0.0;
+            if (!lambertLit(cosWi)) return 0.0;
             double rho = clamp01(m.reflect(lambda));
             return rho / PI;
         }
@@ -193,7 +211,7 @@ inline double bsdfPdf(const Material& m, const Vec3& ns, const Vec3& wo, const V
     switch (m.type) {
         case MatType::Diffuse:
         case MatType::Fluorescent: {
-            if (cosWi <= 0 || cosWo <= 0) return 0.0;
+            if (!lambertLit(cosWi)) return 0.0;      // from either side of ns (lambertLit)
             return cosWi / PI;                       // cosine-weighted hemisphere
         }
         case MatType::Glossy: {

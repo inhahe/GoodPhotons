@@ -3698,6 +3698,21 @@ holding a glass ball), and on the device `-rgb`, mode S and every one of those.
       bit-identical by construction, since `ns == gn` makes the faceforward a no-op and the
       old and new predicates the same test. Full history, sweep numbers and the *refractive*
       mesh bug this was hiding: `known-issues.md`.
+    - **One integrand on a shading normal, mode R's** (BUMP-MODES, 0.439.9 for modes D, J and
+      U). Where `ns` tilts, a ray can meet the surface from the geometric front but below `ns`.
+      R lights such a point: its light sampling takes `rho/PI` and softens the light direction
+      (`shadowTerminatorG`), its continuation draws a cosine about `ns`, and neither asks where
+      the ray came from. So its integrand is a Lambertian lobe lit by light from above `ns`
+      whichever side the camera side lies on, with the softening only where the light-side
+      neighbour is the emitter. Every mode must share it, and the bidirectional ones did not
+      (on a strongly normal-mapped room, mode U read 0.844 of R). The rule, in four parts:
+      `bsdfF` / `bsdfPdf` ask only about the light-side direction (`lambertLit`); a light walk
+      ends at a diffuse vertex it reaches from below `ns`; a connection's light end asks of its
+      camera side only the geometric front, unsoftened, and a camera end softens only toward an
+      emitter; and the softening sits at the vertex next to the emitter alone
+      (`emitterSoftening`: s = 1, the vertex before an s = 0 landing, a light subpath's first
+      bounce in its throughput). Each part is a no-op where `ns == ng`.
+      `tools/check_bump_modes.py` holds D, J and U to R on such a room and its flat twin.
 - **`curve.h`** — the **curve / fiber** primitive (hair, fur, grass, wire, thread),
   added 0.150.0 for TODO §P1. A `curve` is control points + a radius; the loader
   **flattens it at load time** into a chain of `CurveSeg` **round cones** (the convex

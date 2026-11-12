@@ -1388,6 +1388,8 @@ inline void randomWalk(const Scene& scene, const Camera& cam, const Renderer& ma
         switch (mp->type) {
             case MatType::Diffuse:
             case MatType::Fluorescent: {              // elastic base only (see header)
+                // Light arriving below the shading normal lights nothing (lambertLit).
+                if (mode == Mode::Importance && !lambertLit(dot(wo, cur.ns))) { terminate = true; break; }
                 wi = cosineHemisphere(cur.ns, rng);
                 if (dot(wi, cur.ns) <= 0) { terminate = true; break; }
                 double rho = clamp01(diffuseReflectance(scene, *mp, h, lambda));
@@ -1932,6 +1934,40 @@ inline int generateCameraSubpath(const Scene& scene, const Camera& cam, const Re
     return (int)path.size();
 }
 
+// THE TERMINATOR'S SOFTENING (Chiang 2019, shadowTerminatorG) belongs to the one vertex whose
+// light-side neighbour is the emitter itself. That is where mode R applies it -- its light sampling
+// softens the direction toward the light; its continuation and the camera side never are -- and
+// every strategy has to share R's integrand: NEE (s = 1) softens at pt, an eye path landing on the
+// emitter (s = 0) at the vertex before (connectBDPT), a light subpath at its first bounce, in the
+// throughput every later vertex and beam inherits (softenFirstBounce), and no connection between
+// two scene vertices softens at all. 1 at a medium vertex, a delta, a two-sided material or a
+// fiber (whose responses R does not soften either), and wherever ns == ng.
+inline double emitterSoftening(const Vertex& v, const Vec3& toEmitter) {
+    if (v.type != VType::Surface || v.delta || !v.mat || isTwoSidedMat(*v.mat) || isFiberMat(*v.mat))
+        return 1.0;
+    return shadowTerminatorG(toEmitter, v.ns, vertexGeoN(v));
+}
+// A light subpath's first bounce, softened toward the emitter it left (emitterSoftening): path[1]
+// on, and every beam segment leaving path[1] or later.
+inline void softenFirstBounce(std::vector<Vertex>& path, std::vector<PathSeg>* segs) {
+    if (path.size() < 2) return;
+    const Vec3 d = path[0].p - path[1].p;
+    const double l2 = dot(d, d);
+    if (!(l2 > 0.0)) return;
+    const double s = emitterSoftening(path[1], d * (1.0 / std::sqrt(l2)));
+    if (s == 1.0) return;
+    for (size_t k = 1; k < path.size(); ++k) {
+        path[k].beta *= s;
+        for (double& b : path[k].betaSec) b *= s;
+    }
+    if (segs)
+        for (PathSeg& sg : *segs)
+            if (sg.vert >= 1) {
+                sg.beta *= s;
+                for (double& b : sg.betaSec) b *= s;
+            }
+}
+
 // Emit a light subpath from a DELTA light (spot or sun) — the two emitters with no
 // finite emissive surface. Shares the tail (random walk + throughput bookkeeping) with
 // the area-light path below, but the endpoint sampling is entirely different:
@@ -2021,6 +2057,7 @@ inline int deltaLightSubpath(const Scene& scene, const Camera& cam, const Render
     if (bs) beginBeamSpectral(scene, mats, em, em.spdFn(lambda) * invPdfLambda, rng, *bs);
     randomWalk(scene, cam, mats, ray, betaWalk, pdfDir, hb, maxDepth - 1,
                Mode::Importance, rng, path, betaWalkSec, hb.C, nullptr, segs, bs);
+    softenFirstBounce(path, segs);
     // Infinite-light density patch (PBRT): the first scene vertex was given a solid-angle
     // density converted with 1/dist^2 from the fictitious disc point, but the reverse
     // direction (vertexPdfLight) reports the planar pdfPos. Rewrite it to match.
@@ -2087,6 +2124,7 @@ inline int fireLightSubpath(const Scene& scene, const Camera& cam, const Rendere
     for (int i = 0; i + 1 < hb.C; ++i) betaWalkSec[i] = L0.betaSec[i] * k;
     randomWalk(scene, cam, mats, Ray{x, dir}, L0.beta * k, pdfDir, hb, maxDepth - 1,
                Mode::Importance, rng, path, betaWalkSec, hb.C);
+    softenFirstBounce(path, nullptr);
     return (int)path.size();
 }
 
@@ -2188,6 +2226,7 @@ inline int generateLightSubpath(const Scene& scene, const Camera& cam, const Ren
     if (bs) beginBeamSpectral(scene, mats, em, em.spdFn(lambda) * invPdfLambda, rng, *bs);
     randomWalk(scene, cam, mats, ray, betaWalk, pdfDir, hb, maxDepth - 1,
                Mode::Importance, rng, path, betaWalkSec, hb.C, nullptr, segs, bs);
+    softenFirstBounce(path, segs);
     return (int)path.size();
 }
 
@@ -3924,8 +3963,10 @@ inline double connectBDPT(const Scene& scene, const Camera& cam, const Renderer&
             if (LeSec[i] > mxLe) mxLe = LeSec[i];
         }
         if (!(mxLe > 0.0)) return 0.0;
-        L = pt.beta * Le;
-        for (int i = 0; i + 1 < nUp; ++i) Lsec[i] = pt.betaSec[i] * LeSec[i];
+        // The vertex before the emitter softens toward it (emitterSoftening; 1 at t == 2).
+        const double sE = (t >= 3) ? emitterSoftening(eye[t - 2], wo * -1.0) : 1.0;
+        L = pt.beta * Le * sE;
+        for (int i = 0; i + 1 < nUp; ++i) Lsec[i] = pt.betaSec[i] * LeSec[i] * sE;
     } else if (t == 1) {
         // Splat a light-subpath vertex onto the camera (light image). A pinhole projects the
         // vertex onto the sensor. A physical lens has no such projection, so light is traced
@@ -3965,25 +4006,20 @@ inline double connectBDPT(const Scene& scene, const Camera& cam, const Renderer&
                 fSec[i] = mediumScatterF(qs, wo, wcam, hb.lam[i + 1], scene);
         } else {
             cosSurf = dot(qs.ns, wcam);
-            // Reflect-only vertices require the +ns side; a two-sided vertex may connect on
-            // either side (transmit lobe), so gate on bsdfF and use |cosSurf| in G.
-            if (cosSurf == 0.0 || (!isTwoSidedMat(*qs.mat) && cosSurf < 0.0)) return 0.0;
             Vec3 ngo = vertexGeoN(qs);
-            // Geometric-hemisphere softening: a reflect-only vertex must see the camera on
-            // its GEOMETRIC front side, else a smoothed shading normal leaks light through the
-            // back face (shading-normal problem). A hard cutoff there facets the terminator,
-            // so ramp smoothly (Chiang 2019; matches backward.h/render.h). No-op when ns==ng
-            // (flat/analytic, stG==1); skipped for two-sided (transmissive) materials.
-            double stG = isTwoSidedMat(*qs.mat) ? 1.0 : shadowTerminatorG(wcam, qs.ns, ngo);
-            if (stG <= 0.0) return 0.0;
+            // The camera side of a reflect-only vertex: on its GEOMETRIC front (no light leaks
+            // through the back face), on either side of its shading normal (a camera that sees a
+            // bumped point from below ns sees it lit, as in mode R: lambertLit), and unsoftened
+            // (emitterSoftening). A two-sided vertex may connect on either side (transmit lobe),
+            // so its gate is bsdfF's; |cosSurf| in G.
+            if (cosSurf == 0.0 || (!isTwoSidedMat(*qs.mat) && !(dot(ngo, wcam) > 0.0))) return 0.0;
             // ADJOINT: qs is a particle vertex, so the BSDF's own Veach correction applies as
             // well as the shading-normal one below. See bsdfFAdjoint.
             f = bsdfFAdjoint(*qs.mat, qs.ns, wo, wcam, lambda, scene, &qs.hit);
             // Adjoint shading-normal correction: qs is a LIGHT-subpath (particle) vertex
             // whose f is evaluated toward the camera (wcam = outgoing). 1 when ns==ng.
-            // The correction and stG are pure geometry — shared by every wavelength.
-            const double adj = (isFiberMat(*qs.mat) ? 1.0
-                                                    : shadingAdjointCorr(wo, wcam, qs.ns, ngo)) * stG;
+            // The correction is pure geometry — shared by every wavelength.
+            const double adj = isFiberMat(*qs.mat) ? 1.0 : shadingAdjointCorr(wo, wcam, qs.ns, ngo);
             f *= adj;
             for (int i = 0; i + 1 < nUp; ++i)
                 fSec[i] = bsdfFAdjoint(*qs.mat, qs.ns, wo, wcam, hb.lam[i + 1], scene,
@@ -4201,7 +4237,7 @@ inline double connectBDPT(const Scene& scene, const Camera& cam, const Renderer&
         Vec3 woE = normalize(dwE);
         Vec3 woL = normalize(dwL);
         // Each endpoint is a surface (BSDF, cosine) or a medium (phase, cos=1).
-        double cosE, cosL, fE, fL, stGE = 1.0, stGL = 1.0;
+        double cosE, cosL, fE, fL;
         double fESec[hero::kHeroMax - 1] = {0}, fLSec[hero::kHeroMax - 1] = {0};
         // Either subpath may have de-hero'd independently at a delta vertex, so the
         // connection carries only the wavelengths BOTH endpoints still track.
@@ -4213,13 +4249,8 @@ inline double connectBDPT(const Scene& scene, const Camera& cam, const Renderer&
         } else {
             cosE = dot(pt.ns, w);
             if (cosE == 0.0 || (!isTwoSidedMat(*pt.mat) && cosE < 0.0)) return 0.0;
-            // Geometric-hemisphere softening on the eye endpoint (connection dir w): ramp
-            // smoothly instead of a hard cutoff (Chiang 2019). No-op ns==ng (stGE==1).
-            if (!isTwoSidedMat(*pt.mat)) {
-                Vec3 ngoE = vertexGeoN(pt);
-                stGE = shadowTerminatorG(w, pt.ns, ngoE);
-                if (stGE <= 0.0) return 0.0;
-            }
+            // Not behind the true geometry, and unsoftened: qs is no emitter (emitterSoftening).
+            if (!isTwoSidedMat(*pt.mat) && !(dot(vertexGeoN(pt), w) > 0.0)) return 0.0;
             fE = bsdfF(*pt.mat, pt.ns, woE, w, lambda, scene, &pt.hit);
             for (int i = 0; i + 1 < nUp; ++i)
                 fESec[i] = bsdfF(*pt.mat, pt.ns, woE, w, hb.lam[i + 1], scene, &pt.hit);
@@ -4230,14 +4261,10 @@ inline double connectBDPT(const Scene& scene, const Camera& cam, const Renderer&
                 fLSec[i] = mediumScatterF(qs, woL, w * -1.0, hb.lam[i + 1], scene);
         } else {
             cosL = dot(qs.ns, w * -1.0);
-            if (cosL == 0.0 || (!isTwoSidedMat(*qs.mat) && cosL < 0.0)) return 0.0;
             Vec3 ngoL = vertexGeoN(qs);
-            // Geometric-hemisphere softening on the light endpoint (connection dir -w): ramp
-            // smoothly instead of a hard cutoff (Chiang 2019). No-op ns==ng (stGL==1).
-            if (!isTwoSidedMat(*qs.mat)) {
-                stGL = shadowTerminatorG(w * -1.0, qs.ns, ngoL);
-                if (stGL <= 0.0) return 0.0;
-            }
+            // The camera side of the light endpoint: the geometric front, either side of ns,
+            // unsoftened (as at t = 1).
+            if (cosL == 0.0 || (!isTwoSidedMat(*qs.mat) && !(dot(ngoL, w * -1.0) > 0.0))) return 0.0;
             // ADJOINT: qs is the LIGHT endpoint, a particle vertex (see bsdfFAdjoint). pt, the
             // eye endpoint above, is a radiance vertex and correctly uses plain bsdfF.
             fL = bsdfFAdjoint(*qs.mat, qs.ns, woL, w * -1.0, lambda, scene, &qs.hit);
@@ -4273,9 +4300,9 @@ inline double connectBDPT(const Scene& scene, const Camera& cam, const Renderer&
         // Hero transmittance, shared by the bundle (flat extinction; see the t==1 branch).
         double Tr = mats.mediaTransmittance(scene, pt.p, w, dist, lambda, rng) * vis;
         double G = std::fabs(cosE) * std::fabs(cosL) / dist2;
-        L = pt.beta * fE * fL * qs.beta * G * Tr * stGE * stGL;
+        L = pt.beta * fE * fL * qs.beta * G * Tr;
         for (int i = 0; i + 1 < nUp; ++i)
-            Lsec[i] = pt.betaSec[i] * fESec[i] * fLSec[i] * qs.betaSec[i] * G * Tr * stGE * stGL;
+            Lsec[i] = pt.betaSec[i] * fESec[i] * fLSec[i] * qs.betaSec[i] * G * Tr;
     }
     // The MIS weight is a function of the pdfs alone, and every pdf in this renderer is
     // decided by the hero wavelength — so ONE weight serves the whole bundle.
@@ -5142,6 +5169,9 @@ struct BdptRenderer {
                             const double gateK = eye[(size_t)k].delta ? 0.0 : 1.0;  // X to eye[k]
                             const double invFwdK = 1.0 / misRemap0(eye[(size_t)k].pdfFwd);
                             const double sumK = segSumC[(size_t)k];
+                            // eye[k] is the vertex before the fire, so it softens toward it
+                            // (emitterSoftening), along the segment's one direction.
+                            const double sK = (k >= 1) ? emitterSoftening(eye[(size_t)k], sg.d) : 1.0;
                             for (int f = 0; f < (int)scene.emissiveVolumes.size(); ++f) {
                                 const Scene::EmissiveVolume& fv = scene.emissiveVolumes[(size_t)f];
                                 double ta, tb;
@@ -5195,7 +5225,7 @@ struct BdptRenderer {
                                                                0, k + 2);
                                             }
                                         }
-                                        const double sc = w * dt * T * perUp;
+                                        const double sc = w * dt * T * perUp * sK;
                                         if (!(sc > 0.0)) return;
                                         Vec3 c = cie[0] * (sg.beta * med.emissionAtKelvin(kelvin, hb.lam[0]) *
                                                            hb.invPdf[0]);

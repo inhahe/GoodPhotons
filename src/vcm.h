@@ -89,6 +89,7 @@ namespace vcm {
 using bdpt::bsdfF;
 using bdpt::bsdfFAdjoint;   // particle-vertex connections; see bsdf_eval.h
 using bdpt::bsdfPdf;
+using bdpt::lambertLit;
 using bdpt::isConnectibleMat;
 using bdpt::isFiberMat;
 using bdpt::storesMergeVertex;
@@ -384,6 +385,8 @@ inline void scatterSample(const Scene& scene, const Renderer& mats, const Materi
     switch (mp->type) {
         case MatType::Diffuse:
         case MatType::Fluorescent: {
+            // Light arriving below the shading normal lights nothing (bsdf_eval.h lambertLit).
+            if (transport == Renderer::Transport::Flux && !lambertLit(dot(wo, ns))) { terminate = true; break; }
             wi = cosineHemisphere(ns, rng);
             if (dot(wi, ns) <= 0) { terminate = true; break; }
             double rho = clamp01(diffuseReflectance(scene, *mp, h, lambda));
@@ -807,6 +810,13 @@ inline void traceLightSubpath(const Scene& scene, const Camera& cam, const Rende
         // A strand is never a light vertex (0.365.0): neither stored nor splat, and the walk
         // ends after its scatter below (bdpt.h randomWalk's Hair case has the reasoning).
         bool connectible = isConnectibleMat(*mp) && !isFiberMat(*mp);
+        // The first bounce softens toward the emitter it came from, in the throughput every
+        // later vertex inherits (bdpt.h emitterSoftening, where the why is).
+        if (edges == 1 && connectible && !isTwoSidedMat(*mp)) {
+            const double sL = shadowTerminatorG(wo, h.n, ngo);
+            beta *= sL;
+            for (int i = 0; i + 1 < nUp; ++i) betaSec[i] *= sL;
+        }
         if (connectible || storeP > 0.0) {
             LightVertex lv;
             lv.p = h.p; lv.ns = h.n; lv.ng = h.ng; lv.wo = wo;
@@ -835,13 +845,10 @@ inline void traceLightSubpath(const Scene& scene, const Camera& cam, const Rende
                     double distc = std::sqrt(dist2c);
                     Vec3 wcam = toCam / distc;
                     double cosToCamera = dot(h.n, wcam);
-                    // Geometric-hemisphere softening for a reflect-only vertex: the camera must
-                    // lie on the geometric front side too (no back-face light leak), but ramp
-                    // that boundary smoothly instead of a hard cutoff (Chiang 2019). `ngo` is the
-                    // geo normal oriented to h.n (line above). No-op when h.n==h.ng (stG==1).
-                    double stG = isTwoSidedMat(*mp) ? 1.0 : shadowTerminatorG(wcam, h.n, ngo);
-                    bool sideOk = isTwoSidedMat(*mp) ? (cosToCamera != 0.0)
-                                                     : (cosToCamera > 0.0 && stG > 0.0);
+                    // The camera side of a reflect-only vertex: on its geometric front, either
+                    // side of its shading normal, unsoftened (bdpt.h's t = 1 has the why).
+                    bool sideOk = (cosToCamera != 0.0) &&
+                                  (isTwoSidedMat(*mp) || dot(ngo, wcam) > 0.0);
                     double cosAtCamera = dot(cam.w, wcam * -1.0);   // forward vs camera->point
                     if (sideOk && cosAtCamera > 1e-9) {
                         int px, py; double cc, d2c;
@@ -849,7 +856,7 @@ inline void traceLightSubpath(const Scene& scene, const Camera& cam, const Rende
                             // The adjoint + soft-terminator corrections are purely
                             // geometric, so the whole bundle shares them; only the BSDF
                             // value is per-λ (hero.h policy 4: absolute, not a ratio).
-                            const double geo = shadingAdjointCorr(wo, wcam, h.n, ngo) * stG;
+                            const double geo = shadingAdjointCorr(wo, wcam, h.n, ngo);
                             // ADJOINT: particle vertex connected to the camera (bsdfFAdjoint).
                             double f = bsdfFAdjoint(*mp, h.n, wo, wcam, lambda, scene, &h) * geo;
                             double fSec[hero::kHeroMax - 1] = {0}, mxF = f;
@@ -984,6 +991,11 @@ inline Vec3 traceCameraSubpath(const Scene& scene, const Camera& cam, const Rend
     // vertices before it.
     bool camAllDelta = true;
     const bool hasSun = scene.sunCount > 0;
+    // The vertex just left, should the walk land on an emitter next: its shading normal and its
+    // oriented geometric one, and whether it softens toward an emitter at all (bdpt.h
+    // emitterSoftening).
+    Vec3 softN, softNg;
+    bool softOn = false;
 
     for (int edges = 1; edges <= ctx.maxDepth; ++edges) {
         // edges == 1 is the camera-to-first-vertex edge — the primary ray; see
@@ -1107,9 +1119,11 @@ inline Vec3 traceCameraSubpath(const Scene& scene, const Camera& cam, const Rend
                     // Densities are λ-independent, so the bundle shares misW; only the
                     // emitted radiance and the carried throughput are per-λ. De-hero by
                     // averaging the live wavelengths (1/nUp, not a ×C boost).
-                    Vec3 add = cie * (beta * Le * misW);
+                    // ...softened at the vertex before, toward the emitter (emitterSoftening).
+                    const double sE = softOn ? shadowTerminatorG(rd, softN, softNg) : 1.0;
+                    Vec3 add = cie * (beta * Le * misW * sE);
                     for (int i = 0; i + 1 < nUp; ++i)
-                        add = add + cieSec[i] * (betaSec[i] * LeSec[i] * misW);
+                        add = add + cieSec[i] * (betaSec[i] * LeSec[i] * misW * sE);
                     if (nUp > 1) add = add * (1.0 / (double)nUp);
                     result += add;
                 }
@@ -1271,20 +1285,18 @@ inline Vec3 traceCameraSubpath(const Scene& scene, const Camera& cam, const Rend
                 double distc = std::sqrt(dist2); Vec3 w = d / distc;   // camera -> light vertex
                 double cosCam = dot(h.n, w);
                 double cosLit = dot(lv.ns, w * -1.0);
-                // Geometric-hemisphere softening on BOTH reflect-only endpoints (connection dir w
-                // at the camera vertex, -w at the light vertex): each must see the other on its
-                // geometric front side, ramped smoothly instead of a hard cutoff (Chiang 2019).
-                // No-op when ns==ng (stG==1); skipped for two-sided materials.
+                // Each reflect-only end sees the other on its geometric front, unsoftened (no
+                // emitter is either end: bdpt.h emitterSoftening). The camera end's light side
+                // must be above its shading normal (lambertLit, through bsdfF); the light end's
+                // camera side may lie on either side of its own (bdpt.h's t = 1).
                 Vec3 ngoCam = orientedGeoN(h);
                 Vec3 ngoLit = orientedGeoN(lv.hit);
-                double stGCam = isTwoSidedMat(*mp)     ? 1.0 : shadowTerminatorG(w, h.n, ngoCam);
-                double stGLit = isTwoSidedMat(*lv.mat) ? 1.0 : shadowTerminatorG(w * -1.0, lv.ns, ngoLit);
                 bool camSide = isTwoSidedMat(*mp)
-                                   ? (cosCam != 0.0) : (cosCam > 0.0 && stGCam > 0.0);
-                bool litSide = isTwoSidedMat(*lv.mat)
-                                   ? (cosLit != 0.0) : (cosLit > 0.0 && stGLit > 0.0);
+                                   ? (cosCam != 0.0) : (cosCam > 0.0 && dot(ngoCam, w) > 0.0);
+                bool litSide = (cosLit != 0.0) &&
+                               (isTwoSidedMat(*lv.mat) || dot(ngoLit, w * -1.0) > 0.0);
                 if (!camSide || !litSide) continue;
-                double fCam = bsdfF(*mp, h.n, wo, w, lambda, scene, &h) * stGCam;
+                double fCam = bsdfF(*mp, h.n, wo, w, lambda, scene, &h);
                 // ADJOINT on the light endpoint lv (particle side); fCam above is the
                 // Radiance side and correctly uses plain bsdfF. See bsdfFAdjoint.
                 double fLit = bsdfFAdjoint(*lv.mat, lv.ns, lv.wo, w * -1.0, lambda, scene,
@@ -1292,7 +1304,7 @@ inline Vec3 traceCameraSubpath(const Scene& scene, const Camera& cam, const Rend
                 // Adjoint correction on the LIGHT-subpath endpoint lv only (particle side;
                 // outgoing = -w toward the camera vertex). fCam is the Radiance side — none.
                 // Uses lv.ng on the side lv was shaded from (ngoLit above); a no-op when the mesh is flat.
-                const double adjLit = shadingAdjointCorr(lv.wo, w * -1.0, lv.ns, ngoLit) * stGLit;
+                const double adjLit = shadingAdjointCorr(lv.wo, w * -1.0, lv.ns, ngoLit);
                 fLit *= adjLit;
                 // HERO CONNECTION. Both subpaths of this path index were drawn from ONE
                 // bundle (see vcmPass), so lv's secondaries are hb.lam[i+1] as well and the
@@ -1305,7 +1317,7 @@ inline Vec3 traceCameraSubpath(const Scene& scene, const Camera& cam, const Rend
                 double fProdSec[hero::kHeroMax - 1] = {0}, mxProd = fCam * fLit;
                 for (int i = 0; i + 1 < nUpConn; ++i) {
                     const double li = hb.lam[i + 1];
-                    double fc = bsdfF(*mp, h.n, wo, w, li, scene, &h) * stGCam;
+                    double fc = bsdfF(*mp, h.n, wo, w, li, scene, &h);
                     double fl = bsdfFAdjoint(*lv.mat, lv.ns, lv.wo, w * -1.0, li, scene,
                                              &lv.hit) * adjLit;
                     fProdSec[i] = fc * fl;
@@ -1464,6 +1476,9 @@ inline Vec3 traceCameraSubpath(const Scene& scene, const Camera& cam, const Rend
         if (!delta) camAllDelta = false;        // disqualifies the escaped-sun strategy
         if (delta && !keepBundle) nUp = 1;      // de-hero (see traceLightSubpath)
         prevP = h.p;
+        softOn = !delta && connectible && !isTwoSidedMat(*mp) && !isFiberMat(*mp);
+        softN = h.n;
+        softNg = orientedGeoN(h);
         // A fiber scattering out its far side steps clear of its own tube (see fiberStep).
         const double fstep = fiberStep(h, mp->type == MatType::Hair, wi);
         double sgn = dot(wi, h.ng) >= 0.0 ? 1.0 : -1.0;

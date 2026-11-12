@@ -2476,10 +2476,19 @@ recursive weights divide by it: mode U's 16 %), and a light walk, or a photon, t
 went on lighting things R says it cannot. Mode M also gathers a photon whatever side of ns it came
 from.
 
-**The fix, in stages.** (1) Modes D, J and U (0.439.8): `bsdfF` / `bsdfPdf` ask only about the
-light-side direction (`lambertLit`), and the light walks (randomWalk's Importance side, VCM's
-scatterSample under Flux, their device twins) end at a diffuse vertex the light reaches from below
-ns. (2) The photon modes A, B, C, M, S, P and V: a photon that arrives below ns lights nothing --
+**The fix, in stages.** (1) Modes D, J and U, **done in 0.439.9**: `bsdfF` / `bsdfPdf` ask only
+about the light-side direction (`lambertLit`), and the light walks (randomWalk's Importance side,
+VCM's scatterSample under Flux, their device twins) end at a diffuse vertex the light reaches from
+below ns. That alone read D 0.934 and J 1.039 of R: measured part by part with toggles
+(`scraps/_bump_exp.py`), two more parts were needed, the rest of R's integrand. A connection's
+light end asks of its camera side only the geometric front, unsoftened (R never softens a camera
+side), and a camera end softens only toward an emitter; and the terminator's softening sits at the
+vertex next to the emitter alone (bdpt.h `emitterSoftening`: NEE, the vertex before an s = 0
+landing, and a light subpath's first bounce, in its throughput). With all four, against R on the
+room above: D 0.9991 / 0.9999, J 1.0052 / 1.0031, U 1.0014 / 1.0007 (host / device), the flat room
+within 0.2 % (`tools/check_bump_modes.py`; 0.439.8 fails it). check_bitid's `mapped` scene (a
+normal-mapped wall and translucent panel, grazing light) at equal depth: D 1.019 to 1.0075, J 1.024
+to 1.0045, U 1.020 to 1.008 of R -- the rest is the translucent panel's lobe, stage (3). (2) The photon modes A, B, C, M, S, P and V: a photon that arrives below ns lights nothing --
 no deposit, no splat, absorbed -- and, so that every outgoing direction R lights is reachable, its
 diffuse continuation is drawn about the geometric normal, weighted by |cos(wi,ns)| / |cos(wi,ng)|
 (Veach's adjoint with that density; exactly 1 where ns == ng). (3) DiffuseTransmit and Glossy: the
