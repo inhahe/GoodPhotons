@@ -6226,6 +6226,16 @@ as the one at fault.
   converges. Checks: `tools/check_shading_leak.py` (a sheet over a lit floor),
   `tools/check_fur_gather.py` (a diffuse fur coat).
 
+  **A `translucent` gather point takes both faces** (0.440.1, TRANSLUCENT-MS). A photon the sheet
+  transmits is deposited on its far face, facing away from a visible point on the near one, so the
+  facing test above dropped it, and the gather took the reflect albedo alone: a backlit sheet read
+  0.91 of mode R in M and 0.90 in S. At a DiffuseTransmit visible point (`onGatherSurfaceSided`,
+  device `dOnGatherSurfaceSided`) the test also keeps a photon facing the opposite way within the
+  same 60 degrees (`farSide`), through the same band on |cos theta|, and `gatherAlbedo` (device
+  `dGatherAlbedo`) weighs it by the transmit albedo, a near one by the reflect albedo -- the pair
+  guarded as `diffuseTransmitAlbedos` guards it everywhere. Every other material is one-sided as
+  before. Check: `tools/check_translucent_gather.py`.
+
   **An analytic clip was the obvious design and is the wrong one here:** clipping same-facing
   primitives to the disc is exact for triangles and impossible for fur, isosurfaces and CSG
   solids — and fur is the single largest loss on the scene that motivated this, so the exact

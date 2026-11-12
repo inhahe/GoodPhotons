@@ -73,6 +73,19 @@
 // Renderer's struct default of 32 with no flag able to move it.
 // HOST ONLY. The device photon pass in render_cuda.cu has its own cap and does not read this;
 // use -device cpu when sweeping it, and see MAXBOUNCE-IGNORED in known-issues.md.
+// The albedo a gather point (material `m`, hit `h`) weighs a photon by at `lambda`: a translucent
+// one's reflect albedo for a photon on its near side, its transmit albedo for one on its far side
+// (`farSide`, onGatherSurfaceSided), the pair guarded as everywhere (diffuseTransmitAlbedos); any other's
+// diffuse reflectance.
+inline double gatherAlbedo(const Scene& scene, const Material& m, const Hit& h, double lambda, bool farSide) {
+    if (m.type == MatType::DiffuseTransmit) {
+        double rhoR, rhoT;
+        bdpt::diffuseTransmitAlbedos(m, lambda, scene, &h, rhoR, rhoT);
+        return farSide ? rhoT : rhoR;
+    }
+    return clamp01(diffuseReflectance(scene, m, h, lambda));
+}
+
 inline int photonMaxBounce() {
     static const int m = [] {
         const char* e = std::getenv("FTRACE_PHOTONBOUNCE");
@@ -1428,8 +1441,10 @@ inline Vec3 photonGatherSub(const Scene& scene, const PhotonMap& pm, Ray ray, Pc
                                            h.fiberRadius));
                     Vec3 g{0, 0, 0};
                     M.queryR(h.p, rq, [&](const Photon& ph, double d2, int k) {
-                        if (!onGatherSurface(h.p, gn, M.pos[k], ph.n, d2, slack)) return;   // another surface's
-                        double rhoY = clamp01(diffuseReflectance(scene, m, h, ph.lambda));
+                        bool farSide;
+                        if (!onGatherSurfaceSided(h.p, gn, M.pos[k], ph.n, d2, slack,
+                                                  m.type == MatType::DiffuseTransmit, farSide)) return;   // another surface's
+                        double rhoY = gatherAlbedo(scene, m, h, ph.lambda, farSide);
                         double rhoV = clamp01(diffuseReflectance(scene, visMat, visHit, ph.lambda));
                         double f = rhoY * (1.0 / PI);
                         g += M.cie[k] * (f * rhoV * (double)ph.power);  // == cie(lambda_p), precomputed
@@ -1843,8 +1858,10 @@ inline Vec3 photonGather(const Scene& scene, const PhotonMap& pm, Ray ray, doubl
                                            h.fiberRadius));
                     Vec3 g{0, 0, 0};
                     M.queryR(h.p, rq, [&](const Photon& ph, double d2, int k) {
-                        if (!onGatherSurface(h.p, gn, M.pos[k], ph.n, d2, slack)) return;   // another surface's
-                        double rho = clamp01(diffuseReflectance(scene, m, h, ph.lambda));
+                        bool farSide;
+                        if (!onGatherSurfaceSided(h.p, gn, M.pos[k], ph.n, d2, slack,
+                                                  m.type == MatType::DiffuseTransmit, farSide)) return;   // another surface's
+                        double rho = gatherAlbedo(scene, m, h, ph.lambda, farSide);
                         double f = rho * (1.0 / PI);
                         // SPECGATHER: the walk's reflectances belong at THIS photon's wavelength,
                         // not the camera's. Exactly 1 when they were all flat.

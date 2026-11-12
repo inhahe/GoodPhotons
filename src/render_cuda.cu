@@ -7711,6 +7711,14 @@ __device__ static inline bool dOnGatherSurface(const DVec3& x, const DVec3& n, c
     if (c < (Real)kGatherFacingCos) return false;
     return withinGatherBand<Real>(fabs(dot(pp - x, n)), d2, c, slack);
 }
+// ...on a two-sided surface too (host twin onGatherSurfaceSided, where the why is: TRANSLUCENT-MS).
+__device__ static inline bool dOnGatherSurfaceSided(const DVec3& x, const DVec3& n, const DVec3& pp,
+                                                    const DVec3& pn, Real d2, Real slack, bool twoSided,
+                                                    bool& farSide) {
+    const Real c = dot(pn, n);
+    if (!gatherFacing<Real>(c, twoSided, farSide)) return false;
+    return withinGatherBand<Real>(fabs(dot(pp - x, n)), d2, fabs(c), slack);
+}
 
 // ---- GATHER FOOTPRINT (M-GATHERAREA), device twin of photonmap_render.h ----------------------
 // The density estimate divides by pi*r^2, the area of the whole gather disc, while collecting
@@ -14106,6 +14114,17 @@ __device__ static inline void dDiffuseTransmitAlbedos(const DScene& sc, const DM
     double sum = rhoR + rhoT;
     if (sum > 1.0) { rhoR /= sum; rhoT /= sum; }
 }
+// Host twin photonmap_render.h gatherAlbedo: the albedo a gather point weighs a photon by -- a
+// translucent one's reflect albedo on its near side, its transmit albedo on its far side (`farSide`).
+__device__ static inline Real dGatherAlbedo(const DScene& sc, const DMaterial& m, const DHit& h,
+                                            Real lambda, bool farSide) {
+    if (m.type == D_DIFFUSETRANSMIT) {
+        double rhoR, rhoT;
+        dDiffuseTransmitAlbedos(sc, m, h, lambda, rhoR, rhoT, nullptr, nullptr);
+        return (Real)(farSide ? rhoT : rhoR);
+    }
+    return dDiffuseRho(sc, m, h, lambda);
+}
 
 // Host twin bsdf_eval.h lambertLit, where the why is: a Lambertian lobe on a shading normal is lit
 // by light from above ns (cos(ns, wi) > 0, wi the light-side direction) whichever side of ns the
@@ -20393,8 +20412,9 @@ __device__ static void dPhotonGatherSub(const DScene& sc, const DPhotonMap& pm,
                 DVec3 d = h.p - ph.pos;
                 const Real d2 = dot(d, d);
                 if (d2 > r2) return;
-                if (!dOnGatherSurface(h.p, gn, ph.pos, ph.n, d2, slkM)) return;
-                float rhoY = (float)dDiffuseRho(sc, m, h, (Real)ph.lambda);
+                bool farSide;
+                if (!dOnGatherSurfaceSided(h.p, gn, ph.pos, ph.n, d2, slkM, m.type == D_DIFFUSETRANSMIT, farSide)) return;
+                float rhoY = (float)dGatherAlbedo(sc, m, h, (Real)ph.lambda, farSide);
                 float rhoV = (float)dDiffuseRho(sc, visMat, visHit, (Real)ph.lambda);
                 float w = rhoY * rhoV;
                 gx += w * ph.pX; gy += w * ph.pY; gz += w * ph.pZ;
@@ -20424,8 +20444,9 @@ __device__ static void dPhotonGatherSub(const DScene& sc, const DPhotonMap& pm,
                     DVec3 d = h.p - ph.pos;
                     const Real d2 = dot(d, d);
                     if (d2 > r2q) return;
-                    if (!dOnGatherSurface(h.p, gn, ph.pos, ph.n, d2, slkC)) return;
-                    float rhoY = (float)dDiffuseRho(sc, m, h, (Real)ph.lambda);
+                    bool farSide;
+                    if (!dOnGatherSurfaceSided(h.p, gn, ph.pos, ph.n, d2, slkC, m.type == D_DIFFUSETRANSMIT, farSide)) return;
+                    float rhoY = (float)dGatherAlbedo(sc, m, h, (Real)ph.lambda, farSide);
                     float rhoV = (float)dDiffuseRho(sc, visMat, visHit, (Real)ph.lambda);
                     float w = rhoY * rhoV;
                     cx += w * ph.pX; cy += w * ph.pY; cz += w * ph.pZ;
@@ -21104,10 +21125,11 @@ __device__ static void dPhotonGather(const DScene& sc, const DPhotonMap& pm,
                 DVec3 d = h.p - ph.pos;
                 const Real d2 = dot(d, d);
                 if (d2 > r2) return;
-                if (!dOnGatherSurface(h.p, gn, ph.pos, ph.n, d2, slkM)) return;   // another surface's
+                bool farSide;
+                if (!dOnGatherSurfaceSided(h.p, gn, ph.pos, ph.n, d2, slkM, m.type == D_DIFFUSETRANSMIT, farSide)) return;   // another surface's
                 // SPECGATHER: the walk's reflectances belong at THIS photon's wavelength,
                 // not the camera's. Exactly 1.0 when every one of them was flat.
-                float rho = (float)(dDiffuseRho(sc, m, h, (Real)ph.lambda)
+                float rho = (float)(dGatherAlbedo(sc, m, h, (Real)ph.lambda, farSide)
                                     * (sthr.ratio((Real)ph.lambda) * ipk));
                 gx += rho * ph.pX;
                 gy += rho * ph.pY;
@@ -21138,10 +21160,11 @@ __device__ static void dPhotonGather(const DScene& sc, const DPhotonMap& pm,
                     DVec3 d = h.p - ph.pos;
                     const Real d2 = dot(d, d);
                     if (d2 > r2q) return;
-                    if (!dOnGatherSurface(h.p, gn, ph.pos, ph.n, d2, slkC)) return;
+                    bool farSide;
+                    if (!dOnGatherSurfaceSided(h.p, gn, ph.pos, ph.n, d2, slkC, m.type == D_DIFFUSETRANSMIT, farSide)) return;
                     // SPECGATHER: the walk's reflectances belong at THIS photon's wavelength,
                     // not the camera's. Exactly 1.0 when every one of them was flat.
-                    float rho = (float)(dDiffuseRho(sc, m, h, (Real)ph.lambda)
+                    float rho = (float)(dGatherAlbedo(sc, m, h, (Real)ph.lambda, farSide)
                                         * (sthr.ratio((Real)ph.lambda) * ipk));
                     cx += rho * ph.pX;
                     cy += rho * ph.pY;
@@ -21731,8 +21754,9 @@ __global__ void kSppmGather(DScene sc, DPhotonMap pm, DSppmState st, int resX, i
             DVec3 d = h.p - ph.pos;
             const Real d2 = dot(d, d);
             if (d2 > r2) return;
-            if (!dOnGatherSurface(h.p, gn, ph.pos, ph.n, d2, slkS)) return;   // another surface's photon
-            float rho = (float)dDiffuseRho(sc, m, h, (Real)ph.lambda);
+            bool farSide;
+            if (!dOnGatherSurfaceSided(h.p, gn, ph.pos, ph.n, d2, slkS, m.type == D_DIFFUSETRANSMIT, farSide)) return;   // another surface's photon
+            float rho = (float)dGatherAlbedo(sc, m, h, (Real)ph.lambda, farSide);
             if (ratio) rho *= ratio[DSpecThr::binOf((Real)ph.lambda)];
             gx += rho * ph.pX;
             gy += rho * ph.pY;

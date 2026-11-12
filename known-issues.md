@@ -2460,7 +2460,18 @@ Not changed:
   GLOW-LIGHT-MODES' open decision; logged there, and REFERENCE.md says so.
 * BUMP-D-VS-R, left open: it is BUMP-MODES now, being fixed.
 
-## OPEN (2026-11-12, 0.440.0): TRANSLUCENT-MS — modes M and S read a backlit translucent panel 10 % dark
+## DONE (2026-11-12, 0.440.1): TRANSLUCENT-MS — modes M and S read a backlit translucent panel 10 % dark
+
+**Fixed in 0.440.1** as proposed below: at a translucent visible point the gathers keep a photon
+facing either way (gatherplane.h `onGatherSurfaceSided`, device `dOnGatherSurfaceSided`) and weigh a
+far-side one by the transmit albedo, a near-side one by the reflect albedo (photonmap_render.h
+`gatherAlbedo`, device `dGatherAlbedo`) -- mode M's main gather and its sub-gather, mode S's visible
+points, host and device. `tools/check_translucent_gather.py` holds M and S to R within 1 % on the
+room below: on 0.440.0 host / device M 0.912 / 0.911, S 0.908 / 0.910; now M 1.0013 / 1.0008, S
+0.9970 / 0.9995. check_bitid against 0.440.0: identical but for its two scenes with a translucent
+quad (flat, mapped) in modes M and S, +3.7 % and +2.6 %.
+
+The finding:
 
 Found measuring BUMP-MODES' stage 3 (`scraps/_bump_lobes.py`): a room of diffuse walls with a
 `translucent` panel (reflect 0.4, transmit 0.4) standing in it, lit by a tilted panel near one wall,

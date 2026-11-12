@@ -428,8 +428,10 @@ inline void sppmPass(const Scene& scene, const Camera& cam, SPPMState& st,
                 Vec3   phi{0, 0, 0};     // local flux sum (XYZ, per-photon wavelength)
                 const double slack = gatherBandSlack(P.radius, h.fiberRadius);
                 pm.queryR(h.p, P.radius, [&](const Photon& ph, double d2, int k) {
-                    if (!onGatherSurface(h.p, gn, pm.pos[k], ph.n, d2, slack)) return;   // another surface's
-                    double rho = clamp01(diffuseReflectance(scene, m, h, ph.lambda));
+                    bool farSide;
+                    if (!onGatherSurfaceSided(h.p, gn, pm.pos[k], ph.n, d2, slack,
+                                              m.type == MatType::DiffuseTransmit, farSide)) return;   // another surface's
+                    double rho = gatherAlbedo(scene, m, h, ph.lambda, farSide);   // a translucent's far side: rho_T
                     double f = rho * (1.0 / PI);
                     // the camera prefix's factors at this photon's wavelength (SPPM-SPECTRAL)
                     if (P.vpSpec) f *= (double)P.vpRatio[SpecThr::binOf(ph.lambda)];

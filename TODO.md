@@ -152,8 +152,8 @@ Each names the section its line is in.
 23b. **BUMP-MODES** (4.2) — on a normal-mapped surface U reads 16 % under R, M 12 % over, D/J/B
     1-2 %: one inconsistency at a vertex below its shading hemisphere, fixed in three stages
     (D, J and U in 0.439.9; the photon modes in 0.439.10).
-23d. **TRANSLUCENT-MS** (4.2) — modes M and S read a backlit translucent panel 10 % dark: their
-    gathers drop the light it transmits.
+23d. ~~**TRANSLUCENT-MS** (4.2) — modes M and S read a backlit translucent panel 10 % dark: their
+    gathers drop the light it transmits.~~ Done, 0.440.1.
 23e. **GLOSSY-FLAT-DJU** (4.3) — D, J and U read a flat glossy room about 1 % bright.
 23c. ~~**B-GPU-MAXBOUNCE** (4.2) — GPU mode B ignores `-max-bounce` (its kernels get a literal 32).~~
     Done, 0.439.8.
@@ -221,8 +221,8 @@ Then the rest of 4.2-4.6 in their order, 4.7's bookkeeping alongside whatever to
 - [ ] **BUMP-MODES** — on a strongly normal-mapped room mode U reads 0.844 of R, M 1.148, D/J/B 1-2 %
   off: a vertex below its shading hemisphere is lit in R and not consistently elsewhere. Diffuse done
   (0.439.9, 0.439.10); translucent (D/J/U/B 9 %) and glossy (B 6 %) left.
-- [ ] **TRANSLUCENT-MS** — modes M and S read a backlit translucent panel 10 % dark (the gathers drop
-  its transmitted light).
+- [x] **TRANSLUCENT-MS** (0.440.1) — modes M and S read a backlit translucent panel 10 % dark (the
+  gathers dropped its transmitted light).
 - [ ] **GLOSSY-FLAT-DJU** — modes D, J and U read a flat glossy room about 1 % bright.
 - [x] **B-GPU-MAXBOUNCE** (0.439.8) — GPU mode B ignored `-max-bounce` (a literal 32 reached its
   kernels).

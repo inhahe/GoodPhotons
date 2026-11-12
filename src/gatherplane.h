@@ -71,3 +71,21 @@ inline bool onGatherSurface(const Vec3& x, const Vec3& n, const Vec3& pp, const 
     if (c < kGatherFacingCos) return false;
     return withinGatherBand(std::fabs(dot(pp - x, n)), d2, c, slack);
 }
+
+// A gather on a TWO-SIDED surface (`twoSided`: a `translucent` visible point, TRANSLUCENT-MS) takes the
+// photons on either side of it: those facing the gather point's way (its near side, lit as a
+// reflector) and those facing the other (`farSide`: the light the sheet transmits from behind, which
+// it deposits on its far face). The facing test on the normals' cosine `c`; the band test is the
+// same on |c|. One-sided, onGatherSurface's alone.
+template <class T> FT_GP_HD inline bool gatherFacing(T c, bool twoSided, bool& farSide) {
+    farSide = false;
+    if (c >= T(kGatherFacingCos)) return true;
+    if (twoSided && c <= -T(kGatherFacingCos)) { farSide = true; return true; }
+    return false;
+}
+inline bool onGatherSurfaceSided(const Vec3& x, const Vec3& n, const Vec3& pp, const Vec3& pn, double d2,
+                                 double slack, bool twoSided, bool& farSide) {
+    const double c = dot(pn, n);
+    if (!gatherFacing(c, twoSided, farSide)) return false;
+    return withinGatherBand(std::fabs(dot(pp - x, n)), d2, std::fabs(c), slack);
+}
