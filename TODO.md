@@ -167,8 +167,9 @@ Each names the section its line is in.
     millimetres behind as the same surface (MERGE-PROXIMITY's flat allowance).
 23k. **GLOSSY-ADJ-VARIANCE** (4.3) — the glossy lobe's adjoint is unbounded at grazing arrival;
     the cure is a reciprocal lobe, which needs a decision.
-23h. **S-GPU-GLOSSY-BUMP** (4.3) — device mode S reads normal-mapped glossy walls 1.043 of R (host
-    0.997); see BUMP-MODES.
+23h. ~~**S-GPU-GLOSSY-BUMP** (4.3) — device mode S reads normal-mapped glossy walls 1.043 of R (host
+    0.997); see BUMP-MODES.~~ Done, 0.440.6: R's own glossy strategies disagreed (contSoftening).
+23l. **B-ENV-WALLS** (4.2) — mode B reads walls lit by a sky about 1 % bright, flat or bumped.
 23c. ~~**B-GPU-MAXBOUNCE** (4.2) — GPU mode B ignores `-max-bounce` (its kernels get a literal 32).~~
     Done, 0.439.9.
 24. ~~**BEAMEPOCHS-CHUNK-PIN** (4.5) — `-beamepochs` pins cheap scenes' GPU chunks to 1 spp.~~ Done,
@@ -234,7 +235,7 @@ Then the rest of 4.2-4.6 in their order, 4.7's bookkeeping alongside whatever to
 
 - [ ] **BUMP-MODES** — on a strongly normal-mapped room mode U reads 0.844 of R, M 1.148, D/J/B 1-2 %
   off: a vertex below its shading hemisphere is lit in R and not consistently elsewhere. Diffuse done
-  (0.439.9, 0.439.10); translucent (D/J/U/B 9 %) and glossy (B 6 %) left.
+  (0.439.9, 0.439.10); glossy and sky done (0.440.2 - 0.440.6); translucent (D/J/U/B 9 %) left.
 - [x] **TRANSLUCENT-MS** (0.440.1) — modes M and S read a backlit translucent panel 10 % dark (the
   gathers dropped its transmitted light).
 - [x] **GLOSSY-FLAT-DJU** (0.440.2) — modes D, J and U read a flat glossy room about 1 % bright (a
@@ -243,7 +244,9 @@ Then the rest of 4.2-4.6 in their order, 4.7's bookkeeping alongside whatever to
   bias beyond 0.2 % (twelve seeds, 1.0017 +- 0.0007).
 - [ ] **LAYERED-MODES** — a `layered` material reads 1-9 % off mode R elsewhere, even flat (the
   coat's coin is non-reciprocal); decision owed.
-- [ ] **S-GPU-GLOSSY-BUMP** — device mode S reads normal-mapped glossy walls 1.043 of R.
+- [x] **S-GPU-GLOSSY-BUMP** (0.440.6) — device mode S read normal-mapped glossy walls 1.043 of R:
+  R's own lobe and light sampling weighed different integrands (contSoftening).
+- [ ] **B-ENV-WALLS** — mode B reads walls lit by a sky about 1 % bright, flat or bumped.
 - [ ] **THIN-GAP-GATHER** — mode M at a forced large radius gathers a lit surface millimetres behind.
 - [ ] **GLOSSY-ADJ-VARIANCE** — the glossy lobe's adjoint is unbounded at grazing arrival; decision
   owed (a reciprocal glossy lobe).

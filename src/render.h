@@ -390,6 +390,32 @@ inline double glossyAdjointRatio(const Vec3& ns, const Vec3& wIn, const Vec3& wO
     return (ci > 0.0 && co > 0.0) ? co / ci : 0.0;
 }
 
+// Whether a glossy lobe met along `rayDir` reflects toward where the ray came from: only a camera
+// side above the shading normal `ns`. glossyF -- and so bsdfF, every connection's value -- is 0 for
+// wo below ns, the light walks end there (glossyAdjointRatio's 0) and BDPT's camera walk has no
+// density there (bsdfPdf), so a unidirectional camera walk (modes R, W, M, S) ends there too. Its
+// lobe sampler would otherwise go on and light a point no other strategy can: on a normal-mapped
+// glossy room mode R read itself 1.044 with glossy NEE off, the lobe alone. Where ns == ng a ray
+// meeting the surface from its front always passes. Device twin dGlossyCameraSide.
+inline bool glossyCameraSide(const Vec3& rayDir, const Vec3& ns) { return dot(rayDir, ns) < 0.0; }
+
+// THE SOFTENING A VERTEX LENDS THE LIGHT ITS CONTINUATION REACHES. The terminator's softening
+// (shadowTerminatorG) belongs to the vertex next to a light (bdpt.h emitterSoftening), and it is the
+// INTEGRAND's, not one strategy's: a camera walk's light sampling takes it toward the light (neeLight,
+// neeEnv, fireNee), so the same light reached by the walk's own continuation -- an emitter hit after a
+// glossy bounce, the sky after a diffuse or glossy one, the sun, a fire along the segment -- must
+// take it too, or the two halves of the MIS weight sum different integrands on a tilted shading normal
+// (mode R read itself 1.044 on a normal-mapped glossy room with its lobe alone, 1.022 on a sky-lit
+// diffuse one with its escape alone). This is that factor for a vertex `h` (material `m`, its lobe
+// resolved) whose continuation left along `d`: shadowTerminatorG toward it at a Lambertian or glossy
+// vertex, 1 at a specular, two-sided or fiber one. Exactly 1 where ns == ng. Device twin
+// dContSoftening.
+inline double contSoftening(const Material& m, const Hit& h, const Vec3& d) {
+    if (m.type != MatType::Diffuse && m.type != MatType::Fluorescent && m.type != MatType::Glossy)
+        return 1.0;
+    return shadowTerminatorG(d, h.n, orientedGeoN(h));
+}
+
 // A glossy photon vertex's camera splat (Renderer::camSplatAll and kin). A glossy lobe is not
 // Lambertian, so its value is known only once the connection's direction is: the splats call
 // f(wc) for the direction wc they found toward the camera point. `wl` points back along the

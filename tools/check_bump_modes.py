@@ -1,7 +1,7 @@
 """Regression check: the modes agree with mode R on a normal-mapped surface (BUMP-MODES).
 
     python tools/check_bump_modes.py [--out png/check_bump_modes] [--exe ftrace.exe] [--no-gpu]
-                                     [--modes D,J,U,B,M,S] [--seeds 3]
+                                     [--modes D,J,U,B,M,S] [--seeds 3] [--rooms flat,...,sky]
 
 A shading normal can tilt so far that a ray meets the surface from the geometric front but below
 it (ns.wo <= 0 < ng.wo). Mode R lights such a point: its integrand is a Lambertian lobe lit by
@@ -23,10 +23,20 @@ they read the flat room 2 % bright.
 
 A third room carries the map on a `layered` material instead -- a rough coat (roughness 0.3) over a
 diffuse body -- and holds modes M and S to R there: a compound takes its photon deposit before its
-lobe pick, and until 0.440.3 that deposit skipped the arrival rule of the Lambertian lobes it is
-gathered for (Renderer::compoundDepositWeight), so M read it 1.087 of R and S 1.081. The modes
+lobe pick, under the arrival rule of the Lambertian lobes it is gathered for
+(Renderer::compoundDepositWeight); a deposit without it reads M 1.087 of R and S 1.081. The modes
 miss a layered material by about 1 % even on flat geometry (LAYERED-MODES in known-issues.md), so
-there M and S are held within 2 %, and the others not at all. Exits 1 on any failure.
+there M and S are held within 2 %, and the others not at all.
+
+A fourth carries the map on glossy walls (roughness 0.4), every mode held to R within 1 %, and
+mode R to itself with glossy NEE off. The terminator's softening belongs to the vertex next to the
+light, whichever strategy reaches it, so the light the lobe's own sample reaches takes it as the
+light sampling does (contSoftening): an unsoftened lobe read R 1.044 of itself with its lobe alone,
+device mode S 1.043. A fifth, the diffuse room open to a sky (no ceiling, no lamp), holds modes M
+and S to R (D, J and U render no environment light, and mode B reads such walls ~1 % bright flat or
+bumped, B-ENV-WALLS in known-issues.md) and R to itself with sky NEE off (FTRACE_ENV_NEE=0, host): the sky reached by a diffuse
+vertex's escape takes the vertex's softening too, where without it the escape alone read 1.022.
+Exits 1 on any failure.
 """
 import argparse
 import os
@@ -61,14 +71,20 @@ def ripple(path, amp, w=64):
         f.write(np.ascontiguousarray(img).tobytes())
 
 
-def room(d, amp, layered=False):
+def room(d, amp, kind="diffuse"):
+    if kind == "sky":   # the diffuse room open to a sky: no ceiling, no lamp
+        lines = room(d, amp, "diffuse").rstrip(NL).split(NL)
+        lines = [l for l in lines if not l.startswith("quad { origin -2 3 -2") and not l.startswith("light area")]
+        lines.insert(1, "light env { spd preset:bb6500 }")
+        return NL.join(lines) + NL
     ppm = os.path.join(d, "rip.ppm")
     ripple(ppm, amp)
     p = ppm.replace(chr(92), "/")
-    wall = (['material "body" { type diffuse reflect 0.8 }',
-             'material "w" { type layered  coat { reflectance fresnel  ior 1.5  roughness 0.3 }  '
-             'layer "body" 1.0  normal_map texture:rip }'] if layered else
-            ['material "w" { type diffuse reflect 0.8  normal_map texture:rip }'])
+    wall = {"layered": ['material "body" { type diffuse reflect 0.8 }',
+                        'material "w" { type layered  coat { reflectance fresnel  ior 1.5  roughness 0.3 }  '
+                        'layer "body" 1.0  normal_map texture:rip }'],
+            "glossy": ['material "w" { type glossy reflect 0.8  roughness 0.4  normal_map texture:rip }'],
+            "diffuse": ['material "w" { type diffuse reflect 0.8  normal_map texture:rip }']}[kind]
     return NL.join([
         "scene { units meters }",
         'texture "rip" { file "%s"  encoding linear  filter bilinear  wrap repeat }' % p,
@@ -90,26 +106,35 @@ def main():
     ap.add_argument("--no-gpu", action="store_true")
     ap.add_argument("--modes", default="D,J,U,B,M,S")
     ap.add_argument("--seeds", type=int, default=3)
+    ap.add_argument("--rooms", default="flat,bumped,layered,glossy,sky")
     a = ap.parse_args()
     exe, out = os.path.abspath(a.exe), os.path.abspath(a.out)
     seeds = list(range(1, a.seeds + 1))
     fails = []
-    for name, amp, layered in (("flat", 0.0, False), ("bumped", 2.0, False), ("layered", 2.0, True)):
+    for name, amp, kind in (("flat", 0.0, "diffuse"), ("bumped", 2.0, "diffuse"),
+                            ("layered", 2.0, "layered"), ("glossy", 2.0, "glossy"),
+                            ("sky", 2.0, "sky")):
+        if name not in a.rooms.split(","):
+            continue
+        layered = kind == "layered"
         d = os.path.join(out, name)
         os.makedirs(d, exist_ok=True)
         scene = os.path.join(d, "room.ftsl")
         with open(scene, "w", encoding="utf-8", newline="") as f:
-            f.write(room(d, amp, layered))
+            f.write(room(d, amp, kind))
 
-        def frame(mode, dev, seed, depth):
-            png = os.path.join(d, "%s_%s_%d_%d.png" % (mode, dev, depth, seed))
+        def frame(mode, dev, seed, depth, extra=(), tag="", env=None):
+            png = os.path.join(d, "%s%s_%s_%d_%d.png" % (mode, tag, dev, depth, seed))
+            for f in (png, png[:-4] + ".pfm"):          # never score an earlier run's image
+                if os.path.exists(f):
+                    os.remove(f)
             cmd = [exe, "-in", scene, "-mode", mode, "-device", dev,
-                   "-spp", str(SPP[mode] * (4 if dev == "gpu" else 1)),
+                   "-spp", str(SPP[mode] * (4 if dev == "gpu" else 1) * (4 if (extra or env) else 1)),
                    "-n", str(NPHOT.get(mode, 200000)),
                    "-max-bounce", str(depth), "-seed", str(seed), "-hdr", "-no-meter", "-window-min",
-                   "-o", png]
+                   "-o", png] + list(extra)
             p = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8",
-                               errors="replace")
+                               errors="replace", env=dict(os.environ, **(env or {})))
             pfm = png[:-4] + ".pfm"
             if p.returncode != 0 or not os.path.exists(pfm):
                 print((p.stdout + p.stderr)[-1500:])
@@ -120,6 +145,8 @@ def main():
             refs = {}                                # mode R at each depth asked for
             for mode in a.modes.split(","):
                 if layered and mode not in ("M", "S"):
+                    continue
+                if kind == "sky" and mode not in ("M", "S"):   # D, J, U take no sky; B: B-ENV-WALLS
                     continue
                 depth = DEPTH.get(mode, 8)
                 if depth not in refs:
@@ -136,6 +163,24 @@ def main():
                          ratio, err), flush=True)
                 if not good:
                     fails.append("%s %s %s" % (name, mode, dev))
+            # R's two strategies for the same light, one integrand: its lobe (or sky escape) alone
+            if kind in ("glossy", "sky") and (kind == "glossy" or dev == "cpu"):
+                rm, rse = refs.get(8) or (None, None)
+                if rm is None:
+                    r = [frame("R", dev, s, 8) for s in seeds]
+                    rm, rse = np.mean(r), np.std(r, ddof=1) / np.sqrt(len(r))
+                if kind == "glossy":
+                    v = [frame("R", dev, s, 8, ["-no-glossy-nee"], "lobe") for s in seeds]
+                else:
+                    v = [frame("R", dev, s, 8, (), "esc", {"FTRACE_ENV_NEE": "0"})
+                         for s in seeds]
+                ratio = np.mean(v) / rm
+                good = abs(ratio - 1.0) <= TOL
+                print("%s: %-6s mode R with %s NEE off, on the %s: %.4f of mode R"
+                      % ("ok" if good else "FAIL", name, "glossy" if kind == "glossy" else "sky",
+                         "host" if dev == "cpu" else "device", ratio), flush=True)
+                if not good:
+                    fails.append("%s R-%s %s" % (name, kind, dev))
     print("FAILED: " + ", ".join(fails) if fails else "PASS")
     return 1 if fails else 0
 

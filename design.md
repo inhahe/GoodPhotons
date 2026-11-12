@@ -3732,7 +3732,15 @@ holding a glass ball), and on the device `-rgb`, mode S and every one of those.
       softening and adjoint is booked in the photon's energy ledger (what it removes as
       absorbed, what it adds as negative absorption), so the ledger still balances. A compound's
       merge copy at a first bounce whose pick went delta is softened only where its gathering
-      lobes are all Lambertian (`mergeCopySoftening`; vcm.h `sStore`). The arrival adjoint itself is
+      lobes are all Lambertian (`mergeCopySoftening`; vcm.h `sStore`). The camera side mirrors it
+      (0.440.6): the softening is the integrand's, at the vertex next to the light whichever
+      strategy reaches it, so every light a camera walk's own continuation reaches -- an emitter
+      hit after a glossy bounce, the sky after a diffuse or glossy one, the sun, a fire along the
+      segment -- carries `contSoftening` of the vertex it left (R scalar, hero and RGB, M's two
+      walks, S's visible point, host and device), as that vertex's light sampling does; without
+      it mode R read itself 1.044 on a normal-mapped glossy room with its lobe alone and 1.022 on
+      a sky-lit diffuse one with its escape alone. And a camera walk ends at a glossy lobe met
+      from below the shading normal (`glossyCameraSide`), where glossyF is 0. The arrival adjoint itself is
       geometry.h's `arrivalAdjointCorr`, which the point merges of U and J take too, so no two
       estimators read a smooth mesh differently; a grazing denominator falls back to 1.
       `tools/check_bump_modes.py` holds D, J, U, B, M and S to R on such a room and its flat

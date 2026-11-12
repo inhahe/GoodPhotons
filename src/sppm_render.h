@@ -100,6 +100,7 @@ inline void sppmVisiblePoint(const Scene& scene, Ray ray, Pcg32& rng, bool diffr
     BackwardRenderer::GlossyMis gmis;
     // CURVE-GATHER: the previous vertex was a diffuse strand, which took its direct light by NEE.
     bool strandArrival = false;
+    double contSoft = 1.0;   // the softening the last vertex lends what it reaches (contSoftening)
 
     // The tail (b == maxBounce): the ray the last vertex sampled, for the light it reaches and
     // nothing past it -- no visible point either (backward.h radianceLoop, GLOSSY-DEPTH-CAP).
@@ -135,12 +136,12 @@ inline void sppmVisiblePoint(const Scene& scene, Ray ray, Pcg32& rng, bool diffr
             // camera / specular escape: the env as SEEN, bilinear (Scene::envRadianceSeen)
             if (scene.envIndex >= 0)
                 directL += Vec3(cieX(lambda), cieY(lambda), cieZ(lambda))
-                           * (thr * scene.envRadianceSeen(ray.d, lambda) * invPdfL);
+                           * (thr * scene.envRadianceSeen(ray.d, lambda) * invPdfL * contSoft);
             // Directly-viewed solar disc (camera / specular escapes only — a diffuse
             // vertex stores a hit point and returns before it can reach here).
             if (scene.sunCount > 0 && !strandArrival)
                 directL += Vec3(cieX(lambda), cieY(lambda), cieZ(lambda))
-                           * (thr * bwNee.sunRadianceMis(scene, gmis, ray.d, lambda) * invPdfL);
+                           * (thr * bwNee.sunRadianceMis(scene, gmis, ray.d, lambda) * invPdfL * contSoft);
             return;
         }
         const Material* mp = &scene.mats[h.matId];
@@ -174,7 +175,7 @@ inline void sppmVisiblePoint(const Scene& scene, Ray ray, Pcg32& rng, bool diffr
                                             ray.d, &h)
                     : 1.0;
                 directL += Vec3(cieX(lambda), cieY(lambda), cieZ(lambda))
-                           * (thr * emitSlot(scene, m, h, lambda, ray.d * -1.0) * invPdfL * wMis);
+                           * (thr * emitSlot(scene, m, h, lambda, ray.d * -1.0) * invPdfL * wMis * contSoft);
             }
             // A light block's own surface ends the path; any other emissive material also has
             // a body, which is shaded below like any surface (mode M's gather does the same).
@@ -188,6 +189,7 @@ inline void sppmVisiblePoint(const Scene& scene, Ray ray, Pcg32& rng, bool diffr
         // See the twin note in backward.h.
         gmis.clear();
         strandArrival = false;
+        contSoft = 1.0;   // a specular vertex lends nothing; the glossy case sets its own
 
         // CURVE-GATHER: no visible point on a `type diffuse` strand (strandStep, where the why
         // is): lit by NEE, the walk goes on along its diffuse lobe to the surface that gathers.
@@ -219,6 +221,7 @@ inline void sppmVisiblePoint(const Scene& scene, Ray ray, Pcg32& rng, bool diffr
                 break;
             }
             case MatType::Glossy: {
+                if (!glossyCameraSide(ray.d, h.n)) return;     // met from below ns (glossyCameraSide)
                 // NEXT-EVENT ESTIMATION AT A GLOSSY VERTEX. Taken before `thr *= r`: the
                 // connection carries `r` inside bsdfF. See backward.h's twin for why this is
                 // MIS rather than the single-estimator split used elsewhere on this walk.
@@ -250,6 +253,7 @@ inline void sppmVisiblePoint(const Scene& scene, Ray ray, Pcg32& rng, bool diffr
                     gmis.n = h.n;
                 }
                 if (!continueAlong(h, o, Lobe::Reflect, ray)) return;
+                contSoft = contSoftening(m, h, ray.d);
                 break;
             }
             case MatType::Dielectric:

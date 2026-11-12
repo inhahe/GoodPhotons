@@ -2425,6 +2425,7 @@ struct BackwardRenderer {
                 specularArrival = true; return true;
             }
             case MatType::Glossy: {
+                if (!glossyCameraSide(ray.d, h.n)) return false;   // met from below ns: f is 0
                 double r = clamp01(reflectSlot(scene, m, h, lambda));
                 // NEXT-EVENT ESTIMATION AT A GLOSSY VERTEX (GLOSSY-NEE). Without it the only
                 // way to this material's light is a lobe sample that happens to land on the
@@ -2732,6 +2733,7 @@ struct BackwardRenderer {
         bool specularArrival = (gi.depth == 0);
         const int maxB = gi.depth ? std::min(maxBounce, giBounce) : maxBounce;
         double contBsdfPdf = 0.0;      // solid-angle pdf of the current continuation
+        double contSoft = 1.0;         // the softening the last vertex lends what it reaches (contSoftening)
         // GLOSSY-NEE: set by a glossy bounce, cleared by every other interaction, so the two
         // emitter sites below can tell "a light this vertex already connected to" from "a light
         // nothing connected to". Null when the feature is off, which turns every site back into
@@ -2842,7 +2844,7 @@ struct BackwardRenderer {
                             curAbsorb(lambda), rng, &Ef, [&](int vi) {
                                 return fireSegmentWeight(scene, vi, gmis, specularArrival, ray.d);
                             });
-                L += thr * Ef * invPdfLambda;
+                L += thr * Ef * invPdfLambda * contSoft;
             }
 
             // AGGREGATE FUR (the far LOD tier): sample a free flight against the coat's own
@@ -2895,6 +2897,7 @@ struct BackwardRenderer {
                     Vec3 wOut = med.phaseSample(ray.d, lambda, rng, contBsdfPdf);
                     ray = Ray{p, wOut};
                     specularArrival = false;   // phase-NEE covered the direct light
+                    contSoft = 1.0;            // a medium vertex softens nothing
                     continue;
                 }
             }
@@ -2909,6 +2912,7 @@ struct BackwardRenderer {
                 if (!furInteract(scene, fl, ray, lambda, invPdfLambda, thr, L,
                                  specularArrival, contBsdfPdf, rng, spdCache, gi,
                                  Renderer::localN2(scene, stk, lambda))) return L;
+                contSoft = 1.0;                // a fiber vertex softens nothing
                 continue;
             }
 
@@ -2934,7 +2938,7 @@ struct BackwardRenderer {
                     // Delta chain (the camera ray itself, or through mirrors / clear glass):
                     // nothing connected for it, weight 1 -- so this is the env as SEEN, and
                     // takes the bilinear lookup (Scene::envRadianceSeen, 0.370.0).
-                    L += thr * scene.envRadianceSeen(ray.d, lambda) * invPdfLambda;
+                    L += thr * scene.envRadianceSeen(ray.d, lambda) * invPdfLambda * contSoft;
                 } else if (scene.envIndex >= 0) {
                     double Lenv = scene.envRadiance(ray.d, lambda) * invPdfLambda;
                     if (gmis.pdf > 0.0) {
@@ -2944,13 +2948,13 @@ struct BackwardRenderer {
                         // and not the other (the cylinder bug of 0.266.2 was exactly that).
                         const double pdfEnv = scene.envPdfDir(ray.d);
                         const double sum = gmis.pdf + pdfEnv;
-                        L += thr * Lenv * ((sum > 0.0 && envNeeOn()) ? gmis.pdf / sum : 1.0);
+                        L += thr * Lenv * ((sum > 0.0 && envNeeOn()) ? gmis.pdf / sum : 1.0) * contSoft;
                     } else {
                         double pdfEnv = scene.envPdfDir(ray.d);
                         double wMis = !envNeeOn() ? 1.0
                                     : (contBsdfPdf + pdfEnv > 0.0)
                                           ? contBsdfPdf / (contBsdfPdf + pdfEnv) : 0.0;
-                        L += thr * Lenv * wMis;
+                        L += thr * Lenv * wMis * contSoft;
                     }
                 }
                 // Directly-viewed solar disc: camera / specular arrivals only. A diffuse
@@ -2958,7 +2962,7 @@ struct BackwardRenderer {
                 // NEE (emitterGeom / neeVolumeHero) and sets specularArrival = false, so
                 // this is a clean single-strategy split, not a missing MIS weight.
                 if (scene.sunCount > 0 && specularArrival)
-                    L += thr * sunRadianceMis(scene, gmis, ray.d, lambda) * invPdfLambda;
+                    L += thr * sunRadianceMis(scene, gmis, ray.d, lambda) * invPdfLambda * contSoft;
                 // Escaped gather ray → the far-field `ambient` fill (see radianceHero).
                 if (gi.depth && ambient > 0.0) L += thr * ambient;
                 return L;
@@ -2987,6 +2991,7 @@ struct BackwardRenderer {
                 // sheen is the part you can least see at 1 spp anyway.
                 if (whitted) {
                     if (R >= 0.5) {
+                        if (!glossyCameraSide(ray.d, h.n)) return L;   // a glossy lobe: see the Glossy case
                         if (!whittedAttenuate(thr, R, Renderer::localN2(scene, stk, lambda))) return L;
                         Vec3 o = whittedGlossyDir(reflect(ray.d, h.n),
                                                   materialRoughness(scene, cm, h), gi.sIdx, b);
@@ -2994,6 +2999,7 @@ struct BackwardRenderer {
                         if (!continueAlong(h, o, Lobe::Reflect, ray)) return L;
                         specularArrival = true;
                         gmis.clear();      // the sheen does no NEE: its arrival is unweighted
+                        contSoft = contSoftening(scene.mats[(size_t)cm.coatChild], h, ray.d);
                         continue;
                     }
                     if (!whittedAttenuate(thr, 1.0 - R, Renderer::localN2(scene, stk, lambda))) return L;
@@ -3002,6 +3008,7 @@ struct BackwardRenderer {
                     mp = &scene.mats[child];
                 } else {
                 if (rng.uniform() < R) {
+                    if (!glossyCameraSide(ray.d, h.n)) return L;      // a glossy lobe: see the Glossy case
                     Vec3 o = sampleGlossy(reflect(ray.d, h.n), materialRoughness(scene, cm, h), rng);
                     if (dot(o, h.n) <= 0) return L;
                     if (!continueAlong(h, o, Lobe::Reflect, ray)) return L;
@@ -3010,6 +3017,7 @@ struct BackwardRenderer {
                     // glossy bounce's MIS record must not outlive it (interactMaterial, which
                     // clears it, is never reached from here).
                     gmis.clear();
+                    contSoft = contSoftening(scene.mats[(size_t)cm.coatChild], h, ray.d);   // a glossy lobe
                     continue;
                 }
                 int child = mixResolveChild(scene, cm, h, rng.uniform());   // body lobe (honours a weight map)
@@ -3032,7 +3040,7 @@ struct BackwardRenderer {
                 double wMis = 1.0;
                 if (gmis.pdf > 0.0)
                     wMis = glossyHitWeight(scene, gmis, emitterIndexOfResolved(scene, m), ray.d, &h);
-                L += thr * emitSlot(scene, m, h, lambda, ray.d * -1.0) * invPdfLambda * wMis;
+                L += thr * emitSlot(scene, m, h, lambda, ray.d * -1.0) * invPdfLambda * wMis * contSoft;
             }
 
             if (tail) return L;                           // the light it reached, and no more
@@ -3041,6 +3049,7 @@ struct BackwardRenderer {
                                   specularArrival, contBsdfPdf, stk, rng, spdCache, gi, gmp,
                                   &nullEvt))
                 return L;                                 // path terminated in the interaction
+            if (!nullEvt) contSoft = contSoftening(m, h, ray.d);   // a pass-through lends nothing new
             // NULL INTERACTION: refund the bounce. The cap bounds the worst case in fur dense
             // enough to keep handing back steps; 256 is far above anything real fur produces.
             if (nullEvt && nullSteps < 256) { --b; ++nullSteps; }
@@ -3101,7 +3110,7 @@ struct BackwardRenderer {
                           double* Lout, Pcg32& rng, const SpdCache* spdCache,
                           GiCtx gi, bool rcTrain = false,
                           bool firstSegSampled = false, double reentryCoatU = -1.0,
-                          const GlossyMis* gmis0 = nullptr) const {
+                          const GlossyMis* gmis0 = nullptr, double contSoft0 = 1.0) const {
         // `firstSegSampled`: this call RE-ENTERS a vertex its parent already reached (the
         // chromatic-coat split re-traces the segment that hit the coat), so the free flights
         // along that first segment -- the media collision and the aggregate-fur flight -- were
@@ -3140,6 +3149,9 @@ struct BackwardRenderer {
         // `gmis0`: a split sub-path that starts past a pass-through (no vertex) carries its
         // parent's record across it, as the parent does (gmisIn).
         GlossyMis gmis = gmis0 ? *gmis0 : GlossyMis{};
+        // The softening the last vertex lends what it reaches (contSoftening); a re-entered vertex
+        // keeps its parent's (`contSoft0`).
+        double contSoft = contSoft0;
         // Gather rays are bounce-capped (see giBounce) so a highly reflective lattice
         // cannot turn one gather direction into a 60-deep ricochet.
         const int maxB = gi.depth ? std::min(maxBounce, giBounce) : maxBounce;
@@ -3241,7 +3253,7 @@ struct BackwardRenderer {
                             [&](int vi) {
                                 return fireSegmentWeight(scene, vi, gmis, specularArrival, ray.d);
                             });
-                for (int i = 0; i < nUp; ++i) L[i] += thr[i] * Ef[i] * invPdf[i];
+                for (int i = 0; i < nUp; ++i) L[i] += thr[i] * Ef[i] * invPdf[i] * contSoft;
             }
 
             furvol::FurVolume::Flight fl;
@@ -3318,6 +3330,7 @@ struct BackwardRenderer {
                     }
                     ray = Ray{p, wOut};
                     specularArrival = false;
+                    contSoft = 1.0;                   // a medium vertex softens nothing
                     continue;
                 }
             }
@@ -3349,6 +3362,7 @@ struct BackwardRenderer {
                                  Renderer::localN2(scene, stk, lam[0]))) {
                     finish(); return;
                 }
+                contSoft = 1.0;                // a fiber vertex softens nothing
                 continue;
             }
 
@@ -3360,15 +3374,15 @@ struct BackwardRenderer {
                         if (scene.envMap) {
                             const EnvMap::Taps tp = scene.envMap->taps(ray.d);
                             for (int i = 0; i < nUp; ++i)
-                                L[i] += thr[i] * scene.envMap->radianceAt(tp, lam[i]) * invPdf[i];
+                                L[i] += thr[i] * scene.envMap->radianceAt(tp, lam[i]) * invPdf[i] * contSoft;
                         } else {
                             for (int i = 0; i < nUp; ++i)
-                                L[i] += thr[i] * scene.envRadiance(ray.d, lam[i]) * invPdf[i];
+                                L[i] += thr[i] * scene.envRadiance(ray.d, lam[i]) * invPdf[i] * contSoft;
                         }
                     } else if (gmis.pdf > 0.0) {       // GLOSSY-NEE — see the scalar twin
                         const double pdfEnv = scene.envPdfDir(ray.d);
                         const double sum = gmis.pdf + pdfEnv;
-                        const double w = (sum > 0.0 && envNeeOn()) ? gmis.pdf / sum : 1.0;
+                        const double w = ((sum > 0.0 && envNeeOn()) ? gmis.pdf / sum : 1.0) * contSoft;
                         for (int i = 0; i < nUp; ++i)
                             L[i] += thr[i] * scene.envRadiance(ray.d, lam[i]) * invPdf[i] * w;
                     } else {
@@ -3377,12 +3391,12 @@ struct BackwardRenderer {
                                     : (contBsdfPdf + pdfEnv > 0.0)
                                           ? contBsdfPdf / (contBsdfPdf + pdfEnv) : 0.0;
                         for (int i = 0; i < nUp; ++i)
-                            L[i] += thr[i] * scene.envRadiance(ray.d, lam[i]) * invPdf[i] * wMis;
+                            L[i] += thr[i] * scene.envRadiance(ray.d, lam[i]) * invPdf[i] * wMis * contSoft;
                     }
                 }
                 if (scene.sunCount > 0 && specularArrival)   // directly-viewed solar disc
                     for (int i = 0; i < nUp; ++i)
-                        L[i] += thr[i] * sunRadianceMis(scene, gmis, ray.d, lam[i]) * invPdf[i];
+                        L[i] += thr[i] * sunRadianceMis(scene, gmis, ray.d, lam[i]) * invPdf[i] * contSoft;
                 // A GATHER ray that escaped the scene picks up `ambient` as the far-field
                 // fill. This is what makes -ambient and -gi compose instead of compete:
                 // the gather supplies the near field (occlusion + bleeding) and the
@@ -3483,7 +3497,7 @@ struct BackwardRenderer {
                                          /*C=*/1, /*secAlive=*/false, specularArrival,
                                          contBsdfPdf, b, sub, rng, sCp, gs,
                                          /*rcTrain=*/true, /*firstSegSampled=*/true,
-                                         /*reentryCoatU=*/uCoat);
+                                         /*reentryCoatU=*/uCoat, /*gmis0=*/nullptr, contSoft);
                         if (gi.firstSec) gi.firstSec[i] = sFirst;
                         L[i] += sub[0];      // this wavelength's own estimate, own slot
                         thr[i] = 0.0;        // now that sub-path's business, not ours
@@ -3491,6 +3505,7 @@ struct BackwardRenderer {
                     secAlive = false; nUp = 1;   // hero carries on alone, UNBOOSTED
                 }
                 if (refl0) {                     // coat sheen: every live λ reflects
+                    if (!glossyCameraSide(ray.d, h.n)) { finish(); return; }   // see the scalar twin
                     // Whitted only: the deterministic branch carries R as a WEIGHT (the
                     // stochastic coin above already paid for itself). Stop only once the
                     // WHOLE bundle is under the bailout, as in the Glossy case below.
@@ -3507,6 +3522,7 @@ struct BackwardRenderer {
                     if (!continueAlong(h, o, Lobe::Reflect, ray)) { finish(); return; }
                     specularArrival = true;
                     gmis.clear();                // no NEE here: see the scalar twin
+                    contSoft = contSoftening(scene.mats[(size_t)cm.coatChild], h, ray.d);   // a glossy lobe
                     continue;
                 }
                 if (whitted) {                   // body: every live λ enters the stack
@@ -3530,7 +3546,7 @@ struct BackwardRenderer {
                 if (gmis.pdf > 0.0)
                     ep *= glossyHitWeight(scene, gmis, emitterIndexOfResolved(scene, m), ray.d, &h);
                 for (int i = 0; i < nUp; ++i)
-                    L[i] += thr[i] * m.emit(lam[i]) * ep * invPdf[i];
+                    L[i] += thr[i] * m.emit(lam[i]) * ep * invPdf[i] * contSoft;
             }
             if (tail) { finish(); return; }              // the light it reached (scalar twin)
 
@@ -3551,10 +3567,12 @@ struct BackwardRenderer {
                 // A coverage pass-through (a fibre the ray passes straight through) is no vertex: it
                 // keeps the last real vertex's MIS record, is refunded its bounce (capped: 256 is far
                 // above anything real fur hands back), and is not the path's first event.
+                bool nullHere = false;   // a pass-through keeps the last vertex's softening too
                 const auto passedThrough = [&]() {
                     gmis = gmisIn;
                     if (nullSteps < 256) { --b; ++nullSteps; }
                     unnoteFirst(gi, firstHere);
+                    nullHere = true;
                 };
 
             switch (m.type) {
@@ -3628,6 +3646,7 @@ struct BackwardRenderer {
                     // over live λ and the survivors reweight by c_i/q. With nUp == 1,
                     // q == c[0] and thr[0] *= 1.0, so this is the scalar code verbatim —
                     // same rng draws, same order, bit-identical.
+                    if (m.type == MatType::Glossy && !glossyCameraSide(ray.d, h.n)) { finish(); return; }
                     double c[hero::kHeroMax];
                     for (int i = 0; i < nUp; ++i)
                         c[i] = (m.type == MatType::Filter) ? clamp01(transmitSlot(scene, m, h, lam[i]))
@@ -3985,6 +4004,7 @@ struct BackwardRenderer {
                     specularArrival = false; break;
                 }
             }
+            if (!nullHere) contSoft = contSoftening(m, h, ray.d);   // what this vertex lends
         }
         finish();
     }

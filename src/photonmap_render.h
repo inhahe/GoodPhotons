@@ -1301,6 +1301,8 @@ inline Vec3 photonGatherSub(const Scene& scene, const PhotonMap& pm, Ray ray, Pc
     const bool gneeOn = BackwardRenderer::glossyNeeOn();
     BackwardRenderer::GlossyMis gmis;
     bool hairArrival = false;   // HAIR-NEE: the previous vertex was a fiber that already took its direct light
+    // The softening the last vertex lends what it reaches (contSoftening): first the visible point's.
+    double contSoft = contSoftening(visMat, visHit, ray.d);
 
     // The tail (b == maxBounce): the ray the last vertex sampled, for the light it reaches and
     // nothing past it (backward.h radianceLoop, GLOSSY-DEPTH-CAP).
@@ -1328,7 +1330,7 @@ inline Vec3 photonGatherSub(const Scene& scene, const PhotonMap& pm, Ray ray, Pc
             if (scene.envIndex >= 0) {
                 double rhoV = clamp01(diffuseReflectance(scene, visMat, visHit, lambda));
                 L += Vec3(cieX(lambda), cieY(lambda), cieZ(lambda))
-                     * (thr * rhoV * scene.envRadiance(ray.d, lambda) * invPdfL);
+                     * (thr * rhoV * scene.envRadiance(ray.d, lambda) * invPdfL * contSoft);
             }
             return L;
         }
@@ -1370,7 +1372,7 @@ inline Vec3 photonGatherSub(const Scene& scene, const PhotonMap& pm, Ray ray, Pc
                         BackwardRenderer::emitterIndexOfResolved(scene, m), ray.d, &h)
                 : 1.0;
             L += Vec3(cieX(lambda), cieY(lambda), cieZ(lambda))
-                 * (thr * rhoV * emitSlot(scene, m, h, lambda, ray.d * -1.0) * invPdfL * wMis);
+                 * (thr * rhoV * emitSlot(scene, m, h, lambda, ray.d * -1.0) * invPdfL * wMis * contSoft);
         }
         if (tail) return L;                              // the light it reached, and no more
 
@@ -1382,8 +1384,10 @@ inline Vec3 photonGatherSub(const Scene& scene, const PhotonMap& pm, Ray ray, Pc
         // twin note in backward.h. A hair pass-through is no vertex and puts all three back.
         const BackwardRenderer::GlossyMis gmisIn = gmis;
         const bool hairArrivalIn = hairArrival, specularSeenIn = specularSeen;
+        const double contSoftIn = contSoft;
         bool nullHere = false;
         gmis.clear();
+        contSoft = 1.0;   // a specular vertex lends nothing; the glossy case sets its own
         hairArrival = false;
 
         // CURVE-GATHER: no density estimate on a strand that holds no photon (strandStep). Every
@@ -1453,6 +1457,7 @@ inline Vec3 photonGatherSub(const Scene& scene, const PhotonMap& pm, Ray ray, Pc
                 break;
             }
             case MatType::Glossy: {
+                if (!glossyCameraSide(ray.d, h.n)) return L;   // met from below ns (glossyCameraSide)
                 // NEXT-EVENT ESTIMATION AT A GLOSSY VERTEX (GLOSSY-NEE). The gather ray folds
                 // the VISIBLE point's reflectance into everything it reports, so `rhoV`
                 // multiplies the connection exactly as it multiplies the emission above.
@@ -1476,6 +1481,7 @@ inline Vec3 photonGatherSub(const Scene& scene, const PhotonMap& pm, Ray ray, Pc
                     gmis.n = h.n;
                 }
                 if (!continueAlong(h, o, Lobe::Reflect, ray)) return L;
+                contSoft = contSoftening(m, h, ray.d);
                 break;
             }
             case MatType::Dielectric:
@@ -1529,7 +1535,7 @@ inline Vec3 photonGatherSub(const Scene& scene, const PhotonMap& pm, Ray ray, Pc
                 // the fiber is weighed as that vertex would weigh it.
                 if (hs.b.opacity < 1.0 && wl.x == -hs.woLocal.x && wl.y == -hs.woLocal.y &&
                     wl.z == -hs.woLocal.z) {
-                    nullHere = true; hairArrival = hairArrivalIn; gmis = gmisIn;
+                    nullHere = true; hairArrival = hairArrivalIn; gmis = gmisIn; contSoft = contSoftIn;
                 }
                 const Vec3 wo = hair::toWorld(hs.fr, wl);
                 ray = Ray{h.p + wo * 1e-6, wo, hairExitOffset(hs, h.n, wo)};
@@ -1612,6 +1618,7 @@ inline Vec3 photonGather(const Scene& scene, const PhotonMap& pm, Ray ray, doubl
     const bool gneeOn = BackwardRenderer::glossyNeeOn();
     BackwardRenderer::GlossyMis gmis;
     bool hairArrival = false;   // HAIR-NEE: the previous vertex was a fiber that already took its direct light
+    double contSoft = 1.0;      // the softening the last vertex lends what it reaches (contSoftening)
     // The beam gather over one straight camera segment, times the throughput. The walk's spectral
     // factors and the glass the segment runs through are read at each beam's own wavelength
     // (MODEM-BEAM-CARRIER), as the surface gather reads them at each photon's.
@@ -1703,7 +1710,7 @@ inline Vec3 photonGather(const Scene& scene, const PhotonMap& pm, Ray ray, doubl
             // walk has no env NEE, so weight 1): the bilinear lookup, Scene::envRadianceSeen.
             if (scene.envIndex >= 0)
                 L += Vec3(cieX(lambda), cieY(lambda), cieZ(lambda))
-                     * (thr * scene.envRadianceSeen(ray.d, lambda) * invPdfL);
+                     * (thr * scene.envRadianceSeen(ray.d, lambda) * invPdfL * contSoft);
             // Directly-viewed solar disc. This walk terminates at the first diffuse
             // vertex (the density estimate returns there), so an escape reaching here is a
             // camera ray, a specular chain, or a fiber's continuation -- and a fiber's own
@@ -1712,7 +1719,7 @@ inline Vec3 photonGather(const Scene& scene, const PhotonMap& pm, Ray ray, doubl
             // the walk has no sky light sampling, so the escape is the sky's only estimate.
             if (scene.sunCount > 0 && !hairArrival)
                 L += Vec3(cieX(lambda), cieY(lambda), cieZ(lambda))
-                     * (thr * bwNee.sunRadianceMis(scene, gmis, ray.d, lambda) * invPdfL);
+                     * (thr * bwNee.sunRadianceMis(scene, gmis, ray.d, lambda) * invPdfL * contSoft);
             return L;
         }
         const Material* mp = &scene.mats[h.matId];
@@ -1756,7 +1763,7 @@ inline Vec3 photonGather(const Scene& scene, const PhotonMap& pm, Ray ray, doubl
                         BackwardRenderer::emitterIndexOfResolved(scene, m), ray.d, &h)
                 : 1.0;
             L += Vec3(cieX(lambda), cieY(lambda), cieZ(lambda))
-                 * (thr * emitSlot(scene, m, h, lambda, ray.d * -1.0) * invPdfL * wMis);
+                 * (thr * emitSlot(scene, m, h, lambda, ray.d * -1.0) * invPdfL * wMis * contSoft);
         }
         if (tail) return L;                              // the light it reached, and no more
 
@@ -1768,8 +1775,10 @@ inline Vec3 photonGather(const Scene& scene, const PhotonMap& pm, Ray ray, doubl
         // twin note in backward.h. A hair pass-through is no vertex and puts both back.
         const BackwardRenderer::GlossyMis gmisIn = gmis;
         const bool hairArrivalIn = hairArrival;
+        const double contSoftIn = contSoft;
         gmis.clear();
         hairArrival = false;
+        contSoft = 1.0;   // a specular vertex lends nothing; the glossy case sets its own
 
         // CURVE-GATHER: a `type diffuse` strand (fur, grass, wire: any curve) is no surface to gather
         // on. The photons in a ball around a point on it lie on its neighbours, and dividing them by
@@ -1876,6 +1885,7 @@ inline Vec3 photonGather(const Scene& scene, const PhotonMap& pm, Ray ray, doubl
                 break;
             }
             case MatType::Glossy: {
+                if (!glossyCameraSide(ray.d, h.n)) return L;   // met from below ns (glossyCameraSide)
                 double r = clamp01(reflectSlot(scene, m, h, lambda));
                 // NEXT-EVENT ESTIMATION AT A GLOSSY VERTEX (GLOSSY-NEE). See backward.h's twin
                 // for why this is MIS and not the single-estimator split the rest of mode M's
@@ -1921,6 +1931,7 @@ inline Vec3 photonGather(const Scene& scene, const PhotonMap& pm, Ray ray, doubl
                     gmis.n = h.n;
                 }
                 if (!continueAlong(h, o, Lobe::Reflect, ray)) return L;
+                contSoft = contSoftening(m, h, ray.d);
                 break;
             }
             case MatType::Dielectric:
@@ -2018,7 +2029,7 @@ inline Vec3 photonGather(const Scene& scene, const PhotonMap& pm, Ray ray, doubl
                 // ...and no vertex: the last real one's emitter-hit bookkeeping stands (as in the
                 // gather sub-walk), so light seen straight through the fiber is counted as it
                 // would weigh it.
-                if (passedThru) { hairArrival = hairArrivalIn; gmis = gmisIn; }
+                if (passedThru) { hairArrival = hairArrivalIn; gmis = gmisIn; contSoft = contSoftIn; }
                 // SPECGATHER (0.333.0): the fiber's transmission is the most coloured factor a
                 // camera walk meets -- a blonde fiber absorbs blue and green -- and until now the
                 // walk folded it in at the camera's wavelength ALONE, so every photon of every

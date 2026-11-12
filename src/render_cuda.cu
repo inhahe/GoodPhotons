@@ -6213,6 +6213,18 @@ __device__ static Real dGlossyArrival(const DMaterial& lobe, const DHit& h, cons
     if (!firstBounce || dIsPlanarMirrorMat(lobe)) return (Real)1;
     return dShadowTerminatorG(wi, h.n, dShadedNg(h));
 }
+// Host twin glossyCameraSide (render.h, where the why is): a glossy lobe met along `rd` reflects only
+// a camera side above the shading normal.
+__device__ static inline bool dGlossyCameraSide(const DVec3& rd, const DVec3& ns) {
+    return dot(rd, ns) < (Real)0;
+}
+// Host twin contSoftening (render.h, where the why is): the softening a vertex (material `m`, its lobe
+// resolved) lends the light its continuation `d` reaches -- shadowTerminatorG at a Lambertian or
+// glossy vertex, 1 at any other.
+__device__ static inline double dContSoftening(const DMaterial& m, const DHit& h, const DVec3& d) {
+    if (m.type != D_DIFFUSE && m.type != D_FLUORESCENT && m.type != D_GLOSSY) return 1.0;
+    return (double)dShadowTerminatorG(d, h.n, dShadedNg(h));
+}
 // Host twin mergeFromBehind (geometry.h says why): a one-sided camera vertex merges no photon from
 // behind its true surface (`ngo`, on the camera's side); a two-sided one refuses none.
 __device__ static inline bool dMergeFromBehind(bool twoSided, const DVec3& wi, const DVec3& ngo) {
@@ -16247,6 +16259,7 @@ __device__ static bool bkInteract(const DScene& sc, const DMaterial* mp, const D
             specularArrival = true; return true;
         }
         case D_GLOSSY: {
+            if (!dGlossyCameraSide(rd, h.n)) return false;   // met from below ns (host twin)
             Real r = clamp01(dReflectSlot(sc, *mp, h, lambda));
             // NEXT-EVENT ESTIMATION AT A GLOSSY VERTEX (GLOSSY-NEE; host twin backward.h
             // ~1489). Without it the only route to this material's light is a lobe sample
@@ -16467,6 +16480,7 @@ __device__ static double bkRadiance(const DScene& sc, int diffraction, DVec3 ro,
                                                        // gather ray must NOT (the vertex's own
                                                        // NEE already counted that emitter)
     double contBsdfPdf = 0.0;                           // solid-angle pdf of the current continuation (env MIS)
+    double contSoft = 1.0;                              // what the last vertex lends what it reaches (dContSoftening)
     DMediumStack stk; stk.clear();                     // nested-dielectric medium stack (empty = vacuum)
     const bool whitted = (sc.bkWhitted != 0);
     // Gather rays are bounce-capped (see bkGiBounce). The `min` matters: the host is
@@ -16530,7 +16544,7 @@ __device__ static double bkRadiance(const DScene& sc, int diffraction, DVec3 ro,
                          &Ef, [&](int vi) {
                              return dFireSegmentWeight(sc, vi, gmis, specularArrival, rd);
                          });
-            L += thr * Ef * invPdfLambda;
+            L += thr * Ef * invPdfLambda * contSoft;
         }
         // Participating media: sample a free-flight collision (superposition over all
         // media — homogeneous = exact free-flight, heterogeneous = Woodcock/delta
@@ -16572,6 +16586,7 @@ __device__ static double bkRadiance(const DScene& sc, int diffraction, DVec3 ro,
                 Real phPdf;
                 ro = p; rd = dMedPhaseSample(med, rd, lambda, rng, phPdf); specularArrival = false;
                 contBsdfPdf = (double)phPdf;  // phase pdf of the scatter (env MIS)
+                contSoft = 1.0;               // a medium vertex softens nothing
                 continue;
             }
         }
@@ -16591,18 +16606,18 @@ __device__ static double bkRadiance(const DScene& sc, int diffraction, DVec3 ro,
                                         : (double)specLookup(sc.emitters[sc.envIndex].emitSpd, lambda))
                               * invPdfLambda;
                 if (seen) {
-                    L += thr * Lenv;                 // delta chain: nothing connected for it
+                    L += thr * Lenv * contSoft;      // delta chain: nothing connected for it
                 } else if (gmis.pdf > 0.0) {
                     // GLOSSY-NEE: complement of the weight the connection above used. Gated on
                     // the SAME test, so a case cannot appear in one half and not the other.
                     const double pdfEnv = imageEnv ? dEnvPdf(sc.env, rd) : 1.0 / (4.0 * DPI);
                     const double sum = gmis.pdf + pdfEnv;
-                    L += thr * Lenv * ((sum > 0.0) ? gmis.pdf / sum : 1.0);
+                    L += thr * Lenv * ((sum > 0.0) ? gmis.pdf / sum : 1.0) * contSoft;
                 } else {
                     double pdfEnv = imageEnv ? dEnvPdf(sc.env, rd) : 1.0 / (4.0 * DPI);
                     double wMis = (contBsdfPdf + pdfEnv > 0.0)
                                       ? contBsdfPdf / (contBsdfPdf + pdfEnv) : 0.0;
-                    L += thr * Lenv * wMis;
+                    L += thr * Lenv * wMis * contSoft;
                 }
             }
             // Directly-viewed solar disc: camera / specular arrivals only. A diffuse or
@@ -16610,7 +16625,7 @@ __device__ static double bkRadiance(const DScene& sc, int diffraction, DVec3 ro,
             // (bkEmitterGeom / bkNeeVolumeHero) and sets specularArrival = false, so this is
             // a clean single-strategy split, not a missing MIS weight (host twin: backward.h).
             if (sc.sunCount > 0 && specularArrival)
-                L += thr * dSunRadianceMis(sc, gmis, rd, lambda) * invPdfLambda;
+                L += thr * dSunRadianceMis(sc, gmis, rd, lambda) * invPdfLambda * contSoft;
             // Escaped gather ray -> the far-field `ambient` fill. This is what makes -gi and
             // -ambient compose: in an empty scene every direction escapes and the normalised
             // gather collapses exactly back to rho * ambient, so switching -gi on never
@@ -16652,7 +16667,7 @@ __device__ static double bkRadiance(const DScene& sc, int diffraction, DVec3 ro,
                 double wMis = (gmis.pdf > 0.0)
                     ? dGlossyHitWeight(sc, gmis, li, rd, &h) : 1.0;
                 L += thr * (double)specLookup(*eSpd, lambda) * invPdfLambda
-                         * dEmitHitScale(sc, mp->emitPat, li, h, rd * (Real)(-1)) * wMis;
+                         * dEmitHitScale(sc, mp->emitPat, li, h, rd * (Real)(-1)) * wMis * contSoft;
             }
         }
 
@@ -16662,6 +16677,7 @@ __device__ static double bkRadiance(const DScene& sc, int diffraction, DVec3 ro,
                                       invPdfLambda, thr, L, specularArrival, contBsdfPdf, stk,
                                       rng, gi, gmp, &nullEvt, &curveTmin))
             return L;                                   // path terminated in the interaction
+        if (!nullEvt) contSoft = dContSoftening(*mp, h, rd);   // a pass-through lends nothing new
         if (nullEvt && nullSteps < 256) { --b; ++nullSteps; }
         if (nullEvt) dUnnoteFirst(firstHere);           // passed through: not the first event
     }
@@ -16721,7 +16737,7 @@ __device__ static void bkRadianceHeroLoop(const DScene& sc, int diffraction,
                                           bool specularArrival, double contBsdfPdf,
                                           int bounce0, double* Lout, DRng& rng, DGiCtx gi,
                                           const DGlossyMis* gmis0 = nullptr,
-                                          Real curveTmin0 = (Real)0) {
+                                          Real curveTmin0 = (Real)0, double contSoft0 = 1.0) {
     Real   lam[hero::kHeroMax];
     double invPdf[hero::kHeroMax], thr[hero::kHeroMax];
     // GLOSSY-NEE: the hero twin of bkRadiance's carrier. Cleared just before the material
@@ -16729,6 +16745,7 @@ __device__ static void bkRadianceHeroLoop(const DScene& sc, int diffraction,
     // starts past a pass-through (no vertex) carries its parent's record across it.
     DGlossyMis gmis; gmis.clear();
     if (gmis0) gmis = *gmis0;
+    double contSoft = contSoft0;   // what the last vertex lends what it reaches (dContSoftening)
     // Copy only the LIVE entries: a monochromatic sub-path spawned by the split fills only
     // slot 0 of its lamIn/invPdfIn/thrIn, so reading all C would read indeterminate values
     // (harmless while nUp == 1 ignores them, but still UB).
@@ -16789,7 +16806,7 @@ __device__ static void bkRadianceHeroLoop(const DScene& sc, int diffraction,
                          ab, rng, Ef, [&](int vi) {
                              return dFireSegmentWeight(sc, vi, gmis, specularArrival, rd);
                          });
-            for (int i = 0; i < nUp; ++i) L[i] += thr[i] * Ef[i] * invPdf[i];
+            for (int i = 0; i < nUp; ++i) L[i] += thr[i] * Ef[i] * invPdf[i] * contSoft;
         }
 
         // PARTICIPATING MEDIA (SPECTRAL-BUNDLE; host twin: radianceHeroLoop). The bundle is here
@@ -16811,6 +16828,7 @@ __device__ static void bkRadianceHeroLoop(const DScene& sc, int diffraction,
                                       lam, invPdf, nUp, specR, specTech, specW, contBsdfPdf, rng))
                     return;
                 specularArrival = false;
+                contSoft = 1.0;                                    // a medium vertex softens nothing
                 continue;
             }
         }
@@ -16853,12 +16871,12 @@ __device__ static void bkRadianceHeroLoop(const DScene& sc, int diffraction,
                                                     : dEnvRadiance(sc.env, rd, lam[i]))
                                             : (double)specLookup(sc.emitters[sc.envIndex].emitSpd, lam[i]))
                                   * invPdf[i];
-                    L[i] += thr[i] * Lenv * wMis;
+                    L[i] += thr[i] * Lenv * wMis * contSoft;
                 }
             }
             if (sc.sunCount > 0 && specularArrival)     // directly-viewed solar disc
                 for (int i = 0; i < nUp; ++i)
-                    L[i] += thr[i] * dSunRadianceMis(sc, gmis, rd, lam[i]) * invPdf[i];
+                    L[i] += thr[i] * dSunRadianceMis(sc, gmis, rd, lam[i]) * invPdf[i] * contSoft;
             // Escaped GATHER ray -> the far-field `ambient` fill, which is what makes -gi and
             // -ambient compose instead of compete (see the scalar twin bkRadiance).
             if (whitted && gi.depth && sc.bkAmbient > 0.0)
@@ -16908,7 +16926,7 @@ __device__ static void bkRadianceHeroLoop(const DScene& sc, int diffraction,
                 if (gmis.pdf > 0.0)          // GLOSSY-NEE, as in the scalar loop
                     ep *= dGlossyHitWeight(sc, gmis, li, rd, &h);
                 for (int i = 0; i < nUp; ++i)
-                    L[i] += thr[i] * (double)specLookup(*eSpd, lam[i]) * invPdf[i] * ep;
+                    L[i] += thr[i] * (double)specLookup(*eSpd, lam[i]) * invPdf[i] * ep * contSoft;
             }
         }
         if (tail) return;                               // the light it reached (scalar twin)
@@ -16921,6 +16939,7 @@ __device__ static void bkRadianceHeroLoop(const DScene& sc, int diffraction,
         // ...and put back after a hair pass-through, which is no bounce (host twin).
         const DGlossyMis gmisIn = gmis;
         gmis.clear();
+        const int bSw = b;   // a refunded pass-through (b moved back) lends nothing new
 
         switch (mp->type) {
             case D_DIFFUSETRANSMIT: {
@@ -16984,6 +17003,7 @@ __device__ static void bkRadianceHeroLoop(const DScene& sc, int diffraction,
                 return;                                            // absorbed
             }
             case D_MIRROR: case D_FILTER: case D_GLOSSY: {
+                if (mp->type == D_GLOSSY && !dGlossyCameraSide(rd, h.n)) return;   // host twin
                 // ACHROMATIC delta lobes (device twin of backward.h): specular, so no NEE
                 // and specularArrival stays true, but the outgoing DIRECTION is the same
                 // for every λ — a mirror reflects, a gel passes straight through, a glossy
@@ -17143,7 +17163,8 @@ __device__ static void bkRadianceHeroLoop(const DScene& sc, int diffraction,
                                                                &sLam, &sInv, &sThr, /*C=*/1,
                                                                /*secAlive=*/false, sSpec, sPdf,
                                                                refund ? b : b + 1, sub, rng, gi,
-                                                               sNull ? &gmisIn : nullptr, sTmin);
+                                                               sNull ? &gmisIn : nullptr, sTmin,
+                                                               sNull ? contSoft : dContSoftening(*mp, h, sRd));
                             sL += sub[0];
                         }
                         if (sFiles) {
@@ -17229,6 +17250,7 @@ __device__ static void bkRadianceHeroLoop(const DScene& sc, int diffraction,
                 if (!dContinueAlong(h, wOut, DL_REFLECT, ro, rd)) return; specularArrival = false; break;
             }
         }
+        if (b == bSw) contSoft = dContSoftening(*mp, h, rd);   // what this vertex lends
     }
 }
 
@@ -17579,6 +17601,7 @@ __device__ static DVec3 bkRadianceRGB(const DScene& sc, int diffraction, DVec3 r
     DVec3 L(0, 0, 0), beta(1, 1, 1);
     bool specularArrival = true;
     double contBsdfPdf = 0.0;
+    double contSoft = 1.0;   // what the last vertex lends what it reaches (dContSoftening)
     DMediumStack stk; stk.clear();
     const int maxBounce = sc.bkMaxBounce;
     const bool directOnly = (sc.bkDirectOnly != 0);
@@ -17589,12 +17612,12 @@ __device__ static DVec3 bkRadianceRGB(const DScene& sc, int diffraction, DVec3 r
         if (!h.valid) {                                // escaped -> constant env
             if (sc.envIndex >= 0) {
                 if (specularArrival) {
-                    L = L + hadamard(beta, sc.rgbEnv);
+                    L = L + hadamard(beta, sc.rgbEnv) * (Real)contSoft;
                 } else {
                     double pdfEnv = 1.0 / (4.0 * DPI);
                     double wMis = (contBsdfPdf + pdfEnv > 0.0)
                                       ? contBsdfPdf / (contBsdfPdf + pdfEnv) : 0.0;
-                    L = L + hadamard(beta, sc.rgbEnv) * (Real)wMis;
+                    L = L + hadamard(beta, sc.rgbEnv) * (Real)(wMis * contSoft);
                 }
             }
             // Directly-viewed solar disc (camera / specular arrivals only, as in the
@@ -17603,7 +17626,7 @@ __device__ static DVec3 bkRadianceRGB(const DScene& sc, int diffraction, DVec3 r
             if (sc.sunCount > 0 && specularArrival)
                 for (int k = 0; k < sc.nEmitters; ++k) {
                     const DEmitter& e = sc.emitters[k];
-                    if (e.shape == 6 && dInSunCone(e, rd)) L = L + hadamard(beta, e.rgbEmit);
+                    if (e.shape == 6 && dInSunCone(e, rd)) L = L + hadamard(beta, e.rgbEmit) * (Real)contSoft;
                 }
             return L;
         }
@@ -17631,7 +17654,7 @@ __device__ static DVec3 bkRadianceRGB(const DScene& sc, int diffraction, DVec3 r
             // Emitter-less emissive geometry (isosurface / CSG solid) falls back to the
             // material's own baked emission, exactly as the spectral paths do.
             double ep = dEmitHitScale(sc, mp->emitPat, li, h, rd * (Real)(-1));
-            L = L + hadamard(beta * (Real)ep,
+            L = L + hadamard(beta * (Real)(ep * contSoft),
                              (li >= 0) ? sc.emitters[li].rgbEmit : mp->rgbMatEmit);
         }
         if (tail) return L;                             // the light it reached, and no more
@@ -17662,6 +17685,7 @@ __device__ static DVec3 bkRadianceRGB(const DScene& sc, int diffraction, DVec3 r
                 ro = dOffsetAlong(h.p, h.ng, rd); specularArrival = true; break;
             }
             case D_GLOSSY: {
+                if (!dGlossyCameraSide(rd, h.n)) return L;      // met from below ns (bkRadiance)
                 Real q = rgbLuma(mp->rgbAlbedo);
                 if (q <= (Real)0 || rng.uniform() >= (double)q) return L;
                 DVec3 o = sampleGlossy(reflectv(rd, h.n), dMatRoughness(sc, *mp, h), rng);
@@ -17711,6 +17735,7 @@ __device__ static DVec3 bkRadianceRGB(const DScene& sc, int diffraction, DVec3 r
                 if (!dContinueAlong(h, wOut, DL_REFLECT, ro, rd)) return L; specularArrival = false; break;
             }
         }
+        contSoft = dContSoftening(*mp, h, rd);          // what this vertex lends
     }
     return L;
 }
@@ -20433,6 +20458,7 @@ __device__ static void dPhotonGatherSub(const DScene& sc, const DPhotonMap& pm,
     double thr = 1.0;
     bool specularSeen = false;                           // any specular bounce so far?
     bool hairArrival = false;                            // HAIR-NEE (see dPhotonGather)
+    double contSoft = dContSoftening(visMat, visHit, rd); // first the visible point's (dContSoftening)
     DMediumStack stk; stk.clear();
     const Real r2 = (Real)((double)pm.radius * (double)pm.radius);
     const bool causOn = (pmC.photons != nullptr);
@@ -20462,7 +20488,7 @@ __device__ static void dPhotonGatherSub(const DScene& sc, const DPhotonMap& pm,
                                     ? dEnvRadiance(sc.env, rd, lambda)
                                     : (double)specLookup(sc.emitters[sc.envIndex].emitSpd, lambda);
                 double rhoV = (double)clamp01(dDiffuseRho(sc, visMat, visHit, lambda));
-                double e = thr * rhoV * envRad * invPdfL;
+                double e = thr * rhoV * envRad * invPdfL * contSoft;
                 oX += (double)cieX(lambda) * e; oY += (double)cieY(lambda) * e; oZ += (double)cieZ(lambda) * e;
             }
             return;
@@ -20489,7 +20515,7 @@ __device__ static void dPhotonGatherSub(const DScene& sc, const DPhotonMap& pm,
                                                   : nullptr;
             if (eSpd && specularSeen && dot(rd, h.ng) < 0 && !hairArrival) {
                 double rhoV = (double)clamp01(dDiffuseRho(sc, visMat, visHit, lambda));
-                double e = (double)specLookup(*eSpd, lambda) * thr * rhoV * invPdfL
+                double e = (double)specLookup(*eSpd, lambda) * thr * rhoV * invPdfL * contSoft
                          * dEmitHitScale(sc, m.emitPat, li, h, rd * (Real)(-1));   // pattern and aim at this hit
                 oX += (double)cieX(lambda) * e; oY += (double)cieY(lambda) * e; oZ += (double)cieZ(lambda) * e;
             }
@@ -20497,6 +20523,8 @@ __device__ static void dPhotonGatherSub(const DScene& sc, const DPhotonMap& pm,
         if (tail) return;                               // the light it reached, and no more
 
         const bool hairArrivalIn = hairArrival, specularSeenIn = specularSeen;   // a hair pass-through puts these back
+        const double contSoftIn = contSoft;
+        contSoft = 1.0;   // a specular vertex lends nothing; the glossy case sets its own
         bool nullHere = false;
         hairArrival = false;
         // CURVE-GATHER: no density estimate on a strand that holds no photon (host twin).
@@ -20580,13 +20608,15 @@ __device__ static void dPhotonGatherSub(const DScene& sc, const DPhotonMap& pm,
                 if (!dContinueAlong(h, reflectv(rd, h.n), DL_REFLECT, ro, rd)) return; break;
             }
             case D_GLOSSY: {
+                if (!dGlossyCameraSide(rd, h.n)) return;        // met from below ns (host twin)
                 thr *= (double)clamp01(dReflectSlot(sc, m, h, lambda));
                 const DGlossyDraw gd = dDrawGlossy(sc, m, h, rd, h.n, -rd, rng);
                 const DVec3& o = gd.o;
                 if (dot(o, h.n) <= 0) return;
                 // An iridescent lobe's interference reflectance at the pair's half-vector.
                 thr *= (double)gd.R(lambda);
-                if (!dContinueAlong(h, o, DL_REFLECT, ro, rd)) return; break;
+                if (!dContinueAlong(h, o, DL_REFLECT, ro, rd)) return;
+                contSoft = dContSoftening(m, h, rd); break;
             }
             case D_DIELECTRIC:
             case D_THINFILM:
@@ -20629,7 +20659,7 @@ __device__ static void dPhotonGatherSub(const DScene& sc, const DPhotonMap& pm,
                 // A coverage pass-through (exactly -wo) is no vertex: the last real one's
                 // emitter-hit bookkeeping stands (host twin photonGatherSub).
                 if (hsv.b.opacity < 1.0 && wl.x == -hsv.woLocal.x && wl.y == -hsv.woLocal.y &&
-                    wl.z == -hsv.woLocal.z) { nullHere = true; hairArrival = hairArrivalIn; }
+                    wl.z == -hsv.woLocal.z) { nullHere = true; hairArrival = hairArrivalIn; contSoft = contSoftIn; }
                 const DVec3 wOut = dhair::toWorld(hsv.fr, wl);
                 // Clear the strand by skipping curves within its exit distance on the next
                 // trace, from a ULP-moved origin (see interactHair): moving the origin out by
@@ -21018,6 +21048,7 @@ __device__ static void dPhotonGather(const DScene& sc, const DPhotonMap& pm,
     const bool sunOn = (bm != nullptr) && bm->sunNee && sc.sunCount > 0 && sc.mediaN > 0;
 
     Real curveTmin = (Real)0;   // a fiber's exit clearance for the next hop, curve prims only
+    double contSoft = 1.0;   // what the last vertex lends what it reaches (dContSoftening)
     // The tail (b == maxBounce), in-scattering along it skipped: host twin photonGather.
     for (int b = 0; b <= maxBounce; ++b) {
         const bool tail = (b == maxBounce);
@@ -21111,7 +21142,7 @@ __device__ static void dPhotonGather(const DScene& sc, const DPhotonMap& pm,
                 double envRad = (sc.env.scale != nullptr)
                                     ? dEnvRadianceSeen(sc.env, rd, lambda)
                                     : (double)specLookup(sc.emitters[sc.envIndex].emitSpd, lambda);
-                double e = thr * envRad * invPdfL;
+                double e = thr * envRad * invPdfL * contSoft;
                 oX += (double)cieX(lambda) * e;
                 oY += (double)cieY(lambda) * e;
                 oZ += (double)cieZ(lambda) * e;
@@ -21121,7 +21152,7 @@ __device__ static void dPhotonGather(const DScene& sc, const DPhotonMap& pm,
             // and a fiber's own light sampling (HAIR-NEE) already took the sun (`hairArrival`).
             // The sky is not among what it took. (Host twin: photonmap_render.h.)
             if (sc.sunCount > 0 && !hairArrival) {
-                double e = thr * dSunRadianceMis(sc, gmis, rd, lambda) * invPdfL;
+                double e = thr * dSunRadianceMis(sc, gmis, rd, lambda) * invPdfL * contSoft;
                 oX += (double)cieX(lambda) * e;
                 oY += (double)cieY(lambda) * e;
                 oZ += (double)cieZ(lambda) * e;
@@ -21162,7 +21193,7 @@ __device__ static void dPhotonGather(const DScene& sc, const DPhotonMap& pm,
                 // the emitter is not counted twice (host twin: photonGather).
                 const double wMis = (gmis.pdf > 0.0)
                                   ? dGlossyHitWeight(sc, gmis, li, rd, &h) : 1.0;
-                double e = (double)specLookup(*eSpd, lambda) * thr * invPdfL * wMis
+                double e = (double)specLookup(*eSpd, lambda) * thr * invPdfL * wMis * contSoft
                          * dEmitHitScale(sc, m.emitPat, li, h, rd * (Real)(-1));    // pattern and aim at this hit
                 oX += (double)cieX(lambda) * e;
                 oY += (double)cieY(lambda) * e;
@@ -21179,6 +21210,8 @@ __device__ static void dPhotonGather(const DScene& sc, const DPhotonMap& pm,
         // connection in place with no compensating weight, i.e. double counting.
         const DGlossyMis gmisIn = gmis;   // a hair pass-through puts it back
         gmis.clear();
+        const double contSoftIn = contSoft;
+        contSoft = 1.0;   // a specular vertex lends nothing; the glossy case sets its own
         // CURVE-GATHER (host twin photonGather, where the why is): no gather on a `type diffuse`
         // strand; it is lit by NEE and the walk goes on along its diffuse lobe (dStrandStep).
         if (dGatherlessStrand(m, h)) {
@@ -21306,6 +21339,7 @@ __device__ static void dPhotonGather(const DScene& sc, const DPhotonMap& pm,
                 if (!dContinueAlong(h, reflectv(rd, h.n), DL_REFLECT, ro, rd)) return; break;
             }
             case D_GLOSSY: {
+                if (!dGlossyCameraSide(rd, h.n)) return;        // met from below ns (host twin)
                 // NEXT-EVENT ESTIMATION AT A GLOSSY VERTEX (GLOSSY-NEE, 0.340.0). The host
                 // gather has always done this; the device gather did not, so the only route
                 // from a metal to a light was a lobe sample landing on it -- gallery_rain's
@@ -21356,7 +21390,8 @@ __device__ static void dPhotonGather(const DScene& sc, const DPhotonMap& pm,
                     gmis.from = h.p;
                     gmis.n    = h.n;
                 }
-                if (!dContinueAlong(h, o, DL_REFLECT, ro, rd)) return; break;
+                if (!dContinueAlong(h, o, DL_REFLECT, ro, rd)) return;
+                contSoft = dContSoftening(m, h, rd); break;
             }
             case D_DIELECTRIC:
             case D_THINFILM:
@@ -21422,7 +21457,7 @@ __device__ static void dPhotonGather(const DScene& sc, const DPhotonMap& pm,
                 double wCam = fv * cosLong / pdfH; wCam = wCam < 0.0 ? 0.0 : (wCam > 1.0 ? 1.0 : wCam);
                 thr *= wCam;
                 // ...and no vertex: the last real one's emitter-hit bookkeeping stands (host twin).
-                if (passedThru) { hairArrival = hairArrivalIn; gmis = gmisIn; }
+                if (passedThru) { hairArrival = hairArrivalIn; gmis = gmisIn; contSoft = contSoftIn; }
                 if (!passedThru) {   // each bin folded from the sample's angular half (dHairFoldFCos)
                     const double den = m.hairSigmaAFromReflect ? dhair::sigmaADenominator(m.hairBetaN) : -1.0;   // hoisted: three pow() per bin otherwise
                     const double specPat = dHairSpecPatAt(sc, m, h);   // hoisted: the pattern is the same at every bin
@@ -21605,6 +21640,7 @@ __device__ static void dSppmVisiblePoint(const DScene& sc, DVec3 ro, DVec3 rd, R
     double thr = 1.0;
     DMediumStack stk; stk.clear();
     bool strandArrival = false;   // CURVE-GATHER: the previous vertex, a strand, took its direct light
+    double contSoft = 1.0;        // what the last vertex lends what it reaches (dContSoftening)
     for (int b = 0; b <= maxBounce; ++b) {                     // the tail (host twin)
         const bool tail = (b == maxBounce);
         if (sc.hasGrin) {                                // GRADIENT-INDEX: the camera ray bends,
@@ -21635,7 +21671,7 @@ __device__ static void dSppmVisiblePoint(const DScene& sc, DVec3 ro, DVec3 rd, R
                 double envRad = (sc.env.scale != nullptr)
                                     ? dEnvRadianceSeen(sc.env, rd, lambda)
                                     : (double)specLookup(sc.emitters[sc.envIndex].emitSpd, lambda);
-                double e = thr * envRad * invPdfL;
+                double e = thr * envRad * invPdfL * contSoft;
                 dX += (double)cieX(lambda) * e;
                 dY += (double)cieY(lambda) * e;
                 dZ += (double)cieZ(lambda) * e;
@@ -21644,7 +21680,7 @@ __device__ static void dSppmVisiblePoint(const DScene& sc, DVec3 ro, DVec3 rd, R
             // vertex stores a hit point and returns before it can reach here; a strand's NEE
             // took it already). Host twin: sppm_render.h.
             if (sc.sunCount > 0 && !strandArrival) {
-                double e = thr * dSunRadiance(sc, rd, lambda) * invPdfL;
+                double e = thr * dSunRadiance(sc, rd, lambda) * invPdfL * contSoft;
                 dX += (double)cieX(lambda) * e;
                 dY += (double)cieY(lambda) * e;
                 dZ += (double)cieZ(lambda) * e;
@@ -21674,7 +21710,7 @@ __device__ static void dSppmVisiblePoint(const DScene& sc, DVec3 ro, DVec3 rd, R
                                               : nullptr;
         if (eSpd) {
             if (dot(rd, h.ng) < (Real)0 && !strandArrival) {
-                double e = (double)specLookup(*eSpd, lambda) * thr * invPdfL
+                double e = (double)specLookup(*eSpd, lambda) * thr * invPdfL * contSoft
                          * dEmitHitScale(sc, m.emitPat, li, h, rd * (Real)(-1));    // pattern and aim at this hit
                 dX += (double)cieX(lambda) * e;
                 dY += (double)cieY(lambda) * e;
@@ -21684,6 +21720,7 @@ __device__ static void dSppmVisiblePoint(const DScene& sc, DVec3 ro, DVec3 rd, R
         }
         if (tail) return;                               // the light it reached; no visible point
         strandArrival = false;
+        contSoft = 1.0;   // a specular vertex lends nothing; the glossy case sets its own
 
         // CURVE-GATHER: no visible point on a `type diffuse` strand (host twin).
         if (dGatherlessStrand(m, h)) {
@@ -21709,6 +21746,7 @@ __device__ static void dSppmVisiblePoint(const DScene& sc, DVec3 ro, DVec3 rd, R
                 if (!dContinueAlong(h, reflectv(rd, h.n), DL_REFLECT, ro, rd)) return; break;
             }
             case D_GLOSSY: {
+                if (!dGlossyCameraSide(rd, h.n)) return;        // met from below ns (host twin)
                 const double r = (double)clamp01(dReflectSlot(sc, m, h, lambda));
                 thr *= r;
                 dSpecFold(sthr, sc, m, h, r, false);
@@ -21723,7 +21761,8 @@ __device__ static void dSppmVisiblePoint(const DScene& sc, DVec3 ro, DVec3 rd, R
                     thr *= Rh;
                     sthr.mul(sc, [&](double Lw) { return (double)gd.R((Real)Lw); }, Rh);
                 }
-                if (!dContinueAlong(h, o, DL_REFLECT, ro, rd)) return; break;
+                if (!dContinueAlong(h, o, DL_REFLECT, ro, rd)) return;
+                contSoft = dContSoftening(m, h, rd); break;
             }
             case D_DIELECTRIC:
             case D_THINFILM:

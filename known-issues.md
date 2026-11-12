@@ -2587,6 +2587,16 @@ Not changed:
   pay it, and the normalising divide runs only where reflect + transmit exceeds 1; not worth a
   per-material cache.
 
+## OPEN (2026-11-12, 0.440.6): B-ENV-WALLS — mode B reads walls lit by a sky about 1 % bright
+
+Found adding check_bump_modes' sky room: five diffuse walls (reflect 0.8) open to a constant sky (no
+ceiling), `light env { spd preset:bb6500 }`, mode B against R at -max-bounce 8, host: the frame
+1.0076 flat (the directly seen sky itself matches; the walls 1.0083, up to 1.04 on the tiles at the
+opening's edge), 1.010 under the slope-2 normal map (device 1.011). Modes M and S, which emit the
+same sky photons and gather them, read 0.997 - 1.000 there, so it is B's own path: its camera splat
+of a sky photon (render.h tracePhoton's first bounce from an infinite light) or the environment's
+emission density as B weighs it. Not yet looked into.
+
 ## OPEN (2026-11-12, 0.440.5): THIN-GAP-GATHER — mode M at a large radius gathers the lit inner face of a surface a few millimetres behind
 
 Found testing REVIEW-4403's far-side fix: an opaque plate 5 mm behind a translucent sheet, lit from
@@ -2609,6 +2619,12 @@ mode R does not. Exact, so not a bias; the variance is the BSDF's. **Decision ow
 glossy lobe (normalized Phong, r (e + 2) / (2 pi) cos^e of the half-vector or of the mirror angle,
 or a microfacet lobe) has no such tail in either direction, but changes how every glossy material
 renders -- its energy and its highlight shape.
+
+## DONE (2026-11-12, 0.440.6): S-GPU-GLOSSY-BUMP — device mode S read normal-mapped glossy walls 1.043 of R
+
+Not the device's fault: mode R's own two glossy strategies disagreed on a tilted shading normal
+(R read itself 1.044 with its lobe alone), and device S's walk samples the lobe alone. Fixed with
+BUMP-MODES' stage (3) glossy part (0.440.6, contSoftening): device S now reads 0.9982 of R there.
 
 ## OPEN (2026-11-12, 0.440.3): LAYERED-MODES — a `layered` material reads 1-9 % off mode R in the other modes, on flat geometry
 
@@ -2769,8 +2785,24 @@ On 0.440.3 (the glossy adjoint, the photon tracers' glossy softening and shading
 compound deposit), glossy walls under the map, host / device: D 0.991 / 0.992, J 0.992 / 0.986,
 U 0.994 / 0.991, B 0.991 / 0.990, M 1.006 / 1.001, S 0.997 / 1.043 -- the light-side modes agree,
 and R reads them ~0.9 % darker: its glossy integrand on a tilted ns is stage (3)'s glossy part.
-Device S's 1.043 was there on 0.440.2 too (host 0.997): a device-only S fault on a normal-mapped
-glossy surface (S-GPU-GLOSSY-BUMP), not yet looked into.
+Device S's 1.043 was there on 0.440.2 too (host 0.997): S-GPU-GLOSSY-BUMP.
+
+**Stage (3), glossy and sky: done in 0.440.6.** The 0.9 % was R's own: mode R read itself 1.044
+with glossy NEE off -- its lobe alone -- and device S, whose glossy vertex samples the lobe alone,
+read the same 1.043 (S-GPU-GLOSSY-BUMP was this). R's light sampling takes the terminator's
+softening toward the light (neeLight, neeEnv, fireNee), but the same light reached by its own
+continuation -- an emitter hit after a glossy bounce, the sky after a diffuse or glossy one, the
+sun, a fire -- went unsoftened, so the two halves of the MIS weight summed different integrands.
+The softening is the integrand's, at the vertex next to the light whichever strategy reaches it:
+every camera walk (R scalar, hero and RGB; M's eye walk and final gather; S's visible point; host
+and device) now carries `contSoftening` of the vertex it left into each such arrival. On the same
+change a camera walk ends at a glossy lobe it meets from below the shading normal
+(`glossyCameraSide`), where glossyF is 0. On the glossy walls under the map, host / device: D
+0.9997 / 1.0011, J 1.0007 / 0.9999, U 1.0021 / 1.0005, B 0.9998 / 0.9999, M 1.0055 / 1.0011, S
+1.0020 / 0.9982 of R, and R with glossy NEE off 0.9995 / 1.0003 of itself. A sky-lit room (the same
+walls, no ceiling, no lamp) read B 0.951 / 0.953, M 0.940 / 0.941, S 0.942 / 0.942 of R and R 1.022
+of itself with sky NEE off; now M 0.997 / 0.999, S 1.000 / 0.999 and R 1.0006 (B 1.010 / 1.011:
+B-ENV-WALLS). check_bump_modes holds both rooms. What stage (3) has left is the translucent lobe.
 
 ## DONE (2026-11-12, 0.439.9): B-GPU-MAXBOUNCE — GPU mode B ignored `-max-bounce`
 
