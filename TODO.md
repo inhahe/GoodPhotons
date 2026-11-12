@@ -145,7 +145,7 @@ Each names the section its line is in.
 21. ~~**RADCACHE-BATCHES** (4.5) — `-radcache`'s fixed batches outlast `-stop` and the interval.~~
     Done, 0.439.3: the cache's own schedule over absolute samples, a canonical merge, the chunks
     on the clock.
-22. **P-HEROSPLIT-FIRST**, **ROUGH-IRID-AIR** (4.3) — narrow estimator gaps.
+22. ~~**P-HEROSPLIT-FIRST**~~ (0.439.4), **ROUGH-IRID-AIR** (4.3) — narrow estimator gaps.
 23. **REMAP0-IMPOSSIBLE** (4.4) — the MIS sums read every zero density as a delta's.
 24. ~~**BEAMEPOCHS-CHUNK-PIN** (4.5) — `-beamepochs` pins cheap scenes' GPU chunks to 1 spp.~~ Done,
     0.438.2.
@@ -334,7 +334,7 @@ Then the rest of 4.2-4.6 in their order, 4.7's bookkeeping alongside whatever to
   wavelengths and the frame tilted in colour (`tools/check_jchroma.py`).
 - [x] **UPBP-W-RAINBOW** — the same mix in a rainbow-phase medium, through the camera side's phase
   densities: measured at +0.05-0.07 % of the frame, too small to fix.
-- [ ] **P-HEROSPLIT-FIRST** — blurred mode P under `-herosplit` files a sample by the hero's first
+- [x] **P-HEROSPLIT-FIRST** (0.439.4) — blurred mode P under `-herosplit` filed a sample by the hero's first
   event alone.
 - [ ] **ROUGH-IRID-AIR** — a rough interference reflector always interferes against air.
 - [x] **J-FIELD-SLOW's 2 000-beam brightness** — not a bias: with eight seeds an arm, disjoint

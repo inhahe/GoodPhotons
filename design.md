@@ -10825,7 +10825,9 @@ sees the instant, exactly as a static scene with those transforms would show it.
   sun; since 0.423.2 a sun alone too, which the forward pass does not draw either), is the
   backward layer's (classifyComposite's rule); a diffuse or composite surface, or a scatter in a
   medium or a fur coat before any surface, the forward one's, whose medium vertices splat their
-  in-scatter (a fur coverage pass-through is no event). The composite is the
+  in-scatter (a fur coverage pass-through is no event). A hero bundle that splits (`-herosplit`)
+  gives each secondary it sends off its own first event (`GiCtx::firstSec`, 0.439.4): its own
+  coverage coin may pass a fibre the hero stopped at. The composite is the
   forward film over its scale, the ratio of its sum to the diffuse-first backward film's over
   every pixel (`forwardScale`, which the still composite and mode V's comparison use too: the
   least-squares slope they used to take is shrunk by the backward film's noise), plus the

@@ -740,7 +740,15 @@ whatever the calls), so a call that crosses one updates there and any batching r
 image; its deposits since the last boundary then belong in the checkpoint beside the table
 (`writeRadCacheSection`), for a resume to continue them.
 
-## OPEN (2026-11-04, 0.422.1): P-HEROSPLIT-FIRST — blurred mode P under -herosplit files a sample by the hero's first event alone
+## DONE (2026-11-12, 0.439.4; opened 2026-11-04, 0.422.1): P-HEROSPLIT-FIRST — blurred mode P under -herosplit files a sample by the hero's first event alone
+
+**Fixed in 0.439.4** by the fix below: a split gives each secondary it sends off its own first
+event (`GiCtx::firstSec`, from `firstSplitSlot`: the slot as it stood, this vertex's unless its
+own coverage coin passes it, then its continuation's), at both split sites (a dispersive vertex,
+and a coat's re-entry), and `renderRows` files each wavelength by its own. Measured on
+check_motion's fur before a mirror (opacity 0.3, blurred, `-dual-scatter`, 3 seeds): with
+`-herosplit` the fur read 0.959 of the render without it; now 1.0001. check_motion's `... and with
+-herosplit too` holds it to 2.5 % (0.439.3 fails it at 0.965). The rest is how it stood.
 
 Blurred mode P files each backward sample by its path's first event
 (`BackwardRenderer::GiCtx::first`): a specular surface or the sky to the backward layer, a

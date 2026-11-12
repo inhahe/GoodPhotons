@@ -298,6 +298,12 @@ struct BackwardRenderer {
         // mode P's blurred split files each sample by it (renderRows' filmFor). A gather ray or a
         // re-entry inherits the pointer but writes nothing (depth, or the slot already set).
         int* first = nullptr;
+        // ...and where a hero bundle's split (heroSplit: a dispersive vertex, a coat, a fibre
+        // under -dual-scatter or -direct-only) writes the first event of each secondary it sends
+        // off on its own: firstSec[i] for wavelength i, -2 where it rides with the hero's. A
+        // secondary's coverage coin is its own, so it may pass a fibre the hero stopped at, or
+        // the reverse (P-HEROSPLIT-FIRST). Null where there is no filing, and in a sub-path.
+        int* firstSec = nullptr;
     };
     // A camera path's first event: the sky (it escaped), a specular-side surface (the rule
     // classifyComposite applies to a pixel: a non-sensor surface whose own material is a
@@ -315,6 +321,15 @@ struct BackwardRenderer {
         return true;
     }
     static void unnoteFirst(const GiCtx& gi, bool noted) { if (noted) *gi.first = -1; }
+    // Where a secondary a hero bundle sends off on its own at this vertex starts its own first
+    // event (GiCtx::firstSec): the shared slot as it stands -- this vertex's kind if the vertex
+    // noted itself (`noted`), an earlier event's, or none -- except that a sub-path that
+    // `reenters` this vertex (a coat's) notes the vertex again itself, so starts from the slot
+    // as it stood before.
+    static int firstSplitSlot(const GiCtx& gi, bool noted, bool reenters) {
+        if (!gi.first) return -1;
+        return (noted && reenters) ? -1 : *gi.first;
+    }
 
     // One direction of the fixed gather lattice: point `j` of an `n`-point Fibonacci
     // spiral on the WHOLE sphere, Cranley-Patterson-rotated by (p1, p2).
@@ -3436,6 +3451,12 @@ struct BackwardRenderer {
                             sCp = &sCache;
                         }
                         double sub[hero::kHeroMax];
+                        // Its own first event: the slot as it stood before this vertex, which
+                        // the re-entry notes again (firstSplitSlot).
+                        int sFirst = firstSplitSlot(gi, firstHere, /*reenters=*/true);
+                        GiCtx gs = gi;
+                        if (gi.first) gs.first = &sFirst;
+                        gs.firstSec = nullptr;
                         // -radcache: a split sub-path is spawned as a TRAINING path
                         // (rcTrain=true) whatever the parent is. Its radiance is added
                         // into the parent's L[i], so if it could terminate on the cache the
@@ -3444,9 +3465,10 @@ struct BackwardRenderer {
                         // vertices only), so tracing them in full costs almost nothing.
                         radianceHeroLoop(scene, ray, stk, &sLam, &sInv, &sThr,
                                          /*C=*/1, /*secAlive=*/false, specularArrival,
-                                         contBsdfPdf, b, sub, rng, sCp, gi,
+                                         contBsdfPdf, b, sub, rng, sCp, gs,
                                          /*rcTrain=*/true, /*firstSegSampled=*/true,
                                          /*reentryCoatU=*/uCoat);
+                        if (gi.firstSec) gi.firstSec[i] = sFirst;
                         L[i] += sub[0];      // this wavelength's own estimate, own slot
                         thr[i] = 0.0;        // now that sub-path's business, not ours
                     }
@@ -3778,9 +3800,18 @@ struct BackwardRenderer {
                                 sCp = &sCache;
                             }
                             bool sNull = false;
-                            if (interactMaterial(scene, m, h, mats, sRay, sLam, sInv, sThr, sL,
-                                                 sSpec, sPdf, sStk, rng, sCp, gi, nullptr,
-                                                 &sNull)) {
+                            // Its own first event (firstSplitSlot): this vertex's, unless its
+                            // own coverage coin passes it through, then its continuation's.
+                            int sFirst = firstSplitSlot(gi, firstHere, /*reenters=*/false);
+                            GiCtx gs = gi;
+                            if (gi.first) gs.first = &sFirst;
+                            gs.firstSec = nullptr;
+                            const bool sGoes = interactMaterial(scene, m, h, mats, sRay, sLam, sInv,
+                                                                sThr, sL, sSpec, sPdf, sStk, rng, sCp,
+                                                                gs, nullptr, &sNull);
+                            if (sNull && firstHere) sFirst = -1;   // passed through: no event
+                            if (gi.firstSec) gi.firstSec[i] = sFirst;
+                            if (sGoes) {
                                 double sub[hero::kHeroMax];
                                 // A coverage pass-through is no vertex, for a sub-path as for
                                 // the hero below: it keeps the record the hero restores
@@ -3791,10 +3822,11 @@ struct BackwardRenderer {
                                 // the cache, or the parent's deposits would train on it.
                                 radianceHeroLoop(scene, sRay, sStk, &sLam, &sInv, &sThr,
                                                  /*C=*/1, /*secAlive=*/false, sSpec, sPdf,
-                                                 refund ? b : b + 1, sub, rng, sCp, gi,
+                                                 refund ? b : b + 1, sub, rng, sCp, gs,
                                                  /*rcTrain=*/true, /*firstSegSampled=*/false,
                                                  /*reentryCoatU=*/-1.0,
                                                  sNull ? &gmisIn : nullptr);
+                                if (gi.firstSec) gi.firstSec[i] = sFirst;
                                 sL += sub[0];
                             }
                             L[i] += sL;      // this wavelength's own estimate, own slot
@@ -4123,10 +4155,11 @@ struct BackwardRenderer {
         // where there is one to see, an env or a sun: the blurred forward layer draws neither.
         int firstEv = -1;
         int* const firstOut = specFirstFilm ? &firstEv : nullptr;
+        int firstSecEv[hero::kHeroMax];   // a split secondary's own (GiCtx::firstSec), -2: the hero's
         const bool skySeen = scene.envIndex >= 0 || scene.sunCount > 0;
-        const auto filmFor = [&]() -> Film& {
+        const auto filmFor = [&](int ev) -> Film& {
             if (!specFirstFilm) return film;
-            const bool spec = firstEv == kFirstSpec || (firstEv == kFirstSky && skySeen);
+            const bool spec = ev == kFirstSpec || (ev == kFirstSky && skySeen);
             return spec ? *specFirstFilm : film;
         };
         for (int py = y0; py < y1; ++py) {
@@ -4193,13 +4226,17 @@ struct BackwardRenderer {
                         // subpixel and wavelength lattices, the gather is progressive and
                         // independent of how the budget was chunked.
                         firstEv = -1;
+                        for (int i = 0; i < C; ++i) firstSecEv[i] = -2;
                         GiCtx gi0{0, sIdx};
                         gi0.first = firstOut;
+                        gi0.firstSec = firstOut ? firstSecEv : nullptr;
                         radianceHero(scene, ray, lamA, invA, C, Lh, rng, &spdCache, gi0);
-                        Film& to = filmFor();
+                        // Each wavelength by its own first event: a split secondary's may not be
+                        // the hero's (P-HEROSPLIT-FIRST).
                         for (int i = 0; i < C; ++i)
-                            to.add(px, py, Vec3(cieX(lamA[i]), cieY(lamA[i]), cieZ(lamA[i]))
-                                           * (Lh[i] * filmA[i] / C));
+                            filmFor(i > 0 && firstSecEv[i] != -2 ? firstSecEv[i] : firstEv)
+                                .add(px, py, Vec3(cieX(lamA[i]), cieY(lamA[i]), cieZ(lamA[i]))
+                                                 * (Lh[i] * filmA[i] / C));
                         continue;
                     }
                     // Sample lambda from the illuminant times a visible-band window, as the
@@ -4239,7 +4276,7 @@ struct BackwardRenderer {
                         GiCtx gi0{0, sIdx};
                         gi0.first = firstOut;
                         double L = radiance(scene, ray, lambda, invPdfLambda, rng, &spdCache, gi0);
-                        filmFor().add(px, py, Vec3(cieX(lambda), cieY(lambda), cieZ(lambda)) * (L * wLens * filmW));
+                        filmFor(firstEv).add(px, py, Vec3(cieX(lambda), cieY(lambda), cieZ(lambda)) * (L * wLens * filmW));
                         continue;
                     }
                     double sjx, sjy;
@@ -4250,7 +4287,7 @@ struct BackwardRenderer {
                     GiCtx gi0{0, sIdx};
                     gi0.first = firstOut;
                     double L = radiance(scene, ray, lambda, invPdfLambda, rng, &spdCache, gi0);
-                    filmFor().add(px, py, Vec3(cieX(lambda), cieY(lambda), cieZ(lambda)) * (L * filmW));
+                    filmFor(firstEv).add(px, py, Vec3(cieX(lambda), cieY(lambda), cieZ(lambda)) * (L * filmW));
                 }
             }
         }

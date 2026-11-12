@@ -1416,6 +1416,15 @@ def p_split_tests(exe, out, verdict, gpu=False):
     r = float(np.mean([x[fur].mean() for x in dual]) / np.mean([x[fur].mean() for x in ref]))
     verdict("blurred mode P, fur before a mirror, with -dual-scatter = without", abs(r - 1) < 0.1,
             "%.4f of without" % r)
+    # Under -herosplit the fibre's hair case splits the bundle, each secondary drawing its own
+    # coverage coin, so a wavelength may pass a fibre its hero stopped at, or the reverse; each
+    # is filed by its own first event (GiCtx::firstSec). Filed by the hero's, the fur read 0.959
+    # of the render without -herosplit (P-HEROSPLIT-FIRST); since, 1.000.
+    split = [lum(render(exe, out, pf, "pfur_dual_split_s%d" % s, pargs + ["-dual-scatter", "-herosplit"],
+                        seed=s)[0]) for s in (1, 2)]
+    r = float(np.mean([x[fur].mean() for x in split]) / np.mean([x[fur].mean() for x in dual]))
+    verdict("... and with -herosplit too: each wavelength by its own first event", abs(r - 1) < 0.025,
+            "%.4f of without -herosplit" % r)
     p_sun_test(exe, out, verdict, gpu)
 
 
