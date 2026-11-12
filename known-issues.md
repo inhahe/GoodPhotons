@@ -2460,6 +2460,29 @@ Not changed:
   GLOW-LIGHT-MODES' open decision; logged there, and REFERENCE.md says so.
 * BUMP-D-VS-R, left open: it is BUMP-MODES now, being fixed.
 
+## OPEN (2026-11-12, 0.440.0): TRANSLUCENT-MS — modes M and S read a backlit translucent panel 10 % dark
+
+Found measuring BUMP-MODES' stage 3 (`scraps/_bump_lobes.py`): a room of diffuse walls with a
+`translucent` panel (reflect 0.4, transmit 0.4) standing in it, lit by a tilted panel near one wall,
+every mode against R at equal depth (M and S at -max-bounce 32), CPU: D, J, U and B 1.000-1.001,
+M 0.912, S 0.901 -- on flat geometry, so not a shading-normal effect. Cause: at a translucent
+visible point the gathers treat the surface as plain diffuse. They take the reflect albedo alone,
+and `onGatherSurface` keeps only photons that face the gather point's side within 60 deg
+(`kGatherFacingCos`), so the light the sheet transmits -- deposited on its far side, facing the
+other way -- is never gathered (photonmap_render.h photonGather / photonGatherSub, sppm_render.h's
+visible points, and their device twins). Fix: at a DiffuseTransmit visible point, gather the far
+side's photons too, through the same band test with the normals' opposition, weighted by the
+transmit albedo, the near side's by the reflect albedo.
+
+## OPEN (2026-11-12, 0.440.0): GLOSSY-FLAT-DJU — modes D, J and U read a flat glossy room about 1 % bright
+
+Found with TRANSLUCENT-MS: the room's five walls `glossy reflect 0.8 roughness 0.4`, flat, lit by a
+tilted panel, against R at -max-bounce 8, CPU: D 1.011, J 1.008, U 1.012 (B 0.997, M 1.004 and S
+0.991 at -max-bounce 32). Not looked into yet: whether R's glossy NEE (GLOSSY-NEE: on only where
+the MIS pair agree on the selection probability) and its lobe sampling make the integrand the
+bidirectional modes evaluate with bsdfF / bsdfPdf, and what a Phong lobe's part below the horizon
+does on each side.
+
 ## OPEN (2026-11-12, 0.439.7): BUMP-MODES — on a normal-mapped surface most modes disagree with mode R, mode U by 16 %
 
 `scraps/_bump_vs_r.py`: a closed room whose five walls carry one ripple normal map (`AMP`, its
@@ -2513,7 +2536,12 @@ B 1.0002 / 1.0002 (0.439.9: 1.0077 / 1.0084), M 1.0031 / 0.9998 (1.144 / 1.135),
 the panel's lobe, which the wall's error had hidden. (3) DiffuseTransmit and Glossy: the same
 question asked of their lobes (R picks a translucent's lobe by the side of ns the light is on, not
 by the pair's), and the analytic glass-sphere splat (render.h SpecVtx), which tests its camera side
-against the shading normal alone.
+against the shading normal alone. Measured on 0.440.0 (`scraps/_bump_lobes.py`, CPU, against R; the
+flat room in brackets): a translucent panel under the slope-2 map reads D 1.090 (1.000), J 1.089
+(1.000), U 1.089 (1.001), B 1.082 (1.001), M 0.937 (0.912), S 0.924 (0.901); glossy walls under it,
+D 1.013 (1.011), J 1.006 (1.008), U 1.014 (1.012), B 1.055 (0.997), M 1.006 (1.004), S 1.009
+(0.991). So the translucent lobe is stage (3)'s large part, and on glossy walls only B (and S a
+little) moves with the map; the flat rooms' own offsets are TRANSLUCENT-MS and GLOSSY-FLAT-DJU.
 
 ## DONE (2026-11-12, 0.439.8): B-GPU-MAXBOUNCE — GPU mode B ignored `-max-bounce`
 
