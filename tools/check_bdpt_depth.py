@@ -19,6 +19,14 @@ point merges' own density-estimation bias reads ~1 % bright near the corners, wh
 this checks -- where it read x0.984 and x0.995 (14 and 6 sigma), their share being smaller.
 Mode U (VCM, merging at the same quarter radius) is held to the same: its -max-bounce counted
 path edges, one bounce fewer than every other mode's (x0.41 of R at -max-bounce 1).
+A second box makes the cap's last vertex glossy or a mirror: its back wall glossy (roughness 0.3)
+and a mirror patch on its floor. The light such a vertex reaches by its own lobe makes a path of
+the same depth, and mode R counts it by tracing the ray its last vertex samples (the tail of
+backward.h radianceLoop and its device twin): without that, its glossy light sampling keeps only
+its MIS share at the cap, and its mirror sees no light -- mode D then reads x1.29 of R over the
+frame at -max-bounce 1 and up to x1.9 on the glossy wall. Mode S's camera walk ends its cap the
+same way on both backends, so there it is held to its host on the device (its photons, deposited
+over 32 bounces whatever the flag says, keep it from mode R's numbers).
 A tile fails when the two differ by more than 5 standard errors (two seeds each) AND by more
 than 2 %; the frame, by more than 5 standard errors AND 0.5 %. Exits 1 on any failure.
 """
@@ -50,6 +58,18 @@ BOX = [
 ]
 
 
+# The same box, its back wall glossy and a mirror patch on its floor in the camera's view, under
+# the lamp: at -max-bounce 1 and 2 the cap's last vertex is often one of them.
+GLOSSY_BOX = BOX[:1] + [
+    'material "gloss" { type glossy  reflect 0.8  roughness 0.3 }',
+    'material "mir"   { type mirror  reflect 0.9 }',
+] + [l.replace("v 0 2 0   material white }",
+               "v 0 2 0   material gloss }") if l.startswith("quad { origin -1 0 1 ") else l
+     for l in BOX[1:]] + [
+    'quad { origin -0.5 0.001 0.2  u 0 0 0.6  v 1.0 0 0  material mir }',
+]
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split(NL)[0])
     ap.add_argument("--out", default=os.path.join(ROOT, "png", "check_bdpt_depth"))
@@ -62,24 +82,33 @@ def main():
     os.makedirs(d, exist_ok=True)
     with open(os.path.join(d, "box.ftsl"), "w", encoding="utf-8", newline="") as f:
         f.write(NL.join(BOX) + NL)
-
-    def render(tag, args, device="cpu"):
-        """Two seeds of one configuration (render_seeds)."""
-        return render_seeds(a.exe, d, "box.ftsl", tag, args, device, a.spp)
+    with open(os.path.join(d, "gbox.ftsl"), "w", encoding="utf-8", newline="") as f:
+        f.write(NL.join(GLOSSY_BOX) + NL)
 
     pairs = []
-    for depth in ("1", "2"):
+    for scene, depth in (("box", "1"), ("box", "2"), ("gbox", "1"), ("gbox", "2")):
+        def render(tag, args, device="cpu"):
+            """Two seeds of one configuration (render_seeds)."""
+            return render_seeds(a.exe, d, scene + ".ftsl", scene + "_" + tag, args, device, a.spp)
+
         r = render("r_" + depth, ["-mode", "R", "-max-bounce", depth])
+        if not a.no_gpu:
+            pairs.append(("%s, -max-bounce %s: mode R on the device / the host" % (scene, depth),
+                          render("rg_" + depth, ["-mode", "R", "-max-bounce", depth], "gpu"), r))
+            if scene == "gbox":
+                sargs = ["-mode", "S", "-max-bounce", depth, "-n", "200000"]
+                pairs.append(("%s, -max-bounce %s: mode S on the device / the host" % (scene, depth),
+                              render("sg_" + depth, sargs, "gpu"), render("s_" + depth, sargs)))
         for mode in ("D", "J", "U"):
             # Mode J's point merges (and mode U's) at a quarter of the default radius: at the
             # default, their O(r^2) density-estimation bias reads ~1 % bright near the corners,
             # up to x1.03 on a tile, which this check is not about.
             args = ["-mode", mode, "-max-bounce", depth] + (
                 ["-pmradiusfrac", "0.005"] if mode in "JU" else [])
-            pairs.append(("-max-bounce %s: mode %s / mode R" % (depth, mode),
+            pairs.append(("%s, -max-bounce %s: mode %s / mode R" % (scene, depth, mode),
                           render("%s_%s" % (mode.lower(), depth), args), r))
             if not a.no_gpu:
-                pairs.append(("-max-bounce %s: mode %s on the device / mode R" % (depth, mode),
+                pairs.append(("%s, -max-bounce %s: mode %s on the device / mode R" % (scene, depth, mode),
                               render("%sg_%s" % (mode.lower(), depth), args, "gpu"), r))
     ok = True
     for name, x1, x0 in pairs:

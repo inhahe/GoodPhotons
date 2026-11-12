@@ -101,7 +101,10 @@ inline void sppmVisiblePoint(const Scene& scene, Ray ray, Pcg32& rng, bool diffr
     // CURVE-GATHER: the previous vertex was a diffuse strand, which took its direct light by NEE.
     bool strandArrival = false;
 
-    for (int b = 0; b < maxBounce; ++b) {
+    // The tail (b == maxBounce): the ray the last vertex sampled, for the light it reaches and
+    // nothing past it -- no visible point either (backward.h radianceLoop, GLOSSY-DEPTH-CAP).
+    for (int b = 0; b <= maxBounce; ++b) {
+        const bool tail = (b == maxBounce);
         if (grinAny) {
             double arc = 0.0;
             grin::marchSegments(scene, ray,
@@ -177,6 +180,7 @@ inline void sppmVisiblePoint(const Scene& scene, Ray ray, Pcg32& rng, bool diffr
             // a body, which is shaded below like any surface (mode M's gather does the same).
             if (m.reflectsNothing) return;
         }
+        if (tail) return;                                // the light it reached, and no more
 
         // GLOSSY-NEE: cleared HERE, after the two sites that read it and before the branch that
         // writes it -- a clear at the loop top would erase the previous bounce's value a few

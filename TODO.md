@@ -156,10 +156,13 @@ Each names the section its line is in.
     gathers drop the light it transmits.~~ Done, 0.440.1.
 23e. ~~**GLOSSY-FLAT-DJU** (4.3) — D, J and U read a flat glossy room about 1 % bright.~~ Done,
     0.440.2: a light walk's glossy bounce now carries the lobe's adjoint.
-23f. **GLOSSY-ROOM-M** (4.3) — mode M reads a room of glossy walls 0.5 % bright on the host.
+23f. ~~**GLOSSY-ROOM-M** (4.3) — mode M reads a room of glossy walls 0.5 % bright on the host.~~
+    Closed: twelve seeds read 1.0017 +- 0.0007, the 1.0050 was three high seeds.
 23g. **LAYERED-MODES** (4.2) — a `layered` material reads 1-9 % off mode R in the other modes, even
     flat: the coat's coin is taken at the camera's angle in R and the light's elsewhere. Needs a
     decision (keep R's integrand, or make the coat physical in every mode).
+23i. ~~**GLOSSY-DEPTH-CAP** (4.3) — at `-max-bounce`, mode R's glossy NEE keeps only its MIS share:
+    the last vertex's lobe-sampled emitter hit is never traced.~~ Done, 0.440.4 (the tail).
 23h. **S-GPU-GLOSSY-BUMP** (4.3) — device mode S reads normal-mapped glossy walls 1.043 of R (host
     0.997); see BUMP-MODES.
 23c. ~~**B-GPU-MAXBOUNCE** (4.2) — GPU mode B ignores `-max-bounce` (its kernels get a literal 32).~~
@@ -232,10 +235,13 @@ Then the rest of 4.2-4.6 in their order, 4.7's bookkeeping alongside whatever to
   gathers dropped its transmitted light).
 - [x] **GLOSSY-FLAT-DJU** (0.440.2) — modes D, J and U read a flat glossy room about 1 % bright (a
   light walk's glossy bounce took r, not the adjoint's r cos(out)/cos(in)).
-- [ ] **GLOSSY-ROOM-M** — mode M reads a room of glossy walls 0.5 % bright on the host.
+- [x] **GLOSSY-ROOM-M** — mode M reads a room of glossy walls 0.5 % bright on the host. Closed: no
+  bias beyond 0.2 % (twelve seeds, 1.0017 +- 0.0007).
 - [ ] **LAYERED-MODES** — a `layered` material reads 1-9 % off mode R elsewhere, even flat (the
   coat's coin is non-reciprocal); decision owed.
 - [ ] **S-GPU-GLOSSY-BUMP** — device mode S reads normal-mapped glossy walls 1.043 of R.
+- [x] **GLOSSY-DEPTH-CAP** (0.440.4) — at the bounce cap mode R's glossy NEE kept only its MIS share;
+  R now traces the ray its last vertex samples, for the light it reaches.
 - [x] **B-GPU-MAXBOUNCE** (0.439.9) — GPU mode B ignored `-max-bounce` (a literal 32 reached its
   kernels).
 

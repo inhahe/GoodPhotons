@@ -16468,7 +16468,10 @@ __device__ static double bkRadiance(const DScene& sc, int diffraction, DVec3 ro,
     const bool directOnly = (sc.bkDirectOnly != 0);
     int nullSteps = 0;      // hair coverage pass-throughs, refunded below
     Real curveTmin = (Real)0;   // fiber exit step, applied to curve prims only
-    for (int b = 0; b < maxBounce; ++b) {
+    // The tail (b == maxBounce): the ray the last vertex sampled, traced for the light it reaches
+    // and nothing past it (host twin backward.h radianceLoop, GLOSSY-DEPTH-CAP).
+    for (int b = 0; b <= maxBounce; ++b) {
+        const bool tail = (b == maxBounce);
         // Publish the bounce index so a deterministic per-vertex choice (mode W's glossy
         // lobe) can pick a decorrelated sequence at each depth. Costs nothing otherwise.
         gi.bounce = b;
@@ -16536,6 +16539,7 @@ __device__ static double bkRadiance(const DScene& sc, int diffraction, DVec3 ro,
             Real tMed = 0; int whichMed = gmed.which;
             if (gmed.hit || dMediaSampleCollision(sc, ro, rd, dSurf, lambda, rng, tMed, whichMed)) {
                 dNoteFirst(gi, kDFirstOther);
+                if (tail) return L;                                // a vertex past the cap
                 DVec3 p = ro + rd * tMed;
                 // A scatter is a real vertex that never reaches bkInteract, where the glossy MIS
                 // record is cleared: left set, it would weigh this vertex's sky escape with the
@@ -16642,6 +16646,7 @@ __device__ static double bkRadiance(const DScene& sc, int diffraction, DVec3 ro,
             }
         }
 
+        if (tail) return L;                             // the light it reached, and no more
         bool nullEvt = false;
         if (!bkInteract<GiDepth == 0>(sc, mp, h, matId, diffraction, directOnly, ro, rd, lambda,
                                       invPdfLambda, thr, L, specularArrival, contBsdfPdf, stk,
@@ -16745,7 +16750,8 @@ __device__ static void bkRadianceHeroLoop(const DScene& sc, int diffraction,
     // Fiber exit step for the next trace, applied to curve prims only: `curveTmin0` when a split
     // sub-path starts at a fiber, then whatever each fiber interaction leaves; one hop only.
     Real curveTmin = curveTmin0;
-    for (int b = bounce0; b < maxBounce; ++b) {
+    for (int b = bounce0; b <= maxBounce; ++b) {               // the tail: see the scalar twin
+        const bool tail = (b == maxBounce);
         int nUp = secAlive ? C : 1;                    // wavelengths still being propagated
         gi.bounce = b;                                 // see the scalar twin: mode W's per-vertex lattice
         // Camera segment only — same test as the footprint stamp below, and for the same
@@ -16787,6 +16793,7 @@ __device__ static void bkRadianceHeroLoop(const DScene& sc, int diffraction,
             if (dMediaSampleCollisionOutOfLine(sc, ro, rd, h.valid ? h.t : (Real)1e30, lam[0],
                                                rng, tMed, whichMed)) {
                 dNoteFirst(gi, kDFirstOther);
+                if (tail) return;                                  // a vertex past the cap
                 // A scatter is a vertex the material switch never sees, so the glossy MIS state of
                 // an earlier glossy bounce must not outlive it (see the scalar twin).
                 gmis.clear();
@@ -16894,6 +16901,7 @@ __device__ static void bkRadianceHeroLoop(const DScene& sc, int diffraction,
                     L[i] += thr[i] * (double)specLookup(*eSpd, lam[i]) * invPdf[i] * ep;
             }
         }
+        if (tail) return;                               // the light it reached (scalar twin)
 
         // GLOSSY-NEE: cleared HERE and not at the top of the loop. `gmis` is written by the
         // PREVIOUS bounce's glossy branch and read by THIS bounce's emitter/sun sites above, so
@@ -17564,7 +17572,8 @@ __device__ static DVec3 bkRadianceRGB(const DScene& sc, int diffraction, DVec3 r
     DMediumStack stk; stk.clear();
     const int maxBounce = sc.bkMaxBounce;
     const bool directOnly = (sc.bkDirectOnly != 0);
-    for (int b = 0; b < maxBounce; ++b) {
+    for (int b = 0; b <= maxBounce; ++b) {                     // the tail: see bkRadiance
+        const bool tail = (b == maxBounce);
         // b == 0 is the camera ray this path was handed. See DMaterial::hideCamera.
         DHit h = closestHit(sc, ro, rd, RAY_EPS, BIG, /*camHide=*/(b == 0));
         if (!h.valid) {                                // escaped -> constant env
@@ -17615,6 +17624,7 @@ __device__ static DVec3 bkRadianceRGB(const DScene& sc, int diffraction, DVec3 r
             L = L + hadamard(beta * (Real)ep,
                              (li >= 0) ? sc.emitters[li].rgbEmit : mp->rgbMatEmit);
         }
+        if (tail) return L;                             // the light it reached, and no more
 
         switch (mp->type) {
             case D_DIELECTRIC: {
@@ -20412,7 +20422,8 @@ __device__ static void dPhotonGatherSub(const DScene& sc, const DPhotonMap& pm,
     const Real r2C = (Real)((double)pmC.radius * (double)pmC.radius);
     const int maxBounce = 32;
     Real curveTmin = (Real)0;   // a fiber's exit clearance for the next hop, curve prims only
-    for (int b = 0; b < maxBounce; ++b) {
+    for (int b = 0; b <= maxBounce; ++b) {                     // the tail (host twin)
+        const bool tail = (b == maxBounce);
         if (sc.hasGrin) {                                // final-gather rays bend too
             DGrinMedia gm;                               // rng == nullptr: bend only
             dGrinMarch(sc, ro, rd, &gm);
@@ -20466,6 +20477,7 @@ __device__ static void dPhotonGatherSub(const DScene& sc, const DPhotonMap& pm,
                 oX += (double)cieX(lambda) * e; oY += (double)cieY(lambda) * e; oZ += (double)cieZ(lambda) * e;
             }
         }
+        if (tail) return;                               // the light it reached, and no more
 
         const bool hairArrivalIn = hairArrival, specularSeenIn = specularSeen;   // a hair pass-through puts these back
         bool nullHere = false;
@@ -20989,7 +21001,9 @@ __device__ static void dPhotonGather(const DScene& sc, const DPhotonMap& pm,
     const bool sunOn = (bm != nullptr) && bm->sunNee && sc.sunCount > 0 && sc.mediaN > 0;
 
     Real curveTmin = (Real)0;   // a fiber's exit clearance for the next hop, curve prims only
-    for (int b = 0; b < maxBounce; ++b) {
+    // The tail (b == maxBounce), in-scattering along it skipped: host twin photonGather.
+    for (int b = 0; b <= maxBounce; ++b) {
+        const bool tail = (b == maxBounce);
         // Second cancellation point, covering the rays that spend their time BOUNCING rather
         // than in one big beam walk (a scene with no media never enters dGatherPhotonBeams).
         if (dGatherStopped()) return;
@@ -21019,8 +21033,8 @@ __device__ static void dPhotonGather(const DScene& sc, const DPhotonMap& pm,
                 const Real slen = (Real)gm.arc;
                 if ((volOn || sunOn) && slen > 0) {
                     double bX = 0.0, bY = 0.0, bZ = 0.0;
-                    if (volOn) dGatherBeamsM(sc, *bm, sthr, thr, pro, rd, slen, aGlass, cmIdx, rng, oX, oY, oZ);
-                    if (sunOn) dSunNeeMarch(sc, pro, rd, slen, aGlass, lambda, invPdfL, rng, bX, bY, bZ);
+                    if (volOn && !tail) dGatherBeamsM(sc, *bm, sthr, thr, pro, rd, slen, aGlass, cmIdx, rng, oX, oY, oZ);
+                    if (sunOn && !tail) dSunNeeMarch(sc, pro, rd, slen, aGlass, lambda, invPdfL, rng, bX, bY, bZ);
                     oX += bX * thr; oY += bY * thr; oZ += bZ * thr;
                     {   // SPECGATHER: extinction is spectral too (badly so in a coloured medium)
                         double Tv[DSpecThr::K + 1];
@@ -21053,8 +21067,8 @@ __device__ static void dPhotonGather(const DScene& sc, const DPhotonMap& pm,
         if (volOn || sunOn) {
             const Real dSeg = h.valid ? h.t : (Real)1e30;
             double bX = 0.0, bY = 0.0, bZ = 0.0;
-            if (volOn) dGatherBeamsM(sc, *bm, sthr, thr, ro, rd, dSeg, aGlass, cmIdx, rng, oX, oY, oZ);
-            if (sunOn) dSunNeeMarch(sc, ro, rd, dSeg, aGlass, lambda, invPdfL, rng, bX, bY, bZ);
+            if (volOn && !tail) dGatherBeamsM(sc, *bm, sthr, thr, ro, rd, dSeg, aGlass, cmIdx, rng, oX, oY, oZ);
+            if (sunOn && !tail) dSunNeeMarch(sc, ro, rd, dSeg, aGlass, lambda, invPdfL, rng, bX, bY, bZ);
             oX += bX * thr; oY += bY * thr; oZ += bZ * thr;
             {   // SPECGATHER: extinction is spectral too (badly so in a coloured medium)
                 double Tv[DSpecThr::K + 1];
@@ -21138,6 +21152,7 @@ __device__ static void dPhotonGather(const DScene& sc, const DPhotonMap& pm,
                 oZ += (double)cieZ(lambda) * e;
             }
         }
+        if (tail) return;                               // the light it reached, and no more
 
         const bool hairArrivalIn = hairArrival;   // ...and this (host twin)
         hairArrival = false;
@@ -21573,7 +21588,8 @@ __device__ static void dSppmVisiblePoint(const DScene& sc, DVec3 ro, DVec3 rd, R
     double thr = 1.0;
     DMediumStack stk; stk.clear();
     bool strandArrival = false;   // CURVE-GATHER: the previous vertex, a strand, took its direct light
-    for (int b = 0; b < maxBounce; ++b) {
+    for (int b = 0; b <= maxBounce; ++b) {                     // the tail (host twin)
+        const bool tail = (b == maxBounce);
         if (sc.hasGrin) {                                // GRADIENT-INDEX: the camera ray bends,
             DGrinMedia gm;                               // exactly as the deposit's photons do.
             dGrinMarch(sc, ro, rd, &gm, 200000, /*camHide=*/(b == 0));  // rng == nullptr: bend only
@@ -21649,6 +21665,7 @@ __device__ static void dSppmVisiblePoint(const DScene& sc, DVec3 ro, DVec3 rd, R
             }
             if (m.matReflectsNothing) return;
         }
+        if (tail) return;                               // the light it reached; no visible point
         strandArrival = false;
 
         // CURVE-GATHER: no visible point on a `type diffuse` strand (host twin).

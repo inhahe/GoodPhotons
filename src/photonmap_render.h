@@ -1302,7 +1302,10 @@ inline Vec3 photonGatherSub(const Scene& scene, const PhotonMap& pm, Ray ray, Pc
     BackwardRenderer::GlossyMis gmis;
     bool hairArrival = false;   // HAIR-NEE: the previous vertex was a fiber that already took its direct light
 
-    for (int b = 0; b < maxBounce; ++b) {
+    // The tail (b == maxBounce): the ray the last vertex sampled, for the light it reaches and
+    // nothing past it (backward.h radianceLoop, GLOSSY-DEPTH-CAP).
+    for (int b = 0; b <= maxBounce; ++b) {
+        const bool tail = (b == maxBounce);
         ++work.n;
         if (grinAny) {
             double arc = 0.0;
@@ -1369,6 +1372,7 @@ inline Vec3 photonGatherSub(const Scene& scene, const PhotonMap& pm, Ray ray, Pc
             L += Vec3(cieX(lambda), cieY(lambda), cieZ(lambda))
                  * (thr * rhoV * emitSlot(scene, m, h, lambda, ray.d * -1.0) * invPdfL * wMis);
         }
+        if (tail) return L;                              // the light it reached, and no more
 
         // GLOSSY-NEE: cleared HERE and not at the top of the loop. `gmis` is written by the
         // PREVIOUS bounce's glossy branch and read by THIS bounce's emitter/sun sites above, so
@@ -1618,7 +1622,11 @@ inline Vec3 photonGather(const Scene& scene, const PhotonMap& pm, Ray ray, doubl
                                  glass >= 0 ? &scene.mats[glass] : nullptr) *
                (jsOn ? js.beta(thr) : thr);
     };
-    for (int b = 0; b < maxBounce; ++b) {
+    // The tail (b == maxBounce): the ray the last vertex sampled, for the light it reaches --
+    // the volume's in-scattering along it is a vertex past the cap -- and nothing past it
+    // (backward.h radianceLoop, GLOSSY-DEPTH-CAP).
+    for (int b = 0; b <= maxBounce; ++b) {
+        const bool tail = (b == maxBounce);
         ++work.n;
         const int    cmIdx  = stk.topMat();
         const double aGlass = (cmIdx >= 0) ? scene.mats[cmIdx].absorb(lambda) : 0.0;
@@ -1633,9 +1641,9 @@ inline Vec3 photonGather(const Scene& scene, const PhotonMap& pm, Ray ray, doubl
             grin::marchSegments(scene, ray,
                 [&](const Vec3& so, const Vec3& sd, double slen, double&) -> bool {
                     if (volOn || sunOn) {
-                        if (volOn) { MStatTimer _t(&mStats().beamNs, &mStats().beamN);
+                        if (volOn && !tail) { MStatTimer _t(&mStats().beamNs, &mStats().beamN);
                           L += gatherBeams(so, sd, slen, aGlass, cmIdx); }
-                        if (sunOn) L += sunNeeMarch(scene, mats, so, sd, slen, aGlass, lambda, invPdfL, rng) * thr;
+                        if (sunOn && !tail) L += sunNeeMarch(scene, mats, so, sd, slen, aGlass, lambda, invPdfL, rng) * thr;
                         {   double Tv[SpecThr::K + 1];
                             camMediaTrSpec(scene, mats, so, sd, slen, lambda, rng, Tv);
                             thr *= Tv[SpecThr::K];
@@ -1669,10 +1677,10 @@ inline Vec3 photonGather(const Scene& scene, const PhotonMap& pm, Ray ray, doubl
         // needs the transmittance to ITS OWN closest-approach point, not to the segment end.
         if (volOn || sunOn) {
             const double dSeg = h.valid ? h.t : 1e30;
-            if (volOn) { MStatTimer _t(&mStats().beamNs, &mStats().beamN);
+            if (volOn && !tail) { MStatTimer _t(&mStats().beamNs, &mStats().beamN);
               L += gatherBeams(ray.o, ray.d, dSeg, aGlass, cmIdx);
             }
-            if (sunOn) L += sunNeeMarch(scene, mats, ray.o, ray.d, dSeg, aGlass, lambda, invPdfL, rng) * thr;
+            if (sunOn && !tail) L += sunNeeMarch(scene, mats, ray.o, ray.d, dSeg, aGlass, lambda, invPdfL, rng) * thr;
             // Extinction along the camera segment: what is behind the fog gets dimmed.
             {   // SPECGATHER: extinction is spectral too, and with a coloured medium badly so.
                 double Tv[SpecThr::K + 1];
@@ -1750,6 +1758,7 @@ inline Vec3 photonGather(const Scene& scene, const PhotonMap& pm, Ray ray, doubl
             L += Vec3(cieX(lambda), cieY(lambda), cieZ(lambda))
                  * (thr * emitSlot(scene, m, h, lambda, ray.d * -1.0) * invPdfL * wMis);
         }
+        if (tail) return L;                              // the light it reached, and no more
 
         // GLOSSY-NEE: cleared HERE and not at the top of the loop. `gmis` is written by the
         // PREVIOUS bounce's glossy branch and read by THIS bounce's emitter/sun sites above, so

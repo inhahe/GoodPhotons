@@ -2516,6 +2516,36 @@ stages 1 and 2, DEFORM-LIMITS): 14 findings, each checked against the code. Fixe
 The one Lambertian arrival rule the review asked for (six pasted copies) is `lambertArrival` /
 `dLambertArrival`, which every photon tracer's Diffuse, Fluorescent and compound sites call.
 
+## DONE (2026-11-12, 0.440.4): GLOSSY-DEPTH-CAP — at the bounce cap, mode R's glossy NEE keeps only its MIS share
+
+**Fixed in 0.440.4** as proposed below: mode R's loop (backward.h, scalar and hero; render_cuda.cu
+bkRadiance, its hero twin and bkRadianceRGB) runs one iteration past its cap, the TAIL, tracing the
+ray its last vertex sampled for the light it reaches and stopping there; modes M and S's camera
+walks (photonGather, photonGatherSub, sppmVisiblePoint and their device twins) take the same tail,
+their in-scattering along it skipped. On a box whose back wall is glossy and whose floor carries a
+mirror patch, mode D against R at `-max-bounce 1` / `2`: x1.288 / x1.0385 over the frame (up to
+x1.94 on the glossy wall) before, x1.0003 / x1.0004 after; R with glossy NEE off now reads itself
+x1.0001. Mode S's two backends, x0.878 apart there at `-max-bounce 1` before (device over host),
+now agree to 0.1 %. `tools/check_bdpt_depth.py` renders
+that box too (D, J and U against R, host and device; R's and S's devices against their hosts).
+check_bitid against 0.440.3: identical (R at its default depth draws nothing on the tail it did not
+before, outside media).
+
+The finding:
+
+Found closing GLOSSY-ROOM-M. Mode R's loop (backward.h radianceLoop, `for (b = 0; b < maxB; ++b)`)
+never traces the ray it samples at its last vertex, yet a glossy vertex there still takes its light
+sampling at the balance-heuristic weight (interactMaterial's GLOSSY-NEE, `gm` passed at every
+bounce): the lobe-sampled emitter hit that weight assumes is never made, so the light a glossy
+vertex at the cap receives is short by the lobe's share. On the glossy room of
+`tools/check_glossy_adjoint.py` at `-max-bounce 1`, the non-emitter pixels: R with glossy NEE off
+reads 0.22 of R with it on, mode D 1.19 of it. At the default 32 the share left at the cap is
+negligible; at preview depths (and the checks that compare modes at `-max-bounce 8`) it is not.
+The fix: at the last vertex, trace the continuation for its emitter hit alone (what a path of N
+vertices reaches by its lobe is counted, as its light sampling is), host and device, and the same
+for modes M's and S's camera walks, which share the structure; then R's cap means the same with
+glossy NEE on and off.
+
 ## OPEN (2026-11-12, 0.440.3): LAYERED-MODES — a `layered` material reads 1-9 % off mode R in the other modes, on flat geometry
 
 Found measuring REVIEW-4400's compound fix (`scraps/_bump_compound.py`, AMP 0): a room of
@@ -2538,7 +2568,17 @@ and its connections likewise -- non-physical but consistent; or (b) make the mod
 by construction, and a layered body renders darker, by about 8 % at normal incidence for ior 1.5
 and more at grazing angles.
 
-## OPEN (2026-11-12, 0.440.2): GLOSSY-ROOM-M — mode M reads a room of glossy walls 0.5 % bright on the host
+## CLOSED (2026-11-12, 0.440.3): GLOSSY-ROOM-M — mode M reads a room of glossy walls 0.5 % bright on the host
+
+**Not the bias it looked like.** On the same room at -max-bounce 32, host: twelve M seeds at 256 spp
+against eight R seeds at 4096 read **1.0017 +- 0.0007** of R, the seeds spreading 0.2 % (1.0033,
+1.0037, 1.0037 for seeds 1-3 -- the three the check renders -- and 0.9973 to 1.0051 over the rest);
+R reads itself 1.0000 +- 0.0003 with glossy NEE off, M 1.0001 +- 0.0017. What is left is below
+every check's tolerance and not separable from the heavy tail of an all-glossy room's paths at any
+reasonable cost. (A comparison at -max-bounce 1 is no test: there R's lobe-sampled emitter hit is
+past the cap while its NEE keeps its MIS weight, so R reads itself 0.22 without glossy NEE.)
+
+The finding:
 
 `tools/check_glossy_adjoint.py`'s room: five glossy walls (reflect 0.8, roughness 0.4) and an area
 light, no diffuse surface anywhere, so mode M never gathers and its camera walk is the whole

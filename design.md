@@ -5841,6 +5841,17 @@ as the one at fault.
   (`tools/check_bdpt_depth.py`). The connection loop's depth test refuses the longer strategies the
   extra vertex would otherwise allow.
 
+  **Mode R's cap counts the same paths (0.440.4, GLOSSY-DEPTH-CAP).** The light a path's last
+  vertex reaches makes a path of the same depth, whichever strategy reaches it: its light sampling,
+  or its own lobe's ray landing on an emitter or escaping to the sky. Mode R's loop therefore runs
+  one iteration past its cap -- the TAIL, `b == maxB` -- tracing the ray its last vertex sampled for
+  the light it reaches (an emitter at the weight the arrival takes anywhere, the sky or sun, the
+  fire along the segment) and stopping there: no medium or fur collision, no NEE, no material
+  interaction. Without it a glossy vertex at the cap kept only its light sampling's MIS share and a
+  mirror there saw no light (mode D read x1.29 of R over a glossy-walled box at `-max-bounce 1`).
+  The device's bkRadiance, its hero and RGB twins, and the camera walks of modes M and S (host and
+  device, their in-scattering along the tail skipped too) take the same tail.
+
   Since **0.126.0 the same treatment runs on the GPU**, so a spot/sun scene no longer falls
   back to the CPU in mode `D`. `render_cuda.cu` mirrors every piece one-for-one:
   `dIsDeltaEmitter`/`dIsInfiniteEmitter`/`dIsDeltaLightVertex` classify a `DEmitter` (the

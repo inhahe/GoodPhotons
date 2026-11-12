@@ -2760,7 +2760,16 @@ struct BackwardRenderer {
         bool grinAny = grin::sceneHasGrin(scene);
 
         int nullSteps = 0;      // hair coverage pass-throughs, refunded below
-        for (int b = 0; b < maxB; ++b) {
+        // THE TAIL (GLOSSY-DEPTH-CAP). -max-bounce counts scattering vertices, and a path of
+        // that many is rendered at full weight: the light its last vertex reaches. The light
+        // sampling there reaches it at its MIS share (a glossy lobe against its emitter hit,
+        // a diffuse vertex's sky against its BSDF-sampled escape), so the ray the last vertex
+        // sampled is traced too -- iteration b == maxB, the tail -- for its emitter, sky or sun
+        // and the fire along it, and nothing past them: no medium or fur collision, no NEE, no
+        // scatter. A specular chain's last mirror sees its light the same way (BDPT-LAST-DEPTH:
+        // modes D, J and U make the same paths).
+        for (int b = 0; b <= maxB; ++b) {
+            const bool tail = (b == maxB);
             // Publish the bounce index so a deterministic per-vertex choice (mode W's glossy
             // lobe) can pick a decorrelated sequence at each depth. Costs nothing otherwise.
             gi.bounce = b;
@@ -2865,6 +2874,7 @@ struct BackwardRenderer {
                                                    tMed, which);
                 if (hitMed) {
                     noteFirst(gi, kFirstOther);
+                    if (tail) return L;        // a collision is a vertex past the cap
                     const Medium& med = scene.media[which];
                     Vec3 p = ray.o + ray.d * tMed;
                     // A scatter never reaches interactMaterial, which is where the glossy MIS
@@ -2893,6 +2903,7 @@ struct BackwardRenderer {
             // rather than found. Beer-Lambert over the leg first, as the fog branch does.
             if (fl.hit) {
                 noteFirst(gi, kFirstOther);
+                if (tail) return L;            // a vertex past the cap
                 { double a = curAbsorb(lambda); if (a > 0.0) thr *= std::exp(-a * fl.t); }
                 gmis.clear();          // a vertex interactMaterial never sees (see the fog branch)
                 if (!furInteract(scene, fl, ray, lambda, invPdfLambda, thr, L,
@@ -3024,6 +3035,7 @@ struct BackwardRenderer {
                 L += thr * emitSlot(scene, m, h, lambda, ray.d * -1.0) * invPdfLambda * wMis;
             }
 
+            if (tail) return L;                           // the light it reached, and no more
             bool nullEvt = false;
             if (!interactMaterial(scene, m, h, mats, ray, lambda, invPdfLambda, thr, L,
                                   specularArrival, contBsdfPdf, stk, rng, spdCache, gi, gmp,
@@ -3193,7 +3205,9 @@ struct BackwardRenderer {
         };
 
         int nullSteps = 0;      // hair coverage pass-throughs, refunded below
-        for (int b = bounce0; b < maxB; ++b) {
+        // The tail: see the scalar twin (GLOSSY-DEPTH-CAP).
+        for (int b = bounce0; b <= maxB; ++b) {
+            const bool tail = (b == maxB);
             int nUp = secAlive ? C : 1;   // wavelengths still being propagated
             gi.bounce = b;                // see the scalar twin: mode W's per-vertex lattice
             // The scalar twin's tier roll. Sticky through GiCtx, which is what makes a
@@ -3247,6 +3261,7 @@ struct BackwardRenderer {
                 if (Renderer::sampleMediaCollision(scene, ray.o, ray.d, dSurf, lam[0], rng,
                                                    tMed, which)) {
                     noteFirst(gi, kFirstOther);
+                    if (tail) { finish(); return; }   // a vertex past the cap (scalar twin)
                     const Medium& med = scene.media[which];
                     const Vec3 p = ray.o + ray.d * tMed;
                     {   const int mi = stk.topMat();          // Beer-Lambert over a leg in glass
@@ -3326,6 +3341,7 @@ struct BackwardRenderer {
             // interaction on it -- so no aggregate fiber ever reaches a bundle NEE.
             if (fl.hit) {
                 noteFirst(gi, kFirstOther);
+                if (tail) { finish(); return; }
                 deHero();
                 gmis.clear();          // a vertex the material switch never sees (see above)
                 if (!furInteract(scene, fl, ray, lam[0], invPdf[0], thr[0], L[0],
@@ -3516,6 +3532,7 @@ struct BackwardRenderer {
                 for (int i = 0; i < nUp; ++i)
                     L[i] += thr[i] * m.emit(lam[i]) * ep * invPdf[i];
             }
+            if (tail) { finish(); return; }              // the light it reached (scalar twin)
 
                 // GLOSSY-NEE: cleared HERE and not at the top of the loop, which is the whole
                 // subtlety. `gmis` is written by the PREVIOUS bounce's glossy branch and read by
