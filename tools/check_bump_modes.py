@@ -19,7 +19,14 @@ its long paths). Each mode's frame mean over `--seeds` seeds must be within 1 % 
 same device, in both rooms (the seeds spread about 0.1 %; three of them are too few to let a
 standard error widen the band). Modes M and S deposit photons over 32 bounces whatever
 -max-bounce says (photonMaxBounce), so they and their mode-R reference run at -max-bounce 32; at 8
-they read the flat room 2 % bright. Exits 1 on any failure.
+they read the flat room 2 % bright.
+
+A third room carries the map on a `layered` material instead -- a rough coat (roughness 0.3) over a
+diffuse body -- and holds modes M and S to R there: a compound takes its photon deposit before its
+lobe pick, and until 0.440.3 that deposit skipped the arrival rule of the Lambertian lobes it is
+gathered for (Renderer::compoundDepositWeight), so M read it 1.087 of R and S 1.081. The modes
+miss a layered material by about 1 % even on flat geometry (LAYERED-MODES in known-issues.md), so
+there M and S are held within 2 %, and the others not at all. Exits 1 on any failure.
 """
 import argparse
 import os
@@ -54,14 +61,18 @@ def ripple(path, amp, w=64):
         f.write(np.ascontiguousarray(img).tobytes())
 
 
-def room(d, amp):
+def room(d, amp, layered=False):
     ppm = os.path.join(d, "rip.ppm")
     ripple(ppm, amp)
     p = ppm.replace(chr(92), "/")
+    wall = (['material "body" { type diffuse reflect 0.8 }',
+             'material "w" { type layered  coat { reflectance fresnel  ior 1.5  roughness 0.3 }  '
+             'layer "body" 1.0  normal_map texture:rip }'] if layered else
+            ['material "w" { type diffuse reflect 0.8  normal_map texture:rip }'])
     return NL.join([
         "scene { units meters }",
         'texture "rip" { file "%s"  encoding linear  filter bilinear  wrap repeat }' % p,
-        'material "w" { type diffuse reflect 0.8  normal_map texture:rip }',
+    ] + wall + [
         "quad { origin -2 0 -2  u 0 0 4  v 4 0 0  material w }",
         "quad { origin -2 0 -2  u 4 0 0  v 0 3 0  material w }",
         "quad { origin -2 0 -2  u 0 3 0  v 0 0 4  material w }",
@@ -83,12 +94,12 @@ def main():
     exe, out = os.path.abspath(a.exe), os.path.abspath(a.out)
     seeds = list(range(1, a.seeds + 1))
     fails = []
-    for name, amp in (("flat", 0.0), ("bumped", 2.0)):
+    for name, amp, layered in (("flat", 0.0, False), ("bumped", 2.0, False), ("layered", 2.0, True)):
         d = os.path.join(out, name)
         os.makedirs(d, exist_ok=True)
         scene = os.path.join(d, "room.ftsl")
         with open(scene, "w", encoding="utf-8", newline="") as f:
-            f.write(room(d, amp))
+            f.write(room(d, amp, layered))
 
         def frame(mode, dev, seed, depth):
             png = os.path.join(d, "%s_%s_%d_%d.png" % (mode, dev, depth, seed))
@@ -108,6 +119,8 @@ def main():
         for dev in ["cpu"] + ([] if a.no_gpu else ["gpu"]):
             refs = {}                                # mode R at each depth asked for
             for mode in a.modes.split(","):
+                if layered and mode not in ("M", "S"):
+                    continue
                 depth = DEPTH.get(mode, 8)
                 if depth not in refs:
                     r = [frame("R", dev, s, depth) for s in seeds]
@@ -117,7 +130,7 @@ def main():
                 m, se = np.mean(v), np.std(v, ddof=1) / np.sqrt(len(v))
                 ratio = m / rm
                 err = np.hypot(se / rm, m * rse / rm ** 2)
-                good = abs(ratio - 1.0) <= TOL
+                good = abs(ratio - 1.0) <= (2 * TOL if layered else TOL)
                 print("%s: %-6s mode %s on the %s: %.4f of mode R (+-%.4f)"
                       % ("ok" if good else "FAIL", name, mode, "host" if dev == "cpu" else "device",
                          ratio, err), flush=True)

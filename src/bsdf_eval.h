@@ -42,11 +42,10 @@ inline bool isConnectibleMat(const Material& m) {
 }
 
 // A two-sided (transmissive) connectible material scatters into BOTH hemispheres, so a
-// connection edge on the side OPPOSITE the shading normal is legal (transmit lobe).
-// Reflect-only materials require the edge on the +ns side; the surface-cosine sign guards
-// in connectBDPT must not reject the back hemisphere for these materials — bsdfF (which
-// returns 0 for unsupported directions) is the real validity gate, and the geometry term
-// uses |cos| accordingly.
+// connection edge behind the surface is legal (transmit lobe). A reflect-only one takes an edge
+// on its geometric front, on either side of the shading normal where that tilts (lambertLit);
+// bsdfF, which returns 0 for an unsupported pair, is the real validity gate, and the geometry
+// term uses |cos| accordingly.
 inline bool isTwoSidedMat(const Material& m) {
     return m.type == MatType::DiffuseTransmit || m.type == MatType::Hair;
 }
@@ -187,8 +186,9 @@ inline double bsdfF(const Material& m, const Vec3& ns, const Vec3& wo, const Vec
 // camera-side cosine does not. A white-furnace test measures mode R -- which builds paths
 // camera-side and so lands on the first form -- flat to 0.04 % across roughness 0.2/0.6/0.9.
 //
-// A reciprocal BSDF (Diffuse's rho/PI, DiffuseTransmit) is unchanged by the swap, so switching a
-// site from bsdfF to this is a no-op for them and cannot perturb a diffuse scene.
+// DiffuseTransmit's value is unchanged by the swap. Diffuse's rho/PI is too, but its lambertLit
+// test reads wi, so the swap moves that test onto the LIGHT's side -- which is the point: light
+// that arrived below the shading normal lights nothing, whichever way the camera lies.
 // A FIBER is never a light vertex: light subpaths stop at strands (bdpt.h randomWalk, 0.365.0),
 // because no light-side value of this non-reciprocal, camera-offset model agrees pointwise with
 // the camera side's for the same path (known-issues HAIR-RECIPROCITY). 0 keeps a stray light-end

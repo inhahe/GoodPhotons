@@ -3720,8 +3720,19 @@ holding a glass ball), and on the device `-rgb`, mode S and every one of those.
       (`arrivalAdjoint`), since a photon's flux per GEOMETRIC area is what the gather estimates
       while R shades with the shading cosine; and where `ns` tilts the continuation is drawn
       about the geometric normal with that same weight (`diffuseContinuation`), so a direction
-      below `ns` that R lights stays reachable. `tools/check_bump_modes.py` holds D, J, U, B,
-      M and S to R on such a room and its flat twin (M and S at -max-bounce 32: they deposit
+      below `ns` that R lights stays reachable. One rule for every photon tracer, host and
+      device, scalar and hero (0.440.3): `lambertArrival` (lit? and the first bounce's
+      softening) at a Diffuse or Fluorescent vertex and at a compound's own deposit, which a
+      compound makes before its lobe pick and which then takes the arrival adjoint too
+      (`compoundDepositWeight`; a compound with a translucent lobe stores the arrival as a
+      translucent's own case does); `glossyArrival` (the first bounce's softening) at a glossy
+      vertex and at a layered coat's lobe, splat and continuation alike; and at a glossy
+      continuation the shading-normal adjoint `shadingAdjointCorr` beside the lobe's own adjoint
+      (`glossyAdjointRatio`), as bdpt.h's light walk takes it. The arrival adjoint itself is
+      geometry.h's `arrivalAdjointCorr`, which the point merges of U and J take too, so no two
+      estimators read a smooth mesh differently; a grazing denominator falls back to 1.
+      `tools/check_bump_modes.py` holds D, J, U, B, M and S to R on such a room and its flat
+      twin, and M and S on a normal-mapped layered room (M and S at -max-bounce 32: they deposit
       over 32 bounces whatever the flag says).
 - **`curve.h`** — the **curve / fiber** primitive (hair, fur, grass, wire, thread),
   added 0.150.0 for TODO §P1. A `curve` is control points + a radius; the loader
@@ -5964,10 +5975,10 @@ as the one at fault.
     bright, still a picture), an unweighted point merge would be added *on top of* a complete
     BDPT sum and double-count every path it touches.
 
-  `vmGatherCorr` (the shading-vs-geometric-normal correction the density estimate needs, exactly
-  1 on flat geometry) was **moved** here out of `vcm.h`, which now does `using bdpt::vmGatherCorr;`
-  — mode `J`'s point merge and mode `U`'s VM are the same estimator and must not be able to drift
-  apart. Modes `M`/`S` deliberately do **not** use it.
+  The shading-vs-geometric-normal correction the density estimate needs (exactly 1 on flat
+  geometry) is geometry.h's `arrivalAdjointCorr`: mode `J`'s point merge, mode `U`'s VM and,
+  since 0.439.10, modes `M` and `S`'s deposits are the same estimator and must not be able to
+  drift apart.
 
   The deposit side lives in `bdpt.h`'s `traceLightBeamPass` (same subpaths, same `nEmitted`, as
   the beams — they are two views of *one* set of light subpaths, which is why the two merge kinds

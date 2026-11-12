@@ -1,13 +1,16 @@
-"""Regression check: the GPU's forward modes take `-max-bounce` as the CPU's do (B-GPU-MAXBOUNCE).
+"""Regression check: the GPU's photon walks take their bounce caps as the CPU's do (B-GPU-MAXBOUNCE).
 
     python tools/check_forward_depth.py [--out png/check_forward_depth] [--exe ftrace.exe]
 
 `-max-bounce` caps how many surfaces a photon meets in modes A, B and C. The CPU's renderForward
-always took it; the GPU's kernels were launched with a literal 32 until 0.439.8, so GPU mode B
+always took it; the GPU's kernels were launched with a literal 32 until 0.439.9, so GPU mode B
 rendered `-max-bounce 7` and `8` alike and a closed room of albedo 0.8 2 % brighter than CPU mode B
-at 8. The room here keeps a lot of its light in long paths, so a cap shows: mode B at
-`-max-bounce 2` and `8` on the GPU must each read within 1 % of the CPU at the same cap (frame mean,
-two seeds), and 2 must read clearly darker than 8 on both. Exits 1 on any failure.
+at 8. Modes M and S cap their deposits' photons by `-photon-bounce` instead (photonMaxBounce,
+default 32); until 0.440.3 the GPU's were launched with a literal 32 too, and the flag moved only
+the CPU. The room here keeps a lot of its light in long paths, so a cap shows: mode B at
+`-max-bounce 2` and `8`, and modes M and S at `-photon-bounce 2` and `8`, on the GPU must each read
+within 1 % of the CPU at the same cap (frame mean, two seeds; 2 % for S, whose progressive radius
+the backends shrink apart), and 2 must read clearly darker than 8 on both. Exits 1 on any failure.
 """
 import argparse
 import os
@@ -43,13 +46,15 @@ def main():
     with open(scene, "w", encoding="utf-8", newline="") as f:
         f.write(SCENE)
 
-    def mean(dev, cap):
+    def mean(mode, dev, cap):
         v = []
         for seed in (1, 2):
-            png = os.path.join(d, "b_%s_%d_%d.png" % (dev, cap, seed))
-            cmd = [exe, "-in", scene, "-mode", "B", "-device", dev, "-n", "40000000",
-                   "-max-bounce", str(cap), "-seed", str(seed), "-hdr", "-no-meter",
-                   "-window-min", "-o", png]
+            png = os.path.join(d, "%s_%s_%d_%d.png" % (mode.lower(), dev, cap, seed))
+            budget = {"B": ["-n", "40000000", "-max-bounce", str(cap)],
+                      "M": ["-n", "2000000", "-spp", "64", "-photon-bounce", str(cap)],
+                      "S": ["-n", "100000", "-spp", "128", "-photon-bounce", str(cap)]}[mode]
+            cmd = [exe, "-in", scene, "-mode", mode, "-device", dev] + budget + [
+                   "-seed", str(seed), "-hdr", "-no-meter", "-window-min", "-o", png]
             p = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8",
                                errors="replace")
             pfm = png[:-4] + ".pfm"
@@ -60,19 +65,22 @@ def main():
         return sum(v) / len(v)
 
     ok = True
-    got = {}
-    for cap in (2, 8):
-        c, g = mean("cpu", cap), mean("gpu", cap)
-        got[cap] = (c, g)
-        good = abs(g / c - 1.0) <= 0.01
-        ok &= good
-        print("%s: mode B at -max-bounce %d: GPU %.5g, CPU %.5g, x%.4f"
-              % ("ok" if good else "FAIL", cap, g, c, g / c), flush=True)
-    for i, dev in enumerate(("CPU", "GPU")):
-        drop = got[2][i] / got[8][i]
-        good = drop < 0.9
-        ok &= good
-        print("%s: %s mode B at -max-bounce 2 over 8: x%.4f" % ("ok" if good else "FAIL", dev, drop))
+    for mode, flag, tol in (("B", "-max-bounce", 0.01), ("M", "-photon-bounce", 0.01),
+                            ("S", "-photon-bounce", 0.02)):
+        got = {}
+        for cap in (2, 8):
+            c, g = mean(mode, "cpu", cap), mean(mode, "gpu", cap)
+            got[cap] = (c, g)
+            good = abs(g / c - 1.0) <= tol
+            ok &= good
+            print("%s: mode %s at %s %d: GPU %.5g, CPU %.5g, x%.4f"
+                  % ("ok" if good else "FAIL", mode, flag, cap, g, c, g / c), flush=True)
+        for i, dev in enumerate(("CPU", "GPU")):
+            drop = got[2][i] / got[8][i]
+            good = drop < 0.9
+            ok &= good
+            print("%s: %s mode %s at %s 2 over 8: x%.4f"
+                  % ("ok" if good else "FAIL", dev, mode, flag, drop), flush=True)
     print("PASS" if ok else "FAILED")
     return 0 if ok else 1
 

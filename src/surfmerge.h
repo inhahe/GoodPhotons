@@ -57,27 +57,8 @@
 
 namespace bdpt {
 
-// Gather-side shading-normal correction at a merge point (cos_s/cos_g), which rebalances the
-// geometric-cosine density estimate onto the shading cosine so a smooth mesh merges smoothly
-// like mode R:
-//
-//   gcorr = |cos(wp, Ns)| / |cos(wp, Ng)|
-//
-// EXACTLY 1 when Ns==Ng (flat tris, analytic spheres), so every non-smooth scene is
-// bit-identical with or without it. The grazing `cos(wp,Ng)` denominator is guarded
-// (measure-zero, ~0 flux) so a degenerate sample falls back to no correction. NOTE: the
-// standalone photon-map / SPPM gathers (modes M/S) already smooth-shade in this renderer and
-// must NOT use this — only a MIS-COUPLED merge needs it. Why the coupling makes the
-// difference is logged as tech debt in known-issues.md.
-//
-// It lives here rather than in vcm.h (where it was written, for mode U's VM) because mode J's
-// point merge is the same estimator and needs the same correction; vcm.h now pulls it back in
-// by `using bdpt::vmGatherCorr`, so the two modes cannot drift apart.
-inline double vmGatherCorr(const Vec3& wp, const Vec3& ns, const Vec3& ng) {
-    double denom = std::fabs(dot(wp, ng));
-    if (denom <= 1e-8) return 1.0;
-    return std::fabs(dot(wp, ns)) / denom;
-}
+// A merge's gather-side shading-normal correction is geometry.h's arrivalAdjointCorr, which modes
+// M and S's deposits take too: one function, so no two estimators can drift apart on a smooth mesh.
 
 // The light half of a point merge's weight. Same telescoped-ratio idea as `BeamMis`, but
 // shifted one strategy, and the shift is the whole difference between the two files: a beam

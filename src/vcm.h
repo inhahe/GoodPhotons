@@ -132,28 +132,10 @@ inline Vec3 fiberOrigin(const Hit& h, bool isHair, const Vec3& dir) {
     return offsetOrigin(h.p, h.ng, dir);   // the far-side clearance itself is fiberStep's curve-only tmin
 }
 
-// Gather-side shading-normal correction for the VERTEX-MERGE (VM / photon-density) strategy.
-// The VM contribution is a Jensen density estimate MIS-combined with the vertex-connection
-// (VC) strategies; on a smooth (interpolated-normal) mesh the merge reads incident flux per
-// GEOMETRIC area and shades per facet, while the reference backward path tracer (mode R) and
-// the VC strategies integrate against the SHADING cosine. Reweighting each merged light
-// vertex (incident direction `wp`, back toward its source) by cos_s/cos_g rebalances the
-// merge onto the shading cosine so mode U smooth-shades like mode R:
-//
-//   gcorr = |cos(wp, Ns)| / |cos(wp, Ng)|
-//
-// EXACTLY 1 when Ns==Ng (flat tris, analytic spheres), so every non-smooth scene — and the
-// whole existing mode-U validation suite — is bit-identical. The grazing `cos(wp,Ng)`
-// denominator is guarded (measure-zero, ~0 flux) so a degenerate sample falls back to no
-// correction. NOTE: the standalone photon-map / SPPM gathers (modes M/S) already smooth-shade
-// in this renderer and must NOT use this — only the MIS-coupled VM merge needs it. Why the
-// coupling makes the difference is logged as tech debt in known-issues.md.
-//
-// DEFINED IN surfmerge.h (via bdpt.h), not here: mode J's point merge is the same estimator
-// and needs the identical correction, so the function moved to the shared header and this is
-// now only the name. Keeping two copies would let mode U and mode J's merges drift apart on
-// smooth meshes — precisely the class of difference this correction exists to remove.
-using bdpt::vmGatherCorr;
+// The VERTEX-MERGE strategy's gather-side shading-normal correction is geometry.h's
+// arrivalAdjointCorr: the merge reads incident flux per GEOMETRIC area while mode R and the VC
+// strategies integrate against the shading cosine, and mode J's point merges and modes M and S's
+// deposits take the same function.
 
 // A stored light-subpath vertex (only connectible/non-delta surface vertices are kept).
 struct LightVertex {
@@ -819,10 +801,15 @@ inline void traceLightSubpath(const Scene& scene, const Camera& cam, const Rende
             beta *= sL;
             for (int i = 0; i + 1 < nUp; ++i) betaSec[i] *= sL;
         }
+        // ...and a compound's merge copy where the pick went to a lobe that does not connect (a
+        // delta coat): the merges evaluate its gathering lobes, which the first bounce softens as
+        // above, while the delta's continuation goes on unsoftened (bdpt.h softenFirstBounce).
+        const double sStore = (edges == 1 && !connectible && storeP > 0.0)
+                            ? shadowTerminatorG(wo, h.n, ngo) : 1.0;
         if (connectible || storeP > 0.0) {
             LightVertex lv;
             lv.p = h.p; lv.ns = h.n; lv.ng = h.ng; lv.wo = wo;
-            lv.beta = beta; lv.lambda = (float)lambda;
+            lv.beta = beta * sStore; lv.lambda = (float)lambda;
             lv.cx = cieX(lv.lambda); lv.cy = cieY(lv.lambda); lv.cz = cieZ(lv.lambda);
             lv.dVCM = dVCM; lv.dVC = dVC; lv.dVM = dVM;
             lv.matId = h.matId; lv.mat = mp; lv.hit = h; lv.edges = edges;
@@ -832,7 +819,7 @@ inline void traceLightSubpath(const Scene& scene, const Camera& cam, const Rende
                 LightVertexSec ls; ls.nUp = nUp;
                 for (int i = 0; i + 1 < nUp; ++i) {
                     ls.lam[i] = (float)hb.lam[i + 1];
-                    ls.beta[i] = betaSec[i];
+                    ls.beta[i] = betaSec[i] * sStore;
                     ls.cx[i] = cieX(ls.lam[i]); ls.cy[i] = cieY(ls.lam[i]); ls.cz[i] = cieZ(ls.lam[i]);
                 }
                 outSec.push_back(ls);
@@ -1412,7 +1399,7 @@ inline Vec3 traceCameraSubpath(const Scene& scene, const Camera& cam, const Rend
                     // Gather-side shading-normal correction (cos_s/cos_g at the merge point):
                     // rebalances the geometric-cosine density estimate onto the shading cosine
                     // so a smooth mesh merges smoothly like mode R. 1 when h.n==h.ng (flat).
-                    const double gcorr = vmGatherCorr(wMerge, h.n, ngoCam);
+                    const double gcorr = arrivalAdjointCorr(wMerge, h.n, ngoCam);
                     fCam *= gcorr;
                     // The merge MIS weight is built from λ-independent densities, evaluated
                     // once at the light vertex's hero and shared by its secondaries.

@@ -157,8 +157,13 @@ Each names the section its line is in.
 23e. ~~**GLOSSY-FLAT-DJU** (4.3) — D, J and U read a flat glossy room about 1 % bright.~~ Done,
     0.440.2: a light walk's glossy bounce now carries the lobe's adjoint.
 23f. **GLOSSY-ROOM-M** (4.3) — mode M reads a room of glossy walls 0.5 % bright on the host.
+23g. **LAYERED-MODES** (4.2) — a `layered` material reads 1-9 % off mode R in the other modes, even
+    flat: the coat's coin is taken at the camera's angle in R and the light's elsewhere. Needs a
+    decision (keep R's integrand, or make the coat physical in every mode).
+23h. **S-GPU-GLOSSY-BUMP** (4.3) — device mode S reads normal-mapped glossy walls 1.043 of R (host
+    0.997); see BUMP-MODES.
 23c. ~~**B-GPU-MAXBOUNCE** (4.2) — GPU mode B ignores `-max-bounce` (its kernels get a literal 32).~~
-    Done, 0.439.8.
+    Done, 0.439.9.
 24. ~~**BEAMEPOCHS-CHUNK-PIN** (4.5) — `-beamepochs` pins cheap scenes' GPU chunks to 1 spp.~~ Done,
     0.438.2.
 25. ~~**DEFORM-LIMITS**~~ (0.440.0), **MOTION-LIGHT-RIGID**, **PER-OBJECT-MODES** (4.6) — what is left of them.
@@ -228,7 +233,10 @@ Then the rest of 4.2-4.6 in their order, 4.7's bookkeeping alongside whatever to
 - [x] **GLOSSY-FLAT-DJU** (0.440.2) — modes D, J and U read a flat glossy room about 1 % bright (a
   light walk's glossy bounce took r, not the adjoint's r cos(out)/cos(in)).
 - [ ] **GLOSSY-ROOM-M** — mode M reads a room of glossy walls 0.5 % bright on the host.
-- [x] **B-GPU-MAXBOUNCE** (0.439.8) — GPU mode B ignored `-max-bounce` (a literal 32 reached its
+- [ ] **LAYERED-MODES** — a `layered` material reads 1-9 % off mode R elsewhere, even flat (the
+  coat's coin is non-reciprocal); decision owed.
+- [ ] **S-GPU-GLOSSY-BUMP** — device mode S reads normal-mapped glossy walls 1.043 of R.
+- [x] **B-GPU-MAXBOUNCE** (0.439.9) — GPU mode B ignored `-max-bounce` (a literal 32 reached its
   kernels).
 
 - [x] **MERGE-PROXIMITY** (0.431.0) — every gather keeps only the photons near its tangent plane

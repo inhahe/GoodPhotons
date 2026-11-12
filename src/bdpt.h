@@ -1949,25 +1949,40 @@ inline double emitterSoftening(const Vertex& v, const Vec3& toEmitter) {
         return 1.0;
     return shadowTerminatorG(toEmitter, v.ns, vertexGeoN(v));
 }
+// Scale a light subpath's throughput by `f` from its first scene vertex on: path[1] onward, and
+// every beam segment leaving path[1] or later (the one leaving the emitter, vert 0, is not).
+inline void scaleFromFirstVertex(std::vector<Vertex>& path, std::vector<PathSeg>* segs, double f) {
+    for (size_t k = 1; k < path.size(); ++k) {
+        path[k].beta *= f;
+        for (double& b : path[k].betaSec) b *= f;
+    }
+    if (segs)
+        for (PathSeg& sg : *segs)
+            if (sg.vert >= 1) {
+                sg.beta *= f;
+                for (double& b : sg.betaSec) b *= f;
+            }
+}
 // A light subpath's first bounce, softened toward the emitter it left (emitterSoftening): path[1]
-// on, and every beam segment leaving path[1] or later.
+// on, and every beam segment leaving path[1] or later. Where path[1] is a compound's merge vertex
+// whose pick went delta (compoundMergeW), only its merge copy -- path[1]'s own throughput, which
+// nothing but a merge reads at a delta vertex -- is softened, as the compound's lobes the merges
+// evaluate would be; the delta's continuation goes on unsoftened (vcm.h's light walk, sStore).
 inline void softenFirstBounce(std::vector<Vertex>& path, std::vector<PathSeg>* segs) {
     if (path.size() < 2) return;
     const Vec3 d = path[0].p - path[1].p;
     const double l2 = dot(d, d);
     if (!(l2 > 0.0)) return;
-    const double s = emitterSoftening(path[1], d * (1.0 / std::sqrt(l2)));
-    if (s == 1.0) return;
-    for (size_t k = 1; k < path.size(); ++k) {
-        path[k].beta *= s;
-        for (double& b : path[k].betaSec) b *= s;
+    const Vec3 toEm = d * (1.0 / std::sqrt(l2));
+    Vertex& v = path[1];
+    if (v.type == VType::Surface && v.delta && v.compoundMergeW > 0.0) {
+        const double s = shadowTerminatorG(toEm, v.ns, vertexGeoN(v));
+        v.beta *= s;
+        for (double& b : v.betaSec) b *= s;
+        return;
     }
-    if (segs)
-        for (PathSeg& sg : *segs)
-            if (sg.vert >= 1) {
-                sg.beta *= s;
-                for (double& b : sg.betaSec) b *= s;
-            }
+    const double s = emitterSoftening(v, toEm);
+    if (s != 1.0) scaleFromFirstVertex(path, segs, s);
 }
 
 // Emit a light subpath from a DELTA light (spot or sun) — the two emitters with no
@@ -2079,16 +2094,10 @@ inline int deltaLightSubpath(const Scene& scene, const Camera& cam, const Render
     if (isSun && scene.unboundedHaze()) {
         const double F = path.size() > 1
                        ? sunLegFactor(scene, walkFrom, dir, path[1].p, lambda, rng) : 1.0;
-        for (size_t k = 1; k < path.size(); ++k) {
-            path[k].beta *= F;
-            for (double& b : path[k].betaSec) b *= F;
-        }
+        scaleFromFirstVertex(path, segs, F);
         if (segs)
-            for (PathSeg& sg : *segs) {
-                if (sg.vert == 0) { sg.sunLeg = true; continue; }
-                sg.beta *= F;
-                for (double& b : sg.betaSec) b *= F;
-            }
+            for (PathSeg& sg : *segs)
+                if (sg.vert == 0) sg.sunLeg = true;
     }
     return (int)path.size();
 }
@@ -3798,9 +3807,11 @@ inline double misWeight(const Scene& scene, const Camera& cam,
         // eye[i] as the light side would generate it: from eye[i+1], or from qs (or the light's
         // origin, s == 0) at pt -- non-delta, the connection's ends being scoped so above.
         // (Tested before the multiply: a ratio already overflowed to inf times 0 is a NaN.)
-        const double rev = misRevDensity(eye[i].pdfRev, i + 1 < t && eye[i + 1].delta);
-        if (rev == 0.0) break;
-        ri *= rev / misRemap0(eye[i].pdfFwd);
+        const double r = misRevDensity(eye[i].pdfRev, i + 1 < t && eye[i + 1].delta) /
+                         misRemap0(eye[i].pdfFwd);
+        if (!(r > 0.0)) break;
+        ri *= r;
+        if (!(ri > 0.0)) break;                      // underflowed: see the header
         if (!eye[i].delta && !eye[i - 1].delta) sumRi += ri;
         if (merges && i >= 2) {                      // merge at eye[i-1] (see header note)
             // eye[i-1]'s light-side neighbour is eye[i] (pt's flag is scoped false above).
@@ -3814,9 +3825,11 @@ inline double misWeight(const Scene& scene, const Camera& cam,
     ri = 1.0;
     for (int i = s - 1; i >= 0; --i) {               // hypothetical light strategies
         // light[i] as the camera side would generate it: from light[i+1], or from pt at qs.
-        const double rev = misRevDensity(light[i].pdfRev, i + 1 < s && light[i + 1].delta);
-        if (rev == 0.0) break;
-        ri *= rev / misRemap0(light[i].pdfFwd);
+        const double r = misRevDensity(light[i].pdfRev, i + 1 < s && light[i + 1].delta) /
+                         misRemap0(light[i].pdfFwd);
+        if (!(r > 0.0)) break;
+        ri *= r;
+        if (!(ri > 0.0)) break;
         // The hypothetical strategy at index i connects light[i-1] to the eye side, so it
         // is impossible if either end of that new edge is delta. At i == 0 the "edge" is
         // instead the eye path LANDING on the emitter, which a delta light (spot: a point;
@@ -5451,7 +5464,7 @@ struct BdptRenderer {
                                     // estimate reads flux per GEOMETRIC area while every
                                     // strategy it is MIS-combined with integrates against the
                                     // shading cosine. Exactly 1 on flat geometry.
-                                    fCam *= vmGatherCorr(ph.wo, vk.ns, ngo);
+                                    fCam *= arrivalAdjointCorr(ph.wo, vk.ns, ngo);
                                     const double pdfDirRev = bsdfPdf(*vk.mat, vk.ns, woCam,
                                                                      ph.wo, lam, scene,
                                                                      &vk.hit);

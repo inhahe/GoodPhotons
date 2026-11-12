@@ -6169,12 +6169,18 @@ __device__ static Real dShadingAdjointCorr(const DVec3& wi, const DVec3& wo,
 // |cos(wi,ns)| / |cos(wi,ng)|), about ns with the adjoint factor where they agree.
 __device__ static Real dDiffuseContinuation(const DHit& h, const DVec3& ngo, const DVec3& wi,
                                             DRng& rng, DVec3& wo);
-// Host twin render.h arrivalAdjoint: |cos(wi,ns)| / |cos(wi,ng)| at a Lambertian vertex reached
-// along -wi -- a deposit's and the continuation's weight; exactly 1 where ns == ng.
+// Twin of geometry.h arrivalAdjointCorr (where the why is): |cos(w,ns)| / |cos(w,ng)|, 1 at a
+// grazing denominator. Double, as the merges that take it are.
+__device__ static inline double dArrivalAdjointCorr(const DVec3& w, const DVec3& ns, const DVec3& ng) {
+    const double den = fabs(ddot(w, ng));
+    if (den <= 1e-8) return 1.0;
+    return fabs(ddot(w, ns)) / den;
+}
+// Host twin render.h arrivalAdjoint: the arrival adjoint at a Lambertian vertex reached along -wi --
+// a deposit's and the continuation's weight; exactly 1 where ns == ng.
 __device__ static Real dArrivalAdjoint(const DHit& h, const DVec3& ngo, const DVec3& wi) {
     if (dot(h.n, ngo) >= (Real)(1.0 - 1e-7)) return (Real)1;
-    const Real cg = fabs(dot(wi, ngo));
-    return cg > (Real)0 ? fabs(dot(wi, h.n)) / cg : (Real)0;
+    return (Real)dArrivalAdjointCorr(wi, h.n, ngo);
 }
 __device__ static Real dShadowTerminatorG(const DVec3& wi, const DVec3& ns, const DVec3& ng) {
     Real cosNgNs = dot(ng, ns);
@@ -6191,6 +6197,21 @@ __device__ static Real dShadowTerminatorG(const DVec3& wi, const DVec3& ns, cons
     Real g = cosNgWi / denom;
     if (g >= (Real)1) return (Real)1;                  // fully lit -> no darkening
     return g * g * ((Real)1 - g) + g;                  // Chiang cubic: -g^3 + g^2 + g
+}
+// Host twin render.h lambertArrival (where the why is): whether a photon along -wi lights a
+// Lambertian lobe, and in `soften` its first bounce's softening toward the emitter.
+__device__ static bool dLambertArrival(const DHit& h, const DVec3& ngo, const DVec3& wi, bool firstBounce,
+                                       Real& soften) {
+    if (!(dot(wi, h.n) > (Real)0)) return false;
+    soften = firstBounce ? dShadowTerminatorG(wi, h.n, ngo) : (Real)1;
+    return true;
+}
+__device__ static inline bool dIsPlanarMirrorMat(const DMaterial& m);
+// Host twin render.h glossyArrival: a glossy lobe's first bounce softened toward the emitter,
+// unless it is a delta.
+__device__ static Real dGlossyArrival(const DMaterial& lobe, const DHit& h, const DVec3& wi, bool firstBounce) {
+    if (!firstBounce || dIsPlanarMirrorMat(lobe)) return (Real)1;
+    return dShadowTerminatorG(wi, h.n, dShadedNg(h));
 }
 // Host twin mergeFromBehind (geometry.h says why): a one-sided camera vertex merges no photon from
 // behind its true surface (`ngo`, on the camera's side); a two-sided one refuses none.
@@ -7672,6 +7693,26 @@ __device__ static bool dCompoundGathers(const DScene& sc, const DMaterial& m, Re
         if (km.type == D_DIFFUSE && !dGatherlessStrandR(km, fiberRadius)) return true;
     }
     return false;
+}
+// Host twin compoundTransmits: a compound with a translucent lobe that gathers.
+__device__ static bool dCompoundTransmits(const DScene& sc, const DMaterial& m) {
+    for (int k = 0; k < m.mixCount; ++k) {
+        const int c = m.mixChild[k];
+        if (c < 0) continue;
+        const DMaterial& km = sc.mats[c];
+        if (!km.matReflectsNothing && km.type == D_DIFFUSETRANSMIT) return true;
+    }
+    return false;
+}
+// Host twin render.h compoundDepositWeight (where the why is): what a compound's own deposit of a
+// photon arriving along -wi with throughput `beta` stores; 0 nothing.
+__device__ static Real dCompoundDepositWeight(const DScene& sc, const DMaterial& cm, const DHit& h,
+                                              const DVec3& wi, bool firstBounce, Real beta) {
+    if (dCompoundTransmits(sc, cm)) return beta;
+    const DVec3 ngo = dShadedNg(h);
+    Real s;
+    if (!dLambertArrival(h, ngo, wi, firstBounce, s)) return (Real)0;
+    return beta * s * dArrivalAdjoint(h, ngo, wi);
 }
 // Whether the gathers count a face of material `m` as one that holds photons (host twin
 // holdsPhotons, where the reasoning lives).
@@ -12344,6 +12385,9 @@ __device__ static int interactSpecular(const DScene& sc, const DCamSet& cs, int 
         ro = dOffsetAlong(h.p, h.ng, rd);   // straight through, direction unchanged
         return WF_CONTINUE;
     } else if (m.type == D_GLOSSY) {
+        // The first bounce softens toward the emitter (host twin glossyArrival) -- a layered
+        // coat's continuation too, which arrives here as its coat lobe.
+        beta *= dGlossyArrival(m, h, -rd, firstHit);
         // A lobe with a finite value splats to the camera as a diffuse vertex does, with the
         // glossy BSDF toward it, at the arriving beta (host twin: tracePhoton's Glossy case).
         if ((camMode == CAM_A || camMode == CAM_B) && dGlossySplats(m) &&
@@ -12359,9 +12403,9 @@ __device__ static int interactSpecular(const DScene& sc, const DCamSet& cs, int 
         const DGlossyDraw gd = dDrawGlossy(sc, m, h, rd, h.n, -rd, rng);
         const DVec3& o = gd.o;
         if (dot(o, h.n) <= 0) { eAbsorbed += beta; return WF_TERMINATE; }
-        // A photon carries the lobe's adjoint, the ledger the difference (host twin
-        // interactPhotonSpecular, glossyAdjointRatio). A layered coat's lobe arrives here too.
-        const Real adj = (Real)dGlossyAdjointRatio(h.n, -rd, o);
+        // A photon carries the lobe's adjoint and its shading-normal half, the ledger the
+        // difference (host twin interactPhotonSpecular). A layered coat's lobe arrives here too.
+        const Real adj = (Real)dGlossyAdjointRatio(h.n, -rd, o) * dShadingAdjointCorr(-rd, o, h.n, dShadedNg(h));
         if (!(adj > (Real)0)) { eAbsorbed += beta; return WF_TERMINATE; }
         eAbsorbed += (double)(beta * ((Real)1 - adj));
         beta *= adj;
@@ -12387,8 +12431,9 @@ __device__ static int interactSpecular(const DScene& sc, const DCamSet& cs, int 
         DVec3 ngo = dShadedNg(h);   // geo normal on shading side
         DVec3 wiPrev = -rd;                                             // toward previous (light-side)
         // A Lambertian lobe (host twin render.h): lit only from above ns, softened at the first bounce.
-        if (!(dot(wiPrev, h.n) > (Real)0)) { eAbsorbed += beta; return WF_TERMINATE; }
-        if (firstHit) beta *= dShadowTerminatorG(wiPrev, h.n, ngo);
+        Real sEm;                                                       // dLambertArrival
+        if (!dLambertArrival(h, ngo, wiPrev, firstHit, sEm)) { eAbsorbed += beta; return WF_TERMINATE; }
+        beta *= sEm;
         if (camMode == CAM_A || camMode == CAM_B) {
             splatSurfaceAll(sc, cs, camMode, h.p, h.n, ngo, wiPrev, lambda, beta, rho, rng);
             if (canGlow) {
@@ -12769,8 +12814,10 @@ __device__ static int shadeStep(const DScene& sc, const DCamSet& cs,
     // COMPOUND-DOUBLE-PICK (host twin tracePhoton): a mix or layered surface takes its deposit
     // here, before the photon's own pick; the lobe's branch below then deposits nothing.
     const bool compoundDeposit = dCompoundGathers(sc, *mptr, h.fiberRadius);
-    if (compoundDeposit)
-        depositPhoton(cs, h.p, dShadedNg(h), beta, lambda, dPathIsCaustic(pathC), dPathCausticW(pathC));
+    if (compoundDeposit) {
+        const Real w = dCompoundDepositWeight(sc, *mptr, h, -rd, firstHit, beta);
+        if (w > (Real)0) depositPhoton(cs, h.p, dShadedNg(h), w, lambda, dPathIsCaustic(pathC), dPathCausticW(pathC));
+    }
     // A layered stack's coat sheen splats here, whichever lobe the pick below takes (host twin
     // tracePhoton, FWD-GLOSSY-INDIRECT).
     if (mptr->type == D_LAYERED && mptr->coatChild >= 0 && (camMode == CAM_A || camMode == CAM_B) &&
@@ -12778,9 +12825,10 @@ __device__ static int shadeStep(const DScene& sc, const DCamSet& cs,
         const DVec3 wl = -rd;
         DGlossySplat gsp{&sc, &sc.mats[mptr->coatChild], &h, h.n, wl};
         gsp.stack = mptr;
-        splatSurfaceAll(sc, cs, camMode, h.p, h.n, dShadedNg(h), wl, lambda, beta, (Real)0, rng,
+        Real bS = beta * dGlossyArrival(sc.mats[mptr->coatChild], h, wl, firstHit);   // host twin
+        splatSurfaceAll(sc, cs, camMode, h.p, h.n, dShadedNg(h), wl, lambda, bS, (Real)0, rng,
                         nullptr, &gsp);
-        camSpecularSplatAllGlossy(sc, cs, camMode, h.p, h.n, &lambda, &beta, 1, gsp, rng);
+        camSpecularSplatAllGlossy(sc, cs, camMode, h.p, h.n, &lambda, &bS, 1, gsp, rng);
     }
     // Stochastic mix: resolve to a child lobe (or absorb) before dispatch.
     if (dIsCompound(mptr->type)) {
@@ -12807,8 +12855,8 @@ __device__ static int shadeStep(const DScene& sc, const DCamSet& cs,
     } else if (m.type == D_DIFFUSETRANSMIT) {
         // Two-lobe Lambertian (device twin of render.h DiffuseTransmit): `reflect` into
         // the front (+n) hemisphere, `transmit` into the back (-n) hemisphere. Splat BOTH
-        // lobes — connect()/connectLens() self-reject the wrong-side lobe (cosSurf<=0), so
-        // passing the flipped normal images whichever side the camera is on. Non-specular,
+        // lobes -- each takes a camera on its own GEOMETRIC side (dCamSideOk tests the normal
+        // passed as ng), so the flipped normals image whichever side the camera is on. Non-specular,
         // so a directly-viewed translucent solid is VISIBLE in model B (unlike dielectric).
         Real rhoR = dDiffuseRho(sc, m, h, lambda);
         Real rhoT = clamp01(dTransmitSlot(sc, m, h, lambda));
@@ -12840,9 +12888,10 @@ __device__ static int shadeStep(const DScene& sc, const DCamSet& cs,
         DVec3 ngo = dShadedNg(h);   // geo normal on shading side
         DVec3 wiPrev = -rd;                                             // toward previous (light-side)
         // Light arriving below the shading normal lights nothing: no deposit, no splat; the first
-        // bounce softens toward the emitter it came from (host twin render.h tracePhoton).
-        if (!(dot(wiPrev, h.n) > (Real)0)) { eAbsorbed += beta; return WF_TERMINATE; }
-        if (firstHit) beta *= dShadowTerminatorG(wiPrev, h.n, ngo);
+        // bounce softens toward the emitter it came from (host twin render.h lambertArrival).
+        Real sEm;
+        if (!dLambertArrival(h, ngo, wiPrev, firstHit, sEm)) { eAbsorbed += beta; return WF_TERMINATE; }
+        beta *= sEm;
         // photon-map deposit (mode M), routed to the caustic map on an L.S+.D path; not on a strand,
         // where no gather takes it (CURVE-GATHER, host twin render.h)
         if (!compoundDeposit && !dGatherlessStrand(m, h))   // nor where the compound took it (above)
@@ -13185,7 +13234,9 @@ __device__ static int shadeStepHero(const DScene& sc, const DCamSet& cs, int cam
         const bool caus = dPathIsCaustic(pathC);
         const Real cw = dPathCausticW(pathC);
         const DVec3 ngoC = dShadedNg(h);
-        for (int i = 0; i < nUp; ++i) depositPhoton(cs, h.p, ngoC, beta[i], lam[i], caus, cw);
+        const Real w1 = dCompoundDepositWeight(sc, *mptr, h, -rd, firstHit, (Real)1);
+        if (w1 > (Real)0)
+            for (int i = 0; i < nUp; ++i) depositPhoton(cs, h.p, ngoC, beta[i] * w1, lam[i], caus, cw);
     }
     // The coat's sheen, over the bundle, before its pick (scalar twin).
     if (mptr->type == D_LAYERED && mptr->coatChild >= 0 && (camMode == CAM_A || camMode == CAM_B) &&
@@ -13194,9 +13245,12 @@ __device__ static int shadeStepHero(const DScene& sc, const DCamSet& cs, int cam
         DGlossySplat gsp{&sc, &sc.mats[mptr->coatChild], &h, h.n, wl};
         gsp.stack = mptr;
         const Real unused[hero::kHeroMax] = {};
-        splatSurfaceAllHero(sc, cs, camMode, h.p, h.n, dShadedNg(h), wl, lam, beta, unused, nUp, rng,
+        const Real sC = dGlossyArrival(sc.mats[mptr->coatChild], h, wl, firstHit);   // host twin
+        Real bS[hero::kHeroMax];
+        for (int i = 0; i < nUp; ++i) bS[i] = beta[i] * sC;
+        splatSurfaceAllHero(sc, cs, camMode, h.p, h.n, dShadedNg(h), wl, lam, bS, unused, nUp, rng,
                             nullptr, &gsp);
-        camSpecularSplatAllGlossy(sc, cs, camMode, h.p, h.n, lam, beta, nUp, gsp, rng);
+        camSpecularSplatAllGlossy(sc, cs, camMode, h.p, h.n, lam, bS, nUp, gsp, rng);
     }
     if (dIsCompound(mptr->type)) {
         int cpF = -1; double cRF = 0.0, cCosF = 1.0, cUF = 0.0; Real cThF = (Real)0;
@@ -13291,7 +13345,12 @@ __device__ static int shadeStepHero(const DScene& sc, const DCamSet& cs, int cam
         // whenever c_hero == 0 (a Wratten gel is 0 over most of the spectrum) AND amplify by
         // c_i/c_hero, so the survival probability is the MAX over live λ and survivors
         // reweight by c_i/q <= 1. A mirror and a filter are delta, with no camera connect, as
-        // in the scalar path; a glossy lobe with a finite value splats first, as its does.
+        // in the scalar path; a glossy lobe with a finite value splats first, as its does --
+        // softened toward the emitter on the first bounce (dGlossyArrival).
+        if (m.type == D_GLOSSY) {
+            const Real sEm = dGlossyArrival(m, h, -rd, firstHit);
+            for (int i = 0; i < nUp; ++i) beta[i] *= sEm;
+        }
         if ((camMode == CAM_A || camMode == CAM_B) && dGlossySplats(m) &&
             !(cs.pSplit && dIsSpecularType(sc.mats[h.matId].type))) {   // P's split: the camera side's
             const DVec3 wl = -rd;
@@ -13322,7 +13381,8 @@ __device__ static int shadeStepHero(const DScene& sc, const DCamSet& cs, int cam
             const DGlossyDraw gd = dDrawGlossy(sc, m, h, rd, h.n, -rd, rng);
             const DVec3& o = gd.o;
             if (dot(o, h.n) <= 0) { for (int i = 0; i < nUp; ++i) eAbsorbed += (double)beta[i]; return WF_TERMINATE; }
-            const Real adj = (Real)dGlossyAdjointRatio(h.n, -rd, o);   // see the scalar path
+            const Real adj = (Real)dGlossyAdjointRatio(h.n, -rd, o) *   // see the scalar path
+                             dShadingAdjointCorr(-rd, o, h.n, dShadedNg(h));
             if (!(adj > (Real)0)) { for (int i = 0; i < nUp; ++i) eAbsorbed += (double)beta[i]; return WF_TERMINATE; }
             for (int i = 0; i < nUp; ++i) { eAbsorbed += (double)(beta[i] * ((Real)1 - adj)); beta[i] *= adj; }
             if (gd.irid) {
@@ -13366,15 +13426,13 @@ __device__ static int shadeStepHero(const DScene& sc, const DCamSet& cs, int cam
     for (int i = 0; i < nUp; ++i) rho[i] = clamp01(dDiffuseRho(sc, m, h, lam[i]));
     DVec3 ngo = dShadedNg(h);
     DVec3 wiPrev = -rd;
-    // Lit only from above ns; the first bounce softened (as shadeStep).
-    if (!(dot(wiPrev, h.n) > (Real)0)) {
+    // Lit only from above ns; the first bounce softened (dLambertArrival, as shadeStep).
+    Real sEm;
+    if (!dLambertArrival(h, ngo, wiPrev, firstHit, sEm)) {
         for (int i = 0; i < nUp; ++i) eAbsorbed += (double)beta[i];
         return WF_TERMINATE;
     }
-    if (firstHit) {
-        const Real sEm = dShadowTerminatorG(wiPrev, h.n, ngo);
-        for (int i = 0; i < nUp; ++i) beta[i] *= sEm;
-    }
+    for (int i = 0; i < nUp; ++i) beta[i] *= sEm;
     { const bool caus = dPathIsCaustic(pathC);
       // ...with the aimed caustic pass's MIS weight, as the scalar deposits carry it; not on a
       // strand (CURVE-GATHER).
@@ -18647,14 +18705,23 @@ __device__ static double dEmitterSoftening(const DScene& sc, const DVertex& v, c
         return 1.0;
     return (double)dShadowTerminatorG(toEmitter, v.ns, dVertexGeoN(v));
 }
-// Host twin softenFirstBounce: path[1] on (and its C - 1 secondaries), softened toward path[0].
+// Host twin softenFirstBounce: path[1] on (and its C - 1 secondaries), softened toward path[0] --
+// or, where path[1] is a compound's merge vertex whose pick went delta (`compoundMergeW`), its merge
+// copy alone.
 __device__ static void dSoftenFirstBounce(const DScene& sc, DVertex* path, double* pathSec,
-                                          int secStride, int n, int C) {
+                                          int secStride, int n, int C, const float* compoundMergeW) {
     if (n < 2) return;
     const DVec3 d = path[0].p - path[1].p;
     const double l2 = (double)ddot(d, d);
     if (!(l2 > 0.0)) return;
-    const double f = dEmitterSoftening(sc, path[1], d * (Real)(1.0 / sqrt(l2)));
+    const DVec3 toEm = d * (Real)(1.0 / sqrt(l2));
+    if (path[1].type == BV_SURFACE && path[1].delta && compoundMergeW && compoundMergeW[1] > 0.0f) {
+        const double s = (double)dShadowTerminatorG(toEm, path[1].ns, dVertexGeoN(path[1]));
+        path[1].beta *= s;
+        for (int i = 0; i + 1 < C; ++i) pathSec[secStride + i] *= s;
+        return;
+    }
+    const double f = dEmitterSoftening(sc, path[1], toEm);
     if (f == 1.0) return;
     for (int k = 1; k < n; ++k) {
         path[k].beta *= f;
@@ -18743,7 +18810,7 @@ __device__ static int dGenLightSubpath(const DScene& sc, const DCamera& cam, int
         dRandomWalk(sc, cam, diffraction, walkFrom, dir, betaWalkD, pdfDirD, hb, maxDepth - 1, rng,
                     path, pathSec, secStride, maxV, nD, true, betaWalkSecD, hb.C,
                     nullptr, nullptr, nullptr, 0, nullptr, nullptr, compoundMergeW);
-        dSoftenFirstBounce(sc, path, pathSec, secStride, nD, hb.C);
+        dSoftenFirstBounce(sc, path, pathSec, secStride, nD, hb.C, compoundMergeW);
         // Infinite-light density patch (PBRT): the first scene vertex was given a
         // solid-angle density converted with 1/dist^2 from the fictitious disc point, but
         // the reverse direction (dVertexPdfLightF) reports the planar pdfPos. Rewrite
@@ -18817,7 +18884,7 @@ __device__ static int dGenLightSubpath(const DScene& sc, const DCamera& cam, int
     dRandomWalk(sc, cam, diffraction, ro, dir, betaWalk, pdfDir, hb, maxDepth - 1, rng,
                 path, pathSec, secStride, maxV, n, true, betaWalkSec, hb.C,
                 nullptr, nullptr, nullptr, 0, nullptr, nullptr, compoundMergeW);
-    dSoftenFirstBounce(sc, path, pathSec, secStride, n, hb.C);
+    dSoftenFirstBounce(sc, path, pathSec, secStride, n, hb.C, compoundMergeW);
     return n;
 }
 
@@ -18900,9 +18967,10 @@ __device__ static double dMisWeight(const DScene& sc, const DCamera& cam,
         // eye[i]'s reverse density is generated from eye[i+1]; at pt from Qs, and at eye[tMi]
         // from pt, both non-delta here.
         // (Tested before the multiply: a ratio already overflowed to inf times 0 is a NaN.)
-        const float rev = dMisRevDensity(num, i + 1 < ti && eye[i + 1].delta);
-        if (rev == 0.f) break;
-        ri *= rev / dMisRemap0(den);
+        const float r = dMisRevDensity(num, i + 1 < ti && eye[i + 1].delta) / dMisRemap0(den);
+        if (!(r > 0.f)) break;
+        ri *= r;
+        if (!(ri > 0.f)) break;                      // underflowed (host twin)
         if (!dl && !eye[i - 1].delta) sumRi += ri;
         if (merges && i >= 2) {                      // merge at eye[i-1]
             // eye[i-1]'s light-side neighbour is eye[i], whose flag is `dl` (0 at pt).
@@ -18928,9 +18996,10 @@ __device__ static double dMisWeight(const DScene& sc, const DCamera& cam,
         else               { num = (float)light[i].pdfRev; den = (float)light[i].pdfFwd; dl = light[i].delta; }
         // light[i]'s reverse density is generated from light[i+1]; at Qs from pt, and at
         // light[sMi] from Qs, both non-delta here.
-        const float rev = dMisRevDensity(num, i + 1 < si && light[i + 1].delta);
-        if (rev == 0.f) break;
-        ri *= rev / dMisRemap0(den);
+        const float r = dMisRevDensity(num, i + 1 < si && light[i + 1].delta) / dMisRemap0(den);
+        if (!(r > 0.f)) break;
+        ri *= r;
+        if (!(ri > 0.f)) break;
         // The hypothetical strategy at index i connects light[i-1] to the eye side, so it is
         // impossible if either end of that new edge is delta. At i == 0 the "edge" is instead
         // the eye path LANDING on the emitter, which a DELTA light (spot: a point; sun:
@@ -19360,14 +19429,6 @@ __device__ static double dConnectBDPT(const DScene& sc, const DCamera& cam,
 }
 
 // ---- mode J's point x point merges on the device (`-jsurf`) --------------------------------
-// Device twin of surfmerge.h's vmGatherCorr: the density estimate reads flux per GEOMETRIC
-// area while every strategy it is MIS-combined with integrates against the SHADING cosine.
-// Exactly 1 on flat geometry.
-__device__ static inline double dVmGatherCorr(const DVec3& wp, const DVec3& ns, const DVec3& ng) {
-    const double den = fabs(ddot(wp, ng));
-    if (den <= 1e-8) return 1.0;
-    return fabs(ddot(wp, ns)) / den;
-}
 
 // --- A merge weight's camera half at the merged light's wavelength (UPBP-W-CHROMATIC) ----------
 // Device twin of bdpt.h's ChromaMis and cameraSideSumsChroma, where the why is.
@@ -19624,7 +19685,7 @@ __device__ static inline void dSurfMergePhoton(const DScene& sc, const DSurfMap&
     const Real lam = (Real)ph.lambda;
     double fCam = dBsdfF(sc, vk, woCam, ph.wo, lam);
     if (!(fCam > 0.0)) return;
-    fCam *= dVmGatherCorr(ph.wo, vk.ns, site.ngo);
+    fCam *= dArrivalAdjointCorr(ph.wo, vk.ns, site.ngo);   // flux per geometric area -> R's shading
     const double pdfDirRev = dBsdfPdf(sc, vk, woCam, ph.wo, lam);
     const double pdfDirFwd = dBsdfPdf(sc, vk, ph.wo, woCam, lam);
     const double w = sw(lm, pdfDirRev, pdfDirFwd, (double)lam);
@@ -21970,7 +22031,6 @@ __device__ static inline DVertex dVertFromLV(const DVcmLV& lv) {
 __device__ static void dVcmScatter(const DScene& sc, const DMaterial& m, const DHit& h,
                                    const DVec3& rd, Real lambda, DRng& rng, int matId,
                                    DMediumStack& stk, double* radianceScale, int diffraction,
-                                   bool importance,
                                    DVec3& wi, double& betaFactor, double& pdfW, double& pdfRevW,
                                    double& cosThetaOut, bool& delta, bool& terminate,
                                    const Real* lamAll = nullptr, int nUp = 1,
@@ -21983,6 +22043,8 @@ __device__ static void dVcmScatter(const DScene& sc, const DMaterial& m, const D
     // every bin over its value at lambda, as mode J's device walk folds it -- the slots through the
     // shape their own read captured (DJBase), the step through its record (host twin scatterSample).
     if (radianceScale) *radianceScale = 1.0;
+    // The light walk is the one that passes no radianceScale (host twin: Transport::Flux).
+    const bool importance = radianceScale == nullptr;
     DVertex vt = dVertFromHit(h, matId);
     const DVec3& ns = h.n;
     DVec3 wo = normalize(rd * (Real)(-1));
@@ -22425,11 +22487,14 @@ __global__ void kVcmLightT(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx,
                 beta *= sL;
                 for (int k = 0; k + 1 < nUp; ++k) betaSec[k] *= sL;
             }
+            // ...and a compound's merge copy where the pick went delta (host twin vcm.h sStore).
+            const double sStore = (edges == 1 && !connectible && storeP > 0.0)
+                                ? (double)dShadowTerminatorG(wo, h.n, ngo) : 1.0;
             if (connectible || storeP > 0.0) {
                 if (stored < vcmCap) {
                     DVcmLV lv;
                     lv.p = h.p; lv.ns = h.n; lv.ng = h.ng; lv.wo = wo;
-                    lv.beta = beta; lv.lambda = (float)lambda;
+                    lv.beta = beta * sStore; lv.lambda = (float)lambda;
                     lv.cx = (float)cieLx; lv.cy = (float)cieLy; lv.cz = (float)cieLz;
                     lv.dVCM = dVCM; lv.dVC = dVC; lv.dVM = dVM;
                     lv.matId = matId; lv.edges = edges; lv.u = h.u; lv.v = h.v; lv.curv = h.curv;
@@ -22442,7 +22507,7 @@ __global__ void kVcmLightT(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx,
                     lvSlab[i * vcmCap + stored] = lv;
                     if (NS > 0 && lvSec) {
                         DVcmSec* row = lvSec + (size_t)(i * vcmCap + stored) * secStride;
-                        for (int k = 0; k + 1 < nUp; ++k) { row[k].beta = betaSec[k]; row[k].lam = (float)lamAll[k + 1]; }
+                        for (int k = 0; k + 1 < nUp; ++k) { row[k].beta = betaSec[k] * sStore; row[k].lam = (float)lamAll[k + 1]; }
                     }
                     stored++;
                 }
@@ -22518,7 +22583,6 @@ __global__ void kVcmLightT(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx,
             DVec3 wi; double betaFactor, pdfW, pdfRevW, cosThetaOut; bool delta, terminate;
             double secF[SECN]; bool secChromatic = false, keepBundle = false;
             dVcmScatter(sc, *mp, h, rdCur, lambda, rng, matId, stk, /*flux*/ nullptr, diffraction,
-                        /*importance*/ true,
                         wi, betaFactor, pdfW, pdfRevW, cosThetaOut, delta, terminate,
                         lamAll, nUp, secF, &secChromatic, &keepBundle);
             // Kill the walk only when EVERY live λ is dead (nUp == 1 -> mxF == betaFactor).
@@ -23092,8 +23156,7 @@ __global__ void kVcmCameraT(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx
                                   if (fSec[q] > mxF) mxF = fSec[q];
                               }
                               if (!(mxF > 0.0)) continue;   // == the old `fCam <= 0` at lvUp == 1
-                              double denom = fabs(ddot(wMerge, ngoCam));
-                              double gcorr = (denom <= 1e-8) ? 1.0 : fabs(ddot(wMerge, h.n)) / denom;
+                              const double gcorr = dArrivalAdjointCorr(wMerge, h.n, ngoCam);
                               fCam *= gcorr;
                               double camDirPdfW = dBsdfPdf(sc, vt, wo, wMerge, lam);
                               double camRevPdfW = dBsdfPdf(sc, vt, wMerge, wo, lam);
@@ -23138,7 +23201,6 @@ __global__ void kVcmCameraT(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx
             double secF[SECN]; bool secChromatic = false, keepBundle = false;
             double radianceScale = 1.0;
             dVcmScatter(sc, *mp, h, rdCur, lambda, rng, matId, stk, &radianceScale, diffraction,
-                        /*importance*/ false,
                         wi, betaFactor, pdfW, pdfRevW, cosThetaOut, delta, terminate,
                         lamAll, nUp, secF, &secChromatic, &keepBundle, jOn ? &jrun : nullptr,
                         invPdfLambda);
@@ -25932,10 +25994,6 @@ static void wavefrontTrace(DUpload& up, const gpu::DCamSet& cs, double* d_energy
     cudaFree(d_dispatched); cudaFree(d_live);
 }
 
-// How many surface interactions a photon mode M or S deposits makes: the CPU's photonMaxBounce()
-// default (photonmap_render.h), which `-max-bounce` does not move either -- it caps the camera side.
-constexpr int kPhotonDepositMaxBounce = 32;
-
 // Launch the forward trace (megakernel or wavefront backend) over the baked scene `up`
 // and camera set `cs`, accumulating into cs.films/cs.hits and d_energy. Shared by the
 // single-camera and multi-camera drivers so the launch/seeding logic lives in one place.
@@ -25947,8 +26005,8 @@ constexpr int kPhotonDepositMaxBounce = 32;
 // posed copies (a session's), grown here as a launch needs, in DCameras; null, a launch allocates
 // and frees its own.
 // `maxBounce`: the most surface interactions a photon makes -- `-max-bounce` for modes A, B and C
-// (main.cpp effMaxBounce, as the CPU's renderForward takes it), kPhotonDepositMaxBounce for mode M's
-// and mode S's deposits.
+// (main.cpp effMaxBounce, as the CPU's renderForward takes it), photonMaxBounce() (photonmap.h,
+// `-photon-bounce`) for mode M's and mode S's deposits.
 static void launchForward(DUpload& up, const gpu::DCamSet& cs, double* d_energy,
                           long long N, bool diffraction, unsigned long long seedBase,
                           bool wavefront, int camModeInt, int heroC, int maxBounce,
@@ -28961,7 +29019,7 @@ std::vector<Film> renderPhotonMapSharedCuda(const Scene& scene, const std::vecto
         // fill after it deposit the same photons.
         if (!splitDeposit) {
             launchForward(up, cs, eBuf, Nq, diffraction, seed0, /*wavefront*/false,
-                          CAM_B, heroC, kPhotonDepositMaxBounce, /*stableSeed*/true);
+                          CAM_B, heroC, photonMaxBounce(), /*stableSeed*/true);
             return;
         }
         stage->report(label, 0, Nq, nullptr, 0.0);
@@ -28978,7 +29036,7 @@ std::vector<Film> renderPhotonMapSharedCuda(const Scene& scene, const std::vecto
             const long long cs2 = (off + chunk <= Nq) ? chunk : (Nq - off);
             const auto t0 = std::chrono::steady_clock::now();
             launchForward(up, cs, eBuf, cs2, diffraction, seed0 + (unsigned long long)off,
-                          /*wavefront*/false, CAM_B, heroC, kPhotonDepositMaxBounce, /*stableSeed*/true);
+                          /*wavefront*/false, CAM_B, heroC, photonMaxBounce(), /*stableSeed*/true);
             CUDA_CHECK(cudaDeviceSynchronize());   // the launch is async; time the WORK
             const double sec = std::chrono::duration<double>(
                 std::chrono::steady_clock::now() - t0).count();
@@ -29875,7 +29933,7 @@ void sppmSessionPass(SppmSession* s, long long photonsPerPass, double alpha) {
         DCamSet cs{}; cs.nCam = 0;
         cs.depPhotons = buf; cs.depCount = s->d_depCount; cs.depCap = capv;
         launchForward(s->up, cs, s->d_energy, photonsPerPass, s->diffraction,
-                      (unsigned long long)s->emittedTotal, /*wavefront*/false, CAM_B, s->heroC, kPhotonDepositMaxBounce);
+                      (unsigned long long)s->emittedTotal, /*wavefront*/false, CAM_B, s->heroC, photonMaxBounce());
     };
     unsigned long long cap = (unsigned long long)((double)photonsPerPass * 2.5) + (1ull << 20);
     if (cap > s->photonsCap) {

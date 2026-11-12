@@ -463,6 +463,20 @@ inline double shadingAdjointCorr(const Vec3& wi, const Vec3& wo,
     return num / denom;
 }
 
+// The ARRIVAL half of the same adjoint, |cos(w,ns)| / |cos(w,ng)|, for light arriving along -`w`
+// (`w` pointing back toward its source) at a surface whose shading normal is `ns` and geometric
+// normal `ng`. A density estimate of photons reads flux per GEOMETRIC area, while mode R shades with
+// the shading cosine; this turns the one into the other. Every estimator that reads arrivals takes
+// it: a photon deposit of modes M and S (and the continuation drawn about ng where ns tilts,
+// Renderer::arrivalAdjoint), and the point merges of modes U and J. 1 where ns == ng up to rounding;
+// a grazing denominator (measure zero, ~0 flux) falls back to 1, as shadingAdjointCorr's does,
+// rather than lend a near-tangent photon a weight of 1e9. Device twin dArrivalAdjointCorr.
+inline double arrivalAdjointCorr(const Vec3& w, const Vec3& ns, const Vec3& ng) {
+    const double denom = std::fabs(dot(w, ng));
+    if (denom <= 1e-8) return 1.0;
+    return std::fabs(dot(w, ns)) / denom;
+}
+
 // Shadow-terminator softening (Chiang, Li, Burley & Hovhannisyan 2019, "Taming the Shadow
 // Terminator"; the same cubic used by Blender Cycles' `bump_shadowing_term`). Returns a
 // factor in [0,1] to multiply a light connection / NEE contribution by, REPLACING the old

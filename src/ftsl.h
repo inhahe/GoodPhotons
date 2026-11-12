@@ -6453,8 +6453,13 @@ private:
         // work on its output.
         std::vector<std::vector<Vec3>> dynPos, moving;
         if (dI > 0) {
+            // Deformers whose handles all hold still give one rest at every key: solved once.
+            bool keyedBefore = false;
+            for (int di = 0; di < dI; ++di)
+                for (const Hd& h : stack[(size_t)di].hs) keyedBefore = keyedBefore || h.to.size() > 1;
             moving.resize((size_t)K);
             for (int k = 0; k < K; ++k) {
+                if (k > 0 && !keyedBefore) { moving[(size_t)k] = moving[0]; continue; }
                 std::vector<Vec3> p = own;
                 for (int di = 0; di < dI; ++di)
                     if (!applyOne(stack[(size_t)di], p, k)) return false;

@@ -2460,6 +2460,84 @@ Not changed:
   GLOW-LIGHT-MODES' open decision; logged there, and REFERENCE.md says so.
 * BUMP-D-VS-R, left open: it is BUMP-MODES now, being fixed.
 
+## DONE (2026-11-12, 0.440.3): REVIEW-4400 — what the Opus review of 0.439.7-0.440.0 found
+
+`/code-review xhigh` (Opus) of e37cab6..e6df28d (REMAP0, its follow-ups, B-GPU-MAXBOUNCE, BUMP-MODES
+stages 1 and 2, DEFORM-LIMITS): 14 findings, each checked against the code. Fixed in 0.440.3:
+
+* **The compound deposit skipped the Lambertian arrival rule** (render.h tracePhoton and its hero
+  twin, render_cuda.cu shadeStep and shadeStepHero). A mix or layered surface deposits before its
+  lobe pick, at the arriving beta: no below-ns test, no arrival adjoint, no first-bounce softening.
+  `compoundDepositWeight` (device twin) now applies its Lambertian lobes' rule; a compound with a
+  translucent lobe stores the arrival as a translucent's own case does (stage 3). On a
+  normal-mapped room of `layered` walls (coat roughness 0.3 / 0 over a diffuse body), M read 1.087
+  / 1.079 of R and S 1.081 / 1.079 (host; the device alike); now 1.0051 / 1.0113 and 1.0045 /
+  1.0117. check_bump_modes' new `layered` room holds M and S within 2 % (LAYERED-MODES, below, is
+  why not 1 %).
+* **A glossy photon vertex was never softened at its first bounce** -- mode R's light sampling,
+  BDPT's emitterSoftening and VCM's first bounce all soften one. `glossyArrival` (device
+  `dGlossyArrival`) now softens a glossy first bounce, splat and continuation, and a layered coat's
+  sheen splat and coat continuation. And a photon's glossy continuation now carries the shading
+  normal's half of Veach's adjoint (shadingAdjointCorr) beside the lobe's own (0.440.2), as bdpt.h's
+  light walk always has: on the glossy walls under the slope-2 map, B read 1.162 of R on 0.440.2
+  (1.055 on 0.440.0, where two errors partly cancelled); now 0.991 host and 0.990 device, with D,
+  J and U at 0.986-0.994 -- what is left is BUMP-MODES' glossy stage 3, which R alone now misses.
+* **The arrival adjoint had no grazing guard** (render.h arrivalAdjoint, device dArrivalAdjoint):
+  a photon nearly tangent to the geometric face got a weight of up to 1e9, riding the rest of its
+  path. One function now serves the deposits, the continuation and the merges of U and J
+  (geometry.h `arrivalAdjointCorr`, device `dArrivalAdjointCorr`; vmGatherCorr, dVmGatherCorr and an
+  inline copy in the device VCM merge are gone), falling back to 1 below 1e-8 as they did.
+* **A compound's first-bounce merge copy was unsoftened where its pick went delta** (a mix with a
+  mirror lobe, say): vcm.h's light walk and its device twin now soften the stored copy alone
+  (`sStore`), and bdpt.h softenFirstBounce / dSoftenFirstBounce path[1]'s own throughput alone,
+  which nothing but a merge reads at a delta vertex. A layered coat is a connectible glossy lobe,
+  so the layered rooms do not reach this.
+* **An MIS ratio that underflowed to 0 could meet a later infinite one** (bdpt.h misWeight,
+  render_cuda.cu dMisWeight): 0 x inf = NaN, the weight NaN. Each step's ratio and the running
+  product must now be positive or the walk stops, so no NaN can form.
+* **`-photon-bounce` did not reach the device deposits**: `photonMaxBounce` moved to photonmap.h,
+  which both backends include, and the device's three deposit launches take it.
+  check_forward_depth now holds M and S at `-photon-bounce 2` and `8` to the CPU (0.440.2 GPU M at
+  2: x1.330 of the CPU, the same as at 8; now x1.0004).
+* **A dynamic elastic's moving rest re-solved its still deformers at every key** (ftsl.h): solved
+  once and copied when no deformer before it has a keyed handle, so the cache keys are unchanged.
+* **dVcmScatter took an `importance` flag its `radianceScale` already decided**: derived from it.
+* **softenFirstBounce and the sun leg's factor each scaled the subpath by hand**:
+  `scaleFromFirstVertex` serves both.
+* **B-GPU-MAXBOUNCE was committed after 0.439.8 without a bump**, so the docs credited a version
+  without it: they now say 0.439.9, the first that has it. (History stays as it is.)
+* **Stale comments**: surfmerge.h and vcm.h said M and S must not use the arrival adjoint (they
+  have since 0.439.10); bsdfFAdjoint called the swap a no-op for Diffuse and isTwoSidedMat put a
+  reflect-only edge on the +ns side (lambertLit tests wi; the edge needs the geometric front); the
+  translucent splats said the wrong-side lobe self-rejects on cosSurf (camSideOk tests the
+  geometric side passed). 0.440.1 had also slipped gatherAlbedo between photonMaxBounce and its
+  comment; both now stand alone.
+
+The one Lambertian arrival rule the review asked for (six pasted copies) is `lambertArrival` /
+`dLambertArrival`, which every photon tracer's Diffuse, Fluorescent and compound sites call.
+
+## OPEN (2026-11-12, 0.440.3): LAYERED-MODES — a `layered` material reads 1-9 % off mode R in the other modes, on flat geometry
+
+Found measuring REVIEW-4400's compound fix (`scraps/_bump_compound.py`, AMP 0): a room of
+`layered` walls -- a Fresnel coat (ior 1.5) over a diffuse body (reflect 0.8), no normal map --
+lit at a grazing angle, every mode against R, CPU. Coat roughness 0: D 1.014, J 1.002, U 1.012,
+B 0.913, M 1.003, S 1.004. Coat roughness 0.3: D 1.011, J 1.004, U 1.010, B 1.027, M 1.012, S 1.011.
+
+Cause: the coat's coin is not reciprocal. Mode R's camera walk picks the coat with probability
+R(camera incidence) and the body with 1 - R(camera incidence) (backward.h); a light walk picks with
+R at the LIGHT's incidence (render.h tracePhoton, bdpt.h randomWalk, vcm.h), so its body carries
+1 - R(light) where R's carries 1 - R(camera). Each takes one of the two transmissions a real clear
+coat applies (light enters the coat and leaves it again), and they disagree wherever the two
+angles differ; the coat sheen's splat already evaluates R toward the camera (GlossySplat::stack),
+the body's does not.
+
+**Needs a decision** (it changes how layered materials look in mode R): (a) keep mode R's
+integrand, and have every light-side walk re-weight its body lobe by (1 - R(out)) / (1 - R(in))
+and its connections likewise -- non-physical but consistent; or (b) make the model physical,
+(1 - R(in)) (1 - R(out)) on every body scattering in every mode -- reciprocal, so the modes agree
+by construction, and a layered body renders darker, by about 8 % at normal incidence for ior 1.5
+and more at grazing angles.
+
 ## OPEN (2026-11-12, 0.440.2): GLOSSY-ROOM-M — mode M reads a room of glossy walls 0.5 % bright on the host
 
 `tools/check_glossy_adjoint.py`'s room: five glossy walls (reflect 0.8, roughness 0.4) and an area
@@ -2583,13 +2661,20 @@ flat room in brackets): a translucent panel under the slope-2 map reads D 1.090 
 D 1.013 (1.011), J 1.006 (1.008), U 1.014 (1.012), B 1.055 (0.997), M 1.006 (1.004), S 1.009
 (0.991). So the translucent lobe is stage (3)'s large part, and on glossy walls only B (and S a
 little) moves with the map; the flat rooms' own offsets are TRANSLUCENT-MS and GLOSSY-FLAT-DJU.
+On 0.440.3 (the glossy adjoint, the photon tracers' glossy softening and shading adjoint, the
+compound deposit), glossy walls under the map, host / device: D 0.991 / 0.992, J 0.992 / 0.986,
+U 0.994 / 0.991, B 0.991 / 0.990, M 1.006 / 1.001, S 0.997 / 1.043 -- the light-side modes agree,
+and R reads them ~0.9 % darker: its glossy integrand on a tilted ns is stage (3)'s glossy part.
+Device S's 1.043 was there on 0.440.2 too (host 0.997): a device-only S fault on a normal-mapped
+glossy surface (S-GPU-GLOSSY-BUMP), not yet looked into.
 
-## DONE (2026-11-12, 0.439.8): B-GPU-MAXBOUNCE — GPU mode B ignored `-max-bounce`
+## DONE (2026-11-12, 0.439.9): B-GPU-MAXBOUNCE — GPU mode B ignored `-max-bounce`
 
-**Fixed in 0.439.8.** renderForwardCuda, renderForwardSharedCuda and sharedForwardGpuBegin take the
+**Fixed in 0.439.9** (committed after 0.439.8 without a VERSION bump, so 0.439.9 is the first
+version that has it). renderForwardCuda, renderForwardSharedCuda and sharedForwardGpuBegin take the
 cap (main.cpp passes `effMaxBounce()`), and `launchForward` hands it to both backends; mode M's and
-mode S's deposits keep the CPU's `photonMaxBounce` default by name (`kPhotonDepositMaxBounce`),
-which `-max-bounce` does not move there either. New gate `tools/check_forward_depth.py`: GPU mode B
+mode S's deposits take `photonMaxBounce()` (`-photon-bounce`, read on the device too since
+0.440.3), which `-max-bounce` does not move there either. New gate `tools/check_forward_depth.py`: GPU mode B
 against CPU mode B at `-max-bounce 2` and `8` in a closed room of albedo 0.8, 1.0000 at both (2
 reads 0.7695 of 8 on each device). The rest of this entry is how it stood.
 

@@ -23,6 +23,7 @@
 #include <cmath>
 #include <algorithm>
 #include <cstdint>
+#include <cstdlib>          // photonMaxBounce: std::getenv
 #include <utility>
 #include <thread>
 #include "linalg.h"
@@ -30,6 +31,22 @@
 #include "color.h"
 #include "allocreport.h"   // OOM that names the buffer, its size and the flag that sizes it
 #include "workcount.h"    // tlWork: a query's candidates, for the CPU refresh (MODEM-CPU-NONDET)
+
+// FTRACE_PHOTONBOUNCE=<n> (`-photon-bounce <n>`): cap the LIGHT path's bounce count in the
+// photon passes of modes M and S, host (tracePhotonPass) and device (launchForward). It exists
+// because nothing else could reach it. `-max-bounce` governs the CAMERA path, and in mode M that
+// path stops at the first diffuse hit, so `-max-bounce 2`, `32` and `64` produce byte-identical
+// mode-M images -- a perfectly clean, perfectly meaningless null for any question about how far
+// LIGHT travels before it is deposited. Default 32. Here, in the header both backends include, so
+// they read one value.
+inline int photonMaxBounce() {
+    static const int m = [] {
+        const char* e = std::getenv("FTRACE_PHOTONBOUNCE");
+        const int v = e ? std::atoi(e) : 0;
+        return v >= 1 ? v : 32;
+    }();
+    return m;
+}
 
 // ---- Caustic split: the one tunable of the FOCUS/SCATTER classification ---------------
 // Mode M partitions its deposits into a global map and a caustic map by the classic L·S⁺·D
