@@ -101,7 +101,8 @@ Film renderForwardCuda(const Scene& scene, const Camera& cam, int resX, int resY
                        long long N, EnergyReport& eOut, bool diffraction,
                        char camMode, unsigned long long seedBase = 0,
                        bool wavefront = false, int heroC = 1, bool pSplit = false,
-                       bool stableSeed = false, const CudaSceneHold* held = nullptr);
+                       bool stableSeed = false, const CudaSceneHold* held = nullptr,
+                       int maxBounce = 32);
 
 // GPU multi-camera shared forward trace (models A and B — the device twin of the CPU
 // renderForwardShared). Traces ONE set of N photons and splats each vertex to ALL
@@ -120,7 +121,7 @@ std::vector<Film> renderForwardSharedCuda(const Scene& scene,
                                           long long N, EnergyReport& eOut, bool diffraction,
                                           char camMode, unsigned long long seedBase = 0,
                                           bool wavefront = false, int heroC = 1,
-                                          bool beamGather = false);
+                                          bool beamGather = false, int maxBounce = 32);
 
 // ---- Resident shared forward session (the batched-accumulation fast path) ----
 //
@@ -146,7 +147,7 @@ SharedGpuSession* sharedForwardGpuBegin(const Scene& scene,
                                         const std::vector<int>& resX,
                                         const std::vector<int>& resY,
                                         char camMode, bool wavefront, int heroC,
-                                        bool beamGather,
+                                        bool beamGather, int maxBounce,
                                         const std::vector<Film>* seedFilms = nullptr,
                                         const EnergyReport* seedEnergy = nullptr);
 // Trace N more photons into the resident films (async on the device; downloads sync).

@@ -25817,6 +25817,10 @@ static void wavefrontTrace(DUpload& up, const gpu::DCamSet& cs, double* d_energy
     cudaFree(d_dispatched); cudaFree(d_live);
 }
 
+// How many surface interactions a photon mode M or S deposits makes: the CPU's photonMaxBounce()
+// default (photonmap_render.h), which `-max-bounce` does not move either -- it caps the camera side.
+constexpr int kPhotonDepositMaxBounce = 32;
+
 // Launch the forward trace (megakernel or wavefront backend) over the baked scene `up`
 // and camera set `cs`, accumulating into cs.films/cs.hits and d_energy. Shared by the
 // single-camera and multi-camera drivers so the launch/seeding logic lives in one place.
@@ -25827,9 +25831,13 @@ static void wavefrontTrace(DUpload& up, const gpu::DCamSet& cs, double* d_energy
 // `posedKeep` / `posedCapKeep`: a buffer the caller keeps across launches for a moving camera set's
 // posed copies (a session's), grown here as a launch needs, in DCameras; null, a launch allocates
 // and frees its own.
+// `maxBounce`: the most surface interactions a photon makes -- `-max-bounce` for modes A, B and C
+// (main.cpp effMaxBounce, as the CPU's renderForward takes it), kPhotonDepositMaxBounce for mode M's
+// and mode S's deposits.
 static void launchForward(DUpload& up, const gpu::DCamSet& cs, double* d_energy,
                           long long N, bool diffraction, unsigned long long seedBase,
-                          bool wavefront, int camModeInt, int heroC, bool stableSeed = false,
+                          bool wavefront, int camModeInt, int heroC, int maxBounce,
+                          bool stableSeed = false,
                           gpu::DCamera** posedKeep = nullptr, size_t* posedCapKeep = nullptr) {
     using namespace gpu;
     // seedBase==0 keeps the original single-shot seed exactly; each accumulation chunk
@@ -25865,9 +25873,9 @@ static void launchForward(DUpload& up, const gpu::DCamSet& cs, double* d_energy,
     }
     if (wf) {
         // Streaming backend: identical physics, path-regeneration scheduling. Same
-        // maxBounce (32) and camera mode/set as the megakernel. (Hero AND photon-beams
+        // maxBounce and camera mode/set as the megakernel. (Hero AND photon-beams
         // force the megakernel — the wavefront pool carries no per-photon beam RNG stream.)
-        wavefrontTrace(up, csRun, d_energy, N, diffraction ? 1 : 0, kseed, 32, camModeInt);
+        wavefrontTrace(up, csRun, d_energy, N, diffraction ? 1 : 0, kseed, maxBounce, camModeInt);
     } else {
         // FTRACE_GPU_PHOTONSEED=1: per-photon seeding (GPU-VARIANCE's A/B arm) for the launches that
         // seed per thread -- modes A, B and C's own renders. Stable seeding (mode P's batches, mode
@@ -25877,7 +25885,7 @@ static void launchForward(DUpload& up, const gpu::DCamSet& cs, double* d_energy,
             return (e && *e) ? std::atoi(e) : 0;
         }();
         kTrace<<<kFwdNumBlocks, kFwdBlockSize>>>(up.sc, csRun, d_energy, N, diffraction ? 1 : 0,
-                                           kseed, 32, camModeInt, effHeroC,
+                                           kseed, maxBounce, camModeInt, effHeroC,
                                            stableSeed ? 1 : perPhotonSeed,
                                            stableSeed ? (long long)seedBase : 0LL);
     }
@@ -25888,7 +25896,7 @@ static void launchForward(DUpload& up, const gpu::DCamSet& cs, double* d_energy,
 Film renderForwardCuda(const Scene& scene, const Camera& cam, int resX, int resY,
                        long long N, EnergyReport& eOut, bool diffraction,
                        char camMode, unsigned long long seedBase, bool wavefront, int heroC,
-                       bool pSplit, bool stableSeed, const CudaSceneHold* held) {
+                       bool pSplit, bool stableSeed, const CudaSceneHold* held, int maxBounce) {
     using namespace gpu;
     Film out; out.resX = resX; out.resY = resY; out.alloc();
     if (!cudaAvailable() || !cudaForwardSupported(scene)) return out;
@@ -25913,7 +25921,8 @@ Film renderForwardCuda(const Scene& scene, const Camera& cam, int resX, int resY
     std::vector<double*> fp{ d_film }, hp{ d_hits };
     DCamSet cs = makeCamSet(up, hc, fp, hp);
     cs.pSplit = pSplit ? 1 : 0;
-    launchForward(up, cs, d_energy, N, diffraction, seedBase, wavefront, camModeInt, heroC, stableSeed);
+    launchForward(up, cs, d_energy, N, diffraction, seedBase, wavefront, camModeInt, heroC,
+                  maxBounce >= 1 ? maxBounce : 32, stableSeed);
 
     // --- download ---
     std::vector<double> film(npix * 3);
@@ -25951,6 +25960,7 @@ struct SharedGpuSession {
     int  camModeInt = 0;
     bool wavefront = false;
     int  heroC = 1;
+    int  maxBounce = 32;                    // a photon's surface interactions (launchForward)
     int  nc = 0;
 };
 
@@ -25959,7 +25969,7 @@ SharedGpuSession* sharedForwardGpuBegin(const Scene& scene,
                                         const std::vector<int>& resX,
                                         const std::vector<int>& resY,
                                         char camMode, bool wavefront, int heroC,
-                                        bool beamGather,
+                                        bool beamGather, int maxBounce,
                                         const std::vector<Film>* seedFilms,
                                         const EnergyReport* seedEnergy) {
     using namespace gpu;
@@ -25967,6 +25977,7 @@ SharedGpuSession* sharedForwardGpuBegin(const Scene& scene,
     if (nc == 0 || !cudaAvailable() || !cudaForwardSupported(scene)) return nullptr;
 
     auto* s = new SharedGpuSession;
+    s->maxBounce = maxBounce >= 1 ? maxBounce : 32;
     s->nc = nc; s->wavefront = wavefront; s->heroC = heroC;
     s->camModeInt = (camMode == 'A') ? CAM_A : CAM_B;   // shared pass never runs mode C
 
@@ -26038,7 +26049,8 @@ void sharedForwardGpuBatch(SharedGpuSession* s, long long N,
                            unsigned long long seedBase, bool diffraction) {
     if (!s || N <= 0) return;
     launchForward(s->up, s->cs, s->d_energy, N, diffraction, seedBase,
-                  s->wavefront, s->camModeInt, s->heroC, false, &s->d_posed, &s->posedCap);
+                  s->wavefront, s->camModeInt, s->heroC, s->maxBounce, false, &s->d_posed,
+                  &s->posedCap);
 }
 
 void sharedForwardGpuHits0(SharedGpuSession* s, std::vector<double>& hits) {
@@ -26080,14 +26092,15 @@ std::vector<Film> renderForwardSharedCuda(const Scene& scene,
                                           const std::vector<int>& resY,
                                           long long N, EnergyReport& eOut, bool diffraction,
                                           char camMode, unsigned long long seedBase,
-                                          bool wavefront, int heroC, bool beamGather) {
+                                          bool wavefront, int heroC, bool beamGather,
+                                          int maxBounce) {
     // One-shot wrapper over the session API (bit-compatible with the historical
     // single-call behaviour: same bake, same launch, same seeding, energy ADDED to eOut).
     int nc = (int)cams.size();
     std::vector<Film> out(nc);
     for (int c = 0; c < nc; ++c) { out[c].resX = resX[c]; out[c].resY = resY[c]; out[c].alloc(); }
     SharedGpuSession* s = sharedForwardGpuBegin(scene, cams, resX, resY, camMode,
-                                               wavefront, heroC, beamGather);
+                                               wavefront, heroC, beamGather, maxBounce);
     if (!s) return out;
     sharedForwardGpuBatch(s, N, seedBase, diffraction);
     EnergyReport e;
@@ -28833,7 +28846,7 @@ std::vector<Film> renderPhotonMapSharedCuda(const Scene& scene, const std::vecto
         // fill after it deposit the same photons.
         if (!splitDeposit) {
             launchForward(up, cs, eBuf, Nq, diffraction, seed0, /*wavefront*/false,
-                          CAM_B, heroC, /*stableSeed*/true);
+                          CAM_B, heroC, kPhotonDepositMaxBounce, /*stableSeed*/true);
             return;
         }
         stage->report(label, 0, Nq, nullptr, 0.0);
@@ -28850,7 +28863,7 @@ std::vector<Film> renderPhotonMapSharedCuda(const Scene& scene, const std::vecto
             const long long cs2 = (off + chunk <= Nq) ? chunk : (Nq - off);
             const auto t0 = std::chrono::steady_clock::now();
             launchForward(up, cs, eBuf, cs2, diffraction, seed0 + (unsigned long long)off,
-                          /*wavefront*/false, CAM_B, heroC, /*stableSeed*/true);
+                          /*wavefront*/false, CAM_B, heroC, kPhotonDepositMaxBounce, /*stableSeed*/true);
             CUDA_CHECK(cudaDeviceSynchronize());   // the launch is async; time the WORK
             const double sec = std::chrono::duration<double>(
                 std::chrono::steady_clock::now() - t0).count();
@@ -29747,7 +29760,7 @@ void sppmSessionPass(SppmSession* s, long long photonsPerPass, double alpha) {
         DCamSet cs{}; cs.nCam = 0;
         cs.depPhotons = buf; cs.depCount = s->d_depCount; cs.depCap = capv;
         launchForward(s->up, cs, s->d_energy, photonsPerPass, s->diffraction,
-                      (unsigned long long)s->emittedTotal, /*wavefront*/false, CAM_B, s->heroC);
+                      (unsigned long long)s->emittedTotal, /*wavefront*/false, CAM_B, s->heroC, kPhotonDepositMaxBounce);
     };
     unsigned long long cap = (unsigned long long)((double)photonsPerPass * 2.5) + (1ull << 20);
     if (cap > s->photonsCap) {

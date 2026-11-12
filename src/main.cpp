@@ -16294,7 +16294,7 @@ static Film renderForward(const Scene& scene, const Camera* cam, int resX, int r
         cudaAvailable() && cudaForwardSupported(scene)) {
         if (!blurG || forwardCatch || pSplit)
             return renderForwardCuda(scene, *cam, resX, resY, N, eOut, diffraction, camModeG, seedBase,
-                                     wavefront, g_heroC, pSplit, stableSeed, held);
+                                     wavefront, g_heroC, pSplit, stableSeed, held, effMaxBounce());
         Film sky; sky.resX = resX; sky.resY = resY; sky.alloc();
         std::vector<std::thread> skyPool;      // disjoint row bands of one film
         // Joined on every way out, the device call's exceptions included: a joinable thread's
@@ -16309,7 +16309,7 @@ static Film renderForward(const Scene& scene, const Camera* cam, int resX, int r
                                   (int)((long long)resY * (t + 1) / nThreads));
             });
         Film out = renderForwardCuda(scene, *cam, resX, resY, N, eOut, diffraction, camModeG, seedBase,
-                                     wavefront, g_heroC, false, false, held);
+                                     wavefront, g_heroC, false, false, held, effMaxBounce());
         for (auto& th : skyPool) th.join();
         out.merge(sky);
         return out;
@@ -29664,7 +29664,7 @@ static int run(int argc, char** argv) {
         // checkpoint films seed the device accumulators so downloads are full totals.
         SharedGpuSession* gses = groupGpu
             ? sharedForwardGpuBegin(scene, cams, rxs, rys, groupMode, wavefront, g_heroC,
-                                    g_beamGather, (accN > 0) ? &acc : nullptr,
+                                    g_beamGather, effMaxBounce(), (accN > 0) ? &acc : nullptr,
                                     (accN > 0) ? &accE : nullptr)
             : nullptr;
         // A session the device refused (it says why) flies on the CPU.

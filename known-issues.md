@@ -2486,7 +2486,15 @@ diffuse continuation is drawn about the geometric normal, weighted by |cos(wi,ns
 same question asked of their lobes (R picks a translucent's lobe by the side of ns the light is on,
 not by the pair's). A gate in tools/ from this script, every mode against R, flat and bumped.
 
-## OPEN (2026-11-12, 0.439.7): B-GPU-MAXBOUNCE — GPU mode B ignores `-max-bounce`
+## DONE (2026-11-12, 0.439.8): B-GPU-MAXBOUNCE — GPU mode B ignored `-max-bounce`
+
+**Fixed in 0.439.8.** renderForwardCuda, renderForwardSharedCuda and sharedForwardGpuBegin take the
+cap (main.cpp passes `effMaxBounce()`), and `launchForward` hands it to both backends; mode M's and
+mode S's deposits keep the CPU's `photonMaxBounce` default by name (`kPhotonDepositMaxBounce`),
+which `-max-bounce` does not move there either. New gate `tools/check_forward_depth.py`: GPU mode B
+against CPU mode B at `-max-bounce 2` and `8` in a closed room of albedo 0.8, 1.0000 at both (2
+reads 0.7695 of 8 on each device). The rest of this entry is how it stood.
+
 
 Found measuring BUMP-MODES: on a flat closed room of albedo 0.8 (its AMP 0), GPU mode B read 1.021 of
 mode R at `-max-bounce 8`, CPU mode B 1.0004. GPU mode B renders `-max-bounce 7` and `8` to the same
