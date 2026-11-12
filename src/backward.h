@@ -2821,6 +2821,7 @@ struct BackwardRenderer {
             // must be transparent — and nowhere else on the path.
             Hit h = scene.closestHit(ray, 1e-6, nullptr, /*skipHair=*/useVol,
                                      /*skipCamHidden=*/(b == 0 && gi.depth == 0));
+            h.extMat = stk.topMat();   // the medium it met the surface from
             if (b == 0 && gi.depth == 0 && h.valid)         // camera segment only — see fwPerDist
                 h.fw = patShadingFootprint(fwPerDist, h.t, dot(ray.d, h.n));
             double dSurf = h.valid ? h.t : 1e30;
@@ -3204,6 +3205,7 @@ struct BackwardRenderer {
             // `b == bounce0`, for the same heroSplit reason it gives).
             Hit h = scene.closestHit(ray, 1e-6, nullptr, /*skipHair=*/useVol,
                                      /*skipCamHidden=*/(b == 0 && gi.depth == 0));
+            h.extMat = stk.topMat();   // the medium it met the surface from
             // Camera segment only — see fwPerDist. `b == 0` and not `b == bounce0`: a
             // heroSplit re-entry resumes this loop at a DEEPER bounce, and that segment
             // has already been through an interface, so its footprint is not the camera's.

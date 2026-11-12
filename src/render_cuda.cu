@@ -654,6 +654,9 @@ struct DMaterial {
 // Sentinel for an unset dielectric priority (device twin of host INT_MIN).
 #define D_NO_PRIORITY (-2147483647 - 1)
 __device__ __host__ static inline bool dHasPriority(const DMaterial& m) { return m.priority != D_NO_PRIORITY; }
+// A stack's top as DHit::extMat holds it: a short, so a scene's 32 768th material and on read as
+// air (no scene comes near; the hit does not grow for them).
+__device__ static inline short dExtMat(int top) { return (top >= 0 && top <= 32767) ? (short)top : (short)-1; }
 
 // Per-path nested-dielectric medium stack (device twin of host MediumStack). The current
 // optical medium (for Beer-Lambert absorption + exterior IOR at the next interface) is the
@@ -3637,6 +3640,10 @@ struct DHit {
     // start with cavityDone = garbage and could return an uninitialised cavity.
     mutable Real cavity = (Real)0;
     mutable bool cavityDone = false;
+    // Hit::extMat's twin, in the padding after cavityDone: the medium the ray met this surface
+    // from (the top of its walk's stack, dExtMat), -1 for air or where no walk set it.
+    // dIridescenceR reads it.
+    short extMat = -1;
     // O8 stage 2 shading footprint (device twin of Hit::fw): the world-space diameter of
     // the surface patch this shading sample stands for. Like cavity it is NOT written by
     // any intersector — it is a property of the ARRIVING RAY, not of the geometry — so it
@@ -6174,16 +6181,21 @@ __device__ static Real dReflectSlot(const DScene& sc, const DMaterial& m, const 
 __device__ static inline double dGlossyExp(double roughness);
 // Twin of iridescenceR: the interference reflectance an iridescent D_GLOSSY weights its lobe by,
 // for light meeting the coating at `cosH` (each direction's cosine with the pair's half-vector),
-// incident medium air. 1 on a plain glossy. `h` (may be null) supplies a mapped film thickness.
+// from the medium the ray met it from (DHit::extMat) where both carry a priority, else air
+// (dExteriorIor's rule). 1 on a plain glossy. `h` (may be null, read as air) supplies a mapped
+// film thickness and the incident medium.
 __device__ static Real dIridescenceR(const DScene& sc, const DMaterial& m, const DHit* h,
                                      Real lambda, Real cosH) {
     if (m.iridescence == 0) return (Real)1;
     const Real ns = specLookup(m.ior, lambda), ks = specLookup(m.substrateK, lambda);
+    const int e = h ? h->extMat : -1;
+    const Real n0 = (e >= 0 && dHasPriority(m) && dHasPriority(sc.mats[e]))
+                        ? specLookup(sc.mats[e].ior, lambda) : (Real)1;
     if (m.iridescence == 1)
-        return thinFilmReflectance((Real)1, specLookup(m.filmIor, lambda), ns, ks,
+        return thinFilmReflectance(n0, specLookup(m.filmIor, lambda), ns, ks,
                                    h ? dMatFilmThickness(sc, m, *h) : (Real)m.filmThickness,
                                    cosH, lambda);
-    return multilayerReflectance((Real)1, cosH, lambda, m.layerN, m.layerK, m.layerThick,
+    return multilayerReflectance(n0, cosH, lambda, m.layerN, m.layerK, m.layerThick,
                                  m.layerCount, ns, ks);
 }
 // Twin of halfVectorCos: each unit direction's cosine with their half-vector, |a + b| / 2.
@@ -13345,6 +13357,7 @@ __device__ static void traceHeroPhoton(const DScene& sc, const DCamSet& cs, int 
         if (sc.hasGrin) dGrinMarch(sc, ro, rd);   // gate excludes GRIN; kept for symmetry
         DHit h = closestHit(sc, ro, rd, curveTmin > (Real)0 ? (Real)0 : RAY_EPS, BIG, false,
                             curveTmin);
+        h.extMat = dExtMat(stk.topMat());   // the medium it met the surface from
         curveTmin = (Real)0;
         int r;
         if (secAlive)
@@ -13431,6 +13444,7 @@ __global__ void kTrace(DScene sc, DCamSet cs, double* energy,
             if (sc.hasGrin) dGrinMarch(sc, ro, rd, &gm);
             DHit h = closestHit(sc, ro, rd, curveTmin > (Real)0 ? (Real)0 : RAY_EPS, BIG, false,
                                 curveTmin);
+            h.extMat = dExtMat(stk.topMat());   // the medium it met the surface from
             curveTmin = (Real)0;
             if (shadeStep(sc, cs, camMode, diffraction, h, ro, rd, beta, lambda, rng,
                           eAbsorbed, eSensor, eEscaped, stk, cs.beamsOn() ? &crng : nullptr,
@@ -13601,6 +13615,7 @@ __global__ void kWfShade(DScene sc, DCamSet cs, double* energy,
         stk.matIdx[i] = st.stkMat[slot * DMediumStack::CAP + i];
         stk.pri[i]    = st.stkPri[slot * DMediumStack::CAP + i];
     }
+    h.extMat = dExtMat(stk.topMat());   // the medium it met the surface from
     double eAbs = 0, eSen = 0, eEsc = 0;
     DPathCaustic pathC = st.pathC[slot];   // caustic history + MIS weight, from earlier bounces
     Real curveTmin = (Real)0;
@@ -13693,10 +13708,13 @@ struct DVertex {
     // dEmitterSamplePoint (the sampled point); a BV_SURFACE vertex from dEmitPatMul at
     // the hit — the two agree pointwise, which is what keeps s=0 / s=1 MIS unbiased.
     Real  emitPatW;
-    int   nUp;                  // live hero wavelengths here (1 = single-λ walk / de-hero'd)
+    int   nUp : 6;                  // live hero wavelengths here (1 = single-λ walk / de-hero'd)
     // The hit's DHit::patOwnSide: matId is the part a mix resolved to, so a connection
     // rebuilding the hit from it could not decide the surface's rule again.
-    int   patOwnSide = 0;
+    int   patOwnSide : 2 = 0;
+    // The hit's DHit::extMat, for a rough coating's incident medium -- in the word nUp and
+    // patOwnSide share, so the vertex does not grow (its size assert, below).
+    int   extMat : 24 = -1;
     // The hit's vertex colour (DHit::vcol, -1 if none) and its barycentrics in 16 bits each
     // (dPackBary), so a connection shades a vertex-coloured mesh as the walk did
     // (VCOL-BDPT-GPU). The quantum, 1.5e-5 of a barycentric, is far below a colour's.
@@ -13779,6 +13797,7 @@ __device__ static inline DHit dVertHit(const DVertex& vt) {
     // field defined: DHit has members with no default (bitangentSign).
     h.vcol = vt.vcol; h.vb0 = dUnpackBary(vt.vb0q); h.vb1 = dUnpackBary(vt.vb1q);
     h.bitangentSign = (Real)1;
+    h.extMat = (short)vt.extMat;
     return h;
 }
 
@@ -16332,6 +16351,7 @@ __device__ static double bkRadiance(const DScene& sc, int diffraction, DVec3 ro,
         // curveTmin, so RAY_EPS would only re-open the 1e-4 hole it was there to avoid.
         DHit h = closestHit(sc, ro, rd, curveTmin > (Real)0 ? (Real)0 : RAY_EPS, BIG,
                             /*camHide=*/(b == 0 && gi.depth == 0), curveTmin);
+        h.extMat = dExtMat(stk.topMat());   // the medium it met the surface from
         curveTmin = (Real)0;    // spent: only a fiber interaction below sets it again
         // O8 stage 2: stamp the shading footprint on the CAMERA SEGMENT only (host twin:
         // backward.h radiance()). A secondary bounce would need ray differentials /
@@ -16587,6 +16607,7 @@ __device__ static void bkRadianceHeroLoop(const DScene& sc, int diffraction,
         // curveTmin, so RAY_EPS would only re-open the 1e-4 hole it was there to avoid.
         DHit h = closestHit(sc, ro, rd, curveTmin > (Real)0 ? (Real)0 : RAY_EPS, BIG,
                             /*camHide=*/(b == 0 && gi.depth == 0), curveTmin);
+        h.extMat = dExtMat(stk.topMat());   // the medium it met the surface from
         curveTmin = (Real)0;    // spent: only a fiber interaction below sets it again
         // O8 stage 2 footprint, camera segment only — see the scalar twin. The test is
         // `b == 0`, NOT `b == bounce0`: a heroSplit re-entry resumes at a DEEPER bounce,
@@ -17977,6 +17998,7 @@ __device__ static void dRandomWalk(const DScene& sc, const DCamera& cam, int dif
         DHit h = closestHit(sc, ro, rd,
                             (nextTmin >= (Real)0) ? nextTmin : ((curveTmin > (Real)0) ? (Real)0 : RAY_EPS), BIG,
                             /*camHide=*/(!importance && bounces == 0), curveTmin);
+        h.extMat = dExtMat(stk.topMat());   // the medium it met the surface from
         curveTmin = (Real)0; nextTmin = (Real)-1;
         if (h.valid && h.sensorId >= 0) return;
         double dSurf = h.valid ? (double)h.t : 1e30;
@@ -18140,6 +18162,7 @@ __device__ static void dRandomWalk(const DScene& sc, const DCamera& cam, int dif
         v.mediumId = -1;
         v.u = h.u; v.v = h.v; v.curv = h.curv;   // per-hit texcoords + curvature for textured/patterned/record BSDF eval (M9, O3)
         v.vcol = h.vcol; v.vb0q = dPackBary(h.vb0); v.vb1q = dPackBary(h.vb1);   // and its vertex colour
+        v.extMat = h.extMat;
         // The strand frame and radius: dBsdfF / dBsdfPdf read them at a D_HAIR vertex (the fiber
         // BCSDF's frame), the connections' far-side clearance reads them, and fiberR > 0 is how
         // dSurfMergeSite knows a vertex sits on ANY curve primitive. 0 off a curve (DHit default).
@@ -20226,6 +20249,7 @@ __device__ static void dPhotonGatherSub(const DScene& sc, const DPhotonMap& pm,
         }
         DHit h = closestHit(sc, ro, rd, curveTmin > (Real)0 ? (Real)0 : RAY_EPS, BIG, false,
                             curveTmin);
+        h.extMat = dExtMat(stk.topMat());   // the medium it met the surface from
         curveTmin = (Real)0;
         if (h.valid) {                                   // Beer-Lambert in current medium
             int cm = stk.topMat();
@@ -20848,6 +20872,7 @@ __device__ static void dPhotonGather(const DScene& sc, const DPhotonMap& pm,
         // sub-ray leaves a visible point, so it is an indirect ray and must see the flat.
         DHit h = closestHit(sc, ro, rd, curveTmin > (Real)0 ? (Real)0 : RAY_EPS, BIG,
                             /*camHide=*/(b == 0), curveTmin);
+        h.extMat = dExtMat(stk.topMat());   // the medium it met the surface from
         curveTmin = (Real)0;
         // --- Participating media along this segment (mode M with -beams) ------------------
         // Done BEFORE `thr` takes the segment's attenuation, for the same reason: each
@@ -21387,6 +21412,7 @@ __device__ static void dSppmVisiblePoint(const DScene& sc, DVec3 ro, DVec3 rd, R
         }
         // b == 0 is the camera ray this visible-point walk was handed; see DMaterial::hideCamera.
         DHit h = closestHit(sc, ro, rd, RAY_EPS, BIG, /*camHide=*/(b == 0));
+        h.extMat = dExtMat(stk.topMat());   // the medium it met the surface from
         if (h.valid) {                                   // Beer-Lambert in current medium, spectral
             const int cm = stk.topMat();
             if (cm >= 0) {
@@ -21736,10 +21762,10 @@ struct DVcmLV {
                            // in VCM than in every other integrator. Costs 8 B/slot after
                            // alignment (the slab goes 128 -> 136 B), which is the price
                            // of that consistency on the largest allocation in a session.
-    // Hero wavelengths still live here (1 == de-hero'd / single-λ), and the hit's DHit::back
-    // and DHit::patOwnSide (DVertex's) -- in one word, so the slot does not grow.
-    short  nUp;
-    unsigned char back, patOwnSide;
+    // Hero wavelengths still live here (1 == de-hero'd / single-λ), the hit's DHit::back and
+    // DHit::patOwnSide (DVertex's), and its DHit::extMat plus one (0: air) -- in one word, so the
+    // slot does not grow. One type throughout, so no compiler splits the word.
+    unsigned nUp : 5, back : 1, patOwnSide : 1, extMat1 : 25;
     DVec3  tangent;        // fiber axis at a strand vertex (its BCSDF frame for VC / splats, 0.364.0)
     Real   fiberR;         // fiber radius (far-side clearance of a connection that ends on it); 0 off a strand
     Real   pscale;         // the hit's DHit::pscale (DVertex::pscale)
@@ -21791,6 +21817,7 @@ __device__ static inline DVertex dVertFromHit(const DHit& h, int matId) {
     v.emitPatW = (Real)1;   // BSDF-only helper vertex; never read for emission
     v.areaScale = 1.0; v.mediumId = -1; v.u = h.u; v.v = h.v; v.curv = h.curv;
     v.vcol = h.vcol; v.vb0q = dPackBary(h.vb0); v.vb1q = dPackBary(h.vb1);
+    v.extMat = h.extMat;
     v.tangent = h.tangent; v.fiberR = h.fiberRadius; v.pscale = h.pscale;
     v.back = h.back ? 1 : 0; v.patOwnSide = h.patOwnSide ? 1 : 0;
     return v;
@@ -21803,6 +21830,7 @@ __device__ static inline DVertex dVertFromLV(const DVcmLV& lv) {
     v.vcol = lv.vcol; v.vb0q = lv.vb0q; v.vb1q = lv.vb1q;
     v.tangent = lv.tangent; v.fiberR = lv.fiberR; v.pscale = lv.pscale;
     v.back = lv.back; v.patOwnSide = lv.patOwnSide;
+    v.extMat = (int)lv.extMat1 - 1;
     return v;
 }
 
@@ -22216,6 +22244,7 @@ __global__ void kVcmLightT(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx,
 
         for (int edges = 1; edges <= lastEdge; ++edges) {
             DHit h = closestHit(sc, ro, rd, (curveTmin > (Real)0) ? (Real)0 : RAY_EPS, BIG, false, curveTmin);
+            h.extMat = dExtMat(stk.topMat());   // the medium it met the surface from
             if (!h.valid) break;                          // escaped (no env in scope)
             {                                             // colored-glass Beer-Lambert (delta chains)
                 int cm = stk.topMat();
@@ -22280,10 +22309,11 @@ __global__ void kVcmLightT(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx,
                     lv.dVCM = dVCM; lv.dVC = dVC; lv.dVM = dVM;
                     lv.matId = matId; lv.edges = edges; lv.u = h.u; lv.v = h.v; lv.curv = h.curv;
                     lv.vcol = h.vcol; lv.vb0q = dPackBary(h.vb0); lv.vb1q = dPackBary(h.vb1);
+                    lv.extMat1 = (unsigned)(h.extMat + 1);
                     lv.mergeW = (storeP > 0.0) ? (float)(1.0 / storeP) : 1.0f;
                     lv.tangent = h.tangent; lv.fiberR = h.fiberRadius; lv.pscale = h.pscale;
-                    lv.back = h.back ? 1 : 0; lv.patOwnSide = h.patOwnSide ? 1 : 0;
-                    lv.nUp = (short)nUp;
+                    lv.back = h.back ? 1u : 0u; lv.patOwnSide = h.patOwnSide ? 1u : 0u;
+                    lv.nUp = (unsigned)nUp;
                     lvSlab[i * vcmCap + stored] = lv;
                     if (NS > 0 && lvSec) {
                         DVcmSec* row = lvSec + (size_t)(i * vcmCap + stored) * secStride;

@@ -742,6 +742,7 @@ inline void traceLightSubpath(const Scene& scene, const Camera& cam, const Rende
     const int lastEdge = ctx.maxDepth - 1;
     for (int edges = 1; edges <= lastEdge; ++edges) {
         Hit h = scene.closestHit(ray);
+        h.extMat = stk.topMat();   // the medium it met the surface from
         if (!h.valid) return;                    // escaped (no env in scope)
         {
             int mi = stk.topMat();
@@ -990,6 +991,7 @@ inline Vec3 traceCameraSubpath(const Scene& scene, const Camera& cam, const Rend
         // Material::hideCamera. (The light subpath walk above never gets this.)
         Hit h = scene.closestHit(ray, 1e-6, nullptr, /*skipHair=*/false,
                                  /*skipCamHidden=*/(edges == 1));
+        h.extMat = stk.topMat();   // the medium it met the surface from
         if (!h.valid) {
             // The ray left the scene. No env map in VCM scope, but a `light sun` is a
             // delta-DIRECTION emitter with no geometry: the s=0 term never fires for it and

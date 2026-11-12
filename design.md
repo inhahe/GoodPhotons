@@ -10575,8 +10575,12 @@ adjoint is the same function swapped), and as roughness → 0 it becomes the nor
 the rough material converges on the smooth coating. Only opaque coatings qualify — `coatOpaque`
 at every 5 nm — because the transmitted half of a clear one would need its own rough lobe.
 Where it differs from the smooth coating it converges to: it is two-sided (every Glossy is; the
-smooth opaque coating is black from inside its body), and its incident medium is always air
-(`interfaceOptics` takes the exterior medium's index, which the glossy sites do not track).
+smooth opaque coating is black from inside its body). Its incident medium is the smooth one's
+(0.439.6): every walk sets the hit's `extMat` to the top of its medium stack where it lands (a
+BDPT or VCM vertex keeps it with its hit; `DVertex`, and `DVcmLV` in its packed word, carry it on
+the device), and `iridescenceR` / `dIridescenceR` take that medium's index under
+`exteriorIor`'s rule -- both carrying a `priority` -- and air otherwise. `tools/check_irid_medium.py`
+holds a rough film in a water sphere to the smooth one.
 
 Where it reaches each estimator:
 

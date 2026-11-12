@@ -2324,9 +2324,10 @@ oil slick on water, a dichroic filter) refuses a `roughness` with an error, sinc
 transmits has no rough form here. `roughness` takes a constant, a `pattern:` or a
 `texture:`, as on `glossy`, and `reflect` (default 1) tints the lobe. Unlike the smooth
 coating, the rough one is two-sided, as every `glossy` is: an open sheet shows its colour from
-behind too, where the smooth, opaque coating is black from inside. And it always takes the
-medium outside it to be air, where the smooth one interferes against the medium it sits in (a
-`priority` water body, say). The raster preview
+behind too, where the smooth, opaque coating is black from inside. Like the smooth one it
+interferes against the medium it sits in where both carry a `priority` (a beetle in a `priority`
+water body, say), and against air otherwise (since 0.439.6; before, the rough one always took
+air). The raster preview
 draws it in the colour the coating shows face-on, which does not shift with angle there.
 Not on the GPU's fast `-rgb` path, which falls back to the spectral one.
 

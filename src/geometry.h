@@ -265,6 +265,10 @@ inline void motionBracket(int keys, double u, int& i, double& f) {
 struct Hit {
     double t = DBL_MAX;
     bool valid = false;
+    // The medium the ray met this surface from: the top of its walk's MediumStack (Scene::mats'
+    // index), -1 for air or where no walk set it. A rough interference coating interferes
+    // against its index (iridescenceR), as the smooth one does against the stack's.
+    int extMat = -1;
     Vec3 p, n, ng;         // n = oriented against ray; ng = raw geometric normal
     int matId = 0;
     int sensorId = -1;

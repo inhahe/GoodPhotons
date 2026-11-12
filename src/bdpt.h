@@ -1011,6 +1011,7 @@ inline void randomWalk(const Scene& scene, const Camera& cam, const Renderer& ma
         // starts at a light and never has a camera ray at all.
         Hit h = scene.closestHit(ray, 1e-6, nullptr, /*skipHair=*/false,
                                  /*skipCamHidden=*/(mode == Mode::Radiance && bounces == 0));
+        h.extMat = stk.topMat();   // the medium it met the surface from
         if (h.valid && h.sensorId >= 0) return;      // model-A sensor: not used in BDPT
         double dSurf = h.valid ? h.t : 1e30;
         // Inside glass whose absorption varies over the band (Material::absorbChroma)? Read by

@@ -157,13 +157,15 @@ inline double multilayerReflectance(double n0, double cosI, double lambda,
 }
 
 // The reflectance of a rough interference reflector's coating (Material::iridescence: 1 a thin
-// film, 2 a stack) at `lambda`, for light meeting it from air at the cosine `cosI`. `thickness`
-// is the film's (nm) where it is mapped; a stack ignores it. 1 on any other material.
-inline double coatingReflectance(const Material& m, double thickness, double lambda, double cosI) {
+// film, 2 a stack) at `lambda`, for light meeting it at the cosine `cosI` from a medium of index
+// `n0` (1: air). `thickness` is the film's (nm) where it is mapped; a stack ignores it. 1 on any
+// other material.
+inline double coatingReflectance(const Material& m, double thickness, double lambda, double cosI,
+                                 double n0 = 1.0) {
     if (m.iridescence == 0) return 1.0;
     const double ns = m.ior(lambda), ks = m.substrateK(lambda);
     if (m.iridescence == 1)
-        return thinFilmReflectance(1.0, m.filmIor(lambda), ns, ks, thickness, cosI, lambda);
-    return multilayerReflectance(1.0, cosI, lambda, m.layerN.data(), m.layerK.data(),
+        return thinFilmReflectance(n0, m.filmIor(lambda), ns, ks, thickness, cosI, lambda);
+    return multilayerReflectance(n0, cosI, lambda, m.layerN.data(), m.layerK.data(),
                                  m.layerThick.data(), (int)m.layerN.size(), ns, ks);
 }

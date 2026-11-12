@@ -1588,7 +1588,18 @@ check_rough_irid, mode B against mode R:
 - the car paint, 0.824 / 0.144 / 0.229 before (no sheen) and 0.946 / 0.982 / 0.974 now. The rest
   is LAYERED-BODY-COIN. A smooth coat is FWD-SMOOTH-COAT.
 
-## OPEN (2026-11-02, 0.401.0): ROUGH-IRID-AIR — a rough interference reflector always interferes against air
+## DONE (2026-11-12, 0.439.6; opened 2026-11-02, 0.401.0): ROUGH-IRID-AIR — a rough interference reflector always interferes against air
+
+**Fixed in 0.439.6**, not by threading an index through the glossy sites but by putting it on the
+hit: `Hit::extMat` / `DHit::extMat`, the top of the walk's medium stack, set by every walk where
+it lands (ten host walks, eleven device ones, the wavefront's shade stage), kept by a BDPT or VCM
+vertex with its hit (`DVertex::extMat`; `DVcmLV` packs it with its flags, so the slot stays 152
+bytes), and read by `iridescenceR` / `dIridescenceR` under `exteriorIor`'s rule. So every
+evaluator and sampler that takes the hit -- NEE, connections, merges, the draws -- has it.
+`tools/check_irid_medium.py`: an anodized-titanium film at roughness 0.003 against the smooth
+film, inside a sphere of `priority` water under a uniform sky, mode R: 0.439.5 read it 1.18-1.22
+of the smooth one per channel, 0.439.6 within 1 % on both devices (the check holds 3 %); in
+air both within 1 %.
 
 `iridescenceR` (render.h) and `dIridescenceR` take the incident medium as n0 = 1, where the smooth
 coating (`interfaceOptics`) uses the exterior medium's index from the priority stack. Under water

@@ -146,7 +146,7 @@ Each names the section its line is in.
 21. ~~**RADCACHE-BATCHES** (4.5) — `-radcache`'s fixed batches outlast `-stop` and the interval.~~
     Done, 0.439.3: the cache's own schedule over absolute samples, a canonical merge, the chunks
     on the clock.
-22. ~~**P-HEROSPLIT-FIRST**~~ (0.439.4), **ROUGH-IRID-AIR** (4.3) — narrow estimator gaps.
+22. ~~**P-HEROSPLIT-FIRST**~~ (0.439.4), ~~**ROUGH-IRID-AIR**~~ (0.439.6) (4.3) — narrow estimator gaps.
 23. **REMAP0-IMPOSSIBLE** (4.4) — the MIS sums read every zero density as a delta's.
 24. ~~**BEAMEPOCHS-CHUNK-PIN** (4.5) — `-beamepochs` pins cheap scenes' GPU chunks to 1 spp.~~ Done,
     0.438.2.
@@ -338,7 +338,7 @@ Then the rest of 4.2-4.6 in their order, 4.7's bookkeeping alongside whatever to
   densities: measured at +0.05-0.07 % of the frame, too small to fix.
 - [x] **P-HEROSPLIT-FIRST** (0.439.4) — blurred mode P under `-herosplit` filed a sample by the hero's first
   event alone.
-- [ ] **ROUGH-IRID-AIR** — a rough interference reflector always interferes against air.
+- [x] **ROUGH-IRID-AIR** (0.439.6) — a rough interference reflector always interfered against air.
 - [x] **J-FIELD-SLOW's 2 000-beam brightness** — not a bias: with eight seeds an arm, disjoint
   across arms (`scraps/probe/biascheck.py`, 0.435.1, 1024 spp), `_fog_thick`'s mean against the
   mode D reference is 0.998 +- 0.018 at 250 beams, 0.990 +- 0.007 at 1000, 0.994 +- 0.013 at

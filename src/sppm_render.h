@@ -118,6 +118,7 @@ inline void sppmVisiblePoint(const Scene& scene, Ray ray, Pcg32& rng, bool diffr
         // b == 0 is the camera ray this function was handed; see Material::hideCamera.
         Hit h = scene.closestHit(ray, 1e-6, nullptr, /*skipHair=*/false,
                                  /*skipCamHidden=*/(b == 0));
+        h.extMat = stk.topMat();   // the medium it met the surface from
         if (h.valid) {
             // Inside a dielectric whatever it absorbs at the walk's own wavelength: a glass clear
             // there may absorb at a photon's (clear glass folds exactly 1).

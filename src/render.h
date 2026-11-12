@@ -297,16 +297,19 @@ inline double glossyExponent(double roughness) {
 // of the pair makes with their half-vector, i.e. at the microfacet that reflects one into the
 // other. Symmetric in the pair, so the factor is the same whichever side the light is on; as
 // roughness goes to 0 the half-vector becomes the normal and this becomes the specular
-// coating's own reflectance, as the coating shows from its front in air. Two differences from
-// the specular coating remain: the incident medium is always air (the specular one takes the
-// medium around it), and the rough lobe is two-sided, like every Glossy (the specular one,
-// being opaque, is black from inside its body). 1 on a plain glossy. `h` (may be null)
-// supplies a mapped thickness.
+// coating's own reflectance. Its incident medium is the specular coating's: the one the ray met
+// it from (Hit::extMat) where both carry an explicit `priority`, else air (exteriorIor's rule).
+// One difference remains: the rough lobe is two-sided, like every Glossy (the specular one,
+// being opaque, is black from inside its body). 1 on a plain glossy. `h` (may be null, read as
+// air) supplies a mapped thickness and the incident medium.
 inline double iridescenceR(const Scene& scene, const Material& m, const Hit* h, double lambda,
                            double cosH) {
     if (m.iridescence == 0) return 1.0;
+    const int e = h ? h->extMat : -1;
+    const double n0 = (e >= 0 && m.hasPriority() && scene.mats[(size_t)e].hasPriority())
+                          ? scene.mats[(size_t)e].ior(lambda) : 1.0;
     return coatingReflectance(m, (h && m.iridescence == 1) ? materialFilmThickness(scene, m, *h)
-                                                          : m.filmThickness, lambda, cosH);
+                                                          : m.filmThickness, lambda, cosH, n0);
 }
 
 // The cosine iridescenceR takes for the pair (a, b), both unit: each one's cosine with their
@@ -3195,6 +3198,7 @@ struct Renderer {
             }
 
             Hit h = scene.closestHit(ray);
+            h.extMat = stk.topMat();   // the medium it met the surface from
             double dSurf = h.valid ? h.t : 1e30;
             // A collision found DURING the march already happened at ray.o, so nothing is
             // travelled on this iteration: zero distance for the aperture catch, the glass
@@ -3972,6 +3976,7 @@ struct Renderer {
         for (int bounce = bounce0; bounce < maxBounce; ++bounce) {
             int nUp = secAlive ? C : 1;
             Hit h = scene.closestHit(ray);
+            h.extMat = stk.topMat();   // the medium it met the surface from
             double dEvent = h.valid ? h.t : 1e30;
 
             // Model C aperture catch: the photon physically threads the pupil.
