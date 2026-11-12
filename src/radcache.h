@@ -31,12 +31,16 @@
 //     rule, plus a separate 1.3% from the hero/secondary split at a de-hero).
 //
 // So the data now comes from a DEDICATED UPDATE PASS, the shape Epic's LumenRef reference
-// path tracer uses for its world radiance cache. Per progressive chunk:
+// path tracer uses for its world radiance cache. Per BATCH -- the samples between two of the
+// render's schedule boundaries (main.cpp RadCacheSchedule), whatever chunks they are cut into:
 //
 //   1. RENDER. Camera paths read the table (confident cell => stop and read; no data => keep
 //      tracing, exactly as an uncached render would) and MARK every diffuse cell they touch.
 //   2. MERGE MARKS. Marked cells are created in the table, carrying a representative surface
-//      point and normal but no radiance yet, and the work list is rebuilt.
+//      point and normal but no radiance yet, and the work list is rebuilt. The merge is
+//      CANONICAL (pend, mergeMarks): a key's point is the least of every mark its batch made,
+//      the verification records are summed in sorted order, so neither the thread count nor
+//      where the chunks fall reaches the table.
 //   3. UPDATE ROUNDS. Cells that still need data shoot `rays` cosine-hemisphere rays from
 //      their representative point and average what comes back. Those rays read the table
 //      too, so light propagates one further bounce per round.
@@ -378,6 +382,16 @@ struct RadCacheMark {
     uint64_t key;
     Vec3     p, n;
 };
+// The canonical order of marks: by key, then by point and normal. A key's cell takes the least
+// of its batch's marks (pend), a choice no thread count or chunking can move.
+inline bool radCacheMarkLess(const RadCacheMark& a, const RadCacheMark& b) {
+    if (a.key != b.key) return a.key < b.key;
+    const double x[6] = {a.p.x, a.p.y, a.p.z, a.n.x, a.n.y, a.n.z};
+    const double y[6] = {b.p.x, b.p.y, b.p.z, b.n.x, b.n.y, b.n.z};
+    for (int i = 0; i < 6; ++i)
+        if (x[i] != y[i]) return x[i] < y[i];
+    return false;
+}
 
 // Per-thread bank, mirroring photonmap.h's PhotonBank: plain appendable vectors that the
 // merge concatenates, so the trace never synchronises.
@@ -386,11 +400,15 @@ struct RadCacheMark {
 // camera path wants to mark, which is tens of millions of pushes per chunk for a few tens of
 // thousands of distinct cells. A direct-mapped table of recently-seen keys collapses that to
 // (very nearly) one push per cell per thread; a filter MISS costs only a duplicate mark,
-// which the merge folds away, so the filter never has to be exact.
+// which the merge folds away, so the filter never has to be exact. A filter HIT folds its
+// mark into the one it pushed, keeping the least (radCacheMarkLess): every mark is then
+// either pushed or folded into a pushed one, so the least pushed mark of a key is the least
+// of all its marks, whichever duplicates the filter caught.
 struct RadCacheBank {
     static constexpr int kFilterBits = 14;                    // 16 k slots = 128 KB/thread
     static constexpr size_t kFilterSize = (size_t)1 << kFilterBits;
     std::vector<uint64_t>     seen;     // direct-mapped recently-marked keys
+    std::vector<uint32_t>     seenAt;   // ...and where in `marks` each one's mark is
     std::vector<RadCacheMark> marks;
     std::vector<RadCacheVal>  vals;     // verification records (see RadCacheVal)
     // Per-thread tallies for the -radcache status line AND for the budget governor, folded
@@ -416,25 +434,62 @@ struct RadCacheBank {
     double    auditTrace2 = 0.0;  // sum of squares of the same, for that sum's standard error
     long long auditN      = 0;    // audited vertices (first cache-readable vertex per path)
 
-    void ensure() { if (seen.empty()) seen.assign(kFilterSize, ~0ull); }
+    void ensure() {
+        if (seen.empty()) { seen.assign(kFilterSize, ~0ull); seenAt.assign(kFilterSize, 0u); }
+    }
 
     // Returns true if this key was not obviously marked already by this thread.
     bool mark(uint64_t k, size_t slot, const Vec3& p, const Vec3& n) {
         ensure();
-        uint64_t& s = seen[slot & (kFilterSize - 1)];
-        if (s == k) return false;
-        s = k;
-        marks.push_back(RadCacheMark{k, p, n});
+        const size_t f = slot & (kFilterSize - 1);
+        const RadCacheMark m{k, p, n};
+        if (seen[f] == k && seenAt[f] < marks.size() && marks[seenAt[f]].key == k) {
+            RadCacheMark& kept = marks[seenAt[f]];
+            if (radCacheMarkLess(m, kept)) kept = m;
+            return false;
+        }
+        seen[f] = k;
+        seenAt[f] = (uint32_t)marks.size();
+        marks.push_back(m);
         return true;
     }
-    // The filter must be reset at the CHUNK boundary, not at every merge. It is a pure
-    // optimisation only as long as forgetting a key is possible: a cell can be recycled out
-    // of the table (see insertMark), and a thread that still believed it had marked it would
-    // never mark it again, so the cell would never come back. Once per chunk is often enough
-    // to be free and rare enough to keep the dedup rate high within a chunk.
+    // Forget the filter whenever the marks leave the bank (pend), so no slot points at a mark
+    // that has gone. It is a pure optimisation only as long as forgetting a key is possible: a
+    // cell can be recycled out of the table (see insertMark), and a thread that still believed
+    // it had marked it would never mark it again, so the cell would never come back.
     void resetFilter() { if (!seen.empty()) std::fill(seen.begin(), seen.end(), ~0ull); }
     size_t size() const { return marks.size(); }
 };
+
+// Move each bank's marks, verification records and tallies into `into`, the batch's pending
+// store, and forget the banks' filters. `into` keeps one mark a key, the least
+// (radCacheMarkLess), sorted: the same whatever banks and chunks the batch's marks came in, and
+// no larger than the cells they touch however many chunks the batch is cut into. Its records
+// stay as they were made; mergeMarks sums them in a fixed order.
+inline void radCachePend(std::vector<RadCacheBank>& banks, RadCacheBank& into) {
+    for (RadCacheBank& b : banks) {
+        into.marks.insert(into.marks.end(), b.marks.begin(), b.marks.end());
+        into.vals.insert(into.vals.end(), b.vals.begin(), b.vals.end());
+        into.nTerm += b.nTerm;
+        into.nMiss += b.nMiss;
+        into.auditCache  += b.auditCache;
+        into.auditTrace  += b.auditTrace;
+        into.auditTrace2 += b.auditTrace2;
+        into.auditN      += b.auditN;
+        b.marks.clear();
+        b.vals.clear();
+        b.nTerm = b.nMiss = 0;
+        b.auditCache = b.auditTrace = b.auditTrace2 = 0.0;
+        b.auditN = 0;
+        b.resetFilter();
+    }
+    std::sort(into.marks.begin(), into.marks.end(), radCacheMarkLess);
+    into.marks.erase(std::unique(into.marks.begin(), into.marks.end(),
+                                 [](const RadCacheMark& a, const RadCacheMark& b) {
+                                     return a.key == b.key;
+                                 }),
+                     into.marks.end());
+}
 
 struct RadianceCache {
     // ---- configuration (set once, before the first pass) ----
@@ -871,42 +926,45 @@ struct RadianceCache {
         s.cnt[bin]   += 1;
     }
 
-    // Fold every thread's marks into the table and rebuild the work lists. Single-threaded and
-    // after the join, which is what makes the table's state a pure function of the samples
-    // rendered so far rather than of the thread interleaving.
-    void mergeMarks(std::vector<RadCacheBank>& banks) {
+    // Fold a batch's pending store (radCachePend) into the table and rebuild the work lists,
+    // emptying it. Single-threaded, after the join, and in a fixed order -- the marks by key
+    // (one a key, the least), the records sorted -- which is what makes the table's state a pure
+    // function of the samples rendered so far, whatever the threads and the chunks.
+    void mergeMarks(RadCacheBank& pending) {
         ++pass;
-        chunkConsults = 0;
-        chunkTerm     = 0;
-        for (RadCacheBank& b : banks) {
-            for (const RadCacheMark& m : b.marks) insertMark(m);
-            nTerm += b.nTerm;
-            nMiss += b.nMiss;
-            chunkTerm     += b.nTerm;
-            chunkConsults += b.nTerm + b.nMiss;
-            auditCache  += b.auditCache;
-            auditTrace  += b.auditTrace;
-            auditTrace2 += b.auditTrace2;
-            auditN      += b.auditN;
-            b.marks.clear();
-            b.nTerm = b.nMiss = 0;
-            b.auditCache = b.auditTrace = b.auditTrace2 = 0.0; b.auditN = 0;
-        }
+        for (const RadCacheMark& m : pending.marks) insertMark(m);
+        nTerm += pending.nTerm;
+        nMiss += pending.nMiss;
+        chunkTerm     = pending.nTerm;
+        chunkConsults = pending.nTerm + pending.nMiss;
+        auditCache  += pending.auditCache;
+        auditTrace  += pending.auditTrace;
+        auditTrace2 += pending.auditTrace2;
+        auditN      += pending.auditN;
         // Verification records fold in AFTER the marks, so a record for a cell that was born
         // (or reborn) this merge still lands on the right slot. Records for a key that is no
-        // longer in the table are simply dropped -- the cell they described is gone.
-        for (RadCacheBank& b : banks) {
-            for (const RadCacheVal& v : b.vals) {
-                const int s = findSlot(v.key);
-                if (s < 0) continue;
-                RadCacheCell& c = cell[s];
-                c.vOffer += v.offer;
-                c.vTail  += v.tail;
-                c.vTail2 += v.tail * v.tail;
-                ++c.vN;
-            }
-            b.vals.clear();
+        // longer in the table are simply dropped -- the cell they described is gone. Sorted, so
+        // each cell's sums are taken in one order.
+        std::sort(pending.vals.begin(), pending.vals.end(),
+                  [](const RadCacheVal& a, const RadCacheVal& b) {
+                      if (a.key != b.key) return a.key < b.key;
+                      if (a.offer != b.offer) return a.offer < b.offer;
+                      return a.tail < b.tail;
+                  });
+        for (const RadCacheVal& v : pending.vals) {
+            const int s = findSlot(v.key);
+            if (s < 0) continue;
+            RadCacheCell& c = cell[s];
+            c.vOffer += v.offer;
+            c.vTail  += v.tail;
+            c.vTail2 += v.tail * v.tail;
+            ++c.vN;
         }
+        pending.marks.clear();
+        pending.vals.clear();
+        pending.nTerm = pending.nMiss = 0;
+        pending.auditCache = pending.auditTrace = pending.auditTrace2 = 0.0;
+        pending.auditN = 0;
         applyValidation();
         rebuildWork();
     }
@@ -1001,12 +1059,6 @@ struct RadianceCache {
         return false;
     }
 
-    // End of chunk: let the mark filters forget. Marks themselves are NOT dropped -- the
-    // update rounds mark too, and those marks are how the cache grows into geometry no camera
-    // path ever reached, so they ride to the next chunk's merge.
-    void clearBanks(std::vector<RadCacheBank>& banks) {
-        for (RadCacheBank& b : banks) b.resetFilter();
-    }
 
     // Fold this round's scratch into the served cells and re-test their confidence gate.
     //

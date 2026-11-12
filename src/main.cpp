@@ -128,6 +128,7 @@
 #include <cstring>
 #include <cctype>
 #include <cstdint>
+#include <climits>              // RadCacheSchedule::kNone
 #include <csignal>
 #include <chrono>
 #include <fstream>
@@ -14939,6 +14940,39 @@ static double g_radValidate   = 0.05;   // fraction of reads that verify instead
 static size_t g_radCacheCells = (size_t)1 << 18;
 static RadianceCache g_radianceCache;
 
+// The marks, verification records and tallies of the batch under way: what the camera passes
+// since the last boundary made, and the update rays' marks from the advance that ended it, held
+// canonically (radCachePend) until the next boundary's merge. A checkpoint writes it beside the
+// table, so a resumed render finishes the batch it stopped in.
+static RadCacheBank g_rcPending;
+
+// -radcache's batches (RADCACHE-BATCHES): the cache advances only where the absolute sample index
+// reaches a boundary -- 1, 10, then an even split of the rest into 62 -- however the render's
+// calls are cut, so the chunking, the thread count and a stop and resume do not move the image.
+// `total` is the render's sample count (what was loaded included); 0 where none is known (a
+// render the clock ends, the viewer, a meter): every call's end advances then. Set for a render
+// by RadCacheScheduleScope.
+struct RadCacheSchedule {
+    static constexpr long long kNone = LLONG_MAX;
+    long long total = 0;
+    // The first boundary after sample index `pos`; kNone without a schedule.
+    long long next(long long pos) const {
+        if (total <= 0) return kNone;
+        if (pos < 1) return std::min(1LL, total);
+        if (pos < 10) return std::min(10LL, total);
+        const long long batch = std::max(1LL, (total - 10 + 61) / 62);
+        return std::min(total, 10 + ((pos - 10) / batch + 1) * batch);
+    }
+};
+static RadCacheSchedule g_rcSchedule;
+struct RadCacheScheduleScope {
+    explicit RadCacheScheduleScope(long long total) : prev(g_rcSchedule.total) {
+        g_rcSchedule.total = total;
+    }
+    ~RadCacheScheduleScope() { g_rcSchedule.total = prev; }
+    long long prev;
+};
+
 // ---- resume: the table read out of a .ftbuf checkpoint, waiting to be adopted -------------
 //
 // A resumed render reloads the cache table so it continues WARM. This is not just a speed
@@ -14961,6 +14995,7 @@ struct PendingRadCache {
     long long nSample = 0, nEvicted = 0, nTerm = 0, nMiss = 0, nUpdated = 0;
     std::vector<uint64_t>     keys;
     std::vector<RadCacheCell> cells;
+    RadCacheBank              batch;   // the batch it stopped in (g_rcPending's), if any
     void clear() { *this = PendingRadCache{}; }
 };
 static PendingRadCache g_pendingRadCache;
@@ -14980,8 +15015,10 @@ static void radCacheAdoptPending() {
                              "different cache settings (cell size, clipmap centre, spectral "
                              "range or confidence gate); starting with a cold table. The image "
                              "resume itself is unaffected.\n");
+        g_rcPending = RadCacheBank{};
         return;
     }
+    g_rcPending = std::move(p.batch);   // the batch it stopped in goes on
     size_t loaded = 0;
     for (size_t i = 0; i < p.keys.size(); ++i)
         if (g_radianceCache.loadCell(p.keys[i], p.cells[i])) ++loaded;
@@ -16579,34 +16616,18 @@ static Film renderBackward(const Scene& scene, const Camera& cam, int resX, int 
         }
         return br;
     };
-    std::atomic<bool> stoppedAny{false};   // a band stopped part-way (abandonOnStop)
-    auto worker = [&](int tid) {
-        BackwardRenderer br = makeBr();
-        br.specFirstFilm = specFirst;   // mode P's blurred split (BackwardRenderer::specFirstFilm)
-        br.abandonOnStop = abandonOnStop;
-        if (rcOn) br.radBank = &rcBanks[tid];
-        int y0 = bandLo + bandN * tid / nThreads, y1 = bandLo + bandN * (tid + 1) / nThreads;
-        br.renderRows(scene, cam, film, y0, y1, spp, sampleBase);
-        if (br.abandoned) stoppedAny = true;
-        raystats::flushThread();   // -raystats: fold this worker's tally into the total
-    };
-    std::vector<std::thread> pool;
-    for (int t = 0; t < nThreads; ++t) pool.emplace_back(worker, t);
-    for (auto& th : pool) th.join();
-    // A pass a stop abandoned is dropped by its caller, so the cache does not advance on it
-    // (the table a stop's checkpoint saves holds only the samples its film does).
-    if (stoppedAny) { out.abandoned = true; return out; }
-    // ---- -radcache: mark -> update -> apply, once per chunk ---------------------------
-    // All three steps run after the join and before the next chunk, so the table is immutable
-    // for the whole of any render pass. That is what makes the table's state a pure function
-    // of the chunks rendered so far rather than of the thread interleaving -- a chunked render
-    // and a one-shot render of the same budget see the same cache.
-    if (rcOn) {
+    // ---- -radcache: mark -> update -> apply, at each boundary of the render's schedule -------
+    // All three steps run after a join and before the next part, so the table is immutable for
+    // the whole of any camera pass, and they run only where the absolute sample index reaches a
+    // boundary (RadCacheSchedule), the part's banks going to the batch's pending store between.
+    // So the table's state is a pure function of the samples rendered so far -- not of the
+    // thread interleaving, the thread count, nor where the calls are cut.
+    const auto advance = [&]() {
         // 1. MARKS create the cells (geometry, no radiance yet) and rebuild the work list --
         //    the cells that are neither confident yet nor written off as hopeless. Update rays
-        //    mark too, and their marks ride here from the PREVIOUS chunk, which is how the
-        //    table grows into geometry no camera path ever reached.
-        g_radianceCache.mergeMarks(rcBanks);
+        //    mark too, and their marks ride here from the PREVIOUS advance (g_rcPending), which
+        //    is how the table grows into geometry no camera path ever reached.
+        g_radianceCache.mergeMarks(g_rcPending);
         // 2. UPDATE ROUNDS, under a budget. A round shoots rc.rays cosine rays per served
         //    cell; the rays read the table, so every round propagates light one bounce
         //    further. How many cells get served is set by the budget governor (radcache.h):
@@ -16652,7 +16673,40 @@ static Film renderBackward(const Scene& scene, const Camera& cam, int resX, int 
             //    work list, so the next round's budget goes to cells that still need it.
             if (g_radianceCache.apply(served)) g_radianceCache.rebuildWork();
         }
-        g_radianceCache.clearBanks(rcBanks);
+        radCachePend(rcBanks, g_rcPending);   // the update rays' marks, for the next merge
+    };
+    // A call a stop may abandon is dropped whole by its caller, so it must not reach a boundary
+    // before its end: the cache would have advanced on samples the kept film does not hold. Its
+    // chunker cuts it there (cpuSppChunks, mode P's batches).
+    const long long callBegin = (long long)sampleBase, callEnd = callBegin + spp;
+    if (rcOn && abandonOnStop && g_rcSchedule.next(callBegin) < callEnd)
+        throw std::logic_error("renderBackward: a call a stop may abandon spans a radiance-cache "
+                               "boundary; its chunker must cut it there");
+    for (long long pos = callBegin; pos < callEnd; ) {
+        const long long boundary = rcOn ? g_rcSchedule.next(pos) : RadCacheSchedule::kNone;
+        const long long part = std::min(callEnd, boundary);
+        std::atomic<bool> stoppedAny{false};   // a band stopped part-way (abandonOnStop)
+        auto worker = [&](int tid) {
+            BackwardRenderer br = makeBr();
+            br.specFirstFilm = specFirst;   // mode P's blurred split (BackwardRenderer::specFirstFilm)
+            br.abandonOnStop = abandonOnStop;
+            if (rcOn) br.radBank = &rcBanks[tid];
+            int y0 = bandLo + bandN * tid / nThreads, y1 = bandLo + bandN * (tid + 1) / nThreads;
+            br.renderRows(scene, cam, film, y0, y1, part - pos, (unsigned long long)pos);
+            if (br.abandoned) stoppedAny = true;
+            raystats::flushThread();   // -raystats: fold this worker's tally into the total
+        };
+        std::vector<std::thread> pool;
+        for (int t = 0; t < nThreads; ++t) pool.emplace_back(worker, t);
+        for (auto& th : pool) th.join();
+        // A pass a stop abandoned is dropped by its caller, and its banks with it, so the cache
+        // does not advance on it (a stop's checkpoint holds only the samples its film does).
+        if (stoppedAny) { out.abandoned = true; return out; }
+        if (rcOn) {
+            radCachePend(rcBanks, g_rcPending);
+            if (part == boundary || boundary == RadCacheSchedule::kNone) advance();
+        }
+        pos = part;
     }
     return out;
 }
@@ -18051,6 +18105,9 @@ static void warnIfOtherBuild(const std::string& path) {
 // changed scene rejects both, a changed cache setting rejects only the table and still resumes
 // the image.
 static constexpr char kRadCacheTag[8] = {'F','T','R','C','A','C','H','1'};
+// Version 2 appends the batch under way (g_rcPending): its marks, its verification records, and
+// its tallies. A version 1 section reads as one with no batch pending.
+static constexpr char kRadCacheTag2[8] = {'F','T','R','C','A','C','H','2'};
 
 // Returns false only on a write error. Writes nothing at all (leaving the sidecar byte-for-byte
 // what it has always been) when there is no live table, so a render without -radcache is
@@ -18063,7 +18120,7 @@ static bool writeRadCacheSection(std::ostream& o) {
     const uint64_t guard = rc.configGuard();
     const uint32_t pass  = rc.pass;
     const long long ctr[5] = {rc.nSample, rc.nEvicted, rc.nTerm, rc.nMiss, rc.nUpdated};
-    o.write(kRadCacheTag, 8);
+    o.write(kRadCacheTag2, 8);
     o.write((const char*)&guard, 8);
     o.write((const char*)&pass, 4);
     o.write((const char*)ctr, sizeof ctr);
@@ -18072,6 +18129,24 @@ static bool writeRadCacheSection(std::ostream& o) {
         if (rc.key[i] == RadianceCache::kEmpty) continue;
         o.write((const char*)&rc.key[i], 8);
         o.write((const char*)&rc.cell[i], sizeof(RadCacheCell));
+    }
+    const RadCacheBank& b = g_rcPending;
+    const uint64_t nm = b.marks.size(), nv = b.vals.size();
+    const long long tally[3] = {b.nTerm, b.nMiss, b.auditN};
+    const double audit[3] = {b.auditCache, b.auditTrace, b.auditTrace2};
+    o.write((const char*)&nm, 8);
+    o.write((const char*)&nv, 8);
+    o.write((const char*)tally, sizeof tally);
+    o.write((const char*)audit, sizeof audit);
+    for (const RadCacheMark& m : b.marks) {
+        const double pn[6] = {m.p.x, m.p.y, m.p.z, m.n.x, m.n.y, m.n.z};
+        o.write((const char*)&m.key, 8);
+        o.write((const char*)pn, sizeof pn);
+    }
+    for (const RadCacheVal& v : b.vals) {
+        o.write((const char*)&v.key, 8);
+        o.write((const char*)&v.offer, 8);
+        o.write((const char*)&v.tail, 8);
     }
     return (bool)o;
 }
@@ -18090,7 +18165,8 @@ static void readRadCacheSection(std::istream& in, bool adopt = true) {
     const std::streampos at = in.tellg();
     char tag[8] = {0};
     in.read(tag, 8);
-    if (!in || std::memcmp(tag, kRadCacheTag, 8) != 0) { in.clear(); in.seekg(at); return; }
+    const bool v2 = in && std::memcmp(tag, kRadCacheTag2, 8) == 0;
+    if (!in || (!v2 && std::memcmp(tag, kRadCacheTag, 8) != 0)) { in.clear(); in.seekg(at); return; }
     uint64_t guard = 0, n = 0; uint32_t pass = 0; long long ctr[5] = {0,0,0,0,0};
     in.read((char*)&guard, 8);
     in.read((char*)&pass, 4);
@@ -18100,20 +18176,51 @@ static void readRadCacheSection(std::istream& in, bool adopt = true) {
     // than the largest capacity the flag accepts, and the record count is otherwise attacker-
     // or corruption-controlled. A section that cannot be read is no section: `in` goes back.
     if (!in || n > (uint64_t)1 << 28) { in.clear(); in.seekg(at); return; }
+    PendingRadCache p;
     if (!adopt) {
         in.seekg((std::streamoff)n * (std::streamoff)(8 + sizeof(RadCacheCell)), std::ios::cur);
-        in.clear();
-        return;
+    } else {
+        p.keys.resize((size_t)n);
+        p.cells.resize((size_t)n);
+        for (uint64_t i = 0; i < n; ++i) {
+            in.read((char*)&p.keys[(size_t)i], 8);
+            in.read((char*)&p.cells[(size_t)i], sizeof(RadCacheCell));
+        }
     }
-    PendingRadCache p;
-    p.keys.resize((size_t)n);
-    p.cells.resize((size_t)n);
-    for (uint64_t i = 0; i < n; ++i) {
-        in.read((char*)&p.keys[(size_t)i], 8);
-        in.read((char*)&p.cells[(size_t)i], sizeof(RadCacheCell));
+    if (v2) {   // the batch it stopped in
+        uint64_t nm = 0, nv = 0;
+        long long tally[3] = {0, 0, 0};
+        double audit[3] = {0.0, 0.0, 0.0};
+        in.read((char*)&nm, 8);
+        in.read((char*)&nv, 8);
+        in.read((char*)tally, sizeof tally);
+        in.read((char*)audit, sizeof audit);
+        if (!in || nm > (uint64_t)1 << 28 || nv > (uint64_t)1 << 32) { in.clear(); in.seekg(at); return; }
+        if (!adopt) {
+            in.seekg((std::streamoff)(nm * 56 + nv * 24), std::ios::cur);
+        } else {
+            RadCacheBank& b = p.batch;
+            b.marks.resize((size_t)nm);
+            b.vals.resize((size_t)nv);
+            for (RadCacheMark& m : b.marks) {
+                double pn[6] = {0, 0, 0, 0, 0, 0};
+                in.read((char*)&m.key, 8);
+                in.read((char*)pn, sizeof pn);
+                m.p = Vec3{pn[0], pn[1], pn[2]};
+                m.n = Vec3{pn[3], pn[4], pn[5]};
+            }
+            for (RadCacheVal& v : b.vals) {
+                in.read((char*)&v.key, 8);
+                in.read((char*)&v.offer, 8);
+                in.read((char*)&v.tail, 8);
+            }
+            b.nTerm = tally[0]; b.nMiss = tally[1]; b.auditN = tally[2];
+            b.auditCache = audit[0]; b.auditTrace = audit[1]; b.auditTrace2 = audit[2];
+        }
     }
     if (!in) { in.clear(); in.seekg(at); return; }
     in.clear();
+    if (!adopt) return;
     p.have = true; p.guard = guard; p.pass = pass;
     p.nSample = ctr[0]; p.nEvicted = ctr[1]; p.nTerm = ctr[2];
     p.nMiss = ctr[3]; p.nUpdated = ctr[4];
@@ -18898,14 +19005,13 @@ static void warnHazeOnlyNearScene(const Scene& scene, const std::vector<char>& m
 // by the completed spp). Chunk size adapts toward ~0.4s so early frames appear quickly
 // and the per-chunk thread-spawn overhead stays negligible.
 //
-// ...EXCEPT under -radcache with a total to split (a fixed -spp, or a -noise that is one), where
-// the split must not depend on the clock; a render that ends on the clock (prog->clockEnds) keeps
-// the clock's chunks, its image being the clock's anyway. Ordinarily the
-// chunk boundaries are invisible: per-(pixel,sample) seeding means chunk `c` starting at
-// absolute sample `base` renders exactly the samples [base, base+c) whatever the split, so
-// a slow machine and a fast one produce the same film. The radiance cache breaks that
-// invariant, because the cache ADVANCES between chunks -- the update pass runs at each
-// boundary -- so the boundaries themselves become part of the realization. Measured on
+// Under -radcache a chunk also ends at the cache's next boundary (RadCacheSchedule), where
+// renderBackward advances the table, so no chunk a stop drops holds samples it advanced on.
+// Ordinarily the chunk boundaries are invisible: per-(pixel,sample) seeding means chunk `c`
+// starting at absolute sample `base` renders exactly the samples [base, base+c) whatever the
+// split, so a slow machine and a fast one produce the same film. The radiance cache broke that
+// invariant while it advanced at every chunk's end -- the update pass ran at each boundary --
+// so the boundaries themselves became part of the realization. Measured on
 // scenes/cornell.ftsl at 200^2 / 1024 spp: two identical wall-clock-adaptive invocations
 // gave 40.1 % vs 41.4 % of consults terminated and images differing by 0.45 % rel-RMS,
 // while two runs with the split pinned were bit-identical. That silently voided the
@@ -18929,10 +19035,13 @@ static void warnHazeOnlyNearScene(const Scene& scene, const std::vector<char>& m
 // terminates nothing. (Note the timed rule does not ramp geometrically; the `c*8+1` clamp
 // only governs the first two steps, after which it converges on whatever hits 0.4 s.)
 //
-// So the deterministic schedule targets a fixed chunk COUNT rather than a fixed chunk time:
-// 1, then 9, then an equal split of the remainder into kFixedChunks-2 pieces. That is a
-// pure function of sppTarget, keeps the fast first previews, and lands within a few chunks
-// of what the timed rule converges to here.
+// So the cache's schedule targets a fixed COUNT of advances rather than a fixed time: 1, then
+// 9, then an equal split of the remainder into 62 pieces, a pure function of the render's
+// total that lands within a few of what the timed rule converges to here. Until 0.439.3 it was
+// the chunks' schedule, so its batches outlasted the -interval writes and a stop
+// (RADCACHE-BATCHES); since, it is the cache's alone (RadCacheSchedule, over absolute sample
+// indices), the chunks follow the clock, and the cache's merge is canonical (radCachePend), so
+// neither the chunking nor the thread count nor a stop and resume reaches the image.
 //
 // A chunk a stop abandoned part-way comes back `abandoned` and is dropped: the film returned
 // then holds the chunks before it, and is `abandoned` too when it falls short of sppTarget, so
@@ -18957,28 +19066,14 @@ static Film cpuSppChunks(long long sppTarget, const SppProgress* prog, int resX,
     if (const char* e = std::getenv("FTRACE_CHUNK_SPP")) forcedChunk = std::atoll(e);
     if (forcedChunk > 0) chunk = forcedChunk;
     const bool chunkDebug = std::getenv("FTRACE_CHUNK_DEBUG") != nullptr;
-    // See the header comment: the radiance cache makes the split observable, so it gets a
-    // clock-free schedule. `g_radCache` (not `rcOn`) deliberately -- when the cache is set
-    // but inert (-whitted / -direct-only) the two schedules give the same film anyway, so
-    // the broader condition costs nothing and cannot drift out of sync with the read site.
-    // Not where the clock ends the render (-time/-forever): its target, kUnboundedSpp, has no
-    // total to split -- the even batches would each be millions of samples, so neither the
-    // budget nor a stop would ever land -- and the clock decides its image anyway (mode P's
-    // twin agrees).
-    const bool fixedSchedule = g_radCache && !prog->clockEnds;
-    // Chunk count to aim for under the fixed schedule. 64 is the measured-good neighbourhood
-    // (the timed rule settles on ~65 here); the cache wants many update rounds, and the
-    // per-chunk thread-spawn overhead is negligible next to a 200^2 x 16 spp chunk.
-    const long long kFixedChunks = 64;
-    long long settledChunk = 1;
-    if (fixedSchedule && sppTarget > 10) {
-        const long long pieces = kFixedChunks - 2;
-        settledChunk = (sppTarget - 10 + pieces - 1) / pieces;   // ceil, so the plan finishes
-        if (settledChunk < 1) settledChunk = 1;
-    }
     while (done < end) {
         long long c = (done == 0 && prog->span) ? 1 : chunk;   // a span prices one sample
         if (c > end - done) c = end - done;
+        // -radcache: a chunk ends at the cache's next boundary (renderBackward advances there,
+        // and a stop must not drop samples it advanced on). No schedule, no cut.
+        const long long rcNext = g_rcSchedule.next((long long)seedBias + done);
+        if (rcNext != RadCacheSchedule::kNone && c > rcNext - ((long long)seedBias + done))
+            c = rcNext - ((long long)seedBias + done);
         auto t0 = clk::now();
         Film f = renderOne(c, seedBias + (unsigned long long)done);
         // A renderer may ABANDON its chunk part-way when `-stop` / Ctrl-C arrives (the camera
@@ -19003,8 +19098,6 @@ static Film cpuSppChunks(long long sppTarget, const SppProgress* prog, int resX,
                                      c, seedBias + (unsigned long long)(done - c), dt);
         if (forcedChunk > 0) {
             // pinned by FTRACE_CHUNK_SPP; leave `chunk` alone
-        } else if (fixedSchedule) {
-            chunk = (done < 10) ? 9 : settledChunk;   // 1, 9, then an equal split
         } else if (dt > 1e-4) {                // retarget chunk toward ~0.4s of work
             long long next = (long long)((double)c * (0.4 / dt));
             if (next < 1) next = 1;
@@ -19260,12 +19353,10 @@ static int runCompositeProgressive(
 #else
     const CudaSceneHold* const held = nullptr;
 #endif
-    // The CPU's radiance cache advances at the end of each backward batch, so there the batches
-    // are part of the realization: under -radcache a fixed budget keeps a schedule of its own
-    // samples alone, as cpuSppChunks does (1, 9, then an even split into 62 batches), not the
-    // clock's.
-    const bool fixedSchedule = !budgeted && g_radCache && !gpuBackward;
-    long long batchIndex = 0;
+    // The CPU's radiance cache advances only at its schedule's boundaries (RadCacheSchedule),
+    // which a fixed budget sets over the render's absolute samples; the batches follow the
+    // clock, cut at each boundary. A budget the clock ends has no total: every batch advances.
+    const bool rcBatches = !budgeted && g_radCache && !gpuBackward;
 
     // View-dependent first-hit classification: computed once, reused every pass. A blur splits
     // each sample by its own first event instead, and composes without it.
@@ -19320,6 +19411,7 @@ static int runCompositeProgressive(
     // -n / -spp under -resume ADD that many to what the checkpoint holds (REFERENCE.md, as modes
     // R/D/J do): the fixed budgets' totals are counted from what was loaded.
     const long long endN = acc.N + Nreq, endSpp = acc.spp + sppReq;
+    const RadCacheScheduleScope rcSched(rcBatches ? endSpp : 0);
     TrailingRate phMeter, sppMeter;   // this session's rates, from what was loaded
     phMeter.start(0.0, (double)acc.N);
     sppMeter.start(0.0, (double)acc.spp);
@@ -19334,6 +19426,9 @@ static int runCompositeProgressive(
             dN   = std::min(dN,   remN);
             if (dSpp == 0 && dN == 0) { persist(compose(/*done*/true), true); break; }  // both budgets met
         }
+        // -radcache: the backward batch ends at the cache's next boundary (renderBackward).
+        const long long rcNext = g_rcSchedule.next(acc.spp);
+        if (rcNext != RadCacheSchedule::kNone) dSpp = std::min(dSpp, rcNext - acc.spp);
         auto tb = clk::now();
         if (dN > 0) {   // forward model-B layer (seedBase = cumulative photons, like A/B/C)
             EnergyReport e;
@@ -19381,10 +19476,7 @@ static int runCompositeProgressive(
         // lands soon, and overhead stays low. Both layers draw each photon and each sample by its
         // absolute index (stableSeed, sampleStride; the host always does), so where the clock ends a
         // batch changes nothing in the image: one seed, one image.
-        ++batchIndex;
-        if (fixedSchedule) {
-            batchSpp = batchIndex == 1 ? 9 : std::max(1LL, (sppReq - 10 + 61) / 62);
-        } else {
+        {
             double dt = std::chrono::duration<double>(clk::now() - tb).count();
             if (dt > 1e-4) {
                 long long next = (long long)((double)batchSpp * (0.5 / dt));
@@ -20299,6 +20391,10 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
                                                         g_maxBounceOverride, g_directOnly, g_heroC,
                                                         g_whitted ? &whittedOpts : nullptr);
 #endif
+            // -radcache's batches, over the render's absolute samples; none where the clock
+            // ends it (no total to split: every chunk's end advances then).
+            const RadCacheScheduleScope rcSched(
+                g_radCache && p && !p->clockEnds ? p->sampleBase + sppTarget : 0);
             return cpuSppChunks(sppTarget, p, res, resY,
                 [&](long long c, unsigned long long off) {
                     // cpuSppChunks drops an abandoned chunk, so it may stop part-way.

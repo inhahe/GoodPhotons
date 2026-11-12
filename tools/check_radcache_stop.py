@@ -2,17 +2,19 @@
 
     python tools/check_radcache_stop.py [--out png/check_radcache_stop] [--exe ftrace.exe]
 
-Under -radcache the CPU's modes R and P render a fixed -spp in a schedule of its samples (1, 9,
-then 62 even batches), not the clock's, because the cache advances between batches. Two ways that
+Under -radcache the CPU's modes R and P rendered a fixed -spp in a schedule of its samples (1, 9,
+then 62 even batches), not the clock's, because the cache advanced between batches. Two ways that
 schedule kept a render from ending, both on scenes/cornell.ftsl:
 
   - Under a -time budget there is no total to split, and mode R's third batch was about 16
     million samples: `-radcache -time 6` never ended (0.434.26 was still running at 50 s, and its
     -stop failed). It must end, cleanly and with its image, within a few seconds of its budget.
   - At -spp 1000000 a batch is some 16 000 spp, minutes here. A -stop sent inside one must land
-    within seconds, in mode R and in mode P, the batch dropped: mode R's image then holds a
-    sample count the schedule ends a batch on (1 or 10, the stop landing in the third batch).
-    0.434.26 waited for the batch: 28 s for one of 3200 spp, past -stop's wait for these.
+    within seconds, in mode R and in mode P. 0.434.26 waited for the batch: 28 s for one of 3200
+    spp, past -stop's wait for these. Since 0.439.3 the cache's batches are its own
+    (RadCacheSchedule) and the chunks follow the clock again, cut at the batches' boundaries
+    (tools/check_radcache_det.py holds the image to them): mode R's image then holds the
+    chunks the stop came after, past the first two batches.
 
 Exits 1 on any failure. A render that will not stop is reported by pid and left running (this
 project never force-kills ftrace).
@@ -100,8 +102,8 @@ def main():
               % (sec, rc, code))
         if mode == "R":
             m = re.search(r"interrupted at (\d+) spp", logtext(tag))
-            check("mode R: ...dropping the batch: the image ends on a batch boundary",
-                  m is not None and m.group(1) in ("1", "10"), "%s spp" % (m.group(1) if m else "?"))
+            check("mode R: ...keeping the clock's chunks before it",
+                  m is not None and int(m.group(1)) > 10, "%s spp" % (m.group(1) if m else "?"))
 
     if left:
         print("LEFT RUNNING (stop them with ftrace -stop <pid>): " + ", ".join(left))

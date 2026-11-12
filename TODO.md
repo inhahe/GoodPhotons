@@ -142,9 +142,9 @@ Each names the section its line is in.
 20. **JSPEC-CARRIER-SIZE** (4.5) — every mode-J GPU thread reserves the spectral carrier: VRAM, the
     operator's call against build time. (The ~3x camera pass measured against it was the MIS
     weights' transmittances, 0.436.5.)
-21. **RADCACHE-BATCHES** (4.5) — `-radcache`'s fixed batches outlast `-stop` and the interval.
-    0.434.27: a budget no longer hangs in them and `-stop` lands mid-batch (modes R and P); the
-    interval writes and a resume's schedule need a canonical cache merge first (known-issues).
+21. ~~**RADCACHE-BATCHES** (4.5) — `-radcache`'s fixed batches outlast `-stop` and the interval.~~
+    Done, 0.439.3: the cache's own schedule over absolute samples, a canonical merge, the chunks
+    on the clock.
 22. **P-HEROSPLIT-FIRST**, **ROUGH-IRID-AIR** (4.3) — narrow estimator gaps.
 23. **REMAP0-IMPOSSIBLE** (4.4) — the MIS sums read every zero density as a delta's.
 24. ~~**BEAMEPOCHS-CHUNK-PIN** (4.5) — `-beamepochs` pins cheap scenes' GPU chunks to 1 spp.~~ Done,
@@ -457,9 +457,9 @@ Then the rest of 4.2-4.6 in their order, 4.7's bookkeeping alongside whatever to
   transmittances, computed once a sample since 0.436.5 (known-issues). Left: the template
   parameter that sizes the carrier to nothing in an achromatic render costs two more variants of
   the largest kernel -- build time against VRAM, the operator's call.
-- [ ] **RADCACHE-BATCHES** — under `-radcache` a fixed budget's CPU batches follow its samples, not
-  the clock: the periodic writes wait, and a resume reschedules. (0.434.27: `-stop` lands
-  mid-batch, and a `-time`/`-noise`/`-forever` budget takes the clock instead of hanging.)
+- [x] **RADCACHE-BATCHES** — 0.439.3: the cache advances at its own schedule's boundaries over
+  absolute samples, its merge canonical; the chunks follow the clock, and the image is the same
+  at any thread count, chunking or stop and resume (`tools/check_radcache_det.py`).
 - [x] **BEAMEPOCHS-CHUNK-PIN** — `-beamepochs` pinned the GPU chunks to 1 spp, which cost a cheap
   scene. Done, 0.438.2: the surface realizations follow sample blocks, one a sample under the flag,
   and the chunks stay on the clock.

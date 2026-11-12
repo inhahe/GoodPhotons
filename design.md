@@ -5630,6 +5630,23 @@ as the one at fault.
   two **slower than not caching** because the update pass is paid for and no cell ever
   resolves. A flat split — the obvious way to make something reproducible — is precisely the
   wrong answer here, so the rule targets a chunk *count*, not a chunk *size*.
+  **Since 0.439.3 the schedule is the cache's, not the chunks'** (RADCACHE-BATCHES).
+  `RadCacheSchedule` lays the same boundaries over the render's ABSOLUTE samples (1, 10, then
+  an even split of the rest into 62; none where the clock ends the render, when every call's
+  end advances), `renderBackward` runs its camera pass in parts between them and advances only
+  at one, and the chunkers (`cpuSppChunks`, mode P's batches) follow the clock again, cut at
+  each boundary -- so the `-interval` writes, the window and `-stop` land on the clock's
+  cadence, and a call a stop may drop never holds samples the cache advanced on
+  (`renderBackward` throws if one would). The merge is canonical: a thread's mark filter folds
+  a duplicate into the mark it pushed, keeping the least by point (`radCacheMarkLess`), so the
+  least pushed mark of a key is the least of all its marks; `radCachePend` keeps the batch's
+  marks one a key in the pending store `g_rcPending` between boundaries; `mergeMarks` inserts
+  them by key and sums the verification records sorted. The table is then a function of the
+  samples alone: byte-identical at one thread, in chunks of 7, and stopped and resumed (the
+  checkpoint's v2 section, `FTRCACH2`, carries the pending batch; a v1 section reads as none
+  pending) -- `tools/check_radcache_det.py`. The update rays' marks ride to the next merge
+  through the pending store, as the design always meant: until 0.439.3 they were made into
+  banks local to the call and destroyed with it, so no cell was ever born from one.
 
   **The table is checkpointed (0.190.3), sparsely and under its own guard.** It rides in the
   `.ftbuf` sidecar as a trailing section after the film blobs (`writeRadCacheSection` /
@@ -10793,10 +10810,10 @@ sees the instant, exactly as a static scene with those transforms would show it.
   the host always does, and the device does through `renderForwardCuda`'s `stableSeed` (each
   photon seeded from its absolute index under one seed, on the megakernel) and
   `SppProgress::sampleStride` (the backward samples at a fixed stride between pixels, no seed mixed
-  from the batch's base). One seed renders one image on either device. The one exception is the
-  CPU's `-radcache`, which advances at each backward batch's end: under it a fixed budget takes a
-  schedule of its samples alone (`fixedSchedule`: 1, 9, then an even split into 62, as
-  `cpuSppChunks`'s). The batches share one device copy of the scene (`cudaHoldScene`;
+  from the batch's base). One seed renders one image on either device, the CPU's `-radcache`
+  included: it advances only at its schedule's boundaries (`RadCacheSchedule`, over the absolute
+  samples, from the fixed budget's total), and a batch is cut at each. The batches share one
+  device copy of the scene (`cudaHoldScene`;
   `renderForwardCuda` and `renderBackwardCuda` take it, as `renderBdptCuda` and the shared photon
   map do, through `sceneOrHeld`), so a heavy scene's upload is paid once, not twice a batch. Mode
   M's device deposit seeds its clock-sized chunks the same way (`depositLaunch`, `stableSeed`):

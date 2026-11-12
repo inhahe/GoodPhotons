@@ -686,7 +686,19 @@ and a glossy child (mode B alone agreed with R). Found by check_motion's new blu
 which saw the same excess. `forwardScale` now takes the ratio of the films' sums, which has no
 such term; mode V's comparison reports its scale the same way.
 
-## OPEN (2026-11-04, 0.429.1; narrowed 0.434.27): RADCACHE-BATCHES — under -radcache a fixed budget's CPU batches follow its samples, not the clock
+## DONE (2026-11-12, 0.439.3; opened 2026-11-04, 0.429.1; narrowed 0.434.27): RADCACHE-BATCHES — under -radcache a fixed budget's CPU batches follow its samples, not the clock
+
+**Fixed in 0.439.3** by the fix below, with the merge made canonical first (design.md, "Since
+0.439.3 the schedule is the cache's"). `RadCacheSchedule` lays the boundaries over the render's
+absolute samples; `renderBackward` advances only at one, its camera pass run in parts between;
+the chunkers follow the clock, cut at the boundaries. A thread's mark filter keeps the least of
+a key's marks (`radCacheMarkLess`), the pending store holds one a key between boundaries
+(`radCachePend`), and `mergeMarks` inserts by key and sums the records sorted. The checkpoint's
+`FTRCACH2` section carries the pending batch. `tools/check_radcache_det.py`: mode R on cornell
+byte-identical twice, at one thread, in chunks of 7, and stopped and resumed; mode P twice.
+Found on the way: the update rays' marks went into banks local to each call and died with it,
+so the table never grew from them as its design said; they ride to the next merge now. The rest
+of this entry is how it stood.
 
 **0.434.27 fixed two parts of it.** A **budget hung**: mode R's `cpuSppChunks` took the
 fixed schedule under `-time`/`-noise`/`-forever` as well, whose target is `kUnboundedSpp`, so the
