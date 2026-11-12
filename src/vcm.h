@@ -107,6 +107,14 @@ inline Vec3 offsetOrigin(const Vec3& p, const Vec3& ng, const Vec3& dir) {
 // the very strand it left, deleting the forward glow that a pale coat is mostly made of.
 // Stepping a couple of diameters clears the tube and displaces nothing visible. Returns 0
 // (and so degrades to offsetOrigin) for every non-fiber vertex and for the near side.
+// Whether a merge may happen at a vertex of material `m` on hit `h`, in either role: never on a
+// curve, hair or not (VCM-THIN-CURVES). A merge divides the photons of its ball by a disc's area,
+// and a strand a radius wide is mostly empty space; mode J's surfMergeSite refuses the same. A
+// diffuse strand is still a light vertex for the connections: only the merge at it goes. One
+// predicate for the gather, the stored vertex it gathers, and every weight's merge-here term.
+inline bool vcmMergeAt(const Material& m, const Hit& h) {
+    return m.type != MatType::Hair && !(h.fiberRadius > 0.0);
+}
 inline double fiberStep(const Hit& h, bool isHair, const Vec3& dir) {
     return isHair ? hairChordExit(h.fiberRadius, h.n, h.tangent, dir) : 0.0;   // the exact chord (0.364.0)
 }
@@ -867,7 +875,8 @@ inline void traceLightSubpath(const Scene& scene, const Camera& cam, const Rende
                                 double imgToSolid = imgPtDist * imgPtDist / cosAtCamera;
                                 double imgToSurf = imgToSolid * std::fabs(cosToCamera) / dist2c;
                                 double wLight = Mis(imgToSurf / ctx.nLightPaths) *
-                                                ((isHairV ? 0.0 : ctx.misVmWeight) + dVCM + dVC * Mis(bsdfRevPdfW));
+                                                ((vcmMergeAt(*mp, h) ? ctx.misVmWeight : 0.0) + dVCM +
+                                                 dVC * Mis(bsdfRevPdfW));
                                 double misW = 1.0 / (wLight + 1.0);
                                 // contrib = misW * beta * f * (cameraAreaPdf / nLightPaths).
                                 // The MIS weight and every density above are the HERO's
@@ -907,7 +916,7 @@ inline void traceLightSubpath(const Scene& scene, const Camera& cam, const Rende
         if (isFiberMat(*mp) && !delta) return;
 
         misScatter(delta, cosThetaOut, pdfW, pdfRevW, ctx.misVcWeight, ctx.misVmWeight,
-                   dVCM, dVC, dVM, /*mergeable=*/mp->type != MatType::Hair);
+                   dVCM, dVC, dVM, /*mergeable=*/vcmMergeAt(*mp, h));
         beta *= betaFactor;
         for (int i = 0; i + 1 < nUp; ++i) betaSec[i] *= secChromatic ? secF[i] : betaFactor;
         if (!delta) {
@@ -1236,7 +1245,9 @@ inline Vec3 traceCameraSubpath(const Scene& scene, const Camera& cam, const Rend
                                                         : Mis(bsdfDirPdfW / (pdfChoice * directPdfW));
                                 double wCamera = Mis(emissionPdfW * std::fabs(cosToLight) /
                                                      (directPdfW * cosAtLight)) *
-                                                 (mp->type == MatType::Hair ? 0.0 : (ctx.misVmWeight + dVCM + dVC * Mis(bsdfRevPdfW)));   // no light-side alternative through a strand
+                                                 (mp->type == MatType::Hair ? 0.0   // no light-side alternative through a strand
+                                                  : ((vcmMergeAt(*mp, h) ? ctx.misVmWeight : 0.0) + dVCM +
+                                                     dVC * Mis(bsdfRevPdfW)));
                                 double misW = 1.0 / (wLight + 1.0 + wCamera);
                                 double k = misW * std::fabs(cosToLight) / (pdfChoice * directPdfW) * visL;
                                 Vec3 add = cie * (beta * k * Le * f);
@@ -1307,11 +1318,13 @@ inline Vec3 traceCameraSubpath(const Scene& scene, const Camera& cam, const Rend
                 double litRevPdfW = bsdfPdf(*lv.mat, lv.ns, w * -1.0, lv.wo, lambda, scene, &lv.hit);
                 double camDirPdfA = camDirPdfW * std::fabs(cosLit) / dist2;
                 double litDirPdfA = litDirPdfW * std::fabs(cosCam) / dist2;
-                const double vmLit = (lv.mat && lv.mat->type == MatType::Hair) ? 0.0 : ctx.misVmWeight;   // no merge AT a strand
+                // No merge AT a curve, at either end.
+                const double vmLit = (lv.mat && !vcmMergeAt(*lv.mat, lv.hit)) ? 0.0 : ctx.misVmWeight;
+                const double vmCam = vcmMergeAt(*mp, h) ? ctx.misVmWeight : 0.0;
                 double wLight = Mis(camDirPdfA) * (vmLit + lv.dVCM + lv.dVC * Mis(litRevPdfW));
                 // No light-side alternative runs THROUGH a strand (a light walk stops at one).
                 double wCamera = (mp->type == MatType::Hair) ? 0.0
-                                 : Mis(litDirPdfA) * (ctx.misVmWeight + dVCM + dVC * Mis(camRevPdfW));
+                                 : Mis(litDirPdfA) * (vmCam + dVCM + dVC * Mis(camRevPdfW));
                 double misW = 1.0 / (wLight + 1.0 + wCamera);
                 double visV = 0.0;
                 {   // Either end may be a strand; clear both tubes (0 for non-fibers).
@@ -1341,7 +1354,7 @@ inline Vec3 traceCameraSubpath(const Scene& scene, const Camera& cam, const Rend
             // the hair. Every MIS weight excludes the merge at a fiber vertex to match (misScatter
             // `mergeable`, and the NEE / splat / VC terms). Measured before this: a 30 000-strand
             // groom read 0.40 of modes R and B; 3 000 strands 0.99 (0.364.0).
-            if (ctx.vmNorm > 0.0 && mp->type != MatType::Hair) {
+            if (ctx.vmNorm > 0.0 && vcmMergeAt(*mp, h)) {
                 Vec3 mergeXYZ{0, 0, 0};
                 const Vec3 ngoCam = orientedGeoN(h);
                 JSpec js;
@@ -1351,13 +1364,12 @@ inline Vec3 traceCameraSubpath(const Scene& scene, const Camera& cam, const Rend
                 grid.query(lightVerts, h.p, ctx.radius, [&](int idx) {
                     const LightVertex& lv = lightVerts[idx];
                     if (edges + lv.edges > ctx.maxDepth) return;        // merged path too long
-                    // Never merge with a vertex stored ON A FIBER (mode M's rule: fibers are
-                    // never deposited on). The merge treats a stored vertex purely as a photon
-                    // and evaluates the CAMERA BSDF against it, so a photon on a strand lying
-                    // on the skin bleeds into every skin gather point within the radius.
-                    // Measured: opaque hair 2.79x mode R with this merge, 1.029x without. On the
-                    // strand, not of its lobe: a mix's hair lobe picked on a mesh is no strand.
-                    if (lv.mat && lv.mat->type == MatType::Hair && lv.hit.fiberRadius > 0.0) return;
+                    // Never merge with a vertex stored ON A CURVE (vcmMergeAt; mode M's rule:
+                    // strands are never deposited on). The merge treats a stored vertex purely
+                    // as a photon and evaluates the CAMERA BSDF against it, so a photon on a
+                    // strand lying on the skin bleeds into every skin gather point within the
+                    // radius. Measured: opaque hair 2.79x mode R with this merge, 1.029x without.
+                    if (lv.mat && !vcmMergeAt(*lv.mat, lv.hit)) return;
                     Vec3 wMerge = lv.wo;                                // incident illumination dir
                     if (mergeFromBehind(camTwoSided, wMerge, ngoCam)) return;
                     // camera BSDF evaluated at the light vertex's wavelength (XYZ estimate).
@@ -1439,7 +1451,7 @@ inline Vec3 traceCameraSubpath(const Scene& scene, const Camera& cam, const Rend
         if (!delta && (pdfW <= 0.0 || cosThetaOut <= 0.0)) return result;
 
         misScatter(delta, cosThetaOut, pdfW, pdfRevW, ctx.misVcWeight, ctx.misVmWeight,
-                   dVCM, dVC, dVM, /*mergeable=*/mp->type != MatType::Hair);
+                   dVCM, dVC, dVM, /*mergeable=*/vcmMergeAt(*mp, h));
         // A light walk never scatters at a strand (traceLightSubpath, 0.365.0): no alternative
         // from here inward puts one on the light side. dVCM stays -- the light subpath may
         // still END at the next vertex and connect back to this one.

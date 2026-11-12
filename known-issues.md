@@ -228,7 +228,13 @@ case then deposits nothing. A wall of each, its mean against mode R per channel
 `thinfilm` also needs the coat's coin folded into the carrier (0.433.9, from the review), and
 before both fixes read R G B 0.952 0.716 0.801 / 0.950 0.715 0.800 (M CPU / S CPU).
 
-## FIXED FOR MODES M AND S (2026-11-04, 0.433.3; opened 2026-11-04, 0.431.0): CURVE-GATHER — modes M, S and U misread a coat of `type diffuse` curves, and M's two backends disagree on it
+## DONE (2026-11-11, mode U 0.439.2; modes M and S 0.433.3; opened 2026-11-04, 0.431.0): CURVE-GATHER — modes M, S and U misread a coat of `type diffuse` curves, and M's two backends disagree on it
+
+**Mode U, fixed in 0.439.2** (VCM-THIN-CURVES): it merges at no curve vertex, hair or not, in
+either role -- one predicate per backend (`vcmMergeAt` / `dVcmMergeAt`) gates the gather, the
+stored vertices it gathers, and the merge-here term of every weight (both walks' `misScatter`,
+the NEE, connection and camera-splat weights). A diffuse strand is still a light vertex for the
+connections. check_fur_gather's coat, of mode R: U 2.100 (GPU) / 2.356 (CPU) -> 1.000 / 1.014.
 
 **Modes M and S, fixed in 0.433.3** by the fix proposed below. Their camera walks never gather on a
 `type diffuse` strand: they light it by NEE, fold its reflectance into the spectral carrier, and go
@@ -10184,7 +10190,13 @@ nudge against the host's absolute 1e-6). Non-hair scenes are bit-identical to th
 device binary, so it is hair-specific. Not chased here; the CPU twin is the reference for the
 device port to be measured against.
 
-### VCM-THIN-CURVES — FIXED FOR MODE J (0.385.0), OPEN FOR MODE U (found 0.365.0): vertex merging on a thin diffuse curve reads 0.80 of R on both backends
+### VCM-THIN-CURVES — FIXED FOR MODE J (0.385.0) AND MODE U (0.439.2) (found 0.365.0): vertex merging on a thin diffuse curve reads 0.80 of R on both backends
+
+> **Mode U: fixed in 0.439.2** by the same exclusion: `vcmMergeAt` (vcm.h) and `dVcmMergeAt`
+> (render_cuda.cu) refuse a merge at any curve hit (`fiberRadius > 0`) as well as on hair, at the
+> gather, at the stored vertex it would gather, and in every weight's merge-here term.
+> `scraps/_dif_thickblack.ftsl` (64x64, against mode R 4096 spp on the GPU): mode U 0.757 (CPU,
+> 256 spp) / 0.809 (GPU, 1024) before, 1.002 / 1.003 after; mode D 0.994.
 
 > **Mode J: fixed by the exclusion this entry proposes.** `surfMergeSite` (host) and
 > `dSurfMergeSite` (device) now refuse a vertex on ANY curve primitive (`hit.fiberRadius > 0` /

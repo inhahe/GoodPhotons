@@ -5901,7 +5901,10 @@ as the one at fault.
   there contributes nothing, but a photon stored there is gathered by every other surface within
   the radius -- a sheet 5-20 cm over a downward lamp read 14-40 % of its lit brightness through
   the photons the floor sent back onto the lamp's back face (known-issues J-LAMP-PHOTONS). VCM
-  stores no light vertex there, and since 0.400.7 modes `M` and `S` deposit none either.
+  stores no light vertex there, and since 0.400.7 modes `M` and `S` deposit none either. Mode `U`'s
+  merge predicate is `vcmMergeAt` (`dVcmMergeAt` on the device; 0.439.2): no merge at a curve
+  vertex, hair or not, in either role -- the gather, the stored vertex it would gather, and every
+  weight's merge-here term. A diffuse strand stays a light vertex for the connections.
 
   **The radius shrinks per light-side epoch, and that is a correctness property, not a tuning
   knob.** `main.cpp`'s `surfRadiusFor(epoch)` applies Georgiev/SmallVCM's schedule

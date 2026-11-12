@@ -13850,6 +13850,11 @@ __device__ static double dCompoundMergeStoreProb(const DScene& sc, const DMateri
 // gates the store, the gather and the MIS eta terms, so the exclusion is consistent by construction.
 // Nor on a light block's own surface (matReflectsNothing): a photon stored there is gathered by
 // every other surface within the radius (bdpt.h).
+// vcm.h vcmMergeAt's twin (VCM-THIN-CURVES): mode U merges at no curve vertex, hair or not;
+// `fiberR` is the hit's (or the stored vertex's) strand radius, 0 off a curve.
+__device__ static inline bool dVcmMergeAt(const DMaterial& m, Real fiberR) {
+    return m.type != D_HAIR && !(fiberR > (Real)0);
+}
 __device__ static inline bool dSurfMergeSite(const DScene& sc, const DVertex& v) {
     if (v.type != BV_SURFACE || v.delta || v.matId < 0) return false;
     return dStoresMergeVertex(sc.mats[v.matId]) && !(v.fiberR > (Real)0);
@@ -22301,7 +22306,9 @@ __global__ void kVcmLightT(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx,
                                         double imgToSolid = imgPtDist * imgPtDist / cosAtCamera;
                                         double imgToSurf = imgToSolid * fabs(cosToCamera) / dist2c;
                                         double wLight = (imgToSurf / ctx.nLightPaths) *
-                                                        (mp->type == D_HAIR ? 0.0 : (ctx.misVmWeight + dVCM + dVC * bsdfRevPdfW));   // no light-side alternative through a strand
+                                                        (mp->type == D_HAIR ? 0.0   // no light-side alternative through a strand
+                                                         : ((dVcmMergeAt(*mp, h.fiberRadius) ? ctx.misVmWeight : 0.0) +
+                                                            dVCM + dVC * bsdfRevPdfW));
                                         double misW = 1.0 / (wLight + 1.0);
                                         double ax = 0, ay = 0, az = 0;
                                         double contrib = misW * beta * f * imgToSurf / ctx.nLightPaths;
@@ -22348,7 +22355,7 @@ __global__ void kVcmLightT(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx,
                 double t = cosThetaOut / pdfW;
                 // No merge AT a strand (vcm.h misScatter `mergeable`): the merge-at-this-vertex
                 // alternative leaves both accumulators (dVM is dVC in units of 1/etaVCM).
-                const bool mergeable = (mp->type != D_HAIR);
+                const bool mergeable = dVcmMergeAt(*mp, h.fiberRadius);
                 dVC = t * (dVC * pdfRevW + dVCM + (mergeable ? ctx.misVmWeight : 0.0));
                 dVM = t * (dVM * pdfRevW + dVCM * ctx.misVcWeight + (mergeable ? 1.0 : 0.0));
                 dVCM = 1.0 / pdfW;
@@ -22739,7 +22746,9 @@ __global__ void kVcmCameraT(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx
                                                              : (bsdfDirPdfW / (pdfChoice * directPdfW));
                                     double wCamera = (emissionPdfW * fabs(cosToLight) /
                                                       (directPdfW * cosAtLight)) *
-                                                     (mp->type == D_HAIR ? 0.0 : (ctx.misVmWeight + dVCM + dVC * bsdfRevPdfW));   // no light-side alternative through a strand
+                                                     (mp->type == D_HAIR ? 0.0   // no light-side alternative through a strand
+                                                      : ((dVcmMergeAt(*mp, h.fiberRadius) ? ctx.misVmWeight : 0.0) +
+                                                         dVCM + dVC * bsdfRevPdfW));
                                     double misW = 1.0 / (wLight + 1.0 + wCamera);
                                     double contrib = misW * fabs(cosToLight) /
                                                      (pdfChoice * directPdfW) * Le * f;
@@ -22833,11 +22842,13 @@ __global__ void kVcmCameraT(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx
                     double litRevPdfW = dBsdfPdf(sc, lvt, w * (Real)-1, lv.wo, lambda);
                     double camDirPdfA = camDirPdfW * fabs(cosLit) / dist2;
                     double litDirPdfA = litDirPdfW * fabs(cosCam) / dist2;
-                    const double vmLit = litHair ? 0.0 : ctx.misVmWeight;                 // no merge AT a strand
+                    // No merge AT a curve, at either end.
+                    const double vmLit = dVcmMergeAt(sc.mats[lv.matId], lv.fiberR) ? ctx.misVmWeight : 0.0;
+                    const double vmCam = dVcmMergeAt(*mp, h.fiberRadius) ? ctx.misVmWeight : 0.0;
                     double wLight = camDirPdfA * (vmLit + lv.dVCM + lv.dVC * litRevPdfW);
                     // No light-side alternative runs THROUGH a strand (a light walk stops at one).
                     double wCamera = (mp->type == D_HAIR) ? 0.0
-                                     : litDirPdfA * (ctx.misVmWeight + dVCM + dVC * camRevPdfW);
+                                     : litDirPdfA * (vmCam + dVCM + dVC * camRevPdfW);
                     double misW = 1.0 / (wLight + 1.0 + wCamera);
                     double Gt = fabs(cosCam) * fabs(cosLit) / dist2;
                     double contrib = misW * Gt * fCam * fLit * beta * lv.beta;
@@ -22852,7 +22863,7 @@ __global__ void kVcmCameraT(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx
                 }
 
                 // (d) Vertex merging — gather nearby light vertices from ALL paths (XYZ estimate).
-                if (ctx.vmNorm > 0.0 && grid.nLV > 0 && mp->type != D_HAIR) {   // not AT a strand (vcm.h)
+                if (ctx.vmNorm > 0.0 && grid.nLV > 0 && dVcmMergeAt(*mp, h.fiberRadius)) {   // not AT a curve (vcm.h)
                     double mx = 0, my = 0, mz = 0;
                     DJSpec js;
                     if (jOn) jrun.snap(js);
@@ -22874,7 +22885,7 @@ __global__ void kVcmCameraT(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx
                               // Never merge with a vertex stored ON a strand (vcm.h, 0.362.0): the merge
                               // evaluates the CAMERA BSDF against a photon and never looks at where the
                               // photon sits, so a strand lying on the skin would bleed into it.
-                              if (sc.mats[lv.matId].type == D_HAIR && lv.fiberR > (Real)0) continue;
+                              if (!dVcmMergeAt(sc.mats[lv.matId], lv.fiberR)) continue;
                               DVec3 d = h.p - lv.p;
                               if (ddot(d, d) > r2) continue;
                               if (edges + lv.edges > ctx.maxDepth) continue;
@@ -22958,7 +22969,7 @@ __global__ void kVcmCameraT(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx
                 double t = cosThetaOut / pdfW;
                 // No merge AT a strand (vcm.h misScatter `mergeable`): the merge-at-this-vertex
                 // alternative leaves both accumulators (dVM is dVC in units of 1/etaVCM).
-                const bool mergeable = (mp->type != D_HAIR);
+                const bool mergeable = dVcmMergeAt(*mp, h.fiberRadius);
                 dVC = t * (dVC * pdfRevW + dVCM + (mergeable ? ctx.misVmWeight : 0.0));
                 dVM = t * (dVM * pdfRevW + dVCM * ctx.misVcWeight + (mergeable ? 1.0 : 0.0));
                 dVCM = 1.0 / pdfW;

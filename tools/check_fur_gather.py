@@ -7,13 +7,13 @@ a ceiling panel. A gather on a strand is no surface estimate: the photons in its
 neighbouring strands. Since 0.433.3 modes M and S never gather there (known-issues CURVE-GATHER):
 they light a strand by NEE and walk on along its diffuse lobe, and deposit no photon on one. Before
 that the coat read, of mode R, M 0.71 (GPU) / 0.87 (CPU) and S 1.33 / 1.45; now 1.007 / 0.976 and
-0.986 / 0.981. Mode U still merges on strands (VCM-THIN-CURVES), at 2.10 / 2.36. Mode M runs with
-its final gather (`-pmfg`) too, whose sub-walk has taken the same step since 0.433.6: 1.009 / 1.050.
+0.986 / 0.981. Mode U merged on strands until 0.439.2 (VCM-THIN-CURVES), at 2.10 / 2.36; it merges
+at no curve vertex now, 1.000 / 1.014. Mode M runs with its final gather (`-pmfg`) too, whose
+sub-walk has taken the same step since 0.433.6: 1.009 / 1.050.
 
 The coat is the mean over the ball's middle, two seeds, against mode R's on the GPU. In modes M, S
-and U on the CPU and the GPU it must lie within 10 % of the value recorded below. Mode U's is not 1;
-when its merges stop at strands too, its value moves, and `--record` prints the new ones to paste
-in. Exits 0 when every case holds, 1 otherwise.
+and U on the CPU and the GPU it must lie within 10 % of the value recorded below; `--record` prints
+the values to paste in after a change that moves them. Exits 0 when every case holds, 1 otherwise.
 """
 import argparse
 import os
@@ -53,8 +53,8 @@ CASES = [("M_gpu", ["-mode", "M", "-device", "gpu", "-n", "4000000", "-spp", "16
          ("Mfg_cpu", ["-mode", "M", "-device", "cpu", "-n", "2000000", "-spp", "2", "-pmfg", "8"], 1.050),
          ("S_gpu", ["-mode", "S", "-device", "gpu", "-spp", "16"], 0.986),
          ("S_cpu", ["-mode", "S", "-device", "cpu", "-spp", "4"], 0.981),
-         ("U_gpu", ["-mode", "U", "-device", "gpu", "-spp", "16"], 2.100),
-         ("U_cpu", ["-mode", "U", "-device", "cpu", "-spp", "4"], 2.356)]
+         ("U_gpu", ["-mode", "U", "-device", "gpu", "-spp", "16"], 1.000),
+         ("U_cpu", ["-mode", "U", "-device", "cpu", "-spp", "4"], 1.014)]
 TOL = 0.10
 
 
