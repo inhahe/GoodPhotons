@@ -1961,8 +1961,14 @@ bake exits as a stopped render does (0, or `-stop-exit <code>`).
 
 A frame with no record, or one baked for another mesh, handles, targets, settings or keys of its
 own, refuses to load and says so. A render cannot see a change to an earlier frame's scene: bake
-the shot again after one. A dynamic elastic must be its mesh's first deformer, and a frame's
-motion interval may span at most one frame (`-0.5 0.5`, say). loom's `DeformedMesh` /
+the shot again after one. A mesh takes one dynamic elastic, anywhere in its stack (since
+0.440.0; before, it had to come first): the deformers before it give the rest it is simulated on
+at each key, so it follows them with inertia -- a falloff that bends a tail over the shot, and a
+dynamic elastic after it that makes the tail jiggle as it goes -- and those after it work on its
+output. Its handles pick their vertices on the mesh as loaded, and hold them at their place on
+that moving rest plus the handle's move: a handle with no `to` keeps its vertices where the
+deformers before put them. A change to those deformers' motion makes the frame's record stale, as
+a handle's target does. A frame's motion interval may span at most one frame (`-0.5 0.5`, say). loom's `DeformedMesh` /
 `Elastic(dynamic=Dynamics(…))` writes all this, and its shot runner bakes the shot from its first
 frame before it renders any (`-frames` or not).
 

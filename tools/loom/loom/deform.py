@@ -23,7 +23,8 @@ moving handle gets one ``to`` per key.
   it has inertia -- it lags, overshoots and settles -- and is simulated through the shot once, in
   frame order, into a cache each frame then reads: :func:`~loom.drive.render_range` (and so
   ``python -m loom.shot`` / ``ftrace -shot``) runs ``ftrace -bake-elastic`` over the shot's frames
-  before rendering them. A dynamic elastic must be its mesh's first deformer.
+  before rendering them. A mesh takes one dynamic elastic; the deformers before it give the rest it
+  is simulated on (moving with them), those after it work on its output.
 
 Deformers stack in order, each moving the last one's output.
 """
@@ -195,9 +196,8 @@ class DeformedMesh(Element):
         self.deformers = list(deformers)
         if not self.deformers:
             raise ValueError("DeformedMesh: give it at least one deformer")
-        for i, d in enumerate(self.deformers):
-            if i > 0 and isinstance(d, Elastic) and d.dynamic is not None:
-                raise ValueError("DeformedMesh: a dynamic Elastic must be the first deformer")
+        if sum(1 for d in self.deformers if isinstance(d, Elastic) and d.dynamic is not None) > 1:
+            raise ValueError("DeformedMesh: a mesh takes one dynamic Elastic")
         self.material = material
         self.name = name
 

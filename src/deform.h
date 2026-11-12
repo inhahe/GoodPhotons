@@ -313,11 +313,14 @@ public:
     // form's mass term, y the inertial guess). `fromRest`: `x` is the rest mesh, so the first
     // round takes every rotation as the identity -- the plain Laplacian deform, the usual start,
     // exact at once for a translation -- rather than reading rotations off the held vertices'
-    // jump alone.
+    // jump alone. `rest` (null: the mesh build() took) is the rest shape for this solve only -- a
+    // dynamic elastic after other deformers rests on their output, which moves with time -- while
+    // the edges' weights and the masses stay build()'s.
     // False when a stop arrived part-way (ft::parallelFor): `x` is then half-solved, not to be used.
     [[nodiscard]] bool solve(const std::vector<char>& held, const std::vector<Vec3>& target, std::vector<Vec3>& x,
                              int iters, double inertia = 0.0, const std::vector<Vec3>* y = nullptr,
-                             bool fromRest = false) const {
+                             bool fromRest = false, const std::vector<Vec3>* rest = nullptr) const {
+        const std::vector<Vec3>& r0 = rest ? *rest : rest_;
         const int n = (int)rest_.size();
         for (int i = 0; i < n; ++i) if (held[(size_t)i]) x[(size_t)i] = target[(size_t)i];
         std::vector<M3> R((size_t)n, M3{1, 0, 0, 0, 1, 0, 0, 0, 1});
@@ -330,7 +333,7 @@ public:
                         M3 M{};
                         for (int e = start_[(size_t)i]; e < start_[(size_t)i + 1]; ++e) {
                             const int j = nbr_[(size_t)e];
-                            const Vec3 r = rest_[(size_t)i] - rest_[(size_t)j], d = x[(size_t)i] - x[(size_t)j];
+                            const Vec3 r = r0[(size_t)i] - r0[(size_t)j], d = x[(size_t)i] - x[(size_t)j];
                             const double w = w_[(size_t)e];
                             const double rv[3] = {r.x, r.y, r.z}, dv[3] = {d.x, d.y, d.z};
                             for (int p = 0; p < 3; ++p)
@@ -346,7 +349,7 @@ public:
                         Vec3 sum{0, 0, 0};
                         for (int e = start_[(size_t)i]; e < start_[(size_t)i + 1]; ++e) {
                             const int j = nbr_[(size_t)e];
-                            const Vec3 r = rest_[(size_t)i] - rest_[(size_t)j];
+                            const Vec3 r = r0[(size_t)i] - r0[(size_t)j];
                             sum = sum + (mul(R[(size_t)i], r) + mul(R[(size_t)j], r)) * (0.5 * w_[(size_t)e]);
                         }
                         if (inertia > 0.0 && y) sum = sum + (*y)[(size_t)i] * (inertia * mass_[(size_t)i]);

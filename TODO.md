@@ -156,7 +156,7 @@ Each names the section its line is in.
     Done, 0.439.8.
 24. ~~**BEAMEPOCHS-CHUNK-PIN** (4.5) — `-beamepochs` pins cheap scenes' GPU chunks to 1 spp.~~ Done,
     0.438.2.
-25. **DEFORM-LIMITS**, **MOTION-LIGHT-RIGID**, **PER-OBJECT-MODES** (4.6) — what is left of them.
+25. ~~**DEFORM-LIMITS**~~ (0.440.0), **MOTION-LIGHT-RIGID**, **PER-OBJECT-MODES** (4.6) — what is left of them.
 26. **BLACK-PIXELS-ONCE** (4.2) — one render's black pixels, never reproduced.
 27. **SPPM-LOWPASS-DEVHOST** (4.2) — mode S's device and host differ at low pass counts.
 28. ~~**HAZE-BLUR-INVERSE-TR** (4.3) — a blurred mover far out in a density-field haze: modes D and
@@ -516,7 +516,7 @@ Then the rest of 4.2-4.6 in their order, 4.7's bookkeeping alongside whatever to
 
 - [ ] **CURVE-CAUSTIC** — modes M and S miss a point or spot light's caustic on a `type diffuse`
   strand (0.433.3 stopped depositing there); the fix is a strand-shaped estimate on the caustic map.
-- [ ] **DEFORM-LIMITS** — a dynamic elastic must be first in its mesh's stack.
+- [x] **DEFORM-LIMITS** (0.440.0) — a dynamic elastic had to be first in its mesh's stack.
 - [ ] **MOTION-LIGHT-RIGID** — a spot, beam or aimed light its keys stretch unevenly, and a sun or
   sky in a moving group, stay at the instant.
 - [ ] **PER-OBJECT-MODES** — emissive surfaces and bare mesh instances cannot be tagged; only D and

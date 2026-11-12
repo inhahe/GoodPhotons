@@ -11180,8 +11180,14 @@ coordinates and before the mesh light, the watertight record and the fog bound r
   bake writes. A render reads its record, refuses one whose key, path or times are not its own
   frame's, and takes the keys from it (it cannot check the chain: that needs the frames before).
   Under a motion interval the elastic is given keys even when no handle is keyed (about one a
-  substep), since it rings on after its handles stop. It must be the stack's first deformer (its
-  rest is the mesh as loaded). `-bake-elastic` passes a stop on to the frame being baked through
+  substep), since it rings on after its handles stop. It may sit anywhere in the stack (one a
+  mesh, 0.440.0): the deformers before it give its rest at each key (`moving`), on which it is
+  simulated -- `Arap::solve` takes a rest per solve, the cotangent weights and masses staying the
+  mesh as loaded's, and `elastic::run` interpolates the rest between keys as it does the targets
+  -- with its held vertices' targets their place on that rest plus the handle's move. The record
+  keeps the rest at its last key (`restLast`, file version 3; a record with none is written as
+  version 2, so a shot whose elastic comes first keeps its records), for the gap to the next
+  frame, and the frame's path key includes the moving rest at every key. `-bake-elastic` passes a stop on to the frame being baked through
   its `<pid>.stop` sentinel and exits as a stopped render does.
 - **The mesh's own coordinates** (0.417.0). `applyDeformers` takes the mesh's composed
   transform `xf` (its own, its groups' at the instant, the unit scale): the welded vertices are

@@ -87,9 +87,12 @@ def test_two_dynamic_elastics_cannot_share_a_cache(tmp_path):
 def test_refusals():
     with pytest.raises(ValueError):
         Elastic([Handle((0, 0, 0), to=(0, 1, 0))])      # an elastic handle holds vertices: needs a radius
-    with pytest.raises(ValueError):
-        DeformedMesh("bar.obj", [Falloff([Handle((0, 0, 0), radius=1)]),
+    with pytest.raises(ValueError):                     # one dynamic elastic a mesh
+        DeformedMesh("bar.obj", [Elastic([Handle((0, 0, 0), radius=1)], dynamic=Dynamics()),
                                  Elastic([Handle((0, 0, 0), radius=1)], dynamic=Dynamics())])
+    # ...anywhere in the stack (0.440.0): the deformers before it give its moving rest.
+    DeformedMesh("bar.obj", [Falloff([Handle((0, 0, 0), radius=1)]),
+                             Elastic([Handle((0, 0, 0), radius=1)], dynamic=Dynamics())])
     with pytest.raises(ValueError):
         Falloff([Handle((0, 0, 0), radius=1)], profile="cubic")
     with pytest.raises(ValueError):

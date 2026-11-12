@@ -6095,14 +6095,17 @@ private:
     // for frame `frame` (`cache` with the frame number in it) -- or, under -bake-elastic
     // (elastic::g_baking), simulated on from the frame before's record, or from rest when there is
     // none, and written as this frame's. `nh` handles, `handle(i)` each, holding the vertices of
-    // `rest` within their radius.
+    // `rest` within their radius. `moving[k]` (null: none) is its rest at each key where deformers
+    // before it move one (applyDeformers): a held vertex's target is its place there plus the
+    // handle's move.
     template <class HandleAt>
     bool dynamicElastic(size_t nh, HandleAt handle, const elastic::Params& P, const std::string& cache,
                         long long frame, const std::vector<Vec3>& rest,
                         const std::vector<std::array<int, 3>>& tris, int K, const Scene& S,
-                        std::vector<std::vector<Vec3>>& out) {
+                        std::vector<std::vector<Vec3>>& out,
+                        const std::vector<std::vector<Vec3>>* moving = nullptr) {
         std::vector<char> held(rest.size(), 0);
-        std::vector<std::vector<Vec3>> targets((size_t)K, rest);
+        std::vector<std::vector<Vec3>> targets = moving ? *moving : std::vector<std::vector<Vec3>>((size_t)K, rest);
         for (size_t hi = 0; hi < nh; ++hi) {
             const auto& h = handle(hi);
             int n = 0;
@@ -6110,8 +6113,10 @@ private:
                 if (length(rest[i] - h.at) <= h.radius) {
                     held[i] = 1;
                     ++n;
-                    for (int k = 0; k < K; ++k)
-                        targets[(size_t)k][i] = rest[i] + (h.to[h.to.size() > 1 ? (size_t)k : 0] - h.at);
+                    for (int k = 0; k < K; ++k) {
+                        const Vec3& base = moving ? (*moving)[(size_t)k][i] : rest[i];
+                        targets[(size_t)k][i] = base + (h.to[h.to.size() > 1 ? (size_t)k : 0] - h.at);
+                    }
                 }
             if (n == 0) {
                 fail("deform elastic: a handle holds no vertex within its radius (raise `radius`)");
@@ -6121,7 +6126,7 @@ private:
         std::vector<double> times((size_t)K, 0.0);
         for (int k = 0; k < K && K > 1; ++k) times[(size_t)k] = S.motionA + (S.motionB - S.motionA) * k / (K - 1);
         const uint64_t key = elastic::keyOf(rest, tris, held, P);
-        const uint64_t pathKey = elastic::pathKeyOf(held, targets);
+        const uint64_t pathKey = elastic::pathKeyOf(held, targets, moving);
         std::string path, err;
         elastic::framePath(cache, frame, path);
         elastic::Record rec;
@@ -6149,7 +6154,7 @@ private:
                 rec.pos.size() == (size_t)K && rec.vel.size() == rest.size()) {
                 std::printf("[elastic] frame %lld is up to date (%s)\n", frame, path.c_str());
             } else {
-                if (!elastic::bakeFrame(rest, tris, held, targets, times, frame, P, pp, rec, err)) {
+                if (!elastic::bakeFrame(rest, tris, held, targets, times, frame, P, pp, rec, err, moving)) {
                     if (!stopped()) fail("deform elastic: " + err);
                     return false;
                 }
@@ -6176,7 +6181,7 @@ private:
             }
             if (rec.pathKey != pathKey) {
                 fail("deform elastic: " + path + " was baked for other handle targets (a `to` or its keys "
-                     "changed) -- bake the shot again from this frame");
+                     "changed, or the deformers before it) -- bake the shot again from this frame");
                 return false;
             }
         }
@@ -6303,6 +6308,13 @@ private:
             stack.push_back(std::move(d));
         }
         if (stack.empty()) return true;
+        // A mesh takes one dynamic elastic (its cache is the mesh's); `dI` is where it sits.
+        int dI = -1;
+        for (size_t di = 0; di < stack.size(); ++di)
+            if (stack[di].dyn.on) {
+                if (dI >= 0) { fail("deform elastic: a mesh takes one dynamic elastic"); return false; }
+                dI = (int)di;
+            }
         Scene& S = L.scene;
         const size_t triEnd = S.tris.size();
         // The keys: every keyed handle has the same count, spread evenly over the interval.
@@ -6319,8 +6331,8 @@ private:
         // A dynamic elastic moves through the frame whether its handles do or not -- it rings on
         // after they stop -- so over a motion interval it gets keys anyway, about one a substep,
         // to blur by and give the guide pass its motion. The instant must be one of them.
-        if (K == 1 && stack[0].dyn.on && S.motionB > S.motionA) {
-            const int want = std::max(3, (int)std::ceil((S.motionB - S.motionA) * stack[0].dyn.P.substeps) + 1);
+        if (K == 1 && dI >= 0 && S.motionB > S.motionA) {
+            const int want = std::max(3, (int)std::ceil((S.motionB - S.motionA) * stack[(size_t)dI].dyn.P.substeps) + 1);
             for (int k = want; k <= std::max(want, 129) && K == 1; ++k) {
                 const double j = S.motionU(0.0) * (k - 1);
                 if (std::fabs(j - std::lround(j)) < 1e-9) K = k;
@@ -6382,26 +6394,8 @@ private:
                 own[i] = toOwn.apply(rest[i]);
             }
         }
-        // A dynamic elastic is simulated through the shot rather than solved at each key, so its
-        // rest is the mesh as loaded: it comes first. Its keys come from its cache record --
-        // or, baking, from the simulation that record continues.
-        std::vector<std::vector<Vec3>> dynPos;
-        for (size_t di = 1; di < stack.size(); ++di)
-            if (stack[di].dyn.on) {
-                fail("deform elastic: a dynamic elastic must be a mesh's first deformer (it moves the mesh as "
-                     "loaded; others may follow it)");
-                return false;
-            }
-        if (stack[0].dyn.on && !dynamicElastic(stack[0].hs.size(), [&](size_t i) -> const Hd& { return stack[0].hs[i]; },
-                                               stack[0].dyn.P, stack[0].dyn.cache, stack[0].dyn.frame, own, tris, K,
-                                               S, dynPos))
-            return false;
-        // The stack at key k: every deformer in order, each on the last one's output.
-        std::vector<std::vector<Vec3>> keyPos((size_t)K);
-        for (int k = 0; k < K; ++k) {
-            std::vector<Vec3> p = own;
-            for (const Dk& d : stack) {
-                if (d.dyn.on) { p = dynPos[(size_t)k]; continue; }
+        // One deformer, not the dynamic elastic, at key k on `p`: each works on the last one's output.
+        auto applyOne = [&](const Dk& d, std::vector<Vec3>& p, int k) -> bool {
                 std::vector<deform::Handle> hs;
                 for (const Hd& h : d.hs) hs.push_back({h.at, h.to[h.to.size() > 1 ? (size_t)k : 0], h.radius});
                 if (d.kind == "falloff") {
@@ -6449,7 +6443,37 @@ private:
                     }
                     p = std::move(x);
                 }
+                return true;
+        };
+        // A dynamic elastic is simulated through the shot rather than solved at each key. Its keys
+        // come from its cache record -- or, baking, from the simulation that record continues. The
+        // deformers before it give its rest at each key (`moving`: the mesh as loaded where there
+        // are none), on which it is simulated -- its handles pick their vertices on the mesh as
+        // loaded and hold them at their place on that rest plus the handle's move; those after it
+        // work on its output.
+        std::vector<std::vector<Vec3>> dynPos, moving;
+        if (dI > 0) {
+            moving.resize((size_t)K);
+            for (int k = 0; k < K; ++k) {
+                std::vector<Vec3> p = own;
+                for (int di = 0; di < dI; ++di)
+                    if (!applyOne(stack[(size_t)di], p, k)) return false;
+                moving[(size_t)k] = std::move(p);
             }
+        }
+        if (dI >= 0) {
+            const Dk& d = stack[(size_t)dI];
+            if (!dynamicElastic(d.hs.size(), [&](size_t i) -> const Hd& { return d.hs[i]; }, d.dyn.P, d.dyn.cache,
+                                d.dyn.frame, own, tris, K, S, dynPos, dI > 0 ? &moving : nullptr))
+                return false;
+        }
+        // The stack at key k: from the dynamic elastic's output where there is one, every deformer
+        // after it in order.
+        std::vector<std::vector<Vec3>> keyPos((size_t)K);
+        for (int k = 0; k < K; ++k) {
+            std::vector<Vec3> p = dI >= 0 ? dynPos[(size_t)k] : own;
+            for (size_t di = (size_t)(dI + 1); di < stack.size(); ++di)
+                if (!applyOne(stack[di], p, k)) return false;
             for (size_t i = 0; i < p.size(); ++i) p[i] = rest[i] + xf.applyDir(p[i] - own[i]);
             keyPos[(size_t)k] = std::move(p);
         }

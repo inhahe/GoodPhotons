@@ -3821,8 +3821,11 @@ shot again re-simulates only from the first frame that changed; a resumed bake w
 byte what one bake writes, and `ftrace -stop` reaches it cleanly. A frame not yet baked, or
 baked for another mesh, handle targets or settings, says so and does not render. Under a
 `motion_interval` a dynamic elastic gets keys even when its handles hold still, since it rings
-on after they stop. loom's shot runner bakes the shot from its first frame before rendering
-when the scene has one (`Elastic(…, dynamic=Dynamics(…))`).
+on after they stop. A mesh takes one, anywhere in its stack (since 0.440.0): the deformers before
+it give the rest it is simulated on, so it follows them with inertia -- a falloff that swings a
+tail, and a dynamic elastic after it that makes the tail jiggle as it goes. loom's shot runner
+bakes the shot from its first frame before rendering when the scene has one
+(`Elastic(…, dynamic=Dynamics(…))`).
 
 `-export-tris <file.obj>` writes the scene's triangles as loaded (every transform and deformer
 applied) and exits, and `-export-tris-at <frames>` writes them at another time in the shutter.

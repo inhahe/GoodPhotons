@@ -61,6 +61,9 @@ struct Record {
     std::vector<std::vector<Vec3>> pos;     // the mesh at each key
     std::vector<Vec3> vel;                  // the velocities at its last key, m/s
     std::vector<Vec3> target;               // the held vertices' targets at its last key
+    // The rest it was simulated on at its last key, where deformers before the dynamic elastic
+    // move it (bakeFrame's `moving`); empty where its rest is the mesh as loaded.
+    std::vector<Vec3> restLast;
 };
 
 // FNV-1a over bytes, for the record's key.
@@ -91,15 +94,20 @@ inline uint64_t keyOf(const std::vector<Vec3>& rest, const std::vector<std::arra
 inline Vec3 f32(const Vec3& v) { return Vec3{(double)(float)v.x, (double)(float)v.y, (double)(float)v.z}; }
 
 // The key of a frame's handles' path: the held vertices' targets at each of its keys, as the
-// record keeps them (float32). Not in keyOf, since it changes from frame to frame: a render
-// compares its own frame's (a change to an earlier frame's handles needs that frame re-baked,
-// and the frames after it).
-inline uint64_t pathKeyOf(const std::vector<char>& held, const std::vector<std::vector<Vec3>>& targets) {
+// record keeps them (float32) -- and, where deformers before the dynamic elastic move its rest
+// (`moving`, null where they do not), that rest at each key too. Not in keyOf, since it changes
+// from frame to frame: a render compares its own frame's (a change to an earlier frame's handles
+// needs that frame re-baked, and the frames after it).
+inline uint64_t pathKeyOf(const std::vector<char>& held, const std::vector<std::vector<Vec3>>& targets,
+                          const std::vector<std::vector<Vec3>>* moving = nullptr) {
     Hasher h;
     h.i((long long)targets.size());
     for (const auto& tk : targets)
         for (size_t i = 0; i < tk.size(); ++i)
             if (held[i]) { const Vec3 q = f32(tk[i]); h.d(q.x); h.d(q.y); h.d(q.z); }
+    if (moving)
+        for (const auto& rk : *moving)
+            for (const Vec3& v : rk) { const Vec3 q = f32(v); h.d(q.x); h.d(q.y); h.d(q.z); }
     return h.h;
 }
 
@@ -137,15 +145,17 @@ inline bool framePath(const std::string& pat, long long k, std::string& out) {
 }
 
 // ---- the file ----------------------------------------------------------------------------
-// "FTEC", u32 version 2, u64 key, u64 pathKey, u64 chainKey, i64 frame, u32 vertices, u32 keys,
+// "FTEC", u32 version, u64 key, u64 pathKey, u64 chainKey, i64 frame, u32 vertices, u32 keys,
 // f64 times[keys],
-// f32 xyz pos[keys][vertices], f32 xyz vel[vertices], f32 xyz target[vertices].
-constexpr uint32_t kVersion = 2;
+// f32 xyz pos[keys][vertices], f32 xyz vel[vertices], f32 xyz target[vertices], and in version 3
+// only, f32 xyz restLast[vertices]. A record with no moving rest is written as version 2, so the
+// records of a shot whose dynamic elastic comes first are what they always were.
+constexpr uint32_t kVersion = 3;
 inline bool write(const std::string& path, const Record& r, std::string& err) {
     const std::string tmp = path + ".part";
     std::FILE* f = std::fopen(tmp.c_str(), "wb");
     if (!f) { err = "cannot write " + tmp; return false; }
-    const uint32_t ver = kVersion, nv = (uint32_t)r.vel.size(), nk = (uint32_t)r.times.size();
+    const uint32_t ver = r.restLast.empty() ? 2 : 3, nv = (uint32_t)r.vel.size(), nk = (uint32_t)r.times.size();
     const int64_t fr = r.frame;
     bool ok = std::fwrite("FTEC", 1, 4, f) == 4 && std::fwrite(&ver, 4, 1, f) == 1 &&
               std::fwrite(&r.key, 8, 1, f) == 1 && std::fwrite(&r.pathKey, 8, 1, f) == 1 &&
@@ -159,6 +169,7 @@ inline bool write(const std::string& path, const Record& r, std::string& err) {
     };
     for (uint32_t k = 0; ok && k < nk; ++k) ok = put(r.pos[k]);
     ok = ok && put(r.vel) && put(r.target);
+    if (ver == 3) ok = ok && put(r.restLast);
     ok = (std::fclose(f) == 0) && ok;
     if (!ok) { std::remove(tmp.c_str()); err = "writing " + path + " failed"; return false; }
     std::remove(path.c_str());
@@ -176,10 +187,10 @@ inline bool read(const std::string& path, Record& r, std::string& err) {
     int64_t fr = 0;
     const bool ftec = std::fread(magic, 1, 4, f) == 4 && !std::memcmp(magic, "FTEC", 4) &&
                       std::fread(&ver, 4, 1, f) == 1;
-    if (ftec && ver != kVersion) {
+    if (ftec && ver != 2 && ver != kVersion) {
         std::fclose(f);
         err = path + " is an elastic cache record of another ftrace (version " + std::to_string(ver) +
-              ", this one reads " + std::to_string(kVersion) + ") -- bake the shot again";
+              ", this one reads 2 and " + std::to_string(kVersion) + ") -- bake the shot again";
         return false;
     }
     bool ok = ftec && std::fread(&r.key, 8, 1, f) == 1 && std::fread(&r.pathKey, 8, 1, f) == 1 &&
@@ -203,6 +214,8 @@ inline bool read(const std::string& path, Record& r, std::string& err) {
         r.pos.resize(nk);
         for (uint32_t k = 0; ok && k < nk; ++k) ok = get(r.pos[k]);
         ok = ok && get(r.vel) && get(r.target);
+        if (ver == 3) ok = ok && get(r.restLast);
+        else r.restLast.clear();
     }
     std::fclose(f);
     if (!ok) err = path + " is not an elastic cache record (or is truncated)";
@@ -210,15 +223,17 @@ inline bool read(const std::string& path, Record& r, std::string& err) {
 }
 
 // ---- the simulation ----------------------------------------------------------------------
-// Advance `x`, `v` by `h` seconds towards the held vertices' targets `tgt`: one implicit step.
-// False if a stop arrived part-way.
+// Advance `x`, `v` by `h` seconds towards the held vertices' targets `tgt`: one implicit step,
+// on the rest `restNow` (null: the mesh the solver was built on). False if a stop arrived part-way.
 [[nodiscard]] inline bool step(const deform::Arap& arap, const std::vector<char>& held, const std::vector<Vec3>& tgt,
-                 double h, const Params& P, std::vector<Vec3>& x, std::vector<Vec3>& v) {
+                 double h, const Params& P, std::vector<Vec3>& x, std::vector<Vec3>& v,
+                 const std::vector<Vec3>* restNow = nullptr) {
     const size_t n = x.size();
     std::vector<Vec3> y(n), xn(n);
     for (size_t i = 0; i < n; ++i) y[i] = x[i] + v[i] * h;
     xn = y;
-    if (!arap.solve(held, tgt, xn, P.iterations, P.mass / (P.stiffness * h * h), &y)) return false;
+    if (!arap.solve(held, tgt, xn, P.iterations, P.mass / (P.stiffness * h * h), &y, false, restNow))
+        return false;
     const double keep = std::pow(std::max(0.0, 1.0 - P.damping), h);
     for (size_t i = 0; i < n; ++i) {
         v[i] = (xn[i] - x[i]) * (keep / h);
@@ -228,29 +243,37 @@ inline bool read(const std::string& path, Record& r, std::string& err) {
 }
 
 // Run from state (`x`, `v`, targets `t0`) at absolute time `a` (frames) to `b`, the targets moving
-// linearly to `t1`, in about P.substeps steps a frame. False if a stop arrived part-way.
+// linearly to `t1`, in about P.substeps steps a frame -- and the rest likewise from `r0` to `r1`
+// where deformers before the dynamic elastic move it (both null where they do not). False if a
+// stop arrived part-way.
 [[nodiscard]] inline bool run(const deform::Arap& arap, const std::vector<char>& held, const std::vector<Vec3>& t0,
                 const std::vector<Vec3>& t1, double a, double b, const Params& P,
-                std::vector<Vec3>& x, std::vector<Vec3>& v) {
+                std::vector<Vec3>& x, std::vector<Vec3>& v,
+                const std::vector<Vec3>* r0 = nullptr, const std::vector<Vec3>* r1 = nullptr) {
     if (!(b > a)) return true;
     const int n = std::max(1, (int)std::lround((b - a) * P.substeps));
     const double h = (b - a) / n / P.fps;
-    std::vector<Vec3> tgt(t0.size());
+    std::vector<Vec3> tgt(t0.size()), rest(r0 && r1 ? r0->size() : 0);
     for (int s = 1; s <= n; ++s) {
         const double f = (double)s / n;
         for (size_t i = 0; i < tgt.size(); ++i) tgt[i] = t0[i] + (t1[i] - t0[i]) * f;
-        if (!step(arap, held, tgt, h, P, x, v)) return false;
+        for (size_t i = 0; i < rest.size(); ++i) rest[i] = (*r0)[i] + ((*r1)[i] - (*r0)[i]) * f;
+        if (!step(arap, held, tgt, h, P, x, v, rest.empty() ? nullptr : &rest)) return false;
     }
     return true;
 }
 
 // Bake one frame: `rest` and `tris` the mesh, `held` the handles' vertices, `targets[k]` their
 // targets at each of the frame's keys (`times`, frames from its instant), `prev` the frame
-// before's record or null. Fills `out`; false (`err`) when the frames' intervals overlap.
+// before's record or null. `moving[k]` (null: none) is the rest at each key where deformers before
+// the dynamic elastic move it -- their output -- and the simulation rests on it, linearly between
+// keys, the solver's weights and masses staying `rest`'s. Fills `out`; false (`err`) when the
+// frames' intervals overlap.
 inline bool bakeFrame(const std::vector<Vec3>& rest, const std::vector<std::array<int, 3>>& tris,
                       const std::vector<char>& held, const std::vector<std::vector<Vec3>>& targets,
                       const std::vector<double>& times, long long frame, const Params& P,
-                      const Record* prev, Record& out, std::string& err) {
+                      const Record* prev, Record& out, std::string& err,
+                      const std::vector<std::vector<Vec3>>* moving = nullptr) {
     deform::Arap arap;
     arap.build(rest, tris);
     const size_t K = times.size();
@@ -268,14 +291,19 @@ inline bool bakeFrame(const std::vector<Vec3>& rest, const std::vector<std::arra
         x = prev->pos.back();
         v = prev->vel;
         lastT = prev->target;
-        if (!run(arap, held, lastT, targets[0], tPrev, t, P, x, v)) {   // the gap between frames, if any
+        // Across the gap the rest moves from the frame before's last to this frame's first (the
+        // mesh as loaded where either has no moving rest).
+        const std::vector<Vec3>* rPrev = !prev->restLast.empty() ? &prev->restLast : (moving ? &rest : nullptr);
+        const std::vector<Vec3>* rNow = moving ? &(*moving)[0] : (rPrev ? &rest : nullptr);
+        if (!run(arap, held, lastT, targets[0], tPrev, t, P, x, v, rPrev, rNow)) {   // the gap between frames, if any
             err = "stopped by request";
             return false;
         }
     } else {
         // From rest, still: the handles' first targets, met quasi-statically.
-        x = rest;
-        if (!arap.solve(held, targets[0], x, std::max(1, P.iterations * 4), 0.0, nullptr, /*fromRest*/true)) {
+        x = moving ? (*moving)[0] : rest;
+        if (!arap.solve(held, targets[0], x, std::max(1, P.iterations * 4), 0.0, nullptr, /*fromRest*/true,
+                        moving ? &(*moving)[0] : nullptr)) {
             err = "stopped by request";
             return false;
         }
@@ -288,7 +316,7 @@ inline bool bakeFrame(const std::vector<Vec3>& rest, const std::vector<std::arra
     out.pos[0] = x;
     for (size_t k = 1; k < K; ++k) {
         if (!run(arap, held, targets[k - 1], targets[k], (double)frame + times[k - 1], (double)frame + times[k],
-                 P, x, v)) {
+                 P, x, v, moving ? &(*moving)[k - 1] : nullptr, moving ? &(*moving)[k] : nullptr)) {
             err = "stopped by request";
             return false;
         }
@@ -300,6 +328,8 @@ inline bool bakeFrame(const std::vector<Vec3>& rest, const std::vector<std::arra
     for (size_t i = 0; i < v.size(); ++i) out.vel[i] = f32(v[i]);
     out.target.resize(targets[K - 1].size());
     for (size_t i = 0; i < out.target.size(); ++i) out.target[i] = f32(targets[K - 1][i]);
+    if (moving)
+        for (const Vec3& q : (*moving)[K - 1]) out.restLast.push_back(f32(q));
     return true;
 }
 

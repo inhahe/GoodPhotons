@@ -830,12 +830,23 @@ neighbour count (`rebuildCausticMapAt(pmC, radiusC, kGatherC)` on the CPU), so a
 photons would gather its caustics over a wider radius, a bias the main map's fixed radius does
 not have; its count must scale with the epoch's photons too (or its radius be pinned alone).
 
-## OPEN (2026-11-03, 0.413.0): DEFORM-LIMITS — what a deforming mesh cannot do yet
+## DONE (2026-11-12, 0.440.0; opened 2026-11-03, 0.413.0): DEFORM-LIMITS — what a deforming mesh could not do
 
 Refused at load, never rendered wrong:
 
-- **A dynamic elastic must be first** in its mesh's stack (its rest is the mesh as loaded).
-  Proper fix: bake the deformers before it into the record as its moving rest.
+- FIXED (0.440.0): **a dynamic elastic had to be first** in its mesh's stack (its rest was the
+  mesh as loaded). It may sit anywhere now, one a mesh: the deformers before it give its rest at
+  each key, on which it is simulated (`Arap::solve` takes a rest per solve, `elastic::run`
+  interpolates it between keys as it does the targets), its handles picking their vertices on the
+  mesh as loaded and holding them at their place on that rest plus the handle's move. The record
+  keeps the rest at its last key for the next frame's gap (file version 3, written only where
+  there is a moving rest, so existing shots keep their version-2 records), and the frame's path
+  key includes it, so a change to those deformers makes the record stale. check_deform: after an
+  rbf that translates the bar, the elastic moves as one whose own handle translates it (worst tip
+  difference 1.5e-8 m); after a falloff that bends the tail up over frames 2-4 it lags (0.095
+  against the bend's 0.192 at frame 3), overshoots (0.52) and settles on the bend (0.390 against
+  0.384); a changed deformer before it makes the frame's record stale; two on one mesh are
+  refused. 0.439.10 fails all five.
 - FIXED (0.427.0): **a glowing mesh** kept its instant's shape at every time, warned. Each light
   sample is now taken on its triangle as the keys have it at the path's time
   (`Scene::deformedEmitPoint`; the device's `dDeformedEmitOut`), the triangle's area then in every

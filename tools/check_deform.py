@@ -494,7 +494,11 @@ def main():
              mesh(grid, "deform falloff { handle { at 0 0 0  to 0 0.4 0 } }"), "needs a `radius`"),
             ("a dynamic elastic's own iterations",
              mesh(bar, 'deform elastic { iterations 5  dynamic { cache "x_%04d.ftec"  frame 0 }  '
-                       'handle { at 0 0 0  radius 0.25 } }'), "rounds per step")):
+                       'handle { at 0 0 0  radius 0.25 } }'), "rounds per step"),
+            ("two dynamic elastics on one mesh",
+             mesh(bar, 'deform elastic { dynamic { cache "x_%04d.ftec"  frame 0 }  handle { at 0 0 0  radius 0.25 } }'
+                       '  deform elastic { dynamic { cache "y_%04d.ftec"  frame 0 }  handle { at 0 0 0  radius 0.25 } }'),
+             "one dynamic elastic")):
         t, log = c.export(body)
         c.verdict("refused: " + name, t is None and want in log, log.strip().splitlines()[-1][:90] if log.strip() else "")
 
@@ -626,6 +630,76 @@ DYN_STIFF = 2.0e5
 def lift(k):
     """The bar's held root's lift at frame k: up 0.3 m over frames 2-4, then still."""
     return 0.3 * min(1.0, max(0.0, (k - 2) / 2.0))
+
+
+def moving_rest_tests(c, bar, rbar, shot, bake):
+    """A dynamic elastic after other deformers rests on their output, moving with it (0.440.0)."""
+    def scene(k, name, pre, hold, cache):
+        body = ('mesh "bar" { file "%s"  material m  %s  deform elastic { dynamic { cache "%s"  frame %d  '
+                'mass 1  stiffness %r  damping 0.9 }  handle { at 0 0 0  %s radius 0.25 } } }'
+                % (bar, pre, cache, k, DYN_STIFF, hold))
+        with open(os.path.join(shot, (name % k) + ".ftsl"), "w", encoding="utf-8", newline="") as f:
+            f.write(NL.join(["scene { units meters }", 'material "m" { type diffuse reflect 0.6 }', body, LIGHT,
+                             'camera "c" { eye 1 1 5  look_at 1 0 0  up 0 1 0  fov_y 40  film { res 40 30 } }']) + NL)
+
+    def tips(name, n):
+        out = []
+        for k in range(n):
+            o = os.path.join(shot, "mr_%d.obj" % k)
+            r = subprocess.run([c.exe, "-in", os.path.join(shot, (name % k) + ".ftsl"), "-export-tris", o],
+                               capture_output=True, text=True, encoding="utf-8", errors="replace")
+            if r.returncode != 0:
+                return None, (r.stdout + r.stderr).strip()[-160:]
+            t = read_obj_tris(o)[:-LIGHT_TRIS]
+            far = np.abs(rbar[..., 0] - 2.0) < 1e-9
+            out.append(float((t[far][:, 1] - rbar[far][:, 1]).mean()))
+        return out, ""
+
+    n = 24
+    # (1) An rbf with one handle is a translation; lifting the bar that way and holding the root still
+    # on the moving rest is the root lifted by the elastic's own handle (the shot above): ARAP's
+    # energy sees edges only, and the inertia is the same.
+    bake(0, n - 1)                      # the -stop test above left the shot part-baked
+    ref, why = tips("f%04d", n)
+    for k in range(n):
+        scene(k, "t%04d", "deform rbf { handle { at 0 0 0  to 0 %r 0 } }" % lift(k), "",
+              os.path.join(shot, "tbar_%04d.ftec").replace(chr(92), "/"))
+    rc, log = bake(0, n - 1, name="t%04d")
+    got, why2 = tips("t%04d", n) if rc == 0 else (None, log.strip()[-160:])
+    worst = max(abs(a - b) for a, b in zip(ref, got)) if ref and got else None
+    c.verdict("a dynamic elastic after a translating rbf moves as one whose own handle translates",
+              worst is not None and worst < 1e-4, ("worst tip difference %.2g m" % worst) if worst is not None
+              else (why or why2))
+    rec = open(os.path.join(shot, "tbar_0005.ftec"), "rb").read() if rc == 0 else b""
+    c.verdict("... its records keep the moving rest (version 3)", rec[4:8] == bytes([3, 0, 0, 0]),
+              "version %r" % (rec[4:8],))
+    # (2) A falloff that bends the tail up over frames 2-4 and holds: the elastic after it follows
+    # with inertia -- behind the bend at frame 3, past it after, settled on it at the end.
+    def bend(k):
+        return 0.4 * min(1.0, max(0.0, (k - 2) / 2.0))
+    for k in range(n):
+        pre = "deform falloff { handle { at 2 0 0  to 2 %r 0  radius 1.2 } }" % bend(k)
+        scene(k, "b%04d", pre, "", os.path.join(shot, "bbar_%04d.ftec").replace(chr(92), "/"))
+        with open(os.path.join(shot, "s%04d.ftsl" % k), "w", encoding="utf-8", newline="") as f:
+            f.write(NL.join(["scene { units meters }", 'material "m" { type diffuse reflect 0.6 }',
+                             'mesh "bar" { file "%s"  material m  %s }' % (bar, pre), LIGHT,
+                             'camera "c" { eye 1 1 5  look_at 1 0 0  up 0 1 0  fov_y 40  film { res 40 30 } }']) + NL)
+    rc, log = bake(0, n - 1, name="b%04d")
+    dyn, why = tips("b%04d", n) if rc == 0 else (None, log.strip()[-160:])
+    still, why2 = tips("s%04d", n)
+    ok = dyn is not None and still is not None
+    good = ok and dyn[3] < 0.9 * still[3] and max(dyn) > still[-1] * 1.02 and abs(dyn[-1] - still[-1]) < 0.01
+    c.verdict("... after a falloff that bends it, it follows with inertia and settles on the bend", good,
+              ("tip at frame 3 %.3f (bend %.3f), peak %.3f, last %.3f (bend %.3f)"
+               % (dyn[3], still[3], max(dyn), dyn[-1], still[-1])) if ok else (why or why2))
+    # (3) The deformers before it moved at a frame: that frame's record is stale.
+    scene(10, "b%04d", "deform falloff { handle { at 2 0 0  to 2 %r 0  radius 1.2 } }" % (bend(10) + 0.05), "",
+          os.path.join(shot, "bbar_%04d.ftec").replace(chr(92), "/"))
+    r = subprocess.run([c.exe, "-in", os.path.join(shot, "b0010.ftsl"), "-export-tris", os.path.join(shot, "bx.obj")],
+                       capture_output=True, text=True, encoding="utf-8", errors="replace")
+    c.verdict("... and a change to the deformers before it makes the frame's record stale",
+              r.returncode != 0 and "deformers before it" in r.stdout + r.stderr,
+              (r.stdout + r.stderr).strip()[-120:])
 
 
 def dynamic_tests(c, bar, rbar):
@@ -777,6 +851,7 @@ def dynamic_tests(c, bar, rbar):
     left = len([f for f in os.listdir(shot) if f.startswith("bar_") and f.endswith(".ftec")])
     c.verdict("... and `ftrace -stop` stops a bake cleanly", rc == 75 and "stopped" in text and left < 4 * DYN_FRAMES,
               "exit %d, %d of %d frames baked" % (rc, left, 4 * DYN_FRAMES))
+    moving_rest_tests(c, bar, rbar, shot, bake)
 
 
 if __name__ == "__main__":
