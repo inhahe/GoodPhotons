@@ -3197,8 +3197,7 @@ struct Renderer {
                 }
             }
 
-            Hit h = scene.closestHit(ray);
-            h.extMat = stk.topMat();   // the medium it met the surface from
+            Hit h = closestHitIn(scene, stk, ray);
             double dSurf = h.valid ? h.t : 1e30;
             // A collision found DURING the march already happened at ray.o, so nothing is
             // travelled on this iteration: zero distance for the aperture catch, the glass
@@ -3975,8 +3974,7 @@ struct Renderer {
 
         for (int bounce = bounce0; bounce < maxBounce; ++bounce) {
             int nUp = secAlive ? C : 1;
-            Hit h = scene.closestHit(ray);
-            h.extMat = stk.topMat();   // the medium it met the surface from
+            Hit h = closestHitIn(scene, stk, ray);
             double dEvent = h.valid ? h.t : 1e30;
 
             // Model C aperture catch: the photon physically threads the pupil.

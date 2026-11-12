@@ -142,8 +142,8 @@ inline void traceGuide(const Scene& scene, const Renderer& rr, Ray ray, Vec3& al
     for (int b = 0; b < kMaxDepth; ++b) {
         // `skipCamHidden` on the camera segment only, as the renderers do: a hide_camera
         // panel is invisible straight on and visible in a reflection.
-        const Hit h = scene.closestHit(ray, 1e-6, nullptr, /*skipHair=*/false,
-                                       /*skipCamHidden=*/b == 0);
+        const Hit h = closestHitIn(scene, stk, ray, 1e-6, nullptr, /*skipHair=*/false,
+                                   /*skipCamHidden=*/b == 0);
         if (!h.valid) return;
         // Coloured glass: Beer-Lambert over the leg just travelled inside it.
         if (const int top = stk.topMat(); top >= 0) {

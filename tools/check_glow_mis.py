@@ -19,8 +19,9 @@ tracing from the glow at a ratio that depended on the scene's units, and read th
 of mode U on both devices (whose host counts a glow at full weight: vcm.h). What a glow lights is
 not the same in every mode -- R, M, S and B drop it on a diffuse arrival (GLOW-LIGHT-MODES) -- so
 the reference here is mode U on the host. The frame's mean, both seeds averaged, must be within
-3 % (or 5 standard errors, from the seed pair) of it in modes D and J on the host and the device,
-and in mode U on the device. Exits 1 on any failure.
+3 % of it in modes D and J on the host and the device, and in mode U on the device (the seeds
+differ by about 0.5 %; two of them are too few to let a standard error widen the band). Exits 1
+on any failure.
 """
 import argparse
 import os
@@ -88,7 +89,7 @@ def main():
         mean, err = (v[0] + v[1]) / 2, abs(v[0] - v[1]) / 2
         ratio = mean / ref
         sigma = abs(mean - ref) / max((err ** 2 + ref_err ** 2) ** 0.5, 1e-30)
-        good = abs(ratio - 1.0) <= 0.03 or sigma <= 5.0
+        good = abs(ratio - 1.0) <= 0.03
         ok &= good
         print("%s: mode %s on the %s, a floor a glow with no emitter lights: x%.4f of the "
               "reference (%.1f sigma)" % ("ok" if good else "FAIL", mode,

@@ -1592,7 +1592,8 @@ check_rough_irid, mode B against mode R:
 
 **Fixed in 0.439.6**, not by threading an index through the glossy sites but by putting it on the
 hit: `Hit::extMat` / `DHit::extMat`, the top of the walk's medium stack, set by every walk where
-it lands (ten host walks, eleven device ones, the wavefront's shade stage), kept by a BDPT or VCM
+it lands (since 0.439.8 every walk through `closestHitIn`, host and device, and the wavefront's
+shade stage), kept by a BDPT or VCM
 vertex with its hit (`DVertex::extMat`; `DVcmLV` packs it with its flags, so the slot stays 152
 bytes), and read by `iridescenceR` / `dIridescenceR` under `exteriorIor`'s rule. So every
 evaluator and sampler that takes the hit -- NEE, connections, merges, the draws -- has it.
@@ -2415,18 +2416,86 @@ index so a lookup finds its interval in a step or two); everything else keeps th
 grid's points, mode R, GPU against CPU -- red 0.30 and 0.017 before, 1.03 and 1.000 after (the glass's
 red is noisy: +-4 % between CPU seeds). The 1.9 % blue gap noted with clear glass was noise too.
 
-## OPEN (2026-11-12, 0.439.7): BUMP-D-VS-R — modes D and J read a strongly normal-mapped room 1.4-2 % below mode R
+## DONE (2026-11-12, 0.439.8): REVIEW-04397 — what the Opus review of 0.439.6-0.439.7 found
 
-Found validating REMAP0-IMPOSSIBLE (below), which took most of the gap away: a room whose five
-walls carry one strong ripple normal map (a tangent-space slope of 2, lit at a grazing angle by a
-tilted panel; `scraps/_bump_vs_r.py`, 64x48, three seeds) read 0.956 of mode R in mode D before
-0.439.7 and 0.986 after, mode J 0.960 and 0.980 (CPU; GPU 0.987 and 0.986). What is left is a
-shading-normal inconsistency between the strategies. A camera path that meets such a wall from the
-geometric front but below the shading hemisphere walks on through it (its throughput the
-albedo), while a connection at that vertex evaluates `bsdfF`, which is 0 there, so the strategies
-that sample such a path do not all see the same integrand. Where to look: what mode R and BDPT's
-walk do at a vertex with ns.wo <= 0 < ng.wo, and what `bsdfF` / `bsdfPdf` say for it; the fix is
-one rule for that vertex shared by the walks, the evaluators and the densities, on both devices.
+Opus (xhigh) reviewed 380c8e9..e37cab6 (J-FOG-REALCAM's tools, ROUGH-IRID-AIR, REMAP0-IMPOSSIBLE).
+Fixed:
+
+* **GPU mode U's camera walk never stamped the incident medium** (kVcmCameraT), so a rough
+  interference coating it saw still interfered against air; the denoiser's albedo-guide walk
+  (denoise_guide.h traceGuide) likewise, so the guide and the beauty disagreed in colour there.
+  As the review suggested, every walk now traces through one helper that stamps it
+  (medium_stack.h `closestHitIn`, its device twin in render_cuda.cu), so a new walk cannot forget;
+  only the wavefront's shade stage, which loads its stack after the hit, stamps its own.
+  `tools/check_irid_medium.py` now runs modes R, D, J, U and M on both devices -- it ran mode R
+  alone, which is how the mode-U walk went unseen.
+* **The new early exit multiplied before it tested.** A ratio that had already overflowed to inf,
+  times a reverse density of 0, is a NaN in the weight. The ratio loops and the merge recurrences,
+  host and device, now test the factor first; dMisWeight reads its floats through float overloads
+  of dMisRemap0 / dMisRevDensity instead of inline copies.
+* **DVertex's bitfields** (nUp:6, patOwnSide:2, extMat:24) left a 4-byte hole at its tail: three
+  plain fields fill the same 8 bytes, and the size note says so.
+* Three walks scanned their stack twice a hit (Beer-Lambert after the stamp); they read `h.extMat`.
+* REFERENCE.md still said a glow lights nothing; it now says which modes count what.
+* `check_glow_mis.py` let a two-seed (one degree of freedom) standard error widen its 3 % band;
+  the band alone decides now.
+
+Not changed:
+
+* **A glow that shares its material with a mesh light** takes that light's emitter at a hit
+  (`emitterForMat`), so its light origin density is the mesh's, and modes D and J still weigh its
+  light partly. Telling the glow's hit from the mesh's needs either a material copy for each
+  emissive primitive that registers no emitter, or emitters for analytic primitives -- which is
+  GLOW-LIGHT-MODES' open decision; logged there, and REFERENCE.md says so.
+* BUMP-D-VS-R, left open: it is BUMP-MODES now, being fixed.
+
+## OPEN (2026-11-12, 0.439.7): BUMP-MODES — on a normal-mapped surface most modes disagree with mode R, mode U by 16 %
+
+`scraps/_bump_vs_r.py`: a closed room whose five walls carry one ripple normal map (`AMP`, its
+tangent-space slope: 2 tilts the normal up to 63 deg, 0 is flat), lit at a grazing angle by a
+tilted panel, 64x48, three seeds, every mode at `-max-bounce 8` (R's own default is 32, D's 8:
+compared at their defaults the flat room read D 0.979 of R, which is depth, not shading). Each
+mode against mode R on the same device:
+
+| mode | flat (AMP 0), CPU / GPU | AMP 2, CPU / GPU |
+|---|---|---|
+| D | 0.9999 / -- | 0.959 (0.989 since 0.439.7) / 0.990 |
+| J | 1.0007 / -- | 0.964 (0.983 since 0.439.7) / 0.989 |
+| U | 1.0004 / 1.0002 | **0.844 / 0.843** |
+| B | 1.0004 / 1.021 (B-GPU-MAXBOUNCE) | 1.008 / 1.013 |
+| M | 1.024 / 1.023 (its kernel's blur) | **1.148 / 1.139** |
+
+The cause is one inconsistency. A shading normal ns can tilt so that a ray meets the surface from
+the geometric front but below ns (ns.wo <= 0 < ng.wo). Mode R lights such a point -- its NEE takes
+rho/PI and its continuation draws a cosine about ns, neither asking where the ray came from -- so
+its integrand is "rho/PI for light from above ns, whichever side the camera side is on". The other
+modes do not share it: `bsdfF` and `bsdfPdf` (and the device twins) returned 0 whenever the
+camera-side direction was below ns, while the walks went on through such a vertex with the albedo
+as their throughput; so a connection there read 0, the walk's own forward density read 0 (VCM's
+recursive weights divide by it: mode U's 16 %), and a light walk, or a photon, that arrived below ns
+went on lighting things R says it cannot. Mode M also gathers a photon whatever side of ns it came
+from.
+
+**The fix, in stages.** (1) Modes D, J and U (0.439.8): `bsdfF` / `bsdfPdf` ask only about the
+light-side direction (`lambertLit`), and the light walks (randomWalk's Importance side, VCM's
+scatterSample under Flux, their device twins) end at a diffuse vertex the light reaches from below
+ns. (2) The photon modes A, B, C, M, S, P and V: a photon that arrives below ns lights nothing --
+no deposit, no splat, absorbed -- and, so that every outgoing direction R lights is reachable, its
+diffuse continuation is drawn about the geometric normal, weighted by |cos(wi,ns)| / |cos(wi,ng)|
+(Veach's adjoint with that density; exactly 1 where ns == ng). (3) DiffuseTransmit and Glossy: the
+same question asked of their lobes (R picks a translucent's lobe by the side of ns the light is on,
+not by the pair's). A gate in tools/ from this script, every mode against R, flat and bumped.
+
+## OPEN (2026-11-12, 0.439.7): B-GPU-MAXBOUNCE — GPU mode B ignores `-max-bounce`
+
+Found measuring BUMP-MODES: on a flat closed room of albedo 0.8 (its AMP 0), GPU mode B read 1.021 of
+mode R at `-max-bounce 8`, CPU mode B 1.0004. GPU mode B renders `-max-bounce 7` and `8` to the same
+image (mean 0.004517, both seeds identical), brighter than CPU mode B at 9 (0.004457); CPU B at 8 is
+0.004424, R at 8 0.004423. `renderForwardCuda` / `renderForwardSharedCuda` take no bounce cap and
+their kernels are launched with a literal 32 (render_cuda.cu `wavefrontTrace(..., 32, ...)` and its
+megakernel twin), while main.cpp's note on `g_maxBounceOverride` says it is honoured by forward B.
+Fix: pass `effMaxBounce()` through the forward entry points (and the resident shared session) to
+the kernels; a gate holding GPU B to CPU B at two depths.
 
 ## DONE (2026-11-12, 0.439.7; opened 2026-10-21): REMAP0-IMPOSSIBLE — the MIS sums read a zero density as a delta's, whatever made it zero
 
@@ -2451,9 +2520,9 @@ device), 47-49 sigma; 0.439.7: D 0.9995 / 0.991 and J 0.998 / 0.999 (device U 0.
 The shading normal's zeros were the third kind, found by check_bitid: a camera path meeting a
 normal-mapped or smooth-normalled wall from the geometric front but below its shading hemisphere
 walks on, where no light walk can sample that direction. check_bitid's mapped scene moved
-+0.03-0.05 % in D and J and smooth a few pixels; a room of strongly normal-mapped walls read 0.956
-of mode R in D and 0.960 in J before, 0.986 and 0.980 after (CPU; GPU 0.957 to 0.987, 0.961 to
-0.986). The rest of that gap is BUMP-D-VS-R, above. check_sun_rim passes without the special case
++0.03-0.05 % in D and J and smooth a few pixels; a room of strongly normal-mapped walls read
+0.959 of mode R in D and 0.964 in J before, 0.989 and 0.983 after (CPU, every mode at -max-bounce
+8; the GPU alike). The rest of that gap is BUMP-MODES, above. check_sun_rim passes without the special case
 (haze 0.999 / 1.000 of R, GPU / CPU). -misaudit: no disagreement on _fog_cornell (D, J), _sun_haze,
 _deltalight_mix, the glow scene (D, J) and a fire; the poisoned control still disagrees.
 gallery_rain as tagged (GPU, 320x180, 64 spp, one seed) moved +0.6 % over the frame and up to 3 %
@@ -3372,7 +3441,10 @@ reach. Modes D and J weight it against an s = 1 strategy that cannot exist for t
 (its densities remapped from 0 to 1, so the weight is arbitrary), and modes R, M and S drop it.
 **Since 0.439.7 (REMAP0-IMPOSSIBLE) modes D and J count it at full weight too**, like mode U:
 their weights no longer count a strategy that cannot happen (`tools/check_glow_mis.py`, the floor
-under a glow 0.748 of mode U before).
+under a glow 0.748 of mode U before). Except where the glow's material is a mesh light's too: a hit
+on the glow then takes the mesh's emitter (`emitterForMat`) and its light origin density, and D
+and J weigh it partly as before (REVIEW-04397). Registering emitters for analytic primitives would
+end that with the rest.
 Mode P renders the whole frame x368 (the glow x9.2): its composite fits the forward layer, in
 which the glow is dark, against the backward one, and the fit runs away.
 

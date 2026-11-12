@@ -3500,12 +3500,16 @@ a `sphere`, a `quad`, a CSG solid, a marched `isosurface`, a `curve` fiber — m
 too, identically on CPU and GPU. The difference is that only a mesh has triangles to
 register an emitter against, so these surfaces are seen by **emission-on-hit only**: a
 camera ray (or a specular bounce) that lands on one picks up `emit(λ)`, but NEE and
-light subpaths cannot sample points on them, which means *they do not illuminate the
-rest of the scene* and contribute nothing in the forward modes `A/B/C`. Treat them as
-self-luminous **appearance**, not as luminaires, and keep a real light in the scene to
-do the actual lighting — see `tools/loom/examples/glowing_jack.py`, where a
-gyroid-carved isosurface glows from inside its own filigree while a ceiling panel
-shades it.
+light subpaths cannot sample points on them. What that leaves differs by mode: modes
+`R`, `W`, `M` and `S` count a glow only where a camera ray or a specular bounce meets
+it, so there *it does not illuminate the rest of the scene*, and the forward modes
+`A/B/C` see none of it; the bidirectional modes `D`, `J` and `U` also count the light a
+diffuse surface gathers from it, at full weight (`D` and `J` since 0.439.7, which made
+them count it as `U` does; a glow whose material a mesh light also uses still reads only
+part of it there). Treat them as self-luminous **appearance**, not as luminaires, and
+keep a real light in the scene to do the actual lighting — see
+`tools/loom/examples/glowing_jack.py`, where a gyroid-carved isosurface glows from
+inside its own filigree while a ceiling panel shades it.
 
 **Emission is one-sided — mind a `quad`'s winding.** A surface shows its `emit` only to a
 ray arriving on the *front* face, and a `quad`'s front face is the side `cross(u, v)`

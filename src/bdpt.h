@@ -1009,9 +1009,8 @@ inline void randomWalk(const Scene& scene, const Camera& cam, const Renderer& ma
         // `hide_camera` is primary visibility only, so it applies to exactly one ray in
         // this walk: the first edge of the RADIANCE (camera) subpath. An importance walk
         // starts at a light and never has a camera ray at all.
-        Hit h = scene.closestHit(ray, 1e-6, nullptr, /*skipHair=*/false,
-                                 /*skipCamHidden=*/(mode == Mode::Radiance && bounces == 0));
-        h.extMat = stk.topMat();   // the medium it met the surface from
+        Hit h = closestHitIn(scene, stk, ray, 1e-6, nullptr, /*skipHair=*/false,
+                                         /*skipCamHidden=*/(mode == Mode::Radiance && bounces == 0));
         if (h.valid && h.sensorId >= 0) return;      // model-A sensor: not used in BDPT
         double dSurf = h.valid ? h.t : 1e30;
         // Inside glass whose absorption varies over the band (Material::absorbChroma)? Read by
@@ -3104,9 +3103,11 @@ inline void traceLightBeamPass(const Scene& scene, const Camera& cam, long long 
                         sb.mis.push_back(sm);
                     }
                 }
-                accC[u]  = gate + rL * accC[u - 1];
-                accMb[u] = rL * (accMb[u - 1] + eL.beam);
-                accMs[u] = rL * (accMs[u - 1] + eL.surf);
+                // A ratio of 0 (misRevDensity) carries nothing: tested, not multiplied, so an
+                // accumulator that overflowed makes no NaN.
+                accC[u]  = gate + (rL != 0.0 ? rL * accC[u - 1] : 0.0);
+                accMb[u] = rL != 0.0 ? rL * (accMb[u - 1] + eL.beam) : 0.0;
+                accMs[u] = rL != 0.0 ? rL * (accMs[u - 1] + eL.surf) : 0.0;
             }
 
             if (beamsHere) for (const PathSeg& sg : segs) {
@@ -3755,8 +3756,10 @@ inline double misWeight(const Scene& scene, const Camera& cam,
         if (!eye[i].delta && eye[i].mat && isFiberMat(*eye[i].mat)) break;
         // eye[i] as the light side would generate it: from eye[i+1], or from qs (or the light's
         // origin, s == 0) at pt -- non-delta, the connection's ends being scoped so above.
-        ri *= misRevDensity(eye[i].pdfRev, i + 1 < t && eye[i + 1].delta) / misRemap0(eye[i].pdfFwd);
-        if (ri == 0.0) break;
+        // (Tested before the multiply: a ratio already overflowed to inf times 0 is a NaN.)
+        const double rev = misRevDensity(eye[i].pdfRev, i + 1 < t && eye[i + 1].delta);
+        if (rev == 0.0) break;
+        ri *= rev / misRemap0(eye[i].pdfFwd);
         if (!eye[i].delta && !eye[i - 1].delta) sumRi += ri;
         if (merges && i >= 2) {                      // merge at eye[i-1] (see header note)
             // eye[i-1]'s light-side neighbour is eye[i] (pt's flag is scoped false above).
@@ -3770,9 +3773,9 @@ inline double misWeight(const Scene& scene, const Camera& cam,
     ri = 1.0;
     for (int i = s - 1; i >= 0; --i) {               // hypothetical light strategies
         // light[i] as the camera side would generate it: from light[i+1], or from pt at qs.
-        ri *= misRevDensity(light[i].pdfRev, i + 1 < s && light[i + 1].delta) /
-              misRemap0(light[i].pdfFwd);
-        if (ri == 0.0) break;
+        const double rev = misRevDensity(light[i].pdfRev, i + 1 < s && light[i + 1].delta);
+        if (rev == 0.0) break;
+        ri *= rev / misRemap0(light[i].pdfFwd);
         // The hypothetical strategy at index i connects light[i-1] to the eye side, so it
         // is impossible if either end of that new edge is delta. At i == 0 the "edge" is
         // instead the eye path LANDING on the emitter, which a delta light (spot: a point;
@@ -4648,8 +4651,10 @@ inline void cameraSideSums(const Scene& scene, const std::vector<Vertex>& eye, i
             // eye[k-1]'s reverse density is generated from eye[k].
             const double rC = misRevDensity(eye[(size_t)k - 1].pdfRev, eye[(size_t)k].delta) /
                               misRemap0(eye[(size_t)k - 1].pdfFwd);
-            carry  = rC * segSumC[(size_t)k - 1];
-            carryM = rC * segSumM[(size_t)k - 1];
+            if (rC != 0.0) {                          // 0 carries nothing (no inf * 0)
+                carry  = rC * segSumC[(size_t)k - 1];
+                carryM = rC * segSumM[(size_t)k - 1];
+            }
         }
         // A strand is never a light vertex (randomWalk, 0.365.0): every camera-side alternative
         // from eye[k] inward puts it there.
@@ -4760,7 +4765,7 @@ inline void cameraSideSumsChroma(const Scene& scene, const PatTables& tabs,
         double* s = &segSumMB[(size_t)k * K];
         const double* sPrev = &segSumMB[(size_t)(k - 1) * K];
         for (int b = 0; b < K; ++b)
-            s[b] = fiberK ? 0.0 : ((pL > 0.0 ? e1[b] * pL : 0.0) + rC * sPrev[b]);
+            s[b] = fiberK ? 0.0 : ((pL > 0.0 ? e1[b] * pL : 0.0) + (rC != 0.0 ? rC * sPrev[b] : 0.0));
     }
 }
 

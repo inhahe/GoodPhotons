@@ -5768,8 +5768,9 @@ as the one at fault.
   of mode U on `tools/check_glow_mis.py`'s floor); and a shading normal's: a camera path that
   meets a normal-mapped or smooth-normalled surface from the geometric front but below the
   shading hemisphere walks on through it, where no light walk can sample that direction, so the
-  light side's reverse density there is 0 (a room of strongly normal-mapped walls read 0.956 of
-  mode R in mode D and 0.960 in J before, 0.986 and 0.980 after, CPU; the GPU alike).
+  light side's reverse density there is 0 (a room of strongly normal-mapped walls read 0.959 of
+  mode R in mode D and 0.964 in J before, 0.989 and 0.983 after, CPU, every mode at -max-bounce
+  8; the GPU alike).
   `misWeight`, `misWeightReference` (factor by factor in its logs), `dMisWeight`, the light
   pass's and `cameraSideSums`' merge accumulators and their device twins, and a fire's O(1)
   s = 0 weight all apply it; the merge weights' own first steps read densities that are positive

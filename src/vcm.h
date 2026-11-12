@@ -741,11 +741,10 @@ inline void traceLightSubpath(const Scene& scene, const Camera& cam, const Rende
     // adds at least one camera edge to it, the camera splat (t = 1) exactly one.
     const int lastEdge = ctx.maxDepth - 1;
     for (int edges = 1; edges <= lastEdge; ++edges) {
-        Hit h = scene.closestHit(ray);
-        h.extMat = stk.topMat();   // the medium it met the surface from
+        Hit h = closestHitIn(scene, stk, ray);
         if (!h.valid) return;                    // escaped (no env in scope)
         {
-            int mi = stk.topMat();
+            int mi = h.extMat;
             if (mi >= 0) {
                 double a = scene.mats[mi].absorb(lambda);
                 if (a > 0.0) beta *= std::exp(-a * h.t);
@@ -989,9 +988,8 @@ inline Vec3 traceCameraSubpath(const Scene& scene, const Camera& cam, const Rend
     for (int edges = 1; edges <= ctx.maxDepth; ++edges) {
         // edges == 1 is the camera-to-first-vertex edge — the primary ray; see
         // Material::hideCamera. (The light subpath walk above never gets this.)
-        Hit h = scene.closestHit(ray, 1e-6, nullptr, /*skipHair=*/false,
-                                 /*skipCamHidden=*/(edges == 1));
-        h.extMat = stk.topMat();   // the medium it met the surface from
+        Hit h = closestHitIn(scene, stk, ray, 1e-6, nullptr, /*skipHair=*/false,
+                                         /*skipCamHidden=*/(edges == 1));
         if (!h.valid) {
             // The ray left the scene. No env map in VCM scope, but a `light sun` is a
             // delta-DIRECTION emitter with no geometry: the s=0 term never fires for it and

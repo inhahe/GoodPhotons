@@ -149,8 +149,9 @@ Each names the section its line is in.
 22. ~~**P-HEROSPLIT-FIRST**~~ (0.439.4), ~~**ROUGH-IRID-AIR**~~ (0.439.6) (4.3) — narrow estimator gaps.
 23. ~~**REMAP0-IMPOSSIBLE** (4.4) — the MIS sums read every zero density as a delta's.~~ Done,
     0.439.7 (which also counts a glow at full weight in D and J, GLOW-LIGHT-MODES).
-23b. **BUMP-D-VS-R** (4.3) — D and J read a strongly normal-mapped room 1.4-2 % below R: the
-    strategies disagree at a vertex below its shading hemisphere.
+23b. **BUMP-MODES** (4.2) — on a normal-mapped surface U reads 16 % under R, M 12 % over, D/J/B
+    1-2 %: one inconsistency at a vertex below its shading hemisphere, fixed in three stages.
+23c. **B-GPU-MAXBOUNCE** (4.2) — GPU mode B ignores `-max-bounce` (its kernels get a literal 32).
 24. ~~**BEAMEPOCHS-CHUNK-PIN** (4.5) — `-beamepochs` pins cheap scenes' GPU chunks to 1 spp.~~ Done,
     0.438.2.
 25. **DEFORM-LIMITS**, **MOTION-LIGHT-RIGID**, **PER-OBJECT-MODES** (4.6) — what is left of them.
@@ -211,6 +212,10 @@ Then the rest of 4.2-4.6 in their order, 4.7's bookkeeping alongside whatever to
   flag), or does the scene get rebalanced?
 
 ### 4.2 Wrong, missing or silent output
+
+- [ ] **BUMP-MODES** — on a strongly normal-mapped room mode U reads 0.844 of R, M 1.148, D/J/B 1-2 %
+  off: a vertex below its shading hemisphere is lit in R and not consistently elsewhere.
+- [ ] **B-GPU-MAXBOUNCE** — GPU mode B ignores `-max-bounce` (a literal 32 reaches its kernels).
 
 - [x] **MERGE-PROXIMITY** (0.431.0) — every gather keeps only the photons near its tangent plane
   (`gatherplane.h`), except on a curve; mode M's sheet lit from below read 21x, now 0.
@@ -332,8 +337,6 @@ Then the rest of 4.2-4.6 in their order, 4.7's bookkeeping alongside whatever to
 
 ### 4.3 Estimator approximations and accuracy debt
 
-- [ ] **BUMP-D-VS-R** — modes D and J read a strongly normal-mapped room 1.4-2 % below mode R (a
-  vertex below its shading hemisphere: the walk passes it, a connection's `bsdfF` reads 0).
 - [x] **UPBP-BEAM-RADIUS** (0.434.0) — mode J's beam kernel shrinks per light-side epoch under
   -vcmalpha (_fog_cornell -0.70 % of mode D fixed, -0.43 % at 256 epochs, -0.07 % per sample).
 - [x] **J-FOG-REALCAM**, what is left — CPU mode J read realcam's fog below GPU mode J: its counted

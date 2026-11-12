@@ -13,6 +13,7 @@
 // ahead-of-time audit (priority_audit.h) warns about.
 #pragma once
 #include <climits>
+#include <utility>
 
 struct MediumStack {
     static constexpr int CAP = 32;   // deep dielectric nesting is rare; overflow degrades gracefully
@@ -45,3 +46,14 @@ struct MediumStack {
             }
     }
 };
+
+// A walk's closest hit, stamped with the medium its ray meets the surface from (Hit::extMat): the top
+// of the walk's stack. Every walk that shades a hit traces through this rather than stamping the hit
+// itself, so none can leave a rough interference coating reading air (iridescenceR). `a`: the
+// arguments of Scene::closestHit. The device's twin is render_cuda.cu closestHitIn.
+template <class SceneT, class... A>
+inline auto closestHitIn(const SceneT& scene, const MediumStack& stk, A&&... a) {
+    auto h = scene.closestHit(std::forward<A>(a)...);
+    h.extMat = stk.topMat();
+    return h;
+}

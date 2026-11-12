@@ -1,6 +1,7 @@
 """Regression check: a rough interference coating interferes against the medium it sits in (ROUGH-IRID-AIR).
 
     python tools/check_irid_medium.py [--out png/check_irid_medium] [--exe ftrace.exe] [--no-gpu]
+                                      [--modes R,D,J,U,M]
 
 A coating's colour depends on the index of the medium the light meets it from. The smooth coating
 (`thinfilm`, `multilayer`) takes it from the medium stack -- the enclosing medium's index where
@@ -11,11 +12,15 @@ Before, a rough coating always interfered against air.
 An anodized-titanium film (check_rough_irid's) on a sphere inside a larger sphere of water
 (`dielectric ior 1.33`), both given a priority, under a uniform sky (whose reflection holds still,
 so the near-mirror lobe is not a small light's high-variance image), seen from outside the
-water. As the roughness goes to
+water. Modes D, J and U take no environment light, so for them the sky is a box of five
+inward-facing area lights of the same radiance. As the roughness goes to
 0 the rough coating becomes the smooth one, so at roughness 0.003 the sphere must read the same
-colour as at roughness 0 (the specular coating): each channel's mean over the sphere within 3 %,
-in mode R on the CPU and on the GPU. The same in a sphere of air, as the control. Before the fix the
-water case read the rough sphere's hue as the film's in air. Exits 1 on any failure.
+colour as at roughness 0 (the specular coating): each channel's mean over the sphere within 5 %
+(one seed: modes J and M stray 3-4 % in X; the fault this checks moves it 18-22 %),
+in modes R, D, J, U and M on the CPU and on the GPU -- every walk stamps the medium on its hits
+(closestHitIn), and a walk that did not would read the film in air. The same in a sphere of air, as
+the control. Before the fix the water case read the rough sphere's hue as the film's in air (mode R
+1.18-1.22 per channel). Exits 1 on any failure.
 """
 import argparse
 import os
@@ -30,9 +35,22 @@ sys.path.insert(0, os.path.join(ROOT, "tools"))
 from pfm import read_pfm  # noqa: E402
 
 W, H = 64, 64
+SPP = {"R": 1024, "D": 1024, "J": 512, "U": 1024, "M": 256}
+TOL = 0.05
 
 
-def scene(rough, medium):
+# The sky each mode can render: an environment, or a box of area lights (modes D, J and U).
+SKY = {"R": "env", "M": "env", "D": "box", "J": "box", "U": "box"}
+BOX = [
+    "light area { origin -6 8 -6  u 12 0 0  v 0 0 12  normal 0 -1 0  spd preset:d65 }",
+    "light area { origin -6 0 -6  u 12 0 0  v 0 8 0  normal 0 0 1  spd preset:d65 }",
+    "light area { origin -6 0 6  u 12 0 0  v 0 8 0  normal 0 0 -1  spd preset:d65 }",
+    "light area { origin -6 0 -6  u 0 0 12  v 0 8 0  normal 1 0 0  spd preset:d65 }",
+    "light area { origin 6 0 -6  u 0 0 12  v 0 8 0  normal -1 0 0  spd preset:d65 }",
+]
+
+
+def scene(rough, medium, sky):
     film = ('material "ti" { type thinfilm  ior 2.5  substrate_k 3.0  film_ior 2.30  film_thickness 85'
             '  roughness %g  priority 2 }' % rough)
     box = ('material "water" { type dielectric  ior 1.33  priority 1 }' if medium == "water" else
@@ -44,7 +62,7 @@ def scene(rough, medium):
         "quad { origin -3 0 -3  u 6 0 0  v 0 0 6  material floor }",
         "sphere { center 0 0.5 0  radius 0.9  material water }",
         "sphere { center 0 0.5 0  radius 0.4  material ti }",
-        "light env { spd preset:d65 }",
+    ] + (["light env { spd preset:d65 }"] if sky == "env" else BOX) + [
         'camera "c" { eye 0 1.2 3.2  look_at 0 0.5 0  up 0 1 0  fov_y 26  film { res %d %d } }' % (W, H),
     ]) + NL
 
@@ -62,19 +80,20 @@ def main():
     ap.add_argument("--out", default=os.path.join(ROOT, "png", "check_irid_medium"))
     ap.add_argument("--exe", default=os.path.join(ROOT, "ftrace.exe"))
     ap.add_argument("--no-gpu", action="store_true")
+    ap.add_argument("--modes", default="R,D,J,U,M")
     a = ap.parse_args()
     exe, d = os.path.abspath(a.exe), os.path.abspath(a.out)
     os.makedirs(d, exist_ok=True)
     mask = sphere_mask()
     fails = []
 
-    def mean(tag, rough, medium, dev):
+    def mean(tag, rough, medium, dev, mode):
         ftsl = os.path.join(d, tag + ".ftsl")
         with open(ftsl, "w", encoding="utf-8", newline="") as f:
-            f.write(scene(rough, medium))
+            f.write(scene(rough, medium, SKY[mode]))
         png = os.path.join(d, tag + ".png")
-        cmd = [exe, "-in", ftsl, "-mode", "R", "-device", dev, "-spp", "1024", "-seed", "1",
-               "-hdr", "-no-meter", "-window-min", "-o", png]
+        cmd = [exe, "-in", ftsl, "-mode", mode, "-device", dev, "-spp", str(SPP[mode]),
+               "-n", "200000", "-seed", "1", "-hdr", "-no-meter", "-window-min", "-o", png]
         p = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
         if p.returncode != 0 or not os.path.exists(png[:-4] + ".pfm"):
             print((p.stdout + p.stderr)[-1500:])
@@ -84,15 +103,17 @@ def main():
 
     devs = ["cpu"] + ([] if a.no_gpu else ["gpu"])
     for dev in devs:
-        for medium in ("water", "air"):
-            smooth = mean("%s_%s_smooth" % (dev, medium), 0.0, medium, dev)
-            rough = mean("%s_%s_rough" % (dev, medium), 0.003, medium, dev)
-            r = rough / smooth
-            ok = bool(np.all(np.abs(r - 1.0) < 0.03))
-            print("%-4s %-6s rough 0.003 / smooth, X Y Z: %.4f %.4f %.4f  %s"
-                  % (dev, medium, r[0], r[1], r[2], "ok" if ok else "FAIL"))
-            if not ok:
-                fails.append("%s %s" % (dev, medium))
+        for mode in a.modes.split(","):
+            for medium in ("water", "air"):
+                tag = "%s_%s_%s" % (mode, dev, medium)
+                smooth = mean(tag + "_smooth", 0.0, medium, dev, mode)
+                rough = mean(tag + "_rough", 0.003, medium, dev, mode)
+                r = rough / smooth
+                ok = bool(np.all(np.abs(r - 1.0) < TOL))
+                print("%s %-4s %-6s rough 0.003 / smooth, X Y Z: %.4f %.4f %.4f  %s"
+                      % (mode, dev, medium, r[0], r[1], r[2], "ok" if ok else "FAIL"), flush=True)
+                if not ok:
+                    fails.append("%s %s %s" % (mode, dev, medium))
     if fails:
         print("FAILED: " + ", ".join(fails))
         return 1
