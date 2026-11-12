@@ -2833,7 +2833,34 @@ change a camera walk ends at a glossy lobe it meets from below the shading norma
 1.0020 / 0.9982 of R, and R with glossy NEE off 0.9995 / 1.0003 of itself. A sky-lit room (the same
 walls, no ceiling, no lamp) read B 0.951 / 0.953, M 0.940 / 0.941, S 0.942 / 0.942 of R and R 1.022
 of itself with sky NEE off; now M 0.997 / 0.999, S 1.000 / 0.999 and R 1.0006 (B 1.010 / 1.011:
-B-ENV-WALLS). check_bump_modes holds both rooms. What stage (3) has left is the translucent lobe.
+B-ENV-WALLS). check_bump_modes holds both rooms.
+
+**Stage (3), translucent: done in 0.440.8.** R's light sampling lights a translucent hit's reflect
+lobe through the hit and its transmit lobe through `otherSide(h)`, each gated by the true surface
+and softened on the light's side. So its integrand, seen from the camera side, puts a light
+direction in the reflect lobe on the camera's geometric side above ns, in the transmit lobe on the
+far side below it, and in neither in the wedge between the two planes (bsdf_eval.h
+`translucentLobe`); the other modes picked the lobe by the pair's sides of ns alone. Now `bsdfF`
+and `bsdfPdf` share R's rule, and the density is 0 in the wedges, where a walk's draw is absorbed
+(`leavesWrongSide`) while, seen from the light side, f is not 0: with a density there, U read
+0.997 and D 1.007 of R on the room below. A light walk or photon reaching a translucent vertex
+from below ns on its own side stops, as at a diffuse one; a photon's translucent vertex takes the
+Lambertian arrival rule (`lambertArrival`, the arrival adjoint, a continuation drawn about the far
+side's geometric normal where ns tilts); a compound's deposit and merge copy treat a translucent
+lobe as a Lambertian one (`compoundTransmits` is gone); and the softening at the vertex next to the
+light is taken on the light's side everywhere (render.h `sideSoftening`: `emitterSoftening`,
+`contSoftening`, BDPT's light sampling at s = 1 -- which kept two-sided materials out on its own,
+and read D 1.011 once the rest was in -- and vcm.h's light sampling and camera side), host and
+device. check_bump_modes' sixth room, the diffuse room with a normal-mapped translucent panel in
+it, host / device against R (0.440.7 in brackets): D 0.9998 / 0.9997 (1.090 / 1.090), U 1.0005 /
+1.0013 (1.090 / 1.091), B 0.9996 / 0.9998 (1.082 / 1.082), M 1.0033 / 0.9992 (1.026 / 1.024), S
+0.9973 / 0.9993 (1.021 / 1.025), J 0.9983 / 1.0020 (1.091 / 1.091). J runs there at a pinned
+`-jsurf-radius 0.02`: its point merges' O(r^2) bias over the ripples is +0.7 % of R at the default
+starting radius, +0.4 % at 0.04 and -0.15 % at 0.01 (J without them 0.9986), a radius floor that
+shrinks with the epochs, not an integrand. check_bitid's `mapped` scene
+moves 0.5-0.8 % darker in every mode; every other CPU render is byte-identical to 0.440.7. What
+stage (3) has left is the analytic mirror and glass-sphere splat (render.h `SpecVtx`), which tests
+its camera side against the shading normal alone.
 
 ## DONE (2026-11-12, 0.439.9): B-GPU-MAXBOUNCE — GPU mode B ignored `-max-bounce`
 

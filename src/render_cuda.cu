@@ -6168,7 +6168,7 @@ __device__ static Real dShadingAdjointCorr(const DVec3& wi, const DVec3& wo,
 // Lambertian vertex, drawn about the geometric normal where the shading one tilts (weight
 // |cos(wi,ns)| / |cos(wi,ng)|), about ns with the adjoint factor where they agree.
 __device__ static Real dDiffuseContinuation(const DHit& h, const DVec3& ngo, const DVec3& wi,
-                                            DRng& rng, DVec3& wo);
+                                            DRng& rng, DVec3& wo, bool transmit = false);
 // Twin of geometry.h arrivalAdjointCorr (where the why is): |cos(w,ns)| / |cos(w,ng)|, 1 at a
 // grazing denominator. Double, as the merges that take it are.
 __device__ static inline double dArrivalAdjointCorr(const DVec3& w, const DVec3& ns, const DVec3& ng) {
@@ -6221,9 +6221,28 @@ __device__ static inline bool dGlossyCameraSide(const DVec3& rd, const DVec3& ns
 // Host twin contSoftening (render.h, where the why is): the softening a vertex (material `m`, its lobe
 // resolved) lends the light its continuation `d` reaches -- shadowTerminatorG at a Lambertian or
 // glossy vertex, 1 at any other.
+// Host twin sideSoftening (render.h, where the why is): toward a light along `w`, both normals turned
+// to the light's side first at a two-sided vertex.
+__device__ static inline double dSideSoftening(const DVec3& w, const DVec3& ns, const DVec3& ngo,
+                                               bool twoSided) {
+    if (twoSided && dot(w, ngo) < (Real)0) return (double)dShadowTerminatorG(w, ns * (Real)(-1), ngo * (Real)(-1));
+    return (double)dShadowTerminatorG(w, ns, ngo);
+}
 __device__ static inline double dContSoftening(const DMaterial& m, const DHit& h, const DVec3& d) {
+    if (m.type == D_DIFFUSETRANSMIT) return dSideSoftening(d, h.n, dShadedNg(h), true);
     if (m.type != D_DIFFUSE && m.type != D_FLUORESCENT && m.type != D_GLOSSY) return 1.0;
     return (double)dShadowTerminatorG(d, h.n, dShadedNg(h));
+}
+// Host twin bsdf_eval.h translucentLobe (where the why is): +1 reflect, -1 transmit, 0 neither, for
+// `b` seen from `a`; `ns` and `g` the vertex's shading and geometric normals on its reached side.
+__device__ static inline int dTranslucentLobe(const DVec3& ns, const DVec3& g0, const DVec3& a,
+                                              const DVec3& b) {
+    DVec3 g = g0, n = ns;
+    if (!(ddot(a, g) > 0.0)) { g = g * (Real)(-1); n = n * (Real)(-1); }
+    const double bg = ddot(b, g), bn = ddot(b, n);
+    if (bg > 0.0 && bn > 0.0) return 1;
+    if (bg < 0.0 && bn < 0.0) return -1;
+    return 0;
 }
 // Host twin mergeFromBehind (geometry.h says why): a one-sided camera vertex merges no photon from
 // behind its true surface (`ngo`, on the camera's side); a two-sided one refuses none.
@@ -7711,21 +7730,11 @@ __device__ static bool dCompoundGathers(const DScene& sc, const DMaterial& m, Re
     }
     return false;
 }
-// Host twin compoundTransmits: a compound with a translucent lobe that gathers.
-__device__ static bool dCompoundTransmits(const DScene& sc, const DMaterial& m) {
-    for (int k = 0; k < m.mixCount; ++k) {
-        const int c = m.mixChild[k];
-        if (c < 0) continue;
-        const DMaterial& km = sc.mats[c];
-        if (!km.matReflectsNothing && km.type == D_DIFFUSETRANSMIT) return true;
-    }
-    return false;
-}
 // Host twin render.h compoundDepositWeight (where the why is): what a compound's own deposit of a
 // photon arriving along -wi with throughput `beta` stores; 0 nothing.
 __device__ static Real dCompoundDepositWeight(const DScene& sc, const DMaterial& cm, const DHit& h,
                                               const DVec3& wi, bool firstBounce, Real beta) {
-    if (dCompoundTransmits(sc, cm)) return beta;
+    (void)sc; (void)cm;
     const DVec3 ngo = dShadedNg(h);
     Real s;
     if (!dLambertArrival(h, ngo, wi, firstBounce, s)) return (Real)0;
@@ -7736,9 +7745,9 @@ __device__ static Real dCompoundDepositWeight(const DScene& sc, const DMaterial&
 __device__ static double dCompoundMergeSoftening(const DScene& sc, const DMaterial& compound,
                                                  const DVec3& toEm, const DVec3& ns, const DVec3& ngo,
                                                  double vertexSoftening) {
+    (void)sc; (void)compound;
     if (!(vertexSoftening > 0.0)) return 0.0;
-    const double lobes = dCompoundTransmits(sc, compound) ? 1.0 : (double)dShadowTerminatorG(toEm, ns, ngo);
-    return lobes / vertexSoftening;
+    return (double)dShadowTerminatorG(toEm, ns, ngo) / vertexSoftening;
 }
 // Whether the gathers count a face of material `m` as one that holds photons (host twin
 // holdsPhotons, where the reasoning lives).
@@ -12889,10 +12898,17 @@ __device__ static int shadeStep(const DScene& sc, const DCamSet& cs,
         DVec3 nb = h.n * (Real)(-1);
         DVec3 ngo = dShadedNg(h);   // geo normal on shading side
         DVec3 wiPrev = -rd;                                             // toward previous (light-side)
+        // Lit as a Lambertian lobe (host twin render.h): no light from below ns on its own side, the
+        // first bounce softened.
+        Real sEm;
+        if (!dLambertArrival(h, ngo, wiPrev, firstHit, sEm)) { eAbsorbed += beta; return WF_TERMINATE; }
+        eAbsorbed += (double)(beta * ((Real)1 - sEm));
+        beta *= sEm;
         // photon-map deposit (mode M), routed to the caustic map on an L.S+.D path, unless the
-        // compound this lobe was picked from took it (above)
+        // compound this lobe was picked from took it (above); per geometric area, as a diffuse one's
         if (!compoundDeposit)
-            depositPhoton(cs, h.p, ngo, beta, lambda, dPathIsCaustic(pathC), dPathCausticW(pathC));
+            depositPhoton(cs, h.p, ngo, beta * dArrivalAdjoint(h, ngo, wiPrev), lambda,
+                          dPathIsCaustic(pathC), dPathCausticW(pathC));
         if (pathC) pathC->bits |= PV_BIT_SCATTER;   // past here it is diffuse indirect light
         // Both lobes get the adjoint correction; |cos| in the factor makes it lobe-agnostic,
         // so h.n / ngo serve the transmit lobe too (nb = -h.n is used only for the splat side).
@@ -12903,8 +12919,8 @@ __device__ static int shadeStep(const DScene& sc, const DCamSet& cs,
         // Analog scatter: reflect (prob rhoR), transmit (prob rhoT), else absorb — beta
         // unchanged on a scatter (like the diffuse case), plus the adjoint correction.
         Real u = rng.uniform();
-        if (u < rhoR)      { DVec3 wo = cosineHemisphere(h.n, rng); beta *= dShadingAdjointCorr(wiPrev, wo, h.n, ngo); if (!dContinueAlong(h, wo, DL_REFLECT, ro, rd)) { eAbsorbed += beta; return WF_TERMINATE; } return WF_CONTINUE; }
-        else if (u < sum)  { DVec3 wo = cosineHemisphere(nb,  rng); beta *= dShadingAdjointCorr(wiPrev, wo, h.n, ngo); if (!dContinueAlong(h, wo, DL_TRANSMIT, ro, rd)) { eAbsorbed += beta; return WF_TERMINATE; } return WF_CONTINUE; }
+        if (u < rhoR)      { DVec3 wo; beta *= dDiffuseContinuation(h, ngo, wiPrev, rng, wo); if (!dContinueAlong(h, wo, DL_REFLECT, ro, rd)) { eAbsorbed += beta; return WF_TERMINATE; } return WF_CONTINUE; }
+        else if (u < sum)  { DVec3 wo; beta *= dDiffuseContinuation(h, ngo, wiPrev, rng, wo, true); if (!dContinueAlong(h, wo, DL_TRANSMIT, ro, rd)) { eAbsorbed += beta; return WF_TERMINATE; } return WF_CONTINUE; }
         eAbsorbed += beta; return WF_TERMINATE;
     } else {
         // Diffuse (texture-sampled reflectance when the material binds a texture).
@@ -12933,12 +12949,13 @@ __device__ static int shadeStep(const DScene& sc, const DCamSet& cs,
 }
 
 __device__ static Real dDiffuseContinuation(const DHit& h, const DVec3& ngo, const DVec3& wi,
-                                            DRng& rng, DVec3& wo) {
+                                            DRng& rng, DVec3& wo, bool transmit) {
+    const Real s = transmit ? (Real)(-1) : (Real)1;   // a translucent's transmit lobe (host twin)
     if (dot(h.n, ngo) >= (Real)(1.0 - 1e-7)) {
-        wo = cosineHemisphere(h.n, rng);
+        wo = cosineHemisphere(h.n * s, rng);
         return dShadingAdjointCorr(wi, wo, h.n, ngo);
     }
-    wo = cosineHemisphere(ngo, rng);
+    wo = cosineHemisphere(ngo * s, rng);
     return dArrivalAdjoint(h, ngo, wi);
 }
 
@@ -13309,11 +13326,19 @@ __device__ static int shadeStepHero(const DScene& sc, const DCamSet& cs, int cam
         DVec3 nb = h.n * (Real)(-1);
         DVec3 ngo = dShadedNg(h);
         DVec3 wiPrev = -rd;
+        {   Real sEm;                                            // lit as a Lambertian lobe (scalar twin)
+            if (!dLambertArrival(h, ngo, wiPrev, firstHit, sEm)) {
+                for (int i = 0; i < nUp; ++i) eAbsorbed += (double)beta[i];
+                return WF_TERMINATE;
+            }
+            for (int i = 0; i < nUp; ++i) { eAbsorbed += (double)(beta[i] * ((Real)1 - sEm)); beta[i] *= sEm; }
+        }
         { const bool caus = dPathIsCaustic(pathC);
           // ...with the aimed caustic pass's MIS weight, as the scalar deposits carry it.
           const Real cw = dPathCausticW(pathC);
+          const Real adjA = dArrivalAdjoint(h, ngo, wiPrev);
           if (!compoundDeposit)   // else the compound took it (above)
-              for (int i = 0; i < nUp; ++i) depositPhoton(cs, h.p, ngo, beta[i], lam[i], caus, cw);
+              for (int i = 0; i < nUp; ++i) depositPhoton(cs, h.p, ngo, beta[i] * adjA, lam[i], caus, cw);
           if (pathC) pathC->bits |= PV_BIT_SCATTER; }   // past here: diffuse indirect light
         if (camMode == CAM_A || camMode == CAM_B) {
             splatSurfaceAllHero(sc, cs, camMode, h.p, h.n, ngo, wiPrev, lam, beta, rhoR, nUp, rng);
@@ -13342,8 +13367,8 @@ __device__ static int shadeStepHero(const DScene& sc, const DCamSet& cs, int cam
                 eAbsorbed += (double)beta[i] * (double)((Real)1 - w);
                 beta[i] *= w;
             }
-            DVec3 wo = cosineHemisphere(h.n, rng);
-            Real corr = dShadingAdjointCorr(wiPrev, wo, h.n, ngo);
+            DVec3 wo;
+            const Real corr = dDiffuseContinuation(h, ngo, wiPrev, rng, wo);
             for (int i = 0; i < nUp; ++i) beta[i] *= corr;
             if (!dContinueAlong(h, wo, DL_REFLECT, ro, rd)) { for (int i = 0; i < nUp; ++i) eAbsorbed += (double)beta[i]; return WF_TERMINATE; } return WF_CONTINUE;
         } else if (uu < sumHero) {
@@ -13352,8 +13377,8 @@ __device__ static int shadeStepHero(const DScene& sc, const DCamSet& cs, int cam
                 eAbsorbed += (double)beta[i] * (double)((Real)1 - w);
                 beta[i] *= w;
             }
-            DVec3 wo = cosineHemisphere(nb, rng);
-            Real corr = dShadingAdjointCorr(wiPrev, wo, h.n, ngo);
+            DVec3 wo;
+            const Real corr = dDiffuseContinuation(h, ngo, wiPrev, rng, wo, true);
             for (int i = 0; i < nUp; ++i) beta[i] *= corr;
             if (!dContinueAlong(h, wo, DL_TRANSMIT, ro, rd)) { for (int i = 0; i < nUp; ++i) eAbsorbed += (double)beta[i]; return WF_TERMINATE; } return WF_CONTINUE;
         }
@@ -14247,11 +14272,11 @@ __device__ static double dBsdfF(const DScene& sc, const DVertex& vt,
         DHit h = dVertHit(vt);
         return dGlossyF(sc, m, h, ns, wo, wi, lambda);
     } else if (m.type == D_DIFFUSETRANSMIT) {
-        // Two-sided Lambertian: same-hemisphere pair -> reflect albedo, opposite -> transmit.
+        // Two-sided Lambertian, mode R's integrand (host twin bsdfF, dTranslucentLobe).
         DHit h = dVertHit(vt);
         double rhoR, rhoT; dDiffuseTransmitAlbedos(sc, m, h, lambda, rhoR, rhoT);
-        bool sameSide = (cosWi * cosWo) > 0.0;
-        return (sameSide ? rhoR : rhoT) / DPI;
+        const int lobe = dTranslucentLobe(ns, dVertexGeoN(vt), wo, wi);
+        return (lobe > 0 ? rhoR : (lobe < 0 ? rhoT : 0.0)) / DPI;
     } else if (m.type == D_HAIR) {
         // Fiber BCSDF (bsdf_eval.h bsdfF twin). The frame comes from the strand tangent the
         // vertex carries; f is pre-divided by |cos(ns,wi)| (see dHairCosGuard).
@@ -14281,16 +14306,18 @@ __device__ static double dBsdfPdf(const DScene& sc, const DVertex& vt,
         if (cosLobe <= 0) return 0.0;
         return (e + 1.0) / (2.0 * DPI) * pow(cosLobe, e);
     } else if (m.type == D_DIFFUSETRANSMIT) {
-        // The reflect lobe is chosen with prob rhoR/(rhoR+rhoT) and cosine-samples wo's
-        // hemisphere; the transmit lobe (prob rhoT/(rhoR+rhoT)) cosine-samples the opposite
-        // hemisphere. For a given wi only one lobe applies (by its sign vs wo).
+        // The lobe-selected cosine sampling at a vertex reached from `wo`, about the shading
+        // normal turned to wo's geometric side, a draw on the wrong side of the true surface
+        // absorbed: the density of the lobe dTranslucentLobe puts wi in, none in the wedges
+        // (host twin bsdfPdf).
         DHit h = dVertHit(vt);
         double rhoR, rhoT; dDiffuseTransmitAlbedos(sc, m, h, lambda, rhoR, rhoT);
         double tot = rhoR + rhoT;
         if (tot <= 0.0) return 0.0;
-        bool sameSide = (cosWi * cosWo) > 0.0;
-        double pSel = sameSide ? rhoR / tot : rhoT / tot;
-        return pSel * fabs(cosWi) / DPI;
+        (void)cosWo;
+        const int lobe = dTranslucentLobe(ns, dVertexGeoN(vt), wo, wi);
+        if (lobe == 0) return 0.0;
+        return (lobe > 0 ? rhoR : rhoT) / tot * fabs(cosWi) / DPI;
     } else if (m.type == D_HAIR) {
         // The BCSDF's own sampling density in solid angle -- exactly what dhair::sample draws
         // from, so MIS is consistent by construction (bsdf_eval.h bsdfPdf twin).
@@ -18538,6 +18565,9 @@ __device__ static void dRandomWalk(const DScene& sc, const DCamera& cam, int dif
                 break;
             }
             case D_DIFFUSETRANSMIT: {
+                // A light walk arriving below the shading normal on its own side lights neither
+                // lobe (host twin randomWalk): it stops.
+                if (importance && !dLambertLit(ddot(wo, path[cur].ns))) { terminate = true; break; }
                 // Two-lobe Lambertian: pick reflect (+ns) with prob rhoR/(rhoR+rhoT) or
                 // transmit (-ns) with prob rhoT/(rhoR+rhoT); cosine-sample the chosen
                 // hemisphere. Analog: on a scatter beta is unchanged (f*|cos|/pdf == 1 with
@@ -18670,7 +18700,7 @@ __device__ static void dRandomWalk(const DScene& sc, const DCamera& cam, int dif
             if (l2 > 0.0) {
                 const DVec3 toEm = d * (Real)(1.0 / sqrt(l2));
                 const DVec3 ngo = dVertexGeoN(path[cur]);
-                const double vs = (delta || dTwoSidedType(mp->type))       // dEmitterSoftening's
+                const double vs = (delta || mp->type == D_HAIR)       // dEmitterSoftening's (arrival side)
                                 ? 1.0 : (double)dShadowTerminatorG(toEm, path[cur].ns, ngo);
                 compoundMergeW[cur] *= (float)dCompoundMergeSoftening(sc, *compound, toEm, path[cur].ns,
                                                                       ngo, vs);
@@ -18791,9 +18821,10 @@ __device__ static int dGenCameraSubpath(const DScene& sc, const DCamera& cam, in
 // vertex whose light-side neighbour is the emitter itself -- the light sampling's (s = 1), the vertex
 // before an eye path lands on the emitter (s = 0), a light subpath's first bounce -- and to no other.
 __device__ static double dEmitterSoftening(const DScene& sc, const DVertex& v, const DVec3& toEmitter) {
-    if (v.type != BV_SURFACE || v.delta || v.matId < 0 || dTwoSidedType(sc.mats[v.matId].type))
+    if (v.type != BV_SURFACE || v.delta || v.matId < 0 || sc.mats[v.matId].type == D_HAIR)
         return 1.0;
-    return (double)dShadowTerminatorG(toEmitter, v.ns, dVertexGeoN(v));
+    // A translucent vertex softens on the emitter's side (host twin, dSideSoftening).
+    return dSideSoftening(toEmitter, v.ns, dVertexGeoN(v), sc.mats[v.matId].type == D_DIFFUSETRANSMIT);
 }
 // Host twin softenFirstBounce: path[1] on (and its C - 1 secondaries), softened toward path[0]. (A
 // compound's merge copy where the pick went delta: dRandomWalk, host twin mergeCopySoftening.)
@@ -19346,14 +19377,11 @@ __device__ static double dConnectBDPT(const DScene& sc, const DCamera& cam,
             // hemisphere); gate on dBsdfF, use |cosSurf| in G (mirrors CPU bdpt.h).
             bool twoSided = dTwoSidedType(sc.mats[pt.matId].type);
             if (cosSurf == 0.0 || (!twoSided && cosSurf < 0.0)) return 0.0;
-            // Geometric-hemisphere softening on the eye/radiance vertex (matches CPU bdpt.h):
-            // ramp smoothly instead of a hard cutoff (Chiang 2019). No-op when ns==ng (stG==1);
-            // skipped for two-sided (transmissive) materials.
-            if (!twoSided) {
-                DVec3 ngoP = dVertexGeoN(pt);
-                stG = (double)dShadowTerminatorG(wi, pt.ns, ngoP);
-                if (stG <= 0.0) return 0.0;
-            }
+            // The terminator's softening toward the light (host twin bdpt.h, dEmitterSoftening):
+            // a translucent vertex's on the side it lights through, 0 behind the true geometry.
+            // No-op when ns==ng (stG==1).
+            stG = dEmitterSoftening(sc, pt, wi);
+            if (stG <= 0.0) return 0.0;
                         o = dVertConnOrigin(sc, pt, wi);   // a strand's far side starts along wi (bdpt.h connOrigin)
         }
         // A strand eye vertex clears its own tube with the curve-only chord (bdpt.h connFiberStep);
@@ -22208,6 +22236,7 @@ __device__ static void dVcmScatter(const DScene& sc, const DMaterial& m, const D
             break;
         }
         case D_DIFFUSETRANSMIT: {
+            if (importance && !dLambertLit(ddot(wo, ns))) { terminate = true; break; }   // host twin
             double rhoR, rhoT; dDiffuseTransmitAlbedos(sc, m, h, lambda, rhoR, rhoT,
                                                        jr ? &jbS : nullptr, jr ? &tpS : nullptr);
             double tot = rhoR + rhoT;
@@ -22585,7 +22614,7 @@ __global__ void kVcmLightT(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx,
             const bool connectible = dLvConnects(mp->type);
             // The first bounce softens toward the emitter it came from, in the throughput every
             // later vertex inherits (host twin vcm.h; dEmitterSoftening).
-            if (edges == 1 && connectible && !dTwoSidedType(mp->type)) {
+            if (edges == 1 && connectible) {   // a translucent one too, on its arrival side
                 const double sL = (double)dShadowTerminatorG(wo, h.n, ngo);
                 beta *= sL;
                 for (int k = 0; k + 1 < nUp; ++k) betaSec[k] *= sL;
@@ -22594,8 +22623,7 @@ __global__ void kVcmLightT(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx,
             // over the vertex's own above (host twin vcm.h, dCompoundMergeSoftening).
             const double mergeSoft = (edges == 1 && storeP > 0.0)
                 ? dCompoundMergeSoftening(sc, sc.mats[h.matId], wo, h.n, ngo,
-                                          (connectible && !dTwoSidedType(mp->type))
-                                              ? (double)dShadowTerminatorG(wo, h.n, ngo) : 1.0)
+                                          connectible ? (double)dShadowTerminatorG(wo, h.n, ngo) : 1.0)
                 : 1.0;
             if (connectible || storeP > 0.0) {
                 if (stored < vcmCap) {
@@ -22816,7 +22844,7 @@ __global__ void kVcmCameraT(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx
         const bool hasSun = sc.sunCount > 0;
         // The vertex just left, should the walk land on an emitter next (host twin vcm.h).
         DVec3 softN, softNg;
-        bool softOn = false;
+        bool softOn = false, softTwo = false;
         Real curveTmin = (Real)0;   // far-side fiber clearance for the NEXT hop (see the continuation)
         Real nextTmin = (Real)-1;   // >= 0: the next hop leaves a strand (dStrandStart) -- its tmin
 
@@ -22935,7 +22963,7 @@ __global__ void kVcmCameraT(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx
                             misW = 1.0 / (1.0 + wCamera);
                         }
                         // ...softened at the vertex before, toward the emitter (dEmitterSoftening).
-                        const double sE = softOn ? (double)dShadowTerminatorG(rd, softN, softNg) : 1.0;
+                        const double sE = softOn ? dSideSoftening(rd, softN, softNg, softTwo) : 1.0;
                         double e = beta * Le * misW * sE;
                         double ax = cieCx * e, ay = cieCy * e, az = cieCz * e;
                         for (int k = 0; k + 1 < nUp; ++k) {
@@ -23049,7 +23077,8 @@ __global__ void kVcmCameraT(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx
                         }
                         if (geomOk) {
                             double cosToLight = ddot(h.n, wiL);
-                            double stG = twoSidedCam ? 1.0 : (double)dShadowTerminatorG(wiL, h.n, ngoCam);
+                            double stG = (mp->type == D_HAIR) ? 1.0
+                                       : dSideSoftening(wiL, h.n, ngoCam, twoSidedCam);
                             bool sideOk = twoSidedCam ? (cosToLight != 0.0) : (cosToLight > 0.0 && stG > 0.0);
                             if (sideOk) {
                                 // Cheap gates + shadow ray first, BSDF eval after (bit-
@@ -23336,7 +23365,8 @@ __global__ void kVcmCameraT(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx
             if (!delta) camAllDelta = false;               // disqualifies the escaped-sun strategy
             if (delta && !keepBundle) nUp = 1;             // λ-dependent direction change
             prevP = h.p;
-            softOn = !delta && dLvConnects(mp->type) && !dTwoSidedType(mp->type);
+            softOn = !delta && dLvConnects(mp->type);
+            softTwo = mp->type == D_DIFFUSETRANSMIT;
             softN = h.n;
             softNg = dShadedNg(h);
             // A fiber scattering out its far side steps clear of its own tube (vcm.h fiberStep): the

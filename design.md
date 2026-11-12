@@ -3722,18 +3722,17 @@ holding a glass ball), and on the device `-rgb`, mode S and every one of those.
       about the geometric normal with that same weight (`diffuseContinuation`), so a direction
       below `ns` that R lights stays reachable. One rule for every photon tracer, host and
       device, scalar and hero (0.440.3): `lambertArrival` (lit? and the first bounce's
-      softening) at a Diffuse or Fluorescent vertex and at a compound's own deposit, which a
-      compound makes before its lobe pick and which then takes the arrival adjoint too
-      (`compoundDepositWeight`; a compound with a translucent lobe stores the arrival as a
-      translucent's own case does); `glossyArrival` (the first bounce's softening) at a glossy
+      softening) at a Diffuse, Fluorescent or translucent vertex and at a compound's own
+      deposit, which a compound makes before its lobe pick and which then takes the arrival
+      adjoint too (`compoundDepositWeight`); `glossyArrival` (the first bounce's softening) at a glossy
       vertex and at a layered coat's lobe (on the coat's own material), splat and continuation
       alike; and at a glossy continuation the shading-normal adjoint `shadingAdjointCorr` beside
       the lobe's own adjoint (`glossyPhotonAdjoint`), as bdpt.h's light walk takes it. Each
       softening and adjoint is booked in the photon's energy ledger (what it removes as
       absorbed, what it adds as negative absorption), so the ledger still balances. A compound's
-      merge copy at a first bounce whose pick went delta is softened only where its gathering
-      lobes are all Lambertian, in the copy's merge weight over the vertex's own softening
-      (`compoundMergeSoftening`; vcm.h's light walk). The camera side mirrors it
+      merge copy at a first bounce takes its gathering lobes' softening, diffuse or translucent,
+      in the copy's merge weight over the vertex's own (`compoundMergeSoftening`; vcm.h's light
+      walk) -- other than 1 only where the pick went delta. The camera side mirrors it
       (0.440.6): the softening is the integrand's, at the vertex next to the light whichever
       strategy reaches it, so every light a camera walk's own continuation reaches -- an emitter
       hit after a glossy bounce, the sky after a diffuse or glossy one, the sun, a fire along the
@@ -3744,9 +3743,24 @@ holding a glass ball), and on the device `-rgb`, mode S and every one of those.
       from below the shading normal (`glossyCameraSide`), where glossyF is 0. The arrival adjoint itself is
       geometry.h's `arrivalAdjointCorr`, which the point merges of U and J take too, so no two
       estimators read a smooth mesh differently; a grazing denominator falls back to 1.
+      A translucent lobe pair (0.440.8) takes R's integrand the same way. R's light sampling
+      lights its reflect lobe through the hit and its transmit lobe through `otherSide(h)`, each
+      gated by the true surface and softened on the light's side; so, seen from the camera side,
+      a light direction is in the reflect lobe on the camera's geometric side above `ns`, in the
+      transmit lobe on the far side below it, and in neither in the wedge between the two planes
+      (bsdf_eval.h `translucentLobe`). `bsdfF` and `bsdfPdf` share that rule -- a walk's draw
+      into a wedge is absorbed (`leavesWrongSide`), so its density there is 0, and since seen
+      from the light side `f` is not 0 there, a density would count a strategy no walk can take.
+      A light walk or photon that reaches a translucent vertex from below `ns` on its own side
+      stops there, as at a diffuse one; the softening at the vertex next to the light is taken
+      on the light's side (render.h `sideSoftening`, inside `emitterSoftening`, `contSoftening`,
+      BDPT's and vcm.h's light sampling and vcm.h's camera side); and a photon's translucent
+      vertex takes the Lambertian arrival rule (`lambertArrival`, the arrival adjoint, and
+      `diffuseContinuation`'s `transmit` draw about the far side's normal).
       `tools/check_bump_modes.py` holds D, J, U, B, M and S to R on such a room and its flat
-      twin, and M and S on a normal-mapped layered room (M and S at -max-bounce 32: they deposit
-      over 32 bounces whatever the flag says).
+      twin and on the room with a normal-mapped translucent panel in it, and M and S on a
+      normal-mapped layered room (M and S at -max-bounce 32: they deposit over 32 bounces
+      whatever the flag says).
 - **`curve.h`** — the **curve / fiber** primitive (hair, fur, grass, wire, thread),
   added 0.150.0 for TODO §P1. A `curve` is control points + a radius; the loader
   **flattens it at load time** into a chain of `CurveSeg` **round cones** (the convex

@@ -5078,18 +5078,6 @@ inline bool compoundGathers(const Scene& scene, const Material& m, double fiberR
     return false;
 }
 
-// Whether a compound has a translucent lobe that gathers (compoundGathers): its deposit then holds
-// light arriving from either side, and the arrival rule of its Lambertian lobes cannot be applied to
-// it (Renderer::compoundDepositWeight). Device twin dCompoundTransmits.
-inline bool compoundTransmits(const Scene& scene, const Material& m) {
-    for (int c : m.mixChildren) {
-        if (c < 0 || c >= (int)scene.mats.size()) continue;
-        const Material& k = scene.mats[(size_t)c];
-        if (!k.reflectsNothing && k.type == MatType::DiffuseTransmit) return true;
-    }
-    return false;
-}
-
 // Whether the photon gathers count a face of material `m` (unresolved; `fiberRadius` the hit's, 0
 // off a curve) as one that holds photons: what the photon pass deposits on, and the fluorescent
 // surface every gather treats as one. The coverage probes and -gageom's march pass through any

@@ -1,7 +1,7 @@
 """Regression check: the modes agree with mode R on a normal-mapped surface (BUMP-MODES).
 
     python tools/check_bump_modes.py [--out png/check_bump_modes] [--exe ftrace.exe] [--no-gpu]
-                                     [--modes D,J,U,B,M,S] [--seeds 3] [--rooms flat,...,sky]
+                                     [--modes D,J,U,B,M,S] [--seeds 3] [--rooms flat,...,translucent]
 
 A shading normal can tilt so far that a ray meets the surface from the geometric front but below
 it (ns.wo <= 0 < ng.wo). Mode R lights such a point: its integrand is a Lambertian lobe lit by
@@ -36,6 +36,12 @@ device mode S 1.043. A fifth, the diffuse room open to a sky (no ceiling, no lam
 and S to R (D, J and U render no environment light, and mode B reads such walls ~1 % bright flat or
 bumped, B-ENV-WALLS in known-issues.md) and R to itself with sky NEE off (FTRACE_ENV_NEE=0, host): the sky reached by a diffuse
 vertex's escape takes the vertex's softening too, where without it the escape alone read 1.022.
+A sixth, the diffuse room with a normal-mapped translucent panel standing in it, holds every mode
+to R: a translucent lobe pair is lit by light from above ns on the light's own side, in its reflect
+lobe on the camera's geometric side and its transmit lobe on the far one, and in neither between the
+planes (bsdf_eval.h translucentLobe), softened on the light's side. 0.440.7 read it D 1.090, J 1.091,
+U 1.090, B 1.082, M 1.026 and S 1.021 of R on the host. Mode J runs at a pinned merge radius
+(MODE_ARGS, where the why is).
 Exits 1 on any failure.
 """
 import argparse
@@ -55,6 +61,10 @@ SPP = {"R": 2048, "D": 512, "J": 256, "U": 512, "B": 1, "M": 64, "S": 256}   # C
 # room reads 0.991 of R at 64, 0.997 at 256)
 NPHOT = {"B": 40000000, "M": 2000000, "S": 100000}   # photons (mode S's per pass)
 DEPTH = {"M": 32, "S": 32}   # -max-bounce: the photon deposits' own depth; 8 for the rest
+# Mode J's point merges carry an O(r^2) bias over a rippled surface, which its default starting
+# radius leaves at +0.7 % of R on the translucent room (+0.4 % at 0.04, -0.15 % at 0.01; J without
+# them 0.999): pinned where that floor is ~0.1 %, so the check reads J's integrand, not its radius.
+MODE_ARGS = {"J": ["-jsurf-radius", "0.02"]}
 TOL = 0.01
 
 
@@ -76,6 +86,11 @@ def room(d, amp, kind="diffuse"):
         lines = room(d, amp, "diffuse").rstrip(NL).split(NL)
         lines = [l for l in lines if not l.startswith("quad { origin -2 3 -2") and not l.startswith("light area")]
         lines.insert(1, "light env { spd preset:bb6500 }")
+        return NL.join(lines) + NL
+    if kind == "translucent":   # the diffuse room with a normal-mapped translucent panel standing in it
+        lines = room(d, amp, "diffuse").rstrip(NL).split(NL)
+        lines.insert(3, 'material "t" { type translucent reflect 0.4  transmit 0.4  normal_map texture:rip }')
+        lines.insert(4, "quad { origin -1 0 -0.5  u 2 0 0.5  v 0 2 0  material t }")
         return NL.join(lines) + NL
     ppm = os.path.join(d, "rip.ppm")
     ripple(ppm, amp)
@@ -106,14 +121,14 @@ def main():
     ap.add_argument("--no-gpu", action="store_true")
     ap.add_argument("--modes", default="D,J,U,B,M,S")
     ap.add_argument("--seeds", type=int, default=3)
-    ap.add_argument("--rooms", default="flat,bumped,layered,glossy,sky")
+    ap.add_argument("--rooms", default="flat,bumped,layered,glossy,sky,translucent")
     a = ap.parse_args()
     exe, out = os.path.abspath(a.exe), os.path.abspath(a.out)
     seeds = list(range(1, a.seeds + 1))
     fails = []
     for name, amp, kind in (("flat", 0.0, "diffuse"), ("bumped", 2.0, "diffuse"),
                             ("layered", 2.0, "layered"), ("glossy", 2.0, "glossy"),
-                            ("sky", 2.0, "sky")):
+                            ("sky", 2.0, "sky"), ("translucent", 2.0, "translucent")):
         if name not in a.rooms.split(","):
             continue
         layered = kind == "layered"
@@ -132,7 +147,7 @@ def main():
                    "-spp", str(SPP[mode] * (4 if dev == "gpu" else 1) * (4 if (extra or env) else 1)),
                    "-n", str(NPHOT.get(mode, 200000)),
                    "-max-bounce", str(depth), "-seed", str(seed), "-hdr", "-no-meter", "-window-min",
-                   "-o", png] + list(extra)
+                   "-o", png] + MODE_ARGS.get(mode, []) + list(extra)
             p = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8",
                                errors="replace", env=dict(os.environ, **(env or {})))
             pfm = png[:-4] + ".pfm"

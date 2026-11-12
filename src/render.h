@@ -410,10 +410,23 @@ inline bool glossyCameraSide(const Vec3& rayDir, const Vec3& ns) { return dot(ra
 // resolved) whose continuation left along `d`: shadowTerminatorG toward it at a Lambertian or glossy
 // vertex, 1 at a specular, two-sided or fiber one. Exactly 1 where ns == ng. Device twin
 // dContSoftening.
+inline double sideSoftening(const Vec3& w, const Vec3& ns, const Vec3& ngo, bool twoSided);
 inline double contSoftening(const Material& m, const Hit& h, const Vec3& d) {
+    if (m.type == MatType::DiffuseTransmit) return sideSoftening(d, h.n, orientedGeoN(h), true);
     if (m.type != MatType::Diffuse && m.type != MatType::Fluorescent && m.type != MatType::Glossy)
         return 1.0;
     return shadowTerminatorG(d, h.n, orientedGeoN(h));
+}
+
+// The terminator's softening toward a light along `w` at a vertex whose shading normal is `ns` and
+// geometric normal `ngo`, both turned to the side the vertex was reached from. A two-sided
+// (translucent) vertex is lit on its far side by its transmit lobe, softened there as its reflect lobe
+// is on its near side: both normals turned to the light's side first -- what mode R's NEE does when
+// it lights the transmit lobe through otherSide(h). One-sided, shadowTerminatorG as it stands (0 for a
+// light behind the true surface). Device twin dSideSoftening.
+inline double sideSoftening(const Vec3& w, const Vec3& ns, const Vec3& ngo, bool twoSided) {
+    if (twoSided && dot(w, ngo) < 0.0) return shadowTerminatorG(w, ns * -1.0, ngo * -1.0);
+    return shadowTerminatorG(w, ns, ngo);
 }
 
 // A glossy photon vertex's camera splat (Renderer::camSplatAll and kin). A glossy lobe is not
@@ -1292,13 +1305,16 @@ struct Renderer {
     // reachable -- one below the shading normal too (bdpt::lambertLit) -- weighted by Veach's
     // adjoint for that density, |cos(wi,ns)| / |cos(wi,ng)|. Where ns == ng it is the plain cosine
     // draw about ns, with the adjoint factor that is then exactly 1 (bit-identical).
+    // `transmit`: a translucent vertex's transmit lobe, drawn the same way into the far side (about
+    // -ns, or -ng where ns tilts), with the same weight.
     static double diffuseContinuation(const Hit& h, const Vec3& ngo, const Vec3& wi, Pcg32& rng,
-                                      Vec3& wo) {
+                                      Vec3& wo, bool transmit = false) {
+        const double s = transmit ? -1.0 : 1.0;
         if (dot(h.n, ngo) >= 1.0 - 1e-7) {
-            wo = cosineHemisphere(h.n, rng);
+            wo = cosineHemisphere(h.n * s, rng);
             return shadingAdjointCorr(wi, wo, h.n, ngo);
         }
-        wo = cosineHemisphere(ngo, rng);
+        wo = cosineHemisphere(ngo * s, rng);
         return arrivalAdjoint(h, ngo, wi);
     }
     // The arrival half of Veach's adjoint at a Lambertian vertex reached along -`wi`:
@@ -1336,13 +1352,12 @@ struct Renderer {
         return glossyAdjointRatio(h.n, wIn, o) * shadingAdjointCorr(wIn, o, h.n, orientedGeoN(h));
     }
     // A compound's own deposit (compoundGathers), made before its pick, of a photon arriving along
-    // -`wi` with throughput `beta`: what it stores. A compound whose gathering lobes are all
-    // Lambertian takes their arrival rule (lambertArrival, then the arrival adjoint) -- the lobe the
-    // pick then takes applies its own rule to the photon going on; one with a translucent lobe stores
-    // the arrival as a translucent's own case does (BUMP-MODES stage 3, known-issues). 0: nothing.
+    // -`wi` with throughput `beta`: what it stores. Its gathering lobes -- diffuse or translucent,
+    // whose arrival rule is the same (lambertArrival, then the arrival adjoint) -- take it; the lobe the
+    // pick then takes applies its own rule to the photon going on. 0: nothing.
     static double compoundDepositWeight(const Scene& scene, const Material& cm, const Hit& h,
                                         const Vec3& wi, bool firstBounce, double beta) {
-        if (compoundTransmits(scene, cm)) return beta;
+        (void)scene; (void)cm;
         const Vec3 ngo = orientedGeoN(h);
         double s;
         if (!lambertArrival(h, ngo, wi, firstBounce, s)) return 0.0;
@@ -3846,9 +3861,18 @@ struct Renderer {
                     }
                     Vec3 ngo = orientedGeoN(h);
                     Vec3 wi = Vec3{-ray.d.x, -ray.d.y, -ray.d.z};   // toward the previous (light-side) vertex
+                    // A translucent lobe pair is lit as a Lambertian lobe is (bsdf_eval.h
+                    // translucentLobe): light arriving below the shading normal on its own side lights
+                    // neither lobe, and the first bounce softens toward the emitter (lambertArrival).
+                    double sEm;
+                    if (!lambertArrival(h, ngo, wi, bounce == 0, sEm)) { e.absorbed += beta; return; }
+                    e.absorbed += beta * (1.0 - sEm);
+                    beta *= sEm;
                     // Photon-map deposit: incident flux at this translucent vertex (or at the
-                    // compound it was picked from, above).
-                    if (!compoundDeposit) depositPhoton(h.p, ngo, lambda, beta, sawFocus && !sawScatter);
+                    // compound it was picked from, above), per geometric area as a diffuse one's.
+                    if (!compoundDeposit)
+                        depositPhoton(h.p, ngo, lambda, beta * arrivalAdjoint(h, ngo, wi),
+                                      sawFocus && !sawScatter);
                     sawScatter = true;   // whatever leaves this vertex is diffuse indirect light
                     if (nCam > 0 && !forwardCatch) {
                         camSplatAll(scene, cams, nCam, h.p,  h.n,  ngo, wi, lambda, beta, rhoR, rng);
@@ -3866,16 +3890,16 @@ struct Renderer {
                             if (rhoR > 0.0) foldApply(rhoR, foldR, foldK, foldS);
                             else retireSpectral(FK_ZeroWeight);
                         }
-                        Vec3 wo = cosineHemisphere(h.n, rng);
-                        beta *= shadingAdjointCorr(wi, wo, h.n, ngo);
+                        Vec3 wo;
+                        beta *= diffuseContinuation(h, ngo, wi, rng, wo);
                         if (!continueAlong(h, wo, Lobe::Reflect, ray)) { e.absorbed += beta; return; } continue;
                     } else if (u < sum) {
                         if (achroPath || foldS > 0) {
                             if (rhoT > 0.0) foldApply(rhoT, foldTr, foldK, foldS);
                             else retireSpectral(FK_ZeroWeight);
                         }
-                        Vec3 wo = cosineHemisphere(Vec3{-h.n.x, -h.n.y, -h.n.z}, rng);
-                        beta *= shadingAdjointCorr(wi, wo, h.n, ngo);
+                        Vec3 wo;
+                        beta *= diffuseContinuation(h, ngo, wi, rng, wo, /*transmit=*/true);
                         if (!continueAlong(h, wo, Lobe::Transmit, ray)) { e.absorbed += beta; return; } continue;
                     }
                     e.absorbed += beta; return;
@@ -4280,15 +4304,20 @@ struct Renderer {
                     }
                     Vec3 ngo = orientedGeoN(h);
                     Vec3 wi = Vec3{-ray.d.x, -ray.d.y, -ray.d.z};
+                    {   double sEm;                              // lit as a Lambertian lobe (scalar twin)
+                        if (!lambertArrival(h, ngo, wi, bounce == 0, sEm)) { e.absorbed += activeSum(); return; }
+                        for (int i = 0; i < nUp; ++i) { e.absorbed += beta[i] * (1.0 - sEm); beta[i] *= sEm; }
+                    }
                     // Photon-map deposit: store EVERY live wavelength as its own per-λ
                     // photon record (the gather keys off each photon's own λ). C records
                     // of base/C sum to base, and nEmitted counts PATHS, so the estimator
                     // stays energy-consistent with the scalar single-λ deposit.
                     {
                         const bool caus = sawFocus && !sawScatter;
+                        const double adjA = arrivalAdjoint(h, ngo, wi);
                         if (!compoundDeposit)   // else the compound took it (above)
                             for (int i = 0; i < nUp; ++i)
-                                depositPhoton(h.p, ngo, lam[i], beta[i], caus);
+                                depositPhoton(h.p, ngo, lam[i], beta[i] * adjA, caus);
                         sawScatter = true;   // past a diffuse vertex it is indirect light
                     }
                     if (nCam > 0 && !forwardCatch) {
@@ -4314,8 +4343,8 @@ struct Renderer {
                             e.absorbed += beta[i] * (1.0 - w);
                             beta[i] *= w;
                         }
-                        Vec3 wo = cosineHemisphere(h.n, rng);
-                        double corr = shadingAdjointCorr(wi, wo, h.n, ngo);
+                        Vec3 wo;
+                        const double corr = diffuseContinuation(h, ngo, wi, rng, wo);
                         for (int i = 0; i < nUp; ++i) beta[i] *= corr;
                         if (!continueAlong(h, wo, Lobe::Reflect, ray)) { e.absorbed += activeSum(); return; } continue;
                     } else if (uu < sumHero) {                    // transmit (back)
@@ -4324,8 +4353,8 @@ struct Renderer {
                             e.absorbed += beta[i] * (1.0 - w);
                             beta[i] *= w;
                         }
-                        Vec3 wo = cosineHemisphere(Vec3{-h.n.x, -h.n.y, -h.n.z}, rng);
-                        double corr = shadingAdjointCorr(wi, wo, h.n, ngo);
+                        Vec3 wo;
+                        const double corr = diffuseContinuation(h, ngo, wi, rng, wo, /*transmit=*/true);
                         for (int i = 0; i < nUp; ++i) beta[i] *= corr;
                         if (!continueAlong(h, wo, Lobe::Transmit, ray)) { e.absorbed += activeSum(); return; } continue;
                     }

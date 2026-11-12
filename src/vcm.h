@@ -414,6 +414,9 @@ inline void scatterSample(const Scene& scene, const Renderer& mats, const Materi
             break;
         }
         case MatType::DiffuseTransmit: {
+            // Arriving below the shading normal on its own side, light lights neither lobe
+            // (bsdf_eval.h translucentLobe): a light walk stops there.
+            if (transport == Renderer::Transport::Flux && !(dot(wo, ns) > 0.0)) { terminate = true; break; }
             double rhoR, rhoT; bdpt::diffuseTransmitAlbedos(*mp, lambda, scene, &h, rhoR, rhoT);
             double tot = rhoR + rhoT;
             if (tot <= 0.0) { terminate = true; break; }
@@ -796,7 +799,7 @@ inline void traceLightSubpath(const Scene& scene, const Camera& cam, const Rende
         bool connectible = isConnectibleMat(*mp) && !isFiberMat(*mp);
         // The first bounce softens toward the emitter it came from, in the throughput every
         // later vertex inherits (bdpt.h emitterSoftening, where the why is).
-        if (edges == 1 && connectible && !isTwoSidedMat(*mp)) {
+        if (edges == 1 && connectible) {   // a translucent one too, on the side it arrived from
             const double sL = shadowTerminatorG(wo, h.n, ngo);
             beta *= sL;
             for (int i = 0; i + 1 < nUp; ++i) betaSec[i] *= sL;
@@ -805,7 +808,7 @@ inline void traceLightSubpath(const Scene& scene, const Camera& cam, const Rende
         // its merge weight takes over the vertex's own above (bdpt.h compoundMergeSoftening).
         const double mergeSoft = (edges == 1 && storeP > 0.0)
             ? bdpt::compoundMergeSoftening(scene, scene.mats[h.matId], wo, h.n, ngo,
-                                     (connectible && !isTwoSidedMat(*mp)) ? shadowTerminatorG(wo, h.n, ngo) : 1.0)
+                                     connectible ? shadowTerminatorG(wo, h.n, ngo) : 1.0)
             : 1.0;
         if (connectible || storeP > 0.0) {
             LightVertex lv;
@@ -985,7 +988,7 @@ inline Vec3 traceCameraSubpath(const Scene& scene, const Camera& cam, const Rend
     // oriented geometric one, and whether it softens toward an emitter at all (bdpt.h
     // emitterSoftening).
     Vec3 softN, softNg;
-    bool softOn = false;
+    bool softOn = false, softTwo = false;
 
     for (int edges = 1; edges <= ctx.maxDepth; ++edges) {
         // edges == 1 is the camera-to-first-vertex edge — the primary ray; see
@@ -1110,7 +1113,7 @@ inline Vec3 traceCameraSubpath(const Scene& scene, const Camera& cam, const Rend
                     // emitted radiance and the carried throughput are per-λ. De-hero by
                     // averaging the live wavelengths (1/nUp, not a ×C boost).
                     // ...softened at the vertex before, toward the emitter (emitterSoftening).
-                    const double sE = softOn ? shadowTerminatorG(rd, softN, softNg) : 1.0;
+                    const double sE = softOn ? sideSoftening(rd, softN, softNg, softTwo) : 1.0;
                     Vec3 add = cie * (beta * Le * misW * sE);
                     for (int i = 0; i + 1 < nUp; ++i)
                         add = add + cieSec[i] * (betaSec[i] * LeSec[i] * misW * sE);
@@ -1215,9 +1218,11 @@ inline Vec3 traceCameraSubpath(const Scene& scene, const Camera& cam, const Rend
                         double cosToLight = dot(h.n, wi);
                         // Geometric-hemisphere softening on this eye/radiance vertex (matches
                         // backward.h neeLight): the sampled light must be on h's geometric front
-                        // side too, ramped smoothly instead of a hard cutoff (Chiang 2019). No-op
-                        // when h.n==h.ng (stG==1); skipped for two-sided.
-                        double stG = isTwoSidedMat(*mp) ? 1.0 : shadowTerminatorG(wi, h.n, orientedGeoN(h));
+                        // side too, ramped smoothly instead of a hard cutoff (Chiang 2019); a
+                        // translucent vertex's on the light's side (sideSoftening), a fiber's 1.
+                        // No-op when h.n==h.ng (stG==1).
+                        double stG = isFiberMat(*mp) ? 1.0
+                                   : sideSoftening(wi, h.n, orientedGeoN(h), isTwoSidedMat(*mp));
                         bool sideOk = isTwoSidedMat(*mp)
                                           ? (cosToLight != 0.0)
                                           : (cosToLight > 0.0 && stG > 0.0);
@@ -1466,7 +1471,8 @@ inline Vec3 traceCameraSubpath(const Scene& scene, const Camera& cam, const Rend
         if (!delta) camAllDelta = false;        // disqualifies the escaped-sun strategy
         if (delta && !keepBundle) nUp = 1;      // de-hero (see traceLightSubpath)
         prevP = h.p;
-        softOn = !delta && connectible && !isTwoSidedMat(*mp) && !isFiberMat(*mp);
+        softOn = !delta && connectible && !isFiberMat(*mp);
+        softTwo = isTwoSidedMat(*mp);
         softN = h.n;
         softNg = orientedGeoN(h);
         // A fiber scattering out its far side steps clear of its own tube (see fiberStep).

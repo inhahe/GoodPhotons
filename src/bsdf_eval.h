@@ -113,6 +113,27 @@ inline void diffuseTransmitAlbedos(const Material& m, double lambda, const Scene
 // these give modes D, J and U mode R's integrand on a normal-mapped surface (BUMP-MODES).
 inline bool lambertLit(double cosWi) { return cosWi > 0.0; }
 
+// THE TRANSLUCENT LOBE a pair takes (BUMP-MODES), mode R's integrand: its NEE lights a translucent
+// hit's reflect lobe through the hit as found and its transmit lobe through otherSide(h), each gated
+// by the true surface. So, seen from the camera side `a`, a direction `b` lies in the reflect lobe
+// (+1) when it is on a's geometric side and above the shading normal turned to that side, in the
+// transmit lobe (-1) when it is on the far side and below it, and in neither (0) in the wedge between
+// the shading and geometric planes. `ns` is the vertex's shading normal, turned (with its hit) to the
+// side it was reached from; `hit` supplies the geometric normal. Without a hit, ns alone decides: the
+// same side of it or not. Where ns == ng the two rules agree. Device twin dTranslucentLobe.
+inline int translucentLobe(const Vec3& ns, const Hit* hit, const Vec3& a, const Vec3& b) {
+    if (!hit) {
+        const double s = dot(a, ns) * dot(b, ns);
+        return s > 0.0 ? 1 : (s < 0.0 ? -1 : 0);
+    }
+    Vec3 g = orientedGeoN(*hit), n = ns;
+    if (!(dot(a, g) > 0.0)) { g = g * -1.0; n = n * -1.0; }   // both to a's side
+    const double bg = dot(b, g), bn = dot(b, n);
+    if (bg > 0.0 && bn > 0.0) return 1;
+    if (bg < 0.0 && bn < 0.0) return -1;
+    return 0;
+}
+
 // Evaluate the BSDF value f at a surface vertex for the pair (wo, wi), both unit
 // world directions pointing AWAY from the surface. `wo` is toward where the subpath
 // came from; `wi` is the connection/continuation direction. Returns 0 for a delta
@@ -145,12 +166,13 @@ inline double bsdfF(const Material& m, const Vec3& ns, const Vec3& wo, const Vec
             // r carries an iridescent glossy's interference reflectance (render.h glossyF).
             return glossyF(scene, m, hitForTex, ns, wo, wi, lambda);
         case MatType::DiffuseTransmit: {
-            // Two-sided Lambertian: same-hemisphere pair (wo,wi) -> reflect albedo,
-            // opposite hemispheres -> transmit albedo. Symmetric in wo<->wi.
+            // Two-sided Lambertian, mode R's integrand on a tilted shading normal (translucentLobe):
+            // seen from the camera side `wo`, light in the reflect lobe takes the reflect albedo, in
+            // the transmit lobe the transmit albedo, in the wedge between the planes nothing.
+            (void)cosWo;
             double rhoR, rhoT; diffuseTransmitAlbedos(m, lambda, scene, hitForTex, rhoR, rhoT);
-            bool sameSide = (cosWi * cosWo) > 0.0;
-            double rho = sameSide ? rhoR : rhoT;
-            return rho / PI;
+            const int lobe = translucentLobe(ns, hitForTex, wo, wi);
+            return (lobe > 0 ? rhoR : (lobe < 0 ? rhoT : 0.0)) / PI;
         }
         case MatType::Hair: {
             // Needs the hit (the fiber frame comes from the strand tangent), so a
@@ -224,16 +246,21 @@ inline double bsdfPdf(const Material& m, const Vec3& ns, const Vec3& wo, const V
             return (e + 1.0) / (2.0 * PI) * std::pow(cosLobe, e);
         }
         case MatType::DiffuseTransmit: {
-            // Directional pdf of the lobe-selected cosine sampling: the reflect lobe is
-            // chosen with prob rhoR/(rhoR+rhoT) and cosine-samples the same hemisphere as
-            // wo; the transmit lobe (prob rhoT/(rhoR+rhoT)) cosine-samples the opposite
-            // hemisphere. For a given wi only one lobe applies (by its sign vs wo).
+            // Directional pdf of the lobe-selected cosine sampling at a vertex reached from `wo`:
+            // the reflect lobe is chosen with prob rhoR/(rhoR+rhoT) and cosine-samples about the
+            // shading normal turned to wo's geometric side (as a walk's vertex holds it); the
+            // transmit lobe (prob rhoT/(rhoR+rhoT)) about its opposite; and a draw that leaves on
+            // the wrong side of the true surface ends the walk (leavesWrongSide). So wi has the
+            // density of the lobe translucentLobe puts it in, and none in the wedges between the
+            // planes -- where, seen from the light side, f is not 0, so a density there would
+            // count a strategy no walk can take.
+            (void)cosWo;
             double rhoR, rhoT; diffuseTransmitAlbedos(m, lambda, scene, hitForTex, rhoR, rhoT);
             double tot = rhoR + rhoT;
             if (tot <= 0.0) return 0.0;
-            bool sameSide = (cosWi * cosWo) > 0.0;
-            double pSel = sameSide ? rhoR / tot : rhoT / tot;
-            return pSel * std::fabs(cosWi) / PI;
+            const int lobe = translucentLobe(ns, hitForTex, wo, wi);
+            if (lobe == 0) return 0.0;
+            return (lobe > 0 ? rhoR : rhoT) / tot * std::fabs(cosWi) / PI;
         }
         case MatType::Hair: {
             // The BCSDF's own sampling density (hair.h), in solid angle — exactly the

@@ -1468,6 +1468,9 @@ inline void randomWalk(const Scene& scene, const Camera& cam, const Renderer& ma
                 break;
             }
             case MatType::DiffuseTransmit: {
+                // A light walk arriving below the shading normal on its own side lights neither
+                // lobe (bsdf_eval.h translucentLobe), as at a diffuse vertex: it stops.
+                if (mode == Mode::Importance && !(dot(wo, cur.ns) > 0.0)) { terminate = true; break; }
                 // Pick the reflect or transmit lobe in proportion to their albedos, then
                 // cosine-sample the corresponding hemisphere (front = +ns, back = -ns).
                 // f*cos/pdf collapses to the TOTAL albedo (rhoR+rhoT) either way, so the
@@ -1816,7 +1819,7 @@ inline void randomWalk(const Scene& scene, const Camera& cam, const Renderer& ma
             if (l2 > 0.0) {
                 const Vec3 toEm = d * (1.0 / std::sqrt(l2));
                 const Vec3 ngo = vertexGeoN(cur);
-                const double vs = (delta || isTwoSidedMat(*mp) || isFiberMat(*mp))   // emitterSoftening's
+                const double vs = (delta || isFiberMat(*mp))   // emitterSoftening's (arrival side)
                                 ? 1.0 : shadowTerminatorG(toEm, cur.ns, ngo);
                 cur.compoundMergeW *= compoundMergeSoftening(scene, scene.mats[cur.matId], toEm,
                                                              cur.ns, ngo, vs);
@@ -1960,12 +1963,14 @@ inline int generateCameraSubpath(const Scene& scene, const Camera& cam, const Re
 // every strategy has to share R's integrand: NEE (s = 1) softens at pt, an eye path landing on the
 // emitter (s = 0) at the vertex before (connectBDPT), a light subpath at its first bounce, in the
 // throughput every later vertex and beam inherits (softenFirstBounce), and no connection between
-// two scene vertices softens at all. 1 at a medium vertex, a delta, a two-sided material or a
-// fiber (whose responses R does not soften either), and wherever ns == ng.
+// two scene vertices softens at all. A translucent vertex softens on the emitter's side, as R's NEE
+// lights its transmit lobe through otherSide (sideSoftening). 1 at a medium vertex, a delta or a fiber
+// (whose responses R does not soften either), and wherever ns == ng.
 inline double emitterSoftening(const Vertex& v, const Vec3& toEmitter) {
-    if (v.type != VType::Surface || v.delta || !v.mat || isTwoSidedMat(*v.mat) || isFiberMat(*v.mat))
+    if (v.type != VType::Surface || v.delta || !v.mat || isFiberMat(*v.mat))
         return 1.0;
-    return shadowTerminatorG(toEmitter, v.ns, vertexGeoN(v));
+    // A translucent vertex softens on the emitter's side, its transmit lobe's (sideSoftening).
+    return sideSoftening(toEmitter, v.ns, vertexGeoN(v), isTwoSidedMat(*v.mat));
 }
 // Scale a light subpath's throughput by `f` from its first scene vertex on: path[1] onward, and
 // every beam segment leaving path[1] or later (the one leaving the emitter, vert 0, is not).
@@ -1995,19 +2000,18 @@ inline void softenFirstBounce(std::vector<Vertex>& path, std::vector<PathSeg>* s
 
 // A compound's merge copy at a light walk's first bounce (Vertex::compoundMergeW, vcm.h's
 // LightVertex::mergeW): the factor its merge weight takes. The merges evaluate the compound's
-// gathering lobes, whose softening toward the emitter (`toEmitter`; the vertex's shading normal `ns`,
-// its geometric `ngo`) is shadowTerminatorG where they are all Lambertian and none where it has a
-// translucent lobe -- stored as a translucent's own case stores it (Renderer::compoundDepositWeight)
-// -- whatever lobe the pick went to; the vertex's throughput already took `vertexSoftening`, that
-// lobe's (emitterSoftening: 1 for a delta or two-sided one). So: the lobes' over the vertex's; 0 where
-// the vertex's own is 0, its throughput gone. One rule for randomWalk, vcm.h's light walk and the
-// device's twins (dCompoundMergeSoftening).
+// gathering lobes, diffuse or translucent, whose softening toward the emitter (`toEmitter`, on the
+// side it arrived from; the vertex's shading normal `ns`, its geometric `ngo`) is shadowTerminatorG
+// whatever lobe the pick went to; the vertex's throughput already took `vertexSoftening`, that lobe's
+// (emitterSoftening: 1 for a delta). So: the lobes' over the vertex's; 0 where the vertex's own is 0,
+// its throughput gone. One rule for randomWalk, vcm.h's light walk and the device's twins
+// (dCompoundMergeSoftening).
 inline double compoundMergeSoftening(const Scene& scene, const Material& compound,
                                      const Vec3& toEmitter, const Vec3& ns, const Vec3& ngo,
                                      double vertexSoftening) {
+    (void)scene; (void)compound;
     if (!(vertexSoftening > 0.0)) return 0.0;
-    const double lobes = compoundTransmits(scene, compound) ? 1.0 : shadowTerminatorG(toEmitter, ns, ngo);
-    return lobes / vertexSoftening;
+    return shadowTerminatorG(toEmitter, ns, ngo) / vertexSoftening;
 }
 
 // Emit a light subpath from a DELTA light (spot or sun) — the two emitters with no
@@ -4229,14 +4233,12 @@ inline double connectBDPT(const Scene& scene, const Camera& cam, const Renderer&
         } else {
             cosSurf = dot(pt.ns, wi);
             if (cosSurf == 0.0 || (!isTwoSidedMat(*pt.mat) && cosSurf < 0.0)) return 0.0;
-            // Geometric-hemisphere softening (see t==1 splat above): the eye/radiance vertex
-            // must see the sampled light on its geometric front side; ramp smoothly instead of
-            // a hard cutoff (Chiang 2019). No-op when ns==ng (stG==1).
-            if (!isTwoSidedMat(*pt.mat)) {
-                Vec3 ngo = vertexGeoN(pt);
-                stG = shadowTerminatorG(wi, pt.ns, ngo);
-                if (stG <= 0.0) return 0.0;
-            }
+            // The terminator's softening toward the light (emitterSoftening): the eye vertex
+            // must see it on its geometric front -- a translucent one on the side it lights
+            // through -- ramped instead of cut off (Chiang 2019), 0 behind the true geometry.
+            // No-op when ns==ng (stG==1).
+            stG = emitterSoftening(pt, wi);
+            if (stG <= 0.0) return 0.0;
             f = bsdfF(*pt.mat, pt.ns, wo, wi, lambda, scene, &pt.hit);
             for (int i = 0; i + 1 < nUp; ++i)
                 fSec[i] = bsdfF(*pt.mat, pt.ns, wo, wi, hb.lam[i + 1], scene, &pt.hit);
