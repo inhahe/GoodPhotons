@@ -2460,6 +2460,15 @@ Not changed:
   GLOW-LIGHT-MODES' open decision; logged there, and REFERENCE.md says so.
 * BUMP-D-VS-R, left open: it is BUMP-MODES now, being fixed.
 
+## OPEN (2026-11-12, 0.440.2): GLOSSY-ROOM-M — mode M reads a room of glossy walls 0.5 % bright on the host
+
+`tools/check_glossy_adjoint.py`'s room: five glossy walls (reflect 0.8, roughness 0.4) and an area
+light, no diffuse surface anywhere, so mode M never gathers and its camera walk is the whole
+estimate. Host 1.0050 of mode R (+-0.0010, three seeds), device 1.0014 (+-0.0009); the
+bidirectional and photon modes read 0.9996-1.0004. Not yet looked into: whether M's camera walk at
+a glossy vertex (photonmap_render.h's Glossy case, its glossy NEE and its MIS against the lobe's
+emitter hit) takes exactly mode R's integrand, and why the host and device differ.
+
 ## DONE (2026-11-12, 0.440.1): TRANSLUCENT-MS — modes M and S read a backlit translucent panel 10 % dark
 
 **Fixed in 0.440.1** as proposed below: at a translucent visible point the gathers keep a photon
@@ -2485,7 +2494,28 @@ visible points, and their device twins). Fix: at a DiffuseTransmit visible point
 side's photons too, through the same band test with the normals' opposition, weighted by the
 transmit albedo, the near side's by the reflect albedo.
 
-## OPEN (2026-11-12, 0.440.0): GLOSSY-FLAT-DJU — modes D, J and U read a flat glossy room about 1 % bright
+## DONE (2026-11-12, 0.440.2): GLOSSY-FLAT-DJU — modes D, J and U read a flat glossy room about 1 % bright
+
+**Cause and fix (0.440.2).** The glossy BSDF divides its lobe by the cosine on the light's side
+(render.h glossyF), so it is not reciprocal, and a walk from the light must carry its adjoint.
+0.276.0 gave the light end of a connection the adjoint (bsdfFAdjoint) but called a light walk's
+continuation self-consistent and left its factor at r. It is not: drawing its way out of the lobe
+about its arrival, a light walk's f*cos/pdf is r * cos(out)/cos(in) (`glossyAdjointRatio`, device
+`dGlossyAdjointRatio`), so every glossy bounce on a light subpath was off by cos(in)/cos(out) --
+bdpt.h randomWalk, vcm.h scatterSample, render.h's photon tracers (scalar and hero, and a layered
+coat's lobe) and their device twins. A photon tracer's ledger books the gain or loss as negative or
+positive absorption. New gate `tools/check_glossy_adjoint.py`, every mode against R at
+-max-bounce 32, host and device: a glossy floor lit steeply, throwing its light at a grazing angle
+onto a diffuse wall (0.440.1 host / device: D 1.093 / 1.094, J 1.249 / 1.257, U 1.135 / 1.125,
+B 1.297 / 1.297, M 1.292 / 1.295, S 1.298 / 1.299; now 0.992-1.001), and the glossy room below
+(D 1.011, J 1.012, U 1.013 on both; B 0.994; now 0.9996-1.0004 but M). check_bitid against 0.440.1:
+its two scenes with glossy surfaces (flat, smooth) move by -0.26 % to +0.12 % in B, D, J, U, M and
+S; R and the rest identical.
+
+Left: mode M reads the all-glossy room 1.0050 of R on the host (+-0.0010) and 1.0014 on the
+device, before and after -- see GLOSSY-ROOM-M.
+
+The finding:
 
 Found with TRANSLUCENT-MS: the room's five walls `glossy reflect 0.8 roughness 0.4`, flat, lit by a
 tilted panel, against R at -max-bounce 8, CPU: D 1.011, J 1.008, U 1.012 (B 0.997, M 1.004 and S

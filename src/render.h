@@ -377,6 +377,19 @@ inline double glossyF(const Scene& scene, const Material& m, const Hit* h, const
     return r * lobe / cosWi;
 }
 
+// THE GLOSSY LOBE ON A WALK FROM THE LIGHT. glossyF divides by the cosine on the light's side, so
+// the lobe is not reciprocal, and a walk from the light carries its adjoint, glossyF with the pair
+// swapped (bsdf_eval.h bsdfFAdjoint). Drawing the outgoing `wOut` from the lobe mirrored about the
+// arrival `wIn` (pointing back toward the light), that walk's factor f*cos/pdf is therefore r times
+// this ratio, cos(wOut, ns) / cos(wIn, ns), where a camera walk's is r alone. 1 at the mirror
+// direction; 0 for an arrival from below the shading normal `ns`, whose adjoint is 0. It can exceed
+// 1: the lobe conserves energy toward the camera, not toward the light. Device twin
+// dGlossyAdjointRatio.
+inline double glossyAdjointRatio(const Vec3& ns, const Vec3& wIn, const Vec3& wOut) {
+    const double ci = dot(wIn, ns), co = dot(wOut, ns);
+    return (ci > 0.0 && co > 0.0) ? co / ci : 0.0;
+}
+
 // A glossy photon vertex's camera splat (Renderer::camSplatAll and kin). A glossy lobe is not
 // Lambertian, so its value is known only once the connection's direction is: the splats call
 // f(wc) for the direction wc they found toward the camera point. `wl` points back along the
@@ -2621,6 +2634,12 @@ struct Renderer {
                 const GlossyDraw gd = drawGlossy(scene, m, h, ray.d, h.n, ray.d * -1.0, rng);
                 const Vec3& o = gd.o;
                 if (dot(o, h.n) <= 0) { e.absorbed += beta; return false; } // below surface
+                // A photon carries the lobe's adjoint (glossyAdjointRatio). The ledger takes what
+                // it gains or loses as negative or positive absorption, so it still balances.
+                const double adj = glossyAdjointRatio(h.n, ray.d * -1.0, o);
+                if (!(adj > 0.0)) { e.absorbed += beta; return false; }
+                e.absorbed += beta * (1.0 - adj);
+                beta *= adj;
                 // An iridescent lobe's interference reflectance, known only now that the pair
                 // is: a second roulette, beta unchanged.
                 if (gd.irid && rng.uniform() >= gd.R(lambda)) { e.absorbed += beta; return false; }
@@ -3557,11 +3576,16 @@ struct Renderer {
                     double cr = materialRoughness(scene, cm, h);
                     Vec3 o = sampleGlossy(reflect(ray.d, h.n), cr, rng);
                     if (dot(o, h.n) <= 0) { e.absorbed += beta; return; }
+                    // The coat's lobe is a glossy lobe: its adjoint, as interactPhotonSpecular's.
+                    const double adj = glossyAdjointRatio(h.n, ray.d * -1.0, o);
+                    if (!(adj > 0.0)) { e.absorbed += beta; return; }
+                    e.absorbed += beta * (1.0 - adj);
+                    beta *= adj;
                     if (!continueAlong(h, o, Lobe::Reflect, ray)) { e.absorbed += beta; return; }
                     // A clearcoat reflection is a mirror lobe: it focuses when tight (the
                     // highlight a polished coat throws IS a caustic), scatters when rough.
                     (cr <= kCausticGlossRoughness ? sawFocus : sawScatter) = true;
-                    continue;                               // lossless; beta unchanged
+                    continue;                               // lossless but for the adjoint
                 }
                 int child = mixResolveChild(scene, cm, h, rng.uniform());  // body lobe (leftover absorbs; honours a weight map)
                 if (child < 0) { e.absorbed += beta; return; }
@@ -4129,6 +4153,9 @@ struct Renderer {
                     double cr = materialRoughness(scene, cm, h);
                     Vec3 o = sampleGlossy(reflect(ray.d, h.n), cr, rng);
                     if (dot(o, h.n) <= 0) { e.absorbed += activeSum(); return; }
+                    const double adj = glossyAdjointRatio(h.n, ray.d * -1.0, o);   // see scalar twin
+                    if (!(adj > 0.0)) { e.absorbed += activeSum(); return; }
+                    for (int i = 0; i < nUp; ++i) { e.absorbed += beta[i] * (1.0 - adj); beta[i] *= adj; }
                     if (!continueAlong(h, o, Lobe::Reflect, ray)) { e.absorbed += activeSum(); return; }
                     (cr <= kCausticGlossRoughness ? sawFocus : sawScatter) = true;  // see scalar twin
                     continue;
@@ -4255,6 +4282,9 @@ struct Renderer {
                         const GlossyDraw gd = drawGlossy(scene, m, h, ray.d, h.n, ray.d * -1.0, rng);
                         const Vec3& o = gd.o;
                         if (dot(o, h.n) <= 0) { e.absorbed += activeSum(); return; }  // below surface
+                        const double adj = glossyAdjointRatio(h.n, ray.d * -1.0, o);  // see the scalar path
+                        if (!(adj > 0.0)) { e.absorbed += activeSum(); return; }
+                        for (int i = 0; i < nUp; ++i) { e.absorbed += beta[i] * (1.0 - adj); beta[i] *= adj; }
                         if (gd.irid) {
                             // The interference reflectance at the pair's half-vector, per λ, by
                             // the same roulette-on-the-max and bounded reweight as above.

@@ -411,7 +411,9 @@ inline void scatterSample(const Scene& scene, const Renderer& mats, const Materi
             double r = clamp01(reflectSlot(scene, *mp, h, lambda)) * gd.R(lambda);
             pdfW = bsdfPdf(*mp, ns, wo, wi, lambda, scene, &h);
             pdfRevW = bsdfPdf(*mp, ns, wi, wo, lambda, scene, &h);
-            betaFactor = r;
+            // r from the camera; from the light, the adjoint lobe's r * adjG (glossyAdjointRatio).
+            const double adjG = (transport == Renderer::Transport::Flux) ? glossyAdjointRatio(ns, wo, wi) : 1.0;
+            betaFactor = r * adjG;
             if (pdfW <= 0) terminate = true;      // r <= 0 is caught by the caller's max test
             if (jr) jr->mul([&](double L) {
                                 const double rL = clamp01(reflectSlot(scene, *mp, h, L));
@@ -423,7 +425,7 @@ inline void scatterSample(const Scene& scene, const Renderer& mats, const Materi
             if (nSec) {
                 *secChromatic = true;
                 for (int i = 0; i < nSec; ++i) {
-                    secF[i] = clamp01(reflectSlot(scene, *mp, h, lamAll[i + 1]));
+                    secF[i] = clamp01(reflectSlot(scene, *mp, h, lamAll[i + 1])) * adjG;
                     if (gd.irid) secF[i] *= gd.R(lamAll[i + 1]);
                 }
             }

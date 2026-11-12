@@ -173,11 +173,11 @@ inline double bsdfF(const Material& m, const Vec3& ns, const Vec3& wo, const Vec
 // Veach rule; this is the BSDF's own half. The two are independent: shadingAdjointCorr is 1 on
 // flat geometry, where this is still required.
 //
-// WHY IT MATTERS HERE. bsdfF pre-divides by cos(wi) (see the CONVENTION note at the top), which
-// is self-consistent on a continuation, where the direction evaluated is the direction sampled.
-// At a connection it is not: the Glossy lobe factor is symmetric under the swap but the
-// denominator is not, so the same physical path got f = r*lobe/cos(camera-side) from the light
-// subpath and f = r*lobe/cos(light-side) from the camera subpath. MIS then mixed two estimators
+// WHY IT MATTERS HERE. bsdfF pre-divides by cos(wi) (see the CONVENTION note at the top). The
+// Glossy lobe factor is symmetric under the swap but the denominator is not, so without this the
+// same physical path got f = r*lobe/cos(camera-side) from the light subpath and
+// f = r*lobe/cos(light-side) from the camera subpath. A light walk's CONTINUATION needs the same
+// adjoint: its f*cos/pdf is r * glossyAdjointRatio (render.h), not the r a camera walk takes. MIS then mixed two estimators
 // that disagreed by cos(wo)/cos(wcam) -- measured as mode D reading 15 % DIM with the camera near
 // the normal and bright with it grazing, a sign flip no roughness- or solid-angle-scaled error
 // could produce.

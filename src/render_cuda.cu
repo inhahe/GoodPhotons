@@ -6275,6 +6275,12 @@ __device__ static double dGlossyF(const DScene& sc, const DMaterial& m, const DH
     const double lobe = (e + 1.0) / (2.0 * DPI) * pow(cosLobe, e);
     return r * lobe / cosWi;
 }
+// Twin of glossyAdjointRatio (where the why is): what a walk from the light multiplies the lobe's r
+// by, cos(wOut, ns) / cos(wIn, ns), `wIn` toward the light; 0 for an arrival from below ns.
+__device__ static inline double dGlossyAdjointRatio(const DVec3& ns, const DVec3& wIn, const DVec3& wOut) {
+    const double ci = ddot(wIn, ns), co = ddot(wOut, ns);
+    return (ci > 0.0 && co > 0.0) ? co / ci : 0.0;
+}
 __device__ static double dLayeredCoatReflectance(const DScene& sc, const DMaterial& m,
                                                  const DHit& h, const DVec3& d, Real lambda,
                                                  double* cosIOut, Real* thOut);
@@ -12353,6 +12359,12 @@ __device__ static int interactSpecular(const DScene& sc, const DCamSet& cs, int 
         const DGlossyDraw gd = dDrawGlossy(sc, m, h, rd, h.n, -rd, rng);
         const DVec3& o = gd.o;
         if (dot(o, h.n) <= 0) { eAbsorbed += beta; return WF_TERMINATE; }
+        // A photon carries the lobe's adjoint, the ledger the difference (host twin
+        // interactPhotonSpecular, glossyAdjointRatio). A layered coat's lobe arrives here too.
+        const Real adj = (Real)dGlossyAdjointRatio(h.n, -rd, o);
+        if (!(adj > (Real)0)) { eAbsorbed += beta; return WF_TERMINATE; }
+        eAbsorbed += (double)(beta * ((Real)1 - adj));
+        beta *= adj;
         // An iridescent lobe's interference reflectance, known only now that the pair is: a
         // second roulette, beta unchanged (host twin interactPhotonSpecular).
         if (gd.irid && rng.uniform() >= gd.R(lambda)) { eAbsorbed += beta; return WF_TERMINATE; }
@@ -13310,6 +13322,9 @@ __device__ static int shadeStepHero(const DScene& sc, const DCamSet& cs, int cam
             const DGlossyDraw gd = dDrawGlossy(sc, m, h, rd, h.n, -rd, rng);
             const DVec3& o = gd.o;
             if (dot(o, h.n) <= 0) { for (int i = 0; i < nUp; ++i) eAbsorbed += (double)beta[i]; return WF_TERMINATE; }
+            const Real adj = (Real)dGlossyAdjointRatio(h.n, -rd, o);   // see the scalar path
+            if (!(adj > (Real)0)) { for (int i = 0; i < nUp; ++i) eAbsorbed += (double)beta[i]; return WF_TERMINATE; }
+            for (int i = 0; i < nUp; ++i) { eAbsorbed += (double)(beta[i] * ((Real)1 - adj)); beta[i] *= adj; }
             if (gd.irid) {
                 // The interference reflectance at the pair's half-vector, per λ, by the same
                 // roulette-on-the-max and bounded reweight as above (host twin).
@@ -18373,7 +18388,9 @@ __device__ static void dRandomWalk(const DScene& sc, const DCamera& cam, int dif
                          * (double)gd.R(lambda);
                 pdfW = dBsdfPdf(sc, path[cur], wo, wi, lambda);
                 pdfRevW = dBsdfPdf(sc, path[cur], wi, wo, lambda);
-                betaFactor = r;
+                // r from the camera; from the light, the adjoint lobe's r * adjG (host twin).
+                const double adjG = importance ? dGlossyAdjointRatio(path[cur].ns, wo, wi) : 1.0;
+                betaFactor = r * adjG;
                 if (pdfW <= 0) terminate = true;      // r <= 0 is caught by the max test
                 // The glossy LOBE (mirror direction + roughness exponent) carries no
                 // wavelength dependence, so the whole bundle follows the sampled direction
@@ -18381,7 +18398,7 @@ __device__ static void dRandomWalk(const DScene& sc, const DCamera& cam, int dif
                 // de-hero here instead — see known-issues.md.)
                 secChromatic = true;
                 for (int i = 0; i + 1 < nUp; ++i) {
-                    secF[i] = clamp01(dReflectSlot(sc, *mp, h, hb.lam[i + 1]));
+                    secF[i] = clamp01(dReflectSlot(sc, *mp, h, hb.lam[i + 1])) * adjG;
                     if (gd.irid) secF[i] *= gd.R(hb.lam[i + 1]);
                 }
                 break;
@@ -22009,7 +22026,9 @@ __device__ static void dVcmScatter(const DScene& sc, const DMaterial& m, const D
             double r = clamp01(dReflectSlot(sc, m, h, lambda, jr ? &jbS : nullptr)) * (double)gd.R(lambda);
             pdfW = dBsdfPdf(sc, vt, wo, wi, lambda);
             pdfRevW = dBsdfPdf(sc, vt, wi, wo, lambda);
-            betaFactor = r;
+            // r from the camera; from the light, the adjoint lobe's r * adjG (host twin vcm.h).
+            const double adjG = importance ? dGlossyAdjointRatio(ns, wo, wi) : 1.0;
+            betaFactor = r * adjG;
             if (pdfW <= 0) terminate = true;      // r <= 0 is caught by the caller's max test
             // The glossy LOBE (mirror direction + roughness exponent) carries no wavelength
             // dependence, so the whole bundle follows the sampled direction and only the
@@ -22017,7 +22036,7 @@ __device__ static void dVcmScatter(const DScene& sc, const DMaterial& m, const D
             if (nSec) {
                 *secChromatic = true;
                 for (int i = 0; i < nSec; ++i) {
-                    secF[i] = clamp01(dReflectSlot(sc, m, h, lamAll[i + 1]));
+                    secF[i] = clamp01(dReflectSlot(sc, m, h, lamAll[i + 1])) * adjG;
                     if (gd.irid) secF[i] *= gd.R(lamAll[i + 1]);
                 }
             }

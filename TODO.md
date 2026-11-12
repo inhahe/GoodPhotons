@@ -154,7 +154,9 @@ Each names the section its line is in.
     (D, J and U in 0.439.9; the photon modes in 0.439.10).
 23d. ~~**TRANSLUCENT-MS** (4.2) — modes M and S read a backlit translucent panel 10 % dark: their
     gathers drop the light it transmits.~~ Done, 0.440.1.
-23e. **GLOSSY-FLAT-DJU** (4.3) — D, J and U read a flat glossy room about 1 % bright.
+23e. ~~**GLOSSY-FLAT-DJU** (4.3) — D, J and U read a flat glossy room about 1 % bright.~~ Done,
+    0.440.2: a light walk's glossy bounce now carries the lobe's adjoint.
+23f. **GLOSSY-ROOM-M** (4.3) — mode M reads a room of glossy walls 0.5 % bright on the host.
 23c. ~~**B-GPU-MAXBOUNCE** (4.2) — GPU mode B ignores `-max-bounce` (its kernels get a literal 32).~~
     Done, 0.439.8.
 24. ~~**BEAMEPOCHS-CHUNK-PIN** (4.5) — `-beamepochs` pins cheap scenes' GPU chunks to 1 spp.~~ Done,
@@ -223,7 +225,9 @@ Then the rest of 4.2-4.6 in their order, 4.7's bookkeeping alongside whatever to
   (0.439.9, 0.439.10); translucent (D/J/U/B 9 %) and glossy (B 6 %) left.
 - [x] **TRANSLUCENT-MS** (0.440.1) — modes M and S read a backlit translucent panel 10 % dark (the
   gathers dropped its transmitted light).
-- [ ] **GLOSSY-FLAT-DJU** — modes D, J and U read a flat glossy room about 1 % bright.
+- [x] **GLOSSY-FLAT-DJU** (0.440.2) — modes D, J and U read a flat glossy room about 1 % bright (a
+  light walk's glossy bounce took r, not the adjoint's r cos(out)/cos(in)).
+- [ ] **GLOSSY-ROOM-M** — mode M reads a room of glossy walls 0.5 % bright on the host.
 - [x] **B-GPU-MAXBOUNCE** (0.439.8) — GPU mode B ignored `-max-bounce` (a literal 32 reached its
   kernels).
 

@@ -4167,8 +4167,8 @@ holding a glass ball), and on the device `-rgb`, mode S and every one of those.
     A `hairCosGuard` floor of 1e-7 keeps the division finite at a grazing endpoint.
   - *...and that pre-divide is exactly what makes `f` NON-RECIPROCAL, so a particle vertex needs
     the ADJOINT (0.276.0).* The convention divides by `cos(ns, wi)`, the **newly sampled**
-    direction — self-consistent on a continuation, where the direction evaluated is the direction
-    sampled, but not at a *connection*. `Glossy` is the clearest case: its lobe factor is
+    direction, which is the light's side on a camera walk and the camera's on a light walk.
+    `Glossy` is the clearest case: its lobe factor is
     symmetric under swapping `wo`/`wi` (`dot(wi, reflect(-wo,ns)) == dot(wo, reflect(-wi,ns))`,
     algebraically) while the denominator is not, so one physical path picked up
     `r·lobe/cos(camera-side)` when a light subpath built it and `r·lobe/cos(light-side)` when a
@@ -4178,9 +4178,18 @@ holding a glass ball), and on the device `-rgb`, mode S and every one of those.
     `dBsdfFAdjoint`) is Veach's particle-tracing rule for the BSDF itself; `shadingAdjointCorr`
     was already the shading-normal half of it, and the two are **independent** — the latter is 1
     on flat geometry, where this is still required. **The rule for new code: every site that needs
-    `shadingAdjointCorr` needs `bsdfFAdjoint` too, and no other site does.** That criterion is
-    greppable, which is how the scope was bounded to 12 call lines across `bdpt.h`, `vcm.h` and
-    `render_cuda.cu` rather than guessed at. Which direction is correct is settled by energy, not
+    `shadingAdjointCorr` needs the BSDF's adjoint too, and no other site does.** At a connection
+    that is `bsdfFAdjoint`. On a light walk's *continuation* -- which carries `shadingAdjointCorr`
+    too -- it is the factor the sampler applies: drawing the camera-side direction `wOut` from the
+    lobe about the arrival `wIn`, a glossy vertex's `f*·cos/pdf` is `r · cos(wOut)/cos(wIn)`
+    (`glossyAdjointRatio`, device `dGlossyAdjointRatio`), not the `r` a camera walk takes. 0.276.0
+    called the continuation self-consistent and left it at `r`; until 0.440.2 every glossy bounce
+    on a light subpath (bdpt.h randomWalk, vcm.h scatterSample, render.h's photon tracers and a
+    layered coat's lobe, and their device twins) was off by `cos(wIn)/cos(wOut)` -- light that
+    arrives steep and leaves grazing read 1.3x mode R in B and M (GLOSSY-FLAT-DJU,
+    `tools/check_glossy_adjoint.py`). The adjoint is not energy-conserving toward the light (it
+    can exceed `r`), so a photon tracer's ledger books the difference as negative or positive
+    absorption. Which direction is correct is settled by energy, not
     preference: under uniform illumination `∫ r·lobe/cos(w_incident) · cos(w_incident) dω = r`,
     whereas dividing by the camera-side cosine does not integrate to `r` — and a white-furnace
     test measures mode `R`, which builds paths camera-side, flat to **0.04 %**. Leave `bsdfPdf`
