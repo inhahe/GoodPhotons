@@ -168,7 +168,7 @@ inline double gatherFootprintArea(const Scene& sc, const Vec3& p, const Vec3& n,
             if (!h.valid) break;
             h.t += tBase;                            // depth along the chord from `start`
             if (h.t > top) break;
-            // THE FACING TEST MUST BE THE PHOTON QUERY'S, EXACTLY. That query (onGatherSurface)
+            // THE FACING TEST MUST BE THE PHOTON QUERY'S, EXACTLY. That query (onGatherSurfaceSided)
             // keeps a photon when `dot(ph.n, n) >= 0.5` — SIGNED, against consistently-oriented
             // normals — and it lies in the tangent-plane band, which the test below adds —
             // so a back face is rejected and contributes no photons. The first version of

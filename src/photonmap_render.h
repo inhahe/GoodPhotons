@@ -576,7 +576,7 @@ inline double gatherCoverageRaw(const Scene& scene, const Vec3& p, const Vec3& n
                 if (depth > 0.25) g.deep.fetch_add(1, std::memory_order_relaxed);
             }
         }
-        // Same 60-degree acceptance the photon query uses (onGatherSurface: kGatherFacingCos, both
+        // Same 60-degree acceptance the photon query uses (onGatherSurfaceSided: kGatherFacingCos, both
         // the true normal on the side the light arrives from, after the band above), so the
         // footprint and the estimator agree on what surface is "here".
         if (h.valid && h.t <= 2.0 * r) {

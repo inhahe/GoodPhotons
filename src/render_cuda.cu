@@ -7731,6 +7731,15 @@ __device__ static Real dCompoundDepositWeight(const DScene& sc, const DMaterial&
     if (!dLambertArrival(h, ngo, wi, firstBounce, s)) return (Real)0;
     return beta * s * dArrivalAdjoint(h, ngo, wi);
 }
+// Host twin bdpt.h compoundMergeSoftening (where the why is): the factor a compound's first-bounce
+// merge copy's weight takes -- its gathering lobes' softening over the vertex's own.
+__device__ static double dCompoundMergeSoftening(const DScene& sc, const DMaterial& compound,
+                                                 const DVec3& toEm, const DVec3& ns, const DVec3& ngo,
+                                                 double vertexSoftening) {
+    if (!(vertexSoftening > 0.0)) return 0.0;
+    const double lobes = dCompoundTransmits(sc, compound) ? 1.0 : (double)dShadowTerminatorG(toEm, ns, ngo);
+    return lobes / vertexSoftening;
+}
 // Whether the gathers count a face of material `m` as one that holds photons (host twin
 // holdsPhotons, where the reasoning lives).
 __device__ static bool dHoldsPhotons(const DScene& sc, const DMaterial& m, Real fiberRadius) {
@@ -7766,16 +7775,9 @@ __device__ static bool dPassesLight(const DScene& sc, const DMaterial& m) {
 }
 
 // The vector glue of gatherplane.h's rule (MERGE-PROXIMITY), which both backends call: a stored
-// photon belongs to a mode-M or mode-S gather's surface when it faces the gather point's way and
-// lies near its tangent plane (host onGatherSurface). `d2` = |pp - x|^2, from the caller's radius
-// test; `slack` from gatherBandSlack.
-__device__ static inline bool dOnGatherSurface(const DVec3& x, const DVec3& n, const DVec3& pp,
-                                               const DVec3& pn, Real d2, Real slack) {
-    const Real c = dot(pn, n);
-    if (c < (Real)kGatherFacingCos) return false;
-    return withinGatherBand<Real>(fabs(dot(pp - x, n)), d2, c, slack);
-}
-// ...on a two-sided surface too (host twin onGatherSurfaceSided, where the why is: TRANSLUCENT-MS).
+// photon belongs to a mode-M or mode-S gather's surface when it faces the gather point's way (either
+// way at a two-sided one) and lies near its tangent plane (host twin onGatherSurfaceSided, where the
+// why is). `d2` = |pp - x|^2, from the caller's radius test; `slack` from gatherBandSlack.
 __device__ static inline bool dOnGatherSurfaceSided(const DVec3& x, const DVec3& n, const DVec3& pp,
                                                     const DVec3& pn, Real d2, Real slack, bool twoSided,
                                                     bool& farSide) {
@@ -8025,7 +8027,7 @@ __device__ static inline void dPmNeighborhood(const DPhotonMap& pm, const DVec3&
 //
 // Returns pm.radius exactly when kGather <= 0 or the whole disc holds fewer than k photons,
 // so a fixed-radius map keeps the fixed-radius path. The surface test matches the caller's
-// (dOnGatherSurface at gatherBandSlack(pm.radius, fiberR), as its sum; a mismatch would divide accepted
+// (dOnGatherSurfaceSided at gatherBandSlack(pm.radius, fiberR), as its sum; a mismatch would divide accepted
 // photons by an area chosen for a rejected population and print a dark seam along every surface
 // junction).
 #define PM_ADAPT_BINS 16                     // covers r down to r * 2^-8 = r/256
@@ -16167,6 +16169,19 @@ __device__ __noinline__ static bool bkInteractHair(const DScene& sc, const DMate
     return true;
 }
 
+// Host twin BackwardRenderer::tailPassesStrand (where the why is): at a capped path's tail, a strand
+// passes the ray with probability 1 - opacity, weight 1 -- no vertex, so the tail goes on past it,
+// moved as bkInteractHair moves a pass-through.
+__device__ static bool bkTailPassesStrand(const DScene& sc, const DMaterial& m, const DHit& h, Real lambda,
+                                          DVec3& ro, DVec3& rd, DRng& rng, Real* curveTminOut) {
+    const DHairShade hs = dHairShadeAt(sc, m, h, lambda, rd * (Real)(-1));
+    if (!((double)hs.b.opacity < 1.0) || rng.uniform() >= 1.0 - (double)hs.b.opacity) return false;
+    const Real exitOff = dHairExitOffset(hs, h.n, rd);
+    if (curveTminOut) *curveTminOut = exitOff;
+    ro = curveTminOut ? dOffsetPoint(h.p, rd) : (h.p + rd * exitOff);
+    return true;
+}
+
 // Handle ONE surface material interaction on a single wavelength — the whole material
 // switch, factored out of bkRadiance (device twin of backward.h interactMaterial) so the
 // scalar tracer and the hero tracer (which de-heros before calling this) share one copy.
@@ -16671,7 +16686,14 @@ __device__ static double bkRadiance(const DScene& sc, int diffraction, DVec3 ro,
             }
         }
 
-        if (tail) return L;                             // the light it reached, and no more
+        if (tail) {                                     // the light it reached, and no more --
+            if (mp->type == D_HAIR && nullSteps < 256 &&      // but past a strand it passes
+                bkTailPassesStrand(sc, *mp, h, lambda, ro, rd, rng, &curveTmin)) {
+                --b; ++nullSteps; dUnnoteFirst(firstHere);
+                continue;
+            }
+            return L;
+        }
         bool nullEvt = false;
         if (!bkInteract<GiDepth == 0>(sc, mp, h, matId, diffraction, directOnly, ro, rd, lambda,
                                       invPdfLambda, thr, L, specularArrival, contBsdfPdf, stk,
@@ -16929,7 +16951,14 @@ __device__ static void bkRadianceHeroLoop(const DScene& sc, int diffraction,
                     L[i] += thr[i] * (double)specLookup(*eSpd, lam[i]) * invPdf[i] * ep * contSoft;
             }
         }
-        if (tail) return;                               // the light it reached (scalar twin)
+        if (tail) {                                     // the light it reached (scalar twin)
+            if (mp->type == D_HAIR && nullStepsH < 256 &&
+                bkTailPassesStrand(sc, *mp, h, lam[0], ro, rd, rng, &curveTmin)) {
+                --b; ++nullStepsH; dUnnoteFirst(firstHere);
+                continue;
+            }
+            return;
+        }
 
         // GLOSSY-NEE: cleared HERE and not at the top of the loop. `gmis` is written by the
         // PREVIOUS bounce's glossy branch and read by THIS bounce's emitter/sun sites above, so
@@ -18314,9 +18343,9 @@ __device__ static void dRandomWalk(const DScene& sc, const DCamera& cam, int dif
         const DMaterial* mp = &sc.mats[h.matId];
         int matId = h.matId;
         double storeP = 0.0;      // COMPOUND-MERGE-PICK (compoundMergeW)
-        bool compoundLambert = false;   // a compound whose gathering lobes are all Lambertian
+        const DMaterial* compound = nullptr;   // the compound a merge copy here belongs to
         if (dIsCompound(mp->type)) {
-            compoundLambert = !dCompoundTransmits(sc, *mp);
+            compound = mp;
             int coatPick = -1; double coatR = 0.0, coatCos = 1.0, coatU = 0.0; Real coatTh = (Real)0;
             int child = dResolveCompound(sc, *mp, h, rd, lambda, rng,     // honours per-hit blend mask
                                          &coatPick, &coatR, &coatCos, &coatTh, &coatU);
@@ -18633,17 +18662,18 @@ __device__ static void dRandomWalk(const DScene& sc, const DCamera& cam, int dif
 
         beta *= betaFactor;
         for (int i = 0; i + 1 < nUp; ++i) betaSec[i] *= secChromatic ? secF[i] : betaFactor;
-        // A compound's merge copy at the first bounce where the pick went delta (host twin
-        // mergeCopySoftening): path[cur].beta is what a merge reads there.
-        if (importance && delta && cur == 1 && compoundLambert && compoundMergeW &&
-            compoundMergeW[cur] > 0.0f) {
+        // A compound's merge copy at the first bounce (host twin compoundMergeSoftening): its merge
+        // weight takes the gathering lobes' softening over the one dSoftenFirstBounce gives the vertex.
+        if (importance && cur == 1 && compound && compoundMergeW && compoundMergeW[cur] > 0.0f) {
             const DVec3 d = path[0].p - path[cur].p;
             const double l2 = (double)ddot(d, d);
             if (l2 > 0.0) {
-                const double s = (double)dShadowTerminatorG(d * (Real)(1.0 / sqrt(l2)), path[cur].ns,
-                                                            dVertexGeoN(path[cur]));
-                path[cur].beta *= s;
-                for (int i = 0; i + 1 < nUp; ++i) pathSec[cur * secStride + i] *= s;
+                const DVec3 toEm = d * (Real)(1.0 / sqrt(l2));
+                const DVec3 ngo = dVertexGeoN(path[cur]);
+                const double vs = (delta || dTwoSidedType(mp->type))       // dEmitterSoftening's
+                                ? 1.0 : (double)dShadowTerminatorG(toEm, path[cur].ns, ngo);
+                compoundMergeW[cur] *= (float)dCompoundMergeSoftening(sc, *compound, toEm, path[cur].ns,
+                                                                      ngo, vs);
             }
         }
         // Veach adjoint shading-normal correction on the LIGHT subpath only (1 when
@@ -22560,28 +22590,31 @@ __global__ void kVcmLightT(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx,
                 beta *= sL;
                 for (int k = 0; k + 1 < nUp; ++k) betaSec[k] *= sL;
             }
-            // ...and a compound's merge copy where the pick went delta (host twin vcm.h sStore).
-            const double sStore = (edges == 1 && !connectible && storeP > 0.0 &&
-                                   !dCompoundTransmits(sc, sc.mats[h.matId]))
-                                ? (double)dShadowTerminatorG(wo, h.n, ngo) : 1.0;
+            // ...and a compound's merge copy: its gathering lobes' softening in its merge weight,
+            // over the vertex's own above (host twin vcm.h, dCompoundMergeSoftening).
+            const double mergeSoft = (edges == 1 && storeP > 0.0)
+                ? dCompoundMergeSoftening(sc, sc.mats[h.matId], wo, h.n, ngo,
+                                          (connectible && !dTwoSidedType(mp->type))
+                                              ? (double)dShadowTerminatorG(wo, h.n, ngo) : 1.0)
+                : 1.0;
             if (connectible || storeP > 0.0) {
                 if (stored < vcmCap) {
                     DVcmLV lv;
                     lv.p = h.p; lv.ns = h.n; lv.ng = h.ng; lv.wo = wo;
-                    lv.beta = beta * sStore; lv.lambda = (float)lambda;
+                    lv.beta = beta; lv.lambda = (float)lambda;
                     lv.cx = (float)cieLx; lv.cy = (float)cieLy; lv.cz = (float)cieLz;
                     lv.dVCM = dVCM; lv.dVC = dVC; lv.dVM = dVM;
                     lv.matId = matId; lv.edges = edges; lv.u = h.u; lv.v = h.v; lv.curv = h.curv;
                     lv.vcol = h.vcol; lv.vb0q = dPackBary(h.vb0); lv.vb1q = dPackBary(h.vb1);
                     lv.extMat1 = (unsigned)(h.extMat + 1);
-                    lv.mergeW = (storeP > 0.0) ? (float)(1.0 / storeP) : 1.0f;
+                    lv.mergeW = (float)(((storeP > 0.0) ? 1.0 / storeP : 1.0) * mergeSoft);
                     lv.tangent = h.tangent; lv.fiberR = h.fiberRadius; lv.pscale = h.pscale;
                     lv.back = h.back ? 1u : 0u; lv.patOwnSide = h.patOwnSide ? 1u : 0u;
                     lv.nUp = (unsigned)nUp;
                     lvSlab[i * vcmCap + stored] = lv;
                     if (NS > 0 && lvSec) {
                         DVcmSec* row = lvSec + (size_t)(i * vcmCap + stored) * secStride;
-                        for (int k = 0; k + 1 < nUp; ++k) { row[k].beta = betaSec[k] * sStore; row[k].lam = (float)lamAll[k + 1]; }
+                        for (int k = 0; k + 1 < nUp; ++k) { row[k].beta = betaSec[k]; row[k].lam = (float)lamAll[k + 1]; }
                     }
                     stored++;
                 }

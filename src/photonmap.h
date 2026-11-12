@@ -27,7 +27,7 @@
 #include <utility>
 #include <thread>
 #include "linalg.h"
-#include "gatherplane.h"   // onGatherSurface: which photons a gather keeps
+#include "gatherplane.h"   // onGatherSurfaceSided: which photons a gather keeps
 #include "color.h"
 #include "allocreport.h"   // OOM that names the buffer, its size and the flag that sizes it
 #include "workcount.h"    // tlWork: a query's candidates, for the CPU refresh (MODEM-CPU-NONDET)
@@ -451,7 +451,7 @@ struct PhotonMap {
     // `radius` of p. `index` addresses the photon's row in photons[] / cie[].
     template <class F>
     void query(const Vec3& p, F&& fn) const { queryR(p, radius, std::forward<F>(fn)); }
-    // The slack of this map's plane test (onGatherSurface) for a gather point on a curve of radius
+    // The slack of this map's plane test (onGatherSurfaceSided) for a gather point on a curve of radius
     // `fiberR` (0 off one): one value for the adaptive radius's count and the gather's sum.
     double gatherSlack(double fiberR) const { return gatherBandSlack(radius, fiberR); }
 
@@ -493,7 +493,7 @@ struct PhotonMap {
 
     // ------------------------- PER-QUERY ADAPTIVE GATHER RADIUS -------------------------
     // Returns the radius this particular gather should use: the radius of the smallest disc
-    // around `p` that holds `kGather` photons of its own surface (onGatherSurface), capped at
+    // around `p` that holds `kGather` photons of its own surface (onGatherSurfaceSided), capped at
     // `radius`.
     // `kGather <= 0` returns `radius` unchanged, so every caller is bit-identical when the
     // feature is off.
@@ -522,7 +522,7 @@ struct PhotonMap {
     // Take the tightest shell that still holds k, then interpolate inside it under the local
     // uniform-density assumption (count grows as r^2): r_q^2 = r_i^2 * k / C_i.
     //
-    // The surface test (onGatherSurface: facing, and near the tangent plane) is applied HERE and
+    // The surface test (onGatherSurfaceSided: facing, and near the tangent plane) is applied HERE and
     // not only in the caller's sum, deliberately. Counting a wall's photons while gathering the
     // floor beside it would shrink the radius for a population the sum then rejects, and the
     // estimate is divided by pi*r_q^2 either way — so the mismatch would print a dark seam along

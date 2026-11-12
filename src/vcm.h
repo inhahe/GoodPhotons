@@ -801,26 +801,26 @@ inline void traceLightSubpath(const Scene& scene, const Camera& cam, const Rende
             beta *= sL;
             for (int i = 0; i + 1 < nUp; ++i) betaSec[i] *= sL;
         }
-        // ...and a compound's merge copy where the pick went to a lobe that does not connect (a
-        // delta coat): the merges evaluate its gathering lobes, which the first bounce softens as
-        // above, while the delta's continuation goes on unsoftened (bdpt.h softenFirstBounce).
-        const double sStore = (edges == 1 && !connectible && storeP > 0.0 &&
-                               !compoundTransmits(scene, scene.mats[h.matId]))
-                            ? shadowTerminatorG(wo, h.n, ngo) : 1.0;
+        // ...and a compound's merge copy: the merges evaluate its gathering lobes, whose softening
+        // its merge weight takes over the vertex's own above (bdpt.h compoundMergeSoftening).
+        const double mergeSoft = (edges == 1 && storeP > 0.0)
+            ? bdpt::compoundMergeSoftening(scene, scene.mats[h.matId], wo, h.n, ngo,
+                                     (connectible && !isTwoSidedMat(*mp)) ? shadowTerminatorG(wo, h.n, ngo) : 1.0)
+            : 1.0;
         if (connectible || storeP > 0.0) {
             LightVertex lv;
             lv.p = h.p; lv.ns = h.n; lv.ng = h.ng; lv.wo = wo;
-            lv.beta = beta * sStore; lv.lambda = (float)lambda;
+            lv.beta = beta; lv.lambda = (float)lambda;
             lv.cx = cieX(lv.lambda); lv.cy = cieY(lv.lambda); lv.cz = cieZ(lv.lambda);
             lv.dVCM = dVCM; lv.dVC = dVC; lv.dVM = dVM;
             lv.matId = h.matId; lv.mat = mp; lv.hit = h; lv.edges = edges;
-            lv.mergeW = (storeP > 0.0) ? 1.0 / storeP : 1.0;
+            lv.mergeW = ((storeP > 0.0) ? 1.0 / storeP : 1.0) * mergeSoft;
             out.push_back(lv);
             if (C > 1) {                              // lockstep secondary payload
                 LightVertexSec ls; ls.nUp = nUp;
                 for (int i = 0; i + 1 < nUp; ++i) {
                     ls.lam[i] = (float)hb.lam[i + 1];
-                    ls.beta[i] = betaSec[i] * sStore;
+                    ls.beta[i] = betaSec[i];
                     ls.cx[i] = cieX(ls.lam[i]); ls.cy[i] = cieY(ls.lam[i]); ls.cz[i] = cieZ(ls.lam[i]);
                 }
                 outSec.push_back(ls);

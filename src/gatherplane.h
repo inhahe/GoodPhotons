@@ -2,7 +2,7 @@
 // Which stored photons a mode-M or mode-S density estimate keeps (MERGE-PROXIMITY): photonmap.h's
 // adaptive radius, the gathers in photonmap_render.h and sppm_render.h, and the footprints that
 // divide their estimates (photonmap_render.h's probe, gafootprint.h). The scalar rules are
-// templates both backends call, so the device's vector glue (render_cuda.cu, dOnGatherSurface)
+// templates both backends call, so the device's vector glue (render_cuda.cu, dOnGatherSurfaceSided)
 // cannot drift from them.
 //
 // Not modes U and J. Their merges divide by the whole disc with no footprint to say how much of it
@@ -64,17 +64,11 @@ template <class T> FT_GP_HD inline T gatherBandSlack(T radius, T fiberR) {
     return (fiberR > T(0) && fiberR < radius) ? T(HUGE_VAL) : radius * T(1e-3);
 }
 
-// A photon at `pp`, true normal `pn` (on the side its light came from), for a gather at `x`, true
-// normal `n`; `d2` = |pp - x|^2, which every caller has from its radius test. `slack` must be the
-// same wherever one gather's photons are counted and summed (mode M's radius, its sum and its
+// THE GATHER TEST: a photon at `pp`, true normal `pn` (on the side its light came from), for a gather
+// at `x`, true normal `n`; `d2` = |pp - x|^2, which every caller has from its radius test. `slack` must
+// be the same wherever one gather's photons are counted and summed (mode M's radius, its sum and its
 // footprint: PhotonMap::gatherSlack), or they see different populations.
-inline bool onGatherSurface(const Vec3& x, const Vec3& n, const Vec3& pp, const Vec3& pn, double d2,
-                            double slack) {
-    const double c = dot(pn, n);
-    if (c < kGatherFacingCos) return false;
-    return withinGatherBand(std::fabs(dot(pp - x, n)), d2, c, slack);
-}
-
+//
 // A gather on a TWO-SIDED surface (`twoSided`: a `translucent` visible point, TRANSLUCENT-MS) takes the
 // photons on either side of it: those facing the gather point's way (its near side, lit as a
 // reflector) and those facing the other (`farSide`: the light the sheet transmits from behind, which
@@ -82,8 +76,8 @@ inline bool onGatherSurface(const Vec3& x, const Vec3& n, const Vec3& pp, const 
 // far-side photon without the band's flat allowance, so that it must lie on the sheet itself, within
 // its curvature (d sin theta) and the slack: the far face of a thin sheet is the sheet, while the
 // back face of a thick translucent solid, parallel to it a thickness away, is another surface whose
-// photons are the light arriving at that face, not the light this one transmits. One-sided,
-// onGatherSurface's alone.
+// photons are the light arriving at that face, not the light this one transmits. One-sided
+// (`twoSided` false), the near side's alone.
 template <class T> FT_GP_HD inline bool gatherFacing(T c, bool twoSided, bool& farSide) {
     farSide = false;
     if (c >= T(kGatherFacingCos)) return true;

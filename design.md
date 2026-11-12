@@ -3732,7 +3732,8 @@ holding a glass ball), and on the device `-rgb`, mode S and every one of those.
       softening and adjoint is booked in the photon's energy ledger (what it removes as
       absorbed, what it adds as negative absorption), so the ledger still balances. A compound's
       merge copy at a first bounce whose pick went delta is softened only where its gathering
-      lobes are all Lambertian (`mergeCopySoftening`; vcm.h `sStore`). The camera side mirrors it
+      lobes are all Lambertian, in the copy's merge weight over the vertex's own softening
+      (`compoundMergeSoftening`; vcm.h's light walk). The camera side mirrors it
       (0.440.6): the softening is the integrand's, at the vertex next to the light whichever
       strategy reaches it, so every light a camera walk's own continuation reaches -- an emitter
       hit after a glossy bounce, the sky after a diffuse or glossy one, the sun, a fire along the
@@ -5859,8 +5860,9 @@ as the one at fault.
   one iteration past its cap -- the TAIL, `b == maxB` -- tracing the ray its last vertex sampled for
   the light it reaches (an emitter at the weight the arrival takes anywhere, the sky or sun, the
   fire along the segment) and stopping there: no medium or fur collision, no NEE, no material
-  interaction. Without it a glossy vertex at the cap kept only its light sampling's MIS share and a
-  mirror there saw no light (mode D read x1.29 of R over a glossy-walled box at `-max-bounce 1`).
+  interaction -- but a strand it meets that passes it (probability 1 - opacity, hair::sample's
+  null lobe) is no vertex, and the tail goes on past it (`tailPassesStrand`). Without the tail a
+  glossy vertex at the cap kept only its light sampling's MIS share and a mirror there saw no light (mode D read x1.29 of R over a glossy-walled box at `-max-bounce 1`).
   The device's bkRadiance, its hero and RGB twins, and the camera walks of modes M and S (host and
   device, their in-scattering along the tail skipped too) take the same tail.
 

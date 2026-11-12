@@ -2587,6 +2587,37 @@ Not changed:
   pay it, and the normalising divide runs only where reflect + transmit exceeds 1; not worth a
   per-material cache.
 
+## DONE (2026-11-12, 0.440.7): REVIEW-4405 — what the Opus review of 0.440.4-0.440.5 found
+
+`/code-review xhigh` (Opus) of 88558c8..fe35bae (GLOSSY-DEPTH-CAP and REVIEW-4403's follow-ups):
+10 findings, each checked against the code. Fixed in 0.440.7:
+
+* **The tail treated a strand it met as a vertex**, where every other iteration refunds a coverage
+  pass-through as none: see-through fur over a sky-lit floor darkened it at a small cap. At the tail
+  a strand now passes the ray with probability 1 - opacity at weight 1 -- exactly hair::sample's
+  null lobe -- and the tail goes on past it (BackwardRenderer::tailPassesStrand, device
+  bkTailPassesStrand; mode R's scalar and hero loops on both backends). check_fur_null gains the
+  case: a furred ball low over a sky-lit floor, mode R at -max-bounce 1, opacity-0 fur against none.
+* **A compound's merge copy took the softening of whichever lobe its pick went to.** The copy is
+  read by the merges as the vertex's throughput times its merge weight, and the throughput takes the
+  picked lobe's softening; a compound with a translucent and a diffuse lobe was therefore softened
+  when the pick was diffuse and not when it was delta. The merge weight now carries the gathering
+  lobes' softening over the vertex's own (`compoundMergeSoftening`, device twin; one rule for bdpt.h
+  randomWalk, vcm.h's light walk and their device twins, replacing four hand copies), and the
+  device evaluates the compound's lobes only on that first-bounce branch.
+* **A coat's own material was indexed unguarded** (render.h's coat bounces, backward.h's
+  contSoftening calls): `coatChild >= 0` first.
+* **The chromatic-coat split re-entered without the parent's glossy MIS record**, so a sub-path
+  re-scored an emission the parent's glossy NEE had already weighted: it now passes `&gmis`.
+* **onGatherSurface and dOnGatherSurface had no callers left** after the adaptive radius moved to the
+  sided test: removed, and the comments that named them now name onGatherSurfaceSided.
+* vcm.h's comment on the merge copy, and REFERENCE.md's `-max-bounce` row (mode S honours it on both
+  backends; only mode M on the GPU does not).
+
+Not changed: on the tail, a chromatic layered coat still splits into sub-paths that re-trace the
+segment for its body's emission -- at most C - 1 traces, once per capped path that ends on such a
+coat; not worth a separate per-wavelength tail path.
+
 ## OPEN (2026-11-12, 0.440.6): B-ENV-WALLS — mode B reads walls lit by a sky about 1 % bright
 
 Found adding check_bump_modes' sky room: five diffuse walls (reflect 0.8) open to a constant sky (no

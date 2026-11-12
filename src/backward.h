@@ -1151,6 +1151,19 @@ struct BackwardRenderer {
         return Lsun;
     }
 
+    // At a capped path's tail (radianceLoop), a strand the traced ray meets: a coverage pass-through
+    // (probability 1 - opacity, weight exactly 1 -- hair::sample's null lobe) is no vertex, so the tail
+    // goes on past it (true, `ray` moved past the strand, as the Hair case moves it); anything else is a
+    // fiber vertex past the cap. Device twin bkTailPassesStrand.
+    bool tailPassesStrand(const Scene& scene, const Material& m, const Hit& h, double lambda, Ray& ray,
+                          Pcg32& rng) const {
+        const HairShade hs = hairShadeAt(scene, m, h, lambda, ray.d * -1.0);
+        if (!(hs.b.opacity < 1.0) || rng.uniform() >= 1.0 - hs.b.opacity) return false;
+        const Vec3 d = ray.d;
+        ray = Ray{h.p + d * 1e-9, d, hairExitOffset(hs, h.n, d)};
+        return true;
+    }
+
     // Balance-heuristic weight for an emitter reached by the CONTINUATION. 1 when the vertex
     // it left was not a MIS'd glossy bounce, or when the light is not MIS-covered.
     // `hit`: as lightPdfW's.
@@ -2999,7 +3012,7 @@ struct BackwardRenderer {
                         if (!continueAlong(h, o, Lobe::Reflect, ray)) return L;
                         specularArrival = true;
                         gmis.clear();      // the sheen does no NEE: its arrival is unweighted
-                        contSoft = contSoftening(scene.mats[(size_t)cm.coatChild], h, ray.d);
+                        contSoft = (cm.coatChild >= 0) ? contSoftening(scene.mats[(size_t)cm.coatChild], h, ray.d) : 1.0;
                         continue;
                     }
                     if (!whittedAttenuate(thr, 1.0 - R, Renderer::localN2(scene, stk, lambda))) return L;
@@ -3017,7 +3030,7 @@ struct BackwardRenderer {
                     // glossy bounce's MIS record must not outlive it (interactMaterial, which
                     // clears it, is never reached from here).
                     gmis.clear();
-                    contSoft = contSoftening(scene.mats[(size_t)cm.coatChild], h, ray.d);   // a glossy lobe
+                    contSoft = (cm.coatChild >= 0) ? contSoftening(scene.mats[(size_t)cm.coatChild], h, ray.d) : 1.0;   // a glossy lobe
                     continue;
                 }
                 int child = mixResolveChild(scene, cm, h, rng.uniform());   // body lobe (honours a weight map)
@@ -3043,7 +3056,14 @@ struct BackwardRenderer {
                 L += thr * emitSlot(scene, m, h, lambda, ray.d * -1.0) * invPdfLambda * wMis * contSoft;
             }
 
-            if (tail) return L;                           // the light it reached, and no more
+            if (tail) {                                   // the light it reached, and no more --
+                if (m.type == MatType::Hair && nullSteps < 256 &&   // but past a strand it passes
+                    tailPassesStrand(scene, m, h, lambda, ray, rng)) {
+                    --b; ++nullSteps; unnoteFirst(gi, firstHere);
+                    continue;
+                }
+                return L;
+            }
             bool nullEvt = false;
             if (!interactMaterial(scene, m, h, mats, ray, lambda, invPdfLambda, thr, L,
                                   specularArrival, contBsdfPdf, stk, rng, spdCache, gi, gmp,
@@ -3497,7 +3517,7 @@ struct BackwardRenderer {
                                          /*C=*/1, /*secAlive=*/false, specularArrival,
                                          contBsdfPdf, b, sub, rng, sCp, gs,
                                          /*rcTrain=*/true, /*firstSegSampled=*/true,
-                                         /*reentryCoatU=*/uCoat, /*gmis0=*/nullptr, contSoft);
+                                         /*reentryCoatU=*/uCoat, &gmis, contSoft);
                         if (gi.firstSec) gi.firstSec[i] = sFirst;
                         L[i] += sub[0];      // this wavelength's own estimate, own slot
                         thr[i] = 0.0;        // now that sub-path's business, not ours
@@ -3522,7 +3542,7 @@ struct BackwardRenderer {
                     if (!continueAlong(h, o, Lobe::Reflect, ray)) { finish(); return; }
                     specularArrival = true;
                     gmis.clear();                // no NEE here: see the scalar twin
-                    contSoft = contSoftening(scene.mats[(size_t)cm.coatChild], h, ray.d);   // a glossy lobe
+                    contSoft = (cm.coatChild >= 0) ? contSoftening(scene.mats[(size_t)cm.coatChild], h, ray.d) : 1.0;   // a glossy lobe
                     continue;
                 }
                 if (whitted) {                   // body: every live λ enters the stack
@@ -3548,7 +3568,14 @@ struct BackwardRenderer {
                 for (int i = 0; i < nUp; ++i)
                     L[i] += thr[i] * m.emit(lam[i]) * ep * invPdf[i] * contSoft;
             }
-            if (tail) { finish(); return; }              // the light it reached (scalar twin)
+            if (tail) {                                  // the light it reached (scalar twin)
+                if (m.type == MatType::Hair && nullSteps < 256 &&
+                    tailPassesStrand(scene, m, h, lam[0], ray, rng)) {
+                    --b; ++nullSteps; unnoteFirst(gi, firstHere);
+                    continue;
+                }
+                finish(); return;
+            }
 
                 // GLOSSY-NEE: cleared HERE and not at the top of the loop, which is the whole
                 // subtlety. `gmis` is written by the PREVIOUS bounce's glossy branch and read by

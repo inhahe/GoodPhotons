@@ -13,7 +13,14 @@ A fog box under an area light, a ball of `opacity 0` fur between them, rendered 
 wavelength per path (-heroc 1) and with the bundle (-heroc 4), against the same scene without the
 fur block (its core sphere kept, so only the fur differs). Compared tile by tile; a tile fails when
 the two differ by more than 5 standard errors (from the seed pairs, tile- and pixel-wise, the
-larger kept) AND by more than 1 %. Exits 1 on any failure.
+larger kept) AND by more than 1 %.
+
+And the same null at a bounce cap, under a sky: a floor with a furred ball low over it, lit by a
+constant sky alone, mode R at -max-bounce 1. The floor's sky reaches it by its light sampling and by
+its own escape, MIS-weighted, and the escape at the cap is the tail of the walk; a strand it meets
+there is a coverage pass-through (no vertex) and must be passed, as everywhere else in the walk, or
+see-through fur darkens the floor under it (BackwardRenderer::tailPassesStrand). Exits 1 on any
+failure.
 """
 import argparse
 import os
@@ -39,6 +46,12 @@ BASE = [
     'sphere "ball" { center 0 1.45 0.5  radius 0.01  material core }',
 ]
 FUR = 'fur "coat" { on "ball"  material fur  count 30000  length 0.25  length_jitter 0.3  radius 0.001  droop 0.1  jitter 0.25  seed 7 }'
+# The cap's case: no fog, no lamp, a sky; the ball low over the floor, its fur long and dense.
+SKY = [l for l in BASE if not l.startswith(("light area", "medium", "sphere"))] + [
+    'light env { spd preset:d65 }',
+    'sphere "ball" { center 0 0.35 0.5  radius 0.05  material core }',
+]
+SKY_FUR = 'fur "coat" { on "ball"  material fur  count 60000  length 0.3  length_jitter 0.3  radius 0.001  droop 0.0  jitter 0.25  seed 7 }'
 
 
 def main():
@@ -51,19 +64,23 @@ def main():
     a.exe = os.path.abspath(a.exe)
     out = os.path.abspath(a.out)
     os.makedirs(out, exist_ok=True)
-    for name, lines in (("fur", BASE + [FUR]), ("bare", BASE)):
+    for name, lines in (("fur", BASE + [FUR]), ("bare", BASE), ("skyfur", SKY + [SKY_FUR]), ("skybare", SKY)):
         with open(os.path.join(out, name + ".ftsl"), "w", encoding="utf-8", newline="") as f:
             f.write(NL.join(lines) + NL)
     ok = True
-    for heroc in (1, 4):
+    for heroc, pre, extra in ((1, "", []), (4, "", []), (1, "sky", ["-max-bounce", "1"]),
+                              (4, "sky", ["-max-bounce", "1"])):
         stats = {}
-        for name in ("fur", "bare"):
+        for name in (pre + "fur", pre + "bare"):
             imgs = []
             for seed in (1, 2):
                 png = os.path.join(out, "%s_c%d_s%d_n%d.png" % (name, heroc, seed, a.spp))
+                for f in (png, png[:-4] + ".pfm"):          # never score an earlier run's image
+                    if os.path.exists(f):
+                        os.remove(f)
                 cmd = [a.exe, "-in", os.path.join(out, name + ".ftsl"), "-mode", "R", "-device", a.device,
                        "-spp", str(a.spp), "-heroc", str(heroc), "-seed", str(seed), "-hdr",
-                       "-no-meter", "-o", png]
+                       "-no-meter", "-o", png] + extra
                 r = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
                 pfm = png[:-4] + ".pfm"
                 if r.returncode != 0 or not os.path.exists(pfm):
@@ -71,7 +88,7 @@ def main():
                     raise SystemExit("render failed: " + " ".join(cmd))
                 imgs.append(read_pfm(pfm).sum(-1))
             stats[name] = tile_stats(imgs[0], imgs[1])
-        (m1, e1), (m0, e0) = stats["fur"], stats["bare"]
+        (m1, e1), (m0, e0) = stats[pre + "fur"], stats[pre + "bare"]
         z = np.abs(m1 - m0) / np.maximum(np.hypot(e1, e0), 1e-30)
         ratio = m1 / np.maximum(m0, 1e-30)
         live = m0 > 0.02 * m0.max()
@@ -80,8 +97,9 @@ def main():
         ok &= good
         zl = np.where(live, z, 0.0)
         i, j = np.unravel_index(int(np.argmax(zl)), zl.shape)
-        print("%s: heroc %d: opacity-0 fur / no fur, frame x%.4f; worst tile x%.4f (%.1f sigma)" % (
-            "ok" if good else "FAIL", heroc, m1.sum() / m0.sum(), ratio[i, j], zl[i, j]), flush=True)
+        print("%s: %sheroc %d: opacity-0 fur / no fur, frame x%.4f; worst tile x%.4f (%.1f sigma)" % (
+            "ok" if good else "FAIL", "sky at -max-bounce 1, " if pre else "", heroc, m1.sum() / m0.sum(),
+            ratio[i, j], zl[i, j]), flush=True)
     print("PASS" if ok else "FAILED")
     return 0 if ok else 1
 

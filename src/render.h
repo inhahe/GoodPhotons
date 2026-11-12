@@ -3651,8 +3651,8 @@ struct Renderer {
                     // The coat's lobe is a glossy lobe (its own material, coatChild): softened on
                     // the first bounce unless it is a delta (glossyArrival), and its adjoint, as
                     // interactPhotonSpecular's.
-                    const double sC = glossyArrival(scene.mats[(size_t)cm.coatChild], h, ray.d * -1.0,
-                                                    bounce == 0);
+                    const double sC = (cm.coatChild >= 0)
+                        ? glossyArrival(scene.mats[(size_t)cm.coatChild], h, ray.d * -1.0, bounce == 0) : 1.0;
                     e.absorbed += beta * (1.0 - sC);
                     beta *= sC;
                     const double adj = glossyPhotonAdjoint(h, ray.d * -1.0, o);
@@ -4244,8 +4244,8 @@ struct Renderer {
                     double cr = materialRoughness(scene, cm, h);
                     Vec3 o = sampleGlossy(reflect(ray.d, h.n), cr, rng);
                     if (dot(o, h.n) <= 0) { e.absorbed += activeSum(); return; }
-                    const double sC = glossyArrival(scene.mats[(size_t)cm.coatChild], h,   // see scalar twin
-                                                    ray.d * -1.0, bounce == 0);
+                    const double sC = (cm.coatChild >= 0)                             // see scalar twin
+                        ? glossyArrival(scene.mats[(size_t)cm.coatChild], h, ray.d * -1.0, bounce == 0) : 1.0;
                     for (int i = 0; i < nUp; ++i) { e.absorbed += beta[i] * (1.0 - sC); beta[i] *= sC; }
                     const double adj = glossyPhotonAdjoint(h, ray.d * -1.0, o);
                     if (!(adj > 0.0)) { e.absorbed += activeSum(); return; }
