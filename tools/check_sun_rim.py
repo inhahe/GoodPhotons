@@ -16,7 +16,8 @@ is the control: if it fails too, something other than the rim is wrong.
 The second scene, scenes/_sun_haze.ftsl, is the other side of the same disc: a sun-lit unbounded
 haze seen from outside the bounding sphere, where no sun subpath can start toward. Light tracing
 cannot reach it, so the sun's NEE must not share its weight with it there (bdpt.h misWeight,
-`sunMiss`): mode D read that haze at 0.215 of mode R before 0.391.5. Whole frame, mode D on both
+misRevDensity; a sun-only special case from 0.391.5 to 0.439.6): mode D read that haze at 0.215
+of mode R before 0.391.5. Whole frame, mode D on both
 backends against mode R.
 
 The third, scenes/_sun_slab.ftsl, tests the disc's foreshortening: a ray tilted by w from the beam

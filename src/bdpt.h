@@ -643,10 +643,10 @@ inline double vertexPdf(const Scene& scene, const Camera& cam,
 // light sampling = P(choose this emitter) * (1/area). PBRT's PdfLightOrigin.
 // A DELTA light (spot: a point; sun: infinitely distant) has no area density at all —
 // PBRT returns 0 for exactly these (SpotLight/DistantLight::Pdf_Le set pdfPos = 0, and
-// InfiniteLightDensity is 0 for a delta-direction light). The 0 is consistent on BOTH
-// sides of every MIS ratio (the light subpath stores the same 0 in path[0].pdfFwd), and
-// misWeight's remap0 turns both into 1, so the ratios stay finite and unbiased. A FIRE's is a
-// volume density: the pick times the origin draw's (fireOriginPdf).
+// InfiniteLightDensity is 0 for a delta-direction light). The light subpath stores the same 0
+// in path[0].pdfFwd, a forward density every ratio reads through misRemap0 as 1; no ratio reads
+// it as a reverse one, since no eye path lands on a delta light. A FIRE's is a volume density:
+// the pick times the origin draw's (fireOriginPdf).
 inline double vertexPdfLightOrigin(const Scene& scene, const Vertex& cur) {
     if (cur.fire >= 0)
         return bdptPickPdf(scene, nullptr, cur.fire) *
@@ -2192,11 +2192,24 @@ inline int generateLightSubpath(const Scene& scene, const Camera& cam, const Ren
     return (int)path.size();
 }
 
-// The "a delta pdf is not a density" remap misWeight applies to every FACTOR of a ratio:
-// a delta vertex stores 0, and a 0 in a telescoped product would annihilate the whole
-// strategy rather than merely excluding it. Free-standing because Phase 3b's accumulators
+// The two readings of a density in a MIS ratio. Free-standing because Phase 3b's accumulators
 // are built outside misWeight (in the light pass) and must use the identical convention.
+//
+// misRemap0: a density of the path a strategy actually sampled -- a ratio's denominator, the
+// forward density pdfFwd -- with a delta vertex's 0 read as 1 ("a delta pdf is not a density"):
+// a 0 there would divide by zero, where every strategy samples through the same delta vertex
+// and its factor cancels.
 inline double misRemap0(double f) { return f != 0.0 ? f : 1.0; }
+// misRevDensity: a density another strategy would have generated the vertex with -- a ratio's
+// numerator, the reverse density pdfRev -- with a 0 read as 1 only where `fromDelta` (the vertex
+// that strategy would generate it from is a delta: a mirror, glass). Any other 0 means that
+// strategy cannot generate the vertex at all -- a sun subpath cannot reach it, an emitter cannot
+// emit from it, a BSDF cannot sample the direction its value has -- so it stays 0: the ratio,
+// and with it every strategy further along that needs the vertex, drops out of the sum, where a
+// 1 would count them as firing and weigh down the strategy that does (REMAP0-IMPOSSIBLE).
+inline double misRevDensity(double pdfRev, bool fromDelta) {
+    return (pdfRev == 0.0 && fromDelta) ? 1.0 : pdfRev;
+}
 
 // MERGES AFTER A SPECULAR BOUNCE (MODE-J-SDS, 0.387.0). A vertex reached through a delta bounce
 // (glass, a mirror) has light-side density 0 by the convention every connection weight here
@@ -2224,7 +2237,7 @@ inline bool g_jDeltaMerge = [] {
 // the light came from) is `fromDelta`: the stored density, with a delta bounce's 0 read as 1 (see
 // above). Any other 0, and everything with the switch off, is the literal value, as before 0.387.0.
 inline double mergeLightDensity(double pLight, bool fromDelta) {
-    return (g_jDeltaMerge && fromDelta && pLight == 0.0) ? 1.0 : pLight;
+    return g_jDeltaMerge ? misRevDensity(pLight, fromDelta) : pLight;
 }
 
 // --- The merge technique's density, relative to the connection it competes with -------
@@ -3034,7 +3047,9 @@ inline void traceLightBeamPass(const Scene& scene, const Camera& cam, long long 
                 const bool dPrev = (u > 0) ? path[u - 1].delta : path[0].isDeltaLight();
                 const double gate = (!path[u].delta && !dPrev) ? 1.0 : 0.0;
                 if (u == 0) { accC[0] = gate; continue; }
-                const double rL = misRemap0(path[u - 1].pdfRev) / misRemap0(path[u - 1].pdfFwd);
+                // path[u-1]'s reverse density is generated from path[u].
+                const double rL = misRevDensity(path[u - 1].pdfRev, path[u].delta) /
+                                  misRemap0(path[u - 1].pdfFwd);
                 const MergeEta eL = (u >= 2)
                     ? mergeEtaPrime(scene, path[u - 2].p, path[u - 1], path[u].p,
                                     mergeLightDensity(path[u - 1].pdfFwd, path[u - 2].delta),
@@ -3520,10 +3535,12 @@ inline void traceLightBeamPass(const Scene& scene, const Camera& cam, long long 
 //         w_j = p_j / sum_k p_k
 //
 // Products over a dozen area densities overflow doubles in both directions, so the sum
-// is done in logs. The same `remap0` (0 -> 1) is applied per FACTOR, matching what the
-// ratio form does per factor, and the same strategies are excluded: strategy j needs the
-// edge x[j-1]--x[j] to be a real connection, so it dies if either end is delta, and j==0
-// (the eye path landing on the emitter) dies for a delta light.
+// is done in logs. Each FACTOR is read as the ratio form reads it: a density of the path
+// strategy s sampled through misRemap0, a hypothetical one through misRevDensity (whose 0, no
+// delta neighbour's, makes a log of 0 and drops every strategy that needs it). The same
+// strategies are excluded: strategy j needs the edge x[j-1]--x[j] to be a real connection,
+// so it dies if either end is delta, and j==0 (the eye path landing on the emitter) dies for
+// a delta light.
 //
 // Called from inside `misWeight` while its ScopedAssigns are still installed, so both
 // forms read exactly the same patched densities — the densities are not what is under
@@ -3580,7 +3597,6 @@ inline double misWeightReference(const Scene& scene, const std::vector<Vertex>& 
                                  double lambda, const MergeK& mk) {
     const int n = s + t;
     if (n <= 2) return 1.0;
-    auto remap0 = [](double f) { return f != 0.0 ? f : 1.0; };
 
     // Unified light-to-camera path, each vertex with both directional densities.
     std::vector<double> pl((size_t)n), pc((size_t)n);
@@ -3609,21 +3625,23 @@ inline double misWeightReference(const Scene& scene, const std::vector<Vertex>& 
     // the latter is a Surface, so isDeltaLight() is correctly false for it.
     const bool deltaLight = (s > 0) ? light[0].isDeltaLight()
                                     : eye[(size_t)(n - 1)].isDeltaLight();
-    // misWeight's `sunMiss`: a sun's NEE to a point no sun subpath can reach. Every strategy whose
-    // light subpath contains that point (j > s), and every merge, is impossible.
-    const bool sunMiss = s == 1 && light[0].light && light[0].light->shape == EmitterShape::Sun &&
-                         !(pl[1] > 0.0);
-
-    // log p_j = A[j] + B[j], with A the light-side prefix and B the camera-side suffix.
+    // log p_j = A[j] + B[j], with A the light-side prefix and B the camera-side suffix. Below s
+    // the light densities are the ones strategy s sampled, from s on the camera ones; the rest
+    // are another strategy's, generated from x[i-1] (light) or x[i+1] (camera).
     std::vector<double> A((size_t)n + 1, 0.0), B((size_t)n + 1, 0.0);
-    for (int i = 0; i < n; ++i)
-        A[(size_t)i + 1] = A[(size_t)i] + std::log(remap0(pl[(size_t)i]));
-    for (int i = n - 1; i >= 0; --i)
-        B[(size_t)i] = B[(size_t)i + 1] + std::log(remap0(pc[(size_t)i]));
+    for (int i = 0; i < n; ++i) {
+        const double f = (i < s) ? misRemap0(pl[(size_t)i])
+                                 : misRevDensity(pl[(size_t)i], i > 0 && dl[(size_t)i - 1]);
+        A[(size_t)i + 1] = A[(size_t)i] + std::log(f);
+    }
+    for (int i = n - 1; i >= 0; --i) {
+        const double f = (i >= s) ? misRemap0(pc[(size_t)i])
+                                  : misRevDensity(pc[(size_t)i], dl[(size_t)i + 1]);
+        B[(size_t)i] = B[(size_t)i + 1] + std::log(f);
+    }
 
     // Strategies j = 0..n-1 (t' = n-j >= 1; BDPT never runs t'==0).
     auto allowed = [&](int j) {
-        if (sunMiss && j > s) return false;                  // the sun cannot reach x_s
         if (j > firstFiber) return false;                    // a strand on the light side
         if (dl[(size_t)j]) return false;                     // camera-side end of the edge
         if (j == 0) return !deltaLight;                      // eye path hits the emitter
@@ -3639,8 +3657,8 @@ inline double misWeightReference(const Scene& scene, const std::vector<Vertex>& 
     // Mode J: one merge strategy per interior vertex. p_merge,i = eta_i * p_i with p_i the
     // connection strategy at the same vertex, so it rides the ratio already computed above.
     // No `allowed` test: a merge connects nothing, so a delta neighbour does not kill it —
-    // it only needs both subpaths to REACH x_i, which by construction they do.
-    if (mk.any() && !sunMiss) {
+    // it only needs both subpaths to REACH x_i, and where one cannot, A[i] or B[i] is a log 0.
+    if (mk.any()) {
         auto vAt = [&](int i) -> const Vertex& {
             return (i < s) ? light[(size_t)i] : eye[(size_t)(n - 1 - i)];
         };
@@ -3689,7 +3707,6 @@ inline double misWeight(const Scene& scene, const Camera& cam,
                         const MergeK& mk = MergeK{}, const MergeGeo* geoE = nullptr,
                         const MergeGeo* geoL = nullptr) {
     if (s + t == 2) return 1.0;
-    auto remap0 = [](double f) { return f != 0.0 ? f : 1.0; };
     Vertex* qs  = s > 0 ? &light[s - 1] : nullptr;
     Vertex* pt  = t > 0 ? &eye[t - 1]   : nullptr;
     Vertex* qsM = s > 1 ? &light[s - 2] : nullptr;
@@ -3726,17 +3743,20 @@ inline double misWeight(const Scene& scene, const Camera& cam,
     if (qsM) a7 = ScopedAssign<double>(&qsM->pdfRev, vertexPdf(scene, cam, pt, *qs, *qsM, lambda));
 
     const bool merges = mk.any();
-    // A sun's NEE (s == 1) to a point no sun subpath can reach (sunOriginPdfAlong's 0): every
-    // camera-side alternative traces light from the sun THROUGH pt, so none exists. remap0 would
-    // read that 0 as a delta's and weigh NEE against strategies that never fire.
-    const bool sunMiss = s == 1 && t >= 2 && qs->light && qs->light->shape == EmitterShape::Sun &&
-                         !(pt->pdfRev > 0.0);
+    // Each step moves one more vertex to the other side, at the ratio of its reverse density to
+    // its forward one. A reverse density of 0 that no delta neighbour explains (misRevDensity)
+    // zeroes the ratio: the other side cannot generate that vertex, so neither this strategy nor
+    // any further along exists -- a sun's NEE to a point no sun subpath reaches, say, where every
+    // camera-side alternative would trace the sun's light through pt -- and the walk stops.
     double sumRi = 0.0, ri = 1.0;
-    for (int i = t - 1; !sunMiss && i > 0; --i) {    // hypothetical camera strategies
+    for (int i = t - 1; i > 0; --i) {                // hypothetical camera strategies
         // A strand is never a light vertex (randomWalk, 0.365.0): every strategy from here
         // inward would put eye[i] on the light side, so none of them exists.
         if (!eye[i].delta && eye[i].mat && isFiberMat(*eye[i].mat)) break;
-        ri *= remap0(eye[i].pdfRev) / remap0(eye[i].pdfFwd);
+        // eye[i] as the light side would generate it: from eye[i+1], or from qs (or the light's
+        // origin, s == 0) at pt -- non-delta, the connection's ends being scoped so above.
+        ri *= misRevDensity(eye[i].pdfRev, i + 1 < t && eye[i + 1].delta) / misRemap0(eye[i].pdfFwd);
+        if (ri == 0.0) break;
         if (!eye[i].delta && !eye[i - 1].delta) sumRi += ri;
         if (merges && i >= 2) {                      // merge at eye[i-1] (see header note)
             // eye[i-1]'s light-side neighbour is eye[i] (pt's flag is scoped false above).
@@ -3749,7 +3769,10 @@ inline double misWeight(const Scene& scene, const Camera& cam,
     }
     ri = 1.0;
     for (int i = s - 1; i >= 0; --i) {               // hypothetical light strategies
-        ri *= remap0(light[i].pdfRev) / remap0(light[i].pdfFwd);
+        // light[i] as the camera side would generate it: from light[i+1], or from pt at qs.
+        ri *= misRevDensity(light[i].pdfRev, i + 1 < s && light[i + 1].delta) /
+              misRemap0(light[i].pdfFwd);
+        if (ri == 0.0) break;
         // The hypothetical strategy at index i connects light[i-1] to the eye side, so it
         // is impossible if either end of that new edge is delta. At i == 0 the "edge" is
         // instead the eye path LANDING on the emitter, which a delta light (spot: a point;
@@ -4464,9 +4487,9 @@ struct BeamMergeWeight {
         // BeamMis::rCoef carries the cosine and the 1/pdfFwd that turn it into the ratio the
         // light loop accumulates.
         const double R  = phase * (double)lm->rCoef * invR2;
-        // pdfRev(x)/pdfFwd(x): the camera loop's first step. remap0 on BOTH, exactly as
-        // misWeight does, so a delta camera continuation cancels instead of annihilating.
-        const double C1 = misRemap0(gL) / misRemap0(gC);
+        // pdfRev(x)/pdfFwd(x): the camera loop's first step. gL > 0 (above); the forward
+        // density takes misRemap0, as in misWeight, so a delta camera continuation cancels.
+        const double C1 = gL / misRemap0(gC);
         // pdfRev(eye[k]) in the merged path, and the camera loop's second step.
         const double pdfRevK = phase * cosFacK * invT2;
         const double C2   = pdfRevK * invPdfFwdK;
@@ -4573,8 +4596,8 @@ struct SurfMergeWeight {
         // rCoef carries the cosine, the inverse-square and the remapped 1/pdfFwd, all fixed
         // when the photon was stored; only the directional density had to wait for a gather.
         const double R = pdfDirRev * (double)lm.rCoef;
-        // pl_j/pc_k: the camera loop's first step. remap0 on both, as misWeight does.
-        const double D1 = misRemap0(lm.pdfFwdA) * invPdfFwdK;
+        // pl_j/pc_k: the camera loop's first step (pl_j > 0, as etaS is; pc_k misRemap0'd).
+        const double D1 = lm.pdfFwdA * invPdfFwdK;
         // pdfRev(eye[k-1]) in the MERGED path, and with it the camera loop's second step.
         const double pdfRevKm1 = pdfDirFwd * cosPrev * invDistPrev2;
         const double D2 = pdfRevKm1 * invPdfFwdKm1;
@@ -4622,7 +4645,8 @@ inline void cameraSideSums(const Scene& scene, const std::vector<Vertex>& eye, i
         if (k >= 2) {
             // No ratio exists at the camera vertex itself, which is why the recurrence starts
             // one step in.
-            const double rC = misRemap0(eye[(size_t)k - 1].pdfRev) /
+            // eye[k-1]'s reverse density is generated from eye[k].
+            const double rC = misRevDensity(eye[(size_t)k - 1].pdfRev, eye[(size_t)k].delta) /
                               misRemap0(eye[(size_t)k - 1].pdfFwd);
             carry  = rC * segSumC[(size_t)k - 1];
             carryM = rC * segSumM[(size_t)k - 1];
@@ -4729,7 +4753,8 @@ inline void cameraSideSumsChroma(const Scene& scene, const PatTables& tabs,
         if (mk.surf > 0.0 && v.type != VType::Medium && surfMergeSite(v))
             for (int b = 0; b < K; ++b) e1[b] += mk.surf;
         const double pL = mergeLightDensity(eye[(size_t)k - 1].pdfRev, eye[(size_t)k].delta);
-        const double rC = misRemap0(eye[(size_t)k - 1].pdfRev) / misRemap0(eye[(size_t)k - 1].pdfFwd);
+        const double rC = misRevDensity(eye[(size_t)k - 1].pdfRev, eye[(size_t)k].delta) /
+                          misRemap0(eye[(size_t)k - 1].pdfFwd);
         const bool fiberK = !eye[(size_t)k].delta && eye[(size_t)k].mat &&
                             isFiberMat(*eye[(size_t)k].mat);
         double* s = &segSumMB[(size_t)k * K];
@@ -5134,11 +5159,11 @@ struct BdptRenderer {
                                             const double d2 = dot(e, e);
                                             const double invD2 = (d2 > 0.0) ? 1.0 / d2 : 0.0;
                                             const double pdfFwdX = sg.pdfDir * invD2 * lineDens;
-                                            const double rX = misRemap0(pickF * fireOriginPdf(fv, x)) /
+                                            const double rX = pickF * fireOriginPdf(fv, x) /
                                                               misRemap0(pdfFwdX);
                                             const double cosK = surfK
                                                 ? std::fabs(dot(nsK, e)) * std::sqrt(invD2) : 1.0;
-                                            const double rK = misRemap0(invD2 / (4.0 * PI) * cosK) * invFwdK;
+                                            const double rK = invD2 / (4.0 * PI) * cosK * invFwdK;
                                             w = 1.0 / (1.0 + rX * (gateK + rK * sumK));
                                             // Gate (2), off unless `-misaudit`: this O(1) form against
                                             // misWeight itself, with X installed as the eye subpath's

@@ -147,7 +147,10 @@ Each names the section its line is in.
     Done, 0.439.3: the cache's own schedule over absolute samples, a canonical merge, the chunks
     on the clock.
 22. ~~**P-HEROSPLIT-FIRST**~~ (0.439.4), ~~**ROUGH-IRID-AIR**~~ (0.439.6) (4.3) — narrow estimator gaps.
-23. **REMAP0-IMPOSSIBLE** (4.4) — the MIS sums read every zero density as a delta's.
+23. ~~**REMAP0-IMPOSSIBLE** (4.4) — the MIS sums read every zero density as a delta's.~~ Done,
+    0.439.7 (which also counts a glow at full weight in D and J, GLOW-LIGHT-MODES).
+23b. **BUMP-D-VS-R** (4.3) — D and J read a strongly normal-mapped room 1.4-2 % below R: the
+    strategies disagree at a vertex below its shading hemisphere.
 24. ~~**BEAMEPOCHS-CHUNK-PIN** (4.5) — `-beamepochs` pins cheap scenes' GPU chunks to 1 spp.~~ Done,
     0.438.2.
 25. **DEFORM-LIMITS**, **MOTION-LIGHT-RIGID**, **PER-OBJECT-MODES** (4.6) — what is left of them.
@@ -201,10 +204,11 @@ Then the rest of 4.2-4.6 in their order, 4.7's bookkeeping alongside whatever to
   the camera looks past the scene. (b) Keep R, D and J as they are, and have the forward modes
   warn at load that they light an unbounded haze only near the scene. Recommended: (b), since the
   three that agree are the modes scenes are rendered with.
-- [ ] **GLOW-LIGHT-MODES** — a glow with no emitter lights nothing in R/M/S/B, part of itself in
-  D/J, all of itself in U; mode P runs away on it (x368). The fix is to register emitters for
-  emissive analytic primitives (4.6's first line), which makes `gallery_rain`'s grid lines light
-  the scene: does the grid keep glowing unlit (a material flag), or does the scene get rebalanced?
+- [ ] **GLOW-LIGHT-MODES** — a glow with no emitter lights nothing in R/M/S/B, all of itself in
+  D/J/U (D and J only part of it before 0.439.7); mode P runs away on it (x368). The fix is to
+  register emitters for emissive analytic primitives (4.6's first line), which makes
+  `gallery_rain`'s grid lines light the scene: does the grid keep glowing unlit (a material
+  flag), or does the scene get rebalanced?
 
 ### 4.2 Wrong, missing or silent output
 
@@ -328,6 +332,8 @@ Then the rest of 4.2-4.6 in their order, 4.7's bookkeeping alongside whatever to
 
 ### 4.3 Estimator approximations and accuracy debt
 
+- [ ] **BUMP-D-VS-R** — modes D and J read a strongly normal-mapped room 1.4-2 % below mode R (a
+  vertex below its shading hemisphere: the walk passes it, a connection's `bsdfF` reads 0).
 - [x] **UPBP-BEAM-RADIUS** (0.434.0) — mode J's beam kernel shrinks per light-side epoch under
   -vcmalpha (_fog_cornell -0.70 % of mode D fixed, -0.43 % at 256 epochs, -0.07 % per sample).
 - [x] **J-FOG-REALCAM**, what is left — CPU mode J read realcam's fog below GPU mode J: its counted
@@ -395,8 +401,8 @@ Then the rest of 4.2-4.6 in their order, 4.7's bookkeeping alongside whatever to
   wavelengths follow a golden-ratio sequence by absolute sample, which no resume or stop tilts.
 - [x] **GLOSSY-SAMPLE-SITES** — the interference factor is applied by hand at every glossy sampler.
   Done 2026-11-06: one draw helper per backend carries it.
-- [ ] **REMAP0-IMPOSSIBLE** — the MIS sums read a zero density as a delta's, whatever made it zero
-  (only the sun's is special-cased).
+- [x] **REMAP0-IMPOSSIBLE** (0.439.7) — the MIS sums read a zero density as a delta's, whatever
+  made it zero (only the sun's was special-cased).
 
 - [ ] **GPU-STACK-DRIFT** — every kernel's stack reservation moves when unrelated device code changes.
 - [ ] **SLAB-DDA-COPIES** — the box clip and the grid walk are written out several times.

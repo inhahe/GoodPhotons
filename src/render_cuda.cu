@@ -8152,9 +8152,14 @@ struct DTrRay {
     }
 };
 
-// remap0 of the MIS machinery: a zero density is a DELTA one, and the ratio it appears in
-// must cancel rather than annihilate. Host twin: bdpt.h's misRemap0 / its local `remap0`.
+// The two readings of a density in a MIS ratio (host twins bdpt.h misRemap0 / misRevDensity,
+// where the why is). dMisRemap0: a forward density of the sampled path, a delta's 0 read as 1.
+// dMisRevDensity: a reverse density, its 0 read as 1 only where the vertex generating it is a
+// delta (`fromDelta`); any other 0 -- that side cannot generate the vertex -- stays 0.
 __device__ static inline double dMisRemap0(double f) { return f != 0.0 ? f : 1.0; }
+__device__ static inline double dMisRevDensity(double f, bool fromDelta) {
+    return (f == 0.0 && fromDelta) ? 1.0 : f;
+}
 
 // ---------------------- photon BEAMS on the device (mode M volume) --------------------
 // Gather-tuned sub-beam record — what the device beam estimator actually reads. It is the
@@ -8323,7 +8328,7 @@ __device__ static double dSunOriginPdfAlong(const DScene& sc, const DEmitter& em
 // whose light-side neighbour is `fromDelta`, with a delta bounce's 0 read as 1 (MODE-J-SDS,
 // 0.387.0). Any other 0 -- a strategy that cannot produce the vertex -- stays 0.
 __device__ static inline double dMergeLightDensity(double p, bool fromDelta) {
-    return (c_jDeltaMerge && fromDelta && p == 0.0) ? 1.0 : p;
+    return c_jDeltaMerge ? dMisRevDensity(p, fromDelta) : p;
 }
 #define DJSPEC_K    24     // JSpec::K
 static_assert(DJSPEC_K == kBandProbeBins, "the device carrier's grid must be the host's (JSpec::K)");
@@ -8837,9 +8842,9 @@ __device__ static double dBeamMergeWeight(const DScene& sc, const DBeamMergeW& m
     // is its direction density (HG samples proportionally to its own value), and rCoef carries
     // the cosine and the 1/pdfFwd that turn it into the ratio the light loop accumulates.
     const double R  = phase * (double)lm.rCoef * invR2;
-    // pdfRev(x)/pdfFwd(x): remap0 on BOTH, exactly as dMisWeight does, so a delta camera
-    // continuation cancels instead of annihilating.
-    const double C1 = dMisRemap0(gL) / dMisRemap0(gC);
+    // pdfRev(x)/pdfFwd(x). gL > 0 (above); the forward density takes dMisRemap0, as in
+    // dMisWeight, so a delta camera continuation cancels.
+    const double C1 = gL / dMisRemap0(gC);
     const double pdfRevK = phase * mw.cosFacK * invT2;   // pdfRev(eye[k]) in the merged path
     const double C2   = pdfRevK * mw.invPdfFwdK;
     const double etaK = (mw.kappa * etaKCoef + mw.etaKSurf) * pdfRevK;  // merge AT eye[k]
@@ -14249,9 +14254,9 @@ __device__ static float dVertexPdfF(const DScene& sc, const DCamera& cam,
 // Positional density (area measure) of sampling this light vertex's ORIGIN via light
 // sampling = P(choose this emitter) * (1/area). PBRT's PdfLightOrigin. A DELTA light
 // (spot: a point; sun: infinitely distant) has no area density at all — PBRT returns 0 for
-// exactly these. The 0 is consistent on BOTH sides of every MIS ratio (the light subpath
-// stores the same 0 in path[0].pdfFwd) and dMisWeight's remap-0 turns both into 1, so the
-// ratios stay finite and unbiased. Mirrors bdpt.h vertexPdfLightOrigin.
+// exactly these. The light subpath stores the same 0 in path[0].pdfFwd, a forward density
+// every ratio reads as 1 (dMisRemap0); no eye path lands on a delta light, so none reads it as a
+// reverse one. Mirrors bdpt.h vertexPdfLightOrigin.
 __device__ static float dVertexPdfLightOriginF(const DScene& sc, const DVertex& cur) {
     if (cur.lightIdx < 0) return 0.f;
     const DEmitter& em = sc.emitters[cur.lightIdx];
@@ -18766,12 +18771,10 @@ __device__ static double dMisWeight(const DScene& sc, const DCamera& cam,
     if (s >= 1) qsPdfRev  = dVertexPdfF(sc, cam, (t > 1) ? &eye[tMi] : nullptr, *PtP, *QsP, lambda);
     if (s >= 2) qsMPdfRev = dVertexPdfF(sc, cam, PtP, *QsP, light[sMi], lambda);
 
-    // A sun's NEE to a point no sun subpath can reach: no camera-side alternative exists (host
-    // twin misWeight's sunMiss).
-    const bool sunMiss = s == 1 && t >= 2 && QsP->type == BV_LIGHT && QsP->lightIdx >= 0 &&
-                         sc.emitters[QsP->lightIdx].shape == 6 && !(ptPdfRev > 0.f);
+    // A reverse density of 0 that no delta neighbour explains ends a walk (host twin misWeight):
+    // the other side cannot generate that vertex, so no strategy from there on exists.
     float sumRi = 0.f, ri = 1.f;
-    for (int i = t - 1; !sunMiss && i > 0; --i) {
+    for (int i = t - 1; i > 0; --i) {
         float num, den; int dl;
         if (i == ti)       { num = ptPdfRev;             den = (float)PtP->pdfFwd;   dl = 0; }
         else if (i == tMi) { num = ptMPdfRev;            den = (float)eye[i].pdfFwd; dl = eye[i].delta; }
@@ -18783,7 +18786,11 @@ __device__ static double dMisWeight(const DScene& sc, const DCamera& cam,
             const DVertex& vi = (i == ti) ? *PtP : eye[i];
             if (!dl && vi.type == BV_SURFACE && vi.matId >= 0 && sc.mats[vi.matId].type == D_HAIR) break;
         }
-        ri *= (num != 0.f ? num : 1.f) / (den != 0.f ? den : 1.f);
+        // eye[i]'s reverse density is generated from eye[i+1]; at pt from Qs, and at eye[tMi]
+        // from pt, both non-delta here.
+        const bool fromD = i + 1 < ti && eye[i + 1].delta;
+        ri *= ((num == 0.f && fromD) ? 1.f : num) / (den != 0.f ? den : 1.f);
+        if (ri == 0.f) break;
         if (!dl && !eye[i - 1].delta) sumRi += ri;
         if (merges && i >= 2) {                      // merge at eye[i-1]
             // eye[i-1]'s light-side neighbour is eye[i], whose flag is `dl` (0 at pt).
@@ -18807,7 +18814,11 @@ __device__ static double dMisWeight(const DScene& sc, const DCamera& cam,
         if (i == si)       { num = qsPdfRev;               den = (float)QsP->pdfFwd;     dl = 0; }
         else if (i == sMi) { num = qsMPdfRev;              den = (float)light[i].pdfFwd; dl = light[i].delta; }
         else               { num = (float)light[i].pdfRev; den = (float)light[i].pdfFwd; dl = light[i].delta; }
-        ri *= (num != 0.f ? num : 1.f) / (den != 0.f ? den : 1.f);
+        // light[i]'s reverse density is generated from light[i+1]; at Qs from pt, and at
+        // light[sMi] from Qs, both non-delta here.
+        const bool fromD = i + 1 < si && light[i + 1].delta;
+        ri *= ((num == 0.f && fromD) ? 1.f : num) / (den != 0.f ? den : 1.f);
+        if (ri == 0.f) break;
         // The hypothetical strategy at index i connects light[i-1] to the eye side, so it is
         // impossible if either end of that new edge is delta. At i == 0 the "edge" is instead
         // the eye path LANDING on the emitter, which a DELTA light (spot: a point; sun:
@@ -19329,7 +19340,8 @@ struct DChromaRun {
             if (kappaS > 0.0 && v.type != BV_MEDIUM && dSurfMergeSite(sc, v))
                 for (int b = 0; b < DJSPEC_K; ++b) e1[b] += kappaS;
             const double pL = dMergeLightDensity((double)eye[k - 1].pdfRev, eye[k].delta != 0);
-            const double rC = dMisRemap0(eye[k - 1].pdfRev) / dMisRemap0(eye[k - 1].pdfFwd);
+            const double rC = dMisRevDensity(eye[k - 1].pdfRev, eye[k].delta != 0) /
+                              dMisRemap0(eye[k - 1].pdfFwd);
             const bool fiberK = !eye[k].delta && eye[k].type == BV_SURFACE &&
                                 eye[k].matId >= 0 && sc.mats[eye[k].matId].type == D_HAIR;
             for (int b = 0; b < DJSPEC_K; ++b) {
@@ -19370,7 +19382,7 @@ struct DSurfMergeW {
         const double etaS = kappaS * lm.pdfFwdA;
         if (!(etaS > 0.0)) return 0.0;
         const double R  = pdfDirRev * (double)lm.rCoef;
-        const double D1 = dMisRemap0(lm.pdfFwdA) * invPdfFwdK;
+        const double D1 = lm.pdfFwdA * invPdfFwdK;        // pdfFwdA > 0, as etaS is
         const double pdfRevKm1 = pdfDirFwd * cosPrev * invDistPrev2;
         const double D2 = pdfRevKm1 * invPdfFwdKm1;
         const double etaKm1 = chromaM ? dSpecBinAt(chromaKm1, lam) : etaKm1Coef;
@@ -19971,7 +19983,7 @@ kBdptT(DScene sc, const __grid_constant__ DCamera cam, double* camFilm, double* 
                     if (k >= 2) {
                         // No ratio exists at the camera vertex itself, which is why the
                         // recurrence starts one step in.
-                        const double rC = dMisRemap0(eye[k - 1].pdfRev) /
+                        const double rC = dMisRevDensity(eye[k - 1].pdfRev, eye[k].delta != 0) /
                                           dMisRemap0(eye[k - 1].pdfFwd);
                         carry  = rC * segSumC[k - 1];
                         carryM = rC * segSumM[k - 1];
@@ -23488,7 +23500,8 @@ kJSurfLightT(DScene sc, DCamera cam, int diffraction, int maxDepth,
                                        : (dIsDeltaLightVertex(sc, path[0]) != 0);
             const double gate = (!path[u].delta && !dPrev) ? 1.0 : 0.0;
             if (u == 0) { accC = gate; continue; }
-            const double rL = dMisRemap0(path[u - 1].pdfRev) / dMisRemap0(path[u - 1].pdfFwd);
+            const double rL = dMisRevDensity(path[u - 1].pdfRev, path[u].delta != 0) /
+                              dMisRemap0(path[u - 1].pdfFwd);
             // The merge AT y_{u-1}, which the recurrence would not fold in until the next
             // iteration but which this vertex's stored partials need now. Both kinds, because
             // a denominator that carries one is not a partition of unity; at most one is

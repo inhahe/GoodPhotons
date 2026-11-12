@@ -2415,7 +2415,50 @@ index so a lookup finds its interval in a step or two); everything else keeps th
 grid's points, mode R, GPU against CPU -- red 0.30 and 0.017 before, 1.03 and 1.000 after (the glass's
 red is noisy: +-4 % between CPU seeds). The 1.9 % blue gap noted with clear glass was noise too.
 
-## OPEN (2026-10-21): REMAP0-IMPOSSIBLE — the MIS sums read a zero density as a delta's, whatever made it zero
+## OPEN (2026-11-12, 0.439.7): BUMP-D-VS-R — modes D and J read a strongly normal-mapped room 1.4-2 % below mode R
+
+Found validating REMAP0-IMPOSSIBLE (below), which took most of the gap away: a room whose five
+walls carry one strong ripple normal map (a tangent-space slope of 2, lit at a grazing angle by a
+tilted panel; `scraps/_bump_vs_r.py`, 64x48, three seeds) read 0.956 of mode R in mode D before
+0.439.7 and 0.986 after, mode J 0.960 and 0.980 (CPU; GPU 0.987 and 0.986). What is left is a
+shading-normal inconsistency between the strategies. A camera path that meets such a wall from the
+geometric front but below the shading hemisphere walks on through it (its throughput the
+albedo), while a connection at that vertex evaluates `bsdfF`, which is 0 there, so the strategies
+that sample such a path do not all see the same integrand. Where to look: what mode R and BDPT's
+walk do at a vertex with ns.wo <= 0 < ng.wo, and what `bsdfF` / `bsdfPdf` say for it; the fix is
+one rule for that vertex shared by the walks, the evaluators and the densities, on both devices.
+
+## DONE (2026-11-12, 0.439.7; opened 2026-10-21): REMAP0-IMPOSSIBLE — the MIS sums read a zero density as a delta's, whatever made it zero
+
+**Fixed in 0.439.7** as the review proposed. A ratio's reverse density is read through
+`misRevDensity` (device `dMisRevDensity`): its 0 becomes 1 only where the vertex it would be
+generated from is a delta, and any other 0 zeroes the ratio and ends the loop. The forward
+densities keep `misRemap0`. `sunMiss` is gone from `misWeight`, `dMisWeight` and
+`misWeightReference`, which applies the rule factor by factor (a density of the sampled path
+through `misRemap0`, another strategy's through `misRevDensity`, so a 0 is a log of 0 that drops
+every strategy needing it). The light pass's and the camera side's merge accumulators (host and
+device) and a fire's O(1) s = 0 weight read it too; the beam and point merge weights' first steps
+already read positive densities only, and now say so.
+
+It was not only robustness. A glow with no emitter (GLOW-LIGHT-MODES) has a light origin density
+of 0 -- no light subpath starts on it and NEE cannot pick it -- so modes D and J weighed the eye
+path landing on it against light tracing from it, at a ratio that depended on the scene's units.
+New gate `tools/check_glow_mis.py`: a floor lit by a lamp and by a glow behind the camera, modes
+D and J on both devices against mode U on the host (which counts a glow at full weight; the
+device's mode U, checked too, reads 0.995). 0.439.6: D 0.748 / 0.748 and J 0.743 / 0.744 (host /
+device), 47-49 sigma; 0.439.7: D 0.9995 / 0.991 and J 0.998 / 0.999 (device U 0.995).
+
+The shading normal's zeros were the third kind, found by check_bitid: a camera path meeting a
+normal-mapped or smooth-normalled wall from the geometric front but below its shading hemisphere
+walks on, where no light walk can sample that direction. check_bitid's mapped scene moved
++0.03-0.05 % in D and J and smooth a few pixels; a room of strongly normal-mapped walls read 0.956
+of mode R in D and 0.960 in J before, 0.986 and 0.980 after (CPU; GPU 0.957 to 0.987, 0.961 to
+0.986). The rest of that gap is BUMP-D-VS-R, above. check_sun_rim passes without the special case
+(haze 0.999 / 1.000 of R, GPU / CPU). -misaudit: no disagreement on _fog_cornell (D, J), _sun_haze,
+_deltalight_mix, the glow scene (D, J) and a fire; the poisoned control still disagrees.
+gallery_rain as tagged (GPU, 320x180, 64 spp, one seed) moved +0.6 % over the frame and up to 3 %
+in places, presumably from its glowing stand cages (isosurfaces, which register no emitter) and
+its smooth-normalled meshes (not traced further). The rest of this entry is how it stood.
 
 `misWeight`'s `remap0` (bdpt.h; `dMisWeight` and the merge weights' first steps likewise) turns
 every zero density into 1. That is right where the zero comes from a delta neighbour, whose density
@@ -3327,6 +3370,9 @@ So the limitation is not consistent. Mode U's host counts a diffuse arrival on t
 weight (`vcm.h`: no emitter, no MIS), which is the unbiased answer for a light nothing else can
 reach. Modes D and J weight it against an s = 1 strategy that cannot exist for this surface
 (its densities remapped from 0 to 1, so the weight is arbitrary), and modes R, M and S drop it.
+**Since 0.439.7 (REMAP0-IMPOSSIBLE) modes D and J count it at full weight too**, like mode U:
+their weights no longer count a strategy that cannot happen (`tools/check_glow_mis.py`, the floor
+under a glow 0.748 of mode U before).
 Mode P renders the whole frame x368 (the glow x9.2): its composite fits the forward layer, in
 which the glow is dark, against the backward one, and the fit runs away.
 

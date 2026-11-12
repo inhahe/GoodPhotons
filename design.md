@@ -3145,8 +3145,9 @@ disc area dA with cross-section dA (w.n), so the density every strategy reads --
 0.391.5: +7 % on a floor a 60 deg sun lights only through glass, `scenes/_sun_slab.ftsl`, where
 light tracing carries the image; nothing under the real 0.53 deg sun). A point no sun subpath can
 reach -- upstream of the disc plane, or off the disc and every target, as in an unbounded haze
-outside the bounding sphere -- reads 0, and `misWeight` / `dMisWeight` drop the camera-side
-alternatives of a sun's NEE there (`sunMiss`) instead of reading that 0 as a delta's. A share `f` (default
+outside the bounding sphere -- reads 0, and the MIS sums drop the camera-side alternatives of a
+sun's NEE there: a reverse density of 0 no delta neighbour explains ends a sum (`misRevDensity`,
+0.439.7; a special case for the sun, `sunMiss`, from 0.391.5). A share `f` (default
 0.25, `-sunaim`) of sun subpaths now draws its origin from the focusing geometry's footprint
 instead. The targets are the bounding spheres `causticaim.h` builds for mode `M` (64 by
 `-causticaimk`), each projected onto the disc as a circle and picked by r². The mixture density is
@@ -3597,10 +3598,11 @@ holding a glass ball), and on the device `-rgb`, mode S and every one of those.
   its SPD may carry a `power`/`lumens` flux normalisation the raw material spectrum does
   not, and that ordering is also what stops a mesh light double-counting. Such surfaces
   remain emission-on-hit only (no NEE, no forward emission): they glow but illuminate
-  nothing, including themselves — logged as a known limitation (and not uniformly so: modes D,
-  J and U count part or all of what a diffuse arrival sees of one, known-issues
-  GLOW-LIGHT-MODES). Every emission-on-hit site reads the per-hit factor through `emitHitScale` /
-  `dEmitHitScale` (the emission pattern times an aimed quad's law, 0.384.4), and a path ends at
+  nothing, including themselves — logged as a known limitation (and not uniformly so: modes D, J
+  and U count what a diffuse arrival sees of one -- D and J only in part before 0.439.7 --
+  known-issues GLOW-LIGHT-MODES). Every emission-on-hit site reads the per-hit factor through
+  `emitHitScale` / `dEmitHitScale` (the emission pattern times an aimed quad's law, 0.384.4),
+  and a path ends at
   an emissive surface only when it is a light block's own (`Material::reflectsNothing`): any other
   emissive material's body is shaded on, in modes S and U since 0.384.4 as in R, D and M.
   0.118.1 fixed only the *backward* (mode R/W) sites; **0.129.0 extends the same fallback
@@ -3612,9 +3614,11 @@ holding a glass ball), and on the device `-rgb`, mode S and every one of those.
   now consult `sc.mats[v.matId].matIsLight` / `matEmit`. The MIS densities needed no
   change: `dVertexPdfLightF` already routes a `BV_SURFACE` vertex down the cosine-
   Lambertian branch, and `dVertexPdfLightOriginF` returns the same 0 the CPU's
-  `vertexPdfLightOrigin` returns for a `Vertex` with a null `light` (both remapped to 1 by
-  the balance heuristic). Mesh emitters still take the `lightIdx >= 0` branch, so every
-  pre-existing scene is bit-identical.
+  `vertexPdfLightOrigin` returns for a `Vertex` with a null `light` (no light subpath starts
+  there, so since 0.439.7 the weights read that 0 as no strategy, and the eye path's landing
+  takes the glow at weight 1; before, the balance heuristic remapped it to 1 like a delta's).
+  Mesh emitters still take the `lightIdx >= 0` branch, so every pre-existing scene is
+  bit-identical.
   One authoring trap survives on the *quad* side of this: emission is one-sided
   (`dot(rd, ng) < 0`), and a `quad`'s `ng` is `cross(u, v)`, so swapping `u` and `v` is
   the difference between a glowing panel and a black one — while every *reflective* slot
@@ -5725,9 +5729,9 @@ as the one at fault.
   strategies are under-weighted and the image loses energy. The pieces, all in `bdpt.h`:
   `isDeltaEmitter`/`isInfiniteEmitter` classify an `Emitter`; `Vertex::isDeltaLight()`
   reports it at a vertex; `vertexPdfLightOrigin` returns **0** for a delta emitter (there is
-  no positional density to hit), which makes `s == 0` — "the eye path lands on emissive
-  geometry" — vanish on both sides of every MIS ratio (`remap0` then turns both into 1, so
-  the ratios stay finite); `misWeight`'s light loop skips a term whose *previous* light
+  no positional density to hit) and stores in the subpath's first `pdfFwd`, which every ratio
+  reads through `misRemap0` as 1 (no eye path lands on a delta light, so none reads it as a
+  reverse density); `misWeight`'s light loop skips a term whose *previous* light
   vertex is delta, mirroring pbrt's `deltaLightvertex` hook; and `vertexPdfLight` grows two
   branches — uniform-in-cone `1/Ω · 1/d²` for a Spot, and the planar `1/(πR²)` (no `1/d²`)
   for an infinite light, whose subpath origin is a fictitious disc point.
@@ -5748,6 +5752,28 @@ as the one at fault.
   Gated by `Scene::sunCount` so sun-free scenes pay nothing.
   `scenes/_deltalight_mix.ftsl` is the regression scene (area + spot + sun + a mirror
   sphere); mode `D` vs mode `R` agrees to 0.33 % of mean luminance.
+
+  **A density of 0 is a delta's only next to a delta** (REMAP0-IMPOSSIBLE, 0.439.7). The ratio
+  loops read each vertex's two densities differently. Its forward density, the one the sampled
+  path was drawn with, is a ratio's denominator, and a 0 there can only be a delta bounce's,
+  read as 1 (`misRemap0` / `dMisRemap0`). Its reverse density, the one another strategy would
+  have drawn it with, is a numerator: read as 1 only where the vertex that strategy would draw
+  it from is a delta, whose factor cancels between every strategy that crosses it; any other 0
+  says that strategy cannot make the vertex at all, so it stays 0 (`misRevDensity` /
+  `dMisRevDensity`), the ratio vanishes, and the loop stops, since every strategy further along
+  needs that vertex too. Three kinds of such zeros are known: a sun's origin density at a point
+  no sun subpath reaches (special-cased as `sunMiss` from 0.391.5 until this rule replaced it);
+  the light origin density of a glow with no emitter (whose s = 0 strategy now takes its light
+  at weight 1, where the old reading gave it a share that depended on the scene's units -- 0.748
+  of mode U on `tools/check_glow_mis.py`'s floor); and a shading normal's: a camera path that
+  meets a normal-mapped or smooth-normalled surface from the geometric front but below the
+  shading hemisphere walks on through it, where no light walk can sample that direction, so the
+  light side's reverse density there is 0 (a room of strongly normal-mapped walls read 0.956 of
+  mode R in mode D and 0.960 in J before, 0.986 and 0.980 after, CPU; the GPU alike).
+  `misWeight`, `misWeightReference` (factor by factor in its logs), `dMisWeight`, the light
+  pass's and `cameraSideSums`' merge accumulators and their device twins, and a fire's O(1)
+  s = 0 weight all apply it; the merge weights' own first steps read densities that are positive
+  already. `mergeLightDensity` is the same reading behind its A/B switch.
 
   **The s = 1 strategy runs every sample** (0.377.4). It draws a light point of its own, so it
   does not depend on the light subpath -- and every MIS weight counts one s = 1 sample per
