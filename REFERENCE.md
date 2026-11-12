@@ -1609,16 +1609,18 @@ periodic writes, the live window and `-stop` land as often as without the cache.
 cache then advances at every chunk's end, and the clock decides the image; `-noise` is a sample
 count, and keeps the schedule.
 
-The chunk count matters more than it looks, because it *is* the number of update passes the
-table receives: at 65 chunks the cache terminates ~36 % of consults, at 16 it manages 2.3 %,
+The number of advances matters more than it looks, because it *is* the number of update
+passes the table receives: at 65 the cache terminates ~36 % of consults, at 16 it manages 2.3 %,
 and at 5 it terminates nothing at all while still paying for the update pass — **slower than
-not caching**. `FTRACE_CHUNK_SPP=<n>` pins the split and `FTRACE_CHUNK_DEBUG=1` prints the
-sequence, if you want to see this for yourself.
+not caching**. Hence the schedule's 64. (The chunks no longer set it: `FTRACE_CHUNK_SPP=<n>`
+changes how a fixed budget is cut, not where its cache advances.)
 
 **The table survives `-checkpoint` / `-resume`** (0.190.3). It is written into the `.ftbuf`
-sidecar as a sparse trailing section — occupied cells only, ~320 bytes each, so a Cornell box
+sidecar as a sparse trailing section — occupied cells only, ~330 bytes each, so a Cornell box
 adds 11 KB to a 1.3 MB file rather than the 82 MB a whole 262 144-cell table would be — and a
-resumed render therefore continues **warm**. Measured at 200², resuming +512 spp on top of
+resumed render therefore continues **warm**. Since 0.439.5 it also carries each cell's slot, the
+update pass's place in its rotation and the batch under way, so a render resumed to the same
+total is the uninterrupted one, byte for byte. Measured at 200², resuming +512 spp on top of
 1024: **68.4 %** of consults terminated and 65.9 M ray queries, against **24.9 %** and 70.5 M
 resuming the identical film with the section stripped off. Beyond the speed, it removes a
 subtler wart: a cold resume blended never-terminating (unbiased) samples with terminating

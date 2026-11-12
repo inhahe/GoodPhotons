@@ -14995,33 +14995,38 @@ struct PendingRadCache {
     long long nSample = 0, nEvicted = 0, nTerm = 0, nMiss = 0, nUpdated = 0;
     std::vector<uint64_t>     keys;
     std::vector<RadCacheCell> cells;
+    std::vector<uint64_t>     slots;   // each cell's slot (a version 3 section's), to re-home it there
+    uint64_t  capacity = 0;            // the saved table's, and its update pass's cursors
+    uint64_t  cursor = 0, rcursor = 0;
     RadCacheBank              batch;   // the batch it stopped in (g_rcPending's), if any
     void clear() { *this = PendingRadCache{}; }
 };
 static PendingRadCache g_pendingRadCache;
 
-// Fold a checkpointed table into the freshly-initialised one. Called once, from the first
-// backward pass, after the cache's configuration has been finalised. A guard mismatch is NOT
-// fatal: the film still resumes correctly, the table simply starts cold, so this warns and
-// carries on rather than refusing the render.
+// Fold a checkpointed table into the table, at the first backward pass whose settings it was
+// saved under (configGuard): a pass under others -- the exposure meter, at another camera and
+// resolution -- leaves it parked for the frame's. One that no pass matches is not fatal: the film
+// still resumes correctly, the table simply starts cold, and reportRadCache says so.
 static void radCacheAdoptPending() {
-    if (!g_pendingRadCache.have) return;
+    if (!g_pendingRadCache.have || !g_radianceCache.ready()) return;
+    if (g_pendingRadCache.guard != g_radianceCache.configGuard()) return;
     PendingRadCache p;
     p = std::move(g_pendingRadCache);
     g_pendingRadCache.clear();          // one shot: later passes must not re-adopt
-    if (!g_radianceCache.ready()) return;
-    if (p.guard != g_radianceCache.configGuard()) {
-        std::fprintf(stderr, "[resume] the checkpoint's radiance-cache table was built with "
-                             "different cache settings (cell size, clipmap centre, spectral "
-                             "range or confidence gate); starting with a cold table. The image "
-                             "resume itself is unaffected.\n");
-        g_rcPending = RadCacheBank{};
-        return;
-    }
     g_rcPending = std::move(p.batch);   // the batch it stopped in goes on
+    // Each cell back in its own slot where the capacity is the saved one, and the update pass's
+    // cursors with it: the rays it then shoots, seeded by slot and served in rotation, are the
+    // ones the uninterrupted render shot.
+    const bool sameSlots = p.capacity == (uint64_t)g_radianceCache.key.size() &&
+                           p.slots.size() == p.keys.size();
     size_t loaded = 0;
     for (size_t i = 0; i < p.keys.size(); ++i)
-        if (g_radianceCache.loadCell(p.keys[i], p.cells[i])) ++loaded;
+        if (sameSlots ? g_radianceCache.loadCellAt((size_t)p.slots[i], p.keys[i], p.cells[i])
+                      : g_radianceCache.loadCell(p.keys[i], p.cells[i])) ++loaded;
+    if (sameSlots) {
+        g_radianceCache.cursor  = (size_t)p.cursor;
+        g_radianceCache.rcursor = (size_t)p.rcursor;
+    }
     g_radianceCache.pass     = p.pass;
     g_radianceCache.nSample  = p.nSample;
     g_radianceCache.nEvicted = p.nEvicted;
@@ -15043,6 +15048,13 @@ static void radCacheAdoptPending() {
 //            scene at this cell size (raise -radcache-cells, or coarsen with -radcache-cell).
 static void reportRadCache() {
     if (!g_radCache || !g_radianceCache.ready()) return;
+    if (g_pendingRadCache.have) {   // a resume's table no pass could take (radCacheAdoptPending)
+        std::fprintf(stderr, "[resume] the checkpoint's radiance-cache table was built with "
+                             "different cache settings (cell size, clipmap centre, spectral range "
+                             "or confidence gate); the render ran with a cold table. The image "
+                             "resume itself is unaffected.\n");
+        g_pendingRadCache.clear();
+    }
     const RadianceCache& rc = g_radianceCache;
     const long long look = rc.nTerm + rc.nMiss;
     std::printf("[radcache] cell %.4g; %zu cells (%.1f%% full): %lld ready, %lld retired, "
@@ -16562,8 +16574,21 @@ static Film renderBackward(const Scene& scene, const Camera& cam, int resX, int 
         g_radianceCache.lambdaHi   = LAMBDA_MAX;
         g_radianceCache.camera     = cam.eye;    // clipmap centre; re-read every pass
         g_radianceCache.prepare();               // refresh the reciprocals the hot path uses
-        // -resume: adopt the table saved in the .ftbuf sidecar, now that every setting its
-        // guard covers is final. No-op on a fresh render, and after the first pass.
+        // A pass whose cells mean other regions than the table's (keyGuard: another cell size,
+        // the auto one following the camera and the resolution -- an exposure meter's, a frame
+        // after it, the next camera) starts the table afresh, and the batch pending with it:
+        // their cells would be read over regions they were never gathered in.
+        static uint64_t lastKeyGuard = 0;
+        static bool haveKeyGuard = false;
+        const uint64_t keyGuard = g_radianceCache.keyGuard();
+        if (haveKeyGuard && keyGuard != lastKeyGuard) {
+            g_radianceCache.init(g_radianceCache.key.size());
+            g_rcPending = RadCacheBank{};
+        }
+        lastKeyGuard = keyGuard;
+        haveKeyGuard = true;
+        // -resume: adopt the table saved in the .ftbuf sidecar, at the first pass under the
+        // settings it was saved with. No-op on a fresh render, and once adopted.
         radCacheAdoptPending();
     }
     // Factored out of the worker so the -radcache update pass (below) can trace with an
@@ -16673,7 +16698,7 @@ static Film renderBackward(const Scene& scene, const Camera& cam, int resX, int 
             //    work list, so the next round's budget goes to cells that still need it.
             if (g_radianceCache.apply(served)) g_radianceCache.rebuildWork();
         }
-        radCachePend(rcBanks, g_rcPending);   // the update rays' marks, for the next merge
+        radCachePend(rcBanks, g_rcPending, /*counts=*/false);   // the update rays' marks, for the next merge
     };
     // A call a stop may abandon is dropped whole by its caller, so it must not reach a boundary
     // before its end: the cache would have advanced on samples the kept film does not hold. Its
@@ -18105,9 +18130,11 @@ static void warnIfOtherBuild(const std::string& path) {
 // changed scene rejects both, a changed cache setting rejects only the table and still resumes
 // the image.
 static constexpr char kRadCacheTag[8] = {'F','T','R','C','A','C','H','1'};
-// Version 2 appends the batch under way (g_rcPending): its marks, its verification records, and
-// its tallies. A version 1 section reads as one with no batch pending.
-static constexpr char kRadCacheTag2[8] = {'F','T','R','C','A','C','H','2'};
+// Version 3 also carries what a resume needs to go on exactly where the render stood: each cell's
+// slot (re-homed there where the capacity matches, so the update rays, seeded by slot, draw what
+// they drew), the update pass's rotation cursors, and the batch under way (g_rcPending: its marks,
+// its verification records, its tallies). A version 1 section reads as a table alone.
+static constexpr char kRadCacheTag3[8] = {'F','T','R','C','A','C','H','3'};
 
 // Returns false only on a write error. Writes nothing at all (leaving the sidecar byte-for-byte
 // what it has always been) when there is no live table, so a render without -radcache is
@@ -18120,13 +18147,17 @@ static bool writeRadCacheSection(std::ostream& o) {
     const uint64_t guard = rc.configGuard();
     const uint32_t pass  = rc.pass;
     const long long ctr[5] = {rc.nSample, rc.nEvicted, rc.nTerm, rc.nMiss, rc.nUpdated};
-    o.write(kRadCacheTag2, 8);
+    const uint64_t layout[3] = {(uint64_t)rc.key.size(), (uint64_t)rc.cursor, (uint64_t)rc.rcursor};
+    o.write(kRadCacheTag3, 8);
     o.write((const char*)&guard, 8);
     o.write((const char*)&pass, 4);
     o.write((const char*)ctr, sizeof ctr);
+    o.write((const char*)layout, sizeof layout);
     o.write((const char*)&n, 8);
     for (size_t i = 0; i < rc.key.size(); ++i) {
         if (rc.key[i] == RadianceCache::kEmpty) continue;
+        const uint64_t slot = (uint64_t)i;
+        o.write((const char*)&slot, 8);
         o.write((const char*)&rc.key[i], 8);
         o.write((const char*)&rc.cell[i], sizeof(RadCacheCell));
     }
@@ -18158,36 +18189,48 @@ static bool writeRadCacheSection(std::ostream& o) {
 // afterwards: the caller has already read everything it needs and must not see a stray EOF
 // from probing past the end as a truncated FILM. With no section next, `in` is left where it
 // was, for the sections that may follow (readLightEpochSection); with one, after it, whether
-// `adopt` (this render's -radcache) took the table or not.
+// `adopt` (this render's -radcache) took the table or not. Every count the file gives is held
+// to the bytes left in it before anything is sized from it.
 static void readRadCacheSection(std::istream& in, bool adopt = true) {
     if (adopt) g_pendingRadCache.clear();
     if (!g_radCache) adopt = false;
     const std::streampos at = in.tellg();
     char tag[8] = {0};
     in.read(tag, 8);
-    const bool v2 = in && std::memcmp(tag, kRadCacheTag2, 8) == 0;
-    if (!in || (!v2 && std::memcmp(tag, kRadCacheTag, 8) != 0)) { in.clear(); in.seekg(at); return; }
+    const bool v3 = in && std::memcmp(tag, kRadCacheTag3, 8) == 0;
+    if (!in || (!v3 && std::memcmp(tag, kRadCacheTag, 8) != 0)) { in.clear(); in.seekg(at); return; }
     uint64_t guard = 0, n = 0; uint32_t pass = 0; long long ctr[5] = {0,0,0,0,0};
+    uint64_t layout[3] = {0, 0, 0};
     in.read((char*)&guard, 8);
     in.read((char*)&pass, 4);
     in.read((char*)ctr, sizeof ctr);
+    if (v3) in.read((char*)layout, sizeof layout);
     in.read((char*)&n, 8);
-    // Sanity bound before allocating from a file's word: a table can never hold more cells
-    // than the largest capacity the flag accepts, and the record count is otherwise attacker-
-    // or corruption-controlled. A section that cannot be read is no section: `in` goes back.
-    if (!in || n > (uint64_t)1 << 28) { in.clear(); in.seekg(at); return; }
+    // The bytes left after `in`'s position, so no count can claim more than the file holds.
+    const auto left = [&in]() -> uint64_t {
+        const std::streampos here = in.tellg();
+        if (here < 0) return 0;
+        in.seekg(0, std::ios::end);
+        const std::streampos end = in.tellg();
+        in.seekg(here);
+        return end > here ? (uint64_t)(end - here) : 0;
+    };
+    const uint64_t cellBytes = (v3 ? 16 : 8) + sizeof(RadCacheCell);
+    if (!in || n > left() / cellBytes) { in.clear(); in.seekg(at); return; }
     PendingRadCache p;
     if (!adopt) {
-        in.seekg((std::streamoff)n * (std::streamoff)(8 + sizeof(RadCacheCell)), std::ios::cur);
+        in.seekg((std::streamoff)(n * cellBytes), std::ios::cur);
     } else {
         p.keys.resize((size_t)n);
         p.cells.resize((size_t)n);
+        if (v3) p.slots.resize((size_t)n);
         for (uint64_t i = 0; i < n; ++i) {
+            if (v3) in.read((char*)&p.slots[(size_t)i], 8);
             in.read((char*)&p.keys[(size_t)i], 8);
             in.read((char*)&p.cells[(size_t)i], sizeof(RadCacheCell));
         }
     }
-    if (v2) {   // the batch it stopped in
+    if (v3) {   // the batch it stopped in
         uint64_t nm = 0, nv = 0;
         long long tally[3] = {0, 0, 0};
         double audit[3] = {0.0, 0.0, 0.0};
@@ -18195,7 +18238,8 @@ static void readRadCacheSection(std::istream& in, bool adopt = true) {
         in.read((char*)&nv, 8);
         in.read((char*)tally, sizeof tally);
         in.read((char*)audit, sizeof audit);
-        if (!in || nm > (uint64_t)1 << 28 || nv > (uint64_t)1 << 32) { in.clear(); in.seekg(at); return; }
+        const uint64_t room = left();
+        if (!in || nm > room / 56 || nv > (room - nm * 56) / 24) { in.clear(); in.seekg(at); return; }
         if (!adopt) {
             in.seekg((std::streamoff)(nm * 56 + nv * 24), std::ios::cur);
         } else {
@@ -18224,6 +18268,7 @@ static void readRadCacheSection(std::istream& in, bool adopt = true) {
     p.have = true; p.guard = guard; p.pass = pass;
     p.nSample = ctr[0]; p.nEvicted = ctr[1]; p.nTerm = ctr[2];
     p.nMiss = ctr[3]; p.nUpdated = ctr[4];
+    p.capacity = layout[0]; p.cursor = layout[1]; p.rcursor = layout[2];
     g_pendingRadCache = std::move(p);
 }
 
@@ -19007,11 +19052,11 @@ static void warnHazeOnlyNearScene(const Scene& scene, const std::vector<char>& m
 //
 // Under -radcache a chunk also ends at the cache's next boundary (RadCacheSchedule), where
 // renderBackward advances the table, so no chunk a stop drops holds samples it advanced on.
-// Ordinarily the chunk boundaries are invisible: per-(pixel,sample) seeding means chunk `c`
+// The chunk boundaries are otherwise invisible: per-(pixel,sample) seeding means chunk `c`
 // starting at absolute sample `base` renders exactly the samples [base, base+c) whatever the
-// split, so a slow machine and a fast one produce the same film. The radiance cache broke that
-// invariant while it advanced at every chunk's end -- the update pass ran at each boundary --
-// so the boundaries themselves became part of the realization. Measured on
+// split, so a slow machine and a fast one produce the same film. The cache's advances are not
+// invisible -- the update pass runs at each -- so where they fall is part of the realization,
+// and the clock must not choose it. Measured on
 // scenes/cornell.ftsl at 200^2 / 1024 spp: two identical wall-clock-adaptive invocations
 // gave 40.1 % vs 41.4 % of consults terminated and images differing by 0.45 % rel-RMS,
 // while two runs with the split pinned were bit-identical. That silently voided the
@@ -19037,11 +19082,10 @@ static void warnHazeOnlyNearScene(const Scene& scene, const std::vector<char>& m
 //
 // So the cache's schedule targets a fixed COUNT of advances rather than a fixed time: 1, then
 // 9, then an equal split of the remainder into 62 pieces, a pure function of the render's
-// total that lands within a few of what the timed rule converges to here. Until 0.439.3 it was
-// the chunks' schedule, so its batches outlasted the -interval writes and a stop
-// (RADCACHE-BATCHES); since, it is the cache's alone (RadCacheSchedule, over absolute sample
-// indices), the chunks follow the clock, and the cache's merge is canonical (radCachePend), so
-// neither the chunking nor the thread count nor a stop and resume reaches the image.
+// total that lands within a few of what the timed rule converges to here. It is the cache's
+// own (RadCacheSchedule, over absolute sample indices), the chunks following the clock, and the
+// cache's merge is canonical (radCachePend), so neither the chunking nor the thread count nor a
+// stop and resume reaches the image.
 //
 // A chunk a stop abandoned part-way comes back `abandoned` and is dropped: the film returned
 // then holds the chunks before it, and is `abandoned` too when it falls short of sppTarget, so
@@ -19417,8 +19461,13 @@ static int runCompositeProgressive(
     sppMeter.start(0.0, (double)acc.spp);
 
     for (;;) {
-        long long dSpp = batchSpp;
-        long long dN   = std::max(1LL, (long long)std::llround((double)batchSpp * perSpp));
+        // -radcache: the batch ends at the cache's next boundary (renderBackward), its photons
+        // sized from the samples it then holds.
+        long long batch = batchSpp;
+        const long long rcNext = g_rcSchedule.next(acc.spp);
+        if (rcNext != RadCacheSchedule::kNone) batch = std::max(1LL, std::min(batch, rcNext - acc.spp));
+        long long dSpp = batch;
+        long long dN   = std::max(1LL, (long long)std::llround((double)batch * perSpp));
         if (!budgeted) {                              // cap each half to its remaining budget
             long long remSpp = endSpp - acc.spp; if (remSpp < 0) remSpp = 0;
             long long remN   = endN   - acc.N;   if (remN   < 0) remN   = 0;
@@ -19426,9 +19475,6 @@ static int runCompositeProgressive(
             dN   = std::min(dN,   remN);
             if (dSpp == 0 && dN == 0) { persist(compose(/*done*/true), true); break; }  // both budgets met
         }
-        // -radcache: the backward batch ends at the cache's next boundary (renderBackward).
-        const long long rcNext = g_rcSchedule.next(acc.spp);
-        if (rcNext != RadCacheSchedule::kNone) dSpp = std::min(dSpp, rcNext - acc.spp);
         auto tb = clk::now();
         if (dN > 0) {   // forward model-B layer (seedBase = cumulative photons, like A/B/C)
             EnergyReport e;
@@ -19476,12 +19522,12 @@ static int runCompositeProgressive(
         // lands soon, and overhead stays low. Both layers draw each photon and each sample by its
         // absolute index (stableSeed, sampleStride; the host always does), so where the clock ends a
         // batch changes nothing in the image: one seed, one image.
-        {
+        {   // toward ~0.5 s, from the batch it ran (a cut one included)
             double dt = std::chrono::duration<double>(clk::now() - tb).count();
             if (dt > 1e-4) {
-                long long next = (long long)((double)batchSpp * (0.5 / dt));
+                long long next = (long long)((double)batch * (0.5 / dt));
                 if (next < 1) next = 1;
-                if (next > batchSpp * 8 + 1) next = batchSpp * 8 + 1;
+                if (next > batch * 8 + 1) next = batch * 8 + 1;
                 batchSpp = next;
             }
         }

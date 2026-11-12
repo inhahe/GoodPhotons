@@ -1425,6 +1425,16 @@ def p_split_tests(exe, out, verdict, gpu=False):
     r = float(np.mean([x[fur].mean() for x in split]) / np.mean([x[fur].mean() for x in dual]))
     verdict("... and with -herosplit too: each wavelength by its own first event", abs(r - 1) < 0.025,
             "%.4f of without -herosplit" % r)
+    if gpu:
+        # The device splits at a fibre under -direct-only (bkRadianceHeroLoop<true>), each
+        # secondary noting its own first event (s_dFirstSec): 0.957 filed by the hero's, 0.998 now.
+        gargs = ["-mode", "P", "-device", "gpu", "-spp", "256", "-n", "4000000", "-direct-only"]
+        g0 = [lum(render(exe, out, pf, "pfur_gd_s%d" % s, gargs, seed=s, want_gpu=True)[0]) for s in (1, 2)]
+        g1 = [lum(render(exe, out, pf, "pfur_gds_s%d" % s, gargs + ["-herosplit"], seed=s, want_gpu=True)[0])
+              for s in (1, 2)]
+        r = float(np.mean([x[fur].mean() for x in g1]) / np.mean([x[fur].mean() for x in g0]))
+        verdict("... and on the GPU under -direct-only", abs(r - 1) < 0.025,
+                "%.4f of without -herosplit" % r)
     p_sun_test(exe, out, verdict, gpu)
 
 

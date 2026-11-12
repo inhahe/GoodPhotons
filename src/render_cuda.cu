@@ -15852,6 +15852,11 @@ struct DGiCtx {
 // when it splits and to kDFirstOff otherwise, which no path overwrites.
 constexpr int kDFirstSky = 0, kDFirstSpec = 1, kDFirstOther = 2, kDFirstUnset = -1, kDFirstOff = -2;
 __shared__ signed char s_dFirstEv[kMotionSlots];
+// ...and each secondary's own, where a split (bkRadianceHeroLoop<true>) sends it off as a sub-path:
+// its own coverage coin may pass a fibre the hero stopped at, or the reverse (host twin
+// GiCtx::firstSec, P-HEROSPLIT-FIRST). kDFirstHero: it rides with the hero's.
+constexpr int kDFirstHero = -3;
+__shared__ signed char s_dFirstSec[kMotionSlots][hero::kHeroMax];
 __device__ static inline void dNoteFirst(const DGiCtx& gi, int kind) {
     if (gi.depth == 0 && s_dFirstEv[threadIdx.x] == kDFirstUnset) s_dFirstEv[threadIdx.x] = (signed char)kind;
 }
@@ -15865,11 +15870,13 @@ __device__ static inline bool dNoteFirstSurface(const DScene& sc, const DGiCtx& 
 __device__ static inline void dUnnoteFirst(bool noted) {
     if (noted) s_dFirstEv[threadIdx.x] = (signed char)kDFirstUnset;
 }
-// The film a sample of a split render goes to, by its first event (renderRows' filmFor).
-__device__ static inline double* dFirstFilm(const DScene& sc, double* film, double* filmSpec) {
+// The film a sample of a split render goes to, by its first event `f` (renderRows' filmFor).
+__device__ static inline double* dFirstFilm(const DScene& sc, double* film, double* filmSpec, int f) {
     if (!filmSpec) return film;
-    const int f = s_dFirstEv[threadIdx.x];
     return (f == kDFirstSpec || (f == kDFirstSky && (sc.envIndex >= 0 || sc.sunCount > 0))) ? filmSpec : film;
+}
+__device__ static inline double* dFirstFilm(const DScene& sc, double* film, double* filmSpec) {
+    return dFirstFilm(sc, film, filmSpec, s_dFirstEv[threadIdx.x]);
 }
 
 // ---- the deterministic one-bounce gather (N3c) ----------------------------------------
@@ -16928,9 +16935,16 @@ __device__ static void bkRadianceHeroLoop(const DScene& sc, int diffraction,
                         // past a skin the strand grows from.
                         bool sNull = false;
                         Real sTmin = (Real)0;
-                        if (bkInteract<false>(sc, mp, h, matId, diffraction, directOnly, sRo, sRd,
-                                              sLam, sInv, sThr, sL, sSpec, sPdf, sStk, rng, gi,
-                                              nullptr, &sNull, &sTmin)) {
+                        // The sub-path notes its own first event in the thread's slot, the hero's
+                        // put back after: as the slot stands (this vertex's, if it noted itself),
+                        // none if its own coin passes this vertex, then its continuation's.
+                        const signed char heroFirst = s_dFirstEv[threadIdx.x];
+                        const bool sFiles = heroFirst != (signed char)kDFirstOff;
+                        const bool sGoes = bkInteract<false>(sc, mp, h, matId, diffraction, directOnly,
+                                                             sRo, sRd, sLam, sInv, sThr, sL, sSpec, sPdf,
+                                                             sStk, rng, gi, nullptr, &sNull, &sTmin);
+                        if (sFiles && sNull && firstHere) s_dFirstEv[threadIdx.x] = (signed char)kDFirstUnset;
+                        if (sGoes) {
                             double sub[hero::kHeroMax];
                             // A coverage pass-through is no vertex, for a sub-path as for the
                             // hero below: it keeps the record the hero restores (gmisIn) and is
@@ -16946,6 +16960,10 @@ __device__ static void bkRadianceHeroLoop(const DScene& sc, int diffraction,
                                                                refund ? b : b + 1, sub, rng, gi,
                                                                sNull ? &gmisIn : nullptr, sTmin);
                             sL += sub[0];
+                        }
+                        if (sFiles) {
+                            s_dFirstSec[threadIdx.x][i] = s_dFirstEv[threadIdx.x];
+                            s_dFirstEv[threadIdx.x] = heroFirst;
                         }
                         L[i] += sL;      // this wavelength's own estimate, own slot
                         thr[i] = 0.0;    // it is now that sub-path's business, not ours
@@ -17202,13 +17220,17 @@ __global__ void kBackward(DScene sc, const __grid_constant__ DCamera cam, double
             dGenRay(camS, px, py, jx, jy, hro, hrd);
             double Lh[hero::kHeroMax];
             s_dFirstEv[threadIdx.x] = (signed char)(filmSpec ? kDFirstUnset : kDFirstOff);
+            for (int i = 0; i < heroC; ++i) s_dFirstSec[threadIdx.x][i] = (signed char)kDFirstHero;
             // DGiCtx carries the ABSOLUTE sample index down the path, which rotates every
             // deterministic lattice (glossy lobe, gather directions) by it — so, exactly like
             // the subpixel and wavelength lattices, they are progressive and chunk-independent.
             bkRadianceHero<0>(sc, diffraction, hro, hrd, lam, invPdf, heroC, Lh, rng,
                               DGiCtx{0, sIdx, 0});
-            double* const to = dFirstFilm(sc, film, filmSpec);
             for (int i = 0; i < heroC; ++i) {
+                // Each wavelength by its own first event: a split secondary's may not be the hero's.
+                const int fs = s_dFirstSec[threadIdx.x][i];
+                double* const to = dFirstFilm(sc, film, filmSpec,
+                                              (i > 0 && fs != kDFirstHero) ? fs : s_dFirstEv[threadIdx.x]);
                 double w = Lh[i] * filmW[i] / (double)heroC;
                 atomicAdd(&to[o + 0], (double)cieX(lam[i]) * w);
                 atomicAdd(&to[o + 1], (double)cieY(lam[i]) * w);
@@ -22885,7 +22907,7 @@ __global__ void kVcmCameraT(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx
                               // Never merge with a vertex stored ON a strand (vcm.h, 0.362.0): the merge
                               // evaluates the CAMERA BSDF against a photon and never looks at where the
                               // photon sits, so a strand lying on the skin would bleed into it.
-                              if (!dVcmMergeAt(sc.mats[lv.matId], lv.fiberR)) continue;
+                              if (lv.fiberR > (Real)0) continue;   // on a strand (vcm.h: not of its lobe)
                               DVec3 d = h.p - lv.p;
                               if (ddot(d, d) > r2) continue;
                               if (edges + lv.edges > ctx.maxDepth) continue;

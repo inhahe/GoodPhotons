@@ -1364,12 +1364,15 @@ inline Vec3 traceCameraSubpath(const Scene& scene, const Camera& cam, const Rend
                 grid.query(lightVerts, h.p, ctx.radius, [&](int idx) {
                     const LightVertex& lv = lightVerts[idx];
                     if (edges + lv.edges > ctx.maxDepth) return;        // merged path too long
-                    // Never merge with a vertex stored ON A CURVE (vcmMergeAt; mode M's rule:
-                    // strands are never deposited on). The merge treats a stored vertex purely
-                    // as a photon and evaluates the CAMERA BSDF against it, so a photon on a
-                    // strand lying on the skin bleeds into every skin gather point within the
-                    // radius. Measured: opaque hair 2.79x mode R with this merge, 1.029x without.
-                    if (lv.mat && !vcmMergeAt(*lv.mat, lv.hit)) return;
+                    // Never merge with a vertex stored ON A CURVE (mode M's rule: strands are
+                    // never deposited on). The merge treats a stored vertex purely as a photon
+                    // and evaluates the CAMERA BSDF against it, so a photon on a strand lying on
+                    // the skin bleeds into every skin gather point within the radius. Measured:
+                    // opaque hair 2.79x mode R with this merge, 1.029x without. On the strand,
+                    // not of its lobe: a mix's hair lobe picked on a mesh is no strand, and a
+                    // compound's vertex is stored whatever lobe its pick took
+                    // (compoundMergeStoreProb), at a weight that counts on its being gathered.
+                    if (lv.hit.fiberRadius > 0.0) return;
                     Vec3 wMerge = lv.wo;                                // incident illumination dir
                     if (mergeFromBehind(camTwoSided, wMerge, ngoCam)) return;
                     // camera BSDF evaluated at the light vertex's wavelength (XYZ estimate).

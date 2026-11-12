@@ -235,6 +235,9 @@ either role -- one predicate per backend (`vcmMergeAt` / `dVcmMergeAt`) gates th
 stored vertices it gathers, and the merge-here term of every weight (both walks' `misScatter`,
 the NEE, connection and camera-splat weights). A diffuse strand is still a light vertex for the
 connections. check_fur_gather's coat, of mode R: U 2.100 (GPU) / 2.356 (CPU) -> 1.000 / 1.014.
+**0.439.5 (Opus's review):** the gather's test of a STORED vertex is its geometry alone (on a
+curve), as before: a compound whose pick took a hair lobe on a mesh is stored at 1 over its pick's
+chance, and refusing it biased the merge.
 
 **Modes M and S, fixed in 0.433.3** by the fix proposed below. Their camera walks never gather on a
 `type diffuse` strand: they light it by NEE, fold its reflectance into the spectral carrier, and go
@@ -697,8 +700,20 @@ a key's marks (`radCacheMarkLess`), the pending store holds one a key between bo
 `FTRCACH2` section carries the pending batch. `tools/check_radcache_det.py`: mode R on cornell
 byte-identical twice, at one thread, in chunks of 7, and stopped and resumed; mode P twice.
 Found on the way: the update rays' marks went into banks local to each call and died with it,
-so the table never grew from them as its design said; they ride to the next merge now. The rest
-of this entry is how it stood.
+so the table never grew from them as its design said; they ride to the next merge now.
+**0.439.5 (Opus's review of 0.439.2-0.439.4):** the update rays' misses rode along too, read as
+the camera's consults, and inflated the next batch's update budget: the update pass pends its
+marks alone (`radCachePend`'s `counts`). A resume was byte-identical only where an advance served
+the whole work list: the checkpoint (now section `FTRCACH3`) carries each cell's slot, re-homed
+there at the same capacity, and the update pass's rotation cursors; check_radcache_det holds it
+where a round serves 34 of 129 cells (0.439.4 fails it). Mode P's batch, cut at a boundary, was
+retargeted from the batch it asked for, not the one it ran, so it grew without bound; its photons
+are sized from the cut batch now. A table (and the pending batch) built under another cell size --
+the exposure meter's camera and resolution, the frame after it -- was read over the wrong
+regions: a pass whose `keyGuard` differs starts both afresh, and a resume's table waits for the
+pass whose settings it was saved under. A non-finite verification record is dropped, a
+corrupt sidecar's counts are held to its bytes, and the tallies move as one (`RadCacheTally`).
+The rest of this entry is how it stood.
 
 **0.434.27 fixed two parts of it.** A **budget hung**: mode R's `cpuSppChunks` took the
 fixed schedule under `-time`/`-noise`/`-forever` as well, whose target is `kUnboundedSpp`, so the
@@ -748,7 +763,10 @@ own coverage coin passes it, then its continuation's), at both split sites (a di
 and a coat's re-entry), and `renderRows` files each wavelength by its own. Measured on
 check_motion's fur before a mirror (opacity 0.3, blurred, `-dual-scatter`, 3 seeds): with
 `-herosplit` the fur read 0.959 of the render without it; now 1.0001. check_motion's `... and with
--herosplit too` holds it to 2.5 % (0.439.3 fails it at 0.965). The rest is how it stood.
+-herosplit too` holds it to 2.5 % (0.439.3 fails it at 0.965). **0.439.5 (Opus's review):** the
+GPU backward, which splits at a fibre under `-direct-only`, filed every wavelength by its one
+per-thread slot too; each secondary now notes its own in that slot, the hero's put back after
+(`s_dFirstSec`), and `kBackward` files each by its own. The rest is how it stood.
 
 Blurred mode P files each backward sample by its path's first event
 (`BackwardRenderer::GiCtx::first`): a specular surface or the sky to the backward layer, a

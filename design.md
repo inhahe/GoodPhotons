@@ -5645,8 +5645,12 @@ as the one at fault.
   samples alone: byte-identical at one thread, in chunks of 7, and stopped and resumed (the
   checkpoint's v2 section, `FTRCACH2`, carries the pending batch; a v1 section reads as none
   pending) -- `tools/check_radcache_det.py`. The update rays' marks ride to the next merge
-  through the pending store, as the design always meant: until 0.439.3 they were made into
-  banks local to the call and destroyed with it, so no cell was ever born from one.
+  through the pending store (their misses do not: the update pass pends marks alone). Since
+  0.439.5 the checkpoint (`FTRCACH3`) also holds each cell's slot and the update pass's rotation
+  cursors, so a resume is the uninterrupted render where an advance serves part of its list; and
+  a pass whose cells mean other regions (`keyGuard`: another cell size, the auto one following
+  the camera and the resolution) starts the table and the pending batch afresh, a resume's table
+  waiting for the pass whose settings it was saved under.
 
   **The table is checkpointed (0.190.3), sparsely and under its own guard.** It rides in the
   `.ftbuf` sidecar as a trailing section after the film blobs (`writeRadCacheSection` /
