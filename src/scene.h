@@ -516,7 +516,7 @@ inline bool gatherlessStrand(const Material& m, double fiberRadius) {
 inline bool isPlanarMirrorMat(const Material& m) {
     if (m.type == MatType::Mirror || m.type == MatType::HalfMirror) return true;
     return m.type == MatType::Glossy && m.roughness <= 0.0 &&
-           m.roughnessTex < 0 && m.roughnessPat < 0;
+           m.roughnessTex < 0 && m.roughnessPat < 0 && m.recBindingFor(REC_SLOT_ROUGHNESS) == nullptr;
 }
 
 // Resolve a Mix material to one of its child material indices using a single

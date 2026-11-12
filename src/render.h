@@ -1303,6 +1303,12 @@ struct Renderer {
         if (!firstBounce || isPlanarMirrorMat(lobe)) return 1.0;
         return shadowTerminatorG(wi, h.n, orientedGeoN(h));
     }
+    // A photon's glossy continuation from its arrival (`wIn`, toward the light) into `o`: the lobe's
+    // adjoint (glossyAdjointRatio) times the shading normal's half of Veach's (shadingAdjointCorr), as
+    // bdpt.h's light walk takes them. 0 for an arrival from below ns. Device twin dGlossyPhotonAdjoint.
+    static double glossyPhotonAdjoint(const Hit& h, const Vec3& wIn, const Vec3& o) {
+        return glossyAdjointRatio(h.n, wIn, o) * shadingAdjointCorr(wIn, o, h.n, orientedGeoN(h));
+    }
     // A compound's own deposit (compoundGathers), made before its pick, of a photon arriving along
     // -`wi` with throughput `beta`: what it stores. A compound whose gathering lobes are all
     // Lambertian takes their arrival rule (lambertArrival, then the arrival adjoint) -- the lobe the
@@ -2670,8 +2676,7 @@ struct Renderer {
                 // normal tilts, Veach's shading-normal half (shadingAdjointCorr, as bdpt.h's light
                 // walk takes at every non-delta vertex; 1 where ns == ng). The ledger takes what it
                 // gains or loses as negative or positive absorption, so it still balances.
-                const double adj = glossyAdjointRatio(h.n, ray.d * -1.0, o) *
-                                   shadingAdjointCorr(ray.d * -1.0, o, h.n, orientedGeoN(h));
+                const double adj = glossyPhotonAdjoint(h, ray.d * -1.0, o);
                 if (!(adj > 0.0)) { e.absorbed += beta; return false; }
                 e.absorbed += beta * (1.0 - adj);
                 beta *= adj;
@@ -2688,6 +2693,7 @@ struct Renderer {
                 // A Lambertian lobe, as Diffuse's (lambertArrival).
                 double sEm;
                 if (!lambertArrival(h, ngo, wi, firstHit, sEm)) { e.absorbed += beta; return false; }
+                e.absorbed += beta * (1.0 - sEm);
                 beta *= sEm;
                 // Model-B connections: the elastic channel splats at the
                 // incoming lambda; the fluorescent channel samples one
@@ -3616,11 +3622,14 @@ struct Renderer {
                     double cr = materialRoughness(scene, cm, h);
                     Vec3 o = sampleGlossy(reflect(ray.d, h.n), cr, rng);
                     if (dot(o, h.n) <= 0) { e.absorbed += beta; return; }
-                    // The coat's lobe is a glossy lobe: softened on the first bounce, unless it is
-                    // a delta (glossyArrival), and its adjoint, as interactPhotonSpecular's.
-                    if (bounce == 0 && cr > 0.0) beta *= shadowTerminatorG(ray.d * -1.0, h.n, orientedGeoN(h));
-                    const double adj = glossyAdjointRatio(h.n, ray.d * -1.0, o) *
-                                       shadingAdjointCorr(ray.d * -1.0, o, h.n, orientedGeoN(h));
+                    // The coat's lobe is a glossy lobe (its own material, coatChild): softened on
+                    // the first bounce unless it is a delta (glossyArrival), and its adjoint, as
+                    // interactPhotonSpecular's.
+                    const double sC = glossyArrival(scene.mats[(size_t)cm.coatChild], h, ray.d * -1.0,
+                                                    bounce == 0);
+                    e.absorbed += beta * (1.0 - sC);
+                    beta *= sC;
+                    const double adj = glossyPhotonAdjoint(h, ray.d * -1.0, o);
                     if (!(adj > 0.0)) { e.absorbed += beta; return; }
                     e.absorbed += beta * (1.0 - adj);
                     beta *= adj;
@@ -3692,7 +3701,11 @@ struct Renderer {
                         default: break;
                     }
                     // A glossy lobe's first bounce softens toward the emitter (glossyArrival).
-                    if (m.type == MatType::Glossy) beta *= glossyArrival(m, h, ray.d * -1.0, bounce == 0);
+                    if (m.type == MatType::Glossy) {
+                        const double sEm = glossyArrival(m, h, ray.d * -1.0, bounce == 0);
+                        e.absorbed += beta * (1.0 - sEm);   // the ledger books what it removes
+                        beta *= sEm;
+                    }
                     // A glossy lobe with a finite value (glossySplats) splats to the camera as a
                     // diffuse vertex does, with the glossy BSDF toward it; the arriving beta, so
                     // before the roulette below.
@@ -3878,6 +3891,7 @@ struct Renderer {
                     // came from (bdpt.h emitterSoftening). Both 1 / no-ops where ns == ng.
                     double sEm;
                     if (!lambertArrival(h, ngo, wi, bounce == 0, sEm)) { e.absorbed += beta; return; }
+                    e.absorbed += beta * (1.0 - sEm);
                     beta *= sEm;
                     // Photon-map deposit: incident flux at this diffuse vertex. Stored
                     // BEFORE the Russian-roulette reflect/absorb so the record captures
@@ -4204,12 +4218,10 @@ struct Renderer {
                     double cr = materialRoughness(scene, cm, h);
                     Vec3 o = sampleGlossy(reflect(ray.d, h.n), cr, rng);
                     if (dot(o, h.n) <= 0) { e.absorbed += activeSum(); return; }
-                    if (bounce == 0 && cr > 0.0) {                                 // see scalar twin
-                        const double sC = shadowTerminatorG(ray.d * -1.0, h.n, orientedGeoN(h));
-                        for (int i = 0; i < nUp; ++i) beta[i] *= sC;
-                    }
-                    const double adj = glossyAdjointRatio(h.n, ray.d * -1.0, o) *
-                                       shadingAdjointCorr(ray.d * -1.0, o, h.n, orientedGeoN(h));   // see scalar twin
+                    const double sC = glossyArrival(scene.mats[(size_t)cm.coatChild], h,   // see scalar twin
+                                                    ray.d * -1.0, bounce == 0);
+                    for (int i = 0; i < nUp; ++i) { e.absorbed += beta[i] * (1.0 - sC); beta[i] *= sC; }
+                    const double adj = glossyPhotonAdjoint(h, ray.d * -1.0, o);
                     if (!(adj > 0.0)) { e.absorbed += activeSum(); return; }
                     for (int i = 0; i < nUp; ++i) { e.absorbed += beta[i] * (1.0 - adj); beta[i] *= adj; }
                     if (!continueAlong(h, o, Lobe::Reflect, ray)) { e.absorbed += activeSum(); return; }
@@ -4312,7 +4324,7 @@ struct Renderer {
                     // with a finite value splats first, as the scalar path's does.
                     if (m.type == MatType::Glossy) {                // first bounce: glossyArrival
                         const double sEm = glossyArrival(m, h, ray.d * -1.0, bounce == 0);
-                        for (int i = 0; i < nUp; ++i) beta[i] *= sEm;
+                        for (int i = 0; i < nUp; ++i) { e.absorbed += beta[i] * (1.0 - sEm); beta[i] *= sEm; }
                     }
                     if (nCam > 0 && !forwardCatch && glossySplats(m) &&
                         (specularSideSplats || !isSpecularType(scene.mats[h.matId].type))) {
@@ -4342,8 +4354,7 @@ struct Renderer {
                         const GlossyDraw gd = drawGlossy(scene, m, h, ray.d, h.n, ray.d * -1.0, rng);
                         const Vec3& o = gd.o;
                         if (dot(o, h.n) <= 0) { e.absorbed += activeSum(); return; }  // below surface
-                        const double adj = glossyAdjointRatio(h.n, ray.d * -1.0, o) *
-                                       shadingAdjointCorr(ray.d * -1.0, o, h.n, orientedGeoN(h));  // see the scalar path
+                        const double adj = glossyPhotonAdjoint(h, ray.d * -1.0, o);  // see the scalar path
                         if (!(adj > 0.0)) { e.absorbed += activeSum(); return; }
                         for (int i = 0; i < nUp; ++i) { e.absorbed += beta[i] * (1.0 - adj); beta[i] *= adj; }
                         if (gd.irid) {
@@ -4430,7 +4441,7 @@ struct Renderer {
                     // tracePhoton).
                     double sEm;                                     // lambertArrival
                     if (!lambertArrival(h, ngo, wi, bounce == 0, sEm)) { e.absorbed += activeSum(); return; }
-                    for (int i = 0; i < nUp; ++i) beta[i] *= sEm;
+                    for (int i = 0; i < nUp; ++i) { e.absorbed += beta[i] * (1.0 - sEm); beta[i] *= sEm; }
                     // Photon-map deposit: store EVERY live wavelength as its own per-λ
                     // photon record (the gather keys off each photon's own λ). C records
                     // of base/C sum to base, and nEmitted counts PATHS, so the estimator

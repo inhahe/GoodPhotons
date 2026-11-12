@@ -6,16 +6,15 @@
 The glossy BSDF divides its lobe by the cosine on the light's side (render.h glossyF), so it is not
 reciprocal, and a walk from the light must carry its adjoint: drawing its way out of the lobe about
 its arrival, it multiplies r by cos(out)/cos(in) (glossyAdjointRatio), where a walk from the camera
-takes r alone. Until 0.440.2 the light walks took r too -- connections had the adjoint (0.276.0),
-continuations did not -- so every glossy bounce on a light subpath was off by cos(in)/cos(out).
+takes r alone. A light walk that takes r too is off by cos(in)/cos(out) at every glossy bounce.
 
 Two scenes, every mode against mode R on the same device at -max-bounce 32 (modes M and S deposit
 over 32 bounces whatever the flag says):
   * "bounce": a glossy floor lit steeply by a panel that faces it, throwing its light at a grazing
     angle onto a diffuse wall, which is the camera's view -- light that arrives steep and leaves
-    grazing, the ratio far from 1. Before the fix, on the host, B read 1.32 of R, M 1.31, D 1.11.
+    grazing, the ratio far from 1: a light walk taking r reads it ~1.3 of R in B and M, 1.1 in D.
   * "room": five glossy walls (roughness 0.4), lit at a grazing angle by a tilted panel -- many
-    glossy bounces at every angle. Before the fix D read 1.011 of R, J 1.008, U 1.012.
+    glossy bounces at every angle, where the same fault reads ~1 % bright in D, J and U.
 Each mode's frame mean over `--seeds` seeds must be within TOL of mode R's. Exits 1 on any failure.
 """
 import argparse

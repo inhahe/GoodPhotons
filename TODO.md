@@ -163,6 +163,10 @@ Each names the section its line is in.
     decision (keep R's integrand, or make the coat physical in every mode).
 23i. ~~**GLOSSY-DEPTH-CAP** (4.3) — at `-max-bounce`, mode R's glossy NEE keeps only its MIS share:
     the last vertex's lobe-sampled emitter hit is never traced.~~ Done, 0.440.4 (the tail).
+23j. **THIN-GAP-GATHER** (4.2) — mode M at a forced large radius gathers a lit surface a few
+    millimetres behind as the same surface (MERGE-PROXIMITY's flat allowance).
+23k. **GLOSSY-ADJ-VARIANCE** (4.3) — the glossy lobe's adjoint is unbounded at grazing arrival;
+    the cure is a reciprocal lobe, which needs a decision.
 23h. **S-GPU-GLOSSY-BUMP** (4.3) — device mode S reads normal-mapped glossy walls 1.043 of R (host
     0.997); see BUMP-MODES.
 23c. ~~**B-GPU-MAXBOUNCE** (4.2) — GPU mode B ignores `-max-bounce` (its kernels get a literal 32).~~
@@ -240,6 +244,9 @@ Then the rest of 4.2-4.6 in their order, 4.7's bookkeeping alongside whatever to
 - [ ] **LAYERED-MODES** — a `layered` material reads 1-9 % off mode R elsewhere, even flat (the
   coat's coin is non-reciprocal); decision owed.
 - [ ] **S-GPU-GLOSSY-BUMP** — device mode S reads normal-mapped glossy walls 1.043 of R.
+- [ ] **THIN-GAP-GATHER** — mode M at a forced large radius gathers a lit surface millimetres behind.
+- [ ] **GLOSSY-ADJ-VARIANCE** — the glossy lobe's adjoint is unbounded at grazing arrival; decision
+  owed (a reciprocal glossy lobe).
 - [x] **GLOSSY-DEPTH-CAP** (0.440.4) — at the bounce cap mode R's glossy NEE kept only its MIS share;
   R now traces the ray its last vertex samples, for the light it reaches.
 - [x] **B-GPU-MAXBOUNCE** (0.439.9) — GPU mode B ignored `-max-bounce` (a literal 32 reached its

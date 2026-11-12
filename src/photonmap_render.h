@@ -1413,7 +1413,7 @@ inline Vec3 photonGatherSub(const Scene& scene, const PhotonMap& pm, Ray ray, Pc
                     // radius, the coverage and the photon test alike.
                     const Vec3 gn = orientedGeoN(h);
                     const double slack = M.gatherSlack(h.fiberRadius);
-                    const double rq = M.adaptiveRadius(h.p, gn, h.fiberRadius);
+                    const double rq = M.adaptiveRadius(h.p, gn, h.fiberRadius, m.type == MatType::DiffuseTransmit);
                     nrmOut = normFixed;
                     if (rq != M.radius) {
                         const double a = PI * rq * rq;
@@ -1835,7 +1835,7 @@ inline Vec3 photonGather(const Scene& scene, const PhotonMap& pm, Ray ray, doubl
                     // radius, the coverage and the photon test alike.
                     const Vec3 gn = orientedGeoN(h);
                     const double slack = M.gatherSlack(h.fiberRadius);
-                    const double rq = M.adaptiveRadius(h.p, gn, h.fiberRadius);
+                    const double rq = M.adaptiveRadius(h.p, gn, h.fiberRadius, m.type == MatType::DiffuseTransmit);
                     nrmOut = normFixed;
                     if (rq != M.radius) {
                         const double a = PI * rq * rq;

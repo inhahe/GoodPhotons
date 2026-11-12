@@ -914,6 +914,9 @@ inline void beginBeamSpectral(const Scene& scene, const Renderer& mats, const Em
     bs.ok   = true;
 }
 
+inline double mergeCopySoftening(const Scene& scene, const Material& compound, const Vertex& v,
+                                 const Vec3& toEmitter);   // below, beside softenFirstBounce
+
 // Continue a subpath whose endpoint is already path[0] (Camera or Light). `ray` is
 // the first ray leaving that endpoint; `beta` the throughput carried along it;
 // `pdfDir` the solid-angle density of that first direction; `mode` the transport
@@ -1804,6 +1807,18 @@ inline void randomWalk(const Scene& scene, const Camera& cam, const Renderer& ma
             if (fldOK) foldApply(fldHero, fldF, fldK);
             else       retireSpectral(fldWhy);
         }
+        // A compound's merge copy at the first bounce, where the pick went delta (mergeCopySoftening):
+        // `cur.beta` is what a merge reads there; the running `beta` goes on unsoftened.
+        if (mode == Mode::Importance && delta && path.size() == 2 && cur.compoundMergeW > 0.0) {
+            const Vec3 d = path[0].p - cur.p;
+            const double l2 = dot(d, d);
+            if (l2 > 0.0) {
+                const double s = mergeCopySoftening(scene, scene.mats[cur.matId], cur,
+                                                    d * (1.0 / std::sqrt(l2)));
+                cur.beta *= s;
+                for (double& b : cur.betaSec) b *= s;
+            }
+        }
         // Veach shading-normal ADJOINT correction (§5.3) for the LIGHT (Importance)
         // subpath only: a particle tracer deposits irradiance per GEOMETRIC area, so an
         // interpolated shading normal must be reweighted at each non-specular vertex or
@@ -1964,25 +1979,27 @@ inline void scaleFromFirstVertex(std::vector<Vertex>& path, std::vector<PathSeg>
             }
 }
 // A light subpath's first bounce, softened toward the emitter it left (emitterSoftening): path[1]
-// on, and every beam segment leaving path[1] or later. Where path[1] is a compound's merge vertex
-// whose pick went delta (compoundMergeW), only its merge copy -- path[1]'s own throughput, which
-// nothing but a merge reads at a delta vertex -- is softened, as the compound's lobes the merges
-// evaluate would be; the delta's continuation goes on unsoftened (vcm.h's light walk, sStore).
+// on, and every beam segment leaving path[1] or later. (A compound's merge copy where the pick went
+// delta is softened in randomWalk, which still has the compound in hand: mergeCopySoftening.)
 inline void softenFirstBounce(std::vector<Vertex>& path, std::vector<PathSeg>* segs) {
     if (path.size() < 2) return;
     const Vec3 d = path[0].p - path[1].p;
     const double l2 = dot(d, d);
     if (!(l2 > 0.0)) return;
-    const Vec3 toEm = d * (1.0 / std::sqrt(l2));
-    Vertex& v = path[1];
-    if (v.type == VType::Surface && v.delta && v.compoundMergeW > 0.0) {
-        const double s = shadowTerminatorG(toEm, v.ns, vertexGeoN(v));
-        v.beta *= s;
-        for (double& b : v.betaSec) b *= s;
-        return;
-    }
-    const double s = emitterSoftening(v, toEm);
+    const double s = emitterSoftening(path[1], d * (1.0 / std::sqrt(l2)));
     if (s != 1.0) scaleFromFirstVertex(path, segs, s);
+}
+
+// A compound's merge copy at a light walk's first scene vertex `v` whose pick went to a lobe that
+// does not connect (a delta coat, a mirror): the merges evaluate the compound's gathering lobes,
+// which the first bounce softens as emitterSoftening softens any (toward `toEmitter`), while the
+// delta's continuation goes on unsoftened. 1 for a compound with a translucent lobe -- stored as a
+// translucent's own case stores it, unsoftened (Renderer::compoundDepositWeight). vcm.h's light walk
+// (sStore) and the device's walks take the same.
+inline double mergeCopySoftening(const Scene& scene, const Material& compound, const Vertex& v,
+                                 const Vec3& toEmitter) {
+    if (compoundTransmits(scene, compound)) return 1.0;
+    return shadowTerminatorG(toEmitter, v.ns, vertexGeoN(v));
 }
 
 // Emit a light subpath from a DELTA light (spot or sun) — the two emitters with no

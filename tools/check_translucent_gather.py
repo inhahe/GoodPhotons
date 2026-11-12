@@ -5,16 +5,24 @@
 
 A `translucent` sheet (DiffuseTransmit) reflects into its lit side and transmits into the other,
 and a photon it transmits is deposited on its far face, facing away from a visible point on the
-near one. Until 0.440.1 the gathers of modes M and S kept only photons facing the visible point's
-own side (gatherplane.h onGatherSurface) and weighed them by the reflect albedo alone, so a
-translucent sheet lit from behind rendered without its transmitted light: 0.912 of mode R in M,
-0.901 in S, on the room below. Now a translucent visible point takes the far side's photons too,
-at its transmit albedo (onGatherSurfaceSided, gatherAlbedo).
+near one. A translucent visible point takes the far side's photons too, at its transmit albedo
+(gatherplane.h onGatherSurfaceSided, photonmap_render.h gatherAlbedo); a gather that keeps only the
+photons facing its own side, at the reflect albedo, renders a sheet lit from behind without its
+transmitted light, about 0.91 of mode R in M and S on the room below.
 
 The room: five diffuse walls (reflect 0.8), a translucent panel (reflect 0.4, transmit 0.4)
 standing across it, lit at a grazing angle by a tilted panel on the far side, 64x48. Every mode
 against mode R on the same device at -max-bounce 32 (modes M and S deposit over 32 bounces
 whatever the flag says); each mode's frame mean over `--seeds` seeds must be within 1 % of R's.
+
+A far-side photon must lie on the sheet itself: the back face of a thin solid behind it, parallel
+and a thickness away, holds the light arriving at that face, not the light the sheet transmits. The
+second room puts an opaque diffuse plate 5 mm behind the sheet, lit from behind, and gathers mode M
+at a pinned radius of 0.15 (30 times the gap; the adaptive radius stays far smaller here): on the
+host and device the panel's tiles must read under 1.6 of mode R, where a far-side test with the
+band's flat allowance gathers the plate's back and reads them 2.4 and 4.6. (What remains, about
+1.1 and 1.4, is that allowance gathering the plate's lit inner face as a same-facing surface, the
+known reach of MERGE-PROXIMITY's band at a radius this large: THIN-GAP-GATHER in known-issues.md.)
 Exits 1 on any failure.
 """
 import argparse
@@ -48,6 +56,15 @@ SCENE = NL.join([
     "light area { origin -1.9 0.2 -1.5  u 0 0 0.6  v 0 2.4 0  normal 1 0 0.2  spd preset:bb6500  power 40 }",
     'camera "c" { eye 0 1.2 4  look_at 0 1.2 0  up 0 1 0  fov_y 50  film { res 64 48 } }',
 ]) + NL
+
+
+# The plate: opaque, 5 mm behind the sheet (along the sheet's normal), lit from behind.
+_N = np.array([-1.0, 0.0, 4.0]) / np.sqrt(17.0)
+PLATE = SCENE.replace(
+    "quad { origin -1 0 -0.5  u 2 0 0.5  v 0 2 0  material t }",
+    "quad { origin -1 0 -0.5  u 2 0 0.5  v 0 2 0  material t }" + NL +
+    "quad { origin %.6f %.6f %.6f  u 2 0 0.5  v 0 2 0  material w }" % tuple(np.array([-1.0, 0.0, -0.5]) - _N * 0.005))
+PLATE_TILE_MAX = 1.6
 
 
 def main():
@@ -95,6 +112,38 @@ def main():
                   flush=True)
             if not good:
                 fails.append("%s %s" % (mode, dev))
+    plate = os.path.join(out, "plate.ftsl")
+    with open(plate, "w", encoding="utf-8", newline="") as f:
+        f.write(PLATE)
+
+    def img(mode, dev, seed, extra=()):
+        png = os.path.join(out, "plate_%s_%s_%d.png" % (mode, dev, seed))
+        pfm = png[:-4] + ".pfm"
+        for f in (png, pfm):
+            if os.path.exists(f):
+                os.remove(f)
+        cmd = [exe, "-in", plate, "-mode", mode, "-device", dev,
+               "-spp", str(SPP[mode] * (4 if dev == "gpu" else 1)), "-n", str(NPHOT.get(mode, 200000)),
+               "-max-bounce", str(DEPTH), "-seed", str(seed), "-hdr", "-no-meter", "-window-min",
+               "-o", png] + list(extra)
+        p = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
+        if p.returncode != 0 or not os.path.exists(pfm):
+            print((p.stdout + p.stderr)[-1500:])
+            raise SystemExit("render failed (exit %d): %s" % (p.returncode, " ".join(cmd)))
+        return read_pfm(pfm, top_down=True).sum(-1)
+
+    for dev in ["cpu"] + ([] if a.no_gpu else ["gpu"]):
+        r = np.mean([img("R", dev, s) for s in seeds[:2]], 0)
+        m = np.mean([img("M", dev, s, ["-pmradius", "0.15"]) for s in seeds[:2]], 0)
+        h, w = r.shape
+        tiles = [m[h * i // 4:h * (i + 1) // 4, w * 2 // 6:w * 4 // 6].sum() /
+                 r[h * i // 4:h * (i + 1) // 4, w * 2 // 6:w * 4 // 6].sum() for i in (1, 2)]
+        good = max(tiles) < PLATE_TILE_MAX
+        print("%s: plate, mode M at radius 0.15 on the %s: the panel's tiles %s of mode R"
+              % ("ok" if good else "FAIL", "host" if dev == "cpu" else "device",
+                 " and ".join("%.3f" % t for t in tiles)), flush=True)
+        if not good:
+            fails.append("plate M %s" % dev)
     print("FAILED: " + ", ".join(fails) if fails else "PASS")
     return 1 if fails else 0
 

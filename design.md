@@ -3726,9 +3726,13 @@ holding a glass ball), and on the device `-rgb`, mode S and every one of those.
       compound makes before its lobe pick and which then takes the arrival adjoint too
       (`compoundDepositWeight`; a compound with a translucent lobe stores the arrival as a
       translucent's own case does); `glossyArrival` (the first bounce's softening) at a glossy
-      vertex and at a layered coat's lobe, splat and continuation alike; and at a glossy
-      continuation the shading-normal adjoint `shadingAdjointCorr` beside the lobe's own adjoint
-      (`glossyAdjointRatio`), as bdpt.h's light walk takes it. The arrival adjoint itself is
+      vertex and at a layered coat's lobe (on the coat's own material), splat and continuation
+      alike; and at a glossy continuation the shading-normal adjoint `shadingAdjointCorr` beside
+      the lobe's own adjoint (`glossyPhotonAdjoint`), as bdpt.h's light walk takes it. Each
+      softening and adjoint is booked in the photon's energy ledger (what it removes as
+      absorbed, what it adds as negative absorption), so the ledger still balances. A compound's
+      merge copy at a first bounce whose pick went delta is softened only where its gathering
+      lobes are all Lambertian (`mergeCopySoftening`; vcm.h `sStore`). The arrival adjoint itself is
       geometry.h's `arrivalAdjointCorr`, which the point merges of U and J take too, so no two
       estimators read a smooth mesh differently; a grazing denominator falls back to 1.
       `tools/check_bump_modes.py` holds D, J, U, B, M and S to R on such a room and its flat
@@ -6262,10 +6266,13 @@ as the one at fault.
   facing test above dropped it, and the gather took the reflect albedo alone: a backlit sheet read
   0.91 of mode R in M and 0.90 in S. At a DiffuseTransmit visible point (`onGatherSurfaceSided`,
   device `dOnGatherSurfaceSided`) the test also keeps a photon facing the opposite way within the
-  same 60 degrees (`farSide`), through the same band on |cos theta|, and `gatherAlbedo` (device
-  `dGatherAlbedo`) weighs it by the transmit albedo, a near one by the reflect albedo -- the pair
-  guarded as `diffuseTransmitAlbedos` guards it everywhere. Every other material is one-sided as
-  before. Check: `tools/check_translucent_gather.py`.
+  same 60 degrees (`farSide`), through the band on |cos theta| without its flat allowance -- a
+  far-side photon must lie on the sheet itself, within its curvature and the slack, or the back
+  face of a thin solid behind it would pass for the sheet's own far face (0.440.5) -- and
+  `gatherAlbedo` (device `dGatherAlbedo`) weighs it by the transmit albedo, a near one by the
+  reflect albedo -- the pair guarded as `diffuseTransmitAlbedos` guards it everywhere. The adaptive
+  radius counts the same population (`adaptiveRadius(..., twoSided)`). Every other material is
+  one-sided as before. Check: `tools/check_translucent_gather.py`.
 
   **An analytic clip was the obvious design and is the wrong one here:** clipping same-facing
   primitives to the disc is exact for triangles and impossible for fur, isosurfaces and CSG

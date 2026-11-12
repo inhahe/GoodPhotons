@@ -175,11 +175,11 @@ inline double bsdfF(const Material& m, const Vec3& ns, const Vec3& wo, const Vec
 // WHY IT MATTERS HERE. bsdfF pre-divides by cos(wi) (see the CONVENTION note at the top). The
 // Glossy lobe factor is symmetric under the swap but the denominator is not, so without this the
 // same physical path got f = r*lobe/cos(camera-side) from the light subpath and
-// f = r*lobe/cos(light-side) from the camera subpath. A light walk's CONTINUATION needs the same
-// adjoint: its f*cos/pdf is r * glossyAdjointRatio (render.h), not the r a camera walk takes. MIS then mixed two estimators
+// f = r*lobe/cos(light-side) from the camera subpath. MIS then mixed two estimators
 // that disagreed by cos(wo)/cos(wcam) -- measured as mode D reading 15 % DIM with the camera near
 // the normal and bright with it grazing, a sign flip no roughness- or solid-angle-scaled error
-// could produce.
+// could produce. A light walk's CONTINUATION needs the same adjoint: its f*cos/pdf is
+// r * glossyAdjointRatio (render.h), not the r a camera walk takes.
 //
 // WHICH FORM IS RIGHT IS SETTLED BY ENERGY. Under uniform illumination L, reflectance r must
 // return r*L. Dividing by the incident cosine gives \int r*lobe/cos * cos dw = r; dividing by the

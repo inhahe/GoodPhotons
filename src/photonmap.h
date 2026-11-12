@@ -530,7 +530,9 @@ struct PhotonMap {
     static const int kAdaptBins = 16;   // covers r down to r * 2^-8 = r/256
 
     // `fiberR`: the gather point's curve radius (0 off one); its sum takes gatherSlack(fiberR) too.
-    double adaptiveRadius(const Vec3& p, const Vec3& n, double fiberR) const {
+    // `twoSided`: a translucent gather point, whose sum takes its far side's photons too
+    // (onGatherSurfaceSided), so the radius counts them as well.
+    double adaptiveRadius(const Vec3& p, const Vec3& n, double fiberR, bool twoSided) const {
         if (kGather <= 0.0 || photons.empty() || radius <= 0.0) return radius;
         const double slack = gatherSlack(fiberR);
         int hist[kAdaptBins] = {0};
@@ -550,7 +552,9 @@ struct PhotonMap {
                         Vec3 d = p - pp[k];
                         const double d2 = dot(d, d);
                         if (d2 > r2) continue;
-                        if (!onGatherSurface(p, n, pp[k], photons[k].n, d2, slack)) continue;
+                        bool farSide;
+                        if (!onGatherSurfaceSided(p, n, pp[k], photons[k].n, d2, slack, twoSided,
+                                                  farSide)) continue;
                         // Shell index: t in (2^-(i+1), 2^-i] -> i. ilogb(t) is the exponent e
                         // with t = m*2^e, m in [1,2), so i = -e-1. d2 == 0 lands in the
                         // innermost shell (ilogb(0) is FP_ILOGB0, clamped below).

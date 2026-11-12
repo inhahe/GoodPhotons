@@ -41,11 +41,14 @@ constexpr double kGatherFacingCos = 0.5;
 // over the surface's own relief.
 constexpr double kLowLegFrac = 0.01;
 
-template <class T> FT_GP_HD inline bool withinGatherBand(T off, T d2, T c, T slack) {
+// `tol`: the band's flat allowance, kGatherPlaneTol of the distance; 0 for a translucent point's far
+// side (onGatherSurfaceSided).
+template <class T> FT_GP_HD inline bool withinGatherBand(T off, T d2, T c, T slack,
+                                                         T tol = T(kGatherPlaneTol)) {
     if (off <= slack) return true;
     T q = T(1) - c * c;
     if (q < T(0)) q = T(0);
-    const T k = T(kGatherPlaneTol) + gpSqrt(q);
+    const T k = tol + gpSqrt(q);
     const T e = off - slack;
     return e * e <= k * k * d2;
 }
@@ -75,8 +78,12 @@ inline bool onGatherSurface(const Vec3& x, const Vec3& n, const Vec3& pp, const 
 // A gather on a TWO-SIDED surface (`twoSided`: a `translucent` visible point, TRANSLUCENT-MS) takes the
 // photons on either side of it: those facing the gather point's way (its near side, lit as a
 // reflector) and those facing the other (`farSide`: the light the sheet transmits from behind, which
-// it deposits on its far face). The facing test on the normals' cosine `c`; the band test is the
-// same on |c|. One-sided, onGatherSurface's alone.
+// it deposits on its far face). The facing test on the normals' cosine `c`, the band on |c| -- for a
+// far-side photon without the band's flat allowance, so that it must lie on the sheet itself, within
+// its curvature (d sin theta) and the slack: the far face of a thin sheet is the sheet, while the
+// back face of a thick translucent solid, parallel to it a thickness away, is another surface whose
+// photons are the light arriving at that face, not the light this one transmits. One-sided,
+// onGatherSurface's alone.
 template <class T> FT_GP_HD inline bool gatherFacing(T c, bool twoSided, bool& farSide) {
     farSide = false;
     if (c >= T(kGatherFacingCos)) return true;
@@ -87,5 +94,6 @@ inline bool onGatherSurfaceSided(const Vec3& x, const Vec3& n, const Vec3& pp, c
                                  double slack, bool twoSided, bool& farSide) {
     const double c = dot(pn, n);
     if (!gatherFacing(c, twoSided, farSide)) return false;
-    return withinGatherBand(std::fabs(dot(pp - x, n)), d2, std::fabs(c), slack);
+    return withinGatherBand(std::fabs(dot(pp - x, n)), d2, std::fabs(c), slack,
+                            farSide ? 0.0 : kGatherPlaneTol);
 }

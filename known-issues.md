@@ -2546,6 +2546,70 @@ vertices reaches by its lobe is counted, as its light sampling is), host and dev
 for modes M's and S's camera walks, which share the structure; then R's cap means the same with
 glossy NEE on and off.
 
+## DONE (2026-11-12, 0.440.5): REVIEW-4403 — what the Opus review of 0.440.1-0.440.3 found
+
+`/code-review xhigh` (Opus) of e8019b4..88558c8 (TRANSLUCENT-MS, GLOSSY-FLAT-DJU, REVIEW-4400's
+follow-ups): 12 findings, each checked against the code. Fixed in 0.440.5:
+
+* **A translucent point's far side took a thin solid's back face too.** The far-side facing test
+  went through the band with its flat allowance (0.1 of the distance), so the photons on a parallel
+  face a thickness behind the sheet passed wherever the distance passed ten thicknesses: an opaque
+  plate 5 mm behind a translucent sheet, lit from behind, read the panel 2.4 and 4.6 of mode R in M
+  at a radius of 0.15. A far-side photon now has to lie on the sheet itself (`withinGatherBand`'s
+  `tol` 0 there: the slack and d sin theta only); the panel reads 1.14 and 1.36 at that radius, the
+  rest being THIN-GAP-GATHER below. check_translucent_gather's `plate` room holds it under 1.6.
+* **The adaptive radius counted one side** while the sum it sizes takes both at a translucent point:
+  PhotonMap::adaptiveRadius and dPmAdaptiveRadius take `twoSided` and the sided test.
+* **The delta-pick merge copy was softened whatever the compound's lobes**, translucent ones too,
+  which no other site softens: `mergeCopySoftening` (bdpt.h) softens only a compound whose gathering
+  lobes are all Lambertian, as vcm.h's `sStore` and its device twin now do too; and it moved into
+  randomWalk / dRandomWalk, where the compound is still in hand (the device's softenFirstBounce has
+  only the resolved lobe).
+* **The coat bounce decided "delta" by the per-hit `cr > 0`** where its sheen and the device used
+  isPlanarMirrorMat: the host coat bounce now calls glossyArrival on the coat's own material. And
+  isPlanarMirrorMat / dIsPlanarMirrorMat now see a roughness bound to a record, which is no mirror.
+* **The softenings were not booked in the energy ledger**: every lambertArrival / glossyArrival
+  site books beta * (1 - s) as absorbed, host and device, so emitted = absorbed + sensor + escaped +
+  residual again.
+* **The glossy photon adjoint was pasted into seven sites**: `glossyPhotonAdjoint` /
+  `dGlossyPhotonAdjoint`.
+* Comments: main.cpp's `-photon-bounce` note (both backends, photonmap.h), and bsdfFAdjoint's
+  paragraph (the continuation sentence had split the connection's measurement from its cause). The
+  new checks' docstrings now say what they catch rather than the code's history, and
+  check_forward_depth deletes an earlier run's image before rendering, as the others do.
+
+Not changed:
+* **glossyAdjointRatio is unbounded** (a photon arriving at cos(in) ~ 1e-3 gains ~1/cos(in)), so the
+  light walks' second moment grows like the integral of 1/cos(in). That is the adjoint of the glossy
+  BSDF as defined, exactly; bounding it would bias every light-side mode against R. The cure is the
+  BSDF's own normalization -- GLOSSY-ADJ-VARIANCE below, a decision.
+* **gatherAlbedo evaluates both slots per photon at a translucent point.** Only translucent points
+  pay it, and the normalising divide runs only where reflect + transmit exceeds 1; not worth a
+  per-material cache.
+
+## OPEN (2026-11-12, 0.440.5): THIN-GAP-GATHER — mode M at a large radius gathers the lit inner face of a surface a few millimetres behind
+
+Found testing REVIEW-4403's far-side fix: an opaque plate 5 mm behind a translucent sheet, lit from
+behind, mode M at a pinned radius of 0.15 (30 times the gap): the sheet reads 1.14 and 1.36 of mode
+R. The far side no longer reaches the plate's back; what remains is the same-facing band
+(gatherplane.h withinGatherBand, kGatherPlaneTol = 0.1) accepting the plate's inner face, lit through
+the sheet, wherever the distance exceeds ten times the gap -- MERGE-PROXIMITY's band as designed. At
+the adaptive radius the scene reads 1.001, so it shows only where a radius is forced far past the
+local geometry. The proper fix is a band without the flat allowance for every gather, if the curved
+and faceted surfaces it was set for keep their photons through d sin theta alone: needs measuring
+on check_shading_leak, check_fur_gather and the gallery scenes before it is changed.
+
+## OPEN (2026-11-12, 0.440.5): GLOSSY-ADJ-VARIANCE — the glossy lobe's adjoint is unbounded at grazing arrival
+
+The glossy BSDF (render.h glossyF) divides its lobe by the cosine on the light's side, r * lobe /
+cos(wi): energy-conserving toward the camera, not toward the light. A light walk must carry its
+adjoint (glossyAdjointRatio, 0.440.2), r * cos(out) / cos(in), which grows without bound as the
+arrival grazes: the light-side modes (A, B, C, M, S, P, V, D, J, U) take a heavy tail there that
+mode R does not. Exact, so not a bias; the variance is the BSDF's. **Decision owed**: a reciprocal
+glossy lobe (normalized Phong, r (e + 2) / (2 pi) cos^e of the half-vector or of the mirror angle,
+or a microfacet lobe) has no such tail in either direction, but changes how every glossy material
+renders -- its energy and its highlight shape.
+
 ## OPEN (2026-11-12, 0.440.3): LAYERED-MODES — a `layered` material reads 1-9 % off mode R in the other modes, on flat geometry
 
 Found measuring REVIEW-4400's compound fix (`scraps/_bump_compound.py`, AMP 0): a room of

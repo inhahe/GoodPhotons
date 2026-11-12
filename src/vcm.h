@@ -804,7 +804,8 @@ inline void traceLightSubpath(const Scene& scene, const Camera& cam, const Rende
         // ...and a compound's merge copy where the pick went to a lobe that does not connect (a
         // delta coat): the merges evaluate its gathering lobes, which the first bounce softens as
         // above, while the delta's continuation goes on unsoftened (bdpt.h softenFirstBounce).
-        const double sStore = (edges == 1 && !connectible && storeP > 0.0)
+        const double sStore = (edges == 1 && !connectible && storeP > 0.0 &&
+                               !compoundTransmits(scene, scene.mats[h.matId]))
                             ? shadowTerminatorG(wo, h.n, ngo) : 1.0;
         if (connectible || storeP > 0.0) {
             LightVertex lv;

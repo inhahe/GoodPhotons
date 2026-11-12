@@ -3,11 +3,9 @@
     python tools/check_forward_depth.py [--out png/check_forward_depth] [--exe ftrace.exe]
 
 `-max-bounce` caps how many surfaces a photon meets in modes A, B and C. The CPU's renderForward
-always took it; the GPU's kernels were launched with a literal 32 until 0.439.9, so GPU mode B
-rendered `-max-bounce 7` and `8` alike and a closed room of albedo 0.8 2 % brighter than CPU mode B
-at 8. Modes M and S cap their deposits' photons by `-photon-bounce` instead (photonMaxBounce,
-default 32); until 0.440.3 the GPU's were launched with a literal 32 too, and the flag moved only
-the CPU. The room here keeps a lot of its light in long paths, so a cap shows: mode B at
+always took it; GPU kernels launched with a literal 32 render `-max-bounce 7` and `8` alike, and a
+closed room of albedo 0.8 2 % brighter than CPU mode B at 8. Modes M and S cap their deposits' photons by `-photon-bounce` instead (photonMaxBounce,
+default 32), which both backends must take. The room here keeps a lot of its light in long paths, so a cap shows: mode B at
 `-max-bounce 2` and `8`, and modes M and S at `-photon-bounce 2` and `8`, on the GPU must each read
 within 1 % of the CPU at the same cap (frame mean, two seeds; 2 % for S, whose progressive radius
 the backends shrink apart), and 2 must read clearly darker than 8 on both. Exits 1 on any failure.
@@ -55,6 +53,9 @@ def main():
                       "S": ["-n", "100000", "-spp", "128", "-photon-bounce", str(cap)]}[mode]
             cmd = [exe, "-in", scene, "-mode", mode, "-device", dev] + budget + [
                    "-seed", str(seed), "-hdr", "-no-meter", "-window-min", "-o", png]
+            for f in (png, png[:-4] + ".pfm"):          # never score an earlier run's image
+                if os.path.exists(f):
+                    os.remove(f)
             p = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8",
                                errors="replace")
             pfm = png[:-4] + ".pfm"
