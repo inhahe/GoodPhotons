@@ -3013,7 +3013,7 @@ struct BackwardRenderer {
                         if (!continueAlong(h, o, Lobe::Reflect, ray)) return L;
                         specularArrival = true;
                         gmis.clear();      // the sheen does no NEE: its arrival is unweighted
-                        contSoft = coatContSoftening(scene, cm, h, ray.d);
+                        contSoft = coatContSoftening(h, ray.d);
                         continue;
                     }
                     if (!whittedAttenuate(thr, 1.0 - R, Renderer::localN2(scene, stk, lambda))) return L;
@@ -3031,7 +3031,7 @@ struct BackwardRenderer {
                     // glossy bounce's MIS record must not outlive it (interactMaterial, which
                     // clears it, is never reached from here).
                     gmis.clear();
-                    contSoft = coatContSoftening(scene, cm, h, ray.d);   // a glossy lobe
+                    contSoft = coatContSoftening(h, ray.d);   // a glossy lobe
                     continue;
                 }
                 int child = mixResolveChild(scene, cm, h, rng.uniform());   // body lobe (honours a weight map)
@@ -3543,7 +3543,7 @@ struct BackwardRenderer {
                     if (!continueAlong(h, o, Lobe::Reflect, ray)) { finish(); return; }
                     specularArrival = true;
                     gmis.clear();                // no NEE here: see the scalar twin
-                    contSoft = coatContSoftening(scene, cm, h, ray.d);   // a glossy lobe
+                    contSoft = coatContSoftening(h, ray.d);   // a glossy lobe
                     continue;
                 }
                 if (whitted) {                   // body: every live λ enters the stack

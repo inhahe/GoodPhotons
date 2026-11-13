@@ -16059,21 +16059,136 @@ static void thinFilmSwatch(double n1, double n2) {
                 n1, n2, dMin, dMax);
 }
 
+// The sky a forward camera sees directly, summed per pixel (addEnvBackground), for ONE camera: held by
+// whatever renders that camera, for as long as it does -- a render that writes several cameras in
+// turn keeps one per camera -- and restarted when the camera's rays (Camera::RayKey) or the scene
+// build it was summed for change. Sums in float, per pixel 3 x 4 bytes, each sample rounded in as it
+// is added, so they are the same however the samples were split into batches.
+struct SkyView {
+    Camera::RayKey key;
+    uint64_t gen = 0, builds = 0;
+    int rx = 0, ry = 0;
+    long long K = 0;                 // samples per pixel the sums stand for
+    std::vector<float> sum;          // XYZ per pixel
+};
+
+// The sky a forward (model-B) film shows directly, summed into `view` up to what `N` photons ask for
+// (addEnvBackground, which adds it to a film, has the why). Apart so that a caller timing its own
+// work -- a live window's repaint -- can do this first and leave it out of the repaint's cost.
+// False where this pass draws no sky: none in the scene, or a camera under a blur.
+static bool prepareSky(SkyView& view, const Scene& scene, const Camera& cam, int rx, int ry,
+                       long long N) {
+    const bool haveEnv = scene.envIndex >= 0, haveSun = scene.sunCount > 0;
+    if ((!haveEnv && !haveSun) || cam.seesMotion(scene)) return false;
+    constexpr double kLo = 360.0, kHi = 830.0;
+    constexpr long long kFirst = 64;      // a pinhole's whole count; a lens's first
+    constexpr long long kProbe = 16;      // a pinhole pixel these all agree on is done at them
+    const Camera::RayKey key = cam.rayKey();
+    if (!(view.key == key) || view.gen != scene.generation || view.builds != scene.buildCount ||
+        view.rx != rx || view.ry != ry) {
+        view.key = key; view.gen = scene.generation; view.builds = scene.buildCount;
+        view.rx = rx; view.ry = ry; view.K = 0;
+        view.sum.assign((size_t)rx * (size_t)ry * 3, 0.0f);
+    }
+    const bool lensed = cam.hasLens();
+    const double perPixel = (double)N / ((double)rx * (double)ry);
+    const long long want = lensed ? std::max(kFirst, std::min(4096LL, (long long)(perPixel / 4.0))) : kFirst;
+    // A pinhole pixel: kProbe points of its rotated Halton (2,3) lattice, and where they do not all
+    // see one thing -- geometry, sky, the sun -- the rest of kFirst. Its sum scaled to kFirst samples.
+    const auto pinholePixel = [&](size_t pix, int px, int py, float* s) {
+        Pcg32 rot;
+        seedUnit(rot, pix, 0x5EC7A11E5C0FFEEULL);
+        const double offX = rot.uniform(), offY = rot.uniform();
+        Vec3 acc{0, 0, 0};
+        int first = -1;
+        bool mixed = false;
+        long long k = 0;
+        for (; k < kFirst; ++k) {
+            if (k == kProbe && !mixed) break;
+            double jx = offX + BackwardRenderer::radicalInverse2((uint64_t)k);
+            double jy = offY + BackwardRenderer::radicalInverseScr(3, (uint64_t)k);
+            jx -= std::floor(jx); jy -= std::floor(jy);
+            const Ray r = cam.genRay(px, py, jx, jy);
+            // A CAMERA ray, so a `hide_camera` flat lets the sky through (Material::hideCamera).
+            int what = 0;
+            if (!scene.closestHit(r, 1e-6, nullptr, /*skipHair=*/false, /*skipCamHidden=*/true).valid) {
+                what = 1;
+                if (haveEnv) acc += scene.envXYZForDir(r.d);
+                if (haveSun) {
+                    const Vec3 sun = scene.sunXYZForDir(r.d);
+                    if (sun.x != 0.0 || sun.y != 0.0 || sun.z != 0.0) { acc += sun; what = 2; }
+                }
+            }
+            if (first < 0) first = what;
+            else if (what != first) mixed = true;
+        }
+        const double toK = (double)kFirst / (double)k;
+        s[0] = (float)(acc.x * toK); s[1] = (float)(acc.y * toK); s[2] = (float)(acc.z * toK);
+    };
+    // A lens pixel's samples [k0, k1), added to `s` in k order.
+    const auto lensPixel = [&](size_t pix, int px, int py, float* s, long long k0, long long k1) {
+        Pcg32 rot;
+        seedUnit(rot, pix, 0x5EC7A11E5C0FFEEULL);
+        const double off = rot.uniform();
+        for (long long k = k0; k < k1; ++k) {
+            Pcg32 rng;                   // the pupil and pixel point: sample k's own
+            seedUnit(rng, pix, 0xB6C0FFEEULL ^ ((uint64_t)k * 0x9E3779B97F4A7C15ULL));
+            double uu = off + BackwardRenderer::radicalInverse2((uint64_t)k);   // rotated per pixel
+            uu -= std::floor(uu);
+            const double lambda = kLo + (kHi - kLo) * uu;
+            Ray r; double wLens = 0.0;
+            if (!cam.genLensRay(px, py, rng.uniform(), rng.uniform(), rng.uniform(),
+                                rng.uniform(), lambda, r, wLens) || !(wLens > 0.0)) continue;
+            if (scene.closestHit(r, 1e-6, nullptr, /*skipHair=*/false, /*skipCamHidden=*/true).valid)
+                continue;
+            double L = 0.0;
+            if (haveEnv) L += scene.envRadianceSeen(r.d, lambda);   // the bilinear camera view
+            if (haveSun) L += scene.sunRadiance(r.d, lambda);
+            if (!(L > 0.0)) continue;
+            const Vec3 c = Vec3(cieX(lambda), cieY(lambda), cieZ(lambda)) * (L * wLens * (kHi - kLo));
+            s[0] = (float)(s[0] + c.x); s[1] = (float)(s[1] + c.y); s[2] = (float)(s[2] + c.z);
+        }
+    };
+    const auto row = [&](std::vector<float>& dst, long long k0, long long k1, size_t py) {
+        for (int px = 0; px < rx; ++px) {
+            const size_t pix = py * (size_t)rx + (size_t)px;
+            float* s = &dst[pix * 3];
+            if (lensed) lensPixel(pix, px, (int)py, s, k0, k1);
+            else        pinholePixel(pix, px, (int)py, s);
+        }
+    };
+    // The first kFirst samples a pixel are taken whatever a stop says: bounded, and what a stopped
+    // render's last write still has to show. A lens's further samples are left to the next write.
+    if (view.K < kFirst) {
+        const long long k0 = view.K;
+        ft::parallelForAll((size_t)ry, 1, [&](size_t py) { row(view.sum, k0, kFirst, py); });
+        view.K = kFirst;
+    }
+    if (view.K < want) {
+        const long long k0 = view.K;
+        std::vector<float> add = view.sum;   // a stop part-way leaves the sums as they were
+        if (ft::parallelFor((size_t)ry, 1, [&](size_t py) { row(add, k0, want, py); })) {
+            view.sum.swap(add);
+            view.K = want;
+        }
+    }
+    return true;
+}
+
 // Add the directly-viewed environment background to a forward (model-B) film: forward photons carry
 // the env's *illumination* of surfaces, and this pass supplies the *direct view* of the sky behind
 // the geometry, as mode R's ray-miss term does (L_env(dir) * invPdfLambda). A distant `sun` too: a
 // photon fired into the solar cone never travels toward the camera (the disc is at infinity), so
 // the view of the solar disc is a camera-ray term as well (`sunXYZForDir` is 0 outside every sun's
-// cone). No-op unless the scene has either.
+// cone). No-op unless the scene has either; under a blur the forward pass drew it into the film
+// already, batch by batch, each sample at a time of its own (addBlurredSkyRows).
 //
 // Each pixel averages camera rays over its AREA, as mode R's pixel does and as the photon splats
-// fill it, so a pixel the sky's edge crosses takes the sky's share of it (B-ENV-WALLS: one ray
-// through the pixel's centre gave such a pixel all of the sky or none, and the band along a wall's
-// top edge against the sky read 8 % bright). Deposited as N times the mean so writeFilm's
-// 1/(N*cieYIntegral) leaves the radiance in XYZ.
-//   A pinhole: K = 64 points over the pixel, a Halton (2,3) lattice rotated per pixel, each the
-// escape direction's env and sun XYZ (deterministic per direction, so K only has to resolve the
-// edges).
+// fill it, so a pixel the sky's edge crosses takes the sky's share of it. Deposited as N times the
+// mean so writeFilm's 1/(N*cieYIntegral) leaves the radiance in XYZ (prepareSky computes it).
+//   A pinhole: 16 points of a Halton (2,3) lattice rotated per pixel, each the escape direction's
+// env and sun XYZ, and 64 where those 16 do not all see one thing (geometry, sky, the sun): the
+// value is deterministic per direction, so the count only has to resolve what the pixel covers.
 //   A PHYSICAL lens sees the sky over its pupil -- blurred where it is out of focus, darkened toward
 // the corners, dispersed by the glass -- at the lens image's irradiance scale (genLensRay's weight),
 // which is what the forward lens splat deposits for everything else. So each sample is also a
@@ -16081,130 +16196,26 @@ static void thinFilmSwatch(double n1, double n2) {
 //   (1/K) sum_k cie(lambda_k) * L_sky(d_k, lambda_k) * wLens_k * (830 - 360).
 // That is mode R's estimator, with mode R's variance per sample, so a fixed handful of samples
 // would leave a grainy sky over a converged scene. The count grows with the render instead:
-// K = photons per pixel / 4, between 64 and 4096, added to a running sum each time a write asks for
+// K = photons per pixel / 4, between 64 and 4096, added to `view`'s sums each time a write asks for
 // more (the wavelengths follow a per-pixel van der Corput sequence, so they stay stratified at any
-// K).
-// The sums are kept for the last four cameras that asked (least recently used evicted), since a
-// render adds the sky to every interval write and a multi-camera render writes its cameras in turn
-// -- keyed on everything a ray depends on: the scene (its generation and builds), the pose, the
-// projection, the lens and the film.
+// K). Each sample is a function of its pixel and its index k alone, added in k order, so the sums do
+// not depend on how the writes that asked for them split the samples (a live window's refreshes fall
+// where the clock puts them).
+static void addEnvBackground(Film& film, const Scene& scene, const Camera& cam, long long N,
+                             SkyView& view) {
+    if (!prepareSky(view, scene, cam, film.resX, film.resY, N)) return;
+    const double scale = (double)N / (double)view.K;
+    for (int py = 0; py < film.resY; ++py)
+        for (int px = 0; px < film.resX; ++px) {
+            const float* s = &view.sum[((size_t)py * film.resX + px) * 3];
+            if (s[0] != 0.0f || s[1] != 0.0f || s[2] != 0.0f)
+                film.add(px, py, Vec3{(double)s[0], (double)s[1], (double)s[2]} * scale);
+        }
+}
+// A camera written once.
 static void addEnvBackground(Film& film, const Scene& scene, const Camera& cam, long long N) {
-    const bool haveEnv = scene.envIndex >= 0, haveSun = scene.sunCount > 0;
-    if (!haveEnv && !haveSun) return;
-    // Under a blur the forward pass drew it into the film already, batch by batch, each sample at
-    // a time of its own (addBlurredSkyRows).
-    if (cam.seesMotion(scene)) return;
-    constexpr double kLo = 360.0, kHi = 830.0;
-    struct Cache {
-        uint64_t gen = 0, builds = 0;
-        const LensSystem* lens = nullptr;
-        Vec3 eye, w, u, v;
-        double tanX = 0, tanY = 0, shiftX = 0, rEdge = 0;
-        int proj = 0, rx = 0, ry = 0;
-        long long K = 0;                 // samples per pixel in `sum`
-        unsigned long long used = 0;     // last use, for eviction
-        std::vector<Vec3> sum;
-    };
-    constexpr size_t kSlots = 4;
-    static std::mutex mtx;
-    static std::vector<Cache> slots;
-    static unsigned long long clock = 0;
-    std::lock_guard<std::mutex> lock(mtx);
-    const int rx = film.resX, ry = film.resY;
-    const auto eq = [](const Vec3& a, const Vec3& b) { return a.x == b.x && a.y == b.y && a.z == b.z; };
-    auto same = [&](const Cache& c) {
-        return c.gen == scene.generation && c.builds == scene.buildCount && c.lens == cam.lens.get() &&
-               c.rx == rx && c.ry == ry && eq(c.eye, cam.eye) && eq(c.w, cam.w) && eq(c.u, cam.u) &&
-               eq(c.v, cam.v) && c.tanX == cam.tanHalfX && c.tanY == cam.tanHalfY &&
-               c.shiftX == cam.frustumShiftX && c.rEdge == cam.rEdge && c.proj == cam.projection;
-    };
-    Cache* hit = nullptr;
-    for (Cache& c : slots) if (same(c)) { hit = &c; break; }
-    if (!hit) {
-        if (slots.size() < kSlots) slots.emplace_back();
-        hit = &slots[0];
-        for (Cache& c : slots) if (c.used < hit->used) hit = &c;   // an empty slot has used == 0
-        hit->gen = scene.generation; hit->builds = scene.buildCount; hit->lens = cam.lens.get();
-        hit->rx = rx; hit->ry = ry;
-        hit->eye = cam.eye; hit->w = cam.w; hit->u = cam.u; hit->v = cam.v;
-        hit->tanX = cam.tanHalfX; hit->tanY = cam.tanHalfY; hit->shiftX = cam.frustumShiftX;
-        hit->rEdge = cam.rEdge; hit->proj = cam.projection;
-        hit->K = 0;
-        hit->sum.assign((size_t)rx * (size_t)ry, Vec3{0, 0, 0});
-    }
-    hit->used = ++clock;
-    Cache& cache = *hit;
-    const bool lensed = cam.hasLens();
-    const double perPixel = (double)N / ((double)rx * (double)ry);
-    const long long want = lensed ? std::max(64LL, std::min(4096LL, (long long)(perPixel / 4.0))) : 64LL;
-    // The radical inverse of `k` in `base`: a van der Corput point, in [0, 1).
-    const auto radInv = [](long long k, int base) {
-        double r = 0.0, f = 1.0 / base;
-        for (; k > 0; k /= base, f /= base) r += f * (double)(k % base);
-        return r;
-    };
-    // Each sample is a function of its pixel and its index k alone, and is added to the pixel's
-    // running sum in k order, so the sums are the same however the writes that asked for them
-    // split the samples into batches: a live window's refreshes, which fall where the clock puts
-    // them, do not move the image.
-    if (cache.K < want) {
-        const long long k0 = cache.K, k1 = want;
-        std::vector<Vec3> add = cache.sum;
-        const bool done = ft::parallelFor((size_t)ry, 1, [&](size_t py) {
-            for (int px = 0; px < rx; ++px) {
-                const uint64_t pix = (uint64_t)py * (uint64_t)rx + (uint64_t)px;
-                Pcg32 rot;
-                seedUnit(rot, pix, 0x5EC7A11E5C0FFEEULL);
-                const double off = rot.uniform();
-                Vec3 acc = add[pix];
-                if (!lensed) {
-                    const double offY = rot.uniform();
-                    for (long long k = k0; k < k1; ++k) {
-                        double jx = off + radInv(k, 2), jy = offY + radInv(k, 3);
-                        jx -= std::floor(jx); jy -= std::floor(jy);
-                        const Ray r = cam.genRay(px, (int)py, jx, jy);
-                        // A CAMERA ray, so a `hide_camera` flat lets the sky through (Material::hideCamera).
-                        if (scene.closestHit(r, 1e-6, nullptr, /*skipHair=*/false,
-                                             /*skipCamHidden=*/true).valid) continue;
-                        if (haveEnv) acc += scene.envXYZForDir(r.d);
-                        if (haveSun) acc += scene.sunXYZForDir(r.d);
-                    }
-                    add[pix] = acc;
-                    continue;
-                }
-                for (long long k = k0; k < k1; ++k) {
-                    Pcg32 rng;                   // the pupil and pixel point: sample k's own
-                    seedUnit(rng, pix, 0xB6C0FFEEULL ^ ((uint64_t)k * 0x9E3779B97F4A7C15ULL));
-                    double u = off + radInv(k, 2);   // van der Corput in base 2, rotated per pixel
-                    u -= std::floor(u);
-                    const double lambda = kLo + (kHi - kLo) * u;
-                    Ray r; double wLens = 0.0;
-                    if (!cam.genLensRay(px, (int)py, rng.uniform(), rng.uniform(), rng.uniform(),
-                                        rng.uniform(), lambda, r, wLens) || !(wLens > 0.0)) continue;
-                    const Hit h = scene.closestHit(r, 1e-6, nullptr, /*skipHair=*/false,
-                                                   /*skipCamHidden=*/true);
-                    if (h.valid) continue;
-                    double L = 0.0;
-                    if (haveEnv) L += scene.envRadianceSeen(r.d, lambda);   // the bilinear camera view
-                    if (haveSun) L += scene.sunRadiance(r.d, lambda);
-                    if (!(L > 0.0)) continue;
-                    acc += Vec3(cieX(lambda), cieY(lambda), cieZ(lambda)) * (L * wLens * (kHi - kLo));
-                }
-                add[pix] = acc;
-            }
-        });
-        if (done) {                       // a stop part-way leaves the sums as they were
-            cache.sum.swap(add);
-            cache.K = k1;
-        }
-    }
-    if (cache.K <= 0) return;
-    const double scale = (double)N / (double)cache.K;
-    for (int py = 0; py < ry; ++py)
-        for (int px = 0; px < rx; ++px) {
-            const Vec3& b = cache.sum[(size_t)py * rx + px];
-            if (b.x != 0.0 || b.y != 0.0 || b.z != 0.0) film.add(px, py, b * scale);
-        }
+    SkyView view;
+    addEnvBackground(film, scene, cam, N, view);
 }
 
 // The sky a forward camera sees directly UNDER MOTION BLUR, drawn into one batch's film instead of
@@ -22363,6 +22374,7 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
 
     Checkpoint acc;
     acc.film.resX = res; acc.film.resY = resY; acc.film.alloc();
+    SkyView sky;   // the sky its writes and its window add (addEnvBackground)
     if (resume && readCheckpoint(outPath, res, resY, guard, mode, acc))
         std::printf("[resume] loaded %s: %lld photons accumulated so far\n",
                     checkpointPath(outPath).c_str(), acc.N);
@@ -22373,7 +22385,7 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
     bool writeOk = true;   // tracks the most recent writeFilm result (drives exit code)
     auto writeOut = [&](bool announceCheckpoint, bool quiet = false, bool useAnchor = true) {
         Film disp = acc.film;                        // display copy (+ direct sky view)
-        if (useCamera && !forwardCatch) addEnvBackground(disp, scene, cam, acc.N);
+        if (useCamera && !forwardCatch) addEnvBackground(disp, scene, cam, acc.N, sky);
         writeOk = writeFilm(outPath.c_str(), disp, (double)acc.N, manualExposure, quiet,
                   useAnchor ? exposureAnchor : nullptr, scene.absolute);
         if (wantCheckpoint) {
@@ -22504,9 +22516,13 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
                     std::snprintf(st, sizeof st, "[noise] target ~%.2g%%, %s, %lld batches, %lld photons, ~%.1f%% noise%s",
                                   noiseTarget, humanDur(elapsed).c_str(), batches, acc.N, noisePct, why);
                 if (preview || wantWin) {
+                    // The sky's own samples first: the repaint's cost (tPrep) is the cost of every
+                    // repaint, and they are taken once (a lens's, as photons grow).
+                    if (useCamera && !forwardCatch)
+                        prepareSky(sky, scene, cam, acc.film.resX, acc.film.resY, acc.N);
                     auto tPrep = clk::now();
                     Film disp = acc.film;
-                    if (useCamera && !forwardCatch) addEnvBackground(disp, scene, cam, acc.N);
+                    if (useCamera && !forwardCatch) addEnvBackground(disp, scene, cam, acc.N, sky);
                     if (wantSave) {
                         if (preview) ansiPreview(disp, (double)acc.N, manualExposure, st);
                         else { std::printf("%s\n", st); std::fflush(stdout); }
@@ -29613,6 +29629,7 @@ static int run(int argc, char** argv) {
         // Per-camera SUM-film accumulators sharing one photon count + energy tally (all
         // cameras see the same flight, so accN / energy are group-wide).
         std::vector<Film> acc(nc);
+        std::vector<SkyView> skies((size_t)nc);   // each camera's sky (addEnvBackground)
         for (int c = 0; c < nc; ++c) { acc[c].resX = rxs[c]; acc[c].resY = rys[c]; acc[c].alloc(); }
         long long accN = 0;
         EnergyReport accE;
@@ -29786,7 +29803,7 @@ static int run(int argc, char** argv) {
             for (int c = 0; c < nc; ++c) {
                 const RenderCam& rc = toRender[idx[c]];
                 Film disp = acc[c];
-                addEnvBackground(disp, scene, rc.cam, accN);   // directly-viewed sky (env scenes)
+                addEnvBackground(disp, scene, rc.cam, accN, skies[(size_t)c]);   // directly-viewed sky (env scenes)
                 std::string op = outFor(rc.name);
                 if (!quiet && toRender.size() > 1)
                     std::printf("[camera] '%s' (mode %c, %dx%d) -> %s\n",
@@ -29905,9 +29922,12 @@ static int run(int argc, char** argv) {
                         std::snprintf(st, sizeof st, "[noise] ~%.2g%% target, %s, %lld photons, %d cams, ~%.1f%% noise%s",
                                       noiseTarget, humanDur(elapsed).c_str(), accN, nc, noisePct, why);
                     if (preview || wantWin) {
+                        // The sky's own samples first, outside the repaint's cost (the single-camera
+                        // loop has the why).
+                        prepareSky(skies[0], scene, toRender[idx[0]].cam, acc[0].resX, acc[0].resY, accN);
                         auto tPrep = clk::now();
                         Film disp = acc[0];
-                        addEnvBackground(disp, scene, toRender[idx[0]].cam, accN);
+                        addEnvBackground(disp, scene, toRender[idx[0]].cam, accN, skies[0]);
                         if (wantSave) {
                             if (preview) ansiPreview(disp, (double)accN, toRender[idx[0]].exposure, st);
                             else { std::printf("%s\n", st); std::fflush(stdout); }

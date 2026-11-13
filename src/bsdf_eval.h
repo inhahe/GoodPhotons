@@ -1,4 +1,5 @@
 #pragma once
+#include <cassert>
 #include <cstdlib>
 // ============================================================================================
 //  bsdf_eval.h -- the EVALUABLE half of the material model: f(wo, wi) and its sampling density.
@@ -119,9 +120,12 @@ inline bool lambertLit(double cosWi) { return cosWi > 0.0; }
 // (+1) when it is on a's geometric side and above the shading normal turned to that side, in the
 // transmit lobe (-1) when it is on the far side and below it, and in neither (0) in the wedge between
 // the shading and geometric planes. `ns` is the vertex's shading normal, turned (with its hit) to the
-// side it was reached from; `hit` supplies the geometric normal. Without a hit, ns alone decides: the
-// same side of it or not. Where ns == ng the two rules agree. Device twin dTranslucentLobe.
+// side it was reached from; `hit` supplies the geometric normal, and every caller has one: without
+// it ns has to stand in for the geometric normal, which is right only where they agree (asserted
+// against in debug builds -- a normal-mapped panel read 2-9 % bright under that rule). Device twin
+// dTranslucentLobe.
 inline int translucentLobe(const Vec3& ns, const Hit* hit, const Vec3& a, const Vec3& b) {
+    assert(hit && "translucentLobe needs the hit for its geometric normal");
     if (!hit) {
         const double s = dot(a, ns) * dot(b, ns);
         return s > 0.0 ? 1 : (s < 0.0 ? -1 : 0);
@@ -142,7 +146,7 @@ inline int translucentLobe(const Vec3& ns, const Hit* hit, const Vec3& a, const 
 // sampled direction, f*|cos(wi)|/pdf(wi) equals the throughput factor (rho or r).
 inline double bsdfF(const Material& m, const Vec3& ns, const Vec3& wo, const Vec3& wi,
                     double lambda, const Scene& scene, const Hit* hitForTex) {
-    double cosWi = dot(wi, ns), cosWo = dot(wo, ns);
+    double cosWi = dot(wi, ns);
     switch (m.type) {
         case MatType::Diffuse: {
             // Light from above the shading hemisphere, wherever the camera side sits: mode R's
@@ -169,7 +173,6 @@ inline double bsdfF(const Material& m, const Vec3& ns, const Vec3& wo, const Vec
             // Two-sided Lambertian, mode R's integrand on a tilted shading normal (translucentLobe):
             // seen from the camera side `wo`, light in the reflect lobe takes the reflect albedo, in
             // the transmit lobe the transmit albedo, in the wedge between the planes nothing.
-            (void)cosWo;
             double rhoR, rhoT; diffuseTransmitAlbedos(m, lambda, scene, hitForTex, rhoR, rhoT);
             const int lobe = translucentLobe(ns, hitForTex, wo, wi);
             return (lobe > 0 ? rhoR : (lobe < 0 ? rhoT : 0.0)) / PI;
@@ -208,9 +211,11 @@ inline double bsdfF(const Material& m, const Vec3& ns, const Vec3& wo, const Vec
 // camera-side cosine does not. A white-furnace test measures mode R -- which builds paths
 // camera-side and so lands on the first form -- flat to 0.04 % across roughness 0.2/0.6/0.9.
 //
-// DiffuseTransmit's value is unchanged by the swap. Diffuse's rho/PI is too, but its lambertLit
-// test reads wi, so the swap moves that test onto the LIGHT's side -- which is the point: light
-// that arrived below the shading normal lights nothing, whichever way the camera lies.
+// Diffuse's rho/PI is unchanged by the swap, but its lambertLit test reads wi, so the swap moves
+// that test onto the LIGHT's side -- which is the point: light that arrived below the shading normal
+// lights nothing, whichever way the camera lies. DiffuseTransmit's translucentLobe is not symmetric
+// either: it reads the camera's side from wo and the light's lobe from wi, so on a tilted normal
+// f(wo, wi) and f(wi, wo) differ, and a light-side vertex must take this adjoint, not bsdfF.
 // A FIBER is never a light vertex: light subpaths stop at strands (bdpt.h randomWalk, 0.365.0),
 // because no light-side value of this non-reciprocal, camera-offset model agrees pointwise with
 // the camera side's for the same path (known-issues HAIR-RECIPROCITY). 0 keeps a stray light-end
@@ -254,7 +259,6 @@ inline double bsdfPdf(const Material& m, const Vec3& ns, const Vec3& wo, const V
             // density of the lobe translucentLobe puts it in, and none in the wedges between the
             // planes -- where, seen from the light side, f is not 0, so a density there would
             // count a strategy no walk can take.
-            (void)cosWo;
             double rhoR, rhoT; diffuseTransmitAlbedos(m, lambda, scene, hitForTex, rhoR, rhoT);
             double tot = rhoR + rhoT;
             if (tot <= 0.0) return 0.0;

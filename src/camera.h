@@ -433,6 +433,33 @@ struct Camera {
         return imagePlaneArea() / ((double)film.resX * (double)film.resY);
     }
 
+    // Everything genRay and genLensRay read besides the pixel and its samples: two cameras whose
+    // keys are equal draw the same camera rays. Kept here beside them, so a field either comes to
+    // read joins it. A lens is the object itself plus the state a refocus or a sensor change moves.
+    struct RayKey {
+        Vec3 eye, u, v, w;
+        double tanHalfX = 0, tanHalfY = 0, frustumShiftX = 0, rEdge = 0;
+        int projection = -1, resX = 0, resY = 0;
+        const void* lens = nullptr;
+        double lensFilmZ = 0, lensFilmW = 0;
+        bool operator==(const RayKey& o) const {
+            const auto eq = [](const Vec3& a, const Vec3& b) { return a.x == b.x && a.y == b.y && a.z == b.z; };
+            return eq(eye, o.eye) && eq(u, o.u) && eq(v, o.v) && eq(w, o.w) &&
+                   tanHalfX == o.tanHalfX && tanHalfY == o.tanHalfY &&
+                   frustumShiftX == o.frustumShiftX && rEdge == o.rEdge &&
+                   projection == o.projection && resX == o.resX && resY == o.resY &&
+                   lens == o.lens && lensFilmZ == o.lensFilmZ && lensFilmW == o.lensFilmW;
+        }
+    };
+    RayKey rayKey() const {
+        RayKey k;
+        k.eye = eye; k.u = u; k.v = v; k.w = w;
+        k.tanHalfX = tanHalfX; k.tanHalfY = tanHalfY; k.frustumShiftX = frustumShiftX; k.rEdge = rEdge;
+        k.projection = projection; k.resX = film.resX; k.resY = film.resY;
+        if (lens) { k.lens = lens.get(); k.lensFilmZ = lens->filmZ; k.lensFilmW = lens->filmW_mm; }
+        return k;
+    }
+
     // Generate a pinhole ray through raster pixel (px,py) with in-pixel jitter
     // (jx,jy in [0,1)). Exact inverse of project(): sx,sy are the [-1,1] view
     // coordinates project() would recover. Used by the backward reference tracer.

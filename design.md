@@ -7314,7 +7314,7 @@ as the one at fault.
     (`DLensSystem::surf` / `iorAll`, uploaded by bakeCamera), so a prescription has no surface
     limit. The forward modes' directly seen sky goes through the lens too
     (`addEnvBackground`): monochromatic camera rays averaged per pixel, their count growing
-    with photons per pixel, kept in a running sum for the last four cameras. `-checklens` pins it all
+    with photons per pixel, kept in a running sum the render holds per camera (`SkyView`). `-checklens` pins it all
     on a planar-rear achromat, a curved-rear singlet, pbrt's double Gauss at f/8 and the
     published telephoto, wide-angle and fisheye as published (the test cone, and the spread of
     its off-axis points, scale with each lens's field, up to 89 degrees for the fisheye): the
@@ -10842,12 +10842,18 @@ sees the instant, exactly as a static scene with those transforms would show it.
   faces (`Scene::mirrorClaims`, `mirrorDeformPart`). The sky a forward mode
   sees directly is a camera-side pass of its own (`addEnvBackground`, at each write): each pixel
   averages camera rays over its area, as mode R's pixel does and the photon splats fill it -- a
-  pinhole's 64 points of a per-pixel rotated Halton (2,3) lattice, a lens's monochromatic rays over
-  the pupil and the band as many as photons per pixel ask for -- summed once per scene build and
-  camera and kept for the last four (0.440.11; one ray through each pixel's centre gave an edge
-  pixel all of the sky or none, B-ENV-WALLS). Each sample is a function of its pixel and its
-  index alone, added in index order, so the sums do not depend on how the writes that asked for
-  them split the samples (a live window's refreshes fall on the clock). Under a
+  pinhole's 16 points of a per-pixel rotated Halton (2,3) lattice, 64 where those 16 do not all see
+  one thing (geometry, sky, the sun), a lens's monochromatic rays over
+  the pupil and the band as many as photons per pixel ask for (0.440.11; one ray through each
+  pixel's centre gave an edge pixel all of the sky or none, B-ENV-WALLS). The sums, in float, are
+  held per camera by the render that writes it (`SkyView`: one for a single camera's writes and
+  window, one per camera of a shared group, a local one for a camera written once) and restart
+  when the camera or the scene build changes. Each sample is a function of its pixel and its index
+  alone, added in index order, so the sums do not depend on how the writes that asked for them
+  split the samples (a live window's refreshes fall on the clock); the first 64 are taken whatever
+  a stop says (`ft::parallelForAll`), so a render stopped before its first write still shows its
+  sky; and a live window's repaint takes them before it starts timing itself (`prepareSky`), since
+  its measured cost sets how often it repaints. Under a
   blur that pass skips the camera: each forward thread draws its band of the sky into its own
   batch film instead (`addBlurredSkyRows`), K samples a pixel at times of their own (rotated per
   pixel and batch), K a sixteenth of a photon per pixel per camera sharing the batch, at most 64;

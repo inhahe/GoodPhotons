@@ -2677,6 +2677,59 @@ Not changed:
   would still be called at every site. The omissions are what check_bump_modes' R self-checks (glossy
   lobe alone, sky escape alone, the split's sub-paths) and its M and S rooms catch.
 
+## DONE (2026-11-13, 0.440.12): REVIEW-44011 — what the Opus and Fable reviews of 0.440.8-0.440.11 found
+
+`/code-review max` (Opus, 8 findings) and `/code-review xhigh` (Fable, 15) of 2b15ab4..fc9b230
+(BUMP-MODES' translucent stage and analytic splat, REVIEW-4407's follow-ups, B-ENV-WALLS). They
+agreed on the sky pass's three faults; each finding was checked against the code. Fixed in 0.440.12:
+
+* **A render stopped before its first write lost its sky** (both): the pinhole pass had moved into
+  `ft::parallelFor`, which gives up on a pending stop, so the stopped render's last write found no
+  sums and drew no sky; so did any camera the four-slot cache had evicted. The first 64 samples a
+  pixel now run whatever a stop says (new `ft::parallelForAll`); a lens's further samples still
+  yield to a stop. check_sky_repeat gains the case: a pinhole render stopped two seconds in, before
+  any write, must show a completed render's sky to 1e-4 (0.440.11: none of it).
+* **The static four-slot sky cache** (both): a group of five or more cameras missed on every camera
+  at every write and re-traced its sky, and up to four full-frame sums of doubles stayed allocated
+  for the life of the process. The sums are now held by the render that writes the camera
+  (`SkyView`: one for a single camera's writes and window, one per camera of a shared group, a local
+  one for a camera written once), in float, and restart when the camera's rays or the scene build
+  change. The key is `Camera::RayKey`, kept beside genRay / genLensRay, so a field they come to read
+  joins it, and it holds the lens's sensor state as well as its address (Fable).
+* **Every pinhole pixel traced 64 rays** (both): it now traces 16 and the rest of 64 only where those
+  16 do not all see one thing (geometry, sky, the sun) -- the value is deterministic per direction,
+  so only a pixel an edge crosses needs more.
+* **The sky's one-off cost set the live window's repaint budget** (Fable): the repaint times its own
+  work and repaints no sooner than 12 times its largest cost, and the sky's samples ran inside that
+  timer. They are taken first now (`prepareSky`), outside it.
+* **Mode J's pinned merge radius applied in every room** (Opus): only the translucent room pins it;
+  the others run J at its default radius again.
+* **check_bump_modes' mode R self-checks were held at 1 %** (Fable), where the faults they catch read
+  1.2-4.4 % and the fluorescent split's 1.0125 sat in the seed noise of that band: now 0.5 %.
+* **coatContSoftening asserted the coat, in a build that compiles asserts out** (Fable): the coat is
+  always a glossy lobe, so it now takes the glossy softening directly and needs neither the coat's
+  index nor the assert.
+* **bsdfFAdjoint's comment** said DiffuseTransmit is unchanged by the swap, which translucentLobe made
+  false (Fable); contSoftening's comment said a two-sided vertex is unsoftened and sat away from its
+  function behind two forward declarations (Fable) -- the helpers are now defined in order; the coat
+  sheen's photon comment still exempted a delta lobe, and its dead `coatChild >= 0` fallbacks stayed
+  (Fable).
+* **Unused arguments silenced with (void)** (both): glossyArrival's lobe, compoundDepositWeight's scene
+  and compound, their device twins, bsdfF's and bsdfPdf's cosWo: removed, with the callers' lookups
+  of the coat material they fed.
+* **A third radical inverse** (both): the sky pass uses BackwardRenderer::radicalInverse2 and
+  radicalInverseScr.
+* **The device's DSpecVtx copied the camera-side rule** (Fable): it and dCamSideOk share one template
+  now (`dCamSideOkT`, over DVec3 and D3), as the host's SpecVtx and camSplat share camSideOk.
+* **translucentLobe's no-hit branch** (Opus) restored the rule BUMP-MODES removed: no caller passes
+  none, and it now asserts a hit (in a debug build; the branch stays the documented fallback).
+* addEnvBackground's comment narrated the bug's history (both): it keeps the constraint alone.
+
+Not changed: the pass-through bookkeeping hand-copied into each walk (Fable) -- the walks keep
+different records (MIS, softening, strand and hair arrivals, the specular flag), so one struct would
+still be filled and restored per walk; check_fur_null's R and S cases and check_hair_nee_sun guard
+the rule where it has gone wrong.
+
 ## DONE (2026-11-12, 0.440.11): B-ENV-WALLS — mode B read walls lit by a sky about 1 % bright
 
 Found adding check_bump_modes' sky room: five diffuse walls (reflect 0.8) open to a constant sky (no

@@ -74,11 +74,15 @@ NPHOT = {"B": 40000000, "M": 2000000, "S": 100000}   # photons (mode S's per pas
 DEPTH = {"M": 32, "S": 32}   # -max-bounce: the photon deposits' own depth; 8 for the rest
 # Mode J's point merges carry an O(r^2) bias over a rippled surface, which its default starting
 # radius leaves at +0.7 % of R on the translucent room (+0.4 % at 0.04, -0.15 % at 0.01; J without
-# them 0.999): pinned where that floor is ~0.1 %, so the check reads J's integrand, not its radius.
-MODE_ARGS = {"J": ["-jsurf-radius", "0.02"]}
+# them 0.999): pinned there where that floor is ~0.1 %, so the check reads J's integrand, not its
+# radius. Every other room runs J at its default radius. (room kind -> mode -> arguments)
+MODE_ARGS = {"translucent": {"J": ["-jsurf-radius", "0.02"]}}
 # The fluorescent room's mode R splits the hero bundle at each wall vertex, into 7 sub-paths of 8.
 SPLIT = ["-herosplit", "-heroc", "8"]
 TOL = 0.01
+# Mode R against itself (one strategy off): the two frames differ by a few hundredths of a per cent
+# when they agree, and the faults these catch read 1.2-4.4 %.
+TOL_SELF = 0.005
 # Mode B's frame is precise to about 0.03 % over three seeds, so it is held to 0.5 %: at 1 % the sky
 # room's B-ENV-WALLS (1.0097 on the host) passed.
 TOL_MODE = {"B": 0.005}
@@ -178,7 +182,7 @@ def main():
                    "-spp", str(SPP[mode] * (4 if dev == "gpu" else 1) * (4 if (extra or env) else 1)),
                    "-n", str(NPHOT.get(mode, 200000)),
                    "-max-bounce", str(depth), "-seed", str(seed), "-hdr", "-no-meter", "-window-min",
-                   "-o", png] + MODE_ARGS.get(mode, []) + list(extra)
+                   "-o", png] + MODE_ARGS.get(kind, {}).get(mode, []) + list(extra)
             p = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8",
                                errors="replace", env=dict(os.environ, **(env or {})))
             pfm = png[:-4] + ".pfm"
@@ -228,7 +232,7 @@ def main():
                                "splitesc" if kind == "fluoro" else "esc", {"FTRACE_ENV_NEE": "0"})
                          for s in seeds]
                 ratio = np.mean(v) / rm
-                good = abs(ratio - 1.0) <= TOL
+                good = abs(ratio - 1.0) <= TOL_SELF
                 print("%s: %-6s mode R with %s NEE off, on the %s: %.4f of mode R"
                       % ("ok" if good else "FAIL", name, "glossy" if kind == "glossy" else "sky",
                          "host" if dev == "cpu" else "device", ratio), flush=True)

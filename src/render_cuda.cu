@@ -6208,8 +6208,7 @@ __device__ static bool dLambertArrival(const DHit& h, const DVec3& ngo, const DV
 }
 // Host twin render.h glossyArrival: a glossy lobe's first bounce softened toward the emitter, a
 // roughness-0 one too.
-__device__ static Real dGlossyArrival(const DMaterial& lobe, const DHit& h, const DVec3& wi, bool firstBounce) {
-    (void)lobe;
+__device__ static Real dGlossyArrival(const DHit& h, const DVec3& wi, bool firstBounce) {
     if (!firstBounce) return (Real)1;
     return dShadowTerminatorG(wi, h.n, dShadedNg(h));
 }
@@ -6218,9 +6217,6 @@ __device__ static Real dGlossyArrival(const DMaterial& lobe, const DHit& h, cons
 __device__ static inline bool dGlossyCameraSide(const DVec3& rd, const DVec3& ns) {
     return dot(rd, ns) < (Real)0;
 }
-// Host twin contSoftening (render.h, where the why is): the softening a vertex (material `m`, its lobe
-// resolved) lends the light its continuation `d` reaches -- shadowTerminatorG at a Lambertian or
-// glossy vertex, 1 at any other.
 // Host twin sideSoftening (render.h, where the why is): toward a light along `w`, both normals turned
 // to the light's side first at a two-sided vertex.
 __device__ static inline double dSideSoftening(const DVec3& w, const DVec3& ns, const DVec3& ngo,
@@ -6228,6 +6224,9 @@ __device__ static inline double dSideSoftening(const DVec3& w, const DVec3& ns, 
     if (twoSided && dot(w, ngo) < (Real)0) return (double)dShadowTerminatorG(w, ns * (Real)(-1), ngo * (Real)(-1));
     return (double)dShadowTerminatorG(w, ns, ngo);
 }
+// Host twin contSoftening (render.h, where the why is): the softening a vertex (material `m`, its lobe
+// resolved) lends the light its continuation `d` reaches -- shadowTerminatorG at a Lambertian or
+// glossy vertex, on the light's side at a translucent one, 1 at any other.
 __device__ static inline double dContSoftening(const DMaterial& m, const DHit& h, const DVec3& d) {
     if (m.type == D_DIFFUSETRANSMIT) return dSideSoftening(d, h.n, dShadedNg(h), true);
     if (m.type != D_DIFFUSE && m.type != D_FLUORESCENT && m.type != D_GLOSSY) return 1.0;
@@ -6374,13 +6373,20 @@ __device__ static inline bool dCoatSplats(const DMaterial& coat) {
 // Host twin render.h camSideOk, where the why is: the camera side of a forward connection from a
 // surface vertex -- its geometric front, either side of the shading normal for a Lambertian vertex,
 // above it for a glossy one (`glossy`), never softened. False where it may not connect, else true
-// and `cosSurf` its projected cosine.
+// and `cosSurf` its projected cosine. One rule over the splat's vectors (DVec3, in Real) and the
+// analytic mirror / glass-sphere connection's (D3, in double: DSpecVtx).
+__device__ static inline Real dCamDot(const DVec3& a, const DVec3& b) { return dot(a, b); }
+__device__ static inline double dCamDot(const D3& a, const D3& b) { return d3dot(a, b); }
+template <class V, class S>
+__device__ static inline bool dCamSideOkT(const V& n, const V& ng, const V& wdir, bool glossy, S& cosSurf) {
+    const S c = (S)dCamDot(n, wdir);
+    if (c == (S)0 || !((S)dCamDot(ng, wdir) > (S)0) || (glossy && c < (S)0)) return false;
+    cosSurf = c < (S)0 ? -c : c;
+    return true;
+}
 __device__ static inline bool dCamSideOk(const DVec3& n, const DVec3& ng, const DVec3& wdir,
                                          bool glossy, Real& cosSurf) {
-    const Real c = dot(n, wdir);
-    if (c == (Real)0 || !(dot(ng, wdir) > (Real)0) || (glossy && c < (Real)0)) return false;
-    cosSurf = c < (Real)0 ? -c : c;
-    return true;
+    return dCamSideOkT(n, ng, wdir, glossy, cosSurf);
 }
 __device__ static void connect(const DScene& sc, const DCamera& cam, double* film, double* hits,
                                const DVec3& p, const DVec3& n, const DVec3& ng, const DVec3& wi,
@@ -7732,9 +7738,7 @@ __device__ static bool dCompoundGathers(const DScene& sc, const DMaterial& m, Re
 }
 // Host twin render.h compoundDepositWeight (where the why is): what a compound's own deposit of a
 // photon arriving along -wi with throughput `beta` stores; 0 nothing.
-__device__ static Real dCompoundDepositWeight(const DScene& sc, const DMaterial& cm, const DHit& h,
-                                              const DVec3& wi, bool firstBounce, Real beta) {
-    (void)sc; (void)cm;
+__device__ static Real dCompoundDepositWeight(const DHit& h, const DVec3& wi, bool firstBounce, Real beta) {
     const DVec3 ngo = dShadedNg(h);
     Real s;
     if (!dLambertArrival(h, ngo, wi, firstBounce, s)) return (Real)0;
@@ -9909,10 +9913,7 @@ struct DSpecVtx {
     // dCamSideOk): the geometric front, either side of np for a Lambertian vertex, above it
     // for a glossy one; `cosSurf` its projected cosine.
     __device__ bool camSide(const D3& wP, double& cosSurf) const {
-        const double c = d3dot(np, wP);
-        if (c == 0.0 || !(d3dot(ng, wP) > 0.0) || (glossy && c < 0.0)) return false;
-        cosSurf = c < 0.0 ? -c : c;
-        return true;
+        return dCamSideOkT(np, ng, wP, glossy != nullptr, cosSurf);
     }
     // The WAVELENGTH-INDEPENDENT half of term(): everything but `weight` (the per-λ
     // albedo). The mirror connectors solve ONE shared geometry for a whole hero bundle —
@@ -12433,7 +12434,7 @@ __device__ static int interactSpecular(const DScene& sc, const DCamSet& cs, int 
     } else if (m.type == D_GLOSSY) {
         // The first bounce softens toward the emitter (host twin glossyArrival) -- a layered
         // coat's continuation too, which arrives here as its coat lobe.
-        {   const Real sEm = dGlossyArrival(m, h, -rd, firstHit);
+        {   const Real sEm = dGlossyArrival(h, -rd, firstHit);
             eAbsorbed += (double)(beta * ((Real)1 - sEm));   // the ledger books what it removes
             beta *= sEm; }
         // A lobe with a finite value splats to the camera as a diffuse vertex does, with the
@@ -12864,7 +12865,7 @@ __device__ static int shadeStep(const DScene& sc, const DCamSet& cs,
     // here, before the photon's own pick; the lobe's branch below then deposits nothing.
     const bool compoundDeposit = dCompoundGathers(sc, *mptr, h.fiberRadius);
     if (compoundDeposit) {
-        const Real w = dCompoundDepositWeight(sc, *mptr, h, -rd, firstHit, beta);
+        const Real w = dCompoundDepositWeight(h, -rd, firstHit, beta);
         if (w > (Real)0) depositPhoton(cs, h.p, dShadedNg(h), w, lambda, dPathIsCaustic(pathC), dPathCausticW(pathC));
     }
     // A layered stack's coat sheen splats here, whichever lobe the pick below takes (host twin
@@ -12874,7 +12875,7 @@ __device__ static int shadeStep(const DScene& sc, const DCamSet& cs,
         const DVec3 wl = -rd;
         DGlossySplat gsp{&sc, &sc.mats[mptr->coatChild], &h, h.n, wl};
         gsp.stack = mptr;
-        Real bS = beta * dGlossyArrival(sc.mats[mptr->coatChild], h, wl, firstHit);   // host twin
+        Real bS = beta * dGlossyArrival(h, wl, firstHit);   // host twin
         splatSurfaceAll(sc, cs, camMode, h.p, h.n, dShadedNg(h), wl, lambda, bS, (Real)0, rng,
                         nullptr, &gsp);
         camSpecularSplatAllGlossy(sc, cs, camMode, h.p, h.n, dShadedNg(h), wl, &lambda, &bS, 1, gsp, rng);
@@ -13293,7 +13294,7 @@ __device__ static int shadeStepHero(const DScene& sc, const DCamSet& cs, int cam
         const bool caus = dPathIsCaustic(pathC);
         const Real cw = dPathCausticW(pathC);
         const DVec3 ngoC = dShadedNg(h);
-        const Real w1 = dCompoundDepositWeight(sc, *mptr, h, -rd, firstHit, (Real)1);
+        const Real w1 = dCompoundDepositWeight(h, -rd, firstHit, (Real)1);
         if (w1 > (Real)0)
             for (int i = 0; i < nUp; ++i) depositPhoton(cs, h.p, ngoC, beta[i] * w1, lam[i], caus, cw);
     }
@@ -13304,7 +13305,7 @@ __device__ static int shadeStepHero(const DScene& sc, const DCamSet& cs, int cam
         DGlossySplat gsp{&sc, &sc.mats[mptr->coatChild], &h, h.n, wl};
         gsp.stack = mptr;
         const Real unused[hero::kHeroMax] = {};
-        const Real sC = dGlossyArrival(sc.mats[mptr->coatChild], h, wl, firstHit);   // host twin
+        const Real sC = dGlossyArrival(h, wl, firstHit);   // host twin
         Real bS[hero::kHeroMax];
         for (int i = 0; i < nUp; ++i) bS[i] = beta[i] * sC;
         splatSurfaceAllHero(sc, cs, camMode, h.p, h.n, dShadedNg(h), wl, lam, bS, unused, nUp, rng,
@@ -13415,7 +13416,7 @@ __device__ static int shadeStepHero(const DScene& sc, const DCamSet& cs, int cam
         // in the scalar path; a glossy lobe with a finite value splats first, as its does --
         // softened toward the emitter on the first bounce (dGlossyArrival).
         if (m.type == D_GLOSSY) {
-            const Real sEm = dGlossyArrival(m, h, -rd, firstHit);
+            const Real sEm = dGlossyArrival(h, -rd, firstHit);
             for (int i = 0; i < nUp; ++i) { eAbsorbed += (double)(beta[i] * ((Real)1 - sEm)); beta[i] *= sEm; }
         }
         if ((camMode == CAM_A || camMode == CAM_B) && dGlossySplats(m) &&
@@ -14331,7 +14332,6 @@ __device__ static double dBsdfPdf(const DScene& sc, const DVertex& vt,
         double rhoR, rhoT; dDiffuseTransmitAlbedos(sc, m, h, lambda, rhoR, rhoT);
         double tot = rhoR + rhoT;
         if (tot <= 0.0) return 0.0;
-        (void)cosWo;
         const int lobe = dTranslucentLobe(ns, dVertexGeoN(vt), wo, wi);
         if (lobe == 0) return 0.0;
         return (lobe > 0 ? rhoR : rhoT) / tot * fabs(cosWi) / DPI;

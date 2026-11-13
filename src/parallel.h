@@ -73,11 +73,11 @@ inline void setStopMirror(volatile int* m) { stopMirrorSlot().store(m); }
 // Returns true if every i ran; false if a stop was requested and the remaining range
 // was abandoned (see above — the output is then partial and must be thrown away).
 namespace detail {
-// The loop on the caller's thread alone, still chunked to poll the stop flag.
+// The loop on the caller's thread alone, still chunked to poll the stop flag (`stoppable`).
 template <class Fn>
-inline bool serialFor(size_t n, size_t grain, Fn& fn) {
+inline bool serialFor(size_t n, size_t grain, Fn& fn, bool stoppable = true) {
     for (size_t b = 0; b < n; b += grain) {
-        if (stopRequested()) return false;
+        if (stoppable && stopRequested()) return false;
         size_t e = std::min(n, b + grain);
         for (size_t i = b; i < e; ++i) fn(i);
     }
@@ -86,36 +86,46 @@ inline bool serialFor(size_t n, size_t grain, Fn& fn) {
 // One worker's share: chunks claimed from `cursor` until the range or a stop runs out.
 template <class Fn>
 inline void cursorWorker(size_t n, size_t grain, Fn& fn, std::atomic<size_t>& cursor,
-                         std::atomic<bool>& cancelled) {
+                         std::atomic<bool>& cancelled, bool stoppable = true) {
     for (;;) {
         // Poll before claiming work, so a stop drains the cursor: every worker
         // finishes at most the chunk it already holds and then returns, which
         // bounds the stop latency at one chunk rather than the whole range.
-        if (stopRequested()) { cancelled.store(true, std::memory_order_relaxed); return; }
+        if (stoppable && stopRequested()) { cancelled.store(true, std::memory_order_relaxed); return; }
         size_t b = cursor.fetch_add(grain, std::memory_order_relaxed);
         if (b >= n) return;
         size_t e = std::min(n, b + grain);
         for (size_t i = b; i < e; ++i) fn(i);
     }
 }
-}  // namespace detail
-
 template <class Fn>
-[[nodiscard]] inline bool parallelFor(size_t n, size_t grain, Fn&& fn) {
+inline bool threadedFor(size_t n, size_t grain, Fn& fn, bool stoppable) {
     if (grain == 0) grain = 1;
     unsigned hw = std::thread::hardware_concurrency();
     if (hw == 0) hw = 4;
-    if (n < 2 * grain || hw < 2) return detail::serialFor(n, grain, fn);   // not worth a thread
+    if (n < 2 * grain || hw < 2) return serialFor(n, grain, fn, stoppable);   // not worth a thread
     unsigned nt = (unsigned)std::min<size_t>(hw, (n + grain - 1) / grain);
     std::atomic<size_t> cursor{0};
     std::atomic<bool> cancelled{false};
     std::vector<std::thread> pool;
     pool.reserve(nt - 1);
-    auto worker = [&] { detail::cursorWorker(n, grain, fn, cursor, cancelled); };
+    auto worker = [&] { cursorWorker(n, grain, fn, cursor, cancelled, stoppable); };
     for (unsigned t = 0; t + 1 < nt; ++t) pool.emplace_back(worker);
     worker();                                       // the caller is a worker too
     for (auto& t : pool) t.join();
     return !cancelled.load(std::memory_order_relaxed);
+}
+}  // namespace detail
+
+template <class Fn>
+[[nodiscard]] inline bool parallelFor(size_t n, size_t grain, Fn&& fn) {
+    return detail::threadedFor(n, grain, fn, /*stoppable=*/true);
+}
+// parallelFor that runs every i whatever a stop says: for a bounded pass whose partial result
+// would be worse than finishing it (the sky a stopped render's last write still has to show).
+template <class Fn>
+inline void parallelForAll(size_t n, size_t grain, Fn&& fn) {
+    (void)detail::threadedFor(n, grain, fn, /*stoppable=*/false);
 }
 
 // A persistent band pool: N workers that sleep on a condition variable and execute one
