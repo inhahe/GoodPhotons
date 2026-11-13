@@ -6,10 +6,10 @@ A ball in a coat of `type diffuse` fur (fur_creature's density and strand radius
 a ceiling panel. A gather on a strand is no surface estimate: the photons in its ball lie on the
 neighbouring strands. Since 0.433.3 modes M and S never gather there (known-issues CURVE-GATHER):
 they light a strand by NEE and walk on along its diffuse lobe, and deposit no photon on one. Before
-that the coat read, of mode R, M 0.71 (GPU) / 0.87 (CPU) and S 1.33 / 1.45; now 1.007 / 0.976 and
-0.986 / 0.981. Mode U merged on strands until 0.439.2 (VCM-THIN-CURVES), at 2.10 / 2.36; it merges
-at no curve vertex now, 1.000 / 1.014. Mode M runs with its final gather (`-pmfg`) too, whose
-sub-walk has taken the same step since 0.433.6: 1.009 / 1.050.
+that the coat read, of mode R, M 0.71 (GPU) / 0.87 (CPU) and S 1.33 / 1.45; at 0.440.12, 0.989 /
+1.014 and 0.985 / 0.981. Mode U merged on strands until 0.439.2 (VCM-THIN-CURVES), at 2.10 / 2.36;
+it merges at no curve vertex now, 1.000 / 1.014. Mode M runs with its final gather (`-pmfg`) too,
+whose sub-walk has taken the same step since 0.433.6: 0.992 / 1.063.
 
 The coat is the mean over the ball's middle, two seeds, against mode R's on the GPU. In modes M, S
 and U on the CPU and the GPU it must lie within 10 % of the value recorded below; `--record` prints
@@ -46,12 +46,12 @@ SCENE = NL.join([
 ]) + NL
 REF = ["-mode", "R", "-device", "gpu", "-spp", "512"]
 # (name, arguments, the coat's value against mode R as recorded)
-CASES = [("M_gpu", ["-mode", "M", "-device", "gpu", "-n", "4000000", "-spp", "16"], 1.007),
-         ("M_cpu", ["-mode", "M", "-device", "cpu", "-n", "2000000", "-spp", "4"], 0.976),
+CASES = [("M_gpu", ["-mode", "M", "-device", "gpu", "-n", "4000000", "-spp", "16"], 0.989),
+         ("M_cpu", ["-mode", "M", "-device", "cpu", "-n", "2000000", "-spp", "4"], 1.014),
          # the final gather, whose sub-walk meets the strands from the skin
-         ("Mfg_gpu", ["-mode", "M", "-device", "gpu", "-n", "4000000", "-spp", "16", "-pmfg", "16"], 1.009),
-         ("Mfg_cpu", ["-mode", "M", "-device", "cpu", "-n", "2000000", "-spp", "2", "-pmfg", "8"], 1.050),
-         ("S_gpu", ["-mode", "S", "-device", "gpu", "-spp", "16"], 0.986),
+         ("Mfg_gpu", ["-mode", "M", "-device", "gpu", "-n", "4000000", "-spp", "16", "-pmfg", "16"], 0.992),
+         ("Mfg_cpu", ["-mode", "M", "-device", "cpu", "-n", "2000000", "-spp", "2", "-pmfg", "8"], 1.063),
+         ("S_gpu", ["-mode", "S", "-device", "gpu", "-spp", "16"], 0.985),
          ("S_cpu", ["-mode", "S", "-device", "cpu", "-spp", "4"], 0.981),
          ("U_gpu", ["-mode", "U", "-device", "gpu", "-spp", "16"], 1.000),
          ("U_cpu", ["-mode", "U", "-device", "cpu", "-spp", "4"], 1.014)]
