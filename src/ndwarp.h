@@ -541,6 +541,7 @@ inline bool capture(const Scene& s, const std::string& object, Model& m, std::st
     // authoritative (and only) place that fact is written down.
     auto materialIsEmissive = [&](int matId) {
         if (matId < 0) return false;
+        matId = s.matBase(matId);   // a routed copy of a light's material is a light's
         for (const Emitter& e : s.emitters) if (e.matId == matId) return true;
         return false;
     };

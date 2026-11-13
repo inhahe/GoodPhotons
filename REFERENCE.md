@@ -909,7 +909,7 @@ key, and the run prints the multipliers when they are not.
 
 **Limits.**
 - A surface light (`light area`, sphere, tube or mesh, or any emissive object) takes a tag (since
-  0.441.0); a point, spot, sun or sky light has none to take.
+  0.441.0); a spot, collimated, sun or sky (`env`) light has none to take.
 - A `mesh_instance` takes a tag on its own placement, with or without a `material` override (since
   0.441.0).
 - On the **CPU**, mode J with beams does not use the hero-wavelength bundle where mode D would,
@@ -3428,7 +3428,10 @@ normalised mean sky luminance, default 1), `res <px>` (equirect width, height = 
 default 1024), and `rotate <deg>`. Because the solar disk is physically ~10⁵× brighter
 than the sky (as in any real sunny HDRI), sun-lit diffuse surfaces are high-dynamic-range
 and benefit from a generous photon budget / higher `-noise` target in forward modes; the
-sky background itself is read directly and is noise-free. See `scraps/sky_test.ftsl`
+sky background itself is read directly: through a pinhole it is noise-free (each pixel averages
+64 points over its area, so an edge against the sky is antialiased), through a physical lens it
+converges with the photons per pixel, and a render stopped before its first write shows it from a
+few samples a pixel (16 through a lens). See `scraps/sky_test.ftsl`
 (daytime) and `scraps/sky_sunset.ftsl` (low-sun reddening).
 
 **`sun_disk on | off | separate`** controls how that solar disk is delivered. The

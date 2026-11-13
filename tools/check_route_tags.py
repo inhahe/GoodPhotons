@@ -98,13 +98,13 @@ def main():
                 from pfm import read_pfm
                 v = {k: [read_pfm(render(t, m, dev, s, 64)[2], top_down=True).sum(-1).mean()
                          for s in range(1, 7)] for k, t, m in (("tag", tag, cam), ("ref", "", want))}
-                a, b = np.mean(v["tag"]), np.mean(v["ref"])
-                z = (a - b) / np.hypot(np.std(v["tag"], ddof=1), np.std(v["ref"], ddof=1)) * np.sqrt(6)
+                mt, mr = np.mean(v["tag"]), np.mean(v["ref"])
+                z = (mt - mr) / np.hypot(np.std(v["tag"], ddof=1), np.std(v["ref"], ddof=1)) * np.sqrt(6)
                 good = abs(z) <= 3.0
                 ok &= good
                 print("%s: every object tagged %s under a mode-%s camera, on the device: %.4f of mode %s "
                       "(%+.1f sigma; byte identity is ROUTE-D-GPU-STREAM)"
-                      % ("ok" if good else "FAIL", tag, cam, a / b, want, z), flush=True)
+                      % ("ok" if good else "FAIL", tag, cam, mt / mr, want, z), flush=True)
                 continue
             got, warn, _ = render(tag, cam, dev)
             ref, _, _ = render("", want, dev)

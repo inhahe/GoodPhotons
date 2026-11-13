@@ -8048,10 +8048,10 @@ __device__ static inline void dPmNeighborhood(const DPhotonMap& pm, const DVec3&
 // junction).
 #define PM_ADAPT_BINS 16                     // covers r down to r * 2^-8 = r/256
 // A hit's coordinate scale for the gather band's rounding slack (gatherBandSlack's `pscale`): its
-// primitive's reach, or its own distance from the origin where that is larger -- an implicit's hit
-// has no reach, and a point is never computed more finely than its own coordinates round.
+// primitive's reach, or its own largest coordinate where that is larger (dMaxAbs) -- an implicit's
+// hit has no reach, and a point is never computed more finely than its own coordinates round.
 __device__ static inline Real dRoundScale(const DHit& h) {
-    return fmax(h.pscale, (Real)sqrt((double)dot(h.p, h.p)));
+    return fmax(h.pscale, (Real)dMaxAbs(h.p));
 }
 template <int NB = PM_ADAPT_BINS>
 __device__ static inline Real dPmAdaptiveRadius(const DPhotonMap& pm, const DVec3& p,

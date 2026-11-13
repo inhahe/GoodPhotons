@@ -3588,7 +3588,7 @@ every object tagged J it matches mode J bit for bit (`scraps/_rt_*.ftsl`, 0.386.
   `-roi-mask` legends. A tagged mix's children are copied too, because the renderer shades
   the child.
 - An emissive surface takes a tag as any object does, and so does a surface `light` block
-  (`light area { ... mode J }`, a sphere, tube or mesh light). A point, spot, sun or sky light has
+  (`light area { ... mode J }`, a sphere or cylinder light). A spot, collimated, sun or sky light has
   no surface a camera path meets: a `mode` on one is an error -- tag the objects it lights.
 - A `mesh_instance` takes a tag with or without a `material` override: the placement's hits shade
   with tagged copies of its asset's materials, and the asset's other placements keep theirs.

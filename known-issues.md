@@ -2762,6 +2762,51 @@ D's for a path routed D (an extra draw, another light subpath, the hero gate), a
 mode D's; check_route_tags then holds the device's D-under-J pair byte-identical as it holds the
 other three (it holds it in the mean meanwhile).
 
+## DONE (2026-11-13, 0.441.1): REVIEW-4410 — what the Opus review of 0.440.14-0.441.0 found
+
+`/code-review xhigh` (Opus) of 41d8317..2675b14 (REVIEW-44013's follow-ups, PER-OBJECT-MODES' lights
+and instances): 15 findings, each checked against the code. Fixed in 0.441.1:
+
+* **The large-group sky in the flight (`groupSkyInFlight`) was the wrong trade**, four findings
+  over: on the device path it allocated a 32-byte-a-pixel film per camera for it, more than the
+  12-byte sums it replaced; at the scale it was for (600 cameras at 1080p) a pixel took a sky sample
+  about once in 10^4 batches at 10^4 times the weight, salt-and-pepper for most of the render; its
+  samples counted as hits, so the noise estimate and `-noise` read the same frame differently; and
+  the checkpoint guard did not know which kind a sidecar held. And what it saved was never the
+  cost: each camera's film is 32 bytes a pixel (more per thread on the CPU path). Reverted: a group
+  holds every camera's sums, as every other render does; REVIEW-44013's memory finding is dismissed
+  for that reason.
+* **A lens camera stopped before its first sums took 4 samples a pixel**, each a single wavelength
+  and pupil point: its sky came out in colour speckle. It takes 16 (sixteen wavelength strata); a
+  pinhole keeps 4, which resolves pure sky exactly.
+* **A tagged bare instance scanned its asset's whole triangle list**, with a linear search per
+  triangle, for every instance: O(instances x triangles x materials) at load. The distinct
+  materials are found once an asset (`blasMaterials`).
+* **check_sky_repeat's stop waited 120 s**: the forward banner it watches for was not flushed through
+  a pipe. It is now (`std::fflush` after the banner), so the stop lands 2 s into tracing.
+* **`dRoundScale` re-implemented `dMaxAbs`** with an FP64 square root: it uses `dMaxAbs`, the
+  codebase's own "the scale that sets one float ulp of its position".
+* **ndwarp's `materialIsEmissive` compared raw material ids**, so a routed copy of a light's
+  material was not taken for a light's: it compares `matBase`.
+* **`finishRoutes` was a separate pass with an ordering constraint**: `routedMat` records each copy in
+  its original's `routeTo` as it makes it (a copy's own `routeTo` starts empty). `routedLight` calls
+  `routed` instead of repeating it.
+* **The surfaceless-light error named the light by its bareword alone** (`(light)` for the `kind`
+  form), and the docs listed a `point` light that does not exist: `light point` was built as a 1x1
+  area panel, silently, as was any kind the loader did not know. An unknown kind is now an error
+  (it names the kinds, and how to write a point light), and the docs list the surfaceless kinds as
+  they are: spot, collimated, sun, sky.
+* REFERENCE.md's sky background "noise-free" now says what holds: through a pinhole, each pixel
+  averaged over its area; through a lens, converging with the photons; stopped early, from a few
+  samples. check_route_tags' statistics no longer rebind the argument namespace.
+
+Not changed:
+* **The pinhole sky's 64 rays on every pixel** (four times the 16-point early-out on a uniform pixel):
+  REVIEW-44013 removed the early-out because it missed thin features; the cost is once a camera.
+* **Emitters found through `matBase` at each lookup** rather than an emitter index on the material: the
+  lookups are few and now all canonicalise (ndwarp's was the one that did not); an index set after
+  the emitters are finalised would be one more thing for a load step to keep current.
+
 ## DONE (2026-11-13, 0.440.14): REVIEW-44013 — what the Opus review of 0.440.12-0.440.13 found
 
 `/code-review xhigh` (Opus) of fc9b230..41d8317 (REVIEW-44011's follow-ups, THIN-GAP-GATHER): 12
@@ -2778,12 +2823,11 @@ findings, each checked against the code. Fixed in 0.440.14:
   a large group's first write traced every camera's sky in full before exiting, past `-stop`'s 120 s
   window. A render stopped before its first sums takes 4 a pixel (pure sky resolves exactly at any
   count), the rest yielding to a stop.
-* **A shared group held every camera's sky sums for its life** (12 bytes a pixel each: 15 GB for a
+* ~~**A shared group held every camera's sky sums for its life** (12 bytes a pixel each: 15 GB for a
   600-camera 1080p flight). Past 1 GiB of sums (`groupSkyInFlight`), every camera's sky is drawn batch
-  by batch into its film instead, as a blurred camera's is (`addBlurredSkyRows`, which now samples a
-  camera that sees no motion at its instant); the writes add none. check_sky_repeat's GROUP case
-  renders a two-camera flight both ways (`FTRACE_SKY_HELD_MB 0` forces the second): each camera's pure sky
-  agrees exactly, and its frame within 0.1 % (0.9995, 0.9991).
+  by batch into its film instead, as a blurred camera's is.~~ **Reverted in 0.441.1** (REVIEW-4410):
+  it made the sky speckle in exactly the groups it was for, and saved nothing that mattered -- each
+  camera's film is 32 bytes a pixel beside the sums' 12.
 * **check_gather_far** passed whatever backend rendered: a fallback to the host (double, nothing to
   test) now fails it.
 * **check_sky_repeat's stop** could land in the scene load: it waits for the render's banner now.

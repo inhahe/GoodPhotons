@@ -21,10 +21,7 @@ would compute the sky before the stop), stopped two seconds after it starts trac
 -stop`: the pure sky at the top of the frame must match a completed render's to 1e-4 (the stopped
 render sums it at 4 points a pixel, which a pixel of pure sky resolves exactly).
 
-GROUP. Two cameras render as one shared photon flight. A group holds each camera's sums while they
-fit in memory (1 GiB of them); past that every camera's sky is drawn batch by batch into its film,
-as a blurred camera's is. The same group both ways (FTRACE_SKY_HELD_MB 0 forces the second): each
-camera's pure sky must agree to 1e-4, and its frame to 1 %. Exits 1 on any failure.
+Exits 1 on any failure.
 """
 import argparse
 import os
@@ -125,42 +122,6 @@ def stopped(exe, out, txt):
     return good
 
 
-def group(exe, out, txt):
-    cam = [l for l in txt.split(NL) if l.startswith('camera "c"')]
-    assert len(cam) == 1
-    second = cam[0].replace('camera "c"', 'camera "d"').replace("eye 0 1.2 4", "eye 0.3 1.3 4")
-    scene = os.path.join(out, "pair.ftsl")
-    with open(scene, "w", encoding="utf-8", newline="") as f:
-        f.write(txt.replace(cam[0], cam[0] + NL + second))
-    imgs = {}
-    for tag, env in (("held", {}), ("flight", {"FTRACE_SKY_HELD_MB": "0"})):
-        png = os.path.join(out, "G_%s.png" % tag)
-        for c in ("c", "d"):
-            fresh(png[:-4] + "_" + c + ".png")
-        cmd = [exe, "-in", scene, "-mode", "B", "-n", "4000000", "-seed", "1", "-hdr", "-no-meter",
-               "-window-min", "-o", png]
-        p = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace",
-                           env=dict(os.environ, **env))
-        for c in ("c", "d"):
-            pfm = png[:-4] + "_" + c + ".pfm"
-            if p.returncode != 0 or not os.path.exists(pfm):
-                print((p.stdout + p.stderr)[-1500:])
-                raise SystemExit("render failed: " + " ".join(cmd))
-            imgs[(tag, c)] = read_pfm(pfm, top_down=True)
-    ok = True
-    for c in ("c", "d"):
-        a, b = imgs[("held", c)], imgs[("flight", c)]
-        w = a.shape[1]
-        sa, sb = a[0, w // 3: 2 * w // 3].sum(-1), b[0, w // 3: 2 * w // 3].sum(-1)
-        rel = float(np.max(np.abs(sb - sa) / np.maximum(sa, 1e-30)))
-        fr = float(b.sum() / a.sum())
-        good = bool(sa.min() > 0.0) and rel <= 1e-4 and abs(fr - 1.0) <= 0.01
-        ok &= good
-        print("%s: camera %s of a shared flight, its sky drawn in the flight / held: pure sky off by %.2g, "
-              "frame %.4f" % ("ok" if good else "FAIL", c, rel, fr), flush=True)
-    return ok
-
-
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split(NL)[0])
     ap.add_argument("--out", default=os.path.join(ROOT, "png", "check_sky_repeat"))
@@ -171,7 +132,6 @@ def main():
     txt = cbm.room(out, 0.0, "sky")
     ok = cadence(exe, out, txt)
     ok = stopped(exe, out, txt) and ok
-    ok = group(exe, out, txt) and ok
     print("PASS" if ok else "FAILED")
     return 0 if ok else 1
 

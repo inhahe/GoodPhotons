@@ -2797,7 +2797,7 @@ RESOLVED child on the vertex. A layered coat is synthesised later from its paren
 An emissive surface is copied as any other (0.441.0): its emitter, registered on the original before
 the loader retags the surface, is found from the copy through `routeBase` (`Scene::emitterForMat`,
 `aimedEmission`, the device's `dEmitterForMat`, by `matBase` / `solidId`). A surface `light` block takes
-its own `mode` (`routedLight`); a point, spot, sun or sky has no surface to route, and a `mode` on one is
+its own `mode` (`routedLight`); a spot, collimated, sun or sky has no surface to route, and a `mode` on one is
 an error. A `mesh_instance` without a `material` override shares its asset's triangles, and their
 materials, with every placement, so it records its route instead (`MeshInstance::route`): each
 original material knows its routed copies (`Material::routeTo`, filled by `finishRoutes` once every
@@ -10866,8 +10866,8 @@ sees the instant, exactly as a static scene with those transforms would show it.
   stopped before its first sums takes 4 a pixel whatever the stop says (`ft::parallelForAll`), so
   its last write shows its sky at a cost bounded by a few rays a pixel; and a live window's repaint
   takes the sums before it starts timing itself (`prepareSky`), since its measured cost sets how
-  often it repaints. A shared group whose sums would pass 1 GiB (`groupSkyInFlight`) holds none:
-  every camera's sky is drawn batch by batch into its film, as a blurred camera's is, below. Under a
+  often it repaints. A shared group holds every camera's sums: 12 bytes a pixel beside a film of
+  32. Under a
   blur that pass skips the camera: each forward thread draws its band of the sky into its own
   batch film instead (`addBlurredSkyRows`), K samples a pixel at times of their own (rotated per
   pixel and batch), K a sixteenth of a photon per pixel per camera sharing the batch, at most 64;

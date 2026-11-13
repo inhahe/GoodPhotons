@@ -16082,7 +16082,9 @@ static bool prepareSky(SkyView& view, const Scene& scene, const Camera& cam, int
     if ((!haveEnv && !haveSun) || cam.seesMotion(scene)) return false;
     constexpr double kLo = 360.0, kHi = 830.0;
     constexpr long long kFirst = 64;      // a pinhole's whole count; a lens's first
-    constexpr long long kStopped = 4;     // a render stopped before its first sum: its last write's
+    // A render stopped before its first sums: its last write's count -- a pinhole's pure sky is
+    // exact at any count; a lens's samples are monochromatic, so it takes 16 (16 wavelength strata).
+    const long long kStopped = cam.hasLens() ? 16 : 4;
     const Camera::RayKey key = cam.rayKey();
     if (!(view.key == key) || view.gen != scene.generation || view.builds != scene.buildCount ||
         view.rx != rx || view.ry != ry) {
@@ -16149,7 +16151,7 @@ static bool prepareSky(SkyView& view, const Scene& scene, const Camera& cam, int
     // The first sums, which a stop must not leave out of the stopped render's last write: kFirst
     // samples a pixel, yielding to a stop like any other pass; where a stop is pending, or arrives
     // during them, the kStopped first ones instead, taken whatever it says -- so the stopped image
-    // has its sky at a cost bounded by a few rays a pixel, however many cameras and pixels it has.
+    // has its sky at a cost bounded by a few rays a pixel.
     if (view.K == 0) {
         std::vector<float> first(view.sum.size(), 0.0f);
         if (!ft::stopRequested() &&
@@ -16225,8 +16227,7 @@ static void addEnvBackground(Film& film, const Scene& scene, const Camera& cam, 
 // a photon per pixel per camera sharing the batch, at most 64; where that is under one, each pixel
 // takes its one sample with that chance, weighted up by it. So the sky costs a sixteenth of the
 // batch's photons however small the batch. Rows [y0, y1) only, so each forward thread draws its
-// own band into its own film. Also every camera of a shared group too large to hold each camera's
-// sums (groupSkyInFlight); a camera that sees no motion takes its samples at its instant.
+// own band into its own film.
 static void addBlurredSkyRows(Film& film, const Scene& scene, const Camera& cam, long long N,
                               int nCamsSharing, uint64_t seedBase, int y0, int y1) {
     constexpr double kLo = 360.0, kHi = 830.0;
@@ -16239,8 +16240,7 @@ static void addBlurredSkyRows(Film& film, const Scene& scene, const Camera& cam,
     const double chance = std::min(1.0, want);    // a pixel's chance of its one sample, under one
     const double share = (double)N / ((double)K * chance);
     const bool lensed = cam.hasLens();
-    const bool timed = cam.seesMotion(scene);
-    PosedCamera posed(cam, timed);      // a moving camera, at each sample's time
+    PosedCamera posed(cam, true);       // a moving camera, at each sample's time
     for (int py = y0; py < y1; ++py)
         for (int px = 0; px < rx; ++px) {
             const uint64_t pix = (uint64_t)py * (uint64_t)rx + (uint64_t)px;
@@ -16252,9 +16252,9 @@ static void addBlurredSkyRows(Film& film, const Scene& scene, const Camera& cam,
             for (int k = 0; k < K; ++k) {
                 double tU = offT + (double)k / (double)K;
                 tU -= std::floor(tU);
-                const double tFrames = timed ? cam.shutterTime(tU) : 0.0;
-                const MotionTimeScope at(timed ? scene.motionU(tFrames) : -1.0);
-                const Camera& cp = timed ? posed.at(tFrames) : cam;
+                const double tFrames = cam.shutterTime(tU);
+                const MotionTimeScope at(scene.motionU(tFrames));
+                const Camera& cp = posed.at(tFrames);
                 const double jx = rng.uniform(), jy = rng.uniform();
                 Ray r;
                 double w = 1.0, lambda = 0.0;
@@ -16410,7 +16410,7 @@ static std::vector<Film> renderForwardShared(const Scene& scene,
                                              EnergyReport& eOut, bool diffraction = true,
                                              bool lensMode = false,
                                              unsigned long long seedBase = 0,
-                                             bool beamGather = false, bool skyAll = false) {
+                                             bool beamGather = false) {
     int nc = (int)cams.size();
     // One time per photon serves every camera only when they share a shutter or see nothing move
     // (run's joinFlight groups them so); any other flight would render cameras at wrong times.
@@ -16466,10 +16466,9 @@ static std::vector<Film> renderForwardShared(const Scene& scene,
                     if (posed[(size_t)c].moves()) targets[c].cam = &posed[(size_t)c].at(tFrames);
             r.tracePhoton(scene, targets.data(), nc, /*sensorFilm*/nullptr, rng, reports[tid]);
         }
-        // ...and, under a blur, this thread's band of each camera's directly seen sky -- of every
-        // camera's with `skyAll` (groupSkyInFlight).
-        for (int c = 0; c < nc && (blur || skyAll); ++c)
-            if (skyAll || cams[c].seesMotion(scene))
+        // ...and, under a blur, this thread's band of each camera's directly seen sky.
+        for (int c = 0; c < nc && blur; ++c)
+            if (cams[c].seesMotion(scene))
                 addBlurredSkyRows(films[tid][c], scene, cams[c], N, nc, seedBase,
                                   (int)((long long)resY[c] * tid / nThreads),
                                   (int)((long long)resY[c] * (tid + 1) / nThreads));
@@ -22440,6 +22439,7 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
             std::printf("mode %c: tracing until ~%.2g%% noise in %lld-photon batches at %dx%d on %s "
                         "(light=%s)%s (Ctrl-C to stop early) ...\n",
                         mode, noiseTarget, batchN, res, resY, backend.c_str(), lightLabel, resumeTag);
+        std::fflush(stdout);   // the render has started: a log read through a pipe says so now
         if (preview) { enableAnsiTerminal(); g_previewRows = 0; }  // fresh preview per render
         // Trap Ctrl-C so a long/indefinite render stops cleanly (final image +
         // checkpoint) instead of losing the batch since the last periodic save.
@@ -29631,17 +29631,6 @@ static int run(int argc, char** argv) {
         std::vector<Film> acc(nc);
         std::vector<SkyView> skies((size_t)nc);   // each camera's sky (addEnvBackground)
         for (int c = 0; c < nc; ++c) { acc[c].resX = rxs[c]; acc[c].resY = rys[c]; acc[c].alloc(); }
-        // The sky each camera sees directly is summed once a camera and held beside its film
-        // (SkyView, 12 bytes a pixel) -- unless the group is too large for that: past kSkyHeld of
-        // sums, every camera's sky is drawn batch by batch into its film instead, as a blurred
-        // camera's is (addBlurredSkyRows: a sixteenth of the batch's photons in rays, no memory, and
-        // in the film at any write or stop), and the writes add none.
-        // (FTRACE_SKY_HELD_MB overrides the limit, so a check can put a small group either way.)
-        double kSkyHeld = 1024.0 * 1024.0 * 1024.0;
-        if (const char* e = std::getenv("FTRACE_SKY_HELD_MB")) kSkyHeld = std::atof(e) * 1024.0 * 1024.0;
-        double skyBytes = 0.0;
-        for (int c = 0; c < nc; ++c) skyBytes += 12.0 * (double)rxs[c] * (double)rys[c];
-        const bool groupSkyInFlight = (scene.envIndex >= 0 || scene.sunCount > 0) && skyBytes > kSkyHeld;
         long long accN = 0;
         EnergyReport accE;
 
@@ -29734,12 +29723,11 @@ static int run(int argc, char** argv) {
         // pulled (pullDevice). Empty where the scene has no sky or sun, or the camera sees nothing
         // move.
         std::vector<Film> skyAcc;
-        const bool skyOnHost = gses && (blurGroup || groupSkyInFlight) &&
-                               (scene.envIndex >= 0 || scene.sunCount > 0);
+        const bool skyOnHost = gses && blurGroup && (scene.envIndex >= 0 || scene.sunCount > 0);
         if (skyOnHost) {
             skyAcc.resize(nc);
             for (int c = 0; c < nc; ++c)
-                if (groupSkyInFlight || cams[c].seesMotion(scene)) {
+                if (cams[c].seesMotion(scene)) {
                     skyAcc[c].resX = rxs[c]; skyAcc[c].resY = rys[c]; skyAcc[c].alloc();
                 }
         }
@@ -29789,8 +29777,7 @@ static int run(int argc, char** argv) {
             EnergyReport e;
             std::vector<Film> films =
                 renderForwardShared(scene, cams, rxs, rys, batchN, nThreads, e, diffraction,
-                                    groupMode == 'A', (unsigned long long)accN, g_beamGather,
-                                    groupSkyInFlight);
+                                    groupMode == 'A', (unsigned long long)accN, g_beamGather);
             for (int c = 0; c < nc; ++c) acc[c].merge(films[c]);
             accN += batchN;
             accE.emitted += e.emitted; accE.absorbed += e.absorbed; accE.sensor += e.sensor;
@@ -29816,8 +29803,7 @@ static int run(int argc, char** argv) {
             for (int c = 0; c < nc; ++c) {
                 const RenderCam& rc = toRender[idx[c]];
                 Film disp = acc[c];
-                if (!groupSkyInFlight)   // directly-viewed sky (env scenes); else in the film already
-                    addEnvBackground(disp, scene, rc.cam, accN, skies[(size_t)c]);
+                addEnvBackground(disp, scene, rc.cam, accN, skies[(size_t)c]);   // directly-viewed sky (env scenes)
                 std::string op = outFor(rc.name);
                 if (!quiet && toRender.size() > 1)
                     std::printf("[camera] '%s' (mode %c, %dx%d) -> %s\n",
@@ -29938,12 +29924,10 @@ static int run(int argc, char** argv) {
                     if (preview || wantWin) {
                         // The sky's own samples first, outside the repaint's cost (the single-camera
                         // loop has the why).
-                        if (!groupSkyInFlight)
-                            prepareSky(skies[0], scene, toRender[idx[0]].cam, acc[0].resX, acc[0].resY, accN);
+                        prepareSky(skies[0], scene, toRender[idx[0]].cam, acc[0].resX, acc[0].resY, accN);
                         auto tPrep = clk::now();
                         Film disp = acc[0];
-                        if (!groupSkyInFlight)
-                            addEnvBackground(disp, scene, toRender[idx[0]].cam, accN, skies[0]);
+                        addEnvBackground(disp, scene, toRender[idx[0]].cam, accN, skies[0]);
                         if (wantSave) {
                             if (preview) ansiPreview(disp, (double)accN, toRender[idx[0]].exposure, st);
                             else { std::printf("%s\n", st); std::fflush(stdout); }

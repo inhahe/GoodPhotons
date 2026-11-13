@@ -1426,7 +1426,6 @@ public:
             std::fprintf(stderr, "[settle] %s\n", rep.c_str());
         }
         propagateMaterialRoutes(L);   // per-object render modes: a tagged mix's children (0.386.0)
-        finishRoutes(L);              // ...and a tagged instance's routed copies
         if (L.beforeBvh) L.beforeBvh(L);
         { detail::AccelTimer _ct; L.scene.build(); }
         // build() demotes a fire that emits nothing to the smoke it is made of
@@ -7208,6 +7207,7 @@ private:
         Material c = L.scene.mats[(size_t)id];
         c.route = route;
         c.routeBase = L.scene.mats[(size_t)id].solidId(id);   // one solid with its original
+        c.routeTo[0] = c.routeTo[1] = -1;                      // a copy is no tagged instance's original
         // A MIX resolves to one of its children before anything shades it, and the walks store
         // the CHILD on the vertex (bdpt.h Vertex::mat, the device's resolved matId), so the
         // route has to live on the children too: they get routed copies of their own. (A
@@ -7216,20 +7216,11 @@ private:
         for (int& ch : c.mixChildren) ch = routedMat(ch, route, L, ownYields);
         const int nid = (int)L.scene.mats.size();
         L.scene.mats.push_back(std::move(c));
+        L.scene.mats[(size_t)id].routeTo[route] = nid;   // for a tagged instance (MeshInstance::route)
         routeClone_[key] = nid;
         routeIsClone_.resize(L.scene.mats.size(), 0);
         routeIsClone_[(size_t)nid] = 1;
         return nid;
-    }
-    // Each original material learns its routed copies (Material::routeTo), for the tagged instances
-    // that reach them through their asset's shared triangles. Run once, after every object and
-    // propagateMaterialRoutes, before build().
-    void finishRoutes(Loaded& L) {
-        for (const auto& kv : routeClone_) {
-            const int id = kv.first.first, r = kv.first.second;
-            if (id >= 0 && id < (int)L.scene.mats.size() && (r == ROUTE_D || r == ROUTE_J))
-                L.scene.mats[(size_t)id].routeTo[r] = kv.second;
-        }
     }
     // A material tagged in its OWN block passes its route to the children it resolves to, for
     // the reason routedMat gives. Run once, after every object, before build().
@@ -7243,6 +7234,15 @@ private:
             L.scene.mats[i].mixChildren = ch;
         }
     }
+    // The distinct materials of an instanced asset's triangles, found once an asset.
+    std::map<int, std::vector<int>> blasMats_;
+    const std::vector<int>& blasMaterials(int blasId, Loaded& L) {
+        auto it = blasMats_.find(blasId);
+        if (it != blasMats_.end()) return it->second;
+        std::set<int> ms;
+        for (const Tri& t : L.scene.blasList[(size_t)blasId].tris) ms.insert(t.matId);
+        return blasMats_[blasId] = std::vector<int>(ms.begin(), ms.end());
+    }
     void applyRoute(const PrimMark& mk, int route, Loaded& L) {
         Scene& S = L.scene;
         for (size_t i = mk.tris; i < S.tris.size(); ++i)           S.tris[i].matId = routedMat(S.tris[i].matId, route, L);
@@ -7255,35 +7255,29 @@ private:
             if (in.matOverride >= 0) { in.matOverride = routedMat(in.matOverride, route, L); continue; }
             // An instance without a material override shares its asset's triangles, and their
             // materials, with every other instance of the asset: this placement's hits take the
-            // routed copies instead (MeshInstance::route, Material::routeTo, filled once every
-            // object is in: finishRoutes). A tag the instance's own block set wins over its group's.
+            // routed copies instead (MeshInstance::route, Material::routeTo, recorded by routedMat).
+            // A tag the instance's own block set wins over its group's.
             if (in.route >= 0 || in.blasId < 0 || in.blasId >= (int)S.blasList.size()) continue;
             in.route = route;
-            std::vector<int> seen;
-            for (const Tri& t : S.blasList[(size_t)in.blasId].tris)
-                if (std::find(seen.begin(), seen.end(), t.matId) == seen.end()) {
-                    seen.push_back(t.matId);
-                    routedMat(t.matId, route, L);
-                }
+            for (int m : blasMaterials(in.blasId, L)) routedMat(m, route, L);
         }
     }
     // Add one light and retag its surface for its own `mode`, as routed does an object's: a surface
-    // light (area, sphere, tube, mesh) takes one; a point, spot, sun or sky has no surface a camera
+    // light (area, sphere, cylinder) takes one; a spot, collimated, sun or sky has no surface a camera
     // path can meet, and a `mode` on it is an error.
     template <class F>
     bool routedLight(const Block& b, Loaded& L, F&& add) {
         int route = -1;
         if (!routeOf(b, route)) return false;
         const PrimMark mk = primMark(L);
-        if (!add()) return false;
-        if (route < 0) return true;
-        if (L.scene.tris.size() == mk.tris && L.scene.spheres.size() == mk.spheres &&
+        if (!routed(b, L, std::forward<F>(add))) return false;
+        if (route >= 0 && L.scene.tris.size() == mk.tris && L.scene.spheres.size() == mk.spheres &&
             L.scene.instances.size() == mk.instances) {
-            fail("`mode` on a light with no surface (" + (b.subtype.empty() ? b.type : b.subtype) +
-                 "): no camera path meets it, so it routes nothing; tag the objects it lights");
+            const std::string kind = !b.subtype.empty() ? b.subtype : strOf(b, "kind", b.type);
+            fail("`mode` on a `" + kind + "` light, which has no surface: no camera path meets it, so "
+                 "it routes nothing; tag the objects it lights");
             return false;
         }
-        applyRoute(mk, route, L);
         return true;
     }
     // Add one object (or group, or fur) and retag what it added. Mode keys on a group reach its
@@ -8265,6 +8259,16 @@ private:
         // When no bareword subtype was parsed (empty), fall back to the property.
         // Old default point/area lights have no `kind`, so they stay empty as before.
         if (subtype.empty()) subtype = strOf(b, "kind", "");
+        // A kind this loader does not know would otherwise fall through to the default panel below
+        // and render as one, silently (`light point` was a 1x1 panel).
+        static const char* const kKinds[] = {"", "area", "sphere", "cylinder", "spot", "collimated",
+                                             "sun", "env"};
+        if (std::none_of(std::begin(kKinds), std::end(kKinds),
+                         [&](const char* k) { return subtype == k; })) {
+            fail("light: unknown kind '" + subtype + "' (area, sphere, cylinder, spot, collimated, sun, "
+                 "env; a point light is `light spot { ... inner_angle 180  outer_angle 180 }`)");
+            return false;
+        }
         // A light block's emission slot is spelled `spd`, so its pattern spellings are
         // `spd pattern:p` (the pattern IS the profile) and `spd_map pattern:p` (modulate
         // the authored SPD) — the same pair a material spells `emit` / `emit_map`. Only
