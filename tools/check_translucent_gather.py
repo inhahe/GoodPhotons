@@ -19,11 +19,11 @@ A far-side photon must lie on the sheet itself: the back face of a thin solid be
 and a thickness away, holds the light arriving at that face, not the light the sheet transmits. The
 second room puts an opaque diffuse plate 5 mm behind the sheet, lit from behind, and gathers mode M
 at a pinned radius of 0.15 (30 times the gap; the adaptive radius stays far smaller here): on the
-host and device the panel's tiles must read under 1.6 of mode R, where a far-side test with the
-band's flat allowance gathers the plate's back and reads them 2.4 and 4.6. (What remains, about
-1.1 and 1.4, is that allowance gathering the plate's lit inner face as a same-facing surface, the
-known reach of MERGE-PROXIMITY's band at a radius this large: THIN-GAP-GATHER in known-issues.md.)
-Exits 1 on any failure.
+host and device the panel's tiles must read within 2 % of mode R. A far-side test with the band's
+flat allowance gathered the plate's back and read them 2.4 and 4.6 (0.440.4); with the far side's
+fixed, the near side's allowance (a tenth of the distance) still gathered the plate's lit inner
+face as a same-facing surface wherever the distance passed ten times the gap, and read them 1.14
+and 1.36 (0.440.12, THIN-GAP-GATHER). The band has no flat allowance now. Exits 1 on any failure.
 """
 import argparse
 import os
@@ -64,7 +64,7 @@ PLATE = SCENE.replace(
     "quad { origin -1 0 -0.5  u 2 0 0.5  v 0 2 0  material t }",
     "quad { origin -1 0 -0.5  u 2 0 0.5  v 0 2 0  material t }" + NL +
     "quad { origin %.6f %.6f %.6f  u 2 0 0.5  v 0 2 0  material w }" % tuple(np.array([-1.0, 0.0, -0.5]) - _N * 0.005))
-PLATE_TILE_MAX = 1.6
+PLATE_TOL = 0.02
 
 
 def main():
@@ -138,7 +138,7 @@ def main():
         h, w = r.shape
         tiles = [m[h * i // 4:h * (i + 1) // 4, w * 2 // 6:w * 4 // 6].sum() /
                  r[h * i // 4:h * (i + 1) // 4, w * 2 // 6:w * 4 // 6].sum() for i in (1, 2)]
-        good = max(tiles) < PLATE_TILE_MAX
+        good = max(abs(t - 1.0) for t in tiles) <= PLATE_TOL
         print("%s: plate, mode M at radius 0.15 on the %s: the panel's tiles %s of mode R"
               % ("ok" if good else "FAIL", "host" if dev == "cpu" else "device",
                  " and ".join("%.3f" % t for t in tiles)), flush=True)

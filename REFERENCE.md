@@ -1128,7 +1128,9 @@ that converges to the same physical image.
   a photon only if it lies near the gather point's tangent plane, with room for the surface's own
   curvature, so a table top no longer gathers the floor's light once the radius outgrows its
   height (in mode `M` the top of a sheet lit only from below used to read 21× its brightness lit
-  from above). Modes `U` and `J` merge as before: their radius shrinks as the render converges.
+  from above). Since 0.440.13 however close the other surface is: a plate a few millimetres behind
+  a translucent sheet, gathered at a large radius, no longer lends the sheet its light.
+  Modes `U` and `J` merge as before: their radius shrinks as the render converges.
   **No gather on a `type diffuse` strand (0.433.3).** Modes `M` and `S` light a `type diffuse`
   strand (fur, grass, wire) by next-event estimation and walk on along its diffuse lobe to the
   surface that gathers, the final gather's rays (`-pmfg`) too since 0.433.6, and the photon pass

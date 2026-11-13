@@ -7794,8 +7794,7 @@ __device__ static inline bool dOnGatherSurfaceSided(const DVec3& x, const DVec3&
                                                     bool& farSide) {
     const Real c = dot(pn, n);
     if (!gatherFacing<Real>(c, twoSided, farSide)) return false;
-    return withinGatherBand<Real>(fabs(dot(pp - x, n)), d2, fabs(c), slack,
-                                  farSide ? (Real)0 : (Real)kGatherPlaneTol);
+    return withinGatherBand<Real>(fabs(dot(pp - x, n)), d2, fabs(c), slack);
 }
 
 // ---- GATHER FOOTPRINT (M-GATHERAREA), device twin of photonmap_render.h ----------------------
@@ -8038,16 +8037,17 @@ __device__ static inline void dPmNeighborhood(const DPhotonMap& pm, const DVec3&
 //
 // Returns pm.radius exactly when kGather <= 0 or the whole disc holds fewer than k photons,
 // so a fixed-radius map keeps the fixed-radius path. The surface test matches the caller's
-// (dOnGatherSurfaceSided at gatherBandSlack(pm.radius, fiberR), as its sum; a mismatch would divide accepted
+// (dOnGatherSurfaceSided at gatherBandSlack(pm.radius, fiberR, pscale), as its sum; a mismatch would divide accepted
 // photons by an area chosen for a rejected population and print a dark seam along every surface
 // junction).
 #define PM_ADAPT_BINS 16                     // covers r down to r * 2^-8 = r/256
 template <int NB = PM_ADAPT_BINS>
 __device__ static inline Real dPmAdaptiveRadius(const DPhotonMap& pm, const DVec3& p,
-                                                const DVec3& n, Real fiberR, bool twoSided) {
+                                                const DVec3& n, Real fiberR, bool twoSided,
+                                                Real pscale) {
     if (!(pm.kGather > (Real)0) || pm.photons == nullptr || !(pm.radius > (Real)0))
         return pm.radius;
-    const Real slack = gatherBandSlack<Real>(pm.radius, fiberR);
+    const Real slack = gatherBandSlack<Real>(pm.radius, fiberR, pscale);   // the gather's (callers')
     int hist[NB];
 #pragma unroll
     for (int i = 0; i < NB; ++i) hist[i] = 0;
@@ -20612,7 +20612,7 @@ __device__ static void dPhotonGatherSub(const DScene& sc, const DPhotonMap& pm,
             const DVec3 gn = dShadedNg(h);   // the true normal, as the photons carry it
             // Density estimate at y, folding the visible-point reflectance per photon wavelength.
             float gx = 0.f, gy = 0.f, gz = 0.f;
-            const Real slkM = gatherBandSlack<Real>(pm.radius, h.fiberRadius);
+            const Real slkM = gatherBandSlack<Real>(pm.radius, h.fiberRadius, h.pscale);
             dPmNeighborhood(pm, h.p, [&](int k) {
                 const DGatherPhoton& ph = pm.photons[k];
                 DVec3 d = h.p - ph.pos;
@@ -20641,8 +20641,8 @@ __device__ static void dPhotonGatherSub(const DScene& sc, const DPhotonMap& pm,
                 // The caustic map gathers at its own PER-QUERY radius (dPmAdaptiveRadius).
                 // pX/pY/pZ carry the fold for the map's fixed radius, so rescale the sum by
                 // the area ratio r^2/r_q^2 rather than re-folding every record.
-                const Real slkC = gatherBandSlack<Real>(pmC.radius, h.fiberRadius);
-                const Real rq  = dPmAdaptiveRadius(pmC, h.p, gn, h.fiberRadius, m.type == D_DIFFUSETRANSMIT);
+                const Real slkC = gatherBandSlack<Real>(pmC.radius, h.fiberRadius, h.pscale);
+                const Real rq  = dPmAdaptiveRadius(pmC, h.p, gn, h.fiberRadius, m.type == D_DIFFUSETRANSMIT, h.pscale);
                 const Real r2q = rq * rq;
                 float cx = 0.f, cy = 0.f, cz = 0.f;
                 dPmNeighborhood(pmC, h.p, [&](int k) {
@@ -21339,7 +21339,7 @@ __device__ static void dPhotonGather(const DScene& sc, const DPhotonMap& pm,
             // far below the 8-bit output quantum, and FP64 FMAs would issue at 1/64 rate. The
             // per-sample total is promoted to double once at the end (film math stays double).
             float gx = 0.f, gy = 0.f, gz = 0.f;
-            const Real slkM = gatherBandSlack<Real>(pm.radius, h.fiberRadius);
+            const Real slkM = gatherBandSlack<Real>(pm.radius, h.fiberRadius, h.pscale);
             // The carrier's peak goes into the double throughput, ratio / peak into the float sum
             // (DSpecThr::peak): behind dark glass the ratio alone overflows a float.
             const double pk = sthr.peak(), ipk = 1.0 / pk;
@@ -21374,8 +21374,8 @@ __device__ static void dPhotonGather(const DScene& sc, const DPhotonMap& pm,
             // header comment and dPmAdaptiveRadius). The area ratio r^2/r_q^2 corrects the
             // fixed-radius normalisation already folded into pX/pY/pZ.
             if (causOn) {
-                const Real slkC = gatherBandSlack<Real>(pmC.radius, h.fiberRadius);
-                const Real rq  = dPmAdaptiveRadius(pmC, h.p, gn, h.fiberRadius, m.type == D_DIFFUSETRANSMIT);
+                const Real slkC = gatherBandSlack<Real>(pmC.radius, h.fiberRadius, h.pscale);
+                const Real rq  = dPmAdaptiveRadius(pmC, h.p, gn, h.fiberRadius, m.type == D_DIFFUSETRANSMIT, h.pscale);
                 const Real r2q = rq * rq;
                 float cx = 0.f, cy = 0.f, cz = 0.f;
                 dPmNeighborhood(pmC, h.p, [&](int k) {
@@ -21982,7 +21982,7 @@ __global__ void kSppmGather(DScene sc, DPhotonMap pm, DSppmState st, int resX, i
         double M = 0.0;
         // the camera prefix's factors at each photon's wavelength (SPPM-SPECTRAL)
         const float* ratio = st.vpSpec[pix] ? st.vpRatio + (size_t)pix * DSpecThr::K : nullptr;
-        const Real slkS = gatherBandSlack<Real>((Real)R, h.fiberRadius);
+        const Real slkS = gatherBandSlack<Real>((Real)R, h.fiberRadius, h.pscale);
         dPmNeighborhood(pm, h.p, [&](int k) {
             const DGatherPhoton& ph = pm.photons[k];
             DVec3 d = h.p - ph.pos;

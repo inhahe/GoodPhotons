@@ -6269,11 +6269,16 @@ as the one at fault.
   table's height -- lent its light to the first (a sheet lit only from below read 21x its top lit
   from above). A mode-M or mode-S gather (`onGatherSurfaceSided`) keeps a photon only if it faces the
   gather point's way (within 60 degrees) and lies near its tangent plane: off it by at most
-  (0.1 + sin theta) times its distance d, theta the angle between the two normals, plus a rounding
-  slack of a thousandth of the map's radius (`PhotonMap::gatherSlack`, one value for the adaptive
-  radius's count, the sum and the footprint). A smooth surface bends about d sin(theta)/2 off its
-  tangent plane over d, so curved and faceted surfaces keep their photons; a parallel surface above
-  or below does not. A gather point on a curve thinner than the radius (`type diffuse` fur, grass,
+  sin theta times its distance d, theta the angle between the two normals, plus a rounding slack
+  (`gatherBandSlack`: a thousandth of the map's radius, and on the device, which computes positions
+  in float, 8 float epsilons of the hit's coordinate scale `pscale`; one value per gather point for
+  the adaptive radius's count, the sum and the footprint -- `PhotonMap::gatherSlack` on the host).
+  A smooth surface bends about d sin(theta)/2 off its tangent plane over d, and a facet tilted by
+  theta meets its neighbour's plane within d sin(theta), so curved and faceted surfaces keep their
+  photons; a parallel surface above or below does not, however close (0.440.13: until then the band
+  also allowed a tenth of d, which took a plate 5 mm behind a translucent sheet for the sheet at a
+  forced radius of 0.15, THIN-GAP-GATHER; `tools/check_gather_far.py` holds the device's rounding
+  slack, without which a room 3 km from the origin lost its own surface to the band). A gather point on a curve thinner than the radius (`type diffuse` fur, grass,
   wire) takes no band (`gatherBandSlack`): such a strand has no tangent plane at that scale, and the
   photons around it lie on its neighbours, which the band would drop while the estimate still
   divides by the whole disc. Since 0.433.3 (CURVE-GATHER) modes M and S gather on a `type diffuse`
@@ -6298,9 +6303,9 @@ as the one at fault.
   facing test above dropped it, and the gather took the reflect albedo alone: a backlit sheet read
   0.91 of mode R in M and 0.90 in S. At a DiffuseTransmit visible point (`onGatherSurfaceSided`,
   device `dOnGatherSurfaceSided`) the test also keeps a photon facing the opposite way within the
-  same 60 degrees (`farSide`), through the band on |cos theta| without its flat allowance -- a
-  far-side photon must lie on the sheet itself, within its curvature and the slack, or the back
-  face of a thin solid behind it would pass for the sheet's own far face (0.440.5) -- and
+  same 60 degrees (`farSide`), through the band on |cos theta| -- a far-side photon must lie on
+  the sheet itself, within its curvature and the slack, or the back face of a thin solid behind it
+  would pass for the sheet's own far face (0.440.5) -- and
   `gatherAlbedo` (device `dGatherAlbedo`) weighs it by the transmit albedo, a near one by the
   reflect albedo -- the pair guarded as `diffuseTransmitAlbedos` guards it everywhere. The adaptive
   radius counts the same population (`adaptiveRadius(..., twoSided)`). Every other material is

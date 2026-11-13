@@ -164,8 +164,9 @@ Each names the section its line is in.
     decision (keep R's integrand, or make the coat physical in every mode).
 23i. ~~**GLOSSY-DEPTH-CAP** (4.3) — at `-max-bounce`, mode R's glossy NEE keeps only its MIS share:
     the last vertex's lobe-sampled emitter hit is never traced.~~ Done, 0.440.4 (the tail).
-23j. **THIN-GAP-GATHER** (4.2) — mode M at a forced large radius gathers a lit surface a few
-    millimetres behind as the same surface (MERGE-PROXIMITY's flat allowance).
+23j. ~~**THIN-GAP-GATHER** (4.2) — mode M at a forced large radius gathers a lit surface a few
+    millimetres behind as the same surface (MERGE-PROXIMITY's flat allowance).~~ Done, 0.440.13:
+    no allowance, and a slack for the device's float rounding.
 23k. **GLOSSY-ADJ-VARIANCE** (4.3) — the glossy lobe's adjoint is unbounded at grazing arrival;
     the cure is a reciprocal lobe, which needs a decision.
 23h. ~~**S-GPU-GLOSSY-BUMP** (4.3) — device mode S reads normal-mapped glossy walls 1.043 of R (host
@@ -251,7 +252,8 @@ Then the rest of 4.2-4.6 in their order, 4.7's bookkeeping alongside whatever to
   R's own lobe and light sampling weighed different integrands (contSoftening).
 - [x] **B-ENV-WALLS** (0.440.11) — mode B read walls lit by a sky about 1 % bright: the sky the
   forward modes see directly took one ray through each pixel's centre.
-- [ ] **THIN-GAP-GATHER** — mode M at a forced large radius gathers a lit surface millimetres behind.
+- [x] **THIN-GAP-GATHER** (0.440.13) — mode M at a forced large radius gathered a lit surface
+  millimetres behind: the gather band's flat allowance is gone.
 - [ ] **GLOSSY-ADJ-VARIANCE** — the glossy lobe's adjoint is unbounded at grazing arrival; decision
   owed (a reciprocal glossy lobe).
 - [x] **GLOSSY-DEPTH-CAP** (0.440.4) — at the bounce cap mode R's glossy NEE kept only its MIS share;

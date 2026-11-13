@@ -2757,7 +2757,7 @@ and requires the two images byte-identical (0.440.9: 363 of 3072 pixels differ).
 0.03 %; at 1 % the host's 1.0097 passed): 0.440.9 read 1.0097 / 1.0110 (host / device), 0.440.11
 0.9994 / 1.0008.
 
-## OPEN (2026-11-12, 0.440.5): THIN-GAP-GATHER — mode M at a large radius gathers the lit inner face of a surface a few millimetres behind
+## DONE (2026-11-13, 0.440.13): THIN-GAP-GATHER — mode M at a large radius gathered the lit inner face of a surface a few millimetres behind
 
 Found testing REVIEW-4403's far-side fix: an opaque plate 5 mm behind a translucent sheet, lit from
 behind, mode M at a pinned radius of 0.15 (30 times the gap): the sheet reads 1.14 and 1.36 of mode
@@ -2768,6 +2768,21 @@ the adaptive radius the scene reads 1.001, so it shows only where a radius is fo
 local geometry. The proper fix is a band without the flat allowance for every gather, if the curved
 and faceted surfaces it was set for keep their photons through d sin theta alone: needs measuring
 on check_shading_leak, check_fur_gather and the gallery scenes before it is changed.
+
+**Fixed in 0.440.13: the band has no flat allowance.** Measured with it at 0: the plate case reads
+1.006 / 1.006 of mode R on the host and 1.005 / 1.008 on the device (was 1.14 / 1.36);
+check_shading_leak, check_fur_gather, check_compound_gather (to the digit) and check_bump_modes' M
+and S rooms pass; fur_creature in modes M and S reads 1.0000 of the old binary on every tile,
+gallery_rain in mode M 0.9998 (its tiles within 1.1 %); check_bitid moves one pixel of its `flat`
+scene, where the mixed sphere rests on the floor, by up to 11 % (another surface's photons, which
+the allowance let in), and nothing else. But the allowance had also been absorbing the device's
+float rounding: the flat room moved 3000 m from the origin read 3.6 (mode S) and 4.2 (mode M) of
+the room at the origin without it, where 0.440.12 read 1.002 -- a thousandth of the radius is under
+the rounding of float coordinates that large, so the band dropped the gather's own surface, from
+the photons and from the footprint probe that divides them. The slack now adds 8 float epsilons of
+the hit's coordinate scale on the device (`gatherBandSlack`'s `pscale`; the host, in double, needs
+none). New `tools/check_gather_far.py` holds that room 3 km out to the one at the origin within 1 %
+in device modes M and S; check_translucent_gather holds the plate case within 2 % of R.
 
 ## OPEN (2026-11-12, 0.440.5): GLOSSY-ADJ-VARIANCE — the glossy lobe's adjoint is unbounded at grazing arrival
 
