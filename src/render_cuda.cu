@@ -595,6 +595,7 @@ struct DMaterial {
     // twin of Material::priority.
     int    priority;
     int    solidId;     // Material::solidId: the identity the medium stack knows this solid by
+    int    routeTo[2];  // Material::routeTo: a tagged instance's routed copies (ROUTE_D, ROUTE_J)
     int    absorbChroma;// Material::absorbChroma: `absorb` varies over the band
     // Parametric-record REFLECT binding (§records stage 6a — device twin of the CPU
     // recordReflectBound path). recReflDriven==0 means no record drives reflect per-hit
@@ -784,6 +785,7 @@ struct DInstance {
     double handSign;             // MeshInstance::handSign: -1 mirrors a tangent frame's handedness
     int    blasId;
     int    matOverride;   // >=0 replaces the BLAS triangles' matId (mirrors host)
+    int    route;         // MeshInstance::route: -1, or the mode its hits' routed copies take
 };
 
 // Implicit surfaces (isosurface / CSG / metaballs) — device twins of implicit.h.
@@ -4761,7 +4763,7 @@ __device__ static bool blasOccluded(const DScene& sc, const DInstance& inst,
 // (Nm), keeping the orientation the local intersectTri gave the shading normal (the transform
 // preserves the sign of dot(d, n); the host twin says why that matters). Mirrors the host
 // Scene::instanceHitToWorld exactly.
-__device__ static void instanceHitToWorld(const DInstance& inst, DHit& lh) {
+__device__ static void instanceHitToWorld(const DInstance& inst, DHit& lh, const DMaterial* mats) {
     lh.p  = affPoint(inst.Wm, inst.Wt, lh.p);
     lh.pscale = (Real)(inst.reachMul * (double)lh.pscale + inst.reachAdd);
     lh.n  = normalize(affDir(inst.Nm, lh.n));
@@ -4773,6 +4775,10 @@ __device__ static void instanceHitToWorld(const DInstance& inst, DHit& lh) {
     lh.bitangentSign *= (Real)inst.handSign;   // a mirroring transform reverses the frame
     lh.curv *= (Real)inst.curvScale;   // O3: curvature into world units -- mirrors host
     if (inst.matOverride >= 0) lh.matId = inst.matOverride;
+    else if (inst.route >= 0 && lh.matId >= 0) {         // a tagged instance (host twin)
+        const int to = mats[lh.matId].routeTo[inst.route];
+        if (to >= 0) lh.matId = to;
+    }
 }
 
 // ---- Timed intersection (motion blur, ROADMAP 11): the device twins of Scene's *Now ----
@@ -5211,7 +5217,7 @@ __device__ static bool dIntersectOtherNow(const DScene& sc, const DVec3& ro, con
         if (anyHit) return blasOccluded(sc, inst, iro, ird, tmin, h.t);
         DHit lh; lh.t = h.t; lh.valid = false;
         if (!blasClosest(sc, inst, iro, ird, tmin, lh)) return false;
-        instanceHitToWorld(inst, lh);
+        instanceHitToWorld(inst, lh, sc.mats);
         h = lh;
         hit = true;
     }
@@ -5413,7 +5419,7 @@ __device__ static DHit closestHit(const DScene& sc, const DVec3& ro, const DVec3
     }
     if (timed && dTimedClosest(sc, ro, rd, invD, sh, tmin, curveTmin, tMax, h, camHideOn))
         hInst = -1;                                // a mover's hit, in world space already
-    if (hInst >= 0) instanceHitToWorld(sc.instances[hInst], h);
+    if (hInst >= 0) instanceHitToWorld(sc.instances[hInst], h, sc.mats);
     h.patOwnSide = h.valid && h.matId >= 0 && sc.mats[h.matId].patOwnSide;   // host twin Scene::markPatSide
     dApplyNormalMap(sc, h);   // C6: perturb shading normal by a bound normal map
     return h;
@@ -14504,10 +14510,12 @@ __device__ static double dVertexLe(const DScene& sc, const DVertex& v, const DVe
              * (double)dAimRadianceNow(sc, sc.emitters[v.lightIdx], w);
     return (double)specLookup(*eSpd, lambda) * invPdfLambda * (double)v.emitPatW;
 }
-// Emitter that owns an emissive surface material (mirrors Scene::emitterForMat).
+// Emitter that owns an emissive surface material (mirrors Scene::emitterForMat): a routed copy's
+// is its original's.
 __device__ static int dEmitterForMat(const DScene& sc, int matId) {
+    const int id = (matId >= 0) ? sc.mats[matId].solidId : matId;
     for (int i = 0; i < sc.nEmitters; ++i)
-        if (sc.emitters[i].matId == matId) return i;
+        if (sc.emitters[i].matId == id) return i;
     return -1;
 }
 
@@ -24851,7 +24859,7 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
         d.curvScale = in.curvScale;                              // curvature local->world (O3)
         d.handSign = in.handSign;
         d.reachMul = in.reachMul; d.reachAdd = in.reachAdd;
-        d.blasId = in.blasId; d.matOverride = in.matOverride;
+        d.blasId = in.blasId; d.matOverride = in.matOverride; d.route = in.route;
     }
     (void)haveInstances;
 
@@ -24973,6 +24981,7 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
         d.rgbIor = m.ior ? m.ior(550.0) : 1.0;
         d.priority = m.priority;        // nested-dielectric priority (INT_MIN == unset)
         d.solidId  = m.solidId((int)i); // routed copies of one material are one solid
+        d.routeTo[0] = m.routeTo[0]; d.routeTo[1] = m.routeTo[1];
         d.absorbChroma = m.absorbChroma ? 1 : 0;
         d.reflectTex = m.reflectTex;
         d.triplanarScale = m.triplanarScale;

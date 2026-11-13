@@ -560,7 +560,10 @@ Then the rest of 4.2-4.6 in their order, 4.7's bookkeeping alongside whatever to
 - [x] **DEFORM-LIMITS** (0.440.0) — a dynamic elastic had to be first in its mesh's stack.
 - [ ] **MOTION-LIGHT-RIGID** — a spot, beam or aimed light its keys stretch unevenly, and a sun or
   sky in a moving group, stay at the instant.
-- [ ] **PER-OBJECT-MODES** — emissive surfaces and bare mesh instances cannot be tagged; only D and
+- [ ] **ROUTE-D-GPU-STREAM** — on the GPU, mode J's renderer with every path routed D draws other
+  random streams than mode D in a scene without media (unbiased; the host is byte-identical).
+- [ ] **PER-OBJECT-MODES** — ~~emissive surfaces and bare mesh instances cannot be tagged~~ (done,
+  0.441.0); only D and
   J route (U and the unidirectional modes are separate renderers).
 
 - [ ] **An emissive `quad` / isosurface / CSG solid glows but does not illuminate** (two entries:

@@ -2794,7 +2794,14 @@ built from parts tagged differently is still one solid to a ray crossing it. The
 the primitive pools before an object or group is added and retags what it added, which covers
 glTF meshes with many materials. A mix's children are copied too, because both walks store the
 RESOLVED child on the vertex. A layered coat is synthesised later from its parent, so it inherits.
-Emitters are found by material, so an emissive surface keeps the camera's mode.
+An emissive surface is copied as any other (0.441.0): its emitter, registered on the original before
+the loader retags the surface, is found from the copy through `routeBase` (`Scene::emitterForMat`,
+`aimedEmission`, the device's `dEmitterForMat`, by `matBase` / `solidId`). A surface `light` block takes
+its own `mode` (`routedLight`); a point, spot, sun or sky has no surface to route, and a `mode` on one is
+an error. A `mesh_instance` without a `material` override shares its asset's triangles, and their
+materials, with every placement, so it records its route instead (`MeshInstance::route`): each
+original material knows its routed copies (`Material::routeTo`, filled by `finishRoutes` once every
+object is in), and `instanceHitToWorld` gives a tagged instance's hit the copy (host and device).
 
 **Dispatch.** `runRender` reads the tags. A camera in D with anything tagged J becomes a mode-J
 render with `ROUTE_D` as the default (`cudaSetRouting`, `bdpt::g_routeOn`); every other mode prints

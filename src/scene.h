@@ -184,6 +184,10 @@ struct Material {
     // one would never leave it.
     int routeBase = -1;
     int solidId(int self) const { return routeBase >= 0 ? routeBase : self; }
+    // This material's routed copies (index ROUTE_D, ROUTE_J), or -1: what a hit on it through a
+    // tagged mesh_instance shades with (MeshInstance::route), the asset's triangles being shared by
+    // every placement. Filled by the loader for every copy it made.
+    int routeTo[2] = {-1, -1};
     // Spatially-varying diffuse albedo: index into Scene::textures (-1 = use the
     // constant `reflect` spectrum). When set, the reflectance at a hit is the
     // texture's per-texel Jakob-Hanika reflectance sampled at the surface (u,v).
@@ -1488,6 +1492,9 @@ struct MeshInstance {
     Affine toWorld = Affine::identity();   // local -> world
     Affine toLocal = Affine::identity();   // world -> local (= toWorld.inverse())
     int matOverride = -1;                  // >=0 replaces the BLAS triangles' matId
+    // A per-object render mode (ROUTE_D / ROUTE_J) on an instance without matOverride, or -1: its
+    // hits shade with their materials' routed copies (Material::routeTo).
+    int route = -1;
     // Derived from toWorld: the factor a LOCAL curvature (1/length) is multiplied by to
     // become a WORLD curvature (O3). Curvature is inverse-length, so it scales by
     // 1/|det(linear)|^(1/3) — the average linear scale. Cached rather than recomputed
@@ -1893,7 +1900,7 @@ struct Scene {
         Ray lr{inst.toLocal.apply(r.o), inst.toLocal.applyDir(r.d)};
         Hit lh; lh.t = h.t;                    // running world tMax == local tMax
         if (!blasList[inst.blasId].intersectLocal(lr, tmin, lh, vcol)) return false;
-        instanceHitToWorld(inst, lh);
+        instanceHitToWorld(inst, lh, mats.data());
         h = lh;
         return true;
     }
@@ -3006,11 +3013,19 @@ struct Scene {
     // Map a hit surface's material index back to the emitter registered on that
     // geometry (or nullptr if none). Linear scan over the few emitters; used by the
     // BDPT s=0 MIS term when a camera subpath lands on a light surface directly.
+    // A routed copy of a light's material (Material::routeBase: a per-object mode on an emissive
+    // surface) finds its original's emitter: the emitter is registered on the material the light
+    // was built with, before the loader retags its surface.
     const Emitter* emitterForMat(int matId) const {
         if (matId < 0) return nullptr;
+        const int id = matBase(matId);
         for (const auto& e : emitters)
-            if (e.matId == matId) return &e;
+            if (e.matId == id) return &e;
         return nullptr;
+    }
+    // The material `matId` is a routed copy of, or itself (Material::solidId).
+    int matBase(int matId) const {
+        return (matId >= 0 && matId < (int)mats.size()) ? mats[(size_t)matId].solidId(matId) : matId;
     }
 
     // By matId, the index of the AIMED quad (Emitter::normalTilted) whose surface carries that
@@ -3022,6 +3037,7 @@ struct Scene {
     // time) for an aimed quad's surface, 1 for every other. Readers call it only when aimOfMat is
     // non-empty.
     double aimedEmission(int matId, const Vec3& w) const {
+        matId = matBase(matId);   // a routed copy's light is its original's (emitterForMat)
         if (matId < 0 || matId >= (int)aimOfMat.size() || aimOfMat[(size_t)matId] < 0) return 1.0;
         return aimRadianceNow(emitters[(size_t)aimOfMat[(size_t)matId]], w);
     }
@@ -4550,7 +4566,9 @@ struct Scene {
     // dot(n, M^-1 d)), so this is the primitive path's orientation. Re-orienting it against
     // the world ray by the SHADING normal would negate it, and curvature with it, in the
     // silhouette band intersectTri's comment describes.
-    static void instanceHitToWorld(const MeshInstance& inst, Hit& lh) {
+    // `mats`: the scene's materials, for a tagged instance's routed copies (MeshInstance::route);
+    // null only for an instance known to be untagged (a self-test's).
+    static void instanceHitToWorld(const MeshInstance& inst, Hit& lh, const Material* mats) {
         lh.p  = inst.toWorld.apply(lh.p);             // from the local point (intersectTri says why)
         lh.pscale = inst.reachMul * lh.pscale + inst.reachAdd;
         if (lh.patFrame < 0) lh.patFrame = inst.patFrame;
@@ -4572,6 +4590,10 @@ struct Scene {
         // no single scalar can be right and this is documented as an approximation.
         lh.curv *= inst.curvScale;
         if (inst.matOverride >= 0) lh.matId = inst.matOverride;
+        else if (inst.route >= 0 && mats && lh.matId >= 0) {
+            const int to = mats[lh.matId].routeTo[inst.route];
+            if (to >= 0) lh.matId = to;
+        }
     }
 
     // Perturb the shading normal by a bound tangent-space normal map (C6), and replace h.n.
@@ -5002,7 +5024,7 @@ struct Scene {
             } else d = hemiDir(nOut, s3, s4);            // uniform over the outgoing hemisphere
             const Hit h = closestHit(Ray{y + nOut * 1e-5, d});
             if (!h.valid) { ++out.probes; continue; }    // escapes into open space
-            if (e.matId >= 0 && h.matId == e.matId) continue;   // the light's own surface
+            if (e.matId >= 0 && matBase(h.matId) == e.matId) continue;   // the light's own surface
             ++out.probes;
             if (h.matId >= 0 && h.matId < (int)mats.size() &&
                 isSpecularType(mats[h.matId].type)) { ++blocked; ++blockCount[h.matId]; }

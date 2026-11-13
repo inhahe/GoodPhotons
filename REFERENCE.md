@@ -908,8 +908,10 @@ the noisiest part of the frame. With both at 1 the render is bit-identical to on
 key, and the run prints the multipliers when they are not.
 
 **Limits.**
-- An emissive surface cannot be tagged; it keeps the camera's mode.
-- A `mesh_instance` takes a tag only with a `material` override.
+- A surface light (`light area`, sphere, tube or mesh, or any emissive object) takes a tag (since
+  0.441.0); a point, spot, sun or sky light has none to take.
+- A `mesh_instance` takes a tag on its own placement, with or without a `material` override (since
+  0.441.0).
 - On the **CPU**, mode J with beams does not use the hero-wavelength bundle where mode D would,
   so the D-routed part of a mixed CPU render carries a little more colour noise than a pure
   mode-D one. The GPU gates the bundle off in any scene with a medium in both modes, so it is

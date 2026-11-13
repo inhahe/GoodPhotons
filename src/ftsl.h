@@ -1269,7 +1269,7 @@ public:
             else if (b.type == "isosurface") { if (!routed(b, L, [&] { return addIsosurface(b, L); })) return false; }
             else if (b.type == "curve")    { if (!routed(b, L, [&] { return addCurve(b, L); })) return false; }
             else if (b.type == "fur")      { furBlocks.push_back(&b); }
-            else if (b.type == "light")    { if (!addLight(b, L, b.subtype)) return false; haveLight = true; }
+            else if (b.type == "light")    { if (!routedLight(b, L, [&] { return addLight(b, L, b.subtype); })) return false; haveLight = true; }
             else if (b.type == "group")    { if (!routed(b, L, [&] { return addGroup(b, L, Affine::identity(), haveLight); })) return false; }
             else if (b.type == "medium")   { mediaBlocks.push_back(&b); }
             else if (b.type == "settle")   { settleBlocks.push_back(&b); }
@@ -1426,6 +1426,7 @@ public:
             std::fprintf(stderr, "[settle] %s\n", rep.c_str());
         }
         propagateMaterialRoutes(L);   // per-object render modes: a tagged mix's children (0.386.0)
+        finishRoutes(L);              // ...and a tagged instance's routed copies
         if (L.beforeBvh) L.beforeBvh(L);
         { detail::AccelTimer _ct; L.scene.build(); }
         // build() demotes a fire that emits nothing to the smoke it is made of
@@ -7157,7 +7158,6 @@ private:
     // it exactly as it reads the original; only `route` differs.
     std::map<std::pair<int, int>, int> routeClone_;
     std::vector<char> routeIsClone_;   // by material id: made by routedMat for an object or group
-    bool routeWarnedLight_ = false, routeWarnedInst_ = false;
     // The moving group being built, as its children see it (not moving outside one): its exact
     // world transform at any fraction of the motion interval -- every ancestor's authored keys
     // interpolated as written and composed -- the times where that may kink (every authored
@@ -7200,16 +7200,8 @@ private:
             const bool clone = (size_t)id < routeIsClone_.size() && routeIsClone_[(size_t)id];
             if (clone || !ownYields) return id;
         }
-        // An emitter is found BY its material (Scene::emitterForMat), so a light's material
-        // cannot be copied without orphaning its emitter. It keeps the camera's mode.
-        if (L.scene.mats[(size_t)id].isLight) {
-            if (!routeWarnedLight_) {
-                routeWarnedLight_ = true;
-                std::fprintf(stderr, "[ftsl] warning: `mode` does not apply to an emissive surface; "
-                                     "it keeps the camera's mode\n");
-            }
-            return id;
-        }
+        // A light's material is copied as any other: its emitter, registered on the original,
+        // is found from the copy through Material::routeBase (Scene::emitterForMat).
         const auto key = std::make_pair(id, route);
         auto it = routeClone_.find(key);
         if (it != routeClone_.end()) return it->second;
@@ -7228,6 +7220,16 @@ private:
         routeIsClone_.resize(L.scene.mats.size(), 0);
         routeIsClone_[(size_t)nid] = 1;
         return nid;
+    }
+    // Each original material learns its routed copies (Material::routeTo), for the tagged instances
+    // that reach them through their asset's shared triangles. Run once, after every object and
+    // propagateMaterialRoutes, before build().
+    void finishRoutes(Loaded& L) {
+        for (const auto& kv : routeClone_) {
+            const int id = kv.first.first, r = kv.first.second;
+            if (id >= 0 && id < (int)L.scene.mats.size() && (r == ROUTE_D || r == ROUTE_J))
+                L.scene.mats[(size_t)id].routeTo[r] = kv.second;
+        }
     }
     // A material tagged in its OWN block passes its route to the children it resolves to, for
     // the reason routedMat gives. Run once, after every object, before build().
@@ -7252,14 +7254,37 @@ private:
             MeshInstance& in = S.instances[i];
             if (in.matOverride >= 0) { in.matOverride = routedMat(in.matOverride, route, L); continue; }
             // An instance without a material override shares its asset's triangles, and their
-            // materials, with every other instance of the asset: they cannot be retagged for
-            // this placement alone.
-            if (!routeWarnedInst_) {
-                routeWarnedInst_ = true;
-                std::fprintf(stderr, "[ftsl] warning: `mode` on a mesh_instance needs a `material` "
-                                     "override (its asset's own materials are shared); ignored\n");
-            }
+            // materials, with every other instance of the asset: this placement's hits take the
+            // routed copies instead (MeshInstance::route, Material::routeTo, filled once every
+            // object is in: finishRoutes). A tag the instance's own block set wins over its group's.
+            if (in.route >= 0 || in.blasId < 0 || in.blasId >= (int)S.blasList.size()) continue;
+            in.route = route;
+            std::vector<int> seen;
+            for (const Tri& t : S.blasList[(size_t)in.blasId].tris)
+                if (std::find(seen.begin(), seen.end(), t.matId) == seen.end()) {
+                    seen.push_back(t.matId);
+                    routedMat(t.matId, route, L);
+                }
         }
+    }
+    // Add one light and retag its surface for its own `mode`, as routed does an object's: a surface
+    // light (area, sphere, tube, mesh) takes one; a point, spot, sun or sky has no surface a camera
+    // path can meet, and a `mode` on it is an error.
+    template <class F>
+    bool routedLight(const Block& b, Loaded& L, F&& add) {
+        int route = -1;
+        if (!routeOf(b, route)) return false;
+        const PrimMark mk = primMark(L);
+        if (!add()) return false;
+        if (route < 0) return true;
+        if (L.scene.tris.size() == mk.tris && L.scene.spheres.size() == mk.spheres &&
+            L.scene.instances.size() == mk.instances) {
+            fail("`mode` on a light with no surface (" + (b.subtype.empty() ? b.type : b.subtype) +
+                 "): no camera path meets it, so it routes nothing; tag the objects it lights");
+            return false;
+        }
+        applyRoute(mk, route, L);
+        return true;
     }
     // Add one object (or group, or fur) and retag what it added. Mode keys on a group reach its
     // children through this too: they are added inside `add`, then retagged here unless a
@@ -7408,7 +7433,9 @@ private:
             else if (s.key == "curve")    { if (!child(*cb, [&] { return addCurve(*cb, L, world); })) return false; }
             else if (s.key == "light") {
                 const PrimMark lm = primMark(L);
-                if (!addLight(*cb, L, (cb->type == "light" ? std::string() : cb->type), world)) return false;
+                if (!routedLight(*cb, L, [&] {
+                        return addLight(*cb, L, (cb->type == "light" ? std::string() : cb->type), world); }))
+                    return false;
                 if (patFrame_ >= 0) {   // its panel and its emission pattern read the group's space
                     for (size_t i = lm.tris; i < L.scene.tris.size(); ++i) L.scene.tris[i].patFrame = patFrame_;
                     for (size_t i = lm.emitters; i < L.scene.emitters.size(); ++i) L.scene.emitters[i].patFrame = patFrame_;

@@ -2739,6 +2739,22 @@ different records (MIS, softening, strand and hair arrivals, the specular flag),
 still be filled and restored per walk; check_fur_null's R and S cases and check_hair_nee_sun guard
 the rule where it has gone wrong.
 
+## OPEN (2026-11-13, 0.441.0): ROUTE-D-GPU-STREAM — on the GPU, mode J's renderer with every path routed D is not mode D bit for bit in a scene without media
+
+Found building `tools/check_route_tags.py`: a room (no medium) whose every object is tagged D,
+rendered under a mode-J camera on the device, differs from the same room in mode D in every pixel
+(`-heroc 1`, one seed). It is not the 0.441.0 change: 0.440.14 differs the same way on a variant
+with nothing it could not tag (a point light, the instance under a `material` override). And it is
+not a bias: six seeds at 64 spp read 0.9954 (-0.8 sigma) on that variant, sixteen 0.9975 (-0.4
+sigma) on check_route_tags' room. So mode J's camera pass on the device draws other random streams
+than mode D's kernel when no medium makes it run beams -- there it runs surface point merges, the
+device drawing their photon map -- where 0.386.0 found the two byte-identical on `_fog_cornell` (a
+medium, beams). The host is byte-identical in both directions. FTSL.md states the identity
+generally. To do: find where the device's J camera pass consumes its stream differently from mode
+D's for a path routed D (an extra draw, another light subpath, the hero gate), and make it draw
+mode D's; check_route_tags then holds the device's D-under-J pair byte-identical as it holds the
+other three (it holds it in the mean meanwhile).
+
 ## DONE (2026-11-13, 0.440.14): REVIEW-44013 — what the Opus review of 0.440.12-0.440.13 found
 
 `/code-review xhigh` (Opus) of fc9b230..41d8317 (REVIEW-44011's follow-ups, THIN-GAP-GATHER): 12
@@ -3420,8 +3436,17 @@ What it does not do:
   (`render { mode_spp D=x J=y }` / `-mode-spp`; design.md). Each base sample draws
   floor(m) + Bernoulli(frac m) sub-samples per mode, each weighted 1/m. It is unbiased (6 seeds per
   variant, all within 1.1 SE) and bit-identical at multipliers of 1.
-* **Emissive surfaces and bare mesh instances** cannot be tagged: an emitter is found by its
-  material, and an instance without a `material` override shares its asset's materials. Both warn.
+* ~~**Emissive surfaces and bare mesh instances** cannot be tagged: an emitter is found by its
+  material, and an instance without a `material` override shares its asset's materials. Both
+  warn.~~ **Done in 0.441.0.** A light's material is copied as any other, and its emitter is found
+  from the copy through `routeBase` (host `Scene::emitterForMat` / `aimedEmission` / the seal probe,
+  device `dEmitterForMat`); a surface `light` block takes its own `mode`, and one with no surface
+  refuses it. A bare instance records its route (`MeshInstance::route`) and its hits take the routed
+  copies its asset's materials know (`Material::routeTo`), on both backends. New
+  `tools/check_route_tags.py`: a room with a lamp in view and a bare instance, every object tagged J
+  under a mode-D camera and every object tagged D under a mode-J camera, each byte-identical to the
+  untagged render in the tagged mode, host and device (the device's D-under-J pair in the mean:
+  ROUTE-D-GPU-STREAM); 0.440.14 differs in both on the host (and warns).
 * **CPU hero bundle.** On the CPU, mode J with beams runs single-wavelength where mode D would
   use the hero bundle, so the D-routed part of a mixed CPU frame has a little more colour noise
   than a pure D render. The GPU gates the bundle off in media scenes for both modes.

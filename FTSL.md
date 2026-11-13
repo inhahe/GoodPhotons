@@ -3587,10 +3587,11 @@ every object tagged J it matches mode J bit for bit (`scraps/_rt_*.ftsl`, 0.386.
 - A tagged object gets its own copies of the materials it uses, named `glass [mode J]` in
   `-roi-mask` legends. A tagged mix's children are copied too, because the renderer shades
   the child.
-- An emissive surface cannot be tagged; it keeps the camera's mode, with a warning. Its
-  light is found by its material, and a copy would orphan it.
-- A `mesh_instance` can be tagged only together with a `material` override. Its asset's
-  materials are shared by every placement.
+- An emissive surface takes a tag as any object does, and so does a surface `light` block
+  (`light area { ... mode J }`, a sphere, tube or mesh light). A point, spot, sun or sky light has
+  no surface a camera path meets: a `mode` on one is an error -- tag the objects it lights.
+- A `mesh_instance` takes a tag with or without a `material` override: the placement's hits shade
+  with tagged copies of its asset's materials, and the asset's other placements keep theirs.
 - **Each mode can have its own sample count**: `render { mode_spp D=1 J=0.5 }`, or
   `-mode-spp D=1,J=0.5` on the command line (which wins). `-spp`, `-time`, `-noise` and the
   progress line count base samples. A path routed to a mode with multiplier m gets m samples per

@@ -11063,7 +11063,7 @@ static int checkTriNormal() {
                 const Ray lr{silInst.toLocal.apply(wr.o), silInst.toLocal.applyDir(wr.d)};
                 Hit lh;
                 if (!intersectTri(lr, t, 1e-9, lh)) continue;
-                Scene::instanceHitToWorld(silInst, lh);
+                Scene::instanceHitToWorld(silInst, lh, nullptr);   // an untagged test instance
                 instHits++;
                 const Vec3 wgnf = normalize(silInst.toWorld.applyNormal(gnf));
                 if (!(dot(lh.n, wgnf) > 0.0) || !(dot(lh.ng, wgnf) > 0.0) || !(lh.curv > 0.0)) badInst++;
@@ -11230,7 +11230,7 @@ static int checkTriNormal() {
                         const Ray lr{inst.toLocal.apply(wr.o), inst.toLocal.applyDir(wr.d)};
                         Hit lh; lh.t = 1e30;
                         if (!intersectTri(lr, tri, 1e-9, lh)) { ++bad; continue; }
-                        Scene::instanceHitToWorld(inst, lh);
+                        Scene::instanceHitToWorld(inst, lh, nullptr);
                         if (lh.p[wa] != w0[wa]) ++bad;
                     }
                 }
@@ -11276,7 +11276,7 @@ static int checkTriNormal() {
                         bad += dot(frameB(h), dPdv) > 0.0 ? 0 : 1;
                         // Through the mirror (x -> -x): v still grows along +z.
                         Hit lh = h;
-                        Scene::instanceHitToWorld(mirror, lh);
+                        Scene::instanceHitToWorld(mirror, lh, nullptr);
                         ++n;
                         bad += dot(frameB(lh), mirror.toWorld.applyDir(dPdv)) > 0.0 ? 0 : 1;
                     }
