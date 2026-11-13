@@ -178,7 +178,8 @@ Each names the section its line is in.
 24. ~~**BEAMEPOCHS-CHUNK-PIN** (4.5) — `-beamepochs` pins cheap scenes' GPU chunks to 1 spp.~~ Done,
     0.438.2.
 25. ~~**DEFORM-LIMITS**~~ (0.440.0), **MOTION-LIGHT-RIGID**, **PER-OBJECT-MODES** (4.6) — what is left of them.
-26. **BLACK-PIXELS-ONCE** (4.2) — one render's black pixels, never reproduced.
+26. ~~**BLACK-PIXELS-ONCE** (4.2) — one render's black pixels, never reproduced.~~ Closed:
+    28 clean renders of its scene (scraps/_black_pixels.py).
 27. ~~**SPPM-LOWPASS-DEVHOST** (4.2) — mode S's device and host differ at low pass counts.~~
     Closed: noise in one high-variance tile (16 seeds a backend agree).
 28. ~~**HAZE-BLUR-INVERSE-TR** (4.3) — a blurred mover far out in a density-field haze: modes D and
@@ -318,8 +319,8 @@ Then the rest of 4.2-4.6 in their order, 4.7's bookkeeping alongside whatever to
   gutters.
 - [x] **FEATHER-IS-A-THRESHOLD** (0.434.17) — a mesh-bound medium's `feather` shrinks the silhouette
   instead of ramping the density (`tools/check_feather.py`).
-- [ ] **BLACK-PIXELS-ONCE** — one GPU mode-R render had pure-black pixels four reruns did not.
-
+- [x] **BLACK-PIXELS-ONCE** (closed 2026-11-13) — one GPU mode-R render's black pixels: not
+  reproduced in 24 more runs (28 in all); reopen if seen, with the image.
 - [ ] **D-SILENT-EXIT** — one host mode-D render ended with no output and no image during a CUDA
   build; 13 reruns clean. The checks now print the exit code; reproduce under memory pressure.
 - [ ] **SPECGATHER-BIN-RESOLUTION** — mode M's 24-bin carrier misreads a spectral edge or kink inside

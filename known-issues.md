@@ -1718,7 +1718,7 @@ the host's, at the box's edges and corners (a map with `-nopmauto` on both backe
 it); the device spectral carrier (`DSpecThr`) on the coloured walls' upsampled spectra (a grey
 box would clear it); the device caustic map.
 
-## OPEN (2026-11-02, 0.400.8): BLACK-PIXELS-ONCE — one GPU mode-R render had pure-black pixels that four reruns did not
+## CLOSED (2026-11-13, not reproduced): BLACK-PIXELS-ONCE — one GPU mode-R render had pure-black pixels that four reruns did not
 
 One render of the scene `tools/check_mitsuba_import.py` writes to
 `scraps/check_mitsuba_import/bsdfs.ftsl` (64 × 64, its own `mode R` camera, GPU, `-time 8`) came
@@ -1735,6 +1735,13 @@ generator is tracked, so the repro is too), then render `bsdfs.ftsl` repeatedly 
 for pixels whose channel sum is under 60. If it recurs, keep the image and its `.ftbuf`, note
 where the pixels sit, and look for NaN in the HDR film: a NaN sample clamped to black would look
 exactly like this.
+
+**Closed 2026-11-13 on 0.441.0, not reproduced:** `scraps/_black_pixels.py` (the loop above,
+automated: it regenerates the scene, renders it on the GPU with `-time 8` at a fresh seed each run,
+and scans each PNG for a channel sum under 60 and each HDR film for NaN, infinity or a negative
+value, keeping any run that has one) found none in 24 runs; every run's darkest pixel was the
+scene's own (channel sum 81-84). With the four reruns of 0.400.8 that is 28 clean renders of the
+scene. Reopen, with the kept image, if it is seen again; run the loop there.
 
 ## DONE (2026-10-24, 0.399.0): PUPIL-DEFENSIVE — a crossing the pupil tables missed was light the aimed samplers could never draw
 
