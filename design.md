@@ -10847,18 +10847,20 @@ sees the instant, exactly as a static scene with those transforms would show it.
   faces (`Scene::mirrorClaims`, `mirrorDeformPart`). The sky a forward mode
   sees directly is a camera-side pass of its own (`addEnvBackground`, at each write): each pixel
   averages camera rays over its area, as mode R's pixel does and the photon splats fill it -- a
-  pinhole's 16 points of a per-pixel rotated Halton (2,3) lattice, 64 where those 16 do not all see
-  one thing (geometry, sky, the sun), a lens's monochromatic rays over
-  the pupil and the band as many as photons per pixel ask for (0.440.11; one ray through each
+  pinhole's 64 points of a per-pixel rotated Halton (2,3) lattice, every one traced (a strand or a
+  wire thinner than their spacing is seen only by the points on it), a lens's monochromatic rays
+  over the pupil and the band as many as photons per pixel ask for (0.440.11; one ray through each
   pixel's centre gave an edge pixel all of the sky or none, B-ENV-WALLS). The sums, in float, are
   held per camera by the render that writes it (`SkyView`: one for a single camera's writes and
   window, one per camera of a shared group, a local one for a camera written once) and restart
-  when the camera or the scene build changes. Each sample is a function of its pixel and its index
-  alone, added in index order, so the sums do not depend on how the writes that asked for them
-  split the samples (a live window's refreshes fall on the clock); the first 64 are taken whatever
-  a stop says (`ft::parallelForAll`), so a render stopped before its first write still shows its
-  sky; and a live window's repaint takes them before it starts timing itself (`prepareSky`), since
-  its measured cost sets how often it repaints. Under a
+  when the camera's rays (`Camera::RayKey`) or the scene build change. Each sample is a function of
+  its pixel and its index alone, added in index order, so the sums do not depend on how the writes
+  that asked for them split the samples (a live window's refreshes fall on the clock). A render
+  stopped before its first sums takes 4 a pixel whatever the stop says (`ft::parallelForAll`), so
+  its last write shows its sky at a cost bounded by a few rays a pixel; and a live window's repaint
+  takes the sums before it starts timing itself (`prepareSky`), since its measured cost sets how
+  often it repaints. A shared group whose sums would pass 1 GiB (`groupSkyInFlight`) holds none:
+  every camera's sky is drawn batch by batch into its film, as a blurred camera's is, below. Under a
   blur that pass skips the camera: each forward thread draws its band of the sky into its own
   batch film instead (`addBlurredSkyRows`), K samples a pixel at times of their own (rotated per
   pixel and batch), K a sixteenth of a photon per pixel per camera sharing the batch, at most 64;

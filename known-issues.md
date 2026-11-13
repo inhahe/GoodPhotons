@@ -508,7 +508,7 @@ host's double is not needed) and the vertex stacks in a structure-of-arrays layo
 connection loop's loads coalesce -- what bounds mode D's kernel and the rest of mode J's;
 (2) re-measure `__launch_bounds__` (2 and 4 blocks) once (1) has cut the local traffic.
 
-## OPEN (2026-11-04, 0.433.11): SPPM-LOWPASS-DEVHOST — at 16 passes mode S's device reads check_coat_modes' coated balls 16 % bluer than its host
+## CLOSED (2026-11-13, not a bug): SPPM-LOWPASS-DEVHOST — at 16 passes mode S's device read check_coat_modes' coated balls 16 % bluer than its host
 
 Seen once, running tools/check_coat_modes.py at `--spp 16` (a smoke test; the check's budget is
 256): its pair "mode S device / host, channel 2" (the bubble and the dichroic ball over a floor,
@@ -517,6 +517,15 @@ and 5 %), on 0.433.10 and before. A difference that shrinks with the pass count 
 radius schedules or two first-pass radii that differ between the backends; not looked into. To
 start: render that scene in mode S on both backends at 8, 16, 64 and 256 passes and see whether the
 gap falls as the radius does.
+
+**Closed 2026-11-13 (`scraps/_sppm_lowpass.py`, `_sppm_tile.py`): noise.** Both backends start at the
+same radius (R0 0.09, alpha 0.70). Four seeds a backend showed a gap that fell with the passes (one
+channel's worst tile 1.37 at 8, 1.30 at 16, 1.05 at 64, 1.02 at 256), all of it in one 8x8 tile: the
+diffuse core seen through the thin-film bubble, whose value one seed to the next spans 0.10 to 0.67
+at 8 passes (and a seed's 8- and 16-pass renders share their first passes, so those were 4 samples,
+not 8). Sixteen fresh seeds a backend: device / host 0.98, 0.96, 1.00 in that tile at 8 passes (each
+within 0.5 sigma), and the frame within 0.3 %; at 32 passes one channel's tile at -2.0 sigma, one
+comparison in six.
 
 ## OPEN (2026-11-04, 0.433.10): GPU-PHOTON-LAUNCH-FAIL — one GPU photon pass died with "unspecified launch failure", not reproduced
 
@@ -2729,6 +2738,47 @@ Not changed: the pass-through bookkeeping hand-copied into each walk (Fable) -- 
 different records (MIS, softening, strand and hair arrivals, the specular flag), so one struct would
 still be filled and restored per walk; check_fur_null's R and S cases and check_hair_nee_sun guard
 the rule where it has gone wrong.
+
+## DONE (2026-11-13, 0.440.14): REVIEW-44013 — what the Opus review of 0.440.12-0.440.13 found
+
+`/code-review xhigh` (Opus) of fc9b230..41d8317 (REVIEW-44011's follow-ups, THIN-GAP-GATHER): 12
+findings, each checked against the code. Fixed in 0.440.14:
+
+* **An implicit surface's device hits carry no `pscale`** (0), so the gather band's new rounding slack
+  gave them none, and far from the origin they would have lost their own surface as the triangle room
+  did. The device's rounding scale is now max(`pscale`, |p|) (`dRoundScale`): a point never rounds
+  more finely than its own coordinates.
+* **The pinhole sky's 16-point early-out** saw a strand or a wire thinner than its lattice's spacing
+  only when one of the 16 fell on it, and took a pixel of fine HDRI detail at 16 points: every pixel
+  traces all 64 again. They are summed once a camera, so that costs one pass.
+* **A stop's sky pass was unbounded**: the first 64 samples ran whatever a stop said, so a stop before
+  a large group's first write traced every camera's sky in full before exiting, past `-stop`'s 120 s
+  window. A render stopped before its first sums takes 4 a pixel (pure sky resolves exactly at any
+  count), the rest yielding to a stop.
+* **A shared group held every camera's sky sums for its life** (12 bytes a pixel each: 15 GB for a
+  600-camera 1080p flight). Past 1 GiB of sums (`groupSkyInFlight`), every camera's sky is drawn batch
+  by batch into its film instead, as a blurred camera's is (`addBlurredSkyRows`, which now samples a
+  camera that sees no motion at its instant); the writes add none. check_sky_repeat's GROUP case
+  renders a two-camera flight both ways (`FTRACE_SKY_HELD_MB 0` forces the second): each camera's pure sky
+  agrees exactly, and its frame within 0.1 % (0.9995, 0.9991).
+* **check_gather_far** passed whatever backend rendered: a fallback to the host (double, nothing to
+  test) now fails it.
+* **check_sky_repeat's stop** could land in the scene load: it waits for the render's banner now.
+* `Camera::RayKey`'s comment claimed everything genLensRay reads; the lens's prescription and pupil
+  tables are fixed for the lens's life, and it says so. bsdfPdf's comment allowed a null hit for a
+  translucent vertex. `gpEps` takes FLT_EPSILON / DBL_EPSILON.
+
+Not changed:
+* **A corrugated surface gathered past half its wavelength** (the band rejects a phase-matched facet,
+  whose normal matches but whose plane is offset): measured on a floor corrugated at 3 and 10 degrees,
+  wavelength 0.3, mode M at radius 0.15, adaptive, and mode S, against R. 0.440.12 read 1.0016 /
+  0.9995 / 1.0000 and 1.0023 / 0.9993 / 0.9999; 0.440.13 1.0017 / 0.9995 / 1.0000 and 1.0029 /
+  0.9993: the footprint drops the facets' area with their photons.
+* **A coplanar neighbour primitive of much larger reach** rounds at its own scale, which the gather
+  point's slack does not cover: its photons and its footprint probes are dropped alike, so the
+  estimate keeps its population; a per-photon scale would cost every device photon a field.
+* **The meter's sky sums are not reused by the render** (one extra pass a frame, a few rays a pixel
+  once): handing them over needs state shared between the two, which the last review asked to remove.
 
 ## DONE (2026-11-12, 0.440.11): B-ENV-WALLS — mode B read walls lit by a sky about 1 % bright
 

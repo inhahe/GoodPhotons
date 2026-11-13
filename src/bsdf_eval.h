@@ -231,7 +231,8 @@ inline double bsdfFAdjoint(const Material& m, const Vec3& ns, const Vec3& wo, co
 // densities. 0 for delta materials (handled separately) or unsupported hemispheres.
 // `hitForTex` (with `scene`) supplies the per-hit roughness when a roughness map is
 // bound, so the density matches the sampling that used the same textured roughness —
-// essential for unbiased MIS. Pass nullptr where no hit UV is available (constant).
+// essential for unbiased MIS. Pass nullptr where no hit UV is available (constant) -- never
+// for a translucent vertex, whose lobe needs the hit's geometric normal (translucentLobe).
 inline double bsdfPdf(const Material& m, const Vec3& ns, const Vec3& wo, const Vec3& wi,
                       double lambda, const Scene& scene, const Hit* hitForTex) {
     double cosWi = dot(wi, ns), cosWo = dot(wo, ns);

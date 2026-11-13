@@ -11,6 +11,7 @@
 // 1.01 -> 0.61 in mode J at radius 0.1. Their radius shrinks as the render converges, so the
 // cross-surface bias they keep vanishes with it, which mode M's adaptive radius never does.
 #include <algorithm>
+#include <cfloat>
 #include <cmath>
 #include <math.h>
 #include "linalg.h"
@@ -23,8 +24,8 @@
 
 FT_GP_HD inline float  gpSqrt(float x)  { return sqrtf(x); }
 FT_GP_HD inline double gpSqrt(double x) { return ::sqrt(x); }
-FT_GP_HD inline float  gpEps(float)  { return 1.1920929e-7f; }            // FLT_EPSILON
-FT_GP_HD inline double gpEps(double) { return 2.220446049250313e-16; }    // DBL_EPSILON
+FT_GP_HD inline float  gpEps(float)  { return FLT_EPSILON; }
+FT_GP_HD inline double gpEps(double) { return DBL_EPSILON; }
 
 // MERGE-PROXIMITY: which stored photons lie on the surface a gather point is on. A gather takes the
 // photons within a ball, and a second surface inside it -- the floor under a table top, once the
@@ -58,8 +59,9 @@ template <class T> FT_GP_HD inline bool withinGatherBand(T off, T d2, T c, T sla
 constexpr double kGatherRoundUlps = 8.0;
 
 // The slack of a gather of radius `radius` at a point on a curve of radius `fiberR` (0 off a curve)
-// whose positions round at the coordinate scale `pscale` (Hit::pscale, the hit's primitive's
-// distance from the origin): 1e-3 of the radius, plus the rounding of positions computed in T
+// whose positions round at the coordinate scale `pscale` (the hit's primitive's reach, or its own
+// distance from the origin where larger: the device's dRoundScale): 1e-3 of the radius, plus the
+// rounding of positions computed in T
 // there -- what lets the band, which has no flat allowance, keep a flat surface's own photons. In
 // double (the host) that rounding is far below the radius's thousandth, and the host passes none;
 // in float (the device under FTRACE_GPU_FP32) it is about 1e-7 of the coordinates, which outgrows

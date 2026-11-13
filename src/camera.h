@@ -433,9 +433,11 @@ struct Camera {
         return imagePlaneArea() / ((double)film.resX * (double)film.resY);
     }
 
-    // Everything genRay and genLensRay read besides the pixel and its samples: two cameras whose
-    // keys are equal draw the same camera rays. Kept here beside them, so a field either comes to
-    // read joins it. A lens is the object itself plus the state a refocus or a sensor change moves.
+    // What genRay and genLensRay read besides the pixel and its samples and can change while one
+    // camera renders: the pose, the projection and the film, and of a physical lens the object
+    // itself and the sensor state a refocus moves. Its prescription and pupil tables are fixed for
+    // the lens's life (a new prescription is a new LensSystem). Kept here beside the two, so a
+    // field either comes to read joins it.
     struct RayKey {
         Vec3 eye, u, v, w;
         double tanHalfX = 0, tanHalfY = 0, frustumShiftX = 0, rEdge = 0;

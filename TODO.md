@@ -179,7 +179,8 @@ Each names the section its line is in.
     0.438.2.
 25. ~~**DEFORM-LIMITS**~~ (0.440.0), **MOTION-LIGHT-RIGID**, **PER-OBJECT-MODES** (4.6) — what is left of them.
 26. **BLACK-PIXELS-ONCE** (4.2) — one render's black pixels, never reproduced.
-27. **SPPM-LOWPASS-DEVHOST** (4.2) — mode S's device and host differ at low pass counts.
+27. ~~**SPPM-LOWPASS-DEVHOST** (4.2) — mode S's device and host differ at low pass counts.~~
+    Closed: noise in one high-variance tile (16 seeds a backend agree).
 28. ~~**HAZE-BLUR-INVERSE-TR** (4.3) — a blurred mover far out in a density-field haze: modes D and
     J weigh its sun subpaths by a quadrature, not an unbiased estimate.~~ Done, 0.436.4.
 
@@ -330,10 +331,9 @@ Then the rest of 4.2-4.6 in their order, 4.7's bookkeeping alongside whatever to
   scale.
 - [ ] **STUBBLE-DEVICE-UNDERSIDE** — mode W on a stubble coat: device and host 9.6 % apart in its
   dark underside (to investigate).
-- [ ] **SPPM-LOWPASS-DEVHOST** — at 16 passes mode S's device read check_coat_modes' coated balls
-  16 % bluer than its host (x1.158, 11.5 sigma); at 256 passes they agree. A gap that shrinks with
-  the passes points at the two backends' radius schedules or first-pass radii. Start: that scene in
-  mode S on both backends at 8, 16, 64 and 256 passes.
+- [x] **SPPM-LOWPASS-DEVHOST** (closed 2026-11-13) — mode S's device read check_coat_modes' coated
+  balls 16 % bluer than its host at 16 passes: noise in one tile seen through the thin-film bubble;
+  sixteen seeds a backend agree within 0.5 sigma.
 - [ ] **GATHERAREA-TRANSPARENT's remaining limits** — an opaque, photon-holding surface hovering
   within the radius above another; Mix compounds.
 - [ ] **EMISSIVE-VOLUME-SILENT, what is left** — GPU mode D falls back to the CPU on a fire; modes J

@@ -14,7 +14,8 @@ same room at the origin. The slack now takes the device's rounding at the hit's 
 
 check_bump_modes' flat room (five diffuse walls, a lamp) at the origin and moved `--far` metres
 out along x and z, camera and lamp with it, modes M and S on the device: the far room must read
-within 1 % of the near one. Exits 1 on any failure.
+within 1 % of the near one. A render that did not run on the device (a fallback to the host, which
+computes in double and so tests nothing here) fails the check. Exits 1 on any failure.
 """
 import argparse
 import os
@@ -73,6 +74,11 @@ def main():
                 if p.returncode != 0 or not os.path.exists(png[:-4] + ".pfm"):
                     print((p.stdout + p.stderr)[-1500:])
                     raise SystemExit("render failed: " + " ".join(cmd))
+                log = p.stdout + p.stderr
+                banner = [ln for ln in log.splitlines() if ln.startswith("mode %s:" % mode)]
+                if "-> GPU:" not in log or "using CPU" in log or any("CPU thread" in ln for ln in banner):
+                    print(log[-1500:])
+                    raise SystemExit("not rendered on the device: " + " ".join(cmd))
                 v.append(read_pfm(png[:-4] + ".pfm", top_down=True).sum(-1).mean())
             means[t] = np.mean(v)
         ratio = means[a.far] / means[0.0]
