@@ -282,6 +282,9 @@ Then the rest of 4.2-4.6 in their order, 4.7's bookkeeping alongside whatever to
 - [x] **B-GPU-MAXBOUNCE** (0.439.9) — GPU mode B ignored `-max-bounce` (a literal 32 reached its
   kernels).
 
+- [x] **REVIEW-0444-FABLE** (0.444.2) -- a mapped thin film's T-bar at the hit's thickness; a coated
+  fluorescent body normalised at its re-emitted wavelength in mode R; device mode W's layered weight;
+  manual coats uncoated; the coat factor prepared once per pair (CoatEval) and one continuation helper.
 - [x] **REVIEW-0442-FABLE** (0.442.4, 0.443.0) -- a hit finds its emitter by its primitive (`Hit::emitter`),
   not its material: no glow material copies (their solid identity, the instancing refusal, the
   retag, the degenerate group, the spectrum wrap, the load cost); the docs' "one light per material".

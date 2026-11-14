@@ -23,10 +23,17 @@ The rooms: five walls of one material lit at a grazing angle by a tilted panel, 
   glossy    the smooth coat over a glossy body (roughness 0.3): car paint
   sheet     the diffuse room with a translucent panel under a rough coat standing in it: the
             transmit lobe leaves through the coat on the far face, which takes it too
-  furnace   a white furnace (a uniform sky, nothing else) holding two spheres under a smooth coat,
-            one a white diffuse body, one a white mirror: a lossless stack returns exactly what it
-            receives, so mode R must read each sphere at the sky's radiance within 1 %, and modes M
-            and S the frame as R does (D, J and U take no sky)
+  furnace   a white furnace (a uniform sky, nothing else) holding three spheres under a smooth coat:
+            a white diffuse body, a white mirror, and a white diffuse body under a high-index film
+            (film_ior 2.4 over ior 1.5) whose thickness a map sets to a quarter of its authored 240
+            nm, about a quarter wave: a lossless stack returns exactly what it receives, so mode R
+            must read each sphere at the sky's radiance within 1 %, and modes M and S the frame as R
+            does (D, J and U take no sky). Until 0.444.2 the coat's averaged escape (T-bar) was
+            tabulated at the authored thickness only, and the mapped sphere read 0.911 of the sky.
+  fluoro    a rough high-index film (film_ior 2.4, 140 nm) over a fluorescent body that absorbs blue
+            and glows red, where the film's averaged escape is about 0.6 and 0.9: mode B only (the
+            modes that render a Stokes shift are R and the forward ones). Until 0.444.2 mode R
+            normalised the shifted light's way out at the absorbed wavelength, and B read 0.916 of R.
 Each mode's frame mean over `--seeds` seeds must be within 1 % of mode R's on the same device (B's
 within 0.5 %). Mode B is not scored where the coat is smooth (fresnel, glossy, furnace): it connects
 no delta lobe to the camera, so it misses the coat's mirror image of the room (0.90 of R there), as
@@ -47,16 +54,14 @@ from pfm import read_pfm  # noqa: E402
 SPP = {"R": 2048, "D": 512, "J": 256, "U": 512, "B": 1, "M": 64, "S": 256}   # CPU; the GPU takes 4x
 NPHOT = {"B": 40000000, "M": 2000000, "S": 100000}   # photons (mode S's per pass)
 DEPTH = {"M": 32, "S": 32}
-# Arguments a mode takes here beyond the budget (none: mode J's point merges run at their default
-# radius, which read the rough room 0.9961 of R on the host, 0.9981 with -nojsurf; 0.444.0 pinned it
-# at 0.02, which shrank the merges' missing coat factor out of sight).
-MODE_ARGS = {}
 TOL = 0.01
 TOL_MODE = {"B": 0.005}
 # Rooms whose coat is smooth: a delta sheen, which mode B cannot image (see the docstring).
 SMOOTH = {"fresnel", "glossy", "furnace"}
 # Rooms lit by a sky, which modes D, J and U do not render.
 SKY = {"furnace"}
+# Rooms whose light is fluorescent, which only mode R and the forward modes shift: mode B alone.
+FLUORO = {"fluoro"}
 
 COAT = "reflectance fresnel  ior 1.5  roughness %s"
 FILM = "reflectance thinfilm  ior 1.5  film_ior 1.33  film_thickness 380  roughness 0.1"
@@ -72,22 +77,41 @@ WALLS = {
     "sheet": ['material "w" { type diffuse reflect 0.8 }',
               'material "tb" { type translucent reflect 0.4  transmit 0.4 }',
               'material "t" { type layered  coat { %s }  layer "tb" 1.0 }' % (COAT % "0.3")],
+    "fluoro": ['material "body" { type fluorescent reflect 0.05  absorb shortpass edge=480 slope=0.2 amp=1  '
+               'emit gaussian center=620 sigma=25 amp=1  yield 0.9 }',
+               'material "w" { type layered  coat { reflectance thinfilm  ior 1.5  film_ior 2.4  '
+               'film_thickness 140  roughness 0.3 }  layer "body" 1.0 }'],
 }
 
 
-def room(kind, black=False):
-    if kind == "furnace":   # `black`: the spheres black, for the mask that finds them
+# The furnace's spheres, left to right, each in its own third of the frame.
+FURNACE_SPHERES = ("diffuse body", "mirror body", "film-mapped diffuse body")
+
+
+def gray_texture(path):
+    # A uniform 2x2 map of 64/255 (a quarter): the mapped film's thickness everywhere, whatever the
+    # sphere's texture coordinates.
+    with open(path, "w", encoding="ascii", newline="") as f:
+        f.write("P3" + NL + "2 2" + NL + "255" + NL + " ".join(["64 64 64"] * 4) + NL)
+
+
+def room(kind, black=False, tex=None):
+    if kind == "furnace":   # `black`: the spheres black, for the mask that finds them; `tex`: the map
         return NL.join([
             "scene { units meters }",
             "light env { spd preset:bb6500 }",
+            'texture "q" { file "%s"  encoding linear  filter bilinear  wrap repeat }' % tex.replace(chr(92), "/"),
             'material "wd" { type diffuse reflect 1.0 }',
             'material "wm" { type mirror reflect 1.0 }',
             'material "cd" { type layered  coat { %s }  layer "wd" 1.0 }' % (COAT % "0"),
             'material "cm" { type layered  coat { %s }  layer "wm" 1.0 }' % (COAT % "0"),
+            'material "cf" { type layered  coat { reflectance thinfilm  ior 1.5  film_ior 2.4  '
+            'film_thickness 240  film_thickness_map texture:q  roughness 0 }  layer "wd" 1.0 }',
             'material "k" { type diffuse reflect 0 }',
-            "sphere { center -0.6 0 0  radius 0.5  material %s }" % ("k" if black else "cd"),
-            "sphere { center 0.6 0 0  radius 0.5  material %s }" % ("k" if black else "cm"),
-            'camera "c" { eye 0 0 4  look_at 0 0 0  up 0 1 0  fov_y 30  film { res 64 48 } }',
+            "sphere { center -1.1 0 0  radius 0.45  material %s }" % ("k" if black else "cd"),
+            "sphere { center 0 0 0  radius 0.45  material %s }" % ("k" if black else "cm"),
+            "sphere { center 1.1 0 0  radius 0.45  material %s }" % ("k" if black else "cf"),
+            'camera "c" { eye 0 0 5  look_at 0 0 0  up 0 1 0  fov_y 30  film { res 64 48 } }',
         ]) + NL
     lines = ["scene { units meters }"] + WALLS[kind] + [
         "quad { origin -2 0 -2  u 0 0 4  v 4 0 0  material w }",
@@ -110,7 +134,7 @@ def main():
     ap.add_argument("--no-gpu", action="store_true")
     ap.add_argument("--modes", default="D,J,U,B,M,S")
     ap.add_argument("--seeds", type=int, default=3)
-    ap.add_argument("--rooms", default="fresnel,rough,film,glossy,sheet,furnace")
+    ap.add_argument("--rooms", default="fresnel,rough,film,glossy,sheet,furnace,fluoro")
     a = ap.parse_args()
     exe, out = os.path.abspath(a.exe), os.path.abspath(a.out)
     seeds = list(range(1, a.seeds + 1))
@@ -119,8 +143,10 @@ def main():
         d = os.path.join(out, name)
         os.makedirs(d, exist_ok=True)
         scene = os.path.join(d, "room.ftsl")
+        tex = os.path.join(d, "quarter.ppm")
+        gray_texture(tex)
         with open(scene, "w", encoding="utf-8", newline="") as f:
-            f.write(room(name))
+            f.write(room(name, tex=tex))
 
         def image(mode, dev, seed, depth, scn=scene, tag=""):
             png = os.path.join(d, "%s%s_%s_%d_%d.png" % (mode, tag, dev, depth, seed))
@@ -131,7 +157,7 @@ def main():
                    "-spp", str(SPP[mode] * (4 if dev == "gpu" else 1)),
                    "-n", str(NPHOT.get(mode, 200000)),
                    "-max-bounce", str(depth), "-seed", str(seed), "-hdr", "-no-meter", "-window-min",
-                   "-o", png] + MODE_ARGS.get(mode, [])
+                   "-o", png]
             p = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
             pfm = png[:-4] + ".pfm"
             if p.returncode != 0 or not os.path.exists(pfm):
@@ -149,13 +175,14 @@ def main():
                 # with the spheres black; the sky is everything the mask leaves.
                 bscn = os.path.join(d, "black.ftsl")
                 with open(bscn, "w", encoding="utf-8", newline="") as f:
-                    f.write(room(name, black=True))
+                    f.write(room(name, black=True, tex=tex))
                 k = image("R", dev, 1, 8, bscn, "black")
                 img = np.mean([image("R", dev, s, 8) for s in seeds], axis=0)
                 sky = float(np.median(k))
                 inside = k < 0.05 * sky
-                half = img.shape[1] // 2
-                for label, cols in (("diffuse body", slice(0, half)), ("mirror body", slice(half, None))):
+                third = img.shape[1] // 3
+                for j, label in enumerate(FURNACE_SPHERES):
+                    cols = slice(j * third, (j + 1) * third)
                     m = inside[:, cols]
                     ratio = float(img[:, cols][m].mean()) / sky
                     good = abs(ratio - 1.0) <= TOL
@@ -168,6 +195,8 @@ def main():
                 if mode == "B" and name in SMOOTH:
                     continue
                 if mode in ("D", "J", "U") and name in SKY:
+                    continue
+                if mode != "B" and name in FLUORO:
                     continue
                 depth = DEPTH.get(mode, 8)
                 if depth not in refs:

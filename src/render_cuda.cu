@@ -555,13 +555,16 @@ struct DMaterial {
     // coat asked for `scatter stochastic`. Zero-length means use the analytic form.
     int    coatMomN;
     double coatMom[8];
-    // LAYERED-MODES (b), host twins Material::coatStack / coatTbar: on a body copy, the layered
-    // material it lies under, else -1; on a layered material, where its T-bar table starts in
-    // DScene::coatTbar (by nm from DLMIN), -1 for a constant coat and everything else.
+    // LAYERED-MODES (b), host twins Material::coatStack / coatTbar / coatTbarNT: on a body copy, the
+    // layered material it lies under, else -1; on a layered material, where its T-bar table starts in
+    // DScene::coatTbar (by nm from DLMIN, `coatTbarNT` rows across a mapped film's thickness), -1 for a
+    // constant coat and everything else.
     int    coatStack;
     int    coatTbarOff;
+    int    coatTbarNT;
     // On a layered material's coat lobe: that layered material, else -1 (host twin
-    // Material::coatParent): a walk that takes the coat weighs it by dCoatSheenRatio.
+    // Material::coatParent; -1 under a manual coat): a walk that takes the coat weighs it by
+    // dCoatF's F(h) / R(arrival).
     int    coatParent;
     // Procedural (math-driven) scalar drives (§4): index into DScene::patterns, or -1.
     // roughnessPat / filmThicknessPat override the constant/texture value at the hit;
@@ -6383,19 +6386,36 @@ __device__ static inline Real dGlossyPhotonAdjoint(const DHit& h, const DVec3& w
 __device__ static double dLayeredCoatReflectance(const DScene& sc, const DMaterial& m,
                                                  const DHit& h, const DVec3& d, Real lambda,
                                                  double* cosIOut, Real* thOut);
+__device__ static double dCoatRAtJ(const DMaterial& m, double cosI, Real th, Real lambda);
+// Host twin render.h coatTbarAt: the layered material `st`'s T-bar at `lambda` for a film of `th`
+// (a mapped thin film's rows interpolated at it, else its one row), by nm; 1 where it has none.
+__device__ static double dCoatTbarAt(const DScene& sc, const DMaterial& st, Real th, Real lambda) {
+    if (st.coatTbarOff < 0 || !sc.coatTbar) return 1.0;
+    const int nL = (int)(DLMAX - DLMIN) + 1;
+    int l = (int)lround((double)lambda - DLMIN);
+    l = l < 0 ? 0 : (l > nL - 1 ? nL - 1 : l);
+    const int nT = st.coatTbarNT;
+    if (nT <= 1) return sc.coatTbar[st.coatTbarOff + l];
+    double x = (st.filmThickness > (Real)0) ? (double)th / (double)st.filmThickness : 0.0;
+    x = (x < 0.0 ? 0.0 : (x > 1.0 ? 1.0 : x)) * (double)(nT - 1);
+    int r = (int)x;
+    if (r > nT - 2) r = nT - 2;
+    const double a = sc.coatTbar[st.coatTbarOff + r * nL + l];
+    const double b = sc.coatTbar[st.coatTbarOff + (r + 1) * nL + l];
+    return a + (b - a) * (x - (double)r);
+}
 // LAYERED-MODES (b), host twin render.h coatStackS: what the coat of the layered material `st` gives a
 // LAMBERTIAN body's lobe on a direction `w` other than its walk's arrival (the coin took that),
-// (1 - R(w)) / T-bar.
+// (1 - R(w)) / T-bar, both at the film's thickness here.
 __device__ static double dCoatStackS(const DScene& sc, const DMaterial& st, const DHit& h,
                                      const DVec3& w, Real lambda) {
     if (st.coatTbarOff < 0 || !sc.coatTbar) return 1.0;
-    int i = (int)lround((double)lambda - DLMIN);
-    i = i < 0 ? 0 : (i > (int)(DLMAX - DLMIN) ? (int)(DLMAX - DLMIN) : i);
-    const double tb = sc.coatTbar[st.coatTbarOff + i];
+    double cosI = 1.0; Real th = (Real)0;
+    const double r = dLayeredCoatReflectance(sc, st, h, w, lambda, &cosI, &th);
+    const double tb = dCoatTbarAt(sc, st, th, lambda);
     if (!(tb > 0.0)) return 0.0;
-    return (1.0 - dLayeredCoatReflectance(sc, st, h, w, lambda, nullptr, nullptr)) / tb;
+    return (1.0 - r) / tb;
 }
-__device__ static double dCoatRAtJ(const DMaterial& m, double cosI, Real th, Real lambda);
 // Host twins render.h coatPairR / coatSheenR / coatSheenRatio / coatLambertBody / coatF: the coat's
 // reciprocal reflectance for a pair (its Fresnel or thin-film term at their half vector, given the
 // film's thickness `th`); a walk's coat reflection weighed by it over the coin's R at the arrival
@@ -6417,31 +6437,110 @@ __device__ static double dCoatSheenR(const DScene& sc, const DMaterial& st, cons
     const Real th = (st.coatModel == 1) ? dMatFilmThickness(sc, st, h) : (Real)0;
     return dCoatPairR(st, wa, wb, th, lambda);
 }
-__device__ static double dCoatSheenRatio(const DScene& sc, const DMaterial& st, const DHit& h,
-                                         const DVec3& wa, const DVec3& wb, Real lambda) {
-    if (st.coatModel == 2) return 1.0;
-    double cosI = 1.0; Real th = (Real)0;
-    const double ra = dLayeredCoatReflectance(sc, st, h, wa, lambda, &cosI, &th);
-    return (ra > 0.0) ? dCoatPairR(st, wa, wb, th, lambda) / ra : 0.0;
-}
 __device__ static inline bool dCoatLambertBody(const DMaterial& m) {
     return m.type == D_DIFFUSE || m.type == D_DIFFUSETRANSMIT || m.type == D_FLUORESCENT;
 }
 __device__ static inline bool dCoatAny(const DMaterial& m) { return m.coatStack >= 0 || m.coatParent >= 0; }
-__device__ static double dCoatF(const DScene& sc, const DMaterial& m, const DHit& h, const DVec3& wa,
-                                const DVec3& wb, Real lambda) {
+// Host twin render.h CoatEval: the coat's factor for one pair with everything but the wavelength read
+// once (the film's thickness, the pair's cosines), for a caller that takes it at several wavelengths.
+struct DCoatEval {
+    int kind = 0;                    // 0 one, 1 Lambertian body, 2 directional body, 3 coat lobe, 4 zero
+    const DMaterial* st = nullptr;
+    Real th = (Real)0;
+    double cA = 1.0, cB = 1.0;
+    const DScene* sc = nullptr;      // the T-bar table (kind 1)
+    __device__ double at(Real lambda) const {
+        switch (kind) {
+            case 1: {
+                const double tb = dCoatTbarAt(*sc, *st, th, lambda);
+                return (tb > 0.0) ? (1.0 - dCoatRAtJ(*st, cB, th, lambda)) / tb : 0.0;
+            }
+            case 2: {
+                const double ta = 1.0 - dCoatRAtJ(*st, cA, th, lambda);
+                return (ta > 0.0) ? sqrt((1.0 - dCoatRAtJ(*st, cB, th, lambda)) / ta) : 0.0;
+            }
+            case 3: {
+                const double ra = dCoatRAtJ(*st, cA, th, lambda);
+                return (ra > 0.0) ? dCoatRAtJ(*st, cB, th, lambda) / ra : 0.0;
+            }
+            case 4: return 0.0;
+            default: return 1.0;
+        }
+    }
+};
+__device__ static inline double dCoatCos(const DVec3& a, const DVec3& b) {
+    const double c = fabs((double)dot(a, b));
+    return c > 1.0 ? 1.0 : c;
+}
+__device__ static DCoatEval dCoatEval(const DScene& sc, const DMaterial& m, const DHit& h,
+                                      const DVec3& wa, const DVec3& wb) {
+    DCoatEval c;
     if (m.coatStack >= 0) {
         const DMaterial& st = sc.mats[m.coatStack];
-        if (dCoatLambertBody(m)) return dCoatStackS(sc, st, h, wb, lambda);
-        if (st.coatModel == 2) return 1.0;
-        double cosI = 1.0; Real th = (Real)0;
-        const double ta = 1.0 - dLayeredCoatReflectance(sc, st, h, wa, lambda, &cosI, &th);
-        double cb = fabs((double)dot(wb, h.n));
-        if (cb > 1.0) cb = 1.0;
-        return (ta > 0.0) ? sqrt((1.0 - dCoatRAtJ(st, cb, th, lambda)) / ta) : 0.0;
+        const bool lam = dCoatLambertBody(m);
+        if (lam ? (st.coatTbarOff < 0 || !sc.coatTbar) : st.coatModel == 2) return c;
+        c.kind = lam ? 1 : 2;
+        c.st = &st; c.sc = &sc;
+        c.th = (st.coatModel == 1) ? dMatFilmThickness(sc, st, h) : (Real)0;
+        c.cA = dCoatCos(h.n, wa);
+        c.cB = dCoatCos(h.n, wb);
+        return c;
     }
-    if (m.coatParent >= 0) return dCoatSheenRatio(sc, sc.mats[m.coatParent], h, wa, wb, lambda);
-    return 1.0;
+    if (m.coatParent >= 0) {
+        const DMaterial& st = sc.mats[m.coatParent];
+        if (st.coatModel == 2) return c;
+        c.st = &st; c.sc = &sc;
+        c.th = (st.coatModel == 1) ? dMatFilmThickness(sc, st, h) : (Real)0;
+        const DVec3 hv = wa + wb;
+        const double l = (double)length(hv);
+        if (!(l > 0.0)) { c.kind = 4; return c; }
+        c.kind = 3;
+        c.cA = dCoatCos(h.n, wa);
+        double cD = fabs((double)dot(wa, hv)) / l;
+        c.cB = cD > 1.0 ? 1.0 : cD;
+    }
+    return c;
+}
+__device__ static double dCoatF(const DScene& sc, const DMaterial& m, const DHit& h, const DVec3& wa,
+                                const DVec3& wb, Real lambda) {
+    return dCoatEval(sc, m, h, wa, wb).at(lambda);
+}
+// Host twins render.h coatContinueWalk / coatScale: a coated walk's continuation along `wb` (unit)
+// -- the factor into `beta` at the walk's wavelength (false, and nothing more, where it is 0), into
+// `betaSec` at the `nSec` others `lamSec`, into a carrier by `fold(f, atLambda)` -- and a connection's
+// or merge's lobe value `f` / `fSec` the same, 0 included.
+template <class Fold>
+__device__ static inline bool dCoatContinueWalk(const DScene& sc, const DMaterial& m, const DHit& h,
+                                                const DVec3& wa, const DVec3& wb, Real lambda,
+                                                double& beta, double* betaSec, const Real* lamSec,
+                                                int nSec, const Fold& fold) {
+    if (!dCoatAny(m)) return true;
+    const DCoatEval ce = dCoatEval(sc, m, h, wa, wb);
+    const double s = ce.at(lambda);
+    if (!(s > 0.0)) return false;
+    beta *= s;
+    for (int i = 0; i < nSec; ++i) betaSec[i] *= ce.at(lamSec[i]);
+    fold(ce, s);
+    return true;
+}
+__device__ static inline void dCoatScale(const DScene& sc, const DMaterial& m, const DHit& h,
+                                         const DVec3& wa, const DVec3& wb, Real lambda, double& f,
+                                         double* fSec, const Real* lamSec, int nSec) {
+    if (!dCoatAny(m)) return;
+    const DCoatEval ce = dCoatEval(sc, m, h, wa, wb);
+    f *= ce.at(lambda);
+    for (int i = 0; i < nSec; ++i) fSec[i] *= ce.at(lamSec[i]);
+}
+// Host twin render.h coatShiftTbar: what a coated Lambertian body's light, absorbed at `lamIn` and
+// re-emitted at `lamOut`, is multiplied by on a walk at lamIn, whose lobe takes T-bar at lamIn.
+__device__ static double dCoatShiftTbar(const DScene& sc, const DMaterial& m, const DHit& h, Real lamIn,
+                                        Real lamOut) {
+    if (m.coatStack < 0 || !dCoatLambertBody(m)) return 1.0;
+    const DMaterial& st = sc.mats[m.coatStack];
+    if (st.coatTbarOff < 0 || !sc.coatTbar) return 1.0;
+    const Real th = (st.coatModel == 1) ? dMatFilmThickness(sc, st, h) : (Real)0;
+    const double tOut = dCoatTbarAt(sc, st, th, lamOut);
+    return (tOut > 0.0) ? dCoatTbarAt(sc, st, th, lamIn) / tOut : 0.0;
 }
 // The coat a vertex's lobe takes (host twin render.h CoatCtx): its material when coated and the
 // walk's arrival there; empty (m null) elsewhere, where f is 1. dCoatCtxOf builds one.
@@ -6450,6 +6549,10 @@ struct DCoatCtx {
     DVec3 wa = DVec3{(Real)0, (Real)0, (Real)0};
     __device__ double f(const DScene& sc, const DHit& h, const DVec3& wb, Real lambda) const {
         return m ? dCoatF(sc, *m, h, wa, wb, lambda) : 1.0;
+    }
+    // f along `wb` prepared for several wavelengths (DCoatEval).
+    __device__ DCoatEval eval(const DScene& sc, const DHit& h, const DVec3& wb) const {
+        return m ? dCoatEval(sc, *m, h, wa, wb) : DCoatEval{};
     }
 };
 __device__ static inline DCoatCtx dCoatCtxOf(const DMaterial& m, const DVec3& wa) {
@@ -15735,10 +15838,10 @@ __device__ static void bkNeeLightSpecGlossy(const DScene& sc, const DHit& h, con
         for (int i = 0; i < KK; ++i) Tr[i] = 1.0;
         if (sc.mediaN > 0)
             dMediaTransmittanceSpec(sc, h.p, g.wi, g.medDist(sc, h.p), lam, KK, Tr, rng);
+        // a coated vertex's coat (dCoatF: a body's way in, a coat lobe's reflection)
+        const DCoatEval ce = dCoatEval(sc, *nb.m, h, nb.wo, g.wi);
         for (int i = 0; i < KK; ++i) {
-            // a coated vertex's coat (dCoatF: a body's way in, a coat lobe's reflection)
-            const double f = dGlossyFHit(sc, *nb.m, h, nb.wo, g.wi, lam[i]) *
-                             dCoatF(sc, *nb.m, h, nb.wo, g.wi, lam[i]);
+            const double f = dGlossyFHit(sc, *nb.m, h, nb.wo, g.wi, lam[i]) * ce.at(lam[i]);
             if (!(f > 0.0)) continue;
             const double v = gWeight * thrRatio[i] * f
                            * (double)specLookup(em.emitSpd, lam[i]) * Tr[i];
@@ -15804,6 +15907,7 @@ __device__ __noinline__ static void bkNeeLightHero(const DScene& sc, const DHit&
                 const double sum = pNee + pLobe;
                 if (sum > 0.0) wMisG = pNee / sum;
             }
+            const DCoatEval ceB = coatB ? coatB->eval(sc, h, g.wi) : DCoatEval{};
             for (int i = 0; i < nUp; ++i) {
                 double emitW = (double)specLookup(em.emitSpd, lam[i]) * invPdf[i];
                 double contrib;
@@ -15824,7 +15928,7 @@ __device__ __noinline__ static void bkNeeLightHero(const DScene& sc, const DHit&
                         ? (double)(f * g.fall * g.cosSurf / g.dist2 * g.stG) * emitW
                         : (double)(f * g.G) * emitW * (double)em.area * (double)g.stG;
                 }
-                if (coatB) contrib *= coatB->f(sc, h, g.wi, lam[i]);   // a coated vertex's
+                contrib *= ceB.at(lam[i]);   // a coated vertex's coat
                 L[i] += thr[i] * contrib * invS * tm;
             }
         }
@@ -15839,10 +15943,11 @@ __device__ __noinline__ static void bkNeeLightHero(const DScene& sc, const DHit&
                      const Real stG = dShadowTerminatorG(wi, h.n, ngo0);
                      if (stG <= (Real)0) return false;
                      pdfB = nb ? dGlossyPdfHit(sc, *nb->m, h, nb->wo, wi) : (double)cosSurf / DPI;
+                     const DCoatEval ceF = coatB ? coatB->eval(sc, h, wi) : DCoatEval{};
                      for (int i = 0; i < nUp; ++i)
                          fo[i] = (nb ? dGlossyFHit(sc, *nb->m, h, nb->wo, wi, lam[i])
                                      : (double)rho[i] / DPI) * (double)cosSurf * (double)stG *
-                                 (coatB ? coatB->f(sc, h, wi, lam[i]) : 1.0);
+                                 ceF.at(lam[i]);
                      ro = dOffsetAlong(h.p, h.ng, wi);
                      ctmin = 0.0;
                      return true;
@@ -16070,12 +16175,13 @@ __device__ __noinline__ static void bkNeeEnvHero(const DScene& sc, const DHit& h
         if (!(tm > 0.0)) return;
     }
     const bool imageEnv = (sc.env.scale != nullptr);
+    const DCoatEval ceB = coatB ? coatB->eval(sc, h, g.wi) : DCoatEval{};
     for (int i = 0; i < nUp; ++i) {
         double Lenv = imageEnv ? dEnvRadiance(sc.env, g.wi, lam[i])
                                : (double)specLookup(sc.emitters[sc.envIndex].emitSpd, lam[i]);
         if (Lenv <= 0.0) continue;
         const double fVal = (nb ? dGlossyFHit(sc, *nb->m, h, nb->wo, g.wi, lam[i]) : ((double)rho[i] / DPI)) *
-                            (coatB ? coatB->f(sc, h, g.wi, lam[i]) : 1.0);
+                            ceB.at(lam[i]);
         if (!(fVal > 0.0)) continue;
         L[i] += thr[i] * (fVal * Lenv * (double)g.cosSurf * invPdf[i]
                           / g.pdfW * g.wMis * (double)g.stG) * tm;
@@ -16729,7 +16835,7 @@ __device__ static bool bkInteract(const DScene& sc, const DMaterial* mp, const D
             // Elastic base reflects at the output wavelength; the fluorescent channel
             // excites at a separately-sampled lambdaIn (Stokes shift). Both channels NEE;
             // one stochastic continuation carries the indirect term.
-            double rhoEl = clamp01((double)specLookup(mp->reflect, lambda));   // elastic base @lambda(out)
+            double rhoEl = clamp01((double)dDiffuseRho(sc, *mp, h, lambda));   // elastic base @lambda(out), a diffuse body's
             // `gi.depth` matters: it selects bkGiGrid over bkGrid at a gather vertex, exactly
             // as the Diffuse case does. Omitting it made a fluorescent surface pay bkGrid^2
             // shadow rays inside a -gi gather (host twin: backward.h MatType::Fluorescent).
@@ -16740,6 +16846,9 @@ __device__ static bool bkInteract(const DScene& sc, const DMaterial* mp, const D
             bool haveFluoro = (Mint > 0.0 && mp->fluoYield > (Real)0);
             double gOut = 0.0, rhoFluo = 0.0, invPdfIn = 0.0;
             Real lambdaIn = 0;
+            // A coated body gives the shifted light back through its coat at this walk's wavelength
+            // (host twin backward.h, dCoatShiftTbar): its NEE's and its continuation's.
+            double tbShift = 1.0;
             if (haveFluoro) {
                 gOut = ((double)specLookup(mp->fluoEmitSpec, lambda) / Mint) * invPdfLambda;
                 double pin = 0.0;
@@ -16760,16 +16869,17 @@ __device__ static bool bkInteract(const DScene& sc, const DMaterial* mp, const D
                     // analytic dInvPdfLambda, correct only while that sampler was the
                     // illuminant).
                     invPdfIn = 1.0 / pin;
-                    double rhoIn = clamp01((double)specLookup(mp->reflect, lambdaIn));
+                    double rhoIn = clamp01((double)dDiffuseRho(sc, *mp, h, lambdaIn));
                     double eps   = clamp01((double)specLookup(mp->fluoAbsorb, lambdaIn));
                     double aEffIn = fmin(eps, fmax(0.0, 1.0 - rhoIn));
                     rhoFluo = aEffIn * (double)mp->fluoYield;                 // reradiation albedo @lambdaIn
+                    tbShift = dCoatShiftTbar(sc, *mp, h, lambdaIn, lambda);
                     if (rhoFluo > 0.0) {                                      // fluoro DIRECT NEE
-                        L += thr * gOut * bkNeeLight(sc, h, (Real)rhoFluo, invPdfIn, lambdaIn,
-                                                     rng, gi.depth, nullptr, nullptr, coatB);
+                        L += thr * gOut * tbShift * bkNeeLight(sc, h, (Real)rhoFluo, invPdfIn, lambdaIn,
+                                                               rng, gi.depth, nullptr, nullptr, coatB);
                         if (sc.envIndex >= 0)
-                            L += thr * gOut * bkNeeEnv(sc, h, (Real)rhoFluo, invPdfIn, lambdaIn, rng,
-                                                       nullptr, nullptr, coatB);
+                            L += thr * gOut * tbShift * bkNeeEnv(sc, h, (Real)rhoFluo, invPdfIn, lambdaIn, rng,
+                                                                 nullptr, nullptr, coatB);
                     }
                 }
             }
@@ -16783,7 +16893,7 @@ __device__ static bool bkInteract(const DScene& sc, const DMaterial* mp, const D
                 if (!dContinueAlong(h, wOut, DL_REFLECT, ro, rd)) return false;
                 specularArrival = false; return true;
             } else if (u < rhoEl + pF) {                                      // fluoro (wavelength-switched)
-                thr *= wFluo / pF;
+                thr *= wFluo / pF * tbShift;
                 lambda = lambdaIn;                                            // Stokes shift (to the input wl)
                 invPdfLambda = invPdfIn;
                 DVec3 wOut = cosineHemisphere(h.n, rng);
@@ -17024,6 +17134,14 @@ __device__ static double bkRadiance(const DScene& sc, int diffraction, DVec3 ro,
             int child = whitted ? dResolveCompoundDominant(sc, *mp, h, rd, lambda)
                                 : dResolveCompound(sc, *mp, h, rd, lambda, rng);
             if (child < 0) return L;                    // absorbed
+            // Mode W takes a layered stack's dominant layer as a WEIGHT, the coat's R or the
+            // body's 1 - R (host twin bkRadiance's Whitted layered branch): the coat's factor its
+            // lobe then takes is F(h) / R, the coin's price paid here.
+            if (whitted && mp->type == D_LAYERED) {
+                const double R = dLayeredCoatReflectance(sc, *mp, h, rd, lambda);
+                if (!dWhittedAttenuate(thr, (child == mp->coatChild) ? R : 1.0 - R, dLocalN2(sc, stk, lambda)))
+                    return L;
+            }
             mp = &sc.mats[child]; matId = child;
         }
         // Emission on specular/camera arrival (NEE covers diffuse arrivals), scaled by
@@ -17299,6 +17417,18 @@ __device__ static void bkRadianceHeroLoop(const DScene& sc, int diffraction,
                     for (int j = 0; j < C; ++j) specR[j] = 1.0;
                     nUp = 1;
                 }
+            }
+            // Mode W: the dominant layer as a weight, each live wavelength its own R or 1 - R (host
+            // twin radianceHeroLoop; the scalar twin above), then the bundle's bailout.
+            if (whitted && mp->type == D_LAYERED) {
+                const bool coatW = (child == mp->coatChild);
+                double thrMax = 0.0;
+                for (int i = 0; i < nUp; ++i) {
+                    const double R = dLayeredCoatReflectance(sc, *mp, h, rd, lam[i]);
+                    thr[i] *= coatW ? R : 1.0 - R;
+                    if (thr[i] > thrMax) thrMax = thr[i];
+                }
+                if (thrMax * dLocalN2(sc, stk, lam[0]) <= kWhittedCutoff) return;
             }
             mp = &sc.mats[child]; matId = child;
         }
@@ -17657,8 +17787,10 @@ __device__ static void bkRadianceHeroLoop(const DScene& sc, int diffraction,
             }
         }
         if (!nullHereH) contSoft = dContSoftening(*mp, h, rd);   // what this vertex lends
-        if (!nullHereH && dCoatAny(*mp))
-            for (int i = 0; i < nUp; ++i) thr[i] *= dCoatF(sc, *mp, h, -rdInH, rd, lam[i]);
+        if (!nullHereH && dCoatAny(*mp)) {
+            const DCoatEval ce = dCoatEval(sc, *mp, h, -rdInH, rd);
+            for (int i = 0; i < nUp; ++i) thr[i] *= ce.at(lam[i]);
+        }
     }
 }
 
@@ -17734,8 +17866,9 @@ __device__ static void bkGiGatherHero(const DScene& sc, int diffraction, const D
             for (int i = 0; i < nUp; ++i) if (Lg[i] > sc.bkGiClamp) Lg[i] = sc.bkGiClamp;
         // A coated body's lobe takes the coat on the way in from d; its mean under the cosine is
         // 1, so wSum still normalises (host twin giGatherHero).
+        const DCoatEval ce = gi.coat.eval(sc, h, d);
         for (int i = 0; i < nUp; ++i)
-            acc[i] += c * Lg[i] * gi.coat.f(sc, h, d, lam[i]);
+            acc[i] += c * Lg[i] * ce.at(lam[i]);
     }
     if (wSum <= 0.0) return;
     const double inv = 1.0 / wSum;
@@ -19049,14 +19182,10 @@ __device__ static void dRandomWalk(const DScene& sc, const DCamera& cam, int dif
         for (int i = 0; i + 1 < nUp; ++i) betaSec[i] *= secChromatic ? secF[i] : betaFactor;
         // A coated vertex's continuation takes the coat (dCoatF; host twin randomWalk), at each
         // live wavelength and on mode J's carrier.
-        if (dCoatAny(*mp)) {
-            const DVec3 wiC = normalize(wi);
-            const double s = dCoatF(sc, *mp, h, wo, wiC, lambda);
-            if (!(s > 0.0)) return;
-            beta *= s;
-            for (int i = 0; i + 1 < nUp; ++i) betaSec[i] *= dCoatF(sc, *mp, h, wo, wiC, hb.lam[i + 1]);
-            if (jrun) jrun->mul([&](double L) { return dCoatF(sc, *mp, h, wo, wiC, (Real)L); }, s, false);
-        }
+        if (!dCoatContinueWalk(sc, *mp, h, wo, normalize(wi), lambda, beta, betaSec, hb.lam + 1, nUp - 1,
+                               [&](const DCoatEval& ce, double s) {
+                                   if (jrun) jrun->mul([&](double L) { return ce.at((Real)L); }, s, false); }))
+            return;
         // Veach adjoint shading-normal correction on the LIGHT subpath only (1 when
         // ns==ng). wo = toward previous (light-side) vertex; wi = sampled continuation.
         if (importance && !delta) {
@@ -19609,10 +19738,9 @@ __device__ static double dConnectBDPT(const DScene& sc, const DCamera& cam,
             f *= adj;
             for (int i = 0; i + 1 < nUp; ++i)
                 fSec[i] = dBsdfFAdjoint(sc, qs, wo, wcam, hb.lam[i + 1]) * adj;
-            if (dCoatAny(sc.mats[qs.matId])) {   // a coated vertex's coat toward the camera (dCoatF)
-                f *= dVertCoatF(sc, qs, wo, wcam, lambda);
-                for (int i = 0; i + 1 < nUp; ++i) fSec[i] *= dVertCoatF(sc, qs, wo, wcam, hb.lam[i + 1]);
-            }
+            if (dCoatAny(sc.mats[qs.matId]))   // a coated vertex's coat toward the camera (dCoatF)
+                dCoatScale(sc, sc.mats[qs.matId], dVertHit(qs), wo, wcam, lambda, f, fSec, hb.lam + 1,
+                           nUp - 1);
                         o = dOffsetAlong(qs.p, qs.ng, wcam);
         }
         {   // max over live wavelengths (identical to `f <= 0` when nUp == 1)
@@ -19759,10 +19887,9 @@ __device__ static double dConnectBDPT(const DScene& sc, const DCamera& cam,
         for (int i = 0; i + 1 < nUp; ++i)
             fSec[i] = (pt.type == BV_MEDIUM) ? dMediumScatterF(sc, pt, wo, wi, hb.lam[i + 1])
                                              : dBsdfF(sc, pt, wo, wi, hb.lam[i + 1]) * stG;
-        if (pt.type != BV_MEDIUM && dCoatAny(sc.mats[pt.matId])) {   // a coated vertex's coat toward the light
-            f *= dVertCoatF(sc, pt, wo, wi, lambda);
-            for (int i = 0; i + 1 < nUp; ++i) fSec[i] *= dVertCoatF(sc, pt, wo, wi, hb.lam[i + 1]);
-        }
+        if (pt.type != BV_MEDIUM && dCoatAny(sc.mats[pt.matId]))   // a coated vertex's coat toward the light
+            dCoatScale(sc, sc.mats[pt.matId], dVertHit(pt), wo, wi, lambda, f, fSec, hb.lam + 1,
+                       nUp - 1);
         {   // max over live wavelengths (identical to `f <= 0` when nUp == 1)
             double mxF = f;
             for (int i = 0; i + 1 < nUp; ++i) if (fSec[i] > mxF) mxF = fSec[i];
@@ -19857,10 +19984,9 @@ __device__ static double dConnectBDPT(const DScene& sc, const DCamera& cam,
             fE = dBsdfF(sc, pt, woE, w, lambda);
             for (int i = 0; i + 1 < nUp; ++i)
                 fESec[i] = dBsdfF(sc, pt, woE, w, hb.lam[i + 1]);
-            if (dCoatAny(sc.mats[pt.matId])) {   // a coated vertex's coat along the connection (dCoatF)
-                fE *= dVertCoatF(sc, pt, woE, w, lambda);
-                for (int i = 0; i + 1 < nUp; ++i) fESec[i] *= dVertCoatF(sc, pt, woE, w, hb.lam[i + 1]);
-            }
+            if (dCoatAny(sc.mats[pt.matId]))   // a coated vertex's coat along the connection (dCoatF)
+                dCoatScale(sc, sc.mats[pt.matId], dVertHit(pt), woE, w, lambda, fE, fESec, hb.lam + 1,
+                           nUp - 1);
         }
         if (qs.type == BV_MEDIUM) {
             fL = dMediumScatterF(sc, qs, woL, w * (Real)-1, lambda);
@@ -19876,10 +20002,9 @@ __device__ static double dConnectBDPT(const DScene& sc, const DCamera& cam,
             fL *= adjL;
             for (int i = 0; i + 1 < nUp; ++i)
                 fLSec[i] = dBsdfFAdjoint(sc, qs, woL, w * (Real)-1, hb.lam[i + 1]) * adjL;
-            if (dCoatAny(sc.mats[qs.matId])) {   // a coated vertex's coat along the connection (dCoatF)
-                fL *= dVertCoatF(sc, qs, woL, w * (Real)-1, lambda);
-                for (int i = 0; i + 1 < nUp; ++i) fLSec[i] *= dVertCoatF(sc, qs, woL, w * (Real)-1, hb.lam[i + 1]);
-            }
+            if (dCoatAny(sc.mats[qs.matId]))   // a coated vertex's coat along the connection (dCoatF)
+                dCoatScale(sc, sc.mats[qs.matId], dVertHit(qs), woL, w * (Real)-1, lambda, fL, fLSec, hb.lam + 1,
+                           nUp - 1);
         }
         {   // max over live wavelengths on each side (identical to the scalar tests at nUp==1)
             double mxE = fE, mxL = fL;
@@ -20891,11 +21016,9 @@ __device__ static void dPhotonGatherSub(const DScene& sc, const DPhotonMap& pm,
     double contSoft = dContSoftening(visMat, visHit, rd); // first the visible point's (dContSoftening)
     // A coated visible point's lobe takes the coat on the gather ray's way in, at each wavelength a
     // term reads the visible point's reflectance at: it rides in rhoV (host twin photonGatherSub).
-    const DVec3 dVis = rd;
-    const bool visCoat = dCoatAny(visMat);   // the camera walk reached it from visWa
-    const auto sVis = [&](Real Lw) {
-        return visCoat ? dCoatF(sc, visMat, visHit, visWa, dVis, Lw) : 1.0;
-    };
+    // Prepared once (DCoatEval), so a photon pays only its wavelength's Fresnel or film term.
+    const DCoatEval visCe = dCoatAny(visMat) ? dCoatEval(sc, visMat, visHit, visWa, rd) : DCoatEval{};
+    const auto sVis = [&](Real Lw) { return visCe.at(Lw); };
     DMediumStack stk; stk.clear();
     const Real r2 = (Real)((double)pm.radius * (double)pm.radius);
     const bool causOn = (pmC.photons != nullptr);
@@ -21388,14 +21511,10 @@ __device__ static double dStrandStep(const DScene& sc, const DMaterial& m, const
                                       coatC.m ? &coatC : nullptr);
     thr *= rho;
     if (sthr) sthr->mul(sc, [&](Real L) { return (double)clamp01(dDiffuseRho(sc, m, h, L)); }, rho);
-    cont = dContinueAlong(h, cosineHemisphere(h.n, rng), DL_REFLECT, ro, rd) && thr > 0.0;
-    if (cont && dCoatAny(m)) {   // a coated vertex's way out (host twin coatWalkOut)
-        const DVec3 rdS = rd;
-        const double s = dCoatF(sc, m, h, waS, rdS, lambda);
-        thr *= s;
-        if (sthr && s > 0.0) sthr->mul(sc, [&](Real L) { return dCoatF(sc, m, h, waS, rdS, L); }, s);
-        cont = thr > 0.0;
-    }
+    cont = dContinueAlong(h, cosineHemisphere(h.n, rng), DL_REFLECT, ro, rd) && thr > 0.0 &&
+           dCoatContinueWalk(sc, m, h, waS, rd, lambda, thr, nullptr, nullptr, 0,   // host twin coatWalkOut
+                             [&](const DCoatEval& ce, double s) {
+                                 if (sthr) sthr->mul(sc, [&](Real L) { return ce.at(L); }, s); });
     return d;
 }
 
@@ -21964,13 +22083,10 @@ __device__ static void dPhotonGather(const DScene& sc, const DPhotonMap& pm,
         }
         // A coated vertex's continuation takes the coat, at each photon's wavelength too (host twin
         // coatWalkOut). A fibre has no coat, so its pass-through never reaches this.
-        if (dCoatAny(m)) {
-            const DVec3 rdC = rd;
-            const double s = dCoatF(sc, m, h, wArr, rdC, lambda);
-            if (!(s > 0.0)) return;
-            thr *= s;
-            sthr.mul(sc, [&](Real Lw) { return dCoatF(sc, m, h, wArr, rdC, Lw); }, s);
-        }
+        if (!dCoatContinueWalk(sc, m, h, wArr, rd, lambda, thr, nullptr, nullptr, 0,
+                               [&](const DCoatEval& ce, double s) {
+                                   sthr.mul(sc, [&](Real Lw) { return ce.at(Lw); }, s); }))
+            return;
         if (thr <= 0.0) return;
     }
 }
@@ -22292,13 +22408,10 @@ __device__ static void dSppmVisiblePoint(const DScene& sc, DVec3 ro, DVec3 rd, R
         }
         // A coated vertex's continuation takes the coat, at each photon's wavelength too (as mode
         // M's walk).
-        if (dCoatAny(m)) {
-            const DVec3 rdC = rd;
-            const double s = dCoatF(sc, m, h, wArr, rdC, lambda);
-            if (!(s > 0.0)) return;
-            thr *= s;
-            sthr.mul(sc, [&](Real Lw) { return dCoatF(sc, m, h, wArr, rdC, Lw); }, s);
-        }
+        if (!dCoatContinueWalk(sc, m, h, wArr, rd, lambda, thr, nullptr, nullptr, 0,
+                               [&](const DCoatEval& ce, double s) {
+                                   sthr.mul(sc, [&](Real Lw) { return ce.at(Lw); }, s); }))
+            return;
         if (thr <= 0.0) return;
     }
 }
@@ -23107,13 +23220,12 @@ __global__ void kVcmLightT(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx,
                                     // geometric, so they scale every λ the same way.
                                     double geo = (double)dShadingAdjointCorr(wo, wcam, h.n, ngo);
                                     // ...times a coated vertex's coat toward the camera (dCoatF).
-                                    double f = dBsdfFAdjoint(sc, vt, wo, wcam, lambda) * geo *
-                                               dCoatF(sc, *mp, h, wo, wcam, lambda);
+                                    const DCoatEval ce = dCoatEval(sc, *mp, h, wo, wcam);
+                                    double f = dBsdfFAdjoint(sc, vt, wo, wcam, lambda) * geo * ce.at(lambda);
                                     double fSec[SECN], mxf = f;
                                     for (int k = 0; k + 1 < nUp; ++k) {
                                         fSec[k] = dBsdfFAdjoint(sc, vt, wo, wcam,
-                                                                lamAll[k + 1]) * geo *
-                                                  dCoatF(sc, *mp, h, wo, wcam, lamAll[k + 1]);
+                                                                lamAll[k + 1]) * geo * ce.at(lamAll[k + 1]);
                                         if (fSec[k] > mxf) mxf = fSec[k];
                                     }
                                     if (mxf > 0.0) {
@@ -23181,13 +23293,10 @@ __global__ void kVcmLightT(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx,
             if (mp->type == D_HAIR && !delta) break;
             beta *= betaFactor;
             for (int k = 0; k + 1 < nUp; ++k) betaSec[k] *= secChromatic ? secF[k] : betaFactor;
-            if (dCoatAny(*mp)) {   // a coated vertex's coat on the way out (dCoatF; host twin vcm.h)
-                const DVec3 wiC = normalize(wi);
-                const double s = dCoatF(sc, *mp, h, wo, wiC, lambda);
-                if (!(s > 0.0)) break;
-                beta *= s;
-                for (int k = 0; k + 1 < nUp; ++k) betaSec[k] *= dCoatF(sc, *mp, h, wo, wiC, lamAll[k + 1]);
-            }
+            // a coated vertex's coat on the way out (dCoatF; host twin vcm.h)
+            if (!dCoatContinueWalk(sc, *mp, h, wo, normalize(wi), lambda, beta, betaSec, lamAll + 1, nUp - 1,
+                                   [](const DCoatEval&, double) {}))
+                break;
             if (!delta) {
                 double adj = (double)dShadingAdjointCorr(wo, normalize(wi), h.n, ngo);
                 beta *= adj;
@@ -23553,10 +23662,11 @@ __global__ void kVcmCameraT(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx
                                     !occludedTo(sc, nst.o, h.p + wiL * (Real)distL, occlEps, nst.tmin, false,
                                                 nst.curveTmin)) {
                                     // ...times a coated vertex's coat toward the light (dCoatF).
-                                    f = dBsdfF(sc, vt, wo, wiL, lambda) * stG * dCoatF(sc, *mp, h, wo, wiL, lambda);
+                                    const DCoatEval ce = dCoatEval(sc, *mp, h, wo, wiL);
+                                    f = dBsdfF(sc, vt, wo, wiL, lambda) * stG * ce.at(lambda);
                                     for (int k = 0; k + 1 < nUp; ++k)
                                         fSec[k] = dBsdfF(sc, vt, wo, wiL, lamAll[k + 1]) * stG *
-                                                  dCoatF(sc, *mp, h, wo, wiL, lamAll[k + 1]);
+                                                  ce.at(lamAll[k + 1]);
                                 }
                                 // Fuse BSDF x Le per-λ before the max test: either factor may
                                 // vanish at the hero while the product is alive at a secondary.
@@ -23650,9 +23760,12 @@ __global__ void kVcmCameraT(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx
                     DVertex lvt = dVertFromLV(lv);
                     double adjLit = (double)dShadingAdjointCorr(lv.wo, w * (Real)-1, lv.ns, ngoLit);
                     // Each end a coated vertex's coat along the connection (dCoatF).
-                    double fCam = dBsdfF(sc, vt, wo, w, lambda) * dCoatF(sc, *mp, h, wo, w, lambda);
-                    double fLit = dBsdfFAdjoint(sc, lvt, lv.wo, w * (Real)-1, lambda) *
-                                  dVertCoatF(sc, lvt, lv.wo, w * (Real)-1, lambda);
+                    const DCoatEval ceCam = dCoatEval(sc, *mp, h, wo, w);
+                    const DCoatEval ceLit = (lvt.matId >= 0) ? dCoatEval(sc, sc.mats[lvt.matId], dVertHit(lvt),
+                                                                         lv.wo, w * (Real)-1)
+                                                             : DCoatEval{};
+                    double fCam = dBsdfF(sc, vt, wo, w, lambda) * ceCam.at(lambda);
+                    double fLit = dBsdfFAdjoint(sc, lvt, lv.wo, w * (Real)-1, lambda) * ceLit.at(lambda);
                     fLit *= adjLit;
                     // The camera path and the stored light path share this pass's bundle (same
                     // path index i), so a connection is EXACT per-λ over the wavelengths still
@@ -23662,10 +23775,9 @@ __global__ void kVcmCameraT(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx
                     double fProdSec[SECN], mxProd = fCam * fLit;
                     const DVcmSec* lsRow = ((NS > 0) && lvSec) ? (lvSec + (size_t)j * secStride) : nullptr;
                     for (int k = 0; k + 1 < nUpConn; ++k) {
-                        double fc = dBsdfF(sc, vt, wo, w, lamAll[k + 1]) * dCoatF(sc, *mp, h, wo, w, lamAll[k + 1]);
+                        double fc = dBsdfF(sc, vt, wo, w, lamAll[k + 1]) * ceCam.at(lamAll[k + 1]);
                         double fl = dBsdfFAdjoint(sc, lvt, lv.wo, w * (Real)-1,
-                                                  lamAll[k + 1]) * adjLit *
-                                    dVertCoatF(sc, lvt, lv.wo, w * (Real)-1, lamAll[k + 1]);
+                                                  lamAll[k + 1]) * adjLit * ceLit.at(lamAll[k + 1]);
                         fProdSec[k] = fc * fl;
                         if (fProdSec[k] > mxProd) mxProd = fProdSec[k];
                     }
@@ -23740,11 +23852,12 @@ __global__ void kVcmCameraT(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx
                                                  ? (lvSec + (size_t)idx * secStride) : nullptr;
                               // ...times a coated body's coat on the light's way in: the light
                               // vertex was stored before its own pick.
-                              double fCam = dBsdfF(sc, vt, wo, wMerge, lam) * dCoatF(sc, *mp, h, wo, wMerge, lam);
+                              const DCoatEval ce = dCoatEval(sc, *mp, h, wo, wMerge);
+                              double fCam = dBsdfF(sc, vt, wo, wMerge, lam) * ce.at(lam);
                               double fSec[SECN], mxF = fCam;
                               for (int q = 0; q + 1 < lvUp; ++q) {
                                   fSec[q] = dBsdfF(sc, vt, wo, wMerge, (Real)row[q].lam) *
-                                            dCoatF(sc, *mp, h, wo, wMerge, (Real)row[q].lam);
+                                            ce.at((Real)row[q].lam);
                                   if (fSec[q] > mxF) mxF = fSec[q];
                               }
                               if (!(mxF > 0.0)) continue;   // == the old `fCam <= 0` at lvUp == 1
@@ -23818,14 +23931,11 @@ __global__ void kVcmCameraT(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx
             if (mp->type == D_HAIR && !delta) { dVC = 0.0; dVM = 0.0; }
             beta *= betaFactor;                           // camera side: no adjoint on continuation
             for (int k = 0; k + 1 < nUp; ++k) betaSec[k] *= secChromatic ? secF[k] : betaFactor;
-            if (dCoatAny(*mp)) {   // a coated vertex's coat on the way out, and on mode J's carrier
-                const DVec3 wiC = normalize(wi);
-                const double s = dCoatF(sc, *mp, h, wo, wiC, lambda);
-                if (!(s > 0.0)) break;
-                beta *= s;
-                for (int k = 0; k + 1 < nUp; ++k) betaSec[k] *= dCoatF(sc, *mp, h, wo, wiC, lamAll[k + 1]);
-                if (jOn) jrun.mul([&](double L) { return dCoatF(sc, *mp, h, wo, wiC, (Real)L); }, s, false);
-            }
+            // a coated vertex's coat on the way out, and on mode J's carrier
+            if (!dCoatContinueWalk(sc, *mp, h, wo, normalize(wi), lambda, beta, betaSec, lamAll + 1, nUp - 1,
+                                   [&](const DCoatEval& ce, double s) {
+                                       if (jOn) jrun.mul([&](double L) { return ce.at((Real)L); }, s, false); }))
+                break;
             if (!delta) camAllDelta = false;               // disqualifies the escaped-sun strategy
             if (!delta && !dIsSpecularType(mp->type)) camGlow = false;
             if (delta && !keepBundle) nUp = 1;             // λ-dependent direction change
@@ -25485,8 +25595,10 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
         d.coatStack = m.coatStack;
         d.coatParent = m.coatParent;
         d.coatTbarOff = -1;
+        d.coatTbarNT = 1;
         if (!m.coatTbar.empty()) {
             d.coatTbarOff = (int)coatTbarAll.size();
+            d.coatTbarNT = m.coatTbarNT;
             coatTbarAll.insert(coatTbarAll.end(), m.coatTbar.begin(), m.coatTbar.end());
         }
         d.readsCavity = m.readsCavity ? 1 : 0;
@@ -25624,7 +25736,8 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
         coat.coatLobe = 1;
         coat.coatStack = -1;
         coat.coatTbarOff = -1;
-        coat.coatParent = (int)i;
+        coat.coatTbarNT = 1;
+        coat.coatParent = (mats[i].coatModel == 2) ? -1 : (int)i;   // a manual coat's factor is 1
         coat.matIsLight = 0;
         coat.matReflectsNothing = 0;
         coat.emitPat = -1;

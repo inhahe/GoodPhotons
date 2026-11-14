@@ -1803,14 +1803,10 @@ inline void randomWalk(const Scene& scene, const Camera& cam, const Renderer& ma
         // A coated vertex's continuation takes the coat (render.h coatF: a body's way out, a
         // coat's reciprocal reflection), at each live wavelength and, on a mode-J camera walk,
         // each bin of its carrier: the walk took the coat at its arrival (the coin).
-        if (coatAny(*mp)) {
-            const Vec3 wiC = normalize(wi);
-            const double s = coatF(scene, *mp, h, wo, wiC, lambda);
-            if (!(s > 0.0)) return;
-            beta *= s;
-            for (int i = 0; i + 1 < nUp; ++i) betaSec[i] *= coatF(scene, *mp, h, wo, wiC, hb.lam[i + 1]);
-            if (jsw) jsw->run.mul([&](double L) { return coatF(scene, *mp, h, wo, wiC, L); }, s, false);
-        }
+        if (coatAny(*mp) &&
+            !coatContinueWalk(scene, *mp, h, wo, normalize(wi), lambda, beta, betaSec, hb.lam + 1, nUp - 1,
+                              [&](const auto& f, double s) { if (jsw) jsw->run.mul(f, s, false); }))
+            return;
         // Fold this vertex's spectral factor into the beam claim, or retire it. Sits beside
         // `beta *= betaFactor` because it is the same multiplication seen per wavelength:
         // foldT and beamW carry f(lam_k)/f(lambda), the ratio beta itself cannot express.
@@ -4075,11 +4071,8 @@ inline double connectBDPT(const Scene& scene, const Camera& cam, const Renderer&
             for (int i = 0; i + 1 < nUp; ++i)
                 fSec[i] = bsdfFAdjoint(*qs.mat, qs.ns, wo, wcam, hb.lam[i + 1], scene,
                                        &qs.hit) * adj;
-            if (coatAny(*qs.mat)) {   // a coated vertex's coat toward the camera (coatF)
-                f *= coatF(scene, *qs.mat, qs.hit, wo, wcam, lambda);
-                for (int i = 0; i + 1 < nUp; ++i)
-                    fSec[i] *= coatF(scene, *qs.mat, qs.hit, wo, wcam, hb.lam[i + 1]);
-            }
+            // a coated vertex's coat toward the camera (coatF)
+            coatScale(scene, *qs.mat, qs.hit, wo, wcam, lambda, f, fSec, hb.lam + 1, nUp - 1);
         }
         {   // max over live wavelengths (identical to `f <= 0` when nUp==1)
             double mxF = f;
@@ -4254,11 +4247,8 @@ inline double connectBDPT(const Scene& scene, const Camera& cam, const Renderer&
             f = bsdfF(*pt.mat, pt.ns, wo, wi, lambda, scene, &pt.hit);
             for (int i = 0; i + 1 < nUp; ++i)
                 fSec[i] = bsdfF(*pt.mat, pt.ns, wo, wi, hb.lam[i + 1], scene, &pt.hit);
-            if (coatAny(*pt.mat)) {   // a coated vertex's coat toward the light (coatF)
-                f *= coatF(scene, *pt.mat, pt.hit, wo, wi, lambda);
-                for (int i = 0; i + 1 < nUp; ++i)
-                    fSec[i] *= coatF(scene, *pt.mat, pt.hit, wo, wi, hb.lam[i + 1]);
-            }
+            // a coated vertex's coat toward the light (coatF)
+            coatScale(scene, *pt.mat, pt.hit, wo, wi, lambda, f, fSec, hb.lam + 1, nUp - 1);
         }
         {   // max over live wavelengths (identical to `f <= 0` when nUp==1)
             double mxF = f;
@@ -4313,11 +4303,8 @@ inline double connectBDPT(const Scene& scene, const Camera& cam, const Renderer&
             fE = bsdfF(*pt.mat, pt.ns, woE, w, lambda, scene, &pt.hit);
             for (int i = 0; i + 1 < nUp; ++i)
                 fESec[i] = bsdfF(*pt.mat, pt.ns, woE, w, hb.lam[i + 1], scene, &pt.hit);
-            if (coatAny(*pt.mat)) {   // a coated vertex's coat along the connection (coatF)
-                fE *= coatF(scene, *pt.mat, pt.hit, woE, w, lambda);
-                for (int i = 0; i + 1 < nUp; ++i)
-                    fESec[i] *= coatF(scene, *pt.mat, pt.hit, woE, w, hb.lam[i + 1]);
-            }
+            // a coated vertex's coat along the connection (coatF)
+            coatScale(scene, *pt.mat, pt.hit, woE, w, lambda, fE, fESec, hb.lam + 1, nUp - 1);
         }
         if (qs.type == VType::Medium) {
             cosL = 1.0; fL = mediumScatterF(qs, woL, w * -1.0, lambda, scene);
@@ -4343,11 +4330,8 @@ inline double connectBDPT(const Scene& scene, const Camera& cam, const Renderer&
             for (int i = 0; i + 1 < nUp; ++i)
                 fLSec[i] = bsdfFAdjoint(*qs.mat, qs.ns, woL, w * -1.0, hb.lam[i + 1], scene,
                                         &qs.hit) * adjL;
-            if (coatAny(*qs.mat)) {   // a coated vertex's coat along the connection (coatF)
-                fL *= coatF(scene, *qs.mat, qs.hit, woL, w * -1.0, lambda);
-                for (int i = 0; i + 1 < nUp; ++i)
-                    fLSec[i] *= coatF(scene, *qs.mat, qs.hit, woL, w * -1.0, hb.lam[i + 1]);
-            }
+            // a coated vertex's coat along the connection (coatF)
+            coatScale(scene, *qs.mat, qs.hit, woL, w * -1.0, lambda, fL, fLSec, hb.lam + 1, nUp - 1);
         }
         {   // max over live wavelengths (identical to `fE<=0 || fL<=0` when nUp==1)
             double mxE = fE, mxL = fL;

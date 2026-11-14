@@ -3499,10 +3499,11 @@ private:
 
     // Which material families route their reflect slot through diffuseReflectance() /
     // reflectSlot(), the only two accessors that apply reflectPat. Anything else reads
-    // `m.reflect` directly (Fluorescent's fluoroWeights, for instance, which has no hit
-    // to evaluate a pattern at), so a pattern there would be silently dropped — and the
-    // flat-1.0 base that a lone `reflect pattern:` leaves behind would then render as
-    // albedo 1.0, a WRONG image rather than a missing effect. Hence the loader refuses it.
+    // `m.reflect` directly, so a pattern there would be silently dropped — and the flat-1.0
+    // base that a lone `reflect pattern:` leaves behind would then render as albedo 1.0, a
+    // WRONG image rather than a missing effect. Hence the loader refuses it. (Fluorescent's
+    // elastic albedo goes through diffuseReflectance at a hit, render.h fluoroWeights, but a
+    // patterned one is not validated against its absorption band: refused too.)
     static bool reflectPatHonoured(MatType t) {
         return t == MatType::Diffuse   || t == MatType::DiffuseTransmit ||
                t == MatType::Mirror    || t == MatType::HalfMirror      ||

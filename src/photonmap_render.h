@@ -1279,12 +1279,8 @@ inline BackwardRenderer::GiCtx coatGi(const Material& m, const Vec3& wa) {
 // left to carry.
 inline bool coatWalkOut(const Scene& scene, const Material& m, const Hit& h, const Vec3& wa,
                         const Vec3& d, double lambda, double& thr, SpecThr* sthr) {
-    if (!coatAny(m)) return true;
-    const double s = coatF(scene, m, h, wa, d, lambda);
-    if (!(s > 0.0)) return false;
-    thr *= s;
-    if (sthr) sthr->mul([&](double Lw) { return coatF(scene, m, h, wa, d, Lw); }, s);
-    return true;
+    return coatContinueWalk(scene, m, h, wa, d, lambda, thr, nullptr, nullptr, 0,
+                            [&](const auto& f, double s) { if (sthr) sthr->mul(f, s); });
 }
 
 // CURVE-GATHER: a camera walk's step at a strand that holds no photon (gatherlessStrand), for every
@@ -1329,10 +1325,10 @@ inline Vec3 photonGatherSub(const Scene& scene, const PhotonMap& pm, Ray ray, Pc
     double contSoft = contSoftening(visMat, visHit, ray.d);
     // A coated visible point's lobe takes the coat on the gather ray's way in (render.h coatF; the
     // camera walk reached it from `visWa`), at each wavelength a term reads the visible point's
-    // reflectance at: it rides in rhoV. Read per photon, so memoised by nm (the rounding the coat's
-    // T-bar table already takes).
-    const Vec3 dVis = ray.d;
+    // reflectance at: it rides in rhoV. Prepared once (CoatEval) and, read per photon, memoised by
+    // nm (the rounding the coat's T-bar table already takes).
     const bool visCoat = coatAny(visMat);
+    const CoatEval visCe = visCoat ? coatEval(scene, visMat, visHit, visWa, ray.d) : CoatEval{};
     constexpr int kVisN = (int)(LAMBDA_MAX - LAMBDA_MIN) + 1;
     double sVisMemo[kVisN];
     if (visCoat) std::fill(sVisMemo, sVisMemo + kVisN, -1.0);
@@ -1340,8 +1336,7 @@ inline Vec3 photonGatherSub(const Scene& scene, const PhotonMap& pm, Ray ray, Pc
         if (!visCoat) return 1.0;
         int i = (int)std::lround(Lw - LAMBDA_MIN);
         i = i < 0 ? 0 : (i >= kVisN ? kVisN - 1 : i);
-        if (sVisMemo[i] < 0.0)
-            sVisMemo[i] = coatF(scene, visMat, visHit, visWa, dVis, LAMBDA_MIN + (double)i);
+        if (sVisMemo[i] < 0.0) sVisMemo[i] = visCe.at(LAMBDA_MIN + (double)i);
         return sVisMemo[i];
     };
 
@@ -1570,7 +1565,7 @@ inline Vec3 photonGatherSub(const Scene& scene, const PhotonMap& pm, Ray ray, Pc
                     const double rhoV = (clamp01(diffuseReflectance(scene, visMat, visHit, lambda)) * sVis(lambda));
                     L += Vec3(cieX(lambda), cieY(lambda), cieZ(lambda))
                          * (thr * rhoV * bwNee.neeLight(scene, h, 1.0, invPdfL, lambda, rng, nullptr,
-                                                 coatGi(m, ray.d * -1.0), &hs, nullptr, nullptr));
+                                                 BackwardRenderer::GiCtx(), &hs, nullptr, nullptr));   // a fibre has no coat
                     hairArrival = true;
                 }
                 double pdfH = 0.0, fv = 0.0;
@@ -1859,7 +1854,6 @@ inline Vec3 photonGather(const Scene& scene, const PhotonMap& pm, Ray ray, doubl
             continue;
         }
 
-        bool passThrough = false;   // a fibre's coverage pass-through: no vertex (the Hair case)
         const Vec3 wArr = ray.d * -1.0;   // the arrival, for the coat (coatWalkOut)
         switch (m.type) {
             case MatType::Diffuse:
@@ -2075,7 +2069,7 @@ inline Vec3 photonGather(const Scene& scene, const PhotonMap& pm, Ray ray, doubl
                     if (!didSpec)
                         L += Vec3(cieX(lambda), cieY(lambda), cieZ(lambda))
                              * (thr * bwNee.neeLight(scene, h, 1.0, invPdfL, lambda, rng, nullptr,
-                                                     coatGi(m, ray.d * -1.0), &hs, nullptr, nullptr));
+                                                     BackwardRenderer::GiCtx(), &hs, nullptr, nullptr));   // a fibre has no coat
                     hairArrival = true;
                 }
                 double pdfH = 0.0, fv = 0.0;
@@ -2096,7 +2090,6 @@ inline Vec3 photonGather(const Scene& scene, const PhotonMap& pm, Ray ray, doubl
                 // gather sub-walk), so light seen straight through the fiber is counted as it
                 // would weigh it.
                 if (passedThru) {   // ...and its bounce refunded
-                    passThrough = true;
                     hairArrival = hairArrivalIn; gmis = gmisIn; contSoft = contSoftIn;
                     if (nullSteps < 256) { --b; ++nullSteps; }
                 } else {
@@ -2145,8 +2138,8 @@ inline Vec3 photonGather(const Scene& scene, const PhotonMap& pm, Ray ray, doubl
             }
         }
         // A coated vertex's continuation takes the coat, at each photon's wavelength too
-        // (SPECGATHER).
-        if (!passThrough && !coatWalkOut(scene, m, h, wArr, ray.d, lambda, thr, &sthr)) return L;
+        // (SPECGATHER). A fibre has no coat, so its pass-through never reaches this.
+        if (!coatWalkOut(scene, m, h, wArr, ray.d, lambda, thr, &sthr)) return L;
         if (thr <= 0.0) return L;
     }
     return L;

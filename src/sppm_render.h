@@ -216,7 +216,6 @@ inline void sppmVisiblePoint(const Scene& scene, Ray ray, Pcg32& rng, bool diffr
             continue;
         }
 
-        bool passThrough = false;   // a fibre's coverage pass-through: no vertex (the Hair case)
         const Vec3 wArr = ray.d * -1.0;   // the arrival, for the coat (coatWalkOut)
         switch (m.type) {
             case MatType::Diffuse:
@@ -341,7 +340,6 @@ inline void sppmVisiblePoint(const Scene& scene, Ray ray, Pcg32& rng, bool diffr
                 const bool passedThru = (hs.b.opacity < 1.0) && wl.x == -hs.woLocal.x &&
                                         wl.y == -hs.woLocal.y && wl.z == -hs.woLocal.z;
                 if (passedThru) {   // no vertex: the last real one's record stands, its bounce refunded
-                    passThrough = true;
                     gmis = gmisIn; strandArrival = strandArrivalIn; contSoft = contSoftIn;
                     if (nullSteps < 256) { --b; ++nullSteps; }
                 }
@@ -368,8 +366,9 @@ inline void sppmVisiblePoint(const Scene& scene, Ray ray, Pcg32& rng, bool diffr
             }
         }
         // A coated vertex's continuation takes the coat, at each photon's wavelength too
-        // (photonmap_render.h coatWalkOut, as mode M's walk).
-        if (!passThrough && !coatWalkOut(scene, m, h, wArr, ray.d, lambda, thr, &sthr)) return;
+        // (photonmap_render.h coatWalkOut, as mode M's walk). A fibre has no coat, so its
+        // pass-through never reaches this.
+        if (!coatWalkOut(scene, m, h, wArr, ray.d, lambda, thr, &sthr)) return;
         if (thr <= 0.0) return;
     }
 }

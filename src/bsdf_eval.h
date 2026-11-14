@@ -160,9 +160,11 @@ inline double bsdfF(const Material& m, const Vec3& ns, const Vec3& wo, const Vec
         }
         case MatType::Fluorescent: {
             // Only the elastic (wavelength-preserving) diffuse base connects; the
-            // Stokes-shifted re-emission is a wavelength change we don't connect.
+            // Stokes-shifted re-emission is a wavelength change we don't connect. Its albedo is
+            // a diffuse body's (render.h fluoroWeights), which the walks shade it with.
             if (!lambertLit(cosWi)) return 0.0;
-            double rho = clamp01(m.reflect(lambda));
+            double rho = hitForTex ? clamp01(diffuseReflectance(scene, m, *hitForTex, lambda))
+                                   : clamp01(m.reflect(lambda));
             return rho / PI;
         }
         case MatType::Glossy:

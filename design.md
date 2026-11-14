@@ -2010,7 +2010,14 @@ apart. The coat is reciprocal now, on both of its lobes:
   fluorescent: `coatLambertBody`) sends its light everywhere, and its albedo holds the coat's
   averaged escape (`coatedAlbedo`'s 1 - F_dr = T-bar / n^2, T-bar T's cosine-weighted mean, a table
   by nm per layered material, `Material::coatTbar`): it takes T(out) / T-bar (`coatStackS`), with the
-  coin T(in) T(out) / T-bar, the physical clear coat with the same energy. A directional body
+  coin T(in) T(out) / T-bar, the physical clear coat with the same energy. T-bar is read at the film's
+  thickness at the hit: a thin film whose thickness a map varies holds rows of it across the map's 0..1
+  profile, eight to the reflectance's period in the thickness at the shortest wavelength, interpolated
+  (`coatTbarAt`; before 0.444.2 one row at the authored thickness, and a white body under a mapped
+  high-index film did not conserve energy). A fluorescent body's shifted light leaves at its
+  re-emitted wavelength, so its escape is normalised there: a camera walk, which reaches it at the
+  re-emitted wavelength and goes on at the absorbed one, takes T-bar(in) / T-bar(out) on that branch
+  (`coatShiftTbar`), as a light walk does by itself. A directional body
   (glossy, mirror) leaves near the mirror of its arrival and its albedo holds that angle's escape:
   it takes sqrt(T(out) / T(in)), with the coin sqrt(T(in) T(out)) -- exactly T for a mirror, so a
   white mirror under a smooth coat returns what it receives (0.444.0's first form, T/T-bar for every
@@ -2025,6 +2032,9 @@ apart. The coat is reciprocal now, on both of its lobes:
   splat (`GlossySplat::stack`) takes F(h) itself. The coat's angles are read at the SHADING normal
   (`coatRDir`), so a smooth coat's mirror pair -- reflected about the shading normal -- has the ratio
   1 on a normal-mapped surface too. The coat copy names its stack (`Material::coatParent`).
+* **A manual coat (`reflectance manual`) is no coat to the factor**: its R is a constant, so the
+  factor is 1, and its body and coat copies name no stack (`coatAny` false): nothing pays for it, and
+  the radiance cache ends paths there as on a bare body.
 * **One factor, at every site that evaluates a vertex's lobe off its arrival,** passed explicitly:
   `CoatCtx` (the vertex's material and arrival) for the sites that hold the scene and the hit -- a
   walk's continuation (every mode, host and device), mode R's light samples and gathers
@@ -2035,13 +2045,18 @@ apart. The coat is reciprocal now, on both of its lobes:
   a Lambertian lobe gathers), and the gather's camera walk takes the coin at its own; a J/U light
   vertex, stored before its pick too (COMPOUND-MERGE-PICK), takes it at the merge, on the camera
   vertex's material and arrival. A final gather takes the visible point's factor on each gather ray
-  at each photon's wavelength, memoised per nm, inside its `rhoV`. The radiance cache does not end a
-  path at a coated vertex, whose tail its cosine-weighted mean does not hold.
+  at each photon's wavelength, inside its `rhoV`. The radiance cache does not end a path at a coated
+  vertex, whose tail its cosine-weighted mean does not hold. Where the factor is taken at several
+  wavelengths for one pair -- a bundle's live ones, a spectral carrier's bins, a gather's photons --
+  it is prepared once (`CoatEval`, device `DCoatEval`: the film's thickness, a texture or pattern
+  read, and the pair's cosines), and a continuation takes it through one helper
+  (`coatContinueWalk`, `coatScale` for a connection's value; device twins).
 
 `tools/check_layered_modes.py` holds every mode to R within 1 % on five coated rooms (smooth and
-rough Fresnel, thin film, a glossy body, a translucent sheet) and a white furnace (each coated white
-sphere, diffuse and mirror, at the sky's radiance in mode R), host and device; mode B is not scored
-where the coat is smooth, as it images no delta lobe. The weight F(h) / R(arrival) is large where R
+rough Fresnel, thin film, a glossy body, a translucent sheet), mode B to R on a fluorescent body
+under a high-index film, and a white furnace (each coated white sphere -- diffuse, mirror, and
+diffuse under a thickness-mapped film -- at the sky's radiance in mode R), host and device; mode B is
+not scored where the coat is smooth, as it images no delta lobe. The weight F(h) / R(arrival) is large where R
 at the arrival is near 0 and the pair's is not (an anti-reflection film), but the coin takes those as
 rarely as R is small, and a rough quarter-wave film's frames spread no more than a Fresnel coat's
 (known-issues COAT-AR-VARIANCE).
@@ -7776,10 +7791,13 @@ as the one at fault.
   device twins `dDiffuseRho` / `dReflectSlot` — so all six tracers and both backends pick it
   up from one edit, and `renderBackwardRGBCuda`'s baked-RGB fast path opts out alongside the
   existing `reflectTex` opt-out. The families whose reflect slot does *not* go through those
-  accessors (Fluorescent's `fluoroWeights`, which has no hit to evaluate at; ThinFilm;
-  Dielectric) are **rejected at load** rather than silently ignored, because the flat-1.0
-  base a lone `reflect pattern:` leaves behind would otherwise render as albedo 1.0 — a
-  wrong image rather than a missing effect.
+  accessors (ThinFilm; Dielectric) are **rejected at load** rather than silently ignored, because
+  the flat-1.0 base a lone `reflect pattern:` leaves behind would otherwise render as albedo 1.0 —
+  a wrong image rather than a missing effect. Fluorescent is refused too: its elastic albedo has
+  read `diffuseReflectance` at the hit in every walk since 0.444.2 (`fluoroWeights`; before, mode R,
+  the forward walks and the connections read the bare slot while the bidirectional walks and the
+  device's forward walk read the accessor, and a coated or textured fluorescent body rendered
+  differently by mode), but a patterned one is not validated against its absorption band.
 
   **One reflect chain for every BSDF (0.367.2).** Host `reflectSlot` — the tint of the
   specular families (glossy, mirror, grating, half-mirror) — read a bound record or the

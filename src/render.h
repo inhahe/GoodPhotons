@@ -230,10 +230,18 @@ inline int photonVertexKind(const Scene& scene, const Material& m, const Hit& h)
 // (albedo rho, wavelength preserved) and dye excitation (prob aEff = min(eps,
 // 1-rho) so the channels never exceed unity, preserving energy). Excited photons
 // re-radiate with probability Q at a Stokes-shifted wavelength drawn from M.
-inline void fluoroWeights(const Material& m, double lambda, double& rho, double& aEff) {
-    rho = clamp01(m.reflect(lambda));
+// The elastic albedo at a hit is diffuseReflectance's, as a diffuse body's is -- its texture, record
+// or vertex colour, and a coated body's internal reflections (coatedAlbedoAt) -- the one every walk
+// reads (bsdf_eval.h bsdfF, backward.h, the bidirectional walks; device dDiffuseRho). Without a hit
+// (-checkfluoro) the `reflect` slot itself.
+inline void fluoroWeights(const Scene* scene, const Material& m, const Hit* h, double lambda,
+                          double& rho, double& aEff) {
+    rho = (scene && h) ? clamp01(diffuseReflectance(*scene, m, *h, lambda)) : clamp01(m.reflect(lambda));
     double eps = clamp01(m.fluoAbsorb(lambda));
     aEff = std::min(eps, std::max(0.0, 1.0 - rho));
+}
+inline void fluoroWeights(const Material& m, double lambda, double& rho, double& aEff) {
+    fluoroWeights(nullptr, m, nullptr, lambda, rho, aEff);
 }
 
 enum class FluoroEvent { Elastic, Reemit, Absorb };
@@ -244,8 +252,9 @@ struct FluoroResult { FluoroEvent event; double lambdaOut; };
 // Absorb -> photon lost (dye heat / non-excited fraction). Throughput weight is
 // unchanged in all surviving branches (the branch probabilities carry the
 // reradiation efficiency, and M/pdf cancels for the sampled lambdaOut).
-inline FluoroResult fluoroInteract(const Material& m, double lambdaIn, Pcg32& rng) {
-    double rho, aEff; fluoroWeights(m, lambdaIn, rho, aEff);
+inline FluoroResult fluoroInteract(const Scene* scene, const Material& m, const Hit* h, double lambdaIn,
+                                   Pcg32& rng) {
+    double rho, aEff; fluoroWeights(scene, m, h, lambdaIn, rho, aEff);
     double u = rng.uniform();
     if (u < rho)          return {FluoroEvent::Elastic, lambdaIn};
     if (u < rho + aEff) {
@@ -254,6 +263,9 @@ inline FluoroResult fluoroInteract(const Material& m, double lambdaIn, Pcg32& rn
         return {FluoroEvent::Reemit, lp};
     }
     return {FluoroEvent::Absorb, 0.0};
+}
+inline FluoroResult fluoroInteract(const Material& m, double lambdaIn, Pcg32& rng) {
+    return fluoroInteract(nullptr, m, nullptr, lambdaIn, rng);
 }
 
 // Interface (coat) reflectance for a MatType::Layered surface at a hit. Returns the
@@ -279,20 +291,36 @@ inline double layeredCoatReflectance(const Scene& scene, const Material& m, cons
     return coatRDir(m, h, d, coatThickness(scene, m, h), lambda);
 }
 
+// T-bar (Material::coatTbar) of the layered material `st` at `lambda`, for a film of `thickness` (the
+// hit's coatThickness): a mapped thin film's rows interpolated at it, else its one row; by nm. 1 where
+// it has none.
+inline double coatTbarAt(const Material& st, double thickness, double lambda) {
+    constexpr int nL = (int)(LAMBDA_MAX - LAMBDA_MIN) + 1;
+    if (st.coatTbar.size() < (size_t)nL) return 1.0;
+    int l = (int)std::lround(lambda - LAMBDA_MIN);
+    l = l < 0 ? 0 : (l >= nL ? nL - 1 : l);
+    const int nT = st.coatTbarNT;
+    if (nT <= 1) return st.coatTbar[(size_t)l];
+    const double x = clamp01((st.filmThickness > 0.0) ? thickness / st.filmThickness : 0.0) * (double)(nT - 1);
+    int r = (int)x;
+    if (r > nT - 2) r = nT - 2;
+    const double a = st.coatTbar[(size_t)r * nL + (size_t)l], b = st.coatTbar[(size_t)(r + 1) * nL + (size_t)l];
+    return a + (b - a) * (x - (double)r);
+}
+
 // LAYERED-MODES (b): what the coat of the layered material `st` gives a LAMBERTIAN body's lobe under it
 // on a direction `w` other than the one its walk met the coat by -- the light's way out to w, or in
-// from it -- as a multiple of the average the body's albedo already holds: (1 - R(w)) / T-bar. Its
-// mean over the hemisphere with the cosine is 1. 1 for a constant coat (no table). Named by the stack
-// for a compound's deposit, made before its pick and shared by every body under it (only a
-// Lambertian lobe gathers).
+// from it -- as a multiple of the average the body's albedo already holds: (1 - R(w)) / T-bar, both at
+// the film's thickness here. Its mean over the hemisphere with the cosine is 1. 1 for a coat with no
+// table. Named by the stack for a compound's deposit, made before its pick and shared by every body
+// under it (only a Lambertian lobe gathers).
 inline double coatStackS(const Scene& scene, const Material& st, const Hit& h, const Vec3& w,
                          double lambda) {
     if (st.coatTbar.empty()) return 1.0;
-    int i = (int)std::lround(lambda - LAMBDA_MIN);
-    i = i < 0 ? 0 : (i >= (int)st.coatTbar.size() ? (int)st.coatTbar.size() - 1 : i);
-    const double tb = st.coatTbar[(size_t)i];
+    const double th = coatThickness(scene, st, h);
+    const double tb = coatTbarAt(st, th, lambda);
     if (!(tb > 0.0)) return 0.0;
-    return (1.0 - layeredCoatReflectance(scene, st, h, w, lambda)) / tb;
+    return (1.0 - coatRDir(st, h, w, th, lambda)) / tb;
 }
 
 // The coat's reflectance for the pair `wa`, `wb` at `h`, both pointing away from the surface: its
@@ -335,23 +363,120 @@ inline bool coatLambertBody(const Material& m) {
 }
 // The coat's factor on the lobe of `m` at `h`, for a walk that arrived from `wa` (toward the
 // previous vertex) and leaves or connects along `wb`: a body copy's way out, a coat copy's
-// reciprocal reflection (coatSheenRatio), 1 for anything else (coatAny false). The coat is on both
-// faces of the body, as the coin takes it, so a transmit lobe's way out through the far face takes
-// it too. (A dielectric body under a coat is refused at load: thinfilm and multilayer are that.)
+// reciprocal reflection (coatSheenRatio), 1 for anything else (coatAny false: no coat, or a manual
+// one, whose factor is 1). The coat is on both faces of the body, as the coin takes it, so a
+// transmit lobe's way out through the far face takes it too. (A dielectric body under a coat is
+// refused at load: thinfilm and multilayer are that.)
+//
+// CoatEval is that factor for one pair with everything but the wavelength read once -- the film's
+// thickness (a texture or pattern read) and the pair's cosines -- for a caller that takes it at
+// several wavelengths (a bundle's live ones, a spectral carrier's bins, a gather's photons); coatF
+// reads it once. Device twin DCoatEval.
 inline bool coatAny(const Material& m) { return m.coatStack >= 0 || m.coatParent >= 0; }
-inline double coatF(const Scene& scene, const Material& m, const Hit& h, const Vec3& wa,
-                    const Vec3& wb, double lambda) {
+struct CoatEval {
+    enum Kind { One, Lambert, Directional, Sheen, Zero };
+    Kind kind = One;
+    const Material* st = nullptr;   // the layered material whose coat it is
+    double th = 0.0;                // the film's thickness at the hit (coatThickness)
+    double cA = 1.0;                // the arrival's cosine (Directional, Sheen)
+    double cB = 1.0;                // the way out's (Lambert, Directional); the pair's half vector's (Sheen)
+    double at(double lambda) const {
+        switch (kind) {
+            case Lambert: {                              // (1 - R(out)) / T-bar: coatStackS
+                const double tb = coatTbarAt(*st, th, lambda);
+                return (tb > 0.0) ? (1.0 - coatRAtCos(*st, cB, th, lambda)) / tb : 0.0;
+            }
+            case Directional: {                          // sqrt(T(out) / T(in))
+                const double ta = 1.0 - coatRAtCos(*st, cA, th, lambda);
+                return (ta > 0.0) ? std::sqrt((1.0 - coatRAtCos(*st, cB, th, lambda)) / ta) : 0.0;
+            }
+            case Sheen: {                                // F(h) / R(in): coatSheenRatio
+                const double ra = coatRAtCos(*st, cA, th, lambda);
+                return (ra > 0.0) ? coatRAtCos(*st, cB, th, lambda) / ra : 0.0;
+            }
+            case Zero: return 0.0;
+            default: return 1.0;
+        }
+    }
+};
+inline CoatEval coatEval(const Scene& scene, const Material& m, const Hit& h, const Vec3& wa,
+                         const Vec3& wb) {
+    CoatEval c;
     if (m.coatStack >= 0) {
         const Material& st = scene.mats[(size_t)m.coatStack];
-        if (coatLambertBody(m)) return coatStackS(scene, st, h, wb, lambda);
-        if (st.coatModel == 2) return 1.0;
-        const double th = coatThickness(scene, st, h);
-        const double ta = 1.0 - coatRDir(st, h, wa, th, lambda);
-        return (ta > 0.0) ? std::sqrt((1.0 - coatRDir(st, h, wb, th, lambda)) / ta) : 0.0;
+        if (coatLambertBody(m) ? st.coatTbar.empty() : st.coatModel == 2) return c;
+        c.kind = coatLambertBody(m) ? CoatEval::Lambert : CoatEval::Directional;
+        c.st = &st;
+        c.th = coatThickness(scene, st, h);
+        c.cA = clamp01(std::fabs(dot(wa, h.n)));
+        c.cB = clamp01(std::fabs(dot(wb, h.n)));
+        return c;
     }
-    if (m.coatParent >= 0)
-        return coatSheenRatio(scene, scene.mats[(size_t)m.coatParent], h, wa, wb, lambda);
-    return 1.0;
+    if (m.coatParent >= 0) {
+        const Material& st = scene.mats[(size_t)m.coatParent];
+        if (st.coatModel == 2) return c;
+        c.st = &st;
+        c.th = coatThickness(scene, st, h);
+        const Vec3 hv = wa + wb;
+        const double l = length(hv);
+        if (!(l > 0.0)) { c.kind = CoatEval::Zero; return c; }
+        c.kind = CoatEval::Sheen;
+        c.cA = clamp01(std::fabs(dot(wa, h.n)));
+        c.cB = clamp01(std::fabs(dot(wa, hv)) / l);
+    }
+    return c;
+}
+inline double coatF(const Scene& scene, const Material& m, const Hit& h, const Vec3& wa,
+                    const Vec3& wb, double lambda) {
+    return coatEval(scene, m, h, wa, wb).at(lambda);
+}
+// A coated walk's continuation along `wb` (unit), the walk having arrived from `wa`: the coat's factor
+// into `beta` at the walk's wavelength, into `betaSec` at the `nSec` other live wavelengths `lamSec`,
+// and into a spectral carrier by `fold(f, atLambda)` (f the factor at any wavelength; a no-op where
+// there is none). False: the factor is 0 at the walk's wavelength and the walk carries nothing.
+// Nothing for an uncoated material.
+template <class Fold>
+inline bool coatContinueWalk(const Scene& scene, const Material& m, const Hit& h, const Vec3& wa,
+                             const Vec3& wb, double lambda, double& beta, double* betaSec,
+                             const double* lamSec, int nSec, const Fold& fold) {
+    if (!coatAny(m)) return true;
+    const CoatEval ce = coatEval(scene, m, h, wa, wb);
+    const double s = ce.at(lambda);
+    if (!(s > 0.0)) return false;
+    beta *= s;
+    for (int i = 0; i < nSec; ++i) betaSec[i] *= ce.at(lamSec[i]);
+    fold([&](double L) { return ce.at(L); }, s);
+    return true;
+}
+inline bool coatContinueWalk(const Scene& scene, const Material& m, const Hit& h, const Vec3& wa,
+                             const Vec3& wb, double lambda, double& beta, double* betaSec = nullptr,
+                             const double* lamSec = nullptr, int nSec = 0) {
+    return coatContinueWalk(scene, m, h, wa, wb, lambda, beta, betaSec, lamSec, nSec,
+                            [](const auto&, double) {});
+}
+// The same for a connection's or a merge's lobe value: `f` at the walk's wavelength, `fSec` at the
+// `nSec` others, each times the coat's factor there (0 included: the caller's test over the live
+// wavelengths decides).
+inline void coatScale(const Scene& scene, const Material& m, const Hit& h, const Vec3& wa,
+                      const Vec3& wb, double lambda, double& f, double* fSec, const double* lamSec,
+                      int nSec) {
+    if (!coatAny(m)) return;
+    const CoatEval ce = coatEval(scene, m, h, wa, wb);
+    f *= ce.at(lambda);
+    for (int i = 0; i < nSec; ++i) fSec[i] *= ce.at(lamSec[i]);
+}
+// A coated Lambertian body whose light a fluorescent re-emission shifts from `lamIn` (absorbed) to
+// `lamOut` (re-emitted) gives it back through the coat at lamOut, so its lobe's averaged escape is
+// lamOut's: what a walk at lamIn, whose lobe takes coatF's T-bar at lamIn, is multiplied by (a light
+// walk re-emits at lamOut and takes it there by itself). 1 for anything else.
+inline double coatShiftTbar(const Scene& scene, const Material& m, const Hit& h, double lamIn,
+                            double lamOut) {
+    if (m.coatStack < 0 || !coatLambertBody(m)) return 1.0;
+    const Material& st = scene.mats[(size_t)m.coatStack];
+    if (st.coatTbar.empty()) return 1.0;
+    const double th = coatThickness(scene, st, h);
+    const double tOut = coatTbarAt(st, th, lamOut);
+    return (tOut > 0.0) ? coatTbarAt(st, th, lamIn) / tOut : 0.0;
 }
 
 // The coat a vertex's lobe takes, where the scene and the hit are at hand (a light sample, a gather,
@@ -365,6 +490,10 @@ struct CoatCtx {
     explicit operator bool() const { return m != nullptr; }
     double f(const Scene& scene, const Hit& h, const Vec3& wb, double lambda) const {
         return m ? coatF(scene, *m, h, wa, wb, lambda) : 1.0;
+    }
+    // f along `wb` prepared for several wavelengths (CoatEval).
+    CoatEval eval(const Scene& scene, const Hit& h, const Vec3& wb) const {
+        return m ? coatEval(scene, *m, h, wa, wb) : CoatEval{};
     }
 };
 // The same for a light walk's camera splats, which have neither: they come along (device twin
@@ -2784,7 +2913,12 @@ struct Renderer {
                                  const Vec3& wo, const double* lam, double* beta, int nUp,
                                  EnergyReport& e) {
         if (!coatAny(m)) return;
-        for (int i = 0; i < nUp; ++i) coatContinue(scene, m, h, wa, wo, lam[i], beta[i], e);
+        const CoatEval ce = coatEval(scene, m, h, wa, wo);
+        for (int i = 0; i < nUp; ++i) {
+            const double s = ce.at(lam[i]);
+            e.absorbed += beta[i] * (1.0 - s);
+            beta[i] *= s;
+        }
     }
 
     // The lobes below, for a coated body too: its splats (the fluorescent ones) and its continuation
@@ -2887,7 +3021,7 @@ struct Renderer {
                 return true;
             }
             case MatType::Fluorescent: {
-                double rho, aEff; fluoroWeights(m, lambda, rho, aEff);
+                double rho, aEff; fluoroWeights(&scene, m, &h, lambda, rho, aEff);
                 Vec3 ngo = orientedGeoN(h);
                 Vec3 wi = Vec3{-ray.d.x, -ray.d.y, -ray.d.z};   // toward the previous (light-side) vertex
                 // A Lambertian lobe, as Diffuse's (lambertArrival).
@@ -2908,7 +3042,7 @@ struct Renderer {
                                     nullptr, nullptr, coat);
                     }
                 }
-                FluoroResult fr = fluoroInteract(m, lambda, rng);
+                FluoroResult fr = fluoroInteract(&scene, m, &h, lambda, rng);
                 if (fr.event == FluoroEvent::Absorb) { e.absorbed += beta; return false; }
                 lambda = fr.lambdaOut;              // Stokes-shifted on Reemit
                 Vec3 wo;

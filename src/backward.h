@@ -1378,11 +1378,11 @@ struct BackwardRenderer {
                                                  lam, KK, Tr, rng);
             const double gWeight = w * selW * wMis * thrScalar * dLam;
             if (!(gWeight > 0.0)) continue;
+            // the coat on a coated vertex's lobe (render.h coatF: a body's way in, a coat's
+            // reflection; 1 for a bare one): `nb` is the vertex's own material and arrival
+            const CoatEval ce = coatEval(scene, *nb.m, h, nb.wo, wiConn);
             for (int k = 0; k < KK; ++k) {
-                // the coat on a coated vertex's lobe (render.h coatF: a body's way in, a coat's
-                // reflection; 1 for a bare one): `nb` is the vertex's own material and arrival
-                const double f = bdpt::bsdfF(*nb.m, h.n, nb.wo, wiConn, lam[k], scene, &h) *
-                                 coatF(scene, *nb.m, h, nb.wo, wiConn, lam[k]);
+                const double f = bdpt::bsdfF(*nb.m, h.n, nb.wo, wiConn, lam[k], scene, &h) * ce.at(lam[k]);
                 if (!(f > 0.0)) continue;
                 const double v = gWeight * thrRatio[k] * f * em.spdFn(lam[k]) * Tr[k];
                 if (!(v > 0.0)) continue;
@@ -1510,17 +1510,19 @@ struct BackwardRenderer {
                         if (sum > 0.0) wMis = pNee / sum;
                     }
                     const double wsMis = ws * wMis;
+                    const CoatEval ce = gi.coat.eval(scene, h, wiConn);   // a coated vertex's
                     for (int i = 0; i < nUp; ++i) {
                         double f = bdpt::bsdfF(*nb->m, h.n, nb->wo, wiConn,
                                                lam[i], scene, &h);
                         if (!(f > 0.0)) continue;
-                        if (gi.coat) f *= gi.coat.f(scene, h, wiConn, lam[i]);   // a coated vertex's
+                        f *= ce.at(lam[i]);
                         const double spd = cached ? spdCache->at(e, i) : em.spdFn(lam[i]);
                         L[i] += thr[i] * f * (spd * invPdf[i]) * wsMis;
                     }
                 } else if (gi.coat) {   // a coated body: its lobe takes the coat at each member's
+                    const CoatEval ce = gi.coat.eval(scene, h, wiConn);
                     for (int i = 0; i < nUp; ++i)
-                        L[i] += thr[i] * (rho[i] / PI) * gi.coat.f(scene, h, wiConn, lam[i]) *
+                        L[i] += thr[i] * (rho[i] / PI) * ce.at(lam[i]) *
                                 ((cached ? spdCache->at(e, i) : em.spdFn(lam[i])) * invPdf[i]) * ws;
                 } else if (cached) {
                     for (int i = 0; i < nUp; ++i)
@@ -1539,9 +1541,10 @@ struct BackwardRenderer {
                     [&](const Vec3& wi, double* f, double& pdfB, Ray& r) {
                         double cosSurf = 0.0, stG = 0.0;
                         if (!dirResponse(scene, h, wi, nullptr, nb, cosSurf, stG, pdfB)) return false;
+                        const CoatEval ce = gi.coat.eval(scene, h, wi);
                         for (int i = 0; i < nUp; ++i) {
                             f[i] = (nb ? bdpt::bsdfF(*nb->m, h.n, nb->wo, wi, lam[i], scene, &h)
-                                       : rho[i] / PI) * cosSurf * stG * gi.coat.f(scene, h, wi, lam[i]);
+                                       : rho[i] / PI) * cosSurf * stG * ce.at(lam[i]);
                         }
                         r = fireRay(h, ngo, nullptr, wi);
                         return true;
@@ -1597,7 +1600,8 @@ struct BackwardRenderer {
                 for (int i = 0; i < nUp; ++i) if (Lg[i] > giClamp) Lg[i] = giClamp;
             // A coated body's lobe takes the coat on the way in from d (render.h coatF); its mean
             // under the cosine is 1, so wSum still normalises.
-            for (int i = 0; i < nUp; ++i) acc[i] += c * Lg[i] * gi.coat.f(scene, h, d, lam[i]);
+            const CoatEval ce = gi.coat.eval(scene, h, d);
+            for (int i = 0; i < nUp; ++i) acc[i] += c * Lg[i] * ce.at(lam[i]);
         }
         if (wSum <= 0.0) return;
         const double inv = 1.0 / wSum;
@@ -2550,7 +2554,7 @@ struct BackwardRenderer {
                 // fluoroInteract(). Elastic base reflects at the output wavelength; the
                 // fluorescent channel excites at a separately-sampled lambdaIn (Stokes
                 // shift). Both channels NEE; one stochastic continuation carries indirect.
-                double rhoEl = clamp01(m.reflect(lambda));   // elastic base at lambda(out)
+                double rhoEl = clamp01(diffuseReflectance(scene, m, h, lambda));   // elastic base at lambda(out)
                 // `gi` matters (it selects giGrid over lightGrid at a gather vertex) —
                 // omitting it here used to make a fluorescent surface pay lightGrid^2 shadow
                 // rays inside a -gi gather while every Diffuse vertex paid giGrid^2, so the
@@ -2562,6 +2566,10 @@ struct BackwardRenderer {
                 double Mint = m.fluoEmitSampler.integral;
                 bool haveFluoro = (Mint > 0.0 && m.fluoYield > 0.0);
                 double gOut = 0.0, rhoFluo = 0.0, lambdaIn = 0.0, invPdfIn = 0.0;
+                // A coated body gives the shifted light back through its coat at this walk's
+                // wavelength: what the light it took at lambdaIn is normalised by (render.h
+                // coatShiftTbar), its NEE's and its continuation's.
+                double tbShift = 1.0;
                 if (haveFluoro) {
                     gOut = (m.fluoEmit(lambda) / Mint) * invPdfLambda;
                     double pin = 0.0;
@@ -2589,16 +2597,17 @@ struct BackwardRenderer {
                         // emitG/g against a bin-discretised CDF draw.)
                         invPdfIn = 1.0 / pin;
                         double rhoIn, aEffIn;
-                        fluoroWeights(m, lambdaIn, rhoIn, aEffIn);   // shared with forward
+                        fluoroWeights(&scene, m, &h, lambdaIn, rhoIn, aEffIn);   // shared with forward
                         rhoFluo = aEffIn * m.fluoYield;              // reradiation albedo @lambdaIn
+                        tbShift = coatShiftTbar(scene, m, h, lambdaIn, lambda);
                         if (rhoFluo > 0.0) {                          // fluoro DIRECT NEE
                             // (lambdaIn ≠ the cached wavelengths → matches() fails and
                             // this evaluates spdFn live, exactly as before.)
-                            L += thr * gOut * neeLight(scene, h, rhoFluo, invPdfIn, lambdaIn,
-                                                       rng, spdCache, gi);
+                            L += thr * gOut * tbShift * neeLight(scene, h, rhoFluo, invPdfIn, lambdaIn,
+                                                                 rng, spdCache, gi);
                             if (scene.envIndex >= 0)
-                                L += thr * gOut * neeEnv(scene, h, rhoFluo, invPdfIn, lambdaIn, rng, nullptr,
-                                                         nullptr, nullptr, &gi.coat);
+                                L += thr * gOut * tbShift * neeEnv(scene, h, rhoFluo, invPdfIn, lambdaIn, rng,
+                                                                   nullptr, nullptr, nullptr, &gi.coat);
                         }
                     }
                 }
@@ -2612,7 +2621,7 @@ struct BackwardRenderer {
                     if (!continueAlong(h, wOut, Lobe::Reflect, ray)) return false;
                     specularArrival = false; return true;
                 } else if (u < rhoEl + pF) {                 // fluoro (wavelength-switched)
-                    thr *= wFluo / pF;
+                    thr *= wFluo / pF * tbShift;
                     lambda = lambdaIn;                       // Stokes shift (to the input wl)
                     invPdfLambda = invPdfIn;
                     Vec3 wOut = cosineHemisphere(h.n, rng);
@@ -4097,8 +4106,10 @@ struct BackwardRenderer {
                 }
             }
             if (!nullHere) contSoft = contSoftening(m, h, ray.d);   // what this vertex lends
-            if (!nullHere && gi.coat)
-                for (int i = 0; i < nUp; ++i) thr[i] *= gi.coat.f(scene, h, ray.d, lam[i]);
+            if (!nullHere && gi.coat) {
+                const CoatEval ce = gi.coat.eval(scene, h, ray.d);
+                for (int i = 0; i < nUp; ++i) thr[i] *= ce.at(lam[i]);
+            }
             gi.coat = CoatCtx();   // a medium or fur vertex next is no coated vertex
         }
         finish();

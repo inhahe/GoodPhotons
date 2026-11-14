@@ -850,13 +850,13 @@ inline void traceLightSubpath(const Scene& scene, const Camera& cam, const Rende
                             const double geo = shadingAdjointCorr(wo, wcam, h.n, ngo);
                             // ADJOINT: particle vertex connected to the camera (bsdfFAdjoint).
                             // ...times a coated vertex's coat toward the camera (coatF).
+                            const CoatEval ce = coatEval(scene, *mp, h, wo, wcam);
                             double f = bsdfFAdjoint(*mp, h.n, wo, wcam, lambda, scene, &h) * geo *
-                                       coatF(scene, *mp, h, wo, wcam, lambda);
+                                       ce.at(lambda);
                             double fSec[hero::kHeroMax - 1] = {0}, mxF = f;
                             for (int i = 0; i + 1 < nUp; ++i) {
                                 fSec[i] = bsdfFAdjoint(*mp, h.n, wo, wcam, hb.lam[i + 1],
-                                                       scene, &h) * geo *
-                                          coatF(scene, *mp, h, wo, wcam, hb.lam[i + 1]);
+                                                       scene, &h) * geo * ce.at(hb.lam[i + 1]);
                                 if (fSec[i] > mxF) mxF = fSec[i];
                             }
                             const bool isHairV = (mp->type == MatType::Hair);
@@ -920,13 +920,9 @@ inline void traceLightSubpath(const Scene& scene, const Camera& cam, const Rende
                    dVCM, dVC, dVM, /*mergeable=*/vcmMergeAt(*mp, h));
         beta *= betaFactor;
         for (int i = 0; i + 1 < nUp; ++i) betaSec[i] *= secChromatic ? secF[i] : betaFactor;
-        if (coatAny(*mp)) {   // a coated vertex's coat on the way out (render.h coatF; the coin took the way in)
-            const Vec3 wiC = normalize(wi);
-            const double s = coatF(scene, *mp, h, wo, wiC, lambda);
-            if (!(s > 0.0)) return;
-            beta *= s;
-            for (int i = 0; i + 1 < nUp; ++i) betaSec[i] *= coatF(scene, *mp, h, wo, wiC, hb.lam[i + 1]);
-        }
+        // a coated vertex's coat on the way out (render.h coatF; the coin took the way in)
+        if (!coatContinueWalk(scene, *mp, h, wo, normalize(wi), lambda, beta, betaSec, hb.lam + 1, nUp - 1))
+            return;
         if (!delta) {
             const double adj = shadingAdjointCorr(wo, normalize(wi), h.n, ngo);  // adjoint (continuation)
             beta *= adj;                                     // purely geometric: same for every λ
@@ -1240,8 +1236,8 @@ inline Vec3 traceCameraSubpath(const Scene& scene, const Camera& cam, const Rend
                                           : (cosToLight > 0.0 && stG > 0.0);
                         if (sideOk) {
                             // ...times a coated vertex's coat toward the light (coatF).
-                            double f = bsdfF(*mp, h.n, wo, wi, lambda, scene, &h) * stG *
-                                       coatF(scene, *mp, h, wo, wi, lambda);
+                            const CoatEval ce = coatEval(scene, *mp, h, wo, wi);
+                            double f = bsdfF(*mp, h.n, wo, wi, lambda, scene, &h) * stG * ce.at(lambda);
                             double Le = em.spdFn(lambda) * invPdfLambda * epat;
                             // Per-λ BSDF × emitted radiance; the emitter-sampling densities
                             // below are λ-independent and stay the hero's (the pattern
@@ -1249,7 +1245,7 @@ inline Vec3 traceCameraSubpath(const Scene& scene, const Camera& cam, const Rend
                             double fLeSec[hero::kHeroMax - 1] = {0}, mxfLe = f * Le;
                             for (int i = 0; i + 1 < nUp; ++i) {
                                 fLeSec[i] = bsdfF(*mp, h.n, wo, wi, hb.lam[i + 1], scene, &h) * stG *
-                                            coatF(scene, *mp, h, wo, wi, hb.lam[i + 1]) *
+                                            ce.at(hb.lam[i + 1]) *
                                             em.spdFn(hb.lam[i + 1]) * hb.invPdf[i + 1] * epat;
                                 if (fLeSec[i] > mxfLe) mxfLe = fLeSec[i];
                             }
@@ -1307,12 +1303,13 @@ inline Vec3 traceCameraSubpath(const Scene& scene, const Camera& cam, const Rend
                                (isTwoSidedMat(*lv.mat) || dot(ngoLit, w * -1.0) > 0.0);
                 if (!camSide || !litSide) continue;
                 // Each end a coated vertex's coat along the connection (coatF).
-                double fCam = bsdfF(*mp, h.n, wo, w, lambda, scene, &h) * coatF(scene, *mp, h, wo, w, lambda);
+                const CoatEval ceCam = coatEval(scene, *mp, h, wo, w);
+                const CoatEval ceLit = coatEval(scene, *lv.mat, lv.hit, lv.wo, w * -1.0);
+                double fCam = bsdfF(*mp, h.n, wo, w, lambda, scene, &h) * ceCam.at(lambda);
                 // ADJOINT on the light endpoint lv (particle side); fCam above is the
                 // Radiance side and correctly uses plain bsdfF. See bsdfFAdjoint.
                 double fLit = bsdfFAdjoint(*lv.mat, lv.ns, lv.wo, w * -1.0, lambda, scene,
-                                           &lv.hit) *
-                              coatF(scene, *lv.mat, lv.hit, lv.wo, w * -1.0, lambda);
+                                           &lv.hit) * ceLit.at(lambda);
                 // Adjoint correction on the LIGHT-subpath endpoint lv only (particle side;
                 // outgoing = -w toward the camera vertex). fCam is the Radiance side — none.
                 // Uses lv.ng on the side lv was shaded from (ngoLit above); a no-op when the mesh is flat.
@@ -1329,10 +1326,9 @@ inline Vec3 traceCameraSubpath(const Scene& scene, const Camera& cam, const Rend
                 double fProdSec[hero::kHeroMax - 1] = {0}, mxProd = fCam * fLit;
                 for (int i = 0; i + 1 < nUpConn; ++i) {
                     const double li = hb.lam[i + 1];
-                    double fc = bsdfF(*mp, h.n, wo, w, li, scene, &h) * coatF(scene, *mp, h, wo, w, li);
+                    double fc = bsdfF(*mp, h.n, wo, w, li, scene, &h) * ceCam.at(li);
                     double fl = bsdfFAdjoint(*lv.mat, lv.ns, lv.wo, w * -1.0, li, scene,
-                                             &lv.hit) * adjLit *
-                                coatF(scene, *lv.mat, lv.hit, lv.wo, w * -1.0, li);
+                                             &lv.hit) * adjLit * ceLit.at(li);
                     fProdSec[i] = fc * fl;
                     if (fProdSec[i] > mxProd) mxProd = fProdSec[i];
                 }
@@ -1405,8 +1401,8 @@ inline Vec3 traceCameraSubpath(const Scene& scene, const Camera& cam, const Rend
                     // ...times a coated vertex's coat on the light's way in (coatF; a coat copy's
                     // reflection too): the light vertex was stored before its own pick
                     // (compoundMergeStoreProb).
-                    double fCam = bsdfF(*mp, h.n, wo, wMerge, lam, scene, &h) *
-                                  coatF(scene, *mp, h, wo, wMerge, lam);
+                    const CoatEval ce = coatEval(scene, *mp, h, wo, wMerge);
+                    double fCam = bsdfF(*mp, h.n, wo, wMerge, lam, scene, &h) * ce.at(lam);
                     // HERO MERGE. Unlike the connection above, a merge gathers vertices from
                     // OTHER paths, i.e. other bundles — so it is keyed on the LIGHT VERTEX's
                     // wavelengths (its hero plus its live secondaries), exactly as the
@@ -1420,8 +1416,7 @@ inline Vec3 traceCameraSubpath(const Scene& scene, const Camera& cam, const Rend
                     double fSec[hero::kHeroMax - 1] = {0}, mxF = fCam;
                     for (int k = 0; k + 1 < lvUp; ++k) {
                         const double lk = (double)lightSec[(size_t)idx].lam[k];
-                        fSec[k] = bsdfF(*mp, h.n, wo, wMerge, lk, scene, &h) *
-                                  coatF(scene, *mp, h, wo, wMerge, lk);
+                        fSec[k] = bsdfF(*mp, h.n, wo, wMerge, lk, scene, &h) * ce.at(lk);
                         if (fSec[k] > mxF) mxF = fSec[k];
                     }
                     if (mxF <= 0.0) return;
@@ -1491,14 +1486,10 @@ inline Vec3 traceCameraSubpath(const Scene& scene, const Camera& cam, const Rend
         if (isFiberMat(*mp) && !delta) { dVC = 0.0; dVM = 0.0; }
         beta *= betaFactor;
         for (int i = 0; i + 1 < nUp; ++i) betaSec[i] *= secChromatic ? secF[i] : betaFactor;
-        if (coatAny(*mp)) {   // a coated vertex's coat on the way out, and on mode J's carrier (VCM-SPEC)
-            const Vec3 wiC = normalize(wi);
-            const double s = coatF(scene, *mp, h, wo, wiC, lambda);
-            if (!(s > 0.0)) return result;
-            beta *= s;
-            for (int i = 0; i + 1 < nUp; ++i) betaSec[i] *= coatF(scene, *mp, h, wo, wiC, hb.lam[i + 1]);
-            if (jOn) jr.mul([&](double L) { return coatF(scene, *mp, h, wo, wiC, L); }, s, false);
-        }
+        // a coated vertex's coat on the way out, and on mode J's carrier (VCM-SPEC)
+        if (!coatContinueWalk(scene, *mp, h, wo, normalize(wi), lambda, beta, betaSec, hb.lam + 1, nUp - 1,
+                              [&](const auto& f, double s) { if (jOn) jr.mul(f, s, false); }))
+            return result;
         if (!delta) camAllDelta = false;        // disqualifies the escaped-sun strategy
         if (!delta && !isSpecularType(mp->type)) camGlow = false;
         if (delta && !keepBundle) nUp = 1;      // de-hero (see traceLightSubpath)

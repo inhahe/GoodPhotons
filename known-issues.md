@@ -3118,7 +3118,19 @@ problem; a floor on the coin's coat probability (weights F(h)/p and (1 - R)/(1 -
 site, host and device, and the spectral carriers' coin folds) is the remedy if a scene ever shows
 one.
 
-## DONE (2026-11-14, 0.444.0-0.444.1): LAYERED-MODES — a `layered` material reads 1-9 % off mode R in the other modes, on flat geometry
+## DONE (2026-11-14, 0.444.2): FLUORO-ELASTIC-ALBEDO — a fluorescent body's elastic albedo was two different things
+
+Found by check_layered_modes' new fluoro room: device mode B read a coated fluorescent body 0.978 of
+device mode R, under a Fresnel coat as under a film, while every other walk agreed and a bare one
+read 1.000. The elastic base's albedo was read through the diffuse accessor (`diffuseReflectance`,
+device `dDiffuseRho`: a texture, record or vertex colour, and a coated body's internal reflections,
+`coatedAlbedoAt`) by the bidirectional walks and the device's forward walk, and as the bare `reflect`
+slot by mode R, the host's forward walk and the connections (`fluoroWeights`, `bsdfF`, device mode R).
+So a coated or textured fluorescent body rendered differently by mode. Every walk reads the
+accessor now (render.h fluoroWeights takes the hit; bsdf_eval.h bsdfF; backward.h; device mode R),
+the way a diffuse body's albedo is read; a bare, untextured one is unchanged.
+
+## DONE (2026-11-14, 0.444.0-0.444.2): LAYERED-MODES — a `layered` material reads 1-9 % off mode R in the other modes, on flat geometry
 
 **Fixed in 0.444.0 by (b), the coat reciprocal in every mode**, on both of its lobes, and finished in
 0.444.1 after its review (design.md, "A reciprocal coat in every mode"):
@@ -3144,6 +3156,13 @@ one.
   `thinfilm` or `multilayer` layer is refused at load (its light goes into the solid, where the coat
   means nothing, and 0.444.0's factor gained energy on its internal reflections); the radiance cache
   no longer ends a path at a coated vertex; a dispersive split's sub-path starts with no coat.
+* 0.444.2, after the second review: T-bar is read at the film's thickness at the hit (rows across a
+  thickness map's profile; a white body under a high-index film mapped to a quarter of its authored
+  thickness read 0.911 of the furnace's sky, now 0.998); a fluorescent body's shifted light is
+  normalised at its re-emitted wavelength in mode R as the forward modes do (B read 0.916 of R under a
+  high-index film, now 1.000); device mode W weighs a layered stack's dominant layer by R or 1 - R, as the host
+  does (it took it unweighted, the coat's new F(h) / R then 1 / R too bright); a manual coat is no coat
+  to the factor; and the factor is prepared once per pair where it is taken at several wavelengths.
 
 `tools/check_layered_modes.py` (five rooms -- smooth and rough Fresnel, thin film, a glossy body, a
 translucent sheet under a rough coat -- every mode against R, and a white furnace: coated white
