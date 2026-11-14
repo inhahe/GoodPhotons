@@ -413,7 +413,8 @@ Then the rest of 4.2-4.6 in their order, 4.7's bookkeeping alongside whatever to
 - [ ] **"an `include`d file's own asset paths resolve through the ROOT scene"**.
 - [ ] **"`tools/_gemsweep.py` — `spread` is not resolution-stable"**.
 - [ ] **"`tools/_capchroma.py` scores marble VEINS as a caustic"** — refuse a textured cap.
-- [ ] **"`python -m loom.viewer` prints a runpy double-import RuntimeWarning"** (cosmetic).
+- [x] **"`python -m loom.viewer` prints a runpy double-import RuntimeWarning"** (cosmetic): the
+  package re-exports the viewer and anim names lazily.
 
 ### 4.3 Estimator approximations and accuracy debt
 

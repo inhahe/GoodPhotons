@@ -49,10 +49,6 @@ from .axes import (
     Lower, LowerVec, lower,
     ADDITIVE, GAIN, BIPOLAR, AXIS_T, AXIS_S, AXIS_U, AXIS_V,
 )
-from .anim import (
-    CurveDrive, ChannelBinding, MODE_FLYBY, MODE_ANIMATION,
-    Slot, collect_slots, SceneDriver, LiveSession, serve_live,
-)
 from .material import (
     FuncPattern, MixMaterial, PATTERNS,
     waves, checker, rings, blobs,
@@ -80,9 +76,6 @@ from .drive import (
     find_gifski, stabilize_exposure,
 )
 from .preview import PreviewServer, preview_range
-from .viewer import (
-    load_build, build_scene, introspect, ViewerModel,
-)
 from .spatial import (
     SpatialExpr, Surface, Image, VolumeField, GridSample, ScatterSample, SigAt, sexpr,
     X, Y, Z, U, V, A, T,
@@ -162,3 +155,23 @@ __all__ = [
     "Clip", "spacetime_rotate", "spacetime_shear",
     "SampleBuffer",
 ]
+
+# The animation driver's and the viewer's API, imported on first use rather than with the package.
+# The native viewer's live channels run `python -m loom.anim` and `python -m loom.viewer`
+# (src/loomlink.h), and `-m` imports the package first: a module the package had already imported
+# is in sys.modules when runpy executes it, and runpy warns on stderr at every launch -- the stderr
+# the native viewer shows the user.
+_LAZY = {name: ".anim" for name in (
+    "CurveDrive", "ChannelBinding", "MODE_FLYBY", "MODE_ANIMATION",
+    "Slot", "collect_slots", "SceneDriver", "LiveSession", "serve_live")}
+_LAZY.update({name: ".viewer" for name in ("load_build", "build_scene", "introspect", "ViewerModel")})
+
+
+def __getattr__(name):
+    mod = _LAZY.get(name)
+    if mod is None:
+        raise AttributeError("module %r has no attribute %r" % (__name__, name))
+    import importlib
+    value = getattr(importlib.import_module(mod, __name__), name)
+    globals()[name] = value
+    return value

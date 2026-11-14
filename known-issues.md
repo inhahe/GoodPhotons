@@ -33842,7 +33842,16 @@ smoothing at extreme magnification.
 on the CPU before `PrimVtx`), which is cheaper but only correct when a triangle doesn't
 straddle the tile boundary. (a) is the real answer.
 
-## OPEN (cosmetic, 2026-07-28): `python -m loom.viewer` prints a runpy double-import RuntimeWarning
+## FIXED (2026-11-14; cosmetic, opened 2026-07-28): `python -m loom.viewer` prints a runpy double-import RuntimeWarning
+
+**Fixed** without a new entry module: `loom/__init__.py` re-exports the viewer's and the animation
+driver's names lazily (a module `__getattr__`), so importing the package no longer imports
+`loom.viewer` or `loom.anim`, and `-m` finds neither in `sys.modules` -- both live channels
+(`loom.viewer`, `loom.anim`) launch silently, `from loom import ViewerModel` still works, and
+LoomLink and the docs are unchanged. `tools/loom/tests/test_package_import.py` holds it (two of its
+three tests fail on the old init).
+
+The report as filed:
 Starting the F4 live channel spawns `python -X utf8 -u -m loom.viewer <scene.py>`, and
 Python's `runpy` prints to stderr:
 
