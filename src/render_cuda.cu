@@ -449,7 +449,7 @@ struct DSpec {
 struct DMaterial {
     int    type;
     // Twin of Material::readsCavity — the per-hit gate on the cavity probe. See the
-    // note there and on ftsl::setupCavity: without it, one cavity-driven material would
+    // note there and on ftsl::markCavityReaders: without it, one cavity-driven material would
     // charge cavitySamples occlusion rays to every OTHER patterned surface in the scene.
     int    readsCavity;
     int    patOwnSide;      // Material::patOwnSide: patterns see the surface's own side
@@ -573,16 +573,13 @@ struct DMaterial {
     // because MIS combines them.
     int    emitPat;
     // Self-emission carried by the MATERIAL itself (device twin of Material::isLight /
-    // Material::emit). A `light` block registers a DEmitter and emission-on-hit is read
-    // from that (see dEmitterForMat below), but a material can also carry a bare `emit`
-    // spectrum on geometry that has no registered emitter at all — an isosurface, a CSG
-    // sphere, a quadric. Those are marched/analytic rather than tessellated, so there is
-    // nothing to area-sample and no emitter to register; they still have to LOOK lit when
-    // the camera sees them. matEmit is that fallback, consulted only when
-    // dEmitterForMat() < 0 so a mesh/quad light never double-counts.
+    // Material::emit). A surface with an emitter has its emission-on-hit read from that
+    // (dEmitterForHit), but a `glow_only` material lights nothing and has none; it still has
+    // to LOOK lit where the camera sees it. matEmit is that fallback, consulted only where
+    // dEmitterForHit() < 0, so an emitter's surface never counts twice.
     int    matIsLight;
     int    matReflectsNothing;   // Material::reflectsNothing: a light block's own surface
-    int    emitterIdx;           // the emitter its surface is (Scene::emitterForMat), or -1
+    int    emitterIdx;           // the single emitter registered under it (Scene::emitterForMat), else -1
     // Device twin of Material::hideCamera — primary visibility off. Only the bounce-0
     // camera ray of a gather/backward path skips this material; every other ray sees it.
     // See Material::hideCamera (scene.h) for why the flag exists at all, and
@@ -697,12 +694,12 @@ struct DTri    { DVec3 v0, v1, v2, gn; DVec3 uv0, uv1, uv2; DVec3 n0, n1, n2; in
                  unsigned char solid;                    // Tri::solidFace: 1 normals out, 2 in, 0 neither
                                                          // (in FP32's padding before bitangentSign)
                  Real bitangentSign;                     // C6 tangent frame for normal mapping (+-1)
-                 int emitter;                            // Tri::emitter (in the room a double sign took)
+                 int emitter;                            // Tri::emitter (with the sign, 8 B: DTri stays 168)
                  double curvature;                       // O3 per-face mean curvature (Tri::finalize)
                  int vcol;                               // Tri::vcol -> DScene::vertColors, or -1
                  Real reach; };                          // farthest vertex's distance (Hit::pscale)
 // frame: the sphere's own axes, three DVec3 at DScene::sphAxes + 3*frame, or -1 (Sphere::frame).
-struct DSphere { DVec3 c; double r; int matId; int frame; int emitter; };   // emitter: Sphere::emitter
+struct DSphere { DVec3 c; double r; int matId; int frame; };   // its light: DScene::sphEmitter
 // One round cone of a curve/fiber strand — the device twin of CurveSeg (curve.h). The host
 // record is already a POD in exactly this shape; only the scalar type narrows to Real.
 struct DCurveSeg { DVec3 p0, p1; Real r0, r1; int matId; float u0, u1; };
@@ -1356,6 +1353,7 @@ struct DScene {
     PatSlice     ndSlice;     // -nd: the 3-D slice of N-space fields are evaluated on
     const DTri*      tris;  int nTris;
     const DSphere*   sph;   int nSph;
+    const int*       sphEmitter;   // by sphere, the light it is (Scene::sphereEmitter), or null: none is
     const DVec3*     sphAxes;   // turned spheres' axes, three per DSphere::frame
     // Flat mirror surfaces (Scene::mirrorPlanes, uploaded verbatim): one entry per
     // coplanar group of mirror-material triangles, capped at Scene::kMaxMirrorPlanes.
@@ -3690,7 +3688,8 @@ struct DHit {
 };
 #if FTRACE_GPU_FP32
 // Held in every kernel's registers or local memory and in the wavefront state arrays.
-static_assert(sizeof(DHit) == 132, "DHit changed size");   // 128 until DHit::emitter (0.443.0)
+static_assert(sizeof(DHit) == 132, "DHit changed size");   // every kernel's registers and local memory
+static_assert(sizeof(DSphere) == 32, "DSphere changed size: one 32-byte sector a leaf test");
 static_assert(sizeof(DTri) == 168, "DTri changed size: one per triangle, the largest geometry upload");
 #endif
 // The geometric normal on the side being shaded: the side the ray came from (host twin
@@ -4484,7 +4483,8 @@ __device__ static bool intersectSphere(const DVec3& ro, const DVec3& rd, const D
     hit.solid = 1;
     // O3: analytic 1/R, negated from inside — mirrors the host intersectSphere.
     hit.curv = (s.r > 1e-12) ? (Real)((sFlipped ? -1.0 : 1.0) / s.r) : (Real)0;
-    hit.matId = s.matId; hit.sensorId = -1; hit.emitter = s.emitter;
+    hit.matId = s.matId; hit.sensorId = -1;
+    hit.emitter = -1;   // its light is in DScene::sphEmitter, read where the hit is accepted
     // Equirectangular (lat/long) UV so spheres can be textured, in the sphere's own axes when
     // it has been turned (mirrors host).
     const DVec3 nl = axes ? DVec3{dot(ng, axes[0]), dot(ng, axes[1]), dot(ng, axes[2])} : ng;
@@ -5220,6 +5220,7 @@ __device__ static bool dIntersectOtherNow(const DScene& sc, const DVec3& ro, con
                              normalize(affDir(D.m, base[2]))};
         if (!intersectSphere(ro, rd, s, tmin, h, ax)) return false;
         h.motionSet = set; h.deformTri = -1;
+        if (sc.sphEmitter) h.emitter = sc.sphEmitter[k];
         return true;
     }
     k -= sc.nSph;
@@ -5409,7 +5410,10 @@ __device__ static DHit closestHit(const DScene& sc, const DVec3& ro, const DVec3
                 if (prim < sc.nTris)              { const DTri& t = sc.tris[prim];
                                                     if (!hidden(t.matId) && intersectTri(sh, ro, rd, t, tmin, h)) { tMax = h.t; hInst = -1; } }
                 else if (prim < sc.nTris + sc.nSph){ const DSphere& s = sc.sph[prim - sc.nTris];
-                                                    if (!hidden(s.matId) && intersectSphere(ro, rd, s, tmin, h, s.frame >= 0 ? sc.sphAxes + 3 * s.frame : nullptr)) { tMax = h.t; hInst = -1; } }
+                                                    if (!hidden(s.matId) && intersectSphere(ro, rd, s, tmin, h, s.frame >= 0 ? sc.sphAxes + 3 * s.frame : nullptr)) {
+                                                        tMax = h.t; hInst = -1;
+                                                        if (sc.sphEmitter) h.emitter = sc.sphEmitter[prim - sc.nTris];
+                                                    } }
                 else if (prim < sc.nTris + sc.nSph + sc.nImplicits) { const DImplicit& im = sc.implicits[prim - sc.nTris - sc.nSph];
                                                     if (!hidden(im.matId) && intersectImplicit(sc, im, ro, rd, tmin, h)) { tMax = h.t; hInst = -1; } }
                 else if (prim < sc.nTris + sc.nSph + sc.nImplicits + sc.nCurveSegs) { const DCurveSeg& cs = sc.curveSegs[prim - sc.nTris - sc.nSph - sc.nImplicits];
@@ -9463,7 +9467,6 @@ struct DSurfPhoton {
     DVec3 p, wo;                              // wo: unit, toward the PREVIOUS light vertex
     float lambda, beta, cx, cy, cz;           // cie{X,Y,Z}(lambda), cached at store time
     unsigned misIdx;
-    float nx, ny, nz;                         // its surface's true normal, to its light's side (host twin)
 };
 struct DSurfMis {                             // the light-side half of the merge's MIS weight
     double sumC, sumMb, sumMs, pdfFwdA;
@@ -14617,15 +14620,12 @@ __device__ static double dVertexLe(const DScene& sc, const DVertex& v, const DVe
 }
 // Emitter that owns an emissive surface material (mirrors Scene::emitterForMat): a routed copy's
 // is its original's.
-__device__ static int dEmitterForMat(const DScene& sc, int matId) {
-    return (matId >= 0) ? sc.mats[matId].emitterIdx : -1;   // looked up once, at upload
-}
 // The emitter of the surface hit at `h`, shading with material `matId` -- its own or the part a
 // compound resolved it to (host twin Scene::emitterForHit): its primitive's where matId is the
 // surface's own, else the material's single one (a light block's surface), or -1.
 __device__ static int dEmitterForHit(const DScene& sc, const DHit& h, int matId) {
     if (matId < 0 || !sc.mats[matId].matIsLight) return -1;   // an emitter's surface is a light's (host twin)
-    if (matId == h.matId && h.emitter >= 0) return h.emitter;
+    if (matId == h.matId && h.emitter >= 0 && h.emitter < sc.nEmitters) return h.emitter;
     return sc.mats[matId].emitterIdx;
 }
 
@@ -19910,10 +19910,8 @@ struct DSurfSite {
     DVec3 ngo;
     bool twoSided;
     double r2;
-    Real slack;   // the plane band's (gatherBandSlack): a merge drops a parallel surface's photons
     __device__ DSurfSite(const DScene& sc, const DSurfMap& sm, const DVertex& vk) {
         r2 = (double)sm.radius * (double)sm.radius;
-        slack = gatherBandSlack<Real>(sm.radius, (Real)0, fmax(vk.pscale, (Real)dMaxAbs(vk.p)));
         ix = (int)fmin(fmax(floor(((double)vk.p.x - (double)sm.lo.x) / (double)sm.cell), 0.0), (double)(sm.nx - 1));
         iy = (int)fmin(fmax(floor(((double)vk.p.y - (double)sm.lo.y) / (double)sm.cell), 0.0), (double)(sm.ny - 1));
         iz = (int)fmin(fmax(floor(((double)vk.p.z - (double)sm.lo.z) / (double)sm.cell), 0.0), (double)(sm.nz - 1));
@@ -19939,9 +19937,6 @@ __device__ static inline void dSurfMergePhoton(const DScene& sc, const DSurfMap&
     const DVec3 dd{vk.p.x - ph.p.x, vk.p.y - ph.p.y, vk.p.z - ph.p.z};
     if (ddot(dd, dd) > site.r2) return;
     if (dMergeFromBehind(site.twoSided, ph.wo, site.ngo)) return;   // host twin mergeFromBehind
-    // not a parallel surface's (host twin, J-THIN-GAP-LEAK: the band without the facing test)
-    if (!withinGatherBand<Real>(fabs((Real)ddot(dd, site.ngo)), (Real)ddot(dd, dd),
-                                fabs(dot(DVec3(ph.nx, ph.ny, ph.nz), site.ngo)), site.slack)) return;
     const DSurfMis& lm = sm.mis[ph.misIdx];
     const Real lam = (Real)ph.lambda;
     double fCam = dBsdfF(sc, vk, woCam, ph.wo, lam);
@@ -23423,7 +23418,6 @@ __global__ void kVcmCameraT(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx
                     if (jOn) jrun.snap(js);
                     const bool jsOn = jOn && js.on();              // the carrier arriving here (VCM-SPEC)
                     double r2 = ctx.radius * ctx.radius;
-                    const Real slack = gatherBandSlack<Real>((Real)ctx.radius, (Real)0, dRoundScale(h));
                     int ix = (int)floor(((double)h.p.x - grid.lo.x) / grid.cell);
                     int iy = (int)floor(((double)h.p.y - grid.lo.y) / grid.cell);
                     int iz = (int)floor(((double)h.p.z - grid.lo.z) / grid.cell);
@@ -23447,9 +23441,6 @@ __global__ void kVcmCameraT(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx
                               DVec3 wMerge = lv.wo;
                               if (dMergeFromBehind(dTwoSidedType(mp->type), wMerge, ngoCam))
                                   continue;   // host twin mergeFromBehind
-                              // not a parallel surface's (host twin vcm.h, J-THIN-GAP-LEAK)
-                              if (!withinGatherBand<Real>(fabs((Real)ddot(d, ngoCam)), (Real)ddot(d, d),
-                                                          fabs(dot(lv.ng, ngoCam)), slack)) continue;
                               Real lam = (Real)lv.lambda;
                               // A MERGE crosses paths, so the two ends carry DIFFERENT bundles
                               // and there is no shared λ set. The estimate therefore stays keyed
@@ -24036,10 +24027,6 @@ kJSurfLightT(DScene sc, DCamera cam, int diffraction, int maxDepth,
                         ph.beta   = (float)(path[u].beta * (compoundSite ? (double)compoundMergeW[u] : 1.0));
                         ph.cx = (float)cx; ph.cy = (float)cy; ph.cz = (float)cz;
                         ph.misIdx = (unsigned)slot;     // appended 1:1, so index == slot
-                        {   // its surface's true normal, to its light's side (host twin vertexGeoN)
-                            const DVec3 pn = path[u].back ? path[u].ng * (Real)-1 : path[u].ng;
-                            ph.nx = (float)pn.x; ph.ny = (float)pn.y; ph.nz = (float)pn.z;
-                        }
                         DSurfMis& sm = out.mis[slot];
                         sm.sumC    = accC;
                         sm.sumMb   = accMb + eBeam;
@@ -24916,7 +24903,7 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
     for (size_t i = 0; i < scene.spheres.size(); ++i) {
         const Sphere& s = scene.spheres[i]; DSphere& d = sph[i];
         d.c = {s.c.x, s.c.y, s.c.z}; d.r = s.r; d.matId = s.matId;
-        d.frame = s.frame; d.emitter = s.emitter;
+        d.frame = s.frame;
     }
     std::vector<DVec3> sphAxes;
     for (const Scene::SphereAxes& a : scene.sphereAxes)
@@ -25616,6 +25603,7 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
     sc.tris = d_tris; sc.nTris = (int)tris.size();
     sc.sph = d_sph;   sc.nSph = (int)sph.size();
     sc.sphAxes = sphAxes.empty() ? nullptr : (const DVec3*)keep(uploadVec(sphAxes));
+    sc.sphEmitter = scene.sphereEmitter.empty() ? nullptr : (const int*)keep(uploadVec(scene.sphereEmitter));
     sc.mirrorPlanes = d_mirp; sc.nMirrorPlanes = (int)mirrorPlanes.size();
     sc.dielSph   = d_dielSph;   sc.nDielSph   = (int)scene.dielSphereIdx.size();
     sc.mirrorSph = d_mirrorSph; sc.nMirrorSph = (int)scene.mirrorSphereIdx.size();
@@ -27363,7 +27351,6 @@ static void uploadSurfMapCuda(const bdpt::SurfMap* smap, DUpload& up, gpu::DSurf
         d.lambda = q.lambda; d.beta = q.beta;
         d.cx = q.cx; d.cy = q.cy; d.cz = q.cz;
         d.misIdx = q.misIdx;
-        d.nx = q.nx; d.ny = q.ny; d.nz = q.nz;
     }
     // Every SurfMis field is copied below, and a field a copy misses reaches the device as 0. Both
     // structs carry their padding explicitly, so any field added to either changes its size and

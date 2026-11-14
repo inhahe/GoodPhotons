@@ -1179,8 +1179,8 @@ absorption included. The eleven sites that resolved `D_MIX` (shadeStep and its h
 `bkRadiance` x2, the RGB gather, `dRandomWalk`, the two photon gathers, SPPM, and the two VCM
 subpath walks) each became `dIsCompound(...)` plus a call; `dResolveCompoundDominant` mirrors
 backward.h's Whitted rule (the coat only when it dominates). Nothing indexes the device material
-array by host id past `scene.mats.size()`, and `dEmitterForMat` scans emitters rather than a
-per-material table, so the appended entries are invisible to everything that does not ask for them.
+array by host id past `scene.mats.size()`, and `dEmitterForHit` reads a hit's own tag or the
+material's `emitterIdx`, so the appended entries are invisible to everything that does not ask for them.
 
 **The CPU gather had to be fixed to match.** `photonGather` / `photonGatherSub` resolved a layered
 material with `mixPickChild(...)  // approximate: gather the body lobe` -- the camera ray always
@@ -2796,7 +2796,8 @@ glTF meshes with many materials. A mix's children are copied too, because both w
 RESOLVED child on the vertex. A layered coat is synthesised later from its parent, so it inherits.
 An emissive surface is copied as any other (0.441.0): its emitter, registered on the original before
 the loader retags the surface, is found from the copy through `routeBase` (`Scene::emitterForMat`,
-`aimedEmission`, the device's `dEmitterForMat`, by `matBase` / `solidId`). A surface `light` block takes
+`aimedEmission`, the device's `emitterIdx`, by `matBase` / `solidId`; a registerGlows light by its
+primitive's tag, `Scene::emitterForHit`). A surface `light` block takes
 its own `mode` (`routedLight`); a spot, collimated, sun or sky has no surface to route, and a `mode` on one is
 an error. A `mesh_instance` without a `material` override shares its asset's triangles, and their
 materials, with every placement, so it records its route instead (`MeshInstance::route`): each
@@ -3382,21 +3383,24 @@ was lit differently by every mode (known-issues GLOW-LIGHT-MODES). Now:
   which takes any list of triangles; the emitter takes their pattern frame, so a sampled point
   reads its pattern where a hit does); each sphere is a sphere light, or a Glow under an emission
   pattern; each isosurface or CSG solid is a Glow.
-* **A hit finds its emitter by its primitive** (0.443.0): `Tri`, `Sphere` and `Implicit::emitter`,
-  and an instance's `MeshInstance::emitOf` (material, emitter) pairs, are written by every
-  intersector into `Hit::emitter` (device `DHit::emitter`, `DTri::emitter` in the room the old
-  double `bitangentSign` took; `DScene::instEmit`), and `Scene::emitterForHit(h, m)` / device
-  `dEmitterForHit` read it when the material `m` the hit shades with is the surface's own, else
-  the material's single emitter (`emitterForMat`: a light block's surface, whose primitives carry
-  none; `emitterOfMat` / `DMaterial::emitterIdx`, `kEmitterByPrim` where several share it), and
-  never for a material that is not a light. The field is the last of `Tri` and `Sphere`, which are
-  built positionally (`Tri{v0, v1, v2, mat, -1, {}, uv0, uv1, uv2}`), so no initializer list fills
-  it by position. So a
-  material lights the scene through any number of emitters and stays one material: until then a
-  hit's emitter was its material's, and every glowing surface after the first took a copy of its
-  material (`name [2]`), which split one emissive solid into several to the medium stack, refused
-  an instanced asset sharing its material with a mesh block, and made a material per glowing
-  sphere. A glowing material's spectrum is wrapped in one shared object (unless it has a shared
+* **A hit finds its emitter by its primitive** (0.443.0): `Tri` and `Implicit::emitter`, a
+  sphere's in the side table `Scene::sphereEmitter` (device `DScene::sphEmitter`, read where its
+  hit is accepted, so the record every leaf test reads stays 48 / 32 bytes), and an instance's
+  `MeshInstance::emitOf` (material, emitter) pairs are written into the hit (`Hit::emitter`;
+  device `DHit::emitter`, `DTri::emitter` beside the float `bitangentSign`, which keeps `DTri` at
+  168 bytes; `DScene::instEmit`). `Scene::emitterForHit(h, m)` / device `dEmitterForHit` read the
+  tag when the material `m` the hit shades with is the surface's own and the tag is in range (on
+  the host, also that it names an emitter of that material), else the material's single emitter
+  (`emitterForMat`: a light block's surface, whose primitives carry none; `emitterOfMat` marks a
+  material several emitters share `kEmitterByPrim`, and the device's `emitterIdx` is -1 for it),
+  and never for a material that is not a light. `Scene::eraseEmitter` renumbers every tag when an
+  emitter is removed (`-noenv`). `Tri::emitter` is its last field, as `Tri`s are built
+  positionally (`Tri{v0, v1, v2, mat, -1, {}, uv0, uv1, uv2}`). So a material lights the scene
+  through any number of emitters and stays one material: until then a hit's emitter was its
+  material's, and every glowing surface after the first took a copy of its material (`name [2]`),
+  which split one emissive solid into several to the medium stack, refused an instanced asset
+  sharing its material with a mesh block, and made a material per glowing sphere.
+  A glowing material's spectrum is wrapped in one shared object (unless it has a shared
   base already, a `lumens` light's) so the camera's per-sample spectrum table evaluates it once
   however many emitters it has. A light block's own surface (`reflectsNothing`) is left alone; `emit` on a mix or layered material itself is refused (every
   hit takes a layer). build() finalizes the layered coats before the emitters, so a layered
@@ -3683,7 +3687,7 @@ was lit differently by every mode (known-issues GLOW-LIGHT-MODES). Now:
   because all three of its backward emission-on-hit sites keyed off `dEmitterForMat()`
   and so rendered such surfaces black. `DMaterial` now carries `matIsLight` + a baked
   `matEmit[SPEC_N]` (plus `rgbMatEmit` for the fast RGB path), and those sites fall back
-  to it when `dEmitterForMat() < 0`. The *emitter* is still preferred where one exists —
+  to it when the surface has no emitter (`dEmitterForHit() < 0` since 0.443.0). The *emitter* is still preferred where one exists —
   its SPD may carry a `power`/`lumens` flux normalisation the raw material spectrum does
   not, and that ordering is also what stops a mesh light double-counting. Since 0.442.0 every
   emissive surface but a `glow_only` one has an emitter (see "Every emissive surface is a light"),
@@ -6144,7 +6148,7 @@ as the one at fault.
   handing `build()` a different radius retunes the estimator *and* its MIS weight together, per
   epoch, with no second source of truth. Epoch 0 gets `r_0` exactly.
 
-  **Sizing (`-jsurf-count`, default `4e6` ≈ 288 MB at 72 B per photon+`SurfMis`).** The surface map
+  **Sizing (`-jsurf-count`, default `4e6` ≈ 450 MB at 112 B per photon and its `SurfMis`, 72 + 40).** The surface map
   and the beam map are budgeted by the *same* pilot but with deliberately different authority. The
   beam side names a *beam* ceiling and sizes the pass, because its radius **adapts** to the budget
   and undershooting the `-beamk` knee widens the kernel — a measured bias (+6.4 % on the analytic
@@ -6350,13 +6354,14 @@ as the one at fault.
   the device's `dOnGatherSurfaceSided` calls too). A gather takes the photons in a ball, so a second
   surface inside it -- the floor under a table top, once mode M's adaptive radius outgrows the
   table's height -- lent its light to the first (a sheet lit only from below read 21x its top lit
-  from above). (A mode-J surface merge and a mode-U vertex merge apply the band below since 0.442.2,
-  J-THIN-GAP-LEAK -- a `SurfPhoton` carries its surface's normal for it, a mode-U light vertex its
-  hit -- but not the facing test: their weights assume the whole disc, so a perpendicular wall's
-  photons at a corner, which the facing test would drop, stay; dropping them read a flat room 0.3 %
-  dark. No rule of this kind tells a surface's photons beside a gather point from those under an
-  occluder a millimetre over the same surface: a disc on the floor at a gap's mouth takes the gap's
-  trapped light, which is the radius's bias, GAP-MERGE-RADIUS.) A mode-M or mode-S gather (`onGatherSurfaceSided`) keeps a photon only if it faces the
+  from above). (Not a mode-J surface merge or a mode-U vertex merge, which keep every photon in
+  their ball: they divide by the whole disc, with no footprint to say how much of it is their own
+  surface, so another surface's photons stand in for the part of the disc that is not -- the box
+  top's for the floor a box stands on. Dropping them, with the band below alone (0.442.2-0.443.0),
+  read the floor within 2 cm of a box's base 0.64 of mode R at radius 0.1 and 0.72 at the default.
+  What they keep instead is a surface's photons under a slab a millimetre over it, whose light
+  can be nothing like the slab top's: J-THIN-GAP-LEAK, whose fix is the footprint, not a rule.) A
+  mode-M or mode-S gather (`onGatherSurfaceSided`) keeps a photon only if it faces the
   gather point's way (within 60 degrees) and lies near its tangent plane: off it by at most
   sin theta times its distance d, theta the angle between the two normals, plus a rounding slack
   (`gatherBandSlack`: a thousandth of the map's radius, and on the device, which computes positions
@@ -8005,7 +8010,9 @@ as the one at fault.
   gate is not an optimisation but a correctness-of-cost requirement: `patCtxFromHit` runs
   for EVERY patterned material, so a scene-wide-only flag would charge N occlusion rays
   to every unrelated noise-textured surface in a scene that used `cavity` once.
-  `ftsl::setupCavity` sets the flag from `materialFreeInputs` and then lifts it through
+  `ftsl::markCavityReaders` (before `Scene::build`, whose emitters' selection weights read emission
+  patterns, and which derives the probe's reach, `Scene::cavityRadiusDerived`) sets the flag from
+  `materialFreeInputs` and then lifts it through
   `mixChildren` to a fixed point, so a `mix` inherits it from a layer (and from a nested
   mix's layer). The value is computed lazily on first read and cached in
   `Hit::cavity`/`cavityDone` — which is why those are the only two `DHit` fields with
@@ -8169,7 +8176,7 @@ as the one at fault.
     catching anything on exactly the programs it was newly being asked to cover. The probe
     rows also gained `curv`/`cavity` columns for the same reason: a variable left at 0 is
     a variable the comparison is not exercising.
-  * `Builder::optimizePatterns` runs **last** in `build()` — after `setupCavity`,
+  * `Builder::optimizePatterns` runs **last** in `build()` — after `markCavityReaders`,
     `warnCurvOnFlatGeometry`, `checkEmitPatsSupported` — over every `Scene::patterns`
     program and every `Medium::density`/`ior`. CSE preserves the first occurrence of every
     op, so those analyses would still be correct if reordered, but running it last means

@@ -284,16 +284,14 @@ Then the rest of 4.2-4.6 in their order, 4.7's bookkeeping alongside whatever to
 - [x] **REVIEW-0442-FABLE** (0.442.4, 0.443.0) -- a hit finds its emitter by its primitive (`Hit::emitter`),
   not its material: no glow material copies (their solid identity, the instancing refusal, the
   retag, the degenerate group, the spectrum wrap, the load cost); the docs' "one light per material".
-- [ ] **GAP-MERGE-RADIUS** — light trapped in a thin gap reaches the room through the merges' discs at
-  its mouth (modes J and U 2-3.6x on `scenes/_gap_leak_noceil.ftsl`; M and S unaffected, M at a
-  larger radius -- find out why first), then pick the merges' radius rule by an equal-time sweep.
 - [ ] **GLOW-MIS-J-HOST** — host mode J reads a glowing isosurface's floor 1.7 % over mode U (6
   sigma; device J 0.9999), check_glow_mis.
 - [x] **KEEPWINDOW-VRAM** (0.442.3) — a finished render held open by `-keepwindow` kept all its device
   memory, so the next GPU render paged (~45x slower); it gives the device back as the render ends.
-- [x] **J-THIN-GAP-LEAK** (0.442.2) — modes J and U merged the photons a millimetre under a surface
-  as its own; their merges keep their own surface's photons now. Mode D's bright gap mouth was real
-  light, which mode R under-samples (`tools/check_gap_merge.py`). Left: GAP-MERGE-RADIUS.
+- [ ] **J-THIN-GAP-LEAK** (reopened 0.443.1) — modes J and U merge the light trapped a millimetre
+  under a surface at its top (100x and more on `scenes/_gap_leak.ftsl`). 0.442.2's band darkened every
+  object's base (0.64 of R) and is reverted; the fix is a footprint for their merges as M and S
+  have, its cost per merging vertex the open question.
 - [x] **MERGE-PROXIMITY** (0.431.0) — every gather keeps only the photons near its tangent plane
   (`gatherplane.h`), except on a curve; mode M's sheet lit from below read 21x, now 0.
 - [x] **HAZE-SUN-B** (0.434.15, 0.434.16) — mode B lights an unbounded sunlit haze at 0.163 of

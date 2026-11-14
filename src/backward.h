@@ -319,11 +319,19 @@ struct BackwardRenderer {
     static void noteFirst(const GiCtx& gi, int kind) {
         if (gi.first && gi.depth == 0 && *gi.first < 0) *gi.first = kind;
     }
+    // Whether a camera path whose first surface is `h` is mode P's specular-first one: a surface
+    // that is no sensor, whose own material (a compound's, not its pick's) is a specular type. The
+    // one rule mode P's split files a sample by, its composite classifies a pixel by
+    // (main.cpp classifyComposite) and its forward layer leaves a glow to the camera side by
+    // (glowSeenXYZ); device twin dNoteFirstSurface.
+    static bool specularFirstSurface(const Scene& scene, const Hit& h) {
+        return h.sensorId < 0 && isSpecularType(scene.mats[(size_t)h.matId].type);
+    }
     // A surface's kind, and whether it was written: a tentative note, which a pass-through
     // takes back (unnoteFirst).
     static bool noteFirstSurface(const Scene& scene, const GiCtx& gi, const Hit& h) {
         if (!(gi.first && gi.depth == 0 && *gi.first < 0)) return false;
-        *gi.first = (h.sensorId < 0 && isSpecularType(scene.mats[h.matId].type)) ? kFirstSpec : kFirstOther;
+        *gi.first = specularFirstSurface(scene, h) ? kFirstSpec : kFirstOther;
         return true;
     }
     static void unnoteFirst(const GiCtx& gi, bool noted) { if (noted) *gi.first = -1; }

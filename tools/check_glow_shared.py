@@ -20,6 +20,12 @@ and with a copy of the material it was a different solid to the medium stack, so
 through it stayed "inside" the glass and the wall behind read darker. It must render as the same
 box written as one `mesh` block of six faces (mode R, CPU and GPU, the box's tiles within 2 %).
 
+NO ENV. Each surface's light is a number in the emitter list (Hit::emitter), and `-noenv` takes
+the sky out of that list: the numbers after it must move with it. A sky written first, then two
+glowing spheres and two glowing panels: rendered with `-noenv`, it must be the scene written
+without the sky -- modes R and D, CPU and GPU, the frame within 1 %. (0.443.0 left the numbers as
+they were: each glow took the next light's colour and power, the last one past the list's end.)
+
 Exits 1 on any failure.
 """
 import argparse
@@ -98,6 +104,19 @@ def box_scene(d, split):
     if split:   # the back face as a bare quad, wound outward (-z), its emitter not the mesh's
         lines.append("quad { origin -0.3 0.3 -0.3  u 0 0.6 0  v 0.6 0 0  material glowglass }")
     return NL.join(lines + [""])
+
+
+def noenv_scene(d, env):
+    """A sky (or none), then glowing spheres of two colours and the shared panels' room, lit by them."""
+    lines = shared_scene(d).split(NL)
+    head = [l for l in lines if l.startswith("scene") or l.startswith("camera")]
+    rest = [l for l in lines if l and l not in head]
+    return NL.join(head + (['light env { spd 0.02 }'] if env else []) + [
+        'material "red"  { type diffuse reflect 0.0  emit gaussian 620 30 0.4 }',
+        'material "blue" { type diffuse reflect 0.0  emit gaussian 460 30 0.4 }',
+        "sphere { center -0.6 0.4 0.6  radius 0.15  material red }",
+        "sphere { center 0.6 0.4 0.6  radius 0.15  material blue }",
+    ] + rest + [""])
 
 
 def render(exe, scn, mode, gpu, out, budget):
@@ -181,6 +200,26 @@ def main():
         ok = ok and good
         print("%s: the glass box with its back a separate quad, mode R on the %s: %.4f of the one-mesh box"
               % ("ok" if good else "FAIL", "GPU" if gpu else "CPU", r), flush=True)
+    # NO ENV: -noenv on the scene with a sky against the scene without one
+    for env in (True, False):
+        write(os.path.join(out, "noenv_%s.ftsl" % ("sky" if env else "bare")), noenv_scene(out, env))
+    for mode, n in (("R", "512"), ("D", "256")):
+        for gpu in devs:
+            dev = "gpu" if gpu else "cpu"
+            spp = ["-spp", str(int(n) * (4 if gpu else 1))]
+            a0 = render(exe, os.path.join(out, "noenv_sky.ftsl"), mode, gpu,
+                        os.path.join(out, "noenv_sky_%s_%s.png" % (mode, dev)), spp + ["-noenv"])
+            a1 = render(exe, os.path.join(out, "noenv_bare.ftsl"), mode, gpu,
+                        os.path.join(out, "noenv_bare_%s_%s.png" % (mode, dev)), spp)
+            if a0 is None or a1 is None:
+                print("FAIL: -noenv, mode %s on the %s: the scene did not render" % (mode, dev.upper()))
+                ok = False
+                continue
+            r = float(a0.mean() / a1.mean())
+            good = abs(r - 1.0) <= 0.01
+            ok = ok and good
+            print("%s: -noenv, mode %s on the %s: the frame %.4f of the scene without a sky"
+                  % ("ok" if good else "FAIL", mode, dev.upper(), r), flush=True)
     print("PASS" if ok else "FAILED")
     return 0 if ok else 1
 

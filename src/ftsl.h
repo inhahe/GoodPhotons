@@ -1665,7 +1665,7 @@ public:
         return true;
     }
 
-    // Decide whether `cavity` costs anything in this scene, and pick its probe radius.
+    // Decide whether `cavity` costs anything in this scene (its probe radius is Scene::build's).
     //
     // The GATE is the whole reason cavity is affordable. It is the only pattern input
     // that spends RAYS (cavitySamples occlusion queries per shading point), so anything
@@ -1680,15 +1680,15 @@ public:
     // material somewhere reads `cavity`. Keying off the hit's own material id costs a
     // single load — Hit::matId is already in hand — and charges the probe only where it
     // is read. Scene::needsCavity survives as the cheap "any at all?" early-out and as
-    // the flag the GPU upload and the radius derivation below key off.
+    // the flag the GPU upload and Scene::build's radius derivation key off.
     //
     // The RADIUS is derived rather than defaulted to a constant, because cavity is a
     // non-local measure and therefore has no intrinsic scale: the same corner is "deeply
     // enclosed" at a 1 cm probe and "wide open" at 1 m. 2% of the scene's AABB diagonal
     // (sceneRadius is half that diagonal) makes the same model read the same however it
-    // was authored, which no fixed number can. Authored `cavity_radius` always wins.
-    // Material::readsCavity and Scene::needsCavity: whether any cavity probe rays will ever be fired.
-    // Before the build, which derives the probe's reach (Scene::cavityRadiusDerived).
+    // was authored, which no fixed number can. Authored `cavity_radius` always wins. Scene::build
+    // derives it (Scene::cavityRadiusDerived), so this runs before the build, whose emitters'
+    // selection weights read emission patterns.
     void markCavityReaders(Loaded& L) {
         Scene& sc = L.scene;
         const size_t nm = sc.mats.size();
@@ -8236,8 +8236,8 @@ private:
     //     emission pattern, which is all the frame changes);
     //   a sphere: a sphere light, or, under an emission pattern, a Glow (its pattern read off a hit);
     //   an isosurface or CSG solid: a Glow, sampled by the lines through its box.
-    // Each primitive knows the light it is part of (Tri, Sphere, Implicit::emitter; an instance's
-    // MeshInstance::emitOf), and a hit carries it (Hit::emitter, Scene::emitterForHit), so a material
+    // Each primitive knows the light it is part of (Tri, Implicit::emitter, Scene::sphereEmitter; an
+    // instance's MeshInstance::emitOf), and a hit carries it (Hit::emitter, Scene::emitterForHit), so a material
     // may light the scene through any number of emitters and stays one material: the light tree picks
     // among them by where they are. `glow_only on` keeps a material out (Material::glowOnly); a light
     // block's surface has its emitter already. Refused unless `glow_only`: an emissive curve or fur
@@ -8390,7 +8390,8 @@ private:
             Sphere& sp = S.spheres[i];
             if (!wants(sp.matId)) continue;
             const int base = S.matBase(sp.matId);
-            sp.emitter = n0 + (int)made.size();
+            if (S.sphereEmitter.empty()) S.sphereEmitter.assign(S.spheres.size(), -1);
+            S.sphereEmitter[i] = n0 + (int)made.size();
             if (S.mats[(size_t)base].emitPat < 0) {
                 const size_t before = S.emitters.size();
                 S.addSphereLight(sp.c, sp.r, S.mats[(size_t)base].emit, binWidth_, base);

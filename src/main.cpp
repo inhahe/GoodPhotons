@@ -15654,9 +15654,9 @@ static bool g_jSurf = true;
 // rather than importing a second one into the same denominator.
 static double g_jSurfRadius = 0.0;
 // -jsurf-count: the resource ceiling on STORED surface photons, the point-merge counterpart of
-// `-beamcount`. It is a memory bound and nothing else — a SurfPhoton plus its SurfMis is 128 B,
-// so 4 M is ~510 MB, and the default `-n 2000000` on a scene with no media (where the beam
-// budget measures nothing and so never lowers the subpath count) asks for 7.3 M / 930 MB before
+// `-beamcount`. It is a memory bound and nothing else — a SurfPhoton plus its SurfMis is 112 B,
+// so 4 M is ~450 MB, and the default `-n 2000000` on a scene with no media (where the beam
+// budget measures nothing and so never lowers the subpath count) asks for 7.3 M / 820 MB before
 // a single pixel is traced. That is the failure this exists to stop.
 //
 // It lowers the SUBPATH COUNT rather than thinning the map, deliberately: mode J cannot trim a
@@ -16104,8 +16104,7 @@ static int glowMatSeen(const Scene& scene, const Hit& h, const Vec3& d, double l
 static Vec3 glowSeenXYZ(const Scene& scene, const Hit& h, const Ray& r, bool mono, double lambda,
                         double u1, double u2, Pcg32& rng, double w, bool perSample) {
     constexpr double kLo = 360.0, kHi = 830.0;
-    if (perSample && h.sensorId < 0 && isSpecularType(scene.mats[(size_t)h.matId].type))
-        return Vec3{0, 0, 0};
+    if (perSample && BackwardRenderer::specularFirstSurface(scene, h)) return Vec3{0, 0, 0};
     bool resolved = false;
     const int id = glowMatSeen(scene, h, r.d, lambda, u1, u2, resolved);
     if (id < 0) return Vec3{0, 0, 0};
@@ -16203,6 +16202,7 @@ static bool prepareSky(SkyView& view, const Scene& scene, const Camera& cam, int
                 if (!haveGlow) continue;
                 const double u1 = rng.uniform(), u2 = rng.uniform();
                 c = glowSeenXYZ(scene, h, r, /*mono=*/true, lambda, u1, u2, rng, wLens, /*perSample=*/false);
+                if (!(c.x + c.y + c.z > 0.0)) continue;   // nothing, or not a number (an emit pattern's)
             } else {
                 double L = 0.0;
                 if (haveEnv) L += scene.envRadianceSeen(r.d, lambda);   // the bilinear camera view
@@ -16210,7 +16210,6 @@ static bool prepareSky(SkyView& view, const Scene& scene, const Camera& cam, int
                 if (!(L > 0.0)) continue;
                 c = Vec3(cieX(lambda), cieY(lambda), cieZ(lambda)) * (L * wLens * (kHi - kLo));
             }
-            if (c.x == 0.0 && c.y == 0.0 && c.z == 0.0) continue;
             s[0] = (float)(s[0] + c.x); s[1] = (float)(s[1] + c.y); s[2] = (float)(s[2] + c.z);
         }
     };
@@ -16275,8 +16274,8 @@ static bool prepareSky(SkyView& view, const Scene& scene, const Camera& cam, int
 // not depend on how the writes that asked for them split the samples (a live window's refreshes fall
 // where the clock puts them).
 static void addEnvBackground(Film& film, const Scene& scene, const Camera& cam, long long N,
-                             SkyView& view, bool glowsOnly = false) {
-    if (!prepareSky(view, scene, cam, film.resX, film.resY, N, glowsOnly)) return;
+                             SkyView& view) {
+    if (!prepareSky(view, scene, cam, film.resX, film.resY, N)) return;
     const double scale = (double)N / (double)view.K;
     for (int py = 0; py < film.resY; ++py)
         for (int px = 0; px < film.resX; ++px) {
@@ -16286,10 +16285,9 @@ static void addEnvBackground(Film& film, const Scene& scene, const Camera& cam, 
         }
 }
 // A camera written once.
-static void addEnvBackground(Film& film, const Scene& scene, const Camera& cam, long long N,
-                             bool glowsOnly = false) {
+static void addEnvBackground(Film& film, const Scene& scene, const Camera& cam, long long N) {
     SkyView view;
-    addEnvBackground(film, scene, cam, N, view, glowsOnly);
+    addEnvBackground(film, scene, cam, N, view);
 }
 
 // The sky a forward camera sees directly UNDER MOTION BLUR, drawn into one batch's film instead of
@@ -16951,7 +16949,7 @@ static CompositeClass classifyComposite(const Scene& scene, const Camera& cam,
                     cc.skyXYZ[i] = scene.envXYZForDir(r.d); ++cc.nSky;
                 }
                 // (no env => leave as DIFF; the forward film is legitimately black there)
-            } else if (h.sensorId < 0 && isSpecularType(scene.mats[h.matId].type)) {
+            } else if (BackwardRenderer::specularFirstSurface(scene, h)) {
                 cc.cls[i] = CompositeClass::SPEC; ++cc.nSpec;
             }
         }
@@ -29306,7 +29304,9 @@ static int run(int argc, char** argv) {
                 EnergyReport e;
                 Film fwd = renderForward(scene, &mc.cam, W, H, meterN, nThreads,
                                          false, false, true, e, diffraction, onDevice);
-                addEnvBackground(fwd, scene, mc.cam, meterN, /*glowsOnly=*/true);   // as the render's compose
+                SkyView glowView;   // the glows the camera sees, as the render's compose adds them
+                const bool glows = scene.glowAny &&
+                                   prepareSky(glowView, scene, mc.cam, W, H, meterN, /*glowsOnly=*/true);
                 Film ref;
                 bool refGpu = false;
 #ifdef HAVE_CUDA
@@ -29319,7 +29319,7 @@ static int run(int argc, char** argv) {
                 if (!refGpu)
                     ref = renderBackward(scene, mc.cam, W, H, meterSpp, nThreads, diffraction);
                 mf = compositeFromFilms(fwd, meterN, ref, meterSpp, cc,
-                                        scene.envIndex >= 0, /*verbose*/false);
+                                        scene.envIndex >= 0, /*verbose*/false, glows ? &glowView : nullptr);
                 eAuto = autoExposureOf(filmToLinear(mf, 1.0));
                 break;
             }

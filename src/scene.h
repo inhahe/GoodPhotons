@@ -26,7 +26,8 @@
 #include "phase.h"       // hgPhase/sampleHG + rainbow::RainbowPhase (Medium phase dispatch)
 #include "record.h"      // parametric records (§records): named per-channel LUTs
 #include "majorant.h"    // per-cell control/residual majorant grid (Medium::majorant)
-#include "lighttree_build.h"  // Conty-Kulla light BVH: node layout + host builder
+#include "lighttree_build.h"
+#include "parallel.h"  // Conty-Kulla light BVH: node layout + host builder
 
 // ---- ray-query telemetry (-raystats) --------------------------------------------------
 // Counts every ray actually cast against the acceleration structure: closest-hit queries
@@ -1159,7 +1160,7 @@ struct Emitter {
     EmissionSampler spd;      // for forward per-emitter lambda importance sampling
     Spectrum spdFn = constantSpectrum(0.0); // raw SPD, for backward per-lambda eval
     double emitIntegral = 0.0;
-    double power = 0.0;       // emitIntegral * geomWeight * selW (selection weight)
+    double power = 0.0;       // emitIntegral * geomWeight (which carries selW, the selection weight)
     // Its share of the selection, as a multiple of its unpatterned flux over `area`: 1 for every
     // emitter whose `area` is its surface's, and a Glow's the mean crossing count its lines find
     // (finalizeEmitters estimates it), so it is chosen in proportion to the light it emits. The
@@ -1738,6 +1739,14 @@ struct Scene {
     // Turned spheres' axes (Sphere::frame): three world-space unit vectors each.
     struct SphereAxes { Vec3 ax, ay, az; };
     std::vector<SphereAxes> sphereAxes;
+    // By sphere, the light it is (Hit::emitter, set where a hit is accepted: intersectSphereNow),
+    // or -1; empty when no sphere is one. A side table, as sphereAxes is, so the record every BVH
+    // leaf test reads stays small.
+    std::vector<int> sphereEmitter;
+    int sphereEmitterOf(const Sphere& s) const {
+        const size_t i = (size_t)(&s - spheres.data());
+        return (i < sphereEmitter.size()) ? sphereEmitter[i] : -1;
+    }
     const Vec3* sphereAxesOf(const Sphere& s) const {
         return s.frame >= 0 ? &sphereAxes[(size_t)s.frame].ax : nullptr;
     }
@@ -1864,8 +1873,10 @@ struct Scene {
         return true;
     }
     bool intersectSphereNow(const Ray& r, const Sphere& s, double tmin, Hit& h) const {
-        if (s.motion < 0 || g_motionU < 0.0) return intersectSphere(r, s, tmin, h, sphereAxesOf(s));
-        return intersectMovingSphere(r, s, tmin, h);
+        const bool got = (s.motion < 0 || g_motionU < 0.0) ? intersectSphere(r, s, tmin, h, sphereAxesOf(s))
+                                                           : intersectMovingSphere(r, s, tmin, h);
+        if (got && !sphereEmitter.empty()) h.emitter = sphereEmitterOf(s);
+        return got;
     }
     // A moving triangle at the path's time: tested by its moved vertices alone first, and
     // rebuilt in full only when the ray meets it nearer than the hit so far.
@@ -3103,7 +3114,8 @@ struct Scene {
         // An emitter's surface is a light's material, always: a hit on any other is none, whatever
         // its record holds.
         if (matId < 0 || matId >= (int)mats.size() || !mats[(size_t)matId].isLight) return nullptr;
-        if (matId == h.matId && h.emitter >= 0 && h.emitter < (int)emitters.size())
+        if (matId == h.matId && h.emitter >= 0 && h.emitter < (int)emitters.size() &&
+            emitters[(size_t)h.emitter].matId == matBase(matId))
             return &emitters[(size_t)h.emitter];
         return emitterForMat(matId);
     }
@@ -3270,13 +3282,14 @@ struct Scene {
         // estimate unbiased; this one only spends the light samples where the light is. Floored at
         // half a draw's worth, so a light no draw found still emits; a draw that is not a number (a
         // pattern undefined somewhere) counts as none, so it cannot poison every light's choice.
-        // First: the spectral weights below read it (geomWeight).
-        for (size_t i = 0; i < emitters.size(); ++i) {
+        // First: the spectral weights below read it (geomWeight). Each emitter on its own stream, so
+        // the emitters can be measured at once.
+        ft::parallelForAll(emitters.size(), 1, [&](size_t i) {
             Emitter& e = emitters[i];
             e.selW = 1.0;
             const bool areaLike = e.shape == EmitterShape::Quad || e.shape == EmitterShape::Mesh ||
                                   e.shape == EmitterShape::Glow;
-            if (!areaLike || (e.emitPat < 0 && e.shape != EmitterShape::Glow) || e.collimated) continue;
+            if (!areaLike || (e.emitPat < 0 && e.shape != EmitterShape::Glow) || e.collimated) return;
             constexpr int kN = 4096;
             Pcg32 rng;
             seedUnit(rng, (uint64_t)i, 0x5E1EC7ED0CA5ULL);
@@ -3288,7 +3301,7 @@ struct Scene {
                 if (std::isfinite(v)) s += v;
             }
             e.selW = std::max(s / kN, 0.5 / kN);
-        }
+        });
         // Recount the distant suns here (not in addSunLight) so the flag survives every
         // path that rebuilds the emitter list, including applyIgnoreFlags' filtering.
         sunCount = 0;
@@ -4567,6 +4580,20 @@ struct Scene {
     //              local emitters only. Rebuilds the emitter CDF / sampler.
     //   noFluoro — demote fluorescent materials to plain diffuse (their elastic
     //              `reflect` albedo), dropping the Stokes-shift reradiation.
+    // Remove emitter `idx`, every primitive's light (Tri, Implicit::emitter, sphereEmitter,
+    // MeshInstance::emitOf) still naming the emitter it named: those after `idx` move down one, the
+    // removed one's surfaces have none. The caller finalizes the emitters again.
+    void eraseEmitter(int idx) {
+        if (idx < 0 || idx >= (int)emitters.size()) return;
+        emitters.erase(emitters.begin() + idx);
+        const auto fix = [idx](int& e) { if (e == idx) e = -1; else if (e > idx) --e; };
+        for (Tri& t : tris) fix(t.emitter);
+        for (Implicit& im : implicits) fix(im.emitter);
+        for (int& e : sphereEmitter) fix(e);
+        for (MeshInstance& in : instances)
+            for (auto& [m, e] : in.emitOf) fix(e);
+    }
+
     std::string applyIgnoreFlags(bool noMedia, bool noEnv, bool noFluoro) {
         std::string summary;
         auto note = [&](const std::string& s) {
@@ -4581,12 +4608,14 @@ struct Scene {
         }
         if (noEnv && envIndex >= 0) {
             note("environment light");
-            emitters.erase(emitters.begin() + envIndex);
+            eraseEmitter(envIndex);
             envIndex = -1;
             envMap.reset();
             envXYZ = Vec3{0, 0, 0};
             finalizeEmitters();   // rebuild CDF / emission sampler without the env
         }
+        // The rainbow tables are by emitter and medium, and either list may have changed.
+        if ((noMedia || noEnv) && !bowLuts.empty()) finalizeBowLuts();
         if (noFluoro) {
             int n = 0;
             for (auto& m : mats)

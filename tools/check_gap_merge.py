@@ -1,5 +1,8 @@
 """Regression check: a merge keeps the photons of its own surface, not those a millimetre under it.
 
+FAILS until J-THIN-GAP-LEAK's fix (a footprint for modes J's and U's merges): the band below was
+reverted in 0.443.1, as it darkened the floor at every object's base (tools/check_merge_base.py).
+
     python tools/check_gap_merge.py [--out png/check_gap_merge] [--exe ftrace.exe] [--no-gpu]
 
 J-THIN-GAP-LEAK (0.442.2). Mode J's surface merges and mode U's vertex merges kept every photon

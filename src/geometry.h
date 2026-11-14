@@ -197,7 +197,6 @@ struct Sphere {
     // it. A side table, not inline: the record sits in every BVH leaf test, and nearly every
     // sphere is unturned.
     int frame = -1;
-    int emitter = -1;   // the light it is (Hit::emitter), or -1; last, as Tri's (spheres are built positionally)
 };
 
 
@@ -771,7 +770,8 @@ inline bool intersectSphere(const Ray& r, const Sphere& s, double tmin, Hit& hit
     // Analytic mean curvature of a sphere: 1/R everywhere, negated when seen from
     // inside (a room-sized sphere is concave to anything standing in it).
     hit.curv = (s.r > 1e-12) ? ((sFlipped ? -1.0 : 1.0) / s.r) : 0.0;
-    hit.matId = s.matId; hit.sensorId = -1; hit.emitter = s.emitter;
+    hit.matId = s.matId; hit.sensorId = -1;
+    hit.emitter = -1;   // a sphere's light is in a side table its scene reads on a hit (Scene::sphereEmitter)
     sphereSurfaceUV(hit, ng, axes);
     hit.fiberRadius = 0.0; hit.hasVcol = false;   // `hit` is a reused record: not a strand, no colours
     return true;

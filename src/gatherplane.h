@@ -8,8 +8,12 @@
 // Not modes U and J. Their merges divide by the whole disc with no footprint to say how much of it
 // is the gather's own surface, so dropping another surface's photons only darkens the disc where
 // the surface ends: at the base of a box standing on a floor, 0.94 -> 0.62 of mode R in mode U and
-// 1.01 -> 0.61 in mode J at radius 0.1. Their radius shrinks as the render converges, so the
-// cross-surface bias they keep vanishes with it, which mode M's adaptive radius never does.
+// 1.01 -> 0.61 in mode J at radius 0.1; the tangent-plane band alone, without the facing test, does
+// the same (0.65 and 0.64, against 0.93 and 0.95 keeping every photon; tools/check_merge_base.py
+// holds them). Their radius shrinks as the
+// render converges, so the cross-surface bias they keep vanishes with it, which mode M's adaptive
+// radius never does -- except where a parallel surface a millimetre away is lit like nothing near
+// it (known-issues J-THIN-GAP-LEAK), whose fix is a footprint for their merges, not a rule here.
 #include <algorithm>
 #include <cfloat>
 #include <cmath>
