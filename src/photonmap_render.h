@@ -1515,11 +1515,12 @@ inline Vec3 photonGatherSub(const Scene& scene, const PhotonMap& pm, Ray ray, Pc
                                                         nullptr, coatGi(m, ray.d * -1.0), nullptr, nullptr, &nb));
                 }
                 thr *= clamp01(reflectSlot(scene, m, h, lambda));
-                const GlossyDraw gd = drawGlossy(scene, m, h, ray.d, h.n, ray.d * -1.0, rng);
+                const GlossyDraw gd = drawGlossy(scene, m, h, h.n, ray.d * -1.0, rng);
                 const Vec3& o = gd.o;
                 if (dot(o, h.n) <= 0.0) return L;
-                // An iridescent lobe's interference reflectance at the pair's half-vector.
-                thr *= gd.R(lambda);
+                // The draw's weight, and an iridescent lobe's interference reflectance at the
+                // pair's half-vector.
+                thr *= gd.w * gd.R(lambda);
                 if (gneeOn) {
                     gmis.pdf = bdpt::bsdfPdf(m, h.n, ray.d * -1.0, o, lambda, scene, &h);
                     gmis.from = h.p;
@@ -1973,9 +1974,10 @@ inline Vec3 photonGather(const Scene& scene, const PhotonMap& pm, Ray ray, doubl
                 }
                 thr *= r;
                 sthr.mul([&](double Lw) { return clamp01(reflectSlot(scene, m, h, Lw)); }, r);
-                const GlossyDraw gd = drawGlossy(scene, m, h, ray.d, h.n, ray.d * -1.0, rng);
+                const GlossyDraw gd = drawGlossy(scene, m, h, h.n, ray.d * -1.0, rng);
                 const Vec3& o = gd.o;
                 if (dot(o, h.n) <= 0.0) return L;
+                thr *= gd.w;   // the draw's weight: the same at every wavelength, so not sthr's
                 // An iridescent lobe's interference reflectance at the pair's half-vector, into
                 // the scalar and the spectral throughput alike. Where it is 0 at the walk's own
                 // wavelength the path carries nothing (and sthr's ratio would divide by it).

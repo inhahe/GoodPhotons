@@ -479,6 +479,10 @@ struct Material {
     // manual coat's too). A walk that takes the coat by the coin weighs its reflection by render.h
     // coatSheenRatio.
     int    coatParent   = -1;
+    // The coat copy of a layered material (its coatChild), manual or not: a lobe whose reflectance the
+    // coat's Fresnel term at the pair's half vector sets, so it adds no multiple scattering
+    // (render.h glossyMs).
+    bool   coatLobe     = false;
     // On a layered material: T-bar, the coat's transmission 1 - R averaged over the outside
     // hemisphere with the cosine, by nm from LAMBDA_MIN (finalizeLayeredCoats). A thin film whose
     // thickness is mapped (a film_thickness texture or pattern: a 0..1 profile of filmThickness)
@@ -2575,6 +2579,7 @@ struct Scene {
             coat.coatTbar.clear();
             coat.coatTbarNT = 1;
             coat.coatParent = manual ? -1 : (int)i;
+            coat.coatLobe = true;
             coat.routeBase = -1;              // a material of its own, not a routed copy
             coat.isLight = false;
             coat.reflectsNothing = false;
@@ -2607,7 +2612,7 @@ struct Scene {
                             return (double)((s >> 11) & ((1ull << 53) - 1)) / (double)(1ull << 53); } };
                     Rg rg{ 0x9E3779B97F4A7C15ull + (unsigned long long)k * 1013904223ull };
                     if (body.type == MatType::Glossy) {
-                        layered::PhongBody pb; pb.rough = body.roughness;
+                        layered::GgxBody pb; pb.rough = body.roughness;
                         layered::escapeMomentsCosAvg(LP, pb, 8, body.coatMom, 131072, rg);
                     } else {
                         layered::LambertBody lb;

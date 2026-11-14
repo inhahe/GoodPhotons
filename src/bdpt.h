@@ -51,7 +51,7 @@
 #include "scene.h"
 #include "camera.h"
 #include "hero.h"     // kHeroC / kHeroMax — hero-wavelength bundle sizes
-#include "render.h"   // sampleGlossy, Renderer material primitives, clamp01, PI
+#include "render.h"   // drawGlossy, Renderer material primitives, clamp01, PI
 #include "bsdf_eval.h"    // bsdfF / bsdfPdf — the evaluable half, shared with backward.h
 #include "workcount.h"    // JWork: the CPU refresh's work counts
 #include "photonbeams.h"  // BeamMap — mode J (UPBP) merges camera rays against photon beams
@@ -1423,7 +1423,7 @@ inline void randomWalk(const Scene& scene, const Camera& cam, const Renderer& ma
                 break;
             }
             case MatType::Glossy: {
-                gd = drawGlossy(scene, *mp, h, ray.d, cur.ns, wo, rng);   // ray.d == -wo
+                gd = drawGlossy(scene, *mp, h, cur.ns, wo, rng);
                 wi = gd.o;
                 if (dot(wi, cur.ns) <= 0) { terminate = true; break; }
                 // times an iridescent lobe's interference reflectance at the pair's half-vector:
@@ -1448,17 +1448,17 @@ inline void randomWalk(const Scene& scene, const Camera& cam, const Renderer& ma
                 }
                 pdfW = bsdfPdf(*mp, cur.ns, wo, wi, lambda, scene, &h);
                 pdfRevW = bsdfPdf(*mp, cur.ns, wi, wo, lambda, scene, &h);
-                // f*cos/pdf = r from the camera; from the light, the adjoint lobe's r * adjG.
-                const double adjG = (mode == Mode::Importance) ? glossyAdjointRatio(cur.ns, wo, wi) : 1.0;
-                betaFactor = r * adjG;
+                // f*cos/pdf = r times the draw's weight (ggx.h weightAll), from either end of a
+                // path: the lobe is reciprocal.
+                betaFactor = r * gd.w;
                 if (pdfW <= 0) terminate = true;      // r <= 0 is caught by the max test
-                // The glossy LOBE (mirror direction + roughness exponent) carries no
+                // The glossy LOBE (its microfacet draw reads the roughness alone) carries no
                 // wavelength dependence, so the whole bundle can follow the sampled
                 // direction and only the reflectance differs per λ. (The unidirectional
                 // hero tracers de-hero here instead — see known-issues.md.)
                 secChromatic = true;
                 for (int i = 0; i + 1 < nUp; ++i) {
-                    secF[i] = clamp01(reflectSlot(scene, *mp, h, hb.lam[i + 1])) * adjG;
+                    secF[i] = clamp01(reflectSlot(scene, *mp, h, hb.lam[i + 1])) * gd.w;
                     if (gd.irid) secF[i] *= gd.R(hb.lam[i + 1]);
                 }
                 break;
@@ -1735,10 +1735,11 @@ inline void randomWalk(const Scene& scene, const Camera& cam, const Renderer& ma
                     jr.mul([&](double L) { return clamp01(diffuseReflectance(scene, *mp, h, L)); },
                            betaFactor, false);
                     break;
-                case MatType::Glossy:          // f*cos/pdf = r: the reflect slot IS the factor,
-                    // times the draw's interference reflectance at the sampled pair
+                case MatType::Glossy:          // f*cos/pdf = r w: the reflect slot times the
+                    // draw's interference reflectance at the sampled pair is what varies; the
+                    // the draw's weight w is the same at every wavelength, so the value at lambda is r alone
                     jr.mul([&](double L) { return clamp01(reflectSlot(scene, *mp, h, L)) * gd.R(L); },
-                           betaFactor, false);
+                           clamp01(reflectSlot(scene, *mp, h, lambda)) * gd.R(lambda), false);
                     break;
                 case MatType::DiffuseTransmit: {   // the lobe's albedo over the lambda one
                     const bool reflJ = dot(wi, cur.ns) > 0.0;

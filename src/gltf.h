@@ -31,6 +31,7 @@
 #include "geometry.h"
 #include "scene.h"
 #include "linalg.h"
+#include "ggx.h"   // alpha per roughness (gltfRoughness)
 #include "upsample.h"
 #include "assetbytes.h"
 #include "third_party/json.h"
@@ -66,19 +67,19 @@ namespace gltfimp { inline bool metalMixImport = false; }
 
 namespace gltfimpl {
 
-// GLTF-ROUGHNESS-MAP: a glTF roughness `r` as the ftrace roughness of the same lobe width. glTF's is
-// perceptual, its GGX alpha r^2; ftrace's r_t is a Phong lobe of exponent 2 / r_t^2 - 2, which by
-// half-width is a GGX alpha of 0.646 r_t (0.647 at r_t 0.05, 0.68 at 0.5, 0.70 at 0.6), the
-// equivalence the preview's previewRough inverts. So r_t = r^2 / 0.646, at most 1.
+// GLTF-ROUGHNESS-MAP: a glTF roughness `r` as the ftrace roughness of the same lobe. glTF's is
+// perceptual, its GGX alpha r^2; ftrace's lobe is GGX of alpha 0.646 r_t (ggx.h alpha, the width
+// the Phong lobe before 0.445.0 had). So r_t = r^2 / 0.646, at most 1 (glTF's alpha above 0.646
+// is clamped there).
 inline double gltfRoughness(double r) {
     r = std::min(1.0, std::max(0.0, r));
-    return std::min(1.0, r * r / 0.646);
+    return std::min(1.0, r * r / ggx::kAlphaPerRoughness);
 }
-// The least roughness a glTF glossy, coat or metal lobe is given: glossyExponent's own clamp, so the
-// floor widens no lobe the tracers can represent and only keeps a constant of 0 off the planar-mirror
-// path (isPlanarMirrorMat), which a glTF metal is not. The same for the constant and for a map's
-// texels, which glossyExponent clamps there.
-constexpr double kGltfMinRoughness = 1e-3;
+// The least roughness a glTF glossy, coat or metal lobe is given: the lobe's own clamp
+// (ggx::kMinRoughness), so the floor widens no lobe the tracers can represent and only keeps a
+// constant of 0 off the planar-mirror path (isPlanarMirrorMat), which a glTF metal is not. The same
+// for the constant and for a map's texels, which ggx::alpha clamps there.
+constexpr double kGltfMinRoughness = ggx::kMinRoughness;
 
 // GLTF-MAP-MEAN-GUTTERS: how much surface each texel of a `w` x `h` map carries, from the
 // triangles that sample it -- `uv` six per triangle (glTF's u, v: texel row v*h, Texture's

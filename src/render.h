@@ -30,6 +30,7 @@
 #include "hero.h"     // hero-wavelength spectral sampling (kHeroC)
 #include "hair_shade.h" // fiber BCSDF bridge (MatType::Hair, TODO §P3)
 #include "interference.h" // thin-film / multilayer reflectance, clamp01
+#include "ggx.h"      // the glossy lobe (GGX), its sampler and its density
 
 struct EnergyReport {
     double emitted = 0, absorbed = 0, sensor = 0, escaped = 0, residual = 0;
@@ -145,35 +146,42 @@ inline bool foldWorthIt(const Emitter& em, const double* fk, int K) {
     return B <= A;
 }
 
-// Power-cosine lobe around a mirror direction (rough specular), from two CANONICAL
-// uniforms rather than an rng. roughness in [0,1]: 0 -> sharp mirror, 1 -> broad.
-//
-// Split out of sampleGlossy so a DETERMINISTIC caller (mode W, which has no rng to draw
-// from without reintroducing noise) can drive exactly the same lobe off a low-discrepancy
-// lattice. The polar coordinate is `cosT = u1^(1/(e+1))`, so **u1 == 1 is exactly the
-// mirror direction** — that is what lets mode W's sample 0 reproduce the old
-// mirror-direction-only behaviour bit-for-bit, and it is why a deterministic caller should
-// *complement* its sequence (1 - radicalInverse) instead of Cranley-Patterson rotating it.
-// The u1 == 1 case returns `mdir` verbatim, skipping the normalize() below, whose last-bit
-// rescale would otherwise spoil that bit-identity.
-inline Vec3 glossyDirUV(const Vec3& mdir, double roughness, double u1, double u2) {
-    if (u1 >= 1.0) return mdir;              // exact mirror (rng.uniform() is [0,1), so
-                                             // only a deterministic caller reaches this)
-    double rr = roughness < 1e-3 ? 1e-3 : roughness;
+// A ROUGH DIELECTRIC's jitter (frosted glass): a power-cosine cone of exponent 2 / r^2 - 2 about
+// the direction `dir` the interface chose, r the material's roughness (0 sharp, 1 broad). Not a
+// BSDF anyone evaluates -- the reflective lobes are GGX (ggx.h, drawGlossy) -- only a blur, whose
+// width a roughness keeps: a glossy lobe of the same roughness is as wide (ggx.h, ROUGHNESS).
+// Two draws off the caller's stream, in that order (sequenced into locals: passing
+// rng.uniform() twice as arguments would leave the order unspecified). Device twin
+// sampleRoughCone.
+inline Vec3 sampleRoughCone(const Vec3& dir, double roughness, Pcg32& rng) {
+    const double u1 = rng.uniform(), u2 = rng.uniform();
+    const double rr = roughness < 1e-3 ? 1e-3 : roughness;
     double e = 2.0 / (rr * rr) - 2.0; if (e < 0) e = 0;
-    double cosT = std::pow(u1, 1.0 / (e + 1.0));
-    double sinT = std::sqrt(std::max(0.0, 1.0 - cosT * cosT));
-    double phi = 2.0 * PI * u2;
-    Vec3 t, b; onb(mdir, t, b);
-    return normalize(t * (sinT * std::cos(phi)) + b * (sinT * std::sin(phi)) + mdir * cosT);
+    const double cosT = std::pow(u1, 1.0 / (e + 1.0));
+    const double sinT = std::sqrt(std::max(0.0, 1.0 - cosT * cosT));
+    const double phi = 2.0 * PI * u2;
+    Vec3 t, b; onb(dir, t, b);
+    return normalize(t * (sinT * std::cos(phi)) + b * (sinT * std::sin(phi)) + dir * cosT);
 }
 
-// Stochastic form: two draws off the caller's stream, in that order.
-inline Vec3 sampleGlossy(const Vec3& mdir, double roughness, Pcg32& rng) {
-    // Sequenced into locals deliberately: passing rng.uniform() twice as arguments would
-    // leave the draw order unspecified and desynchronise the stream.
-    double u1 = rng.uniform(), u2 = rng.uniform();
-    return glossyDirUV(mdir, roughness, u1, u2);
+// A direction drawn from the GGX lobe of `roughness` about the shading normal `n` for the arrival
+// `wo` (pointing back along the incoming ray) -- with its multiple scattering where `ms` (ggx.h) --
+// from two canonical uniforms -- an rng's, or a deterministic lattice's (mode W: u1 == 1 is the exact
+// mirror direction, ggx::sampleUVAll) -- and `w`, the draw's f cos / pdf over the lobe's reflectance
+// (ggx::weightAll: the single-scattering lobe's masking, in (0, 1]; with `ms` a mean of 1 for a white
+// lobe), wavelength-free and the same from either end of a path. The caller ends the path where the
+// direction is not above n. Device twin dGgxDrawUV.
+inline Vec3 ggxDrawUV(const Vec3& n, const Vec3& wo, double roughness, bool ms, double u1, double u2,
+                      double& w) {
+    const double al = ggx::alpha(roughness);
+    const Vec3 o = ggx::sampleUVAll(n, wo, al, ms, u1, u2);
+    w = ggx::weightAll(ggx::pair(n, wo, o, al), ms);
+    return o;
+}
+// The same off the caller's stream: two draws, in that order.
+inline Vec3 ggxDraw(const Vec3& n, const Vec3& wo, double roughness, bool ms, Pcg32& rng, double& w) {
+    const double u1 = rng.uniform(), u2 = rng.uniform();
+    return ggxDrawUV(n, wo, roughness, ms, u1, u2, w);
 }
 
 // --- Caustic classification: what a photon vertex does to a beam of light -------------
@@ -508,13 +516,7 @@ inline double coatSplatF(const CoatSplat* cs, const Vec3& wb, double lambda) {
     return cs ? cs->c.f(*cs->scene, *cs->h, wb, lambda) : 1.0;
 }
 
-// --- The glossy lobe, and a rough interference reflector ----------------------------------
-// Power-cosine glossy exponent for a roughness, the lobe sampleGlossy draws from.
-inline double glossyExponent(double roughness) {
-    double rr = roughness < 1e-3 ? 1e-3 : roughness;
-    double e = 2.0 / (rr * rr) - 2.0;
-    return e < 0 ? 0 : e;
-}
+// --- The glossy lobe (GGX, ggx.h), and a rough interference reflector ----------------------
 
 // The interference reflectance an iridescent Glossy (Material::iridescence) weights its lobe
 // by, at `lambda`, for light meeting the coating at the cosine `cosH`: the angle each direction
@@ -544,16 +546,20 @@ inline double halfVectorCos(const Vec3& a, const Vec3& b) {
 }
 
 // A direction drawn from a glossy lobe, and the factor the draw leaves beyond the lobe's `reflect`
-// slot: f * cos / pdf = reflect(lambda) * R(lambda), R being an iridescent lobe's interference
-// reflectance at the pair's half-vector and exactly 1 on a plain lobe. Every sampler of a Glossy
-// material's lobe draws through drawGlossy (or glossyAt, for a direction a lattice chose), so the
-// factor comes with the direction, and so does every fold that re-weighs it (mode J's spectral
-// carrier). How to take R -- multiplied in, a roulette, a roulette on a bundle's largest -- is the
-// caller's; `irid` says whether R can differ from 1, for a roulette or a per-wavelength loop
-// that would otherwise run on a plain lobe. A layered coat's sheen lobe draws sampleGlossy
-// itself: a coat never interferes. The draw keeps the hit's address, so it takes no temporary.
+// slot: f * cos / pdf = reflect(lambda) * R(lambda) * w, R an iridescent lobe's interference
+// reflectance at the pair's half-vector (exactly 1 on a plain lobe) and w the draw's weight
+// (ggx::weightAll: wavelength-free, the same from either end of a path, the lobe being reciprocal;
+// the single-scattering lobe's masking, in (0, 1], with its multiple scattering a mean of 1 for a
+// white lobe). Every sampler of a Glossy material's lobe draws through drawGlossy (or glossyDrawUV,
+// for a lattice's uniforms), so the factor comes with the direction, and so does every fold that
+// re-weighs it (mode J's spectral carrier, which takes R per wavelength and w for all). How to take R
+// -- multiplied in, a roulette, a roulette on a bundle's largest -- is the caller's; `irid` says
+// whether R can differ from 1, for a roulette or a per-wavelength loop that would otherwise run on a
+// plain lobe. A layered coat's sheen lobe draws ggxDraw itself: a coat never interferes. The draw
+// keeps the hit's address, so it takes no temporary.
 struct GlossyDraw {
     Vec3 o;              // the direction; the caller ends the path where it is not above the surface
+    double w = 0.0;      // the draw's weight (0 where o is not above the normal)
     bool irid = false;   // the lobe interferes
     double cH = 1.0;     // the half-vector cosine R reads (1 on a plain lobe)
     const Scene* scene = nullptr;
@@ -561,66 +567,60 @@ struct GlossyDraw {
     const Hit* h = nullptr;
     double R(double lambda) const { return irid ? iridescenceR(*scene, *m, h, lambda, cH) : 1.0; }
 };
-// `o` drawn from m's lobe at h some other way; `wo` the direction back along the incoming ray.
-inline GlossyDraw glossyAt(const Scene& scene, const Material& m, const Hit& h, const Vec3& wo,
-                           const Vec3& o) {
+// Whether a Glossy material's lobe adds its multiple scattering (ggx.h): a plain one does; a rough
+// interference reflector and a layered material's coat, whose reflectance is taken at the pair's half
+// vector, do not. Device twin dGlossyMs.
+inline bool glossyMs(const Material& m) { return m.iridescence == 0 && !m.coatLobe; }
+// A draw from m's lobe at h about the shading normal `n`, for the arrival `wo` (the direction back
+// along the incoming ray), from canonical uniforms (ggxDrawUV; u1 == 1 the mirror).
+inline GlossyDraw glossyDrawUV(const Scene& scene, const Material& m, const Hit& h, const Vec3& n,
+                               const Vec3& wo, double u1, double u2) {
     GlossyDraw g;
-    g.o = o;
+    g.o = ggxDrawUV(n, wo, materialRoughness(scene, m, h), glossyMs(m), u1, u2, g.w);
     g.irid = m.iridescence != 0;
-    if (g.irid) g.cH = halfVectorCos(wo, o);
+    if (g.irid) g.cH = halfVectorCos(wo, g.o);
     g.scene = &scene; g.m = &m; g.h = &h;
     return g;
 }
-// A draw from m's lobe about the mirror of the incoming direction `dIn` in the normal `n`; `wo`
-// the direction back along it, as the caller holds it.
-inline GlossyDraw drawGlossy(const Scene& scene, const Material& m, const Hit& h, const Vec3& dIn,
-                             const Vec3& n, const Vec3& wo, Pcg32& rng) {
-    return glossyAt(scene, m, h, wo, sampleGlossy(reflect(dIn, n), materialRoughness(scene, m, h), rng));
+// The same off the caller's stream: two draws, in that order.
+inline GlossyDraw drawGlossy(const Scene& scene, const Material& m, const Hit& h, const Vec3& n,
+                             const Vec3& wo, Pcg32& rng) {
+    const double u1 = rng.uniform(), u2 = rng.uniform();
+    return glossyDrawUV(scene, m, h, n, wo, u1, u2);
 }
-GlossyDraw glossyAt(const Scene&, const Material&, const Hit&&, const Vec3&, const Vec3&) = delete;
+GlossyDraw glossyDrawUV(const Scene&, const Material&, const Hit&&, const Vec3&, const Vec3&, double,
+                        double) = delete;
 GlossyDraw drawGlossy(const Scene&, const Material&, const Hit&&, const Vec3&, const Vec3&,
-                      const Vec3&, Pcg32&) = delete;
+                      Pcg32&) = delete;
 
-// The glossy BSDF for the pair (wo, wi), both unit and pointing away from the surface, the lobe
-// mirrored about `wo`: r * lobe / cos(wi), in bsdf_eval.h's convention (see its header), r the
-// `reflect` slot -- times the interference reflectance on an iridescent glossy. 0 unless both
-// lie above the shading normal `ns` and wi inside the lobe. `h` (may be null) supplies mapped
-// slots; without it the material's constants are read.
+// The glossy BSDF for the pair (wo, wi), both unit and pointing away from the surface: r times the
+// GGX lobe about the shading normal `ns` with its multiple scattering where the material takes it
+// (ggx.h fAll, glossyMs; symmetric in the pair), r the `reflect` slot -- times the interference
+// reflectance at the pair's half vector on an iridescent glossy. 0 unless both lie above ns. `h`
+// (may be null) supplies mapped slots; without it the material's constants are read.
 inline double glossyF(const Scene& scene, const Material& m, const Hit* h, const Vec3& ns,
                       const Vec3& wo, const Vec3& wi, double lambda) {
-    const double cosWi = dot(wi, ns), cosWo = dot(wo, ns);
-    if (cosWi <= 0 || cosWo <= 0) return 0.0;
+    const ggx::Pair p = ggx::pair(ns, wo, wi, ggx::alpha(h ? materialRoughness(scene, m, *h) : m.roughness));
+    if (!p.ok) return 0.0;
     double r = h ? clamp01(reflectSlot(scene, m, *h, lambda)) : clamp01(m.reflect(lambda));
     if (m.iridescence) r *= iridescenceR(scene, m, h, lambda, halfVectorCos(wo, wi));
-    const double e = glossyExponent(h ? materialRoughness(scene, m, *h) : m.roughness);
-    // The mirror direction of the outgoing ray about ns, as sampleGlossy is given it.
-    const Vec3 mdir = reflect(wo * -1.0, ns);
-    const double cosLobe = dot(wi, mdir);
-    if (cosLobe <= 0) return 0.0;
-    const double lobe = (e + 1.0) / (2.0 * PI) * std::pow(cosLobe, e);
-    return r * lobe / cosWi;
+    return r * ggx::fAll(p, glossyMs(m));
 }
-
-// THE GLOSSY LOBE ON A WALK FROM THE LIGHT. glossyF divides by the cosine on the light's side, so
-// the lobe is not reciprocal, and a walk from the light carries its adjoint, glossyF with the pair
-// swapped (bsdf_eval.h bsdfFAdjoint). Drawing the outgoing `wOut` from the lobe mirrored about the
-// arrival `wIn` (pointing back toward the light), that walk's factor f*cos/pdf is therefore r times
-// this ratio, cos(wOut, ns) / cos(wIn, ns), where a camera walk's is r alone. 1 at the mirror
-// direction; 0 for an arrival from below the shading normal `ns`, whose adjoint is 0. It can exceed
-// 1: the lobe conserves energy toward the camera, not toward the light. Device twin
-// dGlossyAdjointRatio.
-inline double glossyAdjointRatio(const Vec3& ns, const Vec3& wIn, const Vec3& wOut) {
-    const double ci = dot(wIn, ns), co = dot(wOut, ns);
-    return (ci > 0.0 && co > 0.0) ? co / ci : 0.0;
+// The density, in solid angle, with which drawGlossy draws `wi` for the arrival `wo` (bsdf_eval.h
+// bsdfPdf's Glossy case): the mixture's where the lobe has its multiple scattering.
+inline double glossyPdf(const Scene& scene, const Material& m, const Hit* h, const Vec3& ns,
+                        const Vec3& wo, const Vec3& wi) {
+    return ggx::pdfAll(ggx::pair(ns, wo, wi, ggx::alpha(h ? materialRoughness(scene, m, *h) : m.roughness)),
+                       glossyMs(m));
 }
 
 // Whether a glossy lobe met along `rayDir` reflects toward where the ray came from: only a camera
 // side above the shading normal `ns`. glossyF -- and so bsdfF, every connection's value -- is 0 for
-// wo below ns, the light walks end there (glossyAdjointRatio's 0) and BDPT's camera walk has no
-// density there (bsdfPdf), so a unidirectional camera walk (modes R, W, M, S) ends there too. Its
-// lobe sampler would otherwise go on and light a point no other strategy can: on a normal-mapped
-// glossy room mode R read itself 1.044 with glossy NEE off, the lobe alone. Where ns == ng a ray
-// meeting the surface from its front always passes. Device twin dGlossyCameraSide.
+// wo below ns, the light walks end there (no microfacet is visible from below: ggx::sampleUV) and
+// BDPT's camera walk has no density there (bsdfPdf), so a unidirectional camera walk (modes R, W, M,
+// S) ends there too. Its lobe sampler would otherwise go on and light a point no other strategy can:
+// on a normal-mapped glossy room mode R read itself 1.044 with glossy NEE off, the lobe alone. Where
+// ns == ng a ray meeting the surface from its front always passes. Device twin dGlossyCameraSide.
 inline bool glossyCameraSide(const Vec3& rayDir, const Vec3& ns) { return dot(rayDir, ns) < 0.0; }
 
 // The terminator's softening toward a light along `w` at a vertex whose shading normal is `ns` and
@@ -659,9 +659,8 @@ inline double coatContSoftening(const Hit& h, const Vec3& d) {
 // A glossy photon vertex's camera splat (Renderer::camSplatAll and kin). A glossy lobe is not
 // Lambertian, so its value is known only once the connection's direction is: the splats call
 // f(wc) for the direction wc they found toward the camera point. `wl` points back along the
-// photon's arrival; a particle vertex takes the ADJOINT BSDF (bsdf_eval.h bsdfFAdjoint), which
-// for the glossy lobe is glossyF with the pair swapped -- divided by the cosine on the light's
-// side, as energy conservation requires.
+// photon's arrival; a particle vertex takes the ADJOINT BSDF (bsdf_eval.h bsdfFAdjoint), glossyF
+// with the pair swapped, which the GGX lobe's reciprocity makes glossyF itself.
 struct GlossySplat {
     const Scene* scene;
     const Material* m;
@@ -1572,11 +1571,12 @@ struct Renderer {
         if (!firstBounce) return 1.0;
         return shadowTerminatorG(wi, h.n, orientedGeoN(h));
     }
-    // A photon's glossy continuation from its arrival (`wIn`, toward the light) into `o`: the lobe's
-    // adjoint (glossyAdjointRatio) times the shading normal's half of Veach's (shadingAdjointCorr), as
-    // bdpt.h's light walk takes them. 0 for an arrival from below ns. Device twin dGlossyPhotonAdjoint.
-    static double glossyPhotonAdjoint(const Hit& h, const Vec3& wIn, const Vec3& o) {
-        return glossyAdjointRatio(h.n, wIn, o) * shadingAdjointCorr(wIn, o, h.n, orientedGeoN(h));
+    // A photon's glossy continuation from its arrival (`wIn`, toward the light) into `o`, drawn with
+    // the draw's weight `w` (GlossyDraw::w, ggxDraw): w times the shading normal's half of Veach's
+    // adjoint (shadingAdjointCorr), as bdpt.h's light walk takes them; the lobe itself is reciprocal.
+    // 0 for an arrival from below ns (w is). Device twin dGlossyPhotonWeight.
+    static double glossyPhotonWeight(const Hit& h, const Vec3& wIn, const Vec3& o, double w) {
+        return w * shadingAdjointCorr(wIn, o, h.n, orientedGeoN(h));
     }
     // A compound's own deposit (compoundGathers), made before its pick, of a photon arriving along
     // -`wi` with throughput `beta`: what it stores. Its gathering lobes -- diffuse or translucent,
@@ -3003,14 +3003,14 @@ struct Renderer {
                 double r = clamp01(reflectSlot(scene, m, h, lambda));
                 // Russian roulette on reflectance (see Mirror).
                 if (rng.uniform() >= r) { e.absorbed += beta; return false; }
-                const GlossyDraw gd = drawGlossy(scene, m, h, ray.d, h.n, ray.d * -1.0, rng);
+                const GlossyDraw gd = drawGlossy(scene, m, h, h.n, ray.d * -1.0, rng);
                 const Vec3& o = gd.o;
                 if (dot(o, h.n) <= 0) { e.absorbed += beta; return false; } // below surface
-                // A photon carries the lobe's adjoint (glossyAdjointRatio) and, where the shading
+                // A photon carries the draw's weight and, where the shading
                 // normal tilts, Veach's shading-normal half (shadingAdjointCorr, as bdpt.h's light
                 // walk takes at every non-delta vertex; 1 where ns == ng). The ledger takes what it
                 // gains or loses as negative or positive absorption, so it still balances.
-                const double adj = glossyPhotonAdjoint(h, ray.d * -1.0, o);
+                const double adj = glossyPhotonWeight(h, ray.d * -1.0, o, gd.w);
                 if (!(adj > 0.0)) { e.absorbed += beta; return false; }
                 e.absorbed += beta * (1.0 - adj);
                 beta *= adj;
@@ -3960,7 +3960,8 @@ struct Renderer {
                 double R = layeredCoatReflectance(scene, cm, h, ray.d, lambda);
                 if (rng.uniform() < R) {                    // coat reflection
                     double cr = materialRoughness(scene, cm, h);
-                    Vec3 o = sampleGlossy(reflect(ray.d, h.n), cr, rng);
+                    double wC;
+                    Vec3 o = ggxDraw(h.n, ray.d * -1.0, cr, false, rng, wC);
                     if (dot(o, h.n) <= 0) { e.absorbed += beta; return; }
                     {   // the reciprocal coat's reflection over the coin's R (coatSheenRatio)
                         const double c = coatSheenRatio(scene, cm, h, ray.d * -1.0, o, lambda);
@@ -3968,11 +3969,11 @@ struct Renderer {
                         beta *= c;
                     }
                     // The coat's lobe is a glossy lobe (its own material, coatChild): softened on
-                    // the first bounce (glossyArrival), and its adjoint, as interactPhotonSpecular's.
+                    // the first bounce (glossyArrival), and its masking, as interactPhotonSpecular's.
                     const double sC = glossyArrival(h, ray.d * -1.0, bounce == 0);
                     e.absorbed += beta * (1.0 - sC);
                     beta *= sC;
-                    const double adj = glossyPhotonAdjoint(h, ray.d * -1.0, o);
+                    const double adj = glossyPhotonWeight(h, ray.d * -1.0, o, wC);
                     if (!(adj > 0.0)) { e.absorbed += beta; return; }
                     e.absorbed += beta * (1.0 - adj);
                     beta *= adj;
@@ -3980,7 +3981,7 @@ struct Renderer {
                     // A clearcoat reflection is a mirror lobe: it focuses when tight (the
                     // highlight a polished coat throws IS a caustic), scatters when rough.
                     (cr <= kCausticGlossRoughness ? sawFocus : sawScatter) = true;
-                    continue;                               // lossless but for the adjoint
+                    continue;                               // lossless but for the masking
                 }
                 int child = mixResolveChild(scene, cm, h, rng.uniform());  // body lobe (leftover absorbs; honours a weight map)
                 if (child < 0) { e.absorbed += beta; return; }
@@ -4006,7 +4007,7 @@ struct Renderer {
                 case MatType::Dielectric:
                 case MatType::Glossy: {
                     // SPECTRAL FOLD (FOLD-GLOSSY, 0.260.1): a glossy lobe's GEOMETRY is
-                    // wavelength-free -- sampleGlossy reads the roughness and nothing else -- so
+                    // wavelength-free -- drawGlossy reads the roughness and nothing else -- so
                     // every wavelength still travels the same chord out of this vertex, which is
                     // the actual test for keeping the claim (retire on wavelength DIVERGENCE,
                     // absorb wavelength DEPENDENCE into the per-bin ratios). Only its albedo
@@ -4585,7 +4586,8 @@ struct Renderer {
                     if ((uCoat < Rl[i]) != refl0) { deHero(); nUp = 1; break; }
                 if (refl0) {
                     double cr = materialRoughness(scene, cm, h);
-                    Vec3 o = sampleGlossy(reflect(ray.d, h.n), cr, rng);
+                    double wC;
+                    Vec3 o = ggxDraw(h.n, ray.d * -1.0, cr, false, rng, wC);
                     if (dot(o, h.n) <= 0) { e.absorbed += activeSum(); return; }
                     for (int i = 0; i < nUp; ++i) {   // the reciprocal coat's reflection (scalar twin)
                         const double c = coatSheenRatio(scene, cm, h, ray.d * -1.0, o, lam[i]);
@@ -4594,7 +4596,7 @@ struct Renderer {
                     }
                     const double sC = glossyArrival(h, ray.d * -1.0, bounce == 0);   // see scalar twin
                     for (int i = 0; i < nUp; ++i) { e.absorbed += beta[i] * (1.0 - sC); beta[i] *= sC; }
-                    const double adj = glossyPhotonAdjoint(h, ray.d * -1.0, o);
+                    const double adj = glossyPhotonWeight(h, ray.d * -1.0, o, wC);
                     if (!(adj > 0.0)) { e.absorbed += activeSum(); return; }
                     for (int i = 0; i < nUp; ++i) { e.absorbed += beta[i] * (1.0 - adj); beta[i] *= adj; }
                     if (!continueAlong(h, o, Lobe::Reflect, ray)) { e.absorbed += activeSum(); return; }
@@ -4738,10 +4740,10 @@ struct Renderer {
                     } else if (m.type == MatType::Filter) {
                         ray = Ray{h.p + ray.d * 1e-6, ray.d};      // direction unchanged
                     } else {
-                        const GlossyDraw gd = drawGlossy(scene, m, h, ray.d, h.n, ray.d * -1.0, rng);
+                        const GlossyDraw gd = drawGlossy(scene, m, h, h.n, ray.d * -1.0, rng);
                         const Vec3& o = gd.o;
                         if (dot(o, h.n) <= 0) { e.absorbed += activeSum(); return; }  // below surface
-                        const double adj = glossyPhotonAdjoint(h, ray.d * -1.0, o);  // see the scalar path
+                        const double adj = glossyPhotonWeight(h, ray.d * -1.0, o, gd.w);  // see the scalar path
                         if (!(adj > 0.0)) { e.absorbed += activeSum(); return; }
                         for (int i = 0; i < nUp; ++i) { e.absorbed += beta[i] * (1.0 - adj); beta[i] *= adj; }
                         if (gd.irid) {
@@ -5065,7 +5067,7 @@ struct Renderer {
         if (m.type == MatType::Dielectric && !whitted) {
             const double rough = materialRoughness(scene, m, h);
             if (rough > 1e-3) {
-                const Vec3 pert = sampleGlossy(out, rough, rng);
+                const Vec3 pert = sampleRoughCone(out, rough, rng);
                 if (st.refracted ? (dot(pert, o.nl) < 0.0) : (dot(pert, o.nl) > 0.0)) out = pert;
             }
         }

@@ -1,20 +1,24 @@
-"""Regression check: a walk from the light carries the glossy lobe's adjoint (GLOSSY-FLAT-DJU).
+"""Regression check: a walk from the light weighs the glossy lobe as a walk from the camera does.
 
     python tools/check_glossy_adjoint.py [--out png/check_glossy_adjoint] [--exe ftrace.exe]
                                          [--no-gpu] [--modes D,J,U,B,M,S] [--seeds 3]
 
-The glossy BSDF divides its lobe by the cosine on the light's side (render.h glossyF), so it is not
-reciprocal, and a walk from the light must carry its adjoint: drawing its way out of the lobe about
-its arrival, it multiplies r by cos(out)/cos(in) (glossyAdjointRatio), where a walk from the camera
-takes r alone. A light walk that takes r too is off by cos(in)/cos(out) at every glossy bounce.
+The glossy lobe is GGX (src/ggx.h, since 0.445.0): reciprocal, so a light walk evaluates the camera's
+function, and a draw from it, from either end, weighs r by the lobe's masking G2 / G1 (at most 1). A
+walk that weighs it otherwise -- r alone, or the Phong lobe's adjoint cos(out) / cos(in), which
+0.440.2 to 0.444.x carried (GLOSSY-FLAT-DJU; before 0.440.2 a light walk took r and read light that
+arrives steep and leaves grazing ~1.3 of R in B and M) -- reads its own image.
 
-Two scenes, every mode against mode R on the same device at -max-bounce 32 (modes M and S deposit
+Three scenes, every mode against mode R on the same device at -max-bounce 32 (modes M and S deposit
 over 32 bounces whatever the flag says):
   * "bounce": a glossy floor lit steeply by a panel that faces it, throwing its light at a grazing
     angle onto a diffuse wall, which is the camera's view -- light that arrives steep and leaves
-    grazing, the ratio far from 1: a light walk taking r reads it ~1.3 of R in B and M, 1.1 in D.
+    grazing.
   * "room": five glossy walls (roughness 0.4), lit at a grazing angle by a tilted panel -- many
-    glossy bounces at every angle, where the same fault reads ~1 % bright in D, J and U.
+    glossy bounces at every angle.
+  * "grazing": the reverse of "bounce": a rough glossy floor (0.8) lit at a grazing angle, throwing
+    its light up onto a diffuse ceiling, which the camera sees from below -- light that arrives
+    grazing and leaves steep, where the Phong lobe's adjoint had no bound (GLOSSY-ADJ-VARIANCE).
 Each mode's frame mean over `--seeds` seeds must be within TOL of mode R's. Exits 1 on any failure.
 """
 import argparse
@@ -53,6 +57,15 @@ SCENES = {
         "quad { origin -2 3 -2  u 4 0 0  v 0 0 4  material w }",
         "light area { origin -1.9 0.2 -1.5  u 0 0 0.6  v 0 2.4 0  normal 1 0 0.2  spd preset:bb6500  power 40 }",
         'camera "c" { eye 0 1.2 4  look_at 0 1.2 0  up 0 1 0  fov_y 50  film { res 64 48 } }',
+    ]),
+    "grazing": (0.02, [
+        "scene { units meters }",
+        'material "g" { type glossy reflect 0.9  roughness 0.8 }',
+        'material "w" { type diffuse reflect 0.8 }',
+        "quad { origin -3 0 -3  u 0 0 6  v 6 0 0  material g }",
+        "quad { origin -3 2 -3  u 6 0 0  v 0 0 6  material w }",
+        "light area { origin -2.9 0.05 -1  u 0 0 2  v 0 0.4 0  normal 1 0.15 0  spd preset:bb6500  power 40 }",
+        'camera "c" { eye 1.5 0.6 0  look_at 0 2 0  up 1 0 0  fov_y 60  film { res 64 48 } }',
     ]),
 }
 

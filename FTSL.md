@@ -1257,7 +1257,7 @@ Fills a complete material; a few knobs may be overridden afterward
 | `translucent` | `reflect <spec>`(0.4); `transmit <spec>`(0.4) — two-sided Lambertian (diffuse transmission / thin-SSS look). Front hemisphere scatters `reflect`, back hemisphere scatters `transmit`; light diffuses THROUGH the surface. `reflect texture:<n>` allowed, and both slots take a pattern (`reflect`/`transmit pattern:<n>`, `reflect_map`/`transmit_map`). Alias: `diffuse_transmit`. `reflect`+`transmit` are energy-clamped to ≤1. |
 | `mirror` | `reflect <spec>`(0.95) |
 | `halfmirror` | `reflect <spec>`(0.5) |
-| `glossy` | `reflect <spec>`(0.9) or `reflect pattern:<n>`/`reflect_map`; `roughness <r>`(0.2) or `roughness pattern:/texture:<n>` |
+| `glossy` | `reflect <spec>`(0.9) or `reflect pattern:<n>`/`reflect_map`; `roughness <r>`(0.2) or `roughness pattern:/texture:<n>`. A GGX microfacet lobe with its multiple scattering (since 0.445.0); `roughness` is its width, GGX alpha 0.646 r (the width the Phong lobe it replaced had), and `reflect` its albedo at every roughness |
 | `filter` | `transmit <spec>`(0.5) — a colored gel / Wratten filter: a thin non-scattering absorber. A ray passes straight through (no reflection, no refraction) and survives with probability T(λ). Feed T from a measured curve (`transmit filter:red-25`, `transmit file:…csv`) or a primitive (`transmit gaussian center=630 sigma=25`); `transmit pattern:<n>` / `transmit_map` vary it across the surface. |
 | `dielectric` | `ior <spec>`(BK7); `roughness`(0)/map; `absorb <spec>`(0) Beer-Lambert tint per metre |
 | `thinfilm` | `ior`(1.5); `film_ior <spec>`(1.30) -- a number, or a dispersive index such as `glass:titania`; `film_thickness <nm>`(300)/`film_thickness_map`; `substrate_k <spec>`(0). With a clear substrate (`substrate_k` 0) this is the surface of a body of index `ior`, coated: the ray refracts in and is then inside that body, as with `dielectric`, so give it a closed shape. A free-standing film (a soap film, a bubble's wall) has air on both sides: `ior 1`. `roughness <r>`(none) or `roughness pattern:/texture:<n>` on an **opaque** film (`substrate_k` > 0 at every wavelength) makes a rough interference reflector: the `glossy` lobe of that roughness, weighted by the film's reflectance at the half-vector's angle, which every mode renders, the forward ones included; `reflect`(1) tints it. A clear film with a `roughness` is an error. |
@@ -1422,7 +1422,8 @@ albedo is flat in roughness while the truth falls, giving errors up to **−32 %
 position-free (`src/layered.h`) and uses the **measured** distribution of bounce counts. That
 distribution depends on the coat index and the body's lobe shape but **not** on its albedo, so it is
 computed once per body at scene build and then serves every wavelength and every albedo for free —
-which is what makes it affordable. Measured on a furnace:
+which is what makes it affordable. Measured on a furnace (with the Phong glossy body before 0.445.0;
+the body is the GGX lobe with its multiple scattering since, as every glossy lobe is):
 
 | body roughness | true | `analytic` | `stochastic` |
 |---|---|---|---|

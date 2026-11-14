@@ -41,6 +41,7 @@
 // a weight (f*cos/pdf) rather than a density. Suboptimal weights cost variance, not correctness.
 // ============================================================================================
 #include "linalg.h"
+#include "ggx.h"   // the glossy body's lobe (GgxBody)
 
 #include <cmath>
 
@@ -277,9 +278,6 @@ inline double albedoFromMoments(double a, const double* P, int K,
 }
 
 // ---- the two body lobes the material system actually ships ---------------------------------
-// Replicated here because scene.h, where the moments are stamped, sits below render.h and
-// cannot call glossyDirUV. `-checklayered` compares this sampler against that one directly, so
-// the duplication is checked rather than merely intended.
 struct LambertBody {
     double f(const Vec3&, const Vec3& b) const { return (b.z > 0.0) ? 1.0 / 3.14159265358979323846 : 0.0; }
     bool sample(const Vec3&, double u1, double u2, Vec3& b, double& weight) const {
@@ -290,39 +288,19 @@ struct LambertBody {
     }
 };
 
-// The engine's glossy lobe is a cosine-power (Phong-style) distribution about the MIRROR
-// direction with exponent e = 2/r^2 - 2 -- not GGX. Using a GGX lobe here would compute the
-// escape statistics of a body the renderer does not have.
-struct PhongBody {
+// The engine's glossy lobe (ggx.h) with its multiple scattering, white, in the frame whose +Z is the
+// normal: the same functions every tracer samples and evaluates for a plain glossy body, so these
+// escape statistics are the body's.
+struct GgxBody {
     double rough = 0.2;
     double f(const Vec3& a, const Vec3& b) const {
-        if (!(a.z > 0.0) || !(b.z > 0.0)) return 0.0;
-        const double rr = rough < 1e-3 ? 1e-3 : rough;
-        const double e = (2.0 / (rr * rr) - 2.0) > 0.0 ? (2.0 / (rr * rr) - 2.0) : 0.0;
-        const Vec3 m{ -a.x, -a.y, a.z };                       // mirror of a about +Z
-        const double c = dot(m, b);
-        if (!(c > 0.0)) return 0.0;
-        return (e + 2.0) * std::pow(c, e) / (2.0 * 3.14159265358979323846 * (b.z > 1e-9 ? b.z : 1e-9));
+        return ggx::fAll(ggx::pair(Vec3{0, 0, 1}, a, b, ggx::alpha(rough)), true);
     }
     bool sample(const Vec3& a, double u1, double u2, Vec3& b, double& weight) const {
-        const double rr = rough < 1e-3 ? 1e-3 : rough;
-        const double e = (2.0 / (rr * rr) - 2.0) > 0.0 ? (2.0 / (rr * rr) - 2.0) : 0.0;
-        const Vec3 m{ -a.x, -a.y, a.z };
-        const double cosT = std::pow(u1, 1.0 / (e + 1.0));
-        const double sinT = std::sqrt(1.0 - cosT * cosT > 0.0 ? 1.0 - cosT * cosT : 0.0);
-        const double phi = 2.0 * 3.14159265358979323846 * u2;
-        Vec3 t{ 1, 0, 0 };
-        if (std::fabs(m.x) > 0.9) t = Vec3{ 0, 1, 0 };
-        Vec3 bt{ m.y * t.z - m.z * t.y, m.z * t.x - m.x * t.z, m.x * t.y - m.y * t.x };
-        const double bl = length(bt);
-        if (!(bl > 0.0)) return false;
-        bt = bt * (1.0 / bl);
-        Vec3 tt{ bt.y * m.z - bt.z * m.y, bt.z * m.x - bt.x * m.z, bt.x * m.y - bt.y * m.x };
-        b = tt * (sinT * std::cos(phi)) + bt * (sinT * std::sin(phi)) + m * cosT;
-        const double l = length(b);
-        if (!(l > 0.0)) return false;
-        b = b * (1.0 / l);
-        weight = 1.0;                 // the engine's lobe is sampled exactly, so f*cos/pdf == 1
+        const Vec3 n{0, 0, 1};
+        const double al = ggx::alpha(rough);
+        b = ggx::sampleUVAll(n, a, al, true, u1, u2);
+        weight = ggx::weightAll(ggx::pair(n, a, b, al), true);   // f cos / pdf
         return b.z > 0.0;
     }
 };

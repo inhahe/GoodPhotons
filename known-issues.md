@@ -3085,7 +3085,20 @@ the hit's coordinate scale on the device (`gatherBandSlack`'s `pscale`; the host
 none). New `tools/check_gather_far.py` holds that room 3 km out to the one at the origin within 1 %
 in device modes M and S; check_translucent_gather holds the plate case within 2 % of R.
 
-## OPEN (2026-11-12, 0.440.5): GLOSSY-ADJ-VARIANCE — the glossy lobe's adjoint is unbounded at grazing arrival
+## DONE (2026-11-14, 0.445.0; opened 2026-11-12, 0.440.5): GLOSSY-ADJ-VARIANCE — the glossy lobe's adjoint is unbounded at grazing arrival
+
+**Fixed in 0.445.0: the glossy lobe is GGX with its multiple scattering** (design.md, "The glossy lobe
+is GGX"). Reciprocal, so a light walk evaluates the camera's function and its draw's weight is the
+camera walk's: r G2 / G1 <= r for the single scattering, and with the Kulla-Conty lobe a weight whose
+mean is r. Roughness keeps its width (GGX alpha 0.646 r). tools/check_glossy_adjoint.py's "grazing"
+scene (light arriving grazing at a rough floor, leaving steep) holds every mode within 0.2 % of R on
+both devices. Measured there, six seeds of each on the host, Phong (0.444.2) against GGX: the seeds'
+spread B 0.11 -> 0.06 %, M 0.22 -> 0.12 %, D 0.12 -> 0.14 %, and R 0.11 -> 0.21 % (a camera walk's
+weight was exactly r under the Phong lobe and now varies about it); neither lobe threw a firefly
+there (the brightest pixel 2.5-3.2 times the mean), so the unbounded weight's tail was rare at
+these budgets -- what 0.445.0 removes is its possibility.
+
+The report as filed:
 
 The glossy BSDF (render.h glossyF) divides its lobe by the cosine on the light's side, r * lobe /
 cos(wi): energy-conserving toward the camera, not toward the light. A light walk must carry its
@@ -4594,6 +4607,20 @@ twelve pairs (the coat x0.42-0.62 at 34-50 sigma, the half mirror x0.47 in red a
 0.381.2 passes them. The edges sit on a carrier bin boundary: an edge inside a bin is the carrier's
 own resolution, SPECGATHER-BIN-RESOLUTION, found here. A layered coat's coin (its Fresnel
 reflectance) is still taken at the walk's wavelength; it varies only with the coat's dispersion.
+
+## OPEN (2026-11-14, 0.445.0): S-IRID-SPHERES — mode S reads check_rough_irid's iridescent spheres several percent off R in single channels
+
+Found validating 0.445.0: check_rough_irid failed on host mode S, the titanium sphere's blue 1.063 of R
+over its two seeds. Six more seeds (3-8) of host S against host R read beetle 0.917 / 0.999 / 1.041 and
+titanium 1.001 / 1.004 / 0.928 (standard errors 0.024-0.034) on 0.445.0, and on 0.444.2, the Phong lobe,
+beetle 0.925 / 0.983 / 1.056 and titanium 1.042 / 0.971 / 0.910: the same, so not the GGX change. Device S
+scatters as much (chameleon red 1.140 in the 0.445.0 run, passing on its z). The check's standard error
+comes from two seeds, so it passes such a channel most runs. Unresolved: heavy-tailed noise or a bias.
+The repeated low titanium blue and beetle red (about 0.92 in both builds, 3 sigma) suggest a bias; the
+suspect is the gather's spectral carrier against an interference reflectance that swings within a
+carrier bin (SPECGATHER-BIN-RESOLUTION, which mode S's per-bin visible point shares). **Next:** many
+more seeds at a higher budget to settle bias against noise; if bias, render the titanium sphere in S
+with the carrier off (one wavelength per walk) to see whether it goes.
 
 ## OPEN (2026-10-14): SPECGATHER-BIN-RESOLUTION — mode M's 24-bin carrier misreads a spectral edge or kink inside one of its bins
 

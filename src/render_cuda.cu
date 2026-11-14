@@ -1932,29 +1932,150 @@ __device__ static DVec3 dSampleAimDir(const DEmitter& em, DRng& rng, double& pdf
     pdfW = 0.0;
     return em.normal;
 }
-// Power-cosine lobe around a mirror direction, from two CANONICAL uniforms rather than an
-// rng — the device twin of glossyDirUV (src/render.h), split out of sampleGlossy for the
-// same reason: mode W has no rng to draw from without reintroducing noise, so it drives the
-// identical lobe off a low-discrepancy lattice. `cosT = u1^(1/(e+1))` makes **u1 == 1
-// exactly the mirror direction**, which is why the deterministic caller complements its
-// sequence instead of rotating it, and why u1 >= 1 returns mdir verbatim (skipping the
-// normalize(), whose last-bit rescale would spoil that identity).
-__device__ static DVec3 glossyDirUV(const DVec3& mdir, Real roughness, Real u1, Real u2) {
-    if (u1 >= (Real)1) return mdir;          // exact mirror (only a deterministic caller
-                                             // reaches this; rng.uniform() is [0,1))
-    Real rr = roughness < (Real)1e-3 ? (Real)1e-3 : roughness;
+// A ROUGH DIELECTRIC's jitter (frosted glass): host twin render.h sampleRoughCone, where the why
+// is -- a power-cosine cone of exponent 2 / r^2 - 2 about the direction the interface chose, two
+// draws in order.
+__device__ static DVec3 sampleRoughCone(const DVec3& dir, Real roughness, DRng& rng) {
+    const Real u1 = rng.uniform(), u2 = rng.uniform();
+    const Real rr = roughness < (Real)1e-3 ? (Real)1e-3 : roughness;
     Real e = (Real)2 / (rr * rr) - (Real)2; if (e < 0) e = 0;
-    Real cosT = pow(u1, (Real)1 / (e + (Real)1));
-    Real sinT = sqrt(fmax((Real)0, (Real)1 - cosT * cosT));
-    Real phi = (Real)2 * (Real)DPI * u2;
-    DVec3 t, b; onb(mdir, t, b);
-    return normalize(t * (sinT * cos(phi)) + b * (sinT * sin(phi)) + mdir * cosT);
+    const Real cosT = pow(u1, (Real)1 / (e + (Real)1));
+    const Real sinT = sqrt(fmax((Real)0, (Real)1 - cosT * cosT));
+    const Real phi = (Real)2 * (Real)DPI * u2;
+    DVec3 t, b; onb(dir, t, b);
+    return normalize(t * (sinT * cos(phi)) + b * (sinT * sin(phi)) + dir * cosT);
 }
-__device__ static DVec3 sampleGlossy(const DVec3& mdir, Real roughness, DRng& rng) {
-    // Sequenced into locals deliberately: passing rng.uniform() twice as arguments would
-    // leave the draw order unspecified and desynchronise the stream.
-    Real u1 = rng.uniform(), u2 = rng.uniform();
-    return glossyDirUV(mdir, roughness, u1, u2);
+
+// ---------------- the glossy lobe: GGX (host twin ggx.h, where the why is) -----------------
+// The lobe's terms in double, as dBsdfF is; its sampler in Real, as every direction is.
+__device__ static inline double dGgxAlpha(double roughness) {
+    return ggx::kAlphaPerRoughness * (roughness < ggx::kMinRoughness ? ggx::kMinRoughness : roughness);
+}
+__device__ static inline double dGgxSmithA(double c, double a2) {
+    const double s2 = 1.0 - c * c;
+    return sqrt(c * c + a2 * (s2 > 0.0 ? s2 : 0.0));
+}
+// Host twin ggx::Pair / ggx::pair: the pair (a, b)'s cosines to n, their A terms and D at their half
+// vector; ok false unless both lie above n.
+struct DGgxPair { bool ok; double ca, cb, Aa, Ab, D, alpha; };
+__device__ static DGgxPair dGgxPair(const DVec3& n, const DVec3& a, const DVec3& b, double alpha) {
+    DGgxPair p{false, 0.0, 0.0, 0.0, 0.0, 0.0, alpha};
+    const double nx = n.x, ny = n.y, nz = n.z;
+    const double ax = a.x, ay = a.y, az = a.z, bx = b.x, by = b.y, bz = b.z;
+    p.ca = ax * nx + ay * ny + az * nz;
+    p.cb = bx * nx + by * ny + bz * nz;
+    if (!(p.ca > 0.0) || !(p.cb > 0.0)) return p;
+    double hx = ax + bx, hy = ay + by, hz = az + bz;
+    const double l = sqrt(hx * hx + hy * hy + hz * hz);
+    if (!(l > 0.0)) return p;
+    hx /= l; hy /= l; hz /= l;
+    const double ch = hx * nx + hy * ny + hz * nz;
+    const double cx = ny * hz - nz * hy, cy = nz * hx - nx * hz, cz = nx * hy - ny * hx;
+    const double s2 = cx * cx + cy * cy + cz * cz;
+    const double a2 = alpha * alpha;
+    const double d = a2 * ch * ch + s2;
+    if (!(d > 0.0)) return p;
+    p.D = a2 / (DPI * d * d);
+    p.Aa = dGgxSmithA(p.ca, a2);
+    p.Ab = dGgxSmithA(p.cb, a2);
+    p.ok = true;
+    return p;
+}
+__device__ static inline double dGgxF(const DGgxPair& p) {
+    return p.ok ? p.D / (2.0 * (p.cb * p.Aa + p.ca * p.Ab)) : 0.0;
+}
+__device__ static inline double dGgxPdf(const DGgxPair& p) {
+    return p.ok ? p.D / (2.0 * (p.ca + p.Aa)) : 0.0;
+}
+__device__ static inline double dGgxWeight(const DGgxPair& p) {
+    return p.ok ? p.cb * (p.ca + p.Aa) / (p.cb * p.Aa + p.ca * p.Ab) : 0.0;
+}
+// Host twin ggx::sampleUV: the visible normals' draw for the arrival a about n (u1 == 1 the exact
+// mirror, as is an arrival below n).
+__device__ static DVec3 dGgxSampleUV(const DVec3& n, const DVec3& a, Real alpha, Real u1, Real u2) {
+    const Real ca = dot(a, n);
+    if (u1 >= (Real)1 || !(ca > (Real)0)) return reflectv(a * (Real)(-1), n);
+    DVec3 t, bt; onb(n, t, bt);
+    const DVec3 vs = normalize(DVec3{alpha * dot(a, t), alpha * dot(a, bt), ca});
+    const Real phi = (Real)2 * (Real)DPI * u2;
+    const Real z = u1 * ((Real)1 + vs.z) - vs.z;
+    const Real st = sqrt(fmax((Real)0, (Real)1 - z * z));
+    const DVec3 hs{st * cos(phi) + vs.x, st * sin(phi) + vs.y, z + vs.z};
+    const DVec3 hl = normalize(DVec3{alpha * hs.x, alpha * hs.y, hs.z > (Real)0 ? hs.z : (Real)0});
+    const DVec3 h = t * hl.x + bt * hl.y + n * hl.z;
+    return normalize(h * ((Real)2 * dot(a, h)) - a);
+}
+// The multiple scattering's table (host twin ggx.h kMsE / kMsEavg, the same initialisers) and its
+// lookups (msE, msEavg, fMs), and the lobe a material shades with (fAll, pdfAll, weightAll,
+// sampleUVAll), where the why is.
+__constant__ float c_ggxMsE[GGX_MS_NA * GGX_MS_NM] = GGX_MS_E_INIT;
+__constant__ float c_ggxMsEavg[GGX_MS_NA] = GGX_MS_EAVG_INIT;
+__device__ static inline void dGgxMsRow(double alpha, int& i, double& t) {
+    double x = alpha / GGX_MS_ALPHA_MAX;
+    x = (x < 0.0 ? 0.0 : (x > 1.0 ? 1.0 : x)) * (GGX_MS_NA - 1);
+    i = (int)x;
+    if (i > GGX_MS_NA - 2) i = GGX_MS_NA - 2;
+    t = x - (double)i;
+}
+__device__ static inline double dGgxMsE(double c, double alpha) {
+    int i; double t;
+    dGgxMsRow(alpha, i, t);
+    const double y = sqrt(c < 0.0 ? 0.0 : (c > 1.0 ? 1.0 : c)) * (GGX_MS_NM - 1);
+    int j = (int)y;
+    if (j > GGX_MS_NM - 2) j = GGX_MS_NM - 2;
+    const double u = y - (double)j;
+    const float* r0 = c_ggxMsE + i * GGX_MS_NM;
+    const float* r1 = r0 + GGX_MS_NM;
+    const double e0 = r0[j] + (r0[j + 1] - r0[j]) * u, e1 = r1[j] + (r1[j + 1] - r1[j]) * u;
+    return e0 + (e1 - e0) * t;
+}
+__device__ static inline double dGgxMsEavg(double alpha) {
+    int i; double t;
+    dGgxMsRow(alpha, i, t);
+    return c_ggxMsEavg[i] + (c_ggxMsEavg[i + 1] - c_ggxMsEavg[i]) * t;
+}
+__device__ static inline double dGgxFMs(const DGgxPair& p) {
+    if (!p.ok) return 0.0;
+    const double ea = dGgxMsEavg(p.alpha);
+    if (!(1.0 - ea > 1e-6)) return 0.0;
+    return (1.0 - dGgxMsE(p.ca, p.alpha)) * (1.0 - dGgxMsE(p.cb, p.alpha)) / (DPI * (1.0 - ea));
+}
+__device__ static inline double dGgxFAll(const DGgxPair& p, bool ms) { return ms ? dGgxF(p) + dGgxFMs(p) : dGgxF(p); }
+__device__ static inline double dGgxPdfAll(const DGgxPair& p, bool ms) {
+    if (!ms || !p.ok) return dGgxPdf(p);
+    const double ps = dGgxMsE(p.ca, p.alpha);
+    return ps * dGgxPdf(p) + (1.0 - ps) * p.cb / DPI;
+}
+__device__ static inline double dGgxWeightAll(const DGgxPair& p, bool ms) {
+    if (!ms) return dGgxWeight(p);
+    if (!p.ok) return 0.0;
+    const double d = dGgxPdfAll(p, true);
+    return (d > 0.0) ? dGgxFAll(p, true) * p.cb / d : 0.0;
+}
+__device__ static DVec3 dGgxSampleUVAll(const DVec3& n, const DVec3& a, Real alpha, bool ms, Real u1, Real u2) {
+    const Real ca = dot(a, n);
+    if (!ms || u1 >= (Real)1 || !(ca > (Real)0)) return dGgxSampleUV(n, a, alpha, u1, u2);
+    const Real ps = (Real)dGgxMsE((double)ca, (double)alpha);
+    if (!(ps < (Real)1) || u1 < ps) return dGgxSampleUV(n, a, alpha, (ps < (Real)1) ? u1 / ps : u1, u2);
+    const Real v = (u1 - ps) / ((Real)1 - ps);          // a cosine draw about n
+    const Real r = sqrt(v), phi = (Real)2 * (Real)DPI * u2;
+    DVec3 t, bt; onb(n, t, bt);
+    return normalize(t * (r * cos(phi)) + bt * (r * sin(phi)) + n * sqrt(fmax((Real)0, (Real)1 - v)));
+}
+// Host twins render.h ggxDrawUV / ggxDraw: a draw from the lobe of `roughness` about the shading
+// normal n for the arrival wo -- with its multiple scattering where `ms` -- from canonical uniforms or
+// off the stream (two draws, in order), and `w` its weight.
+__device__ static inline DVec3 dGgxDrawUV(const DVec3& n, const DVec3& wo, Real roughness, bool ms, Real u1,
+                                          Real u2, Real& w) {
+    const double al = dGgxAlpha((double)roughness);
+    const DVec3 o = dGgxSampleUVAll(n, wo, (Real)al, ms, u1, u2);
+    w = (Real)dGgxWeightAll(dGgxPair(n, wo, o, al), ms);
+    return o;
+}
+__device__ static inline DVec3 dGgxDraw(const DVec3& n, const DVec3& wo, Real roughness, bool ms, DRng& rng,
+                                        Real& w) {
+    const Real u1 = rng.uniform(), u2 = rng.uniform();
+    return dGgxDrawUV(n, wo, roughness, ms, u1, u2, w);
 }
 
 // ---------------- mode W: deterministic sample placement (device twin) ----------------
@@ -2042,28 +2163,22 @@ __device__ static void dGiPhases(unsigned long long sIdx, double& p1, double& p2
     p1 = dRot05(dRadicalInverseScr(7, sIdx));
     p2 = dRot05(dRadicalInverseScr(11, sIdx));
 }
-// Deterministic rough-specular direction: point `sIdx` of a fixed 2-D lattice on the
-// power-cosine lobe. The polar coordinate is COMPLEMENTED (not rot05'd) so sample 0 is
-// exactly the mirror direction, since dRadicalInverseScr(b, 0) == 0 in every base. Each
+// Deterministic rough-specular draw: point `sIdx` of a fixed 2-D lattice on the GGX lobe
+// (dWhittedGlossyDraw). The first coordinate is COMPLEMENTED (not rot05'd) so sample 0 is exactly
+// the mirror direction, since dRadicalInverseScr(b, 0) == 0 in every base. Each
 // bounce depth takes its own prime pair so two glossy vertices on one path are not driven
 // by the same 1-D sequence. Bases 2/3 are the subpixel lattice, 5 the wavelength, 7/11 the
 // gather, so these start at 13.
 // The two lattice COORDINATES are factored out of the direction (host twin:
 // BackwardRenderer::whittedGlossyUV) so `-checklattice` can probe exactly the numbers the
 // kernel uses. They are pure integer-and-`double` arithmetic and so bit-comparable with the
-// host; the direction itself goes through glossyDirUV's trig in `Real` and is not.
+// host; the direction itself goes through the sampler's trig in `Real` and is not.
 __device__ static void dWhittedGlossyUV(unsigned long long sIdx, int bounce,
                                         double& u1, double& u2) {
     const unsigned kBases[4][2] = {{13, 17}, {19, 23}, {29, 31}, {37, 41}};
     const unsigned b0 = kBases[bounce & 3][0], b1 = kBases[bounce & 3][1];
     u1 = 1.0 - dRadicalInverseScr(b0, sIdx);   // 1 at sIdx 0 => mirror
     u2 = dRadicalInverseScr(b1, sIdx);
-}
-__device__ static DVec3 dWhittedGlossyDir(const DVec3& mdir, Real roughness,
-                                          unsigned long long sIdx, int bounce) {
-    double u1, u2;
-    dWhittedGlossyUV(sIdx, bounce, u1, u2);
-    return glossyDirUV(mdir, roughness, (Real)u1, (Real)u2);
 }
 // Deterministic DISCRETE-CHOICE coordinate: one scalar off the (sIdx, bounce) lattice for a
 // pick out of a finite weighted set, as opposed to a direction on a lobe. Not rot05'd, so
@@ -6074,7 +6189,7 @@ __device__ static bool dDielectricStep(const DScene& sc, const DMaterial& m, con
     if (m.type == D_DIELECTRIC && !whittedWeight) {
         const Real rough = dMatRoughness(sc, m, h);
         if (rough > (Real)1e-3) {
-            const DVec3 pert = sampleGlossy(out, rough, rng);
+            const DVec3 pert = sampleRoughCone(out, rough, rng);
             if (refracted ? (dot(pert, o.nl) < 0) : (dot(pert, o.nl) > 0)) out = pert;
         }
     }
@@ -6298,7 +6413,6 @@ __device__ static inline bool dMergeFromBehind(bool twoSided, const DVec3& wi, c
 struct DJBase;
 __device__ static Real dReflectSlot(const DScene& sc, const DMaterial& m, const DHit& h, Real lambda,
                                     DJBase* shp);
-__device__ static inline double dGlossyExp(double roughness);
 // Twin of iridescenceR: the interference reflectance an iridescent D_GLOSSY weights its lobe by,
 // for light meeting the coating at `cosH` (each direction's cosine with the pair's half-vector),
 // from the medium the ray met it from (DHit::extMat) where both carry a priority, else air
@@ -6323,14 +6437,19 @@ __device__ static inline Real dHalfVectorCos(const DVec3& a, const DVec3& b) {
     const Real c = (Real)0.5 * length(a + b);
     return c < (Real)1 ? c : (Real)1;
 }
-// Twin of GlossyDraw (render.h): a direction drawn from a glossy lobe, and the factor R the draw
-// leaves beyond the `reflect` slot -- an iridescent lobe's interference reflectance at the pair's
-// half-vector, exactly 1 on a plain lobe. Every device sampler of a Glossy material's lobe draws
-// through dDrawGlossy or dGlossyAt, and the JSPEC fold (dJFoldLobe) reads the same draw; how to
-// take R is the caller's. Not the RGB backward path, which refuses an iridescent material
+// Twin of GlossyDraw (render.h): a direction drawn from a glossy lobe, and the factors the draw
+// leaves beyond the `reflect` slot -- its weight `w` (ggx.h weightAll: wavelength-free, the same from
+// either end of a path) and R, an iridescent lobe's interference reflectance at the pair's half-vector,
+// exactly 1 on a plain lobe. Every device sampler of a Glossy material's lobe draws through
+// dDrawGlossy or dGlossyDrawUV, and the JSPEC fold (dJFoldLobe) reads the same draw; how to take R
+// is the caller's. Not the RGB backward path, which refuses an iridescent material
 // (cudaBackwardRGBSupported). The draw keeps the hit's address, so it takes no temporary.
+// Host twin render.h glossyMs: a plain glossy lobe adds its multiple scattering; a rough interference
+// reflector and a layered material's coat lobe do not.
+__device__ static inline bool dGlossyMs(const DMaterial& m) { return m.iridescence == 0 && !m.coatLobe; }
 struct DGlossyDraw {
     DVec3 o;
+    Real w;    // the draw's weight (0 where o is not above the normal)
     bool irid;
     Real cH;   // 1 on a plain lobe
     const DScene* sc;
@@ -6338,50 +6457,53 @@ struct DGlossyDraw {
     const DHit* h;
     __device__ Real R(Real lambda) const { return irid ? dIridescenceR(*sc, *m, h, lambda, cH) : (Real)1; }
 };
-__device__ static inline DGlossyDraw dGlossyAt(const DScene& sc, const DMaterial& m, const DHit& h,
-                                               const DVec3& wo, const DVec3& o) {
+// Host twins glossyDrawUV / drawGlossy: a draw from m's lobe at h about the shading normal `n` for
+// the arrival `wo`, from canonical uniforms (u1 == 1 the mirror) or off the stream.
+__device__ static inline DGlossyDraw dGlossyDrawUV(const DScene& sc, const DMaterial& m, const DHit& h,
+                                                   const DVec3& n, const DVec3& wo, Real u1, Real u2) {
     DGlossyDraw g;
-    g.o = o;
+    g.o = dGgxDrawUV(n, wo, dMatRoughness(sc, m, h), dGlossyMs(m), u1, u2, g.w);
     g.irid = m.iridescence != 0;
-    g.cH = g.irid ? dHalfVectorCos(wo, o) : (Real)1;
+    g.cH = g.irid ? dHalfVectorCos(wo, g.o) : (Real)1;
     g.sc = &sc; g.m = &m; g.h = &h;
     return g;
 }
 __device__ static inline DGlossyDraw dDrawGlossy(const DScene& sc, const DMaterial& m, const DHit& h,
-                                                 const DVec3& dIn, const DVec3& n, const DVec3& wo,
-                                                 DRng& rng) {
-    return dGlossyAt(sc, m, h, wo, sampleGlossy(reflectv(dIn, n), dMatRoughness(sc, m, h), rng));
+                                                 const DVec3& n, const DVec3& wo, DRng& rng) {
+    const Real u1 = rng.uniform(), u2 = rng.uniform();
+    return dGlossyDrawUV(sc, m, h, n, wo, u1, u2);
 }
-__device__ DGlossyDraw dGlossyAt(const DScene&, const DMaterial&, const DHit&&, const DVec3&,
-                                 const DVec3&) = delete;
+__device__ DGlossyDraw dGlossyDrawUV(const DScene&, const DMaterial&, const DHit&&, const DVec3&,
+                                     const DVec3&, Real, Real) = delete;
 __device__ DGlossyDraw dDrawGlossy(const DScene&, const DMaterial&, const DHit&&, const DVec3&,
-                                   const DVec3&, const DVec3&, DRng&) = delete;
-// Twin of glossyF: r * lobe / cos(wi), the lobe mirrored about wo, r the reflect slot times an
-// iridescent glossy's interference reflectance; 0 unless both lie above `ns` and wi in the lobe.
-// Double, as dBsdfF is.
+                                   const DVec3&, DRng&) = delete;
+// Mode W's draw off its (sIdx, bounce) lattice (host twin BackwardRenderer::whittedGlossyDraw).
+__device__ static inline DGlossyDraw dWhittedGlossyDraw(const DScene& sc, const DMaterial& m, const DHit& h,
+                                                        const DVec3& wo, unsigned long long sIdx, int bounce) {
+    double u1, u2;
+    dWhittedGlossyUV(sIdx, bounce, u1, u2);
+    return dGlossyDrawUV(sc, m, h, h.n, wo, (Real)u1, (Real)u2);
+}
+// Twin of glossyF: r times the GGX lobe about `ns` (symmetric in the pair), r the reflect slot
+// times an iridescent glossy's interference reflectance; 0 unless both lie above ns. Double, as
+// dBsdfF is.
 __device__ static double dGlossyF(const DScene& sc, const DMaterial& m, const DHit& h,
                                   const DVec3& ns, const DVec3& wo, const DVec3& wi, Real lambda) {
-    const double cosWi = ddot(wi, ns), cosWo = ddot(wo, ns);
-    if (cosWi <= 0 || cosWo <= 0) return 0.0;
+    const DGgxPair p = dGgxPair(ns, wo, wi, dGgxAlpha((double)dMatRoughness(sc, m, h)));
+    if (!p.ok) return 0.0;
     double r = clamp01(dReflectSlot(sc, m, h, lambda, nullptr));
     if (m.iridescence) r *= (double)dIridescenceR(sc, m, &h, lambda, dHalfVectorCos(wo, wi));
-    const double e = dGlossyExp((double)dMatRoughness(sc, m, h));
-    const DVec3 mdir = reflectv(wo * (Real)(-1), ns);
-    const double cosLobe = ddot(wi, mdir);
-    if (cosLobe <= 0) return 0.0;
-    const double lobe = (e + 1.0) / (2.0 * DPI) * pow(cosLobe, e);
-    return r * lobe / cosWi;
+    return r * dGgxFAll(p, dGlossyMs(m));
 }
-// Twin of glossyAdjointRatio (where the why is): what a walk from the light multiplies the lobe's r
-// by, cos(wOut, ns) / cos(wIn, ns), `wIn` toward the light; 0 for an arrival from below ns.
-__device__ static inline double dGlossyAdjointRatio(const DVec3& ns, const DVec3& wIn, const DVec3& wOut) {
-    const double ci = ddot(wIn, ns), co = ddot(wOut, ns);
-    return (ci > 0.0 && co > 0.0) ? co / ci : 0.0;
+// Twin of glossyPdf: the density with which dDrawGlossy draws `wi` for the arrival `wo`.
+__device__ static double dGlossyPdf(const DScene& sc, const DMaterial& m, const DHit& h,
+                                    const DVec3& ns, const DVec3& wo, const DVec3& wi) {
+    return dGgxPdfAll(dGgxPair(ns, wo, wi, dGgxAlpha((double)dMatRoughness(sc, m, h))), dGlossyMs(m));
 }
-// Host twin Renderer::glossyPhotonAdjoint: a photon's glossy continuation, the lobe's adjoint times
-// the shading normal's half of Veach's.
-__device__ static inline Real dGlossyPhotonAdjoint(const DHit& h, const DVec3& wIn, const DVec3& o) {
-    return (Real)dGlossyAdjointRatio(h.n, wIn, o) * dShadingAdjointCorr(wIn, o, h.n, dShadedNg(h));
+// Host twin Renderer::glossyPhotonWeight: a photon's glossy continuation, the draw's weight `w`
+// times the shading normal's half of Veach's adjoint.
+__device__ static inline Real dGlossyPhotonWeight(const DHit& h, const DVec3& wIn, const DVec3& o, Real w) {
+    return w * dShadingAdjointCorr(wIn, o, h.n, dShadedNg(h));
 }
 __device__ static double dLayeredCoatReflectance(const DScene& sc, const DMaterial& m,
                                                  const DHit& h, const DVec3& d, Real lambda,
@@ -12783,12 +12905,13 @@ __device__ static int interactSpecularLobe(const DScene& sc, const DCamSet& cs, 
         }
         Real r = clamp01(dReflectSlot(sc, m, h, lambda));
         if (rng.uniform() >= r) { eAbsorbed += beta; return WF_TERMINATE; }
-        const DGlossyDraw gd = dDrawGlossy(sc, m, h, rd, h.n, -rd, rng);
+        const DGlossyDraw gd = dDrawGlossy(sc, m, h, h.n, -rd, rng);
         const DVec3& o = gd.o;
         if (dot(o, h.n) <= 0) { eAbsorbed += beta; return WF_TERMINATE; }
-        // A photon carries the lobe's adjoint and its shading-normal half, the ledger the
-        // difference (host twin interactPhotonSpecular). A layered coat's lobe arrives here too.
-        const Real adj = dGlossyPhotonAdjoint(h, -rd, o);
+        // A photon carries the draw's weight and the shading normal's half of the adjoint, the
+        // ledger the difference (host twin interactPhotonSpecular). A layered coat's lobe arrives
+        // here too.
+        const Real adj = dGlossyPhotonWeight(h, -rd, o, gd.w);
         if (!(adj > (Real)0)) { eAbsorbed += beta; return WF_TERMINATE; }
         eAbsorbed += (double)(beta * ((Real)1 - adj));
         beta *= adj;
@@ -13806,10 +13929,10 @@ __device__ static int shadeStepHero(const DScene& sc, const DCamSet& cs, int cam
         } else if (m.type == D_FILTER) {
             ro = dOffsetAlong(h.p, h.ng, rd);   // straight through, direction unchanged
         } else {
-            const DGlossyDraw gd = dDrawGlossy(sc, m, h, rd, h.n, -rd, rng);
+            const DGlossyDraw gd = dDrawGlossy(sc, m, h, h.n, -rd, rng);
             const DVec3& o = gd.o;
             if (dot(o, h.n) <= 0) { for (int i = 0; i < nUp; ++i) eAbsorbed += (double)beta[i]; return WF_TERMINATE; }
-            const Real adj = dGlossyPhotonAdjoint(h, -rd, o);   // see the scalar path
+            const Real adj = dGlossyPhotonWeight(h, -rd, o, gd.w);   // see the scalar path
             if (!(adj > (Real)0)) { for (int i = 0; i < nUp; ++i) eAbsorbed += (double)beta[i]; return WF_TERMINATE; }
             for (int i = 0; i < nUp; ++i) { eAbsorbed += (double)(beta[i] * ((Real)1 - adj)); beta[i] *= adj; }
             if (gd.irid) {
@@ -14608,11 +14731,6 @@ __device__ static inline bool dGlowSeenBy(const DScene& sc, const DVertex* eye, 
 __device__ static inline bool dIsDeltaLightVertex(const DScene& sc, const DVertex& v) {
     return v.type == BV_LIGHT && v.lightIdx >= 0 && dIsDeltaEmitter(sc.emitters[v.lightIdx]);
 }
-__device__ static inline double dGlossyExp(double roughness) {
-    double rr = roughness < 1e-3 ? 1e-3 : roughness;
-    double e = 2.0 / (rr * rr) - 2.0;
-    return e < 0 ? 0 : e;
-}
 // A two-sided (transmissive) connectible material scatters into BOTH hemispheres, so a
 // connection edge on the side opposite the shading normal is legal (transmit lobe). Only
 // DiffuseTransmit qualifies (device twin of bdpt.h isTwoSidedMat).
@@ -14669,7 +14787,7 @@ __device__ static double dBsdfF(const DScene& sc, const DVertex& vt,
         double rho = clamp01(dDiffuseRho(sc, m, h, lambda));
         return rho / DPI;
     } else if (m.type == D_GLOSSY) {
-        // r * lobe / cos(wi); r carries an iridescent lobe's interference reflectance (dGlossyF).
+        // r times the GGX lobe; r carries an iridescent lobe's interference reflectance (dGlossyF).
         DHit h = dVertHit(vt);
         return dGlossyF(sc, m, h, ns, wo, wi, lambda);
     } else if (m.type == D_DIFFUSETRANSMIT) {
@@ -14694,18 +14812,13 @@ __device__ static double dBsdfPdf(const DScene& sc, const DVertex& vt,
                                   const DVec3& wo, const DVec3& wi, Real lambda) {
     const DMaterial& m = sc.mats[vt.matId];
     const DVec3& ns = vt.ns;
-    double cosWi = ddot(wi, ns), cosWo = ddot(wo, ns);
+    const double cosWi = ddot(wi, ns);
     if (m.type == D_DIFFUSE || m.type == D_FLUORESCENT) {
         if (!dLambertLit(cosWi)) return 0.0;          // from either side of ns (dLambertLit)
         return cosWi / DPI;
     } else if (m.type == D_GLOSSY) {
-        if (cosWi <= 0 || cosWo <= 0) return 0.0;
         DHit h = dVertHit(vt);
-        double e = dGlossyExp((double)dMatRoughness(sc, m, h));
-        DVec3 mdir = reflectv(wo * (Real)(-1), ns);
-        double cosLobe = ddot(wi, mdir);
-        if (cosLobe <= 0) return 0.0;
-        return (e + 1.0) / (2.0 * DPI) * pow(cosLobe, e);
+        return dGlossyPdf(sc, m, h, ns, wo, wi);      // the visible normals' (dGgxPdf)
     } else if (m.type == D_DIFFUSETRANSMIT) {
         // The lobe-selected cosine sampling at a vertex reached from `wo`, about the shading
         // normal turned to wo's geometric side, a draw on the wrong side of the true surface
@@ -15032,10 +15145,9 @@ __device__ static void dGenRay(const DCamera& cam, int px, int py, Real jx, Real
 // ADJOINT BSDF for a PARTICLE (light-subpath) vertex: f*(wo,wi) = f(wi,wo). Device twin of
 // bsdf_eval.h's bsdfFAdjoint, where the full reasoning lives. Call this, not dBsdfF, wherever a
 // light-subpath vertex is CONNECTED to something -- exactly the sites already carrying
-// dShadingAdjointCorr, which is the shading-normal half of the same Veach rule. dBsdfF
-// pre-divides by cos(wi), which is self-consistent on a continuation but not at a connection,
-// where the Glossy lobe factor is symmetric under the swap and the denominator is not.
-// Reciprocal BSDFs are unchanged by it, so switching a site over cannot perturb a diffuse scene.
+// dShadingAdjointCorr, which is the shading-normal half of the same Veach rule. Reciprocal BSDFs
+// (the GGX glossy lobe among them) are unchanged by it; a Lambertian lobe's lit test and a
+// translucent one's lobe choice are not.
 __device__ static inline double dBsdfFAdjoint(const DScene& sc, const DVertex& vt,
                                               const DVec3& wo, const DVec3& wi, Real lambda) {
     // A fiber is never a light vertex (bsdf_eval.h bsdfFAdjoint, 0.365.0): inert if ever asked.
@@ -15053,13 +15165,7 @@ __device__ static inline double dGlossyFHit(const DScene& sc, const DMaterial& m
 }
 __device__ static inline double dGlossyPdfHit(const DScene& sc, const DMaterial& m, const DHit& h,
                                               const DVec3& wo, const DVec3& wi) {
-    const double cosWi = ddot(wi, h.n), cosWo = ddot(wo, h.n);
-    if (cosWi <= 0 || cosWo <= 0) return 0.0;
-    const double e = dGlossyExp((double)dMatRoughness(sc, m, h));
-    const DVec3 mdir = reflectv(wo * (Real)(-1), h.n);
-    const double cosLobe = ddot(wi, mdir);
-    if (cosLobe <= 0) return 0.0;
-    return (e + 1.0) / (2.0 * DPI) * pow(cosLobe, e);
+    return dGlossyPdf(sc, m, h, h.n, wo, wi);
 }
 
 // The evaluable lobe handed to bkNeeLight; `wo` points toward the previous vertex.
@@ -16479,7 +16585,7 @@ __device__ __noinline__ static int bkHairHeroStep(const DScene& sc, const DMater
 // bkGiBounce). `sIdx` is the ABSOLUTE sample index, which rotates every deterministic lattice
 // so -spp progressively refines instead of re-rendering the identical image. `bounce` is the
 // bounce index along the path, so a per-vertex deterministic decision (the glossy lobe — see
-// dWhittedGlossyDir) picks a different sequence at each vertex rather than driving every
+// dWhittedGlossyDraw) picks a different sequence at each vertex rather than driving every
 // glossy bounce off the same 1-D lattice.
 struct DGiCtx {
     int depth = 0;
@@ -16763,11 +16869,12 @@ __device__ static bool bkInteract(const DScene& sc, const DMaterial* mp, const D
             // in mode W's headline configuration.
             if (whitted) {
                 if (!dWhittedAttenuate(thr, (double)r, dLocalN2(sc, stk, lambda))) return false;
-                const DGlossyDraw gd = dGlossyAt(sc, *mp, h, rd * (Real)(-1),
-                    dWhittedGlossyDir(reflectv(rd, h.n), dMatRoughness(sc, *mp, h), gi.sIdx, gi.bounce));
+                const DGlossyDraw gd = dWhittedGlossyDraw(sc, *mp, h, rd * (Real)(-1), gi.sIdx, gi.bounce);
                 const DVec3& o = gd.o;
                 if (dot(o, h.n) <= 0) return false;
-                // An iridescent lobe's interference reflectance at the pair's half-vector.
+                // The draw's weight, and an iridescent lobe's interference reflectance at the
+                // pair's half-vector.
+                if (!dWhittedAttenuate(thr, (double)gd.w, dLocalN2(sc, stk, lambda))) return false;
                 if (gd.irid && !dWhittedAttenuate(thr, (double)gd.R(lambda), dLocalN2(sc, stk, lambda)))
                     return false;
                 if (gm) {
@@ -16778,12 +16885,12 @@ __device__ static bool bkInteract(const DScene& sc, const DMaterial* mp, const D
                 if (!dContinueAlong(h, o, DL_REFLECT, ro, rd)) return false; specularArrival = true; return true;
             }
             if (rng.uniform() >= r) return false;
-            const DGlossyDraw gd = dDrawGlossy(sc, *mp, h, rd, h.n, rd * (Real)(-1), rng);
+            const DGlossyDraw gd = dDrawGlossy(sc, *mp, h, h.n, rd * (Real)(-1), rng);
             const DVec3& o = gd.o;
             if (dot(o, h.n) <= 0) return false;
-            // An iridescent lobe's interference reflectance at the pair's half-vector (the NEE
-            // above carries it inside dGlossyFHit).
-            thr *= gd.R(lambda);
+            // The draw's weight, and an iridescent lobe's interference reflectance at the pair's
+            // half-vector (the NEE above carries both inside dGlossyFHit).
+            thr *= gd.w * gd.R(lambda);
             if (gm) {                    // the other half of the weight, for whatever `o` hits
                 gm->pdf = dGlossyPdfHit(sc, *mp, h, rd * (Real)(-1), o);
                 gm->from = h.p;
@@ -17585,17 +17692,17 @@ __device__ static void bkRadianceHeroLoop(const DScene& sc, int diffraction,
                     ro = dOffsetAlong(h.p, h.ng, rd);                       // direction unchanged
                 } else if (whitted) {
                     // Glossy: the lobe off the deterministic lattice (mirror at sample 0).
-                    const DGlossyDraw gd = dGlossyAt(sc, *mp, h, rd * (Real)(-1),
-                        dWhittedGlossyDir(reflectv(rd, h.n), dMatRoughness(sc, *mp, h), gi.sIdx, b));
+                    const DGlossyDraw gd = dWhittedGlossyDraw(sc, *mp, h, rd * (Real)(-1), gi.sIdx, b);
                     const DVec3& o = gd.o;
                     if (dot(o, h.n) <= 0) return;
-                    if (gd.irid) {   // interference reflectance at the half-vector, per λ
+                    {   // the draw's weight, and an interference reflectance at the half-vector,
+                        // per λ; then the bundle's bailout again, as the scalar walk's
+                        // dWhittedAttenuate takes it
                         double thrMax = 0.0;
                         for (int i = 0; i < nUp; ++i) {
-                            thr[i] *= (double)gd.R(lam[i]);
+                            thr[i] *= (double)gd.w * (gd.irid ? (double)gd.R(lam[i]) : 1.0);
                             if (thr[i] > thrMax) thrMax = thr[i];
                         }
-                        // the bundle's bailout again, as the scalar walk's dWhittedAttenuate takes it
                         if (thrMax * dLocalN2(sc, stk, lam[0]) <= kWhittedCutoff) return;
                     }
                     if (sc.bkGlossyNee)   // the other half of the weight -- see the scalar twin
@@ -17603,11 +17710,12 @@ __device__ static void bkRadianceHeroLoop(const DScene& sc, int diffraction,
                           gmis.from = h.p; gmis.n = h.n; }
                     if (!dContinueAlong(h, o, DL_REFLECT, ro, rd)) return;
                 } else {
-                    const DGlossyDraw gd = dDrawGlossy(sc, *mp, h, rd, h.n, rd * (Real)(-1), rng);
+                    const DGlossyDraw gd = dDrawGlossy(sc, *mp, h, h.n, rd * (Real)(-1), rng);
                     const DVec3& o = gd.o;
                     if (dot(o, h.n) <= 0) return;
-                    if (gd.irid)   // interference reflectance at the half-vector, per λ
-                        for (int i = 0; i < nUp; ++i) thr[i] *= (double)gd.R(lam[i]);
+                    // the draw's weight, and an interference reflectance at the half-vector, per λ
+                    for (int i = 0; i < nUp; ++i)
+                        thr[i] *= (double)gd.w * (gd.irid ? (double)gd.R(lam[i]) : 1.0);
                     if (sc.bkGlossyNee)      // the other half of the weight, for what `o` hits
                         { gmis.pdf = dGlossyPdfHit(sc, *mp, h, rd * (Real)(-1), o);
                           gmis.from = h.p; gmis.n = h.n; }
@@ -18234,9 +18342,10 @@ __device__ static DVec3 bkRadianceRGB(const DScene& sc, int diffraction, DVec3 r
                 if (!dGlossyCameraSide(rd, h.n)) return L;      // met from below ns (bkRadiance)
                 Real q = rgbLuma(mp->rgbAlbedo);
                 if (q <= (Real)0 || rng.uniform() >= (double)q) return L;
-                DVec3 o = sampleGlossy(reflectv(rd, h.n), dMatRoughness(sc, *mp, h), rng);
+                Real wG;
+                DVec3 o = dGgxDraw(h.n, rd * (Real)(-1), dMatRoughness(sc, *mp, h), dGlossyMs(*mp), rng, wG);
                 if (dot(o, h.n) <= 0) return L;
-                beta = hadamard(beta, mp->rgbAlbedo) / q;
+                beta = hadamard(beta, mp->rgbAlbedo) * (wG / q);   // the albedo, and the draw's weight
                 if (!dContinueAlong(h, o, DL_REFLECT, ro, rd)) return L; specularArrival = true; break;
             }
             case D_DIFFUSETRANSMIT: {
@@ -19028,7 +19137,7 @@ __device__ static void dRandomWalk(const DScene& sc, const DCamera& cam, int dif
                 break;
             }
             case D_GLOSSY: {
-                gd = dDrawGlossy(sc, *mp, h, rd, path[cur].ns, wo, rng);   // rd == -wo
+                gd = dDrawGlossy(sc, *mp, h, path[cur].ns, wo, rng);
                 wi = gd.o;
                 if (dot(wi, path[cur].ns) <= 0) { terminate = true; break; }
                 // per-hit reflect, times an iridescent lobe's interference reflectance at the
@@ -19037,17 +19146,17 @@ __device__ static void dRandomWalk(const DScene& sc, const DCamera& cam, int dif
                          * (double)gd.R(lambda);
                 pdfW = dBsdfPdf(sc, path[cur], wo, wi, lambda);
                 pdfRevW = dBsdfPdf(sc, path[cur], wi, wo, lambda);
-                // r from the camera; from the light, the adjoint lobe's r * adjG (host twin).
-                const double adjG = importance ? dGlossyAdjointRatio(path[cur].ns, wo, wi) : 1.0;
-                betaFactor = r * adjG;
+                // r times the draw's weight, from either end: the lobe is reciprocal (host twin).
+                const double wG = (double)gd.w;
+                betaFactor = r * wG;
                 if (pdfW <= 0) terminate = true;      // r <= 0 is caught by the max test
-                // The glossy LOBE (mirror direction + roughness exponent) carries no
+                // The glossy LOBE (its microfacet draw reads the roughness alone) carries no
                 // wavelength dependence, so the whole bundle follows the sampled direction
                 // and only the reflectance differs per λ. (The unidirectional hero tracers
                 // de-hero here instead — see known-issues.md.)
                 secChromatic = true;
                 for (int i = 0; i + 1 < nUp; ++i) {
-                    secF[i] = clamp01(dReflectSlot(sc, *mp, h, hb.lam[i + 1])) * adjG;
+                    secF[i] = clamp01(dReflectSlot(sc, *mp, h, hb.lam[i + 1])) * wG;
                     if (gd.irid) secF[i] *= gd.R(hb.lam[i + 1]);
                 }
                 break;
@@ -21174,11 +21283,12 @@ __device__ static void dPhotonGatherSub(const DScene& sc, const DPhotonMap& pm,
             case D_GLOSSY: {
                 if (!dGlossyCameraSide(rd, h.n)) return;        // met from below ns (host twin)
                 thr *= (double)clamp01(dReflectSlot(sc, m, h, lambda));
-                const DGlossyDraw gd = dDrawGlossy(sc, m, h, rd, h.n, -rd, rng);
+                const DGlossyDraw gd = dDrawGlossy(sc, m, h, h.n, -rd, rng);
                 const DVec3& o = gd.o;
                 if (dot(o, h.n) <= 0) return;
-                // An iridescent lobe's interference reflectance at the pair's half-vector.
-                thr *= (double)gd.R(lambda);
+                // The draw's weight, and an iridescent lobe's interference reflectance at the
+                // pair's half-vector.
+                thr *= (double)gd.w * (double)gd.R(lambda);
                 if (!dContinueAlong(h, o, DL_REFLECT, ro, rd)) return;
                 contSoft = dContSoftening(m, h, rd); break;
             }
@@ -21962,9 +22072,10 @@ __device__ static void dPhotonGather(const DScene& sc, const DPhotonMap& pm,
                     thr *= rC;
                     dSpecFold(sthr, sc, m, h, rC, false);   // SPECGATHER
                 }
-                const DGlossyDraw gd = dDrawGlossy(sc, m, h, rd, h.n, -rd, rng);
+                const DGlossyDraw gd = dDrawGlossy(sc, m, h, h.n, -rd, rng);
                 const DVec3& o = gd.o;
                 if (dot(o, h.n) <= 0) return;
+                thr *= (double)gd.w;   // the draw's weight: the same at every wavelength, so not sthr's
                 // An iridescent lobe's interference reflectance at the pair's half-vector, into the
                 // scalar and the spectral throughput alike; where it is 0 at the walk's own
                 // wavelength the path carries nothing (and sthr's ratio would divide by it).
@@ -22353,9 +22464,10 @@ __device__ static void dSppmVisiblePoint(const DScene& sc, DVec3 ro, DVec3 rd, R
                 const double r = (double)clamp01(dReflectSlot(sc, m, h, lambda));
                 thr *= r;
                 dSpecFold(sthr, sc, m, h, r, false);
-                const DGlossyDraw gd = dDrawGlossy(sc, m, h, rd, h.n, -rd, rng);
+                const DGlossyDraw gd = dDrawGlossy(sc, m, h, h.n, -rd, rng);
                 const DVec3& o = gd.o;
                 if (dot(o, h.n) <= 0) return;
+                thr *= (double)gd.w;   // the draw's weight: the same at every wavelength, so not sthr's
                 // An iridescent lobe's interference reflectance at the pair's half-vector; where it
                 // is 0 at the walk's own wavelength the path carries nothing.
                 if (gd.irid) {
@@ -22762,7 +22874,7 @@ __device__ static void dVcmScatter(const DScene& sc, const DMaterial& m, const D
             break;
         }
         case D_GLOSSY: {
-            gd = dDrawGlossy(sc, m, h, rd, ns, wo, rng);
+            gd = dDrawGlossy(sc, m, h, ns, wo, rng);
             wi = gd.o;
             if (dot(wi, ns) <= 0) { terminate = true; break; }
             // times an iridescent lobe's interference reflectance at the sampled pair's
@@ -22770,17 +22882,17 @@ __device__ static void dVcmScatter(const DScene& sc, const DMaterial& m, const D
             double r = clamp01(dReflectSlot(sc, m, h, lambda, jr ? &jbS : nullptr)) * (double)gd.R(lambda);
             pdfW = dBsdfPdf(sc, vt, wo, wi, lambda);
             pdfRevW = dBsdfPdf(sc, vt, wi, wo, lambda);
-            // r from the camera; from the light, the adjoint lobe's r * adjG (host twin vcm.h).
-            const double adjG = importance ? dGlossyAdjointRatio(ns, wo, wi) : 1.0;
-            betaFactor = r * adjG;
+            // r times the draw's weight, from either end: the lobe is reciprocal (host twin vcm.h).
+            const double wG = (double)gd.w;
+            betaFactor = r * wG;
             if (pdfW <= 0) terminate = true;      // r <= 0 is caught by the caller's max test
-            // The glossy LOBE (mirror direction + roughness exponent) carries no wavelength
+            // The glossy LOBE (its microfacet draw reads the roughness alone) carries no wavelength
             // dependence, so the whole bundle follows the sampled direction and only the
             // reflectance differs per λ.
             if (nSec) {
                 *secChromatic = true;
                 for (int i = 0; i < nSec; ++i) {
-                    secF[i] = clamp01(dReflectSlot(sc, m, h, lamAll[i + 1])) * adjG;
+                    secF[i] = clamp01(dReflectSlot(sc, m, h, lamAll[i + 1])) * wG;
                     if (gd.irid) secF[i] *= gd.R(lamAll[i + 1]);
                 }
             }

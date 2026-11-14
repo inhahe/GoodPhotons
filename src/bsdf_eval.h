@@ -5,7 +5,7 @@
 //  bsdf_eval.h -- the EVALUABLE half of the material model: f(wo, wi) and its sampling density.
 // ============================================================================================
 //
-// `render.h` knows how to SAMPLE every material (sampleGlossy, interfaceStep, the
+// `render.h` knows how to SAMPLE every material (drawGlossy, interfaceStep, the
 // cosine hemisphere). That is all a plain unidirectional tracer needs, and for a long time
 // only BDPT needed the other half -- given two directions chosen by someone else, what is the
 // BSDF worth and how likely was that direction? -- so `bsdfF` / `bsdfPdf` lived in `bdpt.h`.
@@ -22,15 +22,13 @@
 // CONVENTION (unchanged, and the thing to read before using these): `wo` and `wi` both point
 // AWAY from the surface, `wo` toward where the subpath came from. `bsdfF` returns f such that
 // on a sampled direction `f*|cos(wi)|/pdf(wi)` is the throughput factor the sampler applied --
-// which for Glossy means `bsdfF` pre-divides by cos(wi) and returns `r*lobe/cos`, and for a
-// fiber it pre-divides likewise (see the Hair note below).
+// for Glossy r times the draw's masking weight (render.h GlossyDraw) -- and that for a fiber
+// `bsdfF` pre-divides by cos(wi) (see the Hair note below).
 
 #include "scene.h"
-#include "render.h"   // sampleGlossy's lobe, materialRoughness, reflectSlot, clamp01, PI
+#include "render.h"   // glossyF / glossyPdf, materialRoughness, reflectSlot, clamp01, PI
 
 namespace bdpt {
-
-using ::glossyExponent;   // render.h, beside the glossy lobe's sampler and evaluator
 
 // Is this material a connectible (non-delta) surface for BDPT? Diffuse and Glossy
 // have a finite BSDF value we can evaluate on an arbitrary connection direction;
@@ -168,8 +166,8 @@ inline double bsdfF(const Material& m, const Vec3& ns, const Vec3& wo, const Vec
             return rho / PI;
         }
         case MatType::Glossy:
-            // r * lobe / cos(wi), the denominator the sampled direction's cosine (see header);
-            // r carries an iridescent glossy's interference reflectance (render.h glossyF).
+            // r times the GGX lobe (ggx.h), reciprocal; r carries an iridescent glossy's
+            // interference reflectance (render.h glossyF).
             return glossyF(scene, m, hitForTex, ns, wo, wi, lambda);
         case MatType::DiffuseTransmit: {
             // Two-sided Lambertian, mode R's integrand on a tilted shading normal (translucentLobe):
@@ -197,21 +195,12 @@ inline double bsdfF(const Material& m, const Vec3& ns, const Vec3& wo, const Vec
 // splat to the camera, and the light endpoint of an interior connection. Those are exactly the
 // sites that already carry `shadingAdjointCorr`, which is the shading-normal half of the same
 // Veach rule; this is the BSDF's own half. The two are independent: shadingAdjointCorr is 1 on
-// flat geometry, where this is still required.
+// flat geometry, where a lobe that is not reciprocal still needs this.
 //
-// WHY IT MATTERS HERE. bsdfF pre-divides by cos(wi) (see the CONVENTION note at the top). The
-// Glossy lobe factor is symmetric under the swap but the denominator is not, so without this the
-// same physical path got f = r*lobe/cos(camera-side) from the light subpath and
-// f = r*lobe/cos(light-side) from the camera subpath. MIS then mixed two estimators
-// that disagreed by cos(wo)/cos(wcam) -- measured as mode D reading 15 % DIM with the camera near
-// the normal and bright with it grazing, a sign flip no roughness- or solid-angle-scaled error
-// could produce. A light walk's CONTINUATION needs the same adjoint: its f*cos/pdf is
-// r * glossyAdjointRatio (render.h), not the r a camera walk takes.
-//
-// WHICH FORM IS RIGHT IS SETTLED BY ENERGY. Under uniform illumination L, reflectance r must
-// return r*L. Dividing by the incident cosine gives \int r*lobe/cos * cos dw = r; dividing by the
-// camera-side cosine does not. A white-furnace test measures mode R -- which builds paths
-// camera-side and so lands on the first form -- flat to 0.04 % across roughness 0.2/0.6/0.9.
+// WHERE IT MATTERS. A reciprocal lobe is unchanged by the swap: the GGX glossy lobe (ggx.h, since
+// 0.445.0) is, and so its light walks and connections evaluate the camera's function. (The Phong lobe
+// it replaced divided by the light side's cosine and was not: there a missing swap read mode D 15 %
+// dim with the camera near the normal and bright with it grazing.)
 //
 // Diffuse's rho/PI is unchanged by the swap, but its lambertLit test reads wi, so the swap moves
 // that test onto the LIGHT's side -- which is the point: light that arrived below the shading normal
@@ -237,22 +226,15 @@ inline double bsdfFAdjoint(const Material& m, const Vec3& ns, const Vec3& wo, co
 // for a translucent vertex, whose lobe needs the hit's geometric normal (translucentLobe).
 inline double bsdfPdf(const Material& m, const Vec3& ns, const Vec3& wo, const Vec3& wi,
                       double lambda, const Scene& scene, const Hit* hitForTex) {
-    double cosWi = dot(wi, ns), cosWo = dot(wo, ns);
+    const double cosWi = dot(wi, ns);
     switch (m.type) {
         case MatType::Diffuse:
         case MatType::Fluorescent: {
             if (!lambertLit(cosWi)) return 0.0;      // from either side of ns (lambertLit)
             return cosWi / PI;                       // cosine-weighted hemisphere
         }
-        case MatType::Glossy: {
-            if (cosWi <= 0 || cosWo <= 0) return 0.0;
-            double e = glossyExponent(hitForTex ? materialRoughness(scene, m, *hitForTex)
-                                                : m.roughness);
-            Vec3 mdir = reflect(wo * -1.0, ns);
-            double cosLobe = dot(wi, mdir);
-            if (cosLobe <= 0) return 0.0;
-            return (e + 1.0) / (2.0 * PI) * std::pow(cosLobe, e);
-        }
+        case MatType::Glossy:
+            return glossyPdf(scene, m, hitForTex, ns, wo, wi);   // the visible normals' (ggx.h)
         case MatType::DiffuseTransmit: {
             // Directional pdf of the lobe-selected cosine sampling at a vertex reached from `wo`:
             // the reflect lobe is chosen with prob rhoR/(rhoR+rhoT) and cosine-samples about the

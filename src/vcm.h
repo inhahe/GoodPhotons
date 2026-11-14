@@ -81,7 +81,7 @@
 #include "scene.h"
 #include "camera.h"
 #include "render.h"
-#include "bdpt.h"        // bsdfF, bsdfPdf, isConnectibleMat, isTwoSidedMat, offsetOrigin, glossyExponent
+#include "bdpt.h"        // bsdfF, bsdfPdf, isConnectibleMat, isTwoSidedMat, offsetOrigin
 #include "color.h"
 
 namespace vcm {
@@ -385,7 +385,7 @@ inline void scatterSample(const Scene& scene, const Renderer& mats, const Materi
             break;
         }
         case MatType::Glossy: {
-            const GlossyDraw gd = drawGlossy(scene, *mp, h, rayDir, ns, wo, rng);
+            const GlossyDraw gd = drawGlossy(scene, *mp, h, ns, wo, rng);
             wi = gd.o;
             if (dot(wi, ns) <= 0) { terminate = true; break; }
             // times an iridescent lobe's interference reflectance at the sampled pair's
@@ -393,21 +393,23 @@ inline void scatterSample(const Scene& scene, const Renderer& mats, const Materi
             double r = clamp01(reflectSlot(scene, *mp, h, lambda)) * gd.R(lambda);
             pdfW = bsdfPdf(*mp, ns, wo, wi, lambda, scene, &h);
             pdfRevW = bsdfPdf(*mp, ns, wi, wo, lambda, scene, &h);
-            // r from the camera; from the light, the adjoint lobe's r * adjG (glossyAdjointRatio).
-            const double adjG = (transport == Renderer::Transport::Flux) ? glossyAdjointRatio(ns, wo, wi) : 1.0;
-            betaFactor = r * adjG;
+            // r times the draw's weight (ggx.h weightAll), from either end: the lobe is
+            // reciprocal.
+            betaFactor = r * gd.w;
             if (pdfW <= 0) terminate = true;      // r <= 0 is caught by the caller's max test
+            // The carrier re-expresses what varies with the wavelength, r; the draw's weight is the
+            // same at every one, so its value at lambda is r, not betaFactor.
             if (jr) jr->mul([&](double L) {
                                 const double rL = clamp01(reflectSlot(scene, *mp, h, L));
                                 return rL * gd.R(L); },
-                            betaFactor, false);
-            // The glossy LOBE (mirror direction + roughness exponent) carries no wavelength
+                            r, false);
+            // The glossy LOBE (its microfacet draw reads the roughness alone) carries no wavelength
             // dependence, so the whole bundle follows the sampled direction and only the
             // reflectance differs per λ.
             if (nSec) {
                 *secChromatic = true;
                 for (int i = 0; i < nSec; ++i) {
-                    secF[i] = clamp01(reflectSlot(scene, *mp, h, lamAll[i + 1])) * adjG;
+                    secF[i] = clamp01(reflectSlot(scene, *mp, h, lamAll[i + 1])) * gd.w;
                     if (gd.irid) secF[i] *= gd.R(lamAll[i + 1]);
                 }
             }

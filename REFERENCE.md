@@ -1858,6 +1858,15 @@ machine varied 18.5 s / 25.8 s / 27.2 s.
   proves it is *reached* — which is exactly how this failed once, with a correct model, correct
   scene wiring, and a render that was byte-identical to the analytic one because only the host
   had been taught the new path.
+- **`-checkggx` (self-test, no scene).** Five unit tests for the glossy lobe (`src/ggx.h`, GGX), as
+  pure math about a tilted normal at three roughnesses and three arrivals, on the single-scattering
+  lobe and on the lobe with its multiple scattering: `f(a, b) == f(b, a)` (reciprocity); a draw's
+  weight equals `f cos / pdf` (the factor a walk takes is the one the evaluator and the density
+  imply); the sampler draws its own pdf (three moments of the drawn direction against a quadrature of
+  the pdf, within 5 standard errors -- what MIS rests on); the mean weight equals the quadrature of
+  `f cos`, never above 1 for single scattering and within 1.5 % of 1 with the multiple scattering
+  (the white furnace; measured 0.3 %); and at the least roughness 99 % of the draws lie within
+  0.05 rad of the mirror, which `u1 = 1` returns exactly (mode W's sample 0).
 - **`FTRACE_SPECMEDIA=0` (diagnostic, participating media).** Forces the **scalar** transmittance
   tier on a coloured medium — one walk at one wavelength, applied to every wavelength — which is the
   pre-0.322.0 behaviour exactly, and so is the A/B control for the three-tier spectral
@@ -2270,7 +2279,7 @@ Declared with `material "name" { type <type> … }`.
 | `mirror` | Perfect specular reflector | `reflect` |
 | `halfmirror` | Lossless beamsplitter; `reflect` is the reflect probability (default 0.5 = 50/50). A spectral `reflect` gives a wavelength-dependent (dichroic) split | `reflect` |
 | `filter` | Colored **gel / Wratten filter**: a thin non-scattering absorber. Light passes straight through (no reflection or refraction), surviving with probability `transmit`(λ) — the per-wavelength transmittance T(λ) ∈ [0,1] — and is absorbed otherwise. Like clear glass it isn't lit directly; you see its effect on whatever is behind it | `transmit` (spectrum: `filter:<name>`, `file:<path>`, or a primitive like `gaussian`; also `pattern:<name>` / `transmit_map` for a transmittance that varies across the gel) |
-| `glossy` | Rough microfacet reflector | `reflect`, `roughness` (constant or `texture:<name>` map) |
+| `glossy` | Rough microfacet reflector: since 0.445.0 a **GGX** lobe (visible-normal sampling, height-correlated Smith masking) with its **multiple scattering** (Kulla-Conty: the light the facets' masking keeps from leaving comes back out as a second, diffuse-like lobe), reciprocal, so every mode renders it alike and a light walk's weight stays bounded at grazing, where the Phong lobe before it had none. Its albedo is `reflect` at every roughness: a white one returns what it receives (`-checkggx`). `roughness` `r` is the lobe's **width** as it was under the Phong lobe (GGX α = 0.646 r), so a scene's highlights keep their width; GGX's longer tail gives them a softer glow. A rough interference reflector and a layered coat take the single-scattering lobe alone | `reflect`, `roughness` (constant or `texture:<name>` map) |
 | `thinfilm` | Single-layer interference (iridescence). With `roughness` on an opaque substrate, a **rough** interference reflector — see below | `ior`, `film_ior` (a number, or a dispersive index such as `glass:titania`), `film_thickness` (nm), `film_thickness_map texture:<name>`, `substrate_k`, `roughness` |
 | `multilayer` | N-layer Abelès transfer-matrix stack (right with absorption since 0.403.0: before, an absorbing layer amplified instead of absorbing, and a stack over an absorbing backing had its colours shifted). With `roughness` on an opaque stack, a **rough** interference reflector — see below | `ior`, `substrate_k`, repeated `layer <n> <k> <nm>`, `roughness` |
 | `grating` | Reflective diffraction grating | `reflect`, `groove_spacing` (nm), `groove_dir`, `max_order` |
@@ -3655,7 +3664,7 @@ are worth knowing about:
   A texel two surfaces share (mirrored UV islands) counts for both.
 * **Roughness is converted to ftrace's units, so a highlight is as wide as the asset's author
   saw it** (0.434.4). glTF's roughness `r` is perceptual: its GGX α is `r²`. ftrace's
-  `roughness` is a Phong lobe of exponent `2/r_t² − 2`, as wide as a GGX α of about `0.646 r_t`.
+  `roughness` is a GGX lobe of α `0.646 r_t` (since 0.445.0; before, a Phong lobe of the same width).
   So the import takes `r_t = min(1, r² / 0.646)`: the factor when there is no map, and each
   texel of the map (with the map's mean as the material's constant). Before 0.434.4, `r` was
   copied raw, so every imported glossy surface was blurrier than glTF means: α 0.16 for a glTF

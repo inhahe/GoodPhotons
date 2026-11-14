@@ -8,7 +8,7 @@
 // energy conservation alone cannot catch.
 //
 // It deliberately REUSES the material primitives (Fresnel via Renderer::
-// interfaceOptics, the glossy lobe via sampleGlossy) so the two renderers agree
+// interfaceOptics, the glossy lobe via drawGlossy) so the two renderers agree
 // on materials by construction. That isolates the validation to the part that
 // actually differs — the transport and camera math (connect / G / We).
 //
@@ -16,7 +16,7 @@
 //   Diffuse    : NEE to the light + cosine-sampled continuation, Russian roulette
 //                on the albedo (throughput unchanged on survival).
 //   Mirror     : specular reflect, RR on reflectance; emission added on hit.
-//   Glossy     : power-cosine lobe around the mirror dir, RR on reflectance.
+//   Glossy     : the GGX lobe (ggx.h), RR on reflectance.
 //   HalfMirror : stochastic reflect/transmit, lossless.
 //   Dielectric : Fresnel-weighted reflect/refract, lossless.
 //   Fluorescent: bispectral reradiation (Stokes shift). The elastic base reflects
@@ -46,7 +46,7 @@
 #pragma once
 #include "scene.h"
 #include "camera.h"
-#include "render.h"   // sampleGlossy, Renderer::interfaceStep, clamp01, PI
+#include "render.h"   // drawGlossy, Renderer::interfaceStep, clamp01, PI
 #include "medium_stack.h" // nested-dielectric priority stack
 #include "grin.h"     // shared gradient-index (GRIN) Eikonal marcher
 #include "hero.h"     // hero-wavelength spectral sampling (kHeroC)
@@ -820,7 +820,8 @@ struct BackwardRenderer {
     }
 
     // Deterministic ROUGH-SPECULAR direction for the Whitted preview: point `sIdx` of a
-    // fixed 2-D lattice on the power-cosine lobe around `mdir`, instead of the lobe's single
+    // fixed 2-D lattice on the GGX lobe of `roughness` about the shading normal `n` for the
+    // arrival `wo` (render.h ggxDrawUV, `w` its masking weight), instead of the lobe's single
     // mirror direction.
     //
     // Why this is not just a polish item: collapsing every sample onto the mirror direction
@@ -832,10 +833,10 @@ struct BackwardRenderer {
     // given spp the whole frame shares one lobe direction per vertex), and the sequence is
     // indexed by the ABSOLUTE sample index (so the image is chunk-split-independent).
     //
-    // The polar coordinate is COMPLEMENTED rather than rot05'd, because glossyDirUV maps
+    // The first coordinate is COMPLEMENTED rather than rot05'd, because ggx::sampleUV maps
     // u1 == 1 to the mirror direction and radicalInverse(0) == 0 in every base: sample 0 is
-    // therefore *exactly* the old mirror direction, so a 1-spp preview is bit-identical to
-    // 0.107.0 and only spp > 1 changes. (sinT == 0 there makes the azimuth moot too.)
+    // therefore *exactly* the mirror direction, so a 1-spp preview reflects along it and only
+    // spp > 1 spreads the lobe. (The azimuth is moot there.)
     //
     // Each bounce depth takes its own prime pair so two glossy vertices on one path are not
     // driven by the same 1-D sequence -- which would correlate their offsets and fold a
@@ -848,17 +849,25 @@ struct BackwardRenderer {
     // The two lattice COORDINATES are factored out of the direction so `-checklattice`
     // (N4a) can probe exactly the numbers the renderer uses. They are pure integer-and-
     // `double` arithmetic and so are bit-comparable host-vs-device; the direction itself
-    // goes through `glossyDirUV`'s trig in `Real` and is not.
+    // goes through the sampler's trig in `Real` and is not.
     static void whittedGlossyUV(uint64_t sIdx, int bounce, double& u1, double& u2) {
         static const unsigned kBases[4][2] = {{13, 17}, {19, 23}, {29, 31}, {37, 41}};
         const unsigned* pb = kBases[bounce & 3];
         u1 = 1.0 - radicalInverseScr(pb[0], sIdx);   // 1 at sIdx 0 => mirror
         u2 = radicalInverseScr(pb[1], sIdx);
     }
-    static Vec3 whittedGlossyDir(const Vec3& mdir, double roughness, uint64_t sIdx, int bounce) {
+    static Vec3 whittedGlossyDir(const Vec3& n, const Vec3& wo, double roughness, uint64_t sIdx,
+                                 int bounce, double& w) {   // a coat's sheen: single scattering
         double u1, u2;
         whittedGlossyUV(sIdx, bounce, u1, u2);
-        return glossyDirUV(mdir, roughness, u1, u2);
+        return ggxDrawUV(n, wo, roughness, false, u1, u2, w);
+    }
+    // The same for a Glossy material's lobe, as a GlossyDraw (render.h glossyDrawUV).
+    static GlossyDraw whittedGlossyDraw(const Scene& scene, const Material& m, const Hit& h,
+                                        const Vec3& wo, uint64_t sIdx, int bounce) {
+        double u1, u2;
+        whittedGlossyUV(sIdx, bounce, u1, u2);
+        return glossyDrawUV(scene, m, h, h.n, wo, u1, u2);
     }
 
     // Deterministic DISCRETE-CHOICE coordinate for the Whitted preview. Same job as
@@ -2520,11 +2529,10 @@ struct BackwardRenderer {
                 // exactly as the rng path sets it below.
                 if (whitted) {
                     if (!wAtt(r)) return false;
-                    const GlossyDraw gd = glossyAt(scene, m, h, ray.d * -1.0,
-                        whittedGlossyDir(reflect(ray.d, h.n), materialRoughness(scene, m, h),
-                                         gi.sIdx, gi.bounce));
+                    const GlossyDraw gd = whittedGlossyDraw(scene, m, h, ray.d * -1.0, gi.sIdx, gi.bounce);
                     const Vec3& o = gd.o;
                     if (dot(o, h.n) <= 0) return false;
+                    if (!wAtt(gd.w)) return false;                      // the draw's weight
                     if (gd.irid && !wAtt(gd.R(lambda))) return false;
                     if (gm) {
                         gm->pdf = bdpt::bsdfPdf(m, h.n, ray.d * -1.0, o, lambda, scene, &h);
@@ -2535,11 +2543,12 @@ struct BackwardRenderer {
                     specularArrival = true; return true;
                 }
                 if (rng.uniform() >= r) return false;
-                const GlossyDraw gd = drawGlossy(scene, m, h, ray.d, h.n, ray.d * -1.0, rng);
+                const GlossyDraw gd = drawGlossy(scene, m, h, h.n, ray.d * -1.0, rng);
                 const Vec3& o = gd.o;
                 if (dot(o, h.n) <= 0) return false;
-                // f * cos / pdf = r * R, which bsdfF carries for the NEE above.
-                thr *= gd.R(lambda);
+                // f * cos / pdf = r * R * w (w the draw's weight), which bsdfF carries for the NEE
+                // above.
+                thr *= gd.R(lambda) * gd.w;
                 // The other half of the weight, for whatever this direction goes on to hit.
                 if (gm) {
                     gm->pdf = bdpt::bsdfPdf(m, h.n, ray.d * -1.0, o, lambda, scene, &h);
@@ -3056,10 +3065,12 @@ struct BackwardRenderer {
                     if (R >= 0.5) {
                         if (!glossyCameraSide(ray.d, h.n)) return L;   // a glossy lobe: see the Glossy case
                         if (!whittedAttenuate(thr, R, Renderer::localN2(scene, stk, lambda))) return L;
-                        Vec3 o = whittedGlossyDir(reflect(ray.d, h.n),
-                                                  materialRoughness(scene, cm, h), gi.sIdx, b);
+                        double wC;
+                        Vec3 o = whittedGlossyDir(h.n, ray.d * -1.0, materialRoughness(scene, cm, h),
+                                                  gi.sIdx, b, wC);
                         if (dot(o, h.n) <= 0) return L;
-                        thr *= coatSheenRatio(scene, cm, h, ray.d * -1.0, o, lambda);   // reciprocal
+                        // reciprocal, and the coat lobe's masking
+                        thr *= coatSheenRatio(scene, cm, h, ray.d * -1.0, o, lambda) * wC;
                         if (!continueAlong(h, o, Lobe::Reflect, ray)) return L;
                         specularArrival = true;
                         gmis.clear();      // the sheen does no NEE: its arrival is unweighted
@@ -3073,10 +3084,12 @@ struct BackwardRenderer {
                 } else {
                 if (rng.uniform() < R) {
                     if (!glossyCameraSide(ray.d, h.n)) return L;      // a glossy lobe: see the Glossy case
-                    Vec3 o = sampleGlossy(reflect(ray.d, h.n), materialRoughness(scene, cm, h), rng);
+                    double wC;
+                    Vec3 o = ggxDraw(h.n, ray.d * -1.0, materialRoughness(scene, cm, h), false, rng, wC);
                     if (dot(o, h.n) <= 0) return L;
-                    // the reciprocal coat's reflection over the coin's R (render.h coatSheenRatio)
-                    thr *= coatSheenRatio(scene, cm, h, ray.d * -1.0, o, lambda);
+                    // the reciprocal coat's reflection over the coin's R (render.h coatSheenRatio),
+                    // and the coat lobe's masking
+                    thr *= coatSheenRatio(scene, cm, h, ray.d * -1.0, o, lambda) * wC;
                     if (!continueAlong(h, o, Lobe::Reflect, ray)) return L;
                     specularArrival = true;
                     // The sheen does no NEE, so what it reaches counts at full weight: an earlier
@@ -3595,14 +3608,13 @@ struct BackwardRenderer {
                         for (int i = 0; i < nUp; ++i) thr[i] *= Rl[i];
                         if (hero::maxOf(thr, nUp) * Renderer::localN2(scene, stk, lam[0]) <= kWhittedCutoff) { finish(); return; }
                     }
-                    Vec3 o = whitted
-                                 ? whittedGlossyDir(reflect(ray.d, h.n),
-                                                    materialRoughness(scene, cm, h), gi.sIdx, b)
-                                 : sampleGlossy(reflect(ray.d, h.n),
-                                                materialRoughness(scene, cm, h), rng);
+                    const double cr = materialRoughness(scene, cm, h);
+                    double wC;
+                    Vec3 o = whitted ? whittedGlossyDir(h.n, ray.d * -1.0, cr, gi.sIdx, b, wC)
+                                     : ggxDraw(h.n, ray.d * -1.0, cr, false, rng, wC);
                     if (dot(o, h.n) <= 0) { finish(); return; }
                     for (int i = 0; i < nUp; ++i)    // the reciprocal coat's reflection (scalar twin)
-                        thr[i] *= coatSheenRatio(scene, cm, h, ray.d * -1.0, o, lam[i]);
+                        thr[i] *= coatSheenRatio(scene, cm, h, ray.d * -1.0, o, lam[i]) * wC;
                     if (!continueAlong(h, o, Lobe::Reflect, ray)) { finish(); return; }
                     specularArrival = true;
                     gmis.clear();                // no NEE here: see the scalar twin
@@ -3775,17 +3787,14 @@ struct BackwardRenderer {
                         ray = Ray{h.p + ray.d * 1e-6, ray.d};       // direction unchanged
                     } else if (whitted) {
                         // Glossy: the lobe off the deterministic lattice (mirror at sample 0).
-                        const GlossyDraw gd = glossyAt(scene, m, h, ray.d * -1.0,
-                            whittedGlossyDir(reflect(ray.d, h.n), materialRoughness(scene, m, h),
-                                             gi.sIdx, b));
+                        const GlossyDraw gd = whittedGlossyDraw(scene, m, h, ray.d * -1.0, gi.sIdx, b);
                         const Vec3& o = gd.o;
                         if (dot(o, h.n) <= 0) { finish(); return; }
-                        if (gd.irid) {   // interference reflectance at the half-vector, per λ
-                            for (int i = 0; i < nUp; ++i) thr[i] *= gd.R(lam[i]);
-                            // the bundle's bailout again, as the scalar walk's wAtt takes it
-                            if (hero::maxOf(thr, nUp) * Renderer::localN2(scene, stk, lam[0]) <= kWhittedCutoff)
-                                { finish(); return; }
-                        }
+                        // the draw's weight, and an interference reflectance at the half-vector,
+                        // per λ; then the bundle's bailout again, as the scalar walk's wAtt takes it
+                        for (int i = 0; i < nUp; ++i) thr[i] *= gd.w * (gd.irid ? gd.R(lam[i]) : 1.0);
+                        if (hero::maxOf(thr, nUp) * Renderer::localN2(scene, stk, lam[0]) <= kWhittedCutoff)
+                            { finish(); return; }
                         if (glossyNee) {   // the other half of the weight -- see the scalar twin
                             gmis.pdf = bdpt::bsdfPdf(m, h.n, ray.d * -1.0, o, lam[0], scene, &h);
                             gmis.from = h.p;
@@ -3793,11 +3802,11 @@ struct BackwardRenderer {
                         }
                         if (!continueAlong(h, o, Lobe::Reflect, ray)) { finish(); return; }
                     } else {
-                        const GlossyDraw gd = drawGlossy(scene, m, h, ray.d, h.n, ray.d * -1.0, rng);
+                        const GlossyDraw gd = drawGlossy(scene, m, h, h.n, ray.d * -1.0, rng);
                         const Vec3& o = gd.o;
                         if (dot(o, h.n) <= 0) { finish(); return; }
-                        if (gd.irid)   // interference reflectance at the half-vector, per λ
-                            for (int i = 0; i < nUp; ++i) thr[i] *= gd.R(lam[i]);
+                        // the draw's weight, and an interference reflectance at the half-vector, per λ
+                        for (int i = 0; i < nUp; ++i) thr[i] *= gd.w * (gd.irid ? gd.R(lam[i]) : 1.0);
                         if (glossyNee) {
                             gmis.pdf = bdpt::bsdfPdf(m, h.n, ray.d * -1.0, o, lam[0], scene, &h);
                             gmis.from = h.p;

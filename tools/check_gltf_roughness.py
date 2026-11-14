@@ -2,14 +2,15 @@
 
     D:/python314/python.exe -u tools/check_gltf_roughness.py [--out <dir>] [--exe ftrace.exe]
 
-glTF's roughness `r` is perceptual (GGX alpha = r^2); ftrace's is a Phong lobe, as wide as a GGX
-alpha of 0.646 r_t, so the importer takes r_t = min(1, r^2 / 0.646) (gltfRoughness, src/gltf.h).
+glTF's roughness `r` is perceptual (GGX alpha = r^2); ftrace's lobe is GGX of alpha 0.646 r_t (src/ggx.h;
+before 0.445.0 a Phong lobe of that width), so the importer takes r_t = min(1, r^2 / 0.646)
+(gltfRoughness, src/gltf.h), and the lobe it renders is glTF's own.
 Writes one-quad GLBs of a metal (no coat, so the material is one glossy lobe) and renders each
 (mode R, CPU, fixed seed) against the same quad with `import_materials no` and the FTSL glossy
 material the import should produce:
 
   - roughnessFactor 0.5, no map: byte-identical to `roughness 0.25/0.646`; and 0.05 to
-    `roughness 0.0025/0.646`, the importer's floor being the exponent's own clamp (1e-3);
+    `roughness 0.0025/0.646`, the importer's floor being the lobe's own clamp (1e-3);
   - roughnessFactor 1, a constant map of G 128: within float noise of `roughness (128/255)^2/0.646`
     (the map is sampled bilinearly, so the texel need not come back to the last bit);
   - each against the raw roughness the importer used to copy, which must differ, so the rig can

@@ -171,8 +171,8 @@ Each names the section its line is in.
 23j. ~~**THIN-GAP-GATHER** (4.2) — mode M at a forced large radius gathers a lit surface a few
     millimetres behind as the same surface (MERGE-PROXIMITY's flat allowance).~~ Done, 0.440.13:
     no allowance, and a slack for the device's float rounding.
-23k. **GLOSSY-ADJ-VARIANCE** (4.3) — the glossy lobe's adjoint is unbounded at grazing arrival.
-    Decided 2026-11-14: a GGX microfacet lobe.
+23k. ~~**GLOSSY-ADJ-VARIANCE** (4.3) — the glossy lobe's adjoint is unbounded at grazing arrival.
+    Decided 2026-11-14: a GGX microfacet lobe.~~ Done, 0.445.0: GGX with its multiple scattering.
 23h. ~~**S-GPU-GLOSSY-BUMP** (4.3) — device mode S reads normal-mapped glossy walls 1.043 of R (host
     0.997); see BUMP-MODES.~~ Done, 0.440.6: R's own glossy strategies disagreed (contSoftening).
 23l. ~~**B-ENV-WALLS** (4.2) — mode B reads walls lit by a sky about 1 % bright, flat or bumped.~~
@@ -275,8 +275,8 @@ Then the rest of 4.2-4.6 in their order, 4.7's bookkeeping alongside whatever to
   forward modes see directly took one ray through each pixel's centre.
 - [x] **THIN-GAP-GATHER** (0.440.13) — mode M at a forced large radius gathered a lit surface
   millimetres behind: the gather band's flat allowance is gone.
-- [ ] **GLOSSY-ADJ-VARIANCE** — the glossy lobe's adjoint is unbounded at grazing arrival; decided:
-  a GGX microfacet lobe (4.1).
+- [x] **GLOSSY-ADJ-VARIANCE** (0.445.0) — the glossy lobe's adjoint was unbounded at grazing
+  arrival: the lobe is GGX with its multiple scattering (reciprocal; roughness keeps its width).
 - [x] **GLOSSY-DEPTH-CAP** (0.440.4) — at the bounce cap mode R's glossy NEE kept only its MIS share;
   R now traces the ray its last vertex samples, for the light it reaches.
 - [x] **B-GPU-MAXBOUNCE** (0.439.9) — GPU mode B ignored `-max-bounce` (a literal 32 reached its
@@ -356,6 +356,8 @@ Then the rest of 4.2-4.6 in their order, 4.7's bookkeeping alongside whatever to
   reproduced in 24 more runs (28 in all); reopen if seen, with the image.
 - [ ] **D-SILENT-EXIT** — one host mode-D render ended with no output and no image during a CUDA
   build; 13 reruns clean. The checks now print the exit code; reproduce under memory pressure.
+- [ ] **S-IRID-SPHERES** — mode S reads check_rough_irid's iridescent spheres up to ~9 % off R in single
+  channels (both lobes, both devices): noise or bias, to settle; suspect the carrier's bins.
 - [ ] **SPECGATHER-BIN-RESOLUTION** — mode M's 24-bin carrier misreads a spectral edge or kink inside
   a bin; the 555-585 nm ramp's green excess is unexplained.
 - [x] **SPPM-SPECTRAL** (0.432.0) — mode S's visible point carries its walk's spectral factors per

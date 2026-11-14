@@ -250,9 +250,10 @@ inline void sppmVisiblePoint(const Scene& scene, Ray ray, Pcg32& rng, bool diffr
                 const double r = clamp01(reflectSlot(scene, m, h, lambda));
                 thr *= r;
                 sthr.mul([&](double L) { return clamp01(reflectSlot(scene, m, h, L)); }, r);
-                const GlossyDraw gd = drawGlossy(scene, m, h, ray.d, h.n, ray.d * -1.0, rng);
+                const GlossyDraw gd = drawGlossy(scene, m, h, h.n, ray.d * -1.0, rng);
                 const Vec3& o = gd.o;
                 if (dot(o, h.n) <= 0.0) return;
+                thr *= gd.w;   // the draw's weight: the same at every wavelength, so not sthr's
                 // An iridescent lobe's interference reflectance at the pair's half-vector. Where it
                 // is 0 at the walk's own wavelength the path carries nothing (and the ratio would
                 // divide by it).
