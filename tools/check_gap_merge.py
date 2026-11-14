@@ -9,9 +9,9 @@ J-THIN-GAP-LEAK (0.442.2). Mode J's surface merges and mode U's vertex merges ke
 within their radius. So the light in a gap a millimetre under a plate -- photons on the floor below
 it, which arrived from above -- was merged at the plate's top, where none of it can reach:
 `scenes/_gap_leak.ftsl` (a plate that emits down into the gap) read mode J 167 times mode B, and
-`scenes/_gap_leak2.ftsl` (a light block in the gap) 1.21 times. The merges now keep only photons
-within the tangent-plane band of mode M's gathers (gatherplane.h withinGatherBand), on both
-backends.
+`scenes/_gap_leak2.ftsl` (a light block in the gap) 1.21 times. 0.442.2 made the merges keep only
+the photons within the tangent-plane band of mode M's gathers (gatherplane.h withinGatherBand),
+which passed this check; 0.443.1 took it out again.
 
 Modes J, U and D, CPU and GPU, against mode B: the mean over the middle of the plate's top (lit by
 a ceiling panel, and by the gap's light that escapes through its millimetre-high sides and comes

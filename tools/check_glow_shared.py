@@ -26,6 +26,11 @@ glowing spheres and two glowing panels: rendered with `-noenv`, it must be the s
 without the sky -- modes R and D, CPU and GPU, the frame within 1 %. (0.443.0 left the numbers as
 they were: each glow took the next light's colour and power, the last one past the list's end.)
 
+USEMTL. A `mesh` block's light is its own material's faces: an OBJ whose `usemtl` groups give
+another (`usemtl use_names`) -- here a dark panel beside a glowing one -- must light the room as the
+same two panels written as two blocks. Until 0.443.2 the block's light covered every face of the
+block, so the dark panel was sampled as if it glowed. Mode R, CPU and GPU, within 1 %.
+
 Exits 1 on any failure.
 """
 import argparse
@@ -119,6 +124,28 @@ def noenv_scene(d, env):
     ] + rest + [""])
 
 
+def usemtl_scene(d, one_block):
+    """A glowing panel and a dark one facing down, side by side: one OBJ of two usemtl groups in one
+    block, or two OBJs in two."""
+    q = lambda x0: [(x0, 0, -0.25), (x0 + 0.5, 0, -0.25), (x0 + 0.5, 0, 0.25), (x0, 0, 0.25)]
+    v = q(-0.75) + q(0.25)
+    with open(os.path.join(d, "two.obj"), "w", encoding="utf-8", newline="") as f:
+        f.write(NL.join(["v %g %g %g" % p for p in v] +
+                        ["usemtl lamp", "f 1 2 3", "f 1 3 4", "usemtl dark", "f 5 6 7", "f 5 7 8"]) + NL)
+    obj(os.path.join(d, "lamp1.obj"), q(-0.75), [(0, 1, 2), (0, 2, 3)])
+    obj(os.path.join(d, "dark1.obj"), q(0.25), [(0, 1, 2), (0, 2, 3)])
+    pp = lambda n: os.path.join(d, n).replace(chr(92), "/")
+    geo = (['group { translate 0 1.2 0  mesh { file "%s"  material lamp  usemtl use_names } }' % pp("two.obj")]
+           if one_block else
+           ['group { translate 0 1.2 0  mesh { file "%s"  material lamp } }' % pp("lamp1.obj"),
+            'group { translate 0 1.2 0  mesh { file "%s"  material dark } }' % pp("dark1.obj")])
+    return NL.join(room('camera "c" { eye 0 1.6 2.8  look_at 0 0.3 0  up 0 1 0  fov_y 55  film { res %d %d } }'
+                        % (W, H)) + [
+        'material "lamp" { type diffuse reflect 0.0  emit 0.5 }',
+        'material "dark" { type diffuse reflect 0.1 }',
+    ] + geo + [""])
+
+
 def render(exe, scn, mode, gpu, out, budget):
     pfm = out[:-4] + ".pfm"
     for f in (out, pfm):
@@ -164,7 +191,7 @@ def main():
             lo = img[2 * H // 3:, :]
             l, r = float(lo[:, :W // 2].mean()), float(lo[:, W // 2:].mean())
             halves[(mode, gpu)] = (l, r)
-            good = l > 0 and abs(l / r - 1.0) <= TOL
+            good = l > 0 and r > 0 and abs(l / r - 1.0) <= TOL
             ok = ok and good
             print("%s: the shared panels, mode %s: the floor under the instance reads %.4f of the mesh block's"
                   % ("ok" if good else "FAIL", tag, r / l if l > 0 else float("nan")), flush=True)
@@ -220,6 +247,24 @@ def main():
             ok = ok and good
             print("%s: -noenv, mode %s on the %s: the frame %.4f of the scene without a sky"
                   % ("ok" if good else "FAIL", mode, dev.upper(), r), flush=True)
+    # USEMTL: one block of two usemtl groups against two blocks
+    for one in (True, False):
+        write(os.path.join(out, "usemtl_%s.ftsl" % ("one" if one else "two")), usemtl_scene(out, one))
+    for gpu in devs:
+        dev = "gpu" if gpu else "cpu"
+        spp = ["-spp", "2048" if gpu else "512"]
+        a0 = render(exe, os.path.join(out, "usemtl_one.ftsl"), "R", gpu, os.path.join(out, "usemtl_one_%s.png" % dev), spp)
+        a1 = render(exe, os.path.join(out, "usemtl_two.ftsl"), "R", gpu, os.path.join(out, "usemtl_two_%s.png" % dev), spp)
+        if a0 is None or a1 is None:
+            print("FAIL: usemtl, mode R on the %s: the scene did not render" % dev.upper())
+            ok = False
+            continue
+        # the floor under the dark panel: the right half's lower third
+        r = float(a0[2 * H // 3:, W // 2:].mean() / a1[2 * H // 3:, W // 2:].mean())
+        good = abs(r - 1.0) <= 0.01
+        ok = ok and good
+        print("%s: usemtl, mode R on the %s: the floor under the dark panel %.4f of the two-block scene's"
+              % ("ok" if good else "FAIL", dev.upper(), r), flush=True)
     print("PASS" if ok else "FAILED")
     return 0 if ok else 1
 

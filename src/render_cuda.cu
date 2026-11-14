@@ -579,7 +579,6 @@ struct DMaterial {
     // dEmitterForHit() < 0, so an emitter's surface never counts twice.
     int    matIsLight;
     int    matReflectsNothing;   // Material::reflectsNothing: a light block's own surface
-    int    emitterIdx;           // the single emitter registered under it (Scene::emitterForMat), else -1
     // Device twin of Material::hideCamera — primary visibility off. Only the bounce-0
     // camera ray of a gather/backward path skips this material; every other ray sees it.
     // See Material::hideCamera (scene.h) for why the flag exists at all, and
@@ -14618,15 +14617,15 @@ __device__ static double dVertexLe(const DScene& sc, const DVertex& v, const DVe
              * (double)dAimRadianceNow(sc, sc.emitters[v.lightIdx], w);
     return (double)specLookup(*eSpd, lambda) * invPdfLambda * (double)v.emitPatW;
 }
-// Emitter that owns an emissive surface material (mirrors Scene::emitterForMat): a routed copy's
-// is its original's.
 // The emitter of the surface hit at `h`, shading with material `matId` -- its own or the part a
-// compound resolved it to (host twin Scene::emitterForHit): its primitive's where matId is the
-// surface's own, else the material's single one (a light block's surface), or -1.
+// compound resolved it to (host twin Scene::emitterForHit): its primitive's, where matId is the
+// surface's own and the emitter is of matId's original (DMaterial::solidId), else -1.
 __device__ static int dEmitterForHit(const DScene& sc, const DHit& h, int matId) {
     if (matId < 0 || !sc.mats[matId].matIsLight) return -1;   // an emitter's surface is a light's (host twin)
-    if (matId == h.matId && h.emitter >= 0 && h.emitter < sc.nEmitters) return h.emitter;
-    return sc.mats[matId].emitterIdx;
+    if (matId == h.matId && h.emitter >= 0 && h.emitter < sc.nEmitters &&
+        sc.emitters[h.emitter].matId == sc.mats[matId].solidId)
+        return h.emitter;
+    return -1;
 }
 
 // Sample the shared wavelength from the scene emission sampler (mirrors
@@ -25086,8 +25085,8 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
     // (fluoCdfAll), sliced per material by fluoCdfOffset/fluoCdfN (like lightCdfAll).
     // Sized to the scene's materials, then GROWN by one synthetic lobe per layered material
     // (see the loop after the bake). Nothing indexes this array by host material id beyond
-    // scene.mats.size(), and dEmitterForMat scans the emitters rather than a per-material
-    // table, so the extra entries are invisible to everything that does not ask for them.
+    // scene.mats.size(), and a hit finds its emitter by its primitive (dEmitterForHit), so the
+    // extra entries are invisible to everything that does not ask for them.
     std::vector<DMaterial> mats(scene.mats.size());
     std::vector<double> fluoCdfAll;
     // Parametric-record reflect pools (§records stage 6a): each per-hit driven reflect
@@ -25195,10 +25194,6 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
         // CSG/quadric solids). bakeSpec of a null Spectrum yields all zeros, so a
         // non-emissive material costs nothing but the storage.
         d.matIsLight = m.isLight ? 1 : 0;
-        {
-            const Emitter* em = scene.emitterForMat((int)i);
-            d.emitterIdx = em ? (int)(em - scene.emitters.data()) : -1;
-        }
         d.matReflectsNothing = m.reflectsNothing ? 1 : 0;
         d.hideCamera = m.hideCamera ? 1 : 0;
         d.route = m.route;
@@ -25322,7 +25317,6 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
         coat.coatLobe = 1;
         coat.matIsLight = 0;
         coat.matReflectsNothing = 0;
-        coat.emitterIdx = -1;
         coat.emitPat = -1;
         mats[i].coatChild = (int)mats.size();
         mats.push_back(coat);
@@ -25603,7 +25597,13 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
     sc.tris = d_tris; sc.nTris = (int)tris.size();
     sc.sph = d_sph;   sc.nSph = (int)sph.size();
     sc.sphAxes = sphAxes.empty() ? nullptr : (const DVec3*)keep(uploadVec(sphAxes));
-    sc.sphEmitter = scene.sphereEmitter.empty() ? nullptr : (const int*)keep(uploadVec(scene.sphereEmitter));
+    if (!scene.sphereEmitter.empty()) {   // one per sphere: closestHit indexes it by sphere
+        std::vector<int> se(scene.sphereEmitter);
+        se.resize(scene.spheres.size(), -1);
+        sc.sphEmitter = (const int*)keep(uploadVec(se));
+    } else {
+        sc.sphEmitter = nullptr;
+    }
     sc.mirrorPlanes = d_mirp; sc.nMirrorPlanes = (int)mirrorPlanes.size();
     sc.dielSph   = d_dielSph;   sc.nDielSph   = (int)scene.dielSphereIdx.size();
     sc.mirrorSph = d_mirrorSph; sc.nMirrorSph = (int)scene.mirrorSphereIdx.size();

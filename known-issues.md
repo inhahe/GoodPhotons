@@ -129,14 +129,15 @@ It measured the light a merge's disc at a gap's mouth reaches under the slab for
 the gap's leak the band of 0.442.2 left -- and its fix is the same footprint. The band is
 reverted (J-THIN-GAP-LEAK, which carries its numbers); `scenes/_gap_leak_noceil.ftsl` stays.
 
-## OPEN (2026-11-14, 0.442.2): GLOW-MIS-J-HOST — host mode J reads a glowing isosurface's floor 1.7 % over mode U, 6 standard errors
+## CLOSED (2026-11-14, 0.443.2; opened 0.442.2): GLOW-MIS-J-HOST — host mode J read a glowing isosurface's floor 1.7 % over mode U: two high seeds
 
-`tools/check_glow_mis.py` on 0.442.2: the floor a glowing isosurface lights (now a Glow emitter),
-against host mode U: D 1.0048 / 1.0040, J **1.0173** (6.1 sigma by the two seeds) / 0.9999, U (device)
-1.0041 (host / device). Inside the check's 3 % band, so it passes; but host J alone sits off, and by
-far more than its seeds spread. Not looked into: whether host J's surface merges or its beam pass
-weigh a Glow's light (its crossing-weighted draws, at the nominal density 1 / area) differently from
-the connections and the device.
+Not a bias. With its surface merges off (`-nojsurf`) host J is mode D to the digit (1.0043 of host
+U, three seeds within 0.15 %); with them, its frame moves 0.77 % from seed to seed, and the check's
+seeds 1 and 2 both read high (1.0140, 1.0187), which half their difference -- the check's error
+estimate -- took for 6 standard errors. Eleven seeds: host J 1.0052 +- 0.0023 of host U,
+1.0009 +- 0.0023 of host D. (Host U itself reads some 0.4 % under D on both devices and under
+device U, the merges' radius at this scale -- inside the check's 3 %.) `tools/check_glow_mis.py`
+now prints each seed's ratio instead of a "sigma" two draws cannot give.
 
 ## DONE (2026-11-14, 0.442.1): REVIEW-0442 — what the Opus review of 0.442.0 found
 

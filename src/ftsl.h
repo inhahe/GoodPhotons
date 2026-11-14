@@ -1436,6 +1436,7 @@ public:
         // Whether any cavity probe rays will ever be fired: before the build, whose emitters read
         // emission patterns (build() derives the probe's reach).
         markCavityReaders(L);
+        const bool cavityDerived = L.scene.cavityRadius <= 0.0;   // build() derives it if needed
         if (L.beforeBvh) L.beforeBvh(L);
         { detail::AccelTimer _ct; L.scene.build(); }
         // build() demotes a fire that emits nothing to the smoke it is made of
@@ -1469,7 +1470,7 @@ public:
                                                    : L.scene.matNames[kv.first.first]) +
                                               (kv.first.second == ROUTE_J ? " [mode J]" : " [mode D]");
         warnCurvOnFlatGeometry(L);
-        if (L.scene.cavityRadiusDerived)
+        if (cavityDerived && L.scene.needsCavity)
             std::fprintf(stderr,
                 "[ftsl] cavity: probe radius %.4g m derived from the scene bounds "
                 "(2%% of the AABB diagonal); set `scene { cavity_radius <len> }` to "
@@ -1680,15 +1681,8 @@ public:
     // material somewhere reads `cavity`. Keying off the hit's own material id costs a
     // single load — Hit::matId is already in hand — and charges the probe only where it
     // is read. Scene::needsCavity survives as the cheap "any at all?" early-out and as
-    // the flag the GPU upload and Scene::build's radius derivation key off.
-    //
-    // The RADIUS is derived rather than defaulted to a constant, because cavity is a
-    // non-local measure and therefore has no intrinsic scale: the same corner is "deeply
-    // enclosed" at a 1 cm probe and "wide open" at 1 m. 2% of the scene's AABB diagonal
-    // (sceneRadius is half that diagonal) makes the same model read the same however it
-    // was authored, which no fixed number can. Authored `cavity_radius` always wins. Scene::build
-    // derives it (Scene::cavityRadiusDerived), so this runs before the build, whose emitters'
-    // selection weights read emission patterns.
+    // the flag the GPU upload and Scene::build's radius derivation key off. Before the build, whose
+    // emitters' selection weights read emission patterns.
     void markCavityReaders(Loaded& L) {
         Scene& sc = L.scene;
         const size_t nm = sc.mats.size();
@@ -7237,8 +7231,7 @@ private:
             if (clone || !ownYields) return id;
         }
         // A light's material is copied as any other: its emitter, registered on the original,
-        // is found from the copy through Material::routeBase (Scene::emitterForMat), or by the hit's
-        // primitive (Scene::emitterForHit).
+        // is found from the copy through Material::routeBase by the hit's primitive (Scene::emitterForHit).
         const auto key = std::make_pair(id, route);
         auto it = routeClone_.find(key);
         if (it != routeClone_.end()) return it->second;
@@ -8296,7 +8289,9 @@ private:
             const int base = S.matBase(em.matId);
             if (em.shape != EmitterShape::Mesh || !glows(base)) { owned.insert(base); continue; }
             for (const EmitTri& et : em.meshTris)
-                if (et.tri >= 0) { covered[(size_t)et.tri] = 1; S.tris[(size_t)et.tri].emitter = (int)e; }
+                if (et.tri >= 0 && S.matBase(S.tris[(size_t)et.tri].matId) == base) {
+                    covered[(size_t)et.tri] = 1; S.tris[(size_t)et.tri].emitter = (int)e;
+                }
             em.spdFn = S.mats[(size_t)em.matId].emit;   // the shared object (same values)
         }
         const auto wants = [&](int m) { return glows(m) && !owned.count(S.matBase(m)); };
@@ -8450,22 +8445,31 @@ private:
     // `light` false (a `glow_only` material): the radiance only, and no emitter.
     void addMeshEmitter(const Block& b, Loaded& L, size_t t0, size_t t1, int id, bool own,
                         bool light = true) {
+        // Its own material's faces: a usemtl group of another material is no part of this light
+        // (registerGlows gives one that emits its own).
+        const int id0 = id;
         if (find(b, "power") || find(b, "lumens")) {
-            double area = 0.0;   // the range's whole area: power law geomW = area * PI
+            double area = 0.0;   // the light's whole area: power law geomW = area * PI
             for (size_t i = t0; i < t1; ++i) {
                 const Tri& tr = L.scene.tris[i];
-                area += 0.5 * length(cross(tr.v1 - tr.v0, tr.v2 - tr.v0));
+                if (tr.matId == id0) area += 0.5 * length(cross(tr.v1 - tr.v0, tr.v2 - tr.v0));
             }
             const Spectrum scaled = absPower(b, L.scene.mats[(size_t)id].emit, area * PI, L);
             if (!own) {
                 Material clone = L.scene.mats[(size_t)id];
                 id = (int)L.scene.mats.size();
                 L.scene.mats.push_back(std::move(clone));
-                for (size_t i = t0; i < t1; ++i) L.scene.tris[i].matId = id;
+                for (size_t i = t0; i < t1; ++i)
+                    if (L.scene.tris[i].matId == id0) L.scene.tris[i].matId = id;
             }
             L.scene.mats[(size_t)id].emit = scaled;
         }
-        if (light) L.scene.addMeshLight(t0, t1 - t0, L.scene.mats[(size_t)id].emit, binWidth_, id);
+        if (light) {
+            std::vector<Scene::MeshLightTri> list;
+            for (size_t i = t0; i < t1; ++i)
+                if (L.scene.tris[i].matId == id) list.push_back({&L.scene.tris[i], (int)i});
+            L.scene.addMeshLightOf(list, L.scene.mats[(size_t)id].emit, binWidth_, id);
+        }
     }
 
     // A tube's wall, and with `caps` its end discs, as `segs`-sided triangles of material `id`

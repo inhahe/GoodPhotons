@@ -1179,8 +1179,8 @@ absorption included. The eleven sites that resolved `D_MIX` (shadeStep and its h
 `bkRadiance` x2, the RGB gather, `dRandomWalk`, the two photon gathers, SPPM, and the two VCM
 subpath walks) each became `dIsCompound(...)` plus a call; `dResolveCompoundDominant` mirrors
 backward.h's Whitted rule (the coat only when it dominates). Nothing indexes the device material
-array by host id past `scene.mats.size()`, and `dEmitterForHit` reads a hit's own tag or the
-material's `emitterIdx`, so the appended entries are invisible to everything that does not ask for them.
+array by host id past `scene.mats.size()`, and `dEmitterForHit` reads a hit's own tag, so the
+appended entries are invisible to everything that does not ask for them.
 
 **The CPU gather had to be fixed to match.** `photonGather` / `photonGatherSub` resolved a layered
 material with `mixPickChild(...)  // approximate: gather the body lobe` -- the camera ray always
@@ -2795,9 +2795,9 @@ the primitive pools before an object or group is added and retags what it added,
 glTF meshes with many materials. A mix's children are copied too, because both walks store the
 RESOLVED child on the vertex. A layered coat is synthesised later from its parent, so it inherits.
 An emissive surface is copied as any other (0.441.0): its emitter, registered on the original before
-the loader retags the surface, is found from the copy through `routeBase` (`Scene::emitterForMat`,
-`aimedEmission`, the device's `emitterIdx`, by `matBase` / `solidId`; a registerGlows light by its
-primitive's tag, `Scene::emitterForHit`). A surface `light` block takes
+the loader retags the surface, is found from the copy by its primitive's tag (`Scene::emitterForHit`,
+whose check reads the copy's original through `routeBase`, `matBase` / `solidId`; `aimedEmission`
+likewise). A surface `light` block takes
 its own `mode` (`routedLight`); a spot, collimated, sun or sky has no surface to route, and a `mode` on one is
 an error. A `mesh_instance` without a `material` override shares its asset's triangles, and their
 materials, with every placement, so it records its route instead (`MeshInstance::route`): each
@@ -3389,11 +3389,12 @@ was lit differently by every mode (known-issues GLOW-LIGHT-MODES). Now:
   `MeshInstance::emitOf` (material, emitter) pairs are written into the hit (`Hit::emitter`;
   device `DHit::emitter`, `DTri::emitter` beside the float `bitangentSign`, which keeps `DTri` at
   168 bytes; `DScene::instEmit`). `Scene::emitterForHit(h, m)` / device `dEmitterForHit` read the
-  tag when the material `m` the hit shades with is the surface's own and the tag is in range (on
-  the host, also that it names an emitter of that material), else the material's single emitter
-  (`emitterForMat`: a light block's surface, whose primitives carry none; `emitterOfMat` marks a
-  material several emitters share `kEmitterByPrim`, and the device's `emitterIdx` is -1 for it),
-  and never for a material that is not a light. `Scene::eraseEmitter` renumbers every tag when an
+  tag when the material `m` the hit shades with is the surface's own, the tag is in range and
+  names an emitter of `m`'s original, and never for a material that is not a light; else none.
+  Every emitter's surfaces carry it: registerGlows tags what it registers, and finalizeEmitters
+  (`Scene::tagLightSurfaces`) tags the surfaces of each material with a single emitter -- a light
+  block's own, a built-in scene's -- and warns of an emissive surface of a material several
+  emitters share that has none (`emitterOfMat`, `kEmitterByPrim`, which also answers `isGlow`). `Scene::eraseEmitter` renumbers every tag when an
   emitter is removed (`-noenv`). `Tri::emitter` is its last field, as `Tri`s are built
   positionally (`Tri{v0, v1, v2, mat, -1, {}, uv0, uv1, uv2}`). So a material lights the scene
   through any number of emitters and stays one material: until then a hit's emitter was its

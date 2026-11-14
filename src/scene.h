@@ -26,8 +26,8 @@
 #include "phase.h"       // hgPhase/sampleHG + rainbow::RainbowPhase (Medium phase dispatch)
 #include "record.h"      // parametric records (§records): named per-channel LUTs
 #include "majorant.h"    // per-cell control/residual majorant grid (Medium::majorant)
-#include "lighttree_build.h"
-#include "parallel.h"  // Conty-Kulla light BVH: node layout + host builder
+#include "lighttree_build.h"  // Conty-Kulla light BVH: node layout + host builder
+#include "parallel.h"
 
 // ---- ray-query telemetry (-raystats) --------------------------------------------------
 // Counts every ray actually cast against the acceleration structure: closest-hit queries
@@ -2198,7 +2198,6 @@ struct Scene {
     // Set before build(), whose emitters' selection weights read emission patterns (Emitter::selW):
     // a cavity among them, with the radius build() derives where none was given.
     bool needsCavity = false;
-    bool cavityRadiusDerived = false;   // build() chose cavityRadius (the loader says so)
     Sensor sensor;
     // Participating media. Zero or more independent regions (global haze, bounded
     // boxes/spheres, heterogeneous blobs) that may overlap. The forward tracer treats
@@ -2907,7 +2906,7 @@ struct Scene {
     // common scene — no hidden material anywhere — pays one bool test per camera ray
     // instead of a per-primitive material lookup inside the BVH leaf.
     bool camHiddenAny = false;
-    // The materials that glow with no emitter to sample them (isLight, and emitterForMat finds
+    // The materials that glow with no emitter to sample them (isLight, and matHasEmitter finds
     // none): by material, the XYZ of the emission, sum over the 1 nm grid of CIE x emit -- the
     // directly viewed colour, as envXYZ is the sky's -- and {0, 0, 0} for every other material.
     // Such a glow lights nothing and is seen only through specular surfaces (isSpecularType); the
@@ -3106,10 +3105,10 @@ struct Scene {
     }
 
     // The emitter of the surface a hit `h` lies on, when it shades with material `matId` -- its own,
-    // h.matId, or the part a mix or layered stack resolved it to: its primitive's (Hit::emitter)
-    // where matId is the surface's own, else the material's single one (emitterForMat: a light
-    // block's surface), or null. A routed copy (Material::routeBase: a per-object mode on an emissive
-    // surface) is its original's.
+    // h.matId, or the part a mix or layered stack resolved it to: its primitive's (Hit::emitter),
+    // where matId is the surface's own and the emitter is of matId's original (Material::routeBase),
+    // else null. Every emitter's surfaces are tagged: registerGlows', and finalizeEmitters the rest
+    // (tagLightSurfaces).
     const Emitter* emitterForHit(const Hit& h, int matId) const {
         // An emitter's surface is a light's material, always: a hit on any other is none, whatever
         // its record holds.
@@ -3117,26 +3116,11 @@ struct Scene {
         if (matId == h.matId && h.emitter >= 0 && h.emitter < (int)emitters.size() &&
             emitters[(size_t)h.emitter].matId == matBase(matId))
             return &emitters[(size_t)h.emitter];
-        return emitterForMat(matId);
+        return nullptr;
     }
     int emitterIndexForHit(const Hit& h, int matId) const {
         const Emitter* e = emitterForHit(h, matId);
         return e ? (int)(e - emitters.data()) : -1;
-    }
-    // The emitter registered under a material when it is the only one (a light block's surface), or
-    // null: none, or several -- each of the material's primitives then knows its own (Hit::emitter,
-    // emitterForHit). A routed copy's is its original's.
-    const Emitter* emitterForMat(int matId) const {
-        if (matId < 0) return nullptr;
-        const int id = matBase(matId);
-        if (id >= 0 && id < (int)emitterOfMat.size()) {          // finalized: the table's
-            const int e = emitterOfMat[(size_t)id];
-            return e >= 0 ? &emitters[(size_t)e] : nullptr;
-        }
-        const Emitter* one = nullptr;
-        for (const auto& e : emitters)
-            if (e.matId == id) { if (one) return nullptr; one = &e; }
-        return one;
     }
     // Whether any emitter is registered under a material (or its original): its surfaces light the
     // scene, so it is no glow (isGlow).
@@ -3147,12 +3131,38 @@ struct Scene {
         for (const auto& e : emitters) if (e.matId == id) return true;
         return false;
     }
-    // By material: the one emitter registered under it, kEmitterByPrim where there are several (its
-    // primitives know theirs), -1 where there is none. Filled by finalizeEmitters, so a lookup costs
-    // nothing however many lights a scene has; a material added after it (past the table's end) is
-    // looked up by a scan.
+    // By material: the one emitter registered under it, kEmitterByPrim where there are several, -1
+    // where there is none -- what matHasEmitter reads and tagLightSurfaces tags by. Filled by
+    // finalizeEmitters; a material added after it (past the table's end) is looked up by a scan.
     static constexpr int kEmitterByPrim = -2;
     std::vector<int> emitterOfMat;
+    // Tag the surfaces of each material with a single emitter that registerGlows did not (a light
+    // block's own surface, a built-in scene's light) with it, so every emitter's surface knows its
+    // light; and say so if a surface of a material several emitters share has none (nothing could
+    // sample it there: registerGlows tags each it registers).
+    void tagLightSurfaces() {
+        const auto single = [&](int m) {
+            const int b = matBase(m);
+            return (b >= 0 && b < (int)emitterOfMat.size()) ? emitterOfMat[(size_t)b] : -1;
+        };
+        long long untagged = 0;
+        const auto tag = [&](int m, int& e) {
+            if (e >= 0 || m < 0 || m >= (int)mats.size() || !mats[(size_t)m].isLight) return;
+            const int s = single(m);
+            if (s >= 0) e = s;
+            else if (s == kEmitterByPrim) ++untagged;
+        };
+        for (Tri& t : tris) tag(t.matId, t.emitter);
+        for (Implicit& im : implicits) tag(im.matId, im.emitter);
+        bool anySphere = false;
+        for (const Sphere& sp : spheres) anySphere = anySphere || single(sp.matId) >= 0;
+        if (anySphere && sphereEmitter.size() < spheres.size()) sphereEmitter.resize(spheres.size(), -1);
+        for (size_t i = 0; i < spheres.size() && i < sphereEmitter.size(); ++i)
+            tag(spheres[i].matId, sphereEmitter[i]);
+        if (untagged > 0)
+            std::fprintf(stderr, "[light] warning: %lld emissive primitives of materials several lights "
+                                 "share know none of them: they glow, but light nothing\n", untagged);
+    }
     // The material `matId` is a routed copy of, or itself (Material::solidId).
     int matBase(int matId) const {
         return (matId >= 0 && matId < (int)mats.size()) ? mats[(size_t)matId].solidId(matId) : matId;
@@ -3167,7 +3177,7 @@ struct Scene {
     // time) for an aimed quad's surface, 1 for every other. Readers call it only when aimOfMat is
     // non-empty.
     double aimedEmission(int matId, const Vec3& w) const {
-        matId = matBase(matId);   // a routed copy's light is its original's (emitterForMat)
+        matId = matBase(matId);   // a routed copy's light is its original's (emitterForHit)
         if (matId < 0 || matId >= (int)aimOfMat.size() || aimOfMat[(size_t)matId] < 0) return 1.0;
         return aimRadianceNow(emitters[(size_t)aimOfMat[(size_t)matId]], w);
     }
@@ -3268,6 +3278,7 @@ struct Scene {
             if (m >= 0 && m < (int)mats.size())
                 emitterOfMat[(size_t)m] = (emitterOfMat[(size_t)m] == -1) ? (int)e : kEmitterByPrim;
         }
+        tagLightSurfaces();
         // Adopt each emitter's emission profile from the material on its geometry. Done
         // here — one place, after every registration path — rather than threading an
         // extra argument through addAreaLight / addMeshLight / the built-in scenes.
@@ -3284,12 +3295,18 @@ struct Scene {
         // pattern undefined somewhere) counts as none, so it cannot poison every light's choice.
         // First: the spectral weights below read it (geomWeight). Each emitter on its own stream, so
         // the emitters can be measured at once.
-        ft::parallelForAll(emitters.size(), 1, [&](size_t i) {
+        std::vector<size_t> toMeasure;
+        for (size_t i = 0; i < emitters.size(); ++i) {
             Emitter& e = emitters[i];
             e.selW = 1.0;
             const bool areaLike = e.shape == EmitterShape::Quad || e.shape == EmitterShape::Mesh ||
                                   e.shape == EmitterShape::Glow;
-            if (!areaLike || (e.emitPat < 0 && e.shape != EmitterShape::Glow) || e.collimated) return;
+            if (areaLike && (e.emitPat >= 0 || e.shape == EmitterShape::Glow) && !e.collimated)
+                toMeasure.push_back(i);
+        }
+        ft::parallelForAll(toMeasure.size(), 1, [&](size_t j) {
+            const size_t i = toMeasure[j];
+            Emitter& e = emitters[i];
             constexpr int kN = 4096;
             Pcg32 rng;
             seedUnit(rng, (uint64_t)i, 0x5E1EC7ED0CA5ULL);
@@ -4522,12 +4539,12 @@ struct Scene {
         // weight reads its pattern off hits whose pattern side this decides (Emitter::selW).
         finalizePatternSides();
         // The cavity probe's reach where the scene gave none (needsCavity, set by the loader before
-        // the build): 4 % of the bounds' radius. Before the emitters too, which read cavity.
+        // the build), before the emitters, which read cavity. Derived, not a constant: cavity is a
+        // non-local measure with no scale of its own -- the same corner is "deeply enclosed" at a
+        // 1 cm probe and "wide open" at 1 m -- so 2 % of the bounds' diagonal (4 % of sceneRadius)
+        // reads a model the same however it was authored. An authored `cavity_radius` wins.
         if (needsCavity) {
-            if (cavityRadius <= 0.0) {
-                cavityRadius = (sceneRadius > 0.0) ? 0.04 * sceneRadius : 0.1;
-                cavityRadiusDerived = true;
-            }
+            if (cavityRadius <= 0.0) cavityRadius = (sceneRadius > 0.0) ? 0.04 * sceneRadius : 0.1;
             if (cavitySamples < 1) cavitySamples = 1;
         }
         finalizeEmitters();
@@ -4580,20 +4597,6 @@ struct Scene {
     //              local emitters only. Rebuilds the emitter CDF / sampler.
     //   noFluoro — demote fluorescent materials to plain diffuse (their elastic
     //              `reflect` albedo), dropping the Stokes-shift reradiation.
-    // Remove emitter `idx`, every primitive's light (Tri, Implicit::emitter, sphereEmitter,
-    // MeshInstance::emitOf) still naming the emitter it named: those after `idx` move down one, the
-    // removed one's surfaces have none. The caller finalizes the emitters again.
-    void eraseEmitter(int idx) {
-        if (idx < 0 || idx >= (int)emitters.size()) return;
-        emitters.erase(emitters.begin() + idx);
-        const auto fix = [idx](int& e) { if (e == idx) e = -1; else if (e > idx) --e; };
-        for (Tri& t : tris) fix(t.emitter);
-        for (Implicit& im : implicits) fix(im.emitter);
-        for (int& e : sphereEmitter) fix(e);
-        for (MeshInstance& in : instances)
-            for (auto& [m, e] : in.emitOf) fix(e);
-    }
-
     std::string applyIgnoreFlags(bool noMedia, bool noEnv, bool noFluoro) {
         std::string summary;
         auto note = [&](const std::string& s) {
@@ -4623,6 +4626,20 @@ struct Scene {
             if (n) note(std::to_string(n) + " fluorescent material" + (n > 1 ? "s" : ""));
         }
         return summary;
+    }
+
+    // Remove emitter `idx`, every primitive's light (Tri, Implicit::emitter, sphereEmitter,
+    // MeshInstance::emitOf) still naming the emitter it named: those after `idx` move down one, the
+    // removed one's surfaces have none. The caller finalizes the emitters again.
+    void eraseEmitter(int idx) {
+        if (idx < 0 || idx >= (int)emitters.size()) return;
+        emitters.erase(emitters.begin() + idx);
+        const auto fix = [idx](int& e) { if (e == idx) e = -1; else if (e > idx) --e; };
+        for (Tri& t : tris) fix(t.emitter);
+        for (Implicit& im : implicits) fix(im.emitter);
+        for (int& e : sphereEmitter) fix(e);
+        for (MeshInstance& in : instances)
+            for (auto& [m, e] : in.emitOf) fix(e);
     }
 
     // Is this curve segment one of the fibers a fur grid summarises? Grass and wire are

@@ -16109,12 +16109,17 @@ static Vec3 glowSeenXYZ(const Scene& scene, const Hit& h, const Ray& r, bool mon
     const int id = glowMatSeen(scene, h, r.d, lambda, u1, u2, resolved);
     if (id < 0) return Vec3{0, 0, 0};
     const Material& m = scene.mats[(size_t)id];
-    if (!mono && !resolved && scene.media.empty())
-        return scene.glowXYZ[(size_t)id] * (emitHitScale(scene, m, h, r.d * -1.0) * w);
+    if (!mono && !resolved && scene.media.empty()) {
+        const Vec3 c = scene.glowXYZ[(size_t)id] * (emitHitScale(scene, m, h, r.d * -1.0) * w);
+        return (c.x + c.y + c.z > 0.0) ? c : Vec3{0, 0, 0};
+    }
     const double T = scene.media.empty() ? 1.0
                    : Renderer::mediaTransmittance(scene, r.o, r.d, h.t, lambda, rng);
-    return Vec3(cieX(lambda), cieY(lambda), cieZ(lambda)) *
-           (emitSlot(scene, m, h, lambda, r.d * -1.0) * T * w * (kHi - kLo));
+    const Vec3 c = Vec3(cieX(lambda), cieY(lambda), cieZ(lambda)) *
+                   (emitSlot(scene, m, h, lambda, r.d * -1.0) * T * w * (kHi - kLo));
+    // Nothing for a draw that is not a number (an emit pattern undefined somewhere): the sums it
+    // would enter only accumulate.
+    return (c.x + c.y + c.z > 0.0) ? c : Vec3{0, 0, 0};
 }
 
 // The sky a forward (model-B) film shows directly, summed into `view` up to what `N` photons ask for
@@ -16202,7 +16207,7 @@ static bool prepareSky(SkyView& view, const Scene& scene, const Camera& cam, int
                 if (!haveGlow) continue;
                 const double u1 = rng.uniform(), u2 = rng.uniform();
                 c = glowSeenXYZ(scene, h, r, /*mono=*/true, lambda, u1, u2, rng, wLens, /*perSample=*/false);
-                if (!(c.x + c.y + c.z > 0.0)) continue;   // nothing, or not a number (an emit pattern's)
+                if (!(c.x + c.y + c.z > 0.0)) continue;
             } else {
                 double L = 0.0;
                 if (haveEnv) L += scene.envRadianceSeen(r.d, lambda);   // the bilinear camera view
@@ -17111,11 +17116,11 @@ static volatile std::sig_atomic_t g_stopRequested = 0;
 // handler may call them.
 static void raiseStop() {
     g_stopRequested = 1;
-    if (volatile int* m = ft::stopMirrorSlot().load(std::memory_order_relaxed)) *m = 1;
+    ft::writeStopMirror(1);
 }
 static void clearStop() {
     g_stopRequested = 0;
-    if (volatile int* m = ft::stopMirrorSlot().load(std::memory_order_relaxed)) *m = 0;
+    ft::writeStopMirror(0);
 }
 // -stop-exit <code>: the exit code of a render ended early by -stop or Ctrl-C (0: the usual 0),
 // so a driver can tell a part-rendered image from a finished one (loom's render_range).

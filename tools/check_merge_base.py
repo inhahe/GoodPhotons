@@ -34,6 +34,7 @@ CASES = [("J_cpu", ["-mode", "J", "-device", "cpu", "-spp", "128", "-pmradius", 
          ("U_cpu", ["-mode", "U", "-device", "cpu", "-spp", "128", "-pmradius", "0.1"]),
          ("J_gpu", ["-mode", "J", "-device", "gpu", "-spp", "512", "-pmradius", "0.1"])]
 REF = ["-mode", "R", "-device", "gpu", "-spp", "2048"]
+REF_CPU = ["-mode", "R", "-device", "cpu", "-spp", "512"]   # --no-gpu's
 
 
 def render(exe, scn, out, tag, args):
@@ -63,7 +64,7 @@ def main():
     with open(scn, "w", encoding="utf-8", newline="") as f:
         f.write(g.scene(lines, cam))
     dist = distf()
-    R = render(exe, scn, out, "R_gpu", REF)
+    R = render(exe, scn, out, "R_cpu" if a.no_gpu else "R_gpu", REF_CPU if a.no_gpu else REF)
     ok = True
     for tag, args in CASES:
         if a.no_gpu and tag.endswith("gpu"):

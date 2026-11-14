@@ -79,7 +79,7 @@ def main():
         return out
 
     r = frame(*REF)
-    ref, ref_err = (r[0] + r[1]) / 2, abs(r[0] - r[1]) / 2
+    ref = (r[0] + r[1]) / 2
     print("reference: mode %s on the %s, frame mean %.4g (seeds %.4g / %.4g)"
           % (REF[0], "host" if REF[1] == "cpu" else "device", ref, r[0], r[1]), flush=True)
     ok = True
@@ -87,14 +87,16 @@ def main():
         if dev == "gpu" and a.no_gpu:
             continue
         v = frame(mode, dev)
-        mean, err = (v[0] + v[1]) / 2, abs(v[0] - v[1]) / 2
+        mean = (v[0] + v[1]) / 2
         ratio = mean / ref
-        sigma = abs(mean - ref) / max((err ** 2 + ref_err ** 2) ** 0.5, 1e-30)
         good = abs(ratio - 1.0) <= 0.03
         ok &= good
+        # The two seeds, not a standard error: two draws say little of a spread (host J's is 0.8 %
+        # a seed, and its seeds 1 and 2 both read high, which their difference took for 6 sigma).
         print("%s: mode %s on the %s, a floor a glowing isosurface lights: x%.4f of the "
-              "reference (%.1f sigma)" % ("ok" if good else "FAIL", mode,
-                                          "host" if dev == "cpu" else "device", ratio, sigma),
+              "reference (seeds x%.4f, x%.4f)" % ("ok" if good else "FAIL", mode,
+                                                 "host" if dev == "cpu" else "device", ratio,
+                                                 v[0] / ref, v[1] / ref),
               flush=True)
     print("PASS" if ok else "FAILED")
     return 0 if ok else 1

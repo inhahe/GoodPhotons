@@ -1769,7 +1769,7 @@ inline Vec3 photonGather(const Scene& scene, const PhotonMap& pm, Ray ray, doubl
         // both emits and reflects, so the walk falls through to the density estimate below.
         // Returning here is what made gallery_rain's grid floor render as GRID-ONLY on the
         // CPU (host `m.isLight` hit, emission returned, body dropped) and as BODY-ONLY on the
-        // GPU (dEmitterForMat missed the unregistered quad, so the emitter branch was never
+        // GPU (its emitter lookup missed the unregistered quad, so the emitter branch was never
         // taken and the grid vanished) — two mode-M paths disagreeing with each other and
         // both disagreeing with modes R and D. Measured on scraps/mini_grid.ftsl.
         const int eIdx = m.isLight ? BackwardRenderer::emitterIndexOfResolved(scene, h, m) : -1;

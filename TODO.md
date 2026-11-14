@@ -284,8 +284,8 @@ Then the rest of 4.2-4.6 in their order, 4.7's bookkeeping alongside whatever to
 - [x] **REVIEW-0442-FABLE** (0.442.4, 0.443.0) -- a hit finds its emitter by its primitive (`Hit::emitter`),
   not its material: no glow material copies (their solid identity, the instancing refusal, the
   retag, the degenerate group, the spectrum wrap, the load cost); the docs' "one light per material".
-- [ ] **GLOW-MIS-J-HOST** — host mode J reads a glowing isosurface's floor 1.7 % over mode U (6
-  sigma; device J 0.9999), check_glow_mis.
+- [x] **GLOW-MIS-J-HOST** — closed 0.443.2: two high seeds of a noisy estimator (eleven seeds:
+  host J 1.0009 +- 0.0023 of mode D).
 - [x] **KEEPWINDOW-VRAM** (0.442.3) — a finished render held open by `-keepwindow` kept all its device
   memory, so the next GPU render paged (~45x slower); it gives the device back as the render ends.
 - [ ] **J-THIN-GAP-LEAK** (reopened 0.443.1) — modes J and U merge the light trapped a millimetre

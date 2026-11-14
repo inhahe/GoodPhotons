@@ -65,7 +65,22 @@ inline std::atomic<volatile int*>& stopMirrorSlot() {
     static std::atomic<volatile int*> p{nullptr};
     return p;
 }
-inline void setStopMirror(volatile int* m) { stopMirrorSlot().store(m); }
+// Writes to it in flight (writeStopMirror): clearing the slot waits for them, so a write that read
+// the old pointer lands before its memory is freed. Lock-free counts, so a signal handler may write.
+inline std::atomic<int>& stopMirrorWriters() {
+    static std::atomic<int> n{0};
+    return n;
+}
+inline void writeStopMirror(int v) {
+    stopMirrorWriters().fetch_add(1);
+    if (volatile int* m = stopMirrorSlot().load()) *m = v;
+    stopMirrorWriters().fetch_sub(1);
+}
+inline void setStopMirror(volatile int* m) {
+    stopMirrorSlot().store(m);
+    if (!m)
+        while (stopMirrorWriters().load() != 0) std::this_thread::yield();
+}
 
 // Run fn(i) for i in [0, n), in parallel when that is worth the thread setup.
 // `grain` is the chunk size handed to a worker at a time AND the serial cutoff: fewer
