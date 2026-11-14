@@ -19,6 +19,7 @@
 #include "layered.h"     // A3: the stochastic layered model's escape moments       // curve / fiber primitive (hair, fur, grass, wire) — TODO §P1
 #include "pattern.h"
 #include "spectrum.h"
+#include "thinfilm.h"   // thinFilmReflectance: a layered coat's transmission table (coatRAtCos)
 #include "scene_film.h"
 #include "texture.h"
 #include "envmap.h"
@@ -467,6 +468,16 @@ struct Material {
     // is not stored here -- it is layeredCoatReflectance at the hit, because it depends on the
     // viewing angle, which is the whole point of a Fresnel coat.
     int    coatChild    = -1;
+    // LAYERED-MODES (b). On a body copy: the layered material it lies under, else -1. A walk takes
+    // the coat at its arrival (the coin: 1 - R(in) of the light goes in), and the body's lobe takes
+    // the coat on its other direction, S(w) = (1 - R(w)) / T-bar (render.h coatExitS): the physical
+    // clear coat T(in) T(out), reciprocal, with the escape its albedo already holds on average
+    // (coatedAlbedo's 1 - F_dr) given its angle.
+    int    coatStack    = -1;
+    // On a layered material: T-bar, the coat's transmission 1 - R averaged over the outside
+    // hemisphere with the cosine, by nm from LAMBDA_MIN (finalizeLayeredCoats; a thin film at its
+    // authored thickness). Empty for a constant coat (coatModel manual: S = 1) and anything else.
+    std::vector<double> coatTbar;
     // A3 (0.354.0). `coatScatter` 1 selects the stochastic layered model; `coatMom` is the
     // measured distribution of body-bounce counts before escape, stamped onto the BODY COPY
     // beside coatFdr. It depends on the coat index and the body's lobe but NOT on albedo, so
@@ -1583,6 +1594,26 @@ struct MeshGroup {
     bool   shapeOnly = false;
 };
 
+// A layered material's coat reflectance for light meeting it at incidence cosine `cosI` from outside
+// (render.h layeredCoatReflectance, which finds cosI and the film's thickness at a hit, and the table
+// coatTbar). `thickness`: a thin film's, in nm.
+inline double coatRAtCos(const Material& m, double cosI, double thickness, double lambda) {
+    const auto c01 = [](double x) { return x < 0 ? 0 : (x > 1 ? 1 : x); };
+    if (m.coatModel == 2) return c01(m.coatSpecular);
+    if (m.coatModel == 1) {                          // thin-film Airy coat over the body's index
+        const double ns = m.ior(lambda);
+        return c01(thinFilmReflectance(1.0, m.filmIor(lambda), ns, 0.0, thickness, cosI, lambda));
+    }
+    double n1 = 1.0, n2 = m.ior(lambda);             // Fresnel dielectric
+    double eta = n1 / n2;
+    double sin2t = eta * eta * (1.0 - cosI * cosI);
+    if (sin2t >= 1.0) return 1.0;                     // TIR (only from inside)
+    double cosT = std::sqrt(1.0 - sin2t);
+    double rs = (n1 * cosI - n2 * cosT) / (n1 * cosI + n2 * cosT);
+    double rp = (n1 * cosT - n2 * cosI) / (n1 * cosT + n2 * cosI);
+    return c01(0.5 * (rs * rs + rp * rp));
+}
+
 // A Lambertian body under a smooth coat does not return its own albedo: light that fails to
 // escape the coat-to-air interface is thrown back onto it and scatters again, so the body is
 // seen through a geometric series of internal passes. Summed:
@@ -2465,6 +2496,20 @@ struct Scene {
         const size_t n = mats.size();
         for (size_t i = 0; i < n; ++i) {
             if (mats[i].type != MatType::Layered || mats[i].coatChild >= 0) continue;
+            // T-bar by nm: 2 int_0^1 (1 - R(mu)) mu dmu = int_0^1 (1 - R(sqrt s)) ds, midpoint in s.
+            mats[i].coatTbar.clear();
+            if (mats[i].coatModel != 2) {
+                const int nL = (int)(LAMBDA_MAX - LAMBDA_MIN) + 1;
+                mats[i].coatTbar.assign((size_t)nL, 1.0);
+                constexpr int kS = 256;
+                for (int l = 0; l < nL; ++l) {
+                    const double lam = LAMBDA_MIN + (double)l;
+                    double t = 0.0;
+                    for (int k = 0; k < kS; ++k)
+                        t += 1.0 - coatRAtCos(mats[i], std::sqrt((k + 0.5) / kS), mats[i].filmThickness, lam);
+                    mats[i].coatTbar[(size_t)l] = t / kS;
+                }
+            }
             Material coat = mats[i];          // inherit roughness / normal / pattern plumbing
             coat.type = MatType::Glossy;
             coat.reflect = constantSpectrum(1.0);
@@ -2473,6 +2518,7 @@ struct Scene {
             coat.mixChildren.clear();
             coat.mixWeights.clear();
             coat.coatChild = -1;
+            coat.coatTbar.clear();
             coat.routeBase = -1;              // a material of its own, not a routed copy
             coat.isLight = false;
             coat.reflectsNothing = false;
@@ -2520,6 +2566,7 @@ struct Scene {
                 body.coatAbsorb = mats[i].coatAbsorb;
                 body.coatPathIo = pIo;
                 body.coatPathRt = pRt;
+                body.coatStack = (int)i;
                 mats[i].mixChildren[k] = (int)mats.size();
                 mats.push_back(body);
             }

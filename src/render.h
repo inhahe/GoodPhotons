@@ -269,19 +269,24 @@ inline double layeredCoatReflectance(const Scene& scene, const Material& m, cons
     bool entering = dot(d, h.ng) < 0.0;
     Vec3 nl = entering ? h.ng : -h.ng;
     double cosI = clamp01(-dot(d, nl));
-    if (m.coatModel == 1) {                          // thin-film Airy coat
-        double thickness = materialFilmThickness(scene, m, h);
-        double ns = m.ior(lambda);                   // effective index below the film
-        return clamp01(thinFilmReflectance(1.0, m.filmIor(lambda), ns, 0.0, thickness, cosI, lambda));
-    }
-    double n1 = 1.0, n2 = m.ior(lambda);             // Fresnel dielectric
-    double eta = n1 / n2;
-    double sin2t = eta * eta * (1.0 - cosI * cosI);
-    if (sin2t >= 1.0) return 1.0;                     // TIR (only from inside)
-    double cosT = std::sqrt(1.0 - sin2t);
-    double rs = (n1 * cosI - n2 * cosT) / (n1 * cosI + n2 * cosT);
-    double rp = (n1 * cosT - n2 * cosI) / (n1 * cosT + n2 * cosI);
-    return clamp01(0.5 * (rs * rs + rp * rp));
+    return coatRAtCos(m, cosI, (m.coatModel == 1) ? materialFilmThickness(scene, m, h) : 0.0, lambda);
+}
+
+// LAYERED-MODES (b): what the coat over a body copy (Material::coatStack) gives the body's lobe on
+// a direction `w` other than the one its walk met the coat by -- the light's way out to w, or in
+// from it -- as a multiple of the average the body's albedo already holds: (1 - R(w)) / T-bar.
+// Its mean over the hemisphere with the cosine is 1. 1 for a bare material, a constant coat, and a
+// direction behind the surface `h` was met from (a transmit lobe leaves through the body).
+inline double coatExitS(const Scene& scene, const Material& body, const Hit& h, const Vec3& w,
+                        double lambda) {
+    if (body.coatStack < 0) return 1.0;
+    const Material& st = scene.mats[(size_t)body.coatStack];
+    if (st.coatTbar.empty() || !(dot(w, orientedGeoN(h)) > 0.0)) return 1.0;   // behind: not the coat's way
+    int i = (int)std::lround(lambda - LAMBDA_MIN);
+    i = i < 0 ? 0 : (i >= (int)st.coatTbar.size() ? (int)st.coatTbar.size() - 1 : i);
+    const double tb = st.coatTbar[(size_t)i];
+    if (!(tb > 0.0)) return 0.0;
+    return (1.0 - layeredCoatReflectance(scene, st, h, w * -1.0, lambda)) / tb;
 }
 
 // --- The glossy lobe, and a rough interference reflector ----------------------------------
