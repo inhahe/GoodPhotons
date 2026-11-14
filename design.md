@@ -3399,14 +3399,20 @@ was lit differently by every mode (known-issues GLOW-LIGHT-MODES). Now:
   carrying weight k: `emitterSamplePoint` returns k times the pattern there as the multiplier
   every caller already applies, so the pdfs everywhere else stay the area-light ones. A line that
   crosses nothing gives no point (a forward photon is not born). The point is a real hit, read as
-  closestHit reads one (its pattern side and normal map), so an emission pattern -- curvature and
-  cavity included -- agrees between the sample and a hit exactly. The draw needs more than two
+  closestHit reads one from the side it emits to (a crossing where the line leaves the solid is
+  turned, `otherSide`, 0.442.4; its pattern side and normal map), so an emission pattern --
+  normal, curvature and cavity included -- agrees between the sample and a hit exactly
+  (`tools/check_glow_pattern_side.py`). The draw needs more than two
   uniforms: callers pass their stream; `emitterGeom` (mode W's grid) seeds one from its two.
 * **Selection** (`Emitter::selW`, finalizeEmitters): a patterned or Glow emitter is chosen in
   proportion to the light it emits -- the mean multiplier over 4096 of its draws -- rather than by
   its bare area (a 2000 m^2 ground whose glowing grid lines cover 3 % of it, a wire frame in its
-  box). `power` carries it, so light sampling and every MIS density follow; the forward modes,
-  whose photons carry the total power analog, divide it out of a born photon.
+  box). `power` carries it, so light sampling and every MIS density follow, and so does
+  `geomWeight`, so the camera's wavelength density weighs it by its emitting area (0.442.4); the
+  forward modes, whose photons carry the total power analog, divide it out of a born photon. A
+  draw that is not a number counts as none. build() measures it after the pattern sides
+  (`finalizePatternSides`) and the cavity probe's reach (the loader marks `needsCavity` before
+  the build) are known, since the draws read patterns.
 * **`glow_only on`** (`Material::glowOnly`) keeps a material out of registration: a glow that
   lights nothing. Such a glow (`Scene::isGlow`: emits, no emitter) is counted by every mode only
   along a camera path whose every vertex before it was specular (`isSpecularType`, the set mode
@@ -3417,7 +3423,10 @@ was lit differently by every mode (known-issues GLOW-LIGHT-MODES). Now:
   (`main.cpp glowMatSeen`, `prepareSky`, `addBlurredSkyRows`), through the media's transmittance
   along the camera ray, whose `glowsOnly` form gives mode P's forward layer the same (its fit over
   the diffuse-side pixels otherwise read the glow's edge pixels in the camera side only and ran the
-  frame bright). A plain glow's colour is exact at a pinhole's 64 points; one seen through a medium
+  frame bright); the composite adds those sums where it reads the forward film
+  (`forwardPixel`), without copying it. Under a blur P's split files each sample by its first
+  surface, so its forward layer leaves a glow on a specular-type surface to the camera side, whose
+  specular film has it (`glowSeenXYZ`, the one estimator the three sky passes share). A plain glow's colour is exact at a pinhole's 64 points; one seen through a medium
   or on a compound is a draw a sample, and its count grows with the render. Mode C, which catches photons through
   its pupil, does not see one. The camera's wavelength density includes the glows' emission
   (`Scene::glowG`, a twentieth of its mass; device `DScene::glowG`), so a glow whose colour no

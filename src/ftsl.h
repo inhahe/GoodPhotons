@@ -1432,6 +1432,9 @@ public:
             std::fprintf(stderr, "[settle] %s\n", rep.c_str());
         }
         propagateMaterialRoutes(L);   // per-object render modes: a tagged mix's children (0.386.0)
+        // Whether any cavity probe rays will ever be fired: before the build, whose emitters read
+        // emission patterns (build() derives the probe's reach).
+        markCavityReaders(L);
         if (L.beforeBvh) L.beforeBvh(L);
         { detail::AccelTimer _ct; L.scene.build(); }
         // build() demotes a fire that emits nothing to the smoke it is made of
@@ -1477,8 +1480,11 @@ public:
                                                    : L.scene.matNames[kv.first.first]) +
                                               (kv.first.second == ROUTE_J ? " [mode J]" : " [mode D]");
         warnCurvOnFlatGeometry(L);
-        // Decide whether any cavity probe rays will ever be fired, and how far.
-        setupCavity(L);
+        if (L.scene.cavityRadiusDerived)
+            std::fprintf(stderr,
+                "[ftsl] cavity: probe radius %.4g m derived from the scene bounds "
+                "(2%% of the AABB diagonal); set `scene { cavity_radius <len> }` to "
+                "choose it explicitly.\n", L.scene.cavityRadius);
         // LAST: collapse repeated subexpressions in every shading-hot program.
         optimizePatterns(L);
         return true;
@@ -1497,8 +1503,8 @@ public:
     // is what lets REFERENCE.md tell an author to repeat the field freely instead of
     // hand-unrolling their scene around a performance trap.
     //
-    // WHY LAST. It runs after every pass that INSPECTS a compiled program — setupCavity
-    // (does any pattern read `cavity`, and how far should the probe reach),
+    // WHY LAST. It runs after every pass that INSPECTS a compiled program — markCavityReaders
+    // (does any pattern read `cavity`),
     // warnCurvOnFlatGeometry, checkEmitPatsSupported, rejectUnbakedSdf. CSE keeps the
     // first occurrence of every op and only rewrites LATER ones, so those analyses would
     // still be correct afterwards, but ordering them before it means none of them has to
@@ -1692,7 +1698,9 @@ public:
     // enclosed" at a 1 cm probe and "wide open" at 1 m. 2% of the scene's AABB diagonal
     // (sceneRadius is half that diagonal) makes the same model read the same however it
     // was authored, which no fixed number can. Authored `cavity_radius` always wins.
-    void setupCavity(Loaded& L) {
+    // Material::readsCavity and Scene::needsCavity: whether any cavity probe rays will ever be fired.
+    // Before the build, which derives the probe's reach (Scene::cavityRadiusDerived).
+    void markCavityReaders(Loaded& L) {
         Scene& sc = L.scene;
         const size_t nm = sc.mats.size();
         std::vector<PatOp> vars;
@@ -1718,15 +1726,6 @@ public:
         }
         for (size_t i = 0; i < nm; ++i)
             if (sc.mats[i].readsCavity) { sc.needsCavity = true; break; }
-        if (!sc.needsCavity) return;
-        if (sc.cavityRadius <= 0.0) {
-            sc.cavityRadius = (sc.sceneRadius > 0.0) ? 0.04 * sc.sceneRadius : 0.1;
-            std::fprintf(stderr,
-                "[ftsl] cavity: probe radius %.4g m derived from the scene bounds "
-                "(2%% of the AABB diagonal); set `scene { cavity_radius <len> }` to "
-                "choose it explicitly.\n", sc.cavityRadius);
-        }
-        if (sc.cavitySamples < 1) sc.cavitySamples = 1;
     }
 
     // A `curv`-driven material placed on geometry that can only ever report curvature 0

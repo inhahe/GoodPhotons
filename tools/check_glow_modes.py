@@ -15,7 +15,9 @@ a mirror ball and a glossy ball beside it that reflect it. Rendered with and wit
 mode R, the floor and walls must agree (it lights nothing); every other mode, on the CPU and the
 GPU, is compared with mode R tile by tile over a 4 x 3 grid. The forward modes (B, A) see a glow only
 directly, as they see the sky (main.cpp prepareSky): the tiles holding the two balls are left out of
-their comparison. Exits 1 on any failure.
+their comparison. And mode P under a camera shutter, whose split files each sample by its first
+surface, on a glossy-type `glow_only` panel seen directly: its glow is the camera side's (0.442.4).
+Exits 1 on any failure.
 """
 import argparse
 import os
@@ -100,6 +102,30 @@ def lacquer_scene(glow):
     ])
 
 
+def blur_scene():
+    """Mode P's blurred split (main.cpp addBlurredSkyRows, glowsOnly): a glossy-type `glow_only` panel
+    the camera sees directly, which the split's camera side files in its specular-first film; a
+    ball moving across the room, so the camera sees motion and P takes the split."""
+    return NL.join([
+        "scene { units meters  motion_interval -0.5 0.5 }",
+        'camera "c" { eye 0 1.1 3.6  look_at 0 0.8 0  up 0 1 0  fov_y 50  film { res %d %d }'
+        "  shutter_open -0.25  shutter_close 0.25 }" % (W, H),
+        'material "wall"  { type diffuse reflect 0.6 }',
+        'material "screen" { type glossy reflect 0.3  roughness 0.3  emit 0.05  glow_only on }',
+        'quad { origin -2 0 -2  u 4 0 0  v 0 0 6  material wall }',
+        'quad { origin -2 0 -2  u 0 2.6 0  v 4 0 0  material wall }',
+        'quad { origin -2 0 -2  u 0 0 6  v 0 2.6 0  material wall }',
+        'quad { origin 2 0 -2  u 0 2.6 0  v 0 0 6  material wall }',
+        'quad { origin -2 2.6 -2  u 0 0 6  v 4 0 0  material wall }',
+        'light area { origin -0.4 2.59 -0.4  u 0.8 0 0  v 0 0 0.8  normal 0 -1 0  spd preset:bb6500  power 60 }',
+        # the panel faces the camera, in the middle two columns' lower tiles
+        'quad { origin -0.35 0.4 -0.6  u 0.7 0 0  v 0 0.6 0  material screen }',
+        "group { motion { key { translate -1.4 0.3 0.8 } key { translate -1.0 0.3 0.8 } }",
+        "        sphere { center 0 0 0  radius 0.25  material wall } }",
+        "",
+    ])
+
+
 def write(path, txt):
     with open(path, "w", encoding="utf-8", newline="") as f:
         f.write(txt)
@@ -179,6 +205,20 @@ def main():
         ok = ok and good
         print("%s: mode R on the %s, the floor by a lacquered ball with and without a glow_only panel: "
               "off by %.4f" % ("ok" if good else "FAIL", "GPU" if gpu else "CPU", d), flush=True)
+
+    # Mode P under a blur files each sample by its first surface: the glossy panel's glow is its camera
+    # side's, and the forward layer must not draw it as well (until 0.442.4 it did: twice as bright).
+    s_blur = os.path.join(out, "blur.ftsl")
+    write(s_blur, blur_scene())
+    rb = tiles(render(exe, s_blur, "R", os.path.join(out, "blur_R.png"), False, ["-spp", str(4096 // k)]))
+    for gpu in (False, True):
+        t = tiles(render(exe, s_blur, "P", os.path.join(out, "blur_P_%s.png" % ("gpu" if gpu else "cpu")),
+                         gpu, budget("P", gpu, k)))
+        w = max(abs(t[r, c] / rb[r, c] - 1.0) for c in (1, 2) for r in (1, 2))
+        good = w <= tol
+        ok = ok and good
+        print("%s: mode P on the %s under a blur, the glossy glow's tiles: off mode R's by %.4f"
+              % ("ok" if good else "FAIL", "GPU" if gpu else "CPU", w), flush=True)
 
     runs = [("R", True), ("D", False), ("D", True), ("J", False), ("J", True), ("U", False), ("U", True),
             ("M", False), ("M", True), ("S", False), ("S", True), ("B", False), ("B", True),

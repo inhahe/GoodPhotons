@@ -72,6 +72,53 @@ closed entries, where the cost is a broken historical link rather than a blocked
 Three references — `scenes/_gr_fly0.ftsl`, `scenes/silver_sphere_xenon.ftsl`, `scenes/x.ftsl` —
 name files that no longer exist at all, all in closed entries.
 
+## OPEN (2026-11-14, 0.442.4): REVIEW-0442-FABLE — what Fable's review of 0.442.0-0.442.1 found
+
+`/code-review xhigh` (Fable) of 014762e..4c727e0, the second review GLOW-LIGHT-MODES' batch takes:
+15 findings, each checked against the code; 14 held, the last (J-THIN-GAP-LEAK and KEEPWINDOW-VRAM
+logged with their fixes written out) was already done (0.442.2, 0.442.3).
+
+**Fixed in 0.442.4:**
+
+* **A Glow's emission pattern was read from behind on half its draws.** A line leaving the solid
+  meets the crossing from inside, where the intersector turns the normal and the curvature inward,
+  so a pattern reading the normal, curvature or cavity was read on the wrong side of every exit
+  crossing. A sphere glowing only on its top cap lit the floor beneath it: the floor straight under
+  read 2.6 times the lit floor around it in modes B and R, CPU and GPU, isosurface and patterned
+  sphere alike, where it must read black. The crossing is now turned to its front (`otherSide`,
+  both backends); `tools/check_glow_pattern_side.py`.
+* **Mode P under a blur counted a glow on a specular-type surface twice**: the split's camera side
+  files the sample in its specular film, and the forward layer's glow pass drew it too. The doubled
+  glow also inflated the split's forward-to-camera fit, so the rest of its forward layer dimmed:
+  check_glow_modes' new blur case read the glossy `glow_only` panel's tiles 1.34 of mode R and the
+  floor's below them 0.46 (CPU and GPU). The pass leaves such a surface to the camera side.
+* **`selW` was measured before the build knew the pattern sides and the cavity probe**: build()
+  finalized the pattern sides after the emitters, and the loader set `needsCavity` after the build,
+  so a cavity-reading emission pattern was measured as 0 everywhere (selW at its floor: the light
+  chosen about 1/8000 as often as its light warrants, every pick a firefly). The pattern sides come
+  first, the loader marks the cavity readers before the build, and build() derives the probe's reach.
+* **`geomWeight` left `selW` out**, so the camera's wavelength density weighed a Glow by its box's
+  area and a patterned light by its bare area (gallery_rain's grid ground about 33 times its light):
+  most camera wavelengths went to their spectra. It carries `selW` now (device `dEmitterG` too).
+* **One NaN among the 4096 `selW` draws** made that light's power, the total and the selection
+  table NaN: a draw that is not a number counts as none.
+* The three copies of the "what a camera ray sees of a glow" estimator are one (`glowSeenXYZ`), and
+  mode P's composite reads the glows' sums beside the forward film instead of copying the film
+  (about 200 MB at 4K) at every repaint.
+
+**To fix in 0.443.0 -- one cause:** a hit finds its emitter by its material
+(`Scene::emitterForMat`), which forces a material copy for every glowing primitive after the first
+(`registerGlows`' `cloneOf`). From that: the parts of one emissive dielectric solid that took
+different emitters were different solids to the medium stack (a copy has no `routeBase`); a static
+instanced asset whose emissive material a mesh block also used was refused; a second mesh block's
+retag could take over faces carrying an imported material; a degenerate triangle's group made a
+copy with no emitter, a glow nothing can hit; wrapping a `lumens` light's ScaledSpectrum in a
+SharedSpectrum hid its base; and 100 000 glowing spheres made 100 000 materials, with a quadratic
+name lookup at load. The fix: each primitive knows its emitter (`Hit::emitter`, written by every
+intersector), so a material keeps one entry however many emitters light its surfaces, and none of
+the copies exist. Also then: REFERENCE.md and FTSL.md still say mesh blocks sharing a material
+are one light, which 0.442.1 reversed.
+
 ## OPEN (2026-11-14, 0.442.2): GAP-MERGE-RADIUS — light trapped in a thin gap reaches the room through the merges' discs at its mouth: modes J and U read a room lit by a 1 mm slit 2-3.6x bright
 
 `scenes/_gap_leak_noceil.ftsl` (`_gap_leak` with its ceiling light removed, so the room sees only

@@ -435,10 +435,10 @@ struct Material {
     std::vector<double> mixWeights;                // selection probs, sum <= 1
 
     // Does any program bound to this material (or, for a `mix`, to one of its layers)
-    // read the `cavity` variable? Set once at load by ftsl::setupCavity. This is the
+    // read the `cavity` variable? Set once at load by ftsl::markCavityReaders. This is the
     // per-hit gate on the cavity probe — the ONLY pattern input that spends rays — so
     // a patterned material that never says `cavity` fires none. See the long note on
-    // setupCavity for why a scene-wide flag would not do.
+    // markCavityReaders for why a scene-wide flag would not do.
     bool readsCavity = false;
     // Light can cross this surface: a dielectric (plain or coated), half mirror, filter,
     // translucent, a thin film or multilayer stack entered somewhere in the band (one on an
@@ -1178,12 +1178,14 @@ struct Emitter {
 
     // Per-emitter spectral/geometric weight fed into the combined backward
     // wavelength sampler and the power law: area*PI for surfaces, spotOmega for a
-    // spot. (Area/sphere keep the exact area*PI expression for bit-identity.)
+    // spot. (Area/sphere keep the exact area*PI expression for bit-identity.) A patterned
+    // surface or a Glow's times selW, the mean of its draws' multipliers: its emitting area,
+    // not its bare area or its box's (1 for every other, so the product is the same bits).
     double geomWeight() const {
         if (shape == EmitterShape::Spot) return spotOmega;
         if (shape == EmitterShape::Env || shape == EmitterShape::Sun) return envGeom;
-        if (normalTilted) return area * aimNorm;          // an aimed quad (see nGeom)
-        return area * PI;
+        if (normalTilted) return area * aimNorm * selW;   // an aimed quad (see nGeom)
+        return area * PI * selW;
     }
 
     // ---- an AIMED quad (normalTilted; see nGeom) ------------------------------------------
@@ -2174,7 +2176,10 @@ struct Scene {
     // Load-time gate: true only if some bound pattern actually reads `cavity`. Every
     // probe is skipped otherwise, so a scene that does not use the feature pays exactly
     // nothing — which matters, because this is the one pattern input that costs rays.
+    // Set before build(), whose emitters' selection weights read emission patterns (Emitter::selW):
+    // a cavity among them, with the radius build() derives where none was given.
     bool needsCavity = false;
+    bool cavityRadiusDerived = false;   // build() chose cavityRadius (the loader says so)
     Sensor sensor;
     // Participating media. Zero or more independent regions (global haze, bounded
     // boxes/spheres, heterogeneous blobs) that may overlap. The forward tracer treats
@@ -3223,6 +3228,32 @@ struct Scene {
         // is chosen follows its mean (selW, below).
         for (auto& e : emitters)
             e.emitPat = (e.matId >= 0 && e.matId < (int)mats.size()) ? mats[e.matId].emitPat : -1;
+        // Each patterned or Glow emitter's selection weight (Emitter::selW): the mean multiplier its
+        // draws carry -- its pattern, a Glow's crossing count -- over 4096 of them off a fixed
+        // stream, so it is chosen by the light it emits, not by its bare area (a grid of glowing
+        // lines on a 2000 m^2 ground, a wire frame in its box). Any positive weight leaves every
+        // estimate unbiased; this one only spends the light samples where the light is. Floored at
+        // half a draw's worth, so a light no draw found still emits; a draw that is not a number (a
+        // pattern undefined somewhere) counts as none, so it cannot poison every light's choice.
+        // First: the spectral weights below read it (geomWeight).
+        for (size_t i = 0; i < emitters.size(); ++i) {
+            Emitter& e = emitters[i];
+            e.selW = 1.0;
+            const bool areaLike = e.shape == EmitterShape::Quad || e.shape == EmitterShape::Mesh ||
+                                  e.shape == EmitterShape::Glow;
+            if (!areaLike || (e.emitPat < 0 && e.shape != EmitterShape::Glow) || e.collimated) continue;
+            constexpr int kN = 4096;
+            Pcg32 rng;
+            seedUnit(rng, (uint64_t)i, 0x5E1EC7ED0CA5ULL);
+            double s = 0.0;
+            for (int k = 0; k < kN; ++k) {
+                Vec3 y, n;
+                const double v = emitterSamplePoint(*this, e, (k + rng.uniform()) / kN, rng.uniform(), y, n,
+                                                    nullptr, &rng);
+                if (std::isfinite(v)) s += v;
+            }
+            e.selW = std::max(s / kN, 0.5 / kN);
+        }
         // Recount the distant suns here (not in addSunLight) so the flag survives every
         // path that rebuilds the emitter list, including applyIgnoreFlags' filtering.
         sunCount = 0;
@@ -3322,28 +3353,6 @@ struct Scene {
                     ++e.foldN;
                 }
             }
-        }
-        // Each patterned or Glow emitter's selection weight (Emitter::selW): the mean multiplier its
-        // draws carry -- its pattern, a Glow's crossing count -- over 4096 of them off a fixed
-        // stream, so it is chosen by the light it emits, not by its bare area (a grid of glowing
-        // lines on a 2000 m^2 ground, a wire frame in its box). Any positive weight leaves every
-        // estimate unbiased; this one only spends the light samples where the light is. Floored at
-        // half a draw's worth, so a light no draw found still emits.
-        for (size_t i = 0; i < emitters.size(); ++i) {
-            Emitter& e = emitters[i];
-            e.selW = 1.0;
-            const bool areaLike = e.shape == EmitterShape::Quad || e.shape == EmitterShape::Mesh ||
-                                  e.shape == EmitterShape::Glow;
-            if (!areaLike || (e.emitPat < 0 && e.shape != EmitterShape::Glow) || e.collimated) continue;
-            constexpr int kN = 4096;
-            Pcg32 rng;
-            seedUnit(rng, (uint64_t)i, 0x5E1EC7ED0CA5ULL);
-            double s = 0.0;
-            for (int k = 0; k < kN; ++k) {
-                Vec3 y, n;
-                s += emitterSamplePoint(*this, e, (k + rng.uniform()) / kN, rng.uniform(), y, n, nullptr, &rng);
-            }
-            e.selW = std::max(s / kN, 0.5 / kN);
         }
         emitterCdf.assign(emitters.size(), 0.0);
         for (size_t i = 0; i < emitters.size(); ++i) {
@@ -4461,6 +4470,18 @@ struct Scene {
         // The coats first: they append materials (a layered body's copy among them), which the
         // emitters' pass reads -- a glow under a coat is one (glowXYZ, isGlow).
         finalizeLayeredCoats();
+        // After the coats, which append body copies, and before the emitters: a Glow's selection
+        // weight reads its pattern off hits whose pattern side this decides (Emitter::selW).
+        finalizePatternSides();
+        // The cavity probe's reach where the scene gave none (needsCavity, set by the loader before
+        // the build): 4 % of the bounds' radius. Before the emitters too, which read cavity.
+        if (needsCavity) {
+            if (cavityRadius <= 0.0) {
+                cavityRadius = (sceneRadius > 0.0) ? 0.04 * sceneRadius : 0.1;
+                cavityRadiusDerived = true;
+            }
+            if (cavitySamples < 1) cavitySamples = 1;
+        }
         finalizeEmitters();
         finalizeEmissiveVolumes();
         finalizeBowLuts();
@@ -4468,7 +4489,6 @@ struct Scene {
         // a glass that absorbs only between the carriers' bin centres still absorbs.
         const int nm = (int)(LAMBDA_MAX - LAMBDA_MIN);
         for (auto& m : mats) m.absorbChroma = variesOverBand([&](double L) { return m.absorb(L); }, nm);
-        finalizePatternSides();   // after the coats, which append body copies
     }
     void finalizeTris() { build(); }   // kept for existing call sites
 
@@ -5706,8 +5726,8 @@ inline double emitterPatMulAt(const Scene& scene, const Emitter& em,
 // (Emitter::area = S / 2) carrying weight k: k f(y) area has the mean of the integral of f over the
 // surface. Exact for any primitive the intersector finds crossings on, its caps included, and
 // costs a march along a chord of the box, whether or not it crosses anything (k = 0: no point).
-//   `h`: the crossing, as a ray reaching it sees it (its normal map and pattern side applied, as
-// closestHit applies them), at the frame's instant; false when the line crossed nothing. The
+//   `h`: the crossing, as a ray reaching it from its front sees it (its normal map and pattern side
+// applied, as closestHit applies them), at the frame's instant; false when the line crossed nothing. The
 // crossings are found by the primitive's own intersector, the one every ray meets it by.
 inline bool glowSamplePoint(const Scene& scene, const Emitter& em, Pcg32& rng, Hit& h, int& k) {
     k = 0;
@@ -5747,6 +5767,10 @@ inline bool glowSamplePoint(const Scene& scene, const Emitter& em, Pcg32& rng, H
         tmin = x.t + std::max(step, 1e-6 * (1.0 + x.t));
     }
     if (k == 0) return false;
+    // Seen from its front, as every ray that sees it emit sees it (emission is toward ng): a line
+    // leaving the solid met the crossing from behind, which would read a pattern's normal, curvature
+    // and cavity probe turned inward.
+    if (h.back) h = otherSide(h);
     scene.markPatSide(h);
     scene.applyNormalMap(h);
     return true;

@@ -11778,6 +11778,7 @@ __device__ static bool dGlowSamplePoint(const DScene& sc, const DEmitter& em, DR
         tmin = x.t + (Real)fmax(step, 1e-6 * (1.0 + (double)x.t));
     }
     if (k == 0) return false;
+    if (h.back) h = dOtherSide(h);   // seen from its front, as emission is (host twin)
     h.patOwnSide = h.valid && h.matId >= 0 && sc.mats[h.matId].patOwnSide;   // as closestHit leaves it
     dApplyNormalMap(sc, h);
     return true;
@@ -14677,8 +14678,8 @@ __device__ static double dEmitterG(const DScene& sc, Real lambda) {
         double gw = (e.shape == 2) ? e.spotOmega
                   : (e.shape == 3) ? (4.0 * DPI * DPI * sc.sceneRadius * sc.sceneRadius)
                   : (e.shape == 6) ? (e.spotOmega * DPI * sc.sceneRadius * sc.sceneRadius)
-                  : e.normalTilted   ? ((double)e.area * e.aimNorm)      // an aimed quad
-                                   : ((double)e.area * DPI);
+                  : e.normalTilted   ? ((double)e.area * e.aimNorm * e.selW)   // an aimed quad
+                                   : ((double)e.area * DPI * e.selW);   // selW: its emitting area
         g += gw * (double)specLookup(e.emitSpd, lambda);
     }
     return g;

@@ -36,8 +36,9 @@ W, H = 96, 72
 GX, GY = 4, 3
 DEPTH = {"M": 32, "S": 32}
 # (the frame's thin glowing lines are a few bright pixels each, which modes M and S, a sample a pixel
-# a pass, resolve within a few per cent of R only at these budgets; J's CPU merges likewise)
-ARGS = {"R": ["-spp", "1024"], "D": ["-spp", "512"], "J": ["-spp", "512"], "U": ["-spp", "512"],
+# a pass, resolve within a few per cent of R only at these budgets; J's CPU merges likewise: at 512
+# spp a tile of host J moved 2 % from seed to seed, and read 1.029 of R once)
+ARGS = {"R": ["-spp", "1024"], "D": ["-spp", "512"], "J": ["-spp", "2048"], "U": ["-spp", "512"],
         "M": ["-spp", "512", "-n", "2000000"], "S": ["-spp", "1024", "-n", "100000"],
         "B": ["-n", "40000000"], "P": ["-n", "40000000", "-spp", "256"]}
 
