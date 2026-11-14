@@ -22,11 +22,11 @@ standard error widen the band). Modes M and S deposit photons over 32 bounces wh
 they read the flat room 2 % bright.
 
 A third room carries the map on a `layered` material instead -- a rough coat (roughness 0.3) over a
-diffuse body -- and holds modes M and S to R there: a compound takes its photon deposit before its
+diffuse body -- and holds every mode to R there: a compound takes its photon deposit before its
 lobe pick, under the arrival rule of the Lambertian lobes it is gathered for
-(Renderer::compoundDepositWeight); a deposit without it reads M 1.087 of R and S 1.081. The modes
-miss a layered material by about 1 % even on flat geometry (LAYERED-MODES in known-issues.md), so
-there M and S are held within 2 %, and the others not at all.
+(Renderer::compoundDepositWeight); a deposit without it reads M 1.087 of R and S 1.081. Until
+0.444.0 the modes missed a layered material by about 1 % even on flat geometry (LAYERED-MODES), and
+only M and S were held, within 2 %; tools/check_layered_modes.py holds the flat rooms.
 
 A fourth carries the map on glossy walls (roughness 0.4), every mode held to R within 1 %, and
 mode R to itself with glossy NEE off. The terminator's softening belongs to the vertex next to the
@@ -166,7 +166,6 @@ def main():
                             ("fluoro", 2.0, "fluoro"), ("mirror", 2.0, "mirror")):
         if name not in a.rooms.split(","):
             continue
-        layered = kind == "layered"
         d = os.path.join(out, name)
         os.makedirs(d, exist_ok=True)
         scene = os.path.join(d, "room.ftsl")
@@ -196,8 +195,6 @@ def main():
             for mode in a.modes.split(","):
                 if kind == "fluoro":                    # R against itself alone (below)
                     break
-                if layered and mode not in ("M", "S"):
-                    continue
                 if kind == "sky" and mode not in ("B", "M", "S"):   # D, J and U take no sky
                     continue
                 depth = DEPTH.get(mode, 8)
@@ -210,7 +207,7 @@ def main():
                 ratio = m / rm
                 err = np.hypot(se / rm, m * rse / rm ** 2)
                 tol = TOL_MODE.get(mode, TOL)
-                good = abs(ratio - 1.0) <= (2 * tol if layered else tol)
+                good = abs(ratio - 1.0) <= tol
                 print("%s: %-6s mode %s on the %s: %.4f of mode R (+-%.4f)"
                       % ("ok" if good else "FAIL", name, mode, "host" if dev == "cpu" else "device",
                          ratio, err), flush=True)

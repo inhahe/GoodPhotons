@@ -1270,14 +1270,38 @@ inline void camMediaTrSpec(const Scene& scene, const Renderer& mats, const Vec3&
 // it arrived; its reflectance into `thr` and, if given, the carrier; and `ray` turned along its
 // diffuse lobe. `cont` comes back false where the walk has nothing left to carry. The caller marks
 // the arrival, so the emitter the continuation meets is not counted again (as after a hair strand).
+// The GiCtx a light sample takes at a vertex shading with `m`: a coated body's coat on the way in
+// (BackwardRenderer::GiCtx::coatBody), else nothing.
+inline BackwardRenderer::GiCtx coatGi(const Material& m) {
+    BackwardRenderer::GiCtx g;
+    g.coatBody = (m.coatStack >= 0) ? &m : nullptr;
+    return g;
+}
+
+// A coated vertex's camera-walk continuation along `d`, the walk having arrived from `wa` (toward
+// the previous vertex), takes the coat (render.h coatF: a body's way out, a coat's reciprocal
+// reflection), into `thr` and, if given, the carrier at each grid wavelength. False: nothing is
+// left to carry.
+inline bool coatWalkOut(const Scene& scene, const Material& m, const Hit& h, const Vec3& wa,
+                        const Vec3& d, double lambda, double& thr, SpecThr* sthr) {
+    if (!coatAny(m)) return true;
+    const double s = coatF(scene, m, h, wa, d, lambda);
+    if (!(s > 0.0)) return false;
+    thr *= s;
+    if (sthr) sthr->mul([&](double Lw) { return coatF(scene, m, h, wa, d, Lw); }, s);
+    return true;
+}
+
 inline double strandStep(const Scene& scene, const BackwardRenderer& bw, const Material& m,
                          const Hit& h, double lambda, double invPdfL, Pcg32& rng, double& thr,
                          SpecThr* sthr, Ray& ray, bool& cont) {
     const double rho = clamp01(diffuseReflectance(scene, m, h, lambda));
-    const double d = thr * bw.neeLight(scene, h, rho, invPdfL, lambda, rng);
+    const Vec3 wa = ray.d * -1.0;   // the arrival, for the coat (coatWalkOut)
+    const double d = thr * bw.neeLight(scene, h, rho, invPdfL, lambda, rng, nullptr, coatGi(m));
     thr *= rho;
     if (sthr) sthr->mul([&](double L) { return clamp01(diffuseReflectance(scene, m, h, L)); }, rho);
-    cont = continueAlong(h, cosineHemisphere(h.n, rng), Lobe::Reflect, ray) && thr > 0.0;
+    cont = continueAlong(h, cosineHemisphere(h.n, rng), Lobe::Reflect, ray) && thr > 0.0 &&
+           coatWalkOut(scene, m, h, wa, ray.d, lambda, thr, sthr);
     return d;
 }
 
@@ -1303,6 +1327,12 @@ inline Vec3 photonGatherSub(const Scene& scene, const PhotonMap& pm, Ray ray, Pc
     bool hairArrival = false;   // HAIR-NEE: the previous vertex was a fiber that already took its direct light
     // The softening the last vertex lends what it reaches (contSoftening): first the visible point's.
     double contSoft = contSoftening(visMat, visHit, ray.d);
+    // A coated visible point's lobe takes the coat on the gather ray's way in (coatExitS), at each
+    // wavelength a term reads the visible point's reflectance at: it rides in rhoV.
+    const Vec3 dVis = ray.d;
+    const auto sVis = [&](double Lw) {
+        return (visMat.coatStack >= 0) ? coatExitS(scene, visMat, visHit, dVis, Lw) : 1.0;
+    };
 
     // A coverage pass-through is no vertex: its bounce is refunded (capped: 256 is far above
     // anything real fur hands back), as backward.h's walks refund it.
@@ -1331,7 +1361,7 @@ inline Vec3 photonGatherSub(const Scene& scene, const PhotonMap& pm, Ray ray, Pc
             // NEE / MIS at the visible point), so add it on ANY escape — the map at a
             // diffuse hit already supplies env's INDIRECT bounces, this supplies direct.
             if (scene.envIndex >= 0) {
-                double rhoV = clamp01(diffuseReflectance(scene, visMat, visHit, lambda));
+                double rhoV = (clamp01(diffuseReflectance(scene, visMat, visHit, lambda)) * sVis(lambda));
                 L += Vec3(cieX(lambda), cieY(lambda), cieZ(lambda))
                      * (thr * rhoV * scene.envRadiance(ray.d, lambda) * invPdfL * contSoft);
             }
@@ -1370,7 +1400,7 @@ inline Vec3 photonGatherSub(const Scene& scene, const PhotonMap& pm, Ray ray, Pc
         // is not counted (Scene::isGlow; BackwardRenderer::GiCtx::pastDiffuse).
         const int eIdx = m.isLight ? BackwardRenderer::emitterIndexOfResolved(scene, h, m) : -1;
         if (m.isLight && eIdx >= 0 && specularSeen && dot(ray.d, h.ng) < 0.0 && !hairArrival) {
-            double rhoV = clamp01(diffuseReflectance(scene, visMat, visHit, lambda));
+            double rhoV = (clamp01(diffuseReflectance(scene, visMat, visHit, lambda)) * sVis(lambda));
             // GLOSSY-NEE's lobe-sampling half; 1 (and bit-identical) unless the last bounce was
             // a glossy one that already connected to this emitter.
             const double wMis = (gmis.pdf > 0.0) ? bwNee.glossyHitWeight(scene, gmis, eIdx, ray.d, &h) : 1.0;
@@ -1397,11 +1427,12 @@ inline Vec3 photonGatherSub(const Scene& scene, const PhotonMap& pm, Ray ray, Pc
         gmis.clear();
         contSoft = 1.0;   // a specular vertex lends nothing; the glossy case sets its own
         hairArrival = false;
+        const Vec3 wArr = ray.d * -1.0;   // the arrival, for the coat (coatWalkOut)
 
         // CURVE-GATHER: no density estimate on a strand that holds no photon (strandStep). Every
         // term this sub-walk reports carries the visible point's reflectance.
         if (gatherlessStrand(m, h.fiberRadius)) {
-            const double rhoV = clamp01(diffuseReflectance(scene, visMat, visHit, lambda));
+            const double rhoV = (clamp01(diffuseReflectance(scene, visMat, visHit, lambda)) * sVis(lambda));
             bool cont;
             const double d = strandStep(scene, bwNee, m, h, lambda, invPdfL, rng, thr, nullptr, ray, cont);
             L += Vec3(cieX(lambda), cieY(lambda), cieZ(lambda)) * (d * rhoV);
@@ -1445,7 +1476,7 @@ inline Vec3 photonGatherSub(const Scene& scene, const PhotonMap& pm, Ray ray, Pc
                         if (!onGatherSurfaceSided(h.p, gn, M.pos[k], ph.n, d2, slack,
                                                   m.type == MatType::DiffuseTransmit, farSide)) return;   // another surface's
                         double rhoY = gatherAlbedo(scene, m, h, ph.lambda, farSide);
-                        double rhoV = clamp01(diffuseReflectance(scene, visMat, visHit, ph.lambda));
+                        double rhoV = clamp01(diffuseReflectance(scene, visMat, visHit, ph.lambda)) * sVis(ph.lambda);
                         double f = rhoY * (1.0 / PI);
                         g += M.cie[k] * (f * rhoV * (double)ph.power);  // == cie(lambda_p), precomputed
                     });
@@ -1471,11 +1502,11 @@ inline Vec3 photonGatherSub(const Scene& scene, const PhotonMap& pm, Ray ray, Pc
                 // multiplies the connection exactly as it multiplies the emission above.
                 // Taken before `thr *= r`: the connection carries `r` inside bsdfF.
                 if (gneeOn) {
-                    const double rhoV = clamp01(diffuseReflectance(scene, visMat, visHit, lambda));
+                    const double rhoV = (clamp01(diffuseReflectance(scene, visMat, visHit, lambda)) * sVis(lambda));
                     const BackwardRenderer::NeeBsdf nb{&m, ray.d * -1.0};
                     L += Vec3(cieX(lambda), cieY(lambda), cieZ(lambda))
                          * (thr * rhoV * bwNee.neeLight(scene, h, 1.0, invPdfL, lambda, rng,
-                                                        nullptr, BackwardRenderer::GiCtx{}, nullptr, nullptr, &nb));
+                                                        nullptr, coatGi(m), nullptr, nullptr, &nb));
                 }
                 thr *= clamp01(reflectSlot(scene, m, h, lambda));
                 const GlossyDraw gd = drawGlossy(scene, m, h, ray.d, h.n, ray.d * -1.0, rng);
@@ -1525,10 +1556,10 @@ inline Vec3 photonGatherSub(const Scene& scene, const PhotonMap& pm, Ray ray, Pc
                 const HairShade hs = hairShadeAt(scene, m, h, lambda, wPrev);
                 if (hairNeeOn()) {                          // HAIR-NEE: see photonGather's Hair case
                     // every term this sub-walk reports carries the visible point's albedo
-                    const double rhoV = clamp01(diffuseReflectance(scene, visMat, visHit, lambda));
+                    const double rhoV = (clamp01(diffuseReflectance(scene, visMat, visHit, lambda)) * sVis(lambda));
                     L += Vec3(cieX(lambda), cieY(lambda), cieZ(lambda))
                          * (thr * rhoV * bwNee.neeLight(scene, h, 1.0, invPdfL, lambda, rng, nullptr,
-                                                 BackwardRenderer::GiCtx{}, &hs, nullptr, nullptr));
+                                                 coatGi(m), &hs, nullptr, nullptr));
                     hairArrival = true;
                 }
                 double pdfH = 0.0, fv = 0.0;
@@ -1556,6 +1587,8 @@ inline Vec3 photonGatherSub(const Scene& scene, const PhotonMap& pm, Ray ray, Pc
                 break;
             }
         }
+        // A coated vertex's continuation takes the coat; a pass-through is no vertex.
+        if (!nullHere && !coatWalkOut(scene, m, h, wArr, ray.d, lambda, thr, nullptr)) return L;
         // only specular cases reach here (diffuse/light returned above); a pass-through inherits
         specularSeen = nullHere ? specularSeenIn : true;
         if (thr <= 0.0) return L;
@@ -1815,6 +1848,8 @@ inline Vec3 photonGather(const Scene& scene, const PhotonMap& pm, Ray ray, doubl
             continue;
         }
 
+        bool passThrough = false;   // a fibre's coverage pass-through: no vertex (the Hair case)
+        const Vec3 wArr = ray.d * -1.0;   // the arrival, for the coat (coatWalkOut)
         switch (m.type) {
             case MatType::Diffuse:
             case MatType::DiffuseTransmit:
@@ -1834,7 +1869,7 @@ inline Vec3 photonGather(const Scene& scene, const PhotonMap& pm, Ray ray, doubl
                     //     exp(-28)..exp(-83) and deleted mode M's ENTIRE direct term (M-FGDARK).
                     BackwardRenderer bw; bw.diffraction = diffraction;
                     double rhoVis = clamp01(diffuseReflectance(scene, m, h, lambda));
-                    double direct = bw.neeLight(scene, h, rhoVis, invPdfL, lambda, rng);
+                    double direct = bw.neeLight(scene, h, rhoVis, invPdfL, lambda, rng, nullptr, coatGi(m));
                     L += Vec3(cieX(lambda), cieY(lambda), cieZ(lambda)) * (thr * direct);
                     // (b) INDIRECT (+ env + specular-direct) via K cosine-weighted
                     //     hemisphere sub-rays, each querying the map ONE bounce away. The
@@ -1928,7 +1963,7 @@ inline Vec3 photonGather(const Scene& scene, const PhotonMap& pm, Ray ray, doubl
                     } else {
                         L += Vec3(cieX(lambda), cieY(lambda), cieZ(lambda))
                              * (thr * bwNee.neeLight(scene, h, 1.0, invPdfL, lambda, rng,
-                                                     nullptr, BackwardRenderer::GiCtx{}, nullptr, nullptr, &nb));
+                                                     nullptr, coatGi(m), nullptr, nullptr, &nb));
                     }
                 }
                 thr *= r;
@@ -2029,7 +2064,7 @@ inline Vec3 photonGather(const Scene& scene, const PhotonMap& pm, Ray ray, doubl
                     if (!didSpec)
                         L += Vec3(cieX(lambda), cieY(lambda), cieZ(lambda))
                              * (thr * bwNee.neeLight(scene, h, 1.0, invPdfL, lambda, rng, nullptr,
-                                                     BackwardRenderer::GiCtx{}, &hs, nullptr, nullptr));
+                                                     coatGi(m), &hs, nullptr, nullptr));
                     hairArrival = true;
                 }
                 double pdfH = 0.0, fv = 0.0;
@@ -2050,6 +2085,7 @@ inline Vec3 photonGather(const Scene& scene, const PhotonMap& pm, Ray ray, doubl
                 // gather sub-walk), so light seen straight through the fiber is counted as it
                 // would weigh it.
                 if (passedThru) {   // ...and its bounce refunded
+                    passThrough = true;
                     hairArrival = hairArrivalIn; gmis = gmisIn; contSoft = contSoftIn;
                     if (nullSteps < 256) { --b; ++nullSteps; }
                 } else {
@@ -2097,6 +2133,9 @@ inline Vec3 photonGather(const Scene& scene, const PhotonMap& pm, Ray ray, doubl
                 break;
             }
         }
+        // A coated vertex's continuation takes the coat, at each photon's wavelength too
+        // (SPECGATHER).
+        if (!passThrough && !coatWalkOut(scene, m, h, wArr, ray.d, lambda, thr, &sthr)) return L;
         if (thr <= 0.0) return L;
     }
     return L;

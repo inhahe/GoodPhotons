@@ -272,22 +272,86 @@ inline double layeredCoatReflectance(const Scene& scene, const Material& m, cons
     return coatRAtCos(m, cosI, (m.coatModel == 1) ? materialFilmThickness(scene, m, h) : 0.0, lambda);
 }
 
-// LAYERED-MODES (b): what the coat over a body copy (Material::coatStack) gives the body's lobe on
-// a direction `w` other than the one its walk met the coat by -- the light's way out to w, or in
-// from it -- as a multiple of the average the body's albedo already holds: (1 - R(w)) / T-bar.
-// Its mean over the hemisphere with the cosine is 1. 1 for a bare material, a constant coat, and a
-// direction behind the surface `h` was met from (a transmit lobe leaves through the body).
-inline double coatExitS(const Scene& scene, const Material& body, const Hit& h, const Vec3& w,
-                        double lambda) {
-    if (body.coatStack < 0) return 1.0;
-    const Material& st = scene.mats[(size_t)body.coatStack];
-    if (st.coatTbar.empty() || !(dot(w, orientedGeoN(h)) > 0.0)) return 1.0;   // behind: not the coat's way
+// LAYERED-MODES (b): what the coat of the layered material `st` gives a body's lobe under it on a
+// direction `w` other than the one its walk met the coat by -- the light's way out to w, or in from
+// it -- as a multiple of the average the body's albedo already holds: (1 - R(w)) / T-bar. Its mean
+// over the hemisphere with the cosine is 1. 1 for a constant coat (no table). Named by the stack
+// for a compound's deposit, made before its pick and shared by every body under it.
+inline double coatStackS(const Scene& scene, const Material& st, const Hit& h, const Vec3& w,
+                         double lambda) {
+    if (st.coatTbar.empty()) return 1.0;
     int i = (int)std::lround(lambda - LAMBDA_MIN);
     i = i < 0 ? 0 : (i >= (int)st.coatTbar.size() ? (int)st.coatTbar.size() - 1 : i);
     const double tb = st.coatTbar[(size_t)i];
     if (!(tb > 0.0)) return 0.0;
     return (1.0 - layeredCoatReflectance(scene, st, h, w * -1.0, lambda)) / tb;
 }
+// The same named by a body copy (Material::coatStack). The coat is on both faces, as the coin takes
+// it (layeredCoatReflectance), so a transmit lobe's way out through the far face takes it too; but a
+// dielectric body's refraction goes into its solid, where no coat is: 1 there, and for a bare one.
+inline double coatExitS(const Scene& scene, const Material& body, const Hit& h, const Vec3& w,
+                        double lambda) {
+    if (body.coatStack < 0) return 1.0;
+    const bool solid = body.type == MatType::Dielectric || body.type == MatType::ThinFilm ||
+                       body.type == MatType::Multilayer;
+    if (solid && !(dot(w, orientedGeoN(h)) > 0.0)) return 1.0;
+    return coatStackS(scene, scene.mats[(size_t)body.coatStack], h, w, lambda);
+}
+
+// The coat's reflectance for the pair `wa`, `wb` at `h`, both pointing away from the surface: its
+// Fresnel (or thin-film) term at their half vector, as a microfacet coat's is -- symmetric in the
+// pair, so the coat's reflection is reciprocal. A smooth coat's pair is a mirror pair about the
+// shading normal, which is then the half vector.
+inline double coatSheenR(const Scene& scene, const Material& st, const Hit& h, const Vec3& wa,
+                         const Vec3& wb, double lambda) {
+    if (st.coatModel == 2) return clamp01(st.coatSpecular);
+    const Vec3 hv = wa + wb;
+    const double l = length(hv);
+    if (!(l > 0.0)) return 0.0;
+    const double cosD = clamp01(std::fabs(dot(wa, hv)) / l);
+    return coatRAtCos(st, cosD, (st.coatModel == 1) ? materialFilmThickness(scene, st, h) : 0.0, lambda);
+}
+// What a walk's coat reflection is weighed by: the coin took it with R at the walk's arrival (`wa`,
+// toward the previous vertex), and the coat reflects the pair with coatSheenR.
+inline double coatSheenRatio(const Scene& scene, const Material& st, const Hit& h, const Vec3& wa,
+                             const Vec3& wb, double lambda) {
+    if (st.coatModel == 2) return 1.0;
+    const double ra = layeredCoatReflectance(scene, st, h, wa, lambda);
+    return (ra > 0.0) ? coatSheenR(scene, st, h, wa, wb, lambda) / ra : 0.0;
+}
+// The coat's factor on the lobe of `m` at `h`, for a walk that arrived from `wa` (toward the
+// previous vertex) and leaves or connects along `wb`: a body copy's way out (coatExitS), a coat
+// copy's reciprocal reflection (coatSheenRatio), 1 for anything else (coatAny false).
+inline bool coatAny(const Material& m) { return m.coatStack >= 0 || m.coatParent >= 0; }
+inline double coatF(const Scene& scene, const Material& m, const Hit& h, const Vec3& wa,
+                    const Vec3& wb, double lambda) {
+    if (m.coatStack >= 0) return coatExitS(scene, m, h, wb, lambda);
+    if (m.coatParent >= 0)
+        return coatSheenRatio(scene, scene.mats[(size_t)m.coatParent], h, wa, wb, lambda);
+    return 1.0;
+}
+
+// A light walk's coated body vertex, for its camera splats: each splat evaluates the body's lobe
+// toward the camera (or toward the mirror or glass ball that images it) and takes coatSplatS on that
+// direction, which is 1 outside a CoatSplatScope. Thread-local, like g_motionU, so the dozen splat
+// functions need no extra argument; set only around a vertex's own splats, never around a sub-path
+// a vertex starts (tracePhotonHero's -herosplit), whose vertices are not this one.
+struct CoatSplat { const Scene* scene; const Material* body; const Hit* h; };
+inline thread_local const CoatSplat* tl_coatSplat = nullptr;
+inline double coatSplatS(const Vec3& w, double lambda) {
+    const CoatSplat* c = tl_coatSplat;
+    return c ? coatExitS(*c->scene, *c->body, *c->h, w, lambda) : 1.0;
+}
+struct CoatSplatScope {
+    CoatSplat c;
+    const CoatSplat* prev;
+    CoatSplatScope(const Scene& s, const Material& body, const Hit& h) : c{&s, &body, &h}, prev(tl_coatSplat) {
+        tl_coatSplat = (body.coatStack >= 0) ? &c : nullptr;
+    }
+    ~CoatSplatScope() { tl_coatSplat = prev; }
+    CoatSplatScope(const CoatSplatScope&) = delete;
+    CoatSplatScope& operator=(const CoatSplatScope&) = delete;
+};
 
 // --- The glossy lobe, and a rough interference reflector ----------------------------------
 // Power-cosine glossy exponent for a roughness, the lobe sampleGlossy draws from.
@@ -450,12 +514,11 @@ struct GlossySplat {
     Vec3 ns;   // shading normal
     Vec3 wl;   // toward the previous, light-side vertex
     // A layered stack whose coat `m` is (its coatChild), or null. The coat's lobe then carries
-    // the stack's coat reflectance toward `wc`: a camera-side walk takes the coat with R at its
-    // own incidence, so that is the R its sheen is seen with (FWD-GLOSSY-INDIRECT).
+    // the stack's coat reflectance for the pair (coatSheenR, FWD-GLOSSY-INDIRECT).
     const Material* stack = nullptr;
     double f(const Vec3& wc, double lambda) const {
         const double v = glossyF(*scene, *m, h, ns, wc, wl, lambda);
-        return stack ? v * layeredCoatReflectance(*scene, *stack, *h, -wc, lambda) : v;
+        return stack ? v * coatSheenR(*scene, *stack, *h, wl, wc, lambda) : v;
     }
 };
 
@@ -1418,6 +1481,7 @@ struct Renderer {
         // For a fiber, `hairFCos` IS f*projection (hair_shade.h); cosSurf is 1 so the
         // arithmetic below stays one shared expression instead of two near-copies.
         double f = hs ? hairFCos(*hs, g.wdir) : gs ? gs->f(g.wdir, lambda) : rho / PI;
+        f *= coatSplatS(g.wdir, lambda);           // a coated body's way out (CoatSplatScope)
         double contrib = beta * f * g.cosSurf * g.corr / g.denom;
         // Attenuation of the shadow ray through the fog (Beer-Lambert; ratio tracking
         // for a heterogeneous medium, exact exp for a homogeneous one; product over media).
@@ -1437,6 +1501,7 @@ struct Renderer {
         if (!connectGeom(scene, cam, p, n, ng, wi, g, nullptr, gs != nullptr)) return;
         for (int i = 0; i < nUp; ++i) {
             double f = gs ? gs->f(g.wdir, lam[i]) : rho[i] / PI;
+            f *= coatSplatS(g.wdir, lam[i]);
             double contrib = beta[i] * f * g.cosSurf * g.corr / g.denom;
             if (!scene.media.empty())
                 contrib *= mediaTransmittance(scene, p, g.wdir, g.dist, lam[i], rng);
@@ -1498,8 +1563,8 @@ struct Renderer {
         if (scene.occluded(p + (hs ? wdir : ng) * (hs ? 1e-6 : off), wdir, le.dist - off - 1e-6, 1e-6,
                            /*camLeg=*/true, hs ? off : 0.0)) return;
         const double corr = hs ? 1.0 : shadingAdjointCorr(wi, wdir, n, ng);
-        const double fcos = hs ? hairFCos(*hs, wdir)
-                               : (gs ? gs->f(wdir, lambda) : rho / PI) * cosSurf;
+        const double fcos = (hs ? hairFCos(*hs, wdir)
+                                : (gs ? gs->f(wdir, lambda) : rho / PI) * cosSurf) * coatSplatS(wdir, lambda);
         double contrib = beta * fcos * corr * wgt;
         if (!scene.media.empty())
             contrib *= mediaTransmittance(scene, p, wdir, le.dist, lambda, rng);
@@ -1535,7 +1600,7 @@ struct Renderer {
         for (int i = 0; i < nUp; ++i) {
             if (!ok[i]) continue;
             double contrib = beta[i] * (gs ? gs->f(wdir, lam[i]) : rho[i] / PI) * cosSurf * corr *
-                             wgt[i];
+                             wgt[i] * coatSplatS(wdir, lam[i]);
             if (!scene.media.empty())
                 contrib *= mediaTransmittance(scene, p, wdir, le.dist, lam[i], rng);
             film.add(px[i], py[i], Vec3(cieX(lam[i]), cieY(lam[i]), cieZ(lam[i])) * contrib);
@@ -1615,8 +1680,8 @@ struct Renderer {
         // For a fiber the BRDF-times-projection is hairFCos, and the pi it would be
         // divided by is the same pi that pi*R^2 supplies — hence the explicit factor.
         double corr = hs ? 1.0 : shadingAdjointCorr(wi, wdir, n, ng);
-        double fcos = hs ? PI * hairFCos(*hs, wdir)
-                         : (gs ? PI * gs->f(wdir, lambda) : rho) * cosSurf;
+        double fcos = (hs ? PI * hairFCos(*hs, wdir)
+                          : (gs ? PI * gs->f(wdir, lambda) : rho) * cosSurf) * coatSplatS(wdir, lambda);
         double contrib = beta * fcos * corr * cosLens * (R * R) / (dist * dist);
         // ABSOLUTE-SCALE NORMALISER (A/C <-> B unification). The line above deposits
         // radiant FLUX through the pupil into the film CELL (it carries the pupil area
@@ -1672,7 +1737,7 @@ struct Renderer {
         double cellNorm = 1.0 / (cam.pixelPlaneArea() * cam.filmDist * cam.filmDist);
         for (int i = 0; i < nUp; ++i) {
             double contrib = beta[i] * (gs ? PI * gs->f(wdir, lam[i]) : rho[i]) * cosSurf * corr *
-                             cosLens * (R * R) / (dist * dist);
+                             cosLens * (R * R) / (dist * dist) * coatSplatS(wdir, lam[i]);
             contrib *= cellNorm;
             if (!scene.media.empty())
                 contrib *= mediaTransmittance(scene, p, wdir, dist, lam[i], rng);
@@ -1901,7 +1966,7 @@ struct Renderer {
             if (gated && dot(plane, wP) <= 0.0) return -1.0;
             double cosSurf;
             if (!camSideOk(np, ng, wP, glossy != nullptr, cosSurf)) return -1.0;
-            cosSurf *= adjoint(wP);
+            cosSurf *= adjoint(wP) * coatSplatS(wP, lambda);   // a coated body's way out
             if (glossy) return glossy->f(wP, lambda) * cosSurf;
             return (weight / PI) * cosSurf;
         }
@@ -2348,7 +2413,7 @@ struct Renderer {
         for (int i = 0; i < nUp; ++i) {
             double refl = clamp01(reflectSlot(scene, mm, hm, lam[i]));
             // A glossy vertex's lobe toward wP, at this wavelength (shape is cos/pi there).
-            const double wi = gs ? gs->f(wP, lam[i]) * PI : w[i];
+            const double wi = (gs ? gs->f(wP, lam[i]) * PI : w[i]) * coatSplatS(wP, lam[i]);
             double contrib = beta[i] * (wi * shape) * refl * invD2Omega;
             if (contrib <= 0.0) continue;
             if (!scene.media.empty()) {
@@ -2666,10 +2731,38 @@ struct Renderer {
     // `stk`; on absorption/termination it books the loss into `e` and returns false.
     // Returns true to keep bouncing. Shared verbatim by the scalar tracePhoton and, after
     // de-hero, by tracePhotonHero — so there is a single source of truth for these lobes.
+    // A coated body's continuation along `wo` takes the coat's way out (coatExitS), the ledger
+    // booking what it takes or gives; nothing for any other material.
+    static void coatContinue(const Scene& scene, const Material& m, const Hit& h, const Vec3& wo,
+                             double lambda, double& beta, EnergyReport& e) {
+        if (m.coatStack < 0) return;
+        const double s = coatExitS(scene, m, h, wo, lambda);
+        e.absorbed += beta * (1.0 - s);
+        beta *= s;
+    }
+    // The same for a hero bundle's `nUp` live wavelengths.
+    static void coatContinueHero(const Scene& scene, const Material& m, const Hit& h, const Vec3& wo,
+                                 const double* lam, double* beta, int nUp, EnergyReport& e) {
+        if (m.coatStack < 0) return;
+        for (int i = 0; i < nUp; ++i) coatContinue(scene, m, h, wo, lam[i], beta[i], e);
+    }
+
+    // The lobes below, for a coated body too: its splats (the fluorescent and fiber ones) and its
+    // continuation take the coat's way out, at the wavelength they leave with.
     bool interactPhotonSpecular(const Scene& scene, const CamTarget* cams, int nCam,
                                 const Material& m, const Hit& h, Ray& ray, double& beta,
                                 double& lambda, MediumStack& stk, Pcg32& rng,
                                 EnergyReport& e, bool firstHit = false) const {
+        const CoatSplatScope coat(scene, m, h);
+        if (!interactPhotonSpecularLobe(scene, cams, nCam, m, h, ray, beta, lambda, stk, rng, e, firstHit))
+            return false;
+        coatContinue(scene, m, h, ray.d, lambda, beta, e);
+        return true;
+    }
+    bool interactPhotonSpecularLobe(const Scene& scene, const CamTarget* cams, int nCam,
+                                    const Material& m, const Hit& h, Ray& ray, double& beta,
+                                    double& lambda, MediumStack& stk, Pcg32& rng,
+                                    EnergyReport& e, bool firstHit) const {
         switch (m.type) {
             case MatType::Dielectric:
             case MatType::ThinFilm:
@@ -3647,7 +3740,10 @@ struct Renderer {
             // photon's own pick (compoundGathers); the lobe's case below then deposits nothing.
             const bool compoundDeposit = compoundGathers(scene, *matp, h.fiberRadius);
             if (compoundDeposit) {
-                const double w = compoundDepositWeight(h, ray.d * -1.0, bounce == 0, beta);
+                double w = compoundDepositWeight(h, ray.d * -1.0, bounce == 0, beta);
+                // A layered surface's photon is gathered by a body under its coat, whose walk
+                // takes the coat at its own arrival: the photon's way in is the other (coatStackS).
+                if (matp->type == MatType::Layered) w *= coatStackS(scene, *matp, h, ray.d * -1.0, lambda);
                 if (w > 0.0) depositPhoton(h.p, orientedGeoN(h), lambda, w, sawFocus && !sawScatter);
             }
             // Layered (coat over body): split the photon at the interface BEFORE the
@@ -3688,6 +3784,11 @@ struct Renderer {
                     double cr = materialRoughness(scene, cm, h);
                     Vec3 o = sampleGlossy(reflect(ray.d, h.n), cr, rng);
                     if (dot(o, h.n) <= 0) { e.absorbed += beta; return; }
+                    {   // the reciprocal coat's reflection over the coin's R (coatSheenRatio)
+                        const double c = coatSheenRatio(scene, cm, h, ray.d * -1.0, o, lambda);
+                        e.absorbed += beta * (1.0 - c);
+                        beta *= c;
+                    }
                     // The coat's lobe is a glossy lobe (its own material, coatChild): softened on
                     // the first bounce (glossyArrival), and its adjoint, as interactPhotonSpecular's.
                     const double sC = glossyArrival(h, ray.d * -1.0, bounce == 0);
@@ -3777,6 +3878,7 @@ struct Renderer {
                         (specularSideSplats || !isSpecularType(scene.mats[h.matId].type))) {
                         const Vec3 wl{-ray.d.x, -ray.d.y, -ray.d.z};
                         const GlossySplat gsp{&scene, &m, &h, h.n, wl};
+                        const CoatSplatScope coat(scene, m, h);   // a coated body's way out
                         camSplatAll(scene, cams, nCam, h.p, h.n, orientedGeoN(h), wl, lambda, beta,
                                     0.0, rng, nullptr, &gsp);
                         camSpecularSplatAllGlossy(scene, cams, nCam, h.p, h.n, orientedGeoN(h), wl, &lambda, &beta, 1, gsp, rng);
@@ -3898,6 +4000,7 @@ struct Renderer {
                                       sawFocus && !sawScatter);
                     sawScatter = true;   // whatever leaves this vertex is diffuse indirect light
                     if (nCam > 0 && !forwardCatch) {
+                        const CoatSplatScope coat(scene, m, h);   // a coated body's way out
                         camSplatAll(scene, cams, nCam, h.p,  h.n,  ngo, wi, lambda, beta, rhoR, rng);
                         camSplatAll(scene, cams, nCam, h.p, -h.n, -ngo, wi, lambda, beta, rhoT, rng);
                         camSpecularSplatAll(scene, cams, nCam, h.p,  h.n,  ngo, &wi, lambda, beta, rhoR, rng);
@@ -3915,7 +4018,9 @@ struct Renderer {
                         }
                         Vec3 wo;
                         beta *= diffuseContinuation(h, ngo, wi, rng, wo);
-                        if (!continueAlong(h, wo, Lobe::Reflect, ray)) { e.absorbed += beta; return; } continue;
+                        if (!continueAlong(h, wo, Lobe::Reflect, ray)) { e.absorbed += beta; return; }
+                        coatContinue(scene, m, h, wo, lambda, beta, e);
+                        continue;
                     } else if (u < sum) {
                         if (achroPath || foldS > 0) {
                             if (rhoT > 0.0) foldApply(rhoT, foldTr, foldK, foldS);
@@ -3923,7 +4028,9 @@ struct Renderer {
                         }
                         Vec3 wo;
                         beta *= diffuseContinuation(h, ngo, wi, rng, wo, /*transmit=*/true);
-                        if (!continueAlong(h, wo, Lobe::Transmit, ray)) { e.absorbed += beta; return; } continue;
+                        if (!continueAlong(h, wo, Lobe::Transmit, ray)) { e.absorbed += beta; return; }
+                        coatContinue(scene, m, h, wo, lambda, beta, e);
+                        continue;
                     }
                     e.absorbed += beta; return;
                 }
@@ -3976,6 +4083,7 @@ struct Renderer {
                                       sawFocus && !sawScatter);
                     sawScatter = true;   // whatever leaves this vertex is diffuse indirect light
                     if (nCam > 0 && !forwardCatch) {
+                        const CoatSplatScope coat(scene, m, h);   // a coated body's way out
                         camSplatAll(scene, cams, nCam, h.p, h.n, ngo, wi, lambda, beta, rho, rng);
                         camSpecularSplatAll(scene, cams, nCam, h.p, h.n, ngo, &wi, lambda, beta, rho, rng);
                     }
@@ -3990,6 +4098,7 @@ struct Renderer {
                     Vec3 wo;
                     beta *= diffuseContinuation(h, ngo, wi, rng, wo);
                     if (!continueAlong(h, wo, Lobe::Reflect, ray)) { e.absorbed += beta; return; }
+                    coatContinue(scene, m, h, wo, lambda, beta, e);
                     continue;
                 }
             }
@@ -4250,8 +4359,12 @@ struct Renderer {
                 const bool caus = sawFocus && !sawScatter;
                 const Vec3 ngoC = orientedGeoN(h);
                 const double w1 = compoundDepositWeight(h, ray.d * -1.0, bounce == 0, 1.0);
+                const bool lay = matp->type == MatType::Layered;   // the coat's way in (scalar twin)
                 if (w1 > 0.0)
-                    for (int i = 0; i < nUp; ++i) depositPhoton(h.p, ngoC, lam[i], beta[i] * w1, caus);
+                    for (int i = 0; i < nUp; ++i)
+                        depositPhoton(h.p, ngoC, lam[i],
+                                      beta[i] * w1 * (lay ? coatStackS(scene, *matp, h, ray.d * -1.0, lam[i]) : 1.0),
+                                      caus);
             }
             // Layered coat. The coat interface is NOT dispersive in DIRECTION -- the sheen is
             // a glossy lobe about the mirror direction and the body-lobe pick is a material
@@ -4293,6 +4406,11 @@ struct Renderer {
                     double cr = materialRoughness(scene, cm, h);
                     Vec3 o = sampleGlossy(reflect(ray.d, h.n), cr, rng);
                     if (dot(o, h.n) <= 0) { e.absorbed += activeSum(); return; }
+                    for (int i = 0; i < nUp; ++i) {   // the reciprocal coat's reflection (scalar twin)
+                        const double c = coatSheenRatio(scene, cm, h, ray.d * -1.0, o, lam[i]);
+                        e.absorbed += beta[i] * (1.0 - c);
+                        beta[i] *= c;
+                    }
                     const double sC = glossyArrival(h, ray.d * -1.0, bounce == 0);   // see scalar twin
                     for (int i = 0; i < nUp; ++i) { e.absorbed += beta[i] * (1.0 - sC); beta[i] *= sC; }
                     const double adj = glossyPhotonAdjoint(h, ray.d * -1.0, o);
@@ -4345,6 +4463,7 @@ struct Renderer {
                         sawScatter = true;   // past a diffuse vertex it is indirect light
                     }
                     if (nCam > 0 && !forwardCatch) {
+                        const CoatSplatScope coat(scene, m, h);   // a coated body's way out
                         camSplatAllHero(scene, cams, nCam, h.p,  h.n,  ngo, wi, lam, beta, rhoR, nUp, rng);
                         camSplatAllHero(scene, cams, nCam, h.p, -h.n, -ngo, wi, lam, beta, rhoT, nUp, rng);
                         camSpecularSplatAllHero(scene, cams, nCam, h.p,  h.n,  ngo, &wi, lam, beta, rhoR, nUp, rng);
@@ -4370,7 +4489,9 @@ struct Renderer {
                         Vec3 wo;
                         const double corr = diffuseContinuation(h, ngo, wi, rng, wo);
                         for (int i = 0; i < nUp; ++i) beta[i] *= corr;
-                        if (!continueAlong(h, wo, Lobe::Reflect, ray)) { e.absorbed += activeSum(); return; } continue;
+                        if (!continueAlong(h, wo, Lobe::Reflect, ray)) { e.absorbed += activeSum(); return; }
+                        coatContinueHero(scene, m, h, wo, lam, beta, nUp, e);
+                        continue;
                     } else if (uu < sumHero) {                    // transmit (back)
                         for (int i = 0; i < nUp; ++i) {
                             double w = rhoT[i] / qT;
@@ -4380,7 +4501,9 @@ struct Renderer {
                         Vec3 wo;
                         const double corr = diffuseContinuation(h, ngo, wi, rng, wo, /*transmit=*/true);
                         for (int i = 0; i < nUp; ++i) beta[i] *= corr;
-                        if (!continueAlong(h, wo, Lobe::Transmit, ray)) { e.absorbed += activeSum(); return; } continue;
+                        if (!continueAlong(h, wo, Lobe::Transmit, ray)) { e.absorbed += activeSum(); return; }
+                        coatContinueHero(scene, m, h, wo, lam, beta, nUp, e);
+                        continue;
                     }
                     e.absorbed += activeSum(); return;
                 }
@@ -4410,6 +4533,7 @@ struct Renderer {
                         const Vec3 wl{-ray.d.x, -ray.d.y, -ray.d.z};
                         const GlossySplat gsp{&scene, &m, &h, h.n, wl};
                         double unused[hero::kHeroMax] = {};
+                        const CoatSplatScope coat(scene, m, h);   // a coated body's way out
                         camSplatAllHero(scene, cams, nCam, h.p, h.n, orientedGeoN(h), wl, lam, beta,
                                         unused, nUp, rng, nullptr, &gsp);
                         camSpecularSplatAllGlossy(scene, cams, nCam, h.p, h.n, orientedGeoN(h), wl, lam, beta, nUp, gsp, rng);
@@ -4451,6 +4575,7 @@ struct Renderer {
                         }
                         if (!continueAlong(h, o, Lobe::Reflect, ray)) { e.absorbed += activeSum(); return; }
                     }
+                    coatContinueHero(scene, m, h, ray.d, lam, beta, nUp, e);
                     continue;
                 }
                 case MatType::Dielectric:
@@ -4534,6 +4659,7 @@ struct Renderer {
                         sawScatter = true;   // past a diffuse vertex it is indirect light
                     }
                     if (nCam > 0 && !forwardCatch) {
+                        const CoatSplatScope coat(scene, m, h);   // a coated body's way out
                         camSplatAllHero(scene, cams, nCam, h.p, h.n, ngo, wi, lam, beta, rho, nUp, rng);
                         camSpecularSplatAllHero(scene, cams, nCam, h.p, h.n, ngo, &wi, lam, beta, rho, nUp, rng);
                     }
@@ -4554,6 +4680,7 @@ struct Renderer {
                     const double corr = diffuseContinuation(h, ngo, wi, rng, wo);
                     for (int i = 0; i < nUp; ++i) beta[i] *= corr;
                     if (!continueAlong(h, wo, Lobe::Reflect, ray)) { e.absorbed += activeSum(); return; }
+                    coatContinueHero(scene, m, h, wo, lam, beta, nUp, e);
                     continue;
                 }
             }

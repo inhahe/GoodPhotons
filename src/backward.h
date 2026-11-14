@@ -310,6 +310,10 @@ struct BackwardRenderer {
         // nothing, so the light it would throw through a mirror onto a wall is no more counted than
         // the light it throws on the wall directly. A re-entry inherits it.
         bool pastDiffuse = false;
+        // The coated body this vertex shades with (Material::coatStack >= 0), or null: its light
+        // samples take the coat on their way in (render.h coatExitS), set by interactMaterial and
+        // the hero walk for the vertex in hand. A gather ray or a re-entry starts without one.
+        const Material* coatBody = nullptr;
     };
     // A camera path's first event: the sky (it escaped), a specular-side surface (the rule
     // classifyComposite applies to a pixel: a non-sensor surface whose own material is a
@@ -1263,6 +1267,8 @@ struct BackwardRenderer {
                 double fVal;
                 if (nb) {
                     fVal = bdpt::bsdfF(*nb->m, h.n, nb->wo, wiConn, lambda, scene, &h);
+                    if (nb->m->coatParent >= 0)   // a coat's lobe (render.h coatSheenRatio)
+                        fVal *= coatF(scene, *nb->m, h, nb->wo, wiConn, lambda);
                     if (!(fVal > 0.0)) continue;
                     // Balance heuristic against the lobe-sampling strategy. pdfWLight == 0
                     // is a delta light (a Spot): unhittable by a BSDF sample, weight 1.
@@ -1277,6 +1283,7 @@ struct BackwardRenderer {
                     fVal = rho / PI;
                 }
                 double contrib = fVal * (spdV * invPdfLambda) * w;
+                if (gi.coatBody) contrib *= coatExitS(scene, *gi.coatBody, h, wiConn, lambda);
                 // Media transmittance on the shadow leg, over the WHOLE superposed media
                 // vector and each medium's own bounds/density field (see mediaTr). The
                 // shadow ray starts at the same offset point `blocked` used, so the two
@@ -1299,8 +1306,10 @@ struct BackwardRenderer {
                     [&](const Vec3& wi, double* f, double& pdfB, Ray& r) {
                         double cosSurf = 0.0, stG = 0.0;
                         if (!dirResponse(scene, h, wi, hs, nb, cosSurf, stG, pdfB)) return false;
-                        f[0] = (nb ? bdpt::bsdfF(*nb->m, h.n, nb->wo, wi, lambda, scene, &h)
+                        f[0] = (nb ? bdpt::bsdfF(*nb->m, h.n, nb->wo, wi, lambda, scene, &h) *
+                                             (nb->m->coatParent >= 0 ? coatF(scene, *nb->m, h, nb->wo, wi, lambda) : 1.0)
                                    : rho / PI) * cosSurf * stG;
+                        if (gi.coatBody) f[0] *= coatExitS(scene, *gi.coatBody, h, wi, lambda);
                         r = fireRay(h, ngo, hs, wi);
                         return true;
                     });
@@ -1373,7 +1382,10 @@ struct BackwardRenderer {
             const double gWeight = w * selW * wMis * thrScalar * dLam;
             if (!(gWeight > 0.0)) continue;
             for (int k = 0; k < KK; ++k) {
-                const double f = bdpt::bsdfF(*nb.m, h.n, nb.wo, wiConn, lam[k], scene, &h);
+                // the coat on a coated vertex's lobe (render.h coatF: a body's way in, a coat's
+                // reflection; 1 for a bare one)
+                const double f = bdpt::bsdfF(*nb.m, h.n, nb.wo, wiConn, lam[k], scene, &h) *
+                                 coatF(scene, *nb.m, h, nb.wo, wiConn, lam[k]);
                 if (!(f > 0.0)) continue;
                 const double v = gWeight * thrRatio[k] * f * em.spdFn(lam[k]) * Tr[k];
                 if (!(v > 0.0)) continue;
@@ -1502,12 +1514,18 @@ struct BackwardRenderer {
                     }
                     const double wsMis = ws * wMis;
                     for (int i = 0; i < nUp; ++i) {
-                        const double f = bdpt::bsdfF(*nb->m, h.n, nb->wo, wiConn,
-                                                     lam[i], scene, &h);
+                        double f = bdpt::bsdfF(*nb->m, h.n, nb->wo, wiConn,
+                                               lam[i], scene, &h);
+                        if (nb->m->coatParent >= 0) f *= coatF(scene, *nb->m, h, nb->wo, wiConn, lam[i]);
                         if (!(f > 0.0)) continue;
+                        if (gi.coatBody) f *= coatExitS(scene, *gi.coatBody, h, wiConn, lam[i]);
                         const double spd = cached ? spdCache->at(e, i) : em.spdFn(lam[i]);
                         L[i] += thr[i] * f * (spd * invPdf[i]) * wsMis;
                     }
+                } else if (gi.coatBody) {   // a coated body: its lobe takes the coat at each member's
+                    for (int i = 0; i < nUp; ++i)
+                        L[i] += thr[i] * (rho[i] / PI) * coatExitS(scene, *gi.coatBody, h, wiConn, lam[i]) *
+                                ((cached ? spdCache->at(e, i) : em.spdFn(lam[i])) * invPdf[i]) * ws;
                 } else if (cached) {
                     for (int i = 0; i < nUp; ++i)
                         L[i] += thr[i] * (rho[i] / PI) * (spdCache->at(e, i) * invPdf[i]) * ws;
@@ -1525,9 +1543,12 @@ struct BackwardRenderer {
                     [&](const Vec3& wi, double* f, double& pdfB, Ray& r) {
                         double cosSurf = 0.0, stG = 0.0;
                         if (!dirResponse(scene, h, wi, nullptr, nb, cosSurf, stG, pdfB)) return false;
-                        for (int i = 0; i < nUp; ++i)
-                            f[i] = (nb ? bdpt::bsdfF(*nb->m, h.n, nb->wo, wi, lam[i], scene, &h)
+                        for (int i = 0; i < nUp; ++i) {
+                            f[i] = (nb ? bdpt::bsdfF(*nb->m, h.n, nb->wo, wi, lam[i], scene, &h) *
+                                                 (nb->m->coatParent >= 0 ? coatF(scene, *nb->m, h, nb->wo, wi, lam[i]) : 1.0)
                                        : rho[i] / PI) * cosSurf * stG;
+                            if (gi.coatBody) f[i] *= coatExitS(scene, *gi.coatBody, h, wi, lam[i]);
+                        }
                         r = fireRay(h, ngo, nullptr, wi);
                         return true;
                     });
@@ -1580,7 +1601,10 @@ struct BackwardRenderer {
             // cosines and an unclamped gather is untouched bit-for-bit.
             if (giClamp > 0.0)
                 for (int i = 0; i < nUp; ++i) if (Lg[i] > giClamp) Lg[i] = giClamp;
-            for (int i = 0; i < nUp; ++i) acc[i] += c * Lg[i];
+            // A coated body's lobe takes the coat on the way in from d (coatExitS); its mean
+            // under the cosine is 1, so wSum still normalises.
+            for (int i = 0; i < nUp; ++i)
+                acc[i] += c * Lg[i] * (gi.coatBody ? coatExitS(scene, *gi.coatBody, h, d, lam[i]) : 1.0);
         }
         if (wSum <= 0.0) return;
         const double inv = 1.0 / wSum;
@@ -1607,7 +1631,7 @@ struct BackwardRenderer {
             double Lg = radiance(scene, Ray{h.p + ngo * 1e-6, d}, lambda, invPdfLambda,
                                  rng, spdCache, sub);
             if (giClamp > 0.0 && Lg > giClamp) Lg = giClamp;   // see giClamp
-            acc += c * Lg;
+            acc += c * Lg * (gi.coatBody ? coatExitS(scene, *gi.coatBody, h, d, lambda) : 1.0);   // see giGatherHero
         }
         return (wSum > 0.0) ? rho * (acc / wSum) : 0.0;
     }
@@ -1809,9 +1833,12 @@ struct BackwardRenderer {
         return true;
     }
 
+    // `coatBody`: the coated body the vertex shades with, whose lobe takes the coat on the way in
+    // (render.h coatExitS), or null.
     double neeEnv(const Scene& scene, const Hit& h, double rho, double invPdfLambda,
                   double lambda, Pcg32& rng, const HairShade* hs = nullptr,
-                  const HairDualCtx* dctx = nullptr, const NeeBsdf* nb = nullptr) const {
+                  const HairDualCtx* dctx = nullptr, const NeeBsdf* nb = nullptr,
+                  const Material* coatBody = nullptr) const {
         if (!envNeeOn()) return 0.0;        // FTRACE_ENV_NEE=0: the escape alone
         Vec3 wi; double cosSurf, stG, pdfW, wMis, farDist;
         // As in neeLight: the one forward-spread draw is taken unconditionally, so the rng
@@ -1831,10 +1858,12 @@ struct BackwardRenderer {
         if (Lenv <= 0.0) return 0.0;
         // `rho/PI` IS bsdfF at a diffuse vertex; the branch keeps the default path's float
         // expression untouched so every existing render stays bit-identical.
-        const double fVal = nb ? bdpt::bsdfF(*nb->m, h.n, nb->wo, wi, lambda, scene, &h)
+        const double fVal = nb ? bdpt::bsdfF(*nb->m, h.n, nb->wo, wi, lambda, scene, &h) *
+                                     (nb->m->coatParent >= 0 ? coatF(scene, *nb->m, h, nb->wo, wi, lambda) : 1.0)
                                : (rho / PI);
         if (!(fVal > 0.0)) return 0.0;
         double contrib = fVal * Lenv * cosSurf * invPdfLambda / pdfW * wMis * stG;
+        if (coatBody) contrib *= coatExitS(scene, *coatBody, h, wi, lambda);
         if (!scene.media.empty())        // media attenuation out to the scene exit
             contrib *= mediaTr(scene, h.p + orientedGeoN(h) * 1e-6, wi, scene.mediaExitDistance(h.p), lambda, rng);
         return contrib;
@@ -1844,7 +1873,8 @@ struct BackwardRenderer {
     // all `nUp` active wavelengths, with one shared media transmittance (see neeLightHero).
     void neeEnvHero(const Scene& scene, const Hit& h, const double* rho, double* L,
                     const double* thr, const double* lam, const double* invPdf,
-                    int nUp, Pcg32& rng, const NeeBsdf* nb = nullptr) const {
+                    int nUp, Pcg32& rng, const NeeBsdf* nb = nullptr,
+                    const Material* coatBody = nullptr) const {
         if (!envNeeOn()) return;        // FTRACE_ENV_NEE=0: the escape alone
         Vec3 wi; double cosSurf, stG, pdfW, wMis, farDist;
         if (!envGeom(scene, h, rng, wi, cosSurf, stG, pdfW, wMis, farDist,
@@ -1857,10 +1887,12 @@ struct BackwardRenderer {
             if (Lenv <= 0.0) continue;
             // The lobe's GEOMETRY is wavelength-free, so `wMis` is shared and only the
             // coefficient inside bsdfF varies per member (same argument as neeLightHero).
-            const double fVal = nb ? bdpt::bsdfF(*nb->m, h.n, nb->wo, wi, lam[i], scene, &h)
+            const double fVal = nb ? bdpt::bsdfF(*nb->m, h.n, nb->wo, wi, lam[i], scene, &h) *
+                                         (nb->m->coatParent >= 0 ? coatF(scene, *nb->m, h, nb->wo, wi, lam[i]) : 1.0)
                                    : (rho[i] / PI);
             if (!(fVal > 0.0)) continue;
-            L[i] += thr[i] * fVal * Lenv * cosSurf * invPdf[i] / pdfW * wMis * stG;
+            const double c = coatBody ? coatExitS(scene, *coatBody, h, wi, lam[i]) : 1.0;
+            L[i] += thr[i] * fVal * Lenv * cosSurf * invPdf[i] / pdfW * wMis * stG * c;
         }
     }
 
@@ -2371,6 +2403,9 @@ struct BackwardRenderer {
         // Hair pass-through) puts it back: it is not a bounce.
         const GlossyMis gmIn = gm ? *gm : GlossyMis{};
         if (gm) gm->clear();
+        // A coated body's lobe takes the coat on its light samples (neeLight reads gi; the sky's
+        // and the fire's are told) and on its continuation (radiance, after this returns).
+        gi.coatBody = (m.coatStack >= 0) ? &m : nullptr;
         // Mode W's weight-and-cutoff, in the units of the medium the path is in now.
         auto wAtt = [&](double w) {
             return whittedAttenuate(thr, w, Renderer::localN2(scene, stk, lambda));
@@ -2467,7 +2502,7 @@ struct BackwardRenderer {
                     // exactly the 6.8e-5 sr target this entry is about).
                     if (scene.envIndex >= 0)
                         L += thr * neeEnv(scene, h, 1.0, invPdfLambda, lambda, rng,
-                                          nullptr, nullptr, &nb);
+                                          nullptr, nullptr, &nb, gi.coatBody);
                 }
                 // WHITTED (mode W): the SAME connection, with quadrature instead of the rng. The
                 // lobe comes off a deterministic lattice, so the direction is identical for every
@@ -2531,7 +2566,8 @@ struct BackwardRenderer {
                 // two materials disagreed on the shadow lattice for no reason.
                 L += thr * neeLight(scene, h, rhoEl, invPdfLambda, lambda, rng, spdCache, gi);
                 if (scene.envIndex >= 0)
-                    L += thr * neeEnv(scene, h, rhoEl, invPdfLambda, lambda, rng);
+                    L += thr * neeEnv(scene, h, rhoEl, invPdfLambda, lambda, rng, nullptr, nullptr, nullptr,
+                                      gi.coatBody);
                 double Mint = m.fluoEmitSampler.integral;
                 bool haveFluoro = (Mint > 0.0 && m.fluoYield > 0.0);
                 double gOut = 0.0, rhoFluo = 0.0, lambdaIn = 0.0, invPdfIn = 0.0;
@@ -2570,7 +2606,8 @@ struct BackwardRenderer {
                             L += thr * gOut * neeLight(scene, h, rhoFluo, invPdfIn, lambdaIn,
                                                        rng, spdCache, gi);
                             if (scene.envIndex >= 0)
-                                L += thr * gOut * neeEnv(scene, h, rhoFluo, invPdfIn, lambdaIn, rng);
+                                L += thr * gOut * neeEnv(scene, h, rhoFluo, invPdfIn, lambdaIn, rng, nullptr,
+                                                         nullptr, nullptr, gi.coatBody);
                         }
                     }
                 }
@@ -2690,11 +2727,13 @@ struct BackwardRenderer {
                 if (sum > 1.0) { rhoR /= sum; rhoT /= sum; sum = 1.0; }   // energy guard
                 L += thr * neeLight(scene, h, rhoR, invPdfLambda, lambda, rng, spdCache, gi);
                 if (scene.envIndex >= 0)
-                    L += thr * neeEnv(scene, h, rhoR, invPdfLambda, lambda, rng);
+                    L += thr * neeEnv(scene, h, rhoR, invPdfLambda, lambda, rng, nullptr, nullptr, nullptr,
+                                      gi.coatBody);
                 const Hit hb = otherSide(h);                 // back hemisphere for the transmit lobe
                 L += thr * neeLight(scene, hb, rhoT, invPdfLambda, lambda, rng, spdCache, gi);
                 if (scene.envIndex >= 0)
-                    L += thr * neeEnv(scene, hb, rhoT, invPdfLambda, lambda, rng);
+                    L += thr * neeEnv(scene, hb, rhoT, invPdfLambda, lambda, rng, nullptr, nullptr, nullptr,
+                                      gi.coatBody);
                 if (whitted) {   // both lobes gather, each into its own hemisphere
                     if (giUseGather(gi)) {
                         L += thr * giGather(scene, h,  rhoR, lambda, invPdfLambda, rng, spdCache, gi);
@@ -2723,7 +2762,8 @@ struct BackwardRenderer {
                 double rho = clamp01(diffuseReflectance(scene, m, h, lambda));
                 L += thr * neeLight(scene, h, rho, invPdfLambda, lambda, rng, spdCache, gi);
                 if (scene.envIndex >= 0)   // env-NEE toward the sky (MIS'd on miss)
-                    L += thr * neeEnv(scene, h, rho, invPdfLambda, lambda, rng);
+                    L += thr * neeEnv(scene, h, rho, invPdfLambda, lambda, rng, nullptr, nullptr, nullptr,
+                                      gi.coatBody);
                 if (whitted) {             // indirect diffuse: real gather, or the flat stand-in
                     if (giUseGather(gi))
                         L += thr * giGather(scene, h, rho, lambda, invPdfLambda, rng, spdCache, gi);
@@ -3019,6 +3059,7 @@ struct BackwardRenderer {
                         Vec3 o = whittedGlossyDir(reflect(ray.d, h.n),
                                                   materialRoughness(scene, cm, h), gi.sIdx, b);
                         if (dot(o, h.n) <= 0) return L;
+                        thr *= coatSheenRatio(scene, cm, h, ray.d * -1.0, o, lambda);   // reciprocal
                         if (!continueAlong(h, o, Lobe::Reflect, ray)) return L;
                         specularArrival = true;
                         gmis.clear();      // the sheen does no NEE: its arrival is unweighted
@@ -3034,6 +3075,8 @@ struct BackwardRenderer {
                     if (!glossyCameraSide(ray.d, h.n)) return L;      // a glossy lobe: see the Glossy case
                     Vec3 o = sampleGlossy(reflect(ray.d, h.n), materialRoughness(scene, cm, h), rng);
                     if (dot(o, h.n) <= 0) return L;
+                    // the reciprocal coat's reflection over the coin's R (render.h coatSheenRatio)
+                    thr *= coatSheenRatio(scene, cm, h, ray.d * -1.0, o, lambda);
                     if (!continueAlong(h, o, Lobe::Reflect, ray)) return L;
                     specularArrival = true;
                     // The sheen does no NEE, so what it reaches counts at full weight: an earlier
@@ -3084,6 +3127,8 @@ struct BackwardRenderer {
                                   &nullEvt))
                 return L;                                 // path terminated in the interaction
             if (!nullEvt) contSoft = contSoftening(m, h, ray.d);   // a pass-through lends nothing new
+            // A coated body's continuation takes the coat on its way out (render.h coatExitS).
+            if (!nullEvt && m.coatStack >= 0) thr *= coatExitS(scene, m, h, ray.d, lambda);
             // NULL INTERACTION: refund the bounce. The cap bounds the worst case in fur dense
             // enough to keep handing back steps; 256 is far above anything real fur produces.
             if (nullEvt && nullSteps < 256) { --b; ++nullSteps; }
@@ -3554,6 +3599,8 @@ struct BackwardRenderer {
                                  : sampleGlossy(reflect(ray.d, h.n),
                                                 materialRoughness(scene, cm, h), rng);
                     if (dot(o, h.n) <= 0) { finish(); return; }
+                    for (int i = 0; i < nUp; ++i)    // the reciprocal coat's reflection (scalar twin)
+                        thr[i] *= coatSheenRatio(scene, cm, h, ray.d * -1.0, o, lam[i]);
                     if (!continueAlong(h, o, Lobe::Reflect, ray)) { finish(); return; }
                     specularArrival = true;
                     gmis.clear();                // no NEE here: see the scalar twin
@@ -3619,6 +3666,9 @@ struct BackwardRenderer {
                     nullHere = true;
                 };
 
+            // A coated body's lobe takes the coat on its light samples and its continuation (scalar
+            // twin interactMaterial / radiance), at each member's wavelength.
+            gi.coatBody = (m.coatStack >= 0) ? &m : nullptr;
             switch (m.type) {
                 case MatType::DiffuseTransmit: {
                     double rhoR[hero::kHeroMax], rhoT[hero::kHeroMax];
@@ -3631,11 +3681,11 @@ struct BackwardRenderer {
                     }
                     neeLightHero(scene, h, rhoR, L, thr, lam, invPdf, nUp, rng, spdCache, gi);
                     if (scene.envIndex >= 0)
-                        neeEnvHero(scene, h, rhoR, L, thr, lam, invPdf, nUp, rng);
+                        neeEnvHero(scene, h, rhoR, L, thr, lam, invPdf, nUp, rng, nullptr, gi.coatBody);
                     const Hit hb = otherSide(h);                     // back hemisphere (transmit lobe)
                     neeLightHero(scene, hb, rhoT, L, thr, lam, invPdf, nUp, rng, spdCache, gi);
                     if (scene.envIndex >= 0)
-                        neeEnvHero(scene, hb, rhoT, L, thr, lam, invPdf, nUp, rng);
+                        neeEnvHero(scene, hb, rhoT, L, thr, lam, invPdf, nUp, rng, nullptr, gi.coatBody);
                     if (whitted) {   // both lobes gather, each into its own hemisphere
                         if (giUseGather(gi)) {
                             giGatherHero(scene, h,  rhoR, L, thr, lam, invPdf, nUp, rng, spdCache, gi);
@@ -3704,7 +3754,7 @@ struct BackwardRenderer {
                         neeLightHero(scene, h, /*rho unused*/c, L, thr, lam, invPdf, nUp, rng,
                                      spdCache, gi, &nb);
                         if (scene.envIndex >= 0)      // the sky too — see the scalar twin
-                            neeEnvHero(scene, h, c, L, thr, lam, invPdf, nUp, rng, &nb);
+                            neeEnvHero(scene, h, c, L, thr, lam, invPdf, nUp, rng, &nb, gi.coatBody);
                     }
                     const double q = hero::maxOf(c, nUp);
                     if (whitted) {
@@ -3892,6 +3942,8 @@ struct BackwardRenderer {
                             if (sNull && firstHere) sFirst = -1;   // passed through: no event
                             if (gi.firstSec) gi.firstSec[i] = sFirst;
                             if (sGoes) {
+                                if (!sNull && m.coatStack >= 0)   // a coated body's way out
+                                    sThr *= coatExitS(scene, m, h, sRay.d, sLam);
                                 double sub[hero::kHeroMax];
                                 // A coverage pass-through is no vertex, for a sub-path as for
                                 // the hero below: it keeps the record the hero restores
@@ -3938,7 +3990,7 @@ struct BackwardRenderer {
                         rho[i] = clamp01(diffuseReflectance(scene, m, h, lam[i]));
                     neeLightHero(scene, h, rho, L, thr, lam, invPdf, nUp, rng, spdCache, gi);
                     if (scene.envIndex >= 0)
-                        neeEnvHero(scene, h, rho, L, thr, lam, invPdf, nUp, rng);
+                        neeEnvHero(scene, h, rho, L, thr, lam, invPdf, nUp, rng, nullptr, gi.coatBody);
                     // The Whitted indirect-diffuse term. With -gi this is a real
                     // single-bounce hemisphere gather (occlusion-aware and spectral); with
                     // -gi 0 it falls back to POV-Ray's flat `ambient` -- physically a lie,
@@ -4050,6 +4102,9 @@ struct BackwardRenderer {
                 }
             }
             if (!nullHere) contSoft = contSoftening(m, h, ray.d);   // what this vertex lends
+            if (!nullHere && gi.coatBody)
+                for (int i = 0; i < nUp; ++i) thr[i] *= coatExitS(scene, m, h, ray.d, lam[i]);
+            gi.coatBody = nullptr;   // a medium or fur vertex next is no coated body
         }
         finish();
     }

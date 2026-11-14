@@ -3098,7 +3098,34 @@ Not the device's fault: mode R's own two glossy strategies disagreed on a tilted
 (R read itself 1.044 with its lobe alone), and device S's walk samples the lobe alone. Fixed with
 BUMP-MODES' stage (3) glossy part (0.440.6, contSoftening): device S now reads 0.9982 of R there.
 
-## OPEN (2026-11-12, 0.440.3): LAYERED-MODES — a `layered` material reads 1-9 % off mode R in the other modes, on flat geometry
+## DONE (2026-11-14, 0.444.0): LAYERED-MODES — a `layered` material reads 1-9 % off mode R in the other modes, on flat geometry
+
+**Fixed in 0.444.0 by (b), the coat reciprocal in every mode**, on both of its lobes (design.md, "A
+reciprocal coat in every mode"):
+
+* The body takes the coat both ways: each walk takes T = 1 - R at its arrival by the coin, and the
+  body's lobe on its other direction takes S(w) = T(w) / T-bar (render.h coatExitS), T-bar a table
+  per layered material by wavelength. With the coin that is T(in) T(out) / T-bar, the physical clear
+  coat whose averaged escape the body's albedo already holds -- the same energy.
+* The coat's reflection is reciprocal too: the coin takes it with R at the arrival, and a rough
+  coat's pair reflects with its Fresnel term at their half vector (coatSheenR), so the walk weighs
+  it by F(h) / R(arrival) (coatSheenRatio) and the forward sheen splat takes F(h). This half was not
+  in the decision as written; it showed up measuring the first: with the body's S alone, the rough
+  room below read B 1.0082 and M 1.0093 of R on the host (and only with two coated walls, a coat
+  reflecting light onto another's body: one coated wall alone read 1.001-1.002), and they read
+  0.9999 and 1.0013 with it.
+
+`tools/check_layered_modes.py` (five rooms: smooth and rough Fresnel, thin film, a glossy body, a
+translucent sheet; every mode against R, host and device, within 1 %, B within 0.5 % and not scored
+where the coat is smooth, since it images no delta lobe) reads, host / device: rough D 0.9991 / 1.0000, J 1.0061 (default radius) / 1.0011, U 1.0009 /
+1.0005, B 0.9999 / 1.0002, M 1.0013 / 1.0009, S 0.9999 / 0.9995; on the host fresnel D 0.9991,
+J 0.9988, U 0.9994, M 0.9997, S 1.0004, and film, glossy and sheet every mode within 0.5 %. Against 0.443.2 it fails:
+rough D 1.0109, U 1.0111, B 1.0256, M 1.0120 of R on the host. `tools/check_bump_modes.py`'s layered room now holds every mode to R (only M and S, at
+2 %, before). Mode J's fixed-radius point merges read the rough room +0.6 % at their default radius
+on the host (1.0025 at 0.02, 0.9981 with -nojsurf): their known O(r^2) bias, so the check pins J's
+radius at 0.02.
+
+The finding:
 
 Found measuring REVIEW-4400's compound fix (`scraps/_bump_compound.py`, AMP 0): a room of
 `layered` walls -- a Fresnel coat (ior 1.5) over a diffuse body (reflect 0.8), no normal map --

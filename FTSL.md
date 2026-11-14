@@ -1447,6 +1447,18 @@ coat conserves energy) and nonlinear below it. So **a coated colour deepens** th
 instead of being washed out by the white specular laid over it. Nothing to author -- it follows from
 `ior`.
 
+**The coat works the same both ways** (0.444.0). Light the body scatters crosses the coat twice, in
+and out, and a clear coat transmits `T = 1 - R` each way, so the body passes `T(in) T(out) / T-bar`
+of what the albedo above says, `T-bar` being `T`'s cosine-weighted mean (the escape `1 - F_dr` the
+albedo already holds is exactly `T-bar / n^2`): light and view near the normal read a few per cent
+brighter than the average, grazing ones darker, and the energy is the same. The coat's own
+reflection takes its Fresnel (or thin-film) term at the half vector of the two directions, as a
+microfacet coat's does. Both are symmetric in the two directions, so every mode -- R, B, D, J, U,
+M, S -- renders the same material: before 0.444.0 each took the coat's transmission only at the end
+its own walk started from, and on a room of coated walls lit at a grazing angle they read 1-10 %
+apart. `reflectance manual` (a constant R) is unchanged, and a `hair` layer keeps its own lobes
+bare: a fibre has no face for a coat to lie on.
+
 **`absorb` + `depth` make it a TINTED lacquer** (0.324.0). `absorb` is the layer's absorption
 coefficient sigma_a in **1/m** (any spectrum form: a number, `rgb`, a named `spectrum:`), and
 `depth` its thickness in **METRES**. Beer-Lambert applies on the way in, on the way out, *and* on

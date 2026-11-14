@@ -162,9 +162,10 @@ Each names the section its line is in.
     0.440.2: a light walk's glossy bounce now carries the lobe's adjoint.
 23f. ~~**GLOSSY-ROOM-M** (4.3) — mode M reads a room of glossy walls 0.5 % bright on the host.~~
     Closed: twelve seeds read 1.0017 +- 0.0007, the 1.0050 was three high seeds.
-23g. **LAYERED-MODES** (4.2) — a `layered` material reads 1-9 % off mode R in the other modes, even
-    flat: the coat's coin is taken at the camera's angle in R and the light's elsewhere. Decided
-    2026-11-14: (b), the coat physical in every mode.
+23g. ~~**LAYERED-MODES** (4.2) — a `layered` material reads 1-9 % off mode R in the other modes, even
+    flat: the coat's coin is taken at the camera's angle in R and the light's elsewhere.~~ Done,
+    0.444.0: (b), the coat reciprocal in every mode -- the body takes it both ways, the coat's
+    reflection its Fresnel term at the half vector (tools/check_layered_modes.py).
 23i. ~~**GLOSSY-DEPTH-CAP** (4.3) — at `-max-bounce`, mode R's glossy NEE keeps only its MIS share:
     the last vertex's lobe-sampled emitter hit is never traced.~~ Done, 0.440.4 (the tail).
 23j. ~~**THIN-GAP-GATHER** (4.2) — mode M at a forced large radius gathers a lit surface a few
@@ -266,8 +267,8 @@ Then the rest of 4.2-4.6 in their order, 4.7's bookkeeping alongside whatever to
   light walk's glossy bounce took r, not the adjoint's r cos(out)/cos(in)).
 - [x] **GLOSSY-ROOM-M** — mode M reads a room of glossy walls 0.5 % bright on the host. Closed: no
   bias beyond 0.2 % (twelve seeds, 1.0017 +- 0.0007).
-- [ ] **LAYERED-MODES** — a `layered` material reads 1-9 % off mode R elsewhere, even flat (the
-  coat's coin is non-reciprocal); decided (b), the physical coat (4.1).
+- [x] **LAYERED-MODES** (0.444.0) — a `layered` material read 1-9 % off mode R elsewhere, even flat
+  (the coat's coin was non-reciprocal): the coat is reciprocal now, (b).
 - [x] **S-GPU-GLOSSY-BUMP** (0.440.6) — device mode S read normal-mapped glossy walls 1.043 of R:
   R's own lobe and light sampling weighed different integrands (contSoftening).
 - [x] **B-ENV-WALLS** (0.440.11) — mode B read walls lit by a sky about 1 % bright: the sky the

@@ -1996,6 +1996,47 @@ fixed and only the material varied. The second version compared the coat against
 `reflect rgb 1 1 1` and read 1.29 in mode M, which turned out to be a property of the WHITE, not
 of the coat: see the open entry on `rgb 1 1 1` vs `1.0` in known-issues.
 
+### A reciprocal coat in every mode (0.444.0, LAYERED-MODES)
+
+Every walk shades a layered stack by a coin at its arrival: the coat with its reflectance R there,
+else a body copy. Until 0.444.0 that coin was all the coat the body ever met, so the integrand
+depended on which end a walk started from -- mode R's held T = 1 - R toward the camera, a light
+walk's T toward the light -- and on coated walls lit at a grazing angle the modes read 1-10 %
+apart. The coat is reciprocal now, on both of its lobes:
+
+* **The body takes the coat both ways.** A body copy names its stack (`Material::coatStack`), and
+  the stack holds T-bar(lambda), T's cosine-weighted mean over the outside hemisphere
+  (`Material::coatTbar`, by nm, built by `finalizeLayeredCoats`; a thin film's at its authored
+  thickness, so a patterned film is normalised only roughly). The body's lobe, on the direction
+  other than its walk's arrival, takes `S(w) = T(w) / T-bar` (`render.h coatExitS`, device
+  `dCoatExitS`): with the coin's T at the arrival that is T(in) T(out) / T-bar, the physical clear
+  coat, whose averaged escape the body's albedo (`coatedAlbedo`'s 1 - F_dr = T-bar / n^2) already
+  holds -- the same energy, with its angular shape. Two-sided, as the coin is (a translucent body's
+  transmit lobe leaves through the far face's coat); 1 for a dielectric body's refraction into its
+  solid, for `reflectance manual`, and for a `hair` body, which keeps its lobes bare.
+* **The coat's reflection is reciprocal.** The coin weighs it with R at the arrival, which differs
+  from R at the other end wherever a rough lobe turns the light; the coat reflects a pair with its
+  Fresnel (or thin-film) term at their half vector (`coatSheenR`, as a microfacet coat does), so a
+  walk's coat reflection is weighed by `coatSheenRatio` = F(h) / R(arrival), and the forward sheen
+  splat (`GlossySplat::stack`) takes F(h) itself. A smooth coat's pair is a mirror pair: the ratio
+  is 1. The coat copy names its stack (`Material::coatParent`).
+* **One factor, at every site that evaluates a vertex's lobe off its arrival.** `coatF(m, h, wa,
+  wb)` is a body's S or a coat's ratio (device `dCoatF`). A walk's continuation takes it on its new
+  direction (every mode, host and device); a light sample on the light's (mode R through
+  `GiCtx::coatBody`, modes M and S through `coatGi`; a coat copy's through its `NeeBsdf`); a
+  connection on the connection's at each end (D, J, U); a forward splat on the camera's
+  (`CoatSplatScope`, a thread-local the dozen splat functions read so that their signatures stay;
+  on the device a `DCoatSplat` passed down); Whitted's gather on each gather ray's. A photon map
+  keeps no directions, so a layered surface's compound deposit (made before its pick) takes
+  `coatStackS` of the photon's arrival, and the gather's camera walk takes the coin at its own; a
+  J/U light vertex, stored before its pick too (COMPOUND-MERGE-PICK), takes it at the merge, on the
+  camera vertex's material. A final gather takes the visible point's S on each gather ray, at each
+  photon's wavelength, inside its `rhoV`.
+
+`tools/check_layered_modes.py` holds every mode to R within 1 % on five coated rooms (smooth and
+rough Fresnel, thin film, a glossy body, a translucent sheet), host and device; mode B is not scored
+where the coat is smooth, as it images no delta lobe.
+
 ### A directional environment for the preview's specular (0.317.0)
 
 The split sum's environment half was `PreviewLight::ambient`, one scalar -- and a constant

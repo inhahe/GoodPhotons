@@ -474,6 +474,9 @@ struct Material {
     // clear coat T(in) T(out), reciprocal, with the escape its albedo already holds on average
     // (coatedAlbedo's 1 - F_dr) given its angle.
     int    coatStack    = -1;
+    // On the coat copy of a layered material (its coatChild): that layered material, else -1. A
+    // walk that takes the coat by the coin weighs its reflection by render.h coatSheenRatio.
+    int    coatParent   = -1;
     // On a layered material: T-bar, the coat's transmission 1 - R averaged over the outside
     // hemisphere with the cosine, by nm from LAMBDA_MIN (finalizeLayeredCoats; a thin film at its
     // authored thickness). Empty for a constant coat (coatModel manual: S = 1) and anything else.
@@ -2519,6 +2522,7 @@ struct Scene {
             coat.mixWeights.clear();
             coat.coatChild = -1;
             coat.coatTbar.clear();
+            coat.coatParent = (int)i;
             coat.routeBase = -1;              // a material of its own, not a routed copy
             coat.isLight = false;
             coat.reflectsNothing = false;
@@ -2566,7 +2570,9 @@ struct Scene {
                 body.coatAbsorb = mats[i].coatAbsorb;
                 body.coatPathIo = pIo;
                 body.coatPathRt = pRt;
-                body.coatStack = (int)i;
+                // A fibre has no face for a coat to lie on (its lobes leave all round the strand),
+                // so a `hair` layer keeps its own lobes bare: only the coin takes the coat there.
+                body.coatStack = (body.type == MatType::Hair) ? -1 : (int)i;
                 mats[i].mixChildren[k] = (int)mats.size();
                 mats.push_back(body);
             }
