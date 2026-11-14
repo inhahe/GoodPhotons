@@ -141,7 +141,8 @@ Each names the section its line is in.
     end a GPU mode D/J chunk.~~ Done, 0.436.6. (The 2 000-beam brightness it also found was the
     shared seeds' noise, 4.3; the resume passes' re-walk no longer costs anything measurable, 4.5.)
 20. **JSPEC-CARRIER-SIZE** (4.5) — every mode-J GPU thread reserves the spectral carrier: VRAM, the
-    operator's call against build time. (The ~3x camera pass measured against it was the MIS
+    operator's call against build time. Decided 2026-11-14: option (1), the template parameter;
+    (2), half-precision bins, is the next step if VRAM gets tight (4.1). (The ~3x camera pass measured against it was the MIS
     weights' transmittances, 0.436.5.)
 21. ~~**RADCACHE-BATCHES** (4.5) — `-radcache`'s fixed batches outlast `-stop` and the interval.~~
     Done, 0.439.3: the cache's own schedule over absolute samples, a canonical merge, the chunks
@@ -160,15 +161,15 @@ Each names the section its line is in.
 23f. ~~**GLOSSY-ROOM-M** (4.3) — mode M reads a room of glossy walls 0.5 % bright on the host.~~
     Closed: twelve seeds read 1.0017 +- 0.0007, the 1.0050 was three high seeds.
 23g. **LAYERED-MODES** (4.2) — a `layered` material reads 1-9 % off mode R in the other modes, even
-    flat: the coat's coin is taken at the camera's angle in R and the light's elsewhere. Needs a
-    decision (keep R's integrand, or make the coat physical in every mode).
+    flat: the coat's coin is taken at the camera's angle in R and the light's elsewhere. Decided
+    2026-11-14: (b), the coat physical in every mode.
 23i. ~~**GLOSSY-DEPTH-CAP** (4.3) — at `-max-bounce`, mode R's glossy NEE keeps only its MIS share:
     the last vertex's lobe-sampled emitter hit is never traced.~~ Done, 0.440.4 (the tail).
 23j. ~~**THIN-GAP-GATHER** (4.2) — mode M at a forced large radius gathers a lit surface a few
     millimetres behind as the same surface (MERGE-PROXIMITY's flat allowance).~~ Done, 0.440.13:
     no allowance, and a slack for the device's float rounding.
-23k. **GLOSSY-ADJ-VARIANCE** (4.3) — the glossy lobe's adjoint is unbounded at grazing arrival;
-    the cure is a reciprocal lobe, which needs a decision.
+23k. **GLOSSY-ADJ-VARIANCE** (4.3) — the glossy lobe's adjoint is unbounded at grazing arrival.
+    Decided 2026-11-14: a GGX microfacet lobe.
 23h. ~~**S-GPU-GLOSSY-BUMP** (4.3) — device mode S reads normal-mapped glossy walls 1.043 of R (host
     0.997); see BUMP-MODES.~~ Done, 0.440.6: R's own glossy strategies disagreed (contSoftening).
 23l. ~~**B-ENV-WALLS** (4.2) — mode B reads walls lit by a sky about 1 % bright, flat or bumped.~~
@@ -217,9 +218,24 @@ Then the rest of 4.2-4.6 in their order, 4.7's bookkeeping alongside whatever to
   now refuses the three).
 - [x] **Rendering a scene without `-camera` also renders its 600-frame flyby** — left to judgement;
   stills by default, paths by name (0.383.0).
-- [ ] **COMPOTE-NO-CAUSTIC** — under the 20° sun the gem compote's ruby bowl absorbs the light that
-  made its caustic under the old 45° sun, and no cap fixes it: move the compote, change the bowl,
-  or accept it?
+- [x] **COMPOTE-NO-CAUSTIC** — decided 2026-11-14: accepted. Under the 20° sun the gem compote's
+  ruby bowl absorbs the light that made its caustic under the old 45° sun; the compote stays a
+  piece to look at, not a caustic source.
+- [x] **LAYERED-MODES** — decided 2026-11-14: (b). A `layered` material's coin is taken at the
+  camera's angle in mode R and the light's elsewhere, so the modes read it 1-9 % apart. (a) Keep R's
+  integrand and re-weight every light-side walk; (b) make the coat physical, (1 - R(in)) (1 - R(out))
+  on every body scattering in every mode: reciprocal, and a layered body renders about 8 % darker
+  at normal incidence for ior 1.5.
+- [x] **GLOSSY-ADJ-VARIANCE** — decided 2026-11-14: a GGX microfacet lobe. The glossy lobe divides
+  by the light side's cosine, so its adjoint is unbounded at grazing arrival; a reciprocal lobe has
+  no such tail, and changes how every glossy material renders.
+- [x] **JSPEC-CARRIER-SIZE** — decided 2026-11-14: (1), a template parameter that sizes mode J's
+  device spectral carrier to nothing where it is off (achromatic scene, `FTRACE_JSPEC=0`). Kept for
+  if VRAM gets tight: (2), the carrier's bins as `__half` normalised by their maximum (48 B instead
+  of 96). The two combine -- (1) removes the carrier where it is off, (2) halves it where it is on,
+  which is the only help for a chromatic scene like `gallery_rain` -- and (2) costs precision
+  (about 5e-4 a bin, to be measured on `_lay_chroma` and `gallery_rain` against the float carrier
+  before it replaces it) and a conversion at every read and write.
 - [x] **HAZE-SUN-B** — decided 2026-11-05: (b), done in 0.434.15 (`tools/check_haze_warning.py`).
   Which haze does an unbounded medium under a sun hold? A forward mode starts
   its sun photons on the disc the scene's bounding sphere casts, so mode B lights only the haze in
@@ -230,11 +246,11 @@ Then the rest of 4.2-4.6 in their order, 4.7's bookkeeping alongside whatever to
   the camera looks past the scene. (b) Keep R, D and J as they are, and have the forward modes
   warn at load that they light an unbounded haze only near the scene. Recommended: (b), since the
   three that agree are the modes scenes are rendered with.
-- [ ] **GLOW-LIGHT-MODES** — a glow with no emitter lights nothing in R/M/S/B, all of itself in
-  D/J/U (D and J only part of it before 0.439.7); mode P runs away on it (x368). The fix is to
-  register emitters for emissive analytic primitives (4.6's first line), which makes
-  `gallery_rain`'s grid lines light the scene: does the grid keep glowing unlit (a material
-  flag), or does the scene get rebalanced?
+- [x] **GLOW-LIGHT-MODES** — decided 2026-11-14: register emitters for emissive analytic
+  primitives so every mode agrees, add a material option for a surface that glows without lighting
+  anything (honoured the same way by every mode), and render a `gallery_rain` frame with and
+  without it for the user to choose the grid's look. A glow with no emitter lights nothing in
+  R/M/S/B, all of itself in D/J/U; mode P runs away on it (x368).
 
 ### 4.2 Wrong, missing or silent output
 
@@ -249,15 +265,15 @@ Then the rest of 4.2-4.6 in their order, 4.7's bookkeeping alongside whatever to
 - [x] **GLOSSY-ROOM-M** — mode M reads a room of glossy walls 0.5 % bright on the host. Closed: no
   bias beyond 0.2 % (twelve seeds, 1.0017 +- 0.0007).
 - [ ] **LAYERED-MODES** — a `layered` material reads 1-9 % off mode R elsewhere, even flat (the
-  coat's coin is non-reciprocal); decision owed.
+  coat's coin is non-reciprocal); decided (b), the physical coat (4.1).
 - [x] **S-GPU-GLOSSY-BUMP** (0.440.6) — device mode S read normal-mapped glossy walls 1.043 of R:
   R's own lobe and light sampling weighed different integrands (contSoftening).
 - [x] **B-ENV-WALLS** (0.440.11) — mode B read walls lit by a sky about 1 % bright: the sky the
   forward modes see directly took one ray through each pixel's centre.
 - [x] **THIN-GAP-GATHER** (0.440.13) — mode M at a forced large radius gathered a lit surface
   millimetres behind: the gather band's flat allowance is gone.
-- [ ] **GLOSSY-ADJ-VARIANCE** — the glossy lobe's adjoint is unbounded at grazing arrival; decision
-  owed (a reciprocal glossy lobe).
+- [ ] **GLOSSY-ADJ-VARIANCE** — the glossy lobe's adjoint is unbounded at grazing arrival; decided:
+  a GGX microfacet lobe (4.1).
 - [x] **GLOSSY-DEPTH-CAP** (0.440.4) — at the bounce cap mode R's glossy NEE kept only its MIS share;
   R now traces the ray its last vertex samples, for the light it reaches.
 - [x] **B-GPU-MAXBOUNCE** (0.439.9) — GPU mode B ignored `-max-bounce` (a literal 32 reached its
@@ -512,7 +528,8 @@ Then the rest of 4.2-4.6 in their order, 4.7's bookkeeping alongside whatever to
   not speed. The slow camera pass measured against it was the MIS weights' per-connection
   transmittances, computed once a sample since 0.436.5 (known-issues). Left: the template
   parameter that sizes the carrier to nothing in an achromatic render costs two more variants of
-  the largest kernel -- build time against VRAM, the operator's call.
+  the largest kernel -- decided (1) (4.1), with (2)'s half-precision bins kept for if VRAM gets
+  tight.
 - [x] **RADCACHE-BATCHES** — 0.439.3: the cache advances at its own schedule's boundaries over
   absolute samples, its merge canonical; the chunks follow the clock, and the image is the same
   at any thread count, chunking or stop and resume (`tools/check_radcache_det.py`).

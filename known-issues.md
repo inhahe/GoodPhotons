@@ -2912,6 +2912,8 @@ glossy lobe (normalized Phong, r (e + 2) / (2 pi) cos^e of the half-vector or of
 or a microfacet lobe) has no such tail in either direction, but changes how every glossy material
 renders -- its energy and its highlight shape.
 
+**Decided 2026-11-14: a GGX microfacet lobe** (the user's choice over normalised Phong).
+
 ## DONE (2026-11-12, 0.440.6): S-GPU-GLOSSY-BUMP — device mode S read normal-mapped glossy walls 1.043 of R
 
 Not the device's fault: mode R's own two glossy strategies disagreed on a tilted shading normal
@@ -2939,6 +2941,8 @@ and its connections likewise -- non-physical but consistent; or (b) make the mod
 (1 - R(in)) (1 - R(out)) on every body scattering in every mode -- reciprocal, so the modes agree
 by construction, and a layered body renders darker, by about 8 % at normal incidence for ior 1.5
 and more at grazing angles.
+
+**Decided 2026-11-14: (b)**, the physical coat in every mode.
 
 ## CLOSED (2026-11-12, 0.440.3): GLOSSY-ROOM-M — mode M reads a room of glossy walls 0.5 % bright on the host
 
@@ -3465,6 +3469,12 @@ which needs measuring against the float carrier on `_lay_chroma` and gallery_rai
 replaces it. Not done in 0.391.3 because `gallery_rain`, the scene the VRAM matters for, is
 chromatic (its prism disperses), so only (2) would help it, and its flyby was waiting on the
 correctness fixes.
+
+**Decided 2026-11-14: (1).** (2) is kept as the next step if VRAM gets tight. They are not
+alternatives: (1) removes the carrier where it is off, (2) halves it where it is on -- the only
+help for a chromatic scene such as `gallery_rain`. (2)'s costs: the precision above, which must be
+measured before it replaces the float carrier, a conversion at each read and write, and the
+maximum's renormalisation whenever the bins change.
 
 ## OPEN (2026-10-18): PER-OBJECT-MODES — what per-object render modes do not do yet
 
@@ -4031,7 +4041,10 @@ also fixed for mode U. Hair-free scenes render bit-identically to 0.384.4 (modes
 the measured noise per region for D and J (see RAIN-J-VS-D).
 
 
-## OPEN (2026-10-18): COMPOTE-NO-CAUSTIC — under the 20° sun the gem compote throws no caustic, and no cap can fix it
+## CLOSED (2026-11-14): COMPOTE-NO-CAUSTIC — under the 20° sun the gem compote throws no caustic, and no cap can fix it
+
+**Accepted** (the user's decision, 2026-11-14): the compote is a piece to look at, not a caustic
+source, as its flyplan entry already treats it. The finding:
 
 Found while re-siting the gallery caps for the 20° sun (design.md, "Everything in this list was
 measured under the 45° sun"). `scraps/_compote_rig.py` stands the compote's own 13 mesh blocks on
@@ -4120,6 +4133,10 @@ That changes `gallery_rain`, whose grid lines are meant to glow without lighting
 it waits on the user: either the grid gets a material flag that keeps it unlit, or the fix
 lands and the scene is rebalanced. Until then, mode P's runaway fit is the one result here that
 is plainly wrong rather than a choice; its fix belongs with the emitter registration.
+
+**Decided 2026-11-14:** register the emitters so every mode agrees, add a material option for a
+surface that glows without lighting anything (every mode honouring it the same way), and render a
+`gallery_rain` frame with and without the option for the user to choose the grid's look.
 
 **Fixed alongside (0.384.3): device mode U showed such a glow black.** Its camera kernel keyed
 emission on hit off `dEmitterForMat` alone, and its light subpaths scattered off a glow the host
