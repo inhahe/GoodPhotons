@@ -149,7 +149,12 @@ the code; all 15 held. Fixed in 0.442.1:
   33x too bright); the curv/cavity pattern refusal names `glow_only on`; four comments that still
   said a pattern stays out of an emitter's selection, and registerGlows' history-telling comment.
 
-## OPEN (2026-11-14, 0.442.0): KEEPWINDOW-VRAM — a finished render held open by `-keepwindow` keeps all its device memory
+## DONE (2026-11-14, 0.442.3; opened 0.442.0): KEEPWINDOW-VRAM — a finished render held open by `-keepwindow` keeps all its device memory
+
+**Fixed in 0.442.3:** main() releases OIDN's and CUDA's contexts (`cudaGracefulShutdown`) before the hold instead of after it. A mode-J GPU render of `scenes/_gap_leak.ftsl` held by `-keepwindow`: the GPU's memory in use read 5570 MiB while it held its window (0.442.2), 0 MiB now; the
+window stays up showing its image and `-stop` still ends the hold cleanly.
+
+The finding:
 
 Found rendering two gallery_rain frames one after the other (GLOW-LIGHT-MODES' comparison): the
 first, done and holding its window (`-keepwindow`, which CLAUDE.md asks of every render), still held

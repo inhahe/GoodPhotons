@@ -7590,7 +7590,9 @@ as the one at fault.
     per guide set (keyed by `Images::id`, never by address, which a freed set can hand on).
     `main` releases them (`oidnrt::shutdown`) just before `cudaGracefulShutdown`, which it then
     runs even when ftrace's own CUDA never started if OIDN was on a GPU, so OIDN's context is
-    not left for the driver to reap after exit. OIDN's device follows `-device cpu` unless
+    not left for the driver to reap after exit. Both run as soon as `run()` returns, BEFORE a
+    `-keepwindow` hold (0.442.3, KEEPWINDOW-VRAM): the held window shows a host image, and a
+    held process that kept its contexts kept all their device memory, paging the next GPU render. OIDN's device follows `-device cpu` unless
     `-oidn-device` says otherwise, and its requested memory cap (`maxMemoryMB`, 1 GB) counts as
     this process's in the VRAM preflight.
   - **Guide images** (`denoise_guide.h`): per pixel, the albedo and world-space shading normal

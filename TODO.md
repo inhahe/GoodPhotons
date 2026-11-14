@@ -284,8 +284,8 @@ Then the rest of 4.2-4.6 in their order, 4.7's bookkeeping alongside whatever to
   larger radius -- find out why first), then pick the merges' radius rule by an equal-time sweep.
 - [ ] **GLOW-MIS-J-HOST** — host mode J reads a glowing isosurface's floor 1.7 % over mode U (6
   sigma; device J 0.9999), check_glow_mis.
-- [ ] **KEEPWINDOW-VRAM** — a finished render held open by `-keepwindow` keeps all its device memory,
-  so the next GPU render pages (~45x slower); it should release the device when the render ends.
+- [x] **KEEPWINDOW-VRAM** (0.442.3) — a finished render held open by `-keepwindow` kept all its device
+  memory, so the next GPU render paged (~45x slower); it gives the device back as the render ends.
 - [x] **J-THIN-GAP-LEAK** (0.442.2) — modes J and U merged the photons a millimetre under a surface
   as its own; their merges keep their own surface's photons now. Mode D's bright gap mouth was real
   light, which mode R under-samples (`tools/check_gap_merge.py`). Left: GAP-MERGE-RADIUS.

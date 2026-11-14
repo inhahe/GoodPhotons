@@ -31735,6 +31735,18 @@ int main(int argc, char** argv) {
     // no window; the reason comes from whichever driver last hit its budget.
     if (g_liveWin && !g_liveWin->closed())
         markLiveWindowDone(g_finishReason.empty() ? "render complete" : g_finishReason);
+    // The device goes back before the hold below, not after it: a held window shows a host image,
+    // and a finished render that kept its contexts kept every byte of device memory they held, so
+    // the next GPU render beside it paged (KEEPWINDOW-VRAM: ~45x slower). OIDN first: its GPU
+    // context has to be released before the CUDA teardown, and that teardown has to run even when
+    // ftrace's own CUDA never did (`-topng -oidn`, `-device cpu -oidn`) -- otherwise OIDN's context
+    // is the one the driver reaps after exit.
+    const bool oidnOnGpu = oidnrt::shutdown();
+#ifdef HAVE_CUDA
+    cudaGracefulShutdown(oidnOnGpu || g_optixUsedCuda);
+#else
+    (void)oidnOnGpu;
+#endif
     // -keepwindow / -hold: keep the finished image on screen. The live window runs its
     // own UI thread, so we just block here until the user closes it (or it's already gone)
     // rather than letting process exit tear it down the instant the render completes.
@@ -31750,14 +31762,5 @@ int main(int argc, char** argv) {
             std::this_thread::sleep_for(std::chrono::milliseconds(50));
     }
     stopChannelEnd();
-    // OIDN first: its GPU context has to be released before the CUDA teardown, and that
-    // teardown has to run even when ftrace's own CUDA never did (`-topng -oidn`,
-    // `-device cpu -oidn`) -- otherwise OIDN's context is the one the driver reaps after exit.
-    const bool oidnOnGpu = oidnrt::shutdown();
-#ifdef HAVE_CUDA
-    cudaGracefulShutdown(oidnOnGpu || g_optixUsedCuda);
-#else
-    (void)oidnOnGpu;
-#endif
     return rc;
 }
