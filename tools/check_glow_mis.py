@@ -10,18 +10,19 @@ vertex at all, and every strategy that needs it is impossible. Before 0.439.7 th
 every 0 as the first kind (but a sun's NEE, special-cased in 0.391.5), so the strategy that did
 fire was weighed against ones that never do.
 
-The glow is the case to see it on: a surface whose material emits but that has no emitter (an
-isosurface registers none) can be reached only by the eye path landing on it (s = 0) -- no light
-subpath starts on it and NEE cannot pick it, so its light origin density is 0. The camera sees a
-floor lit by such a glow sphere, standing behind the camera, and by a lamp. In modes D and J the
-s = 0 strategy must take the glow's light at weight 1; before, they weighed it against light
-tracing from the glow at a ratio that depended on the scene's units, and read the frame at 0.748
-of mode U on both devices (whose host counts a glow at full weight: vcm.h). What a glow lights is
-not the same in every mode -- R, M, S and B drop it on a diffuse arrival (GLOW-LIGHT-MODES) -- so
-the reference here is mode U on the host. The frame's mean, both seeds averaged, must be within
-3 % of it in modes D and J on the host and the device, and in mode U on the device (the seeds
-differ by about 0.5 %; two of them are too few to let a standard error widen the band). Exits 1
-on any failure.
+The glow was the case to see it on: a surface whose material emits but that had no emitter (an
+isosurface, until 0.442.0) could be reached only by the eye path landing on it (s = 0), and modes
+D and J weighed that against light tracing from the glow at a ratio that depended on the scene's
+units: the frame read 0.748 of mode U on both devices. Since 0.442.0 the same isosurface is an
+emitter (a Glow, sampled by the lines through its box: ftsl.h registerGlows) and lights the floor
+in every mode, so the check now holds the bidirectional modes' weights of a Glow's light -- its
+light subpaths and light sampling against the eye path landing on it, which weigh the Glow's
+crossing-weighted draws by its nominal density -- to mode U on the host: the camera sees a floor
+lit by the glow sphere, standing behind the camera, and by a lamp. The frame's mean, both seeds
+averaged, must be within 3 % of it in modes D and J on the host and the device, and in mode U on
+the device (the seeds differ by about 0.5 %; two of them are too few to let a standard error widen
+the band). (A glow that lights nothing, `glow_only`, is tools/check_glow_modes.py's.) Exits 1 on
+any failure.
 """
 import argparse
 import os

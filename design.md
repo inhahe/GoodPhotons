@@ -3367,6 +3367,58 @@ covers the coats (a lamp in a thin-film block and in a multilayer one, R against
 seen through glass, against R), mode M's final gather, nested ranked dielectrics (M and S in water
 holding a glass ball), and on the device `-rgb`, mode S and every one of those.
 
+## Every emissive surface is a light; `glow_only` (0.442.0)
+
+A material with `emit` makes whatever it is bound to emit, and an emitter is what lets a mode light
+anything with that: light sampling, a light subpath and a photon all start on one. Until 0.442.0
+only a light block and an emissive `mesh` block registered one, and every other emissive surface
+was lit differently by every mode (known-issues GLOW-LIGHT-MODES). Now:
+
+* **Registration** (`ftsl.h registerGlows`, run once all geometry is loaded and before the
+  unlit-scene test): the triangles of each emissive material -- every mesh block's, bare quad's
+  and polygon's, and the world-space copies of instanced assets' -- form one mesh light per
+  material and motion set (`Scene::addMeshLightOf`, which takes any list of triangles; a mesh
+  block's own emitter is kept when it covers them all already, and replaced by the merge
+  otherwise, which also ends two mesh blocks sharing a material registering two emitters for it);
+  each sphere is a sphere light, or a Glow under an emission pattern; each isosurface or CSG solid
+  is a Glow. `Scene::emitterForMat` finds a hit's emitter by its material, so a material has one
+  emitter: every surface after the first needing one of its own gets a copy of its material
+  (`glowClone`, named `name [2]`, with a routed copy of the copy for a per-object-mode surface).
+  A light block's own surface (`reflectsNothing`) is left alone.
+* **The Glow** (`EmitterShape::Glow`, device shape 7) samples an analytic primitive by the lines
+  through its box (`Scene::glowSamplePoint`, device `dGlowSamplePoint`). A line uniform over the
+  lines meeting a convex box -- entry point uniform over its surface S, direction cosine-
+  distributed inward -- crosses any surface inside it with density 2 / S per unit area, whatever
+  the surface's shape (Crofton). Of the k crossings the primitive's own intersector finds along
+  the line, one chosen uniformly (reservoir) is a point of density 1 / `area`, `area` = S / 2,
+  carrying weight k: `emitterSamplePoint` returns k times the pattern there as the multiplier
+  every caller already applies, so the pdfs everywhere else stay the area-light ones. A line that
+  crosses nothing gives no point (a forward photon is not born). The point is a real hit, read as
+  closestHit reads one (its pattern side and normal map), so an emission pattern -- curvature and
+  cavity included -- agrees between the sample and a hit exactly. The draw needs more than two
+  uniforms: callers pass their stream; `emitterGeom` (mode W's grid) seeds one from its two.
+* **Selection** (`Emitter::selW`, finalizeEmitters): a patterned or Glow emitter is chosen in
+  proportion to the light it emits -- the mean multiplier over 4096 of its draws -- rather than by
+  its bare area (a 2000 m^2 ground whose glowing grid lines cover 3 % of it, a wire frame in its
+  box). `power` carries it, so light sampling and every MIS density follow; the forward modes,
+  whose photons carry the total power analog, divide it out of a born photon.
+* **`glow_only on`** (`Material::glowOnly`) keeps a material out of registration: a glow that
+  lights nothing. Such a glow (`Scene::isGlow`: emits, no emitter) is counted by every mode only
+  along a camera path whose every vertex before it was specular (`isSpecularType`, the set mode
+  R's `specularArrival` already used): mode R's `GiCtx::pastDiffuse` (its specular re-arm would
+  otherwise count the light the glow throws through a mirror onto a wall), modes D and J's
+  `glowSeenBy` at s = 0, mode U's `camGlow`, M's and S's camera walks past a strand; M's final
+  gather does not count one at all. The forward modes see it only directly, in the sky pass
+  (`main.cpp glowMatSeen`, `prepareSky`, `addBlurredSkyRows`), whose `glowsOnly` form gives mode
+  P's forward layer the same (its fit over the diffuse-side pixels otherwise read the glow's edge
+  pixels in the camera side only and ran the frame bright). Mode C, which catches photons through
+  its pupil, does not see one. The camera's wavelength density includes the glows' emission
+  (`Scene::glowG`, a twentieth of its mass; device `DScene::glowG`), so a glow whose colour no
+  light emits is still drawn.
+* **Refused** unless `glow_only`: an emissive curve (nothing samples a strand), an emissive child
+  of a mix or layered material, an emissive isosurface whose motion is not a similarity, and
+  instanced assets' emissive triangles shared by placements that need different emitters.
+
 ## Module map (src/)
 
 - **`main.cpp`** (~6200) — CLI parsing (the option table is a chain of `else if`s split
@@ -3607,11 +3659,9 @@ holding a glass ball), and on the device `-rgb`, mode S and every one of those.
   `matEmit[SPEC_N]` (plus `rgbMatEmit` for the fast RGB path), and those sites fall back
   to it when `dEmitterForMat() < 0`. The *emitter* is still preferred where one exists —
   its SPD may carry a `power`/`lumens` flux normalisation the raw material spectrum does
-  not, and that ordering is also what stops a mesh light double-counting. Such surfaces
-  remain emission-on-hit only (no NEE, no forward emission): they glow but illuminate
-  nothing, including themselves — logged as a known limitation (and not uniformly so: modes D, J
-  and U count what a diffuse arrival sees of one -- D and J only in part before 0.439.7 --
-  known-issues GLOW-LIGHT-MODES). Every emission-on-hit site reads the per-hit factor through
+  not, and that ordering is also what stops a mesh light double-counting. Since 0.442.0 every
+  emissive surface but a `glow_only` one has an emitter (see "Every emissive surface is a light"),
+  so the fallback serves the glows that light nothing. Every emission-on-hit site reads the per-hit factor through
   `emitHitScale` / `dEmitHitScale` (the emission pattern times an aimed quad's law, 0.384.4),
   and a path ends at
   an emissive surface only when it is a light block's own (`Material::reflectsNothing`): any other

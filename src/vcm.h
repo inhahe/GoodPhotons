@@ -670,7 +670,7 @@ inline void traceLightSubpath(const Scene& scene, const Camera& cam, const Rende
         nOut = dir;
     } else {
         double areaScale = 1.0;   // its area at the pass's time about the point
-        emitScale = emitterSamplePoint(scene, em, u1, u2, y, nOut, &areaScale);
+        emitScale = emitterSamplePoint(scene, em, u1, u2, y, nOut, &areaScale, &rng);
         if (em.area <= 0.0) return;
         pdfPos = 1.0 / (em.area * areaScale);
         if (em.normalTilted) {                       // an aimed quad: intensity-proportional
@@ -981,6 +981,9 @@ inline Vec3 traceCameraSubpath(const Scene& scene, const Camera& cam, const Rend
     // inferred from dVCM == 0, which a delta vertex sets but which says nothing about the
     // vertices before it.
     bool camAllDelta = true;
+    // ...and through specular surfaces only (isSpecularType, or a delta step): what a glow no
+    // emitter samples is seen through (bdpt.h glowSeenBy).
+    bool camGlow = true;
     const bool hasSun = scene.sunCount > 0;
     // The vertex just left, should the walk land on an emitter next: its shading normal and its
     // oriented geometric one, and whether it softens toward an emitter at all (bdpt.h
@@ -1071,10 +1074,11 @@ inline Vec3 traceCameraSubpath(const Scene& scene, const Camera& cam, const Rend
 
         Vec3 wo = normalize(prevP - h.p);        // toward the previous camera vertex (= -rd)
 
-        // (a) Emission: the camera path hit an emitter (s=0 strategy).
+        // (a) Emission: the camera path hit an emitter (s=0 strategy), or a glow no emitter
+        // samples, which counts only as it is seen (camGlow).
         if (mp->isLight) {
             double cosLight = dot(h.ng, wo);
-            if (cosLight > 0.0) {
+            if (cosLight > 0.0 && (camGlow || scene.emitterForMat(h.matId))) {
                 // Achromatic `emit pattern:` and aimed-quad factor at this hit (emitHitScale) —
                 // the same value the light-subpath / NEE sides get from emitterSamplePoint and
                 // the aim helpers at this point.
@@ -1191,7 +1195,7 @@ inline Vec3 traceCameraSubpath(const Scene& scene, const Camera& cam, const Rend
                     } else {
                         Vec3 yL, nL;
                         double areaScale = 1.0;   // its area at the pass's time about the point
-                        epat = emitterSamplePoint(scene, em, u1, u2, yL, nL, &areaScale);
+                        epat = emitterSamplePoint(scene, em, u1, u2, yL, nL, &areaScale, &rng);
                         Vec3 toL = yL - h.p; dist2 = dot(toL, toL);
                         if (dist2 > 1e-12 && em.area > 0.0) {
                             distL = std::sqrt(dist2); wi = toL / distL;
@@ -1467,6 +1471,7 @@ inline Vec3 traceCameraSubpath(const Scene& scene, const Camera& cam, const Rend
         beta *= betaFactor;
         for (int i = 0; i + 1 < nUp; ++i) betaSec[i] *= secChromatic ? secF[i] : betaFactor;
         if (!delta) camAllDelta = false;        // disqualifies the escaped-sun strategy
+        if (!delta && !isSpecularType(mp->type)) camGlow = false;
         if (delta && !keepBundle) nUp = 1;      // de-hero (see traceLightSubpath)
         prevP = h.p;
         softOn = !delta && connectible && !isFiberMat(*mp);

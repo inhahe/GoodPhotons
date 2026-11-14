@@ -246,10 +246,10 @@ Then the rest of 4.2-4.6 in their order, 4.7's bookkeeping alongside whatever to
   the camera looks past the scene. (b) Keep R, D and J as they are, and have the forward modes
   warn at load that they light an unbounded haze only near the scene. Recommended: (b), since the
   three that agree are the modes scenes are rendered with.
-- [x] **GLOW-LIGHT-MODES** — decided 2026-11-14: register emitters for emissive analytic
-  primitives so every mode agrees, add a material option for a surface that glows without lighting
-  anything (honoured the same way by every mode), and render a `gallery_rain` frame with and
-  without it for the user to choose the grid's look. A glow with no emitter lights nothing in
+- [x] **GLOW-LIGHT-MODES** — decided 2026-11-14 and done in 0.442.0: every emissive surface has an
+  emitter (an isosurface's sampled by the lines through its box), `glow_only on` keeps one a glow
+  that lights nothing, the same way in every mode. Owed: the user's choice of `gallery_rain`'s grid
+  and stands (`gridground`, `wirecage`: lit, or `glow_only`), from a frame rendered each way. A glow with no emitter lights nothing in
   R/M/S/B, all of itself in D/J/U; mode P runs away on it (x368).
 
 ### 4.2 Wrong, missing or silent output
@@ -279,6 +279,9 @@ Then the rest of 4.2-4.6 in their order, 4.7's bookkeeping alongside whatever to
 - [x] **B-GPU-MAXBOUNCE** (0.439.9) — GPU mode B ignored `-max-bounce` (a literal 32 reached its
   kernels).
 
+- [ ] **J-THIN-GAP-LEAK** — mode J lights a surface's top with a light 1 mm under it (167x mode R
+  with the light the surface's own underside, 1.21x with a light block in the gap; 0.441.1 alike),
+  and mode D shows the gap's mouth as a line mode R barely sees (`scenes/_gap_leak*.ftsl`).
 - [x] **MERGE-PROXIMITY** (0.431.0) — every gather keeps only the photons near its tangent plane
   (`gatherplane.h`), except on a curve; mode M's sheet lit from below read 21x, now 0.
 - [x] **HAZE-SUN-B** (0.434.15, 0.434.16) — mode B lights an unbounded sunlit haze at 0.163 of
@@ -584,9 +587,14 @@ Then the rest of 4.2-4.6 in their order, 4.7's bookkeeping alongside whatever to
   0.441.0); only D and
   J route (U and the unidirectional modes are separate renderers).
 
-- [ ] **An emissive `quad` / isosurface / CSG solid glows but does not illuminate** (two entries:
-  "KNOWN LIMITATION" and "LIMITATION (2026-08-02)") — register emitters for them. Waits on the
-  GLOW-LIGHT-MODES decision (4.1).
+- [x] **An emissive `quad` / isosurface / CSG solid glows but does not illuminate** — done,
+  0.442.0: every emissive surface gets an emitter at load (an isosurface's sampled by the lines
+  through its box), `glow_only on` keeps one a glow that lights nothing (GLOW-LIGHT-MODES).
+- [ ] **Emission-pattern importance sampling** — a patterned emitter (gallery_rain's 2000 m^2
+  ground, whose grid lines are 3 % of it) is chosen by the light its pattern lets out since
+  0.442.0, but sampled uniformly over its area, so most of its samples land where it is dark.
+  Sampling the pattern itself needs its density at a hit: the hit's triangle and barycentrics in
+  every mode, host and device.
 - [ ] **Mode S in participating media** — refused since 0.384.2 (SPPM-LIGHT-SIDE); a volume
   estimator (photon beams, as mode M's `-beams`) would lift it.
 - [ ] **"the live window cannot repaint mid-image"**.

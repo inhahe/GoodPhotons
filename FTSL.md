@@ -1312,22 +1312,45 @@ multiplier, on the emission slot; a `light` block spells its slot `spd`, so ther
 `spd pattern:<n>` / `spd_map pattern:<n>`. Three things make emission different from the other
 two slots:
 
-* **Only quad and mesh emitters may carry one.** An emission profile is read from *both* sides
-  of transport — once when a camera path lands on the emitter, once at the point NEE / a light
-  subpath samples on it — and MIS combines the two, so if they disagreed the image would be
-  **biased**, not merely noisy. Only a rectangular area light (bilinear parameters) and a mesh
-  emitter (barycentric UVs) can report a sampled (u,v) that provably equals the one a hit
-  interpolates. A `sphere` / `cylinder` / `spot` / `sun` / `env` light is **refused** at load.
+* **A `light` block's profile: on `area` lights only.** An emission profile is read from *both*
+  sides of transport — once when a camera path lands on the emitter, once at the point NEE / a
+  light subpath samples on it — and MIS combines the two, so if they disagreed the image would be
+  **biased**, not merely noisy. A rectangular area light (bilinear parameters) and a mesh emitter
+  (barycentric UVs) report a sampled (u,v) that provably equals the one a hit interpolates; an
+  emissive sphere or isosurface is sampled through a real hit on it (since 0.442.0), so it may
+  carry one too. A `sphere` / `cylinder` / `spot` / `sun` / `env` *light block* is **refused**.
 * **`power` / `lumens` normalise the *unpatterned* spectrum.** The pattern is a pure
-  post-multiplier on radiance — which is exactly what keeps every selection and positional pdf
-  untouched, and hence the estimator unbiased — so a profile averaging 0.5 emits about half the
-  requested flux. Scale `power` up to hold total output fixed.
+  post-multiplier on radiance, so a profile averaging 0.5 emits about half the requested flux.
+  Scale `power` up to hold total output fixed. (Since 0.442.0 the light is *chosen* for sampling
+  by the light the pattern lets out, measured at load, so a mostly dark profile no longer takes
+  light samples from the scene's other lights; what it emits is unchanged.)
 * **CPU *and* GPU** (ported in 0.82.0). `DMaterial::emitPat` / `DEmitter::emitPat` mirror the
   host pair, so an emission pattern no longer forces a CPU fallback.
 
-An emissive **material** (`emit` on a `material` block) only becomes a *sampleable* light when
-it is bound to a `mesh {}`; a bare `quad {}` with an emissive material just adds emissive
-triangles that emission-on-hit can see.
+**Every emissive surface is a light** (since 0.442.0). A material with `emit` lights the scene
+wherever it is bound — a `mesh`, a bare `quad` or `polygon`, a `sphere`, an `isosurface` or CSG
+solid, a `mesh_instance` — in every mode alike: ftrace registers an emitter for it at load (one per
+material for its triangles, one per sphere or isosurface; an isosurface's is sampled by the lines
+through its box, which find its surface wherever it is, so even a thin wire frame lights the
+scene exactly). Before 0.442.0 only a `mesh` block's did, and the rest glowed and lit nothing in
+some modes and all of themselves in others.
+
+**`glow_only on` — a glow that lights nothing.** On a material with `emit`, it keeps the surface a
+glow: seen by the camera, and through the mirrors, glass and glossy reflections after it, and
+lighting nothing — no surface, no medium, in any mode. Use it for a glowing grid or a neon outline
+meant to read as light without casting any. The forward modes (`A`, `B`, `V`, and mode `P`'s
+forward layer) see such a glow only where the camera sees it directly, as they see the sky; mode
+`C` does not see it at all.
+
+```
+material "neon" { type diffuse  reflect 0.02  emit gaussian 528 34 0.5  glow_only on }
+```
+
+Refused, unless the material is `glow_only`: an emissive material on a curve or `fur` (nothing
+samples a strand), as the child of a `mix` or `layered` material (the share of the surface it
+covers varies), on an isosurface whose motion stretches it unevenly, and on `mesh_instance`
+placements that move differently from the material's other surfaces without a `material`
+override of their own.
 
 Worked examples: `scenes/reflect_pattern.ftsl`, `scenes/transmit_pattern.ftsl`,
 `scenes/emit_pattern.ftsl`.
@@ -2721,7 +2744,7 @@ See README → **Exporting an isosurface to a mesh** for details; the code is `s
 
 ## 11. `light` — emitters
 
-Every scene needs at least one `light` (an emissive mesh or an emissive volume counts). The
+Every scene needs at least one `light` (an emissive surface or an emissive volume counts). The
 one exception is the preview (0.369.0): a scene opened with nothing to render — `ftrace
 part.ftsl`, `-raster`, `-explore` — that has no light is lit by the model viewer's photo
 studio instead of being refused, so a part written to be `include`d can be looked at on its

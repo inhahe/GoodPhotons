@@ -3038,7 +3038,8 @@ struct Renderer {
             // call) when the emitter carries no pattern.
             // A light its keys scale, or a mesh light that deforms, emits from its area at the
             // photon's time: the power it was chosen by, the instant's, grows with it (1 unchanged).
-            emitPatW = emitterSamplePoint(scene, em, u1, u2, origin, emitN, &spotW);
+            emitPatW = emitterSamplePoint(scene, em, u1, u2, origin, emitN, &spotW, &rng);
+            if (em.shape == EmitterShape::Glow && !(emitPatW > 0.0)) return;   // its line crossed nothing
             if (em.collimated) dir = scene.lightDirNow(em, em.beamDir);
             else if (em.normalTilted) {             // an aimed quad: intensity-proportional
                 double pdfAim = 0.0;
@@ -3069,6 +3070,7 @@ struct Renderer {
         beta = !scene.emissiveVolumes.empty() ? grandTotal
              : ((scene.emitters.size() == 1) ? em.power : scene.totalPower);
         beta *= spotW;   // 1 for a still, unscaled area light (a spot's reweight, a light's growth)
+        if (em.selW != 1.0) beta /= em.selW;   // chosen by its emitted light, not its area (Emitter::selW)
         // Image env: replace the flat power with the directional estimator. The base
         // beta carries the mean env power; multiply by L(dir,lambda)/(4pi*pdfW*mean)
         // so the photon represents the radiance actually arriving from `dir`. (No-op
@@ -4057,7 +4059,8 @@ struct Renderer {
                    + t * (rd * std::cos(pd)) + b * (rd * std::sin(pd));
             emitN = dir;
         } else {
-            emitPatW = emitterSamplePoint(scene, em, u1, u2, origin, emitN, &spotW);   // its area now (scalar tracer)
+            emitPatW = emitterSamplePoint(scene, em, u1, u2, origin, emitN, &spotW, &rng);   // its area now (scalar tracer)
+            if (em.shape == EmitterShape::Glow && !(emitPatW > 0.0)) return;   // its line crossed nothing
             if (em.collimated) dir = scene.lightDirNow(em, em.beamDir);
             else if (em.normalTilted) {             // an aimed quad -- see the scalar tracer
                 double pdfAim = 0.0;
@@ -4081,6 +4084,7 @@ struct Renderer {
         // directional radiance estimator (no-op for a constant env).
         double base = (scene.emitters.size() == 1) ? em.power : scene.totalPower;
         base *= spotW;
+        if (em.selW != 1.0) base /= em.selW;   // see the scalar tracer
         double beta[hero::kHeroMax];
         for (int i = 0; i < C; ++i) beta[i] = base / C;
         if (em.shape == EmitterShape::Env && scene.envMap) {

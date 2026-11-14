@@ -2186,7 +2186,7 @@ inline int generateLightSubpath(const Scene& scene, const Camera& cam, const Ren
     // subpath's s=0/s=1 MIS terms assume — so the estimator is unchanged apart from the
     // radiance itself. Vertex::emitPatW carries the same factor for those MIS terms.
     double areaScale = 1.0;   // its area at the path's time about the point (1 unchanged)
-    double emitPatW = emitterSamplePoint(scene, em, u1, u2, y, nOut, &areaScale);
+    double emitPatW = emitterSamplePoint(scene, em, u1, u2, y, nOut, &areaScale, &rng);
     double Le = em.spdFn(lambda) * invPdfLambda * emitPatW;   // emitted radiance at lambda
     // The bundle's other wavelengths: a subpath dark at the hero alone still carries them (the
     // walk goes on while any wavelength lives), as deltaLightSubpath's does.
@@ -3931,6 +3931,18 @@ inline double connShorten(const Vertex& v, const Vec3& dir, double eps) {
     return eps;
 }
 
+// Whether an eye path's last vertex, eye[t - 1], is seen through what lies before it the way a
+// glow no emitter samples is seen (isSpecularType, scene.h): every vertex between the camera and
+// it a specular surface. Such a glow lights nothing, so only a camera path of that kind counts it,
+// as mode R's specularArrival does. Device twin dGlowSeenBy.
+inline bool glowSeenBy(const std::vector<Vertex>& eye, int t) {
+    for (int i = 1; i + 1 < t; ++i) {
+        const Vertex& v = eye[(size_t)i];
+        if (v.type != VType::Surface || !v.mat || !(v.delta || isSpecularType(v.mat->type))) return false;
+    }
+    return true;
+}
+
 // --- Connect one strategy (s,t) --------------------------------------------------
 // Returns the MIS-weighted radiance contribution of connecting the s-vertex light
 // subpath with the t-vertex eye subpath. For t==1 the contribution is a light-image
@@ -3977,6 +3989,7 @@ inline double connectBDPT(const Scene& scene, const Camera& cam, const Renderer&
         if (t < 2) return 0.0;
         const Vertex& pt = eye[t - 1];
         if (!pt.isLightVertex()) return 0.0;
+        if (pt.type == VType::Surface && !pt.light && !glowSeenBy(eye, t)) return 0.0;   // a glow: seen, not lit by
         Vec3 dwo = eye[t - 2].p - pt.p;          // degeneracy guard: normalize(0) is NaN
         if (dot(dwo, dwo) == 0.0) return 0.0;
         Vec3 wo = normalize(dwo);
@@ -4171,7 +4184,7 @@ inline double connectBDPT(const Scene& scene, const Camera& cam, const Renderer&
                 // Pattern factor at the sampled point (1.0 without a pattern). It scales Le
                 // below, never pdfA — see generateLightSubpath for why that stays unbiased.
                 double areaScale = 1.0;   // its area at the path's time about the point
-                emitPatW = emitterSamplePoint(scene, em, u1, u2, y, nOut, &areaScale);
+                emitPatW = emitterSamplePoint(scene, em, u1, u2, y, nOut, &areaScale, &rng);
                 Vec3 toL = y - pt.p; double dist2 = dot(toL, toL);
                 if (dist2 <= 0.0) return 0.0;
                 dist = std::sqrt(dist2); wi = toL / dist;

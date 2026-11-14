@@ -1366,14 +1366,14 @@ inline Vec3 photonGatherSub(const Scene& scene, const PhotonMap& pm, Ray ray, Pc
         // This no longer RETURNS: an emissive material still has a BSDF, so a glowing
         // diffuse surface both emits and reflects, and the walk has to go on to the density
         // estimate below. See photonGather for the measurement.
-        if (m.isLight && specularSeen && dot(ray.d, h.ng) < 0.0 && !hairArrival) {
+        // A glow no emitter samples lights nothing, so what reaches the visible point from one here
+        // is not counted (Scene::isGlow; BackwardRenderer::GiCtx::pastDiffuse).
+        const int eIdx = m.isLight ? BackwardRenderer::emitterIndexOfResolved(scene, m) : -1;
+        if (m.isLight && eIdx >= 0 && specularSeen && dot(ray.d, h.ng) < 0.0 && !hairArrival) {
             double rhoV = clamp01(diffuseReflectance(scene, visMat, visHit, lambda));
             // GLOSSY-NEE's lobe-sampling half; 1 (and bit-identical) unless the last bounce was
             // a glossy one that already connected to this emitter.
-            const double wMis = (gmis.pdf > 0.0)
-                ? bwNee.glossyHitWeight(scene, gmis,
-                        BackwardRenderer::emitterIndexOfResolved(scene, m), ray.d, &h)
-                : 1.0;
+            const double wMis = (gmis.pdf > 0.0) ? bwNee.glossyHitWeight(scene, gmis, eIdx, ray.d, &h) : 1.0;
             L += Vec3(cieX(lambda), cieY(lambda), cieZ(lambda))
                  * (thr * rhoV * emitSlot(scene, m, h, lambda, ray.d * -1.0) * invPdfL * wMis * contSoft);
         }
@@ -1627,6 +1627,9 @@ inline Vec3 photonGather(const Scene& scene, const PhotonMap& pm, Ray ray, doubl
     const bool gneeOn = BackwardRenderer::glossyNeeOn();
     BackwardRenderer::GlossyMis gmis;
     bool hairArrival = false;   // HAIR-NEE: the previous vertex was a fiber that already took its direct light
+    // The walk has gone on past a fibre's scattering (it does nowhere else but at a specular vertex):
+    // a glow no emitter samples is seen only before (BackwardRenderer::GiCtx::pastDiffuse).
+    bool pastDiffuse = false;
     double contSoft = 1.0;      // the softening the last vertex lends what it reaches (contSoftening)
     // The beam gather over one straight camera segment, times the throughput. The walk's spectral
     // factors and the glass the segment runs through are read at each beam's own wavelength
@@ -1769,11 +1772,10 @@ inline Vec3 photonGather(const Scene& scene, const PhotonMap& pm, Ray ray, doubl
         // GPU (dEmitterForMat missed the unregistered quad, so the emitter branch was never
         // taken and the grid vanished) — two mode-M paths disagreeing with each other and
         // both disagreeing with modes R and D. Measured on scraps/mini_grid.ftsl.
-        if (m.isLight && dot(ray.d, h.ng) < 0.0 && !hairArrival) {
+        const int eIdx = m.isLight ? BackwardRenderer::emitterIndexOfResolved(scene, m) : -1;
+        if (m.isLight && dot(ray.d, h.ng) < 0.0 && !hairArrival && (eIdx >= 0 || !pastDiffuse)) {
             const double wMis = (gmis.pdf > 0.0)          // GLOSSY-NEE, as in the sub-walk
-                ? bwNee.glossyHitWeight(scene, gmis,
-                        BackwardRenderer::emitterIndexOfResolved(scene, m), ray.d, &h)
-                : 1.0;
+                ? bwNee.glossyHitWeight(scene, gmis, eIdx, ray.d, &h) : 1.0;
             L += Vec3(cieX(lambda), cieY(lambda), cieZ(lambda))
                  * (thr * emitSlot(scene, m, h, lambda, ray.d * -1.0) * invPdfL * wMis * contSoft);
         }
@@ -1808,6 +1810,7 @@ inline Vec3 photonGather(const Scene& scene, const PhotonMap& pm, Ray ray, doubl
             L += Vec3(cieX(lambda), cieY(lambda), cieZ(lambda))
                  * strandStep(scene, bwNee, m, h, lambda, invPdfL, rng, thr, &sthr, ray, cont);
             hairArrival = true;
+            pastDiffuse = true;
             if (!cont) return L;
             continue;
         }
@@ -2049,6 +2052,8 @@ inline Vec3 photonGather(const Scene& scene, const PhotonMap& pm, Ray ray, doubl
                 if (passedThru) {   // ...and its bounce refunded
                     hairArrival = hairArrivalIn; gmis = gmisIn; contSoft = contSoftIn;
                     if (nullSteps < 256) { --b; ++nullSteps; }
+                } else {
+                    pastDiffuse = true;   // a fibre's scattering: no glow is seen past it
                 }
                 // SPECGATHER (0.333.0): the fiber's transmission is the most coloured factor a
                 // camera walk meets -- a blonde fiber absorbs blue and green -- and until now the

@@ -25,14 +25,14 @@ Modes R W D U S M B P on the host and the device (A images through a lens whose 
 light across edges). Until 0.384.2 mode S added a light's emission on whichever side its camera
 path met it, so the back of every light glowed in mode S on both backends.
 
-And a GLOW: a sphere whose material emits AND reflects but which has no emitter (an
-isosurface registers none), under a lamp, seen directly, must look as it does in mode R -- glow
-and lit body together, of about equal brightness, the mean over the sphere within 2 % (or 5
-standard errors, from the two seeds) -- in modes R W D U S M J on both backends. There is no floor, so nothing the glow lights
-can come back to it (what such a glow lights differs by mode: GLOW-LIGHT-MODES). B, A and C
-trace light only from emitters, so the glow itself is dark to them by design. Until 0.384.2
-device mode S, and until 0.384.3 device mode U, showed it black; until 0.384.4 modes S and U
-dropped its body, on both backends.
+And a GLOW: a sphere whose material emits AND reflects but which has no emitter (`glow_only`,
+which lights nothing; until 0.442.0 every emissive isosurface had none), under a lamp, seen
+directly, must look as it does in mode R -- glow and lit body together, of about equal brightness,
+the mean over the sphere within 2 % (or 5 standard errors, from the two seeds) -- in modes R W D U
+S M J B on both backends (mode B since 0.442.0, which adds a glow the camera sees directly as it
+adds the sky; tools/check_glow_modes.py checks what one lights). Until 0.384.2 device mode S, and
+until 0.384.3 device mode U, showed it black; until 0.384.4 modes S and U dropped its body, on both
+backends.
 Exits 1 on any failure.
 """
 import argparse
@@ -70,11 +70,11 @@ BEHIND_MODES = "RWDUSMBP"
 GLOW = [
     'camera "c" { eye 0 0.6 -2.5  look_at 0 0.4 0  up 0 1 0  fov_y 40  film { res 64 48 } }',
     # emit is per nm: 0.002 puts the glow beside the lamp-lit body, so losing either shows.
-    'material "glow" { type diffuse  reflect 0.6  emit 0.002 }',
+    'material "glow" { type diffuse  reflect 0.6  emit 0.002  glow_only on }',
     'isosurface { material glow  sphere { center 0 0.4 0  radius 0.3 } }',
     'light area { origin -0.3 1.6 -0.3  u 0.6 0 0  v 0 0 0.6  normal 0 -1 0  power 20  spd preset:d65 }',
 ]
-GLOW_MODES = "RWDUSMJ"
+GLOW_MODES = "RWDUSMJB"
 
 
 def main():

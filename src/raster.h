@@ -674,6 +674,12 @@ inline PreviewLight deriveLight(const Scene& sc, const Vec3& probePos, bool prob
                 p.size = std::sqrt(std::max(0.0, e.area) / (4.0 * PI));
                 break;
             }
+            case EmitterShape::Glow:                         // its box's centre, its surface's light
+                p.kind = PLight::Point;
+                p.pos = (e.glowLo + e.glowHi) * 0.5;
+                p.rgb  = rgb * (e.area * e.selW * 0.25);     // area * selW: what it emits over (selW)
+                p.size = 0.5 * length(e.glowHi - e.glowLo);
+                break;
             default:                                         // Sphere
                 p.kind = PLight::Point;
                 p.pos = e.origin;

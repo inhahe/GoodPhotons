@@ -100,6 +100,9 @@ inline void sppmVisiblePoint(const Scene& scene, Ray ray, Pcg32& rng, bool diffr
     BackwardRenderer::GlossyMis gmis;
     // CURVE-GATHER: the previous vertex was a diffuse strand, which took its direct light by NEE.
     bool strandArrival = false;
+    // The walk has gone on past a fibre's or a diffuse strand's scattering: a glow no emitter
+    // samples is seen only before (BackwardRenderer::GiCtx::pastDiffuse).
+    bool pastDiffuse = false;
     double contSoft = 1.0;   // the softening the last vertex lends what it reaches (contSoftening)
 
     // A coverage pass-through is no vertex: its bounce is refunded (capped: 256 is far above
@@ -169,14 +172,12 @@ inline void sppmVisiblePoint(const Scene& scene, Ray ray, Pcg32& rng, bool diffr
         if (m.isLight) {
             // A light emits from the face its triangles are wound to (the side its `normal`
             // picks, as backward.h tests it); not after a strand's NEE took it.
-            if (dot(ray.d, h.ng) < 0.0 && !strandArrival) {
+            const int eIdx = BackwardRenderer::emitterIndexOfResolved(scene, m);
+            if (dot(ray.d, h.ng) < 0.0 && !strandArrival && (eIdx >= 0 || !pastDiffuse)) {
                 // GLOSSY-NEE's lobe-sampling half; 1, and this expression bit-identical to its
                 // pre-0.266 form, unless the previous bounce was a MIS'd glossy one.
-                const double wMis = (gmis.pdf > 0.0)
-                    ? bwNee.glossyHitWeight(scene, gmis,
-                                            BackwardRenderer::emitterIndexOfResolved(scene, m),
-                                            ray.d, &h)
-                    : 1.0;
+                const double wMis = (gmis.pdf > 0.0) ? bwNee.glossyHitWeight(scene, gmis, eIdx, ray.d, &h)
+                                                     : 1.0;
                 directL += Vec3(cieX(lambda), cieY(lambda), cieZ(lambda))
                            * (thr * emitSlot(scene, m, h, lambda, ray.d * -1.0) * invPdfL * wMis * contSoft);
             }
@@ -210,6 +211,7 @@ inline void sppmVisiblePoint(const Scene& scene, Ray ray, Pcg32& rng, bool diffr
             directL += Vec3(cieX(lambda), cieY(lambda), cieZ(lambda))
                        * strandStep(scene, bwNee, m, h, lambda, invPdfL, rng, thr, &sthr, ray, cont);
             strandArrival = true;
+            pastDiffuse = true;
             if (!cont) return;
             continue;
         }
@@ -341,6 +343,7 @@ inline void sppmVisiblePoint(const Scene& scene, Ray ray, Pcg32& rng, bool diffr
                     if (nullSteps < 256) { --b; ++nullSteps; }
                 }
                 if (!passedThru) {
+                    pastDiffuse = true;   // a fibre's scattering: no glow is seen past it
                     const double* bins = hairSigmaBins<SpecThr::K, &SpecThr::lamOf>(scene, m, h);
                     sthr.mul([&](double lamK) {
                         const HairShade hk = hairShadeRetint(scene, m, h, lamK, hs,

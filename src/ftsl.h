@@ -57,6 +57,7 @@
 #include <unordered_map>
 #include <map>
 #include <set>
+#include <deque>
 #include <cctype>
 #include <cstdio>
 #include <cstdlib>
@@ -1318,8 +1319,9 @@ public:
         // if it has no camera either: a fragment made to be included usually has neither.
         auto unlit = [&]() {
             if (!L.studioIfUnlit) {
-                fail("scene has no light: add a 'light' block, an emissive ('emit') mesh, "
-                     "or an emissive volume ('temperature' + 'emission blackbody') that emits. "
+                fail("scene has no light: add a 'light' block, an emissive ('emit') surface that is "
+                     "not `glow_only`, or an emissive volume ('temperature' + 'emission blackbody') "
+                     "that emits. "
                      "To just look at it -- a groom or prop written to be `include`d, say -- "
                      "open it in the preview (`ftrace <scene.ftsl>` with no render flags, or "
                      "-raster), which lights an unlit scene with the model viewer's photo studio");
@@ -1329,6 +1331,9 @@ public:
             L.studioAdded = true;
             return true;
         };
+        // Every emissive surface a light block did not make gets its emitter (registerGlows) -- so
+        // a scene lit by glowing geometry alone has its lights.
+        if (!registerGlows(L)) return false;
         if (!haveLight && L.scene.emitters.empty() && !haveVolumeEmission && !unlit())
             return false;
         // Catch errors recorded via fail() inside add* helpers that returned true
@@ -1450,6 +1455,18 @@ public:
         for (const auto& kv : matIndex_)
             if (kv.second >= 0 && kv.second < (int)L.scene.matNames.size())
                 L.scene.matNames[kv.second] = kv.first;
+        // A copy registerGlows made for a surface's own emitter is named for its original and its
+        // turn among them: "wirecage [2]" (the original is the first).
+        {
+            std::map<int, int> nth;
+            const int nm = (int)L.scene.matNames.size();
+            for (const auto& [nid, base] : glowClones_)
+                if (nid >= 0 && nid < nm && base >= 0 && base < nm)
+                    L.scene.matNames[(size_t)nid] = (L.scene.matNames[(size_t)base].empty()
+                                                         ? std::string("material ") + std::to_string(base)
+                                                         : L.scene.matNames[(size_t)base]) +
+                                                    " [" + std::to_string(++nth[base] + 1) + "]";
+        }
         // A per-object `mode` copy is named for its original: "glass [mode J]" (see routedMat).
         for (const auto& kv : routeClone_)
             if (kv.second >= 0 && kv.second < (int)L.scene.matNames.size() &&
@@ -1623,6 +1640,10 @@ public:
                     // camera happens to be — which no emission profile may.
                     if (n.op != PatOp::VarCurv && n.op != PatOp::VarCavity &&
                         n.op != PatOp::VarFootprint) continue;
+                    // A Glow reads its pattern off a real hit (Scene::glowSamplePoint), so the
+                    // curvature and cavity its draws see are a hit's; only the view's footprint
+                    // is not.
+                    if (e.shape == EmitterShape::Glow && n.op != PatOp::VarFootprint) continue;
                     const char* which = (n.op == PatOp::VarCurv)   ? "curv"
                                       : (n.op == PatOp::VarCavity) ? "cavity" : "fw";
                     fail(std::string("an emit pattern cannot read `") + which +
@@ -1632,7 +1653,8 @@ public:
                     return false;
                 }
             }
-            if (e.shape == EmitterShape::Quad || e.shape == EmitterShape::Mesh) continue;
+            if (e.shape == EmitterShape::Quad || e.shape == EmitterShape::Mesh ||
+                e.shape == EmitterShape::Glow) continue;
             const char* what = (e.shape == EmitterShape::Sphere)   ? "sphere"
                              : (e.shape == EmitterShape::Cylinder) ? "cylinder"
                              : (e.shape == EmitterShape::Spot)     ? "spot"
@@ -5294,6 +5316,23 @@ private:
                                             constantSpectrum(0.0));
             m.isLight = true;
         }
+        // `glow_only on`: the surface glows -- seen directly and through mirrors, glass and glossy
+        // reflections -- and lights nothing, in every mode (Material::glowOnly). Without it an
+        // emissive surface gets an emitter at load and lights the scene (registerGlows).
+        if (find(b, "glow_only")) {
+            const std::string g = strOf(b, "glow_only", "off");
+            const bool on = (g == "on" || g == "true" || g == "yes" || g == "1");
+            if (!on && g != "off" && g != "false" && g != "no" && g != "0") {
+                fail("glow_only takes on or off (got '" + g + "')");
+                return m;
+            }
+            if (on && !m.isLight) {
+                fail("glow_only on a material that does not emit: give it an `emit` (a fluorescent "
+                     "material's `emit` is its reradiation, not a glow)");
+                return m;
+            }
+            m.glowOnly = on;
+        }
         // Tangent-space NORMAL MAP (C6): `normal_map texture:<name> [strength <s>]`.
         // Common to every material type. Binds a declared (linear-encoded) texture as
         // the material's normal map and reads an optional perturbation strength (default
@@ -6919,7 +6958,7 @@ private:
                                      b.name.empty() ? "(unnamed)" : ("'" + b.name + "'").c_str());
                 }
             }
-            addMeshEmitter(b, L, triStart, triEnd, id, /*own*/false);
+            if (!L.scene.mats[id].glowOnly) addMeshEmitter(b, L, triStart, triEnd, id, /*own*/false);
         }
         // Record the loaded mesh's world AABB for object-name fog bounds. This is no
         // longer the *shape* of such a bound — `bounds { object "..." }` solid-voxelizes
@@ -8188,6 +8227,279 @@ private:
         L.scene.addEnvLight(std::move(map), binWidth_);
         return true;
     }
+
+    // EVERY EMISSIVE SURFACE IS A LIGHT (GLOW-LIGHT-MODES). A material that emits lights the scene
+    // only where an emitter samples it -- light sampling, a light subpath and a photon all start on
+    // one -- and until 0.442.0 only a light block and an emissive mesh block registered one, so a
+    // bare quad, a mesh's second material, a sphere or an isosurface that emitted lit nothing in
+    // some modes and all of itself in others. Before the build each such surface gets one here:
+    //   triangles (quads, polygons, meshes, instanced assets): one mesh light per material and
+    //     motion set, the triangles of every mesh block of that material merged into it;
+    //   a sphere: a sphere light, or, under an emission pattern, a Glow (its pattern read off a hit);
+    //   an isosurface or CSG solid: a Glow, sampled by the lines through its box.
+    // A material is given one emitter only (Scene::emitterForMat finds a hit's emitter by its
+    // material), so every surface after the first that needs an emitter of its own -- each sphere and
+    // isosurface, and each motion set's triangles -- gets a copy of its material (glowClone); the
+    // light tree then picks among them by where they are. `glow_only on` keeps a material out
+    // (Material::glowOnly); a light block's surface has its emitter already. Refused unless
+    // `glow_only`: an emissive curve or fur (nothing samples a strand), the emissive child of a mix
+    // or a layered material (how much of the surface it is varies), an isosurface whose motion
+    // stretches it unevenly, and an instanced asset's emissive material that placements moving
+    // differently share (its triangles cannot take copies). False after a reported failure.
+    bool registerGlows(Loaded& L) {
+        Scene& S = L.scene;
+        const auto glows = [&](int m) {
+            if (m < 0 || m >= (int)S.mats.size()) return false;
+            const Material& mt = S.mats[(size_t)m];
+            return mt.isLight && !mt.glowOnly && !mt.reflectsNothing;
+        };
+        const auto nameOf = [&](int m) {
+            int base = S.matBase(m);
+            for (const auto& [nid, orig] : glowClones_) if (nid == base) base = orig;   // a copy: its original's
+            for (const auto& kv : matIndex_) if (kv.second == base) return "material '" + kv.first + "'";
+            return std::string("material ") + std::to_string(base);
+        };
+        // Refusals first: an emissive child of a compound, an emissive strand.
+        const auto compoundOk = [&](int m, const char* what) {
+            if (m < 0 || m >= (int)S.mats.size()) return true;
+            for (int c : S.mats[(size_t)m].mixChildren)
+                if (glows(c)) {
+                    fail(nameOf(c) + " emits inside the mix or layered " + nameOf(m) + " on " + what +
+                         ": no emitter can sample a share of a surface, so it would light nothing in some "
+                         "modes; give it `glow_only on` to keep it a glow that lights nothing");
+                    return false;
+                }
+            return true;
+        };
+        for (const Tri& t : S.tris) if (!compoundOk(t.matId, "a mesh")) return false;
+        for (const Sphere& s : S.spheres) if (!compoundOk(s.matId, "a sphere")) return false;
+        for (const Implicit& im : S.implicits) if (!compoundOk(im.matId, "an isosurface")) return false;
+        for (const CurveSeg& cs : S.curveSegs)
+            if (glows(cs.matId) || !compoundOk(cs.matId, "a curve")) {
+                fail(nameOf(cs.matId) + " emits on a curve or fur strand: no emitter samples a strand, so it "
+                     "would light nothing in some modes; give it `glow_only on` to keep it a glow");
+                return false;
+            }
+        // What the light blocks own (any surface they made has its emitter), and the mesh lights
+        // the mesh blocks registered, by material.
+        std::set<int> owned;
+        std::map<int, std::vector<int>> meshEm;
+        for (size_t e = 0; e < S.emitters.size(); ++e) {
+            const Emitter& em = S.emitters[e];
+            if (em.matId < 0) continue;
+            const int base = S.matBase(em.matId);
+            if (em.shape == EmitterShape::Mesh && glows(base)) meshEm[base].push_back((int)e);
+            else owned.insert(base);
+        }
+        const auto wants = [&](int m) { return glows(m) && !owned.count(S.matBase(m)); };
+        // Triangles, by (material, motion set): a scene triangle by index, an instance's by a
+        // world-space copy (std::deque: the copies keep their addresses as it grows).
+        struct TriGroup {
+            std::vector<int> tris;                                 // Scene::tris indices
+            std::vector<std::pair<int, size_t>> inst;              // (instance, copy index)
+            bool fixedInst = false;                                // an instance without an override
+        };
+        std::map<std::pair<int, int>, TriGroup> groups;
+        std::deque<Tri> copies;
+        std::vector<double> copyReach;
+        for (size_t i = 0; i < S.tris.size(); ++i)
+            if (wants(S.tris[i].matId)) groups[{S.matBase(S.tris[i].matId), S.tris[i].motion}].tris.push_back((int)i);
+        for (size_t ii = 0; ii < S.instances.size(); ++ii) {
+            const MeshInstance& in = S.instances[ii];
+            if (in.blasId < 0) continue;
+            const Blas& bl = S.blasList[(size_t)in.blasId];
+            // The material a placement shades an asset material `m` with.
+            const auto placed = [&](int m) {
+                if (in.matOverride >= 0) return in.matOverride;
+                if (in.route >= 0 && m >= 0 && S.mats[(size_t)m].routeTo[in.route] >= 0)
+                    return S.mats[(size_t)m].routeTo[in.route];
+                return m;
+            };
+            // Its distinct materials first, so a placement nothing on which emits costs nothing more.
+            bool any = false;
+            for (int m : blasMaterials(in.blasId, L)) {
+                if (!compoundOk(placed(m), "an instanced mesh")) return false;
+                any = any || wants(placed(m));
+            }
+            if (!any) continue;
+            for (const Tri& lt : bl.tris) {
+                const int m = placed(lt.matId);
+                if (!wants(m)) continue;
+                Tri w = lt;                                        // placed in the world
+                w.v0 = in.toWorld.apply(lt.v0); w.v1 = in.toWorld.apply(lt.v1); w.v2 = in.toWorld.apply(lt.v2);
+                const auto nw = [&](const Vec3& n) {
+                    return dot(n, n) > 0.0 ? normalize(in.toLocal.applyDirTranspose(n)) : n;
+                };
+                w.n0 = nw(lt.n0); w.n1 = nw(lt.n1); w.n2 = nw(lt.n2);
+                w.vkeys = -1; w.matId = m;
+                copies.push_back(w);
+                copyReach.push_back(in.reachMul * triReach(lt.v0, lt.v1, lt.v2) + in.reachAdd);
+                TriGroup& g = groups[{S.matBase(m), in.motion}];
+                g.inst.push_back({(int)ii, copies.size() - 1});
+                if (in.matOverride < 0) g.fixedInst = true;
+            }
+        }
+        // A base each surface after whose first takes a copy of; the copies' routed copies.
+        std::set<int> taken;
+        std::map<std::pair<int, int>, int> routedCopy;   // (copy, route) -> its routed copy
+        const auto cloneOf = [&](int base) {
+            Material c = S.mats[(size_t)base];
+            c.routeBase = -1; c.routeTo[0] = c.routeTo[1] = -1;
+            const int nid = (int)S.mats.size();
+            S.mats.push_back(std::move(c));
+            glowClones_.push_back({nid, base});
+            return nid;
+        };
+        // The material a surface of material `m` takes when its emitter's material is `mid` (a copy
+        // of m's base, or the base itself): mid, or for a routed copy of the base, mid's routed copy.
+        const auto retag = [&](int m, int mid) {
+            const int base = S.matBase(m);
+            if (mid == base || m == base) return m == base ? mid : m;
+            const int r = S.mats[(size_t)m].route;
+            auto it = routedCopy.find({mid, r});
+            if (it != routedCopy.end()) return it->second;
+            Material c = S.mats[(size_t)m];
+            c.routeBase = mid; c.routeTo[0] = c.routeTo[1] = -1;
+            const int nid = (int)S.mats.size();
+            S.mats.push_back(std::move(c));
+            S.mats[(size_t)mid].routeTo[r] = nid;
+            routedCopy[{mid, r}] = nid;
+            routeClone_[{mid, r}] = nid;
+            routeIsClone_.resize(S.mats.size(), 0);
+            routeIsClone_[(size_t)nid] = 1;
+            return nid;
+        };
+        // The triangle groups: a base whose triangles one mesh light covers already, at its motion,
+        // keeps it; any other has its mesh lights replaced.
+        std::vector<int> drop;
+        std::vector<Emitter> made;
+        for (auto& [key, g] : groups) {
+            const int base = key.first, motion = key.second;
+            const auto it = meshEm.find(base);
+            if (it != meshEm.end() && it->second.size() == 1 && g.inst.empty()) {
+                const Emitter& em = S.emitters[(size_t)it->second[0]];
+                std::vector<int> have;
+                for (const EmitTri& et : em.meshTris) have.push_back(et.tri);
+                std::vector<int> want = g.tris;
+                std::sort(have.begin(), have.end());
+                std::sort(want.begin(), want.end());
+                // (a degenerate triangle was never registered: compare the ones with area)
+                want.erase(std::remove_if(want.begin(), want.end(), [&](int i) {
+                    const Tri& t = S.tris[(size_t)i];
+                    return !(length(cross(t.v1 - t.v0, t.v2 - t.v0)) > 0.0) && t.vkeys < 0;
+                }), want.end());
+                if (have == want && em.motion == motion && !taken.count(base)) {
+                    taken.insert(base);
+                    it->second.clear();          // kept: no later group of the base drops it
+                    continue;
+                }
+            }
+            if (it != meshEm.end()) {
+                for (int e : it->second) drop.push_back(e);
+                it->second.clear();
+            }
+            const bool copy = taken.count(base) > 0;
+            if (copy && g.fixedInst) {
+                fail(nameOf(base) + " emits on mesh_instance placements that move differently from its "
+                     "other surfaces: they share their asset's triangles, which cannot each take the copy of "
+                     "the material their own emitter needs; give each placement its own material, or the "
+                     "material `glow_only on`");
+                return false;
+            }
+            const int mid = copy ? cloneOf(base) : base;
+            taken.insert(base);
+            std::vector<Scene::MeshLightTri> list;
+            for (int i : g.tris) {
+                S.tris[(size_t)i].matId = retag(S.tris[(size_t)i].matId, mid);
+                list.push_back({&S.tris[(size_t)i], i});
+            }
+            for (const auto& [ii, ci] : g.inst) {
+                MeshInstance& in = S.instances[(size_t)ii];
+                if (in.matOverride >= 0) in.matOverride = retag(in.matOverride, mid);
+                list.push_back({&copies[ci], -1, copyReach[ci]});
+            }
+            const size_t before = S.emitters.size();
+            S.addMeshLightOf(list, S.mats[(size_t)mid].emit, binWidth_, mid);
+            if (S.emitters.size() > before) {
+                S.emitters.back().motion = motion;
+                made.push_back(std::move(S.emitters.back()));
+                S.emitters.pop_back();
+            }
+        }
+        // Spheres, then isosurfaces: each its own emitter.
+        const auto boxEmitter = [&](int mid, int prim, bool sphere, const Vec3& lo, const Vec3& hi, int motion) {
+            Emitter e;
+            e.shape = EmitterShape::Glow; e.matId = mid;
+            e.glowPrim = prim; e.glowSphere = sphere; e.glowLo = lo; e.glowHi = hi;
+            const Vec3 d = hi - lo;
+            e.area = d.x * d.y + d.y * d.z + d.z * d.x;      // half the box's surface (Emitter::area)
+            const Spectrum& spd = S.mats[(size_t)mid].emit;
+            e.spd.build(spd, binWidth_); e.spdFn = spd; e.emitIntegral = e.spd.integral;
+            e.motion = motion;
+            made.push_back(std::move(e));
+        };
+        for (size_t i = 0; i < S.spheres.size(); ++i) {
+            Sphere& s = S.spheres[i];
+            if (!wants(s.matId)) continue;
+            const int base = S.matBase(s.matId);
+            const int mid = taken.count(base) ? cloneOf(base) : base;
+            taken.insert(base);
+            s.matId = retag(s.matId, mid);
+            if (S.mats[(size_t)mid].emitPat < 0) {
+                const size_t before = S.emitters.size();
+                S.addSphereLight(s.c, s.r, S.mats[(size_t)mid].emit, binWidth_, mid);
+                S.emitters.back().motion = s.motion;
+                made.push_back(std::move(S.emitters.back()));
+                S.emitters.resize(before);
+            } else {
+                const Vec3 rr{s.r, s.r, s.r};
+                boxEmitter(mid, (int)i, true, s.c - rr, s.c + rr, s.motion);
+            }
+        }
+        for (size_t i = 0; i < S.implicits.size(); ++i) {
+            Implicit& im = S.implicits[i];
+            if (!wants(im.matId)) continue;
+            if (im.motion >= 0 && S.motionSets[(size_t)im.motion].shape == kMotionAffine) {
+                fail(nameOf(im.matId) + " emits on an isosurface whose motion stretches it unevenly: its "
+                     "light cannot follow it; give the material `glow_only on`, or move it rigidly");
+                return false;
+            }
+            const int base = S.matBase(im.matId);
+            const int mid = taken.count(base) ? cloneOf(base) : base;
+            taken.insert(base);
+            im.matId = retag(im.matId, mid);
+            boxEmitter(mid, (int)i, false, im.bounds.lo, im.bounds.hi, im.motion);
+        }
+        // Out with the mesh lights replaced (envIndex follows), in with the new ones.
+        std::sort(drop.begin(), drop.end());
+        drop.erase(std::unique(drop.begin(), drop.end()), drop.end());
+        for (auto it = drop.rbegin(); it != drop.rend(); ++it) {
+            S.emitters.erase(S.emitters.begin() + *it);
+            if (S.envIndex > *it) --S.envIndex;
+        }
+        // Say what now lights the scene that no light block made: by material, how many of each.
+        if (!made.empty()) {
+            std::map<std::string, std::map<std::string, int>> said;
+            for (const Emitter& e : made) {
+                const char* kind = e.shape == EmitterShape::Mesh   ? "triangle set"
+                                 : e.shape == EmitterShape::Sphere ? "sphere"
+                                 : e.glowSphere                    ? "patterned sphere" : "isosurface";
+                ++said[nameOf(e.matId)][kind];
+            }
+            std::string line;
+            for (const auto& [m, kinds] : said)
+                for (const auto& [k, n] : kinds)
+                    line += (line.empty() ? "" : ", ") + m + ": " + std::to_string(n) + " " + k +
+                            (n > 1 && k != "triangle set" ? "s" : "");
+            std::fprintf(stderr, "[light] glowing surfaces lighting the scene (`glow_only on` keeps one "
+                                 "from it): %s\n", line.c_str());
+        }
+        for (Emitter& e : made) S.emitters.push_back(std::move(e));
+        return true;
+    }
+    // Copies registerGlows made of an emissive material, each for a surface of its own: (copy, the
+    // material it copies). Named for it: "glow [2]".
+    std::vector<std::pair<int, int>> glowClones_;
 
     // A sphere or tube light's own surface: black, emitting `spd`, reflecting nothing. Its id.
     int lightMaterial(Loaded& L, const Spectrum& spd) {

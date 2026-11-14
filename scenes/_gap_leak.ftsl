@@ -1,0 +1,17 @@
+# Thin-gap leak probe (known-issues J-THIN-GAP-LEAK; found 2026-11-14 by check_glow_lights' first
+# draft, whose grid quad was wound face-down): a plate
+# 1 mm over the floor emits DOWN into the gap, its top lit only by a ceiling panel. No light from
+# the gap can reach the top: every mode should read the plate's top as the ceiling panel lights it.
+scene { units meters }
+camera "c" { eye 0 1.3 3.6  look_at 0 0.3 0  up 0 1 0  fov_y 50  film { res 96 72 } }
+material "wall"  { type diffuse reflect 0.6 }
+material "floor" { type diffuse reflect 0.5 }
+material "plate" { type diffuse reflect 0.5  emit 0.05 }
+quad { origin -2 0 -2  u 4 0 0  v 0 0 6  material floor }
+quad { origin -2 0 -2  u 0 2.6 0  v 4 0 0  material wall }
+quad { origin -2 0 -2  u 0 0 6  v 0 2.6 0  material wall }
+quad { origin 2 0 -2  u 0 2.6 0  v 0 0 6  material wall }
+quad { origin -2 2.6 -2  u 0 0 6  v 4 0 0  material wall }
+light area { origin -0.3 2.59 -0.3  u 0.6 0 0  v 0 0 0.6  normal 0 -1 0  spd preset:bb6500  power 4 }
+# u x v = -y: the plate emits downward, into the gap
+quad { origin -1.5 0.001 -1.5  u 3 0 0  v 0 0 3  material plate }

@@ -304,6 +304,12 @@ struct BackwardRenderer {
         // secondary's coverage coin is its own, so it may pass a fibre the hero stopped at, or
         // the reverse (P-HEROSPLIT-FIRST). Null where there is no filing, and in a sub-path.
         int* firstSec = nullptr;
+        // The path has met a surface off a non-specular vertex (specularArrival false there: a
+        // diffuse, translucent, fluorescent or fibre scattering, a medium's, or a gather ray's
+        // start). A glow no emitter samples (Scene::isGlow) is seen only before that -- it lights
+        // nothing, so the light it would throw through a mirror onto a wall is no more counted than
+        // the light it throws on the wall directly. A re-entry inherits it.
+        bool pastDiffuse = false;
     };
     // A camera path's first event: the sky (it escaped), a specular-side surface (the rule
     // classifyComposite applies to a pixel: a non-sensor surface whose own material is a
@@ -1686,7 +1692,7 @@ struct BackwardRenderer {
                 double epat = 1.0;
                 if (!cylVisible) {
                     double areaScale = 1.0;   // its area at the path's time
-                    epat = emitterSamplePoint(scene, em, u1, u2, y, nLight, &areaScale);
+                    epat = emitterSamplePoint(scene, em, u1, u2, y, nLight, &areaScale, &rng);
                     effArea *= areaScale;
                 }
                 const Vec3 toL = y - p;
@@ -3047,13 +3053,18 @@ struct BackwardRenderer {
             // emitSlot applies any `emit pattern:` at this hit; the NEE side below
             // applies the SAME profile via emitterSamplePoint, which is what keeps the
             // two estimators consistent (see Material::emitPat).
-            if (m.isLight && specularArrival && dot(ray.d, h.ng) < 0.0) {
+            // A glow no emitter samples counts only along a path specular from the camera on
+            // (GiCtx::pastDiffuse); an emitter on any specular arrival, the light it throws through
+            // a mirror or glass included.
+            if (!specularArrival) gi.pastDiffuse = true;
+            const int eIdx = m.isLight ? emitterIndexOfResolved(scene, m) : -1;
+            if (m.isLight && specularArrival && (eIdx >= 0 || !gi.pastDiffuse) && dot(ray.d, h.ng) < 0.0) {
                 // The lobe-sampling half of the glossy MIS weight. 1 (and bit-identical to the
                 // old expression) unless the previous bounce was a MIS'd glossy one that
                 // already connected to this same emitter.
                 double wMis = 1.0;
                 if (gmis.pdf > 0.0)
-                    wMis = glossyHitWeight(scene, gmis, emitterIndexOfResolved(scene, m), ray.d, &h);
+                    wMis = glossyHitWeight(scene, gmis, eIdx, ray.d, &h);
                 L += thr * emitSlot(scene, m, h, lambda, ray.d * -1.0) * invPdfLambda * wMis * contSoft;
             }
 
@@ -3560,12 +3571,15 @@ struct BackwardRenderer {
             // Surface emission on a specular/camera arrival (NEE covers diffuse).
             // emitHitScale (an `emit pattern:`, an aimed quad's law) is achromatic, so evaluate
             // it ONCE for the whole hero bundle rather than per-wavelength inside emitSlot.
-            if (m.isLight && specularArrival && dot(ray.d, h.ng) < 0.0) {
+            // A glow no emitter samples only along a path specular from the camera on (scalar twin).
+            if (!specularArrival) gi.pastDiffuse = true;
+            const int eIdx = m.isLight ? emitterIndexOfResolved(scene, m) : -1;
+            if (m.isLight && specularArrival && (eIdx >= 0 || !gi.pastDiffuse) && dot(ray.d, h.ng) < 0.0) {
                 double ep = emitHitScale(scene, m, h, ray.d * -1.0);
                 // The lobe-sampling half of the glossy MIS weight; 1 (and bit-identical to the
                 // old expression) unless the last bounce was a MIS'd glossy one.
                 if (gmis.pdf > 0.0)
-                    ep *= glossyHitWeight(scene, gmis, emitterIndexOfResolved(scene, m), ray.d, &h);
+                    ep *= glossyHitWeight(scene, gmis, eIdx, ray.d, &h);
                 for (int i = 0; i < nUp; ++i)
                     L[i] += thr[i] * m.emit(lam[i]) * ep * invPdf[i] * contSoft;
             }
@@ -4199,8 +4213,8 @@ struct BackwardRenderer {
         const int*    baseIdx  = haveBases ? scene.spdBaseIdx.data() : fbIdx.data();
         const double* baseScl  = haveBases ? scene.spdScale.data()   : fbScale.data();
         // Per-base geomWeight*scale sums (Scene::spdBaseGeom): lets the per-sample
-        // invPdfLambda = camG / (sum_e geomWeight_e*SPD_e(lambda) + fireG) be evaluated over
-        // BASES instead of emitters, which is what removes the last O(N_lights) term
+        // invPdfLambda = camG / (sum_e geomWeight_e*SPD_e(lambda) + fireG + glowG) be evaluated
+        // over BASES instead of emitters, which is what removes the last O(N_lights) term
         // from the backward CPU sample loop.
         const double* baseGeom = haveBases ? scene.spdBaseGeom.data() : fbGeom.data();
         // A fire is part of the illuminant's wavelength density (Scene::camSampler): its
@@ -4276,7 +4290,7 @@ struct BackwardRenderer {
                         SpdCache spdCache{lamA, baseBuf.data(), baseIdx, baseScl, C, 0};
                         for (int i = 0; i < C; ++i) {
                             if (i > 0 && pdfA[i] <= 0.0) { invA[i] = 0.0; filmA[i] = 0.0; continue; }
-                            double g = fire ? scene.fireG(lamA[i]) : 0.0;
+                            double g = (fire ? scene.fireG(lamA[i]) : 0.0) + scene.glowG(lamA[i]);
                             for (int b = 0; b < nBase; ++b)
                                 g += baseGeom[(size_t)b] * baseBuf[(size_t)b * C + i];
                             invA[i] = (g > 0.0) ? scene.camG / g : 0.0;
@@ -4323,7 +4337,7 @@ struct BackwardRenderer {
                         baseBuf[(size_t)g] = haveBases ? scene.spdBase[g](lambda)
                                                        : scene.emitters[g].spdFn(lambda);
                     SpdCache spdCache{&lambda, baseBuf.data(), baseIdx, baseScl, 1, 0};
-                    double gSum = fire ? scene.fireG(lambda) : 0.0;
+                    double gSum = (fire ? scene.fireG(lambda) : 0.0) + scene.glowG(lambda);
                     for (int b = 0; b < nBase; ++b)
                         gSum += baseGeom[(size_t)b] * baseBuf[(size_t)b];
                     double invPdfLambda = (gSum > 0.0) ? scene.camG / gSum : 0.0;

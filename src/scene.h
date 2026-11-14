@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <memory>
 #include <climits>
+#include <cstring>
 #include <cstdint>
 #include <cstdlib>
 #include <cstdio>
@@ -54,6 +55,10 @@ enum class MatType { Diffuse, Dielectric, Mirror, HalfMirror, Glossy, Fluorescen
 // here too although modes A and B splat a rough one through its lobe (render.h glossySplats): a
 // sharp lobe converges slowly that way, and the camera side does it far better.
 // Diffuse and Fluorescent connect in model B, so they are NOT specular-side.
+// The same set is what a glow no emitter samples is seen through (a surface whose material emits
+// and that no Emitter covers): mode R counts its emission only on a camera or specular arrival, a
+// vertex of these types (backward.h specularArrival), and every other mode follows that rule
+// (bdpt.h glowSeenBy, vcm.h camGlow), as nothing can sample the glow from its own side.
 inline bool isSpecularType(MatType t) {
     return t == MatType::Dielectric || t == MatType::Mirror ||
            t == MatType::HalfMirror || t == MatType::ThinFilm ||
@@ -147,6 +152,11 @@ struct Material {
     double roughness = 0.1;                    // glossy lobe width [0,1]; on a Dielectric it
                                                // roughens the reflected+refracted lobes (frosted)
     bool isLight = false;
+    // `glow_only on`: the surface emits and is seen -- by a camera ray, and through the specular
+    // surfaces after one (isSpecularType) -- but lights nothing: no emitter samples it, so no mode
+    // lights anything with it (Scene::isGlow). Every other emissive surface gets an emitter at load
+    // (ftsl.h registerGlows) and lights the scene as a light does.
+    bool glowOnly = false;
     // The surface a `light` block (or a built-in scene's lamp) makes: it emits and reflects
     // nothing, so a path that meets it can end there. Any other emissive material -- `emit` on
     // a material of its own -- may also reflect, and a path is walked on through it.
@@ -982,7 +992,10 @@ struct Sensor {
 // ~1e5x-brighter-than-sky sun from the env importance sampler, which is why a daylight
 // scene lit by `light sun` converges like any single-light scene while the same sun
 // baked into an HDRI produces fireflies (see known-issues, K2 follow-up).
-enum class EmitterShape { Quad, Sphere, Spot, Env, Cylinder, Mesh, Sun };
+// Glow: an emissive analytic primitive -- an isosurface or CSG solid, or a sphere whose emission a
+// pattern varies -- sampled by the lines through its box (Scene::glowSamplePoint, the Crofton draw).
+// Append new shapes at the END: render_cuda.cu's DEmitter::shape is `(int)shape`.
+enum class EmitterShape { Quad, Sphere, Spot, Env, Cylinder, Mesh, Sun, Glow };
 
 // SPECTRAL FOLD QUADRATURE (Emitter::foldCie / foldLam; used by render.h's photon tracer
 // and photonbeams.h's beam records). The achromatic fold replaces a beam's noisy
@@ -1145,7 +1158,18 @@ struct Emitter {
     EmissionSampler spd;      // for forward per-emitter lambda importance sampling
     Spectrum spdFn = constantSpectrum(0.0); // raw SPD, for backward per-lambda eval
     double emitIntegral = 0.0;
-    double power = 0.0;       // emitIntegral * geomWeight (selection weight)
+    double power = 0.0;       // emitIntegral * geomWeight * selW (selection weight)
+    // Its share of the selection, as a multiple of its unpatterned flux over `area`: 1 for every
+    // emitter whose `area` is its surface's, and a Glow's the mean crossing count its lines find
+    // (finalizeEmitters estimates it), so it is chosen in proportion to the light it emits. The
+    // forward modes, whose photons carry the total power analog, divide it back out of a photon.
+    double selW = 1.0;
+    // Glow: the primitive it samples -- Scene::implicits' index (glowSphere false) or Scene::spheres'
+    // -- and the box its lines are drawn through (Scene::glowSamplePoint): `area` is half the box's
+    // surface, the inverse of the lines' crossing density 2 / S over any surface inside it.
+    int glowPrim = -1;
+    bool glowSphere = false;
+    Vec3 glowLo{0, 0, 0}, glowHi{0, 0, 0};
     // Index into Scene::patterns of an emission profile over this emitter's surface,
     // copied from the emissive material's `emitPat` at registration; -1 = uniform.
     // Deliberately absent from `power` above — see Material::emitPat for why.
@@ -1646,6 +1670,9 @@ inline void expandCarried(Aabb& into, const Aabb& b, const Affine& D) {
                                  (c & 4) ? b.hi.z : b.lo.z}));
 }
 inline double slotPatMul(const Scene& scene, int pat, const Hit& h);
+inline double emitterSamplePoint(const Scene& scene, const Emitter& em, double u1, double u2,
+                                 Vec3& y, Vec3& nOut, double* areaScaleOut = nullptr,
+                                 Pcg32* rng = nullptr);
 
 struct Scene {
     // Distinct for every Scene constructed in the process (copies share it, being the same
@@ -2191,6 +2218,20 @@ struct Scene {
     // g(lambda) at emitSampler's bin centres, tabulated once by finalizeEmitters, so the samplers
     // finalizeCameraSpectrum builds on the same bins read it rather than every emitter's spectrum.
     std::vector<double> emitGTab;
+    // The glows' share of g (finalizeEmitters): what emitSampler, and every wavelength density built
+    // on it, gives the glows no emitter samples (isGlow), so a wavelength only a glow emits is drawn
+    // too -- a camera path sees the glow, and no light's spectrum need cover it. A twentieth of g's
+    // mass between them (all of it in a scene of glows alone), each in its own emission's shape;
+    // tabulated per nm, read through glowG, and part of emitterG. Empty without a glow. Device twin
+    // DScene::glowG.
+    std::vector<double> glowGTab;
+    double glowG(double lambda) const {
+        if (glowGTab.empty()) return 0.0;
+        const double t = lambda - LAMBDA_MIN;
+        size_t i = (t > 0.0) ? (size_t)t : 0;
+        if (i >= glowGTab.size()) i = glowGTab.size() - 1;
+        return glowGTab[i];
+    }
     // A Spectrum reading `tab` -- a function tabulated at the bin centres LAMBDA_MIN + (i + 0.5) *
     // step -- back at those centres, the points EmissionSampler::build evaluates. `tab` must
     // outlive it.
@@ -2841,6 +2882,19 @@ struct Scene {
     // common scene — no hidden material anywhere — pays one bool test per camera ray
     // instead of a per-primitive material lookup inside the BVH leaf.
     bool camHiddenAny = false;
+    // The materials that glow with no emitter to sample them (isLight, and emitterForMat finds
+    // none): by material, the XYZ of the emission, sum over the 1 nm grid of CIE x emit -- the
+    // directly viewed colour, as envXYZ is the sky's -- and {0, 0, 0} for every other material.
+    // Such a glow lights nothing and is seen only through specular surfaces (isSpecularType); the
+    // forward modes, which see by their emitters' photons, add what the camera sees of it
+    // directly in their sky pass (main.cpp prepareSky). Empty when no material is one, which is
+    // that pass's fast path (glowAny false). Filled by finalizeEmitters.
+    std::vector<Vec3> glowXYZ;
+    bool glowAny = false;
+    bool isGlow(int matId) const {
+        return matId >= 0 && matId < (int)glowXYZ.size() && mats[(size_t)matId].isLight &&
+               !emitterForMat(matId);
+    }
 
     // Environment radiance from direction `d` at wavelength lambda (0 if no env).
     // Constant env ignores `d`; an image env samples the lat-long map.
@@ -2965,13 +3019,26 @@ struct Scene {
     // to Scene::tris. If every triangle is degenerate, registers nothing.
     void addMeshLight(size_t triStart, size_t triCount, const Spectrum& spd,
                       double stepNm, int matId = -1) {
+        std::vector<MeshLightTri> list;
+        size_t end = triStart + triCount;
+        if (end > tris.size()) end = tris.size();
+        for (size_t i = triStart; i < end; ++i) list.push_back({&tris[i], (int)i});
+        addMeshLightOf(list, spd, stepNm, matId);
+    }
+    // One triangle of a mesh light: a world-space triangle, its index in Scene::tris or -1 for one
+    // that is no scene triangle (an instanced asset's, placed in the world, which cannot deform),
+    // and the reach a hit on it reports (Hit::pscale; below 0: its corners', as a scene
+    // triangle's), which a sampled point's pattern is read with.
+    struct MeshLightTri { const Tri* t; int src; double reach = -1.0; };
+    // addMeshLight over any triangles. Registers nothing if every triangle is degenerate.
+    void addMeshLightOf(const std::vector<MeshLightTri>& list, const Spectrum& spd,
+                        double stepNm, int matId = -1) {
         Emitter e;
         e.shape = EmitterShape::Mesh; e.matId = matId;
         double total = 0.0;
-        size_t end = triStart + triCount;
-        if (end > tris.size()) end = tris.size();
-        for (size_t i = triStart; i < end; ++i) {
-            const Tri& t = tris[i];
+        for (const MeshLightTri& mt : list) {
+            const Tri& t = *mt.t;
+            const int src = mt.src;
             Vec3 e1 = t.v1 - t.v0, e2 = t.v2 - t.v0;
             Vec3 nc = cross(e1, e2);
             double a = 0.5 * length(nc);
@@ -2979,7 +3046,7 @@ struct Scene {
             // give it area at other times -- then chosen by its mean area over them
             // (deformSelectArea2), which its samples' area growth is measured against.
             const bool flat = !(a > 0.0);
-            if (flat && t.vkeys >= 0) a = 0.5 * deformSelectArea2(t);
+            if (flat && src >= 0 && t.vkeys >= 0) a = 0.5 * deformSelectArea2(t);
             if (a <= 0.0) continue;               // skip degenerate triangles
             total += a;
             EmitTri et;
@@ -2994,14 +3061,14 @@ struct Scene {
                 const Vec3 ns = t.n0 + t.n1 + t.n2;
                 et.nrm = dot(ns, ns) > 0.0 ? normalize(ns) : Vec3{0, 1, 0};
             }
-            et.reach = triReach(t.v0, t.v1, t.v2);
+            et.reach = (mt.reach >= 0.0) ? mt.reach : triReach(t.v0, t.v1, t.v2);
             et.cumArea = total;
             // Carry the source triangle's UVs as uv0 + edges, so a sampled point can
             // report the same (u,v) the ray-hit path interpolates — required for an
             // emission pattern to agree across NEE and emission-on-hit.
             et.uv0 = t.uv0; et.uvE1 = t.uv1 - t.uv0; et.uvE2 = t.uv2 - t.uv0;
-            et.tri = (int)i;
-            e.deforms = e.deforms || t.vkeys >= 0;
+            et.tri = src;
+            e.deforms = e.deforms || (src >= 0 && t.vkeys >= 0);
             e.meshTris.push_back(et);
         }
         if (e.meshTris.empty() || total <= 0.0) return; // nothing emissive
@@ -3147,6 +3214,36 @@ struct Scene {
         // rebuilds materials/emitters leaves the fast-path gate consistent with `mats`.
         camHiddenAny = false;
         for (const auto& m : mats) if (m.hideCamera) { camHiddenAny = true; break; }
+        glowXYZ.clear();
+        glowAny = false;
+        for (size_t i = 0; i < mats.size(); ++i) {
+            if (!mats[i].isLight || emitterForMat((int)i)) continue;
+            if (glowXYZ.empty()) glowXYZ.assign(mats.size(), Vec3{0, 0, 0});
+            for (double lam = LAMBDA_MIN; lam <= LAMBDA_MAX; lam += 1.0)
+                glowXYZ[i] += Vec3(cieX(lam), cieY(lam), cieZ(lam)) * mats[i].emit(lam);
+            glowAny = true;
+        }
+        glowGTab.clear();
+        if (glowAny) {
+            const size_t nb = (size_t)(LAMBDA_MAX - LAMBDA_MIN);
+            const auto at = [](size_t i) { return LAMBDA_MIN + (double)i + 0.5; };
+            double gSum = 0.0;
+            for (size_t i = 0; i < nb; ++i)
+                for (const auto& e : emitters) gSum += e.geomWeight() * e.spdFn(at(i));
+            std::vector<int> gm;
+            for (size_t m = 0; m < mats.size(); ++m) if (isGlow((int)m)) gm.push_back((int)m);
+            std::vector<double> tab(nb, 0.0);
+            bool any = false;
+            for (int m : gm) {
+                double eSum = 0.0;
+                for (size_t i = 0; i < nb; ++i) eSum += std::max(0.0, mats[(size_t)m].emit(at(i)));
+                if (!(eSum > 0.0)) continue;
+                const double c = (gSum > 0.0 ? 0.05 * gSum : 1.0) / ((double)gm.size() * eSum);
+                for (size_t i = 0; i < nb; ++i) tab[i] += c * std::max(0.0, mats[(size_t)m].emit(at(i)));
+                any = true;
+            }
+            if (any) glowGTab.swap(tab);
+        }
         // The SPD-weighted mean CIE of every emitter (see Emitter::cieMean). Both integrals
         // run over the SAME 1 nm grid so the quadrature step cancels in the ratio and the
         // result does not depend on `stepNm` or on how `spd` was built. An emitter with no
@@ -3206,6 +3303,28 @@ struct Scene {
                 }
             }
         }
+        // Each patterned or Glow emitter's selection weight (Emitter::selW): the mean multiplier its
+        // draws carry -- its pattern, a Glow's crossing count -- over 4096 of them off a fixed
+        // stream, so it is chosen by the light it emits, not by its bare area (a grid of glowing
+        // lines on a 2000 m^2 ground, a wire frame in its box). Any positive weight leaves every
+        // estimate unbiased; this one only spends the light samples where the light is. Floored at
+        // half a draw's worth, so a light no draw found still emits.
+        for (size_t i = 0; i < emitters.size(); ++i) {
+            Emitter& e = emitters[i];
+            e.selW = 1.0;
+            const bool areaLike = e.shape == EmitterShape::Quad || e.shape == EmitterShape::Mesh ||
+                                  e.shape == EmitterShape::Glow;
+            if (!areaLike || (e.emitPat < 0 && e.shape != EmitterShape::Glow) || e.collimated) continue;
+            constexpr int kN = 4096;
+            Pcg32 rng;
+            seedUnit(rng, (uint64_t)i, 0x5E1EC7ED0CA5ULL);
+            double s = 0.0;
+            for (int k = 0; k < kN; ++k) {
+                Vec3 y, n;
+                s += emitterSamplePoint(*this, e, (k + rng.uniform()) / kN, rng.uniform(), y, n, nullptr, &rng);
+            }
+            e.selW = std::max(s / kN, 0.5 / kN);
+        }
         emitterCdf.assign(emitters.size(), 0.0);
         for (size_t i = 0; i < emitters.size(); ++i) {
             // Area/sphere keep the exact emitIntegral*area*PI expression so those
@@ -3219,6 +3338,7 @@ struct Scene {
                 : emitters[i].normalTilted                      // an aimed quad (see nGeom)
                     ? emitters[i].emitIntegral * emitters[i].area * emitters[i].aimNorm
                 : emitters[i].emitIntegral * emitters[i].area * PI;
+            if (emitters[i].selW != 1.0) emitters[i].power *= emitters[i].selW;   // a Glow's (Emitter::selW)
             totalPower += emitters[i].power;
             emitterCdf[i] = totalPower;
         }
@@ -3236,7 +3356,7 @@ struct Scene {
         emitGTab.assign((size_t)std::max(nb, 0), 0.0);
         for (int i = 0; i < nb; ++i) {
             const double w = LAMBDA_MIN + (i + 0.5) * stepNm;
-            double s = 0.0;
+            double s = glowG(w);
             for (const auto& e : emitters) s += e.geomWeight() * e.spdFn(w);
             emitGTab[(size_t)i] = s;
         }
@@ -3745,6 +3865,12 @@ struct Scene {
                 out.cosThetaE = e.spotCosOuter;
                 break;
             }
+            case EmitterShape::Glow: {                // its lines' box holds every point of it
+                setBox(e.glowLo, e.glowHi);
+                out.cosThetaO = -1.0;
+                ax = Vec3{0, 0, 1};
+                break;
+            }
             case EmitterShape::Mesh: {
                 if (e.meshTris.empty()) return false;
                 bool first = true;
@@ -3924,10 +4050,10 @@ struct Scene {
         const double g = emitterG(lambda) + fireG(lambda);
         return (g > 0.0) ? camG / g : 0.0;
     }
-    // The emitters' g(lambda) = sum geomWeight * SPD, the density emitSampler tabulates, evaluated
-    // directly (cheap: a few SPD evaluations).
+    // The emitters' g(lambda) = sum geomWeight * SPD, with the glows' share (glowG): the density
+    // emitSampler tabulates, evaluated directly (cheap: a few SPD evaluations).
     double emitterG(double lambda) const {
-        double g = 0.0;
+        double g = glowG(lambda);
         for (const auto& e : emitters) g += e.geomWeight() * e.spdFn(lambda);
         return g;
     }
@@ -5013,7 +5139,9 @@ struct Scene {
             const double s2 = vdc(i, 2), s3 = vdc(i, 3), s4 = vdc(i, 5);
             Vec3 y, nOut;
             if (e.shape == EmitterShape::Spot) { y = e.origin; nOut = e.beamDir; }
-            else                                 e.samplePoint(s1, s2, y, nOut);
+            else if (e.shape == EmitterShape::Glow) {   // its draw off a stream seeded from (s1, s2)
+                if (!(emitterSamplePoint(*this, e, s1, s2, y, nOut) > 0.0)) continue;
+            } else                               e.samplePoint(s1, s2, y, nOut);
             Vec3 d;
             if (e.collimated) d = e.beamDir;
             else if (e.shape == EmitterShape::Spot) {
@@ -5547,6 +5675,58 @@ inline double emitterPatMulAt(const Scene& scene, const Emitter& em,
     return p < 0.0 ? 0.0 : (p > 1.0 ? 1.0 : p);
 }
 
+// A point on a Glow emitter (EmitterShape::Glow), the Crofton draw. A line uniform over the lines
+// that meet a convex box -- an entry point uniform over the box's surface, a direction cosine-
+// distributed inward -- crosses every surface inside the box with the same density, 2 / S per unit
+// area (S the box's surface), whatever the surface's shape and wherever it lies. Of the k crossings
+// such a line through the emitter's box (Emitter::glowLo, glowHi) makes with its primitive, one
+// taken uniformly (reservoir sampling, by `rng`) is therefore a point of density 1 / area
+// (Emitter::area = S / 2) carrying weight k: k f(y) area has the mean of the integral of f over the
+// surface. Exact for any primitive the intersector finds crossings on, its caps included, and
+// costs a march along a chord of the box, whether or not it crosses anything (k = 0: no point).
+//   `h`: the crossing, as a ray reaching it sees it (its normal map and pattern side applied, as
+// closestHit applies them), at the frame's instant; false when the line crossed nothing. The
+// crossings are found by the primitive's own intersector, the one every ray meets it by.
+inline bool glowSamplePoint(const Scene& scene, const Emitter& em, Pcg32& rng, Hit& h, int& k) {
+    k = 0;
+    const Vec3 lo = em.glowLo, ext = em.glowHi - em.glowLo;
+    const double fa[3] = {ext.y * ext.z, ext.x * ext.z, ext.x * ext.y};   // a face's area, by axis
+    const double tot = fa[0] + fa[1] + fa[2];
+    if (!(tot > 0.0) || em.glowPrim < 0) return false;
+    const double uf = rng.uniform() * tot;
+    const int a = (uf < fa[0]) ? 0 : (uf < fa[0] + fa[1]) ? 1 : 2;
+    const bool high = rng.uniform() < 0.5;
+    const double s1 = rng.uniform(), s2 = rng.uniform();
+    Vec3 o = lo, n{0, 0, 0};
+    const auto at = [](Vec3& v, int i) -> double& { return i == 0 ? v.x : (i == 1 ? v.y : v.z); };
+    const int b = (a + 1) % 3, c = (a + 2) % 3;
+    at(o, a) = vget(lo, a) + (high ? vget(ext, a) : 0.0);
+    at(o, b) = vget(lo, b) + s1 * vget(ext, b);
+    at(o, c) = vget(lo, c) + s2 * vget(ext, c);
+    at(n, a) = high ? -1.0 : 1.0;                        // into the box
+    const Ray r{o, cosineHemisphere(n, rng)};
+    const PatTables tabs = scene.patTables();
+    double tmin = 0.0;
+    for (int guard = 0; guard < 1 << 20; ++guard) {
+        Hit x;
+        const bool got = em.glowSphere
+            ? intersectSphere(r, scene.spheres[(size_t)em.glowPrim], tmin, x,
+                              scene.sphereAxesOf(scene.spheres[(size_t)em.glowPrim]))
+            : intersectImplicit(r, scene.implicits[(size_t)em.glowPrim], tmin, x, &tabs);
+        if (!got) break;
+        ++k;
+        if (rng.uniform() * (double)k < 1.0) h = x;         // each crossing kept with chance 1 / k
+        // On past it, by more than the march could read as the same root again and less than the
+        // thinnest feature it resolves (Implicit::minStep).
+        const double step = em.glowSphere ? 0.0 : 0.5 * scene.implicits[(size_t)em.glowPrim].minStep;
+        tmin = x.t + std::max(step, 1e-6 * (1.0 + x.t));
+    }
+    if (k == 0) return false;
+    scene.markPatSide(h);
+    scene.applyNormalMap(h);
+    return true;
+}
+
 // Draw a point on `em` and return the emission-pattern multiplier there, so a caller can
 // write `Le = em.spdFn(lambda) * invPdfLambda * pmul`. 1.0 whenever no pattern is bound,
 // which is every scene that does not use the feature — those keep bit-identical draws
@@ -5557,14 +5737,34 @@ inline double emitterPatMulAt(const Scene& scene, const Emitter& em,
 // when given, receives how much the light's area has grown about the point at the path's time
 // (1 for one that does not change size): what its area densities divide by, its photons' power
 // multiplies by.
+//   A Glow (an emissive isosurface, CSG solid or patterned sphere) is drawn by glowSamplePoint,
+// which needs more dimensions than two: from `rng`, `u1` and `u2` unused. Its multiplier carries
+// the crossing count that draw weighs its point by, so it may exceed 1, and is 0 where the line
+// missed. (Without an `rng` the draw's stream is seeded from u1 and u2.)
 inline double emitterSamplePoint(const Scene& scene, const Emitter& em,
                                  double u1, double u2, Vec3& y, Vec3& nOut,
-                                 double* areaScaleOut = nullptr) {
+                                 double* areaScaleOut, Pcg32* rng) {
     double pmul = 1.0;
     const bool deform = em.deforms;
     int mt = -1;
     double bary[2] = {0.0, 0.0};
-    if (em.emitPat < 0) {
+    if (em.shape == EmitterShape::Glow) {
+        Pcg32 own;
+        if (!rng) {
+            uint64_t b1, b2;
+            std::memcpy(&b1, &u1, sizeof b1); std::memcpy(&b2, &u2, sizeof b2);
+            seedUnit(own, b1 ^ (b2 * 0x9E3779B97F4A7C15ULL), 0xC0F70E5A11FEEDULL);
+        }
+        Hit h;
+        int k = 0;
+        if (!glowSamplePoint(scene, em, rng ? *rng : own, h, k)) {
+            y = (em.glowLo + em.glowHi) * 0.5; nOut = Vec3{0, 0, 1};
+            if (areaScaleOut) *areaScaleOut = 1.0;
+            return 0.0;
+        }
+        y = h.p; nOut = h.ng;
+        pmul = (double)k * ((em.emitPat >= 0) ? slotPatMul(scene, em.emitPat, h) : 1.0);
+    } else if (em.emitPat < 0) {
         em.samplePoint(u1, u2, y, nOut, nullptr, nullptr, nullptr, deform ? &mt : nullptr, bary);
     } else {
         double uu = 0.0, vv = 0.0;

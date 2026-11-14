@@ -16072,14 +16072,39 @@ struct SkyView {
     std::vector<float> sum;          // XYZ per pixel
 };
 
+// The material whose glow a camera ray along `d` sees at its hit `h` (Scene::isGlow: one that emits
+// and that no emitter samples, met from its front), or -1. A compound resolves as the camera walks
+// resolve it: a layered's coat with its reflectance at `lambda` by the coin `u1` (it then reflects,
+// which is no direct view), else a body, and a mix's child, by `u2`. `resolved` says a compound was:
+// the answer then stands for one wavelength's draw, where a plain glow's holds at every wavelength.
+static int glowMatSeen(const Scene& scene, const Hit& h, const Vec3& d, double lambda, double u1,
+                       double u2, bool& resolved) {
+    resolved = false;
+    if (!scene.glowAny || dot(d, h.ng) >= 0.0) return -1;
+    int id = h.matId;
+    const Material* m = &scene.mats[(size_t)id];
+    if (m->type == MatType::Layered) {
+        resolved = true;
+        if (u1 < layeredCoatReflectance(scene, *m, h, d, lambda)) return -1;
+        id = mixResolveChild(scene, *m, h, u2);
+    } else if (m->type == MatType::Mix) {
+        resolved = true;
+        id = mixResolveChild(scene, *m, h, u2);
+    }
+    return scene.isGlow(id) ? id : -1;
+}
+
 // The sky a forward (model-B) film shows directly, summed into `view` up to what `N` photons ask for
 // (addEnvBackground, which adds it to a film, has the why). Apart so that a caller timing its own
 // work -- a live window's repaint -- can do this first and leave it out of the repaint's cost.
-// False where this pass draws no sky: none in the scene, or a camera under a blur.
+// False where this pass draws no sky: none in the scene, or a camera under a blur. The glows the
+// camera sees (glowMatSeen) are drawn the same way; `glowsOnly` draws them alone, for mode P's
+// forward layer, whose sky its composite takes from the camera side.
 static bool prepareSky(SkyView& view, const Scene& scene, const Camera& cam, int rx, int ry,
-                       long long N) {
-    const bool haveEnv = scene.envIndex >= 0, haveSun = scene.sunCount > 0;
-    if ((!haveEnv && !haveSun) || cam.seesMotion(scene)) return false;
+                       long long N, bool glowsOnly = false) {
+    const bool haveEnv = !glowsOnly && scene.envIndex >= 0, haveSun = !glowsOnly && scene.sunCount > 0;
+    const bool haveGlow = scene.glowAny;
+    if ((!haveEnv && !haveSun && !haveGlow) || cam.seesMotion(scene)) return false;
     constexpr double kLo = 360.0, kHi = 830.0;
     constexpr long long kFirst = 64;      // a pinhole's whole count; a lens's first
     // A render stopped before its first sums: its last write's count -- a pinhole's pure sky is
@@ -16095,6 +16120,22 @@ static bool prepareSky(SkyView& view, const Scene& scene, const Camera& cam, int
     const bool lensed = cam.hasLens();
     const double perPixel = (double)N / ((double)rx * (double)ry);
     const long long want = lensed ? std::max(kFirst, std::min(4096LL, (long long)(perPixel / 4.0))) : kFirst;
+    // What pinhole sample k of pixel `pix` sees of a glow at its hit (glowMatSeen): a plain glow's XYZ
+    // exactly, its emission's (Scene::glowXYZ) times the pattern at the hit; a compound's through one
+    // wavelength, uniform over [kLo, kHi], and the coin and child the sample's own.
+    const auto glowXYZAt = [&](const Hit& h, const Vec3& d, size_t pix, long long k) -> Vec3 {
+        Pcg32 g;
+        seedUnit(g, pix, 0x61C0FFEE5EE0ULL ^ ((uint64_t)k * 0x9E3779B97F4A7C15ULL));
+        const double lambda = kLo + (kHi - kLo) * g.uniform();
+        const double u1 = g.uniform(), u2 = g.uniform();
+        bool resolved = false;
+        const int id = glowMatSeen(scene, h, d, lambda, u1, u2, resolved);
+        if (id < 0) return Vec3{0, 0, 0};
+        const Material& m = scene.mats[(size_t)id];
+        if (!resolved) return scene.glowXYZ[(size_t)id] * emitHitScale(scene, m, h, d * -1.0);
+        return Vec3(cieX(lambda), cieY(lambda), cieZ(lambda)) *
+               (emitSlot(scene, m, h, lambda, d * -1.0) * (kHi - kLo));
+    };
     // A pinhole pixel's samples [k0, k1), points of its rotated Halton (2,3) lattice, added to `s`
     // in k order. Every one is traced: a feature thinner than the lattice's spacing (a strand, a
     // wire against the sky) is seen only by the points that fall on it.
@@ -16108,11 +16149,15 @@ static bool prepareSky(SkyView& view, const Scene& scene, const Camera& cam, int
             jx -= std::floor(jx); jy -= std::floor(jy);
             const Ray r = cam.genRay(px, py, jx, jy);
             // A CAMERA ray, so a `hide_camera` flat lets the sky through (Material::hideCamera).
-            if (scene.closestHit(r, 1e-6, nullptr, /*skipHair=*/false, /*skipCamHidden=*/true).valid)
-                continue;
+            const Hit h = scene.closestHit(r, 1e-6, nullptr, /*skipHair=*/false, /*skipCamHidden=*/true);
             Vec3 c{0, 0, 0};
-            if (haveEnv) c += scene.envXYZForDir(r.d);
-            if (haveSun) c += scene.sunXYZForDir(r.d);
+            if (h.valid) {
+                if (!haveGlow) continue;
+                c = glowXYZAt(h, r.d, pix, k);
+            } else {
+                if (haveEnv) c += scene.envXYZForDir(r.d);
+                if (haveSun) c += scene.sunXYZForDir(r.d);
+            }
             s[0] = (float)(s[0] + c.x); s[1] = (float)(s[1] + c.y); s[2] = (float)(s[2] + c.z);
         }
     };
@@ -16130,11 +16175,18 @@ static bool prepareSky(SkyView& view, const Scene& scene, const Camera& cam, int
             Ray r; double wLens = 0.0;
             if (!cam.genLensRay(px, py, rng.uniform(), rng.uniform(), rng.uniform(),
                                 rng.uniform(), lambda, r, wLens) || !(wLens > 0.0)) continue;
-            if (scene.closestHit(r, 1e-6, nullptr, /*skipHair=*/false, /*skipCamHidden=*/true).valid)
-                continue;
+            const Hit h = scene.closestHit(r, 1e-6, nullptr, /*skipHair=*/false, /*skipCamHidden=*/true);
             double L = 0.0;
-            if (haveEnv) L += scene.envRadianceSeen(r.d, lambda);   // the bilinear camera view
-            if (haveSun) L += scene.sunRadiance(r.d, lambda);
+            if (h.valid) {
+                if (!haveGlow) continue;
+                bool resolved = false;
+                const double u1 = rng.uniform(), u2 = rng.uniform();
+                const int id = glowMatSeen(scene, h, r.d, lambda, u1, u2, resolved);
+                if (id >= 0) L = emitSlot(scene, scene.mats[(size_t)id], h, lambda, r.d * -1.0);
+            } else {
+                if (haveEnv) L += scene.envRadianceSeen(r.d, lambda);   // the bilinear camera view
+                if (haveSun) L += scene.sunRadiance(r.d, lambda);
+            }
             if (!(L > 0.0)) continue;
             const Vec3 c = Vec3(cieX(lambda), cieY(lambda), cieZ(lambda)) * (L * wLens * (kHi - kLo));
             s[0] = (float)(s[0] + c.x); s[1] = (float)(s[1] + c.y); s[2] = (float)(s[2] + c.z);
@@ -16201,8 +16253,8 @@ static bool prepareSky(SkyView& view, const Scene& scene, const Camera& cam, int
 // not depend on how the writes that asked for them split the samples (a live window's refreshes fall
 // where the clock puts them).
 static void addEnvBackground(Film& film, const Scene& scene, const Camera& cam, long long N,
-                             SkyView& view) {
-    if (!prepareSky(view, scene, cam, film.resX, film.resY, N)) return;
+                             SkyView& view, bool glowsOnly = false) {
+    if (!prepareSky(view, scene, cam, film.resX, film.resY, N, glowsOnly)) return;
     const double scale = (double)N / (double)view.K;
     for (int py = 0; py < film.resY; ++py)
         for (int px = 0; px < film.resX; ++px) {
@@ -16212,9 +16264,10 @@ static void addEnvBackground(Film& film, const Scene& scene, const Camera& cam, 
         }
 }
 // A camera written once.
-static void addEnvBackground(Film& film, const Scene& scene, const Camera& cam, long long N) {
+static void addEnvBackground(Film& film, const Scene& scene, const Camera& cam, long long N,
+                             bool glowsOnly = false) {
     SkyView view;
-    addEnvBackground(film, scene, cam, N, view);
+    addEnvBackground(film, scene, cam, N, view, glowsOnly);
 }
 
 // The sky a forward camera sees directly UNDER MOTION BLUR, drawn into one batch's film instead of
@@ -16227,12 +16280,15 @@ static void addEnvBackground(Film& film, const Scene& scene, const Camera& cam, 
 // a photon per pixel per camera sharing the batch, at most 64; where that is under one, each pixel
 // takes its one sample with that chance, weighted up by it. So the sky costs a sixteenth of the
 // batch's photons however small the batch. Rows [y0, y1) only, so each forward thread draws its
-// own band into its own film.
+// own band into its own film. The glows the camera sees (glowMatSeen) are drawn the same way;
+// `glowsOnly` draws them alone, for mode P's blurred split, whose camera side has the sky.
 static void addBlurredSkyRows(Film& film, const Scene& scene, const Camera& cam, long long N,
-                              int nCamsSharing, uint64_t seedBase, int y0, int y1) {
+                              int nCamsSharing, uint64_t seedBase, int y0, int y1,
+                              bool glowsOnly = false) {
     constexpr double kLo = 360.0, kHi = 830.0;
-    const bool haveEnv = scene.envIndex >= 0, haveSun = scene.sunCount > 0;
-    if ((!haveEnv && !haveSun) || N <= 0 || y0 >= y1) return;
+    const bool haveEnv = !glowsOnly && scene.envIndex >= 0, haveSun = !glowsOnly && scene.sunCount > 0;
+    const bool haveGlow = scene.glowAny;
+    if ((!haveEnv && !haveSun && !haveGlow) || N <= 0 || y0 >= y1) return;
     const int rx = film.resX, ry = film.resY;
     const double perPixel = (double)N / ((double)rx * (double)ry * (double)std::max(1, nCamsSharing));
     const double want = perPixel / 16.0;
@@ -16266,8 +16322,24 @@ static void addBlurredSkyRows(Film& film, const Scene& scene, const Camera& cam,
                     r = cp.genRay(px, py, jx, jy);
                 }
                 // A camera ray, so a `hide_camera` flat lets the sky through (Material::hideCamera).
-                if (scene.closestHit(r, 1e-6, nullptr, /*skipHair=*/false, /*skipCamHidden=*/true).valid)
+                const Hit h = scene.closestHit(r, 1e-6, nullptr, /*skipHair=*/false, /*skipCamHidden=*/true);
+                if (h.valid) {
+                    if (!haveGlow) continue;
+                    // A glow it meets (glowMatSeen), as prepareSky adds it: a pinhole's draws a
+                    // wavelength of its own, which only a compound's glow reads.
+                    const double lam = lensed ? lambda : kLo + (kHi - kLo) * rng.uniform();
+                    const double g1 = rng.uniform(), g2 = rng.uniform();
+                    bool resolved = false;
+                    const int id = glowMatSeen(scene, h, r.d, lam, g1, g2, resolved);
+                    if (id < 0) continue;
+                    const Material& m = scene.mats[(size_t)id];
+                    if (!lensed && !resolved)
+                        acc += scene.glowXYZ[(size_t)id] * emitHitScale(scene, m, h, r.d * -1.0);
+                    else
+                        acc += Vec3(cieX(lam), cieY(lam), cieZ(lam)) *
+                               (emitSlot(scene, m, h, lam, r.d * -1.0) * w * (kHi - kLo));
                     continue;
+                }
                 if (!lensed) {
                     if (haveEnv) acc += scene.envXYZForDir(r.d);
                     if (haveSun) acc += scene.sunXYZForDir(r.d);
@@ -16307,12 +16379,13 @@ static Film renderForward(const Scene& scene, const Camera* cam, int resX, int r
     // Under a blur the device times each photon (cudaBlurUnsupported says when it cannot), and
     // the sky the camera sees directly is drawn here meanwhile, as the CPU threads below draw it
     // (addBlurredSkyRows; mode C catches the sky's photons instead). Mode P's blurred split
-    // (pSplit) skips the splats the camera side draws, and its sky, which the camera side has.
+    // (pSplit) skips the splats the camera side draws, and its sky, which the camera side has; its
+    // glows (Scene::glowAny) it draws, as the rest of what the camera's diffuse first hits show.
     const char camModeG = lensMode ? 'A' : forwardCatch ? 'C' : 'B';
     const bool blurG = cam && cam->seesMotion(scene);
     if (useGpu && cam && (!blurG || !cudaBlurUnsupported(scene, *cam, pSplit ? 'P' : camModeG)) &&
         cudaAvailable() && cudaForwardSupported(scene)) {
-        if (!blurG || forwardCatch || pSplit)
+        if (!blurG || forwardCatch || (pSplit && !scene.glowAny))
             return renderForwardCuda(scene, *cam, resX, resY, N, eOut, diffraction, camModeG, seedBase,
                                      wavefront, g_heroC, pSplit, stableSeed, held, effMaxBounce());
         Film sky; sky.resX = resX; sky.resY = resY; sky.alloc();
@@ -16326,10 +16399,10 @@ static Film renderForward(const Scene& scene, const Camera* cam, int resX, int r
         for (int t = 0; t < nThreads; ++t)
             skyPool.emplace_back([&, t] {
                 addBlurredSkyRows(sky, scene, *cam, N, 1, seedBase, (int)((long long)resY * t / nThreads),
-                                  (int)((long long)resY * (t + 1) / nThreads));
+                                  (int)((long long)resY * (t + 1) / nThreads), /*glowsOnly=*/pSplit);
             });
         Film out = renderForwardCuda(scene, *cam, resX, resY, N, eOut, diffraction, camModeG, seedBase,
-                                     wavefront, g_heroC, false, false, held, effMaxBounce());
+                                     wavefront, g_heroC, pSplit, stableSeed, held, effMaxBounce());
         for (auto& th : skyPool) th.join();
         out.merge(sky);
         return out;
@@ -16372,11 +16445,11 @@ static Film renderForward(const Scene& scene, const Camera* cam, int resX, int r
                           rng, reports[tid]);
         }
         // ...and, under a blur, this thread's band of the sky the camera sees directly (mode C
-        // catches the sky's photons through its pupil instead).
-        if (blur && camFilm && !forwardCatch && !pSplit)
+        // catches the sky's photons through its pupil instead); in mode P's split, of its glows.
+        if (blur && camFilm && !forwardCatch)
             addBlurredSkyRows(*camFilm, scene, *cam, N, 1, seedBase,
                               (int)((long long)resY * tid / nThreads),
-                              (int)((long long)resY * (tid + 1) / nThreads));
+                              (int)((long long)resY * (tid + 1) / nThreads), /*glowsOnly=*/pSplit);
     };
     std::vector<std::thread> pool;
     for (int t = 0; t < nThreads; ++t) pool.emplace_back(worker, t);
@@ -19458,10 +19531,20 @@ static int runCompositeProgressive(
     // Compositing is split from persisting so the live window can repaint on its own
     // (much faster) cadence without also rewriting the PNG and the dual-film sidecar —
     // see g_windowIntervalSec.
+    // The glows the camera sees, which the forward layer's photons cannot show (Scene::glowAny): a
+    // diffuse-side pixel takes them from the sky pass, as mode B's film does (under a blur the
+    // forward batches draw them). Fitted with the rest, so the pixels a glow's edge crosses agree.
+    SkyView glowView;
     auto compose = [&](bool done) {
         if (blurP)
             return compositeSplitFilms(acc.fwd, std::max(acc.N, 1LL), acc.ref, acc.spec,
                                        std::max(acc.spp, 1LL), /*verbose*/done);
+        if (scene.glowAny) {
+            Film f = acc.fwd;
+            addEnvBackground(f, scene, cam, std::max(acc.N, 1LL), glowView, /*glowsOnly=*/true);
+            return compositeFromFilms(f, std::max(acc.N, 1LL), acc.ref,
+                                      std::max(acc.spp, 1LL), cc, envScene, /*verbose*/done);
+        }
         return compositeFromFilms(acc.fwd, std::max(acc.N, 1LL), acc.ref,
                                   std::max(acc.spp, 1LL), cc, envScene, /*verbose*/done);
     };
@@ -29195,6 +29278,7 @@ static int run(int argc, char** argv) {
                 EnergyReport e;
                 Film fwd = renderForward(scene, &mc.cam, W, H, meterN, nThreads,
                                          false, false, true, e, diffraction, onDevice);
+                addEnvBackground(fwd, scene, mc.cam, meterN, /*glowsOnly=*/true);   // as the render's compose
                 Film ref;
                 bool refGpu = false;
 #ifdef HAVE_CUDA

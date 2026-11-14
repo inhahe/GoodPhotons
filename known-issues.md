@@ -72,6 +72,33 @@ closed entries, where the cost is a broken historical link rather than a blocked
 Three references — `scenes/_gr_fly0.ftsl`, `scenes/silver_sphere_xenon.ftsl`, `scenes/x.ftsl` —
 name files that no longer exist at all, all in closed entries.
 
+## OPEN (2026-11-14, 0.441.1): J-THIN-GAP-LEAK — mode J lights a surface with the light under it, 1 mm away; mode D shows a gap's mouth that mode R does not
+
+Found by `tools/check_glow_lights.py`'s first draft, whose glowing grid quad was wound face-down
+1 mm over the floor (`scenes/_gap_leak.ftsl`): a plate that emits DOWN into a 1 mm gap over the
+floor, its top lit only by a ceiling panel. No light from the gap can reach the plate's top. CPU,
+256 spp, against mode R: **mode J 167x over the frame** (its median pixel 23x), the plate's whole
+top aglow; **mode D 1.58x on the plate's region**, almost all of it a bright line along the gap's
+front edge, which mode R barely shows.
+
+**Not new.** `scenes/_gap_leak2.ftsl` -- an ordinary `light area` 1 mm under a diffuse plate,
+facing down -- reads mode J 1.21x mode R (mean; median 1.03) with 0.441.1 and with 0.442.0 alike.
+The emissive plate only made it louder: there every photon of the gap starts or ends on the
+plate's own plane.
+
+**Mode J's cause, read off the code:** its surface merges (bdpt.h, the `photons->query` callback;
+the device twin) keep every photon within the radius -- `SurfMap::query` is a sphere test, and no
+plane test follows. Mode M and S gathers keep only the photons on the gather point's own surface
+(gatherplane.h `onGatherSurfaceSided`, MERGE-PROXIMITY, 0.431.0); J's merges never got it, and a
+`SurfPhoton` stores no surface normal to apply it with. So the photons on the floor 1 mm under the
+plate, which arrived from above (the plate's emission), pass the merge's from-behind test at the
+plate's top and are counted there. **Fix:** store the photon's surface normal and apply
+`onGatherSurfaceSided` in J's surface merges on both backends (and see whether mode U's merges,
+vcm.h, lack it too). Not yet looked into: (D) whether the line along the
+gap's mouth is real light mode R's camera rays almost never find (a slit 1 mm high at a grazing
+angle is a few per cent of a pixel row, and inside it an emitter 1 mm away), i.e. R's noise, or D
+counting light the slit cannot let out. Both repros are tracked.
+
 ## NOTED (2026-11-09, the machine, not ftrace): BUGCHECK-INTSTEER — two blue screens in a day were one driver corrupting Windows kernel memory
 
 At ~08:19:40 on 2026-11-09 the machine bugchecked (0x1E KMODE_EXCEPTION_NOT_HANDLED) while
@@ -4101,7 +4128,33 @@ Dismissed: clamping `aimRadiance` near grazing (Fable offered it as one option) 
 bias every aimed light seen edge-on to cure noise in the views no other strategy reaches; the
 model is documented instead.
 
-## OPEN (2026-10-16): GLOW-LIGHT-MODES — what a glow with no emitter lights differs by mode, and mode P breaks on it
+## DONE (2026-11-14, 0.442.0): GLOW-LIGHT-MODES — what a glow with no emitter lights differs by mode, and mode P breaks on it
+
+**Fixed in 0.442.0, the user's decision (2026-11-14): register the emitters, and add an option for
+a glow that lights nothing.** design.md, "Every emissive surface is a light; `glow_only`".
+
+* Every emissive surface now has an emitter (ftsl.h `registerGlows`): its material's triangles one
+  mesh light, a sphere a sphere light, an isosurface or CSG solid (and a sphere under an emission
+  pattern) a Glow, sampled by the lines through its box (the Crofton draw, `Scene::
+  glowSamplePoint`). `tools/check_glow_lights.py`: mode R's floor under a glowing ball written as
+  an isosurface reads **1.0000** of the same ball as a sphere light, as a patterned sphere 1.0000
+  (2048 spp); a frame lit by a glowing wire frame and a grid of glowing lines reads within noise of
+  mode R in every mode on both backends.
+* `glow_only on` keeps a material a glow that lights nothing, and every mode now counts such a glow
+  only along a camera path specular from the camera on -- mode R included, whose specular re-arm
+  had counted the light the glow threw through a mirror onto the walls (+7 % of the room in
+  `tools/check_glow_modes.py`'s), and mode M's final gather, which counted it at the visible point.
+  The forward modes add what the camera sees of one directly, as they add the sky, and mode P's
+  forward layer likewise: its fit had read the glow's edge pixels on the camera side alone and ran
+  the frame 13 % bright (the x368 below, in a scene the glow dominates). check_glow_modes, against
+  mode R, worst tile: R GPU 1.003, D 0.995 / 0.996, J 0.980 / 1.006, U 0.990 / 1.002, B 1.001 /
+  0.998, P 0.992 / 1.002 (CPU / GPU); M and S within their noise on the glow's few-pixel reflection
+  in the mirror ball (three seeds of M on it: 0.84, 1.13, 1.15); the room reads the same with the
+  glow and without.
+* The camera's wavelength density includes the glows (`Scene::glowG`), so a glow whose colour no
+  light emits is drawn at all.
+
+The finding:
 
 A surface whose material emits but that has no emitter (a marched isosurface or CSG solid; the
 KNOWN LIMITATION under the 0.199.3 entry) is said to "glow but illuminate nothing, consistently
@@ -20756,7 +20809,13 @@ matching auto-exposure (3.18e-13 vs 3.17e-13), and mode M's frame mean 70.37 vs 
 surface gets a brighter body now. `gallery_rain`'s ground was, and its albedo was dropped from
 5 % to 1 % in the same commit to restore the intended near-black plane.
 
-### KNOWN LIMITATION (not a regression): an emissive `quad` / isosurface / CSG solid GLOWS but does not ILLUMINATE
+### FIXED (2026-11-14, 0.442.0): an emissive `quad` / isosurface / CSG solid GLOWS but does not ILLUMINATE
+
+Every emissive surface has an emitter since 0.442.0, and `glow_only on` keeps one a glow that
+lights nothing (GLOW-LIGHT-MODES). The huge emissive quad's flux no longer starves the other
+lights: an emitter is chosen by the light its pattern lets out (`Emitter::selW`). The original
+entry:
+
 
 Only tessellated geometry registers an `Emitter` (`Scene::addAreaLight` / `addMeshLight` are
 called from `light` blocks and mesh lights). A bare `quad {}` whose material carries an `emit`
@@ -25645,7 +25704,12 @@ a rest pose that doesn't exist. `gallery.ftsl`'s torus is now `major 0.105 minor
 0.150), so the balls are the lowest feature and the piece rests on its two spheres like a dumbbell
 should.
 
-### LIMITATION (2026-08-02): emissive geometry with no registered emitter is invisible to NEE, so it lights nothing
+### FIXED (2026-11-14, 0.442.0): emissive geometry with no registered emitter is invisible to NEE, so it lights nothing
+
+Fixed without the proxy mesh this proposed: an isosurface or CSG solid is sampled exactly by the
+lines through its box, its crossings found by its own intersector, so no proxy has to agree with
+the marched surface (GLOW-LIGHT-MODES). The original entry:
+
 
 A material's `emit` makes *any* surface glow — including a marched isosurface or a CSG / quadric
 solid, which have no triangles to register an `Emitter` against (only the single-material mesh

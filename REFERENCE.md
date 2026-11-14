@@ -3490,8 +3490,8 @@ radiate into its own interior and look black, so such shells are auto-oriented
 outward at load — the loader flips the winding of any emissive mesh that encloses a
 volume with inward orientation, leaving flat/open sheets (which enclose no volume)
 exactly as authored. Emissive meshes count as lights, so a scene lit *only* by one
-needs no separate `light` block. (Meshes that import their own materials — glTF/GLB —
-are not auto-lit; bind an FTSL `emit` material instead.)
+needs no separate `light` block. Several mesh blocks (or quads, or instances) bound to one
+emissive material are one light, sampled over all of their triangles.
 
 Because the sampling is uniform by area and takes no account of the shading point,
 keep an emissive mesh **spatially compact** — one fixture per `mesh` block rather than
@@ -3503,20 +3503,37 @@ a tessellated emissive sphere is as clean as the analytic `light sphere`.
 
 **Emissive non-mesh geometry (glowing solids).** `emit` is a property of the
 *material*, not of the `mesh` block, so binding an emissive material to anything else —
-a `sphere`, a `quad`, a CSG solid, a marched `isosurface`, a `curve` fiber — makes it glow
-too, identically on CPU and GPU. The difference is that only a mesh has triangles to
-register an emitter against, so these surfaces are seen by **emission-on-hit only**: a
-camera ray (or a specular bounce) that lands on one picks up `emit(λ)`, but NEE and
-light subpaths cannot sample points on them. What that leaves differs by mode: modes
-`R`, `W`, `M` and `S` count a glow only where a camera ray or a specular bounce meets
-it, so there *it does not illuminate the rest of the scene*, and the forward modes
-`A/B/C` see none of it; the bidirectional modes `D`, `J` and `U` also count the light a
-diffuse surface gathers from it, at full weight (`D` and `J` since 0.439.7, which made
-them count it as `U` does; a glow whose material a mesh light also uses still reads only
-part of it there). Treat them as self-luminous **appearance**, not as luminaires, and
-keep a real light in the scene to do the actual lighting — see
-`tools/loom/examples/glowing_jack.py`, where a gyroid-carved isosurface glows from
-inside its own filigree while a ceiling panel shades it.
+a `sphere`, a bare `quad` or `polygon`, a CSG solid, a marched `isosurface`, a
+`mesh_instance` — makes it a light too (since 0.442.0), on CPU and GPU and in every mode
+alike: ftrace registers an emitter for it at load. The triangles of each emissive material
+(every `mesh` block's, quad's and instance's, merged) form one mesh light; each sphere is a
+sphere light; each isosurface or CSG solid — and a sphere under an emission pattern — is
+sampled by **random lines through its box**: such a line crosses any surface inside the box
+with the same density everywhere (the Crofton formula), so one of its crossings, weighted by
+how many there are, is an exact sample of the surface whatever its shape, a thin wire frame
+included. Lines that miss the surface cost a march and add nothing, so a sparse solid in a
+large box takes more samples to light the room cleanly than a mesh light of the same area
+would. Each emissive sphere and isosurface gets its own emitter (a copy of its material, named
+`glow [2]`, `glow [3]`, … in diagnostics), so many glowing objects are sampled where they are.
+Until 0.442.0 only a `mesh` block registered one: the rest lit nothing in modes `R`, `W`, `M`
+and `S`, nothing and were not even seen in the forward modes, and lit everything around them at
+full weight in `D`, `J` and `U`.
+
+**A glow that lights nothing: `glow_only on`.** On an emissive material, it keeps the surface
+self-luminous **appearance**: seen by the camera, and in mirrors, through glass and in glossy
+reflections, but lighting nothing — no surface and no medium, in any mode (every mode counts its
+emission only along a camera path that met nothing but specular surfaces before it). Use it for
+a glowing grid, a neon outline or a screen meant to read as light without casting any:
+
+```ftsl
+material "neon" { type diffuse  reflect 0.02  emit gaussian 528 34 0.5  glow_only on }
+```
+
+The forward modes see such a glow only where the camera sees it directly — `A`, `B` and `V` add
+it as they add the sky, and mode `P`'s forward layer likewise — and mode `C` not at all. An
+emissive curve or `fur`, an emissive child of a `mix` or `layered` material, and an emissive
+isosurface whose motion stretches it unevenly have no emitter to give the lighting, so they are
+refused unless their material is `glow_only`.
 
 **Emission is one-sided — mind a `quad`'s winding.** A surface shows its `emit` only to a
 ray arriving on the *front* face, and a `quad`'s front face is the side `cross(u, v)`

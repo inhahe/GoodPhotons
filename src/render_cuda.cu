@@ -1042,7 +1042,7 @@ struct DEmitter {
     double aimNorm;            // an aimed quad's flux constant, PI*(1+cos t)/2 (Emitter::aimNorm)
     double area, power;
     int    collimated;
-    int    shape;              // 0 quad, 1 sphere, 2 spot, 3 env, 4 cylinder, 5 mesh, 6 sun
+    int    shape;              // 0 quad, 1 sphere, 2 spot, 3 env, 4 cylinder, 5 mesh, 6 sun, 7 glow
     double radius;             // sphere radius (shape==1) / tube radius (shape==4)
     int    caps;               // cylinder (shape==4): also emit from the two end discs
     // Cone cosines / solid angle. Spot (shape==2): the smoothstep penumbra. Distant sun
@@ -1081,6 +1081,13 @@ struct DEmitter {
     // 1 for a mesh light some of whose triangles deform (Emitter::deforms): sampled on them as the
     // keys have them at the path's time (dEmitterSamplePoint).
     int    deforms;
+    // Its selection weight (Emitter::selW), which a forward photon divides back out of the total
+    // power it carries.
+    double selW;
+    // Glow (shape 7, host EmitterShape::Glow): the primitive its lines meet -- DScene::implicits'
+    // index, or spheres' where glowSphere -- and their box (dGlowSamplePoint).
+    int    glowPrim, glowSphere;
+    DVec3  glowLo, glowHi;
 };
 
 // PBRT's IsDeltaLight (device twin of bdpt.h isDeltaEmitter): this emitter's emission
@@ -1474,6 +1481,8 @@ struct DScene {
     // BDPT samples one shared lambda per sample from this and sets invPdfLambda=1/pdf.
     const double*    emitSamplerCdf; int emitSamplerN; double emitSamplerStep;
     double           emitG;
+    // The glows' share of g, per nm from LAMBDA_MIN (Scene::glowGTab), or null: part of dEmitterG.
+    const double*    glowG; int glowGN;
     // The camera's illuminant (mirror Scene::camSampler / camG): emitSampler's g(lambda) plus the
     // fires' (dFireG), so a fire is reached at every wavelength it emits, and its integral. Its
     // draws (Scene::camDraw): the same times a visible-band window, camVisCdf for mode R and
@@ -11724,14 +11733,76 @@ __device__ static double dEmitterPatMulAt(const DScene& sc, const DEmitter& em,
 // when given, receives how much the light's area has grown about the point at the path's time
 // (1 for one that does not change size): what its area densities divide by, its photons' power
 // multiplies by.
+// Device twin of Scene::glowSamplePoint (scene.h, where the why is): a point on a Glow emitter
+// (shape 7), drawn by a line through its box, and `k` the line's crossings with its primitive; false
+// where it crossed nothing. The hit as closestHit leaves one (its pattern side, its normal map).
+__device__ static bool dGlowSamplePoint(const DScene& sc, const DEmitter& em, DRng& rng, DHit& h,
+                                        int& k) {
+    k = 0;
+    const Real lo[3] = {em.glowLo.x, em.glowLo.y, em.glowLo.z};
+    const Real ext[3] = {em.glowHi.x - em.glowLo.x, em.glowHi.y - em.glowLo.y, em.glowHi.z - em.glowLo.z};
+    const double fa[3] = {(double)ext[1] * ext[2], (double)ext[0] * ext[2], (double)ext[0] * ext[1]};
+    const double tot = fa[0] + fa[1] + fa[2];
+    if (!(tot > 0.0) || em.glowPrim < 0) return false;
+    const double uf = (double)rng.uniform() * tot;
+    const int a = (uf < fa[0]) ? 0 : (uf < fa[0] + fa[1]) ? 1 : 2;
+    const bool high = rng.uniform() < (Real)0.5;
+    const Real s1 = rng.uniform(), s2 = rng.uniform();
+    Real o[3] = {lo[0], lo[1], lo[2]}, n[3] = {0, 0, 0};
+    const int b = (a + 1) % 3, c = (a + 2) % 3;
+    o[a] += high ? ext[a] : (Real)0;
+    o[b] += s1 * ext[b];
+    o[c] += s2 * ext[c];
+    n[a] = high ? (Real)-1 : (Real)1;                    // into the box
+    const DVec3 ro(o[0], o[1], o[2]);
+    const DVec3 rd = cosineHemisphere(DVec3(n[0], n[1], n[2]), rng);
+    const double step = em.glowSphere ? 0.0 : 0.5 * sc.implicits[em.glowPrim].minStep;
+    Real tmin = (Real)0;
+    for (int guard = 0; guard < (1 << 20); ++guard) {
+        DHit x; x.t = (Real)1e30; x.valid = false;
+        bool got;
+        if (em.glowSphere) {
+            const DSphere& s = sc.sph[em.glowPrim];
+            got = intersectSphere(ro, rd, s, tmin, x, s.frame >= 0 ? sc.sphAxes + 3 * s.frame : nullptr);
+        } else {
+            got = intersectImplicit(sc, sc.implicits[em.glowPrim], ro, rd, tmin, x);
+        }
+        if (!got) break;
+        ++k;
+        if ((double)rng.uniform() * (double)k < 1.0) h = x;   // each crossing kept with chance 1 / k
+        tmin = x.t + (Real)fmax(step, 1e-6 * (1.0 + (double)x.t));
+    }
+    if (k == 0) return false;
+    h.patOwnSide = h.valid && h.matId >= 0 && sc.mats[h.matId].patOwnSide;   // as closestHit leaves it
+    dApplyNormalMap(sc, h);
+    return true;
+}
+
 __device__ static double dEmitterSamplePoint(const DScene& sc, const DEmitter& em,
                                              double u1, double u2,
-                                             DVec3& y, DVec3& nOut, double* areaScaleOut = nullptr) {
+                                             DVec3& y, DVec3& nOut, double* areaScaleOut = nullptr,
+                                             DRng* rng = nullptr) {
     const bool deform = em.deforms;   // its triangle wanted, timed or not (a flat one, below)
     int mt = -1;
     double bary[2] = {0.0, 0.0};
     double pmul = 1.0;
-    if (em.emitPat < 0) {
+    if (em.shape == 7) {   // a Glow (host twin emitterSamplePoint): its draw needs a stream
+        DRng own;
+        if (!rng) {
+            own.seedUnit((unsigned long long)__double_as_longlong(u1) ^
+                         ((unsigned long long)__double_as_longlong(u2) * 0x9E3779B97F4A7C15ULL),
+                         0xC0F70E5A11FEEDULL);
+        }
+        DHit gh;
+        int k = 0;
+        if (!dGlowSamplePoint(sc, em, rng ? *rng : own, gh, k)) {
+            y = (em.glowLo + em.glowHi) * (Real)0.5; nOut = DVec3(0, 0, 1);
+            if (areaScaleOut) *areaScaleOut = 1.0;
+            return 0.0;
+        }
+        y = gh.p; nOut = gh.ng;
+        pmul = (double)k * ((em.emitPat >= 0) ? dEmitPatMul(sc, em.emitPat, gh) : 1.0);
+    } else if (em.emitPat < 0) {
         emitterSamplePoint(em, u1, u2, y, nOut, nullptr, nullptr, nullptr, deform ? &mt : nullptr, bary);
     } else {
         double uu = 0.0, vv = 0.0, reach = 0.0;
@@ -12235,7 +12306,8 @@ __device__ static bool genPhoton(const DScene& sc, const DCamSet& cs,
         // photon's time: the power it was chosen by, the instant's, grows with it (host twin
         // render.h; 1 unchanged).
         double areaScale = 1.0;
-        emitPatW = dEmitterSamplePoint(sc, em, u1, u2, origin, emitN, &areaScale);
+        emitPatW = dEmitterSamplePoint(sc, em, u1, u2, origin, emitN, &areaScale, &rng);
+        if (em.shape == 7 && !(emitPatW > 0.0)) return false;   // its line crossed nothing (host twin)
         spotW = (Real)areaScale;
         if (em.collimated) dir = dLightDirNow(sc, em, em.beamDir);
         else if (em.normalTilted) {                // an aimed quad: intensity-proportional
@@ -12269,6 +12341,7 @@ __device__ static bool genPhoton(const DScene& sc, const DCamSet& cs,
     beta = (Real)((sc.emissiveVolN > 0) ? grandTotal
                   : ((sc.nEmitters == 1) ? em.power : sc.totalPower));
     beta *= spotW;          // 1 for a still, unscaled area light
+    if (em.selW != 1.0) beta = (Real)(beta / em.selW);   // chosen by its emitted light (Emitter::selW)
     // Image env: reweight so the photon carries the radiance actually arriving
     // from `dir`, = L(dir,lambda)/(4pi*envPdfW*avgSpd(lambda)). The shared
     // illuminant in L and avgSpd cancels, leaving the per-texel JH ratio.
@@ -13161,7 +13234,8 @@ __device__ static bool genPhotonHero(const DScene& sc, const DCamSet& cs, int ca
         emitN = dir;
     } else {
         double areaScale = 1.0;   // its area at the photon's time -- see genPhoton
-        emitPatW = dEmitterSamplePoint(sc, em, u1, u2, origin, emitN, &areaScale);
+        emitPatW = dEmitterSamplePoint(sc, em, u1, u2, origin, emitN, &areaScale, &rng);
+        if (em.shape == 7 && !(emitPatW > 0.0)) return false;   // its line crossed nothing (host twin)
         spotW = (Real)areaScale;
         if (em.collimated) dir = dLightDirNow(sc, em, em.beamDir);
         else if (em.normalTilted) {                // an aimed quad: intensity-proportional
@@ -13194,6 +13268,7 @@ __device__ static bool genPhotonHero(const DScene& sc, const DCamSet& cs, int ca
     }
     Real base = (Real)((sc.nEmitters == 1) ? em.power : sc.totalPower);
     base *= spotW;
+    if (em.selW != 1.0) base = (Real)(base / em.selW);   // see genPhoton
     for (int i = 0; i < C; ++i) beta[i] = base / (Real)C;
     if (envImage) {
         int ti = dEnvTexel(sc.env, -dir);   // the sky it came from (dir is the travel direction)
@@ -14239,6 +14314,16 @@ __device__ static inline bool dIsLightVertex(const DScene& sc, const DVertex& v)
     if (v.type != BV_SURFACE) return false;
     return v.lightIdx >= 0 || (v.matId >= 0 && sc.mats[v.matId].matIsLight);
 }
+// Whether eye[t - 1] is seen the way a glow no emitter samples is: every vertex between the camera
+// and it a specular surface (dIsSpecularType, or a delta step). Host twin bdpt.h glowSeenBy.
+__device__ static inline bool dGlowSeenBy(const DScene& sc, const DVertex* eye, int t) {
+    for (int i = 1; i + 1 < t; ++i) {
+        const DVertex& v = eye[i];
+        if (v.type != BV_SURFACE || v.matId < 0 || !(v.delta || dIsSpecularType(sc.mats[v.matId].type)))
+            return false;
+    }
+    return true;
+}
 // PBRT's Vertex::IsDeltaLight (device twin of bdpt.h Vertex::isDeltaLight): this vertex IS
 // a light whose emission carries a Dirac delta, so the "eye path lands on the light" (s=0)
 // strategy cannot produce it. dMisWeight uses it to drop that strategy from the sum.
@@ -14575,6 +14660,12 @@ __device__ static Real dSampleFluoInU(const DScene& sc, const DMaterial& m,
 // emitSampler tabulates.
 __device__ static double dEmitterG(const DScene& sc, Real lambda) {
     double g = 0.0;
+    if (sc.glowG) {                                    // the glows' share (Scene::glowG)
+        const double t = (double)lambda - DLMIN;
+        int i = (t > 0.0) ? (int)t : 0;
+        if (i >= sc.glowGN) i = sc.glowGN - 1;
+        g = sc.glowG[i];
+    }
     for (int k = 0; k < sc.nEmitters; ++k) {
         const DEmitter& e = sc.emitters[k];
         // geomWeight (mirrors Scene::Emitter::geomWeight): area/sphere/cylinder = area*PI;
@@ -15176,6 +15267,7 @@ __device__ static bool bkEmitterGeom(const DScene& sc, const DHit& h, const DVec
     // it takes keeps), the sample carried to the path's time; a deforming one on its triangles as
     // they are then. `areaScale`: how much its area has grown about the point.
     double areaScale = 1.0;
+    // (no stream: a Glow's draw is seeded from u1 and u2, as the host's emitterGeom's)
     double epat = dEmitterSamplePoint(sc, em, (double)u1, (double)u2, y, nL, &areaScale);
     DVec3 toL = y - h.p;
     g.dist2 = dot(toL, toL);
@@ -15624,7 +15716,7 @@ __device__ __noinline__ static void bkNeeVolumeHero(const DScene& sc, const DMed
             DVec3 y, nL;
             // Also returns the sampled point's emission-pattern factor (1.0 when unpatterned).
             double areaScale = 1.0;   // its area at the path's time about the point
-            const double epat = dEmitterSamplePoint(sc, em, (double)u1, (double)u2, y, nL, &areaScale);
+            const double epat = dEmitterSamplePoint(sc, em, (double)u1, (double)u2, y, nL, &areaScale, &rng);
             const DVec3 toL = y - p;
             const Real dist2 = dot(toL, toL);
             dist = sqrt(dist2);
@@ -16091,6 +16183,9 @@ struct DGiCtx {
     int depth = 0;
     unsigned long long sIdx = 0;
     int bounce = 0;
+    // The path has met a surface off a non-specular vertex: a glow no emitter samples is seen only
+    // before (host twin BackwardRenderer::GiCtx::pastDiffuse). A split sub-path inherits it.
+    bool pastDiffuse = false;
 };
 
 // Mode P's blurred split on the device (host twins BackwardRenderer::GiCtx::first, noteFirst,
@@ -16729,14 +16824,15 @@ __device__ static double bkRadiance(const DScene& sc, int diffraction, DVec3 ro,
         // this hit's `emit pattern:` factor — the same value the NEE side gets from the
         // sampler at this point (device twin of host emitSlot).
         int li = dEmitterForMat(sc, matId);
+        if (!specularArrival) gi.pastDiffuse = true;
         if (specularArrival && dot(rd, h.ng) < 0) {
             // Prefer the registered emitter's baked SPD (it may carry a `power`/`lumens`
             // flux normalisation the raw material spectrum does not); fall back to the
-            // material's own `emit` when this geometry has no emitter — an isosurface or
-            // CSG solid is marched, never tessellated, so nothing registers for it.
-            const DSpec* eSpd = (li >= 0)          ? &sc.emitters[li].emitSpd
-                               : (mp->matIsLight)   ? &mp->matEmit
-                                                    : nullptr;
+            // material's own `emit` where no emitter samples the glow -- which counts only along
+            // a path specular from the camera on (DGiCtx::pastDiffuse): it lights nothing.
+            const DSpec* eSpd = (li >= 0)                           ? &sc.emitters[li].emitSpd
+                               : (mp->matIsLight && !gi.pastDiffuse) ? &mp->matEmit
+                                                                     : nullptr;
             if (eSpd) {
                 // GLOSSY-NEE's lobe-sampling half; 1 -- and this expression bit-identical to
                 // its pre-0.266 form -- unless the previous bounce was a MIS'd glossy one.
@@ -16999,11 +17095,12 @@ __device__ static void bkRadianceHeroLoop(const DScene& sc, int diffraction,
         // Surface emission on a specular/camera arrival (NEE covers diffuse arrivals).
         // The `emit pattern:` factor is achromatic, so one eval serves the whole bundle.
         int li = dEmitterForMat(sc, matId);
+        if (!specularArrival) gi.pastDiffuse = true;
         if (specularArrival && dot(rd, h.ng) < 0) {
             // Same emitter-then-material fallback as the single-wavelength path above.
-            const DSpec* eSpd = (li >= 0)        ? &sc.emitters[li].emitSpd
-                               : (mp->matIsLight) ? &mp->matEmit
-                                                  : nullptr;
+            const DSpec* eSpd = (li >= 0)                           ? &sc.emitters[li].emitSpd
+                               : (mp->matIsLight && !gi.pastDiffuse) ? &mp->matEmit
+                                                                     : nullptr;
             if (eSpd) {
                 double ep = dEmitHitScale(sc, mp->emitPat, li, h, rd * (Real)(-1));
                 if (gmis.pdf > 0.0)          // GLOSSY-NEE, as in the scalar loop
@@ -17637,7 +17734,7 @@ __device__ static DVec3 bkNeeLightRGB(const DScene& sc, const DHit& h, const DVe
         // Also returns the sampled point's emission-pattern factor (1.0 when unpatterned).
         // The pattern is achromatic, so it scales the baked RGB radiance directly.
         double areaScale = 1.0;   // its area at the path's time about the point
-        double epat = dEmitterSamplePoint(sc, em, (double)u1, (double)u2, y, nL, &areaScale);
+        double epat = dEmitterSamplePoint(sc, em, (double)u1, (double)u2, y, nL, &areaScale, &rng);
         DVec3 toL = y - h.p;
         Real dist2 = dot(toL, toL);
         Real dist = sqrt(dist2);
@@ -17690,6 +17787,7 @@ __device__ static DVec3 bkRadianceRGB(const DScene& sc, int diffraction, DVec3 r
                                       DRng& rng) {
     DVec3 L(0, 0, 0), beta(1, 1, 1);
     bool specularArrival = true;
+    bool pastDiffuse = false;   // a glow no emitter samples is seen only before (DGiCtx::pastDiffuse)
     double contBsdfPdf = 0.0;
     double contSoft = 1.0;   // what the last vertex lends what it reaches (dContSoftening)
     DMediumStack stk; stk.clear();
@@ -17739,7 +17837,8 @@ __device__ static DVec3 bkRadianceRGB(const DScene& sc, int diffraction, DVec3 r
             mp = &sc.mats[child]; matId = child;
         }
         int li = dEmitterForMat(sc, matId);
-        if (specularArrival && dot(rd, h.ng) < 0 && (li >= 0 || mp->matIsLight)) {
+        if (!specularArrival) pastDiffuse = true;
+        if (specularArrival && dot(rd, h.ng) < 0 && (li >= 0 || (mp->matIsLight && !pastDiffuse))) {
             // The emission pattern is achromatic, so it scales the baked RGB radiance.
             // Emitter-less emissive geometry (isosurface / CSG solid) falls back to the
             // material's own baked emission, exactly as the spectral paths do.
@@ -18970,7 +19069,7 @@ __device__ static int dGenLightSubpath(const DScene& sc, const DCamera& cam, int
     // when the emitter is unpatterned). It scales the emitted radiance the subpath starts
     // with, exactly as the emission-on-hit side scales the s=0 strategy's radiance.
     double areaScale = 1.0;   // its area at the path's time about the point (1 unchanged)
-    double emitPatW = dEmitterSamplePoint(sc, em, u1, u2, y, nOut, &areaScale);
+    double emitPatW = dEmitterSamplePoint(sc, em, u1, u2, y, nOut, &areaScale, &rng);
     double Le = (double)specLookup(em.emitSpd, lambda) * invPdfLambda * emitPatW;
     // The bundle's other wavelengths: a subpath dark at the hero alone still carries them (the
     // walk goes on while any wavelength lives), as the spot / sun branch's does. Host twin:
@@ -19208,6 +19307,7 @@ __device__ static double dConnectBDPT(const DScene& sc, const DCamera& cam,
         if (t < 2) return 0.0;
         const DVertex& pt = eye[t - 1];
         if (!dIsLightVertex(sc, pt)) return 0.0;
+        if (pt.type == BV_SURFACE && pt.lightIdx < 0 && !dGlowSeenBy(sc, eye, t)) return 0.0;   // a glow: seen, not lit by
         DVec3 dwo = eye[t - 2].p - pt.p;             // degeneracy guard: normalize(0) is NaN
         if (ddot(dwo, dwo) == 0.0) return 0.0;
         DVec3 wo = normalize(dwo);
@@ -19359,7 +19459,7 @@ __device__ static double dConnectBDPT(const DScene& sc, const DCamera& cam,
             // sees; s=0 applies the pointwise-equal emission-on-hit factor, which is what
             // keeps the two MIS-combined strategies consistent.
             double areaScale = 1.0;   // its area at the path's time about the point
-            emitPatW = dEmitterSamplePoint(sc, em, u1, u2, y, nOut, &areaScale);
+            emitPatW = dEmitterSamplePoint(sc, em, u1, u2, y, nOut, &areaScale, &rng);
             DVec3 toL = y - pt.p; double dist2 = ddot(toL, toL);
             if (dist2 <= 0.0) return 0.0;
             dist = sqrt(dist2); wi = toL * (Real)(1.0 / dist);
@@ -20583,16 +20683,13 @@ __device__ static void dPhotonGatherSub(const DScene& sc, const DPhotonMap& pm,
         const DMaterial& m = *mp;
 
         // Self-emission on a SPECULAR arrival (a diffuse arrival's direct term comes from NEE
-        // at the visible point). Prefers the registered emitter's baked SPD and falls back to
-        // the material's own `emit` for geometry that registers none — a quad, isosurface or
-        // CSG solid — exactly as bkRadiance does; testing `li >= 0` alone made every such
-        // glowing surface invisible to mode M. Does NOT return: an emissive material still
+        // at the visible point), the registered emitter's baked SPD. A glow no emitter samples
+        // lights nothing, so what this ray -- one gathering light for the visible point -- sees of
+        // one is not counted (DGiCtx::pastDiffuse). Does NOT return: an emissive material still
         // has a BSDF. Host twin: photonGatherSub.
         {
             const int li = dEmitterForMat(sc, matId);
-            const DSpec* eSpd = (li >= 0)        ? &sc.emitters[li].emitSpd
-                               : (m.matIsLight)   ? &m.matEmit
-                                                  : nullptr;
+            const DSpec* eSpd = (li >= 0) ? &sc.emitters[li].emitSpd : nullptr;
             if (eSpd && specularSeen && dot(rd, h.ng) < 0 && !hairArrival) {
                 double rhoV = (double)clamp01(dDiffuseRho(sc, visMat, visHit, lambda));
                 double e = (double)specLookup(*eSpd, lambda) * thr * rhoV * invPdfL * contSoft
@@ -21121,6 +21218,7 @@ __device__ static void dPhotonGather(const DScene& sc, const DPhotonMap& pm,
     double thr = 1.0;
     DSpecThr sthr; sthr.init();      // SPECGATHER: the walk's spectral factors (see above)
     bool hairArrival = false;        // HAIR-NEE: the previous vertex was a fiber that already took its direct light
+    bool pastDiffuse = false;        // past a fibre's scattering: no glow is seen (host twin photonGather)
     DGlossyMis gmis; gmis.clear();   // GLOSSY-NEE: the lobe density of a glossy continuation, for the MIS weight
     DMediumStack stk; stk.clear();   // nested-dielectric medium stack (empty = vacuum)
     // norm folded into pX/pY/pZ; radius^2 kept in Real — the distance test runs once per
@@ -21273,9 +21371,9 @@ __device__ static void dPhotonGather(const DScene& sc, const DPhotonMap& pm,
         // twin: photonGather — see its comment for the four-mode measurement.
         {
             const int li = dEmitterForMat(sc, matId);
-            const DSpec* eSpd = (li >= 0)        ? &sc.emitters[li].emitSpd
-                               : (m.matIsLight)   ? &m.matEmit
-                                                  : nullptr;
+            const DSpec* eSpd = (li >= 0)                        ? &sc.emitters[li].emitSpd
+                               : (m.matIsLight && !pastDiffuse)   ? &m.matEmit   // a glow: seen only before
+                                                                  : nullptr;
             if (eSpd && dot(rd, h.ng) < 0 && !hairArrival) {
                 // GLOSSY-NEE's other half: if the previous bounce was a glossy lobe that was
                 // already connected to this light, the two strategies are balance-weighted so
@@ -21313,6 +21411,7 @@ __device__ static void dPhotonGather(const DScene& sc, const DPhotonMap& pm,
             const double dc = dStrandStep(sc, m, h, lambda, invPdfL, rng, thr, &sthr, ro, rd, cont);
             oX += (double)cieX(lambda) * dc; oY += (double)cieY(lambda) * dc; oZ += (double)cieZ(lambda) * dc;
             hairArrival = true;
+            pastDiffuse = true;
             if (!cont) return;
             continue;
         }
@@ -21556,6 +21655,7 @@ __device__ static void dPhotonGather(const DScene& sc, const DPhotonMap& pm,
                     if (nullSteps < 256) { --b; ++nullSteps; }
                 }
                 if (!passedThru) {   // each bin folded from the sample's angular half (dHairFoldFCos)
+                    pastDiffuse = true;   // a fibre's scattering: no glow is seen past it
                     const double den = m.hairSigmaAFromReflect ? dhair::sigmaADenominator(m.hairBetaN) : -1.0;   // hoisted: three pow() per bin otherwise
                     const double specPat = dHairSpecPatAt(sc, m, h);   // hoisted: the pattern is the same at every bin
                     double vk[DSpecThr::K];
@@ -21737,6 +21837,7 @@ __device__ static void dSppmVisiblePoint(const DScene& sc, DVec3 ro, DVec3 rd, R
     double thr = 1.0;
     DMediumStack stk; stk.clear();
     bool strandArrival = false;   // CURVE-GATHER: the previous vertex, a strand, took its direct light
+    bool pastDiffuse = false;     // past a strand's scattering: no glow is seen (host twin sppm_render.h)
     double contSoft = 1.0;        // what the last vertex lends what it reaches (dContSoftening)
     for (int b = 0; b <= maxBounce; ++b) {                     // the tail (host twin)
         const bool tail = (b == maxBounce);
@@ -21806,7 +21907,7 @@ __device__ static void dSppmVisiblePoint(const DScene& sc, DVec3 ro, DVec3 rd, R
                            : (m.matIsLight)   ? &m.matEmit
                                               : nullptr;
         if (eSpd) {
-            if (dot(rd, h.ng) < (Real)0 && !strandArrival) {
+            if (dot(rd, h.ng) < (Real)0 && !strandArrival && (li >= 0 || !pastDiffuse)) {
                 double e = (double)specLookup(*eSpd, lambda) * thr * invPdfL * contSoft
                          * dEmitHitScale(sc, m.emitPat, li, h, rd * (Real)(-1));    // pattern and aim at this hit
                 dX += (double)cieX(lambda) * e;
@@ -21825,6 +21926,7 @@ __device__ static void dSppmVisiblePoint(const DScene& sc, DVec3 ro, DVec3 rd, R
             const double dc = dStrandStep(sc, m, h, lambda, invPdfL, rng, thr, &sthr, ro, rd, cont);
             dX += (double)cieX(lambda) * dc; dY += (double)cieY(lambda) * dc; dZ += (double)cieZ(lambda) * dc;
             strandArrival = true;
+            pastDiffuse = true;
             if (!cont) return;
             continue;
         }
@@ -22526,7 +22628,7 @@ __global__ void kVcmLightT(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx,
             // unpatterned) scales the radiance the light subpath starts with — the MIS pdfs
             // are untouched, exactly as in dGenLightSubpath.
             double areaScale = 1.0;                  // its area at the pass's time about the point
-            emitScale = dEmitterSamplePoint(sc, em, u1, u2, y, nOut, &areaScale);
+            emitScale = dEmitterSamplePoint(sc, em, u1, u2, y, nOut, &areaScale, &rng);
             if (em.area <= 0.0) continue;
             pdfPos = 1.0 / (em.area * areaScale);    // over its area now
             if (em.normalTilted) {                   // an aimed quad: intensity-proportional
@@ -22878,6 +22980,7 @@ __global__ void kVcmCameraT(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx
         // inferred from dVCM == 0, which a delta vertex sets but which says nothing about the
         // vertices before it.
         bool camAllDelta = true;
+        bool camGlow = true;   // ...and through specular surfaces only: a glow is seen (host twin vcm.h)
         const bool hasSun = sc.sunCount > 0;
         // The vertex just left, should the walk land on an emitter next (host twin vcm.h).
         DVec3 softN, softNg;
@@ -22969,11 +23072,12 @@ __global__ void kVcmCameraT(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx
             // (a) Emission (s=0): an emitter's own geometry, or a surface that glows with no
             // emitter registered (a marched isosurface or CSG solid: vcm.h's `isLight`), whose
             // spectrum falls back to the material's `emit` as bkRadiance's does. With no emitter
-            // nothing else can reach the path, so it keeps the whole weight.
+            // nothing else can reach the path, so it keeps the whole weight -- where the glow is
+            // seen at all (camGlow: through specular surfaces only).
             int li = dEmitterForMat(sc, matId);
-            const DSpec* eSpd = (li >= 0)          ? &sc.emitters[li].emitSpd
-                               : (mp->matIsLight)   ? &mp->matEmit
-                                                    : nullptr;
+            const DSpec* eSpd = (li >= 0)                     ? &sc.emitters[li].emitSpd
+                               : (mp->matIsLight && camGlow)   ? &mp->matEmit
+                                                               : nullptr;
             if (eSpd) {
                 double cosLight = ddot(h.ng, wo);
                 if (cosLight > 0.0) {
@@ -23087,7 +23191,7 @@ __global__ void kVcmCameraT(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx
                             DVec3 yL, nL;
                             // Sampled point's emission-pattern factor (1.0 when unpatterned).
                             double areaScale = 1.0;   // its area at the pass's time about the point
-                            epat = dEmitterSamplePoint(sc, em, u1, u2, yL, nL, &areaScale);
+                            epat = dEmitterSamplePoint(sc, em, u1, u2, yL, nL, &areaScale, &rng);
                             DVec3 toL = yL - h.p; dist2 = ddot(toL, toL);
                             if (dist2 > 1e-12 && em.area > 0.0) {
                                 distL = sqrt(dist2); wiL = toL * (Real)(1.0 / distL);
@@ -23400,6 +23504,7 @@ __global__ void kVcmCameraT(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx
             beta *= betaFactor;                           // camera side: no adjoint on continuation
             for (int k = 0; k + 1 < nUp; ++k) betaSec[k] *= secChromatic ? secF[k] : betaFactor;
             if (!delta) camAllDelta = false;               // disqualifies the escaped-sun strategy
+            if (!delta && !dIsSpecularType(mp->type)) camGlow = false;
             if (delta && !keepBundle) nUp = 1;             // λ-dependent direction change
             prevP = h.p;
             softOn = !delta && dLvConnects(mp->type);
@@ -24339,6 +24444,7 @@ static int deviceEmitterShapeCode(EmitterShape s) {
         case EmitterShape::Cylinder: return 4;
         case EmitterShape::Mesh:     return 5;
         case EmitterShape::Sun:      return 6;
+        case EmitterShape::Glow:     return 7;
     }
     return -1;   // unknown / newly-added shape: CPU fallback, never a silent coercion
 }
@@ -25315,6 +25421,11 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
         de.cieMean = {e.cieMean.x, e.cieMean.y, e.cieMean.z};   // achromatic-path beam fold
         de.motion = e.motion;
         de.deforms = e.deforms ? 1 : 0;
+        de.selW = e.selW;
+        de.glowPrim = e.glowPrim;
+        de.glowSphere = e.glowSphere ? 1 : 0;
+        de.glowLo = {(Real)e.glowLo.x, (Real)e.glowLo.y, (Real)e.glowLo.z};
+        de.glowHi = {(Real)e.glowHi.x, (Real)e.glowHi.y, (Real)e.glowHi.z};
         cdfAll.insert(cdfAll.end(), e.spd.cdf.begin(), e.spd.cdf.end());
         dems.push_back(de);
     }
@@ -25545,6 +25656,8 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
     sc.emitSamplerN = (int)(emitSampCdf.empty() ? 0 : emitSampCdf.size() - 1);
     sc.emitSamplerStep = scene.emitSampler.step;
     sc.emitG = scene.emitG;
+    sc.glowG = scene.glowGTab.empty() ? nullptr : (const double*)keep(uploadVec(scene.glowGTab));
+    sc.glowGN = (int)scene.glowGTab.size();
     sc.camCdf = d_cam;
     sc.camVisCdf = d_camVis;
     sc.camWCdf = d_camW;
