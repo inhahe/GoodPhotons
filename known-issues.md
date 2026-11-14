@@ -1733,7 +1733,13 @@ every wavelength. Fixed by writing the index n - ik and taking the decaying root
 backends; `-checkmultilayer` gained the two cases that catch it (design.md, "The Abelès matrix's
 sign convention"). Anything rendered with an absorbing stack before 0.403.0 changes colour.
 
-## OPEN (2026-11-05, 0.434.8): LAYERED-BODY-COIN — a forward mode weighs a coated body by the photon's coin, at the light's angle
+## DONE (2026-11-14, 0.444.0; opened 2026-11-05, 0.434.8): LAYERED-BODY-COIN — a forward mode weighs a coated body by the photon's coin, at the light's angle
+
+**Fixed by LAYERED-MODES (0.444.0), the second fix proposed below**: every mode takes the coat at
+both of the body's directions. check_rough_irid's car paint, mode B against mode R per channel on
+0.444.1: 0.997 / 0.990 / 0.989 (CPU), 1.000 / 0.987 / 0.988 (GPU); its allowance is 3 % again.
+
+The report as filed:
 
 Found validating FWD-GLOSSY-INDIRECT on check_rough_irid's car-paint sphere (red diffuse under a
 1.5 coat of roughness 0.05). Mode B reads it 0.946 / 0.982 / 0.974 of mode R per channel on both

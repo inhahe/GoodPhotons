@@ -35,9 +35,10 @@ judged against its own background. Drop that once the offset is fixed.
 It also requires a CLEAR coating given a `roughness` (a soap film) to be refused at load, with
 the message saying why, and the same film given `roughness 0` -- the specular coating, as with no
 roughness at all -- to load. And it requires mode B to render a `layered` car-paint sphere as
-mode R does (GPU, 4096 spp), on each backend, within 8 % (LAYERED-BODY-COIN: the coated body's
-share is the photon's coin's), and the GPU as the CPU (sphere mean per channel, 5 standard errors and
-3 %). The coat's sheen splats at the stack's vertex, whichever lobe its coin takes, as the coat's
+mode R does (GPU, 4096 spp), on each backend, within 3 % (0.434.8 to 0.443.x allowed 8 %: the coated
+body's share was the photon's coin's, at the light's angle, and the red body read 0.946 of R; the
+coat is reciprocal since 0.444.0, known-issues LAYERED-BODY-COIN), and the GPU as the CPU (sphere
+mean per channel, 5 standard errors and 3 %). The coat's sheen splats at the stack's vertex, whichever lobe its coin takes, as the coat's
 lobe toward the camera at the coat's reflectance there (known-issues FWD-GLOSSY-INDIRECT). And mode
 S, on each backend, to mode R: until 0.433.2 both gathered a layered body's visible point through
 the compound's own reflect slot rather than the resolved base's (the red paint's green and blue read
@@ -317,12 +318,11 @@ def main():
               for d in ("cpu", "gpu")]
         ms = [stats(render(exe, out, coat, "coat_S_" + d, ["-mode", "S", "-spp", "256", "-device", d]), m)
               for d in ("cpu", "gpu")]
-        # Mode B against mode R at 8 %: the coated body's share is weighed by the photon's coin, at
-        # the light's angle, where a camera walk weighs it at its own (known-issues
-        # LAYERED-BODY-COIN), and the red body reads 5 % low for it.
+        # Mode B against mode R at 3 %: 0.444.1 reads 0.997 / 0.990 / 0.989 (CPU) and 1.000 / 0.987 /
+        # 0.988 (GPU) per channel.
         for what, x, x0, tol in (("mode B, GPU / CPU", mb[1], mb[0], 0.03),
-                                 ("mode B, CPU / mode R", mb[0], ref, 0.08),
-                                 ("mode B, GPU / mode R", mb[1], ref, 0.08),
+                                 ("mode B, CPU / mode R", mb[0], ref, 0.03),
+                                 ("mode B, GPU / mode R", mb[1], ref, 0.03),
                                  ("mode S, CPU / mode R", ms[0], ref, 0.03),
                                  ("mode S, GPU / mode R", ms[1], ref, 0.03)):
             ratio = deviation(x[0], x0[0])

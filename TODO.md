@@ -342,8 +342,8 @@ Then the rest of 4.2-4.6 in their order, 4.7's bookkeeping alongside whatever to
   within 1.4 % of mode R in modes M and J on both backends).
 - [x] **FWD-GLOSSY-INDIRECT** — modes A and B splat a rough reflector only where it is seen directly
   (and a layered clearcoat's sheen on neither backend). 0.434.8.
-- [ ] **LAYERED-BODY-COIN** — a forward mode weighs a coated body by the photon's coin, at the light's
-  angle (5 % on the car paint).
+- [x] **LAYERED-BODY-COIN** (0.444.0) — a forward mode weighed a coated body by the photon's coin, at
+  the light's angle (5 % on the car paint): closed by LAYERED-MODES (mode B 0.987-1.000 of R now).
 - [ ] **FWD-SMOOTH-COAT** — a smooth clearcoat shows no sheen in modes A and B.
 - [x] **GLTF-MAP-MEAN-GUTTERS** — the importer's mean metalness and roughness count the atlas's
   gutters.
