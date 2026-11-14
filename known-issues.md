@@ -3098,32 +3098,60 @@ Not the device's fault: mode R's own two glossy strategies disagreed on a tilted
 (R read itself 1.044 with its lobe alone), and device S's walk samples the lobe alone. Fixed with
 BUMP-MODES' stage (3) glossy part (0.440.6, contSoftening): device S now reads 0.9982 of R there.
 
-## DONE (2026-11-14, 0.444.0): LAYERED-MODES — a `layered` material reads 1-9 % off mode R in the other modes, on flat geometry
+## CLOSED (2026-11-14, 0.444.1): COAT-AR-VARIANCE — a rough anti-reflection coat's reflection weight
 
-**Fixed in 0.444.0 by (b), the coat reciprocal in every mode**, on both of its lobes (design.md, "A
-reciprocal coat in every mode"):
+Raised by 0.444.0's review: a walk's coat reflection is weighed by F(h) / R(arrival)
+(render.h coatSheenRatio), which grows without bound where R at the arrival is near 0 and F at the
+pair's half vector is not -- a quarter-wave anti-reflection film (film_ior 1.22, 113 nm over ior
+1.5: R about 1.5e-5 head-on at 550 nm) under a rough coat. Unbiased; the question was fireflies.
+Measured on a room of such walls (roughness 0.3), five seeds of mode R at 256 spp and D at 64, host:
+the frames' seed spread 0.15 % (R) and 0.23 % (D), their brightest pixel 30.6 times the mean (the
+lamp seen directly); a plain Fresnel coat in the same room 0.16 %, 0.23 % and 29.8. The coin takes
+the coat as rarely as R is small, which keeps the weight's variance at the size of its share. Not a
+problem; a floor on the coin's coat probability (weights F(h)/p and (1 - R)/(1 - p) at every coin
+site, host and device, and the spectral carriers' coin folds) is the remedy if a scene ever shows
+one.
+
+## DONE (2026-11-14, 0.444.0-0.444.1): LAYERED-MODES — a `layered` material reads 1-9 % off mode R in the other modes, on flat geometry
+
+**Fixed in 0.444.0 by (b), the coat reciprocal in every mode**, on both of its lobes, and finished in
+0.444.1 after its review (design.md, "A reciprocal coat in every mode"):
 
 * The body takes the coat both ways: each walk takes T = 1 - R at its arrival by the coin, and the
-  body's lobe on its other direction takes S(w) = T(w) / T-bar (render.h coatExitS), T-bar a table
-  per layered material by wavelength. With the coin that is T(in) T(out) / T-bar, the physical clear
-  coat whose averaged escape the body's albedo already holds -- the same energy.
+  body's lobe on its other direction takes the coat (render.h coatF). A Lambertian body takes
+  T(out) / T-bar, T-bar a table per layered material by wavelength: with the coin T(in) T(out) / T-bar,
+  the physical clear coat whose averaged escape the body's albedo already holds -- the same energy. A
+  directional body (glossy, mirror) takes sqrt(T(out) / T(in)), with the coin sqrt(T(in) T(out)):
+  0.444.0 gave it T(out) / T-bar too, and a white mirror under a smooth coat returned 1.026 of the
+  light it received (the review; tools/check_layered_modes.py's furnace room now holds it at 1.0009).
 * The coat's reflection is reciprocal too: the coin takes it with R at the arrival, and a rough
-  coat's pair reflects with its Fresnel term at their half vector (coatSheenR), so the walk weighs
-  it by F(h) / R(arrival) (coatSheenRatio) and the forward sheen splat takes F(h). This half was not
-  in the decision as written; it showed up measuring the first: with the body's S alone, the rough
+  coat's pair reflects with its Fresnel term at their half vector (coatPairR), so the walk weighs it
+  by F(h) / R(arrival) (coatSheenRatio) and the forward sheen splat takes F(h). This half was not in
+  the decision as written; it showed up measuring the first: with the body's factor alone, the rough
   room below read B 1.0082 and M 1.0093 of R on the host (and only with two coated walls, a coat
-  reflecting light onto another's body: one coated wall alone read 1.001-1.002), and they read
-  0.9999 and 1.0013 with it.
+  reflecting light onto another's body: one coated wall alone read 1.001-1.002), and 0.9999 and
+  1.0013 with it. The coat's angles are read at the shading normal since 0.444.1, so a smooth coat's
+  mirror pair has the ratio 1 on a normal-mapped surface too (it did not at the geometric normal).
+* 0.444.1 also gave J's and U's merges the coat copy's ratio on the host (0.444.0 took only a body's
+  factor there, so a merge at a rough coat dropped it; the device's did not): host J on the rough room
+  read 1.0061 of R at its default radius, now 0.9961 (0.9981 without merges). A coated `dielectric`,
+  `thinfilm` or `multilayer` layer is refused at load (its light goes into the solid, where the coat
+  means nothing, and 0.444.0's factor gained energy on its internal reflections); the radiance cache
+  no longer ends a path at a coated vertex; a dispersive split's sub-path starts with no coat.
 
-`tools/check_layered_modes.py` (five rooms: smooth and rough Fresnel, thin film, a glossy body, a
-translucent sheet; every mode against R, host and device, within 1 %, B within 0.5 % and not scored
-where the coat is smooth, since it images no delta lobe) reads, host / device: rough D 0.9991 / 1.0000, J 1.0061 (default radius) / 1.0011, U 1.0009 /
-1.0005, B 0.9999 / 1.0002, M 1.0013 / 1.0009, S 0.9999 / 0.9995; on the host fresnel D 0.9991,
-J 0.9988, U 0.9994, M 0.9997, S 1.0004, and film, glossy and sheet every mode within 0.5 %. Against 0.443.2 it fails:
-rough D 1.0109, U 1.0111, B 1.0256, M 1.0120 of R on the host. `tools/check_bump_modes.py`'s layered room now holds every mode to R (only M and S, at
-2 %, before). Mode J's fixed-radius point merges read the rough room +0.6 % at their default radius
-on the host (1.0025 at 0.02, 0.9981 with -nojsurf): their known O(r^2) bias, so the check pins J's
-radius at 0.02.
+`tools/check_layered_modes.py` (five rooms -- smooth and rough Fresnel, thin film, a glossy body, a
+translucent sheet under a rough coat -- every mode against R, and a white furnace: coated white
+diffuse and mirror spheres at the sky's radiance in mode R, M and S against R; host and device; within
+1 %, B within 0.5 % and not scored where the coat is smooth, since it images no delta lobe) on 0.444.1,
+host / device: rough D 0.9991 / 1.0000, J 0.9970 (at radius 0.02; 0.9961 at its default, which the check
+now runs) / 0.9999, U 1.0000 / 1.0005, B 0.9999 / 1.0002,
+M 1.0013 / 1.0009, S 0.9999 / 0.9995; every other room every mode within 0.5 % but host J on the
+glossy-body room, 0.9939 (J reads a bare glossy room 0.9921 of R at its default radius too, 0.9980
+without merges: its merges' radius bias on a glossy lobe, which the epochs shrink); the furnace
+1.0009 / 1.0005 of the sky for both spheres. Against 0.443.2 it fails: rough D 1.0109, U 1.0111,
+B 1.0256, M 1.0120, S 1.0112 of R, fresnel D 1.0135, U 1.0128 on the host; against 0.444.0 its
+furnace fails (the mirror's 1.0262). `tools/check_bump_modes.py`'s layered room holds every mode to R
+(only M and S, at 2 %, before 0.444.0).
 
 The finding:
 

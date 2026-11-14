@@ -5443,6 +5443,17 @@ private:
                 L.scene.mats[child].type == MatType::Layered) {
                 fail("layer '" + cname + "' is itself a mix/layered (nesting is not allowed)"); return false;
             }
+            // A coat lies on a surface's face; a dielectric body's light goes on into its solid,
+            // where the coat's coin and transmission have no meaning (render.h coatF). `thinfilm`
+            // and `multilayer` are the coated dielectrics.
+            const MatType ct = L.scene.mats[child].type;
+            if (L.scene.mats[matIdx].type == MatType::Layered &&
+                (ct == MatType::Dielectric || ct == MatType::ThinFilm || ct == MatType::Multilayer)) {
+                fail("layer '" + cname + "' is a " + matTypeName(ct) + ": a `layered` coat lies over a "
+                     "surface, not over a solid's interior -- for a coated dielectric use `type thinfilm` "
+                     "or `type multilayer`");
+                return false;
+            }
             if (w < 0.0) { fail("mix layer weight must be >= 0"); return false; }
             kids.push_back(child);
             wts.push_back(w);

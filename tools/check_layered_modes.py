@@ -3,29 +3,34 @@
     python tools/check_layered_modes.py [--out png/check_layered_modes] [--exe ftrace.exe] [--no-gpu]
                                         [--modes D,J,U,B,M,S] [--seeds 3] [--rooms fresnel,...]
 
-A layered material is a clear coat over a body. Light that the body scatters crosses the coat twice,
-in and out, and a physical coat transmits T = 1 - R each way: f = T(in) T(out) / T-bar * f_body, where
-T-bar is T's cosine-weighted mean (the body's albedo already holds the averaged escape). Every walk
-takes the coat at its own arrival by a coin (reflect with R, else enter), and the body's lobe takes it
-on the other direction, S(w) = T(w) / T-bar (render.h coatExitS), so the integrand is reciprocal and
-the modes agree by construction. Before 0.444.0 the body lobe took the coat only at the walk's
+A layered material is a clear coat over a body. Every walk takes the coat at its own arrival by a
+coin (reflect with R, else enter: T = 1 - R), and the lobe it then shades with takes the coat on its
+other direction (render.h coatF), so the integrand is reciprocal and the modes agree by
+construction: a Lambertian body's light crosses the coat twice, T(in) T(out) / T-bar (T-bar the
+cosine-weighted mean the body's albedo already holds); a directional body's (glossy, mirror) takes
+sqrt(T(in) T(out)), its albedo holding its own angle's escape; and the coat's reflection takes its
+Fresnel term at the pair's half vector. Before 0.444.0 the body took the coat only at the walk's
 arrival: mode R's integrand held T toward the camera, the light walks' T toward the light, and on the
-room below at coat roughness 0 the host read D 1.014, J 1.002, U 1.012, B 0.913, M 1.003 and S 1.004
-of R.
+rough room below the host read D 1.0109, U 1.0111, B 1.0256, M 1.0120 and S 1.0112 of R.
 
 The rooms: five walls of one material lit at a grazing angle by a tilted panel, 64x48, every mode at
 -max-bounce 8 (M and S, which deposit photons over 32 bounces, and their mode-R reference at 32).
   fresnel   a smooth Fresnel coat (ior 1.5, roughness 0) over a diffuse body (0.8)
-  rough     the same coat at roughness 0.3
-  film      a thin-film coat (film_ior 1.33, 380 nm over ior 1.5): R and with it S swing across the
-            spectrum, so the factor is read per wavelength
-  glossy    the Fresnel coat over a glossy body (roughness 0.3): car paint
-  sheet     the diffuse room with a coated translucent panel standing in it: the transmit lobe
-            leaves through the coat on the far face, which takes it too
+  rough     the same coat at roughness 0.3: the coat's reflection turns the light, so it must be
+            reciprocal too
+  film      a thin-film coat (film_ior 1.33, 380 nm over ior 1.5): R and with it the coat's factors
+            swing across the spectrum, so they are read per wavelength
+  glossy    the smooth coat over a glossy body (roughness 0.3): car paint
+  sheet     the diffuse room with a translucent panel under a rough coat standing in it: the
+            transmit lobe leaves through the coat on the far face, which takes it too
+  furnace   a white furnace (a uniform sky, nothing else) holding two spheres under a smooth coat,
+            one a white diffuse body, one a white mirror: a lossless stack returns exactly what it
+            receives, so mode R must read each sphere at the sky's radiance within 1 %, and modes M
+            and S the frame as R does (D, J and U take no sky)
 Each mode's frame mean over `--seeds` seeds must be within 1 % of mode R's on the same device (B's
-within 0.5 %). Mode B is not scored where the coat is smooth (fresnel, glossy): it connects no delta
-lobe to the camera, so it misses the coat's mirror image of the room (0.90 of R there), as it misses
-any mirror's. Exits 1 on any failure.
+within 0.5 %). Mode B is not scored where the coat is smooth (fresnel, glossy, furnace): it connects
+no delta lobe to the camera, so it misses the coat's mirror image of the room (0.90 of R there), as
+it misses any mirror's. Exits 1 on any failure.
 """
 import argparse
 import os
@@ -42,14 +47,16 @@ from pfm import read_pfm  # noqa: E402
 SPP = {"R": 2048, "D": 512, "J": 256, "U": 512, "B": 1, "M": 64, "S": 256}   # CPU; the GPU takes 4x
 NPHOT = {"B": 40000000, "M": 2000000, "S": 100000}   # photons (mode S's per pass)
 DEPTH = {"M": 32, "S": 32}
-# Mode J's point merges keep a fixed radius, and their O(r^2) bias reads +0.6 % of R on the rough room
-# at its default (the host: 1.0061; 1.0056 at 0.05, 1.0025 at 0.02, 0.9981 with -nojsurf): pinned
-# small, as check_bump_modes pins it, so the check reads J's integrand, not its radius.
-MODE_ARGS = {"J": ["-jsurf-radius", "0.02"]}
+# Arguments a mode takes here beyond the budget (none: mode J's point merges run at their default
+# radius, which read the rough room 0.9961 of R on the host, 0.9981 with -nojsurf; 0.444.0 pinned it
+# at 0.02, which shrank the merges' missing coat factor out of sight).
+MODE_ARGS = {}
 TOL = 0.01
 TOL_MODE = {"B": 0.005}
 # Rooms whose coat is smooth: a delta sheen, which mode B cannot image (see the docstring).
-SMOOTH = {"fresnel", "glossy"}
+SMOOTH = {"fresnel", "glossy", "furnace"}
+# Rooms lit by a sky, which modes D, J and U do not render.
+SKY = {"furnace"}
 
 COAT = "reflectance fresnel  ior 1.5  roughness %s"
 FILM = "reflectance thinfilm  ior 1.5  film_ior 1.33  film_thickness 380  roughness 0.1"
@@ -64,11 +71,24 @@ WALLS = {
                'material "w" { type layered  coat { %s }  layer "body" 1.0 }' % (COAT % "0")],
     "sheet": ['material "w" { type diffuse reflect 0.8 }',
               'material "tb" { type translucent reflect 0.4  transmit 0.4 }',
-              'material "t" { type layered  coat { %s }  layer "tb" 1.0 }' % (COAT % "0")],
+              'material "t" { type layered  coat { %s }  layer "tb" 1.0 }' % (COAT % "0.3")],
 }
 
 
-def room(kind):
+def room(kind, black=False):
+    if kind == "furnace":   # `black`: the spheres black, for the mask that finds them
+        return NL.join([
+            "scene { units meters }",
+            "light env { spd preset:bb6500 }",
+            'material "wd" { type diffuse reflect 1.0 }',
+            'material "wm" { type mirror reflect 1.0 }',
+            'material "cd" { type layered  coat { %s }  layer "wd" 1.0 }' % (COAT % "0"),
+            'material "cm" { type layered  coat { %s }  layer "wm" 1.0 }' % (COAT % "0"),
+            'material "k" { type diffuse reflect 0 }',
+            "sphere { center -0.6 0 0  radius 0.5  material %s }" % ("k" if black else "cd"),
+            "sphere { center 0.6 0 0  radius 0.5  material %s }" % ("k" if black else "cm"),
+            'camera "c" { eye 0 0 4  look_at 0 0 0  up 0 1 0  fov_y 30  film { res 64 48 } }',
+        ]) + NL
     lines = ["scene { units meters }"] + WALLS[kind] + [
         "quad { origin -2 0 -2  u 0 0 4  v 4 0 0  material w }",
         "quad { origin -2 0 -2  u 4 0 0  v 0 3 0  material w }",
@@ -90,7 +110,7 @@ def main():
     ap.add_argument("--no-gpu", action="store_true")
     ap.add_argument("--modes", default="D,J,U,B,M,S")
     ap.add_argument("--seeds", type=int, default=3)
-    ap.add_argument("--rooms", default="fresnel,rough,film,glossy,sheet")
+    ap.add_argument("--rooms", default="fresnel,rough,film,glossy,sheet,furnace")
     a = ap.parse_args()
     exe, out = os.path.abspath(a.exe), os.path.abspath(a.out)
     seeds = list(range(1, a.seeds + 1))
@@ -102,12 +122,12 @@ def main():
         with open(scene, "w", encoding="utf-8", newline="") as f:
             f.write(room(name))
 
-        def frame(mode, dev, seed, depth):
-            png = os.path.join(d, "%s_%s_%d_%d.png" % (mode, dev, depth, seed))
+        def image(mode, dev, seed, depth, scn=scene, tag=""):
+            png = os.path.join(d, "%s%s_%s_%d_%d.png" % (mode, tag, dev, depth, seed))
             for f in (png, png[:-4] + ".pfm"):          # never score an earlier run's image
                 if os.path.exists(f):
                     os.remove(f)
-            cmd = [exe, "-in", scene, "-mode", mode, "-device", dev,
+            cmd = [exe, "-in", scn, "-mode", mode, "-device", dev,
                    "-spp", str(SPP[mode] * (4 if dev == "gpu" else 1)),
                    "-n", str(NPHOT.get(mode, 200000)),
                    "-max-bounce", str(depth), "-seed", str(seed), "-hdr", "-no-meter", "-window-min",
@@ -117,12 +137,37 @@ def main():
             if p.returncode != 0 or not os.path.exists(pfm):
                 print((p.stdout + p.stderr)[-1500:])
                 raise SystemExit("render failed (exit %d): %s" % (p.returncode, " ".join(cmd)))
-            return float(read_pfm(pfm, top_down=True).sum(-1).mean())
+            return read_pfm(pfm, top_down=True).sum(-1)
+
+        def frame(mode, dev, seed, depth):
+            return float(image(mode, dev, seed, depth).mean())
 
         for dev in ["cpu"] + ([] if a.no_gpu else ["gpu"]):
+            where = "host" if dev == "cpu" else "device"
+            if name == "furnace":
+                # Energy: each sphere at the sky's radiance in mode R. The mask is the same frame
+                # with the spheres black; the sky is everything the mask leaves.
+                bscn = os.path.join(d, "black.ftsl")
+                with open(bscn, "w", encoding="utf-8", newline="") as f:
+                    f.write(room(name, black=True))
+                k = image("R", dev, 1, 8, bscn, "black")
+                img = np.mean([image("R", dev, s, 8) for s in seeds], axis=0)
+                sky = float(np.median(k))
+                inside = k < 0.05 * sky
+                half = img.shape[1] // 2
+                for label, cols in (("diffuse body", slice(0, half)), ("mirror body", slice(half, None))):
+                    m = inside[:, cols]
+                    ratio = float(img[:, cols][m].mean()) / sky
+                    good = abs(ratio - 1.0) <= TOL
+                    print("%s: furnace mode R on the %s: coated white %s %.4f of the sky"
+                          % ("ok" if good else "FAIL", where, label, ratio), flush=True)
+                    if not good:
+                        fails.append("furnace %s R %s" % (label, dev))
             refs = {}                                # mode R at each depth asked for
             for mode in a.modes.split(","):
                 if mode == "B" and name in SMOOTH:
+                    continue
+                if mode in ("D", "J", "U") and name in SKY:
                     continue
                 depth = DEPTH.get(mode, 8)
                 if depth not in refs:
@@ -135,8 +180,7 @@ def main():
                 err = np.hypot(se / rm, m * rse / rm ** 2)
                 good = abs(ratio - 1.0) <= TOL_MODE.get(mode, TOL)
                 print("%s: %-7s mode %s on the %s: %.4f of mode R (+-%.4f)"
-                      % ("ok" if good else "FAIL", name, mode, "host" if dev == "cpu" else "device",
-                         ratio, err), flush=True)
+                      % ("ok" if good else "FAIL", name, mode, where, ratio, err), flush=True)
                 if not good:
                     fails.append("%s %s %s" % (name, mode, dev))
     print("FAILED: " + ", ".join(fails) if fails else "PASS")

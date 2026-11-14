@@ -1402,10 +1402,11 @@ inline Vec3 traceCameraSubpath(const Scene& scene, const Camera& cam, const Rend
                     if (mergeFromBehind(camTwoSided, wMerge, ngoCam)) return;
                     // camera BSDF evaluated at the light vertex's wavelength (XYZ estimate).
                     double lam = (double)lv.lambda;
-                    // ...times a coated body's coat on the light's way in: the light vertex was
-                    // stored before its own pick (compoundMergeStoreProb).
+                    // ...times a coated vertex's coat on the light's way in (coatF; a coat copy's
+                    // reflection too): the light vertex was stored before its own pick
+                    // (compoundMergeStoreProb).
                     double fCam = bsdfF(*mp, h.n, wo, wMerge, lam, scene, &h) *
-                                  coatExitS(scene, *mp, h, wMerge, lam);
+                                  coatF(scene, *mp, h, wo, wMerge, lam);
                     // HERO MERGE. Unlike the connection above, a merge gathers vertices from
                     // OTHER paths, i.e. other bundles — so it is keyed on the LIGHT VERTEX's
                     // wavelengths (its hero plus its live secondaries), exactly as the
@@ -1420,7 +1421,7 @@ inline Vec3 traceCameraSubpath(const Scene& scene, const Camera& cam, const Rend
                     for (int k = 0; k + 1 < lvUp; ++k) {
                         const double lk = (double)lightSec[(size_t)idx].lam[k];
                         fSec[k] = bsdfF(*mp, h.n, wo, wMerge, lk, scene, &h) *
-                                  coatExitS(scene, *mp, h, wMerge, lk);
+                                  coatF(scene, *mp, h, wo, wMerge, lk);
                         if (fSec[k] > mxF) mxF = fSec[k];
                     }
                     if (mxF <= 0.0) return;

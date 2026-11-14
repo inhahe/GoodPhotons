@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <cmath>
 #include <complex>
+#include "geometry.h"   // PI
 
 inline double clamp01(double x) { return x < 0 ? 0 : (x > 1 ? 1 : x); }
 

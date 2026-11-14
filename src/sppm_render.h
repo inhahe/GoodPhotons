@@ -245,7 +245,7 @@ inline void sppmVisiblePoint(const Scene& scene, Ray ray, Pcg32& rng, bool diffr
                     const BackwardRenderer::NeeBsdf nb{&m, ray.d * -1.0};
                     directL += Vec3(cieX(lambda), cieY(lambda), cieZ(lambda))
                              * (thr * bwNee.neeLight(scene, h, 1.0, invPdfL, lambda, rng, nullptr,
-                                                     coatGi(m), nullptr, nullptr,
+                                                     coatGi(m, ray.d * -1.0), nullptr, nullptr,
                                                      &nb));
                 }
                 const double r = clamp01(reflectSlot(scene, m, h, lambda));

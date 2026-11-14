@@ -470,9 +470,9 @@ struct Material {
     int    coatChild    = -1;
     // LAYERED-MODES (b). On a body copy: the layered material it lies under, else -1. A walk takes
     // the coat at its arrival (the coin: 1 - R(in) of the light goes in), and the body's lobe takes
-    // the coat on its other direction, S(w) = (1 - R(w)) / T-bar (render.h coatExitS): the physical
-    // clear coat T(in) T(out), reciprocal, with the escape its albedo already holds on average
-    // (coatedAlbedo's 1 - F_dr) given its angle.
+    // the coat on its other direction (render.h coatF): a Lambertian body (1 - R(out)) / T-bar, the
+    // physical clear coat T(in) T(out) with the escape its albedo already holds on average
+    // (coatedAlbedo's 1 - F_dr) given its angle; a directional one sqrt(T(out) / T(in)).
     int    coatStack    = -1;
     // On the coat copy of a layered material (its coatChild): that layered material, else -1. A
     // walk that takes the coat by the coin weighs its reflection by render.h coatSheenRatio.

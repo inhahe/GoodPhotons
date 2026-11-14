@@ -1448,16 +1448,24 @@ instead of being washed out by the white specular laid over it. Nothing to autho
 `ior`.
 
 **The coat works the same both ways** (0.444.0). Light the body scatters crosses the coat twice, in
-and out, and a clear coat transmits `T = 1 - R` each way, so the body passes `T(in) T(out) / T-bar`
-of what the albedo above says, `T-bar` being `T`'s cosine-weighted mean (the escape `1 - F_dr` the
-albedo already holds is exactly `T-bar / n^2`): light and view near the normal read a few per cent
-brighter than the average, grazing ones darker, and the energy is the same. The coat's own
-reflection takes its Fresnel (or thin-film) term at the half vector of the two directions, as a
-microfacet coat's does. Both are symmetric in the two directions, so every mode -- R, B, D, J, U,
-M, S -- renders the same material: before 0.444.0 each took the coat's transmission only at the end
-its own walk started from, and on a room of coated walls lit at a grazing angle they read 1-10 %
-apart. `reflectance manual` (a constant R) is unchanged, and a `hair` layer keeps its own lobes
-bare: a fibre has no face for a coat to lie on.
+and out, and a clear coat transmits `T = 1 - R` each way. A diffuse (or translucent, or fluorescent)
+body sends its light out in every direction, and its albedo above already holds the coat's AVERAGE
+escape (`1 - F_dr` is exactly `T-bar / n^2`, `T-bar` being `T`'s cosine-weighted mean), so it passes
+`T(in) T(out) / T-bar` of what that albedo says: light and view near the normal read a few per cent
+brighter than the average, grazing ones darker, and the energy is the same. A glossy or mirror body
+sends its light back near the mirror of its arrival, whose escape its albedo holds, so it passes
+`sqrt(T(in) T(out))` -- exactly the coat's `T` for a mirror, which keeps a white mirror under a clear
+coat at exactly the light it receives. The coat's own reflection takes its Fresnel (or thin-film)
+term at the half vector of the two directions, as a microfacet coat's does, and the coat's angles are
+read at the shading normal, so it follows a normal map. All of it is symmetric in the two
+directions, so every mode -- R, B, D, J, U, M, S -- renders the same material: before 0.444.0 each
+took the coat's transmission only at the end its own walk started from, and on a room of coated
+walls lit at a grazing angle they read 1-10 % apart. `reflectance manual` (a constant R) is
+unchanged, and a `hair` layer keeps its own lobes bare: a fibre has no face for a coat to lie on.
+
+**A coat lies over a surface, not a solid.** A `dielectric`, `thinfilm` or `multilayer` layer is
+refused at load: its light goes on into the solid's interior, where the coat's coin and transmission
+mean nothing, and `thinfilm` and `multilayer` are themselves the coated dielectrics.
 
 **`absorb` + `depth` make it a TINTED lacquer** (0.324.0). `absorb` is the layer's absorption
 coefficient sigma_a in **1/m** (any spectrum form: a number, `rgb`, a named `spectrum:`), and

@@ -5511,11 +5511,12 @@ struct BdptRenderer {
                                     if (!lm) return;      // no weight: refuse (see misOf)
                                     if (mergeFromBehind(vkTwoSided, ph.wo, ngo)) return;
                                     const double lam = (double)ph.lambda;
-                                    // ...times a coated body's coat on the photon's way in: it
-                                    // was stored before its own pick (compoundMergeW).
+                                    // ...times a coated vertex's coat on the photon's way in
+                                    // (coatF; a coat copy's reflection too): it was stored before
+                                    // its own pick (compoundMergeW).
                                     double fCam = bsdfF(*vk.mat, vk.ns, woCam, ph.wo, lam,
                                                         scene, &vk.hit) *
-                                                  coatExitS(scene, *vk.mat, vk.hit, ph.wo, lam);
+                                                  coatF(scene, *vk.mat, vk.hit, woCam, ph.wo, lam);
                                     if (!(fCam > 0.0)) return;
                                     // Gather-side shading-normal correction: the density
                                     // estimate reads flux per GEOMETRIC area while every
