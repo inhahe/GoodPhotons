@@ -1370,6 +1370,7 @@ inline Vec3 traceCameraSubpath(const Scene& scene, const Camera& cam, const Rend
                 if (jOn) jr.snap(js);
                 const JSpec* vs = (jOn && js.on()) ? &js : nullptr;   // the carrier arriving here
                 const bool camTwoSided = isTwoSidedMat(*mp);   // for mergeFromBehind
+                const double slack = gatherBandSlack(ctx.radius, 0.0);
                 grid.query(lightVerts, h.p, ctx.radius, [&](int idx) {
                     const LightVertex& lv = lightVerts[idx];
                     if (edges + lv.edges > ctx.maxDepth) return;        // merged path too long
@@ -1384,6 +1385,13 @@ inline Vec3 traceCameraSubpath(const Scene& scene, const Camera& cam, const Rend
                     if (lv.hit.fiberRadius > 0.0) return;
                     Vec3 wMerge = lv.wo;                                // incident illumination dir
                     if (mergeFromBehind(camTwoSided, wMerge, ngoCam)) return;
+                    // Not a parallel surface's (J-THIN-GAP-LEAK): one on a floor a millimetre
+                    // under this surface is no light it receives (mode J's merge has the why).
+                    {
+                        const Vec3 dd = lv.p - h.p;
+                        if (!withinGatherBand(std::fabs(dot(dd, ngoCam)), dot(dd, dd),
+                                              std::fabs(dot(lv.ng, ngoCam)), slack)) return;
+                    }
                     // camera BSDF evaluated at the light vertex's wavelength (XYZ estimate).
                     double lam = (double)lv.lambda;
                     double fCam = bsdfF(*mp, h.n, wo, wMerge, lam, scene, &h);

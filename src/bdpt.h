@@ -56,6 +56,7 @@
 #include "workcount.h"    // JWork: the CPU refresh's work counts
 #include "photonbeams.h"  // BeamMap — mode J (UPBP) merges camera rays against photon beams
 #include "surfmerge.h"    // SurfMap — mode J's OTHER merge kind, the point x point (VCM's VM)
+#include "gatherplane.h"  // withinGatherBand: a merge drops a parallel surface's photons
 #include "beamgather.h"   // gatherPhotonBeamsW — the Beam x Ray estimator, with a MIS hook
 #include "parallel.h"          // ft::stopRequested — cooperative -stop inside mode J's beam pass
 #include "render_progress.h"   // StageProgress — deposit progress for the live window/title
@@ -3152,6 +3153,8 @@ inline void traceLightBeamPass(const Scene& scene, const Camera& cam, long long 
                         ph.cy = (float)cieY(ph.lambda);
                         ph.cz = (float)cieZ(ph.lambda);
                         ph.misIdx = (unsigned)sb.mis.size();
+                        const Vec3 pn = vertexGeoN(path[u]);
+                        ph.nx = (float)pn.x; ph.ny = (float)pn.y; ph.nz = (float)pn.z;
                         SurfMis sm;
                         sm.sumC    = accC[u - 1];
                         sm.sumMb   = accMb[u - 1] + eL.beam;
@@ -5470,6 +5473,7 @@ struct BdptRenderer {
                                 sw.work = &workCam;
                                 const Vec3 ngo = vertexGeoN(vk);
                                 const bool vkTwoSided = isTwoSidedMat(*vk.mat);   // mergeFromBehind
+                                const double slack = gatherBandSlack(photons->radius, 0.0);
                                 const JSpec* vkSpec =
                                     (jSpecOn && (size_t)k < jsw.vert.size() && jsw.vert[(size_t)k].on())
                                         ? &jsw.vert[(size_t)k] : nullptr;
@@ -5479,6 +5483,15 @@ struct BdptRenderer {
                                     const SurfMis* lm = photons->misOf((size_t)idx);
                                     if (!lm) return;      // no weight: refuse (see misOf)
                                     if (mergeFromBehind(vkTwoSided, ph.wo, ngo)) return;
+                                    // Not a parallel surface's (J-THIN-GAP-LEAK): one on the floor a
+                                    // millimetre under a plate is no light the plate's top receives.
+                                    // The tangent-plane band of a mode M gather, without its facing
+                                    // test: a perpendicular wall's photons at a corner stay, as the
+                                    // disc normalisation the weights assume counts on them.
+                                    const Vec3 dd = ph.p - vk.p;
+                                    if (!withinGatherBand(std::fabs(dot(dd, ngo)), dot(dd, dd),
+                                                          std::fabs(dot(Vec3{ph.nx, ph.ny, ph.nz}, ngo)), slack))
+                                        return;
                                     const double lam = (double)ph.lambda;
                                     double fCam = bsdfF(*vk.mat, vk.ns, woCam, ph.wo, lam,
                                                         scene, &vk.hit);

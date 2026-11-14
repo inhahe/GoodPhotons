@@ -6331,7 +6331,13 @@ as the one at fault.
   the device's `dOnGatherSurfaceSided` calls too). A gather takes the photons in a ball, so a second
   surface inside it -- the floor under a table top, once mode M's adaptive radius outgrows the
   table's height -- lent its light to the first (a sheet lit only from below read 21x its top lit
-  from above). A mode-M or mode-S gather (`onGatherSurfaceSided`) keeps a photon only if it faces the
+  from above). (A mode-J surface merge and a mode-U vertex merge apply the band below since 0.442.2,
+  J-THIN-GAP-LEAK -- a `SurfPhoton` carries its surface's normal for it, a mode-U light vertex its
+  hit -- but not the facing test: their weights assume the whole disc, so a perpendicular wall's
+  photons at a corner, which the facing test would drop, stay; dropping them read a flat room 0.3 %
+  dark. No rule of this kind tells a surface's photons beside a gather point from those under an
+  occluder a millimetre over the same surface: a disc on the floor at a gap's mouth takes the gap's
+  trapped light, which is the radius's bias, GAP-MERGE-RADIUS.) A mode-M or mode-S gather (`onGatherSurfaceSided`) keeps a photon only if it faces the
   gather point's way (within 60 degrees) and lies near its tangent plane: off it by at most
   sin theta times its distance d, theta the angle between the two normals, plus a rounding slack
   (`gatherBandSlack`: a thousandth of the map's radius, and on the device, which computes positions

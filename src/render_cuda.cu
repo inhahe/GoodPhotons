@@ -9449,6 +9449,7 @@ struct DSurfPhoton {
     DVec3 p, wo;                              // wo: unit, toward the PREVIOUS light vertex
     float lambda, beta, cx, cy, cz;           // cie{X,Y,Z}(lambda), cached at store time
     unsigned misIdx;
+    float nx, ny, nz;                         // its surface's true normal, to its light's side (host twin)
 };
 struct DSurfMis {                             // the light-side half of the merge's MIS weight
     double sumC, sumMb, sumMs, pdfFwdA;
@@ -19886,8 +19887,10 @@ struct DSurfSite {
     DVec3 ngo;
     bool twoSided;
     double r2;
+    Real slack;   // the plane band's (gatherBandSlack): a merge drops a parallel surface's photons
     __device__ DSurfSite(const DScene& sc, const DSurfMap& sm, const DVertex& vk) {
         r2 = (double)sm.radius * (double)sm.radius;
+        slack = gatherBandSlack<Real>(sm.radius, (Real)0, fmax(vk.pscale, (Real)dMaxAbs(vk.p)));
         ix = (int)fmin(fmax(floor(((double)vk.p.x - (double)sm.lo.x) / (double)sm.cell), 0.0), (double)(sm.nx - 1));
         iy = (int)fmin(fmax(floor(((double)vk.p.y - (double)sm.lo.y) / (double)sm.cell), 0.0), (double)(sm.ny - 1));
         iz = (int)fmin(fmax(floor(((double)vk.p.z - (double)sm.lo.z) / (double)sm.cell), 0.0), (double)(sm.nz - 1));
@@ -19913,6 +19916,9 @@ __device__ static inline void dSurfMergePhoton(const DScene& sc, const DSurfMap&
     const DVec3 dd{vk.p.x - ph.p.x, vk.p.y - ph.p.y, vk.p.z - ph.p.z};
     if (ddot(dd, dd) > site.r2) return;
     if (dMergeFromBehind(site.twoSided, ph.wo, site.ngo)) return;   // host twin mergeFromBehind
+    // not a parallel surface's (host twin, J-THIN-GAP-LEAK: the band without the facing test)
+    if (!withinGatherBand<Real>(fabs((Real)ddot(dd, site.ngo)), (Real)ddot(dd, dd),
+                                fabs(dot(DVec3(ph.nx, ph.ny, ph.nz), site.ngo)), site.slack)) return;
     const DSurfMis& lm = sm.mis[ph.misIdx];
     const Real lam = (Real)ph.lambda;
     double fCam = dBsdfF(sc, vk, woCam, ph.wo, lam);
@@ -23394,6 +23400,7 @@ __global__ void kVcmCameraT(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx
                     if (jOn) jrun.snap(js);
                     const bool jsOn = jOn && js.on();              // the carrier arriving here (VCM-SPEC)
                     double r2 = ctx.radius * ctx.radius;
+                    const Real slack = gatherBandSlack<Real>((Real)ctx.radius, (Real)0, dRoundScale(h));
                     int ix = (int)floor(((double)h.p.x - grid.lo.x) / grid.cell);
                     int iy = (int)floor(((double)h.p.y - grid.lo.y) / grid.cell);
                     int iz = (int)floor(((double)h.p.z - grid.lo.z) / grid.cell);
@@ -23417,6 +23424,9 @@ __global__ void kVcmCameraT(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx
                               DVec3 wMerge = lv.wo;
                               if (dMergeFromBehind(dTwoSidedType(mp->type), wMerge, ngoCam))
                                   continue;   // host twin mergeFromBehind
+                              // not a parallel surface's (host twin vcm.h, J-THIN-GAP-LEAK)
+                              if (!withinGatherBand<Real>(fabs((Real)ddot(d, ngoCam)), (Real)ddot(d, d),
+                                                          fabs(dot(lv.ng, ngoCam)), slack)) continue;
                               Real lam = (Real)lv.lambda;
                               // A MERGE crosses paths, so the two ends carry DIFFERENT bundles
                               // and there is no shared λ set. The estimate therefore stays keyed
@@ -24003,6 +24013,10 @@ kJSurfLightT(DScene sc, DCamera cam, int diffraction, int maxDepth,
                         ph.beta   = (float)(path[u].beta * (compoundSite ? (double)compoundMergeW[u] : 1.0));
                         ph.cx = (float)cx; ph.cy = (float)cy; ph.cz = (float)cz;
                         ph.misIdx = (unsigned)slot;     // appended 1:1, so index == slot
+                        {   // its surface's true normal, to its light's side (host twin vertexGeoN)
+                            const DVec3 pn = path[u].back ? path[u].ng * (Real)-1 : path[u].ng;
+                            ph.nx = (float)pn.x; ph.ny = (float)pn.y; ph.nz = (float)pn.z;
+                        }
                         DSurfMis& sm = out.mis[slot];
                         sm.sumC    = accC;
                         sm.sumMb   = accMb + eBeam;
@@ -27319,6 +27333,7 @@ static void uploadSurfMapCuda(const bdpt::SurfMap* smap, DUpload& up, gpu::DSurf
         d.lambda = q.lambda; d.beta = q.beta;
         d.cx = q.cx; d.cy = q.cy; d.cz = q.cz;
         d.misIdx = q.misIdx;
+        d.nx = q.nx; d.ny = q.ny; d.nz = q.nz;
     }
     // Every SurfMis field is copied below, and a field a copy misses reaches the device as 0. Both
     // structs carry their padding explicitly, so any field added to either changes its size and

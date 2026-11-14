@@ -41,7 +41,7 @@
 // file's reason for existing. See bdpt::mergeEtaPrimeSurf for the weight's derivation and
 // SurfMergeWeight for its assembly.
 //
-// MEMORY. 72 bytes of photon + 40 of MIS, and the MIS array is separate rather
+// MEMORY. 88 bytes of photon + 40 of MIS, and the MIS array is separate rather
 // than inlined so that the day a non-MIS consumer wants these photons it does not pay for
 // them (`BeamMis` is split from `PhotonBeam` for the same reason). Unlike beams there is no
 // split step, so the two arrays are indexed 1:1 and `misIdx` is currently the identity — it
@@ -123,8 +123,12 @@ struct SurfPhoton {
     float beta   = 0.0f;       // throughput carried here at `lambda` (emission + 1/p(lam) in)
     float cx = 0.0f, cy = 0.0f, cz = 0.0f;   // cie{X,Y,Z}(lambda), cached at store time
     unsigned misIdx = 0;
+    // The true normal of the surface it lies on, turned to the side its light came from (bdpt.h
+    // vertexGeoN), as mode M's photons carry theirs: a merge keeps only the photons of its own
+    // surface (gatherplane.h onGatherSurfaceSided).
+    float nx = 0.0f, ny = 0.0f, nz = 0.0f;
 };
-static_assert(sizeof(SurfPhoton) == 72, "SurfPhoton's size is quoted in -jsurf-count's memory notes");
+static_assert(sizeof(SurfPhoton) == 88, "SurfPhoton's size is quoted in -jsurf-count's memory notes");
 
 // A per-thread bank, merged into the map at the end of the light pass (mirrors BeamBank).
 struct SurfBank {
