@@ -128,6 +128,9 @@ struct Tri {
     unsigned char solidFace = 0;
     // triReach of the vertices, baked here for the hit to copy (Hit::pscale).
     double reach = 0.0;
+    // The light it is part of (Hit::emitter), or -1. Last: triangles are built positionally
+    // (`Tri{v0, v1, v2, mat, -1, {}, uv0, uv1, uv2}`), and a field among those would take their values.
+    int emitter = -1;
     void finalize() {
         gn = normalize(cross(v1 - v0, v2 - v0));
         reach = triReach(v0, v1, v2);
@@ -194,6 +197,7 @@ struct Sphere {
     // it. A side table, not inline: the record sits in every BVH leaf test, and nearly every
     // sphere is unturned.
     int frame = -1;
+    int emitter = -1;   // the light it is (Hit::emitter), or -1; last, as Tri's (spheres are built positionally)
 };
 
 
@@ -272,6 +276,11 @@ struct Hit {
     Vec3 p, n, ng;         // n = oriented against ray; ng = raw geometric normal
     int matId = 0;
     int sensorId = -1;
+    // The light the surface's primitive is (Scene::emitters' index: Tri, Sphere, Implicit::emitter,
+    // an instance's MeshInstance::emitterOf), or -1 for one that is none, or whose material's single
+    // emitter stands for it (a light block's surface). Every intersector writes it (the record is
+    // reused). Read through Scene::emitterForHit.
+    int emitter = -1;
     double u = 0, v = 0;   // interpolated surface texture coordinates
     double fieldVal = 0;   // implicit field value at the hit (~0 on a surface; 0 for
                            // non-implicit hits). Exposed to procedural patterns as `f`.
@@ -647,7 +656,7 @@ inline bool intersectTri(const TriShear& sh, const Ray& r, const Tri& tri,
     hit.t = t; hit.p = tri.v0 + (tri.v1 - tri.v0) * b1 + (tri.v2 - tri.v0) * b2; hit.valid = true;
     hit.pscale = tri.reach;
     hit.motionSet = -1; hit.deformTri = -1; hit.patFrame = tri.patFrame;
-    hit.matId = tri.matId; hit.sensorId = tri.sensorId;
+    hit.matId = tri.matId; hit.sensorId = tri.sensorId; hit.emitter = tri.emitter;
     // Barycentric-interpolated UV and shading normal (matches the old M-T convention:
     // b0,b1,b2 == w0,u,v).
     hit.u = b0 * tri.uv0.x + b1 * tri.uv1.x + b2 * tri.uv2.x;
@@ -762,7 +771,7 @@ inline bool intersectSphere(const Ray& r, const Sphere& s, double tmin, Hit& hit
     // Analytic mean curvature of a sphere: 1/R everywhere, negated when seen from
     // inside (a room-sized sphere is concave to anything standing in it).
     hit.curv = (s.r > 1e-12) ? ((sFlipped ? -1.0 : 1.0) / s.r) : 0.0;
-    hit.matId = s.matId; hit.sensorId = -1;
+    hit.matId = s.matId; hit.sensorId = -1; hit.emitter = s.emitter;
     sphereSurfaceUV(hit, ng, axes);
     hit.fiberRadius = 0.0; hit.hasVcol = false;   // `hit` is a reused record: not a strand, no colours
     return true;

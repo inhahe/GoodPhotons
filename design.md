@@ -3378,16 +3378,27 @@ was lit differently by every mode (known-issues GLOW-LIGHT-MODES). Now:
   unlit-scene test): each emissive mesh block keeps the mesh light it registered; the other
   triangles of each emissive material -- bare quads and polygons, a mesh's further material, and
   the world-space copies of instanced assets' -- form one mesh light per material, motion set and
-  pattern frame (`Scene::addMeshLightOf`, which takes any list of triangles; the emitter takes
-  their pattern frame, so a sampled point reads its pattern where a hit does); each sphere is a
-  sphere light, or a Glow under an emission pattern; each isosurface or CSG solid is a Glow.
-  `Scene::emitterForMat` finds a hit's emitter by its material (a table, `emitterOfMat`, on the
-  host and `DMaterial::emitterIdx` on the device, so a lookup is O(1)), so a material has one
-  emitter: every surface after the first with one of its own -- a further mesh block, sphere,
-  isosurface or group of triangles -- takes a copy of its material (`cloneOf`, named `name [2]`,
-  with a routed copy of the copy for a per-object-mode surface), all sharing one spectrum object
-  so the camera's per-sample spectrum table evaluates it once. A light block's own surface
-  (`reflectsNothing`) is left alone; `emit` on a mix or layered material itself is refused (every
+  pattern frame (the frame only where the material has an emission pattern; `Scene::addMeshLightOf`,
+  which takes any list of triangles; the emitter takes their pattern frame, so a sampled point
+  reads its pattern where a hit does); each sphere is a sphere light, or a Glow under an emission
+  pattern; each isosurface or CSG solid is a Glow.
+* **A hit finds its emitter by its primitive** (0.443.0): `Tri`, `Sphere` and `Implicit::emitter`,
+  and an instance's `MeshInstance::emitOf` (material, emitter) pairs, are written by every
+  intersector into `Hit::emitter` (device `DHit::emitter`, `DTri::emitter` in the room the old
+  double `bitangentSign` took; `DScene::instEmit`), and `Scene::emitterForHit(h, m)` / device
+  `dEmitterForHit` read it when the material `m` the hit shades with is the surface's own, else
+  the material's single emitter (`emitterForMat`: a light block's surface, whose primitives carry
+  none; `emitterOfMat` / `DMaterial::emitterIdx`, `kEmitterByPrim` where several share it), and
+  never for a material that is not a light. The field is the last of `Tri` and `Sphere`, which are
+  built positionally (`Tri{v0, v1, v2, mat, -1, {}, uv0, uv1, uv2}`), so no initializer list fills
+  it by position. So a
+  material lights the scene through any number of emitters and stays one material: until then a
+  hit's emitter was its material's, and every glowing surface after the first took a copy of its
+  material (`name [2]`), which split one emissive solid into several to the medium stack, refused
+  an instanced asset sharing its material with a mesh block, and made a material per glowing
+  sphere. A glowing material's spectrum is wrapped in one shared object (unless it has a shared
+  base already, a `lumens` light's) so the camera's per-sample spectrum table evaluates it once
+  however many emitters it has. A light block's own surface (`reflectsNothing`) is left alone; `emit` on a mix or layered material itself is refused (every
   hit takes a layer). build() finalizes the layered coats before the emitters, so a layered
   body's copy is known to be a glow.
 * **The Glow** (`EmitterShape::Glow`, device shape 7) samples an analytic primitive by the lines
@@ -3432,8 +3443,7 @@ was lit differently by every mode (known-issues GLOW-LIGHT-MODES). Now:
   (`Scene::glowG`, a twentieth of its mass; device `DScene::glowG`), so a glow whose colour no
   light emits is still drawn.
 * **Refused** unless `glow_only`: an emissive curve (nothing samples a strand), an emissive child
-  of a mix or layered material, an emissive isosurface whose motion is not a similarity, and
-  instanced assets' emissive triangles shared by placements that need different emitters.
+  of a mix or layered material, and an emissive isosurface whose motion is not a similarity.
 
 ## Module map (src/)
 

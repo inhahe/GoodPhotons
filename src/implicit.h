@@ -240,6 +240,7 @@ struct Implicit {
     std::vector<PatNode> exprNodes; // shared pool backing FieldOp::Expr leaves (f(x,y,z))
     std::string name;               // authored ftsl block name (used to name -export-mesh groups)
     int    matId = 0;
+    int    emitter = -1;            // the light it is (a Glow: Hit::emitter), or -1
     Aabb   bounds;                  // conservative world AABB (BVH leaf box + ray clip)
     // Container shape + cap policy (expression isosurfaces only; SDF/CSG leaves are
     // closed and never touch their computed bounds, so they leave these at defaults).
@@ -425,7 +426,7 @@ inline bool intersectImplicit(const Ray& r, const Implicit& im, double tmin, Hit
         hit.back = !(dot(r.d, ng) < 0.0);
         hit.solid = im.solidSide ? 1 : 0;
         hit.n  = hit.back ? -ng : ng;
-        hit.matId = im.matId; hit.sensorId = -1;
+        hit.matId = im.matId; hit.sensorId = -1; hit.emitter = im.emitter;
         if (im.uvProj != UvProjection::None) {
             const Aabb& b = im.uvBoundsSet ? im.uvBounds : im.bounds;
             Vec3 ctr = (b.lo + b.hi) * 0.5;

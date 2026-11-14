@@ -3490,8 +3490,9 @@ radiate into its own interior and look black, so such shells are auto-oriented
 outward at load — the loader flips the winding of any emissive mesh that encloses a
 volume with inward orientation, leaving flat/open sheets (which enclose no volume)
 exactly as authored. Emissive meshes count as lights, so a scene lit *only* by one
-needs no separate `light` block. Several mesh blocks (or quads, or instances) bound to one
-emissive material are one light, sampled over all of their triangles.
+needs no separate `light` block. Each `mesh` block is a light of its own; the bare quads, polygons
+and instances bound to an emissive material form one more, sampled over all of their triangles
+(one per motion, and per pattern frame for a patterned emission).
 
 Because the sampling is uniform by area and takes no account of the shading point,
 keep an emissive mesh **spatially compact** — one fixture per `mesh` block rather than
@@ -3507,16 +3508,17 @@ a `sphere`, a bare `quad` or `polygon`, a CSG solid, a marched `isosurface`, a
 `mesh_instance` — makes it a light too (since 0.442.0), on CPU and GPU and in every mode
 alike: ftrace registers an emitter for it at load. Each `mesh` block keeps the light it registers;
 the other triangles of each emissive material (bare quads and polygons, instances) form one mesh
-light; each sphere is a sphere light; each isosurface or CSG solid — and a sphere under an emission
+light (one per motion, and per pattern frame for a patterned emission); each sphere is a sphere light; each isosurface or CSG solid — and a sphere under an emission
 pattern — is
 sampled by **random lines through its box**: such a line crosses any surface inside the box
 with the same density everywhere (the Crofton formula), so one of its crossings, weighted by
 how many there are, is an exact sample of the surface whatever its shape, a thin wire frame
 included. Lines that miss the surface cost a march and add nothing, so a sparse solid in a
 large box takes more samples to light the room cleanly than a mesh light of the same area
-would. Each mesh block, emissive sphere and isosurface has its own emitter (the ones after the
-first of a material take a copy of it, named `glow [2]`, `glow [3]`, … in diagnostics), so many
-glowing objects are sampled where they are. A line at load names what now lights the scene.
+would. Each mesh block, emissive sphere and isosurface has its own emitter, so many glowing objects
+are sampled where they are; they all keep their one material (since 0.443.0: each surface knows its
+own light, where until then each after the first took a copy of the material, `glow [2]`, …, and an
+instanced asset sharing its emissive material with a `mesh` block was refused). A line at load names what now lights the scene.
 `emit` belongs on a material's layers, not on a `mix` or `layered` material itself (refused).
 Until 0.442.0 only a `mesh` block registered one: the rest lit nothing in modes `R`, `W`, `M`
 and `S`, nothing and were not even seen in the forward modes, and lit everything around them at

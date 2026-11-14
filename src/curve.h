@@ -328,6 +328,7 @@ inline bool intersectCurveSeg(const CurveRay& cr, const Ray& r, const CurveSeg& 
     hit.motionSet = -1; hit.deformTri = -1; hit.patFrame = s.patFrame;
     hit.matId = s.matId;
     hit.sensorId = -1;
+    hit.emitter = -1;   // no strand is a light (the loader refuses one that would be)
     hit.fieldVal = 0.0;
 
     // Outward geometric normal of the piece that was hit.

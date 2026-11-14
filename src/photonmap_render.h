@@ -1368,7 +1368,7 @@ inline Vec3 photonGatherSub(const Scene& scene, const PhotonMap& pm, Ray ray, Pc
         // estimate below. See photonGather for the measurement.
         // A glow no emitter samples lights nothing, so what reaches the visible point from one here
         // is not counted (Scene::isGlow; BackwardRenderer::GiCtx::pastDiffuse).
-        const int eIdx = m.isLight ? BackwardRenderer::emitterIndexOfResolved(scene, m) : -1;
+        const int eIdx = m.isLight ? BackwardRenderer::emitterIndexOfResolved(scene, h, m) : -1;
         if (m.isLight && eIdx >= 0 && specularSeen && dot(ray.d, h.ng) < 0.0 && !hairArrival) {
             double rhoV = clamp01(diffuseReflectance(scene, visMat, visHit, lambda));
             // GLOSSY-NEE's lobe-sampling half; 1 (and bit-identical) unless the last bounce was
@@ -1772,7 +1772,7 @@ inline Vec3 photonGather(const Scene& scene, const PhotonMap& pm, Ray ray, doubl
         // GPU (dEmitterForMat missed the unregistered quad, so the emitter branch was never
         // taken and the grid vanished) — two mode-M paths disagreeing with each other and
         // both disagreeing with modes R and D. Measured on scraps/mini_grid.ftsl.
-        const int eIdx = m.isLight ? BackwardRenderer::emitterIndexOfResolved(scene, m) : -1;
+        const int eIdx = m.isLight ? BackwardRenderer::emitterIndexOfResolved(scene, h, m) : -1;
         if (m.isLight && dot(ray.d, h.ng) < 0.0 && !hairArrival && (eIdx >= 0 || !pastDiffuse)) {
             const double wMis = (gmis.pdf > 0.0)          // GLOSSY-NEE, as in the sub-walk
                 ? bwNee.glossyHitWeight(scene, gmis, eIdx, ray.d, &h) : 1.0;

@@ -172,7 +172,7 @@ inline void sppmVisiblePoint(const Scene& scene, Ray ray, Pcg32& rng, bool diffr
         if (m.isLight) {
             // A light emits from the face its triangles are wound to (the side its `normal`
             // picks, as backward.h tests it); not after a strand's NEE took it.
-            const int eIdx = BackwardRenderer::emitterIndexOfResolved(scene, m);
+            const int eIdx = BackwardRenderer::emitterIndexOfResolved(scene, h, m);
             if (dot(ray.d, h.ng) < 0.0 && !strandArrival && (eIdx >= 0 || !pastDiffuse)) {
                 // GLOSSY-NEE's lobe-sampling half; 1, and this expression bit-identical to its
                 // pre-0.266 form, unless the previous bounce was a MIS'd glossy one.

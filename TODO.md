@@ -279,7 +279,7 @@ Then the rest of 4.2-4.6 in their order, 4.7's bookkeeping alongside whatever to
 - [x] **B-GPU-MAXBOUNCE** (0.439.9) — GPU mode B ignored `-max-bounce` (a literal 32 reached its
   kernels).
 
-- [ ] **REVIEW-0442-FABLE** (0.443.0) -- a hit finds its emitter by its primitive (`Hit::emitter`),
+- [x] **REVIEW-0442-FABLE** (0.442.4, 0.443.0) -- a hit finds its emitter by its primitive (`Hit::emitter`),
   not its material: no glow material copies (their solid identity, the instancing refusal, the
   retag, the degenerate group, the spectrum wrap, the load cost); the docs' "one light per material".
 - [ ] **GAP-MERGE-RADIUS** — light trapped in a thin gap reaches the room through the merges' discs at

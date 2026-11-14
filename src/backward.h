@@ -1124,22 +1124,14 @@ struct BackwardRenderer {
         return dist2 / (em.area * scene.lightAreaScaleAt(em, hit->ng, hit->deformTri) * cosLight);   // its area now
     }
 
-    // Index of the emitter that owns an emissive surface material, or -1. Scene::emitterForMat
-    // returns the record; the balance heuristic needs the INDEX, because `lightPickExact` and
-    // `lightPdfW` are both keyed on it.
-    static int emitterIndexForMat(const Scene& scene, int matId) {
-        const Emitter* e = scene.emitterForMat(matId);
-        return e ? (int)(e - scene.emitters.data()) : -1;
-    }
-    // The EMITTER index for a hit, keyed on the RESOLVED material rather than on `h.matId`.
-    // A Mix/Layered hit resolves to a child before the emission test, and if the emitter is
-    // registered against that CHILD then `h.matId` -- the parent -- misses it. NEE would then
-    // connect to the light and the hit would still be taken at full weight: a double count.
-    // The device twin already used its resolved `matId`; this is the host saying the same
-    // thing, via the pointer-difference trick interactMaterial uses to recover a Mix child's
-    // true index for the nested-dielectric stack.
-    static int emitterIndexOfResolved(const Scene& scene, const Material& m) {
-        return emitterIndexForMat(scene, (int)(&m - scene.mats.data()));
+    // The index of the emitter the surface hit at `h` is, shading with `m` -- the RESOLVED material,
+    // not h.matId: a Mix/Layered hit resolves to a child before the emission test, and an emitter
+    // registered against that CHILD is missed by `h.matId` -- the parent -- so NEE would connect to
+    // the light and the hit would still be taken at full weight, a double count (Scene::emitterForHit;
+    // `m` is one of scene.mats, the pointer difference its index). -1 for none. The balance heuristic
+    // needs the INDEX, because `lightPickExact` and `lightPdfW` are both keyed on it.
+    static int emitterIndexOfResolved(const Scene& scene, const Hit& h, const Material& m) {
+        return scene.emitterIndexForHit(h, (int)(&m - scene.mats.data()));
     }
 
     // Scene::sunRadiance, but with the glossy MIS weight applied PER SUN -- the weight depends
@@ -3059,7 +3051,7 @@ struct BackwardRenderer {
             // A glow no emitter samples counts only along a path specular from the camera on
             // (GiCtx::pastDiffuse, set at the hit above); an emitter on any specular arrival, the
             // light it throws through a mirror or glass included.
-            const int eIdx = m.isLight ? emitterIndexOfResolved(scene, m) : -1;
+            const int eIdx = m.isLight ? emitterIndexOfResolved(scene, h, m) : -1;
             if (m.isLight && specularArrival && (eIdx >= 0 || !gi.pastDiffuse) && dot(ray.d, h.ng) < 0.0) {
                 // The lobe-sampling half of the glossy MIS weight. 1 (and bit-identical to the
                 // old expression) unless the previous bounce was a MIS'd glossy one that
@@ -3575,7 +3567,7 @@ struct BackwardRenderer {
             // emitHitScale (an `emit pattern:`, an aimed quad's law) is achromatic, so evaluate
             // it ONCE for the whole hero bundle rather than per-wavelength inside emitSlot.
             // A glow no emitter samples only along a path specular from the camera on (scalar twin).
-            const int eIdx = m.isLight ? emitterIndexOfResolved(scene, m) : -1;
+            const int eIdx = m.isLight ? emitterIndexOfResolved(scene, h, m) : -1;
             if (m.isLight && specularArrival && (eIdx >= 0 || !gi.pastDiffuse) && dot(ray.d, h.ng) < 0.0) {
                 double ep = emitHitScale(scene, m, h, ray.d * -1.0);
                 // The lobe-sampling half of the glossy MIS weight; 1 (and bit-identical to the

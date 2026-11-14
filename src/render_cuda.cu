@@ -696,12 +696,13 @@ struct DTri    { DVec3 v0, v1, v2, gn; DVec3 uv0, uv1, uv2; DVec3 n0, n1, n2; in
                  DVec3 tangent;
                  unsigned char solid;                    // Tri::solidFace: 1 normals out, 2 in, 0 neither
                                                          // (in FP32's padding before bitangentSign)
-                 double bitangentSign;                   // C6 tangent frame for normal mapping
+                 Real bitangentSign;                     // C6 tangent frame for normal mapping (+-1)
+                 int emitter;                            // Tri::emitter (in the room a double sign took)
                  double curvature;                       // O3 per-face mean curvature (Tri::finalize)
                  int vcol;                               // Tri::vcol -> DScene::vertColors, or -1
                  Real reach; };                          // farthest vertex's distance (Hit::pscale)
 // frame: the sphere's own axes, three DVec3 at DScene::sphAxes + 3*frame, or -1 (Sphere::frame).
-struct DSphere { DVec3 c; double r; int matId; int frame; };
+struct DSphere { DVec3 c; double r; int matId; int frame; int emitter; };   // emitter: Sphere::emitter
 // One round cone of a curve/fiber strand — the device twin of CurveSeg (curve.h). The host
 // record is already a POD in exactly this shape; only the scalar type narrows to Real.
 struct DCurveSeg { DVec3 p0, p1; Real r0, r1; int matId; float u0, u1; };
@@ -787,6 +788,8 @@ struct DInstance {
     int    blasId;
     int    matOverride;   // >=0 replaces the BLAS triangles' matId (mirrors host)
     int    route;         // MeshInstance::route: -1, or the mode its hits' routed copies take
+    // MeshInstance::emitOf: its (material, emitter) pairs, DScene::instEmit[2 * emitOff ..], emitN of them.
+    int    emitOff, emitN;
 };
 
 // Implicit surfaces (isosurface / CSG / metaballs) — device twins of implicit.h.
@@ -831,6 +834,7 @@ struct PatNodeF { int op; float a; };   // FP32 twin of pattern.h PatNode (8B vs
 struct DImplicit {
     int    nodeOff, nodeN;   // slice [nodeOff, nodeOff+nodeN) into DScene::fieldNodes
     int    matId;
+    int    emitter;          // Implicit::emitter: the Glow it is, or -1
     double lo[3], hi[3];     // world AABB (ray clip)
     double lipschitz, minStep;
     int    method;           // 0 = adaptive (|f|/lipschitz), 1 = fixed-step sample
@@ -1397,6 +1401,7 @@ struct DScene {
     // (offsets into the shared blasNodes/blasTris/blasPrim pools). Null/0 when the scene
     // has no instances (the common path uploads Scene::bvh verbatim, bit-identical).
     const DInstance*  instances; int nInstances;
+    const int*        instEmit;   // the instances' (material, emitter) pairs (DInstance::emitOff), or null
     const DBlas*      blas;                 // per-BLAS pool offsets, indexed by blasId
     const DNode*      blasNodes;            // concatenated per-BLAS BVH nodes (0-based)
     const int*        blasPrim;             // concatenated per-BLAS primIdx (0-based)
@@ -3627,6 +3632,9 @@ struct DHit {
     signed char solid = 0;
     DVec3 p, n, ng;
     int matId, sensorId;
+    // Hit::emitter's twin: the light the surface's primitive is, or -1 (dEmitterForHit). Every
+    // intersector writes it.
+    int emitter;
     Real u, v;   // interpolated surface texture coordinates
     DVec3 tangent; Real bitangentSign;  // C6 surface tangent frame for normal mapping
     Real curv;   // O3 mean curvature, signed toward the shaded side (see Hit::curv)
@@ -3682,7 +3690,7 @@ struct DHit {
 };
 #if FTRACE_GPU_FP32
 // Held in every kernel's registers or local memory and in the wavefront state arrays.
-static_assert(sizeof(DHit) == 128, "DHit changed size");
+static_assert(sizeof(DHit) == 132, "DHit changed size");   // 128 until DHit::emitter (0.443.0)
 static_assert(sizeof(DTri) == 168, "DTri changed size: one per triangle, the largest geometry upload");
 #endif
 // The geometric normal on the side being shaded: the side the ray came from (host twin
@@ -4115,7 +4123,7 @@ __device__ static bool intersectImplicit(const DScene& sc, const DImplicit& im,
         hit.back = !(side < 0.0);
         hit.solid = im.solidSide ? 1 : 0;
         hit.n = hit.back ? DVec3(-gx, -gy, -gz) : DVec3(gx, gy, gz);
-        hit.matId = im.matId; hit.sensorId = -1;
+        hit.matId = im.matId; hit.sensorId = -1; hit.emitter = im.emitter;
         if (im.uvProj != 0) {
             double uu, vv;
             dProjectUV(px, py, pz, im.uvLo, im.uvHi, im.uvProj, im.uvAxis, uu, vv);
@@ -4399,7 +4407,7 @@ __device__ static inline void dTriFill(const DVec3& rd, const DTri& tri, Real t,
     // From the vertices, not the ray (host twin intersectTri says why).
     hit.t = t; hit.p = tri.v0 + (tri.v1 - tri.v0) * b1 + (tri.v2 - tri.v0) * b2; hit.valid = true;
     hit.pscale = tri.reach;
-    hit.matId = tri.matId; hit.sensorId = tri.sensorId;
+    hit.matId = tri.matId; hit.sensorId = tri.sensorId; hit.emitter = tri.emitter;
     hit.u = b0 * tri.uv0.x + b1 * tri.uv1.x + b2 * tri.uv2.x;
     hit.v = b0 * tri.uv0.y + b1 * tri.uv1.y + b2 * tri.uv2.y;
     DVec3 ns = tri.n0 * b0 + tri.n1 * b1 + tri.n2 * b2;
@@ -4476,7 +4484,7 @@ __device__ static bool intersectSphere(const DVec3& ro, const DVec3& rd, const D
     hit.solid = 1;
     // O3: analytic 1/R, negated from inside — mirrors the host intersectSphere.
     hit.curv = (s.r > 1e-12) ? (Real)((sFlipped ? -1.0 : 1.0) / s.r) : (Real)0;
-    hit.matId = s.matId; hit.sensorId = -1;
+    hit.matId = s.matId; hit.sensorId = -1; hit.emitter = s.emitter;
     // Equirectangular (lat/long) UV so spheres can be textured, in the sphere's own axes when
     // it has been turned (mirrors host).
     const DVec3 nl = axes ? DVec3{dot(ng, axes[0]), dot(ng, axes[1]), dot(ng, axes[2])} : ng;
@@ -4605,6 +4613,7 @@ __device__ static bool intersectCurveSeg(const DCurveRay& cr, const DVec3& ro, c
 
     hit.matId = s.matId;
     hit.sensorId = -1;
+    hit.emitter = -1;   // no strand is a light (host twin)
 
     DVec3 ng;
     if (piece == 0)      ng = (oa + dn * bestTn) * d2 - ba * bestY;   // lateral (iq)
@@ -4773,7 +4782,8 @@ __device__ static bool blasOccluded(const DScene& sc, const DInstance& inst,
 // (Nm), keeping the orientation the local intersectTri gave the shading normal (the transform
 // preserves the sign of dot(d, n); the host twin says why that matters). Mirrors the host
 // Scene::instanceHitToWorld exactly.
-__device__ static void instanceHitToWorld(const DInstance& inst, DHit& lh, const DMaterial* mats) {
+__device__ static void instanceHitToWorld(const DScene& sc, const DInstance& inst, DHit& lh) {
+    const DMaterial* mats = sc.mats;
     lh.p  = affPoint(inst.Wm, inst.Wt, lh.p);
     lh.pscale = (Real)(inst.reachMul * (double)lh.pscale + inst.reachAdd);
     lh.n  = normalize(affDir(inst.Nm, lh.n));
@@ -4789,6 +4799,10 @@ __device__ static void instanceHitToWorld(const DInstance& inst, DHit& lh, const
         const int to = mats[lh.matId].routeTo[inst.route];
         if (to >= 0) lh.matId = to;
     }
+    // Its own light, not the shared asset triangle's (host twin MeshInstance::emitterOf).
+    lh.emitter = -1;
+    for (int k = 0; k < inst.emitN; ++k)
+        if (sc.instEmit[2 * (inst.emitOff + k)] == lh.matId) { lh.emitter = sc.instEmit[2 * (inst.emitOff + k) + 1]; break; }
 }
 
 // ---- Timed intersection (motion blur, ROADMAP 11): the device twins of Scene's *Now ----
@@ -5227,7 +5241,7 @@ __device__ static bool dIntersectOtherNow(const DScene& sc, const DVec3& ro, con
         if (anyHit) return blasOccluded(sc, inst, iro, ird, tmin, h.t);
         DHit lh; lh.t = h.t; lh.valid = false;
         if (!blasClosest(sc, inst, iro, ird, tmin, lh)) return false;
-        instanceHitToWorld(inst, lh, sc.mats);
+        instanceHitToWorld(sc, inst, lh);
         h = lh;
         hit = true;
     }
@@ -5356,7 +5370,7 @@ __device__ static inline void dApplyNormalMap(const DScene& sc, DHit& h);
 __device__ static DHit closestHit(const DScene& sc, const DVec3& ro, const DVec3& rd,
                                    Real tmin = RAY_EPS, Real tCap = BIG,
                                    bool camHide = false, Real curveTmin = (Real)0) {
-    DHit h; h.t = tCap; h.valid = false; h.matId = 0; h.sensorId = -1;
+    DHit h; h.t = tCap; h.valid = false; h.matId = 0; h.sensorId = -1; h.emitter = -1;
     if (sc.nNodes == 0) return h;
     // One uniform test, hoisted out of the leaf loop. `hidden()` is checked BEFORE the
     // intersection, so a hidden primitive costs a matId load rather than a full ray test.
@@ -5429,7 +5443,7 @@ __device__ static DHit closestHit(const DScene& sc, const DVec3& ro, const DVec3
     }
     if (timed && dTimedClosest(sc, ro, rd, invD, sh, tmin, curveTmin, tMax, h, camHideOn))
         hInst = -1;                                // a mover's hit, in world space already
-    if (hInst >= 0) instanceHitToWorld(sc.instances[hInst], h, sc.mats);
+    if (hInst >= 0) instanceHitToWorld(sc, sc.instances[hInst], h);
     h.patOwnSide = h.valid && h.matId >= 0 && sc.mats[h.matId].patOwnSide;   // host twin Scene::markPatSide
     dApplyNormalMap(sc, h);   // C6: perturb shading normal by a bound normal map
     return h;
@@ -14081,7 +14095,7 @@ __device__ static inline DHit dVertHit(const DVertex& vt) {
     DHit h;
     h.t = (Real)0; h.valid = true;
     h.p = vt.p; h.n = vt.ns; h.ng = vt.ng;
-    h.matId = vt.matId; h.sensorId = -1;
+    h.matId = vt.matId; h.sensorId = -1; h.emitter = -1;
     h.u = vt.u; h.v = vt.v; h.curv = vt.curv;
     h.tangent = vt.tangent; h.fiberRadius = vt.fiberR; h.pscale = vt.pscale;
     h.back = vt.back != 0; h.patOwnSide = vt.patOwnSide != 0;
@@ -14605,6 +14619,14 @@ __device__ static double dVertexLe(const DScene& sc, const DVertex& v, const DVe
 // is its original's.
 __device__ static int dEmitterForMat(const DScene& sc, int matId) {
     return (matId >= 0) ? sc.mats[matId].emitterIdx : -1;   // looked up once, at upload
+}
+// The emitter of the surface hit at `h`, shading with material `matId` -- its own or the part a
+// compound resolved it to (host twin Scene::emitterForHit): its primitive's where matId is the
+// surface's own, else the material's single one (a light block's surface), or -1.
+__device__ static int dEmitterForHit(const DScene& sc, const DHit& h, int matId) {
+    if (matId < 0 || !sc.mats[matId].matIsLight) return -1;   // an emitter's surface is a light's (host twin)
+    if (matId == h.matId && h.emitter >= 0) return h.emitter;
+    return sc.mats[matId].emitterIdx;
 }
 
 // Sample the shared wavelength from the scene emission sampler (mirrors
@@ -16826,7 +16848,7 @@ __device__ static double bkRadiance(const DScene& sc, int diffraction, DVec3 ro,
         // Emission on specular/camera arrival (NEE covers diffuse arrivals), scaled by
         // this hit's `emit pattern:` factor — the same value the NEE side gets from the
         // sampler at this point (device twin of host emitSlot).
-        int li = dEmitterForMat(sc, matId);
+        int li = dEmitterForHit(sc, h, matId);
         if (!specularArrival) gi.pastDiffuse = true;
         if (specularArrival && dot(rd, h.ng) < 0) {
             // Prefer the registered emitter's baked SPD (it may carry a `power`/`lumens`
@@ -17097,7 +17119,7 @@ __device__ static void bkRadianceHeroLoop(const DScene& sc, int diffraction,
         }
         // Surface emission on a specular/camera arrival (NEE covers diffuse arrivals).
         // The `emit pattern:` factor is achromatic, so one eval serves the whole bundle.
-        int li = dEmitterForMat(sc, matId);
+        int li = dEmitterForHit(sc, h, matId);
         if (!specularArrival) gi.pastDiffuse = true;
         if (specularArrival && dot(rd, h.ng) < 0) {
             // Same emitter-then-material fallback as the single-wavelength path above.
@@ -17839,7 +17861,7 @@ __device__ static DVec3 bkRadianceRGB(const DScene& sc, int diffraction, DVec3 r
             if (child < 0) return L;
             mp = &sc.mats[child]; matId = child;
         }
-        int li = dEmitterForMat(sc, matId);
+        int li = dEmitterForHit(sc, h, matId);
         if (!specularArrival) pastDiffuse = true;
         if (specularArrival && dot(rd, h.ng) < 0 && (li >= 0 || (mp->matIsLight && !pastDiffuse))) {
             // The emission pattern is achromatic, so it scales the baked RGB radiance.
@@ -18535,7 +18557,7 @@ __device__ static void dRandomWalk(const DScene& sc, const DCamera& cam, int dif
         DVertex v;
         v.type = BV_SURFACE; v.p = h.p; v.ns = h.n; v.ng = h.ng;
         v.beta = beta; v.pdfFwd = 0; v.pdfRev = 0; v.delta = 0;
-        v.matId = matId; v.lightIdx = dEmitterForMat(sc, matId);
+        v.matId = matId; v.lightIdx = dEmitterForHit(sc, h, matId);
         // Emission-on-hit half of the slot, evaluated once here where the DHit is in hand
         // (dVertexLe is called later from several MIS strategies with no hit available).
         // Host twin: bdpt.h's slotPatMul at the same hit.
@@ -20696,7 +20718,7 @@ __device__ static void dPhotonGatherSub(const DScene& sc, const DPhotonMap& pm,
         // one is not counted (DGiCtx::pastDiffuse). Does NOT return: an emissive material still
         // has a BSDF. Host twin: photonGatherSub.
         {
-            const int li = dEmitterForMat(sc, matId);
+            const int li = dEmitterForHit(sc, h, matId);
             const DSpec* eSpd = (li >= 0) ? &sc.emitters[li].emitSpd : nullptr;
             if (eSpd && specularSeen && dot(rd, h.ng) < 0 && !hairArrival) {
                 double rhoV = (double)clamp01(dDiffuseRho(sc, visMat, visHit, lambda));
@@ -21378,7 +21400,7 @@ __device__ static void dPhotonGather(const DScene& sc, const DPhotonMap& pm,
         // both emits and reflects and the walk falls through to the density estimate. Host
         // twin: photonGather — see its comment for the four-mode measurement.
         {
-            const int li = dEmitterForMat(sc, matId);
+            const int li = dEmitterForHit(sc, h, matId);
             const DSpec* eSpd = (li >= 0)                        ? &sc.emitters[li].emitSpd
                                : (m.matIsLight && !pastDiffuse)   ? &m.matEmit   // a glow: seen only before
                                                                   : nullptr;
@@ -21910,7 +21932,7 @@ __device__ static void dSppmVisiblePoint(const DScene& sc, DVec3 ro, DVec3 rd, R
         // material's `emit` the same way). It adds its emission from its front face only; a
         // light block's own surface then ends the path, and any other glowing material has a
         // body that is shaded below like any surface.
-        int li = dEmitterForMat(sc, matId);
+        int li = dEmitterForHit(sc, h, matId);
         const DSpec* eSpd = (li >= 0)        ? &sc.emitters[li].emitSpd
                            : (m.matIsLight)   ? &m.matEmit
                                               : nullptr;
@@ -23082,7 +23104,7 @@ __global__ void kVcmCameraT(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx
             // spectrum falls back to the material's `emit` as bkRadiance's does. With no emitter
             // nothing else can reach the path, so it keeps the whole weight -- where the glow is
             // seen at all (camGlow: through specular surfaces only).
-            int li = dEmitterForMat(sc, matId);
+            int li = dEmitterForHit(sc, h, matId);
             const DSpec* eSpd = (li >= 0)                     ? &sc.emitters[li].emitSpd
                                : (mp->matIsLight && camGlow)   ? &mp->matEmit
                                                                : nullptr;
@@ -23870,7 +23892,7 @@ __global__ static void kHitProbe(DScene sc, const DevHitProbeRay* rays, int n, D
     if (q.kind < 0) {
         h = closestHit(sc, ro, rd);
     } else {
-        h.t = (Real)BIG; h.valid = false; h.matId = -7; h.sensorId = -1; h.back = true;
+        h.t = (Real)BIG; h.valid = false; h.matId = -7; h.sensorId = -1; h.emitter = -1; h.back = true;
         h.pscale = (Real)777; h.fiberRadius = (Real)0.5; h.vcol = 3; h.vb0 = h.vb1 = (Real)0.3;
         h.tangent = DVec3{(Real)0, (Real)0, (Real)9}; h.bitangentSign = (Real)-1; h.curv = (Real)99;
         h.solid = 7;
@@ -24873,7 +24895,8 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
         d.n1 = {t.n1.x, t.n1.y, t.n1.z};
         d.n2 = {t.n2.x, t.n2.y, t.n2.z};
         d.tangent = {t.tangent.x, t.tangent.y, t.tangent.z};
-        d.bitangentSign = t.bitangentSign;
+        d.bitangentSign = (Real)t.bitangentSign;   // +-1, exact
+        d.emitter = t.emitter;
         d.curvature = t.curvature;      // O3 per-face mean curvature (from Tri::finalize)
         d.solid = t.solidFace;          // PROBE-SOLID-SIDE (markSolidFaces)
         d.matId = t.matId; d.sensorId = t.sensorId;
@@ -24893,7 +24916,7 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
     for (size_t i = 0; i < scene.spheres.size(); ++i) {
         const Sphere& s = scene.spheres[i]; DSphere& d = sph[i];
         d.c = {s.c.x, s.c.y, s.c.z}; d.r = s.r; d.matId = s.matId;
-        d.frame = s.frame;
+        d.frame = s.frame; d.emitter = s.emitter;
     }
     std::vector<DVec3> sphAxes;
     for (const Scene::SphereAxes& a : scene.sphereAxes)
@@ -24965,6 +24988,7 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
         blasPrim.insert(blasPrim.end(), bl.bvh.primIdx.begin(), bl.bvh.primIdx.end());
     }
     std::vector<DInstance> dinst(scene.instances.size());
+    std::vector<int> instEmit;   // MeshInstance::emitOf, flattened (DInstance::emitOff)
     for (size_t ii = 0; ii < scene.instances.size(); ++ii) {
         const MeshInstance& in = scene.instances[ii]; DInstance& d = dinst[ii];
         for (int k = 0; k < 9; ++k) d.Lm[k] = in.toLocal.m[k];
@@ -24982,6 +25006,8 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
         d.handSign = in.handSign;
         d.reachMul = in.reachMul; d.reachAdd = in.reachAdd;
         d.blasId = in.blasId; d.matOverride = in.matOverride; d.route = in.route;
+        d.emitOff = (int)(instEmit.size() / 2); d.emitN = (int)in.emitOf.size();
+        for (const auto& [m, e] : in.emitOf) { instEmit.push_back(m); instEmit.push_back(e); }
     }
     (void)haveInstances;
 
@@ -25017,6 +25043,7 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
     for (size_t i = 0; i < scene.implicits.size(); ++i) {
         const Implicit& im = scene.implicits[i]; DImplicit& d = dimpl[i];
         d.matId   = im.matId;
+        d.emitter = im.emitter;
         d.lo[0] = im.bounds.lo.x; d.lo[1] = im.bounds.lo.y; d.lo[2] = im.bounds.lo.z;
         d.hi[0] = im.bounds.hi.x; d.hi[1] = im.bounds.hi.y; d.hi[2] = im.bounds.hi.z;
         d.lipschitz = im.lipschitz; d.minStep = im.minStep;
@@ -25352,6 +25379,7 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
     DCurveSeg*  d_curves = curveSegs.empty()  ? nullptr : (DCurveSeg*)keep(uploadVec(curveSegs));
     // Two-level BVH pools (shared BLAS + instance table). Empty for scenes with no instances.
     DInstance*  d_inst   = dinst.empty()     ? nullptr : (DInstance*)keep(uploadVec(dinst));
+    int*        d_instEmit = instEmit.empty() ? nullptr : (int*)keep(uploadVec(instEmit));
     DBlas*      d_blas   = dblas.empty()     ? nullptr : (DBlas*)keep(uploadVec(dblas));
     DNode*      d_blasN  = blasNodes.empty() ? nullptr : (DNode*)keep(uploadVec(blasNodes));
     int*        d_blasP  = blasPrim.empty()  ? nullptr : (int*)keep(uploadVec(blasPrim));
@@ -25599,6 +25627,7 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
     sc.implicits = d_impl; sc.nImplicits = (int)dimpl.size();
     sc.curveSegs = d_curves; sc.nCurveSegs = (int)curveSegs.size();
     sc.instances = d_inst; sc.nInstances = (int)dinst.size();
+    sc.instEmit = d_instEmit;
     sc.blas = d_blas; sc.blasNodes = d_blasN; sc.blasPrim = d_blasP; sc.blasTris = d_blasT;
     uploadMotion(scene, up);
     sc.patNodes = d_pnodes; sc.patterns = d_pat; sc.nPatterns = (int)dpat.size();

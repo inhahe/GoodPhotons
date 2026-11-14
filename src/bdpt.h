@@ -1309,7 +1309,7 @@ inline void randomWalk(const Scene& scene, const Camera& cam, const Renderer& ma
         v.nUp = nUp;
         for (int i = 0; i + 1 < nUp; ++i) v.betaSec[i] = betaSec[i];
         if (mp->isLight) {
-            v.light = scene.emitterForMat(h.matId);
+            v.light = scene.emitterForHit(h, (int)(mp - scene.mats.data()));
             // Evaluate the emission pattern once, here, where the Hit is in hand — Le()
             // is called later from several MIS strategies with no Scene available.
             if (mp->emitPat >= 0) v.emitPatW = slotPatMul(scene, mp->emitPat, h);

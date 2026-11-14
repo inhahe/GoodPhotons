@@ -1330,7 +1330,8 @@ two slots:
 **Every emissive surface is a light** (since 0.442.0). A material with `emit` lights the scene
 wherever it is bound — a `mesh`, a bare `quad` or `polygon`, a `sphere`, an `isosurface` or CSG
 solid, a `mesh_instance` — in every mode alike: ftrace registers an emitter for it at load (one per
-material for its triangles, one per sphere or isosurface; an isosurface's is sampled by the lines
+`mesh` block, one for the material's other triangles -- per motion, and per pattern frame for a
+patterned emission -- and one per sphere or isosurface; an isosurface's is sampled by the lines
 through its box, which find its surface wherever it is, so even a thin wire frame lights the
 scene exactly). Before 0.442.0 only a `mesh` block's did, and the rest glowed and lit nothing in
 some modes and all of themselves in others. `emit` goes on a `mix`'s or `layered`'s layers, not on

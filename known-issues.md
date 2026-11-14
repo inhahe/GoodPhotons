@@ -72,7 +72,7 @@ closed entries, where the cost is a broken historical link rather than a blocked
 Three references — `scenes/_gr_fly0.ftsl`, `scenes/silver_sphere_xenon.ftsl`, `scenes/x.ftsl` —
 name files that no longer exist at all, all in closed entries.
 
-## OPEN (2026-11-14, 0.442.4): REVIEW-0442-FABLE — what Fable's review of 0.442.0-0.442.1 found
+## DONE (2026-11-14, 0.442.4 and 0.443.0): REVIEW-0442-FABLE — what Fable's review of 0.442.0-0.442.1 found
 
 `/code-review xhigh` (Fable) of 014762e..4c727e0, the second review GLOW-LIGHT-MODES' batch takes:
 15 findings, each checked against the code; 14 held, the last (J-THIN-GAP-LEAK and KEEPWINDOW-VRAM
@@ -106,7 +106,7 @@ logged with their fixes written out) was already done (0.442.2, 0.442.3).
   mode P's composite reads the glows' sums beside the forward film instead of copying the film
   (about 200 MB at 4K) at every repaint.
 
-**To fix in 0.443.0 -- one cause:** a hit finds its emitter by its material
+**Fixed in 0.443.0 -- one cause:** a hit found its emitter by its material
 (`Scene::emitterForMat`), which forces a material copy for every glowing primitive after the first
 (`registerGlows`' `cloneOf`). From that: the parts of one emissive dielectric solid that took
 different emitters were different solids to the medium stack (a copy has no `routeBase`); a static
@@ -114,10 +114,14 @@ instanced asset whose emissive material a mesh block also used was refused; a se
 retag could take over faces carrying an imported material; a degenerate triangle's group made a
 copy with no emitter, a glow nothing can hit; wrapping a `lumens` light's ScaledSpectrum in a
 SharedSpectrum hid its base; and 100 000 glowing spheres made 100 000 materials, with a quadratic
-name lookup at load. The fix: each primitive knows its emitter (`Hit::emitter`, written by every
-intersector), so a material keeps one entry however many emitters light its surfaces, and none of
-the copies exist. Also then: REFERENCE.md and FTSL.md still say mesh blocks sharing a material
-are one light, which 0.442.1 reversed.
+name lookup at load. Now each primitive knows its emitter (`Tri`, `Sphere`, `Implicit::emitter`, an
+instance's `MeshInstance::emitOf`; every intersector writes `Hit::emitter`, read by
+`Scene::emitterForHit` -- device `DHit::emitter`, `dEmitterForHit`), so a material keeps one entry
+however many emitters light its surfaces, and none of the copies exist. `tools/check_glow_shared.py`:
+a panel material shared by a `mesh` block and a static instance, refused by 0.442.4, loads and
+lights both halves of the room alike in modes R, D and B; an emissive, absorbing glass box whose
+back face is a separate quad read 0.9245 of the same box as one mesh in 0.442.4 (CPU and GPU),
+1.0000 / 1.0001 now. REFERENCE.md and FTSL.md no longer say mesh blocks sharing a material are one light.
 
 ## OPEN (2026-11-14, 0.442.2): GAP-MERGE-RADIUS — light trapped in a thin gap reaches the room through the merges' discs at its mouth: modes J and U read a room lit by a 1 mm slit 2-3.6x bright
 

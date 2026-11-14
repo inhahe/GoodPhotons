@@ -1522,6 +1522,14 @@ struct MeshInstance {
     // A per-object render mode (ROUTE_D / ROUTE_J) on an instance without matOverride, or -1: its
     // hits shade with their materials' routed copies (Material::routeTo).
     int route = -1;
+    // The lights its emissive triangles are part of: (the material a hit shades with, the emitter),
+    // a pair per emissive material it places (registerGlows); empty for every other placement.
+    std::vector<std::pair<int, int>> emitOf;
+    // The emitter a hit on it shading with material `m` lies on (Hit::emitter), or -1.
+    int emitterOf(int m) const {
+        for (const auto& [mm, e] : emitOf) if (mm == m) return e;
+        return -1;
+    }
     // Derived from toWorld: the factor a LOCAL curvature (1/length) is multiplied by to
     // become a WORLD curvature (O3). Curvature is inverse-length, so it scales by
     // 1/|det(linear)|^(1/3) — the average linear scale. Cached rather than recomputed
@@ -2902,7 +2910,7 @@ struct Scene {
     bool glowCompound = false;
     bool isGlow(int matId) const {
         return matId >= 0 && matId < (int)glowXYZ.size() && mats[(size_t)matId].isLight &&
-               !emitterForMat(matId);
+               !matHasEmitter(matId);
     }
 
     // Environment radiance from direction `d` at wavelength lambda (0 if no env).
@@ -3086,12 +3094,26 @@ struct Scene {
         emitters.push_back(std::move(e));
     }
 
-    // Map a hit surface's material index back to the emitter registered on that
-    // geometry (or nullptr if none). Linear scan over the few emitters; used by the
-    // BDPT s=0 MIS term when a camera subpath lands on a light surface directly.
-    // A routed copy of a light's material (Material::routeBase: a per-object mode on an emissive
-    // surface) finds its original's emitter: the emitter is registered on the material the light
-    // was built with, before the loader retags its surface.
+    // The emitter of the surface a hit `h` lies on, when it shades with material `matId` -- its own,
+    // h.matId, or the part a mix or layered stack resolved it to: its primitive's (Hit::emitter)
+    // where matId is the surface's own, else the material's single one (emitterForMat: a light
+    // block's surface), or null. A routed copy (Material::routeBase: a per-object mode on an emissive
+    // surface) is its original's.
+    const Emitter* emitterForHit(const Hit& h, int matId) const {
+        // An emitter's surface is a light's material, always: a hit on any other is none, whatever
+        // its record holds.
+        if (matId < 0 || matId >= (int)mats.size() || !mats[(size_t)matId].isLight) return nullptr;
+        if (matId == h.matId && h.emitter >= 0 && h.emitter < (int)emitters.size())
+            return &emitters[(size_t)h.emitter];
+        return emitterForMat(matId);
+    }
+    int emitterIndexForHit(const Hit& h, int matId) const {
+        const Emitter* e = emitterForHit(h, matId);
+        return e ? (int)(e - emitters.data()) : -1;
+    }
+    // The emitter registered under a material when it is the only one (a light block's surface), or
+    // null: none, or several -- each of the material's primitives then knows its own (Hit::emitter,
+    // emitterForHit). A routed copy's is its original's.
     const Emitter* emitterForMat(int matId) const {
         if (matId < 0) return nullptr;
         const int id = matBase(matId);
@@ -3099,13 +3121,25 @@ struct Scene {
             const int e = emitterOfMat[(size_t)id];
             return e >= 0 ? &emitters[(size_t)e] : nullptr;
         }
+        const Emitter* one = nullptr;
         for (const auto& e : emitters)
-            if (e.matId == id) return &e;
-        return nullptr;
+            if (e.matId == id) { if (one) return nullptr; one = &e; }
+        return one;
     }
-    // By material, the emitter emitterForMat finds for it (its base's first), or -1: filled by
-    // finalizeEmitters, so a lookup costs nothing however many lights a scene has; a material added
-    // after it (past the table's end) is looked up by the scan.
+    // Whether any emitter is registered under a material (or its original): its surfaces light the
+    // scene, so it is no glow (isGlow).
+    bool matHasEmitter(int matId) const {
+        if (matId < 0) return false;
+        const int id = matBase(matId);
+        if (id >= 0 && id < (int)emitterOfMat.size()) return emitterOfMat[(size_t)id] != -1;
+        for (const auto& e : emitters) if (e.matId == id) return true;
+        return false;
+    }
+    // By material: the one emitter registered under it, kEmitterByPrim where there are several (its
+    // primitives know theirs), -1 where there is none. Filled by finalizeEmitters, so a lookup costs
+    // nothing however many lights a scene has; a material added after it (past the table's end) is
+    // looked up by a scan.
+    static constexpr int kEmitterByPrim = -2;
     std::vector<int> emitterOfMat;
     // The material `matId` is a routed copy of, or itself (Material::solidId).
     int matBase(int matId) const {
@@ -3217,9 +3251,10 @@ struct Scene {
     void finalizeEmitters(double stepNm = 1.0) {
         totalPower = 0.0;
         emitterOfMat.assign(mats.size(), -1);
-        for (size_t e = emitters.size(); e-- > 0;) {     // the first emitter of a material wins
+        for (size_t e = 0; e < emitters.size(); ++e) {
             const int m = emitters[e].matId;
-            if (m >= 0 && m < (int)mats.size()) emitterOfMat[(size_t)m] = (int)e;
+            if (m >= 0 && m < (int)mats.size())
+                emitterOfMat[(size_t)m] = (emitterOfMat[(size_t)m] == -1) ? (int)e : kEmitterByPrim;
         }
         // Adopt each emitter's emission profile from the material on its geometry. Done
         // here — one place, after every registration path — rather than threading an
@@ -3265,7 +3300,7 @@ struct Scene {
         glowXYZ.clear();
         glowAny = false;
         for (size_t i = 0; i < mats.size(); ++i) {
-            if (!mats[i].isLight || emitterForMat((int)i)) continue;
+            if (!mats[i].isLight || matHasEmitter((int)i)) continue;
             if (glowXYZ.empty()) glowXYZ.assign(mats.size(), Vec3{0, 0, 0});
             for (double lam = LAMBDA_MIN; lam <= LAMBDA_MAX; lam += 1.0)
                 glowXYZ[i] += Vec3(cieX(lam), cieY(lam), cieZ(lam)) * mats[i].emit(lam);
@@ -4762,6 +4797,8 @@ struct Scene {
             const int to = mats[lh.matId].routeTo[inst.route];
             if (to >= 0) lh.matId = to;
         }
+        // Its own light, not the shared asset triangle's (which has none).
+        lh.emitter = inst.emitOf.empty() ? -1 : inst.emitterOf(lh.matId);
     }
 
     // Perturb the shading normal by a bound tangent-space normal map (C6), and replace h.n.

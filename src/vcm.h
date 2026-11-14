@@ -1078,7 +1078,7 @@ inline Vec3 traceCameraSubpath(const Scene& scene, const Camera& cam, const Rend
         // samples, which counts only as it is seen (camGlow).
         if (mp->isLight) {
             double cosLight = dot(h.ng, wo);
-            if (cosLight > 0.0 && (camGlow || scene.emitterForMat(h.matId))) {
+            if (cosLight > 0.0 && (camGlow || scene.emitterForHit(h, (int)(mp - scene.mats.data())))) {
                 // Achromatic `emit pattern:` and aimed-quad factor at this hit (emitHitScale) —
                 // the same value the light-subpath / NEE sides get from emitterSamplePoint and
                 // the aim helpers at this point.
@@ -1091,7 +1091,7 @@ inline Vec3 traceCameraSubpath(const Scene& scene, const Camera& cam, const Rend
                 }
                 if (mxLe > 0.0) {
                     double misW = 1.0;
-                    const Emitter* em = scene.emitterForMat(h.matId);
+                    const Emitter* em = scene.emitterForHit(h, (int)(mp - scene.mats.data()));
                     if (em && em->area > 0.0 && scene.totalPower > 0.0 && edges >= 2) {
                         double pdfChoice = em->power / scene.totalPower;
                         // its area at the pass's time (Scene::lightAreaScale: 1 unless its keys scale it)
