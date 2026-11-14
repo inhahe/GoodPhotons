@@ -3122,6 +3122,20 @@ and more at grazing angles.
 
 **Decided 2026-11-14: (b)**, the physical coat in every mode.
 
+**How (b) is built (2026-11-14).** The "8 % darker" the option was offered with counted the light's
+way out twice: the body copy's albedo already holds the escape through the coat, averaged
+(`coatedAlbedo`: a (1 - F_dr) / (1 - a F_dr), its (1 - F_dr) the diffuse light that gets out). The
+physical clear coat over a Lambertian body is f(wi, wo) = T(wi) T(wo) / n^2 * a / (pi (1 - a F_dr)),
+T = 1 - R, and T-bar / n^2 = 1 - F_dr where T-bar is T's cosine-weighted mean over the outside
+hemisphere -- so it is the present model with the averaged escape (1 - F_dr) replaced by the angular
+one, T(wo) / T-bar: the same energy, a few per cent brighter head-on, darker at grazing. Every mode
+already takes T at its walk's arrival (the coin), so each multiplies the body's lobe by
+S(w) = T(w) / T-bar(lambda) on the other direction: a continuation's, a light sample's, a
+connection's, a splat's, a merge's photon's. The body copy names its stack (Material::coatStack), and
+T-bar is a table by wavelength per layered material (a thin film's at its base thickness, so a
+patterned film is normalised only roughly; reciprocal all the same). `coatModel manual` (constant R)
+has S = 1. The same S for a glossy body and a `scatter none` body: reciprocal, energy as now.
+
 ## CLOSED (2026-11-12, 0.440.3): GLOSSY-ROOM-M — mode M reads a room of glossy walls 0.5 % bright on the host
 
 **Not the bias it looked like.** On the same room at -max-bounce 32, host: twelve M seeds at 256 spp
