@@ -3661,6 +3661,19 @@ help for a chromatic scene such as `gallery_rain`. (2)'s costs: the precision ab
 measured before it replaces the float carrier, a conversion at each read and write, and the
 maximum's renormalisation whenever the bins change.
 
+**Revisited 2026-11-14, before building (1): (1) reaches almost no scene, so neither is done now.**
+The carrier folds every factor of the camera prefix that varies with wavelength -- the diffuse
+lobe's reflectance included (render_cuda.cu dJFoldLobe, after `dDiffuseRho(..., &jbS)`), not only
+glass, gratings, filters, coats and media -- and switches on (`any`) at the first such factor
+(DJSpecRun::mul). So any scene with one coloured surface needs it, and the "achromatic scene" for
+which (1) would size it to nothing is a scene whose every reflectance is grey: a test room, not a
+user's scene. (1) would buy that case its 0.5 GB (3.2 GB deep) at the price of twice the
+instantiations of the largest kernel (compile time) and an exact host test for "nothing here can
+fold" that must track every fold site. Not worth it; the operator left the pick to the agent, and
+this is the pick. (2) stays the next step if VRAM gets tight: it is the one that helps a scene
+with colour, `gallery_rain` among them. FTRACE_JSPEC=0 (the old estimator) could have its own
+carrier-free kernel too, but nobody renders with it but an A/B test.
+
 ## OPEN (2026-10-18): PER-OBJECT-MODES — what per-object render modes do not do yet
 
 `mode D` / `mode J` per object, group, fur, material or medium shipped in 0.386.0 (FTSL.md §16.1,

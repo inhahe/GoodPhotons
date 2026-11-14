@@ -140,9 +140,11 @@ Each names the section its line is in.
 19b. ~~**J-FIELD-SLOW's open ends** (4.5), found measuring it 2026-11-09/10: a `-time` budget cannot
     end a GPU mode D/J chunk.~~ Done, 0.436.6. (The 2 000-beam brightness it also found was the
     shared seeds' noise, 4.3; the resume passes' re-walk no longer costs anything measurable, 4.5.)
-20. **JSPEC-CARRIER-SIZE** (4.5) — every mode-J GPU thread reserves the spectral carrier: VRAM, the
-    operator's call against build time. Decided 2026-11-14: option (1), the template parameter;
-    (2), half-precision bins, is the next step if VRAM gets tight (4.1). (The ~3x camera pass measured against it was the MIS
+20. ~~**JSPEC-CARRIER-SIZE** (4.5) — every mode-J GPU thread reserves the spectral carrier.~~
+    Deferred 2026-11-14: option (1) (decided that morning, the agent's pick) turned out to reach
+    only all-grey scenes -- the carrier folds every coloured reflectance of the camera prefix -- so
+    it is not worth the compile time; (2), half-precision bins, is the step if VRAM gets tight
+    (4.1), and helps scenes with colour. (The ~3x camera pass measured against it was the MIS
     weights' transmittances, 0.436.5.)
 21. ~~**RADCACHE-BATCHES** (4.5) — `-radcache`'s fixed batches outlast `-stop` and the interval.~~
     Done, 0.439.3: the cache's own schedule over absolute samples, a canonical merge, the chunks
