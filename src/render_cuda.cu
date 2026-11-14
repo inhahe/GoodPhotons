@@ -582,6 +582,7 @@ struct DMaterial {
     // dEmitterForMat() < 0 so a mesh/quad light never double-counts.
     int    matIsLight;
     int    matReflectsNothing;   // Material::reflectsNothing: a light block's own surface
+    int    emitterIdx;           // the emitter its surface is (Scene::emitterForMat), or -1
     // Device twin of Material::hideCamera — primary visibility off. Only the bounce-0
     // camera ray of a gather/backward path skips this material; every other ray sees it.
     // See Material::hideCamera (scene.h) for why the flag exists at all, and
@@ -1064,8 +1065,8 @@ struct DEmitter {
     DSpec  emitSpd;
     // Index into DScene::patterns of this emitter's emission profile (device twin of
     // Emitter::emitPat, itself adopted from the emissive material at registration);
-    // -1 = uniform. Deliberately absent from `power` — the pattern modulates the
-    // radiance at a point, not the emitter's selection weight, exactly as on the host.
+    // -1 = uniform. In `power` only through its mean (Emitter::selW), exactly as on the host;
+    // the pattern itself modulates the radiance at a point.
     int    emitPat;
     // Fast RGB backward (mode R -rgb): the emitter's linear-sRGB radiance, baked as
     // xyzToLinearSrgb(integral over lambda of CIE(lambda)*emitSpd(lambda)) — the exact
@@ -11748,14 +11749,17 @@ __device__ static bool dGlowSamplePoint(const DScene& sc, const DEmitter& em, DR
     const int a = (uf < fa[0]) ? 0 : (uf < fa[0] + fa[1]) ? 1 : 2;
     const bool high = rng.uniform() < (Real)0.5;
     const Real s1 = rng.uniform(), s2 = rng.uniform();
+    const Real hi[3] = {em.glowHi.x, em.glowHi.y, em.glowHi.z};
     Real o[3] = {lo[0], lo[1], lo[2]}, n[3] = {0, 0, 0};
     const int b = (a + 1) % 3, c = (a + 2) % 3;
-    o[a] += high ? ext[a] : (Real)0;
+    o[a] = high ? hi[a] : lo[a];                         // the face itself (host twin)
     o[b] += s1 * ext[b];
     o[c] += s2 * ext[c];
     n[a] = high ? (Real)-1 : (Real)1;                    // into the box
-    const DVec3 ro(o[0], o[1], o[2]);
     const DVec3 rd = cosineHemisphere(DVec3(n[0], n[1], n[2]), rng);
+    // started a hair outside the box, so a cap on the face it enters by lies ahead (host twin)
+    const Real back = (Real)(1e-6 * (1.0 + fmax(fabs((double)o[0]), fmax(fabs((double)o[1]), fabs((double)o[2])))));
+    const DVec3 ro = DVec3(o[0], o[1], o[2]) - rd * back;
     const double step = em.glowSphere ? 0.0 : 0.5 * sc.implicits[em.glowPrim].minStep;
     Real tmin = (Real)0;
     for (int guard = 0; guard < (1 << 20); ++guard) {
@@ -12352,11 +12356,11 @@ __device__ static bool genPhoton(const DScene& sc, const DCamSet& cs,
         double denom = 4.0 * 3.14159265358979323846 * envPdfW * avg;
         beta = (denom > 0.0) ? (Real)((double)beta * rad / denom) : (Real)0;
     }
-    // An emission pattern is a pure post-multiplier on the photon's carried power: the
-    // emitter is still SELECTED by its unpatterned power and the point still drawn
-    // uniformly over its area, so no pdf changes and the estimator stays unbiased
-    // (host twin: render.h). eEmitted is credited the patterned value so the energy
-    // report matches what actually leaves the surface.
+    // An emission pattern (a Glow's crossing count with it) is a post-multiplier on the
+    // photon's carried power: the point is drawn uniformly over the surface, so no positional
+    // pdf changes (host twin: render.h); the emitter was chosen by its mean (selW, divided
+    // out above). eEmitted is credited the patterned value so the energy report matches what
+    // actually leaves the surface.
     if (emitPatW != 1.0) beta = (Real)((double)beta * emitPatW);
     eEmitted += beta;
 
@@ -14598,10 +14602,7 @@ __device__ static double dVertexLe(const DScene& sc, const DVertex& v, const DVe
 // Emitter that owns an emissive surface material (mirrors Scene::emitterForMat): a routed copy's
 // is its original's.
 __device__ static int dEmitterForMat(const DScene& sc, int matId) {
-    const int id = (matId >= 0) ? sc.mats[matId].solidId : matId;
-    for (int i = 0; i < sc.nEmitters; ++i)
-        if (sc.emitters[i].matId == id) return i;
-    return -1;
+    return (matId >= 0) ? sc.mats[matId].emitterIdx : -1;   // looked up once, at upload
 }
 
 // Sample the shared wavelength from the scene emission sampler (mirrors
@@ -25165,6 +25166,10 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
         // CSG/quadric solids). bakeSpec of a null Spectrum yields all zeros, so a
         // non-emissive material costs nothing but the storage.
         d.matIsLight = m.isLight ? 1 : 0;
+        {
+            const Emitter* em = scene.emitterForMat((int)i);
+            d.emitterIdx = em ? (int)(em - scene.emitters.data()) : -1;
+        }
         d.matReflectsNothing = m.reflectsNothing ? 1 : 0;
         d.hideCamera = m.hideCamera ? 1 : 0;
         d.route = m.route;
@@ -25288,6 +25293,7 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
         coat.coatLobe = 1;
         coat.matIsLight = 0;
         coat.matReflectsNothing = 0;
+        coat.emitterIdx = -1;
         coat.emitPat = -1;
         mats[i].coatChild = (int)mats.size();
         mats.push_back(coat);

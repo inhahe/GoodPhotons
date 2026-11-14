@@ -653,7 +653,8 @@ inline PreviewLight deriveLight(const Scene& sc, const Vec3& probePos, bool prob
                 p.pos = e.origin + (e.u + e.v) * 0.5;
                 p.dir = e.collimated ? normalize(e.beamDir) : normalize(e.normal);
                 if (e.normalTilted && !e.collimated) p.face = e.nGeom;   // an aimed quad
-                p.rgb  = rgb * e.area;                       // I(w) = L A cos -- the cos is per point
+                p.rgb  = rgb * (e.area * e.selW);            // I(w) = L A cos -- the cos is per point
+                                                             // (selW: what its pattern lets out)
                 p.size = std::sqrt(std::max(0.0, e.area) / PI);
                 break;
             case EmitterShape::Cylinder:
@@ -670,14 +671,14 @@ inline PreviewLight deriveLight(const Scene& sc, const Vec3& probePos, bool prob
                     cen += (t.v0 + (t.e1 + t.e2) * (1.0 / 3.0)) * a; wsum += a;
                 }
                 p.pos = (wsum > 0.0) ? cen * (1.0 / wsum) : e.origin;
-                p.rgb  = rgb * (e.area * 0.25);
+                p.rgb  = rgb * (e.area * e.selW * 0.25);     // selW: what its pattern lets out
                 p.size = std::sqrt(std::max(0.0, e.area) / (4.0 * PI));
                 break;
             }
             case EmitterShape::Glow:                         // its box's centre, its surface's light
                 p.kind = PLight::Point;
                 p.pos = (e.glowLo + e.glowHi) * 0.5;
-                p.rgb  = rgb * (e.area * e.selW * 0.25);     // area * selW: what it emits over (selW)
+                p.rgb  = rgb * (e.area * e.selW * 0.25);     // area * selW: the surface it emits from
                 p.size = 0.5 * length(e.glowHi - e.glowLo);
                 break;
             default:                                         // Sphere

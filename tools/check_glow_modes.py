@@ -79,6 +79,27 @@ def scene(glow, flag):
     ])
 
 
+def lacquer_scene(glow):
+    """A diffuse floor, a lacquered ball (a Fresnel coat over a dark body) and a glow_only panel
+    whose glow the ball's coat throws onto the floor; the camera looks down at that floor."""
+    emit = "emit 0.5  glow_only on" if glow else ""
+    return NL.join([
+        "scene { units meters }",
+        # straight down at the floor in front of the ball: neither the ball nor the panel in view
+        'camera "c" { eye 0 2.0 1.0  look_at 0 0 0.9  up 0 0 -1  fov_y 30  film { res 64 48 } }',
+        'material "floor" { type diffuse reflect 0.6 }',
+        'material "body"  { type diffuse reflect 0.05 }',
+        'material "lacquer" { type layered  coat { reflectance fresnel  ior 1.5  roughness 0 }  layer "body" 1 }',
+        'material "glow"  { type diffuse reflect 0.0 %s }' % emit,
+        "quad { origin -3 0 -3  u 0 0 6  v 6 0 0  material floor }",
+        'light area { origin -0.2 2.4 -0.2  u 0.4 0 0  v 0 0 0.4  normal 0 -1 0  spd preset:bb6500  power 6 }',
+        "sphere { center 0 0.3 0  radius 0.3  material lacquer }",
+        # the panel faces the ball, out of the camera's view behind it
+        "quad { origin -0.5 0.1 -1.2  u 1 0 0  v 0 0.8 0  material glow }",
+        "",
+    ])
+
+
 def write(path, txt):
     with open(path, "w", encoding="utf-8", newline="") as f:
         f.write(txt)
@@ -141,6 +162,23 @@ def main():
           % ("ok" if good else "FAIL", worst, tol), flush=True)
     print("     the glow's tiles read %.3g with it, %.3g without"
           % (ref[1, 1] + ref[1, 2], dark[1, 1] + dark[1, 2]))
+
+    # ...nor through a lacquered ball's coat: the floor the coat would throw the glow on reads the
+    # same with the glow and without, in mode R on both backends (0.442.0's host R counted it).
+    for gpu in (False, True):
+        fl = []
+        for glow in (True, False):
+            scn = os.path.join(out, "lacquer_%s.ftsl" % ("on" if glow else "off"))
+            write(scn, lacquer_scene(glow))
+            img = render(exe, scn, "R", os.path.join(out, "lacquer_%s_%s.png"
+                                                        % ("on" if glow else "off", "gpu" if gpu else "cpu")),
+                         gpu, ["-spp", str(4096 // k)])
+            fl.append(img[:, :].mean())
+        d = abs(fl[0] / fl[1] - 1.0)
+        good = d <= tol / 2
+        ok = ok and good
+        print("%s: mode R on the %s, the floor by a lacquered ball with and without a glow_only panel: "
+              "off by %.4f" % ("ok" if good else "FAIL", "GPU" if gpu else "CPU", d), flush=True)
 
     runs = [("R", True), ("D", False), ("D", True), ("J", False), ("J", True), ("U", False), ("U", True),
             ("M", False), ("M", True), ("S", False), ("S", True), ("B", False), ("B", True),

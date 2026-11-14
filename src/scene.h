@@ -261,13 +261,14 @@ struct Material {
     // MUST agree pointwise or the image is biased, not just noisy. That is why the
     // pattern is only accepted where the emitter sampler's (u,v) provably equals the
     // geometry's hit (u,v): a rectangular area light (whose two tris now carry the same
-    // corner UVs addQuad uses) and a mesh area light (whose EmitTri carries the source
-    // triangle's UVs). Sphere / tube / spot / env emitters are rejected at load.
+    // corner UVs addQuad uses), a mesh area light (whose EmitTri carries the source
+    // triangle's UVs), and a Glow, sampled through a real hit on it. Sphere / tube / spot / env
+    // light blocks are rejected at load.
     //
-    // The multiplier is deliberately NOT folded into Emitter::power, so no selection or
-    // positional pdf changes anywhere: it is a pure post-multiplier on radiance and on a
-    // born photon's beta, which keeps every estimator unbiased by construction. The cost
-    // is variance — a mostly-dark pattern still gets sampled as if it were fully on.
+    // The multiplier changes no positional pdf: it is a post-multiplier on radiance and on a born
+    // photon's beta, so every estimator stays unbiased whatever it is. It does set how often the
+    // emitter is chosen (Emitter::selW, its mean over the surface), so a mostly dark pattern is not
+    // sampled as if it were all lit; its points are still drawn uniformly over the surface.
     int emitPat = -1;
 
     // --- Parametric-record drive (§records) ---------------------------------
@@ -1172,7 +1173,7 @@ struct Emitter {
     Vec3 glowLo{0, 0, 0}, glowHi{0, 0, 0};
     // Index into Scene::patterns of an emission profile over this emitter's surface,
     // copied from the emissive material's `emitPat` at registration; -1 = uniform.
-    // Deliberately absent from `power` above — see Material::emitPat for why.
+    // In `power` only through selW, its mean -- see Material::emitPat.
     int emitPat = -1;
 
     // Per-emitter spectral/geometric weight fed into the combined backward
@@ -2891,6 +2892,9 @@ struct Scene {
     // that pass's fast path (glowAny false). Filled by finalizeEmitters.
     std::vector<Vec3> glowXYZ;
     bool glowAny = false;
+    // A mix or layered material one of whose children is such a glow: what a camera ray sees of it
+    // is a draw (its child, its coat's coin), not a fixed colour (main.cpp prepareSky).
+    bool glowCompound = false;
     bool isGlow(int matId) const {
         return matId >= 0 && matId < (int)glowXYZ.size() && mats[(size_t)matId].isLight &&
                !emitterForMat(matId);
@@ -3086,10 +3090,18 @@ struct Scene {
     const Emitter* emitterForMat(int matId) const {
         if (matId < 0) return nullptr;
         const int id = matBase(matId);
+        if (id >= 0 && id < (int)emitterOfMat.size()) {          // finalized: the table's
+            const int e = emitterOfMat[(size_t)id];
+            return e >= 0 ? &emitters[(size_t)e] : nullptr;
+        }
         for (const auto& e : emitters)
             if (e.matId == id) return &e;
         return nullptr;
     }
+    // By material, the emitter emitterForMat finds for it (its base's first), or -1: filled by
+    // finalizeEmitters, so a lookup costs nothing however many lights a scene has; a material added
+    // after it (past the table's end) is looked up by the scan.
+    std::vector<int> emitterOfMat;
     // The material `matId` is a routed copy of, or itself (Material::solidId).
     int matBase(int matId) const {
         return (matId >= 0 && matId < (int)mats.size()) ? mats[(size_t)matId].solidId(matId) : matId;
@@ -3199,11 +3211,16 @@ struct Scene {
     // wavelength sampler. Idempotent; called by build().
     void finalizeEmitters(double stepNm = 1.0) {
         totalPower = 0.0;
+        emitterOfMat.assign(mats.size(), -1);
+        for (size_t e = emitters.size(); e-- > 0;) {     // the first emitter of a material wins
+            const int m = emitters[e].matId;
+            if (m >= 0 && m < (int)mats.size()) emitterOfMat[(size_t)m] = (int)e;
+        }
         // Adopt each emitter's emission profile from the material on its geometry. Done
         // here — one place, after every registration path — rather than threading an
         // extra argument through addAreaLight / addMeshLight / the built-in scenes.
-        // NOT folded into `power` below: the pattern is a pure post-multiplier on
-        // radiance, so no selection or positional pdf anywhere has to change.
+        // A post-multiplier on radiance, which no positional pdf reads; how often the emitter
+        // is chosen follows its mean (selW, below).
         for (auto& e : emitters)
             e.emitPat = (e.matId >= 0 && e.matId < (int)mats.size()) ? mats[e.matId].emitPat : -1;
         // Recount the distant suns here (not in addSunLight) so the flag survives every
@@ -3223,6 +3240,9 @@ struct Scene {
                 glowXYZ[i] += Vec3(cieX(lam), cieY(lam), cieZ(lam)) * mats[i].emit(lam);
             glowAny = true;
         }
+        glowCompound = false;
+        for (const auto& m : mats)
+            for (int c : m.mixChildren) if (isGlow(c)) glowCompound = true;
         glowGTab.clear();
         if (glowAny) {
             const size_t nb = (size_t)(LAMBDA_MAX - LAMBDA_MIN);
@@ -4438,10 +4458,12 @@ struct Scene {
         // flag that can be flipped by applyIgnoreFlags after build(), and a stale -1 would be
         // worse than a computed answer nobody reads.
         for (auto& m : media) m.bakeAchromatic();
+        // The coats first: they append materials (a layered body's copy among them), which the
+        // emitters' pass reads -- a glow under a coat is one (glowXYZ, isGlow).
+        finalizeLayeredCoats();
         finalizeEmitters();
         finalizeEmissiveVolumes();
         finalizeBowLuts();
-        finalizeLayeredCoats();
         // After the coats, which append materials. A 1 nm scan, once, rather than a probe per walk:
         // a glass that absorbs only between the carriers' bin centres still absorbs.
         const int nm = (int)(LAMBDA_MAX - LAMBDA_MIN);
@@ -5700,11 +5722,14 @@ inline bool glowSamplePoint(const Scene& scene, const Emitter& em, Pcg32& rng, H
     Vec3 o = lo, n{0, 0, 0};
     const auto at = [](Vec3& v, int i) -> double& { return i == 0 ? v.x : (i == 1 ? v.y : v.z); };
     const int b = (a + 1) % 3, c = (a + 2) % 3;
-    at(o, a) = vget(lo, a) + (high ? vget(ext, a) : 0.0);
+    at(o, a) = high ? vget(em.glowHi, a) : vget(lo, a);   // the face itself, not lo + (hi - lo)
     at(o, b) = vget(lo, b) + s1 * vget(ext, b);
     at(o, c) = vget(lo, c) + s2 * vget(ext, c);
     at(n, a) = high ? -1.0 : 1.0;                        // into the box
-    const Ray r{o, cosineHemisphere(n, rng)};
+    const Vec3 dir = cosineHemisphere(n, rng);
+    // Started a hair outside the box, so the face it enters by -- a cap there -- lies ahead of it.
+    const double back = 1e-9 * (1.0 + std::max({std::fabs(o.x), std::fabs(o.y), std::fabs(o.z)}));
+    const Ray r{o - dir * back, dir};
     const PatTables tabs = scene.patTables();
     double tmin = 0.0;
     for (int guard = 0; guard < 1 << 20; ++guard) {

@@ -2988,6 +2988,9 @@ struct BackwardRenderer {
                 return L;
             }
             const bool firstHere = noteFirstSurface(scene, gi, h);
+            // Past a diffuse vertex from here on, before a compound's coat can re-arm the arrival
+            // (a glow is seen only before: GiCtx::pastDiffuse).
+            if (!specularArrival) gi.pastDiffuse = true;
             const Material* mp = &scene.mats[h.matId];
             // Stochastic mix: resolve to a child material (or terminate on the
             // leftover absorption slice) before the switch, mirroring the forward
@@ -3054,9 +3057,8 @@ struct BackwardRenderer {
             // applies the SAME profile via emitterSamplePoint, which is what keeps the
             // two estimators consistent (see Material::emitPat).
             // A glow no emitter samples counts only along a path specular from the camera on
-            // (GiCtx::pastDiffuse); an emitter on any specular arrival, the light it throws through
-            // a mirror or glass included.
-            if (!specularArrival) gi.pastDiffuse = true;
+            // (GiCtx::pastDiffuse, set at the hit above); an emitter on any specular arrival, the
+            // light it throws through a mirror or glass included.
             const int eIdx = m.isLight ? emitterIndexOfResolved(scene, m) : -1;
             if (m.isLight && specularArrival && (eIdx >= 0 || !gi.pastDiffuse) && dot(ray.d, h.ng) < 0.0) {
                 // The lobe-sampling half of the glossy MIS weight. 1 (and bit-identical to the
@@ -3441,6 +3443,7 @@ struct BackwardRenderer {
             }
 
             const bool firstHere = noteFirstSurface(scene, gi, h);
+            if (!specularArrival) gi.pastDiffuse = true;   // before a coat re-arms it (scalar twin)
             const Material* mp = &scene.mats[h.matId];
             if (mp->type == MatType::Mix) {
                 int child = whitted ? mixResolveDominant(scene, *mp, h)
@@ -3572,7 +3575,6 @@ struct BackwardRenderer {
             // emitHitScale (an `emit pattern:`, an aimed quad's law) is achromatic, so evaluate
             // it ONCE for the whole hero bundle rather than per-wavelength inside emitSlot.
             // A glow no emitter samples only along a path specular from the camera on (scalar twin).
-            if (!specularArrival) gi.pastDiffuse = true;
             const int eIdx = m.isLight ? emitterIndexOfResolved(scene, m) : -1;
             if (m.isLight && specularArrival && (eIdx >= 0 || !gi.pastDiffuse) && dot(ray.d, h.ng) < 0.0) {
                 double ep = emitHitScale(scene, m, h, ray.d * -1.0);

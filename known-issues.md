@@ -72,6 +72,55 @@ closed entries, where the cost is a broken historical link rather than a blocked
 Three references — `scenes/_gr_fly0.ftsl`, `scenes/silver_sphere_xenon.ftsl`, `scenes/x.ftsl` —
 name files that no longer exist at all, all in closed entries.
 
+## DONE (2026-11-14, 0.442.1): REVIEW-0442 — what the Opus review of 0.442.0 found
+
+`/code-review max` (Opus) of 014762e..583e7fd (GLOW-LIGHT-MODES): 15 findings, each checked against
+the code; all 15 held. Fixed in 0.442.1:
+
+* **Mode R let a `glow_only` glow light the scene through a layered coat.** The coat's reflection
+  re-arms the specular arrival and goes on before the emission test, where `pastDiffuse` was set:
+  diffuse -> coat -> glow counted the glow. `pastDiffuse` is now set at the hit, before any compound
+  resolves (both loops).
+* **A mesh light registerGlows made had no pattern frame**, so a patterned glow in a `pattern_space
+  object` group was sampled reading its pattern in world space and hit reading it in its own:
+  triangles group by (material, motion, pattern frame) and the emitter takes the frame.
+* **A `glow_only` body under a layered coat was no glow to the forward modes**: build() appended the
+  layered bodies' copies after finalizeEmitters had sized the glow table. The coats come first now.
+* **Every mesh block of a material was merged into one emitter**, losing the light tree's sense of
+  where each lamp is (and contradicting REFERENCE's "split into separate mesh blocks"). Each mesh
+  block keeps its own; a further block of a material takes a copy, as spheres and isosurfaces do.
+* **The forward sky pass showed a glow through a medium undimmed** (gallery_rain's grid behind its
+  rain, about 2x): it now takes the media's transmittance along the camera ray, one wavelength a
+  sample; and **a pinhole's 64 samples froze the draw** of such a glow, or of one on a compound, so
+  its count now grows with the render as a lens's does.
+* **The multi-camera device forward path under a blur drew no glow** (its host sky films existed only
+  with a sky or sun).
+* **`emit` on a mix or layered material itself** was registered and lit the room while no camera hit
+  could see it (every hit takes a layer): refused at load.
+* **A Glow's line on a high face started at lo + (hi - lo)**, which can round inside the box, missing
+  a cap on that face and halving its sampled emission: the face is `glowHi` itself, and the line
+  starts a hair outside the box (both backends).
+* **A `glow_only` mesh block lost its `power` / `lumens`** (applied only where the emitter was
+  registered): the radiance is set either way.
+* **Emitter lookup scanned every emitter** at each emissive hit (host) and each bounce (device),
+  and each copy's spectrum was its own entry in mode R's per-sample table: a table by material
+  (`Scene::emitterOfMat`, `DMaterial::emitterIdx`) and one shared spectrum object per material.
+* The raster preview's quad and mesh lights take `selW` (a 2000 m^2 patterned ground had lit it
+  33x too bright); the curv/cavity pattern refusal names `glow_only on`; four comments that still
+  said a pattern stays out of an emitter's selection, and registerGlows' history-telling comment.
+
+## OPEN (2026-11-14, 0.442.0): KEEPWINDOW-VRAM — a finished render held open by `-keepwindow` keeps all its device memory
+
+Found rendering two gallery_rain frames one after the other (GLOW-LIGHT-MODES' comparison): the
+first, done and holding its window (`-keepwindow`, which CLAUDE.md asks of every render), still held
+its GPU allocations -- nvidia-smi read 24 022 of 24 564 MiB used -- and the second, a mode-J render
+of the same scene, ran at ~90 s a sample against the first's ~2 s (WDDM paging; ftrace's own
+`[gpu-stall]` note blamed "another process saturating the GPU"). `ftrace -stop` on the first freed
+it all (0 MiB) at once. A render that has written its last image and only holds a window has no
+use for the device: it should release its device scene, films and queues (and the CUDA context)
+when the render ends, keeping the host image the window shows. Until then, stop a held render
+before starting another GPU one.
+
 ## OPEN (2026-11-14, 0.441.1): J-THIN-GAP-LEAK — mode J lights a surface with the light under it, 1 mm away; mode D shows a gap's mouth that mode R does not
 
 Found by `tools/check_glow_lights.py`'s first draft, whose glowing grid quad was wound face-down

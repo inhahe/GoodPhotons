@@ -92,7 +92,7 @@ def main():
         sigma = abs(mean - ref) / max((err ** 2 + ref_err ** 2) ** 0.5, 1e-30)
         good = abs(ratio - 1.0) <= 0.03
         ok &= good
-        print("%s: mode %s on the %s, a floor a glow with no emitter lights: x%.4f of the "
+        print("%s: mode %s on the %s, a floor a glowing isosurface lights: x%.4f of the "
               "reference (%.1f sigma)" % ("ok" if good else "FAIL", mode,
                                           "host" if dev == "cpu" else "device", ratio, sigma),
               flush=True)

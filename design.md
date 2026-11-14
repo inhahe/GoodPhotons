@@ -3375,16 +3375,21 @@ only a light block and an emissive `mesh` block registered one, and every other 
 was lit differently by every mode (known-issues GLOW-LIGHT-MODES). Now:
 
 * **Registration** (`ftsl.h registerGlows`, run once all geometry is loaded and before the
-  unlit-scene test): the triangles of each emissive material -- every mesh block's, bare quad's
-  and polygon's, and the world-space copies of instanced assets' -- form one mesh light per
-  material and motion set (`Scene::addMeshLightOf`, which takes any list of triangles; a mesh
-  block's own emitter is kept when it covers them all already, and replaced by the merge
-  otherwise, which also ends two mesh blocks sharing a material registering two emitters for it);
-  each sphere is a sphere light, or a Glow under an emission pattern; each isosurface or CSG solid
-  is a Glow. `Scene::emitterForMat` finds a hit's emitter by its material, so a material has one
-  emitter: every surface after the first needing one of its own gets a copy of its material
-  (`glowClone`, named `name [2]`, with a routed copy of the copy for a per-object-mode surface).
-  A light block's own surface (`reflectsNothing`) is left alone.
+  unlit-scene test): each emissive mesh block keeps the mesh light it registered; the other
+  triangles of each emissive material -- bare quads and polygons, a mesh's further material, and
+  the world-space copies of instanced assets' -- form one mesh light per material, motion set and
+  pattern frame (`Scene::addMeshLightOf`, which takes any list of triangles; the emitter takes
+  their pattern frame, so a sampled point reads its pattern where a hit does); each sphere is a
+  sphere light, or a Glow under an emission pattern; each isosurface or CSG solid is a Glow.
+  `Scene::emitterForMat` finds a hit's emitter by its material (a table, `emitterOfMat`, on the
+  host and `DMaterial::emitterIdx` on the device, so a lookup is O(1)), so a material has one
+  emitter: every surface after the first with one of its own -- a further mesh block, sphere,
+  isosurface or group of triangles -- takes a copy of its material (`cloneOf`, named `name [2]`,
+  with a routed copy of the copy for a per-object-mode surface), all sharing one spectrum object
+  so the camera's per-sample spectrum table evaluates it once. A light block's own surface
+  (`reflectsNothing`) is left alone; `emit` on a mix or layered material itself is refused (every
+  hit takes a layer). build() finalizes the layered coats before the emitters, so a layered
+  body's copy is known to be a glow.
 * **The Glow** (`EmitterShape::Glow`, device shape 7) samples an analytic primitive by the lines
   through its box (`Scene::glowSamplePoint`, device `dGlowSamplePoint`). A line uniform over the
   lines meeting a convex box -- entry point uniform over its surface S, direction cosine-
@@ -3409,9 +3414,11 @@ was lit differently by every mode (known-issues GLOW-LIGHT-MODES). Now:
   otherwise count the light the glow throws through a mirror onto a wall), modes D and J's
   `glowSeenBy` at s = 0, mode U's `camGlow`, M's and S's camera walks past a strand; M's final
   gather does not count one at all. The forward modes see it only directly, in the sky pass
-  (`main.cpp glowMatSeen`, `prepareSky`, `addBlurredSkyRows`), whose `glowsOnly` form gives mode
-  P's forward layer the same (its fit over the diffuse-side pixels otherwise read the glow's edge
-  pixels in the camera side only and ran the frame bright). Mode C, which catches photons through
+  (`main.cpp glowMatSeen`, `prepareSky`, `addBlurredSkyRows`), through the media's transmittance
+  along the camera ray, whose `glowsOnly` form gives mode P's forward layer the same (its fit over
+  the diffuse-side pixels otherwise read the glow's edge pixels in the camera side only and ran the
+  frame bright). A plain glow's colour is exact at a pinhole's 64 points; one seen through a medium
+  or on a compound is a draw a sample, and its count grows with the render. Mode C, which catches photons through
   its pupil, does not see one. The camera's wavelength density includes the glows' emission
   (`Scene::glowG`, a twentieth of its mass; device `DScene::glowG`), so a glow whose colour no
   light emits is still drawn.

@@ -282,6 +282,8 @@ Then the rest of 4.2-4.6 in their order, 4.7's bookkeeping alongside whatever to
 - [ ] **J-THIN-GAP-LEAK** — mode J lights a surface's top with a light 1 mm under it (167x mode R
   with the light the surface's own underside, 1.21x with a light block in the gap; 0.441.1 alike),
   and mode D shows the gap's mouth as a line mode R barely sees (`scenes/_gap_leak*.ftsl`).
+- [ ] **KEEPWINDOW-VRAM** — a finished render held open by `-keepwindow` keeps all its device memory,
+  so the next GPU render pages (~45x slower); it should release the device when the render ends.
 - [x] **MERGE-PROXIMITY** (0.431.0) — every gather keeps only the photons near its tangent plane
   (`gatherplane.h`), except on a curve; mode M's sheet lit from below read 21x, now 0.
 - [x] **HAZE-SUN-B** (0.434.15, 0.434.16) — mode B lights an unbounded sunlit haze at 0.163 of

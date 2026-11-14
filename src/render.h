@@ -3079,12 +3079,11 @@ struct Renderer {
             double denom = 4.0 * PI * envPdfW * em.spdFn(lambda);
             beta = (denom > 0.0) ? beta * (scene.envMap->radiance(-dir, lambda) / denom) : 0.0;   // -dir: the sky it came from
         }
-        // An emission pattern is a pure post-multiplier on the photon's carried power:
-        // the emitter is still SELECTED by its unpatterned power and the point still
-        // drawn uniformly over its area, so no pdf anywhere changes and the estimator
-        // stays unbiased. The cost is variance — a mostly-dark pattern spends most of
-        // its photons on near-zero beta. `emitted` is credited the patterned value so
-        // the energy report matches what actually leaves the surface.
+        // An emission pattern (a Glow's crossing count with it) is a post-multiplier on the
+        // photon's carried power: the point is drawn uniformly over the surface, so no
+        // positional pdf changes and the estimator stays unbiased; the emitter was chosen by
+        // its mean (Emitter::selW, divided out above). `emitted` is credited the patterned
+        // value so the energy report matches what actually leaves the surface.
         if (emitPatW != 1.0) beta *= emitPatW;
         e.emitted += beta;
 

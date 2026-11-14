@@ -16119,22 +16119,29 @@ static bool prepareSky(SkyView& view, const Scene& scene, const Camera& cam, int
     }
     const bool lensed = cam.hasLens();
     const double perPixel = (double)N / ((double)rx * (double)ry);
-    const long long want = lensed ? std::max(kFirst, std::min(4096LL, (long long)(perPixel / 4.0))) : kFirst;
+    // A pinhole's 64 points resolve the sky and a plain glow exactly; a glow seen through a medium or
+    // on a compound is a draw a sample (glowXYZAt), so its count grows with the render as a lens's.
+    const bool glowDrawn = haveGlow && (scene.glowCompound || !scene.media.empty());
+    const long long want = (lensed || glowDrawn)
+                         ? std::max(kFirst, std::min(4096LL, (long long)(perPixel / 4.0))) : kFirst;
     // What pinhole sample k of pixel `pix` sees of a glow at its hit (glowMatSeen): a plain glow's XYZ
     // exactly, its emission's (Scene::glowXYZ) times the pattern at the hit; a compound's through one
     // wavelength, uniform over [kLo, kHi], and the coin and child the sample's own.
-    const auto glowXYZAt = [&](const Hit& h, const Vec3& d, size_t pix, long long k) -> Vec3 {
+    const auto glowXYZAt = [&](const Hit& h, const Ray& r, size_t pix, long long k) -> Vec3 {
         Pcg32 g;
         seedUnit(g, pix, 0x61C0FFEE5EE0ULL ^ ((uint64_t)k * 0x9E3779B97F4A7C15ULL));
         const double lambda = kLo + (kHi - kLo) * g.uniform();
         const double u1 = g.uniform(), u2 = g.uniform();
         bool resolved = false;
-        const int id = glowMatSeen(scene, h, d, lambda, u1, u2, resolved);
+        const int id = glowMatSeen(scene, h, r.d, lambda, u1, u2, resolved);
         if (id < 0) return Vec3{0, 0, 0};
         const Material& m = scene.mats[(size_t)id];
-        if (!resolved) return scene.glowXYZ[(size_t)id] * emitHitScale(scene, m, h, d * -1.0);
+        if (!resolved && scene.media.empty())
+            return scene.glowXYZ[(size_t)id] * emitHitScale(scene, m, h, r.d * -1.0);
+        const double T = scene.media.empty() ? 1.0
+                       : Renderer::mediaTransmittance(scene, r.o, r.d, h.t, lambda, g);
         return Vec3(cieX(lambda), cieY(lambda), cieZ(lambda)) *
-               (emitSlot(scene, m, h, lambda, d * -1.0) * (kHi - kLo));
+               (emitSlot(scene, m, h, lambda, r.d * -1.0) * T * (kHi - kLo));
     };
     // A pinhole pixel's samples [k0, k1), points of its rotated Halton (2,3) lattice, added to `s`
     // in k order. Every one is traced: a feature thinner than the lattice's spacing (a strand, a
@@ -16153,7 +16160,7 @@ static bool prepareSky(SkyView& view, const Scene& scene, const Camera& cam, int
             Vec3 c{0, 0, 0};
             if (h.valid) {
                 if (!haveGlow) continue;
-                c = glowXYZAt(h, r.d, pix, k);
+                c = glowXYZAt(h, r, pix, k);
             } else {
                 if (haveEnv) c += scene.envXYZForDir(r.d);
                 if (haveSun) c += scene.sunXYZForDir(r.d);
@@ -16182,7 +16189,10 @@ static bool prepareSky(SkyView& view, const Scene& scene, const Camera& cam, int
                 bool resolved = false;
                 const double u1 = rng.uniform(), u2 = rng.uniform();
                 const int id = glowMatSeen(scene, h, r.d, lambda, u1, u2, resolved);
-                if (id >= 0) L = emitSlot(scene, scene.mats[(size_t)id], h, lambda, r.d * -1.0);
+                if (id >= 0)
+                    L = emitSlot(scene, scene.mats[(size_t)id], h, lambda, r.d * -1.0) *
+                        (scene.media.empty() ? 1.0
+                                             : Renderer::mediaTransmittance(scene, r.o, r.d, h.t, lambda, rng));
             } else {
                 if (haveEnv) L += scene.envRadianceSeen(r.d, lambda);   // the bilinear camera view
                 if (haveSun) L += scene.sunRadiance(r.d, lambda);
@@ -16333,11 +16343,13 @@ static void addBlurredSkyRows(Film& film, const Scene& scene, const Camera& cam,
                     const int id = glowMatSeen(scene, h, r.d, lam, g1, g2, resolved);
                     if (id < 0) continue;
                     const Material& m = scene.mats[(size_t)id];
-                    if (!lensed && !resolved)
+                    if (!lensed && !resolved && scene.media.empty())
                         acc += scene.glowXYZ[(size_t)id] * emitHitScale(scene, m, h, r.d * -1.0);
                     else
                         acc += Vec3(cieX(lam), cieY(lam), cieZ(lam)) *
-                               (emitSlot(scene, m, h, lam, r.d * -1.0) * w * (kHi - kLo));
+                               (emitSlot(scene, m, h, lam, r.d * -1.0) * w * (kHi - kLo) *
+                                (scene.media.empty() ? 1.0
+                                                     : Renderer::mediaTransmittance(scene, r.o, r.d, h.t, lam, rng)));
                     continue;
                 }
                 if (!lensed) {
@@ -29804,10 +29816,10 @@ static int run(int argc, char** argv) {
         bool accFresh = true;   // do host acc[]/accE match the device accumulators?
         // Under a blur, the directly seen sky of each camera that blurs, drawn on the host beside
         // the device's photons: running totals, added to what the device holds whenever it is
-        // pulled (pullDevice). Empty where the scene has no sky or sun, or the camera sees nothing
-        // move.
+        // pulled (pullDevice), with the glows it sees (prepareSky). Empty where the scene has no sky,
+        // sun or glow, or the camera sees nothing move.
         std::vector<Film> skyAcc;
-        const bool skyOnHost = gses && blurGroup && (scene.envIndex >= 0 || scene.sunCount > 0);
+        const bool skyOnHost = gses && blurGroup && (scene.envIndex >= 0 || scene.sunCount > 0 || scene.glowAny);
         if (skyOnHost) {
             skyAcc.resize(nc);
             for (int c = 0; c < nc; ++c)

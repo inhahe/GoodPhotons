@@ -3505,16 +3505,19 @@ a tessellated emissive sphere is as clean as the analytic `light sphere`.
 *material*, not of the `mesh` block, so binding an emissive material to anything else —
 a `sphere`, a bare `quad` or `polygon`, a CSG solid, a marched `isosurface`, a
 `mesh_instance` — makes it a light too (since 0.442.0), on CPU and GPU and in every mode
-alike: ftrace registers an emitter for it at load. The triangles of each emissive material
-(every `mesh` block's, quad's and instance's, merged) form one mesh light; each sphere is a
-sphere light; each isosurface or CSG solid — and a sphere under an emission pattern — is
+alike: ftrace registers an emitter for it at load. Each `mesh` block keeps the light it registers;
+the other triangles of each emissive material (bare quads and polygons, instances) form one mesh
+light; each sphere is a sphere light; each isosurface or CSG solid — and a sphere under an emission
+pattern — is
 sampled by **random lines through its box**: such a line crosses any surface inside the box
 with the same density everywhere (the Crofton formula), so one of its crossings, weighted by
 how many there are, is an exact sample of the surface whatever its shape, a thin wire frame
 included. Lines that miss the surface cost a march and add nothing, so a sparse solid in a
 large box takes more samples to light the room cleanly than a mesh light of the same area
-would. Each emissive sphere and isosurface gets its own emitter (a copy of its material, named
-`glow [2]`, `glow [3]`, … in diagnostics), so many glowing objects are sampled where they are.
+would. Each mesh block, emissive sphere and isosurface has its own emitter (the ones after the
+first of a material take a copy of it, named `glow [2]`, `glow [3]`, … in diagnostics), so many
+glowing objects are sampled where they are. A line at load names what now lights the scene.
+`emit` belongs on a material's layers, not on a `mix` or `layered` material itself (refused).
 Until 0.442.0 only a `mesh` block registered one: the rest lit nothing in modes `R`, `W`, `M`
 and `S`, nothing and were not even seen in the forward modes, and lit everything around them at
 full weight in `D`, `J` and `U`.
@@ -3530,7 +3533,9 @@ material "neon" { type diffuse  reflect 0.02  emit gaussian 528 34 0.5  glow_onl
 ```
 
 The forward modes see such a glow only where the camera sees it directly — `A`, `B` and `V` add
-it as they add the sky, and mode `P`'s forward layer likewise — and mode `C` not at all. An
+it as they add the sky (dimmed by any medium between, as every mode dims it), and mode `P`'s
+forward layer likewise — and mode `C` not at all. A `mesh` block's `power` or `lumens` still sets
+a `glow_only` mesh's radiance. An
 emissive curve or `fur`, an emissive child of a `mix` or `layered` material, and an emissive
 isosurface whose motion stretches it unevenly have no emitter to give the lighting, so they are
 refused unless their material is `glow_only`.
