@@ -21,6 +21,20 @@ metric `_gemsweep.py` uses -- 4x box in LINEAR light, then coverage above 2x the
 median, excess-weighted saturation, and chromaticity `spread`.  Reporting several caps from
 ONE frame is the point: they share an exposure, a sun and a fill, so the comparison between
 them is exact even though the absolute numbers are not comparable with the rig's.
+
+IT METERS THE LIGHT, NOT THE STONE.  The metric attributes every variation across a cap to light,
+which holds only for a uniform albedo, and the caps are marble (a `reflect texture:`): a
+full-contrast slab's own veins clear the 2x bar and, varying smoothly with position, score high on
+`fan` too (a converged frame's opaque-gold cap metered coverage 4.55 % on rock, its untextured
+control 0.00 %).  So each pixel is divided by the frame's ALBEDO, the image `-write-aovs` writes
+beside it (`<frame>.albedo.pfm`): radiance over albedo is the cap's irradiance, whatever the stone.
+And a pixel counts as cap only where the frame's POSITION image (`<frame>.position.pfm`, the same
+pass) puts its first hit on the cap's top face: seen from 11 degrees above, floor just past a cap's
+edge back-projects inside its rectangle, and the piece masks below are spheres (on one 124-spp
+frame the opaque pieces' caps read brass 11.9 %, Alice 16.5 %, Julia 4.6 % that way, and 0.00 % from
+the positions, while the diamond's and the axicon's caustics stay).  Render with `-hdr
+-write-aovs`.  Without the albedo image a textured cap is refused rather than metered; an
+untextured one is metered as before (its albedo only scales it), with the projection and the masks.
 """
 import math, re, sys, os
 
@@ -118,7 +132,16 @@ while (h := HDR.search(src, pos)):
     m = BOX.search(body)
     c = [float(m.group(i)) + off[i - 1] for i in (1, 2, 3)]
     sz = [float(m.group(i)) for i in (4, 5, 6)]
-    caps[name] = (c, sz)
+    mm = re.search(r'material\s+(\S+)', body)
+    caps[name] = (c, sz, mm.group(1) if mm else None)
+
+# The caps' materials: is a cap's `reflect` a texture (its albedo varies across it)?
+MATS = {m.group(1): m.group(2) for m in re.finditer(r'material\s+"([^"]+)"\s*\{([^}]*)\}', src)}
+
+
+def textured(name):
+    body = MATS.get(caps[name][2] or '', '')
+    return re.search(r'reflect\s+texture:', body) is not None
 
 
 # ---- the pieces themselves, which sit over the caps and so occlude them ---------------
@@ -194,8 +217,15 @@ def unproject(x, y, w, h, ylevel):
     return None if t <= 0 else tuple(EYE[i] + t * d[i] for i in range(3))
 
 
-def meter(im, name):
-    c, sz = caps[name]
+def meter(im, name, alb=None, pos=None):
+    """Meter cap `name` in the frame `im`, each pixel over the albedo image `alb` (the frame's
+    `-write-aovs` albedo) where given, and only the pixels whose first hit lies on the cap's top
+    face where the position image `pos` (`-write-aovs` too) is given."""
+    c, sz, mat = caps[name]
+    if alb is None and textured(name):
+        print(f'  {name}: its stone is textured ({mat}) and no albedo image sits beside the frame -- '
+              f'render with -write-aovs, or its veins meter as caustic')
+        return
     w, h = im.w, im.h
 
     # Walk the cap's screen footprint, but decide membership in WORLD space: back-project
@@ -228,18 +258,32 @@ def meter(im, name):
             if p3 is None or abs(p3[0] - c[0]) > sz[0] / 2 or abs(p3[2] - c[2]) > sz[2] / 2:
                 continue
             box += 1
-            if occluded(p3):
+            if pos is None and occluded(p3):
                 continue
             acc = [0.0, 0.0, 0.0]
+            nacc = 0
             for y in range(by, by + DOWN):
                 for x in range(bx, bx + DOWN):
+                    if pos is not None:            # the cap's top face, or not the cap at all
+                        q3 = pos.at(x, y)
+                        if (abs(q3[1] - top) > 0.005 or abs(q3[0] - c[0]) > sz[0] / 2
+                                or abs(q3[2] - c[2]) > sz[2] / 2):
+                            continue
                     p = im.at(x, y)
                     px += 1
-                    if max(p) * GAIN >= 1.0:
+                    if max(p) * GAIN >= 1.0:       # the DISPLAYED pixel's clip: radiance
                         clip += 1
+                    if alb is not None:            # irradiance: radiance over the stone's albedo
+                        a = alb.at(x, y)
+                        if min(a) < 1e-3:          # no albedo to divide by (a black vein, a seam)
+                            continue
+                        p = tuple(p[k] / a[k] for k in range(3))
+                    nacc += 1
                     for k in range(3):
                         acc[k] += p[k]
-            cells.append((tuple(a / (DOWN * DOWN) for a in acc), p3[0], p3[2]))
+            if nacc == 0:
+                continue
+            cells.append((tuple(a / nacc for a in acc), p3[0], p3[2]))
     if len(cells) < 16:
         print(f'  {name}: only {len(cells)} of {box} cap cells survive the piece mask')
         return
@@ -312,11 +356,20 @@ if __name__ == '__main__':
     src = sys.argv[1]
     want = sys.argv[2:] or sorted(caps)
     im = Linear(src)
-    print(f'{src}, caustic = >{CUT:g}x each cap\'s OWN median, {DOWN}x box in linear light')
+    aov = {}
+    for kind in ('albedo', 'position'):
+        p_ = os.path.splitext(src)[0] + '.' + kind + '.pfm'
+        if os.path.exists(p_):
+            aov[kind] = Linear(p_)
+            if (aov[kind].w, aov[kind].h) != (im.w, im.h):
+                sys.exit(f'{p_} is {aov[kind].w}x{aov[kind].h}, the frame {im.w}x{im.h}')
+    print(f'{src}, caustic = >{CUT:g}x each cap\'s OWN median, {DOWN}x box in linear light, '
+          + ('over its albedo' if 'albedo' in aov else 'no albedo image (textured caps refused)')
+          + (', the cap face from its positions' if 'position' in aov else ''))
     if im.clipped:
         print(im.banner())
     print()
     for nm in want:
         if nm not in caps:
             nm = f'stand_{nm}_cap'
-        meter(im, nm)
+        meter(im, nm, aov.get('albedo'), aov.get('position'))

@@ -25115,7 +25115,19 @@ whatever it is given to the cap albedo. The other nine sources are of unverified
 unwatermarked provenance and should be spot-checked at the same time. The raw drops themselves
 are deliberately left untracked (see `.gitignore`); only the prepared PNGs are committed.
 
-### OPEN (2026-08-04): `tools/_capchroma.py` scores marble VEINS as a caustic — the metric assumes a uniform cap albedo
+### FIXED (2026-11-14; opened 2026-08-04): `tools/_capchroma.py` scores marble VEINS as a caustic — the metric assumes a uniform cap albedo
+
+**Fixed** by the frame's own passes rather than by re-deriving the texture: `_capchroma.py` reads the
+`-write-aovs` images beside the frame, divides each pixel by `<frame>.albedo.pfm` (radiance over
+albedo is the cap's irradiance, whatever the stone) and keeps only the pixels whose first hit
+`<frame>.position.pfm` puts on the cap's top face. The second half was a bug of its own, found here:
+seen from 11 degrees above, floor just past a cap's edge back-projects inside the cap's rectangle,
+and the piece masks are spheres, so on a 124-spp gallery_rain frame the opaque pieces' caps metered
+brass 11.9 %, Alice 16.5 %, Julia 4.6 %, Klein 3.6 % (floor and veins) and read 0.00 % with both
+passes, while the diamond's (28.8 %) and the axicon's (7.1 %) caustics stay. Without the albedo image
+a textured cap is refused (all fifteen of gallery_rain's are marble).
+
+The report as filed:
 
 **Symptom.** With the tabletops textured, the gyroid cap meters **coverage 4.55 %, sat 0.434,
 spread 0.201, fan 0.84** in the converged frame. The untextured control of the same frame meters
