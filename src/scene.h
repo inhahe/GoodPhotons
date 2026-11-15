@@ -3414,6 +3414,19 @@ struct Scene {
                 emitterOfMat[(size_t)m] = (emitterOfMat[(size_t)m] == -1) ? (int)e : kEmitterByPrim;
         }
         tagLightSurfaces();
+        // A two-sided light's triangles name its front face, the emitter after it its back
+        // (Tri::emitsBack): they must be that pair, or a hit from behind would light by another.
+        for (const Tri& t : tris) {
+            if (!t.emitsBack) continue;
+            const int f = t.emitter;
+            const bool ok = f >= 0 && f + 1 < (int)emitters.size() &&
+                            emitters[(size_t)f].shape == EmitterShape::Quad &&
+                            emitters[(size_t)f + 1].shape == EmitterShape::Quad &&
+                            emitters[(size_t)f].matId == matBase(t.matId) &&
+                            emitters[(size_t)f + 1].matId == emitters[(size_t)f].matId &&
+                            dot(emitters[(size_t)f].normal, emitters[(size_t)f + 1].normal) < 0.0;
+            if (!ok) throw std::logic_error("finalizeEmitters: a two-sided light's triangle names no pair of faces");
+        }
         // Adopt each emitter's emission profile from the material on its geometry. Done
         // here — one place, after every registration path — rather than threading an
         // extra argument through addAreaLight / addMeshLight / the built-in scenes.
@@ -4930,7 +4943,12 @@ struct Scene {
         if (idx < 0 || idx >= (int)emitters.size()) return;
         emitters.erase(emitters.begin() + idx);
         const auto fix = [idx](int& e) { if (e == idx) e = -1; else if (e > idx) --e; };
-        for (Tri& t : tris) fix(t.emitter);
+        for (Tri& t : tris) {
+            // A two-sided light's faces are a pair (Tri::emitsBack): removing one leaves none.
+            if (t.emitsBack && (t.emitter == idx || t.emitter + 1 == idx))
+                throw std::logic_error("eraseEmitter: one face of a two-sided light");
+            fix(t.emitter);
+        }
         for (Implicit& im : implicits) fix(im.emitter);
         for (int& e : sphereEmitter) fix(e);
         for (MeshInstance& in : instances)

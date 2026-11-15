@@ -1,0 +1,13 @@
+# A two-sided panel lamp (`two_sided on`) hung in the middle of a white room, its `normal` up, the
+# camera below it: the camera sees the back face directly, and the ceiling, lit by the front face,
+# beyond it. Judged by tools/check_two_sided.py against two one-sided panels a millimetre apart.
+scene { units meters }
+material "white" { type diffuse reflect 0.7 }
+quad { origin -1 0 -1  u 0 0 2  v 2 0 0  material white }
+quad { origin -1 2 -1  u 2 0 0  v 0 0 2  material white }
+quad { origin -1 0 -1  u 2 0 0  v 0 2 0  material white }
+quad { origin -1 0 1  u 0 2 0  v 2 0 0  material white }
+quad { origin -1 0 -1  u 0 2 0  v 0 0 2  material white }
+quad { origin 1 0 -1  u 0 0 2  v 0 2 0  material white }
+light area { origin -0.25 1.0 -0.25  u 0.5 0 0  v 0 0 0.5  normal 0 1 0  two_sided on  spd preset:bb6500  power 20 }
+camera "c" { eye 0 0.5 0.9  look_at 0 1.2 -1.0  up 0 1 0  fov_y 60  film { res 96 72 } }

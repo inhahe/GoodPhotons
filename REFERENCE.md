@@ -3363,7 +3363,7 @@ per-path carrier is left unqualified here.
 
 | Subtype | Description | Key parameters |
 |---|---|---|
-| *(default)* area | Rectangular area light | `origin`, `u`, `v`, `normal`, `spd`, `hide_camera` |
+| *(default)* area | Rectangular area light | `origin`, `u`, `v`, `normal`, `spd`, `hide_camera`, `two_sided` |
 | `sphere` | Spherical area light (an ellipsoid under an uneven scale: an emissive mesh) | `center`, `radius`, `spd` |
 | `cylinder` | Cylindrical tube light (elliptic under an uneven scale: an emissive mesh) | `center`, `axis`, `length`, `radius`, `caps`, `spd` |
 | `spot` | Cone spotlight with penumbra | `origin`, `dir`, `inner_angle`, `outer_angle`, `spd` |
@@ -3382,6 +3382,8 @@ fixed in 0.370.0: **the forward modes (A, B, C, and M's / S's photon passes) lit
 image environment point-mirrored** -- a window on one side of the sky lit the scene from the other
 -- while showing the backdrop the right way round. Forward and backward modes now agree on which
 side an environment lights. Constant (uniform) environments were never affected.
+
+**A panel lit on both faces — `two_sided` (0.446.0).** `two_sided on` in an `area` block makes both faces of the rectangle emit, at one radiance: a hanging panel that lights the floor and the ceiling alike. `power` is the total over both faces, so each face gets half of it. Every mode on both backends sees it the same way: light sampling, a ray that meets it from either side, and the light walks born on either face. Two one-sided panels written back to back on one plane are **not** the same thing. A ray that meets them keeps whichever face its closest-hit test finds first, so mode R and the camera walks of D, J and U saw such a pair at about half its brightness from each side, while light sampling saw both. ftrace now warns at load when two area lights overlap on one plane, back to back or facing the same way, and names the remedy. A leaning `normal` (an aimed panel) cannot be two-sided: write two aimed panels a few millimetres apart instead.
 
 **Invisible fill flats — `hide_camera`.** A rectangular `area` light is real,
 opaque geometry (two triangles in the BVH), so it renders as a visible slab whenever

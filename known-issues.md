@@ -210,7 +210,7 @@ after another, where mode J queues its sites for a warp each (SURF-WAVEFRONT): s
 the GPU grows with its population at single-lane speed. The fix: mode J's queued gather for mode U's
 merges.
 
-## NOTED (2026-11-15): COINCIDENT-LAMP-FACES — two lamp quads back to back on one plane read half as bright to every camera walk
+## DONE (2026-11-15, 0.446.0): COINCIDENT-LAMP-FACES — two lamp quads back to back on one plane read half as bright to every camera walk
 
 A two-sided panel lamp written as two `light area` quads on the same plane, facing opposite ways,
 gives every ray that meets the panel two faces at one distance, and the closest-hit test keeps
@@ -222,9 +222,15 @@ walk sees the panel itself, or reaches it through glass with its NEE blocked. Me
 `_birth_in_glass`'s first draft, the lamp in clear glass (ior 1): mode R's walls read 0.42 of mode
 B's. With the faces 4 mm apart they agree to 1 % (0.00182 against 0.00180), and with no ball mode R
 read the panel's brightest pixel at a third of B's. No tracked scene does this (all of `scenes/`, scanned for
-coincident opposite-facing `light area` pairs). Remedies, not built: a `two_sided` option on
-`light area` (one face emitting both ways, sampled by side), or a load-time warning for
-coincident opposite-facing emitters.
+coincident opposite-facing `light area` pairs).
+
+**Both remedies, 0.446.0.** `two_sided on` on `light area`: two emitters, a face each, on one
+rectangle whose triangles a hit from behind meets as the back face (`Tri::emitsBack`; design.md,
+"A hit finds its emitter by its primitive"); `power` is the two faces' total. And a load-time
+warning when area lights overlap on one plane, back to back or facing alike (`warnCoincidentLamps`
+in ftsl.h), naming the remedy. `tools/check_two_sided.py`: the panel against two one-sided panels
+1 mm apart in modes R, B, D, J, U, M and S on both devices, the warning, and the refusal of an
+aimed two-sided panel.
 
 ## DONE (2026-11-14, 0.442.4 and 0.443.0): REVIEW-0442-FABLE — what Fable's review of 0.442.0-0.442.1 found
 
@@ -384,7 +390,13 @@ extremely steep. **What would remove it** is a merge radius that adapts to the p
 M's caustic map gathers at a per-query radius (PhotonMap::adaptiveRadius): small where the density
 climbs. For J and U that means a per-query kappa in the merge's MIS weight, against the fixed kappa VCM's
 weights assume across all the techniques -- **a design decision**, put to the user on 2026-11-15:
-whether a pathological emitter in a millimetre slit is worth an adaptive-radius VCM.
+whether a pathological emitter in a millimetre slit is worth an adaptive-radius VCM. Its
+downsides, as put: VCM's weights are recursive in one radius a pass (dVCM / dVM, the merge's
+`pi r^2 N`), so a radius per query either leaves the weights not summing to one -- a bias of its
+own -- or needs them evaluated over each path's vertices, far slower; every merge pays a
+nearest-neighbour search first; and a small radius where photons are dense is a noisier merge.
+Recommended against: the bias falls with the radius schedule, `-pmradius` pins it, and only a lamp
+shining into a slit shows it. Left until the user wants it.
 
 ## DONE (2026-11-15, 0.445.3): J-THIN-GAP-LEAK — modes J and U lit a surface with the light trapped a millimetre under it
 

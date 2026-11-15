@@ -3574,7 +3574,16 @@ was lit differently by every mode (known-issues GLOW-LIGHT-MODES). Now:
   (`Scene::tagLightSurfaces`) tags the surfaces of each material with a single emitter -- a light
   block's own, a built-in scene's -- and warns of an emissive surface of a material several
   emitters share that has none (`emitterOfMat`, `kEmitterByPrim`, which also answers `isGlow`). `Scene::eraseEmitter` renumbers every tag when an
-  emitter is removed (`-noenv`). `Tri::emitter` is its last field, as `Tri`s are built
+  emitter is removed (`-noenv`). A two-sided area light (`two_sided on`, 0.446.0) is two `Quad`
+  emitters, its front face's and then its back face's, on one rectangle whose two triangles carry
+  `Tri::emitsBack` (device `DTri::emitsBack`, in the padding beside `solid`) and the front's
+  index: `intersectTri` / `dTriFill` turn such a triangle's hit from behind to face the ray (`ng`,
+  `back` false, the solid side with them) and name the back face (`emitter + 1`). It is the one
+  primitive whose `ng` faces the ray, and it ends every walk that meets it, so what reads that `ng`
+  is the emission tests. Every estimator thus sees the face toward it, where two one-sided quads
+  back to back leave the closest-hit test either (COINCIDENT-LAMP-FACES; the loader warns of
+  overlapping coplanar area lights, `warnCoincidentLamps`). finalizeEmitters checks that each such
+  triangle names such a pair, and eraseEmitter refuses to remove one face. `Tri::emitter` is its last field, as `Tri`s are built
   positionally (`Tri{v0, v1, v2, mat, -1, {}, uv0, uv1, uv2}`). So a material lights the scene
   through any number of emitters and stays one material: until then a hit's emitter was its
   material's, and every glowing surface after the first took a copy of its material (`name [2]`),

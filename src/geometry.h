@@ -126,6 +126,10 @@ struct Tri {
     // it in. 0 on any face that cannot say. Set before a mode-M or mode-S batch, and read only by
     // its footprint probes.
     unsigned char solidFace = 0;
+    // Part of a two-sided light (`light area` with `two_sided on`): met from behind, it is the
+    // panel's back face -- the geometric normal turned to the ray, the light emitter + 1 -- where
+    // two one-sided faces back to back would leave the closest-hit test either (intersectTri).
+    bool emitsBack = false;
     // triReach of the vertices, baked here for the hit to copy (Hit::pscale).
     double reach = 0.0;
     // The light it is part of (Hit::emitter), or -1. Last: triangles are built positionally
@@ -711,6 +715,13 @@ inline bool intersectTri(const TriShear& sh, const Ray& r, const Tri& tri,
     hit.bitangentSign = againstWinding ? -tri.bitangentSign : tri.bitangentSign;
     // Curvature follows the shaded side: seen from the back, a bulge IS a pit (O3).
     hit.curv = flipped ? -tri.curvature : tri.curvature;
+    // A two-sided light met from behind (Tri::emitsBack) is its back face, turned to the ray: the
+    // one exception to the NB above, on a surface that ends every walk meeting it, so what reads
+    // ng there is the emission tests, which pass and name that face's light. Its solid side turns
+    // with ng (dShadedNg and orientedGeoN are unchanged: n already faced the ray).
+    if (tri.emitsBack && flipped) {
+        hit.ng = -gn; hit.back = false; hit.solid = -hit.solid; hit.emitter = tri.emitter + 1;
+    }
     return true;
 }
 

@@ -1336,6 +1336,7 @@ public:
         // Every emissive surface a light block did not make gets its emitter (registerGlows) -- so
         // a scene lit by glowing geometry alone has its lights.
         if (!registerGlows(L)) return false;
+        warnCoincidentLamps(L.scene);
         if (!haveLight && L.scene.emitters.empty() && !haveVolumeEmission && !unlit())
             return false;
         // Catch errors recorded via fail() inside add* helpers that returned true
@@ -8838,9 +8839,19 @@ private:
                         "its light toward `normal %g %g %g`, as if turned to face it, and nothing "
                         "behind its own plane\n", o.x, o.y, o.z,
                         std::acos(std::fmin(1.0, cosAim)) * 180.0 / PI, nrm.x, nrm.y, nrm.z);
+        // `two_sided on`: both faces emit, at one radiance -- two lights, a face each, on one
+        // surface whose back face a hit from behind meets (Tri::emitsBack).
+        const std::string tsv = strOf(b, "two_sided", "off");
+        const bool twoSided = (tsv == "on" || tsv == "true" || tsv == "yes" || tsv == "1");
+        if (twoSided && Emitter::leans(cosAim)) {
+            fail("light area: `two_sided on` takes a normal standing straight out of the panel -- an "
+                 "aimed face has no one counterpart on the other side; for a panel aimed both ways, "
+                 "write two aimed panels a few millimetres apart");
+            return false;
+        }
         // A `power` is the light's total flux: area * aimNorm (PI for a panel that does not lean),
-        // the flux addAreaLight's emitter emits.
-        spd = absPower(b, spd, length(cross(us, vs)) * Emitter::aimNormFor(cosAim), L);
+        // the flux addAreaLight's emitter emits -- each face's, so twice that for two faces.
+        spd = absPower(b, spd, length(cross(us, vs)) * Emitter::aimNormFor(cosAim) * (twoSided ? 2.0 : 1.0), L);
         Material lm; lm.reflect = constantSpectrum(0.0); lm.emit = spd; lm.isLight = true;
         lm.reflectsNothing = true;
         lm.emitPat = spdPat;
@@ -8879,9 +8890,92 @@ private:
             L.scene.tris.push_back(Tri{a, dd, cc, id, -1, {},
                                        Vec3{0, 0, 0}, Vec3{0, 1, 0}, Vec3{1, 1, 0}});
         }
+        // Two faces: the front `normal`'s, then the back's, the emitter after it, which the
+        // triangles name their back face by (several emitters share the material, so
+        // tagLightSurfaces would tag them with neither).
+        const int front = (int)L.scene.emitters.size();
+        if (twoSided)
+            for (size_t k = L.scene.tris.size() - 2; k < L.scene.tris.size(); ++k) {
+                L.scene.tris[k].emitter = front;
+                L.scene.tris[k].emitsBack = true;
+            }
         L.scene.addAreaLight(os, us, vs, nw, length(cross(us, vs)), spd, binWidth_,
                              /*collimated*/false, /*beamDir*/{1, 0, 0}, /*matId*/id);
+        if (twoSided)
+            L.scene.addAreaLight(os, us, vs, nw * -1.0, length(cross(us, vs)), spd, binWidth_,
+                                 /*collimated*/false, /*beamDir*/{1, 0, 0}, /*matId*/id);
         return true;
+    }
+
+    // Area lights on one plane that overlap (COINCIDENT-LAMP-FACES): a ray meeting them keeps
+    // whichever face the closest-hit test finds, so whatever sees the panels -- mode R, the camera
+    // walks of D, J and U -- reads one light where light sampling reads both: a panel of two
+    // faces back to back at about half its radiance from each side. Said at load, with the
+    // remedy. Pairs are found by sweeping the panels' boxes along x.
+    void warnCoincidentLamps(const Scene& S) {
+        struct Q { size_t e; Vec3 lo, hi, c[4]; };
+        std::vector<Q> qs;
+        for (size_t i = 0; i < S.emitters.size(); ++i) {
+            const Emitter& e = S.emitters[i];
+            if (e.shape != EmitterShape::Quad || e.collimated || e.matId < 0) continue;
+            Q q{i, e.origin, e.origin, {e.origin, e.origin + e.u, e.origin + e.u + e.v, e.origin + e.v}};
+            for (const Vec3& p : q.c) {
+                q.lo = Vec3{std::min(q.lo.x, p.x), std::min(q.lo.y, p.y), std::min(q.lo.z, p.z)};
+                q.hi = Vec3{std::max(q.hi.x, p.x), std::max(q.hi.y, p.y), std::max(q.hi.z, p.z)};
+            }
+            qs.push_back(q);
+        }
+        if (qs.size() < 2) return;
+        std::sort(qs.begin(), qs.end(), [](const Q& a, const Q& b) { return a.lo.x < b.lo.x; });
+        // What a closest-hit test cannot tell apart: a millionth of the panels' reach.
+        double reach = 1.0;
+        for (const Q& q : qs)
+            for (const Vec3& p : q.c) reach = std::max({reach, std::fabs(p.x), std::fabs(p.y), std::fabs(p.z)});
+        const double tol = 1e-6 * reach;
+        int found = 0;
+        for (size_t i = 0; i < qs.size(); ++i)
+            for (size_t j = i + 1; j < qs.size(); ++j) {
+                const Q& A = qs[i];
+                const Q& B = qs[j];
+                if (B.lo.x > A.hi.x + tol) break;
+                if (B.lo.y > A.hi.y + tol || A.lo.y > B.hi.y + tol ||
+                    B.lo.z > A.hi.z + tol || A.lo.z > B.hi.z + tol) continue;
+                const Emitter& ea = S.emitters[A.e];
+                const Emitter& eb = S.emitters[B.e];
+                if (ea.matId == eb.matId) continue;               // one light's faces (`two_sided`)
+                const Vec3 na = normalize(cross(ea.u, ea.v)), nb = normalize(cross(eb.u, eb.v));
+                if (std::fabs(dot(na, nb)) < 1.0 - 1e-9) continue;
+                bool onPlane = true;
+                for (const Vec3& p : B.c) onPlane = onPlane && std::fabs(dot(na, p - ea.origin)) <= tol;
+                if (!onPlane) continue;
+                // Overlap in the plane, by separating axes: the edges' normals of both rectangles.
+                // An edge two panels share (a tiled wall) is no overlap.
+                const Vec3 axes[4] = {cross(na, ea.u), cross(na, ea.v), cross(na, eb.u), cross(na, eb.v)};
+                bool overlap = true;
+                for (const Vec3& ax0 : axes) {
+                    const double al = length(ax0);
+                    if (!(al > 0.0)) continue;
+                    const Vec3 ax = ax0 / al;
+                    double a0 = 1e300, a1 = -1e300, b0 = 1e300, b1 = -1e300;
+                    for (const Vec3& p : A.c) { a0 = std::min(a0, dot(ax, p)); a1 = std::max(a1, dot(ax, p)); }
+                    for (const Vec3& p : B.c) { b0 = std::min(b0, dot(ax, p)); b1 = std::max(b1, dot(ax, p)); }
+                    if (std::min(a1, b1) - std::max(a0, b0) <= tol) { overlap = false; break; }
+                }
+                if (!overlap) continue;
+                if (++found > 8) continue;
+                const Vec3 ca = ea.origin + (ea.u + ea.v) * 0.5, cb = eb.origin + (eb.u + eb.v) * 0.5;
+                const bool backToBack = dot(ea.nGeom, eb.nGeom) < 0.0;
+                std::fprintf(stderr,
+                             "[light] warning: the area lights centred at (%g %g %g) and (%g %g %g) overlap on "
+                             "one plane, %s: a ray that meets them takes either one, so mode R and the camera "
+                             "walks of D, J and U see about half their light -- %s\n",
+                             ca.x, ca.y, ca.z, cb.x, cb.y, cb.z,
+                             backToBack ? "back to back" : "facing the same way",
+                             backToBack ? "for a panel lit on both faces, write one light with `two_sided on`"
+                                        : "write one light with their power, or move one off the other");
+            }
+        if (found > 8)
+            std::fprintf(stderr, "[light] warning: %d pairs of area lights overlap on one plane in all\n", found);
     }
 
     // ---- medium ----

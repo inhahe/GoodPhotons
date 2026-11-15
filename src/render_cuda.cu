@@ -710,7 +710,8 @@ struct DMediumStack {
 struct DTri    { DVec3 v0, v1, v2, gn; DVec3 uv0, uv1, uv2; DVec3 n0, n1, n2; int matId, sensorId;
                  DVec3 tangent;
                  unsigned char solid;                    // Tri::solidFace: 1 normals out, 2 in, 0 neither
-                                                         // (in FP32's padding before bitangentSign)
+                 unsigned char emitsBack;                // Tri::emitsBack (both in FP32's padding
+                                                         // before bitangentSign)
                  Real bitangentSign;                     // C6 tangent frame for normal mapping (+-1)
                  int emitter;                            // Tri::emitter (with the sign, 8 B: DTri stays 168)
                  double curvature;                       // O3 per-face mean curvature (Tri::finalize)
@@ -4452,6 +4453,10 @@ __device__ static inline void dTriFill(const DVec3& rd, const DTri& tri, Real t,
     hit.curv = (Real)(flipped ? -tri.curvature : tri.curvature);
     hit.vcol = tri.vcol; hit.vb0 = b0; hit.vb1 = b1;
     hit.fiberRadius = (Real)0;                 // `hit` is a reused record: not a strand
+    // A two-sided light met from behind is its back face, turned to the ray (host twin intersectTri).
+    if (tri.emitsBack && flipped) {
+        hit.ng = -gn; hit.back = false; hit.solid = -hit.solid; hit.emitter = tri.emitter + 1;
+    }
 }
 __device__ static bool intersectTri(const DTriShear& sh, const DVec3& ro, const DVec3& rd,
                                      const DTri& tri, Real tmin, DHit& hit) {
@@ -25636,6 +25641,7 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
         d.emitter = t.emitter;
         d.curvature = t.curvature;      // O3 per-face mean curvature (from Tri::finalize)
         d.solid = t.solidFace;          // PROBE-SOLID-SIDE (markSolidFaces)
+        d.emitsBack = t.emitsBack ? 1 : 0;
         d.matId = t.matId; d.sensorId = t.sensorId;
         d.vcol  = t.vcol;               // per-vertex colour (Scene::vertColors), or -1
         d.reach = (Real)t.reach;

@@ -294,6 +294,8 @@ Then the rest of 4.2-4.6 in their order, 4.7's bookkeeping alongside whatever to
   memory, so the next GPU render paged (~45x slower); it gives the device back as the render ends.
 - [x] **J-THIN-GAP-LEAK** (0.445.3) — J's and U's merges keep their own surface's photons over its
   share of the disc (the footprint): the gap's light stays off the plate, and object bases read true.
+- [x] **COINCIDENT-LAMP-FACES** (0.446.0) — `light area { two_sided on }`, and a load-time warning
+  for area lights overlapping on one plane; `tools/check_two_sided.py`.
 - [ ] **GAP-MERGE-RADIUS** — beside a millimetre gap's mouth a merge's disc averages in the gap's
   trapped light at the default radius (J 2-3.6x mode B): the kernel's blur across a 1000x step, a
   bias that converges as E^(-1/4). The remedy, an adaptive merge radius, awaits the user's decision.
