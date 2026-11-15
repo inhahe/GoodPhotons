@@ -1451,7 +1451,7 @@ inline void randomWalk(const Scene& scene, const Camera& cam, const Renderer& ma
                 }
                 pdfW = bsdfPdf(*mp, cur.ns, wo, wi, lambda, scene, &h);
                 pdfRevW = bsdfPdf(*mp, cur.ns, wi, wo, lambda, scene, &h);
-                // f*cos/pdf = r times the draw's weight (ggx.h weightAll), from either end of a
+                // f*cos/pdf = r times the draw's weight (ggx::drawUV's), from either end of a
                 // path: the lobe is reciprocal.
                 betaFactor = r * gd.w;
                 glossyR = r;
@@ -2702,7 +2702,7 @@ struct BeamBudgetReq {
     //   default and tries to store ~7 M photons for a 64x64 image.
     //
     //   `maxSurfPhotons` -- a pure MEMORY ceiling, applied always. A SurfPhoton + its SurfMis
-    //   is 112 B, so an unbounded map is the one way this feature can take the process down;
+    //   is 128 B, so an unbounded map is the one way this feature can take the process down;
     //   it lowers the surface map's subpaths (the first `surfStore` of the pass store photons;
     //   the beams keep theirs), never thins the map (a thinned map's survival probability is exactly
     //   what a MIS weight cannot read -- the same reason mode J refuses to trim its beams).

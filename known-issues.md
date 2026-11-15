@@ -72,6 +72,59 @@ closed entries, where the cost is a broken historical link rather than a blocked
 Three references — `scenes/_gr_fly0.ftsl`, `scenes/silver_sphere_xenon.ftsl`, `scenes/x.ftsl` —
 name files that no longer exist at all, all in closed entries.
 
+## DONE (2026-11-15, 0.445.6 and 0.445.7): REVIEW-0445 — what the Opus and Fable reviews of 2613698..b004c3b found
+
+`/code-review max` (Opus, 12 findings) and `/code-review xhigh` (Fable, 14) of the GGX, COAT-FACTOR,
+POV-FMOD and J-THIN-GAP-LEAK commits, each checked against the code; several were found by both.
+
+**Fixed in 0.445.6 (modes J and U's merge footprint):**
+
+* **The footprint's probe passed through glossy faces** (both). It stopped only on the faces mode M
+  stores photons on (holdsPhotons), but J and U merge on glossy surfaces too, so a merge on a glossy
+  surface rising above its tangent plane counted its own surface as missing and read up to 9x. The
+  probe takes the gather's own test (`GatherHolds`; `holdsMergeVertex` for the merges, device
+  `DGATHER_MERGES`). `tools/check_merge_glossy.py`, the inside of a rough glossy sphere: J and U read
+  8.0 times mode R; now 1.006 and 1.001 (CPU).
+* **Solid faces were marked only for an M or S camera** (Fable), so a J or U probe over a box taller
+  than the radius started inside it, crossed nothing, and counted the column as covered floor: the
+  floor within 2 cm of a 30 cm tower's foot read 0.61-0.63 of mode M at the same radius (whose
+  footprint check_gather_base holds), 0.85-0.90 from 2 to 5 cm. `markSolidFaces` runs for J and U
+  too; check_merge_base's new tower case holds them to mode M there (J 1.006 / 1.011, U 0.941 /
+  0.978, GPU J 0.918 / 0.971).
+* **The four copies of the footprint** (host J and U, device J and U; both reviews) are
+  `MergeFootprint` / `DMergeFootprint`, and mode U takes its photon's normal by the hit's side as J
+  does, not by the sign of dot(ng, wo).
+* **A negative `-gatherarea`** (Opus) turned the photon test on with no footprint in J and U: it
+  counts as 0 at both readers.
+* Includes (both): gathercoverage.h reaches bsdf_eval.h and hair_shade.h itself, vcm.h includes it,
+  ggx_check.h includes linalg.h.
+
+**Fixed in 0.445.7:**
+
+* **A roughness pattern or record was held to 1** (both) while the lobe takes 0.001-2:
+  `clampRoughness` / `dClampRoughness` hold it to ggx::kMaxRoughness. `tools/check_rough_range.py`: a
+  1.6 pattern renders byte for byte as the 1.6 constant on both devices; it rendered as roughness 1,
+  the frame 5.6 % brighter.
+* **NaN in the lobe's table lookups** (Opus): `ggx::alpha`, `msAt` and `msE` send NaN to the least
+  roughness, row 0 and cosine 0. Defence only: the pattern VM guards its `sqrt` and division, so a
+  pattern cannot yield NaN (`0/0` and `sqrt(0-1)` render as roughness 0).
+
+**Cleanups (no render changes):** `-checkggx` tests the draw the tracers take (`drawUV`), and the
+`sampleUVAll` / `weightAll` pair nothing else used is gone (Fable); the dead `scI` / `sc0` flags of
+the hero loop's dispersive case (Fable); nvcc's #20011, a host-only function called from device-shared
+code, is an error in render_cuda.cu (Fable; a probe compile showed the pragma turns POV-FMOD-INT's
+`fmod(x, 2)` into one); stale comments and docs (both: gatherplane.h's header, the device twins'
+names, "no rng draw" at the merges, the merge stream in design.md, the `-gatherarea` modes and the
+coat's multiple scattering in REFERENCE.md, `coatLobe`, the SurfPhoton sizes, design.md's
+`ggxDrawUV`); check_bitid's `--scenes` compared stale images (Opus); history in the tools'
+comments (Opus).
+
+**Measured; fixed in the commit after these (WARP-PROBES):** the lane-0 probes (both). GPU mode J,
+256 spp at 256 x 256: the diffuse Cornell box took 39.9 s with `-gatherarea 8` against 17.8 s with
+0 (2.2x), the room of gyroids 118.0 s against 57.8 s (2.0x) -- a queued site's probes, run by lane
+0 alone while 31 lanes waited, were most of the gather. (The 0.90-1.07x quoted for 0.445.3 was a
+small scene's.)
+
 ## OPEN (2026-11-15): CAMERA-EMPTY-STACK — a camera inside a dielectric starts its walks outside it
 
 The camera-side twin of BIRTH-EMPTY-STACK. Every camera walk starts with an empty dielectric stack
@@ -84,10 +137,16 @@ goes wrong in two ways, the same two the light walks had:
   * a solid inside the one the camera is in (a glass ball under water): it is entered from "air",
     refracting 1.0 -> 1.5 instead of 1.33 -> 1.5, and its priority ranks against nothing.
 The radiance factor (n_from / n_to)^2 at the exit is right regardless: an exit takes the inside
-index from the material, not the stack. The forward tracer's splats are right too, carrying flux.
-Fix: seed each camera walk's stack from `Scene::enclosureAt` at the eye, once per camera at build
-(a thin lens's aperture is within a few millimetres of it), uploaded with the light tables, and
-held against mode B by a check with the camera inside an absorbing water tank.
+index from the material, not the stack. The light side has the matching gap: a forward splat
+(`Renderer::connect`) and a BDPT connection to a camera inside the solid run through it with fog's
+transmittance but none of the solid's absorption -- for a camera in air an interface blocks every
+such segment, so it never showed (TODO "BDPT connection edges through colored glass are not
+absorption-weighted" is the same gap at every connection). Fix: each camera's stack from
+`Scene::enclosureAt` at its ray origins, once per camera (the eye; a thin lens's aperture, an
+orthographic film's corners -- per ray where they disagree), carried into every camera walk and
+uploaded with the camera; the solid's absorption on every camera leg inside it. Held by a check
+with the camera inside an absorbing water tank against Beer-Lambert's closed form (a lamp in the
+water at a known distance) and modes B, D, J, U, M and S against mode R.
 
 ## NOTED (2026-11-15): COINCIDENT-LAMP-FACES — two lamp quads back to back on one plane read half as bright to every camera walk
 

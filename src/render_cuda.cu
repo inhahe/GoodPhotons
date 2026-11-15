@@ -25,6 +25,13 @@
 // use onto their hip* equivalents, which are 1:1 in name and signature. Under
 // nvcc nothing changes. Porting to ROCm is therefore a build-system change
 // (compile this file with hipcc, define FTRACE_USE_HIP) — not a code rewrite.
+//
+// A host-only function called from a __host__ __device__ one compiles, under nvcc's warning #20011, to
+// a device call whose result is garbage (MSVC's host-only fmod<double, int> is one): an error, for this
+// file and every header it includes.
+#if defined(__CUDACC__)
+#pragma nv_diag_error 20011
+#endif
 #if defined(FTRACE_USE_HIP) || defined(__HIP_PLATFORM_AMD__)
   #include <hip/hip_runtime.h>
   #define cudaError_t             hipError_t
@@ -8056,7 +8063,7 @@ __device__ static inline bool dOnGatherSurfaceSided(const DVec3& x, const DVec3&
     return withinGatherBand<Real>(fabs(dot(pp - x, n)), d2, fabs(c), slack);
 }
 
-// ---- GATHER FOOTPRINT (M-GATHERAREA), device twin of photonmap_render.h ----------------------
+// ---- GATHER FOOTPRINT (M-GATHERAREA), device twin of gathercoverage.h ------------------------
 // The density estimate divides by pi*r^2, the area of the whole gather disc, while collecting
 // only from the part of that disc that is real, same-facing surface. Where the disc overhangs --
 // a cap edge, a fold of cloth, a hair strand -- the divisor is too big and the estimate is dark
@@ -8106,7 +8113,7 @@ __device__ static double dGatherCoverage(const DScene& sc, const DVec3& p, const
     DVec3 t, b; onb(n, t, b);
     double area = 0.0;                       // in units of the full disc; 1.0 == fully covered
     int    nRej = 0;                         // probes that FOUND geometry facing the wrong way
-    // `-gagate n` holds this at n regardless of M, host twin in photonmap_render.h. Clamped to
+    // `-gagate n` holds this at n regardless of M, host twin in gathercoverage.h. Clamped to
     // M-1 so the check index stays inside the loop.
     int probe0 = (M >= 4) ? ((M / 4 < 2) ? 2 : M / 4) : M;
     if (sc.gaGate) probe0 = (sc.gaGate < M) ? sc.gaGate : (M > 1 ? M - 1 : M);
@@ -8224,19 +8231,19 @@ __device__ static double dGatherCoverage(const DScene& sc, const DVec3& p, const
         if (c >= kGatherFacingCos) { if (inBall) area += 1.0 / c; }  // the query's facing test
         else          ++nRej;                // geometry IS here, facing the wrong way: a tangle
     }
-    // THE TANGLE GATE, host twin in photonmap_render.h. A high reject share means the disc is
+    // THE TANGLE GATE, host twin in gathercoverage.h. A high reject share means the disc is
     // full of geometry pointing every which way rather than hanging over empty space, and there
     // the correction is not merely weaker -- it points the wrong way, reading dense fur +48 %
     // bright. Doing nothing is the measured-correct action. Must stay identical to the host
     // predicate or the two backends diverge on fur.
     if (sc.gatherRejPct > 0 && nRej * 100 >= sc.gatherRejPct * M) return 1.0;
-    // THE FIBER GATE, host twin in photonmap_render.h. A gather point on a strand has no surface
+    // THE FIBER GATE, host twin in gathercoverage.h. A gather point on a strand has no surface
     // footprint for a tangent-plane disc to be clipped against, so the ratio measured above is not
     // the quantity the density estimate divides by. Decided HERE, after the probes have consumed
     // their rng draws, exactly as the host does -- returning early would desynchronise the two
     // backends' streams and make a cross-backend comparison meaningless.
     if (fiberR > (Real)0 && sc.gaFiberSkip) return 1.0;
-    // The pseudo-count, host twin in photonmap_render.h's gaBiasOn(). Applied here and not at the
+    // The pseudo-count, host twin in gathercoverage.h's gaBiasOn(). Applied here and not at the
     // early returns above, which all mean "do not correct" and must stay exactly 1.0 -- which
     // this form also gives at `area == M`, so they agree by construction, not by a special case.
     if (sc.gaBias) return (area + 1.0) / (double)(M + 1);

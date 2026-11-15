@@ -385,12 +385,6 @@ template <class T> GGX_HD T weightAt(const PairT<T>& p, const MsAt<T>& at, T ea)
     const T d = pdfMix(p, at, ea);
     return (d > (T)0) ? (f(p) + fMsAt(p, at, ea)) * p.cb / d : (T)0;
 }
-template <class T> GGX_HD T weightAll(const PairT<T>& p, bool ms) {
-    if (!ms) return weight(p);
-    if (!p.ok) return (T)0;
-    const MsAt<T> at = msAt(p.alpha);
-    return weightAt(p, at, msE(p.ca, at));
-}
 // sampleUV for the lobe with its multiple scattering where `ms`, given the table's place and
 // E(cos_a): u1 splits at the single scattering's share (u1 == 1 still the mirror; an arrival below n
 // still returns it). `msOut` (may be null) says whether the draw took f_ms's branch: a scattering
@@ -405,13 +399,8 @@ GGX_V template <class V, class T> GGX_HD V sampleUVAt(const V& n, const V& a, T 
     vonb(n, t, bt);
     return vframe(t, bt, n, msSampleCos((u1 - ea) / ((T)1 - ea), at), (T)2 * (T)kPi * u2);
 }
-GGX_V template <class V, class T> GGX_HD V sampleUVAll(const V& n, const V& a, T alpha, bool ms, T u1, T u2) {
-    const T ca = vdot(a, n);
-    if (!ms || u1 >= (T)1 || !(ca > (T)0)) return sampleUV(n, a, alpha, u1, u2);
-    const MsAt<T> at = msAt(alpha);
-    return sampleUVAt(n, a, alpha, at, msE(ca, at), u1, u2, (bool*)nullptr);
-}
-// A draw (sampleUVAll) and its weight `w`, f cos / pdf over r (weightAll), in precision T; `msOut`
+// A draw from the lobe, with its multiple scattering where `ms` (sampleUVAt; the single scattering's
+// for an arrival below n), and its weight `w`, f cos / pdf over r (weightAt), in precision T; `msOut`
 // as sampleUVAt's. Mode W's sample 0 (u1 == 1, the exact mirror, standing for the whole lobe at one
 // sample) takes the lobe's albedo there instead: 1 with the multiple scattering, E(cos_a) without.
 GGX_V template <class V, class T> GGX_HD V drawUV(const V& n, const V& a, T alpha, bool ms, T u1, T u2, T& w,

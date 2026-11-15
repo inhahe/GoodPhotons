@@ -524,7 +524,7 @@ inline double halfVectorCos(const Vec3& a, const Vec3& b) {
 // A direction drawn from a glossy lobe, and the factor the draw leaves beyond the lobe's `reflect`
 // slot: f * cos / pdf = reflect(lambda) * R(lambda) * w, R an iridescent lobe's interference
 // reflectance at the pair's half-vector (exactly 1 on a plain lobe) and w the draw's weight
-// (ggx::weightAll: wavelength-free, the same from either end of a path, the lobe being reciprocal;
+// (ggx::drawUV's: wavelength-free, the same from either end of a path, the lobe being reciprocal;
 // the single-scattering lobe's masking, in (0, 1], with its multiple scattering a mean of 1 for a
 // white lobe). Every sampler of a Glossy material's lobe draws through drawGlossy (or glossyDrawUV,
 // for a lattice's uniforms), so the factor comes with the direction, and so does every fold that
@@ -4797,30 +4797,25 @@ struct Renderer {
                             cl[0] = lam[i]; cb[0] = beta[i];
                             MediumStack cstk = stk;         // sub-paths diverge from here on
                             Ray cray = ray;
-                            bool scI = false;
                             if (interactPhotonSpecular(scene, cams, nCam, m, h, cray, cb[0],
-                                                       cl[0], cstk, rng, e, bounce == 0, &scI))
+                                                       cl[0], cstk, rng, e, bounce == 0))
                                 tracePhotonHeroLoop(scene, cams, nCam, sensorFilm, cray, cstk,
                                                     cl, cb, /*secAlive=*/false, bounce + 1,
-                                                    rng, e, sawFocus, sawScatter || scI);
+                                                    rng, e, sawFocus, sawScatter);
                             beta[i] = 0.0;                  // its energy is now that sub-path's
                         }
                         secAlive = false;                   // hero carries on alone, UNBOOSTED
-                        bool sc0 = false;
                         if (!interactPhotonSpecular(scene, cams, nCam, m, h, ray, beta[0],
-                                                    lam[0], stk, rng, e, bounce == 0, &sc0))
+                                                    lam[0], stk, rng, e, bounce == 0))
                             return;
-                        if (sc0) sawScatter = true;
                         continue;
                     }
                     // Default policy: terminate secondaries, then run the shared scalar
                     // interaction on the (boosted) hero channel.
                     deHero();
-                    bool sc0 = false;
                     if (!interactPhotonSpecular(scene, cams, nCam, m, h, ray, beta[0], lam[0], stk, rng, e,
-                                                bounce == 0, &sc0))
+                                                bounce == 0))
                         return;
-                    if (sc0) sawScatter = true;
                     continue;
                 }
                 case MatType::Diffuse:

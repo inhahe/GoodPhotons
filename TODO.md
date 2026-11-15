@@ -362,11 +362,10 @@ Then the rest of 4.2-4.6 in their order, 4.7's bookkeeping alongside whatever to
   birth (Scene::birthStack, dBirthStack); `tools/check_birth_stack.py`.
 - [ ] **CAMERA-EMPTY-STACK** — a camera inside a dielectric starts its walks outside it (no
   absorption on the first leg; a solid inside it entered from air).
-- [ ] **REVIEW-0445** — the Opus (max) and Fable (xhigh) reviews of 2613698..b004c3b: the J/U
-  probe passes through glossy surfaces; markSolidFaces skipped without an M/S camera; roughness
-  pattern capped at 1; `-gatherarea` < 0; msAt NaN; check_bitid `--scenes` stale compare;
-  lane-0 probes; four footprint copies; stale comments, docs and includes; #20011 as an
-  error; `-checkggx` tests a sampler no tracer uses; dead `scI` plumbing.
+- [x] **REVIEW-0445** (0.445.6, 0.445.7) — the Opus (max) and Fable (xhigh) reviews of
+  2613698..b004c3b: the J/U probe stops on glossy faces (check_merge_glossy), solid faces marked for
+  J/U (check_merge_base's tower), roughness patterns reach 2 (check_rough_range), and the cleanups;
+  known-issues REVIEW-0445.
 - [ ] **GRIN-RADIANCE-SCALE** — a camera path ending inside a GRIN region misses the n² radiance
   scale.
 - [ ] **STUBBLE-DEVICE-UNDERSIDE** — mode W on a stubble coat: device and host 9.6 % apart in its

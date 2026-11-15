@@ -5,8 +5,9 @@
 // plain glossy material shades with).
 //
 //   1. RECIPROCITY. fAll(a, b) == fAll(b, a), to rounding.
-//   2. THE DRAW'S WEIGHT. weightAll() == fAll cos(b) / pdfAll() on drawn pairs, to rounding: the
-//      factor a walk takes is the one the evaluator and the density imply.
+//   2. THE DRAW'S WEIGHT. drawUV's weight == fAll cos(b) / pdfAll() on its draws, to rounding: the
+//      factor a walk takes is the one the evaluator and the density imply. Every test draws through
+//      drawUV, the draw the tracers take (drawRough).
 //   3. THE SAMPLER DRAWS ITS PDF. For test functions g of the drawn direction, the mean of g over
 //      draws equals the integral of g pdfAll over the hemisphere by quadrature, within the
 //      estimator's noise: the sampler and the density are one distribution (what MIS rests on).
@@ -16,8 +17,8 @@
 //   4b. THE POLISHED FURNACE (ms only). The same at roughness 0.01-0.06, arrivals down to 88.6
 //      degrees, where a near-mirror lobe's E dips within a cosine of about its alpha.
 //   5. THE MIRROR LIMIT. At the least roughness 99 % of the draws lie within a few hundredths of
-//      a radian of the mirror direction, sampleUVAll(u1 == 1) is the mirror exactly, and drawUV
-//      weighs it by the lobe's albedo (mode W's sample 0, standing for the whole lobe): 1 with `ms`,
+//      a radian of the mirror direction, and drawUV's u1 == 1 is the mirror exactly, weighed by the
+//      lobe's albedo (mode W's sample 0, standing for the whole lobe): 1 with `ms`,
 //      E(cos_a) without. A roughness past the table's span is held to it.
 //   6. THE MULTIPLE SCATTERING'S OWN DRAW (ms only). msPdf integrates to 1 over the hemisphere, and
 //      a draw from it (msSampleCos) weighs r = f_ms cos / msPdf over 1 - E(cos_a): mean 1 (f_ms
@@ -67,12 +68,13 @@ inline int run() {
                 for (double ca : cosArr) {
                     const Vec3 a = dirAt(ca, 0.7);
                     for (int i = 0; i < 20000; ++i) {
-                        const Vec3 b = sampleUVAll(n, a, al, ms, rng(), rng());
+                        double w = 0.0;
+                        const Vec3 b = drawUV(n, a, al, ms, rng(), rng(), w);
                         const Pair p = pair(n, a, b, al), q = pair(n, b, a, al);
                         if (!p.ok) continue;
                         const double fa = fAll(p, ms), fb = fAll(q, ms);
                         worstR = std::max(worstR, std::fabs(fa - fb) / std::max(fa, 1e-300));
-                        const double w = weightAll(p, ms), w2 = fa * p.cb / pdfAll(p, ms);
+                        const double w2 = fa * p.cb / pdfAll(p, ms);
                         worstW = std::max(worstW, std::fabs(w - w2) / std::max(w2, 1e-300));
                     }
                 }
@@ -115,12 +117,12 @@ inline int run() {
                     const int N = 2000000;
                     double s[3] = {0, 0, 0}, s2[3] = {0, 0, 0}, sw = 0.0, sw2 = 0.0;
                     for (int k = 0; k < N; ++k) {
-                        const Vec3 b = sampleUVAll(n, a, al, ms, rng(), rng());
+                        double w = 0.0;
+                        const Vec3 b = drawUV(n, a, al, ms, rng(), rng(), w);
                         const Pair p = pair(n, a, b, al);
                         if (!p.ok) continue;
                         const double g[3] = {1.0, p.cb, dot(b, lean)};
                         for (int m = 0; m < 3; ++m) { s[m] += g[m]; s2[m] += g[m] * g[m]; }
-                        const double w = weightAll(p, ms);
                         sw += w; sw2 += w * w;
                     }
                     for (int m = 0; m < 3; ++m) {
@@ -171,8 +173,9 @@ inline int run() {
                     const int N = 1000000;
                     double sw = 0.0;
                     for (int k = 0; k < N; ++k) {
-                        const Vec3 b = sampleUVAll(n, a, al, true, rng(), rng());
-                        sw += weightAll(pair(n, a, b, al), true);
+                        double w = 0.0;
+                        drawUV(n, a, al, true, rng(), rng(), w);   // w is 0 for a draw below n
+                        sw += w;
                     }
                     const double e = std::fabs(sw / N - 1.0);
                     if (e > worstP) {
@@ -197,10 +200,13 @@ inline int run() {
             for (double ca : cosArr) {
                 const Vec3 a = dirAt(ca, 2.1);
                 const Vec3 mirror = reflect(a * -1.0, n);
-                const Vec3 m0 = sampleUVAll(n, a, al, ms, 1.0, 0.37);
+                double w0 = 0.0;
+                const Vec3 m0 = drawUV(n, a, al, ms, 1.0, 0.37, w0);
                 exact &= (m0.x == mirror.x && m0.y == mirror.y && m0.z == mirror.z);
-                for (double& x : ang)
-                    x = std::acos(std::min(1.0, dot(sampleUVAll(n, a, al, ms, rng(), rng()), mirror)));
+                for (double& x : ang) {
+                    double w = 0.0;
+                    x = std::acos(std::min(1.0, dot(drawUV(n, a, al, ms, rng(), rng(), w), mirror)));
+                }
                 std::nth_element(ang.begin(), ang.begin() + 99000, ang.end());
                 worst = std::max(worst, ang[99000]);
             }

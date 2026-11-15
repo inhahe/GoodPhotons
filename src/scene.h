@@ -15,10 +15,10 @@
 #include "rng.h"
 #include "bvh.h"
 #include "implicit.h"
-#include "curve.h"
+#include "curve.h"       // curve / fiber primitive (hair, fur, grass, wire)
 #include "medium_stack.h" // MediumStack: a birth's enclosing solids (BIRTH-EMPTY-STACK)
 #include "ggx.h"         // ggx::kMaxRoughness (clampRoughness)
-#include "layered.h"     // A3: the stochastic layered model's escape moments       // curve / fiber primitive (hair, fur, grass, wire) — TODO §P1
+#include "layered.h"     // A3: the stochastic layered model's escape moments
 #include "pattern.h"
 #include "spectrum.h"
 #include "thinfilm.h"   // thinFilmReflectance: a layered coat's transmission table (coatRAtCos)
@@ -481,9 +481,10 @@ struct Material {
     // manual coat's too). A walk that takes the coat by the coin weighs its reflection by render.h
     // coatEvalSheen.
     int    coatParent   = -1;
-    // The coat copy of a layered material (its coatChild), manual or not: a lobe whose reflectance the
-    // coat's Fresnel term at the pair's half vector sets, so it adds no multiple scattering
-    // (render.h glossyMs).
+    // The coat copy of a layered material (its coatChild), manual or not. A Fresnel coat's lobe takes
+    // its reflectance from the coat's Fresnel term at the pair's half vector, so it adds no multiple
+    // scattering; a manual coat's (coatModel 2), whose factor is 1, is a plain lobe and does (render.h
+    // glossyMs).
     bool   coatLobe     = false;
     // On a layered material: T-bar, the coat's transmission 1 - R averaged over the outside
     // hemisphere with the cosine, by nm from LAMBDA_MIN (finalizeLayeredCoats). A thin film whose
