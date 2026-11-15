@@ -136,7 +136,7 @@ def main():
     ok = True
 
     # The warning, and the refusal: a load each, rendering a pixel's worth.
-    probe = ["-mode", "R", "-device", "cpu", "-spp", "1", "-r", "8", "6", "-no-meter"]
+    probe = ["-mode", "R", "-device", "cpu", "-spp", "1", "-r", "8", "6", "-no-meter", "-window-min"]
     for name, light, warns in (("two_sided", LIGHT, False), ("reference", REFERENCE, False),
                                ("coincident", COINCIDENT, True), ("same_facing", SAME_FACING, True)):
         p = run(exe, ["-in", variant(out, name, light), "-o", os.path.join(out, "load_%s.png" % name)] + probe)
@@ -172,7 +172,7 @@ def main():
             rm, rse = stats(ref, "%s_%s_ref" % (mode, dev), full, seeds)
             q = tm / rm
             err = np.hypot(tse / rm, rse * tm / (rm * rm))
-            bad = (np.abs(q - 1.0) > TOL) & (np.abs(q - 1.0) > 5.0 * err)
+            bad = ~(np.isfinite(q) & np.isfinite(err)) | ((np.abs(q - 1.0) > TOL) & (np.abs(q - 1.0) > 5.0 * err))
             ok = ok and not bad.any()
             print("%s: mode %s on the %s, two-sided of the reference: %s"
                   % ("FAIL" if bad.any() else "ok", mode, dev.upper(),
@@ -209,7 +209,7 @@ def main():
                 rm, rse = vstats(vref, "%s_%s_%s_ref" % (vname, mode, dev), full)
                 q = tm / rm
                 err = np.hypot(tse / rm, rse * tm / (rm * rm))
-                bad = (np.abs(q - 1.0) > TOL) & (np.abs(q - 1.0) > 5.0 * err)
+                bad = ~(np.isfinite(q) & np.isfinite(err)) | ((np.abs(q - 1.0) > TOL) & (np.abs(q - 1.0) > 5.0 * err))
                 ok = ok and not bad.any()
                 print("%s: %s, mode %s on the %s, two-sided of the reference: %s"
                       % ("FAIL" if bad.any() else "ok", vname, mode, dev.upper(),

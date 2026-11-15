@@ -2838,6 +2838,21 @@ __device__ static bool dLensConnect(const DCamera& cam, const DVec3& p, Real lam
     Yw = e.Y; wdir = e.wdir; dist = e.dist;
     return true;
 }
+// A hero bundle's leg to the camera's aperture or front element (tCatch long) runs in the walk's
+// medium -- a camera inside a solid -- and takes its absorption per wavelength, counted as absorbed
+// (host twin: the hero loop's absorbToCatch).
+__device__ static inline void dAbsorbToCatch(const DScene& sc, const DMediumStack& stk, const Real* lam, int nUp,
+                                             Real* beta, Real tCatch, double& eAbsorbed) {
+    const int cm = stk.topMat();
+    if (cm < 0) return;
+    for (int i = 0; i < nUp; ++i) {
+        const Real a = (Real)specLookup(sc.mats[cm].absorb, lam[i]);
+        if (!(a > (Real)0)) continue;
+        const Real tr = exp(-a * tCatch);
+        eAbsorbed += (double)(beta[i] * ((Real)1 - tr));
+        beta[i] *= tr;
+    }
+}
 // Mode C through the lens (host twins Camera::lensCatchEntry / lensCatchImage / lensCatch):
 // DLENS_MISSED (flies on), DLENS_CAUGHT (px, py set) or DLENS_ABSORBED (entered, clipped
 // inside). The entry is geometry, once per flight; the image is per wavelength.
@@ -5484,7 +5499,7 @@ __device__ static DHit closestHit(const DScene& sc, const DVec3& ro, const DVec3
     if (hInst >= 0) instanceHitToWorld(sc, sc.instances[hInst], h);
     // A surface emitting from both faces met from behind is its back face (host twin Scene::markBackFace).
     if (h.valid && h.back && h.matId >= 0 && sc.mats[h.matId].emitsBack) {
-        h.ng = -h.ng; h.back = false; h.solid = -h.solid;
+        h.ng = -h.ng; h.back = false; h.solid = -h.solid; h.bitangentSign = -h.bitangentSign;
         if (h.emitter >= 0) h.emitter += 1;
     }
     h.patOwnSide = h.valid && h.matId >= 0 && sc.mats[h.matId].patOwnSide;   // host twin Scene::markPatSide
@@ -10393,7 +10408,7 @@ __global__ void kSphScanInit() {
 // refraction) — the path the camera sees flying THROUGH the glass. Port of
 // Renderer::connectSpecularSphereInside.
 __device__ static void dConnectSpecularSphereInside(const DScene& sc, const DCamera& cam,
-        double* film, double* hits, const DSphere& S, const DMaterial& glass, double n, int aroundMat,
+        double* film, double* hits, const DSphere& S, double n, int aroundMat, int insideMat,
         const D3& p, const DSpecVtx& vt, Real lambda, double beta, DRng& rng) {
     D3 O(S.c); double r = S.r; D3 eye(cam.eye);
     double dEyeO = d3len(eye - O);
@@ -10498,8 +10513,7 @@ __device__ static void dConnectSpecularSphereInside(const DScene& sc, const DCam
 
         double contrib = beta * term * G * ch.Tf / omega * (n * n);   // n^2: host twin
         if (contrib <= 0.0) continue;
-        double aGlass = (double)specLookup(glass.absorb, lambda);
-        if (aGlass > 0.0) contrib *= exp(-aGlass * ch.innerLen);
+        contrib *= dLegAbsorption(sc, insideMat, ch.innerLen, lambda);   // Beer-Lambert inside S
 
         DVec3 wPR = wP.toR();
         if (occludedTo(sc, dOffsetAlong(p.toR(), wPR, wPR), p.toR() + wPR * dP, 2e-6)) continue;
@@ -10525,8 +10539,13 @@ __device__ static void dConnectSpecularSphere(const DScene& sc, const DCamera& c
     int extMat = -1;
     bool ranked = false;
     n /= (double)dExteriorIor(sc, glass, around, lambda, extMat, ranked);
+    // A boundary the priority rule suppresses: the medium around it, optically (host twin).
+    const bool suppressed = ranked && around.topMat() >= 0 && glass.priority <= around.topPri();
+    if (suppressed) n = 1.0;
+    const int insideMat = suppressed ? around.topMat() : S.matId;
     if (dEyeO <= r * 0.9999) {                        // eye inside -> single refraction
-        dConnectSpecularSphereInside(sc, cam, film, hits, S, glass, n, around.topMat(), p, vt, lambda, beta, rng);
+        dConnectSpecularSphereInside(sc, cam, film, hits, S, n, around.topMat(), insideMat, p, vt, lambda, beta,
+                                     rng);
         return;
     }
     if (dEyeO <= r * 1.0001) return;                  // eye ~on surface -> degenerate
@@ -10643,8 +10662,7 @@ __device__ static void dConnectSpecularSphere(const DScene& sc, const DCamera& c
 
         double contrib = beta * term * G * ch.Tf / omega;
         if (contrib <= 0.0) continue;
-        double aGlass = (double)specLookup(glass.absorb, lambda);
-        if (aGlass > 0.0) contrib *= exp(-aGlass * ch.innerLen);
+        contrib *= dLegAbsorption(sc, insideMat, ch.innerLen, lambda);   // Beer-Lambert inside S
 
         DVec3 wPR = wP.toR();
         if (occludedTo(sc, dOffsetAlong(p.toR(), wPR, wPR), p.toR() + wPR * dP2, 2e-6)) continue;
@@ -12538,7 +12556,7 @@ __device__ static void dEnclosureAt(const DScene& sc, const DVec3& p, DMediumSta
         for (;;) {
             const DHit h = closestHit(sc, o, d, RAY_EPS, BIG, /*camHide=*/false);
             if (!h.valid) break;
-            if (h.fiberRadius > (Real)0 ? ++strands > 1024 : ++surfaces > 64) break;
+            if (h.fiberRadius > (Real)0 ? ++strands > 64 : ++surfaces > 64) break;
             tAcc += (double)h.t;
             const int si = sc.mats[h.matId].encSolid;
             if (si >= 0 && h.solid != 0) {
@@ -12548,7 +12566,7 @@ __device__ static void dEnclosureAt(const DScene& sc, const DVec3& p, DMediumSta
                     sid[k][nS[k]] = si;
                     spri[k][nS[k]] = sc.mats[si].priority;
                     st[k][nS[k]] = tAcc;
-                    sin_[k][nS[k]] = (h.solid > 0) == h.back;
+                    sin_[k][nS[k]] = dot(d, h.ng) > (Real)0;   // met from behind: the walks' side
                     ++nS[k];
                 }
             }
@@ -13807,7 +13825,9 @@ __device__ static int shadeStepHero(const DScene& sc, const DCamSet& cs, int cam
         int pxs[hero::kHeroMax], pys[hero::kHeroMax];
         bool hitL[hero::kHeroMax];
         D3 lo, ld;
-        if (dLensCatchEntry(cc, ro, rd, dEvent, lo, ld)) {
+        double tCatch = 0.0;   // how far the flight runs to the front element
+        if (dLensCatchEntry(cc, ro, rd, dEvent, lo, ld, &tCatch)) {
+            dAbsorbToCatch(sc, stk, lam, nUp, beta, (Real)tCatch, eAbsorbed);
             for (int i = 0; i < nUp; ++i)
                 hitL[i] = dLensCatchImage(cc, lo, ld, lam[i], pxs[i], pys[i]) == DLENS_CAUGHT;
             const Real cCell = (Real)dLensCellNorm(cc);
@@ -13831,14 +13851,7 @@ __device__ static int shadeStepHero(const DScene& sc, const DCamSet& cs, int cam
         const DCamera& cc = cs.cam(0);
         Real tCatch = (Real)0;
         if (cc.catchPhoton(ro, rd, dEvent, px, py, &tCatch)) {
-            {   // the leg to the aperture, inside the walk's medium (scalar twin above)
-                const int cm = stk.topMat();
-                if (cm >= 0)
-                    for (int i = 0; i < nUp; ++i) {
-                        const Real a = (Real)specLookup(sc.mats[cm].absorb, lam[i]);
-                        if (a > (Real)0) beta[i] *= exp(-a * tCatch);
-                    }
-            }
+            dAbsorbToCatch(sc, stk, lam, nUp, beta, tCatch, eAbsorbed);
             Real cCell = (Real)1 / (Real)(cc.pixelPlaneArea() * cc.filmDist * cc.filmDist);
             const bool envSeen = pathC && (pathC->bits & PV_BIT_ENVFIRST);   // the env SEEN: bilinear
             DEnvTaps tp;
@@ -18339,7 +18352,7 @@ __global__ void kBackward(DScene sc, const __grid_constant__ DCamera cam, double
 // `legMat`: the solid the vertex lies in (the walk's stack top), or -1, whose 3-tap absorption
 // every light sample's leg takes, as the walk's own segments do.
 __device__ static DVec3 bkNeeLightRGB(const DScene& sc, const DHit& h, const DVec3& rhoRGB,
-                                      DRng& rng, int legMat = -1) {
+                                      DRng& rng, int legMat) {
     DVec3 total(0, 0, 0);
     const DVec3 aLeg = legMat >= 0 ? sc.mats[legMat].rgbAbsorb : DVec3(0, 0, 0);
     const bool legAbs = aLeg.x > 0 || aLeg.y > 0 || aLeg.z > 0;

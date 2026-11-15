@@ -121,10 +121,11 @@ struct Tri {
     // its shape at the frame's instant, which is one of the keys.
     int vkeys = -1;
     int vkeyCount = 0;
-    // On the boundary of a closed solid (main.cpp markSolidFaces, over watertight::markSolidFaces):
+    // On the boundary of a closed solid (Scene::markSolidFaces, over watertight::markSolidFaces):
     // 1 with its normal out, so a ray meeting it from behind (Hit::back) is leaving the solid; 2 with
-    // it in. 0 on any face that cannot say. Set before a mode-M or mode-S batch, and read only by
-    // its footprint probes.
+    // it in. 0 on any face that cannot say. Set at build where a walk can be inside a solid (only the
+    // closed solids enclose a light or camera: Scene::enclosureAt) and for a footprint's batch, whose
+    // probes read it too.
     unsigned char solidFace = 0;
     // triReach of the vertices, baked here for the hit to copy (Hit::pscale).
     double reach = 0.0;
@@ -317,8 +318,8 @@ struct Hit {
     // The face bounds a closed solid, so `back` says which way the ray crosses it: +1 with the
     // solid's normals out (from behind is leaving: an analytic sphere, a triangle Tri::solidFace
     // marks 1), -1 with them in (from behind is entering), 0 where the side a ray meets a face from
-    // says nothing of inside and out (an open quad, a curve, an isosurface). Every intersector
-    // writes it (the record is reused).
+    // says nothing of inside and out (an open quad, a curve, an isosurface that may end at its
+    // container: Implicit::solidSide). Every intersector writes it (the record is reused).
     signed char solid = 0;
     // The surface's material lets light cross it (Material::patOwnSide), so its patterns see
     // its own side, ng's: their normal and curvature turned there when `back`, its cavity
@@ -698,7 +699,8 @@ inline bool intersectTri(const TriShear& sh, const Ray& r, const Tri& tri,
     // NB `hit.ng` is deliberately NOT flipped toward the ray, here or in any other
     // primitive: downstream `bool entering = dot(d, h.ng) < 0` (refraction, medium
     // crossing) and `dot(rd, h.ng) < 0` (one-sided emitter tests) read the side OFF it,
-    // and a pre-flipped `ng` would make both unconditionally true. Callers that want the
+    // and a pre-flipped `ng` would make both unconditionally true. (One exception, made
+    // after the hit is found: a surface emitting from both faces, Scene::markBackFace.) Callers that want the
     // geometric normal on the *shaded* side use orientedGeoN(h), which — now that both
     // fields derive from the same `gn` — provably equals `flipped ? -gn : gn`.
     hit.ng = gn;

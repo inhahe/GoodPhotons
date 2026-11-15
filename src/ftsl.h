@@ -5313,12 +5313,8 @@ private:
         // reflections -- and lights nothing, in every mode (Material::glowOnly). Without it an
         // emissive surface gets an emitter at load and lights the scene (registerGlows).
         if (find(b, "glow_only")) {
-            const std::string g = strOf(b, "glow_only", "off");
-            const bool on = (g == "on" || g == "true" || g == "yes" || g == "1");
-            if (!on && g != "off" && g != "false" && g != "no" && g != "0") {
-                fail("glow_only takes on or off (got '" + g + "')");
-                return m;
-            }
+            bool on = false;
+            if (!onOffOf(b, "glow_only", on)) return m;
             if (on && !m.isLight) {
                 fail("glow_only on a material that does not emit: give it an `emit` (a fluorescent "
                      "material's `emit` is its reradiation, not a glow)");
@@ -5330,12 +5326,8 @@ private:
         // for a sheet (a quad, a polygon, an open mesh), of a material no light crosses, whose faces
         // then say nothing of which way a ray goes; registerGlows refuses it on a solid primitive.
         if (find(b, "emit_two_sided")) {
-            const std::string g = strOf(b, "emit_two_sided", "off");
-            const bool on = (g == "on" || g == "true" || g == "yes" || g == "1");
-            if (!on && g != "off" && g != "false" && g != "no" && g != "0") {
-                fail("emit_two_sided takes on or off (got '" + g + "')");
-                return m;
-            }
+            bool on = false;
+            if (!onOffOf(b, "emit_two_sided", on)) return m;
             if (on && !m.isLight) {
                 fail("emit_two_sided on a material that does not emit: give it an `emit`");
                 return m;
@@ -8288,13 +8280,22 @@ private:
         // Refusals first: an emissive child of a compound, an emissive strand.
         const auto compoundOk = [&](int m, const char* what) {
             if (m < 0 || m >= (int)S.mats.size()) return true;
-            for (int c : S.mats[(size_t)m].mixChildren)
+            for (int c : S.mats[(size_t)m].mixChildren) {
                 if (glows(c)) {
                     fail(nameOf(c) + " emits inside the mix or layered " + nameOf(m) + " on " + what +
                          ": no emitter can sample a share of a surface, so it would light nothing in some "
                          "modes; give it `glow_only on` to keep it a glow that lights nothing");
                     return false;
                 }
+                // The face a hit meets is decided by the surface's own material, before the compound
+                // picks a layer (Scene::markBackFace), so a layer cannot emit from both faces.
+                if (c >= 0 && c < (int)S.mats.size() && S.mats[(size_t)c].emitsBack) {
+                    fail(nameOf(c) + " has emit_two_sided on, inside the mix or layered " + nameOf(m) + " on " +
+                         what + ": which face a ray meets is settled before the mix picks its layer, so a layer "
+                         "cannot glow on both; give the two-sided glow a surface of its own");
+                    return false;
+                }
+            }
             return true;
         };
         for (const Tri& t : S.tris) if (!compoundOk(t.matId, "a mesh")) return false;
@@ -8306,6 +8307,29 @@ private:
                      "would light nothing in some modes; give it `glow_only on` to keep it a glow");
                 return false;
             }
+        // A surface emitting from both faces that closes a solid would throw half its light into its own
+        // inside, from back faces nothing outside can see: emit_two_sided is a sheet's (watertight's
+        // closed pieces, over the material's triangles, the scene's and each asset's it places).
+        for (size_t m = 0; m < S.mats.size(); ++m) {
+            if (!S.mats[m].emitsBack || S.mats[m].reflectsNothing) continue;   // a light block's panel is open
+            std::vector<Tri> mine;
+            for (const Tri& t : S.tris)
+                if (S.matBase(t.matId) == (int)m) mine.push_back(t);
+            for (const MeshInstance& in : S.instances) {
+                if (in.blasId < 0) continue;
+                for (const Tri& t : S.blasList[(size_t)in.blasId].tris) {
+                    const int placed = in.matOverride >= 0 ? in.matOverride : t.matId;
+                    if (S.matBase(placed) == (int)m) mine.push_back(t);
+                }
+            }
+            for (Tri& t : mine) { t.solidFace = 0; t.finalize(); }
+            if (!mine.empty() && watertight::markSolidFaces(mine.data(), mine.size()) > 0) {
+                fail(nameOf((int)m) + " has emit_two_sided on a surface that closes a solid: its back faces "
+                     "would light only its inside; two-sided emission is for a sheet (a quad, a polygon, an "
+                     "open mesh)");
+                return false;
+            }
+        }
         // One spectrum object for a glowing material, so the camera's per-sample table of emitter
         // spectra evaluates it once however many of its emitters there are (Scene::buildSpdBases) --
         // unless it has one already (a `lumens` light's scaled base, which a wrap would hide).
@@ -8319,8 +8343,12 @@ private:
         std::vector<char> covered(S.tris.size(), 0);   // a mesh block's light holds it
         for (size_t e = 0; e < S.emitters.size(); ++e) {
             Emitter& em = S.emitters[e];
-            if (em.matId < 0 || em.backFace) continue;   // a back face's surfaces name its front
+            if (em.matId < 0) continue;
             const int base = S.matBase(em.matId);
+            if (em.backFace) {                           // its surfaces name its front; its spectrum is
+                if (em.shape == EmitterShape::Mesh && glows(base)) em.spdFn = S.mats[(size_t)em.matId].emit;
+                continue;                                // the shared object, as the front's (below)
+            }
             if (em.shape != EmitterShape::Mesh || !glows(base)) { owned.insert(base); continue; }
             for (const EmitTri& et : em.meshTris)
                 if (et.tri >= 0 && S.matBase(S.tris[(size_t)et.tri].matId) == base) {
@@ -8520,8 +8548,7 @@ private:
                 if (L.scene.tris[i].matId == id) list.push_back({&L.scene.tris[i], (int)i});
             const size_t before = L.scene.emitters.size();
             L.scene.addMeshLightOf(list, L.scene.mats[(size_t)id].emit, binWidth_, id);
-            if (L.scene.mats[(size_t)id].emitsBack && L.scene.emitters.size() > before)
-                L.scene.emitters.push_back(Scene::backFaceOf(L.scene.emitters.back()));
+            if (L.scene.mats[(size_t)id].emitsBack && L.scene.emitters.size() > before) L.scene.addBackFace();
         }
     }
 
@@ -8554,6 +8581,17 @@ private:
         }
     }
 
+    // A boolean property `key`: on / true / yes / 1, or off / false / no / 0; `out` keeps its value where
+    // the block does not set it. False, after a reported failure, for any other word.
+    bool onOffOf(const Block& b, const char* key, bool& out) {
+        if (!find(b, key)) return true;
+        const std::string g = strOf(b, key, "off");
+        if (g == "on" || g == "true" || g == "yes" || g == "1") { out = true; return true; }
+        if (g == "off" || g == "false" || g == "no" || g == "0") { out = false; return true; }
+        fail(std::string(key) + " takes on or off (got '" + g + "')");
+        return false;
+    }
+
     // Each `light` block registers one Emitter. Multiple light blocks accumulate;
     // the forward tracer selects among them power-weighted and the backward
     // reference sums over them (see scene.h / render.h / backward.h).
@@ -8568,6 +8606,12 @@ private:
         // and render as one, silently (`light point` was a 1x1 panel).
         static const char* const kKinds[] = {"", "area", "sphere", "cylinder", "spot", "collimated",
                                              "sun", "env"};
+        // Both faces emitting is a flat panel's: no other kind has a back face to light.
+        if (subtype != "" && subtype != "area" && find(b, "two_sided")) {
+            fail("light " + subtype + ": `two_sided` is for an area light (a panel's two faces); a " + subtype +
+                 " light has no back face to light");
+            return false;
+        }
         if (std::none_of(std::begin(kKinds), std::end(kKinds),
                          [&](const char* k) { return subtype == k; })) {
             fail("light: unknown kind '" + subtype + "' (area, sphere, cylinder, spot, collimated, sun, "
@@ -8656,8 +8700,8 @@ private:
             Vec3 dir{0, 1, 0}; vec3Of(b, "axis", dir);
             int segs = (int)dblOf(b, "segments", 48.0);
             if (segs < 3) segs = 3;
-            std::string capsStr = strOf(b, "caps", "off");
-            bool caps = (capsStr == "on" || capsStr == "true" || capsStr == "yes");
+            bool caps = false;
+            if (!onOffOf(b, "caps", caps)) return false;
             // An uneven scale makes it an elliptic tube, and a moving group whose keys scale it
             // unevenly (sphereAsMesh_) one at some time: the same wall (and caps) as an emissive
             // mesh, built where the group puts it, its normals by the inverse transpose.
@@ -8881,8 +8925,8 @@ private:
                         std::acos(std::fmin(1.0, cosAim)) * 180.0 / PI, nrm.x, nrm.y, nrm.z);
         // `two_sided on`: both faces emit, at one radiance -- two lights, a face each, on one
         // surface whose back face a hit from behind meets (Material::emitsBack).
-        const std::string tsv = strOf(b, "two_sided", "off");
-        const bool twoSided = (tsv == "on" || tsv == "true" || tsv == "yes" || tsv == "1");
+        bool twoSided = false;
+        if (!onOffOf(b, "two_sided", twoSided)) return false;
         if (twoSided && Emitter::leans(cosAim)) {
             fail("light area: `two_sided on` takes a normal standing straight out of the panel -- an "
                  "aimed face has no one counterpart on the other side; for a panel aimed both ways, "
@@ -8904,8 +8948,7 @@ private:
         // it is otherwise a large solid rectangle that any later camera move can swing into
         // frame. See Material::hideCamera and Scene::closestHit's `skipCamHidden`.
         {
-            const std::string hc = strOf(b, "hide_camera", "off");
-            lm.hideCamera = (hc == "on" || hc == "true" || hc == "yes" || hc == "1");
+            if (!onOffOf(b, "hide_camera", lm.hideCamera)) return false;
             // Set the scene-wide gate here as well as in finalizeEmitters(), so no load
             // path can leave the fast-path bool disagreeing with the materials.
             if (lm.hideCamera) L.scene.camHiddenAny = true;
@@ -8939,7 +8982,7 @@ private:
             for (size_t k = L.scene.tris.size() - 2; k < L.scene.tris.size(); ++k) L.scene.tris[k].emitter = front;
         L.scene.addAreaLight(os, us, vs, nw, length(cross(us, vs)), spd, binWidth_,
                              /*collimated*/false, /*beamDir*/{1, 0, 0}, /*matId*/id);
-        if (twoSided) L.scene.emitters.push_back(Scene::backFaceOf(L.scene.emitters.back()));
+        if (twoSided) L.scene.addBackFace();
         return true;
     }
 
@@ -8949,31 +8992,33 @@ private:
     // faces back to back at about half its radiance from each side. Said at load, with the
     // remedy. Pairs are found by sweeping the panels' boxes along x.
     void warnCoincidentLamps(const Scene& S) {
-        struct Q { size_t e; Vec3 lo, hi, c[4]; };
+        // `reach`: the panel's farthest coordinate, which sets what a closest-hit test cannot tell apart
+        // there, a millionth of it. A two-sided light's back face is its front's panel (Emitter::backFace).
+        struct Q { size_t e; Vec3 lo, hi, c[4]; double reach; };
         std::vector<Q> qs;
+        double maxReach = 1.0;
         for (size_t i = 0; i < S.emitters.size(); ++i) {
             const Emitter& e = S.emitters[i];
-            if (e.shape != EmitterShape::Quad || e.collimated || e.matId < 0) continue;
-            Q q{i, e.origin, e.origin, {e.origin, e.origin + e.u, e.origin + e.u + e.v, e.origin + e.v}};
+            if (e.shape != EmitterShape::Quad || e.collimated || e.matId < 0 || e.backFace) continue;
+            Q q{i, e.origin, e.origin, {e.origin, e.origin + e.u, e.origin + e.u + e.v, e.origin + e.v}, 1.0};
             for (const Vec3& p : q.c) {
                 q.lo = Vec3{std::min(q.lo.x, p.x), std::min(q.lo.y, p.y), std::min(q.lo.z, p.z)};
                 q.hi = Vec3{std::max(q.hi.x, p.x), std::max(q.hi.y, p.y), std::max(q.hi.z, p.z)};
+                q.reach = std::max({q.reach, std::fabs(p.x), std::fabs(p.y), std::fabs(p.z)});
             }
+            maxReach = std::max(maxReach, q.reach);
             qs.push_back(q);
         }
         if (qs.size() < 2) return;
         std::sort(qs.begin(), qs.end(), [](const Q& a, const Q& b) { return a.lo.x < b.lo.x; });
-        // What a closest-hit test cannot tell apart: a millionth of the panels' reach.
-        double reach = 1.0;
-        for (const Q& q : qs)
-            for (const Vec3& p : q.c) reach = std::max({reach, std::fabs(p.x), std::fabs(p.y), std::fabs(p.z)});
-        const double tol = 1e-6 * reach;
+        const double sweepTol = 1e-6 * maxReach;   // no pair's tolerance is wider
         int found = 0;
         for (size_t i = 0; i < qs.size(); ++i)
             for (size_t j = i + 1; j < qs.size(); ++j) {
                 const Q& A = qs[i];
                 const Q& B = qs[j];
-                if (B.lo.x > A.hi.x + tol) break;
+                if (B.lo.x > A.hi.x + sweepTol) break;
+                const double tol = 1e-6 * std::max(A.reach, B.reach);
                 if (B.lo.y > A.hi.y + tol || A.lo.y > B.hi.y + tol ||
                     B.lo.z > A.hi.z + tol || A.lo.z > B.hi.z + tol) continue;
                 const Emitter& ea = S.emitters[A.e];
@@ -9000,15 +9045,16 @@ private:
                 if (!overlap) continue;
                 if (++found > 8) continue;
                 const Vec3 ca = ea.origin + (ea.u + ea.v) * 0.5, cb = eb.origin + (eb.u + eb.v) * 0.5;
+                const bool twoSided = S.mats[(size_t)ea.matId].emitsBack || S.mats[(size_t)eb.matId].emitsBack;
                 const bool backToBack = dot(ea.nGeom, eb.nGeom) < 0.0;
                 std::fprintf(stderr,
                              "[light] warning: the area lights centred at (%g %g %g) and (%g %g %g) overlap on "
                              "one plane, %s: a ray that meets them takes either one, so mode R and the camera "
                              "walks of D, J and U see about half their light -- %s\n",
                              ca.x, ca.y, ca.z, cb.x, cb.y, cb.z,
-                             backToBack ? "back to back" : "facing the same way",
-                             backToBack ? "for a panel lit on both faces, write one light with `two_sided on`"
-                                        : "write one light with their power, or move one off the other");
+                             twoSided ? "one of them two-sided" : backToBack ? "back to back" : "facing the same way",
+                             twoSided || !backToBack ? "move one off the other, or write one light with their power"
+                                                     : "for a panel lit on both faces, write one light with `two_sided on`");
             }
         if (found > 8)
             std::fprintf(stderr, "[light] warning: %d pairs of area lights overlap on one plane in all\n", found);

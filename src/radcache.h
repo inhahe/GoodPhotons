@@ -355,6 +355,11 @@ struct RadCacheCell {
     double   vTail  = 0.0;          // sum of what those paths' traced tails actually delivered
     double   vTail2 = 0.0;          // ...and of their squares, for the ratio's standard error
     uint32_t vN     = 0;            // validation paths scored against this cell
+    // The solids around the point (Scene::eyeStack), where its update rays start: found at its first
+    // update and kept (stkN -1 until then; kStkMax + 1 for a stack too deep to keep, found each round).
+    static constexpr int kStkMax = 4;
+    int8_t   stkN = -1;
+    int32_t  stkMat[kStkMax] = {}, stkPri[kStkMax] = {};
     Vec3 point()  const { return Vec3{px, py, pz}; }
     Vec3 normal() const { return Vec3{(double)nx, (double)ny, (double)nz}; }
 };

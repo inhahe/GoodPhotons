@@ -303,6 +303,8 @@ Then the rest of 4.2-4.6 in their order, 4.7's bookkeeping alongside whatever to
 - [x] **LEG-TRANSMITTANCE** — one call for a leg's whole transmittance (media and its solid's
   absorption) at every connection site, host and device, and a walk's starting stack a required
   argument rather than GiCtx::stk0's pointer (REVIEW-0445B's last two findings).
+- [x] **REVIEW-0446** (0.447.1) — the Opus (max) and Fable (xhigh) reviews of 0.446.0-0.447.0;
+  known-issues REVIEW-0446.
 - [x] **EMIT-TWO-SIDED** (0.447.0) — `emit_two_sided on` for emissive materials (a glowing quad or mesh sheet
   lit both ways), the back face decided by material at the hit's finalizer rather than by triangle,
   so instances take it too; known-issues "a quad's emission is invisible from the side its winding
@@ -311,7 +313,8 @@ Then the rest of 4.2-4.6 in their order, 4.7's bookkeeping alongside whatever to
   for area lights overlapping on one plane; `tools/check_two_sided.py`.
 - [ ] **GAP-MERGE-RADIUS** — beside a millimetre gap's mouth a merge's disc averages in the gap's
   trapped light at the default radius (J 2-3.6x mode B): the kernel's blur across a 1000x step, a
-  bias that converges as E^(-1/4). The remedy, an adaptive merge radius, awaits the user's decision.
+  bias that converges as E^(-1/4). The remedy, an adaptive merge radius, was put to the user with its
+  downsides and recommended against (known-issues GAP-MERGE-RADIUS): left until the user wants it.
 - [ ] **MODEM-GPU-CORNER**, what is left — the corner was noise (0.433.2); GPU mode M reads
   check_bitid's `flat` red 1 % low against the CPU (3.5 sigma).
 - [x] **CURVE-GATHER**, mode U's half (VCM-THIN-CURVES) — 0.439.2: mode U merges at no curve

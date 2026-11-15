@@ -29091,13 +29091,16 @@ static int run(int argc, char** argv) {
     // Every camera's walks start inside the solids around its eye (CAMERA-EMPTY-STACK).
     for (RenderCam& rc : toRender) rc.cam.enclosure = scene.eyeStack(rc.cam.eye);
     // Say which lights are born inside solids and which cameras start inside them (Scene::buildEnclosures,
-    // eyeStack), so a lamp in a globe or a camera under water can be seen to be found.
+    // eyeStack), so a lamp in a globe or a camera under water can be seen to be found. Innermost first
+    // ("'glass' in 'water'"), a two-sided light once (its back face starts as its front), and no more
+    // than kMaxSaid lines of lights, the rest counted.
     {
         const auto names = [&](const MediumStack& st) {
             std::string s;
-            for (int i = 0; i < st.n; ++i) {
+            for (int i = st.n - 1; i >= 0; --i) {
                 const char* nm = scene.matNameFor(st.matIdx[i]);
-                s += (i ? " in " : "") + (nm ? "'" + std::string(nm) + "'" : "material " + std::to_string(st.matIdx[i]));
+                s += (i < st.n - 1 ? " in " : "") +
+                     (nm ? "'" + std::string(nm) + "'" : "material " + std::to_string(st.matIdx[i]));
             }
             return s;
         };
@@ -29105,27 +29108,38 @@ static int run(int argc, char** argv) {
             static const char* const kShape[] = {"area", "sphere", "spot", "env", "cylinder", "mesh", "sun", "glow"};
             const Emitter& em = scene.emitters[e];
             const int sh = (int)em.shape;
-            // Where it is: its origin, a glow's box's centre (it has no origin of its own).
-            const Vec3 at = em.shape == EmitterShape::Glow ? (em.glowLo + em.glowHi) * 0.5 : em.origin;
+            // Where it is: its origin; a glow's box's centre, a mesh's first triangle's (neither has one).
+            Vec3 at = em.origin;
+            if (em.shape == EmitterShape::Glow) at = (em.glowLo + em.glowHi) * 0.5;
+            if (em.shape == EmitterShape::Mesh && !em.meshTris.empty()) {
+                const EmitTri& t = em.meshTris.front();
+                at = t.v0 + (t.e1 + t.e2) * (1.0 / 3.0);
+            }
             char buf[160];
             std::snprintf(buf, sizeof buf, "light %zu (%s at %g %g %g)", e, sh >= 0 && sh < 8 ? kShape[sh] : "?",
                           at.x, at.y, at.z);
             return std::string(buf);
         };
+        constexpr int kMaxSaid = 16;
+        int said = 0, unsaid = 0;
+        const auto say = [&](const std::string& line) {
+            if (said < kMaxSaid) { std::printf("%s\n", line.c_str()); ++said; }
+            else ++unsaid;
+        };
         for (size_t e = 0; e < scene.emitterEnclosure.size() && e < scene.emitters.size(); ++e) {
+            if (scene.emitters[e].backFace) continue;
             if (!scene.emitterEnclosureUniform[e])
-                std::printf("[light] %s straddles a solid's surface: each birth finds the solids around it\n",
-                            lightName(e).c_str());
+                say("[light] " + lightName(e) + " straddles a solid's surface: each birth finds the solids around it");
             else if (scene.emitterEnclosure[e].n)
-                std::printf("[light] %s is born inside %s\n", lightName(e).c_str(),
-                            names(scene.emitterEnclosure[e]).c_str());
+                say("[light] " + lightName(e) + " is born inside " + names(scene.emitterEnclosure[e]));
         }
-        for (size_t f = 0; f < scene.fireEnclosure.size(); ++f) {
+        for (size_t f = 0; f < scene.fireEnclosure.size() && f < scene.emissiveVolumes.size(); ++f) {
             if (!scene.fireEnclosureUniform[f])
-                std::printf("[light] fire %zu straddles a solid's surface: each birth finds the solids around it\n", f);
+                say("[light] fire " + std::to_string(f) + " straddles a solid's surface: each birth finds the solids around it");
             else if (scene.fireEnclosure[f].n)
-                std::printf("[light] fire %zu is born inside %s\n", f, names(scene.fireEnclosure[f]).c_str());
+                say("[light] fire " + std::to_string(f) + " is born inside " + names(scene.fireEnclosure[f]));
         }
+        if (unsaid) std::printf("[light] ... and %d more lights inside or across solids\n", unsaid);
         std::map<std::string, std::vector<std::string>> camsIn;
         for (const RenderCam& rc : toRender)
             if (rc.cam.enclosure.n) camsIn[names(rc.cam.enclosure)].push_back(rc.name);

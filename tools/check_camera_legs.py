@@ -7,15 +7,17 @@ takes its medium's absorption (legAbsorption). The reviews of 0.445.8 (REVIEW-04
 missed; each case here is `scenes/_camera_in_water.ftsl` (a white room under water absorbing 0.3 per
 metre, the camera and a lamp in it) or a variant, a mode against mode R, the walls' mean (and where
 named, a region's) within the tolerance and 5 standard errors over the seeds:
-  * mode C, CPU and GPU, against mode A (mode C's own scale) through a wide aperture: a photon
-    caught by the aperture took no absorption on its last leg;
+  * mode C, CPU and GPU, against mode A (mode C's own scale) through a wide aperture and through a
+    physical lens: a photon caught by the aperture or the front element took no absorption on its last
+    leg;
   * mode M with a glossy ball, CPU and GPU: the ball's spectral glossy light sample took none;
   * mode R with `-rgb` on the GPU: its light samples took none;
   * mode B with a `glow_only` panel seen directly, CPU and GPU: the forward modes' view of a glow took
     none;
-  * mode B with the camera inside a glass ball in the water, CPU and GPU, the lamp seen through it,
-    in the water and in air: the leg outside the ball took the ball's absorption instead of the
-    water's, the ball refracted against vacuum and its inside lacked n^2;
+  * mode B with the camera inside a glass ball in the water (the two ranked by `priority`, so the
+    ball refracts against the water's index), CPU and GPU, the lamp seen through it, in the water and
+    in air: the leg outside the ball took the ball's absorption instead of the water's, the ball
+    refracted against vacuum and its inside lacked n^2;
   * mode R with `-radcache`: the cache's update rays started in air;
   * mode W at one sample: the hero bundle of a camera inside a solid collapsed to one wavelength for the
     whole frame, where `-herosplit` (which mode W forces) splits it -- one sample's lamp, against the
@@ -68,6 +70,20 @@ def wide_aperture(out):
     return path
 
 
+def lens_camera(out):
+    # The same room seen through a physical lens (an achromat), whose front element the mode-C catch
+    # tests -- the hero bundle's catch as well as the scalar one.
+    with open(SCENE, encoding="utf-8") as f:
+        src = f.read()
+    a = "film { res 96 72 }"
+    if src.count(a) != 1:
+        raise SystemExit("the scene's camera is not the one this check fits a lens to")
+    path = os.path.join(out, "lensed.ftsl")
+    with open(path, "w", encoding="utf-8", newline="") as g:
+        g.write(src.replace(a, "focus 2.8  lens { preset achromat  focal 50  fstop 2.8 }  " + a))
+    return path
+
+
 def variant(out, name, extra):
     with open(SCENE, encoding="utf-8") as f:
         src = f.read()
@@ -109,11 +125,22 @@ def main():
     glossy = variant(out, "glossy", GLOSSY)
     glowing = variant(out, "glowing", GLOWING)
     bubble = variant(out, "bubble", BUBBLE)
+    with open(bubble, encoding="utf-8") as f:
+        ranked = f.read()
+    wa = 'material "water" { type dielectric  ior 1.33  absorb 0.3 }'
+    if ranked.count(wa) != 1:
+        raise SystemExit("the scene's water is not the one this check ranks")
+    with open(bubble, "w", encoding="utf-8", newline="") as g:
+        g.write(ranked.replace(wa, wa[:-1] + " priority 1 }"))
+    lensed = lens_camera(out)
     wide = wide_aperture(out)
     # (name, scene, mode args, region, region name, devices, tolerance, seeds[, reference args])
     cases = []
     for dev in devs:
         cases += [("mode C", wide, ["-mode", "C", "-device", dev, "-n", "2000000000" if dev == "gpu" else "400000000"],
+                   WALLS, "walls", dev, 0.05, (1, 2), ["-mode", "A", "-device", refdev, "-n", "40000000"]),
+                  ("mode C, a physical lens", lensed,
+                   ["-mode", "C", "-device", dev, "-n", "2000000000" if dev == "gpu" else "400000000"],
                    WALLS, "walls", dev, 0.05, (1, 2), ["-mode", "A", "-device", refdev, "-n", "40000000"]),
                   ("mode M, glossy ball", glossy, ["-mode", "M", "-device", dev, "-spp", "64", "-n", "2000000"],
                    BALL, "ball", dev, 0.04, (1, 2, 3)),
@@ -137,7 +164,7 @@ def main():
         m, se = stats(exe, out, scene, tag, args, region, seeds)
         q = m / rm
         err = np.hypot(se / rm, rse * m / (rm * rm))
-        bad = abs(q - 1.0) > tol and abs(q - 1.0) > 5.0 * err
+        bad = not (np.isfinite(q) and np.isfinite(err)) or (abs(q - 1.0) > tol and abs(q - 1.0) > 5.0 * err)
         ok = ok and not bad
         print("%s: %s on the %s: %s %.4f (+- %.4f) of mode %s" % ("FAIL" if bad else "ok", name, dev.upper(), rname,
                                                                q, err, ref[1]), flush=True)
@@ -157,7 +184,7 @@ def main():
                           ["-mode", "B", "-device", dev, "-n", "30000000"], LAMP, (1, 2))
             q = m / rm
             err = np.hypot(se / rm, rse * m / (rm * rm))
-            bad = abs(q - 1.0) > 0.03 and abs(q - 1.0) > 5.0 * err
+            bad = not (np.isfinite(q) and np.isfinite(err)) or (abs(q - 1.0) > 0.03 and abs(q - 1.0) > 5.0 * err)
             ok = ok and not bad
             print("%s: mode B on the %s, the lamp from inside a glass ball %s: %.4f (+- %.4f) of mode R"
                   % ("FAIL" if bad else "ok", dev.upper(), tag, q, err), flush=True)
@@ -168,7 +195,7 @@ def main():
         c1 = np.array([one[0] / one[1], one[2] / one[1]])
         c64 = np.array([many[0] / many[1], many[2] / many[1]])
         d = np.abs(c1 / c64 - 1.0)
-        bad = bool((d > 0.10).any())
+        bad = not bool(np.isfinite(d).all()) or bool((d > 0.10).any())
         ok = ok and not bad
         print("%s: mode W on the %s, one sample's lamp r/g %.3f b/g %.3f of 64 samples'" %
               ("FAIL" if bad else "ok", dev.upper(), c1[0] / c64[0], c1[1] / c64[1]), flush=True)

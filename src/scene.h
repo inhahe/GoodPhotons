@@ -10,6 +10,7 @@
 #include <cstdio>
 #include <stdexcept>
 #include <atomic>
+#include <map>
 #include <chrono>
 #include <unordered_map>
 #include "geometry.h"
@@ -593,8 +594,7 @@ inline bool isSmoothCoatMat(const Material& m) {
 // opaque at every wavelength reflects or absorbs, and is never entered; Material::bodyClear, which
 // Scene::finalizePatternSides sets).
 inline bool enterableSolidMat(const Material& m) {
-    if (m.type == MatType::Dielectric) return true;
-    return (m.type == MatType::ThinFilm || m.type == MatType::Multilayer) && m.bodyClear;
+    return m.type == MatType::Dielectric || m.bodyClear;   // bodyClear is a coating's alone
 }
 
 // What the forward modes' closed-form connections reflect the eye in (Scene::mirrorPlanes,
@@ -3171,6 +3171,9 @@ struct Scene {
         return b;
     }
 
+    // The back face of the light just added (backFaceOf), after it: a two-sided surface's pair.
+    void addBackFace() { emitters.push_back(backFaceOf(emitters.back())); }
+
     // Register a spherical area light: a glowing ball of radius r at center c.
     // area = 4*PI*r^2 feeds the same power law (power = emitIntegral*area*PI) and
     // the same 1/area point-sampling pdf as a quad. u/v/normal are unused.
@@ -3960,7 +3963,8 @@ struct Scene {
             bool flat = true;
             for (const Vec3& vn : {t.n0, t.n1, t.n2}) {
                 const double l = length(vn);
-                flat = flat && l > 0.0 && std::fabs(dot(vn, n)) >= (1.0 - 1e-9) * l;
+                // Within ~0.08 degrees: what a file's rounded normals (4 decimals) leave a flat face.
+                flat = flat && l > 0.0 && std::fabs(dot(vn, n)) >= (1.0 - 1e-6) * l;
             }
             if (!flat) continue;
             // Canonical orientation: a mirror reflects from either face, so the two
@@ -4625,18 +4629,30 @@ struct Scene {
     // PROBE-SOLID-SIDE: mark the triangles that bound a closed solid (watertight::markSolidFaces), so a
     // ray can tell inside a solid from outside off the side it meets a face from (Hit::solid): the
     // footprint probes of modes M, S, J and U, and enclosureAt. Each mesh object by itself, an asset's
-    // once however many instances place it; then every triangle no mesh object holds -- quads, a
-    // light's own surface -- as one pool, in which a box of six quads meeting edge to edge is a closed
-    // piece as a mesh is. (A sphere's hit says it is solid itself.) Also each isosurface's side, and the
-    // world boxes of the solids light does not pass (solidNear). Once a build: a second call returns
-    // the first's counts.
+    // once however many instances place it; then the triangles no mesh object holds -- quads, a
+    // light's own surface -- as pools, in which a box of six quads meeting edge to edge is a closed
+    // piece as a mesh is: one per solid a walk can be inside (encSolidOf), so the faces of a water
+    // volume or a glass box are a piece of their own whatever they touch, and one of all the rest.
+    // (A sphere's hit says it is solid itself.) Also each isosurface's side, and the world boxes of the
+    // solids light does not pass (solidNear). `enclosuresOnly`: only the pieces holding a material a
+    // walk can be inside, which is all enclosureAt reads -- what build() asks for, the rest left to
+    // the full pass a footprint needs. Once a build each: a repeated call returns the first's counts.
     struct SolidMarks { size_t seen = 0, solid = 0, isoSolid = 0; double ms = 0.0; };
     SolidMarks solidMarks;
-    uint64_t solidMarksBuild = 0;   // the buildCount markSolidFaces last ran at (0: never)
-    const SolidMarks& markSolidFaces() {
-        if (solidMarksBuild == buildCount && buildCount != 0) return solidMarks;
+    uint64_t solidMarksBuild = 0;       // the buildCount the full pass last ran at (0: never)
+    uint64_t enclosureMarksBuild = 0;   // ... and the enclosuresOnly one
+    const SolidMarks& markSolidFaces(bool enclosuresOnly = false) {
+        if (buildCount != 0 && solidMarksBuild == buildCount) return solidMarks;
+        if (buildCount != 0 && enclosuresOnly && enclosureMarksBuild == buildCount) return solidMarks;
         const auto t0 = std::chrono::steady_clock::now();
         SolidMarks sm;
+        const auto solidOf = [&](int m) {
+            return (m >= 0 && (size_t)m < encSolidOf.size()) ? encSolidOf[(size_t)m] : -1;
+        };
+        const auto holdsEnterable = [&](const Tri* t, size_t n) {
+            for (size_t i = 0; i < n; ++i) if (solidOf(t[i].matId) >= 0) return true;
+            return false;
+        };
         std::vector<char> done(blasList.size(), 0), held(tris.size(), 0);
         // Each closed piece's bounds, for the boxes below: per asset, in its own frame, and in the world.
         std::vector<std::vector<watertight::PieceBox>> blasPieces(blasList.size());
@@ -4645,22 +4661,36 @@ struct Scene {
             if (g.shapeOnly) continue;
             if (g.blasId >= 0 && g.blasId < (int)blasList.size()) {
                 if (done[(size_t)g.blasId]) continue;
-                done[(size_t)g.blasId] = 1;
                 std::vector<Tri>& tr = blasList[(size_t)g.blasId].tris;
+                if (enclosuresOnly && !holdsEnterable(tr.data(), tr.size())) {
+                    bool placedEnterable = false;   // or an instance places it with such a material
+                    for (const MeshInstance& in : instances)
+                        placedEnterable = placedEnterable || (in.blasId == g.blasId && solidOf(in.matOverride) >= 0);
+                    if (!placedEnterable) continue;
+                }
+                done[(size_t)g.blasId] = 1;
                 sm.solid += watertight::markSolidFaces(tr.data(), tr.size(), &blasPieces[(size_t)g.blasId]);
                 sm.seen += tr.size();
             } else if (g.triStart + g.triCount <= tris.size()) {
-                sm.solid += watertight::markSolidFaces(tris.data() + g.triStart, g.triCount, &worldPieces);
-                sm.seen += g.triCount;
                 std::fill(held.begin() + (std::ptrdiff_t)g.triStart,
                           held.begin() + (std::ptrdiff_t)(g.triStart + g.triCount), (char)1);
+                if (enclosuresOnly && !holdsEnterable(tris.data() + g.triStart, g.triCount)) continue;
+                sm.solid += watertight::markSolidFaces(tris.data() + g.triStart, g.triCount, &worldPieces);
+                sm.seen += g.triCount;
             }
         }
-        std::vector<Tri*> loose;
+        std::map<int, std::vector<Tri*>> looseBySolid;   // -1: the faces of no enterable material
         for (size_t i = 0; i < tris.size(); ++i)
-            if (!held[i]) loose.push_back(&tris[i]);
-        sm.solid += watertight::markSolidFaces(loose.data(), loose.size(), &worldPieces);
-        sm.seen += loose.size();
+            if (!held[i]) looseBySolid[solidOf(tris[i].matId)].push_back(&tris[i]);
+        for (auto& [sid, pool] : looseBySolid) {
+            if (enclosuresOnly && sid < 0) continue;
+            sm.solid += watertight::markSolidFaces(pool.data(), pool.size(), &worldPieces);
+            sm.seen += pool.size();
+        }
+        if (enclosuresOnly) {
+            enclosureMarksBuild = buildCount;
+            return solidMarks;
+        }
         // An isosurface bounds a closed solid unless an `open` expression's surface may end at its
         // container (Implicit::solidSide).
         for (Implicit& im : implicits) {
@@ -4705,7 +4735,7 @@ struct Scene {
         solidBoundsKnown = !hasMotion();
         sm.ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
         solidMarks = sm;
-        solidMarksBuild = buildCount;
+        solidMarksBuild = enclosureMarksBuild = buildCount;
         return solidMarks;
     }
 
@@ -4717,12 +4747,15 @@ struct Scene {
     //
     // enclosureAt(p): the solids containing p, outermost first (as a walk coming in would have pushed
     // them). Three rays from p, in fixed directions none of a scene's axes; along each, the first face
-    // of every closed solid a walk goes inside (encSolidOf) says whether p is inside that solid: the
-    // ray leaves it there (Hit::solid, read off the face's side). A solid counts when two of the three
-    // agree, so one ray grazing an edge cannot decide. An open sheet -- a pane of one quad, a mesh with
-    // holes -- bounds no inside (markSolidFaces leaves its faces unmarked), so it encloses nothing.
-    // Each ray goes on through 64 surfaces, and strands (which enclose nothing) besides, up to 1024,
-    // keeping the first kEnclosureMax solids it meets. Order: by the distance at which the ray leaves,
+    // of every closed solid a walk goes inside (encSolidOf) says whether p is inside that solid: met from
+    // behind, the ray leaves it there -- the side a walk reads at a face (interfaceStep's `entering`),
+    // so a walk born at p starts with the stack one coming in would have. A solid counts when two of
+    // the three agree, so one ray grazing an edge cannot decide. An open sheet -- a pane of one quad, a
+    // mesh with holes -- bounds no inside (markSolidFaces leaves its faces unmarked: Hit::solid 0), so
+    // it encloses nothing.
+    // Each ray goes on through 64 surfaces, and 64 strands (which enclose nothing) besides -- a bound a
+    // light straddling a solid's surface pays at each birth -- keeping the first kEnclosureMax solids
+    // it meets. Order: by the distance at which the ray leaves,
     // farthest (outermost) first. Device twin dEnclosureAt.
     static constexpr int kEnclosureMax = 8;
     MediumStack enclosureAt(const Vec3& p) const {
@@ -4740,14 +4773,14 @@ struct Scene {
             for (;;) {
                 const Hit h = closestHit(r, eps);
                 if (!h.valid) break;
-                if (h.fiberRadius > 0.0 ? ++strands > 1024 : ++surfaces > 64) break;
+                if (h.fiberRadius > 0.0 ? ++strands > 64 : ++surfaces > 64) break;
                 tAcc += h.t;
                 const int si = (h.matId >= 0 && (size_t)h.matId < encSolidOf.size()) ? encSolidOf[(size_t)h.matId] : -1;
                 if (si >= 0 && h.solid != 0) {
                     bool known = false;
                     for (int i = 0; i < nSeen[k]; ++i) known = known || seen[k][i].solid == si;
                     if (!known && nSeen[k] < kEnclosureMax)
-                        seen[k][nSeen[k]++] = Seen{si, mats[(size_t)si].priority, tAcc, (h.solid > 0) == h.back};
+                        seen[k][nSeen[k]++] = Seen{si, mats[(size_t)si].priority, tAcc, dot(kDirs[k], h.ng) > 0.0};
                 }
                 r = Ray{h.p, kDirs[k]};
             }
@@ -4812,7 +4845,7 @@ struct Scene {
             anyEnterable = anyEnterable || encSolidOf[i] >= 0;
         }
         if (!anyEnterable) return;                  // nothing to be born inside: every stack empty
-        markSolidFaces();                           // which faces bound a closed solid (Hit::solid)
+        markSolidFaces(/*enclosuresOnly=*/true);    // which faces bound a closed solid (Hit::solid)
         std::vector<Vec3> pts;
         auto settle = [&](MediumStack& out, char& uniform) {
             for (size_t i = 0; i < pts.size(); ++i) {
@@ -5131,8 +5164,10 @@ struct Scene {
             envXYZ = Vec3{0, 0, 0};
             finalizeEmitters();   // rebuild CDF / emission sampler without the env
         }
-        // The rainbow tables are by emitter and medium, and either list may have changed.
+        // The rainbow tables are by emitter and medium, and either list may have changed; so are the
+        // births' starting stacks.
         if ((noMedia || noEnv) && !bowLuts.empty()) finalizeBowLuts();
+        if (noMedia || noEnv) buildEnclosures();
         if (noFluoro) {
             int n = 0;
             for (auto& m : mats)
@@ -5488,17 +5523,19 @@ struct Scene {
     }
 
     // A surface whose material emits from both faces (Material::emitsBack) met from behind is its back
-    // face, turned to the ray: ng and the solid side turn, `back` clears (n already faced the ray), and
-    // its light is the back face's, the emitter after the front's its primitive names (a glow's none).
-    // The one hit whose ng faces the ray (intersectTri's NB): such a material lets no light through
-    // (the loader refuses it on one that does), so what reads ng there is the emission tests, which
-    // pass and name that face. Device twin: closestHit's tail.
+    // face, turned to the ray: every field the intersectors keep relative to ng's side turns with it --
+    // ng, `back` (which clears: n already faced the ray), the solid side and the tangent frame's sign
+    // -- and its light is the back face's, the emitter after the front's its primitive names (a glow's
+    // none). The one hit whose ng faces the ray (intersectTri's NB): such a material lets no light
+    // through (the loader refuses it on one that does), so what reads ng there is the emission tests,
+    // which pass and name that face. Device twin: closestHit's tail.
     void markBackFace(Hit& h) const {
         if (!h.valid || !h.back || h.matId < 0 || h.matId >= (int)mats.size() || !mats[(size_t)h.matId].emitsBack)
             return;
         h.ng = h.ng * -1.0;
         h.back = false;
         h.solid = (signed char)-h.solid;
+        h.bitangentSign = -h.bitangentSign;
         if (h.emitter >= 0) h.emitter += 1;
     }
 

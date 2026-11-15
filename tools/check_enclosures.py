@@ -16,7 +16,10 @@ check reads those lines:
   * a camera under water starts inside it, and one in air beside it does not;
   * a lamp inside a glowing ball inside glass (a glow's probes are its surface, not its box) is born
     inside the glass, wholly;
-  * an inward-wound closed glass box still holds the lamp inside it.
+  * a lamp in the air cavity of a hollow glass box starts in air, and one in an inward-wound closed
+    glass box starts outside the glass, as the walks read a face's side off its winding;
+  * a lamp in a box of water whose bottom shares its edges with another quad starts in the water (a
+    solid's faces are a closed piece of their own).
 Exits 1 on any failure.
 """
 import argparse
@@ -74,8 +77,20 @@ CASES = {
         "sphere { center 0 1 0  radius 0.45  material ember }" + NL + LAMP % "-0.05 3.0 -0.05",
         [], {r"\[light\] light \d+ \(glow[^)]*\) is born inside 'glass'": True,
              r"straddles": False}),
+    "hollow_box": (
+        # A glass box with an air cavity: an inner box wound to face the cavity. A lamp in the cavity is
+        # outside the glass, as the walks read it.
+        NL.join(['quad { origin -0.6 0.4 -0.6  u 1.2 0 0  v 0 0 1.2  material glass }', 'quad { origin -0.6 1.6 -0.6  u 0 0 1.2  v 1.2 0 0  material glass }', 'quad { origin -0.6 0.4 -0.6  u 0 0 1.2  v 0 1.2 0  material glass }', 'quad { origin 0.6 0.4 -0.6  u 0 1.2 0  v 0 0 1.2  material glass }', 'quad { origin -0.6 0.4 -0.6  u 0 1.2 0  v 1.2 0 0  material glass }', 'quad { origin -0.6 0.4 0.6  u 1.2 0 0  v 0 1.2 0  material glass }', 'quad { origin -0.4 0.6 -0.4  u 0 0 0.8  v 0.8 0 0  material glass }', 'quad { origin -0.4 1.4 -0.4  u 0.8 0 0  v 0 0 0.8  material glass }', 'quad { origin -0.4 0.6 -0.4  u 0 0.8 0  v 0 0 0.8  material glass }', 'quad { origin 0.4 0.6 -0.4  u 0 0 0.8  v 0 0.8 0  material glass }', 'quad { origin -0.4 0.6 -0.4  u 0.8 0 0  v 0 0.8 0  material glass }', 'quad { origin -0.4 0.6 0.4  u 0 0.8 0  v 0.8 0 0  material glass }']) + NL + LAMP % "-0.05 1.0 -0.05",
+        [], {r"\[light\] light 0 \([^)]*\) is born inside": False}),
+    "water_on_a_quad": (
+        # A box of water whose bottom shares its edges with a white quad: the water's faces are a closed
+        # piece of their own whatever they touch.
+        NL.join(['quad { origin -1 0 -1  u 2 0 0  v 0 0 2  material water }', 'quad { origin -1 2 -1  u 0 0 2  v 2 0 0  material water }', 'quad { origin -1 0 -1  u 0 0 2  v 0 2 0  material water }', 'quad { origin 1 0 -1  u 0 2 0  v 0 0 2  material water }', 'quad { origin -1 0 -1  u 0 2 0  v 2 0 0  material water }', 'quad { origin -1 0 1  u 2 0 0  v 0 2 0  material water }', 'quad { origin -1 0 -1  u 2 0 0  v 0 0 2  material white }']) + NL + LAMP % "-0.05 1.5 -0.05",
+        [], {r"\[light\] light 0 \([^)]*\) is born inside 'water'": True}),
     "inward_box": (
-        # Six quads closing a box, every one wound to face in (a quad's normal is u x v).
+        # Six quads closing a box, every one wound to face in (a quad's normal is u x v): the walks read
+        # a face's side off its winding (interfaceStep), so to them the lamp inside is outside the
+        # glass, and it starts so.
         NL.join([
             "quad { origin -0.5 0.5 -0.5  u 0 0 1  v 1 0 0  material glass }",
             "quad { origin -0.5 1.5 -0.5  u 1 0 0  v 0 0 1  material glass }",
@@ -84,7 +99,7 @@ CASES = {
             "quad { origin -0.5 0.5 -0.5  u 1 0 0  v 0 1 0  material glass }",
             "quad { origin -0.5 0.5 0.5  u 0 1 0  v 1 0 0  material glass }",
         ]) + NL + LAMP % "-0.05 1.0 -0.05",
-        [], {r"\[light\] light 0 \([^)]*\) is born inside 'glass'": True}),
+        [], {r"\[light\] light 0 \([^)]*\) is born inside": False}),
 }
 
 
@@ -100,7 +115,7 @@ def main():
         scn = os.path.join(out, name + ".ftsl")
         with open(scn, "w", encoding="utf-8", newline="") as f:
             f.write(HEAD + body + NL)
-        p = subprocess.run([exe, "-in", scn, "-mode", "R", "-device", "cpu", "-spp", "1", "-no-meter",
+        p = subprocess.run([exe, "-in", scn, "-mode", "R", "-device", "cpu", "-spp", "1", "-no-meter", "-window-min",
                             "-o", os.path.join(out, name + ".png")] + extra,
                            capture_output=True, text=True, encoding="utf-8", errors="replace")
         said = [l for l in (p.stdout + p.stderr).splitlines() if l.startswith(("[light] light", "[light] fire", "[camera]"))]

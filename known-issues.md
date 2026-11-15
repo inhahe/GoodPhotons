@@ -102,6 +102,63 @@ D against 0.8e-4 in mode B -- mode B spreads the focus it should make, so its li
 where the lens puts it. To narrow next: the photon walk's directions through the ball (the spot seen
 directly, not through the ball), and the outside-sphere connection's imaging of a sharp spot.
 
+## DONE (2026-11-15, 0.447.1): REVIEW-0446 — what the Opus (max) and Fable (xhigh) reviews of 0.446.0-0.447.0 found
+
+`/code-review max` (Opus, 14 findings) and `/code-review xhigh` (Fable, 15) of 7ba82c0..21f970f, one
+after the other in a worktree. Each checked against the code; all held. (both) where both found it.
+
+**Fixed in 0.447.1:**
+
+* **The hero mode-C catch through a physical lens took no leg absorption (Opus).** REVIEW-0445B gave
+  the scalar catch and the hero thin-lens catch theirs; the hero lens branch (host and device) now
+  takes the walk's medium over the leg to the front element too, and both hero catches count what it
+  absorbed (absorbToCatch / dAbsorbToCatch).
+* **A two-sided surface's back face kept the tangent frame's sign (both).** markBackFace turned ng,
+  `back` and the solid side but not `bitangentSign`, so a normal-mapped two-sided surface showed its
+  relief mirrored from behind. It turns all four now, host and device; intersectTri's NB says so.
+* **The enclosure probe read a face's side its own way (Fable).** `(h.solid > 0) == h.back` called the
+  air cavity of a hollow glass shell glass (the inner shell's piece is wound in). It reads the side
+  the walks read (met from behind), on closed pieces only, so a walk born there starts as one coming
+  in would have.
+* **A solid's closedness depended on what touched it (Fable), and the marking ran over everything at
+  every build (both).** markSolidFaces pooled every loose quad together, so a water box sharing edges
+  with a pool's quads was no closed piece; each enterable solid's loose faces are a pool of their own
+  now, and build() marks only the pieces holding such a material (`enclosuresOnly`), the rest left to
+  a footprint's batch.
+* **The glass-sphere connection lensed through a boundary the priority rule suppresses (Opus).** Such
+  a sphere is optically the medium around it: index 1, no reflection, that medium's absorption across
+  it (host and device).
+* **emit_two_sided was accepted on a closed mesh (both) and on a mix's layer (Fable).** The first threw
+  half its light into its own inside; the second never turned its back face (the face is settled before
+  the mix picks). Both are refused at load.
+* **The load report read nested solids backwards (both)**, listed a fire removed by -no-media (Opus),
+  placed a mesh light at (0 0 0), said a two-sided light twice and had no cap (Fable): innermost first,
+  bounded by the scene's fires, a mesh at its first triangle, the back face skipped, 16 lines and a
+  count. -no-media and -no-env now rebuild the births' stacks (the device's tables with them).
+* **warnCoincidentLamps (both):** a two-sided light's back face is skipped (it said each pair twice,
+  with contradictory remedies), a pair with a two-sided light gets its own remedy, and the tolerance
+  is each pair's own reach (a light a kilometre out had widened every pair's to millimetres).
+* **A back face kept an unshared spectrum copy (Fable)**, defeating the per-curve SPD table: it takes
+  the material's shared object as its front does.
+* **The probe's strand allowance (Opus)** was 1024 a ray, paid at each birth of a straddling light in
+  fur: 64.
+* **The mirror planes' flatness test (Fable)** was tighter than a file's rounded normals (a flat mirror
+  OBJ with 4-decimal normals could lose its plane): ~0.08 degrees.
+* **-radcache recomputed each cell's stack every round (Opus)**: a cell keeps it (RadCacheCell::stkN).
+* **Cleanups (both):** one strict on/off parse (onOffOf) for `two_sided` (which silently read anything
+  but on as off), `emit_two_sided`, `glow_only`, `hide_camera` and `caps`; `two_sided` refused on a
+  light other than an area; Scene::addBackFace; spdColumn for the three copies of the SPD cache's
+  re-pointing; bkNeeLightRGB's medium a required argument; enterableSolidMat's redundant test; the
+  stale Tri::solidFace and Hit::solid comments.
+* **The checks (both):** check_camera_legs adds mode C through a physical lens and ranks its water so
+  the ball's relative index is exercised; every pass test fails on a NaN or infinite ratio (a blacked
+  region had passed); check_enclosures and check_two_sided's loads pass -window-min; check_enclosures
+  adds a hollow glass box and a water box sharing edges with another quad, and reads an inward-wound
+  box as the walks do.
+
+**Not changed:** markBackFace keeps its four flips in one place with the intersectors' rule named
+(Opus suggested a shared helper; the flips have one host site and its device twin).
+
 ## DONE (2026-11-15, 0.446.1): REVIEW-0445B — what the Opus (max) and Fable (xhigh) reviews of 0.445.4-0.445.9 found
 
 `/code-review max` (Opus, 15 findings) and `/code-review xhigh` (Fable, 13) of b004c3b..7ba82c0, run

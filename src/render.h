@@ -2207,9 +2207,17 @@ struct Renderer {
         MediumStack around = cam.enclosure;
         around.popMat(scene.mats[(size_t)S.matId].solidId(S.matId));
         int extMat = -1;
-        n /= exteriorIor(scene, glass, around, lambda, extMat);
+        bool ranked = false;
+        n /= exteriorIor(scene, glass, around, lambda, extMat, &ranked);
+        // A boundary the priority rule suppresses lets every walk straight through (interfaceStep): the
+        // sphere is then, optically, the medium around it -- an index of 1, no reflection, that medium's
+        // absorption across it -- and the connection reads it so. `insideMat`: whose absorption the
+        // chord through it takes.
+        const bool suppressed = ranked && around.topMat() >= 0 && glass.priority <= around.topPri();
+        if (suppressed) n = 1.0;
+        const int insideMat = suppressed ? around.topMat() : S.matId;
         if (dEyeO <= r * 0.9999) {         // eye inside the glass -> single-refraction path
-            connectSpecularSphereInside(scene, cam, film, S, glass, n, around.topMat(), p, vt, lambda,
+            connectSpecularSphereInside(scene, cam, film, S, n, around.topMat(), insideMat, p, vt, lambda,
                                         beta, rng);
             return;
         }
@@ -2324,8 +2332,7 @@ struct Renderer {
 
             double contrib = beta * term * G * ch.Tf / omega;
             if (contrib <= 0.0) continue;
-            double aGlass = glass.absorb(lambda);           // Beer-Lambert inside the glass
-            if (aGlass > 0.0) contrib *= std::exp(-aGlass * ch.innerLen);
+            contrib *= legAbsorption(scene, insideMat, ch.innerLen, lambda);   // Beer-Lambert inside
 
             // Visibility on the two outer segments (the connecting sphere's own
             // surface is excluded by shortening maxDist just short of the endpoint).
@@ -2379,9 +2386,9 @@ struct Renderer {
     // sphere S: light travels p -> P1 (surface) -> refracts once -> eye. This is the
     // path the camera sees while flying THROUGH the glass. Planar in plane(eye,p,O).
     // `n`: S's index relative to the medium it refracts against; `aroundMat` the medium p lies in
-    // (-1: air), whose absorption the leg outside S takes.
+    // (-1: air), whose absorption the leg outside S takes; `insideMat` the one the leg inside it takes.
     void connectSpecularSphereInside(const Scene& scene, const Camera& cam, Film& film,
-                                     const Sphere& S, const Material& glass, double n, int aroundMat,
+                                     const Sphere& S, double n, int aroundMat, int insideMat,
                                      const Vec3& p, const SpecVtx& vt, double lambda,
                                      double beta, Pcg32& rng) const {
         const Vec3 O = S.c; const double r = S.r; const Vec3 eye = cam.eye;
@@ -2484,8 +2491,7 @@ struct Renderer {
             // L is what a ray keeps across the interface), as a camera walk refracting out reads it.
             double contrib = beta * term * G * ch.Tf / omega * (n * n);
             if (contrib <= 0.0) continue;
-            double aGlass = glass.absorb(lambda);           // Beer-Lambert eye->P1 (in glass)
-            if (aGlass > 0.0) contrib *= std::exp(-aGlass * ch.innerLen);
+            contrib *= legAbsorption(scene, insideMat, ch.innerLen, lambda);   // eye -> P1, inside S
 
             // Visibility on the exterior segment p -> P1 only (eye -> P1 is inside glass).
             if (scene.occluded(p + wP * 1e-6, wP, dP - 2e-6)) continue;
@@ -4486,6 +4492,20 @@ struct Renderer {
             double dEvent = h.valid ? h.t : 1e30;
 
             // Model C aperture catch: the photon physically threads the pupil.
+            // The leg to the camera's aperture or front element (tCatch long) runs in the walk's medium -- a
+            // camera inside a solid -- and takes its absorption per wavelength, counted as absorbed (the
+            // scalar catch's twin).
+            const auto absorbToCatch = [&](double tCatch) {
+                const int cmC = stk.topMat();
+                if (cmC < 0) return;
+                for (int i = 0; i < nUp; ++i) {
+                    const double a = scene.mats[(size_t)cmC].absorb(lam[i]);
+                    if (!(a > 0.0)) continue;
+                    const double tr = std::exp(-a * tCatch);
+                    e.absorbed += beta[i] * (1.0 - tr);
+                    beta[i] *= tr;
+                }
+            };
             if (forwardCatch && nCam > 0 && cams[0].cam && cams[0].film && cams[0].cam->hasLens()) {
                 // Through a physical lens. Entering the front element is geometry, the same
                 // for every live wavelength; inside, the glass disperses, so each wavelength is
@@ -4495,7 +4515,9 @@ struct Renderer {
                 int pxs[hero::kHeroMax], pys[hero::kHeroMax];
                 bool hit[hero::kHeroMax] = {};
                 Vec3 lo, ld;
-                if (cc.lensCatchEntry(ray, dEvent, lo, ld)) {
+                double tCatch = 0.0;   // how far the flight runs to the front element
+                if (cc.lensCatchEntry(ray, dEvent, lo, ld, &tCatch)) {
+                    absorbToCatch(tCatch);
                     for (int i = 0; i < nUp; ++i)
                         hit[i] = cc.lensCatchImage(lo, ld, lam[i], pxs[i], pys[i]) == Camera::LENS_CAUGHT;
                     const double cCell = cc.lensCellNorm();
@@ -4522,15 +4544,7 @@ struct Renderer {
                 double tCatch = 0.0;
                 if (cams[0].cam->catchPhoton(ray, dEvent, px, py, &tCatch)) {
                     const Camera& cc = *cams[0].cam;
-                    // The leg to the aperture, inside the walk's medium (scalar twin above).
-                    {
-                        const int cmC = stk.topMat();
-                        if (cmC >= 0)
-                            for (int i = 0; i < nUp; ++i) {
-                                const double a = scene.mats[(size_t)cmC].absorb(lam[i]);
-                                if (a > 0.0) beta[i] *= std::exp(-a * tCatch);
-                            }
-                    }
+                    absorbToCatch(tCatch);
                     double cCell = 1.0 / (cc.pixelPlaneArea() * cc.filmDist * cc.filmDist);
                     // first flight of an env photon: the env SEEN, bilinear (scalar twin above)
                     const bool envSeen = (bounce == 0 && envBorn);

@@ -3493,16 +3493,21 @@ A light walk starts inside the solids that enclose its birth (BIRTH-EMPTY-STACK,
 emitter or a fire inside a dielectric -- a lamp in a coloured glass globe, glass in water -- carries
 the solid's absorption from its birth to the wall and leaves into the medium around it, as the
 camera walks that went in after it do. `Scene::enclosureAt(p)` finds the closed solids containing a
-point: three fixed rays, each walking every face along it (64 surfaces, and up to 1024 strands
-besides, which enclose nothing); for each solid a walk goes inside (`Scene::encSolidOf`: a dielectric
-or a coated body clear at some wavelength, `enterableSolidMat`, as its original's solid; a mix as its
-first such part's, since its walks enter the part they resolve to) the first of its faces met along a
-ray says whether p is inside it -- the ray leaves it there, read off the face's side (`Hit::solid`) --
-a two-of-three vote settles it, and the stack lists them outermost (farthest) first, at most
-`kEnclosureMax` (8, the device stack's size). Only a face that bounds a closed solid counts:
-`buildEnclosures` runs `Scene::markSolidFaces` first wherever a walk can be inside anything, so an
-open sheet -- a window of one quad, a glass mesh with a hole -- encloses nothing, and an inward-wound
-closed mesh is read the right way round. `Scene::buildEnclosures`, at build, asks it at a few points
+point: three fixed rays, each walking every face along it (64 surfaces, and 64 strands besides,
+which enclose nothing -- a bound a straddling light pays at each birth); for each solid a walk goes
+inside (`Scene::encSolidOf`: a dielectric or a coated body clear at some wavelength,
+`enterableSolidMat`, as its original's solid; a mix as its first such part's, since its walks enter
+the part they resolve to) the first of its faces met along a ray says whether p is inside it -- met
+from behind, the side a walk reads at a face (interfaceStep's `entering`), so a walk born at p starts
+with the stack one coming in would have (a hollow glass shell's cavity is air; an inward-wound box's
+inside is outside its glass, to the walks and so to this) -- a two-of-three vote settles it, and the
+stack lists them outermost (farthest) first, at most `kEnclosureMax` (8, the device stack's size).
+Only a face that bounds a closed solid counts (`Hit::solid` not 0): `buildEnclosures` runs
+`Scene::markSolidFaces(enclosuresOnly)` first wherever a walk can be inside anything -- the mesh
+objects and assets holding such a material, and each such solid's loose faces as a pool of their own
+(so a water box closes whatever quads it touches) -- so an open sheet, a window of one quad or a glass
+mesh with a hole, encloses nothing. The full pass, every piece and the solid boxes, is left to a
+footprint's batch. `Scene::buildEnclosures`, at build, asks it at a few points
 on each emitter's emitting side (a quad's centre and four inset corners, off its face along its
 normal; a sphere's six poles; five of a mesh's triangles; a tube's wall at three heights and its
 caps; a spot's origin; a glow's own surface, drawn as its births are, its box only where no draw
@@ -3520,7 +3525,8 @@ coloured glass is absorbed per wavelength on its first leg (`tracePhotonHeroLoop
 `shadeStepHero`), the one leg a whole bundle spends inside glass, since entering a dielectric
 de-heros it. `tools/check_birth_stack.py` holds B, D, J, U, M and S, CPU and GPU, to mode R on two
 lamps inside an amber ball (`scenes/_birth_in_glass.ftsl`). At load ftrace names each light born
-inside a solid (or straddling one's surface) and each camera starting inside one;
+inside a solid (or straddling one's surface) and each camera starting inside one, innermost first
+("'glass' in 'water'"), a two-sided light once, and no more than 16 lights' lines;
 `tools/check_enclosures.py` reads those lines on small scenes, one per way the probe has gone wrong.
 
 The camera side has the same two halves (CAMERA-EMPTY-STACK, 0.445.8). Every camera walk starts inside
@@ -3610,10 +3616,16 @@ was lit differently by every mode (known-issues GLOW-LIGHT-MODES). Now:
   mirror surface only, and refuses it on a sphere or isosurface, which have an inside), so what reads
   that `ng` is the emission tests. Every estimator thus sees the face toward it, where two one-sided
   faces back to back leave the closest-hit test either (COINCIDENT-LAMP-FACES; the loader warns of
-  overlapping coplanar area lights, `warnCoincidentLamps`). By material rather than by triangle, so an
-  instanced asset's placements take it too. finalizeEmitters checks that every back face follows a
-  front of its surface and every two-sided surface with a light names a front, and eraseEmitter
-  refuses to remove one face. A mesh block's `power` on such a material is the two faces' total. `Tri::emitter` is its last field, as `Tri`s are built
+  overlapping coplanar area lights, `warnCoincidentLamps`, which takes a two-sided light once and a
+  tolerance from each pair's own panels). By material rather than by triangle, so an instanced asset's
+  placements take it too. `markBackFace` turns every field the intersectors keep relative to ng's side
+  together: ng, `back`, the solid side and the tangent frame's sign (`bitangentSign`, which a normal
+  map's frame reads). The loader refuses it on a mix's or stack's layer (the face is settled before
+  the compound picks one) and on a surface that closes a solid (watertight's closed pieces over the
+  material's triangles: its back faces would light only its inside). finalizeEmitters checks that
+  every back face follows a front of its surface and every two-sided surface with a light names a
+  front, and eraseEmitter refuses to remove one face; `Scene::addBackFace` adds one. A mesh block's
+  `power` on such a material is the two faces' total. `Tri::emitter` is its last field, as `Tri`s are built
   positionally (`Tri{v0, v1, v2, mat, -1, {}, uv0, uv1, uv2}`). So a material lights the scene
   through any number of emitters and stays one material: until then a hit's emitter was its
   material's, and every glowing surface after the first took a copy of its material (`name [2]`),
@@ -10921,7 +10933,9 @@ device versions do all the precision-critical math in `double` regardless of the
 
 The sphere refracts as a walk's interface does (since 0.446.1): against the camera's solids (but
 the sphere, for an eye inside it) where the priority rule ranks them (`exteriorIor`), else air, so
-`n` is the sphere's index over that; and an eye inside sees the radiance outside `n²` times over
+`n` is the sphere's index over that, and where the rule suppresses its boundary (a sphere of no
+higher priority than the medium around it, which the walks pass straight through) it is that
+medium, optically: an index of 1, no reflection, that medium's absorption across it; and an eye inside sees the radiance outside `n²` times over
 (the radiance theorem), as a camera walk refracting out of it reads it. It reads only the one refraction out, so the light a
 camera walk finds reflecting inside the sphere before it leaves is mode B's other paths' to find.
 
@@ -10936,8 +10950,9 @@ inverse-square law measured along the folded-out path. So the mirror estimator *
 `Scene::build` because it needs finalized `Tri::gn`) groups mirror-material triangles by a
 quantised `(n, d)` key — normal canonically oriented, since a mirror is two-sided — into
 `Scene::mirrorPlanes`, each carrying the plane, the member AABB and the total area.
-Only a face shaded flat joins (its corner normals all along its face normal): a smooth-shaded
-mesh's walks reflect off interpolated normals no facet's plane is, so it is left to them.
+Only a face shaded flat joins (its corner normals within ~0.08 degrees of its face normal, what a
+file's rounded normals leave a flat face): a smooth-shaded mesh's walks reflect off interpolated
+normals no facet's plane is, so it is left to them.
 That makes the per-photon-vertex cost **O(#mirror surfaces)**, not O(#mirror triangles),
 and it is capped at `kMaxMirrorPlanes = 64` (planar mirrors before smooth coats, then the
 largest-area planes win). The list uploads

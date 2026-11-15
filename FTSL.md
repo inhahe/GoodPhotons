@@ -1354,9 +1354,13 @@ face. `emit_two_sided on`, on a material with `emit`, makes both faces emit at o
 lit both ways, a glowing sign seen from either side, an emissive panel hung in a room -- and lights the
 scene from both in every mode (its light is two emitters, a face each); a `mesh` block's `power` is
 then the two faces' total. It is for sheets -- a quad, a polygon, an open mesh, a `mesh_instance` of
-one -- on a `diffuse`, `glossy` or `mirror` material, and is refused on a sphere or an isosurface
-(which have an inside) and on a material light crosses (whose faces tell which way a ray goes). With
-`glow_only on` it is a glow seen from both sides. A `light area`'s `two_sided on` is the same.
+one -- on a `diffuse`, `glossy` or `mirror` material, and is refused on a sphere, an isosurface or a
+mesh (or box of quads) that closes a solid (which have an inside), on a material light crosses (whose
+faces tell which way a ray goes), and on a layer of a `mix` or `layered` material (which face a ray
+meets is settled before the compound picks its layer). With `glow_only on` it is a glow seen from both
+sides. A `light area`'s `two_sided on` is the same, and is refused on any other kind of light. Both
+take `on` or `off` (or true/false, yes/no, 1/0), as `glow_only`, `hide_camera` and a tube's `caps`
+do: any other word is an error.
 
 ```
 material "sign" { type diffuse  reflect 0.05  emit blackbody 3200  emit_two_sided on }

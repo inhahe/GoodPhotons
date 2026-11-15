@@ -3185,6 +3185,18 @@ struct BackwardRenderer {
         return L;
     }
 
+    // The emitter-SPD cache for wavelength i alone, a monochromatic sub-path of the bundle it serves: the
+    // table is base-major with stride C, so its column i is the same table read from lam + i and iOff + i
+    // -- zero-copy, and matches(&lam, 1) still checks the sub-path's wavelength. Written into `col` and
+    // returned; null where there is no cache, or none for i (the sub-path evaluates the SPDs itself).
+    static const SpdCache* spdColumn(const SpdCache* spdCache, int i, SpdCache& col) {
+        if (!(spdCache && spdCache->lam && spdCache->base && i < spdCache->C)) return nullptr;
+        col = *spdCache;
+        col.lam  = spdCache->lam + i;
+        col.iOff = spdCache->iOff + i;
+        return &col;
+    }
+
     // Hero-wavelength variant of radiance(): carries C wavelengths (hero + C-1
     // stratified secondaries) down ONE camera path. Index 0 is the hero; it drives
     // every sampling decision with the same rng stream a single-wavelength path would,
@@ -3226,13 +3238,7 @@ struct BackwardRenderer {
                 if (invPdfIn[i] == 0.0) continue;
                 double sThr = 1.0, sL = 0.0;
                 SpdCache sCache;
-                const SpdCache* sCp = nullptr;
-                if (spdCache && spdCache->lam && spdCache->base && i < spdCache->C) {
-                    sCache = *spdCache;
-                    sCache.lam  = spdCache->lam + i;
-                    sCache.iOff = spdCache->iOff + i;
-                    sCp = &sCache;
-                }
+                const SpdCache* sCp = spdColumn(spdCache, i, sCache);   // wavelength i's column
                 int sFirst = -1;
                 GiCtx gs = gi;
                 if (i > 0) gs.first = gi.firstSec ? &sFirst : nullptr;
@@ -3635,14 +3641,8 @@ struct BackwardRenderer {
                     for (int i = 1; i < nUp; ++i) {
                         if (invPdf[i] == 0.0) continue;      // dead secondary (zero-mass λ bin)
                         double sLam = lam[i], sInv = invPdf[i], sThr = thr[i];
-                        SpdCache sCache;                     // re-point at λ_i's COLUMN
-                        const SpdCache* sCp = nullptr;
-                        if (spdCache && spdCache->lam && spdCache->base && i < spdCache->C) {
-                            sCache = *spdCache;              // same table, one λ column
-                            sCache.lam  = spdCache->lam + i;
-                            sCache.iOff = spdCache->iOff + i;
-                            sCp = &sCache;
-                        }
+                        SpdCache sCache;
+                        const SpdCache* sCp = spdColumn(spdCache, i, sCache);   // wavelength i's column
                         double sub[hero::kHeroMax];
                         // Its own first event: the slot as it stood before this vertex, which
                         // the re-entry notes again (firstSplitSlot).
@@ -3996,20 +3996,10 @@ struct BackwardRenderer {
                             double sPdf = contBsdfPdf;
                             MediumStack sStk = stk;
                             Ray sRay = ray;
-                            // Re-point the emitter-SPD cache at wavelength i's COLUMN. The
-                            // table is base-major with stride C, so bumping `iOff` by i makes
-                            // the sub-path's at(e, 0) read exactly emitter e at λ_i -- zero-
-                            // copy, and matches(&sLam, 1) still validates against lam[i].
-                            // Without this the cache would silently hand the sub-path the
-                            // HERO's SPD values.
+                            // The emitter-SPD cache at wavelength i's column: without it the
+                            // sub-path would read the HERO's SPD values.
                             SpdCache sCache;
-                            const SpdCache* sCp = nullptr;
-                            if (spdCache && spdCache->lam && spdCache->base && i < spdCache->C) {
-                                sCache = *spdCache;
-                                sCache.lam  = spdCache->lam + i;
-                                sCache.iOff = spdCache->iOff + i;
-                                sCp = &sCache;
-                            }
+                            const SpdCache* sCp = spdColumn(spdCache, i, sCache);   // wavelength i's column
                             bool sNull = false;
                             // Its own first event (firstSplitSlot): this vertex's, unless its
                             // own coverage coin passes it through, then its continuation's.
@@ -4262,8 +4252,23 @@ struct BackwardRenderer {
             seedUnit(rng, RadianceCache::mix(((uint64_t)slot << 24) ^ (uint64_t)(round + 1)),
                      0x9E3779B97F4A7C15ULL);
             // Its rays start inside the solids around the cell, as the camera paths that read it
-            // went in (Scene::eyeStack: none where no walk can be inside anything).
-            const MediumStack stk0 = scene.eyeStack(p + n * 1e-6);
+            // went in (Scene::eyeStack: none where no walk can be inside anything), found once a cell.
+            MediumStack stk0;
+            if (scene.anyEnterable) {
+                RadCacheCell& cw = rc.cell[slot];
+                if (cw.stkN >= 0 && cw.stkN <= RadCacheCell::kStkMax) {
+                    for (int s = 0; s < cw.stkN; ++s) stk0.push(cw.stkMat[s], cw.stkPri[s]);
+                } else {
+                    stk0 = scene.eyeStack(p + n * 1e-6);
+                    if (cw.stkN < 0) {
+                        cw.stkN = (int8_t)(stk0.n <= RadCacheCell::kStkMax ? stk0.n : RadCacheCell::kStkMax + 1);
+                        for (int s = 0; s < stk0.n && s < RadCacheCell::kStkMax; ++s) {
+                            cw.stkMat[s] = stk0.matIdx[s];
+                            cw.stkPri[s] = stk0.pri[s];
+                        }
+                    }
+                }
+            }
             for (int k = 0; k < nRays; ++k) {
                 const int    b   = rc.scheduleBin(round, k);
                 double       lam = rc.lambdaOfBin(b, rng.uniform());

@@ -2441,8 +2441,8 @@ start in air.) Only a closed solid encloses anything (since 0.446.1): a window o
 quad, or a glass mesh with a hole, has no inside, so a lamp or camera behind it starts in air. A
 `mix` with a glass part encloses as that glass. At load ftrace says which lights are born inside a
 solid (`[light] light 2 (area at ...) is born inside 'amber'`, or that one straddles a solid's
-surface) and which cameras start inside one (`[camera] 'c' starts inside 'water'`), so you can see
-that a lamp in a globe was found.
+surface) and which cameras start inside one (`[camera] 'c' starts inside 'glass' in 'water'`,
+innermost first), so you can see that a lamp in a globe was found.
 
 Priorities are **opt-in and safe to omit**: a scene that never writes `priority` renders
 exactly as before (each dielectric treated against air). Because that flat model is
