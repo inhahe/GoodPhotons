@@ -943,7 +943,7 @@ inline void randomWalk(const Scene& scene, const Camera& cam, const Renderer& ma
                        int maxDepth, Mode mode, Pcg32& rng, std::vector<Vertex>& path,
                        const double* betaSecIn, int nUpIn, Escape* esc = nullptr,
                        PathSegs* segs = nullptr, const BeamSpectral* bsIn = nullptr,
-                       JSpecWalk* jsw = nullptr) {
+                       JSpecWalk* jsw = nullptr, const MediumStack* stk0 = nullptr) {
     (void)cam;   // cam reserved for future NEE-to-camera use; mode now drives adjoint corr
     const double lambda = hb.lam[0];   // the hero drives geometry, sampling and every pdf
     if (maxDepth == 0) return;
@@ -1000,8 +1000,9 @@ inline void randomWalk(const Scene& scene, const Camera& cam, const Renderer& ma
     // Nested-dielectric medium stack (Schmidt & Budge 2002): the solids the subpath is
     // currently inside. Current medium (Beer-Lambert absorption + exterior IOR at the
     // next interface) = the highest-priority entry. Behaves like the old single-pointer
-    // `interior` for a lone dielectric.
-    MediumStack stk;
+    // `interior` for a lone dielectric. A light subpath starts inside the solids that enclose its
+    // birth (`stk0`, Scene::birthStack; BIRTH-EMPTY-STACK).
+    MediumStack stk = stk0 ? *stk0 : MediumStack{};
     auto curAbsorb = [&](double lam) -> double {
         int mi = stk.topMat();
         return (mi >= 0) ? scene.mats[mi].absorb(lam) : 0.0;
@@ -2095,8 +2096,9 @@ inline int deltaLightSubpath(const Scene& scene, const Camera& cam, const Render
     // exactly the same reason an area light does, and `spdFn(lambda) * invPdfLambda` is the
     // whole of the λ-dependence in `Le`.
     if (bs) beginBeamSpectral(scene, mats, em, em.spdFn(lambda) * invPdfLambda, rng, *bs);
+    const MediumStack stk0 = scene.birthStack((int)(&em - scene.emitters.data()), -1, ray.o);
     randomWalk(scene, cam, mats, ray, betaWalk, pdfDir, hb, maxDepth - 1,
-               Mode::Importance, rng, path, betaWalkSec, hb.C, nullptr, segs, bs);
+               Mode::Importance, rng, path, betaWalkSec, hb.C, nullptr, segs, bs, nullptr, &stk0);
     softenFirstBounce(path, segs);
     // Infinite-light density patch (PBRT): the first scene vertex was given a solid-angle
     // density converted with 1/dist^2 from the fictitious disc point, but the reverse
@@ -2156,8 +2158,9 @@ inline int fireLightSubpath(const Scene& scene, const Camera& cam, const Rendere
     const double k = 1.0 / (pick.pdf * pdfPos * pdfDir);
     double betaWalkSec[hero::kHeroMax - 1];
     for (int i = 0; i + 1 < hb.C; ++i) betaWalkSec[i] = L0.betaSec[i] * k;
+    const MediumStack stk0 = scene.birthStack(-1, pick.fire, x);
     randomWalk(scene, cam, mats, Ray{x, dir}, L0.beta * k, pdfDir, hb, maxDepth - 1,
-               Mode::Importance, rng, path, betaWalkSec, hb.C);
+               Mode::Importance, rng, path, betaWalkSec, hb.C, nullptr, nullptr, nullptr, nullptr, &stk0);
     softenFirstBounce(path, nullptr);
     return (int)path.size();
 }
@@ -2258,8 +2261,9 @@ inline int generateLightSubpath(const Scene& scene, const Camera& cam, const Ren
     // so that product is exactly what `scale` has to undo to recover the emitter-normalised
     // power a mode-M photon would have carried.
     if (bs) beginBeamSpectral(scene, mats, em, em.spdFn(lambda) * invPdfLambda, rng, *bs);
+    const MediumStack stk0 = scene.birthStack((int)(&em - scene.emitters.data()), -1, ray.o);
     randomWalk(scene, cam, mats, ray, betaWalk, pdfDir, hb, maxDepth - 1,
-               Mode::Importance, rng, path, betaWalkSec, hb.C, nullptr, segs, bs);
+               Mode::Importance, rng, path, betaWalkSec, hb.C, nullptr, segs, bs, nullptr, &stk0);
     softenFirstBounce(path, segs);
     return (int)path.size();
 }

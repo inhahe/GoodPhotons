@@ -72,6 +72,39 @@ closed entries, where the cost is a broken historical link rather than a blocked
 Three references — `scenes/_gr_fly0.ftsl`, `scenes/silver_sphere_xenon.ftsl`, `scenes/x.ftsl` —
 name files that no longer exist at all, all in closed entries.
 
+## OPEN (2026-11-15): CAMERA-EMPTY-STACK — a camera inside a dielectric starts its walks outside it
+
+The camera-side twin of BIRTH-EMPTY-STACK. Every camera walk starts with an empty dielectric stack
+(`MediumStack`): mode R's and W's radiance loops, scalar and hero (and the device's `bk*`), mode D's
+eye walk, the camera passes of M, S, P and U, and their device twins. For a camera in air that is
+right. For a camera inside a solid -- under water, inside a glass block, inside a lamp's globe -- it
+goes wrong in two ways, the same two the light walks had:
+  * coloured glass or water with an `absorb`: the camera's first leg carries no Beer-Lambert
+    absorption, from the eye to the solid's surface or to anything inside it;
+  * a solid inside the one the camera is in (a glass ball under water): it is entered from "air",
+    refracting 1.0 -> 1.5 instead of 1.33 -> 1.5, and its priority ranks against nothing.
+The radiance factor (n_from / n_to)^2 at the exit is right regardless: an exit takes the inside
+index from the material, not the stack. The forward tracer's splats are right too, carrying flux.
+Fix: seed each camera walk's stack from `Scene::enclosureAt` at the eye, once per camera at build
+(a thin lens's aperture is within a few millimetres of it), uploaded with the light tables, and
+held against mode B by a check with the camera inside an absorbing water tank.
+
+## NOTED (2026-11-15): COINCIDENT-LAMP-FACES — two lamp quads back to back on one plane read half as bright to every camera walk
+
+A two-sided panel lamp written as two `light area` quads on the same plane, facing opposite ways,
+gives every ray that meets the panel two faces at one distance, and the closest-hit test keeps
+either. A camera ray from below keeps the face pointing up about half the time, which emits
+nothing that way. So mode R, the camera walks of D, J and U, and NEE-less arrivals all see the
+panel at about half its radiance, while the light walks, born on the faces, are right. Light
+sampling is unaffected (a shadow ray ends short of the sampled face), so it shows where a camera
+walk sees the panel itself, or reaches it through glass with its NEE blocked. Measured on
+`_birth_in_glass`'s first draft, the lamp in clear glass (ior 1): mode R's walls read 0.42 of mode
+B's. With the faces 4 mm apart they agree to 1 % (0.00182 against 0.00180), and with no ball mode R
+read the panel's brightest pixel at a third of B's. No tracked scene does this (all of `scenes/`, scanned for
+coincident opposite-facing `light area` pairs). Remedies, not built: a `two_sided` option on
+`light area` (one face emitting both ways, sampled by side), or a load-time warning for
+coincident opposite-facing emitters.
+
 ## DONE (2026-11-14, 0.442.4 and 0.443.0): REVIEW-0442-FABLE — what Fable's review of 0.442.0-0.442.1 found
 
 `/code-review xhigh` (Fable) of 014762e..4c727e0, the second review GLOW-LIGHT-MODES' batch takes:
@@ -5195,7 +5228,32 @@ of the stored visible point. The alternative is to reorder a pass -- photons fir
 pixel's camera walk gathering at once -- which needs no per-pixel visible point at all; it
 touches the host pass, the device pipeline and the resident session alike.
 
-## OPEN (2026-10-13): BIRTH-EMPTY-STACK — a light walk born inside a dielectric does not know it is inside
+## DONE (2026-11-15, 0.445.5; opened 2026-10-13): BIRTH-EMPTY-STACK — a light walk born inside a dielectric does not know it is inside
+
+**Fixed.** Every light walk now starts inside the solids that enclose its birth (design.md, the
+nested-dielectric section): `Scene::enclosureAt` finds them by three rays and a two-of-three vote,
+`Scene::buildEnclosures` caches each emitter's and each fire's at build (or leaves a light that
+straddles a surface to ask per birth), and `birthStack` / `dBirthStack` seed the forward tracer's
+walks (scalar and hero), BDPT's three kinds of light subpath and mode U's, on both devices. The
+device's hero photon step had no Beer-Lambert at all, its bundles never having been inside glass
+whole: it takes the host's, per live wavelength.
+
+`tools/check_birth_stack.py`, on `scenes/_birth_in_glass.ftsl` (two lamps inside an amber ball,
+absorbing 0.5 / 3 / 9 per metre, in a white room), the walls' mean per channel against mode R on the
+GPU, three seeds: every mode within 0.8 % in red and green -- B 1.0009 / 0.9992 (CPU), 1.0010 /
+0.9987 (GPU); D 1.0002 / 1.0000, 1.0000 / 0.9975; J 1.0009 / 0.9968, 0.9994 / 0.9974; U 0.9993 /
+0.9991, 1.0010 / 0.9975; M 1.0064 / 1.0081, 1.0067 / 1.0050; S 1.0066 / 1.0042, 1.0071 / 1.0037.
+A build without the fix (0.445.2) read mode B (CPU) 1.546 / 3.669 / 11.8 there: the light left
+the ball unabsorbed.
+
+The check's first draft found a second thing on the way, not this bug: its lamp was two quads back
+to back on one plane, which mode R saw at about half its brightness (COINCIDENT-LAMP-FACES), and
+which first read as mode R being n^2 too dark inside glass. It reads the walls only: through the
+glass the ball shows the lamp, which mode B's light walks cannot reach a pinhole by.
+
+The camera side has the same gap: CAMERA-EMPTY-STACK.
+
+What it was:
 
 Every light walk starts with an empty dielectric stack (`MediumStack`): the forward tracer's
 births (`render.h`, emitters and fires alike), BDPT's light subpaths (`generateLightSubpath`,

@@ -603,6 +603,7 @@ struct DMaterial {
     // twin of Material::priority.
     int    priority;
     int    solidId;     // Material::solidId: the identity the medium stack knows this solid by
+    int    enterable;   // host enterableSolidMat: a walk goes inside it (dEnclosureAt)
     int    routeTo[2];  // Material::routeTo: a tagged instance's routed copies (ROUTE_D, ROUTE_J)
     int    absorbChroma;// Material::absorbChroma: `absorb` varies over the band
     // Parametric-record REFLECT binding (§records stage 6a — device twin of the CPU
@@ -1514,6 +1515,12 @@ struct DScene {
     // Volumetric blackbody emission ("fire", ROADMAP C3). Photon birth splits emitter-
     // vs-fire by power: grandTotal = totalPower + totalEmissionPower. Null/0 => no fire.
     const DEmissiveVolume* emissiveVolumes; int emissiveVolN;
+    // BIRTH-EMPTY-STACK (host twin Scene::emitterEnclosure / fireEnclosure, birthStack): each light's
+    // births' starting stack, its entries in encPool (solid, priority pairs) from encOff, encN of them;
+    // encN -1 where the light straddles a solid's boundary and each birth asks dEnclosureAt. encAny 0:
+    // the scene has nothing to be born inside.
+    const int* encEmOff; const int* encEmN; const int* encFireOff; const int* encFireN; const int* encPool;
+    int encAny;
     double           totalEmissionPower;
     int              hasGrin;  // 1 => some enabled medium carries an `ior` (GRIN) field.
                                // Gates the per-bounce Eikonal march (grin::sceneHasGrin twin);
@@ -12401,12 +12408,82 @@ __device__ static bool dApplyCausticAim(const DScene& sc, const DCamSet& cs,
 // `spec` (optional out) is the photon's SPECTRAL BUNDLE at birth (DBeamSpec): the extra
 // stratified wavelengths its beams may also carry. It is left empty unless the scene and the
 // emitter both qualify — see the fill site below.
+// Host twin Scene::enclosureAt (BIRTH-EMPTY-STACK, where the why is): the solids containing p, outermost
+// first, by three rays and a two-of-three vote on whether each solid's first face along them is met
+// from inside.
+__device__ static void dEnclosureAt(const DScene& sc, const DVec3& p, DMediumStack& stk) {
+    stk.clear();
+    const DVec3 dirs[3] = {DVec3(0.267261, 0.534522, 0.801784), DVec3(-0.693889, 0.191741, -0.694108),
+                           DVec3(0.401842, -0.887563, 0.225382)};
+    int sid[3][DMediumStack::CAP], spri[3][DMediumStack::CAP], nS[3] = {0, 0, 0};
+    double st[3][DMediumStack::CAP];
+    bool sin_[3][DMediumStack::CAP];
+    for (int k = 0; k < 3; ++k) {
+        const DVec3 d = normalize(dirs[k]);
+        DVec3 o = p;
+        double tAcc = 0.0;
+        for (int pass = 0; pass < 64; ++pass) {
+            const DHit h = closestHit(sc, o, d, RAY_EPS, BIG, /*camHide=*/false);
+            if (!h.valid) break;
+            tAcc += (double)h.t;
+            const DMaterial& m = sc.mats[h.matId];
+            if (m.enterable) {
+                bool known = false;
+                for (int i = 0; i < nS[k]; ++i) known = known || sid[k][i] == m.solidId;
+                if (!known && nS[k] < DMediumStack::CAP) {
+                    sid[k][nS[k]] = m.solidId;
+                    spri[k][nS[k]] = sc.mats[m.solidId].priority;
+                    st[k][nS[k]] = tAcc;
+                    sin_[k][nS[k]] = dot(d, h.ng) > (Real)0;
+                    ++nS[k];
+                }
+            }
+            o = dOffsetAlong(h.p, h.ng, d);
+        }
+    }
+    int inId[DMediumStack::CAP], inPri[DMediumStack::CAP], nIn = 0;
+    double inT[DMediumStack::CAP];
+    for (int k = 0; k < 3; ++k)
+        for (int i = 0; i < nS[k]; ++i) {
+            if (!sin_[k][i]) continue;
+            bool dup = false;
+            for (int j = 0; j < nIn; ++j) dup = dup || inId[j] == sid[k][i];
+            if (dup) continue;
+            int votes = 0;
+            double tMax = 0.0;
+            for (int kk = 0; kk < 3; ++kk)
+                for (int j = 0; j < nS[kk]; ++j)
+                    if (sid[kk][j] == sid[k][i] && sin_[kk][j]) { ++votes; if (st[kk][j] > tMax) tMax = st[kk][j]; }
+            if (votes >= 2 && nIn < DMediumStack::CAP) { inId[nIn] = sid[k][i]; inPri[nIn] = spri[k][i]; inT[nIn] = tMax; ++nIn; }
+        }
+    for (int a = 1; a < nIn; ++a)                    // farthest (outermost) first
+        for (int b = a; b > 0 && inT[b] > inT[b - 1]; --b) {
+            const int ti = inId[b]; inId[b] = inId[b - 1]; inId[b - 1] = ti;
+            const int tp = inPri[b]; inPri[b] = inPri[b - 1]; inPri[b - 1] = tp;
+            const double tt = inT[b]; inT[b] = inT[b - 1]; inT[b - 1] = tt;
+        }
+    for (int i = 0; i < nIn; ++i) stk.push(inId[i], inPri[i]);
+}
+// Host twin Scene::birthStack: the stack a walk born at `p`, of emitter `emitter` or emissive volume
+// `fire` (-1: not), starts with.
+__device__ static void dBirthStack(const DScene& sc, int emitter, int fire, const DVec3& p, DMediumStack& stk) {
+    stk.clear();
+    if (!sc.encAny) return;
+    int off = 0, n = 0;
+    if (emitter >= 0 && sc.encEmN) { off = sc.encEmOff[emitter]; n = sc.encEmN[emitter]; }
+    else if (fire >= 0 && sc.encFireN) { off = sc.encFireOff[fire]; n = sc.encFireN[fire]; }
+    else return;
+    if (n < 0) { dEnclosureAt(sc, p, stk); return; }
+    for (int i = 0; i < n; ++i) stk.push(sc.encPool[2 * (off + i)], sc.encPool[2 * (off + i) + 1]);
+}
+
 __device__ static bool genPhoton(const DScene& sc, const DCamSet& cs,
                                  int camMode, DRng& rng,
                                  DVec3& ro, DVec3& rd, Real& beta, Real& lambda, double& eEmitted,
                                  DBeamSpec* spec = nullptr, Real* causticW = nullptr,
-                                 int* emOut = nullptr) {
+                                 int* emOut = nullptr, int* fireOut = nullptr) {
     if (emOut) *emOut = -1;   // chord provenance (-sunnee): the emitter this photon is born on
+    if (fireOut) *fireOut = -1;   // the emissive volume it is born in (dBirthStack)
     if (spec) { spec->n = 0; spec->achro = 0; spec->cie = DVec3{0, 0, 0}; spec->emIdx = -1; }
     if (causticW) *causticW = (Real)1;
     // ROADMAP C3: split birth between surface/point/env emitters and volumetric "fire"
@@ -12422,6 +12499,7 @@ __device__ static bool genPhoton(const DScene& sc, const DCamSet& cs,
         double r = (double)rng.uniform() * sc.totalEmissionPower;
         int vi = 0;
         for (; vi + 1 < sc.emissiveVolN; ++vi) { r -= sc.emissiveVolumes[vi].power; if (r <= 0.0) break; }
+        if (fireOut) *fireOut = vi;
         const DEmissiveVolume ev = sc.emissiveVolumes[vi];
         const DMedium& fm = sc.media[ev.mediumIndex];
         // Uniform position in the grid AABB; lambda importance-sampled from the volume's
@@ -13642,8 +13720,17 @@ __device__ static int shadeStepHero(const DScene& sc, const DCamSet& cs, int cam
         }
     }
     if (pathC) pathC->bits &= ~PV_BIT_ENVFIRST;   // past its first flight
-    // (No Beer-Lambert while secAlive: entering a dielectric de-heros, so the stack is empty
-    // here and topMat() would be -1.)
+    // Beer-Lambert over the free path just travelled inside glass, per live wavelength. Entering a
+    // dielectric de-heros the bundle, so the one leg this meets whole is a birth inside a coloured
+    // solid (dBirthStack) on its way to the solid's wall. Host twin: tracePhotonHeroLoop.
+    {
+        const int cm = stk.topMat();
+        if (cm >= 0)
+            for (int i = 0; i < nUp; ++i) {
+                const Real a = (Real)specLookup(sc.mats[cm].absorb, lam[i]);
+                if (a > (Real)0) beta[i] *= exp(-a * dEvent);
+            }
+    }
     if (!h.valid) { for (int i = 0; i < nUp; ++i) eEscaped += (double)beta[i]; return WF_TERMINATE; }
     if (h.sensorId >= 0) { for (int i = 0; i < nUp; ++i) eSensor += (double)beta[i]; return WF_TERMINATE; }
 
@@ -13930,7 +14017,7 @@ __device__ static void traceHeroPhoton(const DScene& sc, const DCamSet& cs, int 
     int emH = -1;
     if (!genPhotonHero(sc, cs, camMode, C, rng, ro, rd, lam, beta, secAlive, eEmitted,
                        &bornCausticW, &emH)) return;
-    DMediumStack stk; stk.clear();
+    DMediumStack stk; dBirthStack(sc, emH, -1, ro, stk);   // born inside its enclosing solids
     bool done = false;
     // Caustic classification of the path so far (host twin: sawFocus/sawScatter in
     // Renderer::tracePhotonHero). It survives the de-hero handoff below because the two step
@@ -13998,10 +14085,12 @@ __global__ void kTrace(DScene sc, DCamSet cs, double* energy,
         // caustic deposit a path can make (causticaim.h). Exactly 1 without `-causticn`.
         Real bornCausticW = (Real)1;
         int srcEm = -1;   // chord provenance (-sunnee): the emitter this photon is born on
+        int srcFire = -1; // the emissive volume it is born in
         if (!genPhoton(sc, cs, camMode, rng, ro, rd, beta, lambda, eEmitted, &spec,
-                       &bornCausticW, &srcEm)) continue;
+                       &bornCausticW, &srcEm, &srcFire)) continue;
         bool done = false;
-        DMediumStack stk; stk.clear();   // nested-dielectric medium stack (empty = vacuum)
+        // nested-dielectric medium stack, born inside its birth's enclosing solids (BIRTH-EMPTY-STACK)
+        DMediumStack stk; dBirthStack(sc, srcEm, srcFire, ro, stk);
         // PHOTON-BEAMS: an INDEPENDENT per-photon stream used ONLY by the beam branch —
         // to resample each camera's in-scatter point (splat) or to roll the deposit's
         // Russian roulette and its beam-side transmittance (mode M). Seeded from the main
@@ -14122,11 +14211,19 @@ __device__ static bool wfSpawn(const DScene& sc, const DCamSet& cs,
         st.timeX[slot] = tx;
         DVec3 ro, rd; Real beta, lambda; double eEm = 0;
         Real bornCausticW = (Real)1;
-        int emW = -1;
-        if (genPhoton(sc, cs, camMode, rng, ro, rd, beta, lambda, eEm, nullptr, &bornCausticW, &emW)) {
+        int emW = -1, fireW = -1;
+        if (genPhoton(sc, cs, camMode, rng, ro, rd, beta, lambda, eEm, nullptr, &bornCausticW, &emW, &fireW)) {
             st.ro[slot] = ro; st.rd[slot] = rd;
             st.beta[slot] = beta; st.lambda[slot] = lambda;
-            st.bounce[slot] = 0; st.alive[slot] = 1; st.stkN[slot] = 0;
+            st.bounce[slot] = 0; st.alive[slot] = 1;
+            {   // born inside its enclosing solids (BIRTH-EMPTY-STACK)
+                DMediumStack b0; dBirthStack(sc, emW, fireW, ro, b0);
+                st.stkN[slot] = b0.n;
+                for (int i = 0; i < b0.n; ++i) {
+                    st.stkMat[slot * DMediumStack::CAP + i] = b0.matIdx[i];
+                    st.stkPri[slot * DMediumStack::CAP + i] = b0.pri[i];
+                }
+            }
             st.curveTmin[slot] = (Real)0;
             // Fresh photon: no vertex seen yet, so neither bit is set; the aimed pass's
             // weight is whatever emission just assigned it (1 without `-causticn`).
@@ -18717,7 +18814,8 @@ __device__ static void dRandomWalk(const DScene& sc, const DCamera& cam, int dif
                                    DEscape* esc = nullptr,
                                    DPathSeg* segs = nullptr, int* nSegs = nullptr,
                                    int maxSegs = 0, DJSpecRun* jrun = nullptr,
-                                   DJSpec* vspec = nullptr, float* compoundMergeW = nullptr) {
+                                   DJSpec* vspec = nullptr, float* compoundMergeW = nullptr,
+                                   const DMediumStack* stk0 = nullptr) {
     // `compoundMergeW`, if given, takes each vertex's share as a compound's merge vertex (host twin
     // Vertex::compoundMergeW): 1 over the chance the pick there went on, or 0 where it is none.
     const Real lambda = hb.lam[0];   // the hero drives geometry, sampling and every pdf
@@ -18727,7 +18825,9 @@ __device__ static void dRandomWalk(const DScene& sc, const DCamera& cam, int dif
     double betaSec[BDPT_NSEC];
     int nUp = nUpIn < 1 ? 1 : nUpIn;
     for (int i = 0; i + 1 < nUp; ++i) betaSec[i] = betaSecIn[i];
-    DMediumStack stk; stk.clear();   // nested-dielectric medium stack for exterior-IOR resolution
+    // nested-dielectric medium stack for exterior-IOR resolution; a light subpath starts inside its
+    // birth's enclosing solids (`stk0`, dBirthStack; BIRTH-EMPTY-STACK)
+    DMediumStack stk; if (stk0) stk = *stk0; else stk.clear();
     // A fiber's far-side exit clearance for the NEXT hop, curve primitives only (bdpt.h
     // randomWalk's `fiberFar` Ray, kVcmCameraT's twin). 0 everywhere off a strand, so a hair-free
     // walk traces exactly the rays it always did.
@@ -19408,9 +19508,10 @@ __device__ static int dGenLightSubpath(const DScene& sc, const DCamera& cam, int
         // out past them); the vertex stays on the disc, where its densities are measured.
         DVec3 walkFrom = org;
         if (isSun) dSkyEntryPastHaze(sc, walkFrom, dir, /*mayDrop=*/false);
+        DMediumStack stk0; dBirthStack(sc, ei, -1, walkFrom, stk0);
         dRandomWalk(sc, cam, diffraction, walkFrom, dir, betaWalkD, pdfDirD, hb, maxDepth - 1, rng,
                     path, pathSec, secStride, maxV, nD, true, betaWalkSecD, hb.C,
-                    nullptr, nullptr, nullptr, 0, nullptr, nullptr, compoundMergeW);
+                    nullptr, nullptr, nullptr, 0, nullptr, nullptr, compoundMergeW, &stk0);
         dSoftenFirstBounce(sc, path, pathSec, secStride, nD, hb.C, compoundMergeW);
         // Infinite-light density patch (PBRT): the first scene vertex was given a
         // solid-angle density converted with 1/dist^2 from the fictitious disc point, but
@@ -19482,9 +19583,10 @@ __device__ static int dGenLightSubpath(const DScene& sc, const DCamera& cam, int
     for (int i = 0; i + 1 < hb.C; ++i)
         betaWalkSec[i] = pathSec[i] * cosLight / (pdfChoice * pdfPos * pdfDir);
     DVec3 ro = y + nFace * (Real)1e-6;
+    DMediumStack stk0; dBirthStack(sc, ei, -1, ro, stk0);
     dRandomWalk(sc, cam, diffraction, ro, dir, betaWalk, pdfDir, hb, maxDepth - 1, rng,
                 path, pathSec, secStride, maxV, n, true, betaWalkSec, hb.C,
-                nullptr, nullptr, nullptr, 0, nullptr, nullptr, compoundMergeW);
+                nullptr, nullptr, nullptr, 0, nullptr, nullptr, compoundMergeW, &stk0);
     dSoftenFirstBounce(sc, path, pathSec, secStride, n, hb.C, compoundMergeW);
     return n;
 }
@@ -23129,10 +23231,10 @@ __global__ void kVcmLightT(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx,
             cieSz[k] = (double)cieZ(lamAll[k + 1]);
         }
         double cieLx = (double)cieX(lambda), cieLy = (double)cieY(lambda), cieLz = (double)cieZ(lambda);
-        DMediumStack stk; stk.clear();
         DVec3 prevP = y;
         DVec3 ro = y + nOut * (Real)1e-6;
         DVec3 rd = dir;
+        DMediumStack stk; dBirthStack(sc, ei, -1, ro, stk);   // born inside its enclosing solids
         int stored = 0;
         Real curveTmin = (Real)0;   // far-side fiber clearance for the NEXT hop (see the continuation)
         // A light vertex reached over more than maxDepth - 1 edges joins no path short enough
@@ -25577,6 +25679,7 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
         d.rgbIor = m.ior ? m.ior(550.0) : 1.0;
         d.priority = m.priority;        // nested-dielectric priority (INT_MIN == unset)
         d.solidId  = m.solidId((int)i); // routed copies of one material are one solid
+        d.enterable = enterableSolidMat(m) ? 1 : 0;
         d.routeTo[0] = m.routeTo[0]; d.routeTo[1] = m.routeTo[1];
         d.absorbChroma = m.absorbChroma ? 1 : 0;
         d.reflectTex = m.reflectTex;
@@ -26407,6 +26510,28 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
         sc.emissiveVolumes    = devs.empty() ? nullptr : (const DEmissiveVolume*)keep(uploadVec(devs));
         sc.emissiveVolN       = (int)devs.size();
         sc.totalEmissionPower = scene.totalEmissionPower;
+    }
+    {   // BIRTH-EMPTY-STACK: the lights' starting stacks (Scene::buildEnclosures)
+        std::vector<int> pool, emOff, emN, fireOff, fireN;
+        auto add = [&](const MediumStack& st, bool uniform, std::vector<int>& off, std::vector<int>& cnt) {
+            off.push_back((int)(pool.size() / 2));
+            if (!uniform) { cnt.push_back(-1); return; }
+            const int n = st.n < gpu::DMediumStack::CAP ? st.n : gpu::DMediumStack::CAP;
+            for (int i = 0; i < n; ++i) { pool.push_back(st.matIdx[i]); pool.push_back(st.pri[i]); }
+            cnt.push_back(n);
+        };
+        for (size_t i = 0; i < scene.emitterEnclosure.size(); ++i)
+            add(scene.emitterEnclosure[i], scene.emitterEnclosureUniform[i] != 0, emOff, emN);
+        for (size_t i = 0; i < scene.fireEnclosure.size(); ++i)
+            add(scene.fireEnclosure[i], scene.fireEnclosureUniform[i] != 0, fireOff, fireN);
+        bool any = false;
+        for (const Material& m : scene.mats) any = any || enterableSolidMat(m);
+        sc.encAny     = any ? 1 : 0;
+        sc.encEmOff   = emOff.empty()   ? nullptr : (const int*)keep(uploadVec(emOff));
+        sc.encEmN     = emN.empty()     ? nullptr : (const int*)keep(uploadVec(emN));
+        sc.encFireOff = fireOff.empty() ? nullptr : (const int*)keep(uploadVec(fireOff));
+        sc.encFireN   = fireN.empty()   ? nullptr : (const int*)keep(uploadVec(fireN));
+        sc.encPool    = pool.empty()    ? nullptr : (const int*)keep(uploadVec(pool));
     }
     sc.sensorOrigin = {scene.sensor.origin.x, scene.sensor.origin.y, scene.sensor.origin.z};
     sc.sensorUAxis  = {scene.sensor.uAxis.x,  scene.sensor.uAxis.y,  scene.sensor.uAxis.z};

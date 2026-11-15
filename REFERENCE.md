@@ -2428,6 +2428,11 @@ the GPU forward/backward/BDPT/photon backends). A `thinfilm` or `multilayer` bod
 substrate is a dielectric body too, coated: it takes `priority` the same way, and its coating
 interferes against the index of the medium around it (since 0.378.5). Like any refracting body
 it should be closed -- a ray that refracts in through an open surface stays "inside" it.
+A light inside a dielectric -- a lamp in a coloured glass globe, a fire in a glass jar, a glass
+lamp under water -- starts its light walks inside it (since 0.445.5), in every mode on both
+devices: ftrace finds the solids around each light at load, so its light is absorbed by the
+glass on its way to the wall and leaves into the medium around it rather than air. A light
+straddling a solid's surface is looked up per photon.
 
 Priorities are **opt-in and safe to omit**: a scene that never writes `priority` renders
 exactly as before (each dielectric treated against air). Because that flat model is

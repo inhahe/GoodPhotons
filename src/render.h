@@ -3173,6 +3173,7 @@ struct Renderer {
         // photon that never hits a surface pays nothing for any of this.
         const Emitter* foldEm = nullptr;
         int srcEmIdx = -1;   // chord provenance (-sunnee): the emitter this photon is born on; -1 = a volume (fire) birth
+        int srcFireIdx = -1; // the emissive volume it is born in, for its enclosing solids (birthStack)
         double foldT[kFoldBins];
         bool   foldChroma = false;
         const bool volumeBirth = !scene.emissiveVolumes.empty() &&
@@ -3181,6 +3182,7 @@ struct Renderer {
             // --- Volumetric blackbody birth (fire) ---
             // Select an emissive volume proportional to its power.
             const int vi = scene.pickFire(rng.uniform());
+            srcFireIdx = vi;
             const Scene::EmissiveVolume& ev = scene.emissiveVolumes[(size_t)vi];
             const Medium& fm = scene.media[ev.mediumIndex];
             // Uniform position in the grid AABB; wavelength importance-sampled from a
@@ -3433,7 +3435,8 @@ struct Renderer {
         // The current medium (for Beer-Lambert absorption and the exterior IOR at the
         // next interface) is the highest-priority entry (Schmidt & Budge 2002). Replaces
         // the old single `interior` pointer; behaves identically for a lone dielectric.
-        MediumStack stk;
+        // Born inside the solids that enclose its birth (Scene::birthStack, BIRTH-EMPTY-STACK).
+        MediumStack stk = scene.birthStack(srcEmIdx, srcFireIdx, ray.o);
         auto curAbsorb = [&](double lam) -> double {           // sigma_a of the current medium
             int mi = stk.topMat();
             return (mi >= 0) ? scene.mats[mi].absorb(lam) : 0.0;
@@ -4403,7 +4406,8 @@ struct Renderer {
         }
 
         Ray ray{origin + dir * 1e-6, dir};
-        MediumStack stk;                 // dielectric priority (Beer-Lambert uses hero λ)
+        // dielectric priority (Beer-Lambert uses hero λ), born inside its enclosing solids
+        MediumStack stk = scene.birthStack(ei, -1, ray.o);
         tracePhotonHeroLoop(scene, cams, nCam, sensorFilm, ray, stk, lam, beta,
                             secAlive, /*bounce0=*/0, rng, e, false, false,
                             /*envBorn=*/em.shape == EmitterShape::Env && scene.envMap != nullptr);
@@ -4502,9 +4506,9 @@ struct Renderer {
                 }
             }
 
-            // Beer-Lambert over the free path just travelled inside glass. A non-empty
-            // stack implies we've already de-hero'd (dielectric entry de-heros), so
-            // nUp == 1 whenever this is non-zero; the loop handles the general case.
+            // Beer-Lambert over the free path just travelled inside glass, per live wavelength.
+            // Dielectric entry de-heros the bundle, so the one leg this meets whole is a birth
+            // inside a coloured solid (Scene::birthStack) on its way to the solid's wall.
             {
                 int mi = stk.topMat();
                 if (mi >= 0)

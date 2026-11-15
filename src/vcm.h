@@ -725,7 +725,8 @@ inline void traceLightSubpath(const Scene& scene, const Camera& cam, const Rende
     double dVM  = dVC * ctx.misVcWeight;
 
     const Vec3 cie(cieX(lambda), cieY(lambda), cieZ(lambda));
-    MediumStack stk;                              // nested-dielectric medium stack
+    // nested-dielectric medium stack, born inside its birth's enclosing solids (BIRTH-EMPTY-STACK)
+    MediumStack stk = scene.birthStack(ei, -1, y + nOut * 1e-6);
     Vec3 prevP = y;
     Ray ray{y + nOut * 1e-6, dir};
 

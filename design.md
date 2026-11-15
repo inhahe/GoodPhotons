@@ -3489,6 +3489,29 @@ taken in the units of the medium the path is in (`localN2`: the stack top's n^2)
 walk, in the bundle loops, at a fur coat and at a strand -- so a path inside glass is cut, and
 filled, as its air-equivalent would be.
 
+A light walk starts inside the solids that enclose its birth (BIRTH-EMPTY-STACK, 0.445.5), so an
+emitter or a fire inside a dielectric -- a lamp in a coloured glass globe, glass in water -- carries
+the solid's absorption from its birth to the wall and leaves into the medium around it, as the
+camera walks that went in after it do. `Scene::enclosureAt(p)` finds the solids containing a point:
+three fixed rays, each walking every face along it; for each enterable solid (`enterableSolidMat`: a
+dielectric, or a coated body clear at some wavelength) the first of its faces met along a ray says
+whether p is inside it (met from inside, the ray leaving), a two-of-three vote settles it, and the
+stack lists them outermost (farthest) first. `Scene::buildEnclosures`, at build, asks it at a few
+points on each emitter's emitting side (a quad's centre and four inset corners, off its face along
+its normal; a sphere's six poles; five of a mesh's triangles; a spot's origin; a glow's box) and at
+each fire's box (centre and corners). Where the points agree, that is every birth's stack
+(`emitterEnclosure`, `fireEnclosure`); where they do not -- a light straddling a solid's surface --
+each birth asks (`birthStack`). A sun or an environment is born outside everything. Every light walk
+starts there: the forward tracer's, scalar and hero (and with it the photon passes of M and S), the
+three kinds of BDPT light subpath, and mode U's. The device mirrors it: `DMaterial::enterable`, the
+tables `DScene::encEmOff` / `encEmN` / `encFireOff` / `encFireN` / `encPool` (`encAny` 0 when no
+material is enterable), `dEnclosureAt` and `dBirthStack`, called by `kTrace`, `traceHeroPhoton`,
+the wavefront's spawn, `dRandomWalk` (its `stk0`) and mode U's light walk. A hero bundle born inside
+coloured glass is absorbed per wavelength on its first leg (`tracePhotonHeroLoop`,
+`shadeStepHero`), the one leg a whole bundle spends inside glass, since entering a dielectric
+de-heros it. `tools/check_birth_stack.py` holds B, D, J, U, M and S, CPU and GPU, to mode R on two
+lamps inside an amber ball (`scenes/_birth_in_glass.ftsl`).
+
 It cancels for the usual glass object, crossed in and out, which is why its absence went unseen
 until 0.378.1: it matters only when a camera path ends inside a dielectric and meets something the
 light side computed there -- photon density (modes M, S), merges (U, J), BDPT connections, an

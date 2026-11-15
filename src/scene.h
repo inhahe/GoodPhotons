@@ -16,6 +16,7 @@
 #include "bvh.h"
 #include "implicit.h"
 #include "curve.h"
+#include "medium_stack.h" // MediumStack: a birth's enclosing solids (BIRTH-EMPTY-STACK)
 #include "layered.h"     // A3: the stochastic layered model's escape moments       // curve / fiber primitive (hair, fur, grass, wire) — TODO §P1
 #include "pattern.h"
 #include "spectrum.h"
@@ -568,6 +569,17 @@ inline bool isSmoothCoatMat(const Material& m) {
     return m.type == MatType::Layered && m.roughness <= 0.0 && m.roughnessTex < 0 && m.roughnessPat < 0 &&
            m.recBindingFor(REC_SLOT_ROUGHNESS) == nullptr;
 }
+// A material whose body a walk goes inside, onto its MediumStack (render.h interfaceStep): a
+// dielectric, or a thin film or multilayer whose substrate lets light through at some wavelength (one
+// opaque at every wavelength reflects or absorbs, and is never entered).
+inline bool enterableSolidMat(const Material& m) {
+    if (m.type == MatType::Dielectric) return true;
+    if (m.type != MatType::ThinFilm && m.type != MatType::Multilayer) return false;
+    for (double L = LAMBDA_MIN; L <= LAMBDA_MAX; L += 10.0)
+        if (!m.coatOpaque(L)) return true;
+    return false;
+}
+
 // What the forward modes' closed-form connections reflect the eye in (Scene::mirrorPlanes,
 // mirrorSphereIdx; render.h connectSpecularPlane / connectSpecularSphereMirror): a planar mirror, or a
 // smooth coat. Only those connections: everywhere else a coat is a coat. Device twin dMirrorConnectsMat.
@@ -4537,6 +4549,160 @@ struct Scene {
     // when nothing was dropped, which is the overwhelming majority of scenes.
     Aabb droppedBounds;
 
+    // ---- BIRTH-EMPTY-STACK: the solids a light's walks are born inside ----------------------------
+    // A walk keeps the dielectric solids it is inside on a MediumStack, pushing a solid as it enters
+    // and popping it as it leaves; one born inside a solid -- a lamp in a coloured glass globe, a fire
+    // in a lantern, a light in a pool -- must start with it there, or it carries no absorption to the
+    // first wall and refracts out into "air" whatever encloses the solid.
+    //
+    // enclosureAt(p): the solids containing p, outermost first (as a walk coming in would have pushed
+    // them). Three rays from p, in fixed directions none of a scene's axes; along each, the first face
+    // of every enterable solid it meets says whether p is inside that solid (met from inside: the ray
+    // leaves it). A solid counts when two of the three agree, so one ray grazing an edge cannot decide.
+    // Order: by the distance at which the ray leaves, farthest (outermost) first.
+    MediumStack enclosureAt(const Vec3& p) const {
+        static const Vec3 kDirs[3] = {normalize(Vec3{0.267261, 0.534522, 0.801784}),
+                                      normalize(Vec3{-0.693889, 0.191741, -0.694108}),
+                                      normalize(Vec3{0.401842, -0.887563, 0.225382})};
+        struct Seen { int solid; int pri; double t; bool inside; };
+        Seen seen[3][16];
+        int nSeen[3] = {0, 0, 0};
+        const double eps = 1e-7 * (1.0 + std::max(std::fabs(p.x), std::max(std::fabs(p.y), std::fabs(p.z))));
+        for (int k = 0; k < 3; ++k) {
+            Ray r{p, kDirs[k]};
+            double tAcc = 0.0;
+            for (int pass = 0; pass < 64; ++pass) {
+                const Hit h = closestHit(r, eps);
+                if (!h.valid) break;
+                tAcc += h.t;
+                if (h.matId >= 0 && h.matId < (int)mats.size() && enterableSolidMat(mats[(size_t)h.matId])) {
+                    const int si = mats[(size_t)h.matId].solidId(h.matId);
+                    bool known = false;
+                    for (int i = 0; i < nSeen[k]; ++i) known = known || seen[k][i].solid == si;
+                    if (!known && nSeen[k] < 16)
+                        seen[k][nSeen[k]++] = Seen{si, mats[(size_t)si].priority, tAcc,
+                                                   dot(kDirs[k], h.ng) > 0.0};
+                }
+                r = Ray{h.p, kDirs[k]};
+            }
+        }
+        Seen in[16];
+        int nIn = 0;
+        for (int i = 0; i < nSeen[0] + nSeen[1] + nSeen[2]; ++i) {
+            const int k = i < nSeen[0] ? 0 : (i < nSeen[0] + nSeen[1] ? 1 : 2);
+            const Seen& c = seen[k][i - (k > 0 ? nSeen[0] : 0) - (k > 1 ? nSeen[1] : 0)];
+            if (!c.inside) continue;
+            bool dup = false;
+            for (int j = 0; j < nIn; ++j) dup = dup || in[j].solid == c.solid;
+            if (dup) continue;
+            int votes = 0;
+            double tMax = 0.0;
+            for (int kk = 0; kk < 3; ++kk)
+                for (int j = 0; j < nSeen[kk]; ++j)
+                    if (seen[kk][j].solid == c.solid && seen[kk][j].inside) {
+                        ++votes;
+                        tMax = std::max(tMax, seen[kk][j].t);
+                    }
+            if (votes >= 2 && nIn < 16) in[nIn++] = Seen{c.solid, c.pri, tMax, true};
+        }
+        std::sort(in, in + nIn, [](const Seen& a, const Seen& b) { return a.t > b.t; });
+        MediumStack stk;
+        for (int i = 0; i < nIn; ++i) stk.push(in[i].solid, in[i].pri);
+        return stk;
+    }
+    // Per emitter (index into `emitters`) and per emissive volume: the stack their births start with
+    // when it is the same over the whole light (`...Uniform`), probed at a few of its points just off
+    // its emitting face; where it is not (a light straddling a solid's boundary), each birth asks
+    // enclosureAt itself (birthStack). A sun or an environment is born outside everything.
+    std::vector<MediumStack> emitterEnclosure, fireEnclosure;
+    std::vector<char> emitterEnclosureUniform, fireEnclosureUniform;
+    static bool sameStack(const MediumStack& a, const MediumStack& b) {
+        if (a.n != b.n) return false;
+        for (int i = 0; i < a.n; ++i)
+            if (a.matIdx[i] != b.matIdx[i] || a.pri[i] != b.pri[i]) return false;
+        return true;
+    }
+    void buildEnclosures() {
+        emitterEnclosure.assign(emitters.size(), MediumStack{});
+        emitterEnclosureUniform.assign(emitters.size(), 1);
+        fireEnclosure.assign(emissiveVolumes.size(), MediumStack{});
+        fireEnclosureUniform.assign(emissiveVolumes.size(), 1);
+        bool anySolid = false;
+        for (const Material& m : mats) anySolid = anySolid || enterableSolidMat(m);
+        if (!anySolid) return;                      // nothing to be born inside: every stack empty
+        std::vector<Vec3> pts;
+        auto settle = [&](MediumStack& out, char& uniform) {
+            for (size_t i = 0; i < pts.size(); ++i) {
+                const MediumStack e = enclosureAt(pts[i]);
+                if (i == 0) out = e;
+                else if (!sameStack(out, e)) { uniform = 0; return; }
+            }
+        };
+        for (size_t ei = 0; ei < emitters.size(); ++ei) {
+            const Emitter& e = emitters[ei];
+            pts.clear();
+            const double off = 1e-5 * (1.0 + std::max(std::fabs(e.origin.x),
+                                                      std::max(std::fabs(e.origin.y), std::fabs(e.origin.z))));
+            switch (e.shape) {
+                case EmitterShape::Quad: {
+                    // The emitting side: the patch's own orientation (a leaning `normal` aims it).
+                    const Vec3 nrm = normalize(length(e.nGeom) > 0.0 ? e.nGeom : e.normal);
+                    static const double kAB[5][2] = {{0.5, 0.5}, {0.1, 0.1}, {0.9, 0.1}, {0.1, 0.9}, {0.9, 0.9}};
+                    for (const auto& ab : kAB) pts.push_back(e.origin + e.u * ab[0] + e.v * ab[1] + nrm * off);
+                    break;
+                }
+                case EmitterShape::Sphere:
+                    for (const Vec3& d : {Vec3{1, 0, 0}, Vec3{-1, 0, 0}, Vec3{0, 1, 0}, Vec3{0, -1, 0},
+                                          Vec3{0, 0, 1}, Vec3{0, 0, -1}})
+                        pts.push_back(e.origin + d * (e.radius + off));
+                    break;
+                case EmitterShape::Mesh: {
+                    const size_t n = e.meshTris.size();
+                    for (size_t k : {(size_t)0, n / 4, n / 2, (3 * n) / 4, n ? n - 1 : 0}) {
+                        if (k >= n) continue;
+                        const EmitTri& t = e.meshTris[k];
+                        pts.push_back(t.v0 + (t.e1 + t.e2) * (1.0 / 3.0) + normalize(t.nrm) * off);
+                    }
+                    break;
+                }
+                case EmitterShape::Spot:
+                    pts.push_back(e.origin);
+                    break;
+                case EmitterShape::Env:
+                case EmitterShape::Sun:
+                    break;                          // born outside the scene's bounds
+                default:                            // a cylinder, a glow: its box's centre and corners
+                    if (e.glowHi.x >= e.glowLo.x) {
+                        pts.push_back((e.glowLo + e.glowHi) * 0.5);
+                        pts.push_back(e.glowLo); pts.push_back(e.glowHi);
+                    } else {
+                        pts.push_back(e.origin);
+                    }
+                    break;
+            }
+            if (!pts.empty()) settle(emitterEnclosure[ei], emitterEnclosureUniform[ei]);
+        }
+        for (size_t fi = 0; fi < emissiveVolumes.size(); ++fi) {
+            const EmissiveVolume& v = emissiveVolumes[fi];
+            pts.clear();
+            pts.push_back((v.bmin + v.bmax) * 0.5);
+            for (int c = 0; c < 8; ++c)
+                pts.push_back(Vec3{(c & 1) ? v.bmax.x : v.bmin.x, (c & 2) ? v.bmax.y : v.bmin.y,
+                                   (c & 4) ? v.bmax.z : v.bmin.z});
+            settle(fireEnclosure[fi], fireEnclosureUniform[fi]);
+        }
+    }
+    // The stack a walk born at `origin`, of emitter `emitter` or emissive volume `fire` (-1: not), starts
+    // with.
+    MediumStack birthStack(int emitter, int fire, const Vec3& origin) const {
+        if (emitter >= 0 && (size_t)emitter < emitterEnclosure.size() && emitterEnclosureUniform[(size_t)emitter])
+            return emitterEnclosure[(size_t)emitter];
+        if (fire >= 0 && (size_t)fire < fireEnclosure.size() && fireEnclosureUniform[(size_t)fire])
+            return fireEnclosure[(size_t)fire];
+        if (emitter < 0 && fire < 0) return MediumStack{};
+        return enclosureAt(origin);
+    }
+
     // Finalize triangle normals and build the BVH. Call after all geometry is
     // added. Primitive index i: i < tris.size() -> tris[i]; else spheres[i-nTris].
     void build() {
@@ -4671,6 +4837,7 @@ struct Scene {
         finalizeEmitters();
         finalizeEmissiveVolumes();
         finalizeBowLuts();
+        buildEnclosures();   // after the lights and the BVH: their births' enclosing solids
         // After the coats, which append materials. A 1 nm scan, once, rather than a probe per walk:
         // a glass that absorbs only between the carriers' bin centres still absorbs.
         const int nm = (int)(LAMBDA_MAX - LAMBDA_MIN);
