@@ -411,7 +411,8 @@ Then the rest of 4.2-4.6 in their order, 4.7's bookkeeping alongside whatever to
 - [ ] **"`settle.drop()` falls back to the surface's TOP PLANE when the footprint 'misses'"** — find
   why the down-rays miss.
 - [ ] **"an `include`d file's own asset paths resolve through the ROOT scene"**.
-- [ ] **"`tools/_gemsweep.py` — `spread` is not resolution-stable"**.
+- [x] **"`tools/_gemsweep.py` — `spread` is not resolution-stable"** — metered on a fixed-world cell
+  (`GEMCELL`); the orb's caustic reads alike at 480 and 960 px.
 - [x] **"`tools/_capchroma.py` scores marble VEINS as a caustic"** — meters over the frame's albedo
   and position passes; refuses a textured cap without them.
 - [x] **"`python -m loom.viewer` prints a runpy double-import RuntimeWarning"** (cosmetic): the

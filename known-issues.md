@@ -24671,7 +24671,7 @@ to before.
 **Standing lesson.** A rendering CLI's console output can be broken in a way that no
 redirected test will ever catch. When touching terminal output, check it in a real console.
 
-### OPEN (2026-08-05): `tools/_gemsweep.py` — `spread` is not resolution-stable and can invert a ranking
+### DONE (2026-11-14): `tools/_gemsweep.py` — `spread` is not resolution-stable and can invert a ranking
 
 Found while adjudicating a box vs sphere clip for `gallery_rain`'s crystal gyroid. `coverage`
 is a *count* of cells above the cut, so it is stable across render resolution (the same
@@ -24703,6 +24703,17 @@ for), and/or weight by excess over a fixed *world-area* normalisation instead of
 Until then: **never rank two pieces measured at different `GEMRES`**, and stamp the
 resolution into every printed row (`_remeter.py` already prints `[NNNpx]`; `_gemsweep.py`'s
 own sweep header prints it once but the per-row lines do not carry it).
+
+**Fixed: the metered cell is a fixed patch of cap.** `GEMCELL` metres on a side (default 2.92 cm,
+the old 4-pixel box at 480 px), the box being however many pixels make that at `GEMRES`, and every
+row prints its resolution and cell (`[960px 2.92cm]`). The population the statistics describe is then
+the same at any resolution. Measured on the orb at drop 0.25, where its focus lands on the cap (a
+real caustic, peak 111x / 114x): coverage 0.63 % / 0.63 %, sat 0.226 / 0.220, spread 0.042 / 0.052,
+at 480 / 960 px. What spread still moves is the render's own: a pixel's filter blurs the caustic's
+coloured fringe less at 960 px, so a cell there holds slightly purer colour. (At drop 0.90, the
+gallery's, the orb throws no caustic on the cap: its focus lies 0.67 m along the sun's ray and the
+cap 2.6 m, so the beam has spread over about eight times the shadow -- and `solid10` and `slab10`
+read 0 % coverage there too, at both resolutions.)
 
 ### DONE (2026-08-05): `tools/_gemsweep.py` — `-fireflies 3` did not hold at the rig's own prescribed finalist setting
 

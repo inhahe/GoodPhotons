@@ -44,12 +44,22 @@ CAP_Y = 0.85
 CX, CZ = 3.0, 3.0
 HALF = 1.75             # half-width of the metered patch, metres
 # 480/600 is the SWEEP setting -- cheap enough to run a dozen geometries.  It is NOT enough to
-# adjudicate a close call: at 480 with a 4x box the metered patch is 120x120 = 14400 cells, so
-# a 0.13%-coverage caustic is 19 of them and `fan` (which needs 20) comes back unmeasurable.
-# `GEMRES=960 GEMSPP=1200` for a finalist; cells go up 4x and the render cost about 8x.
+# adjudicate a close call, which wants `GEMRES=960 GEMSPP=1200` for its finalists (render cost about
+# 8x): each metered cell then holds 4x the pixels and 2x the samples a pixel, so its noise falls.
 RES = int(os.environ.get('GEMRES', '480'))
 SPP = int(os.environ.get('GEMSPP', '600'))
-DOWN = 4                # box factor that averages the hero-wavelength speckle away
+# THE METERED CELL IS A FIXED PATCH OF CAP, `GEMCELL` metres on a side (default 2.92 cm, the
+# 4-pixel box at 480): the box is however many pixels make that at RES.  The statistics are taken
+# over the cells that clear the cut, so a cell that shrank with the resolution changed the
+# population they describe -- a finer grid resolves faint fringe into cells that clear the bar,
+# with noisier colour than the core -- and `spread` was not comparable across resolutions: a
+# sphere- against a box-clipped gyroid read 0.014 / 0.022 at 480 px and 0.060 / 0.012 at 960, the
+# ranking inverted.  The patch is 120 x 120 = 14400 cells at any RES, so a 0.13 %-coverage caustic is
+# 19 of them and `fan` (which needs 20) is unmeasurable at any RES: give it a smaller GEMCELL, and
+# never rank rows metered on different cells (each row prints its own).
+CELL = float(os.environ.get('GEMCELL', str(2 * HALF * 4 / 480)))
+DOWN = max(1, round(CELL * RES / (2 * HALF)))   # box factor: averages the hero-wavelength speckle away
+CELL = DOWN * 2 * HALF / RES                      # the cell as the grid realises it
 # A cell is "caustic" at this multiple of the bare cap.  2.0 is the right bar for a LENS,
 # but it hides a whole class of piece: a prism deviates and disperses without CONVERGING, so
 # its coloured band never gets above ~1x the bare sunlight and scores a flat zero here.  Set
@@ -707,14 +717,11 @@ def measure(png, label):
             row.append(c)
         grid.append(row)
 
-    # SPIKE REJECTION AT THE CELL LEVEL, because `-fireflies 3` and the 4x box together are
-    # NOT enough and the failure is worst exactly where the rig is trusted most.  Measured:
-    # one geometry (`solid10`, drop 0.90) reported peak 3.00x / sat 0.182 / spread 0.014 at
-    # 480px/600spp and peak 1179.42x / sat 0.844 / spread 0.672 at the 960px/1200spp setting
-    # this file's own docstring prescribes for finalists -- same piece, same optics, garbage
-    # numbers.  Raising resolution puts FEWER samples in each metered cell, so a single hero-
-    # wavelength spike is diluted less by the box, and the finalist setting is therefore the
-    # most contaminated one rather than the least.
+    # SPIKE REJECTION AT THE CELL LEVEL, because `-fireflies 3` and the box together are NOT
+    # enough: a single hero-wavelength spike can carry more light than the whole cell around it.
+    # Measured on a 4-pixel box at both settings: one geometry (`solid10`, drop 0.90) reported
+    # peak 3.00x / sat 0.182 / spread 0.014 at 480px/600spp and peak 1179.42x / sat 0.844 /
+    # spread 0.672 at 960px/1200spp -- same piece, same optics, garbage numbers.
     #
     # The discriminator is the one the sampler cannot fake, and it is already written down in
     # this file: A CAUSTIC IS NEVER ISOLATED -- its neighbours are bright too, because it is
@@ -816,7 +823,7 @@ def measure(png, label):
     # says it is ARRANGED rather than just loud.  Both live in `_pfm.py` so this rig and
     # `_capchroma.py` score pieces on one implementation.
     spread, noise = scatter(chroma), scatter(ctrl)
-    print(f'  {label:22s} peak {peak/bg:5.2f}x   coverage {cov:5.2f}%   '
+    print(f'  {label:22s} [{RES}px {100 * CELL:.2f}cm]   peak {peak/bg:5.2f}x   coverage {cov:5.2f}%   '
           f'sat {sat:.3f}   spread {spread:.3f}   '
           f'noise {noise:.3f}/fan {fmt(fan(ctrl))}   fan {fmt(fan(chroma))}'
           f'{"" if not spikes else f"   [{len(spikes)} spike cells dropped]"}')
@@ -850,7 +857,7 @@ def measure(png, label):
 
 if __name__ == '__main__':
     print(f'over a bare cap, {RES}x{RES} / {2*HALF:.1f} m, {SPP} spp, '
-          f'{DOWN}x box, caustic = >{CUT:g}x cap\n'
+          f'{DOWN}x box ({100 * CELL:.2f} cm cells), caustic = >{CUT:g}x cap\n'
           f'sun elevation {math.degrees(math.asin(SUN[1])):.1f} deg (from '
           f'{"GEMSUN" if os.environ.get("GEMSUN") else "scenes/gallery_rain.ftsl"}), '
           f'window {GEMOFF} m downwind, hole {HOLE:g} m\n')
