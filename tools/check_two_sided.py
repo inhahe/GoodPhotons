@@ -1,19 +1,24 @@
-"""Regression check: a `two_sided on` area light is two one-sided panels back to back, in every mode.
+"""Regression check: a surface emitting from both faces is two one-sided ones back to back, in every mode.
 
     python tools/check_two_sided.py [--out png/check_two_sided] [--exe ftrace.exe] [--no-gpu]
 
 COINCIDENT-LAMP-FACES. Two `light area` quads on one plane, back to back, leave the closest-hit test
 either face, so a camera walk saw such a panel at about half its light. `two_sided on` makes one
-surface of two lights, whose back face a hit from behind meets (Tri::emitsBack).
+surface of two lights, whose back face a hit from behind meets (Material::emitsBack), and a
+material's `emit_two_sided on` the same.
 `scenes/_two_sided_lamp.ftsl` hangs one in a white room, its `normal` up and `power 20`, the camera
 below it: the camera sees the back face directly and the ceiling, lit by the front face, beyond it.
-Three parts:
+Four parts:
   * the modes: R, B, D, J, U, M and S, CPU and GPU, each against itself on the reference -- two
     one-sided panels of `power 10`, 1 mm apart -- the panel's face, the ceiling and the lower frame
     within 2 % and 5 standard errors over the seeds;
   * the warning: the same two panels on one plane, back to back and facing alike, warn at load,
     and the two-sided light and the reference do not;
-  * the refusal: `two_sided on` with an aimed (leaning) normal fails to load.
+  * the refusal: `two_sided on` with an aimed (leaning) normal fails to load, as does
+    `emit_two_sided on` on a sphere and on a dielectric;
+  * the materials: an `emit_two_sided` glowing quad, the same reflecting half the light that meets it,
+    and an instanced glowing mesh, each against two one-sided ones 1 mm apart, in modes R, B, D and M
+    on both devices, as the light is.
 Without the back face a camera walk sees the panel black from below. Exits 1 on any failure.
 """
 import argparse
@@ -52,6 +57,41 @@ SEEDS_OF = {"S": tuple(range(1, 9)), "J": (1, 2, 3, 4)}
 TOL = 0.02
 REGIONS = ("panel", "ceiling", "lower frame")
 WARNING = "overlap on one plane"
+
+# The materials (emit_two_sided): one emitting from both faces, its one-sided twin, and the same pair
+# reflecting half the light that meets them.
+MATS = NL.join([
+    'material "glowpanel" { type diffuse  reflect 0.0  emit preset:bb6500  emit_two_sided on }',
+    'material "glowone" { type diffuse  reflect 0.0  emit preset:bb6500 }',
+    'material "sheen" { type diffuse  reflect 0.5  emit preset:bb6500  emit_two_sided on }',
+    'material "sheenone" { type diffuse  reflect 0.5  emit preset:bb6500 }'])
+
+
+def quad(y, ny, mat):
+    # The panel's rectangle at height y, facing up (ny 1) or down (-1): a quad's normal is u x v.
+    if ny > 0:
+        return "quad { origin -0.25 %s -0.25  u 0 0 0.5  v 0.5 0 0  material %s }" % (y, mat)
+    return "quad { origin -0.25 %s -0.25  u 0.5 0 0  v 0 0 0.5  material %s }" % (y, mat)
+
+
+def instance(asset, y, ny):
+    # meshes/uvquad.obj (the unit square in z = 0, facing +z) turned to face up or down, the panel.
+    if ny > 0:
+        return ('mesh_instance { of "%s"  scale 0.5  rotate -90 0 0  translate -0.25 %s 0.25 }' % (asset, y))
+    return ('mesh_instance { of "%s"  scale 0.5  rotate 90 0 0  translate -0.25 %s -0.25 }' % (asset, y))
+
+
+ASSETS = NL.join(['mesh_asset "q2" { file "meshes/uvquad.obj"  material glowpanel }',
+                  'mesh_asset "q1" { file "meshes/uvquad.obj"  material glowone }'])
+MATERIAL_VARIANTS = [
+    ("glow_quad", MATS + NL + quad("1.0", 1, "glowpanel"),
+     MATS + NL + quad("0.9995", -1, "glowone") + NL + quad("1.0005", 1, "glowone")),
+    ("reflecting_glow", MATS + NL + quad("1.0", 1, "sheen"),
+     MATS + NL + quad("0.9995", -1, "sheenone") + NL + quad("1.0005", 1, "sheenone")),
+    ("glow_instance", MATS + NL + ASSETS + NL + instance("q2", "1.0", 1),
+     MATS + NL + ASSETS + NL + instance("q1", "0.9995", -1) + NL + instance("q1", "1.0005", 1)),
+]
+MATERIAL_MODES = ("R", "B", "D", "M")
 
 
 def variant(out, name, light):
@@ -137,6 +177,44 @@ def main():
             print("%s: mode %s on the %s, two-sided of the reference: %s"
                   % ("FAIL" if bad.any() else "ok", mode, dev.upper(),
                      ", ".join("%s %.4f (+- %.4f)" % (r, x, e) for r, x, e in zip(REGIONS, q, err))), flush=True)
+    # The materials: a glowing sheet, one reflecting half the light that meets it, and an instanced one.
+    for name, why in (("sphere", "an inside"), ("dielectric", "light crosses")):
+        bad_scene = {"sphere": MATS + NL + "sphere { center 0 1 0  radius 0.2  material glowpanel }",
+                     "dielectric": 'material "glassglow" { type dielectric  ior 1.5  emit preset:bb6500  '
+                                   'emit_two_sided on }' + NL + quad("1.0", 1, "glassglow")}[name]
+        p = run(exe, ["-in", variant(out, "refuse_" + name, bad_scene), "-o",
+                      os.path.join(out, "load_refuse_%s.png" % name)] + probe)
+        good = p.returncode != 0 and "emit_two_sided" in p.stdout + p.stderr
+        ok = ok and good
+        print("%s: emit_two_sided on a %s (%s) %s" % ("ok" if good else "FAIL", name, why,
+                                                    "is refused" if p.returncode != 0 else "loads"), flush=True)
+    for vname, two, refl in MATERIAL_VARIANTS:
+        vscene, vref = variant(out, vname, two), variant(out, vname + "_ref", refl)
+        img = render(exe, out, vref, vname + "_mask", ["-mode", "R", "-device", "cpu", "-spp", "64"], 1)
+        pan = img > 0.5 * img.max()
+        vmasks = [pan, (rows < h // 8) & ~pan, (rows >= h - h // 3) & ~pan]
+        if not pan.any() or any(not m.any() for m in vmasks):
+            raise SystemExit("a region is empty in %s: the frame is not the one this check reads" % vname)
+
+        def vstats(scene, tag, args):
+            v = np.array([[render(exe, out, scene, tag, args, s)[m].mean() for m in vmasks] for s in SEEDS])
+            return v.mean(0), v.std(0, ddof=1) / np.sqrt(len(SEEDS))
+
+        for mode, args in CASES:
+            if mode not in MATERIAL_MODES:
+                continue
+            for dev in devs:
+                full = ["-mode", mode, "-device", dev] + args
+                tm, tse = vstats(vscene, "%s_%s_%s_two" % (vname, mode, dev), full)
+                rm, rse = vstats(vref, "%s_%s_%s_ref" % (vname, mode, dev), full)
+                q = tm / rm
+                err = np.hypot(tse / rm, rse * tm / (rm * rm))
+                bad = (np.abs(q - 1.0) > TOL) & (np.abs(q - 1.0) > 5.0 * err)
+                ok = ok and not bad.any()
+                print("%s: %s, mode %s on the %s, two-sided of the reference: %s"
+                      % ("FAIL" if bad.any() else "ok", vname, mode, dev.upper(),
+                         ", ".join("%s %.4f (+- %.4f)" % (r, x, e) for r, x, e in zip(REGIONS, q, err))),
+                      flush=True)
     print("PASS" if ok else "FAILED")
     return 0 if ok else 1
 

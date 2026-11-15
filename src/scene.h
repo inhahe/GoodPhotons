@@ -163,6 +163,10 @@ struct Material {
     // lights anything with it (Scene::isGlow). Every other emissive surface gets an emitter at load
     // (ftsl.h registerGlows) and lights the scene as a light does.
     bool glowOnly = false;
+    // Both faces emit, at one radiance: `two_sided on` on a light block, `emit_two_sided on` on an
+    // emissive material. Its light is two emitters, a face each, the front face's and then the back
+    // face's (Emitter::backFace), and a hit from behind meets the back face (Scene::markBackFace).
+    bool emitsBack = false;
     // The surface a `light` block (or a built-in scene's lamp) makes: it emits and reflects
     // nothing, so a path that meets it can end there. Any other emissive material -- `emit` on
     // a material of its own -- may also reflect, and a path is walked on through it.
@@ -1148,6 +1152,9 @@ struct Emitter {
     // camera-ray hit on a light surface back to its emitter for the s=0 MIS term
     // (pdfLightOrigin = selection prob * 1/area). Set by the scene builders.
     int matId = -1;
+    // The back face of a two-sided surface's light (Material::emitsBack): the emitter before it is
+    // the front face's, alike but for the side it emits from (Scene::backFaceOf).
+    bool backFace = false;
     double radius = 0.0;      // sphere radius (Sphere); tube radius (Cylinder)
     // Cylinder (fluorescent-tube) light: `origin` is the base-cap center, `v` is the
     // axis vector (its length = the tube length), and `u`/`normal` are an orthonormal
@@ -2182,7 +2189,10 @@ struct Scene {
         const Vec3 c = cross(e1, e2);
         const double l = length(c);
         y = p[0] + e1 * b1 + e2 * b2;
-        const double toward = flat ? dot(c, nk[0] + nk[1] + nk[2]) : dot(c0, et.nrm);
+        // The side it emits from: its normal's at the instant -- for a flat face, its corner normals'
+        // then, turned as et.nrm turns from them (a two-sided surface's back face: Emitter::backFace).
+        const double toward = flat ? dot(c, nk[0] + nk[1] + nk[2]) * (dot(et.nrm, t.n0 + t.n1 + t.n2) >= 0.0 ? 1.0 : -1.0)
+                                   : dot(c0, et.nrm);
         n = (l > 0.0) ? c * ((toward >= 0.0 ? 1.0 : -1.0) / l) : et.nrm;
         areaScale = l / l0;
         return true;
@@ -3150,6 +3160,17 @@ struct Scene {
         emitters.push_back(std::move(e));
     }
 
+    // The back face of a two-sided surface's front-face light `e` (Material::emitsBack): the same
+    // surface emitting from its other side, a quad's normal or a mesh's triangle normals turned.
+    static Emitter backFaceOf(const Emitter& e) {
+        Emitter b = e;
+        b.backFace = true;
+        b.normal = e.normal * -1.0;
+        b.nGeom = e.nGeom * -1.0;
+        for (EmitTri& t : b.meshTris) t.nrm = t.nrm * -1.0;
+        return b;
+    }
+
     // Register a spherical area light: a glowing ball of radius r at center c.
     // area = 4*PI*r^2 feeds the same power law (power = emitIntegral*area*PI) and
     // the same 1/area point-sampling pdf as a quad. u/v/normal are unused.
@@ -3428,19 +3449,28 @@ struct Scene {
                 emitterOfMat[(size_t)m] = (emitterOfMat[(size_t)m] == -1) ? (int)e : kEmitterByPrim;
         }
         tagLightSurfaces();
-        // A two-sided light's triangles name its front face, the emitter after it its back
-        // (Tri::emitsBack): they must be that pair, or a hit from behind would light by another.
-        for (const Tri& t : tris) {
-            if (!t.emitsBack) continue;
-            const int f = t.emitter;
-            const bool ok = f >= 0 && f + 1 < (int)emitters.size() &&
-                            emitters[(size_t)f].shape == EmitterShape::Quad &&
-                            emitters[(size_t)f + 1].shape == EmitterShape::Quad &&
-                            emitters[(size_t)f].matId == matBase(t.matId) &&
-                            emitters[(size_t)f + 1].matId == emitters[(size_t)f].matId &&
-                            dot(emitters[(size_t)f].normal, emitters[(size_t)f + 1].normal) < 0.0;
-            if (!ok) throw std::logic_error("finalizeEmitters: a two-sided light's triangle names no pair of faces");
+        // A two-sided surface's light is a pair: its front face's emitter, then its back face's
+        // (Emitter::backFace). A hit from behind names the one after the front its surface names
+        // (markBackFace), so each back face must follow a front of its surface, and each surface of a
+        // two-sided material that has a light must name a front with its back after it.
+        for (size_t e = 0; e < emitters.size(); ++e) {
+            const Emitter& b = emitters[e];
+            if (!b.backFace) continue;
+            const bool ok = e > 0 && !emitters[e - 1].backFace && emitters[e - 1].shape == b.shape &&
+                            emitters[e - 1].matId == b.matId &&
+                            (b.shape == EmitterShape::Quad || b.shape == EmitterShape::Mesh);
+            if (!ok) throw std::logic_error("finalizeEmitters: a back face's light follows no front of its surface");
         }
+        const auto pairOk = [&](int matId, int e) {
+            if (matId < 0 || (size_t)matId >= mats.size() || !mats[(size_t)matId].emitsBack || e < 0) return true;
+            return (size_t)e + 1 < emitters.size() && !emitters[(size_t)e].backFace && emitters[(size_t)e + 1].backFace;
+        };
+        for (const Tri& t : tris)
+            if (!pairOk(t.matId, t.emitter))
+                throw std::logic_error("finalizeEmitters: a two-sided surface names no pair of faces");
+        for (const MeshInstance& in : instances)
+            for (const auto& [m, e] : in.emitOf)
+                if (!pairOk(m, e)) throw std::logic_error("finalizeEmitters: a two-sided placement names no pair of faces");
         // Adopt each emitter's emission profile from the material on its geometry. Done
         // here — one place, after every registration path — rather than threading an
         // extra argument through addAreaLight / addMeshLight / the built-in scenes.
@@ -5117,14 +5147,13 @@ struct Scene {
     // removed one's surfaces have none. The caller finalizes the emitters again.
     void eraseEmitter(int idx) {
         if (idx < 0 || idx >= (int)emitters.size()) return;
+        // A two-sided surface's faces are a pair (Emitter::backFace): removing one leaves none.
+        if (emitters[(size_t)idx].backFace ||
+            ((size_t)idx + 1 < emitters.size() && emitters[(size_t)idx + 1].backFace))
+            throw std::logic_error("eraseEmitter: one face of a two-sided light");
         emitters.erase(emitters.begin() + idx);
         const auto fix = [idx](int& e) { if (e == idx) e = -1; else if (e > idx) --e; };
-        for (Tri& t : tris) {
-            // A two-sided light's faces are a pair (Tri::emitsBack): removing one leaves none.
-            if (t.emitsBack && (t.emitter == idx || t.emitter + 1 == idx))
-                throw std::logic_error("eraseEmitter: one face of a two-sided light");
-            fix(t.emitter);
-        }
+        for (Tri& t : tris) fix(t.emitter);
         for (Implicit& im : implicits) fix(im.emitter);
         for (int& e : sphereEmitter) fix(e);
         for (MeshInstance& in : instances)
@@ -5452,9 +5481,25 @@ struct Scene {
             }
         };
         traverseWorldClosest(r, tmin, tMax, leaf, stats, skipHair);
+        markBackFace(h);
         markPatSide(h);
         applyNormalMap(h);
         return h;
+    }
+
+    // A surface whose material emits from both faces (Material::emitsBack) met from behind is its back
+    // face, turned to the ray: ng and the solid side turn, `back` clears (n already faced the ray), and
+    // its light is the back face's, the emitter after the front's its primitive names (a glow's none).
+    // The one hit whose ng faces the ray (intersectTri's NB): such a material lets no light through
+    // (the loader refuses it on one that does), so what reads ng there is the emission tests, which
+    // pass and name that face. Device twin: closestHit's tail.
+    void markBackFace(Hit& h) const {
+        if (!h.valid || !h.back || h.matId < 0 || h.matId >= (int)mats.size() || !mats[(size_t)h.matId].emitsBack)
+            return;
+        h.ng = h.ng * -1.0;
+        h.back = false;
+        h.solid = (signed char)-h.solid;
+        if (h.emitter >= 0) h.emitter += 1;
     }
 
     // Hit::patOwnSide: the surface's own material (h.matId here, before any mix resolves) lets
@@ -5821,6 +5866,7 @@ struct Scene {
             for (const auto& cs : curveSegs) intersectCurveNow(cray, r, cs, curveMin(r, tmin), h);
         }
         for (const auto& inst : instances) intersectInstanceNow(r, inst, tmin, h, nullptr);
+        markBackFace(h);
         markPatSide(h);
         applyNormalMap(h);
         return h;

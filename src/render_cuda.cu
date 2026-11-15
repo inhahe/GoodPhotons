@@ -597,6 +597,7 @@ struct DMaterial {
     // dEmitterForHit() < 0, so an emitter's surface never counts twice.
     int    matIsLight;
     int    matReflectsNothing;   // Material::reflectsNothing: a light block's own surface
+    int    emitsBack;            // Material::emitsBack: both faces emit (closestHit's tail)
     // Device twin of Material::hideCamera — primary visibility off. Only the bounce-0
     // camera ray of a gather/backward path skips this material; every other ray sees it.
     // See Material::hideCamera (scene.h) for why the flag exists at all, and
@@ -710,8 +711,7 @@ struct DMediumStack {
 struct DTri    { DVec3 v0, v1, v2, gn; DVec3 uv0, uv1, uv2; DVec3 n0, n1, n2; int matId, sensorId;
                  DVec3 tangent;
                  unsigned char solid;                    // Tri::solidFace: 1 normals out, 2 in, 0 neither
-                 unsigned char emitsBack;                // Tri::emitsBack (both in FP32's padding
-                                                         // before bitangentSign)
+                                                         // (in FP32's padding before bitangentSign)
                  Real bitangentSign;                     // C6 tangent frame for normal mapping (+-1)
                  int emitter;                            // Tri::emitter (with the sign, 8 B: DTri stays 168)
                  double curvature;                       // O3 per-face mean curvature (Tri::finalize)
@@ -4464,10 +4464,6 @@ __device__ static inline void dTriFill(const DVec3& rd, const DTri& tri, Real t,
     hit.curv = (Real)(flipped ? -tri.curvature : tri.curvature);
     hit.vcol = tri.vcol; hit.vb0 = b0; hit.vb1 = b1;
     hit.fiberRadius = (Real)0;                 // `hit` is a reused record: not a strand
-    // A two-sided light met from behind is its back face, turned to the ray (host twin intersectTri).
-    if (tri.emitsBack && flipped) {
-        hit.ng = -gn; hit.back = false; hit.solid = -hit.solid; hit.emitter = tri.emitter + 1;
-    }
 }
 __device__ static bool intersectTri(const DTriShear& sh, const DVec3& ro, const DVec3& rd,
                                      const DTri& tri, Real tmin, DHit& hit) {
@@ -5142,7 +5138,11 @@ __device__ __noinline__ static DEmitNow dDeformedEmitOut(const DScene& sc, const
     const DVec3 c = cross(e1, e2);
     const double l = (double)length(c);
     r.y = p[0] + e1 * (Real)b1 + e2 * (Real)b2;
-    const double toward = flat ? (double)dot(c, nk[0] + nk[1] + nk[2]) : (double)dot(c0, et->nrm);
+    // The side it emits from, as et->nrm turns from the corner normals (host twin deformedEmitPoint).
+    const DTri& tt = sc.tris[tri];
+    const double toward = flat ? (double)dot(c, nk[0] + nk[1] + nk[2]) *
+                                     ((double)dot(et->nrm, tt.n0 + tt.n1 + tt.n2) >= 0.0 ? 1.0 : -1.0)
+                               : (double)dot(c0, et->nrm);
     r.n = (l > 0.0) ? c * (Real)((toward >= 0.0 ? 1.0 : -1.0) / l) : et->nrm;
     r.J = l / l0;
     r.ok = 1;
@@ -5482,6 +5482,11 @@ __device__ static DHit closestHit(const DScene& sc, const DVec3& ro, const DVec3
     if (timed && dTimedClosest(sc, ro, rd, invD, sh, tmin, curveTmin, tMax, h, camHideOn))
         hInst = -1;                                // a mover's hit, in world space already
     if (hInst >= 0) instanceHitToWorld(sc, sc.instances[hInst], h);
+    // A surface emitting from both faces met from behind is its back face (host twin Scene::markBackFace).
+    if (h.valid && h.back && h.matId >= 0 && sc.mats[h.matId].emitsBack) {
+        h.ng = -h.ng; h.back = false; h.solid = -h.solid;
+        if (h.emitter >= 0) h.emitter += 1;
+    }
     h.patOwnSide = h.valid && h.matId >= 0 && sc.mats[h.matId].patOwnSide;   // host twin Scene::markPatSide
     dApplyNormalMap(sc, h);   // C6: perturb shading normal by a bound normal map
     return h;
@@ -25698,7 +25703,6 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
         d.emitter = t.emitter;
         d.curvature = t.curvature;      // O3 per-face mean curvature (from Tri::finalize)
         d.solid = t.solidFace;          // PROBE-SOLID-SIDE (markSolidFaces)
-        d.emitsBack = t.emitsBack ? 1 : 0;
         d.matId = t.matId; d.sensorId = t.sensorId;
         d.vcol  = t.vcol;               // per-vertex colour (Scene::vertColors), or -1
         d.reach = (Real)t.reach;
@@ -26019,6 +26023,7 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
         // CSG/quadric solids). bakeSpec of a null Spectrum yields all zeros, so a
         // non-emissive material costs nothing but the storage.
         d.matIsLight = m.isLight ? 1 : 0;
+        d.emitsBack = m.emitsBack ? 1 : 0;
         d.matReflectsNothing = m.reflectsNothing ? 1 : 0;
         d.hideCamera = m.hideCamera ? 1 : 0;
         d.route = m.route;

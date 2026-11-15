@@ -1348,6 +1348,20 @@ forward layer) see such a glow only where the camera sees it directly, as they s
 material "neon" { type diffuse  reflect 0.02  emit gaussian 528 34 0.5  glow_only on }
 ```
 
+**`emit_two_sided on` — a surface that glows on both faces** (since 0.447.0). Emission is
+one-sided: a surface emits toward its front, the side its winding (a `quad`'s `u`×`v`) or its normals
+face. `emit_two_sided on`, on a material with `emit`, makes both faces emit at one radiance -- a sheet
+lit both ways, a glowing sign seen from either side, an emissive panel hung in a room -- and lights the
+scene from both in every mode (its light is two emitters, a face each); a `mesh` block's `power` is
+then the two faces' total. It is for sheets -- a quad, a polygon, an open mesh, a `mesh_instance` of
+one -- on a `diffuse`, `glossy` or `mirror` material, and is refused on a sphere or an isosurface
+(which have an inside) and on a material light crosses (whose faces tell which way a ray goes). With
+`glow_only on` it is a glow seen from both sides. A `light area`'s `two_sided on` is the same.
+
+```
+material "sign" { type diffuse  reflect 0.05  emit blackbody 3200  emit_two_sided on }
+```
+
 Refused, unless the material is `glow_only`: an emissive material on a curve or `fur` (nothing
 samples a strand), as the child of a `mix` or `layered` material (the share of the surface it
 covers varies), on an isosurface whose motion stretches it unevenly, and on `mesh_instance`

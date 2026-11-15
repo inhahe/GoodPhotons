@@ -3595,7 +3595,10 @@ differ only in the order of `u` and `v`, and only the second one lights up. Ever
 *reflective* slot looks identical either way — direct lighting flips the normal toward the
 light itself — so a mis-wound emissive quad shades perfectly normally and silently loses
 just its glow. If a glowing panel or floor renders as a plain lit surface, swap `u` and `v`
-first.
+first. For a surface meant to glow on **both** faces, give its material `emit_two_sided on`
+(since 0.447.0; a diffuse, glossy or mirror surface, not a sphere or isosurface): both faces
+then emit at the material's radiance and light the scene in every mode, a `mesh` block's
+`power` being their total.
 
 ---
 

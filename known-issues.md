@@ -34786,7 +34786,7 @@ of its energy" (false) from "the rig cannot see specular" (true). It is the same
 earlier retracted glossy claim, where a mirror also read exactly 0 in both modes and I walked past
 it.
 
-## OPEN (2026-08-04): a quad's emission is invisible from the side its winding faces away from
+## DONE (2026-08-04; 0.447.0): a quad's emission is invisible from the side its winding faces away from
 
 The backward tracer only adds a surface's own emission when the camera/specular ray strikes
 the FRONT face:
@@ -34819,6 +34819,16 @@ load time when a scene contains an emissive `quad` whose normal faces away from 
 Option (a) matches what people actually author (a glowing panel), and the one-sided rule is
 only really load-bearing for closed `isosurface`/mesh solids, whose normals are already
 outward.
+
+**0.447.0: option (b), `emit_two_sided on`** (EMIT-TWO-SIDED): both faces emit, by the mechanism a
+two-sided `light area` uses (Material::emitsBack, Scene::markBackFace; design.md, "A hit finds its
+emitter by its primitive"). Not (a): making every emissive quad two-sided by default would change
+the light of every scene with one, half of it thrown behind panels that are meant to light one way
+(a ceiling panel would light the void above). Not (c): a warning for an emissive surface facing away
+from every camera would fire on every lamp whose back is to the camera, which is most of them -- what
+the warning was for, a glow seen from its back, is what (b) lets the author ask for.
+`tools/check_two_sided.py` holds the option to two faces 1 mm apart, for a quad, an instanced mesh
+and a reflecting glow.
 
 ## ~~OPEN~~ **DONE (v0.275.0)** (2026-08-04): `type glossy` had no direct-lighting term in the backward modes (R / W)
 

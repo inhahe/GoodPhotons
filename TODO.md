@@ -303,7 +303,7 @@ Then the rest of 4.2-4.6 in their order, 4.7's bookkeeping alongside whatever to
 - [x] **LEG-TRANSMITTANCE** — one call for a leg's whole transmittance (media and its solid's
   absorption) at every connection site, host and device, and a walk's starting stack a required
   argument rather than GiCtx::stk0's pointer (REVIEW-0445B's last two findings).
-- [ ] **EMIT-TWO-SIDED** — `emit_two_sided on` for emissive materials (a glowing quad or mesh sheet
+- [x] **EMIT-TWO-SIDED** (0.447.0) — `emit_two_sided on` for emissive materials (a glowing quad or mesh sheet
   lit both ways), the back face decided by material at the hit's finalizer rather than by triangle,
   so instances take it too; known-issues "a quad's emission is invisible from the side its winding
   faces away from".

@@ -3598,16 +3598,22 @@ was lit differently by every mode (known-issues GLOW-LIGHT-MODES). Now:
   (`Scene::tagLightSurfaces`) tags the surfaces of each material with a single emitter -- a light
   block's own, a built-in scene's -- and warns of an emissive surface of a material several
   emitters share that has none (`emitterOfMat`, `kEmitterByPrim`, which also answers `isGlow`). `Scene::eraseEmitter` renumbers every tag when an
-  emitter is removed (`-noenv`). A two-sided area light (`two_sided on`, 0.446.0) is two `Quad`
-  emitters, its front face's and then its back face's, on one rectangle whose two triangles carry
-  `Tri::emitsBack` (device `DTri::emitsBack`, in the padding beside `solid`) and the front's
-  index: `intersectTri` / `dTriFill` turn such a triangle's hit from behind to face the ray (`ng`,
-  `back` false, the solid side with them) and name the back face (`emitter + 1`). It is the one
-  primitive whose `ng` faces the ray, and it ends every walk that meets it, so what reads that `ng`
-  is the emission tests. Every estimator thus sees the face toward it, where two one-sided quads
-  back to back leave the closest-hit test either (COINCIDENT-LAMP-FACES; the loader warns of
-  overlapping coplanar area lights, `warnCoincidentLamps`). finalizeEmitters checks that each such
-  triangle names such a pair, and eraseEmitter refuses to remove one face. `Tri::emitter` is its last field, as `Tri`s are built
+  emitter is removed (`-noenv`). A surface that emits from both faces -- a `light area` with
+  `two_sided on` (0.446.0), a material with `emit_two_sided on` (0.447.0) -- has `Material::emitsBack`,
+  and its light is a pair of emitters, its front face's and then its back face's (`Emitter::backFace`,
+  made by `Scene::backFaceOf`: a quad's normal or a mesh's triangle normals turned; a deforming face's
+  sample turns with them), its surfaces naming the front. The closest-hit's finalizer
+  (`Scene::markBackFace`, device `closestHit`'s tail, after an instance's hit is put in the world)
+  turns a hit from behind on such a material to face the ray (`ng`, `back` false, the solid side with
+  them) and names the back face (`emitter + 1`; a `glow_only` surface none). It is the one hit whose `ng`
+  faces the ray, on a material no light crosses (the loader allows the option on a diffuse, glossy or
+  mirror surface only, and refuses it on a sphere or isosurface, which have an inside), so what reads
+  that `ng` is the emission tests. Every estimator thus sees the face toward it, where two one-sided
+  faces back to back leave the closest-hit test either (COINCIDENT-LAMP-FACES; the loader warns of
+  overlapping coplanar area lights, `warnCoincidentLamps`). By material rather than by triangle, so an
+  instanced asset's placements take it too. finalizeEmitters checks that every back face follows a
+  front of its surface and every two-sided surface with a light names a front, and eraseEmitter
+  refuses to remove one face. A mesh block's `power` on such a material is the two faces' total. `Tri::emitter` is its last field, as `Tri`s are built
   positionally (`Tri{v0, v1, v2, mat, -1, {}, uv0, uv1, uv2}`). So a material lights the scene
   through any number of emitters and stays one material: until then a hit's emitter was its
   material's, and every glowing surface after the first took a copy of its material (`name [2]`),

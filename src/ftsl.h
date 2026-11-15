@@ -5326,6 +5326,28 @@ private:
             }
             m.glowOnly = on;
         }
+        // `emit_two_sided on`: both faces of the surface emit, at one radiance (Material::emitsBack) --
+        // for a sheet (a quad, a polygon, an open mesh), of a material no light crosses, whose faces
+        // then say nothing of which way a ray goes; registerGlows refuses it on a solid primitive.
+        if (find(b, "emit_two_sided")) {
+            const std::string g = strOf(b, "emit_two_sided", "off");
+            const bool on = (g == "on" || g == "true" || g == "yes" || g == "1");
+            if (!on && g != "off" && g != "false" && g != "no" && g != "0") {
+                fail("emit_two_sided takes on or off (got '" + g + "')");
+                return m;
+            }
+            if (on && !m.isLight) {
+                fail("emit_two_sided on a material that does not emit: give it an `emit`");
+                return m;
+            }
+            if (on && m.type != MatType::Diffuse && m.type != MatType::Glossy && m.type != MatType::Mirror) {
+                fail(std::string("emit_two_sided on a ") + matTypeName(m.type) + " material: only an opaque "
+                     "diffuse, glossy or mirror surface may emit from both faces -- one that light crosses "
+                     "tells which way a ray goes by the face it meets");
+                return m;
+            }
+            m.emitsBack = on;
+        }
         // Tangent-space NORMAL MAP (C6): `normal_map texture:<name> [strength <s>]`.
         // Common to every material type. Binds a declared (linear-encoded) texture as
         // the material's normal map and reads an optional perturbation strength (default
@@ -8297,7 +8319,7 @@ private:
         std::vector<char> covered(S.tris.size(), 0);   // a mesh block's light holds it
         for (size_t e = 0; e < S.emitters.size(); ++e) {
             Emitter& em = S.emitters[e];
-            if (em.matId < 0) continue;
+            if (em.matId < 0 || em.backFace) continue;   // a back face's surfaces name its front
             const int base = S.matBase(em.matId);
             if (em.shape != EmitterShape::Mesh || !glows(base)) { owned.insert(base); continue; }
             for (const EmitTri& et : em.meshTris)
@@ -8380,6 +8402,8 @@ private:
             S.emitters.back().patFrame = patFrame;   // its pattern read where its hits read theirs
             made.push_back(std::move(S.emitters.back()));
             S.emitters.pop_back();
+            // Both faces emitting (emit_two_sided): the back face's light after the front's.
+            if (S.mats[(size_t)base].emitsBack) made.push_back(Scene::backFaceOf(made.back()));
         }
         // Spheres, then isosurfaces: each its own emitter.
         const auto boxEmitter = [&](int mid, int prim, bool sphere, const Vec3& lo, const Vec3& hi, int motion) {
@@ -8393,6 +8417,17 @@ private:
             e.motion = motion;
             made.push_back(std::move(e));
         };
+        // A solid has an inside, which a second face would light: emit_two_sided is a sheet's.
+        const auto twoSidedSolid = [&](int m, const char* what) {
+            if (!S.mats[(size_t)S.matBase(m)].emitsBack) return false;
+            fail(nameOf(m) + " has emit_two_sided on " + what + ", which has an inside: both faces "
+                 "emitting is for a sheet (a quad, a polygon, an open mesh)");
+            return true;
+        };
+        for (const Sphere& sp : S.spheres)
+            if (glows(sp.matId) && twoSidedSolid(sp.matId, "a sphere")) return false;
+        for (const Implicit& im : S.implicits)
+            if (glows(im.matId) && twoSidedSolid(im.matId, "an isosurface")) return false;
         for (size_t i = 0; i < S.spheres.size(); ++i) {
             Sphere& sp = S.spheres[i];
             if (!wants(sp.matId)) continue;
@@ -8425,6 +8460,7 @@ private:
         if (!made.empty()) {
             std::map<std::string, std::map<std::string, int>> said;
             for (const Emitter& e : made) {
+                if (e.backFace) continue;   // its front's light, the other way
                 const char* kind = e.shape == EmitterShape::Mesh   ? "triangle set"
                                  : e.shape == EmitterShape::Sphere ? "sphere"
                                  : e.glowSphere                    ? "patterned sphere" : "isosurface";
@@ -8466,7 +8502,9 @@ private:
                 const Tri& tr = L.scene.tris[i];
                 if (tr.matId == id0) area += 0.5 * length(cross(tr.v1 - tr.v0, tr.v2 - tr.v0));
             }
-            const Spectrum scaled = absPower(b, L.scene.mats[(size_t)id].emit, area * PI, L);
+            // Both faces emitting (emit_two_sided): the power is the two faces' total.
+            const double faces = L.scene.mats[(size_t)id].emitsBack ? 2.0 : 1.0;
+            const Spectrum scaled = absPower(b, L.scene.mats[(size_t)id].emit, area * PI * faces, L);
             if (!own) {
                 Material clone = L.scene.mats[(size_t)id];
                 id = (int)L.scene.mats.size();
@@ -8480,7 +8518,10 @@ private:
             std::vector<Scene::MeshLightTri> list;
             for (size_t i = t0; i < t1; ++i)
                 if (L.scene.tris[i].matId == id) list.push_back({&L.scene.tris[i], (int)i});
+            const size_t before = L.scene.emitters.size();
             L.scene.addMeshLightOf(list, L.scene.mats[(size_t)id].emit, binWidth_, id);
+            if (L.scene.mats[(size_t)id].emitsBack && L.scene.emitters.size() > before)
+                L.scene.emitters.push_back(Scene::backFaceOf(L.scene.emitters.back()));
         }
     }
 
@@ -8839,7 +8880,7 @@ private:
                         "behind its own plane\n", o.x, o.y, o.z,
                         std::acos(std::fmin(1.0, cosAim)) * 180.0 / PI, nrm.x, nrm.y, nrm.z);
         // `two_sided on`: both faces emit, at one radiance -- two lights, a face each, on one
-        // surface whose back face a hit from behind meets (Tri::emitsBack).
+        // surface whose back face a hit from behind meets (Material::emitsBack).
         const std::string tsv = strOf(b, "two_sided", "off");
         const bool twoSided = (tsv == "on" || tsv == "true" || tsv == "yes" || tsv == "1");
         if (twoSided && Emitter::leans(cosAim)) {
@@ -8854,6 +8895,7 @@ private:
         Material lm; lm.reflect = constantSpectrum(0.0); lm.emit = spd; lm.isLight = true;
         lm.reflectsNothing = true;
         lm.emitPat = spdPat;
+        lm.emitsBack = twoSided;
         // `hide_camera on` — primary visibility off. The emitter is untouched (it lights,
         // it is sampled by NEE, its power keeps the same share of the selection CDF) and so
         // is the geometry (it still occludes, still shadows, still shows up in a specular
@@ -8889,20 +8931,15 @@ private:
             L.scene.tris.push_back(Tri{a, dd, cc, id, -1, {},
                                        Vec3{0, 0, 0}, Vec3{0, 1, 0}, Vec3{1, 1, 0}});
         }
-        // Two faces: the front `normal`'s, then the back's, the emitter after it, which the
-        // triangles name their back face by (several emitters share the material, so
-        // tagLightSurfaces would tag them with neither).
+        // Two faces: the front `normal`'s, then the back's (Scene::backFaceOf), which a hit from
+        // behind names by the one after the front its triangles name (several emitters share the
+        // material, so tagLightSurfaces would tag them with neither).
         const int front = (int)L.scene.emitters.size();
         if (twoSided)
-            for (size_t k = L.scene.tris.size() - 2; k < L.scene.tris.size(); ++k) {
-                L.scene.tris[k].emitter = front;
-                L.scene.tris[k].emitsBack = true;
-            }
+            for (size_t k = L.scene.tris.size() - 2; k < L.scene.tris.size(); ++k) L.scene.tris[k].emitter = front;
         L.scene.addAreaLight(os, us, vs, nw, length(cross(us, vs)), spd, binWidth_,
                              /*collimated*/false, /*beamDir*/{1, 0, 0}, /*matId*/id);
-        if (twoSided)
-            L.scene.addAreaLight(os, us, vs, nw * -1.0, length(cross(us, vs)), spd, binWidth_,
-                                 /*collimated*/false, /*beamDir*/{1, 0, 0}, /*matId*/id);
+        if (twoSided) L.scene.emitters.push_back(Scene::backFaceOf(L.scene.emitters.back()));
         return true;
     }
 
