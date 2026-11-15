@@ -362,14 +362,14 @@ Then the rest of 4.2-4.6 in their order, 4.7's bookkeeping alongside whatever to
   birth (Scene::birthStack, dBirthStack); `tools/check_birth_stack.py`.
 - [ ] **SPPM-GPU-LAMP** — GPU mode S reads a lamp seen directly 2.5 % bright of mode R (the CPU's
   1 % dark); pre-existing.
-- [ ] **GPU-U-GLOSSY-SLOW** — GPU mode U runs 4-5x slower than the CPU's inside a glossy sphere
-  (check_merge_glossy's scene); under water it is the faster. To narrow by stage.
+- [ ] **GPU-U-GLOSSY-SLOW** — GPU mode U's merges run on the thread that reached the vertex, so at
+  a large radius (-pmradius 0.05: 112 s against the CPU's 11) they crawl: give them mode J's queue.
 - [x] **CAMERA-EMPTY-STACK** (0.445.8) — every camera walk starts inside the solids around the eye,
   and every connection leg takes its medium's absorption; `tools/check_camera_in_water.py`.
 - [x] **REVIEW-0445** (0.445.6, 0.445.7) — the Opus (max) and Fable (xhigh) reviews of
   2613698..b004c3b: the J/U probe stops on glossy faces (check_merge_glossy), solid faces marked for
   J/U (check_merge_base's tower), roughness patterns reach 2 (check_rough_range), and the cleanups;
-  known-issues REVIEW-0445.
+  known-issues REVIEW-0445. The lane-0 probes: WARP-PROBES (0.445.9), 2.0-2.2x -> 1.16-1.24x.
 - [ ] **GRIN-RADIANCE-SCALE** — a camera path ending inside a GRIN region misses the n² radiance
   scale.
 - [ ] **STUBBLE-DEVICE-UNDERSIDE** — mode W on a stubble coat: device and host 9.6 % apart in its

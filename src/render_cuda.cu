@@ -8123,133 +8123,131 @@ __device__ static DSegmentCrossings dWalkSegment(const DScene& sc, DVec3 o, cons
     return c;
 }
 
-// `slack`: the gather's plane-test slack (gatherBandSlack at its map's radius), its photon test's;
-// `holds`, the faces its photons lie on (DGatherHolds).
-__device__ static double dGatherCoverage(const DScene& sc, const DVec3& p, const DVec3& n,
-                                         Real r, Real slack, DRng& rng, int M, Real fiberR = (Real)0,
-                                         int holds = DGATHER_PHOTONS) {
-    if (M <= 0 || !(r > (Real)0)) return 1.0;
-    DVec3 t, b; onb(n, t, b);
-    double area = 0.0;                       // in units of the full disc; 1.0 == fully covered
-    int    nRej = 0;                         // probes that FOUND geometry facing the wrong way
-    // `-gagate n` holds this at n regardless of M, host twin in gathercoverage.h. Clamped to
-    // M-1 so the check index stays inside the loop.
-    int probe0 = (M >= 4) ? ((M / 4 < 2) ? 2 : M / 4) : M;
-    if (sc.gaGate) probe0 = (sc.gaGate < M) ? sc.gaGate : (M > 1 ? M - 1 : M);
-    const Real pathEps = fmaxf((Real)1e-4 * r, (Real)2 * RAY_EPS);
-    for (int i = 0; i < M; ++i) {
-        if (i == probe0 && area >= (double)probe0 * 0.995) return 1.0;
-        const double rr = (double)r * sqrt((double)rng.uniform());
-        const double ph = 2.0 * DPI * (double)rng.uniform();
-        const DVec3 q = p + t * (Real)(rr * cos(ph)) + b * (Real)(rr * sin(ph));
-        // `2r` of travel: within the disc a curved surface deviates from the tangent plane by
-        // at most ~r^2/(2R), far inside this window for any radius worth gathering at.
-        // Through any surface that holds no photon (dProbePassesThrough), and through a fiber of
-        // opacity below 1 with the probability it is absent -- the coin every walk tosses there
-        // (host twin gatherCoverageRaw). `h.t` stays the depth from the launch point.
-        // A photon-holding face off the band: below it a miss, above it crossed. Every opaque face
-        // crossed above the plane is counted, an odd count where the probe meets this surface being
-        // the inside of a solid resting on it -- a miss too (host twin gatherCoverageRaw, where the
-        // reasoning lives).
-        DHit h;
-        {
-            DVec3 o = q + n * r;
-            const DVec3 dn = n * (Real)(-1);
-            Real tAcc = (Real)0, curveTmin = (Real)0;
-            // The opaque faces passed above the plane: a closed solid's says which side the probe
-            // went (`lastSolid`, +1 into, -1 out of), and where it crosses none the side it began
-            // on, along the segment from the gather point to its top, taken when asked (`kAsk`); one
-            // that cannot say counts toward the parity (`crossed`), whose odd count the low leg must
-            // confirm (parityInside); either can put the column inside (host twin
-            // gatherCoverageRaw).
-            constexpr int kAsk = 2;
-            int crossed = 0, lastSolid = kAsk;
-            const auto side = [&]() {
-                if (lastSolid == kAsk) {
-                    const DVec3 so = p + n * pathEps, top = q + n * r;
-                    const Real len = length(top - so);
-                    lastSolid = dWalkSegment(sc, so, (top - so) * ((Real)1 / len), len, pathEps).side;
-                }
-                return lastSolid;
+// One probe of the footprint (dGatherCoverage's; host twin gatherCoverageRaw's): a column at a
+// uniform point of the disc of radius `r` about `p` (frame t, b, n), cast down from r above. Its
+// area -- 1/cos where it ends on this surface facing its way (inside the ball, under -gaball), else
+// 0 -- and whether it found geometry facing the wrong way. Draws from `rng`. `pathEps`: the segments'
+// step past a face (dWalkSegment); `holds`: DGatherHolds.
+struct DProbe { double area; int rej; };
+__device__ static DProbe dCoverageProbe(const DScene& sc, const DVec3& p, const DVec3& n, const DVec3& t,
+                                        const DVec3& b, Real r, Real slack, Real pathEps, DRng& rng,
+                                        int holds) {
+    DProbe o{0.0, 0};
+    const double rr = (double)r * sqrt((double)rng.uniform());
+    const double ph = 2.0 * DPI * (double)rng.uniform();
+    const DVec3 q = p + t * (Real)(rr * cos(ph)) + b * (Real)(rr * sin(ph));
+    // `2r` of travel: within the disc a curved surface deviates from the tangent plane by
+    // at most ~r^2/(2R), far inside this window for any radius worth gathering at.
+    // Through any surface that holds no photon (dProbePassesThrough), and through a fiber of
+    // opacity below 1 with the probability it is absent -- the coin every walk tosses there
+    // (host twin gatherCoverageRaw). `h.t` stays the depth from the launch point.
+    // A photon-holding face off the band: below it a miss, above it crossed. Every opaque face
+    // crossed above the plane is counted, an odd count where the probe meets this surface being
+    // the inside of a solid resting on it -- a miss too (host twin gatherCoverageRaw, where the
+    // reasoning lives).
+    DHit h;
+    {
+        DVec3 o = q + n * r;
+        const DVec3 dn = n * (Real)(-1);
+        Real tAcc = (Real)0, curveTmin = (Real)0;
+        // The opaque faces passed above the plane: a closed solid's says which side the probe
+        // went (`lastSolid`, +1 into, -1 out of), and where it crosses none the side it began
+        // on, along the segment from the gather point to its top, taken when asked (`kAsk`); one
+        // that cannot say counts toward the parity (`crossed`), whose odd count the low leg must
+        // confirm (parityInside); either can put the column inside (host twin
+        // gatherCoverageRaw).
+        constexpr int kAsk = 2;
+        int crossed = 0, lastSolid = kAsk;
+        const auto side = [&]() {
+            if (lastSolid == kAsk) {
+                const DVec3 so = p + n * pathEps, top = q + n * r;
+                const Real len = length(top - so);
+                lastSolid = dWalkSegment(sc, so, (top - so) * ((Real)1 / len), len, pathEps).side;
+            }
+            return lastSolid;
+        };
+        // An odd parity puts the column inside only if the low leg agrees (host twin's
+        // parityInside): a cup's wall, not a hovering sheet.
+        const auto parityInside = [&]() {
+            if (!(crossed & 1)) return false;
+            if (!(rr > (double)pathEps)) return true;
+            const Real hL = (Real)kLowLegFrac * r;
+            return (dWalkSegment(sc, p + n * hL, (q - p) * (Real)(1.0 / rr), (Real)rr, pathEps).open & 1) != 0;
+        };
+        bool found = false;                  // the probe ended on what it counts
+        bool ended = false;                  // ... or on what it does not
+        DHit under; under.valid = false;     // a closed solid's in-band face passed from inside
+        bool underFound = false;
+        for (int pass = 0, skip = 0; pass < 16 + skip; ++pass) {   // a strand costs none, to 48 (host twin)
+            // Past a strand the curve tmin clears its tube and a surface just behind it must
+            // still be found: tmin 0 then, as every curve-tmin caller does.
+            h = closestHit(sc, o, dn, (curveTmin > (Real)0) ? (Real)0 : RAY_EPS,
+                           (Real)2 * r - tAcc, false, curveTmin);
+            if (!h.valid) break;
+            h.t += tAcc;
+            const DMaterial& hm = sc.mats[h.matId];
+            // A strand that holds no photon, whatever its lobes: through the tube, for none of
+            // the sixteen faces (host twin).
+            if (h.fiberRadius > (Real)0 && hm.type != D_HAIR && !dGatherHoldsAt(sc, hm, h.fiberRadius, holds)) {
+                if (skip < 48) ++skip;
+                tAcc = h.t; o = h.p; curveTmin = (Real)2.5 * h.fiberRadius;
+                continue;
+            }
+            // Only a face above the plane, by more than the relaunch's own tmin skips: one on it
+            // is the surface's height (a glass box standing on the floor). An opaque one is a
+            // crossing all the same (dPassesLight) -- host twin.
+            const auto cross = [&]() {
+                if (dPassesLight(sc, hm)) return;
+                if (h.solid) lastSolid = ((h.solid > 0) == h.back) ? -1 : 1;   // leaving : entering
+                else ++crossed;
             };
-            // An odd parity puts the column inside only if the low leg agrees (host twin's
-            // parityInside): a cup's wall, not a hovering sheet.
-            const auto parityInside = [&]() {
-                if (!(crossed & 1)) return false;
-                if (!(rr > (double)pathEps)) return true;
-                const Real hL = (Real)kLowLegFrac * r;
-                return (dWalkSegment(sc, p + n * hL, (q - p) * (Real)(1.0 / rr), (Real)rr, pathEps).open & 1) != 0;
-            };
-            bool found = false;                  // the probe ended on what it counts
-            bool ended = false;                  // ... or on what it does not
-            DHit under; under.valid = false;     // a closed solid's in-band face passed from inside
-            bool underFound = false;
-            for (int pass = 0, skip = 0; pass < 16 + skip; ++pass) {   // a strand costs none, to 48 (host twin)
-                // Past a strand the curve tmin clears its tube and a surface just behind it must
-                // still be found: tmin 0 then, as every curve-tmin caller does.
-                h = closestHit(sc, o, dn, (curveTmin > (Real)0) ? (Real)0 : RAY_EPS,
-                               (Real)2 * r - tAcc, false, curveTmin);
-                if (!h.valid) break;
-                h.t += tAcc;
-                const DMaterial& hm = sc.mats[h.matId];
-                // A strand that holds no photon, whatever its lobes: through the tube, for none of
-                // the sixteen faces (host twin).
-                if (h.fiberRadius > (Real)0 && hm.type != D_HAIR && !dGatherHoldsAt(sc, hm, h.fiberRadius, holds)) {
-                    if (skip < 48) ++skip;
-                    tAcc = h.t; o = h.p; curveTmin = (Real)2.5 * h.fiberRadius;
-                    continue;
-                }
-                // Only a face above the plane, by more than the relaunch's own tmin skips: one on it
-                // is the surface's height (a glass box standing on the floor). An opaque one is a
-                // crossing all the same (dPassesLight) -- host twin.
-                const auto cross = [&]() {
-                    if (dPassesLight(sc, hm)) return;
-                    if (h.solid) lastSolid = ((h.solid > 0) == h.back) ? -1 : 1;   // leaving : entering
-                    else ++crossed;
-                };
-                if (dProbePassesThrough(sc, hm, holds) && r - h.t > fmaxf((Real)1e-3 * r, (Real)2 * RAY_EPS)) {
+            if (dProbePassesThrough(sc, hm, holds) && r - h.t > fmaxf((Real)1e-3 * r, (Real)2 * RAY_EPS)) {
+                cross();
+                tAcc = h.t; o = h.p; curveTmin = (Real)0;
+                continue;
+            }
+            if (hm.type == D_HAIR && h.fiberRadius > (Real)0) {
+                const double op = dHairOpacityAt(sc, hm, h);
+                if (op >= 1.0 || (double)rng.uniform() < op) { found = ended = true; break; }   // the strand IS here
+                tAcc = h.t; o = h.p; curveTmin = (Real)2.5 * h.fiberRadius;
+                continue;
+            }
+            const Real dzH = r - h.t;
+            if (withinGatherBand<Real>(fabs(dzH), (Real)(rr * rr) + dzH * dzH, dot(dShadedNg(h), n), slack)) {
+                // A closed solid's face in the band but above the plane, met from inside, is
+                // crossed and passed, the probe ending there only if nothing below is this
+                // surface in the band; met from outside it is the surface, and one on the
+                // plane says nothing (host twin), "on" to within rounding: 2 RAY_EPS here.
+                if (h.solid && dzH > fmaxf((Real)1e-7 * r, (Real)2 * RAY_EPS) && (h.solid > 0) == h.back) {
                     cross();
+                    if (!under.valid) { under = h; underFound = !parityInside() && side() <= 0; }
                     tAcc = h.t; o = h.p; curveTmin = (Real)0;
                     continue;
                 }
-                if (hm.type == D_HAIR && h.fiberRadius > (Real)0) {
-                    const double op = dHairOpacityAt(sc, hm, h);
-                    if (op >= 1.0 || (double)rng.uniform() < op) { found = ended = true; break; }   // the strand IS here
-                    tAcc = h.t; o = h.p; curveTmin = (Real)2.5 * h.fiberRadius;
-                    continue;
-                }
-                const Real dzH = r - h.t;
-                if (withinGatherBand<Real>(fabs(dzH), (Real)(rr * rr) + dzH * dzH, dot(dShadedNg(h), n), slack)) {
-                    // A closed solid's face in the band but above the plane, met from inside, is
-                    // crossed and passed, the probe ending there only if nothing below is this
-                    // surface in the band; met from outside it is the surface, and one on the
-                    // plane says nothing (host twin), "on" to within rounding: 2 RAY_EPS here.
-                    if (h.solid && dzH > fmaxf((Real)1e-7 * r, (Real)2 * RAY_EPS) && (h.solid > 0) == h.back) {
-                        cross();
-                        if (!under.valid) { under = h; underFound = !parityInside() && side() <= 0; }
-                        tAcc = h.t; o = h.p; curveTmin = (Real)0;
-                        continue;
-                    }
-                    found = !parityInside() && side() <= 0;
-                    ended = true;
-                    break;
-                }
-                if (!(dzH > (Real)0)) break;                            // below the band: a miss
-                cross();
-                tAcc = h.t; o = h.p; curveTmin = (Real)0;
+                found = !parityInside() && side() <= 0;
+                ended = true;
+                break;
             }
-            if (!ended && under.valid) { h = under; found = underFound; }
-            if (!found) h.valid = false;         // a miss, or sixteen faces without an answer
+            if (!(dzH > (Real)0)) break;                            // below the band: a miss
+            cross();
+            tAcc = h.t; o = h.p; curveTmin = (Real)0;
         }
-        if (!h.valid) continue;
-        const double c = (double)dot(dShadedNg(h), n);   // the host twin's facing test
-        // Only `area` is gated on the ball (see DScene::gaBall), so nRej and therefore the
-        // tangle gate below are held fixed by construction and the arms differ in one quantity.
-        const double dz = (double)r - (double)h.t;   // hit height above the tangent plane
-        const bool inBall = !sc.gaBall || (rr * rr + dz * dz <= (double)r * (double)r);
-        if (c >= kGatherFacingCos) { if (inBall) area += 1.0 / c; }  // the query's facing test
-        else          ++nRej;                // geometry IS here, facing the wrong way: a tangle
+        if (!ended && under.valid) { h = under; found = underFound; }
+        if (!found) h.valid = false;         // a miss, or sixteen faces without an answer
     }
+    if (!h.valid) return o;
+    const double c = (double)dot(dShadedNg(h), n);   // the host twin's facing test
+    // Only `area` is gated on the ball (see DScene::gaBall), so nRej and therefore the
+    // tangle gate below are held fixed by construction and the arms differ in one quantity.
+    const double dz = (double)r - (double)h.t;   // hit height above the tangent plane
+    const bool inBall = !sc.gaBall || (rr * rr + dz * dz <= (double)r * (double)r);
+    if (c >= kGatherFacingCos) { if (inBall) o.area = 1.0 / c; }  // the query's facing test
+    else          o.rej = 1;             // geometry IS here, facing the wrong way: a tangle
+    return o;
+}
+// What `M` probes' summed `area` and rejects `nRej` say of the coverage (dGatherCoverage's end, host
+// twin gatherCoverageRaw's): the tangle and fiber gates, which return 1, and the pseudo-count.
+__device__ static double dCoverageFinish(const DScene& sc, int M, double area, int nRej, Real fiberR) {
     // THE TANGLE GATE, host twin in gathercoverage.h. A high reject share means the disc is
     // full of geometry pointing every which way rather than hanging over empty space, and there
     // the correction is not merely weaker -- it points the wrong way, reading dense fur +48 %
@@ -8267,6 +8265,34 @@ __device__ static double dGatherCoverage(const DScene& sc, const DVec3& p, const
     // this form also gives at `area == M`, so they agree by construction, not by a special case.
     if (sc.gaBias) return (area + 1.0) / (double)(M + 1);
     return area / (double)M;
+}
+// How many probes the footprint's early gate reads before it decides, or -1 for no gate: `-gagate n`'s
+// n (gaGateProbes; -1, no gate, its default), held below M so the gate's index stays inside the loop,
+// and at `-gagate 0` max(2, M / 4) (host twin: gatherCoverageRaw's probe0). The gate is the loop's
+// `i == probe0`, so a probe0 outside [0, M) never gates.
+__device__ static inline int dGateProbes(const DScene& sc, int M) {
+    int probe0 = (M >= 4) ? ((M / 4 < 2) ? 2 : M / 4) : M;
+    if (sc.gaGate) probe0 = (sc.gaGate < M) ? sc.gaGate : (M > 1 ? M - 1 : M);
+    return probe0;
+}
+// `slack`: the gather's plane-test slack (gatherBandSlack at its map's radius), its photon test's;
+// `holds`, the faces its photons lie on (DGatherHolds).
+__device__ static double dGatherCoverage(const DScene& sc, const DVec3& p, const DVec3& n,
+                                         Real r, Real slack, DRng& rng, int M, Real fiberR = (Real)0,
+                                         int holds = DGATHER_PHOTONS) {
+    if (M <= 0 || !(r > (Real)0)) return 1.0;
+    DVec3 t, b; onb(n, t, b);
+    double area = 0.0;                       // in units of the full disc; 1.0 == fully covered
+    int    nRej = 0;                         // probes that FOUND geometry facing the wrong way
+    const int probe0 = dGateProbes(sc, M);
+    const Real pathEps = fmaxf((Real)1e-4 * r, (Real)2 * RAY_EPS);
+    for (int i = 0; i < M; ++i) {
+        if (i == probe0 && area >= (double)probe0 * 0.995) return 1.0;
+        const DProbe o = dCoverageProbe(sc, p, n, t, b, r, slack, pathEps, rng, holds);
+        area += o.area;
+        nRej += o.rej;
+    }
+    return dCoverageFinish(sc, M, area, nRej, fiberR);
 }
 __device__ static inline double dGatherAreaScale(int gaBias, double cov) {
     // With the pseudo-count on, `cov` is bounded below by 1/(M+1) and the cliff would only
@@ -20534,12 +20560,60 @@ __device__ static inline void dSurfMergePhoton(const DScene& sc, const DSurfMap&
     const double cf = w * fCam * (double)ph.beta * (js ? js->at((double)lam) : 1.0);   // JSPEC
     gX += (double)ph.cx * cf; gY += (double)ph.cy * cf; gZ += (double)ph.cz * cf;
 }
-// The footprint's scale for a merge at a site whose sum came out nonzero (DMergeFootprint::scale), its
-// probes off a stream of their own seeded by `seed`, which was drawn from the walk's stream at the site,
-// so the inline and the queued gather probe alike (the host probes off the walk's own stream).
+// Mode J's merge footprint draws probe `i` at a site off a stream of its own, seeded from `seed`,
+// which the walk drew from its stream at the site: so the queued gather can run a site's probes
+// across the warp (kWfSurfGather) and the inline one in turn, the two agreeing but for their sums'
+// order. (The host, and the device's mode U, probe off the walk's own stream.)
+__device__ static inline DRng dMergeProbeRng(unsigned long long seed, int i) {
+    DRng prng; prng.seedUnit(seed + (unsigned long long)i * 0x9E3779B97F4A7C15ULL, 0x6A09E667F3BCC909ULL);
+    return prng;
+}
+// The footprint's scale for a merge at a site whose sum came out nonzero, its probes one after another.
 __device__ static double dSurfFootprint(const DScene& sc, const DSurfSite& site, unsigned long long seed) {
-    DRng prng; prng.seedUnit(seed, 0x6A09E667F3BCC909ULL);
-    return site.fp.scale(sc, prng);
+    const DMergeFootprint& fp = site.fp;
+    if (!fp.on() || !(fp.r > (Real)0)) return 1.0;
+    DVec3 t, b; onb(fp.n, t, b);
+    const Real pathEps = fmaxf((Real)1e-4 * fp.r, (Real)2 * RAY_EPS);
+    const int probe0 = dGateProbes(sc, fp.M);
+    double area = 0.0;
+    int nRej = 0;
+    for (int i = 0; i < fp.M; ++i) {
+        if (i == probe0 && area >= (double)probe0 * 0.995) return 1.0;   // dGatherCoverage's early gate
+        DRng prng = dMergeProbeRng(seed, i);
+        const DProbe o = dCoverageProbe(sc, fp.p, fp.n, t, b, fp.r, fp.slack, pathEps, prng, DGATHER_MERGES);
+        area += o.area;
+        nRej += o.rej;
+    }
+    return dGatherAreaScale(sc.gaBias, dCoverageFinish(sc, fp.M, area, nRej, fp.fiberR));
+}
+// The same, the warp's lanes taking the probes, lane l probes l, l + 32, ...: every lane of the warp
+// calls it, and every lane gets the scale.
+__device__ static double dSurfFootprintWarp(const DScene& sc, const DSurfSite& site, unsigned long long seed,
+                                            int lane) {
+    const DMergeFootprint& fp = site.fp;
+    if (!fp.on() || !(fp.r > (Real)0)) return 1.0;
+    DVec3 t, b; onb(fp.n, t, b);
+    const Real pathEps = fmaxf((Real)1e-4 * fp.r, (Real)2 * RAY_EPS);
+    const int probe0 = dGateProbes(sc, fp.M);
+    double area = 0.0, area0 = 0.0;   // all of this lane's probes; those the early gate reads
+    int nRej = 0;
+    for (int i = lane; i < fp.M; i += 32) {
+        DRng prng = dMergeProbeRng(seed, i);
+        const DProbe o = dCoverageProbe(sc, fp.p, fp.n, t, b, fp.r, fp.slack, pathEps, prng, DGATHER_MERGES);
+        area += o.area;
+        nRej += o.rej;
+        if (i < probe0) area0 += o.area;
+    }
+    for (int off = 16; off > 0; off >>= 1) {
+        area  += __shfl_down_sync(0xffffffffu, area, off);
+        area0 += __shfl_down_sync(0xffffffffu, area0, off);
+        nRej  += __shfl_down_sync(0xffffffffu, nRej, off);
+    }
+    double scale = 1.0;
+    // The early gate's verdict, as the loop's `i == probe0` gives it: none for a probe0 outside [0, M).
+    if (lane == 0 && !(probe0 >= 0 && probe0 < fp.M && area0 >= (double)probe0 * 0.995))
+        scale = dGatherAreaScale(sc.gaBias, dCoverageFinish(sc, fp.M, area, nRej, fp.fiberR));
+    return __shfl_sync(0xffffffffu, scale, 0);
 }
 // One camera vertex's gather, by the thread that reached it (the inline path; kWfSurfGather is the
 // wavefront's, a warp a site). Returns the photons it weighed (g_dWork's count).
@@ -20608,8 +20682,11 @@ __global__ void kWfSurfGather(DScene sc, DSurfMap sm, DSurfQueue sq, int n, doub
             gY += __shfl_down_sync(0xffffffffu, gY, off);
             gZ += __shfl_down_sync(0xffffffffu, gZ, off);
         }
-        if (lane == 0 && (gX != 0.0 || gY != 0.0 || gZ != 0.0)) {
-            const double fa = rq.f * (sc.gatherArea ? dSurfFootprint(sc, site, rq.gaSeed) : 1.0);
+        // Lane 0 holds the sum; the footprint's probes, for a sum that found light, are the warp's.
+        const int lit = __shfl_sync(0xffffffffu, (gX != 0.0 || gY != 0.0 || gZ != 0.0) ? 1 : 0, 0);
+        const double fpScale = (lit && sc.gatherArea) ? dSurfFootprintWarp(sc, site, rq.gaSeed, lane) : 1.0;
+        if (lane == 0 && lit) {
+            const double fa = rq.f * fpScale;
             atomicAdd(&camFilm[rq.pix + 0], gX * fa);
             atomicAdd(&camFilm[rq.pix + 1], gY * fa);
             atomicAdd(&camFilm[rq.pix + 2], gZ * fa);

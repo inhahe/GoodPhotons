@@ -119,11 +119,13 @@ coat's multiple scattering in REFERENCE.md, `coatLobe`, the SurfPhoton sizes, de
 `ggxDrawUV`); check_bitid's `--scenes` compared stale images (Opus); history in the tools'
 comments (Opus).
 
-**Measured; fixed in the commit after these (WARP-PROBES):** the lane-0 probes (both). GPU mode J,
-256 spp at 256 x 256: the diffuse Cornell box took 39.9 s with `-gatherarea 8` against 17.8 s with
-0 (2.2x), the room of gyroids 118.0 s against 57.8 s (2.0x) -- a queued site's probes, run by lane
-0 alone while 31 lanes waited, were most of the gather. (The 0.90-1.07x quoted for 0.445.3 was a
-small scene's.)
+**Fixed in 0.445.9 (WARP-PROBES):** the lane-0 probes (both). GPU mode J, 256 spp at 256 x 256:
+the diffuse Cornell box took 39.9 s with `-gatherarea 8` against 17.8 s with 0 (2.2x), the room of
+gyroids 118.0 s against 57.8 s (2.0x) -- a queued site's probes, run by lane 0 alone while 31 lanes
+waited, were most of the gather. (The 0.90-1.07x quoted for 0.445.3 was a small scene's.) The
+queued gather spreads a site's probes over the warp, each off a stream of its own
+(dSurfFootprintWarp), the inline one drawing them alike (dSurfFootprint): now 22.1 s against 18.2 s,
+and 67.3 s against 56.9 s.
 
 ## DONE (2026-11-15, 0.445.8): CAMERA-EMPTY-STACK — a camera inside a dielectric starts its walks outside it
 
@@ -192,16 +194,21 @@ Beside it, not this: dry, modes S on both devices read the walls 2.25 % bright o
 they agree to 0.05 %. A depth mismatch (the measurement trap at this file's head) until shown
 otherwise.
 
-## OPEN (2026-11-15): GPU-U-GLOSSY-SLOW — GPU mode U is several times slower than the CPU's inside a glossy sphere
+## OPEN (2026-11-15): GPU-U-GLOSSY-SLOW — GPU mode U's merges run single-lane, ten times the CPU's at a large radius
 
 Found running tools/check_merge_glossy.py (`scenes/_merge_glossy_bowl.ftsl`, a room inside a rough
 glossy sphere, `-max-bounce 24 -pmradius 0.05`, 96 x 72): mode U on the GPU took about 75 s a seed at
 128 spp and 5 minutes at 512, the CPU's about 16 s at 128 -- the GPU some 4-5 times slower. Not mode
 U on the GPU in general: under water (`scenes/_camera_in_water.ftsl`, diffuse walls, `-max-bounce
-12`, 256 spp) it took 12 s a seed against the CPU's 16. Suspects: the glossy merges' cost per merge
-on the device (each a GGX evaluation and pdf at the merge's wavelength), the depth, or the light
-pass's size at a pinned radius. To narrow: the same scene at -max-bounce 8, with -nojsurf-style
-merges off, and with the sphere diffuse, timing each stage (`-vcmstats` if it prints them).
+12`, 256 spp) it took 12 s a seed against the CPU's 16.
+
+**Localised: the merge radius.** 64 spp of the glossy sphere: at mode U's own radius (R0 0.0104)
+GPU 6.9 s against CPU 5.4 s at -max-bounce 24 (2.6 against 4.7 at 8); at `-pmradius 0.05`, five
+times the radius and some 25 times the light vertices a merge takes, GPU 112.2 s against CPU 10.7.
+The device's mode U gathers each camera vertex's light vertices on the thread that reached it, one
+after another, where mode J queues its sites for a warp each (SURF-WAVEFRONT): so a merge's cost on
+the GPU grows with its population at single-lane speed. The fix: mode J's queued gather for mode U's
+merges.
 
 ## NOTED (2026-11-15): COINCIDENT-LAMP-FACES — two lamp quads back to back on one plane read half as bright to every camera walk
 

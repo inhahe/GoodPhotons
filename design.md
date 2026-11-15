@@ -6536,8 +6536,12 @@ as the one at fault.
   0.64 of mode R at radius 0.1 -- because the merges still divided by the whole disc; with it the
   base reads 0.99-1.00, and the light trapped in a millimetre gap under a plate stays off the
   plate's top (J 36x mode B before). A merge probes only where its sum found light -- off the
-  camera walk's own stream on the host, and on the device off a stream seeded from it at the
-  site, so mode J's queued and inline gathers probe alike -- and `-gatherarea 0` restores the
+  camera walk's own stream on the host and in the device's mode U; in the device's mode J each probe
+  off a stream of its own seeded from the walk's at the site (`dMergeProbeRng`), so the queued
+  gather runs a site's probes across the warp (`dSurfFootprintWarp`, lane l taking probes l, l + 32,
+  ..., their areas summed by shuffles) and the inline one in turn (`dSurfFootprint`), the two alike
+  but for the sums' order (one probe is `dCoverageProbe`, the gates `dCoverageFinish`, which
+  `dGatherCoverage` loops over for every other gather) -- and `-gatherarea 0` restores the
   whole disc over every photon, as it does for M and S. Solid faces are marked
   (`markSolidFaces`) whenever a batch has an M, S, J or U camera. A
   mode-M or mode-S gather (`onGatherSurfaceSided`) keeps a photon only if it faces the
