@@ -890,9 +890,11 @@ inline void traceLightSubpath(const Scene& scene, const Camera& cam, const Rende
                                 // nUp live wavelengths — the same 1/nUp normalisation
                                 // bdpt.h applies at its splat, NOT a ×C boost.
                                 double k = misW * imgToSurf / ctx.nLightPaths * visC;
-                                Vec3 add = cie * (k * beta * f);
+                                const int cm = cam.medium();   // the leg in the camera's solid (legAbsorption)
+                                Vec3 add = cie * (k * beta * f * legAbsorption(scene, cm, distc, lambda));
                                 for (int i = 0; i + 1 < nUp; ++i)
-                                    add = add + cieSec[i] * (k * betaSec[i] * fSec[i]);
+                                    add = add + cieSec[i] * (k * betaSec[i] * fSec[i] *
+                                                             legAbsorption(scene, cm, distc, hb.lam[i + 1]));
                                 if (nUp > 1) add = add * (1.0 / (double)nUp);
                                 splat[(size_t)py * W + px] += add;
                             }
@@ -961,7 +963,9 @@ inline Vec3 traceCameraSubpath(const Scene& scene, const Camera& cam, const Rend
     const double lambda = hb.lam[0], invPdfLambda = hb.invPdf[0];
     const int C = hb.C;                 // bundle width (1 == plain single-λ)
     const bool heroOn = (C > 1);
-    int nUp = C;                        // wavelengths still riding this ray
+    // Wavelengths still riding this ray: the hero alone from a camera inside a solid, a bundle inside
+    // one being one wavelength, as one that enters a solid becomes (CAMERA-EMPTY-STACK).
+    int nUp = cam.enclosure.empty() ? C : 1;
     double betaSec[hero::kHeroMax - 1] = {0};
     Vec3   cieSec[hero::kHeroMax - 1];
     for (int i = 0; i + 1 < C; ++i) {
@@ -978,7 +982,7 @@ inline Vec3 traceCameraSubpath(const Scene& scene, const Camera& cam, const Rend
     double beta = 1.0;
     double dVCM = Mis(ctx.nLightPaths / cameraPdfW);
     double dVC = 0.0, dVM = 0.0;
-    MediumStack stk;                              // nested-dielectric medium stack
+    MediumStack stk = cam.enclosure;              // nested-dielectric medium stack, from the eye's
     // VCM-SPEC: the walk's spectral factors on mode J's carrier (JSpec, beamgather.h). A merge pairs
     // this walk, at lambda, with light vertices of every wavelength, and owes each the walk's
     // factors at its own: beta * at(lambda_v). FTRACE_JSPEC=0 turns it off with mode J's.
@@ -1274,9 +1278,11 @@ inline Vec3 traceCameraSubpath(const Scene& scene, const Camera& cam, const Rend
                                                      dVC * Mis(bsdfRevPdfW)));
                                 double misW = 1.0 / (wLight + 1.0 + wCamera);
                                 double k = misW * std::fabs(cosToLight) / (pdfChoice * directPdfW) * visL;
-                                Vec3 add = cie * (beta * k * Le * f);
+                                // the leg in the vertex's solid (legAbsorption)
+                                Vec3 add = cie * (beta * k * Le * f * legAbsorption(scene, h.extMat, distL, lambda));
                                 for (int i = 0; i + 1 < nUp; ++i)
-                                    add = add + cieSec[i] * (betaSec[i] * k * fLeSec[i]);
+                                    add = add + cieSec[i] * (betaSec[i] * k * fLeSec[i] *
+                                                             legAbsorption(scene, h.extMat, distL, hb.lam[i + 1]));
                                 if (nUp > 1) add = add * (1.0 / (double)nUp);
                                 result += add;
                             }
@@ -1363,11 +1369,13 @@ inline Vec3 traceCameraSubpath(const Scene& scene, const Camera& cam, const Rend
                 }
                 double G = std::fabs(cosCam) * std::fabs(cosLit) / dist2;
                 double k = misW * G * visV;
-                Vec3 add = cie * (k * fCam * fLit * beta * lv.beta);
+                // the leg in the solid both ends lie in (legAbsorption)
+                Vec3 add = cie * (k * fCam * fLit * beta * lv.beta * legAbsorption(scene, h.extMat, distc, lambda));
                 if (nUpConn > 1) {
                     const LightVertexSec& ls = lightSec[(size_t)j];
                     for (int i = 0; i + 1 < nUpConn; ++i)
-                        add = add + cieSec[i] * (k * fProdSec[i] * betaSec[i] * ls.beta[i]);
+                        add = add + cieSec[i] * (k * fProdSec[i] * betaSec[i] * ls.beta[i] *
+                                                 legAbsorption(scene, h.extMat, distc, hb.lam[i + 1]));
                     add = add * (1.0 / (double)nUpConn);
                 }
                 result += add;

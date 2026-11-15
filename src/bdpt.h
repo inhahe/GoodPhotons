@@ -1184,6 +1184,7 @@ inline void randomWalk(const Scene& scene, const Camera& cam, const Renderer& ma
             v.nUp = nUp;
             for (int i = 0; i + 1 < nUp; ++i) v.betaSec[i] = betaSec[i];
             v.mediumG = sm.g; v.mediumId = scatterMed;
+            v.hit.extMat = stk.topMat();   // the solid it lies in, as a surface vertex's hit says
             v.pdfFwd = convertDensity(pdfFwd, path[prevIdx], v);
             path.push_back(v);
             if (jsw) { jsw->vert.resize(path.size()); jsw->run.snap(jsw->vert.back()); }
@@ -1891,9 +1892,12 @@ inline int generateCameraSubpath(const Scene& scene, const Camera& cam, const Re
     // (Hero is gated off for a lensed camera, whose ray IS wavelength-dependent.)
     double betaSec0[hero::kHeroMax - 1];
     for (int i = 0; i + 1 < hb.C; ++i) betaSec0[i] = 1.0;
+    // The walk starts inside the solids around the eye (Camera::enclosure), and a bundle inside a
+    // solid is one wavelength, as one that enters a solid becomes: the hero alone from the start.
+    const int nUp0 = cam.enclosure.empty() ? hb.C : 1;
     Vertex c;
     c.type = VType::Camera; c.ns = cam.w; c.ng = cam.w; c.beta = 1.0;
-    c.nUp = hb.C;
+    c.nUp = nUp0;
     for (int i = 0; i + 1 < hb.C; ++i) c.betaSec[i] = 1.0;
     if (cam.hasLens()) {
         Ray ray; double wLens = 0.0;
@@ -1933,7 +1937,7 @@ inline int generateCameraSubpath(const Scene& scene, const Camera& cam, const Re
         }
         double pdfDir = cam.lensPdfDir(ray.o, ray.d, lambda);
         randomWalk(scene, cam, mats, ray, wLens, pdfDir, hb, maxDepth - 1,
-                   Mode::Radiance, rng, path, betaSec0, 1, esc, segs, nullptr, jsw);
+                   Mode::Radiance, rng, path, betaSec0, 1, esc, segs, nullptr, jsw, &cam.enclosure);
         // The light image picks this camera vertex with a density that depends on the vertex
         // it is picked from (lensAimRatio), which was not known until the walk found eye[1].
         // The first segment's pdfDir stays against 1/A_front: mode J's merges along it apply
@@ -1947,7 +1951,7 @@ inline int generateCameraSubpath(const Scene& scene, const Camera& cam, const Re
     double cosCam = dot(ray.d, cam.w);
     double pdfDir = cameraPdfDir(cam, cosCam);
     randomWalk(scene, cam, mats, ray, /*beta*/1.0, pdfDir, hb, maxDepth - 1,
-               Mode::Radiance, rng, path, betaSec0, hb.C, esc, segs, nullptr, jsw);
+               Mode::Radiance, rng, path, betaSec0, nUp0, esc, segs, nullptr, jsw, &cam.enclosure);
     return (int)path.size();
 }
 
@@ -3982,6 +3986,13 @@ inline double connectBDPT(const Scene& scene, const Camera& cam, const Renderer&
     const double lambda = hb.lam[0], invPdfLambda = hb.invPdf[0];
     isSplat = false;
     nUpConn = 0;                    // set to the real width only once a contribution exists
+    // The connection's leg runs inside one solid (legAbsorption): its absorption over `len`, at every
+    // wavelength the connection carries (`n`).
+    const auto legAbsorb = [&](double& Lh, double* Ls, int n, int solid, double len) {
+        if (solid < 0) return;
+        Lh *= legAbsorption(scene, solid, len, lambda);
+        for (int i = 0; i + 1 < n; ++i) Ls[i] *= legAbsorption(scene, solid, len, hb.lam[i + 1]);
+    };
     // PBRT's "ignore invalid connections related to infinite area lights" guard. It tests
     // the vertex TYPE, not `isLightVertex()`, and the difference is load-bearing: a
     // VType::Light eye vertex is a fictitious endpoint standing in for an infinite light,
@@ -4120,6 +4131,7 @@ inline double connectBDPT(const Scene& scene, const Camera& cam, const Renderer&
             for (int i = 0; i + 1 < nUp; ++i)
                 Lsec[i] = qs.betaSec[i] * fSec[i] * G * cameraWe(cam, cosCam) * Tr;
         }
+        legAbsorb(L, Lsec, nUp, cam.medium(), dist);   // the camera's solid
         sampled.type = VType::Camera; sampled.p = camP; sampled.ns = cam.w; sampled.ng = cam.w;
         sampled.beta = 1.0; sampled.delta = false;
         outPx = px; outPy = py; isSplat = true;
@@ -4274,6 +4286,7 @@ inline double connectBDPT(const Scene& scene, const Camera& cam, const Renderer&
         L = pt.beta * f * Le * G * Tr * stG;
         for (int i = 0; i + 1 < nUp; ++i)
             Lsec[i] = pt.betaSec[i] * fSec[i] * LeSec[i] * G * Tr * stG;
+        legAbsorb(L, Lsec, nUp, pt.hit.extMat, dist);   // the eye vertex's solid
     } else {
         // Interior connection light[s-1] <-> eye[t-1].
         const Vertex& qs = light[s - 1];
@@ -4366,6 +4379,7 @@ inline double connectBDPT(const Scene& scene, const Camera& cam, const Renderer&
         L = pt.beta * fE * fL * qs.beta * G * Tr;
         for (int i = 0; i + 1 < nUp; ++i)
             Lsec[i] = pt.betaSec[i] * fESec[i] * fLSec[i] * qs.betaSec[i] * G * Tr;
+        legAbsorb(L, Lsec, nUp, pt.hit.extMat, dist);   // the solid both ends lie in
     }
     // The MIS weight is a function of the pdfs alone, and every pdf in this renderer is
     // decided by the hero wavelength — so ONE weight serves the whole bundle.

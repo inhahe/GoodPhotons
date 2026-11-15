@@ -4629,9 +4629,9 @@ struct Scene {
         emitterEnclosureUniform.assign(emitters.size(), 1);
         fireEnclosure.assign(emissiveVolumes.size(), MediumStack{});
         fireEnclosureUniform.assign(emissiveVolumes.size(), 1);
-        bool anySolid = false;
-        for (const Material& m : mats) anySolid = anySolid || enterableSolidMat(m);
-        if (!anySolid) return;                      // nothing to be born inside: every stack empty
+        anyEnterable = false;
+        for (const Material& m : mats) anyEnterable = anyEnterable || enterableSolidMat(m);
+        if (!anyEnterable) return;                  // nothing to be born inside: every stack empty
         std::vector<Vec3> pts;
         auto settle = [&](MediumStack& out, char& uniform) {
             for (size_t i = 0; i < pts.size(); ++i) {
@@ -4694,6 +4694,11 @@ struct Scene {
             settle(fireEnclosure[fi], fireEnclosureUniform[fi]);
         }
     }
+    // Whether some material is one a walk goes inside (enterableSolidMat): else every stack stays empty.
+    bool anyEnterable = false;
+    // The stack a camera walk from `eye` starts with (CAMERA-EMPTY-STACK): the solids around it, none
+    // where the scene has nothing to be inside. Camera::enclosure holds it per camera.
+    MediumStack eyeStack(const Vec3& eye) const { return anyEnterable ? enclosureAt(eye) : MediumStack{}; }
     // The stack a walk born at `origin`, of emitter `emitter` or emissive volume `fire` (-1: not), starts
     // with.
     MediumStack birthStack(int emitter, int fire, const Vec3& origin) const {

@@ -1,0 +1,17 @@
+# CAMERA-EMPTY-STACK: a room under water, the camera and the lamp in it. Every walk runs in one absorbing
+# medium (0.3 per metre at every wavelength): the camera's walks must start inside it, and every
+# connection's leg -- a light sample, a splat to the camera, a BDPT or VCM connection -- must take its
+# absorption. The lamp faces the camera 2.8 m away, so seen directly it reads exp(-0.3 * 2.8) of the
+# same room dry. Judged by tools/check_camera_in_water.py.
+scene { units meters }
+material "white" { type diffuse reflect 0.7 }
+material "water" { type dielectric  ior 1.33  absorb 0.3 }
+sphere { center 0 1.5 0  radius 6  material water }
+quad { origin -2 0 -2  u 0 0 4  v 4 0 0  material white }
+quad { origin -2 3 -2  u 4 0 0  v 0 0 4  material white }
+quad { origin -2 0 -2  u 4 0 0  v 0 3 0  material white }
+quad { origin -2 0 2  u 0 3 0  v 4 0 0  material white }
+quad { origin -2 0 -2  u 0 3 0  v 0 0 4  material white }
+quad { origin 2 0 -2  u 0 0 4  v 0 3 0  material white }
+light area { origin -0.15 1.35 -1.0  u 0.3 0 0  v 0 0.3 0  normal 0 0 1  spd preset:bb6500  power 20 }
+camera "c" { eye 0 1.5 1.8  look_at 0 1.5 -1.0  up 0 1 0  fov_y 50  film { res 96 72 } }

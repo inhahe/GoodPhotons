@@ -315,6 +315,10 @@ struct BackwardRenderer {
         // set by interactMaterial and the hero walk. Empty off a coated vertex; a gather ray, a
         // re-entry and a split's sub-path start without one.
         CoatCtx coat;
+        // The stack the walk this context starts begins with: a camera path's camera's
+        // (Camera::enclosure), a gather ray's its vertex's. Inside a walk, the walk's own stack, so
+        // that a gather ray it sends takes it. Null for none (air).
+        const MediumStack* stk0 = nullptr;
     };
     // A camera path's first event: the sky (it escaped), a specular-side surface (the rule
     // classifyComposite applies to a pixel: a non-sensor surface whose own material is a
@@ -1297,6 +1301,7 @@ struct BackwardRenderer {
                 // measure the same segment.
                 if (med) contrib *= mediaTr(scene, h.p + ngo * 1e-6, wiConn, sunMediaDist(scene, em, h.p, dist),
                                             lambda, rng);
+                contrib *= legAbsorption(scene, h.extMat, dist, lambda);   // the vertex's solid, if any
                 acc += contrib;
             }
             // selW is 1 on the exact path, so this multiply is a no-op there (and the
@@ -1309,7 +1314,7 @@ struct BackwardRenderer {
             const bool agg = hs && hs->aggregate;
             const double one = 1.0;
             fireNee(scene, h.p, &lambda, 1, &one, &invPdfLambda, &total, nb != nullptr, agg,
-                    agg ? FireVis::SkipHair : FireVis::Strands, rng,
+                    agg ? FireVis::SkipHair : FireVis::Strands, h.extMat, rng,
                     [&](const Vec3& wi, double* f, double& pdfB, Ray& r) {
                         double cosSurf = 0.0, stG = 0.0;
                         if (!dirResponse(scene, h, wi, hs, nb, cosSurf, stG, pdfB)) return false;
@@ -1446,6 +1451,8 @@ struct BackwardRenderer {
             if (med)
                 Renderer::mediaTransmittanceSpec(scene, h.p + ngo * 1e-6, wiConn, dist,
                                                  lam, KK, Tr, rng);
+            if (h.extMat >= 0)   // the leg inside the vertex's solid (legAbsorption)
+                for (int k = 0; k < KK; ++k) Tr[k] *= legAbsorption(scene, h.extMat, dist, lam[k]);
             const double gWeight = w * selW * thrScalar * dLam / PI;   // rho/PI with rho == 1
             if (!(gWeight > 0.0)) continue;
             for (int k = 0; k < KK; ++k) {
@@ -1504,6 +1511,14 @@ struct BackwardRenderer {
                 // skips it without touching the rng.
                 if (!scene.media.empty())
                     ws *= mediaTr(scene, h.p + ngo * 1e-6, wiConn, sunMediaDist(scene, em, h.p, dist), lam[0], rng);
+                // Inside a solid the leg takes its absorption (legAbsorption), per wavelength: on the
+                // throughput each branch below reads.
+                double thrLeg[hero::kHeroMax];
+                const double* tr = thr;
+                if (h.extMat >= 0) {
+                    for (int i = 0; i < nUp; ++i) thrLeg[i] = thr[i] * legAbsorption(scene, h.extMat, dist, lam[i]);
+                    tr = thrLeg;
+                }
                 // GLOSSY-NEE. The lobe's GEOMETRY is wavelength-free -- which is the same fact
                 // that lets the bundle survive a glossy vertex at all -- so the balance-heuristic
                 // weight is computed once and shared, and only the coefficient inside bsdfF
@@ -1525,19 +1540,19 @@ struct BackwardRenderer {
                         if (!(f > 0.0)) continue;
                         f *= ce.at(lam[i]);
                         const double spd = cached ? spdCache->at(e, i) : em.spdFn(lam[i]);
-                        L[i] += thr[i] * f * (spd * invPdf[i]) * wsMis;
+                        L[i] += tr[i] * f * (spd * invPdf[i]) * wsMis;
                     }
                 } else if (gi.coat) {   // a coated body: its lobe takes the coat at each member's
                     const CoatEval ce = gi.coat.eval(scene, h, wiConn);
                     for (int i = 0; i < nUp; ++i)
-                        L[i] += thr[i] * (rho[i] / PI) * ce.at(lam[i]) *
+                        L[i] += tr[i] * (rho[i] / PI) * ce.at(lam[i]) *
                                 ((cached ? spdCache->at(e, i) : em.spdFn(lam[i])) * invPdf[i]) * ws;
                 } else if (cached) {
                     for (int i = 0; i < nUp; ++i)
-                        L[i] += thr[i] * (rho[i] / PI) * (spdCache->at(e, i) * invPdf[i]) * ws;
+                        L[i] += tr[i] * (rho[i] / PI) * (spdCache->at(e, i) * invPdf[i]) * ws;
                 } else {
                     for (int i = 0; i < nUp; ++i)
-                        L[i] += thr[i] * (rho[i] / PI) * (em.spdFn(lam[i]) * invPdf[i]) * ws;
+                        L[i] += tr[i] * (rho[i] / PI) * (em.spdFn(lam[i]) * invPdf[i]) * ws;
                 }
             }
         }
@@ -1545,7 +1560,7 @@ struct BackwardRenderer {
         // sampled direction, as for an emitter above.
         if (!scene.emissiveVolumes.empty())
             fireNee(scene, h.p, lam, nUp, thr, invPdf, L, nb != nullptr, /*coat=*/false,
-                    FireVis::Strands, rng,
+                    FireVis::Strands, h.extMat, rng,
                     [&](const Vec3& wi, double* f, double& pdfB, Ray& r) {
                         double cosSurf = 0.0, stG = 0.0;
                         if (!dirResponse(scene, h, wi, nullptr, nb, cosSurf, stG, pdfB)) return false;
@@ -1589,7 +1604,8 @@ struct BackwardRenderer {
         double acc[hero::kHeroMax];
         for (int i = 0; i < nUp; ++i) acc[i] = 0.0;
         double wSum = 0.0;
-        const GiCtx sub{gi.depth + 1, gi.sIdx, 0, gi.furTier};   // inherit the fur tier
+        GiCtx sub{gi.depth + 1, gi.sIdx, 0, gi.furTier};   // inherit the fur tier
+        sub.stk0 = gi.stk0;                                  // and start inside the vertex's solids
         for (int j = 0; j < n; ++j) {
             const Vec3 d = giDir(j, n, p1, p2);
             const double c = dot(h.n, d);
@@ -1626,7 +1642,8 @@ struct BackwardRenderer {
         double p1, p2;
         giPhases(gi.sIdx, p1, p2);
         double acc = 0.0, wSum = 0.0;
-        const GiCtx sub{gi.depth + 1, gi.sIdx, 0, gi.furTier};   // inherit the fur tier
+        GiCtx sub{gi.depth + 1, gi.sIdx, 0, gi.furTier};   // inherit the fur tier
+        sub.stk0 = gi.stk0;                                  // and start inside the vertex's solids
         for (int j = 0; j < n; ++j) {
             const Vec3 d = giDir(j, n, p1, p2);
             const double c = dot(h.n, d);
@@ -1666,7 +1683,7 @@ struct BackwardRenderer {
     // its media being flat in λ). neeVolumeHero's, for the bundle and (at nUp == 1) the scalar path
     // alike.
     bool volumeEmitterGeom(const Scene& scene, const Emitter& em, const Vec3& p, double lambda,
-                           Pcg32& rng, Vec3& wi, double& geom) const {
+                           Pcg32& rng, Vec3& wi, double& geom, double* distOut = nullptr) const {
         if (em.collimated) return false;                  // beams aren't area-samplable
         // The shadow ray's far-end shortening (Scene::connMaxT): 0 for the sun, whose far end is
         // the scene's exit, not a sampled point.
@@ -1742,6 +1759,7 @@ struct BackwardRenderer {
         const double vis = scene.shadowTransmittanceTo(p + wi * 1e-6, p + wi * dist, shorten);
         if (!(vis > 0.0)) return false;
         geom *= vis * mediaTr(scene, p + wi * 1e-6, wi, sunMediaDist(scene, em, p, dist), lambda, rng);
+        if (distOut) *distOut = dist;
         return geom > 0.0;
     }
 
@@ -1936,14 +1954,14 @@ struct BackwardRenderer {
             for (int i = 0; i < nUp; ++i) {
                 if (!(thr[i] > 0.0) || !(resp[i] > 0.0)) continue;
                 const double spd = cached ? spdCache->at(e, i) : em.spdFn(lam[i]);
-                L[i] += thr[i] * resp[i] * (spd * invPdf[i]) * w;
+                L[i] += thr[i] * resp[i] * (spd * invPdf[i]) * w * legAbsorption(scene, h.extMat, dist, lam[i]);
             }
         }
         // The fire, as one more light (fireNee), with the fiber's response per wavelength. No
         // MIS: as for the emitters above, a continuation after a fiber does not count it.
         if (!scene.emissiveVolumes.empty())
             fireNee(scene, h.p, lam, nUp, thr, invPdf, L, /*mis=*/false, /*coat=*/false,
-                    FireVis::Strands, rng,
+                    FireVis::Strands, h.extMat, rng,
                     [&](const Vec3& wi, double* f, double& pdfB, Ray& r) {
                         const Vec3 wl = hair::toLocal(hs[0].fr, wi);
                         hairBundleAt(hs, nUp, wl,
@@ -2208,8 +2226,10 @@ struct BackwardRenderer {
     // the balance heuristic sel*p / (sel*p + pdfB); otherwise it is the only strategy. Adds
     // thr[i] * invPdf[i] times the estimate into L[i].
     template <class Resp>
+    // `solid`: the solid the vertex lies in (Hit::extMat; -1 air), whose absorption the integral takes
+    // along the ray (legAbsorption's); a vertex inside one carries one wavelength.
     void fireNee(const Scene& scene, const Vec3& x, const double* lam, int n, const double* thr,
-                 const double* invPdf, double* L, bool mis, bool coat, FireVis vis, Pcg32& rng,
+                 const double* invPdf, double* L, bool mis, bool coat, FireVis vis, int solid, Pcg32& rng,
                  Resp&& resp) const {
         const int nV = (int)scene.emissiveVolumes.size();
         if (nV == 0 || !(scene.totalEmissionPower > 0.0) || !fireNeeOn()) return;
@@ -2237,7 +2257,8 @@ struct BackwardRenderer {
         double E[hero::kHeroMax] = {0};
         // Unbounded: the clip to the box the fire emits in ends it, and that box can reach past the
         // scene sphere (a `temperature` grid wider than the medium's `density` bound).
-        fireSegment(scene, r.o, r.d, 1e30, lam, n, coat, vis, r.curveTmin, /*absorb=*/0.0, rng, E,
+        fireSegment(scene, r.o, r.d, 1e30, lam, n, coat, vis, r.curveTmin,
+                    (solid >= 0) ? scene.mats[(size_t)solid].absorb(lam[0]) : 0.0, rng, E,
                     [](int) { return 1.0; }, vi);
         const double den = sel * pdfDir + (mis ? pdfB : 0.0);
         if (!(den > 0.0)) return;
@@ -2252,9 +2273,11 @@ struct BackwardRenderer {
     // estimate serves every wavelength -- and the albedo, phase value and emitter spectrum per
     // wavelength. The phase is a rainbow's, whose lobes move with λ, or an HG lobe, whose do not;
     // either way `phaseValue` at each λ is that wavelength's own response.
+    // `solid`: the solid the scatter lies in (its walk's stack top; -1 air), whose absorption every leg
+    // takes (legAbsorption).
     void neeVolumeHero(const Scene& scene, const Medium& med, const Vec3& p, const Vec3& wIn,
                        double* L, const double* thr, const double* lam, const double* invPdf,
-                       int nUp, Pcg32& rng, const SpdCache* spdCache) const {
+                       int nUp, Pcg32& rng, const SpdCache* spdCache, int solid) const {
         const bool cached = spdCache && spdCache->matches(lam, nUp);
         double alb[hero::kHeroMax];
         for (int i = 0; i < nUp; ++i) alb[i] = med.albedo(lam[i]);
@@ -2265,20 +2288,21 @@ struct BackwardRenderer {
             if (selW <= 0.0) continue;
             const Emitter& em = scene.emitters[e];
             Vec3 wi;
-            double geom = 0.0;
-            if (!volumeEmitterGeom(scene, em, p, lam[0], rng, wi, geom)) continue;
+            double geom = 0.0, dist = 0.0;
+            if (!volumeEmitterGeom(scene, em, p, lam[0], rng, wi, geom, &dist)) continue;
             geom *= selW;
             const double cosT = dot(wIn, wi);
             for (int i = 0; i < nUp; ++i) {
                 if (!(thr[i] > 0.0)) continue;
                 const double spd = cached ? spdCache->at(e, i) : em.spdFn(lam[i]);
-                L[i] += thr[i] * alb[i] * med.phaseValue(cosT, lam[i]) * spd * invPdf[i] * geom;
+                L[i] += thr[i] * alb[i] * med.phaseValue(cosT, lam[i]) * spd * invPdf[i] * geom *
+                        legAbsorption(scene, solid, dist, lam[i]);
             }
         }
         // The fire, as one more light (fireNee); the vertex may sit inside it.
         if (!scene.emissiveVolumes.empty())
             fireNee(scene, p, lam, nUp, thr, invPdf, L, /*mis=*/false, /*coat=*/false,
-                    FireVis::Strands, rng,
+                    FireVis::Strands, solid, rng,
                     [&](const Vec3& wi, double* f, double& pdfB, Ray& r) {
                         const double cosT = dot(wIn, wi);
                         for (int i = 0; i < nUp; ++i) f[i] = alb[i] * med.phaseValue(cosT, lam[i]);
@@ -2816,8 +2840,10 @@ struct BackwardRenderer {
         // Nested-dielectric medium stack: the solids the ray is currently inside. The
         // current medium (for Beer-Lambert absorption + the exterior IOR at the next
         // interface) is the highest-priority entry. Replaces the old single `interior`
-        // pointer; behaves identically for a lone dielectric.
-        MediumStack stk;
+        // pointer; behaves identically for a lone dielectric. It starts with gi's (GiCtx::stk0), and
+        // a gather ray this walk sends starts with it as it is then.
+        MediumStack stk = gi.stk0 ? *gi.stk0 : MediumStack{};
+        gi.stk0 = &stk;
         auto curAbsorb = [&](double lam) -> double {           // sigma_a of the current medium
             int mi = stk.topMat();
             return (mi >= 0) ? scene.mats[mi].absorb(lam) : 0.0;
@@ -2957,7 +2983,7 @@ struct BackwardRenderer {
                         if (a > 0.0) thr *= std::exp(-a * tMed);
                     }
                     neeVolumeHero(scene, med, p, ray.d, &L, &thr, &lambda, &invPdfLambda, 1, rng,
-                                  spdCache);   // its one-wavelength case
+                                  spdCache, stk.topMat());   // its one-wavelength case
                     if (scene.envIndex >= 0)   // env-NEE at the volume vertex
                         L += thr * neeEnvVolume(scene, med, p, ray.d, lambda, invPdfLambda, rng);
                     if (directOnly) return L;  // Whitted: single-scatter only, no indirect
@@ -3177,8 +3203,14 @@ struct BackwardRenderer {
         // first estimate.
         const bool rcTrain = rcActive() && radTrainFrac > 0.0
                            && (rng.uniform() < radTrainFrac);
-        radianceHeroLoop(scene, ray, MediumStack{}, lamIn, invPdfIn, thr, C,
-                         /*secAlive=*/(C > 1), /*specularArrival=*/(gi.depth == 0),
+        // The walk starts inside gi's solids (GiCtx::stk0), and a bundle inside a solid is one
+        // wavelength, as one that enters a solid becomes (the dielectric case's deHero): there the
+        // hero carries the bundle from the start, boosted xC.
+        const MediumStack stk0 = gi.stk0 ? *gi.stk0 : MediumStack{};
+        const bool whole = (C > 1) && stk0.empty();
+        if (C > 1 && !whole) thr[0] = (double)C;
+        radianceHeroLoop(scene, ray, stk0, lamIn, invPdfIn, thr, C,
+                         /*secAlive=*/whole, /*specularArrival=*/(gi.depth == 0),
                          /*contBsdfPdf=*/0.0, /*bounce0=*/0, Lout, rng, spdCache, gi,
                          rcTrain);
     }
@@ -3203,6 +3235,7 @@ struct BackwardRenderer {
                           GiCtx gi, bool rcTrain = false,
                           bool firstSegSampled = false, double reentryCoatU = -1.0,
                           const GlossyMis* gmis0 = nullptr, double contSoft0 = 1.0) const {
+        gi.stk0 = &stk;   // a gather ray from this walk starts with its stack as it then is
         // `firstSegSampled`: this call RE-ENTERS a vertex its parent already reached (the
         // chromatic-coat split re-traces the segment that hit the coat), so the free flights
         // along that first segment -- the media collision and the aggregate-fur flight -- were
@@ -3378,7 +3411,7 @@ struct BackwardRenderer {
                     // A scatter is a vertex the material switch never sees, so the glossy MIS
                     // state of an earlier glossy bounce must not outlive it (see gmis.clear()).
                     gmis.clear();
-                    neeVolumeHero(scene, med, p, ray.d, L, thr, lam, invPdf, nUp, rng, spdCache);
+                    neeVolumeHero(scene, med, p, ray.d, L, thr, lam, invPdf, nUp, rng, spdCache, stk.topMat());
                     if (scene.envIndex >= 0)
                         neeEnvVolumeHero(scene, med, p, ray.d, L, thr, lam, invPdf, nUp,
                                          specR, specTech, rng);
@@ -4380,6 +4413,7 @@ struct BackwardRenderer {
                         firstEv = -1;
                         for (int i = 0; i < C; ++i) firstSecEv[i] = -2;
                         GiCtx gi0{0, sIdx};
+                        gi0.stk0 = &cam.enclosure;
                         gi0.first = firstOut;
                         gi0.firstSec = firstOut ? firstSecEv : nullptr;
                         radianceHero(scene, ray, lamA, invA, C, Lh, rng, &spdCache, gi0);
@@ -4426,6 +4460,7 @@ struct BackwardRenderer {
                             continue;                       // clipped by an element / the stop
                         firstEv = -1;
                         GiCtx gi0{0, sIdx};
+                        gi0.stk0 = &cam.enclosure;
                         gi0.first = firstOut;
                         double L = radiance(scene, ray, lambda, invPdfLambda, rng, &spdCache, gi0);
                         filmFor(firstEv).add(px, py, Vec3(cieX(lambda), cieY(lambda), cieZ(lambda)) * (L * wLens * filmW));
@@ -4437,6 +4472,7 @@ struct BackwardRenderer {
                     Ray ray = cam.genRay(px, py, sjx, sjy);
                     firstEv = -1;
                     GiCtx gi0{0, sIdx};
+                    gi0.stk0 = &cam.enclosure;
                     gi0.first = firstOut;
                     double L = radiance(scene, ray, lambda, invPdfLambda, rng, &spdCache, gi0);
                     filmFor(firstEv).add(px, py, Vec3(cieX(lambda), cieY(lambda), cieZ(lambda)) * (L * filmW));

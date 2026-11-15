@@ -2432,7 +2432,12 @@ A light inside a dielectric -- a lamp in a coloured glass globe, a fire in a gla
 lamp under water -- starts its light walks inside it (since 0.445.5), in every mode on both
 devices: ftrace finds the solids around each light at load, so its light is absorbed by the
 glass on its way to the wall and leaves into the medium around it rather than air. A light
-straddling a solid's surface is looked up per photon.
+straddling a solid's surface is looked up per photon. A camera inside a dielectric -- under water,
+inside a glass block -- sees from inside it the same way (since 0.445.8): its walks start inside the
+solids around its eye, and every connection to it, and every light sample inside a coloured solid,
+takes that solid's absorption over its length. (The eye's solids are found once per camera; a lens
+aperture or front element straddling a surface takes the eye's. The interactive viewer's cameras
+start in air.)
 
 Priorities are **opt-in and safe to omit**: a scene that never writes `priority` renders
 exactly as before (each dielectric treated against air). Because that flat model is

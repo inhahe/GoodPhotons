@@ -75,7 +75,7 @@ struct SPPMState {
 // camera prefix's factors at its own (SPPM-SPECTRAL).
 inline void sppmVisiblePoint(const Scene& scene, Ray ray, Pcg32& rng, bool diffraction,
                              int maxBounce, Hit& vp, double& thrOut, bool& vpValid,
-                             Vec3& directL, SpecThr& sthr) {
+                             Vec3& directL, SpecThr& sthr, const MediumStack* stk0 = nullptr) {
     directL = Vec3{0, 0, 0};
     thrOut = 0.0; vpValid = false;
 
@@ -85,7 +85,8 @@ inline void sppmVisiblePoint(const Scene& scene, Ray ray, Pcg32& rng, bool diffr
     const double invPdfL = scene.invPdfLambda(lambda);
 
     Renderer mats; mats.diffraction = diffraction;
-    MediumStack stk;                                     // nested-dielectric medium stack
+    // nested-dielectric medium stack, from the camera's (`stk0`, Camera::enclosure)
+    MediumStack stk = stk0 ? *stk0 : MediumStack{};
     // GRADIENT-INDEX: the camera ray bends, exactly as mode M's gather does. Without this
     // the SPPM deposit marched its photons through a GRIN lens while the view walked
     // straight past it, and the lens rendered flat.
@@ -415,7 +416,7 @@ inline void sppmPass(const Scene& scene, const Camera& cam, SPPMState& st,
                     Vec3 directL;
                     SpecThr sthr(scene.emitSampler);
                     sppmVisiblePoint(scene, ray, rng, diffraction, maxBounce,
-                                     P.vpHit, P.vpThr, P.vpValid, directL, sthr);
+                                     P.vpHit, P.vpThr, P.vpValid, directL, sthr, &c.enclosure);
                     P.vpSpec = P.vpValid && sthr.any;
                     if (P.vpSpec) {   // in float over its peak, the peak in vpThr (SpecThr::peak)
                         const double pk = sthr.peak();

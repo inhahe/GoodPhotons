@@ -3512,6 +3512,27 @@ coloured glass is absorbed per wavelength on its first leg (`tracePhotonHeroLoop
 de-heros it. `tools/check_birth_stack.py` holds B, D, J, U, M and S, CPU and GPU, to mode R on two
 lamps inside an amber ball (`scenes/_birth_in_glass.ftsl`).
 
+The camera side has the same two halves (CAMERA-EMPTY-STACK, 0.445.8). Every camera walk starts inside
+the solids around its eye: `Scene::eyeStack` (enclosureAt at the eye, none where nothing is
+enterable), set once per batch on each `RenderCam`'s `Camera::enclosure` in main.cpp and carried by
+the camera's posed copies; the device's `DCamera::enclosure` mirrors it. Mode R and W take it through
+`GiCtx::stk0` (and `DGiCtx::stk0`), which inside a walk points at the walk's own stack so a gather ray
+starts with the vertex's; D and J through randomWalk's `stk0`; U, M (its final gather too), S and the
+denoiser's guide through their own `stk0` parameters. A thin lens's aperture and a physical lens's
+front element are taken to lie in the eye's solids. A camera bundle born inside a solid is one
+wavelength from the start, as one that enters a solid becomes (mode R's hero boosted xC; BDPT and VCM
+average over the wavelengths they carry, so the lone hero needs no boost), so the invariant "inside a
+solid, one wavelength" holds on the camera side too. And every connection runs inside one medium,
+since any dielectric face blocks one: `legAbsorption(scene, medium, dist, lambda)` (device
+`dLegAbsorption`) is that medium's Beer-Lambert over the leg, exactly 1 in air. A light sample takes
+its vertex's (`Hit::extMat`, the stack top the walk reached it through; a BDPT medium vertex records
+it in `hit.extMat` too, the device's in `DVertex::extMat`), as do BDPT's and VCM's connections; a
+forward splat and a light-tracing splat take the camera's (`Camera::medium`), which a leg that reached
+the eye never left; the fire's light sampling takes it along its integral (fireSegment's absorption).
+`tools/check_camera_in_water.py` (`scenes/_camera_in_water.ftsl`, a room under water absorbing 0.3
+per metre): mode R reads the lamp exp(-0.84) of the room dry, and B, D, J, U, M and S, CPU and GPU,
+read the walls and the lamp as mode R does.
+
 It cancels for the usual glass object, crossed in and out, which is why its absence went unseen
 until 0.378.1: it matters only when a camera path ends inside a dielectric and meets something the
 light side computed there -- photon density (modes M, S), merges (U, J), BDPT connections, an

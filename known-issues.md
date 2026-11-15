@@ -125,7 +125,29 @@ comments (Opus).
 0 alone while 31 lanes waited, were most of the gather. (The 0.90-1.07x quoted for 0.445.3 was a
 small scene's.)
 
-## OPEN (2026-11-15): CAMERA-EMPTY-STACK — a camera inside a dielectric starts its walks outside it
+## DONE (2026-11-15, 0.445.8): CAMERA-EMPTY-STACK — a camera inside a dielectric starts its walks outside it
+
+**Fixed** (design.md, the nested-dielectric section): every camera walk starts inside the solids
+around its eye (`Scene::eyeStack`, set on each camera once the scene is built: `Camera::enclosure`,
+`DCamera::enclosure`), a camera bundle born inside a solid being one wavelength from the start; and
+every connection leg -- light samples, forward and light-tracing splats, BDPT and VCM connections,
+the fire's light sampling -- takes the absorption of the one medium it runs in (`legAbsorption`,
+`dLegAbsorption`), which closes "BDPT connection edges through colored glass" below too.
+`tools/check_camera_in_water.py`, `scenes/_camera_in_water.ftsl` (a room under water absorbing 0.3
+per metre, the camera and the lamp in it, the lamp 2.8 m from the eye):
+  * mode R reads the lamp exp(-0.84) of the room dry, 0.4316 against 0.4317 on both devices (one
+    wavelength a path in both renders, so the ratio is the absorption's alone; the 0.445.7 build
+    read 1.0000, the camera seeing no water at all);
+  * every other mode, CPU and GPU, reads the walls within 0.4 % of mode R and the lamp within 3 %:
+    B 1.0004 / 1.0002, D 0.9991 / 0.9998, J 1.0038 / 1.0009, U 1.0012 / 1.0018, M 0.9981 / 1.0021,
+    S 1.0002 / 1.0003 (its lamp 1.0254 on the GPU: SPPM-GPU-LAMP, which the build before reads the
+    same). The 0.445.7 build read the walls 0.08-0.43 of its own mode R.
+
+Left: the interactive viewer's cameras start in air (they are made as the user moves, after the
+batch's are set), and a lens aperture or front element straddling a solid's surface takes the
+eye's stack.
+
+What it was:
 
 The camera-side twin of BIRTH-EMPTY-STACK. Every camera walk starts with an empty dielectric stack
 (`MediumStack`): mode R's and W's radiance loops, scalar and hero (and the device's `bk*`), mode D's
@@ -147,6 +169,39 @@ orthographic film's corners -- per ray where they disagree), carried into every 
 uploaded with the camera; the solid's absorption on every camera leg inside it. Held by a check
 with the camera inside an absorbing water tank against Beer-Lambert's closed form (a lamp in the
 water at a known distance) and modes B, D, J, U, M and S against mode R.
+
+## OPEN (2026-11-15): SPPM-GPU-LAMP — GPU mode S reads a lamp seen directly 2.5 % bright
+
+Found by tools/check_camera_in_water.py, and not of its making. `scenes/_camera_in_water.ftsl`'s lamp
+faces the camera; over a 2.5-pixel disc at its middle GPU mode S (256 spp, -n 200000, -max-bounce 12)
+reads it 1.0254 +- 0.0068 of GPU mode R under water (eight seeds) and 1.0235 +- 0.0087 with the water
+removed (six), and the 0.445.7 build the same dry (1.033, three seeds); CPU mode S reads it 0.9845 +-
+0.0107 under water (two seeds) and 0.992 dry (three). Mode R is the same on both devices (1.0001).
+A lamp seen directly is deterministic in mode R, so the device's visible point on an emitter -- its
+emission term, or what its gather adds there -- is the place to look. **The lead:** mode S's visible
+point draws its wavelength from the BINNED emission CDF (dSampleSceneLambda; host emitSampler) but
+weighs it by the exact density's inverse, `emitG / g(lambda)` (dInvPdfLambda; host invPdfLambda):
+unbiased only where g is flat within a bin. Mode R's camera draw carries the correction for exactly
+this (dSampleCamLambdaU's `filmW`, Scene::camFilmWeight); the visible point's emission term does not.
+Only what the visible point weighs by its own wavelength is touched -- the lamp seen directly, not
+the photons the walls gather at theirs -- which is the pattern measured. Mode M's visible point to
+be checked the same way.
+
+Beside it, not this: dry, modes S on both devices read the walls 2.25 % bright of mode R at
+`-max-bounce 12`, which caps R's camera path and not S's photons. Under water, where long paths die,
+they agree to 0.05 %. A depth mismatch (the measurement trap at this file's head) until shown
+otherwise.
+
+## OPEN (2026-11-15): GPU-U-GLOSSY-SLOW — GPU mode U is several times slower than the CPU's inside a glossy sphere
+
+Found running tools/check_merge_glossy.py (`scenes/_merge_glossy_bowl.ftsl`, a room inside a rough
+glossy sphere, `-max-bounce 24 -pmradius 0.05`, 96 x 72): mode U on the GPU took about 75 s a seed at
+128 spp and 5 minutes at 512, the CPU's about 16 s at 128 -- the GPU some 4-5 times slower. Not mode
+U on the GPU in general: under water (`scenes/_camera_in_water.ftsl`, diffuse walls, `-max-bounce
+12`, 256 spp) it took 12 s a seed against the CPU's 16. Suspects: the glossy merges' cost per merge
+on the device (each a GGX evaluation and pdf at the merge's wavelength), the depth, or the light
+pass's size at a pinned radius. To narrow: the same scene at -max-bounce 8, with -nojsurf-style
+merges off, and with the sphere diffuse, timing each stage (`-vcmstats` if it prints them).
 
 ## NOTED (2026-11-15): COINCIDENT-LAMP-FACES — two lamp quads back to back on one plane read half as bright to every camera walk
 
@@ -32457,7 +32512,12 @@ correctly on **both** backends.
 
 ## Limitations (by design, tracked for future work)
 
-### BDPT connection edges through colored glass are not absorption-weighted
+### DONE (2026-11-15, 0.445.8): BDPT connection edges through colored glass are not absorption-weighted
+**Fixed with CAMERA-EMPTY-STACK.** No connection crosses a dielectric's face (the face blocks it), so
+the case this entry meant is a connection running INSIDE one -- an object inside coloured glass, lit
+by a lamp inside it, or a camera under water -- and the gap was every estimator's, not BDPT's alone:
+mode R's light samples and the forward splats had it too. Every connection leg now takes its
+medium's absorption (`legAbsorption`, `dLegAbsorption`). What the entry said:
 - **What:** Beer-Lambert interior absorption (`Material::absorb`, colored glass)
   is threaded through all three CPU transport loops via an `interior` medium
   pointer (forward `tracePhoton`, backward `radiance`, BDPT `randomWalk`). In
@@ -32477,6 +32537,8 @@ correctly on **both** backends.
   `exp(-sigma_a*dist)`. Deferred until BDPT-through-glass accuracy is needed.
 
 ### VCM (mode `U`): merges use a spectral XYZ estimate; connections through glass share BDPT's absorption gap; CPU-only
+**Two of the three parts are gone:** its connections take their medium's absorption (0.445.8,
+CAMERA-EMPTY-STACK), and mode U runs on the GPU too. The spectral XYZ merge stands, by design.
 - **What:** Mode `U` (VCM/UPS, `src/vcm.h`) is single-wavelength like the rest of the
   renderer. Its **vertex connections** pair a camera subpath with its **own** light
   subpath, so both share one wavelength and the connection is exact (like BDPT). Its

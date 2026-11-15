@@ -135,9 +135,10 @@ inline Vec3 mul(const Vec3& a, const Vec3& b) { return Vec3{a.x * b.x, a.y * b.y
 // coloured glass's absorption along the way), and that surface's shading normal. A ray that
 // escapes, is absorbed, or runs out of depth adds nothing (albedo 0, normal 0, which is
 // what OIDN expects of a background).
-inline void traceGuide(const Scene& scene, const Renderer& rr, Ray ray, Vec3& alb, Vec3& nrm) {
+inline void traceGuide(const Scene& scene, const Renderer& rr, Ray ray, Vec3& alb, Vec3& nrm,
+                       const MediumStack& stk0 = MediumStack{}) {
     Vec3 tint{1, 1, 1};
-    MediumStack stk;
+    MediumStack stk = stk0;   // the camera's (Camera::enclosure)
     Pcg32 rng;   // interfaceStep's signature; the whitted step draws nothing from it
     for (int b = 0; b < kMaxDepth; ++b) {
         // `skipCamHidden` on the camera segment only, as the renderers do: a hide_camera
@@ -381,7 +382,7 @@ inline Images render(const Scene& scene, const Camera& cam, int W, int H, int si
                     } else {
                         ray = c.genRay(px, py, jx, jy);
                     }
-                    traceGuide(scene, rr, ray, alb, nrm);
+                    traceGuide(scene, rr, ray, alb, nrm, c.enclosure);
                 }
             g.albedo[i] = alb * inv;
             g.normal[i] = nrm * inv;

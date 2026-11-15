@@ -12,6 +12,7 @@
 #include <memory>
 #include <vector>
 #include "geometry.h"
+#include "medium_stack.h"   // Camera::enclosure
 #include "scene_film.h"
 #include "lens.h"
 
@@ -159,6 +160,14 @@ struct Camera {
     // and the brute-force forward catch (model C). Smaller aperture -> deeper focus
     // (sharper), larger -> shallower depth of field (more bokeh). Model B is the
     // apertureR -> 0 pinhole limit and ignores these.
+    // The solids around the eye, outermost first (Scene::eyeStack), which every camera walk starts
+    // inside and a forward splat reaching the camera last crossed; empty -- air -- until the renderer
+    // sets it once the scene is built (main.cpp; CAMERA-EMPTY-STACK). A thin lens's aperture and a
+    // physical lens's front element are taken to lie in them too.
+    MediumStack enclosure;
+    // The medium the eye sits in (Scene::mats' index; -1 air): the one a forward splat's leg reaching
+    // the camera runs through (legAbsorption).
+    int medium() const { return enclosure.topMat(); }
     double apertureR = 0.02; // aperture radius (scene units)
     double filmDist  = 1.0;  // aperture->film distance (only ratio to apertureR matters for blur)
     double lensF     = 0.0;  // thin-lens focal length; 0 => no lens (straight-through

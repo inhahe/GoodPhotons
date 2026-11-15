@@ -16455,7 +16455,7 @@ static Film renderForward(const Scene& scene, const Camera* cam, int resX, int r
         // Motion blur (ROADMAP 11): each photon, and its splat to the camera, at one time in the
         // shutter, drawn off its own stream -- a moving camera posed there on this thread's copy.
         const bool blur = cam && cam->seesMotion(scene);
-        static const Camera kNoCamera;   // both arms lvalues: `posed` keeps a pointer
+        static const Camera kNoCamera{};   // both arms lvalues: `posed` keeps a pointer
         PosedCamera posed(cam ? *cam : kNoCamera, blur && camPtr);
         for (long long i = lo; i < hi; ++i) {
             seedUnit(rng, seedBase + (uint64_t)i, 0x9E3779B97F4A7C15ULL);
@@ -29155,6 +29155,9 @@ static int run(int argc, char** argv) {
 #endif
         return 0;
     }
+
+    // Every camera's walks start inside the solids around its eye (CAMERA-EMPTY-STACK).
+    for (RenderCam& rc : toRender) rc.cam.enclosure = scene.eyeStack(rc.cam.eye);
 
     // The footprint probes of modes M and S, and of J's and U's merges, read which side of a closed
     // solid a face is met from (Hit::solid): marked once for the whole batch, before the meter below

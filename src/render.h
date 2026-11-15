@@ -613,6 +613,18 @@ inline double sideSoftening(const Vec3& w, const Vec3& ns, const Vec3& ngo, bool
     return shadowTerminatorG(w, ns, ngo);
 }
 
+// THE ABSORPTION ON A CONNECTION'S LEG (CAMERA-EMPTY-STACK). A connection -- a light sample's
+// shadow ray, a forward splat to the camera, a BDPT or VCM connection -- is blocked by every face of
+// a dielectric, so one that is not runs inside a single medium end to end: the one its vertex was
+// reached through (Hit::extMat), which for a leg reaching the camera is the camera's (Camera::medium).
+// That medium's Beer-Lambert transmittance over the leg's length `dist` at `lambda`: exactly 1 in air
+// (`medium` -1) and in a clear solid. Device twin dLegAbsorption.
+inline double legAbsorption(const Scene& scene, int medium, double dist, double lambda) {
+    if (medium < 0) return 1.0;
+    const double a = scene.mats[(size_t)medium].absorb(lambda);
+    return a > 0.0 ? std::exp(-a * dist) : 1.0;
+}
+
 // THE SOFTENING A VERTEX LENDS THE LIGHT ITS CONTINUATION REACHES. The terminator's softening
 // (shadowTerminatorG) belongs to the vertex next to a light (bdpt.h emitterSoftening), and it is the
 // INTEGRAND's, not one strategy's: a camera walk's light sampling takes it toward the light (neeLight,
@@ -1622,6 +1634,7 @@ struct Renderer {
         // for a heterogeneous medium, exact exp for a homogeneous one; product over media).
         if (!scene.media.empty())
             contrib *= mediaTransmittance(scene, p, g.wdir, g.dist, lambda, rng);
+        contrib *= legAbsorption(scene, cam.medium(), g.dist, lambda);
         film.add(g.px, g.py, Vec3(cieX(lambda), cieY(lambda), cieZ(lambda)) * contrib);
     }
 
@@ -1641,6 +1654,7 @@ struct Renderer {
             double contrib = beta[i] * f * g.cosSurf * g.corr / g.denom;
             if (!scene.media.empty())
                 contrib *= mediaTransmittance(scene, p, g.wdir, g.dist, lam[i], rng);
+            contrib *= legAbsorption(scene, cam.medium(), g.dist, lam[i]);
             film.add(g.px, g.py, Vec3(cieX(lam[i]), cieY(lam[i]), cieZ(lam[i])) * contrib);
         }
     }
@@ -1665,6 +1679,7 @@ struct Renderer {
         double omega = cam.pixelSolidAngle(cosCam);         // projection-general pixel solid angle
         double contrib = beta * Lambda * ph / (dist2 * omega);
         contrib *= mediaTransmittance(scene, p, wdir, dist, lambda, rng);   // fog transmittance (all media)
+        contrib *= legAbsorption(scene, cam.medium(), dist, lambda);
         film.add(px, py, Vec3(cieX(lambda), cieY(lambda), cieZ(lambda)) * contrib);
     }
 
@@ -1705,6 +1720,7 @@ struct Renderer {
         double contrib = beta * fcos * corr * wgt;
         if (!scene.media.empty())
             contrib *= mediaTransmittance(scene, p, wdir, le.dist, lambda, rng);
+        contrib *= legAbsorption(scene, cam.medium(), le.dist, lambda);
         film.add(px, py, Vec3(cieX(lambda), cieY(lambda), cieZ(lambda)) * contrib);
     }
 
@@ -1741,6 +1757,7 @@ struct Renderer {
                              wgt[i] * coatSplatF(coat, wdir, lam[i]);
             if (!scene.media.empty())
                 contrib *= mediaTransmittance(scene, p, wdir, le.dist, lam[i], rng);
+            contrib *= legAbsorption(scene, cam.medium(), le.dist, lam[i]);
             film.add(px[i], py[i], Vec3(cieX(lam[i]), cieY(lam[i]), cieZ(lam[i])) * contrib);
         }
     }
@@ -1758,6 +1775,7 @@ struct Renderer {
         if (med && wIn) f = med->albedo(lambda) * med->phaseValue(dot(*wIn, wdir), lambda);
         double contrib = beta * f * wgt;
         contrib *= mediaTransmittance(scene, p, wdir, dist, lambda, rng);
+        contrib *= legAbsorption(scene, cam.medium(), dist, lambda);
         film.add(px, py, Vec3(cieX(lambda), cieY(lambda), cieZ(lambda)) * contrib);
     }
 
@@ -1837,6 +1855,7 @@ struct Renderer {
         contrib *= 1.0 / (cam.pixelPlaneArea() * cam.filmDist * cam.filmDist);
         if (!scene.media.empty())
             contrib *= mediaTransmittance(scene, p, wdir, dist, lambda, rng);
+        contrib *= legAbsorption(scene, cam.medium(), dist, lambda);
         film.add(px, py, Vec3(cieX(lambda), cieY(lambda), cieZ(lambda)) * contrib);
     }
 
@@ -1881,6 +1900,7 @@ struct Renderer {
             contrib *= cellNorm;
             if (!scene.media.empty())
                 contrib *= mediaTransmittance(scene, p, wdir, dist, lam[i], rng);
+            contrib *= legAbsorption(scene, cam.medium(), dist, lam[i]);
             film.add(px, py, Vec3(cieX(lam[i]), cieY(lam[i]), cieZ(lam[i])) * contrib);
         }
     }
@@ -1918,6 +1938,7 @@ struct Renderer {
         // exposed scenes unaffected).
         contrib *= 1.0 / (cam.pixelPlaneArea() * cam.filmDist * cam.filmDist);
         contrib *= mediaTransmittance(scene, p, wdir, dist, lambda, rng);   // all media
+        contrib *= legAbsorption(scene, cam.medium(), dist, lambda);
         film.add(px, py, Vec3(cieX(lambda), cieY(lambda), cieZ(lambda)) * contrib);
     }
 
@@ -1939,6 +1960,7 @@ struct Renderer {
         double omega = cam.pixelSolidAngle(cosCam);
         double contrib = beta * (1.0 / (4.0 * PI)) / (dist2 * omega);
         contrib *= mediaTransmittance(scene, p, wdir, dist, lambda, rng);
+        contrib *= legAbsorption(scene, cam.medium(), dist, lambda);
         film.add(px, py, Vec3(cieX(lambda), cieY(lambda), cieZ(lambda)) * contrib);
     }
 
@@ -1968,6 +1990,7 @@ struct Renderer {
         double contrib = beta * (1.0 / (4.0 * PI)) * cosLens * (PI * R * R) / (dist * dist);
         contrib *= 1.0 / (cam.pixelPlaneArea() * cam.filmDist * cam.filmDist);
         contrib *= mediaTransmittance(scene, p, wdir, dist, lambda, rng);
+        contrib *= legAbsorption(scene, cam.medium(), dist, lambda);
         film.add(px, py, Vec3(cieX(lambda), cieY(lambda), cieZ(lambda)) * contrib);
     }
 
@@ -2317,6 +2340,7 @@ struct Renderer {
                 contrib *= mediaTransmittance(scene, p,     wP, dP2, lambda, rng);
                 contrib *= mediaTransmittance(scene, ch.P1, wE, dE,  lambda, rng);
             }
+            contrib *= legAbsorption(scene, cam.medium(), dP2 + dE, lambda);   // both in the camera's
             film.add(px, py, Vec3(cieX(lambda), cieY(lambda), cieZ(lambda)) * contrib);
         }
     }
@@ -2466,6 +2490,7 @@ struct Renderer {
             // Fog transmittance on the exterior segment only (interior is solid glass).
             if (!scene.media.empty())
                 contrib *= mediaTransmittance(scene, p, wP, dP, lambda, rng);
+            contrib *= legAbsorption(scene, cam.medium(), dP, lambda);   // the camera's medium
 
             film.add(px, py, Vec3(cieX(lambda), cieY(lambda), cieZ(lambda)) * contrib);
         }
@@ -2551,7 +2576,7 @@ struct Renderer {
                          int px, int py, double omega, const Vec3& p, const Vec3& wP,
                          double dP, const Vec3& R, const Vec3& wRE, double dE, double D,
                          double shape, const double* lam, const double* beta,
-                         const double* w, int nUp, Pcg32& rng,
+                         const double* w, int nUp, int camMedium, Pcg32& rng,
                          const GlossySplat* gs = nullptr, const CoatSplat* coat = nullptr) const {
         const double invD2Omega = 1.0 / (D * D * omega);
         for (int i = 0; i < nUp; ++i) {
@@ -2566,6 +2591,7 @@ struct Renderer {
                 contrib *= mediaTransmittance(scene, p, wP,  dP, lam[i], rng);
                 contrib *= mediaTransmittance(scene, R, wRE, dE, lam[i], rng);
             }
+            contrib *= legAbsorption(scene, camMedium, dP + dE, lam[i]);   // both in the camera's
             film.add(px, py, Vec3(cieX(lam[i]), cieY(lam[i]), cieZ(lam[i])) * contrib);
         }
     }
@@ -2613,7 +2639,8 @@ struct Renderer {
         if (!mirrorSeenAt(scene, eye, -wRE, dE, hm) || !scene.mirrorClaims(mp, hm)) return;
 
         splatMirrorLegs(scene, film, scene.mats[hm.matId], hm, px, py, omega,
-                        p, wP, dP, R, wRE, dE, D, shape, lam, beta, w, nUp, rng, vt.glossy, vt.coat);
+                        p, wP, dP, R, wRE, dE, D, shape, lam, beta, w, nUp, cam.medium(), rng, vt.glossy,
+                        vt.coat);
     }
 
     // Connect vertex p to the pinhole `cam` by reflection in one SPHERICAL mirror.
@@ -2739,7 +2766,8 @@ struct Renderer {
             if (!mirrorSeenAt(scene, eye, -wRE, dE, hm)) continue;
 
             splatMirrorLegs(scene, film, scene.mats[hm.matId], hm, px, py, omega,
-                            p, wP, dP, ch.P1, wRE, dE, D, shape, lam, beta, w, nUp, rng, vt.glossy, vt.coat);
+                            p, wP, dP, ch.P1, wRE, dE, D, shape, lam, beta, w, nUp, cam.medium(), rng,
+                            vt.glossy, vt.coat);
         }
     }
 
