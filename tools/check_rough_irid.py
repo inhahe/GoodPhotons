@@ -19,7 +19,7 @@ camera path's colours at each light vertex's wavelength (known-issues VCM-SPEC).
 its walk is mode D's, and its surface merges on these small curved glossy spheres are too noisy to
 resolve a bias at a check's budget (at 1102 spp its sphere means still scattered by 5-12 %, the CPU
 and GPU in opposite directions). A sphere channel fails when it differs from the reference by more
-than 5 standard errors (two seeds each) AND by more than 3 % -- of the channel, or of a tenth of
+than 5 standard errors (two seeds each, eight for mode S: see SEEDS) AND by more than 3 % -- of the channel, or of a tenth of
 the sphere's total where the channel is smaller (the chameleon's saturated colour leaves a linear
 sRGB channel near zero, even below it).
 
@@ -139,6 +139,11 @@ CASES = [   # the A cases render SCENE_A, through the lens
     ("R1_gpu", ["-mode", "R", "-device", "gpu", "-spp", "4096", "-heroc", "1"]),
     ("D1_gpu", ["-mode", "D", "-device", "gpu", "-spp", "512", "-heroc", "1"]),
 ]
+# Seeds per case where two are too few. Mode S's gather blurs neighbouring pixels together, so its
+# per-pixel noise estimate is too small, and two seeds' means are one degree of freedom: titanium's
+# blue failed at 1.063 of R on two seeds, a 1.8-sigma deviation by S's real seed-to-seed scatter (5 %
+# per seed; sixteen seeds read 0.993 +- 0.008), judged 5 sigma by the two seeds' estimate.
+SEEDS = {"S_cpu": tuple(range(1, 9)), "S_gpu": tuple(range(1, 9))}
 GPU_TOKENS = ("-> GPU", "[gpu]", "VCM/UPS on ", "SPPM on ")
 
 
@@ -276,12 +281,18 @@ def deviation(m1, m0):
 
 
 def stats(imgs, m):
-    """The mean colour over mask `m` of the seeds' average, and its standard error per channel:
-    the larger of the estimate from the seed means and the per-pixel one."""
-    a, b = imgs[0][m], imgs[1][m]
-    d = a - b
-    mean = (a.mean(0) + b.mean(0)) / 2
-    err = np.maximum(np.abs(a.mean(0) - b.mean(0)) / 2, np.sqrt((d * d).sum(0)) / (2.0 * len(d)))
+    """The mean colour over mask `m` of the seeds' average (every image in `imgs`, one per seed), and
+    its standard error per channel: the larger of the estimate from the scatter of the seeds' means
+    and the per-pixel one (which takes the pixels as independent -- they are not under a photon
+    gather's blur, which is why mode S runs more seeds)."""
+    v = np.array([im[m] for im in imgs])                  # seeds x pixels x 3
+    n, npx = v.shape[0], v.shape[1]
+    if n < 2:
+        raise ValueError("stats needs two seeds or more")
+    per = v.mean(1)                                       # each seed's mean colour
+    mean = per.mean(0)
+    s2 = ((v - v.mean(0)) ** 2).sum(0) / (n - 1)          # each pixel's variance over the seeds
+    err = np.maximum(per.std(0, ddof=1) / np.sqrt(n), np.sqrt(s2.sum(0) / n) / npx)
     return mean, err
 
 
@@ -316,7 +327,8 @@ def main():
         ref = stats(render(exe, out, coat, "coat_R_gpu", ["-mode", "R", "-device", "gpu", "-spp", "4096"]), m)
         mb = [stats(render(exe, out, coat, "coat_B_" + d, ["-mode", "B", "-n", "60000000", "-device", d]), m)
               for d in ("cpu", "gpu")]
-        ms = [stats(render(exe, out, coat, "coat_S_" + d, ["-mode", "S", "-spp", "256", "-device", d]), m)
+        ms = [stats(render(exe, out, coat, "coat_S_" + d, ["-mode", "S", "-spp", "256", "-device", d],
+                           tuple(range(1, 7))), m)   # six seeds: S scatters ~10 % a seed here (SEEDS)
               for d in ("cpu", "gpu")]
         # Mode B against mode R at 3 %: 0.444.1 reads 0.997 / 0.990 / 0.989 (CPU) and 1.000 / 0.987 /
         # 0.988 (GPU) per channel.
@@ -374,11 +386,11 @@ def main():
             continue
         lens = "A" in args
         rescale = lens or tag == "M_gpu"   # MODEM-GPU-OFFSET: see the docstring
-        imgs = render(exe, out, scene_a if lens else scene, tag, args)
+        imgs = render(exe, out, scene_a if lens else scene, tag, args, SEEDS.get(tag, (1, 2)))
         if lens:   # irradiance to radiance: undo the vignetting
             imgs = [x / cos4 for x in imgs]
         if rescale:   # then the camera equation (mode A), or the device's offset (GPU mode M)
-            k = sum(ref[i][rest].sum() for i in (0, 1)) / sum(x[rest].sum() for x in imgs)
+            k = np.mean([x[rest].sum() for x in ref]) / np.mean([x[rest].sum() for x in imgs])
             imgs = [x * k for x in imgs]
         cells = []
         for (name, m), (m0, e0) in zip(ms, rs):

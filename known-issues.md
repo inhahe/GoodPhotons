@@ -193,6 +193,16 @@ use for the device: it should release its device scene, films and queues (and th
 when the render ends, keeping the host image the window shows. Until then, stop a held render
 before starting another GPU one.
 
+## OPEN (2026-11-14, 0.445.1): POV-FMOD-INT — `f_hex_x` / `f_hex_y` call a host-only `fmod` from device code
+
+Every CUDA build warns (#20011) that `povFnEval` (`src/pov_functions.h`, host and device) calls
+`std::fmod<double, int>` from a `__host__ __device__` function, at its cases 27 and 28 (`f_hex_x`,
+`f_hex_y`): `fmod(fabs(PARAM_Y), 3)` passes an int, so overload resolution picks MSVC's `<cmath>`
+template for mixed arguments, which has no device version. What the device then runs there is not
+the CPU's function. **Fix:** `3.0`, so the double overload is taken on both sides; then render a hex
+`function` isosurface on both devices and compare. The same build warns that `y2` is set and never read
+in two of the file's cases (#550, 534 and 755): read them or drop them.
+
 ## OPEN (2026-11-14, reopened 0.443.1; the fix of 0.442.2 reverted): J-THIN-GAP-LEAK — modes J and U light a surface with the light trapped a millimetre under it
 
 **Reopened in 0.443.1: 0.442.2's fix was worse than the leak, and is reverted.** It made J's and U's
@@ -4608,19 +4618,21 @@ twelve pairs (the coat x0.42-0.62 at 34-50 sigma, the half mirror x0.47 in red a
 own resolution, SPECGATHER-BIN-RESOLUTION, found here. A layered coat's coin (its Fresnel
 reflectance) is still taken at the walk's wavelength; it varies only with the coat's dispersion.
 
-## OPEN (2026-11-14, 0.445.0): S-IRID-SPHERES — mode S reads check_rough_irid's iridescent spheres several percent off R in single channels
+## DONE (2026-11-14, 0.445.1): S-IRID-SPHERES — mode S read check_rough_irid's iridescent spheres several percent off R in single channels: the check's noise estimate, not a bias
 
 Found validating 0.445.0: check_rough_irid failed on host mode S, the titanium sphere's blue 1.063 of R
-over its two seeds. Six more seeds (3-8) of host S against host R read beetle 0.917 / 0.999 / 1.041 and
-titanium 1.001 / 1.004 / 0.928 (standard errors 0.024-0.034) on 0.445.0, and on 0.444.2, the Phong lobe,
-beetle 0.925 / 0.983 / 1.056 and titanium 1.042 / 0.971 / 0.910: the same, so not the GGX change. Device S
-scatters as much (chameleon red 1.140 in the 0.445.0 run, passing on its z). The check's standard error
-comes from two seeds, so it passes such a channel most runs. Unresolved: heavy-tailed noise or a bias.
-The repeated low titanium blue and beetle red (about 0.92 in both builds, 3 sigma) suggest a bias; the
-suspect is the gather's spectral carrier against an interference reflectance that swings within a
-carrier bin (SPECGATHER-BIN-RESOLUTION, which mode S's per-bin visible point shares). **Next:** many
-more seeds at a higher budget to settle bias against noise; if bias, render the titanium sphere in S
-with the carrier off (one wavelength per walk) to see whether it goes.
+over its two seeds. **There is no bias.** The studies that seemed to show one (sixteen seeds reading
+titanium blue 0.945, beetle red 0.967, and half the gather radius reading the same to three decimals)
+scored through `check_rough_irid.stats()`, which read only the first two images it was given: all three
+compared seeds 3 and 4 alone, the radius run on those same two seeds (hence the three decimals). Over
+every seed (`scraps/_irid_allseeds.py`, sixteen of S against eight of R) titanium reads 0.996 / 0.999 /
+0.993 and beetle 1.003 / 1.004 / 1.008, each channel within 2 sigma; titanium's reflectance is smooth
+anyway (85 nm at n 2.3: a bin centre and its bin's mean differ by 0.3 % at most), so the 24-bin carrier
+could not have cost 5 %. What failed was the check's error bar: two seeds' means are one degree of
+freedom, and the per-pixel estimate takes the pixels as independent, which a gather's blur makes false.
+S's real seed-to-seed scatter is 5 % a seed, so 1.063 was a 1.8-sigma deviation the check judged 5
+sigma. **Fixed in the check:** `stats()` takes every seed it is given (bit-identical at two), and modes
+S run eight (`SEEDS`).
 
 ## OPEN (2026-10-14): SPECGATHER-BIN-RESOLUTION — mode M's 24-bin carrier misreads a spectral edge or kink inside one of its bins
 
