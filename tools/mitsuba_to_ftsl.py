@@ -308,22 +308,26 @@ def get_ior(elem, name, default, defaults):
     g = LIBRARY_GLASS.get(nm)
     return (f"ior glass:{g}" if g else f"ior {MITSUBA_IOR[nm]!r}"), MITSUBA_IOR[nm]
 
-PHONG_HW = math.sqrt(math.log(2))           # Phong lobe half-width per unit FTSL roughness
+PHONG_HW = math.sqrt(math.log(2))           # a frosting cone's half-width per unit FTSL roughness
 BECKMANN_HW = math.sqrt(math.log(2))        # half-vector half-width per unit alpha
 GGX_HW = math.sqrt(math.sqrt(2) - 1)
+GGX_ALPHA_PER_ROUGHNESS = 0.646             # src/ggx.h kAlphaPerRoughness
+GLOSSY_MAX_ROUGHNESS = 2.0                  # src/ggx.h kMaxRoughness
 
-def ftsl_roughness(bsdf, name, defaults, spread=2.0):
+def ftsl_roughness(bsdf, name, defaults, spread=None):
     """(FTSL `roughness`, Mitsuba alpha) for the microfacet BSDF `bsdf` (material `name`).
 
-    Matched by lobe width. FTSL's glossy lobe, which a dielectric's frosting also puts about
-    its refracted ray, is a Phong lobe of exponent 2/r^2 - 2: half-width PHONG_HW * r.
-    Mitsuba's alpha sets the half-vector distribution, half-width BECKMANN_HW * alpha (its
-    default, and what 0.6's Phong reduces to) or GGX_HW * alpha, and the outgoing ray turns
-    `spread` times as fast as the half-vector: 2 for a reflection, 1 - 1/eta entering a
-    refraction and eta - 1 leaving it. So r = spread * alpha for Beckmann (0.773 of that for
-    GGX), capped at 1. An anisotropic alpha_u/alpha_v pair is averaged (a lone one, invalid
-    in Mitsuba, against 0.1), and an alpha this cannot read (a texture) becomes Mitsuba's
-    default 0.1; each with a warning."""
+    A REFLECTION (`spread` None): FTSL's glossy lobe is GGX of alpha 0.646 r (src/ggx.h), so a
+    Mitsuba GGX alpha is r = alpha / 0.646 exactly, and a Beckmann alpha (Mitsuba's default, and
+    what 0.6's Phong reduces to) the GGX alpha of the same half-vector half-width, BECKMANN_HW /
+    GGX_HW = 1.29 times it; held to 2, the lobe's range. A DIELECTRIC's frosting is a cone of
+    exponent 2/r^2 - 2 about its refracted ray (render.h sampleRoughCone), half-width PHONG_HW * r,
+    so it is matched by width: Mitsuba's alpha sets the half-vector distribution, half-width
+    BECKMANN_HW * alpha or GGX_HW * alpha, and the refracted ray turns `spread` times as fast as
+    the half-vector (1 - 1/eta entering, eta - 1 leaving), so r = spread * alpha for Beckmann
+    (0.773 of that for GGX), capped at 1, where the cone is widest. An anisotropic alpha_u/alpha_v
+    pair is averaged (a lone one, invalid in Mitsuba, against 0.1), and an alpha this cannot read
+    (a texture) becomes Mitsuba's default 0.1; each with a warning."""
     a = get_float(bsdf, 'alpha', None, defaults)
     if a is None:
         au = get_float(bsdf, 'alpha_u', None, defaults)
@@ -343,6 +347,9 @@ def ftsl_roughness(bsdf, name, defaults, spread=2.0):
             if any(c.get('name') in ('alpha', 'alpha_u', 'alpha_v') for c in bsdf):
                 warn(f"'{name}': a textured alpha -> Mitsuba's default 0.1")
     ggx = (get_string(bsdf, 'distribution', defaults) or '').lower() == 'ggx'
+    if spread is None:
+        r = (a if ggx else a * BECKMANN_HW / GGX_HW) / GGX_ALPHA_PER_ROUGHNESS
+        return min(max(r, 0.0), GLOSSY_MAX_ROUGHNESS), a
     r = spread * (GGX_HW if ggx else BECKMANN_HW) / PHONG_HW * a
     return min(max(r, 0.0), 1.0), a
 

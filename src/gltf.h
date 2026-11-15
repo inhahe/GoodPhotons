@@ -68,12 +68,11 @@ namespace gltfimp { inline bool metalMixImport = false; }
 namespace gltfimpl {
 
 // GLTF-ROUGHNESS-MAP: a glTF roughness `r` as the ftrace roughness of the same lobe. glTF's is
-// perceptual, its GGX alpha r^2; ftrace's lobe is GGX of alpha 0.646 r_t (ggx.h alpha, the width
-// the Phong lobe before 0.445.0 had). So r_t = r^2 / 0.646, at most 1 (glTF's alpha above 0.646
-// is clamped there).
+// perceptual, its GGX alpha r^2; ftrace's lobe is GGX of alpha 0.646 r_t (ggx.h alpha). So
+// r_t = r^2 / 0.646: glTF's whole range, r_t up to 1.548, inside the lobe's (ggx::kMaxRoughness).
 inline double gltfRoughness(double r) {
     r = std::min(1.0, std::max(0.0, r));
-    return std::min(1.0, r * r / ggx::kAlphaPerRoughness);
+    return std::min(ggx::kMaxRoughness, r * r / ggx::kAlphaPerRoughness);
 }
 // The least roughness a glTF glossy, coat or metal lobe is given: the lobe's own clamp
 // (ggx::kMinRoughness), so the floor widens no lobe the tracers can represent and only keeps a

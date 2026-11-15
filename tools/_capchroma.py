@@ -281,14 +281,17 @@ def meter(im, name, alb=None, pos=None):
                     nacc += 1
                     for k in range(3):
                         acc[k] += p[k]
-            if nacc == 0:
+            # A cell the masks leave under half its pixels is an edge cell, up to DOWN^2 / 2 times
+            # noisier than a whole one, and noise alone clears the bar there: it is not metered.
+            # The rest weigh the coverage by the pixels they hold.
+            if 2 * nacc < DOWN * DOWN:
                 continue
-            cells.append((tuple(a / nacc for a in acc), p3[0], p3[2]))
+            cells.append((tuple(a / nacc for a in acc), p3[0], p3[2], nacc))
     if len(cells) < 16:
         print(f'  {name}: only {len(cells)} of {box} cap cells survive the piece mask')
         return
 
-    lums = sorted(0.2126 * q[0] + 0.7152 * q[1] + 0.0722 * q[2] for q, _, _ in cells)
+    lums = sorted(0.2126 * q[0] + 0.7152 * q[1] + 0.0722 * q[2] for q, _, _, _ in cells)
     bg = lums[len(lums) // 2]
     if bg <= 1e-9:
         print(f'  {name}: screen is black here')
@@ -301,13 +304,14 @@ def meter(im, name, alb=None, pos=None):
     # colour of the LIGHT THE PIECE ADDED and so the number comparable with the rig's.  If
     # spread collapses but xspread does not, the caustic is coloured and the fill is
     # washing it out -- a lighting problem, not an optics one.
-    ped = tuple(sorted(q[k] for q, _, _ in cells)[len(cells) // 2] for k in range(3))
+    ped = tuple(sorted(q[k] for q, _, _, _ in cells)[len(cells) // 2] for k in range(3))
 
     wsum = satsum = 0.0
-    n = 0
+    n = 0                                 # caustic pixels, over the metered cells' pixels
+    npx = sum(t[3] for t in cells)
     chroma, xchroma, patch, ctrl = [], [], [], []
     peak = 0.0
-    for q, wx, wz in cells:
+    for q, wx, wz, nq in cells:
         lum = 0.2126 * q[0] + 0.7152 * q[1] + 0.0722 * q[2]
         peak = max(peak, lum / bg)
         # CONTROL BAND: cells at 1.0-1.2x the median are plain sunlit cap -- no caustic, so
@@ -323,7 +327,7 @@ def meter(im, name, alb=None, pos=None):
                 ctrl.append((1.0, q[0] / s0, q[2] / s0, wx, wz))
         if lum < CUT * bg:
             continue
-        n += 1
+        n += nq
         e = lum - bg
         mx = max(q)
         satsum += e * ((mx - min(q)) / mx if mx > 1e-9 else 0.0)
@@ -341,7 +345,7 @@ def meter(im, name, alb=None, pos=None):
     spread, xspread = scatter(chroma), scatter(xchroma)
     noise = scatter(ctrl)
 
-    print(f'  {name:22s} {len(cells):5d}/{box:5d} cells   coverage {100.0*n/len(cells):5.2f}%   '
+    print(f'  {name:22s} {len(cells):5d}/{box:5d} cells   coverage {100.0*n/npx:5.2f}%   '
           f'sat {sat:.3f}   spread {spread:.3f}   xspread {xspread:.3f}   peak {peak:.2f}x   '
           f'clip {100.0*clip/px if px else 0.0:5.2f}%   '
           f'noise {noise:.3f}/fan {fmt(fan(ctrl))}   fan {fmt(fan(chroma))}')

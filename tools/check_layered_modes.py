@@ -9,9 +9,9 @@ other direction (render.h coatF), so the integrand is reciprocal and the modes a
 construction: a Lambertian body's light crosses the coat twice, T(in) T(out) / T-bar (T-bar the
 cosine-weighted mean the body's albedo already holds); a directional body's (glossy, mirror) takes
 sqrt(T(in) T(out)), its albedo holding its own angle's escape; and the coat's reflection takes its
-Fresnel term at the pair's half vector. Before 0.444.0 the body took the coat only at the walk's
-arrival: mode R's integrand held T toward the camera, the light walks' T toward the light, and on the
-rough room below the host read D 1.0109, U 1.0111, B 1.0256, M 1.0120 and S 1.0112 of R.
+Fresnel term at the pair's half vector. A body that takes the coat only at its walk's arrival holds
+T toward the camera in mode R's integrand and toward the light in the light walks', and on the rough
+room below reads D 1.0109, U 1.0111, B 1.0256, M 1.0120 and S 1.0112 of R.
 
 The rooms: five walls of one material lit at a grazing angle by a tilted panel, 64x48, every mode at
 -max-bounce 8 (M and S, which deposit photons over 32 bounces, and their mode-R reference at 32).
@@ -28,12 +28,12 @@ The rooms: five walls of one material lit at a grazing angle by a tilted panel, 
             (film_ior 2.4 over ior 1.5) whose thickness a map sets to a quarter of its authored 240
             nm, about a quarter wave: a lossless stack returns exactly what it receives, so mode R
             must read each sphere at the sky's radiance within 1 %, and modes M and S the frame as R
-            does (D, J and U take no sky). Until 0.444.2 the coat's averaged escape (T-bar) was
-            tabulated at the authored thickness only, and the mapped sphere read 0.911 of the sky.
+            does (D, J and U take no sky). A coat's averaged escape (T-bar) tabulated at the
+            authored thickness alone reads the mapped sphere 0.911 of the sky.
   fluoro    a rough high-index film (film_ior 2.4, 140 nm) over a fluorescent body that absorbs blue
             and glows red, where the film's averaged escape is about 0.6 and 0.9: mode B only (the
-            modes that render a Stokes shift are R and the forward ones). Until 0.444.2 mode R
-            normalised the shifted light's way out at the absorbed wavelength, and B read 0.916 of R.
+            modes that render a Stokes shift are R and the forward ones). A mode R that normalises
+            the shifted light's way out at the absorbed wavelength reads B 0.916 of itself.
 Each mode's frame mean over `--seeds` seeds must be within 1 % of mode R's on the same device (B's
 within 0.5 %). Mode B is not scored where the coat is smooth (fresnel, glossy, furnace): it connects
 no delta lobe to the camera, so it misses the coat's mirror image of the room (0.90 of R there), as

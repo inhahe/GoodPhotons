@@ -1,17 +1,23 @@
 """Generate src/ggx_ms_table.h: the GGX lobe's single-scattering albedo, for its multiple-scattering
 compensation (src/ggx.h, Kulla & Conty 2017).
 
-    python tools/gen_ggx_ms_table.py [--k 512]
+    python tools/gen_ggx_ms_table.py [--k 512] [--nm 65] [--out src/ggx_ms_table.h]
 
 E(mu, alpha) is the directional albedo of a white GGX reflector (height-correlated Smith) for an arrival
 at cosine mu to the normal: the mean of the visible-normal draw's weight G2 / G1 (ggx.h weight), taken
 here over a K x K midpoint grid of the draw's two uniforms -- the same spherical-cap sampler ggx.h
 uses, so the integrand is smooth but for the edge where a draw leaves below the surface. Eavg(alpha)
-is 2 int_0^1 E(mu) mu dmu, on 512 cosines. The table spans alpha in [0, ALPHA_MAX] (roughness 0 to 2
-at 0.646 alpha per roughness), uniform, and mu in [0, 1] uniform in sqrt(mu): with height-correlated
-masking E returns to 1 at grazing (G2 / G1 -> 1 as the arrival's cosine -> 0) and falls to its bulk
-value within mu ~ 0.05, which uniform cosines would not resolve. NA x NM nodes, read bilinearly in
-(alpha, sqrt(mu)) (ggx.h msE / msEavg). Deterministic; rerun only to change the grid.
+is 2 int_0^1 E(mu) mu dmu of the tabulated E itself, read as msE reads it (linear in sqrt(mu) between
+its nodes): f_ms = (1 - E(a)) (1 - E(b)) / (pi (1 - Eavg)) then integrates to exactly 1 - E(cos_a), at
+every alpha (both are linear in the rows), where an Eavg integrated afresh on finer cosines disagreed
+with the nodes' E by 11 % of 1 - Eavg on a polished lobe's grazing dip. The table spans alpha in [0, ALPHA_MAX] (roughness 0 to 2
+at 0.646 alpha per roughness) uniform in sqrt(alpha), and mu in [0, 1] uniform in sqrt(mu). With
+height-correlated masking E returns to 1 at grazing (G2 / G1 -> 1 as the arrival's cosine -> 0) and
+dips below its bulk value within a cosine of about alpha, so a near-mirror lobe's E is a function of
+mu / alpha there: rows uniform in alpha (the first at 0.040) left every lobe under roughness 0.06 to an
+interpolation from the all-ones row at alpha 0, and a white roughness-0.03 lobe returned 0.94 at 88.6
+degrees. NA x NM nodes, read bilinearly in (sqrt(alpha), sqrt(mu)) (ggx.h msE / msEavg).
+Deterministic; rerun only to change the grid.
 """
 import argparse
 import os
@@ -19,7 +25,7 @@ import os
 import numpy as np
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-NA, NM = 33, 33
+NA, NM = 33, 65
 ALPHA_MAX = 0.646 * 2.0
 MU_MIN = 1e-4          # mu = 0 itself has no visible normal: its node holds the limit
 
@@ -57,27 +63,60 @@ def albedo(alpha, mu, k):
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split(chr(10))[0])
     ap.add_argument("--k", type=int, default=512)
+    ap.add_argument("--nm", type=int, default=NM)
+    ap.add_argument("--out", default=os.path.join(ROOT, "src", "ggx_ms_table.h"))
     a = ap.parse_args()
-    alphas = ALPHA_MAX * np.arange(NA) / (NA - 1)
-    mus = np.maximum((np.arange(NM) / (NM - 1)) ** 2, MU_MIN)
-    muf = (np.arange(512) + 0.5) / 512
-    E = np.empty((NA, NM))
+    nm = a.nm
+    alphas = ALPHA_MAX * (np.arange(NA) / (NA - 1)) ** 2
+    mus = np.maximum((np.arange(nm) / (nm - 1)) ** 2, MU_MIN)
+    E = np.empty((NA, nm))
     Eavg = np.empty(NA)
     for i, al in enumerate(alphas):
         E[i] = albedo(al, mus, a.k)
-        Eavg[i] = 2.0 * np.mean(albedo(al, muf, a.k // 2) * muf)
-        print("alpha %.4f  E(0) %.4f  E(1) %.4f  Eavg %.4f" % (al, E[i, 0], E[i, -1], Eavg[i]), flush=True)
+        print("alpha %.4f  E(0) %.4f  E(1) %.4f" % (al, E[i, 0], E[i, -1]), flush=True)
+    # The multiple-scattering lobe's draw (ggx.h msSampleCos): per alpha row, the cumulative share of each
+    # of the NT cells of the cosine grid (cell k spans t in [k, k+1] / NT, mu = t^2) under the density
+    # (1 - E(mu)) mu, E the row's own values as the header holds them, linear in t as msE reads them;
+    # the shares' sum is int (1 - E) mu dmu = (1 - Eavg) / 2, which is Eavg.
+    # A draw picks a cell by it and, within it, a cosine in proportion to mu, so its weight
+    # f_ms cos / pdf is nearly 1 - E(cos_a) whatever the exit.
+    Ef = E.astype(np.float32).astype(np.float64)
+    NT = nm - 1
+    sub = (np.arange(256) + 0.5) / 256
+    cdf = np.zeros((NA, NT + 1))
+    for i in range(NA):
+        share = np.empty(NT)
+        for k in range(NT):
+            t = (k + sub) / NT
+            e = Ef[i, k] + (Ef[i, k + 1] - Ef[i, k]) * sub
+            share[k] = np.mean((1.0 - e) * t * t * 2.0 * t) / NT     # (1 - E) mu dmu, dmu = 2t dt
+        Eavg[i] = min(1.0, 1.0 - 2.0 * share.sum())
+        share = np.clip(share, 0.0, None)
+        tot = share.sum()
+        if tot <= 1e-12:                    # no multiple scattering (alpha 0): never drawn
+            share = np.full(NT, 1.0 / NT)
+            tot = 1.0
+        cdf[i, 1:] = np.cumsum(share) / tot
+        cdf[i, -1] = 1.0
+    for i, al in enumerate(alphas):
+        print("alpha %.4f  Eavg %.6f" % (al, Eavg[i]), flush=True)
     NL = chr(10)
     lines = ["#pragma once",
              "// GENERATED by tools/gen_ggx_ms_table.py (k %d) -- do not edit by hand." % a.k,
              "// The GGX lobe's single-scattering albedo E(mu, alpha) for its multiple-scattering",
-             "// compensation (ggx.h msE / msEavg): GGX_MS_NA alphas uniform in [0, GGX_MS_ALPHA_MAX]",
-             "// (rows) by GGX_MS_NM cosines mu uniform in sqrt(mu) over [0, 1] (columns), and",
-             "// Eavg(alpha) = 2 int E mu dmu.",
-             "// The initialisers are macros so the host (ggx.h) and the device (render_cuda.cu,",
-             "// __constant__) hold the same numbers.",
+             "// compensation (ggx.h msE / msEavg): GGX_MS_NA alphas uniform in sqrt(alpha) over",
+             "// [0, GGX_MS_ALPHA_MAX] (rows) by GGX_MS_NM cosines mu uniform in sqrt(mu) over [0, 1]",
+             "// (columns), and",
+             "// Eavg(alpha) = 2 int E mu dmu of these E; and the multiple-scattering lobe's draw",
+             "// (ggx.h msSampleCos):",
+             "// per row, the cumulative share of each of GGX_MS_NT cells of that cosine grid under the",
+             "// density (1 - E(mu)) mu.",
+             "// The initialisers are macros so the host and the device copies (ggx.h) hold the same",
+             "// numbers.",
+             "#define GGX_MS_ROWS_SQRT_ALPHA 1   // row i is alpha = GGX_MS_ALPHA_MAX (i / (NA - 1))^2",
              "#define GGX_MS_NA %d" % NA,
-             "#define GGX_MS_NM %d" % NM,
+             "#define GGX_MS_NM %d" % nm,
+             "#define GGX_MS_NT %d" % NT,
              "#define GGX_MS_ALPHA_MAX %.17g" % ALPHA_MAX,
              "#define GGX_MS_E_INIT { \\"]
     for i in range(NA):
@@ -87,7 +126,12 @@ def main():
     lines.append("#define GGX_MS_EAVG_INIT { \\")
     lines.append("    %s \\" % ", ".join("%.8ff" % v for v in Eavg))
     lines.append("}")
-    path = os.path.join(ROOT, "src", "ggx_ms_table.h")
+    lines.append("#define GGX_MS_CDF_INIT { \\")
+    for i in range(NA):
+        row = ", ".join("%.8ff" % v for v in cdf[i])
+        lines.append("    %s%s \\" % (row, "," if i + 1 < NA else ""))
+    lines.append("}")
+    path = os.path.abspath(a.out)
     with open(path, "w", encoding="ascii", newline="") as f:
         f.write(NL.join(lines) + NL)
     print("wrote", path)

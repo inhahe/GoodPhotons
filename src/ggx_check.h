@@ -13,10 +13,20 @@
 //   4. ALBEDO. The mean weight over draws equals the integral of fAll cos by quadrature; without
 //      `ms` it is never above 1 (single scattering loses energy, never gains it), and with it a white
 //      lobe returns what it receives -- the white furnace -- within 1.5 % (the table's resolution).
+//   4b. THE POLISHED FURNACE (ms only). The same at roughness 0.01-0.06, arrivals down to 88.6
+//      degrees, where a near-mirror lobe's E dips within a cosine of about its alpha.
 //   5. THE MIRROR LIMIT. At the least roughness 99 % of the draws lie within a few hundredths of
-//      a radian of the mirror direction, and sampleUVAll(u1 == 1) is the mirror exactly.
+//      a radian of the mirror direction, sampleUVAll(u1 == 1) is the mirror exactly, and drawUV
+//      weighs it by the lobe's albedo (mode W's sample 0, standing for the whole lobe): 1 with `ms`,
+//      E(cos_a) without. A roughness past the table's span is held to it.
+//   6. THE MULTIPLE SCATTERING'S OWN DRAW (ms only). msPdf integrates to 1 over the hemisphere, and
+//      a draw from it (msSampleCos) weighs r = f_ms cos / msPdf over 1 - E(cos_a): mean 1 (f_ms
+//      integrates to 1 - E(cos_a)), relative second moment near 1 (the draw adds little variance)
+//      and no draw far heavier, wherever the branch carries energy -- the near-mirror lobe met at
+//      grazing included, where a cosine draw's weight reaches (1 - E(cos_b)) / (1 - Eavg), tens.
 // ============================================================================================
 #include "ggx.h"
+#include "rng.h"
 
 #include <algorithm>
 #include <cstdio>
@@ -26,14 +36,7 @@
 namespace ggx {
 namespace check {
 
-struct Rng {
-    unsigned long long s;
-    explicit Rng(unsigned long long seed) : s(seed * 6364136223846793005ull + 1442695040888963407ull) {}
-    double operator()() {
-        s = s * 6364136223846793005ull + 1442695040888963407ull;
-        return (double)((s >> 11) & ((1ull << 53) - 1)) / (double)(1ull << 53);
-    }
-};
+using Rng = ::Lcg53;
 
 inline int run() {
     int fails = 0;
@@ -150,6 +153,36 @@ inline int run() {
             }
         }
 
+        // ---- 4b. the polished furnace (ms only) -----------------------------------------------------
+        // A near-mirror lobe's E dips only near grazing, within a cosine of about its alpha, so the
+        // table must resolve E there at small alphas: the white furnace again, at roughness 0.01 to 0.06
+        // and arrivals down to 88.6 degrees.
+        if (ms) {
+            const double rs[4] = {0.01, 0.02, 0.03, 0.06};
+            const double cs[5] = {0.024, 0.05, 0.1, 0.3, 1.0};
+            double worstP = 0.0;
+            char what[96] = "";
+            for (double r : rs)
+                for (double ca : cs) {
+                    const double al = alpha(r);
+                    const Vec3 a = dirAt(ca, 0.7);
+                    Rng rng(4000 + (unsigned long long)(r * 1000) + (unsigned long long)(ca * 1000));
+                    const int N = 1000000;
+                    double sw = 0.0;
+                    for (int k = 0; k < N; ++k) {
+                        const Vec3 b = sampleUVAll(n, a, al, true, rng(), rng());
+                        sw += weightAll(pair(n, a, b, al), true);
+                    }
+                    const double e = std::fabs(sw / N - 1.0);
+                    if (e > worstP) {
+                        worstP = e;
+                        std::snprintf(what, sizeof what, "roughness %.2f cos %.3f: albedo %.4f", r, ca, sw / N);
+                    }
+                }
+            std::snprintf(buf, sizeof buf, "worst |albedo - 1| %.4f (want < 0.015); %s", worstP, what);
+            report("polished furnace", ms, worstP < 0.015, buf);
+        }
+
         // ---- 5. the mirror limit -------------------------------------------------------------
         // GGX's tail is long (a draw beyond the half-vector angle x has odds about alpha^2 / x^2), so
         // the test reads the 99th percentile of the draws' angle to the mirror, not the widest: about
@@ -174,6 +207,71 @@ inline int run() {
                           "99th percentile %.4f rad off the mirror (want < 0.05); u1 = 1 %s", worst,
                           exact ? "is the mirror" : "is NOT the mirror");
             report("mirror limit", ms, worst < 0.05 && exact, buf);
+            // drawUV's sample 0, at every test lobe and arrival.
+            double worstM = 0.0;
+            for (double al2 : alphas)
+                for (double ca : cosArr) {
+                    double w = -1.0;
+                    drawUV(n, dirAt(ca, 2.1), al2, ms, 1.0, 0.37, w);
+                    worstM = std::max(worstM, std::fabs(w - (ms ? 1.0 : msE(ca, al2))));
+                }
+            const bool held = alpha(3.0) == alpha(kMaxRoughness) && alpha(0.0) == alpha(kMinRoughness);
+            std::snprintf(buf, sizeof buf, "worst |w - albedo| %.2e (want < 1e-12); roughness %s", worstM,
+                          held ? "held to [0.001, 2]" : "NOT held to [0.001, 2]");
+            report("mirror sample", ms, worstM < 1e-12 && held, buf);
+        }
+
+        // ---- 6. the multiple scattering's own draw -------------------------------------------------
+        // Its weight r = f_ms cos / msPdf over 1 - E(cos_a) has mean 1; what the draw adds to a
+        // render's variance is its relative second moment E[r^2] / E[r]^2, held near 1 wherever the
+        // branch carries energy (1 - E(cos_a) above 1 %), and no draw is far heavier than the rest.
+        if (ms) {
+            const double alphas6[4] = {alpha(0.01), alpha(0.05), 0.3, alpha(kMaxRoughness)};
+            const double cos6[5] = {1.0, 0.5, 0.15, 0.05, 0.024};
+            double worstInt = 0.0, worstQ = 0.0, worstM = 0.0, hi = 0.0;
+            char qWhat[96] = "", hiWhat[96] = "";
+            Rng rng(123);
+            for (double al : alphas6) {
+                // msPdf over the hemisphere, by quadrature in (cos, phi): the azimuth is uniform.
+                const int NC = 200000;
+                double q = 0.0;
+                for (int i = 0; i < NC; ++i) q += msPdf((i + 0.5) / NC, al) * (2.0 * kPi / NC);
+                worstInt = std::max(worstInt, std::fabs(q - 1.0));
+                for (double ca : cos6) {
+                    const Vec3 a = dirAt(ca, 0.7);
+                    const double ea = msE(ca, al);
+                    if (!(1.0 - ea > 0.01)) continue;   // the branch carries next to nothing
+                    double s1 = 0.0, s2 = 0.0;
+                    int nk = 0;
+                    for (int k = 0; k < 200000; ++k) {
+                        const double cb = msSampleCos(rng(), al);
+                        const Vec3 b = dirAt(cb, 2.0 * kPi * rng());
+                        const Pair p = pair(n, a, b, al);
+                        if (!p.ok) continue;
+                        const double r = fMs(p) * p.cb / msPdf(p.cb, al) / (1.0 - ea);
+                        s1 += r;
+                        s2 += r * r;
+                        ++nk;
+                        if (r > hi) {
+                            hi = r;
+                            std::snprintf(hiWhat, sizeof hiWhat, "alpha %.4f cos_a %.3f cos_b %.4f", al, ca, p.cb);
+                        }
+                    }
+                    const double m = s1 / nk, qm = (s2 / nk) / (m * m);
+                    worstM = std::max(worstM, std::fabs(m - 1.0));
+                    if (qm > worstQ) {
+                        worstQ = qm;
+                        std::snprintf(qWhat, sizeof qWhat, "alpha %.4f cos_a %.3f", al, ca);
+                    }
+                }
+            }
+            std::snprintf(buf, sizeof buf, "worst |int pdf - 1| %.1e (want < 1e-3)", worstInt);
+            report("ms pdf", ms, worstInt < 1e-3, buf);
+            std::snprintf(buf, sizeof buf,
+                          "E[r^2]/E[r]^2 at most %.3f (want < 1.1) at %s; |E[r] - 1| at most %.3f (want < 0.05); "
+                          "heaviest %.2f (want < 4) at %s",
+                          worstQ, qWhat, worstM, hi, hiWhat);
+            report("ms draw weight", ms, worstQ < 1.1 && worstM < 0.05 && hi < 4.0, buf);
         }
     }
 

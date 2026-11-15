@@ -1344,6 +1344,7 @@ inline void randomWalk(const Scene& scene, const Camera& cam, const Renderer& ma
         if (dot(dwo, dwo) == 0.0) return;
         Vec3 wo = normalize(dwo);
         Vec3 wi; double pdfW = 0.0, pdfRevW = 0.0, betaFactor = 0.0;
+        double glossyR = 0.0;   // a Glossy vertex's r at lambda (bsdfF's), for the carrier's fold
         GlossyDraw gd;   // a Glossy scatter's draw, which its JSPEC fold below re-weighs too
         // Hero bundle: per-secondary throughput factor, i.e. secF[i] = f_{i+1}·cos/pdf
         // for the lobe the hero actually sampled (pdf is always the hero's). This is the
@@ -1451,6 +1452,7 @@ inline void randomWalk(const Scene& scene, const Camera& cam, const Renderer& ma
                 // f*cos/pdf = r times the draw's weight (ggx.h weightAll), from either end of a
                 // path: the lobe is reciprocal.
                 betaFactor = r * gd.w;
+                glossyR = r;
                 if (pdfW <= 0) terminate = true;      // r <= 0 is caught by the max test
                 // The glossy LOBE (its microfacet draw reads the roughness alone) carries no
                 // wavelength dependence, so the whole bundle can follow the sampled
@@ -1737,9 +1739,9 @@ inline void randomWalk(const Scene& scene, const Camera& cam, const Renderer& ma
                     break;
                 case MatType::Glossy:          // f*cos/pdf = r w: the reflect slot times the
                     // draw's interference reflectance at the sampled pair is what varies; the
-                    // the draw's weight w is the same at every wavelength, so the value at lambda is r alone
+                    // draw's weight w is the same at every wavelength, so the value at lambda is r
                     jr.mul([&](double L) { return clamp01(reflectSlot(scene, *mp, h, L)) * gd.R(L); },
-                           clamp01(reflectSlot(scene, *mp, h, lambda)) * gd.R(lambda), false);
+                           glossyR, false);
                     break;
                 case MatType::DiffuseTransmit: {   // the lobe's albedo over the lambda one
                     const bool reflJ = dot(wi, cur.ns) > 0.0;

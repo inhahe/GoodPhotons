@@ -8,7 +8,7 @@
 // failed its own control at +10.2 % with NO COAT PRESENT, because its two sides were two renders
 // of geometrically different scenes (TODO item 10). Here both sides are the same function.
 //
-// Five checks, ordered so that a failure points at a cause:
+// The checks, ordered so that a failure points at a cause:
 //
 //   1. ETA = 1 REDUCTION. A coat of index 1.0 is not a coat. Both the walk's albedo and its f
 //      must collapse to the bare body's. This is the control that has to hold even when every
@@ -24,8 +24,13 @@
 //      the sampler produces (excluding the coat's delta lobe, which f cannot represent). This is
 //      what pins the refraction Jacobian: no wrong power of eta survives it.
 //   5. RECIPROCITY. f(wi, wo) == f(wo, wi) to within the estimator's noise.
+//   6. THE LAMBERTIAN REDUCTION. The escape moments reproduce the shipped analytic coatedAlbedo.
+//   6b. GLOSSY MOMENTS. A GGX body's moments reproduce its own walk's albedo: they take the lobe's
+//      draw weights, which follow the exit angle.
+//   7. THE WIRING. The loader's finalizeLayeredCoats reaches the model.
 // ============================================================================================
 #include "layered.h"
+#include "rng.h"
 
 #include <cstdio>
 #include <cmath>
@@ -59,14 +64,7 @@ struct Mirror {
     }
 };
 
-struct Rng {
-    unsigned long long s;
-    explicit Rng(unsigned long long seed) : s(seed * 6364136223846793005ull + 1442695040888963407ull) {}
-    double operator()() {
-        s = s * 6364136223846793005ull + 1442695040888963407ull;
-        return (double)((s >> 11) & ((1ull << 53) - 1)) / (double)(1ull << 53);
-    }
-};
+using Rng = ::Lcg53;
 
 // mean weight of the walk; `nonSpecOnly` drops the coat's delta lobe so the result is comparable
 // with an integral of f
@@ -205,7 +203,7 @@ inline int run() {
     // cosine hemisphere against the shipped Egan-Hilgeman polynomial internalFresnelDiffuse().
     {
         Params P; P.eta = 1.5; P.maxBounce = 32;
-        Lambert body; body.alb = 1.0;            // albedo is deliberately absent from the moments
+        Lambert body; body.alb = 1.0;            // white: the moments take its draw weights
         const int K = 24;
         double mom[K];
         Rng rng(97);
@@ -224,6 +222,39 @@ inline int run() {
             worst = std::max(worst, e);
         }
         report("lambertian reduction", worst < 0.02, "moments %.4f vs analytic %.4f", gm, ga);
+    }
+
+    // ---- 6b. a GLOSSY body's moments are its walk's ---------------------------------------------
+    // The moments must describe the lobe, not its sampler: a GGX body's draws weigh f cos / pdf, not
+    // 1, and the weights follow the exit angle -- a grazing exit, which the coat throws back, weighs
+    // more than a steep one, which leaves. So albedoFromMoments over the glossy body's moments has to
+    // reproduce the walk's own albedo (sample(), which takes every weight), at every incidence.
+    {
+        struct TintedGgx {
+            GgxBody g;
+            double alb = 0.7;
+            bool sample(const Vec3& a, double u1, double u2, Vec3& b, double& w) const {
+                const bool ok = g.sample(a, u1, u2, b, w);
+                w *= alb;
+                return ok;
+            }
+        };
+        Params P; P.eta = 1.5; P.maxBounce = 32;
+        double worst = 0.0, gm = 0.0, gw = 0.0;
+        for (double rough : { 0.25, 0.8 }) {
+            TintedGgx body; body.g.rough = rough;
+            for (const Vec3& wi : dirs) {
+                double mom[32];
+                Rng rng(131);
+                escapeMoments(P, body.g, wi.z, 32, mom, 400000, rng);
+                const double byMom = albedoFromMoments(body.alb, mom, 32);
+                const double byWalk = albedo(P, body, wi, 400000, 149, /*nonSpecOnly=*/true);
+                const double e = std::fabs(byMom - byWalk) / std::max(byWalk, 1e-9);
+                if (e > worst) { gm = byMom; gw = byWalk; }
+                worst = std::max(worst, e);
+            }
+        }
+        report("glossy moments", worst < 0.01, "moments %.4f vs walk %.4f (want within 1 %%)", gm, gw);
     }
 
     // ---- 7. THE WIRING, not just the math ----------------------------------------------------

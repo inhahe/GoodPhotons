@@ -2607,10 +2607,7 @@ struct Scene {
                 body.coatFdr = (mats[i].coatScatter == 2) ? 0.0 : fdr;
                 if (mats[i].coatScatter == 1) {
                     layered::Params LP; LP.eta = nCoat;
-                    struct Rg { unsigned long long s;
-                        double operator()() { s = s * 6364136223846793005ull + 1442695040888963407ull;
-                            return (double)((s >> 11) & ((1ull << 53) - 1)) / (double)(1ull << 53); } };
-                    Rg rg{ 0x9E3779B97F4A7C15ull + (unsigned long long)k * 1013904223ull };
+                    Lcg53 rg(0x9E3779B97F4A7C15ull + (unsigned long long)k * 1013904223ull);
                     if (body.type == MatType::Glossy) {
                         layered::GgxBody pb; pb.rough = body.roughness;
                         layered::escapeMomentsCosAvg(LP, pb, 8, body.coatMom, 131072, rg);

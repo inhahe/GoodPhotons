@@ -117,7 +117,7 @@ the same on top of ftrace's mode-R walk:
 | Mode `R` (random) | Mode `W` (fixed) |
 |---|---|
 | one random point per area light | an **N×N lattice** over the light (`-whitted-grid`, default 4 → 16 shadow rays) |
-| random direction in the glossy lobe | the **mirror direction**, weighted by the lobe's reflectance |
+| random direction in the glossy lobe | a **fixed lattice** on the lobe, indexed by (sample, bounce): sample 0 is the **mirror direction**, weighted by the lobe's albedo (its reflectance; a coat's lobe, which has no multiple scattering, that times its single scattering's share), and extra `-spp` spread the lobe |
 | Russian roulette at specular vertices | **attenuate the throughput** instead, and stop below an `adc_bailout`-style 1/512 cutoff |
 | random branch at half-mirrors / layers / mixes / thin films / multilayers | the **dominant** branch, weighted (mixes hard-threshold at ½) |
 | random diffraction order at a `grating`; random Stokes-shift excitation λ at a `fluorescent` | the same weighted pick, but driven by a **low-discrepancy lattice** indexed by (sample, bounce) instead of the rng — one *fixed* choice per sample, not a coin. Sample 0 gives the grating's **specular order m = 0** and the **median** excitation λ; extra `-spp` fan the diffracted spectrum out into the higher orders |
@@ -1844,7 +1844,7 @@ machine varied 18.5 s / 25.8 s / 27.2 s.
   spectral fold, so a rainbow beam is demoted to its monochromatic `CIE(λ)` record the way it was
   before 0.264.0. The A/B control for that fold; on `gallery_rain` the fold changes 63 % of pixels and
   is ~10 % faster.
-- **`-checklayered` (self-test, no scene).** Seven unit tests for the stochastic layered BSDF
+- **`-checklayered` (self-test, no scene).** Eight unit tests for the stochastic layered BSDF
   (`src/layered.h`), run as pure math with no scene, camera or film. `eta=1` must reduce to the
   bare body; a white body under a clear coat must return albedo exactly 1 (light can be delayed by
   total internal reflection, never destroyed); a MIRROR body has no TIR series at all and must hit
@@ -1853,20 +1853,29 @@ machine varied 18.5 s / 25.8 s / 27.2 s.
   be reciprocal; and a LAMBERTIAN body must reproduce the shipped analytic `coatedAlbedo` to
   within noise, which is the control proving the new model generalises the old rather than
   replacing it. Measured: 0.000 %, 0.0000, 0.6362 vs 0.6364, 0.5520 vs 0.5511, 0.19911 vs 0.19955,
-  0.3970 vs 0.3968. The seventh builds a `Scene`, runs the loader's own `finalizeLayeredCoats`
+  0.3970 vs 0.3968. A GLOSSY (GGX) body's escape moments must reproduce its own walk's albedo at
+  roughness 0.25 and 0.8 and three incidences, within 1 % (measured 0.24 %): they take the lobe's
+  draw weights, which follow the exit angle (moments that counted each escape as 1 missed by up to
+  24 %). The last builds a `Scene`, runs the loader's own `finalizeLayeredCoats`
   and reads back what shading would see, because the first six prove the model and none of them
   proves it is *reached* — which is exactly how this failed once, with a correct model, correct
   scene wiring, and a render that was byte-identical to the analytic one because only the host
   had been taught the new path.
-- **`-checkggx` (self-test, no scene).** Five unit tests for the glossy lobe (`src/ggx.h`, GGX), as
+- **`-checkggx` (self-test, no scene).** Six unit tests for the glossy lobe (`src/ggx.h`, GGX), as
   pure math about a tilted normal at three roughnesses and three arrivals, on the single-scattering
   lobe and on the lobe with its multiple scattering: `f(a, b) == f(b, a)` (reciprocity); a draw's
   weight equals `f cos / pdf` (the factor a walk takes is the one the evaluator and the density
   imply); the sampler draws its own pdf (three moments of the drawn direction against a quadrature of
   the pdf, within 5 standard errors -- what MIS rests on); the mean weight equals the quadrature of
   `f cos`, never above 1 for single scattering and within 1.5 % of 1 with the multiple scattering
-  (the white furnace; measured 0.3 %); and at the least roughness 99 % of the draws lie within
-  0.05 rad of the mirror, which `u1 = 1` returns exactly (mode W's sample 0).
+  (the white furnace; measured 0.07 %), and so on polished lobes (roughness 0.01-0.06) met down to
+  88.6 degrees, where their single scattering dips within a cosine of about alpha (measured 0.4 %);
+  at the least roughness 99 % of the draws lie within 0.05 rad of the mirror, which `u1 = 1` returns
+  exactly (mode W's sample 0), weighed by the lobe's albedo (1 with the multiple scattering, E(cos)
+  without), and a roughness past 2 is held there; and the multiple scattering's own draw has a
+  density that integrates to 1 and a weight whose mean is `1 - E` and whose relative second moment
+  stays under 1.1 wherever that branch carries energy (measured 1.004; a cosine draw's weight reached
+  20 on a near-mirror lobe met at grazing).
 - **`FTRACE_SPECMEDIA=0` (diagnostic, participating media).** Forces the **scalar** transmittance
   tier on a coloured medium — one walk at one wavelength, applied to every wavelength — which is the
   pre-0.322.0 behaviour exactly, and so is the A/B control for the three-tier spectral
@@ -2279,7 +2288,7 @@ Declared with `material "name" { type <type> … }`.
 | `mirror` | Perfect specular reflector | `reflect` |
 | `halfmirror` | Lossless beamsplitter; `reflect` is the reflect probability (default 0.5 = 50/50). A spectral `reflect` gives a wavelength-dependent (dichroic) split | `reflect` |
 | `filter` | Colored **gel / Wratten filter**: a thin non-scattering absorber. Light passes straight through (no reflection or refraction), surviving with probability `transmit`(λ) — the per-wavelength transmittance T(λ) ∈ [0,1] — and is absorbed otherwise. Like clear glass it isn't lit directly; you see its effect on whatever is behind it | `transmit` (spectrum: `filter:<name>`, `file:<path>`, or a primitive like `gaussian`; also `pattern:<name>` / `transmit_map` for a transmittance that varies across the gel) |
-| `glossy` | Rough microfacet reflector: since 0.445.0 a **GGX** lobe (visible-normal sampling, height-correlated Smith masking) with its **multiple scattering** (Kulla-Conty: the light the facets' masking keeps from leaving comes back out as a second, diffuse-like lobe), reciprocal, so every mode renders it alike and a light walk's weight stays bounded at grazing, where the Phong lobe before it had none. Its albedo is `reflect` at every roughness: a white one returns what it receives (`-checkggx`). `roughness` `r` is the lobe's **width** as it was under the Phong lobe (GGX α = 0.646 r), so a scene's highlights keep their width; GGX's longer tail gives them a softer glow. A rough interference reflector and a layered coat take the single-scattering lobe alone | `reflect`, `roughness` (constant or `texture:<name>` map) |
+| `glossy` | Rough microfacet reflector: since 0.445.0 a **GGX** lobe (visible-normal sampling, height-correlated Smith masking) with its **multiple scattering** (Kulla-Conty: the light the facets' masking keeps from leaving comes back out as a second, diffuse-like lobe), reciprocal, so every mode renders it alike and a light walk's weight stays bounded at grazing, where the Phong lobe before it had none. Its albedo is `reflect` at every roughness: a white one returns what it receives (`-checkggx`). `roughness` `r` is the lobe's **width** as it was under the Phong lobe (GGX α = 0.646 r), so a scene's highlights keep their width; GGX's longer tail gives them a softer glow. `roughness` is held to 0.001–2 (2 is α 1.29, the widest the multiple-scattering table holds). A rough interference reflector and a Fresnel or thin-film coat take the single-scattering lobe alone (their reflectance is read at the half vector); a `manual` coat keeps its multiple scattering | `reflect`, `roughness` (constant or `texture:<name>` map) |
 | `thinfilm` | Single-layer interference (iridescence). With `roughness` on an opaque substrate, a **rough** interference reflector — see below | `ior`, `film_ior` (a number, or a dispersive index such as `glass:titania`), `film_thickness` (nm), `film_thickness_map texture:<name>`, `substrate_k`, `roughness` |
 | `multilayer` | N-layer Abelès transfer-matrix stack (right with absorption since 0.403.0: before, an absorbing layer amplified instead of absorbing, and a stack over an absorbing backing had its colours shifted). With `roughness` on an opaque stack, a **rough** interference reflector — see below | `ior`, `substrate_k`, repeated `layer <n> <k> <nm>`, `roughness` |
 | `grating` | Reflective diffraction grating | `reflect`, `groove_spacing` (nm), `groove_dir`, `max_order` |
@@ -3665,15 +3674,14 @@ are worth knowing about:
 * **Roughness is converted to ftrace's units, so a highlight is as wide as the asset's author
   saw it** (0.434.4). glTF's roughness `r` is perceptual: its GGX α is `r²`. ftrace's
   `roughness` is a GGX lobe of α `0.646 r_t` (since 0.445.0; before, a Phong lobe of the same width).
-  So the import takes `r_t = min(1, r² / 0.646)`: the factor when there is no map, and each
+  So the import takes `r_t = r² / 0.646` (up to 1.55 at glTF's `r` 1, inside the lobe's range): the factor when there is no map, and each
   texel of the map (with the map's mean as the material's constant). Before 0.434.4, `r` was
   copied raw, so every imported glossy surface was blurrier than glTF means: α 0.16 for a glTF
   0.25, where glTF means 0.0625. The two agree only near `r` 1. The least it is given is `r_t`
   0.001 (glTF 0.025), the tracers' own floor; from 0.434.4 to 0.434.8 a factor with no map was
   floored at `r_t` 0.02 after the conversion, so a constant under glTF 0.11 imported as 0.11 while a
-  map's texels did not. The raster preview's GGX now
-  comes out at glTF's own α for `r` up to 0.8. Past that, ftrace's lobe is already at its widest
-  (`r_t` 1, a cosine lobe). Frosted glass (`KHR_materials_transmission` with a roughness)
+  map's texels did not. The tracers' lobe and the raster preview's both come out at glTF's own α
+  over its whole range. Frosted glass (`KHR_materials_transmission` with a roughness)
   uses the same conversion for its refracted lobe.
 * **A metal is tinted by the base-colour texture, texel by texel** (0.367.2). glTF's metal F0
   *is* its base colour, so a textured metal — a whole-metal material, or the metal lobe of
@@ -6367,11 +6375,12 @@ Mitsuba is also a spectral, physically-based renderer, so most constructs map
 almost 1:1: the `perspective`/`thinlens` sensor → an FTSL `camera`;
 `diffuse`/`conductor`/`roughconductor`/`dielectric`/`roughdielectric`/`plastic` BSDFs →
 `diffuse`/`mirror`/`glossy`/`dielectric` materials, and a `thindielectric` → a
-`halfmirror` reflecting the sheet's normal-incidence reflectance. A microfacet `alpha`
-becomes the `roughness` whose lobe is as wide: 2 `alpha` for a Beckmann reflection
-(Mitsuba's default distribution; 0.77 of that for GGX), capped at 1. A rough
-dielectric is matched to its transmitted lobe, which carries most of its light and is
-far narrower (0.42 `alpha` at n 1.5), so its reflection comes out the sharper.
+`halfmirror` reflecting the sheet's normal-incidence reflectance. A reflection's microfacet
+`alpha` becomes the glossy GGX lobe of the same alpha, `roughness` = `alpha` / 0.646 for GGX
+(exact), and for a Beckmann `alpha` (Mitsuba's default distribution) the GGX lobe of the same
+half-vector width, 2 `alpha`; held to 2. A rough dielectric frosts with a cone of the
+roughness's width, matched to its transmitted lobe, which carries most of its light and is
+far narrower (0.42 `alpha` at n 1.5), capped at 1, so its reflection comes out the sharper.
 
 Emitters become FTSL lights at Mitsuba's own magnitude, so lights keep their brightness
 relative to one another: an RGB value becomes `rgbillum`, a bare number (or `d65`
@@ -6813,9 +6822,9 @@ light.
 | `-light-split <v>` | Adaptive-splitting threshold, as `(node radius / distance)²` (default `1.0`). A node subtending more than this is traversed into **both** children instead of choosing one, which is what stops a nearby cluster of lights from being resolved by a single random pick. Raising it selects more aggressively (faster, noisier); `0` disables splitting; a very large value degenerates back to the all-emitters estimator. |
 
 **Glossy next-event estimation** — a rough metal is the one common material whose light the
-renderer used to find only *by accident*. A `glossy` lobe is a power cosine about the mirror
-direction with solid angle `≈ 2π/(e+1)`, `e = 2/roughness² − 2` — 0.104 sr at `roughness 0.18`,
-0.0079 sr at the metal presets' default 0.05 — and until 0.266.0 no unidirectional mode
+renderer used to find only *by accident*. A `glossy` lobe is a GGX lobe about the mirror
+direction whose core is as wide as a power cosine's of solid angle `≈ 2π/(e+1)`, `e = 2/roughness² − 2`
+— 0.104 sr at `roughness 0.18`, 0.0079 sr at the metal presets' default 0.05 — and until 0.266.0 no unidirectional mode
 connected such a vertex to a light: it multiplied by the reflectance and walked on, so a
 `light sun { angle 0.53 }` (a disc of **6.8e-5 sr**) was collected only when a lobe sample
 happened to land inside it. Odds of about 1 in 1500 for the gold case, 1 in 115 for chrome, with

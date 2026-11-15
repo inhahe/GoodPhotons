@@ -2,15 +2,16 @@
 
     D:/python314/python.exe -u tools/check_gltf_roughness.py [--out <dir>] [--exe ftrace.exe]
 
-glTF's roughness `r` is perceptual (GGX alpha = r^2); ftrace's lobe is GGX of alpha 0.646 r_t (src/ggx.h;
-before 0.445.0 a Phong lobe of that width), so the importer takes r_t = min(1, r^2 / 0.646)
-(gltfRoughness, src/gltf.h), and the lobe it renders is glTF's own.
+glTF's roughness `r` is perceptual (GGX alpha = r^2); ftrace's lobe is GGX of alpha 0.646 r_t (src/ggx.h),
+so the importer takes r_t = r^2 / 0.646 (gltfRoughness, src/gltf.h; at most 1.55, inside the lobe's
+range of 2), and the lobe it renders is glTF's own.
 Writes one-quad GLBs of a metal (no coat, so the material is one glossy lobe) and renders each
 (mode R, CPU, fixed seed) against the same quad with `import_materials no` and the FTSL glossy
 material the import should produce:
 
-  - roughnessFactor 0.5, no map: byte-identical to `roughness 0.25/0.646`; and 0.05 to
-    `roughness 0.0025/0.646`, the importer's floor being the lobe's own clamp (1e-3);
+  - roughnessFactor 0.5, no map: byte-identical to `roughness 0.25/0.646`; 0.05 to
+    `roughness 0.0025/0.646`, the importer's floor being the lobe's own clamp (1e-3); and 1 to
+    `roughness 1/0.646`, wider than the 1 a cap there would leave;
   - roughnessFactor 1, a constant map of G 128: within float noise of `roughness (128/255)^2/0.646`
     (the map is sampled bilinearly, so the texel need not come back to the last bit);
   - each against the raw roughness the importer used to copy, which must differ, so the rig can
@@ -145,6 +146,16 @@ def main():
     conv, _ = render("low_ftsl", scene("low.glb", 0.05 * 0.05 / 0.646))
     check("factor 0.05 imports as roughness 0.0025/0.646 (byte-identical)", imp == conv,
           "%d of %d bytes differ" % (sum(x != y for x, y in zip(imp, conv)), len(imp)))
+
+    # 1c. glTF's widest lobe: alpha 1, roughness 1/0.646 -- no cap at 1.
+    write_glb(os.path.join(d, "wide.glb"), 1.0)
+    imp, imp_img = render("wide_import", scene("wide.glb"))
+    conv, _ = render("wide_ftsl", scene("wide.glb", 1.0 / 0.646))
+    _, cap_img = render("wide_cap", scene("wide.glb", 1.0))
+    check("factor 1 imports as roughness 1/0.646 (byte-identical)", imp == conv,
+          "%d of %d bytes differ" % (sum(x != y for x, y in zip(imp, conv)), len(imp)))
+    rel = np.abs(imp_img - cap_img).sum() / max(1e-30, cap_img.sum())
+    check("  ... and not as roughness 1", rel > 0.01, "relative L1 %.3f" % rel)
 
     # 2. A constant map under factor 1.
     g = 128

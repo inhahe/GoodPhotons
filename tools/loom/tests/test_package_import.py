@@ -9,9 +9,9 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
 def _run(args):
-    env = dict(os.environ, PYTHONPATH=ROOT)
+    env = dict(os.environ, PYTHONPATH=ROOT, PYTHONIOENCODING="utf-8")
     return subprocess.run([sys.executable, "-W", "error::RuntimeWarning"] + args, cwd=ROOT, env=env,
-                          capture_output=True, text=True)
+                          capture_output=True, text=True, encoding="utf-8", errors="replace")
 
 
 def test_package_import_leaves_viewer_and_anim_unloaded():

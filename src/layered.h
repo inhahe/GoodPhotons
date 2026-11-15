@@ -229,7 +229,8 @@ inline double f(const Params& P, const Body& body, const Vec3& wi, const Vec3& w
 //
 // So keep the expansion and drop the assumption. `escapeMoments` measures the real distribution
 // P_k -- the probability of escaping after exactly k+1 body interactions -- by running the
-// position-free walk. The crucial property is that P_k depends on the coat index, the incidence
+// position-free walk, each walk weighed by the product of its white lobe's draw weights (f cos /
+// pdf), so the moments are the lobe's and not its sampler's. The crucial property is that P_k depends on the coat index, the incidence
 // and the body's LOBE SHAPE, but NOT on the body's albedo: albedo only ever multiplies, once per
 // bounce. So P_k is computed once per (material, incidence) and then serves every wavelength and
 // every albedo for free, which is what makes this affordable at all.
@@ -250,13 +251,15 @@ inline void escapeMoments(const Params& P, const Body& body, double cosI, int K,
         Vec3 p;
         if (!refractProp(Vec3{ -wi.x, -wi.y, -wi.z }, P.eta, p)) continue;
         Vec3 a = Vec3{ -p.x, -p.y, -p.z };
+        double thr = 1.0;     // the product of the white lobe's draw weights: f cos / pdf, geometry only
         for (int k = 0; k < K; ++k) {
             Vec3 b;
             double w = 0.0;
-            if (!body.sample(a, rng(), rng(), b, w)) break;   // the ALBEDO in w is deliberately
-            //                                                   ignored: these are pure geometry
+            if (!body.sample(a, rng(), rng(), b, w)) break;
+            thr *= w;
+            if (!(thr > 0.0)) break;
             const double F2 = fresnel(b.z, 1.0 / P.eta);
-            if (rng() >= F2) { out[k] += 1.0; break; }        // escaped after k+1 interactions
+            if (rng() >= F2) { out[k] += thr; break; }        // escaped after k+1 interactions
             const Vec3 down = reflectProp(b);
             a = Vec3{ -down.x, -down.y, -down.z };
         }
@@ -297,10 +300,7 @@ struct GgxBody {
         return ggx::fAll(ggx::pair(Vec3{0, 0, 1}, a, b, ggx::alpha(rough)), true);
     }
     bool sample(const Vec3& a, double u1, double u2, Vec3& b, double& weight) const {
-        const Vec3 n{0, 0, 1};
-        const double al = ggx::alpha(rough);
-        b = ggx::sampleUVAll(n, a, al, true, u1, u2);
-        weight = ggx::weightAll(ggx::pair(n, a, b, al), true);   // f cos / pdf
+        b = ggx::drawRough(Vec3{0, 0, 1}, a, rough, true, u1, u2, weight);   // weight: f cos / pdf
         return b.z > 0.0;
     }
 };

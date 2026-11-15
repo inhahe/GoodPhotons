@@ -423,10 +423,10 @@ inline bool previewLightAt(const PLight& lp, const Vec3& P, Vec3& Ld, Vec3& E, d
 // lobe convolved with the source, which GGX approximates by widening alpha by half the source's
 // angular radius (a half-vector turns half as fast as the reflection). D stays normalised, so a
 // big softbox gives a big soft highlight carrying the same energy a small one packs into a glint.
-// The tracers' glossy lobe is GGX of alpha = 0.646 r (ggx.h alpha, which keeps the width the Phong
-// lobe before 0.445.0 had); this preview's is GGX with alpha = rough^2, so a material roughness
-// reaches the preview as sqrt(0.646 r) and the two lobes are one. Used raw, as it was before
-// 0.368.0, every preview highlight came out a factor ~2 narrower than the render's.
+// The tracers' glossy lobe is GGX of alpha = 0.646 r (ggx.h alpha); this preview's is GGX with
+// alpha = rough^2, so a material roughness reaches the preview as sqrt(0.646 r) and the two lobes
+// are one. (A roughness used raw here would preview every highlight a factor ~2 narrower than the
+// render's.)
 inline double previewRough(double r) { return std::sqrt(ggx::kAlphaPerRoughness * std::max(0.0, r)); }
 
 inline double widenRough(double rough, double ang) {

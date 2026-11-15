@@ -24,9 +24,10 @@ Writes small Mitsuba scenes, converts each, and checks:
   - a `<default>` parameter keeps its camelCase name, so `$fovDeg` still substitutes.
 
   BSDFs:
-  - a microfacet alpha becomes the `roughness` of matching lobe width, worked out here from
-    the distributions' half-widths: a reflection's lobe for a conductor or plastic, the
-    transmitted lobe (mean of entering and leaving) for a rough dielectric; capped at 1;
+  - a microfacet alpha becomes a `roughness`: a conductor's or plastic's the glossy GGX lobe of
+    the same alpha (a Beckmann alpha by its half-vector half-width), held to 2; a rough
+    dielectric's the frosting cone as wide as its transmitted lobe (mean of entering and
+    leaving), capped at 1;
     an anisotropic alpha_u/alpha_v is averaged and a textured alpha read as 0.1, both flagged;
   - thindielectric becomes a `halfmirror` reflecting a sheet's 2R/(1+R) at normal incidence;
   - a dielectric's specular_transmittance, a conductor's eta/k, and a conductor material FTSL
@@ -135,12 +136,15 @@ def planck_nm(nm, t):
     return 2 * h * c * c / lam ** 5 / (math.exp(h * c / (lam * k * t)) - 1) * 1e-9
 
 
-def roughness_for(alpha, spread, ggx=False):
-    """The FTSL roughness whose Phong lobe is as wide as a microfacet lobe of `alpha` whose
-    outgoing ray turns `spread` times as fast as its half-vector."""
-    phong = math.sqrt(math.log(2))
-    hw = math.sqrt(math.sqrt(2) - 1) if ggx else math.sqrt(math.log(2))
-    return min(1.0, spread * hw / phong * alpha)
+def roughness_for(alpha, spread=None, ggx=False):
+    """The FTSL roughness for a microfacet lobe of `alpha`. A reflection (`spread` None): the glossy
+    GGX lobe of the same alpha, 0.646 per unit roughness (src/ggx.h), a Beckmann alpha taken as the
+    GGX alpha of the same half-vector half-width, at most 2. A refraction: the frosting cone as wide
+    as the lobe, whose outgoing ray turns `spread` times as fast as its half-vector, at most 1."""
+    beck, gg = math.sqrt(math.log(2)), math.sqrt(math.sqrt(2) - 1)
+    if spread is None:
+        return min(2.0, (alpha if ggx else alpha * beck / gg) / 0.646)
+    return min(1.0, spread * (gg if ggx else beck) / beck * alpha)
 
 
 def glass_files():
@@ -310,7 +314,7 @@ def scene_bsdfs(ply):
                   '<string name="distribution" value="ggx"/></bsdf>'),
         sphere(2, '<bsdf type="roughconductor" id="aniso"><string name="material" value="Au"/>'
                   '<float name="alpha_u" value="0.2"/><float name="alpha_v" value="0.1"/></bsdf>'),
-        sphere(3, '<bsdf type="roughplastic" id="capped"><float name="alpha" value="0.7"/></bsdf>'),
+        sphere(3, '<bsdf type="roughplastic" id="capped"><float name="alpha" value="1.6"/></bsdf>'),
         sphere(4, '<bsdf type="thindielectric" id="thin"/>'),
         sphere(5, '<bsdf type="dielectric" id="tinted"><rgb name="specular_transmittance" value="0.6, 0.8, 1"/></bsdf>'),
         sphere(6, '<bsdf type="conductor" id="tungsten"><string name="material" value="W"/></bsdf>'),
@@ -515,7 +519,7 @@ def main():
                          ('v06_numeric', 'dielectric  ior 2.4'),
                          ('v06_diffuse', 'diffuse  reflect rgb 0.2 0.4 0.6'),
                          ('v06_conductor', 'mirror  reflect metal:Cu'),
-                         ('v06_alphav', f"glossy  reflect metal:Au  roughness {roughness_for(0.25, 2):.6g}"),
+                         ('v06_alphav', f"glossy  reflect metal:Au  roughness {roughness_for(0.25):.6g}"),
                          ('v06_srgb', 'diffuse  reflect rgb ' + g6([srgb_decode(0.5)] * 3)),
                          ('v06_hex', 'diffuse  reflect rgb ' + g6(srgb_decode(v / 255) for v in (0xff, 0xcc, 0x88))),
                          ('v06_rgbhex', 'diffuse  reflect rgb ' + g6([0x80 / 255] * 3)))
@@ -546,10 +550,10 @@ def main():
              f"roughdielectric Beckmann alpha 0.3 came out as {mats.get('rough')!r}, not roughness {want_r:.6g}"),
             (close(rough('rough_ggx'), want_g),
              f"GGX alpha 0.3 came out as {mats.get('rough_ggx')!r}, not roughness {want_g:.6g}"),
-            (close(rough('aniso'), roughness_for(0.15, 2)) and warned(out, "'aniso': anisotropic alpha_u 0.2 / alpha_v 0.1"),
+            (close(rough('aniso'), roughness_for(0.15)) and warned(out, "'aniso': anisotropic alpha_u 0.2 / alpha_v 0.1"),
              f"alpha_u 0.2 / alpha_v 0.1 came out as {mats.get('aniso')!r} or left no # WARN"),
-            (close(rough('capped'), 1.0), f"alpha 0.7 came out as {mats.get('capped')!r}, not capped at 1"),
-            (close(rough('texalpha'), roughness_for(0.1, 2)) and warned(out, "'texalpha': a textured alpha"),
+            (close(rough('capped'), 2.0), f"alpha 1.6 came out as {mats.get('capped')!r}, not held at 2"),
+            (close(rough('texalpha'), roughness_for(0.1)) and warned(out, "'texalpha': a textured alpha"),
              f"a textured alpha came out as {mats.get('texalpha')!r} or left no # WARN"),
             (bool(thin) and close(float(thin.group(1)), want_thin),
              f"thindielectric came out as {mats.get('thin')!r}, not halfmirror reflect {want_thin:.6f}"),

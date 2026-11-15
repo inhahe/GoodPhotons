@@ -1946,138 +1946,6 @@ __device__ static DVec3 sampleRoughCone(const DVec3& dir, Real roughness, DRng& 
     return normalize(t * (sinT * cos(phi)) + b * (sinT * sin(phi)) + dir * cosT);
 }
 
-// ---------------- the glossy lobe: GGX (host twin ggx.h, where the why is) -----------------
-// The lobe's terms in double, as dBsdfF is; its sampler in Real, as every direction is.
-__device__ static inline double dGgxAlpha(double roughness) {
-    return ggx::kAlphaPerRoughness * (roughness < ggx::kMinRoughness ? ggx::kMinRoughness : roughness);
-}
-__device__ static inline double dGgxSmithA(double c, double a2) {
-    const double s2 = 1.0 - c * c;
-    return sqrt(c * c + a2 * (s2 > 0.0 ? s2 : 0.0));
-}
-// Host twin ggx::Pair / ggx::pair: the pair (a, b)'s cosines to n, their A terms and D at their half
-// vector; ok false unless both lie above n.
-struct DGgxPair { bool ok; double ca, cb, Aa, Ab, D, alpha; };
-__device__ static DGgxPair dGgxPair(const DVec3& n, const DVec3& a, const DVec3& b, double alpha) {
-    DGgxPair p{false, 0.0, 0.0, 0.0, 0.0, 0.0, alpha};
-    const double nx = n.x, ny = n.y, nz = n.z;
-    const double ax = a.x, ay = a.y, az = a.z, bx = b.x, by = b.y, bz = b.z;
-    p.ca = ax * nx + ay * ny + az * nz;
-    p.cb = bx * nx + by * ny + bz * nz;
-    if (!(p.ca > 0.0) || !(p.cb > 0.0)) return p;
-    double hx = ax + bx, hy = ay + by, hz = az + bz;
-    const double l = sqrt(hx * hx + hy * hy + hz * hz);
-    if (!(l > 0.0)) return p;
-    hx /= l; hy /= l; hz /= l;
-    const double ch = hx * nx + hy * ny + hz * nz;
-    const double cx = ny * hz - nz * hy, cy = nz * hx - nx * hz, cz = nx * hy - ny * hx;
-    const double s2 = cx * cx + cy * cy + cz * cz;
-    const double a2 = alpha * alpha;
-    const double d = a2 * ch * ch + s2;
-    if (!(d > 0.0)) return p;
-    p.D = a2 / (DPI * d * d);
-    p.Aa = dGgxSmithA(p.ca, a2);
-    p.Ab = dGgxSmithA(p.cb, a2);
-    p.ok = true;
-    return p;
-}
-__device__ static inline double dGgxF(const DGgxPair& p) {
-    return p.ok ? p.D / (2.0 * (p.cb * p.Aa + p.ca * p.Ab)) : 0.0;
-}
-__device__ static inline double dGgxPdf(const DGgxPair& p) {
-    return p.ok ? p.D / (2.0 * (p.ca + p.Aa)) : 0.0;
-}
-__device__ static inline double dGgxWeight(const DGgxPair& p) {
-    return p.ok ? p.cb * (p.ca + p.Aa) / (p.cb * p.Aa + p.ca * p.Ab) : 0.0;
-}
-// Host twin ggx::sampleUV: the visible normals' draw for the arrival a about n (u1 == 1 the exact
-// mirror, as is an arrival below n).
-__device__ static DVec3 dGgxSampleUV(const DVec3& n, const DVec3& a, Real alpha, Real u1, Real u2) {
-    const Real ca = dot(a, n);
-    if (u1 >= (Real)1 || !(ca > (Real)0)) return reflectv(a * (Real)(-1), n);
-    DVec3 t, bt; onb(n, t, bt);
-    const DVec3 vs = normalize(DVec3{alpha * dot(a, t), alpha * dot(a, bt), ca});
-    const Real phi = (Real)2 * (Real)DPI * u2;
-    const Real z = u1 * ((Real)1 + vs.z) - vs.z;
-    const Real st = sqrt(fmax((Real)0, (Real)1 - z * z));
-    const DVec3 hs{st * cos(phi) + vs.x, st * sin(phi) + vs.y, z + vs.z};
-    const DVec3 hl = normalize(DVec3{alpha * hs.x, alpha * hs.y, hs.z > (Real)0 ? hs.z : (Real)0});
-    const DVec3 h = t * hl.x + bt * hl.y + n * hl.z;
-    return normalize(h * ((Real)2 * dot(a, h)) - a);
-}
-// The multiple scattering's table (host twin ggx.h kMsE / kMsEavg, the same initialisers) and its
-// lookups (msE, msEavg, fMs), and the lobe a material shades with (fAll, pdfAll, weightAll,
-// sampleUVAll), where the why is.
-__constant__ float c_ggxMsE[GGX_MS_NA * GGX_MS_NM] = GGX_MS_E_INIT;
-__constant__ float c_ggxMsEavg[GGX_MS_NA] = GGX_MS_EAVG_INIT;
-__device__ static inline void dGgxMsRow(double alpha, int& i, double& t) {
-    double x = alpha / GGX_MS_ALPHA_MAX;
-    x = (x < 0.0 ? 0.0 : (x > 1.0 ? 1.0 : x)) * (GGX_MS_NA - 1);
-    i = (int)x;
-    if (i > GGX_MS_NA - 2) i = GGX_MS_NA - 2;
-    t = x - (double)i;
-}
-__device__ static inline double dGgxMsE(double c, double alpha) {
-    int i; double t;
-    dGgxMsRow(alpha, i, t);
-    const double y = sqrt(c < 0.0 ? 0.0 : (c > 1.0 ? 1.0 : c)) * (GGX_MS_NM - 1);
-    int j = (int)y;
-    if (j > GGX_MS_NM - 2) j = GGX_MS_NM - 2;
-    const double u = y - (double)j;
-    const float* r0 = c_ggxMsE + i * GGX_MS_NM;
-    const float* r1 = r0 + GGX_MS_NM;
-    const double e0 = r0[j] + (r0[j + 1] - r0[j]) * u, e1 = r1[j] + (r1[j + 1] - r1[j]) * u;
-    return e0 + (e1 - e0) * t;
-}
-__device__ static inline double dGgxMsEavg(double alpha) {
-    int i; double t;
-    dGgxMsRow(alpha, i, t);
-    return c_ggxMsEavg[i] + (c_ggxMsEavg[i + 1] - c_ggxMsEavg[i]) * t;
-}
-__device__ static inline double dGgxFMs(const DGgxPair& p) {
-    if (!p.ok) return 0.0;
-    const double ea = dGgxMsEavg(p.alpha);
-    if (!(1.0 - ea > 1e-6)) return 0.0;
-    return (1.0 - dGgxMsE(p.ca, p.alpha)) * (1.0 - dGgxMsE(p.cb, p.alpha)) / (DPI * (1.0 - ea));
-}
-__device__ static inline double dGgxFAll(const DGgxPair& p, bool ms) { return ms ? dGgxF(p) + dGgxFMs(p) : dGgxF(p); }
-__device__ static inline double dGgxPdfAll(const DGgxPair& p, bool ms) {
-    if (!ms || !p.ok) return dGgxPdf(p);
-    const double ps = dGgxMsE(p.ca, p.alpha);
-    return ps * dGgxPdf(p) + (1.0 - ps) * p.cb / DPI;
-}
-__device__ static inline double dGgxWeightAll(const DGgxPair& p, bool ms) {
-    if (!ms) return dGgxWeight(p);
-    if (!p.ok) return 0.0;
-    const double d = dGgxPdfAll(p, true);
-    return (d > 0.0) ? dGgxFAll(p, true) * p.cb / d : 0.0;
-}
-__device__ static DVec3 dGgxSampleUVAll(const DVec3& n, const DVec3& a, Real alpha, bool ms, Real u1, Real u2) {
-    const Real ca = dot(a, n);
-    if (!ms || u1 >= (Real)1 || !(ca > (Real)0)) return dGgxSampleUV(n, a, alpha, u1, u2);
-    const Real ps = (Real)dGgxMsE((double)ca, (double)alpha);
-    if (!(ps < (Real)1) || u1 < ps) return dGgxSampleUV(n, a, alpha, (ps < (Real)1) ? u1 / ps : u1, u2);
-    const Real v = (u1 - ps) / ((Real)1 - ps);          // a cosine draw about n
-    const Real r = sqrt(v), phi = (Real)2 * (Real)DPI * u2;
-    DVec3 t, bt; onb(n, t, bt);
-    return normalize(t * (r * cos(phi)) + bt * (r * sin(phi)) + n * sqrt(fmax((Real)0, (Real)1 - v)));
-}
-// Host twins render.h ggxDrawUV / ggxDraw: a draw from the lobe of `roughness` about the shading
-// normal n for the arrival wo -- with its multiple scattering where `ms` -- from canonical uniforms or
-// off the stream (two draws, in order), and `w` its weight.
-__device__ static inline DVec3 dGgxDrawUV(const DVec3& n, const DVec3& wo, Real roughness, bool ms, Real u1,
-                                          Real u2, Real& w) {
-    const double al = dGgxAlpha((double)roughness);
-    const DVec3 o = dGgxSampleUVAll(n, wo, (Real)al, ms, u1, u2);
-    w = (Real)dGgxWeightAll(dGgxPair(n, wo, o, al), ms);
-    return o;
-}
-__device__ static inline DVec3 dGgxDraw(const DVec3& n, const DVec3& wo, Real roughness, bool ms, DRng& rng,
-                                        Real& w) {
-    const Real u1 = rng.uniform(), u2 = rng.uniform();
-    return dGgxDrawUV(n, wo, roughness, ms, u1, u2, w);
-}
-
 // ---------------- mode W: deterministic sample placement (device twin) ----------------
 // Exact ports of BackwardRenderer's statics in src/backward.h. All of these run in
 // `double` regardless of FTRACE_GPU_FP32, and on pure integer / double arithmetic, so they
@@ -6031,6 +5899,13 @@ __device__ static double dLocalN2(const DScene& sc, const DMediumStack& stk, Rea
 // Forward decl: the per-hit thin-film thickness helper (definition with the other texture
 // samplers, below dTexScalarAt) is used here before its point of definition.
 __device__ static Real dMatFilmThickness(const DScene& sc, const DMaterial& m, const DHit& h);
+// Host twin render.h coatThickness: a thin-film coat's thickness at `h`, its map held to [0, 1] of
+// its film_thickness (the span of its T-bar rows); 0 for any other coat.
+__device__ static Real dCoatThickness(const DScene& sc, const DMaterial& m, const DHit& h) {
+    if (m.coatModel != 1) return (Real)0;
+    const Real th = dMatFilmThickness(sc, m, h);
+    return th < (Real)0 ? (Real)0 : (th > (Real)m.filmThickness ? (Real)m.filmThickness : th);
+}
 
 // A coating that takes the transmitted light instead of passing it into a body: a thin film or
 // multilayer stack on an absorbing substrate, or a stack with an absorbing layer, at `lambda`. It
@@ -6444,14 +6319,17 @@ __device__ static inline Real dHalfVectorCos(const DVec3& a, const DVec3& b) {
 // dDrawGlossy or dGlossyDrawUV, and the JSPEC fold (dJFoldLobe) reads the same draw; how to take R
 // is the caller's. Not the RGB backward path, which refuses an iridescent material
 // (cudaBackwardRGBSupported). The draw keeps the hit's address, so it takes no temporary.
-// Host twin render.h glossyMs: a plain glossy lobe adds its multiple scattering; a rough interference
-// reflector and a layered material's coat lobe do not.
-__device__ static inline bool dGlossyMs(const DMaterial& m) { return m.iridescence == 0 && !m.coatLobe; }
+// Host twin render.h glossyMs: a plain glossy lobe adds its multiple scattering, and so does a manual
+// coat's; a rough interference reflector and a Fresnel or thin-film coat lobe do not.
+__device__ static inline bool dGlossyMs(const DMaterial& m) {
+    return m.iridescence == 0 && (!m.coatLobe || m.coatModel == 2);
+}
 struct DGlossyDraw {
     DVec3 o;
     Real w;    // the draw's weight (0 where o is not above the normal)
     bool irid;
     Real cH;   // 1 on a plain lobe
+    bool ms;   // took the multiple scattering's branch: a scattering, not a focus (host twin)
     const DScene* sc;
     const DMaterial* m;
     const DHit* h;
@@ -6462,7 +6340,8 @@ struct DGlossyDraw {
 __device__ static inline DGlossyDraw dGlossyDrawUV(const DScene& sc, const DMaterial& m, const DHit& h,
                                                    const DVec3& n, const DVec3& wo, Real u1, Real u2) {
     DGlossyDraw g;
-    g.o = dGgxDrawUV(n, wo, dMatRoughness(sc, m, h), dGlossyMs(m), u1, u2, g.w);
+    g.ms = false;
+    g.o = ggx::drawRough(n, wo, dMatRoughness(sc, m, h), dGlossyMs(m), u1, u2, g.w, &g.ms);
     g.irid = m.iridescence != 0;
     g.cH = g.irid ? dHalfVectorCos(wo, g.o) : (Real)1;
     g.sc = &sc; g.m = &m; g.h = &h;
@@ -6489,16 +6368,16 @@ __device__ static inline DGlossyDraw dWhittedGlossyDraw(const DScene& sc, const 
 // dBsdfF is.
 __device__ static double dGlossyF(const DScene& sc, const DMaterial& m, const DHit& h,
                                   const DVec3& ns, const DVec3& wo, const DVec3& wi, Real lambda) {
-    const DGgxPair p = dGgxPair(ns, wo, wi, dGgxAlpha((double)dMatRoughness(sc, m, h)));
+    const ggx::Pair p = ggx::pair(ns, wo, wi, ggx::alpha((double)dMatRoughness(sc, m, h)));
     if (!p.ok) return 0.0;
     double r = clamp01(dReflectSlot(sc, m, h, lambda, nullptr));
     if (m.iridescence) r *= (double)dIridescenceR(sc, m, &h, lambda, dHalfVectorCos(wo, wi));
-    return r * dGgxFAll(p, dGlossyMs(m));
+    return r * ggx::fAll(p, dGlossyMs(m));
 }
 // Twin of glossyPdf: the density with which dDrawGlossy draws `wi` for the arrival `wo`.
 __device__ static double dGlossyPdf(const DScene& sc, const DMaterial& m, const DHit& h,
                                     const DVec3& ns, const DVec3& wo, const DVec3& wi) {
-    return dGgxPdfAll(dGgxPair(ns, wo, wi, dGgxAlpha((double)dMatRoughness(sc, m, h))), dGlossyMs(m));
+    return ggx::pdfAll(ggx::pair(ns, wo, wi, ggx::alpha((double)dMatRoughness(sc, m, h))), dGlossyMs(m));
 }
 // Host twin Renderer::glossyPhotonWeight: a photon's glossy continuation, the draw's weight `w`
 // times the shading normal's half of Veach's adjoint.
@@ -6556,7 +6435,7 @@ __device__ static double dCoatPairR(const DMaterial& st, const DVec3& wa, const 
 }
 __device__ static double dCoatSheenR(const DScene& sc, const DMaterial& st, const DHit& h,
                                      const DVec3& wa, const DVec3& wb, Real lambda) {
-    const Real th = (st.coatModel == 1) ? dMatFilmThickness(sc, st, h) : (Real)0;
+    const Real th = dCoatThickness(sc, st, h);
     return dCoatPairR(st, wa, wb, th, lambda);
 }
 __device__ static inline bool dCoatLambertBody(const DMaterial& m) {
@@ -6603,7 +6482,7 @@ __device__ static DCoatEval dCoatEval(const DScene& sc, const DMaterial& m, cons
         if (lam ? (st.coatTbarOff < 0 || !sc.coatTbar) : st.coatModel == 2) return c;
         c.kind = lam ? 1 : 2;
         c.st = &st; c.sc = &sc;
-        c.th = (st.coatModel == 1) ? dMatFilmThickness(sc, st, h) : (Real)0;
+        c.th = dCoatThickness(sc, st, h);
         c.cA = dCoatCos(h.n, wa);
         c.cB = dCoatCos(h.n, wb);
         return c;
@@ -6612,7 +6491,7 @@ __device__ static DCoatEval dCoatEval(const DScene& sc, const DMaterial& m, cons
         const DMaterial& st = sc.mats[m.coatParent];
         if (st.coatModel == 2) return c;
         c.st = &st; c.sc = &sc;
-        c.th = (st.coatModel == 1) ? dMatFilmThickness(sc, st, h) : (Real)0;
+        c.th = dCoatThickness(sc, st, h);
         const DVec3 hv = wa + wb;
         const double l = (double)length(hv);
         if (!(l > 0.0)) { c.kind = 4; return c; }
@@ -6660,7 +6539,7 @@ __device__ static double dCoatShiftTbar(const DScene& sc, const DMaterial& m, co
     if (m.coatStack < 0 || !dCoatLambertBody(m)) return 1.0;
     const DMaterial& st = sc.mats[m.coatStack];
     if (st.coatTbarOff < 0 || !sc.coatTbar) return 1.0;
-    const Real th = (st.coatModel == 1) ? dMatFilmThickness(sc, st, h) : (Real)0;
+    const Real th = dCoatThickness(sc, st, h);
     const double tOut = dCoatTbarAt(sc, st, th, lamOut);
     return (tOut > 0.0) ? dCoatTbarAt(sc, st, th, lamIn) / tOut : 0.0;
 }
@@ -11785,7 +11664,7 @@ __device__ static double dLayeredCoatReflectance(const DScene& sc, const DMateri
     double cosI = fabs((double)dot(h.n, d));         // at the shading normal (host twin)
     if (cosI > 1.0) cosI = 1.0;
     if (cosIOut) *cosIOut = cosI;
-    const Real th = (m.coatModel == 1) ? dMatFilmThickness(sc, m, h) : (Real)0;   // a thin film's
+    const Real th = dCoatThickness(sc, m, h);   // a thin film's
     if (thOut) *thOut = th;
     return dCoatRAtJ(m, cosI, th, lambda);
 }
@@ -12837,25 +12716,29 @@ __device__ __noinline__ static int interactHair(const DScene& sc, const DCamSet&
 __device__ static int interactSpecularLobe(const DScene& sc, const DCamSet& cs, int camMode,
         int diffraction, const DMaterial& m, int matIndex, const DHit& h,
         DVec3& ro, DVec3& rd, Real& beta, Real& lambda, DRng& rng, double& eAbsorbed,
-        DMediumStack& stk, Real* curveTminOut, bool firstHit, const DCoatSplat* coat);
+        DMediumStack& stk, Real* curveTminOut, bool firstHit, const DCoatSplat* coat,
+        bool* scattered = nullptr);
 // The lobes below, for a coated body too (host twin Renderer::interactPhotonSpecular): its splats
-// and its continuation take the coat's way out, at the wavelength they leave with.
+// and its continuation take the coat's way out, at the wavelength they leave with. `scattered` (may
+// be null): set where a glossy draw took its multiple scattering's branch (DGlossyDraw::ms).
 __device__ static int interactSpecular(const DScene& sc, const DCamSet& cs, int camMode,
         int diffraction, const DMaterial& m, int matIndex, const DHit& h,
         DVec3& ro, DVec3& rd, Real& beta, Real& lambda, DRng& rng, double& eAbsorbed,
-        DMediumStack& stk, Real* curveTminOut = nullptr, bool firstHit = false) {
+        DMediumStack& stk, Real* curveTminOut = nullptr, bool firstHit = false,
+        bool* scattered = nullptr) {
     const DVec3 wa = -rd;   // the arrival
     const DCoatSplat coat{&sc, &h, dCoatCtxOf(m, wa)};
     const DCoatSplat* cp = coat.c.m ? &coat : nullptr;
     const int r = interactSpecularLobe(sc, cs, camMode, diffraction, m, matIndex, h, ro, rd, beta,
-                                       lambda, rng, eAbsorbed, stk, curveTminOut, firstHit, cp);
+                                       lambda, rng, eAbsorbed, stk, curveTminOut, firstHit, cp, scattered);
     if (r == WF_CONTINUE) dCoatContinue(sc, m, h, wa, rd, lambda, beta, eAbsorbed);   // a body's or a coat's
     return r;
 }
 __device__ static int interactSpecularLobe(const DScene& sc, const DCamSet& cs, int camMode,
         int diffraction, const DMaterial& m, int matIndex, const DHit& h,
         DVec3& ro, DVec3& rd, Real& beta, Real& lambda, DRng& rng, double& eAbsorbed,
-        DMediumStack& stk, Real* curveTminOut, bool firstHit, const DCoatSplat* coat) {
+        DMediumStack& stk, Real* curveTminOut, bool firstHit, const DCoatSplat* coat,
+        bool* scattered) {
     if (m.type == D_DIELECTRIC || m.type == D_THINFILM || m.type == D_MULTILAYER) {
         // A dielectric body's surface, plain or coated. A photon carries flux: no radiance scale.
         DVec3 nro, nrd;
@@ -12906,6 +12789,7 @@ __device__ static int interactSpecularLobe(const DScene& sc, const DCamSet& cs, 
         Real r = clamp01(dReflectSlot(sc, m, h, lambda));
         if (rng.uniform() >= r) { eAbsorbed += beta; return WF_TERMINATE; }
         const DGlossyDraw gd = dDrawGlossy(sc, m, h, h.n, -rd, rng);
+        if (scattered) *scattered = gd.ms;
         const DVec3& o = gd.o;
         if (dot(o, h.n) <= 0) { eAbsorbed += beta; return WF_TERMINATE; }
         // A photon carries the draw's weight and the shading normal's half of the adjoint, the
@@ -13360,8 +13244,11 @@ __device__ static int shadeStep(const DScene& sc, const DCamSet& cs,
         // one place that holds both `m` and `h`, and keeping it out of interactSpecular (which
         // the hero tracer also calls) leaves exactly one definition of the rule.
         if (pathC) pathC->bits |= dPhotonVertexBit(sc, m, h);
-        return interactSpecular(sc, cs, camMode, diffraction, m, matIndex, h,
-                                ro, rd, beta, lambda, rng, eAbsorbed, stk, curveTminOut, firstHit);
+        bool scat = false;   // a glossy draw into its multiple scattering: a scattering
+        const int r = interactSpecular(sc, cs, camMode, diffraction, m, matIndex, h,
+                                       ro, rd, beta, lambda, rng, eAbsorbed, stk, curveTminOut, firstHit, &scat);
+        if (pathC && scat) pathC->bits |= PV_BIT_SCATTER;
+        return r;
     } else if (m.type == D_DIFFUSETRANSMIT) {
         // Two-lobe Lambertian (device twin of render.h DiffuseTransmit): `reflect` into
         // the front (+n) hemisphere, `transmit` into the back (-n) hemisphere. Splat BOTH
@@ -13930,6 +13817,7 @@ __device__ static int shadeStepHero(const DScene& sc, const DCamSet& cs, int cam
             ro = dOffsetAlong(h.p, h.ng, rd);   // straight through, direction unchanged
         } else {
             const DGlossyDraw gd = dDrawGlossy(sc, m, h, h.n, -rd, rng);
+            if (pathC && gd.ms) pathC->bits |= PV_BIT_SCATTER;   // the multiple scattering's branch
             const DVec3& o = gd.o;
             if (dot(o, h.n) <= 0) { for (int i = 0; i < nUp; ++i) eAbsorbed += (double)beta[i]; return WF_TERMINATE; }
             const Real adj = dGlossyPhotonWeight(h, -rd, o, gd.w);   // see the scalar path
@@ -13968,8 +13856,11 @@ __device__ static int shadeStepHero(const DScene& sc, const DCamSet& cs, int cam
         if (pathC) pathC->bits |= dPhotonVertexBit(sc, m, h);   // caustic split
         if (nUp > 1) beta[0] *= (Real)C;   // not twice: a coat's coin may have de-heroed already
         secAlive = false;
-        return interactSpecular(sc, cs, camMode, diffraction, m, matIndex, h,
-                                ro, rd, beta[0], lam[0], rng, eAbsorbed, stk, curveTminOut, firstHit);
+        bool scat = false;   // a glossy draw into its multiple scattering (an iridescent lobe has none)
+        const int r = interactSpecular(sc, cs, camMode, diffraction, m, matIndex, h,
+                                       ro, rd, beta[0], lam[0], rng, eAbsorbed, stk, curveTminOut, firstHit, &scat);
+        if (pathC && scat) pathC->bits |= PV_BIT_SCATTER;
+        return r;
     }
 
     // Diffuse (texture-sampled reflectance when the material binds a texture).
@@ -14818,7 +14709,7 @@ __device__ static double dBsdfPdf(const DScene& sc, const DVertex& vt,
         return cosWi / DPI;
     } else if (m.type == D_GLOSSY) {
         DHit h = dVertHit(vt);
-        return dGlossyPdf(sc, m, h, ns, wo, wi);      // the visible normals' (dGgxPdf)
+        return dGlossyPdf(sc, m, h, ns, wo, wi);      // the visible normals' (ggx::pdfAll)
     } else if (m.type == D_DIFFUSETRANSMIT) {
         // The lobe-selected cosine sampling at a vertex reached from `wo`, about the shading
         // normal turned to wo's geometric side, a draw on the wrong side of the true surface
@@ -18343,7 +18234,7 @@ __device__ static DVec3 bkRadianceRGB(const DScene& sc, int diffraction, DVec3 r
                 Real q = rgbLuma(mp->rgbAlbedo);
                 if (q <= (Real)0 || rng.uniform() >= (double)q) return L;
                 Real wG;
-                DVec3 o = dGgxDraw(h.n, rd * (Real)(-1), dMatRoughness(sc, *mp, h), dGlossyMs(*mp), rng, wG);
+                DVec3 o = ggx::drawRough(h.n, rd * (Real)(-1), dMatRoughness(sc, *mp, h), dGlossyMs(*mp), rng, wG);
                 if (dot(o, h.n) <= 0) return L;
                 beta = hadamard(beta, mp->rgbAlbedo) * (wG / q);   // the albedo, and the draw's weight
                 if (!dContinueAlong(h, o, DL_REFLECT, ro, rd)) return L; specularArrival = true; break;

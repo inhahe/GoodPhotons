@@ -59,7 +59,7 @@ inline int photonMaxBounce() {
 // `roughness` is the lobe's width (0 = perfect mirror; ggx.h, ROUGHNESS). 0.15 is about where
 // the lobe stops being able to hold a caustic together over a scene-scale throw: GGX alpha 0.097,
 // a lobe some 7 degrees to half maximum in the reflected direction, with GGX's long tail
-// beyond (the Phong lobe of that width before 0.445.0 had none). Anything broader produces a diffuse
+// beyond. Anything broader produces a diffuse
 // glow that the global map already represents perfectly well — and folding that broad
 // population into the caustic map would drag ITS density estimate back up, which is exactly
 // what the split exists to prevent.

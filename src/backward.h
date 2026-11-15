@@ -821,8 +821,7 @@ struct BackwardRenderer {
 
     // Deterministic ROUGH-SPECULAR direction for the Whitted preview: point `sIdx` of a
     // fixed 2-D lattice on the GGX lobe of `roughness` about the shading normal `n` for the
-    // arrival `wo` (render.h ggxDrawUV, `w` its masking weight), instead of the lobe's single
-    // mirror direction.
+    // arrival `wo` (ggx::drawRough, `w` its weight), instead of the lobe's single mirror direction.
     //
     // Why this is not just a polish item: collapsing every sample onto the mirror direction
     // makes mode W INCONSISTENT on rough specular -- raising -spp changed nothing at all,
@@ -856,11 +855,11 @@ struct BackwardRenderer {
         u1 = 1.0 - radicalInverseScr(pb[0], sIdx);   // 1 at sIdx 0 => mirror
         u2 = radicalInverseScr(pb[1], sIdx);
     }
-    static Vec3 whittedGlossyDir(const Vec3& n, const Vec3& wo, double roughness, uint64_t sIdx,
-                                 int bounce, double& w) {   // a coat's sheen: single scattering
+    static Vec3 whittedGlossyDir(const Vec3& n, const Vec3& wo, double roughness, bool ms, uint64_t sIdx,
+                                 int bounce, double& w) {   // a coat's sheen (ms: coatMs)
         double u1, u2;
         whittedGlossyUV(sIdx, bounce, u1, u2);
-        return ggxDrawUV(n, wo, roughness, false, u1, u2, w);
+        return ggx::drawRough(n, wo, roughness, ms, u1, u2, w);
     }
     // The same for a Glossy material's lobe, as a GlossyDraw (render.h glossyDrawUV).
     static GlossyDraw whittedGlossyDraw(const Scene& scene, const Material& m, const Hit& h,
@@ -3067,7 +3066,7 @@ struct BackwardRenderer {
                         if (!whittedAttenuate(thr, R, Renderer::localN2(scene, stk, lambda))) return L;
                         double wC;
                         Vec3 o = whittedGlossyDir(h.n, ray.d * -1.0, materialRoughness(scene, cm, h),
-                                                  gi.sIdx, b, wC);
+                                                  coatMs(cm), gi.sIdx, b, wC);
                         if (dot(o, h.n) <= 0) return L;
                         // reciprocal, and the coat lobe's masking
                         thr *= coatSheenRatio(scene, cm, h, ray.d * -1.0, o, lambda) * wC;
@@ -3085,7 +3084,7 @@ struct BackwardRenderer {
                 if (rng.uniform() < R) {
                     if (!glossyCameraSide(ray.d, h.n)) return L;      // a glossy lobe: see the Glossy case
                     double wC;
-                    Vec3 o = ggxDraw(h.n, ray.d * -1.0, materialRoughness(scene, cm, h), false, rng, wC);
+                    Vec3 o = ggx::drawRough(h.n, ray.d * -1.0, materialRoughness(scene, cm, h), coatMs(cm), rng, wC);
                     if (dot(o, h.n) <= 0) return L;
                     // the reciprocal coat's reflection over the coin's R (render.h coatSheenRatio),
                     // and the coat lobe's masking
@@ -3610,8 +3609,8 @@ struct BackwardRenderer {
                     }
                     const double cr = materialRoughness(scene, cm, h);
                     double wC;
-                    Vec3 o = whitted ? whittedGlossyDir(h.n, ray.d * -1.0, cr, gi.sIdx, b, wC)
-                                     : ggxDraw(h.n, ray.d * -1.0, cr, false, rng, wC);
+                    Vec3 o = whitted ? whittedGlossyDir(h.n, ray.d * -1.0, cr, coatMs(cm), gi.sIdx, b, wC)
+                                     : ggx::drawRough(h.n, ray.d * -1.0, cr, coatMs(cm), rng, wC);
                     if (dot(o, h.n) <= 0) { finish(); return; }
                     for (int i = 0; i < nUp; ++i)    // the reciprocal coat's reflection (scalar twin)
                         thr[i] *= coatSheenRatio(scene, cm, h, ray.d * -1.0, o, lam[i]) * wC;

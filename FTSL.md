@@ -1257,7 +1257,7 @@ Fills a complete material; a few knobs may be overridden afterward
 | `translucent` | `reflect <spec>`(0.4); `transmit <spec>`(0.4) — two-sided Lambertian (diffuse transmission / thin-SSS look). Front hemisphere scatters `reflect`, back hemisphere scatters `transmit`; light diffuses THROUGH the surface. `reflect texture:<n>` allowed, and both slots take a pattern (`reflect`/`transmit pattern:<n>`, `reflect_map`/`transmit_map`). Alias: `diffuse_transmit`. `reflect`+`transmit` are energy-clamped to ≤1. |
 | `mirror` | `reflect <spec>`(0.95) |
 | `halfmirror` | `reflect <spec>`(0.5) |
-| `glossy` | `reflect <spec>`(0.9) or `reflect pattern:<n>`/`reflect_map`; `roughness <r>`(0.2) or `roughness pattern:/texture:<n>`. A GGX microfacet lobe with its multiple scattering (since 0.445.0); `roughness` is its width, GGX alpha 0.646 r (the width the Phong lobe it replaced had), and `reflect` its albedo at every roughness |
+| `glossy` | `reflect <spec>`(0.9) or `reflect pattern:<n>`/`reflect_map`; `roughness <r>`(0.2) or `roughness pattern:/texture:<n>`. A GGX microfacet lobe with its multiple scattering (since 0.445.0); `roughness` is its width, GGX alpha 0.646 r (the width the Phong lobe it replaced had), held to 0.001–2, and `reflect` its albedo at every roughness |
 | `filter` | `transmit <spec>`(0.5) — a colored gel / Wratten filter: a thin non-scattering absorber. A ray passes straight through (no reflection, no refraction) and survives with probability T(λ). Feed T from a measured curve (`transmit filter:red-25`, `transmit file:…csv`) or a primitive (`transmit gaussian center=630 sigma=25`); `transmit pattern:<n>` / `transmit_map` vary it across the surface. |
 | `dielectric` | `ior <spec>`(BK7); `roughness`(0)/map; `absorb <spec>`(0) Beer-Lambert tint per metre |
 | `thinfilm` | `ior`(1.5); `film_ior <spec>`(1.30) -- a number, or a dispersive index such as `glass:titania`; `film_thickness <nm>`(300)/`film_thickness_map`; `substrate_k <spec>`(0). With a clear substrate (`substrate_k` 0) this is the surface of a body of index `ior`, coated: the ray refracts in and is then inside that body, as with `dielectric`, so give it a closed shape. A free-standing film (a soap film, a bubble's wall) has air on both sides: `ior 1`. `roughness <r>`(none) or `roughness pattern:/texture:<n>` on an **opaque** film (`substrate_k` > 0 at every wavelength) makes a rough interference reflector: the `glossy` lobe of that roughness, weighted by the film's reflectance at the half-vector's angle, which every mode renders, the forward ones included; `reflect`(1) tints it. A clear film with a `roughness` is an error. |
@@ -1387,7 +1387,8 @@ material "carpaint" {
         roughness 0.05            # glossy coat lobe; map allowed
         ior glass:BK7             # coat index (fresnel/thinfilm)
         film_ior 1.30  film_thickness 300  film_thickness_map texture:t   # thinfilm coat
-                                  # (film_ior a spectrum too: glass:titania is a titania coat)
+                                  # (film_ior a spectrum too: glass:titania is a titania coat;
+                                  # the map is a 0..1 profile of film_thickness, held to 0..1)
         specular 0.05             # flat reflectance (manual model)
         absorb rgb 400 2600 5200  # TINTED lacquer: sigma_a inside the layer, 1/m
         depth 0.0001              # layer thickness in METRES (needed by `absorb`)
@@ -1436,8 +1437,11 @@ Worst error 31.9 % → 11.1 %, and near-exact at the smooth end where the analyt
 The residual at high roughness is the known limitation: the moments are averaged over a
 cosine-weighted **incidence**, because the albedo accessor they feed has no incident direction, and
 the escape statistics vary with incidence more as the body roughens. It stays off by default so no
-existing scene changes appearance without being asked. Verified by `ftrace -checklayered` (seven
-tests, including that a Lambertian body reproduces the analytic form it generalises) and identical
+existing scene changes appearance without being asked. A GGX body's moments take its draws' weights
+(f cos / pdf, which follow the exit angle), so they are the lobe's and not its sampler's; the table above
+predates that and the GGX body both. Verified by `ftrace -checklayered` (eight
+tests, including that a Lambertian body reproduces the analytic form it generalises, and a glossy one
+its own walk) and identical
 on both backends to 0.49 %.
 
 **The body is seen THROUGH the coat, both ways** (0.323.0). Light that leaves the body meets the

@@ -197,10 +197,9 @@ inline double bsdfF(const Material& m, const Vec3& ns, const Vec3& wo, const Vec
 // Veach rule; this is the BSDF's own half. The two are independent: shadingAdjointCorr is 1 on
 // flat geometry, where a lobe that is not reciprocal still needs this.
 //
-// WHERE IT MATTERS. A reciprocal lobe is unchanged by the swap: the GGX glossy lobe (ggx.h, since
-// 0.445.0) is, and so its light walks and connections evaluate the camera's function. (The Phong lobe
-// it replaced divided by the light side's cosine and was not: there a missing swap read mode D 15 %
-// dim with the camera near the normal and bright with it grazing.)
+// WHERE IT MATTERS. A reciprocal lobe is unchanged by the swap: the GGX glossy lobe (ggx.h) is, and
+// so its light walks and connections evaluate the camera's function. A lobe that is not -- one that
+// divides by one side's cosine -- must be evaluated with the pair swapped at every light vertex.
 //
 // Diffuse's rho/PI is unchanged by the swap, but its lambertLit test reads wi, so the swap moves
 // that test onto the LIGHT's side -- which is the point: light that arrived below the shading normal

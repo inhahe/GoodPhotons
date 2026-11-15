@@ -164,26 +164,6 @@ inline Vec3 sampleRoughCone(const Vec3& dir, double roughness, Pcg32& rng) {
     return normalize(t * (sinT * std::cos(phi)) + b * (sinT * std::sin(phi)) + dir * cosT);
 }
 
-// A direction drawn from the GGX lobe of `roughness` about the shading normal `n` for the arrival
-// `wo` (pointing back along the incoming ray) -- with its multiple scattering where `ms` (ggx.h) --
-// from two canonical uniforms -- an rng's, or a deterministic lattice's (mode W: u1 == 1 is the exact
-// mirror direction, ggx::sampleUVAll) -- and `w`, the draw's f cos / pdf over the lobe's reflectance
-// (ggx::weightAll: the single-scattering lobe's masking, in (0, 1]; with `ms` a mean of 1 for a white
-// lobe), wavelength-free and the same from either end of a path. The caller ends the path where the
-// direction is not above n. Device twin dGgxDrawUV.
-inline Vec3 ggxDrawUV(const Vec3& n, const Vec3& wo, double roughness, bool ms, double u1, double u2,
-                      double& w) {
-    const double al = ggx::alpha(roughness);
-    const Vec3 o = ggx::sampleUVAll(n, wo, al, ms, u1, u2);
-    w = ggx::weightAll(ggx::pair(n, wo, o, al), ms);
-    return o;
-}
-// The same off the caller's stream: two draws, in that order.
-inline Vec3 ggxDraw(const Vec3& n, const Vec3& wo, double roughness, bool ms, Pcg32& rng, double& w) {
-    const double u1 = rng.uniform(), u2 = rng.uniform();
-    return ggxDrawUV(n, wo, roughness, ms, u1, u2, w);
-}
-
 // --- Caustic classification: what a photon vertex does to a beam of light -------------
 //
 // Mode M splits its deposit into a GLOBAL map and a CAUSTIC map (Jensen's two-map scheme),
@@ -203,7 +183,9 @@ inline Vec3 ggxDraw(const Vec3& n, const Vec3& wo, double roughness, bool ms, Pc
 //              subsequent deposit is ordinary indirect light, not a caustic: a rough glossy
 //              lobe, a fluorescent re-emission (cosine-distributed, and wavelength-shifted
 //              on top), a hair BCSDF, an analog medium collision, and of course any diffuse
-//              vertex.
+//              vertex. A tight glossy lobe's draw that took its multiple scattering's branch
+//              (GlossyDraw::ms, ggx.h) is one too: the walks mark it after the draw, which
+//              this function, called before it, cannot see.
 //   NEUTRAL  — no deflection at all, so the classification is unchanged either way: a
 //              `filter` gel is a coloured absorber the photon passes straight through.
 //
@@ -260,9 +242,8 @@ struct FluoroResult { FluoroEvent event; double lambdaOut; };
 // Absorb -> photon lost (dye heat / non-excited fraction). Throughput weight is
 // unchanged in all surviving branches (the branch probabilities carry the
 // reradiation efficiency, and M/pdf cancels for the sampled lambdaOut).
-inline FluoroResult fluoroInteract(const Scene* scene, const Material& m, const Hit* h, double lambdaIn,
-                                   Pcg32& rng) {
-    double rho, aEff; fluoroWeights(scene, m, h, lambdaIn, rho, aEff);
+// fluoroResolve is the same given the hit's fluoroWeights, for a caller that already holds them.
+inline FluoroResult fluoroResolve(const Material& m, double rho, double aEff, double lambdaIn, Pcg32& rng) {
     double u = rng.uniform();
     if (u < rho)          return {FluoroEvent::Elastic, lambdaIn};
     if (u < rho + aEff) {
@@ -271,6 +252,11 @@ inline FluoroResult fluoroInteract(const Scene* scene, const Material& m, const 
         return {FluoroEvent::Reemit, lp};
     }
     return {FluoroEvent::Absorb, 0.0};
+}
+inline FluoroResult fluoroInteract(const Scene* scene, const Material& m, const Hit* h, double lambdaIn,
+                                   Pcg32& rng) {
+    double rho, aEff; fluoroWeights(scene, m, h, lambdaIn, rho, aEff);
+    return fluoroResolve(m, rho, aEff, lambdaIn, rng);
 }
 inline FluoroResult fluoroInteract(const Material& m, double lambdaIn, Pcg32& rng) {
     return fluoroInteract(nullptr, m, nullptr, lambdaIn, rng);
@@ -286,9 +272,14 @@ inline FluoroResult fluoroInteract(const Material& m, double lambdaIn, Pcg32& rn
 // taken at the SHADING normal: the coat follows the surface's bumps, so a smooth coat's mirror pair
 // (reflected about the shading normal) meets it at the angle the coin reads (coatSheenRatio 1).
 // A thin film's thickness at `h` (coatThickness), read once by a caller that evaluates the coat at
-// several directions or wavelengths, and R at the direction `d` given it (coatRDir).
+// several directions or wavelengths, and R at the direction `d` given it (coatRDir). A coat's
+// thickness map is a profile in [0, 1] of its film_thickness, held there: the body's T-bar rows
+// (coatTbarAt) span that range only, and a coat's R and T-bar must be read at one thickness for the
+// body under it to conserve energy. Device twin dCoatThickness.
 inline double coatThickness(const Scene& scene, const Material& m, const Hit& h) {
-    return (m.coatModel == 1) ? materialFilmThickness(scene, m, h) : 0.0;
+    if (m.coatModel != 1) return 0.0;
+    const double th = materialFilmThickness(scene, m, h);
+    return th < 0.0 ? 0.0 : (th > m.filmThickness ? m.filmThickness : th);
 }
 inline double coatRDir(const Material& m, const Hit& h, const Vec3& d, double thickness, double lambda) {
     if (m.coatModel == 2) return clamp01(m.coatSpecular);
@@ -555,28 +546,31 @@ inline double halfVectorCos(const Vec3& a, const Vec3& b) {
 // re-weighs it (mode J's spectral carrier, which takes R per wavelength and w for all). How to take R
 // -- multiplied in, a roulette, a roulette on a bundle's largest -- is the caller's; `irid` says
 // whether R can differ from 1, for a roulette or a per-wavelength loop that would otherwise run on a
-// plain lobe. A layered coat's sheen lobe draws ggxDraw itself: a coat never interferes. The draw
+// plain lobe. A layered coat's sheen lobe draws ggx::drawRough itself: a coat never interferes. The draw
 // keeps the hit's address, so it takes no temporary.
 struct GlossyDraw {
     Vec3 o;              // the direction; the caller ends the path where it is not above the surface
     double w = 0.0;      // the draw's weight (0 where o is not above the normal)
     bool irid = false;   // the lobe interferes
     double cH = 1.0;     // the half-vector cosine R reads (1 on a plain lobe)
+    bool ms = false;     // the draw took the multiple scattering's branch: a scattering, not a focus
     const Scene* scene = nullptr;
     const Material* m = nullptr;
     const Hit* h = nullptr;
     double R(double lambda) const { return irid ? iridescenceR(*scene, *m, h, lambda, cH) : 1.0; }
 };
-// Whether a Glossy material's lobe adds its multiple scattering (ggx.h): a plain one does; a rough
-// interference reflector and a layered material's coat, whose reflectance is taken at the pair's half
-// vector, do not. Device twin dGlossyMs.
-inline bool glossyMs(const Material& m) { return m.iridescence == 0 && !m.coatLobe; }
+// Whether a Glossy material's lobe adds its multiple scattering (ggx.h): a plain one does, and so does
+// a manual coat's (a constant reflectance); a rough interference reflector and a Fresnel or thin-film
+// coat, whose reflectance is taken at the pair's half vector, do not. A layered material's coat draw
+// takes it as coatMs. Device twin dGlossyMs.
+inline bool glossyMs(const Material& m) { return m.iridescence == 0 && (!m.coatLobe || m.coatModel == 2); }
+inline bool coatMs(const Material& st) { return st.coatModel == 2; }   // st: the layered material
 // A draw from m's lobe at h about the shading normal `n`, for the arrival `wo` (the direction back
-// along the incoming ray), from canonical uniforms (ggxDrawUV; u1 == 1 the mirror).
+// along the incoming ray), from canonical uniforms (ggx::drawRough; u1 == 1 the mirror).
 inline GlossyDraw glossyDrawUV(const Scene& scene, const Material& m, const Hit& h, const Vec3& n,
                                const Vec3& wo, double u1, double u2) {
     GlossyDraw g;
-    g.o = ggxDrawUV(n, wo, materialRoughness(scene, m, h), glossyMs(m), u1, u2, g.w);
+    g.o = ggx::drawRough(n, wo, materialRoughness(scene, m, h), glossyMs(m), u1, u2, g.w, &g.ms);
     g.irid = m.iridescence != 0;
     if (g.irid) g.cH = halfVectorCos(wo, g.o);
     g.scene = &scene; g.m = &m; g.h = &h;
@@ -1572,7 +1566,7 @@ struct Renderer {
         return shadowTerminatorG(wi, h.n, orientedGeoN(h));
     }
     // A photon's glossy continuation from its arrival (`wIn`, toward the light) into `o`, drawn with
-    // the draw's weight `w` (GlossyDraw::w, ggxDraw): w times the shading normal's half of Veach's
+    // the draw's weight `w` (GlossyDraw::w, ggx::drawRough): w times the shading normal's half of Veach's
     // adjoint (shadingAdjointCorr), as bdpt.h's light walk takes them; the lobe itself is reciprocal.
     // 0 for an arrival from below ns (w is). Device twin dGlossyPhotonWeight.
     static double glossyPhotonWeight(const Hit& h, const Vec3& wIn, const Vec3& o, double w) {
@@ -2923,14 +2917,16 @@ struct Renderer {
 
     // The lobes below, for a coated body too: its splats (the fluorescent ones) and its continuation
     // take the coat's way out, at the wavelength they leave with.
+    // `scattered` (may be null): set where a glossy draw took its multiple scattering's branch, a
+    // scattering for the caustic split (GlossyDraw::ms).
     bool interactPhotonSpecular(const Scene& scene, const CamTarget* cams, int nCam,
                                 const Material& m, const Hit& h, Ray& ray, double& beta,
                                 double& lambda, MediumStack& stk, Pcg32& rng,
-                                EnergyReport& e, bool firstHit = false) const {
+                                EnergyReport& e, bool firstHit = false, bool* scattered = nullptr) const {
         const Vec3 wa = ray.d * -1.0;   // the arrival
         const CoatSplat cs{&scene, &h, CoatCtx(m, wa)};
         if (!interactPhotonSpecularLobe(scene, cams, nCam, m, h, ray, beta, lambda, stk, rng, e, firstHit,
-                                        cs.c ? &cs : nullptr))
+                                        cs.c ? &cs : nullptr, scattered))
             return false;
         coatContinue(scene, m, h, wa, ray.d, lambda, beta, e);
         return true;
@@ -2938,7 +2934,8 @@ struct Renderer {
     bool interactPhotonSpecularLobe(const Scene& scene, const CamTarget* cams, int nCam,
                                     const Material& m, const Hit& h, Ray& ray, double& beta,
                                     double& lambda, MediumStack& stk, Pcg32& rng,
-                                    EnergyReport& e, bool firstHit, const CoatSplat* coat) const {
+                                    EnergyReport& e, bool firstHit, const CoatSplat* coat,
+                                    bool* scattered = nullptr) const {
         switch (m.type) {
             case MatType::Dielectric:
             case MatType::ThinFilm:
@@ -3004,6 +3001,7 @@ struct Renderer {
                 // Russian roulette on reflectance (see Mirror).
                 if (rng.uniform() >= r) { e.absorbed += beta; return false; }
                 const GlossyDraw gd = drawGlossy(scene, m, h, h.n, ray.d * -1.0, rng);
+                if (scattered) *scattered = gd.ms;
                 const Vec3& o = gd.o;
                 if (dot(o, h.n) <= 0) { e.absorbed += beta; return false; } // below surface
                 // A photon carries the draw's weight and, where the shading
@@ -3042,7 +3040,7 @@ struct Renderer {
                                     nullptr, nullptr, coat);
                     }
                 }
-                FluoroResult fr = fluoroInteract(&scene, m, &h, lambda, rng);
+                FluoroResult fr = fluoroResolve(m, rho, aEff, lambda, rng);   // the weights above
                 if (fr.event == FluoroEvent::Absorb) { e.absorbed += beta; return false; }
                 lambda = fr.lambdaOut;              // Stokes-shifted on Reemit
                 Vec3 wo;
@@ -3961,7 +3959,8 @@ struct Renderer {
                 if (rng.uniform() < R) {                    // coat reflection
                     double cr = materialRoughness(scene, cm, h);
                     double wC;
-                    Vec3 o = ggxDraw(h.n, ray.d * -1.0, cr, false, rng, wC);
+                    bool msC = false;
+                    Vec3 o = ggx::drawRough(h.n, ray.d * -1.0, cr, coatMs(cm), rng, wC, &msC);
                     if (dot(o, h.n) <= 0) { e.absorbed += beta; return; }
                     {   // the reciprocal coat's reflection over the coin's R (coatSheenRatio)
                         const double c = coatSheenRatio(scene, cm, h, ray.d * -1.0, o, lambda);
@@ -3979,8 +3978,10 @@ struct Renderer {
                     beta *= adj;
                     if (!continueAlong(h, o, Lobe::Reflect, ray)) { e.absorbed += beta; return; }
                     // A clearcoat reflection is a mirror lobe: it focuses when tight (the
-                    // highlight a polished coat throws IS a caustic), scatters when rough.
-                    (cr <= kCausticGlossRoughness ? sawFocus : sawScatter) = true;
+                    // highlight a polished coat throws IS a caustic), scatters when rough, and
+                    // when it took the multiple scattering's branch (a manual coat's), which keeps
+                    // nothing of the arrival's direction.
+                    (cr <= kCausticGlossRoughness && !msC ? sawFocus : sawScatter) = true;
                     continue;                               // lossless but for the masking
                 }
                 int child = mixResolveChild(scene, cm, h, rng.uniform());  // body lobe (leftover absorbs; honours a weight map)
@@ -4063,9 +4064,11 @@ struct Renderer {
                                     0.0, rng, nullptr, &gsp, cp);
                         camSpecularSplatAllGlossy(scene, cams, nCam, h.p, h.n, orientedGeoN(h), wl, &lambda, &beta, 1, gsp, rng, cp);
                     }
+                    bool msBranch = false;   // a draw into the multiple scattering: a scattering
                     if (!interactPhotonSpecular(scene, cams, nCam, m, h, ray, beta, lambda, stk, rng, e,
-                                                bounce == 0))
+                                                bounce == 0, &msBranch))
                         return;
+                    if (msBranch) sawScatter = true;
                     if (gFold) {
                         const double rH = clamp01(reflectSlot(scene, m, h, lambda));
                         if (rH > 0.0) foldApply(rH, gR, gK, gS);
@@ -4587,7 +4590,8 @@ struct Renderer {
                 if (refl0) {
                     double cr = materialRoughness(scene, cm, h);
                     double wC;
-                    Vec3 o = ggxDraw(h.n, ray.d * -1.0, cr, false, rng, wC);
+                    bool msC = false;
+                    Vec3 o = ggx::drawRough(h.n, ray.d * -1.0, cr, coatMs(cm), rng, wC, &msC);
                     if (dot(o, h.n) <= 0) { e.absorbed += activeSum(); return; }
                     for (int i = 0; i < nUp; ++i) {   // the reciprocal coat's reflection (scalar twin)
                         const double c = coatSheenRatio(scene, cm, h, ray.d * -1.0, o, lam[i]);
@@ -4600,7 +4604,7 @@ struct Renderer {
                     if (!(adj > 0.0)) { e.absorbed += activeSum(); return; }
                     for (int i = 0; i < nUp; ++i) { e.absorbed += beta[i] * (1.0 - adj); beta[i] *= adj; }
                     if (!continueAlong(h, o, Lobe::Reflect, ray)) { e.absorbed += activeSum(); return; }
-                    (cr <= kCausticGlossRoughness ? sawFocus : sawScatter) = true;  // see scalar twin
+                    (cr <= kCausticGlossRoughness && !msC ? sawFocus : sawScatter) = true;  // see scalar twin
                     continue;
                 }
                 int child = mixResolveChild(scene, cm, h, rng.uniform());   // honours a bound weight map
@@ -4741,6 +4745,7 @@ struct Renderer {
                         ray = Ray{h.p + ray.d * 1e-6, ray.d};      // direction unchanged
                     } else {
                         const GlossyDraw gd = drawGlossy(scene, m, h, h.n, ray.d * -1.0, rng);
+                        if (gd.ms) sawScatter = true;          // the multiple scattering's branch
                         const Vec3& o = gd.o;
                         if (dot(o, h.n) <= 0) { e.absorbed += activeSum(); return; }  // below surface
                         const double adj = glossyPhotonWeight(h, ray.d * -1.0, o, gd.w);  // see the scalar path
@@ -4799,25 +4804,30 @@ struct Renderer {
                             cl[0] = lam[i]; cb[0] = beta[i];
                             MediumStack cstk = stk;         // sub-paths diverge from here on
                             Ray cray = ray;
+                            bool scI = false;
                             if (interactPhotonSpecular(scene, cams, nCam, m, h, cray, cb[0],
-                                                       cl[0], cstk, rng, e, bounce == 0))
+                                                       cl[0], cstk, rng, e, bounce == 0, &scI))
                                 tracePhotonHeroLoop(scene, cams, nCam, sensorFilm, cray, cstk,
                                                     cl, cb, /*secAlive=*/false, bounce + 1,
-                                                    rng, e, sawFocus, sawScatter);
+                                                    rng, e, sawFocus, sawScatter || scI);
                             beta[i] = 0.0;                  // its energy is now that sub-path's
                         }
                         secAlive = false;                   // hero carries on alone, UNBOOSTED
+                        bool sc0 = false;
                         if (!interactPhotonSpecular(scene, cams, nCam, m, h, ray, beta[0],
-                                                    lam[0], stk, rng, e, bounce == 0))
+                                                    lam[0], stk, rng, e, bounce == 0, &sc0))
                             return;
+                        if (sc0) sawScatter = true;
                         continue;
                     }
                     // Default policy: terminate secondaries, then run the shared scalar
                     // interaction on the (boosted) hero channel.
                     deHero();
+                    bool sc0 = false;
                     if (!interactPhotonSpecular(scene, cams, nCam, m, h, ray, beta[0], lam[0], stk, rng, e,
-                                                bounce == 0))
+                                                bounce == 0, &sc0))
                         return;
+                    if (sc0) sawScatter = true;
                     continue;
                 }
                 case MatType::Diffuse:

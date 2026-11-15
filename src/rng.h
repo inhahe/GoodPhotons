@@ -40,6 +40,18 @@ struct Pcg32 {
     double uniformOpen() { double u = uniform(); return u > 0.0 ? u : 0.5 / 16777216.0; }
 };
 
+// A 64-bit LCG drawn as a 53-bit double in [0, 1): the stream of a load-time table walk (the
+// stochastic coat's escape moments) and of the self-tests (-checkggx, -checklayered), where a
+// render's per-pixel seeding has no part and the numbers need only be deterministic and fine.
+struct Lcg53 {
+    unsigned long long s;
+    explicit Lcg53(unsigned long long seed) : s(seed * 6364136223846793005ull + 1442695040888963407ull) {}
+    double operator()() {
+        s = s * 6364136223846793005ull + 1442695040888963407ull;
+        return (double)((s >> 11) & ((1ull << 53) - 1)) / (double)(1ull << 53);
+    }
+};
+
 // SplitMix64 finalizer: bijective avalanche mix for turning structured indices
 // (pixel number, absolute sample/photon index) into decorrelated seed material.
 inline uint64_t mix64(uint64_t x) {
