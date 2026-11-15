@@ -44,6 +44,11 @@
 
 // POV's ROT2D "surface of revolution" switch, verbatim (operates on the mutable
 // PARAM_X/PARAM_Y locals and recomputes x2,y2).  p>0 enables the revolve.
+// A verbatim port: some functions declare `y2` for ROT2D, which assigns it, and never read it
+// (nvcc #550, set but never used). Suppressed for this header alone.
+#if defined(__CUDACC__)
+#pragma nv_diag_suppress 550
+#endif
 #define ROT2D(p,d,ang) if (p>0) {x2=sqrt(x2+PARAM_Z*PARAM_Z)- d; th=(ang)*M_PI_180; \
     if (th!=0){ PARAM_X= x2*cos(th)-PARAM_Y*sin(th); PARAM_Y= x2*sin(th)+PARAM_Y*cos(th);} else PARAM_X=x2; \
     x2=PARAM_X*PARAM_X; y2=PARAM_Y*PARAM_Y;}
@@ -961,3 +966,6 @@ inline bool povFnLookup(const char* name, int& id, int& arity) {
         if (strcmp(name, T[i].name) == 0) { id = T[i].id; arity = T[i].arity; return true; }
     return false;
 }
+#if defined(__CUDACC__)
+#pragma nv_diag_default 550
+#endif

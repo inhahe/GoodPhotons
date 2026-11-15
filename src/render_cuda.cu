@@ -9674,6 +9674,7 @@ struct DSurfPhoton {
     DVec3 p, wo;                              // wo: unit, toward the PREVIOUS light vertex
     float lambda, beta, cx, cy, cz;           // cie{X,Y,Z}(lambda), cached at store time
     unsigned misIdx;
+    float nx, ny, nz;                         // its surface's true normal, to its light's side (host twin)
 };
 struct DSurfMis {                             // the light-side half of the merge's MIS weight
     double sumC, sumMb, sumMs, pdfFwdA;
@@ -20238,6 +20239,7 @@ struct DSurfReq {
     int         flags;       // 1: a JSPEC carrier in `spec`; 2: chromatic weights in `chroma`
     double      f;           // the site's scale: throughput (JSPEC's) * 1/kappaS * wJ
     long long   pix;         // the film offset (pixel * 3) the gather adds to
+    unsigned long long gaSeed;   // its footprint probe's stream (dSurfFootprint)
 };
 struct DSurfQueue {
     DSurfReq* reqs; int* nReqs; int cap;   // null reqs: gather inline
@@ -20255,8 +20257,10 @@ struct DSurfSite {
     DVec3 ngo;
     bool twoSided;
     double r2;
+    Real slack;   // the footprint's band (gatherBandSlack), for its photon test and its probe alike
     __device__ DSurfSite(const DScene& sc, const DSurfMap& sm, const DVertex& vk) {
         r2 = (double)sm.radius * (double)sm.radius;
+        slack = gatherBandSlack<Real>(sm.radius, vk.fiberR, fmax(vk.pscale, (Real)dMaxAbs(vk.p)));
         ix = (int)fmin(fmax(floor(((double)vk.p.x - (double)sm.lo.x) / (double)sm.cell), 0.0), (double)(sm.nx - 1));
         iy = (int)fmin(fmax(floor(((double)vk.p.y - (double)sm.lo.y) / (double)sm.cell), 0.0), (double)(sm.ny - 1));
         iz = (int)fmin(fmax(floor(((double)vk.p.z - (double)sm.lo.z) / (double)sm.cell), 0.0), (double)(sm.nz - 1));
@@ -20282,6 +20286,12 @@ __device__ static inline void dSurfMergePhoton(const DScene& sc, const DSurfMap&
     const DVec3 dd{vk.p.x - ph.p.x, vk.p.y - ph.p.y, vk.p.z - ph.p.z};
     if (ddot(dd, dd) > site.r2) return;
     if (dMergeFromBehind(site.twoSided, ph.wo, site.ngo)) return;   // host twin mergeFromBehind
+    if (sc.gatherArea) {   // the footprint: this surface's photons (host twin bdpt.h, surfmerge.h)
+        bool farSide;
+        if (!dOnGatherSurfaceSided(vk.p, site.ngo, ph.p, DVec3(ph.nx, ph.ny, ph.nz), (Real)ddot(dd, dd),
+                                   site.slack, site.twoSided, farSide))
+            return;
+    }
     const DSurfMis& lm = sm.mis[ph.misIdx];
     const Real lam = (Real)ph.lambda;
     // ...times a coated body's coat on the photon's way in: it was stored before its own pick.
@@ -20302,6 +20312,15 @@ __device__ static inline void dSurfMergePhoton(const DScene& sc, const DSurfMap&
     }
     const double cf = w * fCam * (double)ph.beta * (js ? js->at((double)lam) : 1.0);   // JSPEC
     gX += (double)ph.cx * cf; gY += (double)ph.cy * cf; gZ += (double)ph.cz * cf;
+}
+// The footprint's scale for a merge at `vk` whose sum came out nonzero (host twin: bdpt.h's merge, which
+// probes off the walk's own stream): 1 / the share of the disc that is vk's surface. `seed` was drawn
+// from the walk's stream at the site, so the inline and the queued gather probe alike.
+__device__ static double dSurfFootprint(const DScene& sc, const DSurfMap& sm, const DVertex& vk,
+                                        const DSurfSite& site, unsigned long long seed) {
+    DRng prng; prng.seedUnit(seed, 0x6A09E667F3BCC909ULL);
+    return dGatherAreaScale(sc.gaBias, dGatherCoverage(sc, vk.p, site.ngo, sm.radius, site.slack, prng,
+                                                       sc.gatherArea, vk.fiberR));
 }
 // One camera vertex's gather, by the thread that reached it (the inline path; kWfSurfGather is the
 // wavefront's, a warp a site). Returns the photons it weighed (g_dWork's count).
@@ -20371,9 +20390,10 @@ __global__ void kWfSurfGather(DScene sc, DSurfMap sm, DSurfQueue sq, int n, doub
             gZ += __shfl_down_sync(0xffffffffu, gZ, off);
         }
         if (lane == 0 && (gX != 0.0 || gY != 0.0 || gZ != 0.0)) {
-            atomicAdd(&camFilm[rq.pix + 0], gX * rq.f);
-            atomicAdd(&camFilm[rq.pix + 1], gY * rq.f);
-            atomicAdd(&camFilm[rq.pix + 2], gZ * rq.f);
+            const double fa = rq.f * (sc.gatherArea ? dSurfFootprint(sc, sm, rq.vk, site, rq.gaSeed) : 1.0);
+            atomicAdd(&camFilm[rq.pix + 0], gX * fa);
+            atomicAdd(&camFilm[rq.pix + 1], gY * fa);
+            atomicAdd(&camFilm[rq.pix + 2], gZ * fa);
         }
     }
 }
@@ -20925,6 +20945,9 @@ kBdptT(DScene sc, const __grid_constant__ DCamera cam, double* camFilm, double* 
                     const DJSpec* vks = (jSpecOn && vspec[k].on()) ? &vspec[k] : nullptr;
                     const double f = (vks ? vks->beta(vk.beta) : vk.beta) * vmNorm * wJ;   // JSPEC scale
                     const size_t o = ((size_t)py * resX + px) * 3;
+                    // The footprint probe's stream, off the walk's (dSurfFootprint).
+                    unsigned long long gaSeed = 0;
+                    if (sc.gatherArea) gaSeed = ((unsigned long long)rng.next() << 32) | rng.next();
                     // Queued for kWfSurfGather (DSurfQueue); gathered inline, and counted in
                     // `overflow`, where the queue is full. renderBdptCuda allocates the JSPEC
                     // carrier and chromatic tables exactly when c_jSpecOn and chromaOn's switches
@@ -20943,6 +20966,7 @@ kBdptT(DScene sc, const __grid_constant__ DCamera cam, double* camFilm, double* 
                             rq.woCam = woCam;
                             rq.f = f;
                             rq.pix = (long long)o;
+                            rq.gaSeed = gaSeed;
                             rq.flags = 0;
                             if (vks) { sq.spec[qslot] = *vks; rq.flags |= 1; }
                             if (chromaOn) {
@@ -20960,9 +20984,11 @@ kBdptT(DScene sc, const __grid_constant__ DCamera cam, double* camFilm, double* 
                     double gX = 0.0, gY = 0.0, gZ = 0.0;
                     work += (unsigned long long)dSurfMergeAt(sc, sm, vk, woCam, sw, gX, gY, gZ, vks);
                     if (gX != 0.0 || gY != 0.0 || gZ != 0.0) {
-                        atomicAdd(&camFilm[o + 0], gX * f);
-                        atomicAdd(&camFilm[o + 1], gY * f);
-                        atomicAdd(&camFilm[o + 2], gZ * f);
+                        const double fa = f * (sc.gatherArea ? dSurfFootprint(sc, sm, vk, DSurfSite(sc, sm, vk), gaSeed)
+                                                             : 1.0);
+                        atomicAdd(&camFilm[o + 0], gX * fa);
+                        atomicAdd(&camFilm[o + 1], gY * fa);
+                        atomicAdd(&camFilm[o + 2], gZ * fa);
                     }
                 }
             }
@@ -23815,6 +23841,10 @@ __global__ void kVcmCameraT(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx
                     if (jOn) jrun.snap(js);
                     const bool jsOn = jOn && js.on();              // the carrier arriving here (VCM-SPEC)
                     double r2 = ctx.radius * ctx.radius;
+                    // The footprint (host twin vcm.h): this surface's light vertices over the share of
+                    // the disc it covers, at one slack for the test and the probe.
+                    const Real gaSlack = gatherBandSlack<Real>((Real)ctx.radius, h.fiberRadius, dRoundScale(h));
+                    const bool camTwoSidedG = dTwoSidedType(mp->type);
                     int ix = (int)floor(((double)h.p.x - grid.lo.x) / grid.cell);
                     int iy = (int)floor(((double)h.p.y - grid.lo.y) / grid.cell);
                     int iz = (int)floor(((double)h.p.z - grid.lo.z) / grid.cell);
@@ -23838,6 +23868,13 @@ __global__ void kVcmCameraT(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx
                               DVec3 wMerge = lv.wo;
                               if (dMergeFromBehind(dTwoSidedType(mp->type), wMerge, ngoCam))
                                   continue;   // host twin mergeFromBehind
+                              if (sc.gatherArea) {   // its surface's true normal, to its light's side
+                                  const DVec3 pn = (dot(lv.ng, lv.wo) >= (Real)0) ? lv.ng : lv.ng * (Real)-1;
+                                  bool farSide;
+                                  if (!dOnGatherSurfaceSided(h.p, ngoCam, lv.p, pn, (Real)ddot(d, d), gaSlack,
+                                                             camTwoSidedG, farSide))
+                                      continue;
+                              }
                               Real lam = (Real)lv.lambda;
                               // A MERGE crosses paths, so the two ends carry DIFFERENT bundles
                               // and there is no shared λ set. The estimate therefore stays keyed
@@ -23894,6 +23931,9 @@ __global__ void kVcmCameraT(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx
                           }
                     }}}
                     double bn = (jsOn ? js.beta(beta) : beta) * ctx.vmNorm;
+                    if (sc.gatherArea && (mx != 0.0 || my != 0.0 || mz != 0.0))
+                        bn *= dGatherAreaScale(sc.gaBias, dGatherCoverage(sc, h.p, ngoCam, (Real)ctx.radius, gaSlack,
+                                                                          rng, sc.gatherArea, h.fiberRadius));
                     rx += mx * bn; ry += my * bn; rz += mz * bn;
                 }
             }
@@ -24433,6 +24473,10 @@ kJSurfLightT(DScene sc, DCamera cam, int diffraction, int maxDepth,
                         ph.beta   = (float)(path[u].beta * (compoundSite ? (double)compoundMergeW[u] : 1.0));
                         ph.cx = (float)cx; ph.cy = (float)cy; ph.cz = (float)cz;
                         ph.misIdx = (unsigned)slot;     // appended 1:1, so index == slot
+                        {   // its surface's true normal, to its light's side (host twin vertexGeoN)
+                            const DVec3 pn = path[u].back ? path[u].ng * (Real)-1 : path[u].ng;
+                            ph.nx = (float)pn.x; ph.ny = (float)pn.y; ph.nz = (float)pn.z;
+                        }
                         DSurfMis& sm = out.mis[slot];
                         sm.sumC    = accC;
                         sm.sumMb   = accMb + eBeam;
@@ -27773,6 +27817,7 @@ static void uploadSurfMapCuda(const bdpt::SurfMap* smap, DUpload& up, gpu::DSurf
         d.lambda = q.lambda; d.beta = q.beta;
         d.cx = q.cx; d.cy = q.cy; d.cz = q.cz;
         d.misIdx = q.misIdx;
+        d.nx = q.nx; d.ny = q.ny; d.nz = q.nz;
     }
     // Every SurfMis field is copied below, and a field a copy misses reaches the device as 0. Both
     // structs carry their padding explicitly, so any field added to either changes its size and

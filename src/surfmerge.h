@@ -41,7 +41,15 @@
 // file's reason for existing. See bdpt::mergeEtaPrimeSurf for the weight's derivation and
 // SurfMergeWeight for its assembly.
 //
-// MEMORY. 72 bytes of photon + 40 of MIS, and the MIS array is separate rather
+// THE FOOTPRINT (J-THIN-GAP-LEAK). With the gather footprint on (`-gatherarea`, the default), the sum
+// takes only the photons on the camera vertex's own surface -- near its tangent plane and facing its
+// way (gatherplane.h onGatherSurfaceSided), as a mode M gather does -- and divides by the share of the
+// disc that surface covers (gathercoverage.h gatherCoverage), probed only where the sum found light.
+// The light trapped in a millimetre gap under a plate is then not the plate's, and the floor at the
+// base of a box standing on it loses neither the wall's photons nor the area they stood for. The MIS
+// weights keep the whole disc's kappa: they need only sum to one over the techniques.
+//
+// MEMORY. 88 bytes of photon + 40 of MIS, and the MIS array is separate rather
 // than inlined so that the day a non-MIS consumer wants these photons it does not pay for
 // them (`BeamMis` is split from `PhotonBeam` for the same reason). Unlike beams there is no
 // split step, so the two arrays are indexed 1:1 and `misIdx` is currently the identity — it
@@ -123,8 +131,11 @@ struct SurfPhoton {
     float beta   = 0.0f;       // throughput carried here at `lambda` (emission + 1/p(lam) in)
     float cx = 0.0f, cy = 0.0f, cz = 0.0f;   // cie{X,Y,Z}(lambda), cached at store time
     unsigned misIdx = 0;
+    // The true normal of the surface it lies on, turned to the side its light came from (bdpt.h
+    // vertexGeoN), as mode M's photons carry theirs: the footprint above.
+    float nx = 0.0f, ny = 0.0f, nz = 0.0f;
 };
-static_assert(sizeof(SurfPhoton) == 72, "SurfPhoton's size is quoted in -jsurf-count's memory notes");
+static_assert(sizeof(SurfPhoton) == 88, "SurfPhoton's size is quoted in -jsurf-count's memory notes");
 
 // A per-thread bank, merged into the map at the end of the light pass (mirrors BeamBank).
 struct SurfBank {

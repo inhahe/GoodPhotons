@@ -292,19 +292,11 @@ Then the rest of 4.2-4.6 in their order, 4.7's bookkeeping alongside whatever to
   host J 1.0009 +- 0.0023 of mode D).
 - [x] **KEEPWINDOW-VRAM** (0.442.3) — a finished render held open by `-keepwindow` kept all its device
   memory, so the next GPU render paged (~45x slower); it gives the device back as the render ends.
-- [ ] **J-THIN-GAP-LEAK** (reopened 0.443.1) — modes J and U merge the light trapped a millimetre
-  under a surface at its top (100x and more on `scenes/_gap_leak.ftsl`). 0.442.2's band darkened every
-  object's base (0.64 of R) and is reverted; the fix is a footprint for their merges as M and S
-  have, its cost per merging vertex the open question.
-- [x] **MERGE-PROXIMITY** (0.431.0) — every gather keeps only the photons near its tangent plane
-  (`gatherplane.h`), except on a curve; mode M's sheet lit from below read 21x, now 0.
-- [x] **HAZE-SUN-B** (0.434.15, 0.434.16) — mode B lights an unbounded sunlit haze at 0.163 of
-  mode R, its floor 0.846; the modes whose haze comes from forward photons (A, B, C, P, V,
-  M) say so (the user's choice, 4.1).
-- [x] **HAZE-BLUR-DOMAIN** (0.434.29) — in an unbounded sunlit haze modes D and J's sun subpaths
-  walked less haze than their NEE leg counts; they take the NEE leg's now (option (a)).
-- [x] **VCM-SPEC** (0.433.0) — mode U's camera walk carries mode J's spectral carrier, and each
-  merge reads it at the light vertex's wavelengths.
+- [x] **J-THIN-GAP-LEAK** (0.445.3) — J's and U's merges keep their own surface's photons over its
+  share of the disc (the footprint): the gap's light stays off the plate, and object bases read true.
+- [ ] **GAP-MERGE-RADIUS** — beside a millimetre gap's mouth a merge's disc averages in the gap's
+  trapped light at the default radius (J 2-3.6x mode B): the kernel's blur across a 1000x step, a
+  bias that converges as E^(-1/4). The remedy, an adaptive merge radius, awaits the user's decision.
 - [ ] **MODEM-GPU-CORNER**, what is left — the corner was noise (0.433.2); GPU mode M reads
   check_bitid's `flat` red 1 % low against the CPU (3.5 sigma).
 - [x] **CURVE-GATHER**, mode U's half (VCM-THIN-CURVES) — 0.439.2: mode U merges at no curve

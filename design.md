@@ -6484,13 +6484,14 @@ as the one at fault.
   the device's `dOnGatherSurfaceSided` calls too). A gather takes the photons in a ball, so a second
   surface inside it -- the floor under a table top, once mode M's adaptive radius outgrows the
   table's height -- lent its light to the first (a sheet lit only from below read 21x its top lit
-  from above). (Not a mode-J surface merge or a mode-U vertex merge, which keep every photon in
-  their ball: they divide by the whole disc, with no footprint to say how much of it is their own
-  surface, so another surface's photons stand in for the part of the disc that is not -- the box
-  top's for the floor a box stands on. Dropping them, with the band below alone (0.442.2-0.443.0),
-  read the floor within 2 cm of a box's base 0.64 of mode R at radius 0.1 and 0.72 at the default.
-  What they keep instead is a surface's photons under a slab a millimetre over it, whose light
-  can be nothing like the slab top's: J-THIN-GAP-LEAK, whose fix is the footprint, not a rule.) A
+  from above). A mode-J surface merge and a mode-U vertex merge keep the same photons and divide by
+  the same footprint (0.445.3, J-THIN-GAP-LEAK; `surfmerge.h` says how): the rule alone, without the
+  footprint (0.442.2-0.443.0), darkened every object's base -- the floor within 2 cm of a box read
+  0.64 of mode R at radius 0.1 -- because the merges still divided by the whole disc; with it the
+  base reads 0.99-1.00, and the light trapped in a millimetre gap under a plate stays off the
+  plate's top (J 36x mode B before). A merge probes only where its sum found light, from a stream
+  of its own (the device's queued gathers seed it at the site), and `-gatherarea 0` restores the
+  whole disc over every photon, as it does for M and S. A
   mode-M or mode-S gather (`onGatherSurfaceSided`) keeps a photon only if it faces the
   gather point's way (within 60 degrees) and lies near its tangent plane: off it by at most
   sin theta times its distance d, theta the angle between the two normals, plus a rounding slack

@@ -56,6 +56,7 @@
 #include "workcount.h"    // JWork: the CPU refresh's work counts
 #include "photonbeams.h"  // BeamMap — mode J (UPBP) merges camera rays against photon beams
 #include "surfmerge.h"    // SurfMap — mode J's OTHER merge kind, the point x point (VCM's VM)
+#include "gathercoverage.h"   // the surface merges' footprint (J-THIN-GAP-LEAK)
 #include "beamgather.h"   // gatherPhotonBeamsW — the Beam x Ray estimator, with a MIS hook
 #include "parallel.h"          // ft::stopRequested — cooperative -stop inside mode J's beam pass
 #include "render_progress.h"   // StageProgress — deposit progress for the live window/title
@@ -3162,6 +3163,8 @@ inline void traceLightBeamPass(const Scene& scene, const Camera& cam, long long 
                         ph.cy = (float)cieY(ph.lambda);
                         ph.cz = (float)cieZ(ph.lambda);
                         ph.misIdx = (unsigned)sb.mis.size();
+                        const Vec3 pn = vertexGeoN(path[u]);   // the footprint's (surfmerge.h)
+                        ph.nx = (float)pn.x; ph.ny = (float)pn.y; ph.nz = (float)pn.z;
                         SurfMis sm;
                         sm.sumC    = accC[u - 1];
                         sm.sumMb   = accMb[u - 1] + eL.beam;
@@ -5488,6 +5491,10 @@ struct BdptRenderer {
                                 sw.work = &workCam;
                                 const Vec3 ngo = vertexGeoN(vk);
                                 const bool vkTwoSided = isTwoSidedMat(*vk.mat);   // mergeFromBehind
+                                // The footprint (surfmerge.h): this surface's photons over the share
+                                // of the disc it covers, at one slack for the test and the probe.
+                                const int gaM = gatherAreaSamples();
+                                const double gaSlack = gatherBandSlack(photons->radius, vk.hit.fiberRadius);
                                 const JSpec* vkSpec =
                                     (jSpecOn && (size_t)k < jsw.vert.size() && jsw.vert[(size_t)k].on())
                                         ? &jsw.vert[(size_t)k] : nullptr;
@@ -5497,6 +5504,13 @@ struct BdptRenderer {
                                     const SurfMis* lm = photons->misOf((size_t)idx);
                                     if (!lm) return;      // no weight: refuse (see misOf)
                                     if (mergeFromBehind(vkTwoSided, ph.wo, ngo)) return;
+                                    if (gaM) {
+                                        const Vec3 dd = ph.p - vk.p;
+                                        bool farSide;
+                                        if (!onGatherSurfaceSided(vk.p, ngo, ph.p, Vec3{ph.nx, ph.ny, ph.nz},
+                                                                  dot(dd, dd), gaSlack, vkTwoSided, farSide))
+                                            return;
+                                    }
                                     const double lam = (double)ph.lambda;
                                     // ...times a coated vertex's coat on the photon's way in
                                     // (coatF; a coat copy's reflection too): it was stored before
@@ -5534,9 +5548,14 @@ struct BdptRenderer {
                                                            (vkSpec ? vkSpec->at(lam) : 1.0));
                                 });
                                 if (mergeXYZ.x != 0.0 || mergeXYZ.y != 0.0 ||
-                                    mergeXYZ.z != 0.0)
+                                    mergeXYZ.z != 0.0) {
+                                    const double ga = gaM ? gatherAreaScale(gatherCoverage(
+                                                                scene, vk.p, ngo, photons->radius, gaSlack, rng,
+                                                                gaM, vk.hit.matId, vk.hit.fiberRadius))
+                                                          : 1.0;
                                     camFilm.add(px, py, mergeXYZ * ((vkSpec ? vkSpec->beta(vk.beta) : vk.beta) *
-                                                                    vmNorm * wJ));
+                                                                    vmNorm * wJ * ga));
+                                }
                             }
                         }
                     }

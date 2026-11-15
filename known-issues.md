@@ -205,62 +205,53 @@ the double overload on both sides; the GPU's mean now equals the CPU's (0.000934
 bit-identical to before. The build's other warning in that file (#550, `y2` set but never read in
 cases 50 and 75, which `ROT2D` assigns: a verbatim POV port) is cosmetic.
 
-## OPEN (2026-11-14, reopened 0.443.1; the fix of 0.442.2 reverted): J-THIN-GAP-LEAK — modes J and U light a surface with the light trapped a millimetre under it
+## OPEN (2026-11-15, split from J-THIN-GAP-LEAK): GAP-MERGE-RADIUS — a merge beside a millimetre gap's mouth counts the gap's trapped light
 
-**Reopened in 0.443.1: 0.442.2's fix was worse than the leak, and is reverted.** It made J's and U's
-merges drop a parallel surface's photons off their tangent plane (the band of mode M's gathers).
-That does stop the gap's light reaching the slab's top. But J and U divide by the whole disc, with
-no footprint to say how much of it is their own surface (mode M and S have one), so another
-surface's photons stand in for the part of the disc that is not theirs -- and dropping them
-darkens the disc wherever a surface ends against another. At the base of a box standing on a floor
-(Opus's review of 0.442.2-0.443.0 asked for it, `tools/check_merge_base.py`) the floor within 2 cm
-of the base read 0.64 of mode R in mode J and 0.65 in U at radius 0.1, 0.72 / 0.71 at the default,
-and 0.82-0.88 from 2 to 5 cm; without the rule 0.950 / 0.941 (J, CPU), 0.926 / 0.929 (U),
-0.881 / 0.924 (J, GPU) in the two rings -- the radius's own bias at a contact, which the footprint
-below would take away as well. Every
-object resting on a surface has such a base; light trapped in a gap a millimetre high is rare. So
-0.443.1 restores the merges of 0.442.1 (and the 72-byte SurfPhoton), and this entry is open again.
+`scenes/_gap_leak_noceil.ftsl`: a plate 1 mm over a floor, emitting down into the gap, the room lit only
+by the light that escapes through the gap's sides. At the merges' default radius (0.077 m here) the
+plate's top reads, against mode B: J 3.59 (CPU) / 2.00 (GPU), U 2.26 / 1.84 with 0.445.3's footprint
+(and 8951 / 6157 / 6791 / 5568 without it). On the floor just outside the plate, a merge's disc
+reaches under the plate into the gap's trapped light, hundreds of times denser, and the camera paths
+that bounce off that rim carry the excess into the whole room. This is not the footprint's to catch:
+the floor under the plate is the same surface, and rightly counted -- the footprint's probe passes a
+hovering sheet and counts the floor beneath it as the disc's, since photons land there (as they do
+under a table). It is the density kernel's own blur across a step of a thousandfold in the floor's
+irradiance, at the rim: a radius bias, which falls with the radius (at 0.02, J 1.005 and U 1.016:
+`tools/check_gap_merge.py` pins it there). Modes M and S read 0.99-1.03 on the plate at their own
+radius because their camera walks end at their first diffuse vertex: the rim itself is as bright in
+them, but its excess goes no further.
 
-**The fix is a footprint for J's and U's merges, not a rule**, as M and S have: divide a merge's
-photons by the area of its disc that is its own surface (photonmap_render.h's probe,
-`gatherCoverage`, or gafootprint.h's geometric twin), and keep only that surface's photons (the
-band). The MIS weights need not follow -- they only have to sum to one over the techniques, and
-keep the whole disc's kappa -- so the change is the estimate's denominator and the band. Its cost
-is the decision: M and S probe once per visible point, J and U would probe at every camera vertex
-that merges, every sample (a cache of coverage by position might share it). The light trapped in a
-gap then stays in it, at the slab's top and at the gap's mouth alike (what GAP-MERGE-RADIUS, folded
-in here, measured at the mouth: 2.4-3.6x mode B on `scenes/_gap_leak_noceil.ftsl` with the band at
-the default radius, 1.07-1.09x at 0.02). `tools/check_gap_merge.py` holds that and fails until it
-is done.
+**It is a consistent estimator's bias, converging slowly.** Both modes shrink the merge radius over a
+render on VCM's schedule, r_e = r_0 (e+1)^((alpha-1)/2) at `-vcmalpha` 0.75 (mode U per pass, mode J per
+light-side epoch: main.cpp `surfRadiusFor`), so the bias falls as E^(-1/4) in the epochs -- and a
+thousandfold step leaves a great deal of it at any practical count. No visibility test separates the
+gap's photons: the gap opens onto the rim, so the floor's irradiance is continuous there, only
+extremely steep. **What would remove it** is a merge radius that adapts to the photon density, as mode
+M's caustic map gathers at a per-query radius (PhotonMap::adaptiveRadius): small where the density
+climbs. For J and U that means a per-query kappa in the merge's MIS weight, against the fixed kappa VCM's
+weights assume across all the techniques -- **a design decision**, put to the user on 2026-11-15:
+whether a pathological emitter in a millimetre slit is worth an adaptive-radius VCM.
 
-What 0.442.2 measured, against mode B on the middle of the plate's top at a merge radius of 0.02 m:
-with the band, the plate emitting into the gap (`_gap_leak`) J 1.005 / 0.998, U 1.011 / 0.998
-(CPU / GPU), a light block in the gap (`_gap_leak2`) J 1.000 / 1.001, U 1.000 / 1.000; without it
-(0.442.0, and 0.443.1 again) J 36.2 / 18.8, U 20.0 / 14.7 and J 1.20 / 1.10, U 1.10 / 1.07. **Mode D
-was right** all along (1.014 / 0.987 of B): the gap's light leaving through its millimetre-high
-sides, which D's light subpaths find and mode R's camera paths almost never do.
+## DONE (2026-11-15, 0.445.3): J-THIN-GAP-LEAK — modes J and U lit a surface with the light trapped a millimetre under it
 
-Found by `tools/check_glow_lights.py`'s first draft, whose glowing grid quad was wound face-down
-1 mm over the floor (`scenes/_gap_leak.ftsl`): a plate that emits DOWN into a 1 mm gap over the
-floor, its top lit only by a ceiling panel. No light from the gap can reach the plate's top. CPU,
-256 spp, against mode R: **mode J 167x over the frame** (its median pixel 23x), the plate's whole
-top aglow; **mode D 1.58x on the plate's region**, almost all of it a bright line along the gap's
-front edge, which mode R barely shows.
+**Fixed by a footprint for J's and U's merges** (`surfmerge.h`): with `-gatherarea` on (the
+default), a merge keeps only its own surface's photons -- near its tangent plane and facing its way
+(`onGatherSurfaceSided`, mode M's rule) -- and divides by the share of the disc that surface covers
+(`gatherCoverage`, moved to `gathercoverage.h`), probed only where the sum found light; host and
+device, inline and queued. `-gatherarea 0` restores the whole disc over every photon exactly. The
+rule alone (0.442.2) had been reverted in 0.443.1 because, dividing by the whole disc still, it
+darkened every object's base; the footprint takes that away too.
 
-**Not new.** `scenes/_gap_leak2.ftsl` -- an ordinary `light area` 1 mm under a diffuse plate,
-facing down -- reads mode J 1.21x mode R (mean; median 1.03) with 0.441.1 and with 0.442.0 alike.
-The emissive plate only made it louder: there every photon of the gap starts or ends on the
-plate's own plane.
-
-**Mode J's cause, read off the code:** its surface merges (bdpt.h, the `photons->query` callback;
-the device twin) keep every photon within the radius -- `SurfMap::query` is a sphere test, and no
-plane test follows. Mode M and S gathers keep only the photons on the gather point's own surface
-(gatherplane.h `onGatherSurfaceSided`, MERGE-PROXIMITY, 0.431.0); J's merges never got it, and a
-`SurfPhoton` stores no surface normal to apply it with. So the photons on the floor 1 mm under the
-plate, which arrived from above (the plate's emission), pass the merge's from-behind test at the
-plate's top and are counted there. **Fix:** store the photon's surface normal and apply
-`onGatherSurfaceSided` in J's surface merges on both backends (and see whether mode U's merges,
-vcm.h, lack it too). Both repros are tracked.
+Against mode B on the plate's top at a merge radius of 0.02 (`tools/check_gap_merge.py`, which now
+passes): the plate emitting into the gap (`_gap_leak`) J 1.005 / 0.998, U 1.016 / 0.998 (CPU / GPU),
+where 0.445.2 read J 36.2 / 18.8, U 20.0 / 14.7; a light block in the gap (`_gap_leak2`) J 1.000 /
+1.001, U 1.000 / 1.000. The floor at a box's base against mode R (`tools/check_merge_base.py`, its
+tolerances tightened to 4 % and 5 %): within 2 cm J 1.003 (CPU) / 0.993 (GPU), U 0.998, 2-5 cm
+0.967 / 0.964, 0.962, where the whole disc read 0.950 / 0.881, 0.926 and 0.941 / 0.924, 0.929, and
+the band alone 0.639 / 0.664, 0.650. Cost, paired against `-gatherarea 0` on `_gap_leak_noceil`:
+0.90-1.07x. What is left at the gap's mouth at the default radius is GAP-MERGE-RADIUS (above).
+Mode D was right throughout: the gap's light leaving through its millimetre-high sides is what its
+light subpaths find and mode R's camera paths almost never do.
 
 ## NOTED (2026-11-09, the machine, not ftrace): BUGCHECK-INTSTEER — two blue screens in a day were one driver corrupting Windows kernel memory
 

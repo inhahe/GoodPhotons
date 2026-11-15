@@ -2,21 +2,19 @@
 
     python tools/check_merge_base.py [--out png/check_merge_base] [--exe ftrace.exe] [--no-gpu]
 
-Mode J's surface merges and mode U's vertex merges divide the photons in their disc by the whole
-disc's area: no footprint says how much of it is the merge's own surface (modes M and S have one,
-tools/check_gather_base.py). So at the base of a box the photons of the box's top stand in for the
-floor the box covers, and the estimate keeps only the radius's own bias (below). A rule that drops
-another surface's photons darkens it: with the tangent-plane band of mode M's gathers
-(0.442.2-0.443.0, the fix J-THIN-GAP-LEAK tried) the floor within 2 cm of the base read 0.64 of mode
-R in mode J and 0.65 in mode U at radius 0.1, 0.72 / 0.71 at the default (gatherplane.h says why the
-rule is M's and S's).
+Mode J's surface merges and mode U's vertex merges keep only their own surface's photons and divide
+by the share of their disc that surface covers (the footprint, surfmerge.h; J-THIN-GAP-LEAK), as
+modes M and S do (tools/check_gather_base.py). At the base of a box the box's top is another
+surface: its photons are not the floor's light, and the disc's part over it is not the floor's area.
 
 check_gather_base's diffuse box (30 cm square, 3 cm tall) on its lit floor, seen from straight
 above: modes J and U on the CPU, J on the GPU, at a pinned radius of 0.1, against mode R on the
-GPU, in rings out from the base -- 0-2 cm within 15 %, 2-5 cm within 10 %. They read 0.950 / 0.941
-(J, CPU), 0.926 / 0.929 (U), 0.881 / 0.924 (J, GPU) in 0.443.1: the merges' own radius bias at a
-contact, which only a footprint would take away (known-issues J-THIN-GAP-LEAK); the band read
-0.639 / 0.821, 0.650 / 0.847 and 0.664 / 0.883. Exits 1 on any failure.
+GPU, in rings out from the base -- 0-2 cm within 4 %, 2-5 cm within 5%. With the footprint they read
+1.003 / 0.967 (J, CPU), 0.998 / 0.962 (U), 0.993 / 0.964 (J, GPU). Both estimators before it fail:
+the whole disc over every photon in it (to 0.443.x) read 0.950 / 0.941, 0.926 / 0.929 and 0.881 /
+0.924 -- the box top's photons standing in for the floor it covers -- and the tangent-plane band
+alone (0.442.2-0.443.0), dropping them but dividing by the whole disc still, 0.639 / 0.821, 0.650 /
+0.847 and 0.664 / 0.883. Exits 1 on any failure.
 """
 import argparse
 import os
@@ -29,7 +27,7 @@ sys.path.insert(0, os.path.join(ROOT, "tools"))
 import check_gather_base as g  # noqa: E402
 from pfm import read_pfm  # noqa: E402
 
-RINGS = ((0.0, 0.02, 0.15), (0.02, 0.05, 0.10))   # (from, to, tolerance), metres from the base
+RINGS = ((0.0, 0.02, 0.04), (0.02, 0.05, 0.05))   # (from, to, tolerance), metres from the base
 CASES = [("J_cpu", ["-mode", "J", "-device", "cpu", "-spp", "128", "-pmradius", "0.1"]),
          ("U_cpu", ["-mode", "U", "-device", "cpu", "-spp", "128", "-pmradius", "0.1"]),
          ("J_gpu", ["-mode", "J", "-device", "gpu", "-spp", "512", "-pmradius", "0.1"])]

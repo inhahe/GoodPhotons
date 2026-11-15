@@ -1384,6 +1384,10 @@ inline Vec3 traceCameraSubpath(const Scene& scene, const Camera& cam, const Rend
                 if (jOn) jr.snap(js);
                 const JSpec* vs = (jOn && js.on()) ? &js : nullptr;   // the carrier arriving here
                 const bool camTwoSided = isTwoSidedMat(*mp);   // for mergeFromBehind
+                // The footprint (bdpt::SurfMap's, surfmerge.h): this surface's light vertices over
+                // the share of the disc it covers, at one slack for the test and the probe.
+                const int gaM = gatherAreaSamples();
+                const double gaSlack = gatherBandSlack(ctx.radius, h.fiberRadius);
                 grid.query(lightVerts, h.p, ctx.radius, [&](int idx) {
                     const LightVertex& lv = lightVerts[idx];
                     if (edges + lv.edges > ctx.maxDepth) return;        // merged path too long
@@ -1398,6 +1402,14 @@ inline Vec3 traceCameraSubpath(const Scene& scene, const Camera& cam, const Rend
                     if (lv.hit.fiberRadius > 0.0) return;
                     Vec3 wMerge = lv.wo;                                // incident illumination dir
                     if (mergeFromBehind(camTwoSided, wMerge, ngoCam)) return;
+                    if (gaM) {   // its surface's true normal, turned to the side its light came from
+                        const Vec3 pn = (dot(lv.ng, lv.wo) >= 0.0) ? lv.ng : lv.ng * -1.0;
+                        const Vec3 dd = lv.p - h.p;
+                        bool farSide;
+                        if (!onGatherSurfaceSided(h.p, ngoCam, lv.p, pn, dot(dd, dd), gaSlack, camTwoSided,
+                                                  farSide))
+                            return;
+                    }
                     // camera BSDF evaluated at the light vertex's wavelength (XYZ estimate).
                     double lam = (double)lv.lambda;
                     // ...times a coated vertex's coat on the light's way in (coatF; a coat copy's
@@ -1462,6 +1474,9 @@ inline Vec3 traceCameraSubpath(const Scene& scene, const Camera& cam, const Rend
                     }
                     mergeXYZ += add * lv.mergeW;   // COMPOUND-MERGE-PICK
                 });
+                if (gaM && (mergeXYZ.x != 0.0 || mergeXYZ.y != 0.0 || mergeXYZ.z != 0.0))
+                    mergeXYZ = mergeXYZ * gatherAreaScale(gatherCoverage(scene, h.p, ngoCam, ctx.radius, gaSlack,
+                                                                         rng, gaM, h.matId, h.fiberRadius));
                 result += mergeXYZ * ((vs ? vs->beta(beta) : beta) * ctx.vmNorm);
             }
         }
