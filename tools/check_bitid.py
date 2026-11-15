@@ -236,17 +236,21 @@ def render_all(exe, out, label, paths, log):
     return ok
 
 
-def compare(out, a, b, tol, log):
+def expected(paths):
+    """The images render_all makes of the scenes `paths` names, in order."""
+    return ["%s_%s.pfm" % (name, tag) for name in sorted(paths) for tag, _ in SCENE_MODES.get(name, MODES)]
+
+
+def compare(out, a, b, tol, log, paths):
+    """Compares the images of the scenes `paths` names under labels a and b, and only those: a label's
+    directory may still hold another selection's images from an earlier run."""
     da, db = os.path.join(out, a), os.path.join(out, b)
-    names = sorted(f for f in os.listdir(da) if f.endswith(".pfm"))
-    if not names:
-        log("  nothing rendered under %s" % a)
-        return False
     ok = True
-    for n in names:
+    for n in expected(paths):
         pa, pb = os.path.join(da, n), os.path.join(db, n)
-        if not os.path.exists(pb):
-            log("  %-22s missing under %s FAIL" % (n[:-4], b))
+        missing = [lab for lab, f in ((a, pa), (b, pb)) if not os.path.exists(f)]
+        if missing:
+            log("  %-22s missing under %s FAIL" % (n[:-4], " and ".join(missing)))
             ok = False
             continue
         if open(pa, "rb").read() == open(pb, "rb").read():
@@ -302,19 +306,19 @@ def main():
     elif a.what == "compare":
         if len(a.labels) != 2:
             ap.error("compare takes two labels")
-        ok = compare(out, a.labels[0], a.labels[1], a.tol, log)
+        ok = compare(out, a.labels[0], a.labels[1], a.tol, log, paths)
     else:
         if not a.before:
             ap.error("run needs --before <the old ftrace.exe>")
         ok = render_all(os.path.abspath(a.before), out, "before", paths, log)
         ok &= render_all(os.path.abspath(a.before), out, "before_again", paths, log)
         log("determinism (the old build against itself):")
-        det = compare(out, "before", "before_again", 0.0, log)
+        det = compare(out, "before", "before_again", 0.0, log, paths)
         if not det:
             log("  a case above is not deterministic: its comparison below proves nothing")
         ok &= render_all(os.path.abspath(a.after), out, "after", paths, log)
         log("the new build against the old:")
-        ok &= compare(out, "before", "after", a.tol, log) and det
+        ok &= compare(out, "before", "after", a.tol, log, paths) and det
     print("PASS" if ok else "FAIL")
     return 0 if ok else 1
 

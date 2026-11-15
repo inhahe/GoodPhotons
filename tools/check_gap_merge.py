@@ -2,12 +2,12 @@
 
     python tools/check_gap_merge.py [--out png/check_gap_merge] [--exe ftrace.exe] [--no-gpu]
 
-J-THIN-GAP-LEAK. Mode J's surface merges and mode U's vertex merges kept every photon within their
-radius. So the light in a gap a millimetre under a plate -- photons on the floor below it, which
-arrived from above -- was merged at the plate's top, where none of it can reach:
-`scenes/_gap_leak.ftsl` (a plate that emits down into the gap) read mode J 167 times mode B, and
-`scenes/_gap_leak2.ftsl` (a light block in the gap) 1.21 times. Since 0.445.3 they keep only their
-own surface's photons and divide by that surface's share of the disc (the footprint, surfmerge.h).
+J-THIN-GAP-LEAK. Mode J's surface merges and mode U's vertex merges keep only their own surface's
+photons and divide by that surface's share of the disc (the footprint, MergeFootprint). A merge that
+kept every photon within its radius would take the light in a gap a millimetre under a plate --
+photons on the floor below it, which arrived from above -- at the plate's top, where none of it can
+reach: `scenes/_gap_leak.ftsl` (a plate that emits down into the gap) then reads mode J 167 times
+mode B, and `scenes/_gap_leak2.ftsl` (a light block in the gap) 1.21 times.
 
 Modes J, U and D, CPU and GPU, against mode B: the mean over the middle of the plate's top (lit by
 a ceiling panel, and by the gap's light that escapes through its millimetre-high sides and comes

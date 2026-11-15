@@ -140,9 +140,9 @@ CASES = [   # the A cases render SCENE_A, through the lens
     ("D1_gpu", ["-mode", "D", "-device", "gpu", "-spp", "512", "-heroc", "1"]),
 ]
 # Seeds per case where two are too few. Mode S's gather blurs neighbouring pixels together, so its
-# per-pixel noise estimate is too small, and two seeds' means are one degree of freedom: titanium's
-# blue failed at 1.063 of R on two seeds, a 1.8-sigma deviation by S's real seed-to-seed scatter (5 %
-# per seed; sixteen seeds read 0.993 +- 0.008), judged 5 sigma by the two seeds' estimate.
+# per-pixel noise estimate is too small, and two seeds' means give its seed-to-seed scatter (5 % a
+# seed in titanium's blue) one degree of freedom: an estimate that can sit several times under the
+# truth, and judge a two-sigma deviation five.
 SEEDS = {"S_cpu": tuple(range(1, 9)), "S_gpu": tuple(range(1, 9))}
 GPU_TOKENS = ("-> GPU", "[gpu]", "VCM/UPS on ", "SPPM on ")
 
