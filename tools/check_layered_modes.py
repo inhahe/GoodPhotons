@@ -35,9 +35,11 @@ The rooms: five walls of one material lit at a grazing angle by a tilted panel, 
             modes that render a Stokes shift are R and the forward ones). A mode R that normalises
             the shifted light's way out at the absorbed wavelength reads B 0.916 of itself.
 Each mode's frame mean over `--seeds` seeds must be within 1 % of mode R's on the same device (B's
-within 0.5 %). Mode B is not scored where the coat is smooth (fresnel, glossy, furnace): it connects
-no delta lobe to the camera, so it misses the coat's mirror image of the room (0.90 of R there), as
-it misses any mirror's. Exits 1 on any failure.
+within 0.5 %). Mode B images a smooth coat's mirror reflection through its closed-form mirror
+connections, the coat a mirror of its own reflectance R(theta): fresnel reads 0.997 and glossy 0.999 of
+R (without, 0.90: the coat's image of the room missing). It is not scored in the furnace, whose coats
+reflect a sky -- a light seen in a mirror, with no vertex between for a connection to join. Exits 1 on
+any failure.
 """
 import argparse
 import os
@@ -56,8 +58,9 @@ NPHOT = {"B": 40000000, "M": 2000000, "S": 100000}   # photons (mode S's per pas
 DEPTH = {"M": 32, "S": 32}
 TOL = 0.01
 TOL_MODE = {"B": 0.005}
-# Rooms whose coat is smooth: a delta sheen, which mode B cannot image (see the docstring).
-SMOOTH = {"fresnel", "glossy", "furnace"}
+# Rooms mode B cannot image: the furnace's smooth coats reflect its sky, a light seen in a mirror with
+# no vertex between for the closed-form connection to join (see the docstring).
+SMOOTH = {"furnace"}
 # Rooms lit by a sky, which modes D, J and U do not render.
 SKY = {"furnace"}
 # Rooms whose light is fluorescent, which only mode R and the forward modes shift: mode B alone.

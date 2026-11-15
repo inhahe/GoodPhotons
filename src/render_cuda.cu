@@ -10578,6 +10578,13 @@ __device__ static inline bool dIsPlanarMirrorMat(const DMaterial& m) {
     return m.type == D_GLOSSY && m.roughness <= 0.0 &&
            m.roughnessTex < 0 && m.roughnessPat < 0 && m.recRoughMode < 0;
 }
+// Host twins isSmoothCoatMat / mirrorConnectsMat (scene.h, FWD-SMOOTH-COAT): what the connections
+// reflect the eye in -- a planar mirror, or a layered material whose coat is a perfect mirror.
+__device__ static inline bool dMirrorConnectsMat(const DMaterial& m) {
+    if (dIsPlanarMirrorMat(m)) return true;
+    return m.type == D_LAYERED && m.roughness <= 0.0 && m.roughnessTex < 0 && m.roughnessPat < 0 &&
+           m.recRoughMode < 0;
+}
 
 // Reflect a ray off sphere S at its first intersection ahead of `o`. Works from either
 // side (a convex mirror ball seen from outside, a mirrored room seen from within), since
@@ -10711,7 +10718,7 @@ __device__ static bool dMirrorSeenAt(const DScene& sc, const D3& eye, const D3& 
     hm = closestHit(sc, eye.toR(), wE.toR(), RAY_EPS, BIG, /*camHide=*/true);
     if (!hm.valid) return false;
     if (fabs((double)hm.t - dE) > 1e-4 * (1.0 + dE)) return false;   // something in front
-    return dIsPlanarMirrorMat(sc.mats[hm.matId]);
+    return dMirrorConnectsMat(sc.mats[hm.matId]);
 }
 
 // Splat the `nUp` live wavelengths of a photon vertex through one connection whose
@@ -10728,7 +10735,9 @@ __device__ static void dSplatMirrorLegs(const DScene& sc, const DCamera& cam, do
     const DVec3 wPR = wP.toR(), wRER = wRE.toR();
     const DVec3 pR = p.toR(), RR = R.toR();
     for (int i = 0; i < nUp; ++i) {
-        double refl = clamp01((double)dReflectSlot(sc, mm, hm, lam[i]));
+        // A smooth coat's (host twin): its reflectance at the reflection's angle.
+        double refl = (mm.type == D_LAYERED) ? dLayeredCoatReflectance(sc, mm, hm, wRER, lam[i], nullptr, nullptr)
+                                             : clamp01((double)dReflectSlot(sc, mm, hm, lam[i]));
         // A glossy vertex's lobe toward wP, at this wavelength (shape is cos/pi there).
         double wi = gs ? (double)gs->f(wPR, lam[i]) * DPI : (double)w[i];
         if (coat) wi *= dCoatS(coat, wPR, lam[i]);   // a coated body's way out

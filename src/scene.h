@@ -558,6 +558,20 @@ inline bool isPlanarMirrorMat(const Material& m) {
     return m.type == MatType::Glossy && m.roughness <= 0.0 &&
            m.roughnessTex < 0 && m.roughnessPat < 0 && m.recBindingFor(REC_SLOT_ROUGHNESS) == nullptr;
 }
+// A `layered` material whose coat is a perfect mirror (FWD-SMOOTH-COAT): roughness 0 with nothing to
+// open its lobe (no roughness map). The coat reflects a delta whose reflectance is the coat's own at
+// the angle, R(theta) (render.h layeredCoatReflectance), so the forward connections take it as a mirror
+// of that reflectance, the body beneath rendering as before. A normal map does not keep it out: the
+// connection then images it flat, as it does a normal-mapped mirror (known-issues NMAP-MIRROR-FLAT),
+// which beats not imaging it at all.
+inline bool isSmoothCoatMat(const Material& m) {
+    return m.type == MatType::Layered && m.roughness <= 0.0 && m.roughnessTex < 0 && m.roughnessPat < 0 &&
+           m.recBindingFor(REC_SLOT_ROUGHNESS) == nullptr;
+}
+// What the forward modes' closed-form connections reflect the eye in (Scene::mirrorPlanes,
+// mirrorSphereIdx; render.h connectSpecularPlane / connectSpecularSphereMirror): a planar mirror, or a
+// smooth coat. Only those connections: everywhere else a coat is a coat. Device twin dMirrorConnectsMat.
+inline bool mirrorConnectsMat(const Material& m) { return isPlanarMirrorMat(m) || isSmoothCoatMat(m); }
 
 // Resolve a Mix material to one of its child material indices using a single
 // uniform u in [0,1). Returns the chosen child index, or -1 if the photon falls
@@ -3833,7 +3847,7 @@ struct Scene {
             const int m = spheres[i].matId;
             if (m < 0 || m >= (int)mats.size()) continue;
             if (mats[m].type == MatType::Dielectric) dielSphereIdx.push_back(i);
-            if (isPlanarMirrorMat(mats[m]))          mirrorSphereIdx.push_back(i);
+            if (mirrorConnectsMat(mats[m]))          mirrorSphereIdx.push_back(i);
         }
         mirrorPlanes.clear();
         mirrorDeformPart.clear();
@@ -3861,7 +3875,7 @@ struct Scene {
         std::vector<std::vector<int>> members;   // each plane's faces, for a mixed one's parts
         for (const Tri& t : tris) {
             if (t.matId < 0 || t.matId >= (int)mats.size()) continue;
-            if (!isPlanarMirrorMat(mats[t.matId])) continue;
+            if (!mirrorConnectsMat(mats[t.matId])) continue;
             Vec3 n = t.gn;
             double nl = length(n);
             if (nl < 1e-12) continue;

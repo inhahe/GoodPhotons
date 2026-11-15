@@ -1758,14 +1758,33 @@ splat has theta_c, as the coat sheen's does), or move every mode to the reciproc
 changes every coated render, so it wants its own A/B. check_rough_irid holds B to R at 8 % on the
 car paint for this.
 
-## OPEN (2026-11-05, 0.434.8): FWD-SMOOTH-COAT — a smooth clearcoat shows no sheen in modes A and B
+## NOTED (2026-11-15, 0.445.4): NMAP-MIRROR-FLAT — mode B images a normal-mapped mirror (or smooth coat) as a flat one
+
+The forward modes reach a delta reflector's image only through the closed-form connections
+(render.h connectSpecularPlane / connectSpecularSphereMirror), which unfold the eye across the
+geometric plane or solve the sphere's reflection point: they image a mirror by its geometry. Under a
+normal map every walk reflects off the rippled shading normal instead, and nothing of that kind has a
+closed form -- the point that reflects a photon vertex into a pixel is where the shading normal bisects
+the two directions, a root of the map itself. Measured on check_bump_modes' mirror room with the ripple
+map put on the mirror (`png/nmap_mirror/room.ftsl`): mode B 1.23x mode R over the mirror's half of the
+frame, 1.001 over the other. Left out of the connections, the mirror would be black in mode B, which is
+worse; a smooth coat under a normal map is connected the same way (its reflection is a few percent of
+the light, so the flat image costs a fraction of that). Not fixable within a pure light tracer; modes R,
+D, J, U, M and S render it right, and mode B's reference documentation says so.
+
+## DONE (2026-11-15, 0.445.4): FWD-SMOOTH-COAT — a smooth clearcoat showed no sheen in modes A and B
 
 A `layered` coat of roughness 0 is a delta lobe: the deterministic coat splat (GlossySplat::stack)
-cannot evaluate it toward the camera, and the closed-form mirror connection handles only flat
-planes and spheres of a mirror material, not a coated surface. So a polished coat's mirror
-reflection is missing in the forward modes, while its body renders. **Proper fix:** treat a
-smooth coat like a mirror in the analytic connections (a coated sphere as a mirror sphere of
-reflectance R(theta), a coated plane as a mirror plane), weighted by R at the reflection's angle.
+cannot evaluate it toward the camera, and the closed-form mirror connection handled only mirror
+materials. **Fixed:** the connections take a layered material whose coat is a perfect mirror
+(`isSmoothCoatMat`, device `dMirrorConnectsMat`) as a mirror whose reflectance is the coat's own at the
+reflection's angle (`layeredCoatReflectance`), planes and analytic spheres alike, host and device; the
+body beneath renders as before. check_layered_modes now scores mode B in its smooth-coat rooms: fresnel
+0.9969 / 0.9970 of mode R (CPU / GPU), glossy 0.9987 / 0.9991, where the coat's mirror image was missing
+before (0.90). The rest is the coat's reflection of itself, two mirror bounces, which one connection
+does not chain. Mode A shares mode B's connections only through a pinhole: its thin lens takes no
+mirror connection at all, for a coat as for a mirror. The furnace room stays unscored for B: its coats
+reflect a sky, a light seen in a mirror with no vertex between for the connection to join.
 
 ## DONE (2026-11-05, 0.434.8): FWD-GLOSSY-INDIRECT — modes A and B splat a rough reflector only where it is seen directly
 

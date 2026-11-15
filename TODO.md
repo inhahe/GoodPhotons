@@ -339,7 +339,8 @@ Then the rest of 4.2-4.6 in their order, 4.7's bookkeeping alongside whatever to
   (and a layered clearcoat's sheen on neither backend). 0.434.8.
 - [x] **LAYERED-BODY-COIN** (0.444.0) — a forward mode weighed a coated body by the photon's coin, at
   the light's angle (5 % on the car paint): closed by LAYERED-MODES (mode B 0.987-1.000 of R now).
-- [ ] **FWD-SMOOTH-COAT** — a smooth clearcoat shows no sheen in modes A and B.
+- [x] **FWD-SMOOTH-COAT** (0.445.4) — mode B's mirror connections take a smooth coat as a mirror of
+  its own reflectance R(theta): the smooth-coat rooms read 0.997-0.999 of R (0.90 before).
 - [x] **GLTF-MAP-MEAN-GUTTERS** — the importer's mean metalness and roughness count the atlas's
   gutters.
 - [x] **FEATHER-IS-A-THRESHOLD** (0.434.17) — a mesh-bound medium's `feather` shrinks the silhouette

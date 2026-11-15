@@ -2538,7 +2538,7 @@ struct Renderer {
         if (!hm.valid) return false;
         if (std::fabs(hm.t - dE) > 1e-4 * (1.0 + dE)) return false;   // something in front
         if (hm.matId < 0 || hm.matId >= (int)scene.mats.size()) return false;
-        return isPlanarMirrorMat(scene.mats[hm.matId]);
+        return mirrorConnectsMat(scene.mats[hm.matId]);
     }
 
     // Splat the `nUp` live wavelengths of a photon vertex through one connection whose
@@ -2555,7 +2555,9 @@ struct Renderer {
                          const GlossySplat* gs = nullptr, const CoatSplat* coat = nullptr) const {
         const double invD2Omega = 1.0 / (D * D * omega);
         for (int i = 0; i < nUp; ++i) {
-            double refl = clamp01(reflectSlot(scene, mm, hm, lam[i]));
+            // A smooth coat's (FWD-SMOOTH-COAT): its reflectance at the reflection's angle.
+            double refl = (mm.type == MatType::Layered) ? layeredCoatReflectance(scene, mm, hm, wRE, lam[i])
+                                                        : clamp01(reflectSlot(scene, mm, hm, lam[i]));
             // A glossy vertex's lobe toward wP, at this wavelength (shape is cos/pi there).
             const double wi = (gs ? gs->f(wP, lam[i]) * PI : w[i]) * coatSplatF(coat, wP, lam[i]);
             double contrib = beta[i] * (wi * shape) * refl * invD2Omega;

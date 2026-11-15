@@ -1507,12 +1507,16 @@ form** instead of sampled, and then it is drawn exactly. Mode `B` does this for:
 
 | Directly-seen surface | How the connection is solved | Since |
 |---|---|---|
-| **Flat mirror panel** — coplanar `mirror` / `halfmirror` / roughness-0 `glossy` triangles | *Unfolding*: the eye is mirrored across the plane, so the bent path `p → R → eye` becomes a straight segment and the specular Jacobian is exactly `1/D²` along it | 0.188.0 |
+| **Flat mirror panel** — coplanar `mirror` / `halfmirror` / roughness-0 `glossy` triangles, and since 0.445.4 a `layered` material whose coat has roughness 0 (a mirror whose reflectance is the coat's own at the angle) | *Unfolding*: the eye is mirrored across the plane, so the bent path `p → R → eye` becomes a straight segment and the specular Jacobian is exactly `1/D²` along it | 0.188.0 |
 | **Mirror sphere** — a `sphere` primitive with the same materials | 1-D root solve in the plane through (eye, vertex, centre) + ray-differential Jacobian | 0.188.0 |
 | **Smooth dielectric sphere** — a `sphere` with `type dielectric`, seen from outside *or* flown through | Same root solve, with two refractions (dispersive: each λ gets its own image, which is what makes the glass-orb caustic image chromatic) | 0.160.0 |
 
 So a mirrored wall, the room reflected in it, and lights that are only visible *in* the
-reflection now render in mode `B` — on both the CPU and the GPU, which agree.
+reflection now render in mode `B` — on both the CPU and the GPU, which agree. The connections image
+a mirror by its **geometry**: under a normal map, which every other mode reflects off, mode `B`
+shows it flat (1.23x mode `R` over a strongly rippled mirror; no closed form exists for a delta
+reflector under a varying normal), and a light seen in a mirror with nothing between (a sky in a
+mirror ball) is beyond them. Mode `A`'s thin lens takes none of these connections.
 
 A **rough** reflector needs no closed form: its lobe has a finite density toward any
 direction, so every photon that reaches it is splatted to the camera through the lobe,
@@ -1526,8 +1530,9 @@ also seen **in a mirror or through a glass sphere**: the closed-form connections
 diffuse vertex takes, evaluate the rough lobe toward the first specular point, where a diffuse
 vertex gives `ρ/π`. A `layered` material's clearcoat **sheen** splats too, at every photon that
 reaches the coat, whichever way the photon then goes: the coat's lobe toward the camera, times
-the coat's reflectance at the camera's angle. A smooth coat (`roughness 0`) is a delta lobe and
-still shows no sheen in `B`; neither does a rough reflector seen in a mirror *mesh*.
+the coat's reflectance at the camera's angle. A smooth coat (`roughness 0`) is a delta lobe, which
+the mirror connections above image instead (since 0.445.4). A rough reflector seen in a mirror
+*mesh* still shows nothing in `B`.
 
 **Still black in `B`, by design:** a glass or mirror **mesh** (only world-space triangles
 grouped into planes, and analytic spheres, are collected — an instanced/BLAS mirror is

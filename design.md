@@ -10854,16 +10854,22 @@ splat or none.
 
 **One traversal does three jobs.** A plane does not know where its panel *ends*, so
 `mirrorSeenAt` / `dMirrorSeenAt` casts one `closestHit(eye → R)` and requires
-`|hit.t − dE| ≤ 1e-4·(1+dE)` **and** `isPlanarMirrorMat(mats[hit.matId])`. That
+`|hit.t − dE| ≤ 1e-4·(1+dE)` **and** `mirrorConnectsMat(mats[hit.matId])`. That
 simultaneously proves (a) the authored panel really contains `R`, (b) the eye-side leg is
 unoccluded, and (c) hands back a real `Hit`, so `reflectSlot` reads the mirror's
 texture/pattern reflectance at the exact point. The light-side leg is a separate
 `occluded()`, and `splatMirrorLegs` / `dSplatMirrorLegs` applies fog transmittance on both
 legs.
 
-**Which materials qualify** (`isPlanarMirrorMat`, `scene.h`; `dIsPlanarMirrorMat`):
-`mirror`; `halfmirror` (its reflect *probability* is its specular reflectance in
-expectation); `glossy` only when `roughness <= 0 && roughnessTex < 0 && roughnessPat < 0`.
+**Which materials qualify** (`mirrorConnectsMat`, `scene.h`; `dMirrorConnectsMat`): the
+planar mirrors (`isPlanarMirrorMat`) -- `mirror`; `halfmirror` (its reflect *probability* is
+its specular reflectance in expectation); `glossy` only when `roughness <= 0 && roughnessTex < 0
+&& roughnessPat < 0` -- and since 0.445.4 a `layered` material whose coat is a perfect mirror
+(`isSmoothCoatMat`, the same roughness test), whose reflectance is the coat's own at the
+reflection's angle (`layeredCoatReflectance`, in `splatMirrorLegs`): the coat's image, its body
+rendering as before (FWD-SMOOTH-COAT). Only the connections use this predicate; everywhere else a
+coat is a coat. A connection images by **geometry**: a normal-mapped mirror or coat, which the
+walks reflect off its shading normal, is imaged flat (NMAP-MIRROR-FLAT: no closed form exists).
 
 **Hero bundles.** A mirror is achromatic, so ONE geometry solve serves the whole live-λ
 bundle and only the reflectance varies per λ — hence `camSpecularSplatAllVtxN`
