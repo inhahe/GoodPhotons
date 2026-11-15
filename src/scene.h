@@ -17,6 +17,7 @@
 #include "implicit.h"
 #include "curve.h"
 #include "medium_stack.h" // MediumStack: a birth's enclosing solids (BIRTH-EMPTY-STACK)
+#include "ggx.h"         // ggx::kMaxRoughness (clampRoughness)
 #include "layered.h"     // A3: the stochastic layered model's escape moments       // curve / fiber primitive (hair, fur, grass, wire) — TODO §P1
 #include "pattern.h"
 #include "spectrum.h"
@@ -6217,6 +6218,12 @@ inline double patternScalarAt(const Scene& scene, int pat, const Hit& h, double 
     return dflt;
 }
 
+// A roughness a pattern or a record evaluated, held to the lobe's range [0, kMaxRoughness]
+// (ggx::alpha raises it to kMinRoughness), NaN to 0. Device twin dClampRoughness.
+inline double clampRoughness(double r) {
+    return !(r > 0.0) ? 0.0 : (r > ggx::kMaxRoughness ? ggx::kMaxRoughness : r);
+}
+
 // Per-hit glossy roughness: a bound roughness pattern (highest priority, for
 // implicit surfaces) or roughnessTex's grayscale value at the hit, else the
 // constant. Shared by every tracer so sampling and (in BDPT) the MIS pdf see the
@@ -6239,12 +6246,10 @@ inline double materialRoughness(const Scene& scene, const Material& m, const Hit
                 r = recSampleScalar(rec, ch, d, c);
             }
         }
-        return r < 0.0 ? 0.0 : (r > 1.0 ? 1.0 : r);
+        return clampRoughness(r);
     }
-    if (m.roughnessPat >= 0 && m.roughnessPat < (int)scene.patterns.size()) {
-        double r = scene.patterns[m.roughnessPat].eval(patCtxFromHit(scene, h));
-        return r < 0.0 ? 0.0 : (r > 1.0 ? 1.0 : r);
-    }
+    if (m.roughnessPat >= 0 && m.roughnessPat < (int)scene.patterns.size())
+        return clampRoughness(scene.patterns[m.roughnessPat].eval(patCtxFromHit(scene, h)));
     if (m.roughnessTex >= 0 && m.roughnessTex < (int)scene.textures.size())
         return scene.textures[m.roughnessTex].scalarAt(h.u, h.v);
     return m.roughness;

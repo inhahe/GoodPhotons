@@ -11621,6 +11621,10 @@ __device__ static double dRecSampleScalar(const DScene& sc, const DRecScalarStop
 }
 // Per-hit roughness from a bound scalar record, if the material binds one (device twin of
 // the record branch of materialRoughness). Returns true + sets `out` (clamped [0,1]).
+// Host twin clampRoughness: the lobe's range [0, kMaxRoughness], NaN to 0.
+__device__ static inline double dClampRoughness(double r) {
+    return !(r > 0.0) ? 0.0 : (r > ggx::kMaxRoughness ? ggx::kMaxRoughness : r);
+}
 __device__ static bool dRecordRoughness(const DScene& sc, const DMaterial& m, const DHit& h, Real& out) {
     if (m.recRoughMode < 0) return false;
     double v;
@@ -11637,7 +11641,7 @@ __device__ static bool dRecordRoughness(const DScene& sc, const DMaterial& m, co
         v = dRecSampleScalar(sc, sc.recScalarStops + m.recRoughStopOff, m.recRoughStopN,
                              m.recRoughInterp, h, d);
     }
-    out = (Real)(v < 0.0 ? 0.0 : (v > 1.0 ? 1.0 : v));
+    out = (Real)dClampRoughness(v);
     return true;
 }
 
@@ -11647,10 +11651,7 @@ __device__ static bool dRecordRoughness(const DScene& sc, const DMaterial& m, co
 __device__ static Real dMatRoughness(const DScene& sc, const DMaterial& m, const DHit& h) {
     Real rr;
     if (dRecordRoughness(sc, m, h, rr)) return rr;
-    if (m.roughnessPat >= 0) {
-        double r = dPatternScalarAt(sc, m.roughnessPat, h);
-        return (Real)(r < 0.0 ? 0.0 : (r > 1.0 ? 1.0 : r));
-    }
+    if (m.roughnessPat >= 0) return (Real)dClampRoughness(dPatternScalarAt(sc, m.roughnessPat, h));
     if (m.roughnessTex >= 0) return (Real)dTexScalarAt(sc.textures[m.roughnessTex], h.u, h.v);
     return (Real)m.roughness;
 }

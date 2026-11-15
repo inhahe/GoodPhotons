@@ -167,8 +167,8 @@ GGX_V template <class V, class T> GGX_HD V vframe(const V& t, const V& b, const 
 
 // The GGX alpha of a material roughness.
 template <class T> GGX_HD T alpha(T roughness) {
-    const T r = roughness < (T)kMinRoughness ? (T)kMinRoughness
-                                             : (roughness > (T)kMaxRoughness ? (T)kMaxRoughness : roughness);
+    const T r = !(roughness > (T)kMinRoughness) ? (T)kMinRoughness   // NaN too
+                                                : (roughness > (T)kMaxRoughness ? (T)kMaxRoughness : roughness);
     return (T)kAlphaPerRoughness * r;
 }
 
@@ -269,7 +269,7 @@ template <class T> struct MsAt {
 };
 template <class T> GGX_HD MsAt<T> msAt(T alpha) {
     T x = alpha / (T)GGX_MS_ALPHA_MAX;
-    x = GGX_SQRT(x < (T)0 ? (T)0 : (x > (T)1 ? (T)1 : x)) * (T)(GGX_MS_NA - 1);
+    x = GGX_SQRT(!(x > (T)0) ? (T)0 : (x > (T)1 ? (T)1 : x)) * (T)(GGX_MS_NA - 1);   // NaN: row 0
     MsAt<T> at;
     at.i = (int)x;
     if (at.i > GGX_MS_NA - 2) at.i = GGX_MS_NA - 2;
@@ -279,7 +279,7 @@ template <class T> GGX_HD MsAt<T> msAt(T alpha) {
 // E(c): a white lobe's single-scattering albedo for an arrival at cosine `c`, bilinear in
 // (sqrt(alpha), sqrt(c)).
 template <class T> GGX_HD T msE(T c, const MsAt<T>& at) {
-    const T y = GGX_SQRT(c < (T)0 ? (T)0 : (c > (T)1 ? (T)1 : c)) * (T)(GGX_MS_NM - 1);
+    const T y = GGX_SQRT(!(c > (T)0) ? (T)0 : (c > (T)1 ? (T)1 : c)) * (T)(GGX_MS_NM - 1);   // NaN: 0
     int j = (int)y;
     if (j > GGX_MS_NM - 2) j = GGX_MS_NM - 2;
     const T u = y - (T)j;
