@@ -270,7 +270,7 @@ inline FluoroResult fluoroInteract(const Material& m, double lambdaIn, Pcg32& rn
 //   coatModel 0 (fresnel): plain dielectric Fresnel from m.ior(lambda) at cosI.
 // Shared by the forward and backward tracers so both split the photon identically. The incidence is
 // taken at the SHADING normal: the coat follows the surface's bumps, so a smooth coat's mirror pair
-// (reflected about the shading normal) meets it at the angle the coin reads (coatSheenRatio 1).
+// (reflected about the shading normal) meets it at the angle the coin reads (coatEvalSheen's 1).
 // A thin film's thickness at `h` (coatThickness), read once by a caller that evaluates the coat at
 // several directions or wavelengths, and R at the direction `d` given it (coatRDir). A coat's
 // thickness map is a profile in [0, 1] of its film_thickness, held there: the body's T-bar rows
@@ -307,21 +307,6 @@ inline double coatTbarAt(const Material& st, double thickness, double lambda) {
     return a + (b - a) * (x - (double)r);
 }
 
-// LAYERED-MODES (b): what the coat of the layered material `st` gives a LAMBERTIAN body's lobe under it
-// on a direction `w` other than the one its walk met the coat by -- the light's way out to w, or in
-// from it -- as a multiple of the average the body's albedo already holds: (1 - R(w)) / T-bar, both at
-// the film's thickness here. Its mean over the hemisphere with the cosine is 1. 1 for a coat with no
-// table. Named by the stack for a compound's deposit, made before its pick and shared by every body
-// under it (only a Lambertian lobe gathers).
-inline double coatStackS(const Scene& scene, const Material& st, const Hit& h, const Vec3& w,
-                         double lambda) {
-    if (st.coatTbar.empty()) return 1.0;
-    const double th = coatThickness(scene, st, h);
-    const double tb = coatTbarAt(st, th, lambda);
-    if (!(tb > 0.0)) return 0.0;
-    return (1.0 - coatRDir(st, h, w, th, lambda)) / tb;
-}
-
 // The coat's reflectance for the pair `wa`, `wb` at `h`, both pointing away from the surface: its
 // Fresnel (or thin-film) term at their half vector, as a microfacet coat's is -- symmetric in the
 // pair, so the coat's reflection is reciprocal. `thickness`: coatThickness.
@@ -337,21 +322,9 @@ inline double coatSheenR(const Scene& scene, const Material& st, const Hit& h, c
                          const Vec3& wb, double lambda) {
     return coatPairR(st, wa, wb, coatThickness(scene, st, h), lambda);
 }
-// What a walk's coat reflection is weighed by: the coin took it with R at the walk's arrival (`wa`,
-// toward the previous vertex), and the coat reflects the pair with coatSheenR. Large where R at the
-// arrival is near 0 and the pair's is not (an anti-reflection film), but the coin takes those as rarely
-// as R is small: on a rough quarter-wave film the frames spread no more than a Fresnel coat's
-// (known-issues COAT-AR-VARIANCE).
-inline double coatSheenRatio(const Scene& scene, const Material& st, const Hit& h, const Vec3& wa,
-                             const Vec3& wb, double lambda) {
-    if (st.coatModel == 2) return 1.0;
-    const double th = coatThickness(scene, st, h);
-    const double ra = coatRDir(st, h, wa, th, lambda);
-    return (ra > 0.0) ? coatPairR(st, wa, wb, th, lambda) / ra : 0.0;
-}
 // A body copy whose light leaves in every direction (a Lambertian lobe, a translucent pair, a
 // fluorescent's), whose albedo therefore holds the coat's AVERAGE escape: its lobe takes the
-// angular escape over it (coatStackS). Any other body leaves near the mirror of its arrival
+// angular escape over it (CoatEval's Lambert case). Any other body leaves near the mirror of its arrival
 // (glossy, mirror) and its albedo holds that angle's escape, so it takes the geometric mean of the
 // two transmissions over the arrival's, sqrt(T(out) / T(in)): with the coin's T(in), sqrt(T(in)
 // T(out)) -- reciprocal, and exactly the coin's T for a mirror body, which returns what a smooth coat
@@ -362,7 +335,7 @@ inline bool coatLambertBody(const Material& m) {
 }
 // The coat's factor on the lobe of `m` at `h`, for a walk that arrived from `wa` (toward the
 // previous vertex) and leaves or connects along `wb`: a body copy's way out, a coat copy's
-// reciprocal reflection (coatSheenRatio), 1 for anything else (coatAny false: no coat, or a manual
+// reciprocal reflection over the coin's R, 1 for anything else (coatAny false: no coat, or a manual
 // one, whose factor is 1). The coat is on both faces of the body, as the coin takes it, so a
 // transmit lobe's way out through the far face takes it too. (A dielectric body under a coat is
 // refused at load: thinfilm and multilayer are that.)
@@ -381,7 +354,7 @@ struct CoatEval {
     double cB = 1.0;                // the way out's (Lambert, Directional); the pair's half vector's (Sheen)
     double at(double lambda) const {
         switch (kind) {
-            case Lambert: {                              // (1 - R(out)) / T-bar: coatStackS
+            case Lambert: {                              // (1 - R(out)) / T-bar
                 const double tb = coatTbarAt(*st, th, lambda);
                 return (tb > 0.0) ? (1.0 - coatRAtCos(*st, cB, th, lambda)) / tb : 0.0;
             }
@@ -389,7 +362,7 @@ struct CoatEval {
                 const double ta = 1.0 - coatRAtCos(*st, cA, th, lambda);
                 return (ta > 0.0) ? std::sqrt((1.0 - coatRAtCos(*st, cB, th, lambda)) / ta) : 0.0;
             }
-            case Sheen: {                                // F(h) / R(in): coatSheenRatio
+            case Sheen: {                                // F(h) / R(in)
                 const double ra = coatRAtCos(*st, cA, th, lambda);
                 return (ra > 0.0) ? coatRAtCos(*st, cB, th, lambda) / ra : 0.0;
             }
@@ -398,32 +371,44 @@ struct CoatEval {
         }
     }
 };
+// The factor's two cases, by the layered material `st` itself. coatEvalStack: a body under st's coat
+// (`lambert`: a Lambertian-like body, coatLambertBody), also what a compound's deposit takes, made
+// before its pick and shared by every body under it (only a Lambertian lobe gathers; then wa is
+// unused). coatEvalSheen: st's coat reflection, for a walk that took it -- weighed by F(h) / R(wa),
+// large where R at the arrival is near 0 and the pair's is not (an anti-reflection film), but the coin
+// takes those as rarely as R is small: on a rough quarter-wave film the frames spread no more than a
+// Fresnel coat's (known-issues COAT-AR-VARIANCE).
+inline CoatEval coatEvalStack(const Scene& scene, const Material& st, const Hit& h, const Vec3& wa,
+                              const Vec3& wb, bool lambert) {
+    CoatEval c;
+    if (lambert ? st.coatTbar.empty() : st.coatModel == 2) return c;
+    c.kind = lambert ? CoatEval::Lambert : CoatEval::Directional;
+    c.st = &st;
+    c.th = coatThickness(scene, st, h);
+    c.cA = clamp01(std::fabs(dot(wa, h.n)));
+    c.cB = clamp01(std::fabs(dot(wb, h.n)));
+    return c;
+}
+inline CoatEval coatEvalSheen(const Scene& scene, const Material& st, const Hit& h, const Vec3& wa,
+                              const Vec3& wb) {
+    CoatEval c;
+    if (st.coatModel == 2) return c;
+    c.st = &st;
+    c.th = coatThickness(scene, st, h);
+    const Vec3 hv = wa + wb;
+    const double l = length(hv);
+    if (!(l > 0.0)) { c.kind = CoatEval::Zero; return c; }
+    c.kind = CoatEval::Sheen;
+    c.cA = clamp01(std::fabs(dot(wa, h.n)));
+    c.cB = clamp01(std::fabs(dot(wa, hv)) / l);
+    return c;
+}
 inline CoatEval coatEval(const Scene& scene, const Material& m, const Hit& h, const Vec3& wa,
                          const Vec3& wb) {
-    CoatEval c;
-    if (m.coatStack >= 0) {
-        const Material& st = scene.mats[(size_t)m.coatStack];
-        if (coatLambertBody(m) ? st.coatTbar.empty() : st.coatModel == 2) return c;
-        c.kind = coatLambertBody(m) ? CoatEval::Lambert : CoatEval::Directional;
-        c.st = &st;
-        c.th = coatThickness(scene, st, h);
-        c.cA = clamp01(std::fabs(dot(wa, h.n)));
-        c.cB = clamp01(std::fabs(dot(wb, h.n)));
-        return c;
-    }
-    if (m.coatParent >= 0) {
-        const Material& st = scene.mats[(size_t)m.coatParent];
-        if (st.coatModel == 2) return c;
-        c.st = &st;
-        c.th = coatThickness(scene, st, h);
-        const Vec3 hv = wa + wb;
-        const double l = length(hv);
-        if (!(l > 0.0)) { c.kind = CoatEval::Zero; return c; }
-        c.kind = CoatEval::Sheen;
-        c.cA = clamp01(std::fabs(dot(wa, h.n)));
-        c.cB = clamp01(std::fabs(dot(wa, hv)) / l);
-    }
-    return c;
+    if (m.coatStack >= 0)
+        return coatEvalStack(scene, scene.mats[(size_t)m.coatStack], h, wa, wb, coatLambertBody(m));
+    if (m.coatParent >= 0) return coatEvalSheen(scene, scene.mats[(size_t)m.coatParent], h, wa, wb);
+    return CoatEval{};
 }
 inline double coatF(const Scene& scene, const Material& m, const Hit& h, const Vec3& wa,
                     const Vec3& wb, double lambda) {
@@ -3918,8 +3903,9 @@ struct Renderer {
             if (compoundDeposit) {
                 double w = compoundDepositWeight(h, ray.d * -1.0, bounce == 0, beta);
                 // A layered surface's photon is gathered by a body under its coat, whose walk
-                // takes the coat at its own arrival: the photon's way in is the other (coatStackS).
-                if (matp->type == MatType::Layered) w *= coatStackS(scene, *matp, h, ray.d * -1.0, lambda);
+                // takes the coat at its own arrival: the photon's way in is the other (coatEvalStack).
+                if (matp->type == MatType::Layered)
+                    w *= coatEvalStack(scene, *matp, h, ray.d * -1.0, ray.d * -1.0, true).at(lambda);
                 if (w > 0.0) depositPhoton(h.p, orientedGeoN(h), lambda, w, sawFocus && !sawScatter);
             }
             // Layered (coat over body): split the photon at the interface BEFORE the
@@ -3962,8 +3948,8 @@ struct Renderer {
                     bool msC = false;
                     Vec3 o = ggx::drawRough(h.n, ray.d * -1.0, cr, coatMs(cm), rng, wC, &msC);
                     if (dot(o, h.n) <= 0) { e.absorbed += beta; return; }
-                    {   // the reciprocal coat's reflection over the coin's R (coatSheenRatio)
-                        const double c = coatSheenRatio(scene, cm, h, ray.d * -1.0, o, lambda);
+                    {   // the reciprocal coat's reflection over the coin's R (coatEvalSheen)
+                        const double c = coatEvalSheen(scene, cm, h, ray.d * -1.0, o).at(lambda);
                         e.absorbed += beta * (1.0 - c);
                         beta *= c;
                     }
@@ -4545,11 +4531,11 @@ struct Renderer {
                 const Vec3 ngoC = orientedGeoN(h);
                 const double w1 = compoundDepositWeight(h, ray.d * -1.0, bounce == 0, 1.0);
                 const bool lay = matp->type == MatType::Layered;   // the coat's way in (scalar twin)
+                const CoatEval ceD = lay ? coatEvalStack(scene, *matp, h, ray.d * -1.0, ray.d * -1.0, true)
+                                         : CoatEval{};
                 if (w1 > 0.0)
                     for (int i = 0; i < nUp; ++i)
-                        depositPhoton(h.p, ngoC, lam[i],
-                                      beta[i] * w1 * (lay ? coatStackS(scene, *matp, h, ray.d * -1.0, lam[i]) : 1.0),
-                                      caus);
+                        depositPhoton(h.p, ngoC, lam[i], beta[i] * w1 * (lay ? ceD.at(lam[i]) : 1.0), caus);
             }
             // Layered coat. The coat interface is NOT dispersive in DIRECTION -- the sheen is
             // a glossy lobe about the mirror direction and the body-lobe pick is a material
@@ -4593,8 +4579,9 @@ struct Renderer {
                     bool msC = false;
                     Vec3 o = ggx::drawRough(h.n, ray.d * -1.0, cr, coatMs(cm), rng, wC, &msC);
                     if (dot(o, h.n) <= 0) { e.absorbed += activeSum(); return; }
+                    const CoatEval ceS = coatEvalSheen(scene, cm, h, ray.d * -1.0, o);
                     for (int i = 0; i < nUp; ++i) {   // the reciprocal coat's reflection (scalar twin)
-                        const double c = coatSheenRatio(scene, cm, h, ray.d * -1.0, o, lam[i]);
+                        const double c = ceS.at(lam[i]);
                         e.absorbed += beta[i] * (1.0 - c);
                         beta[i] *= c;
                     }

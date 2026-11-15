@@ -2078,7 +2078,7 @@ apart. The coat is reciprocal now, on both of its lobes:
   symmetric (`render.h coatF`, device `dCoatF`). A Lambertian-like body (diffuse, translucent,
   fluorescent: `coatLambertBody`) sends its light everywhere, and its albedo holds the coat's
   averaged escape (`coatedAlbedo`'s 1 - F_dr = T-bar / n^2, T-bar T's cosine-weighted mean, a table
-  by nm per layered material, `Material::coatTbar`): it takes T(out) / T-bar (`coatStackS`), with the
+  by nm per layered material, `Material::coatTbar`): it takes T(out) / T-bar (`coatEvalStack`), with the
   coin T(in) T(out) / T-bar, the physical clear coat with the same energy. T-bar is read at the film's
   thickness at the hit: a thin film whose thickness a map varies holds rows of it across the map's 0..1
   profile, eight to the reflectance's period in the thickness at the shortest wavelength, interpolated
@@ -2097,7 +2097,7 @@ apart. The coat is reciprocal now, on both of its lobes:
 * **The coat's reflection is reciprocal.** The coin weighs it with R at the arrival, which differs
   from R at the other end wherever a rough lobe turns the light; the coat reflects a pair with its
   Fresnel (or thin-film) term at their half vector (`coatPairR`, as a microfacet coat does), so a
-  walk's coat reflection is weighed by `coatSheenRatio` = F(h) / R(arrival), and the forward sheen
+  walk's coat reflection is weighed by `coatEvalSheen` = F(h) / R(arrival), and the forward sheen
   splat (`GlossySplat::stack`) takes F(h) itself. The coat's angles are read at the SHADING normal
   (`coatRDir`), so a smooth coat's mirror pair -- reflected about the shading normal -- has the ratio
   1 on a normal-mapped surface too. The coat copy names its stack (`Material::coatParent`).
@@ -2110,7 +2110,7 @@ apart. The coat is reciprocal now, on both of its lobes:
   (`GiCtx::coat`), M's and S's (`coatGi`) -- and `CoatSplat` (with the scene and hit) for the forward
   splats, which take it as an argument as `GlossySplat` is taken (device `DCoatCtx`/`DCoatSplat`).
   D, J and U take `coatF` at each connection's ends and at the merges. A photon map keeps no
-  directions, so a layered surface's compound deposit takes `coatStackS` of the photon's arrival (only
+  directions, so a layered surface's compound deposit takes `coatEvalStack` of the photon's arrival (only
   a Lambertian lobe gathers), and the gather's camera walk takes the coin at its own; a J/U light
   vertex, stored before its pick too (COMPOUND-MERGE-PICK), takes it at the merge, on the camera
   vertex's material and arrival. A final gather takes the visible point's factor on each gather ray

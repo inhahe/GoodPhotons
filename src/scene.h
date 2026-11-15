@@ -477,7 +477,7 @@ struct Material {
     int    coatStack    = -1;
     // On the coat copy of a layered material (its coatChild): that layered material, else -1 (a
     // manual coat's too). A walk that takes the coat by the coin weighs its reflection by render.h
-    // coatSheenRatio.
+    // coatEvalSheen.
     int    coatParent   = -1;
     // The coat copy of a layered material (its coatChild), manual or not: a lobe whose reflectance the
     // coat's Fresnel term at the pair's half vector sets, so it adds no multiple scattering

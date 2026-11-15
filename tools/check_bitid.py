@@ -22,7 +22,11 @@ a few samples:
            height by mesh_instance (its interpolated normals turned across its faces' planes),
            lit from above and from below;
   shapes   curve tubes and an isosurface under a pattern.
-And one scene with modes of its own (SCENE_MODES):
+And scenes with modes of their own (SCENE_MODES):
+  coated   `layered` spheres: a rough Fresnel coat over a diffuse body, a rough thin-film coat over a
+           glossy one, a manual coat, and a stochastic coat over a glossy body -- the coat's sheen
+           draws, its factors on the body and the compound deposits -- in MODES and mode W, whose
+           Whitted walk takes the coat its own way.
   fog      a heterogeneous coloured fog in a grey box, in mode J only. On the CPU at 256 spp and
            -beamrefresh 0.5: several light-side epochs, whose layout on the CPU follows work
            counts (workcount.h), with the merges' transmittance estimates drawing from the
@@ -68,6 +72,8 @@ MODES = [  # (tag, ftrace arguments)
 ]
 # Scenes rendered in modes of their own rather than in MODES.
 SCENE_MODES = {
+    "coated": MODES + [("W_cpu", ["-mode", "W", "-spp", "4", "-device", "cpu"]),
+                       ("W_gpu", ["-mode", "W", "-spp", "4", "-device", "gpu"])],
     "fog": [("J_cpu", ["-mode", "J", "-spp", "256", "-device", "cpu", "-nojsurf",
                        "-beamcount", "100000", "-beamk", "2", "-beamrefresh", "0.5",
                        "-max-bounce", "8"]),
@@ -178,6 +184,19 @@ def scenes(out):
             'curve { material tube  basis linear  radius 0.06  point -1.2 0.1 0  point -0.6 1.2 -0.4  point 0 0.3 -0.8 }\n'
             'curve { material tube  basis linear  radius 0.04  point 0.2 0.1 0.6  point 0.8 1.0 0.2 }\n'
             'isosurface { material iso  sphere { center 0.9 0.5 -0.6  radius 0.45 } }\n') + room + lamp + cam,
+        "coated": "scene { units meters }\n" + mats + (
+            'material "gloss" { type glossy reflect 0.8  roughness 0.25 }\n'
+            'material "paint" { type layered  ior 1.5  coat { roughness 0.2 }  layer "red" 1.0 }\n'
+            'material "film"  { type layered  ior 1.5  coat { reflectance thinfilm  film_ior 1.33'
+            '  film_thickness 380  roughness 0.1 }  layer "gloss" 1.0 }\n'
+            'material "manual" { type layered  ior 1.5  coat { reflectance manual  specular 0.3'
+            '  roughness 0.3 }  layer "white" 1.0 }\n'
+            'material "stoch" { type layered  ior 1.5  coat { scatter stochastic  roughness 0.05 }'
+            '  layer "gloss" 1.0 }\n'
+            'sphere { center -1.1 0.4 -0.4  radius 0.4  material paint }\n'
+            'sphere { center -0.2 0.4 -0.6  radius 0.4  material film }\n'
+            'sphere { center 0.7 0.4 -0.4  radius 0.4  material manual }\n'
+            'sphere { center 0.3 0.3 0.6  radius 0.3  material stoch }\n') + room + lamp + cam,
         "fog": (
             'scene { units meters  spectral 360 830 1 }\n'
             'material "grey" { type diffuse reflect 0.6 }\n'
@@ -262,6 +281,7 @@ def main():
     ap.add_argument("--before")
     ap.add_argument("--after", default=os.path.join(ROOT, "ftrace.exe"))
     ap.add_argument("--tol", type=float, default=0.0)
+    ap.add_argument("--scenes", default="", help="comma-separated scene names: only these")
     a = ap.parse_args()
     out = os.path.abspath(a.out)
     os.makedirs(out, exist_ok=True)
@@ -269,6 +289,12 @@ def main():
     def log(s):
         print(s, flush=True)
     paths = scenes(out)
+    if a.scenes:
+        want = a.scenes.split(",")
+        unknown = [w for w in want if w not in paths]
+        if unknown:
+            ap.error("no such scene: " + ", ".join(unknown))
+        paths = {k: v for k, v in paths.items() if k in want}
     if a.what == "render":
         if len(a.labels) != 1:
             ap.error("render takes one label")

@@ -6405,24 +6405,11 @@ __device__ static double dCoatTbarAt(const DScene& sc, const DMaterial& st, Real
     const double b = sc.coatTbar[st.coatTbarOff + (r + 1) * nL + l];
     return a + (b - a) * (x - (double)r);
 }
-// LAYERED-MODES (b), host twin render.h coatStackS: what the coat of the layered material `st` gives a
-// LAMBERTIAN body's lobe on a direction `w` other than its walk's arrival (the coin took that),
-// (1 - R(w)) / T-bar, both at the film's thickness here.
-__device__ static double dCoatStackS(const DScene& sc, const DMaterial& st, const DHit& h,
-                                     const DVec3& w, Real lambda) {
-    if (st.coatTbarOff < 0 || !sc.coatTbar) return 1.0;
-    double cosI = 1.0; Real th = (Real)0;
-    const double r = dLayeredCoatReflectance(sc, st, h, w, lambda, &cosI, &th);
-    const double tb = dCoatTbarAt(sc, st, th, lambda);
-    if (!(tb > 0.0)) return 0.0;
-    return (1.0 - r) / tb;
-}
-// Host twins render.h coatPairR / coatSheenR / coatSheenRatio / coatLambertBody / coatF: the coat's
+// Host twins render.h coatPairR / coatSheenR / coatLambertBody / CoatEval / coatF: the coat's
 // reciprocal reflectance for a pair (its Fresnel or thin-film term at their half vector, given the
-// film's thickness `th`); a walk's coat reflection weighed by it over the coin's R at the arrival
-// `wa`; and the coat's factor on a vertex's lobe -- a Lambertian body's way out over the averaged
-// escape, a directional body's sqrt(T(out) / T(in)), a coat lobe's reflection -- for a walk that
-// arrived from `wa` and leaves along `wb`.
+// film's thickness `th`); and the coat's factor on a vertex's lobe -- a Lambertian body's way out
+// over the averaged escape, a directional body's sqrt(T(out) / T(in)), a coat lobe's reflection
+// over the coin's R at the arrival -- for a walk that arrived from `wa` and leaves along `wb`.
 __device__ static double dCoatPairR(const DMaterial& st, const DVec3& wa, const DVec3& wb, Real th,
                                     Real lambda) {
     if (st.coatModel == 2) return (double)clamp01((Real)st.coatSpecular);
@@ -6473,34 +6460,41 @@ __device__ static inline double dCoatCos(const DVec3& a, const DVec3& b) {
     const double c = fabs((double)dot(a, b));
     return c > 1.0 ? 1.0 : c;
 }
+// Host twins render.h coatEvalStack / coatEvalSheen / coatEval: the factor's two cases by the layered
+// material `st` itself (a body under its coat, `lambert` for a Lambertian-like one -- also what a
+// compound's deposit takes, wa unused then; its coat's reflection), and the dispatch by the vertex's
+// material.
+__device__ static DCoatEval dCoatEvalStack(const DScene& sc, const DMaterial& st, const DHit& h,
+                                           const DVec3& wa, const DVec3& wb, bool lambert) {
+    DCoatEval c;
+    if (lambert ? (st.coatTbarOff < 0 || !sc.coatTbar) : st.coatModel == 2) return c;
+    c.kind = lambert ? 1 : 2;
+    c.st = &st; c.sc = &sc;
+    c.th = dCoatThickness(sc, st, h);
+    c.cA = dCoatCos(h.n, wa);
+    c.cB = dCoatCos(h.n, wb);
+    return c;
+}
+__device__ static DCoatEval dCoatEvalSheen(const DScene& sc, const DMaterial& st, const DHit& h,
+                                           const DVec3& wa, const DVec3& wb) {
+    DCoatEval c;
+    if (st.coatModel == 2) return c;
+    c.st = &st; c.sc = &sc;
+    c.th = dCoatThickness(sc, st, h);
+    const DVec3 hv = wa + wb;
+    const double l = (double)length(hv);
+    if (!(l > 0.0)) { c.kind = 4; return c; }
+    c.kind = 3;
+    c.cA = dCoatCos(h.n, wa);
+    double cD = fabs((double)dot(wa, hv)) / l;
+    c.cB = cD > 1.0 ? 1.0 : cD;
+    return c;
+}
 __device__ static DCoatEval dCoatEval(const DScene& sc, const DMaterial& m, const DHit& h,
                                       const DVec3& wa, const DVec3& wb) {
-    DCoatEval c;
-    if (m.coatStack >= 0) {
-        const DMaterial& st = sc.mats[m.coatStack];
-        const bool lam = dCoatLambertBody(m);
-        if (lam ? (st.coatTbarOff < 0 || !sc.coatTbar) : st.coatModel == 2) return c;
-        c.kind = lam ? 1 : 2;
-        c.st = &st; c.sc = &sc;
-        c.th = dCoatThickness(sc, st, h);
-        c.cA = dCoatCos(h.n, wa);
-        c.cB = dCoatCos(h.n, wb);
-        return c;
-    }
-    if (m.coatParent >= 0) {
-        const DMaterial& st = sc.mats[m.coatParent];
-        if (st.coatModel == 2) return c;
-        c.st = &st; c.sc = &sc;
-        c.th = dCoatThickness(sc, st, h);
-        const DVec3 hv = wa + wb;
-        const double l = (double)length(hv);
-        if (!(l > 0.0)) { c.kind = 4; return c; }
-        c.kind = 3;
-        c.cA = dCoatCos(h.n, wa);
-        double cD = fabs((double)dot(wa, hv)) / l;
-        c.cB = cD > 1.0 ? 1.0 : cD;
-    }
-    return c;
+    if (m.coatStack >= 0) return dCoatEvalStack(sc, sc.mats[m.coatStack], h, wa, wb, dCoatLambertBody(m));
+    if (m.coatParent >= 0) return dCoatEvalSheen(sc, sc.mats[m.coatParent], h, wa, wb);
+    return DCoatEval{};
 }
 __device__ static double dCoatF(const DScene& sc, const DMaterial& m, const DHit& h, const DVec3& wa,
                                 const DVec3& wb, Real lambda) {
@@ -13208,8 +13202,8 @@ __device__ static int shadeStep(const DScene& sc, const DCamSet& cs,
     const bool compoundDeposit = dCompoundGathers(sc, *mptr, h.fiberRadius);
     if (compoundDeposit) {
         Real w = dCompoundDepositWeight(h, -rd, firstHit, beta);
-        // a layered surface's photon: its way in through the coat (host twin coatStackS)
-        if (mptr->type == D_LAYERED) w *= (Real)dCoatStackS(sc, *mptr, h, -rd, lambda);
+        // a layered surface's photon: its way in through the coat (host twin coatEvalStack)
+        if (mptr->type == D_LAYERED) w *= (Real)dCoatEvalStack(sc, *mptr, h, -rd, -rd, true).at(lambda);
         if (w > (Real)0) depositPhoton(cs, h.p, dShadedNg(h), w, lambda, dPathIsCaustic(pathC), dPathCausticW(pathC));
     }
     // A layered stack's coat sheen splats here, whichever lobe the pick below takes (host twin
@@ -13653,10 +13647,11 @@ __device__ static int shadeStepHero(const DScene& sc, const DCamSet& cs, int cam
         const DVec3 ngoC = dShadedNg(h);
         const Real w1 = dCompoundDepositWeight(h, -rd, firstHit, (Real)1);
         const bool lay = mptr->type == D_LAYERED;   // the coat's way in (scalar twin)
+        const DCoatEval ceD = lay ? dCoatEvalStack(sc, *mptr, h, -rd, -rd, true) : DCoatEval{};
         if (w1 > (Real)0)
             for (int i = 0; i < nUp; ++i)
                 depositPhoton(cs, h.p, ngoC,
-                              beta[i] * w1 * (lay ? (Real)dCoatStackS(sc, *mptr, h, -rd, lam[i]) : (Real)1),
+                              beta[i] * w1 * (lay ? (Real)ceD.at(lam[i]) : (Real)1),
                               lam[i], caus, cw);
     }
     // The coat's sheen, over the bundle, before its pick (scalar twin).

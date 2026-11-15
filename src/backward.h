@@ -3069,7 +3069,7 @@ struct BackwardRenderer {
                                                   coatMs(cm), gi.sIdx, b, wC);
                         if (dot(o, h.n) <= 0) return L;
                         // reciprocal, and the coat lobe's masking
-                        thr *= coatSheenRatio(scene, cm, h, ray.d * -1.0, o, lambda) * wC;
+                        thr *= coatEvalSheen(scene, cm, h, ray.d * -1.0, o).at(lambda) * wC;
                         if (!continueAlong(h, o, Lobe::Reflect, ray)) return L;
                         specularArrival = true;
                         gmis.clear();      // the sheen does no NEE: its arrival is unweighted
@@ -3086,9 +3086,9 @@ struct BackwardRenderer {
                     double wC;
                     Vec3 o = ggx::drawRough(h.n, ray.d * -1.0, materialRoughness(scene, cm, h), coatMs(cm), rng, wC);
                     if (dot(o, h.n) <= 0) return L;
-                    // the reciprocal coat's reflection over the coin's R (render.h coatSheenRatio),
+                    // the reciprocal coat's reflection over the coin's R (render.h coatEvalSheen),
                     // and the coat lobe's masking
-                    thr *= coatSheenRatio(scene, cm, h, ray.d * -1.0, o, lambda) * wC;
+                    thr *= coatEvalSheen(scene, cm, h, ray.d * -1.0, o).at(lambda) * wC;
                     if (!continueAlong(h, o, Lobe::Reflect, ray)) return L;
                     specularArrival = true;
                     // The sheen does no NEE, so what it reaches counts at full weight: an earlier
@@ -3612,8 +3612,9 @@ struct BackwardRenderer {
                     Vec3 o = whitted ? whittedGlossyDir(h.n, ray.d * -1.0, cr, coatMs(cm), gi.sIdx, b, wC)
                                      : ggx::drawRough(h.n, ray.d * -1.0, cr, coatMs(cm), rng, wC);
                     if (dot(o, h.n) <= 0) { finish(); return; }
+                    const CoatEval ceS = coatEvalSheen(scene, cm, h, ray.d * -1.0, o);
                     for (int i = 0; i < nUp; ++i)    // the reciprocal coat's reflection (scalar twin)
-                        thr[i] *= coatSheenRatio(scene, cm, h, ray.d * -1.0, o, lam[i]) * wC;
+                        thr[i] *= ceS.at(lam[i]) * wC;
                     if (!continueAlong(h, o, Lobe::Reflect, ray)) { finish(); return; }
                     specularArrival = true;
                     gmis.clear();                // no NEE here: see the scalar twin
