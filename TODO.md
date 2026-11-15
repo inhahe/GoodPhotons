@@ -359,9 +359,8 @@ Then the rest of 4.2-4.6 in their order, 4.7's bookkeeping alongside whatever to
 - [x] **S-IRID-SPHERES** (0.445.1) — no bias: the studies scored two seeds through a `stats()` that
   read only its first two images; over every seed S holds R within 2 sigma. check_rough_irid's
   `stats()` takes every seed, and mode S runs eight.
-- [ ] **POV-FMOD-INT** — `pov_functions.h` `f_hex_x` / `f_hex_y` call `fmod(double, 3)`, MSVC's
-  host-only template overload, from device code (nvcc warning 20011); fix with `3.0` and check the
-  GPU against the CPU on a hex function.
+- [x] **POV-FMOD-INT** (0.445.2) — `f_hex_x` / `f_hex_y` were flat on the GPU (MSVC's host-only
+  `fmod<double, int>` in device code); `3.0` takes the double overload on both.
 - [ ] **SPECGATHER-BIN-RESOLUTION** — mode M's 24-bin carrier misreads a spectral edge or kink inside
   a bin; the 555-585 nm ramp's green excess is unexplained.
 - [x] **SPPM-SPECTRAL** (0.432.0) — mode S's visible point carries its walk's spectral factors per

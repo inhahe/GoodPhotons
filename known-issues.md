@@ -193,15 +193,17 @@ use for the device: it should release its device scene, films and queues (and th
 when the render ends, keeping the host image the window shows. Until then, stop a held render
 before starting another GPU one.
 
-## OPEN (2026-11-14, 0.445.1): POV-FMOD-INT — `f_hex_x` / `f_hex_y` call a host-only `fmod` from device code
+## DONE (2026-11-14, 0.445.2): POV-FMOD-INT — `f_hex_x` / `f_hex_y` were flat on the GPU: a host-only `fmod` in device code
 
-Every CUDA build warns (#20011) that `povFnEval` (`src/pov_functions.h`, host and device) calls
+Every CUDA build warned (#20011) that `povFnEval` (`src/pov_functions.h`, host and device) called
 `std::fmod<double, int>` from a `__host__ __device__` function, at its cases 27 and 28 (`f_hex_x`,
-`f_hex_y`): `fmod(fabs(PARAM_Y), 3)` passes an int, so overload resolution picks MSVC's `<cmath>`
-template for mixed arguments, which has no device version. What the device then runs there is not
-the CPU's function. **Fix:** `3.0`, so the double overload is taken on both sides; then render a hex
-`function` isosurface on both devices and compare. The same build warns that `y2` is set and never read
-in two of the file's cases (#550, 534 and 755): read them or drop them.
+`f_hex_y`): `fmod(fabs(PARAM_Y), 3)` passed an int, so overload resolution took MSVC's `<cmath>`
+template for mixed arguments, which has no device version. **On the GPU the functions never made their
+pattern:** a floor reflecting `0.15 + 0.7 saturate(f_hex_x(5x, 5z, 0, 0)) + ...` (`scraps/_hex_test.ftsl`)
+rendered its hexagons on the CPU and a flat grey on the GPU, 0.26 of the CPU's mean. **Fixed:** `3.0`,
+the double overload on both sides; the GPU's mean now equals the CPU's (0.000934) and the CPU render is
+bit-identical to before. The build's other warning in that file (#550, `y2` set but never read in
+cases 50 and 75, which `ROT2D` assigns: a verbatim POV port) is cosmetic.
 
 ## OPEN (2026-11-14, reopened 0.443.1; the fix of 0.442.2 reverted): J-THIN-GAP-LEAK — modes J and U light a surface with the light trapped a millimetre under it
 

@@ -329,7 +329,7 @@ POV_HD inline double povFnEval(int id, const double* _pp) {
     case 27: { // f_hex_x
     double x1,y1,x2,y2, th;
     x1=fabs(fmod(fabs(PARAM_X), sqrt(3.0))-sqrt(3.0)/2);
-    y1=fabs(fmod(fabs(PARAM_Y), 3)-1.5);
+    y1=fabs(fmod(fabs(PARAM_Y), 3.0)-1.5);   // 3.0: an int picks MSVC's host-only fmod<double, int>
     x2=sqrt(3.0)/2-x1;
     y2=1.5-y1;
     if ((x1*x1+y1*y1)>(x2*x2+y2*y2))
@@ -351,7 +351,7 @@ POV_HD inline double povFnEval(int id, const double* _pp) {
     case 28: { // f_hex_y
     double x1,y1,x2,y2, th;
     x1=fabs(fmod(fabs(PARAM_X), sqrt(3.0))-sqrt(3.0)/2);
-    y1=fabs(fmod(fabs(PARAM_Y), 3)-1.5);
+    y1=fabs(fmod(fabs(PARAM_Y), 3.0)-1.5);   // 3.0: an int picks MSVC's host-only fmod<double, int>
     x2=sqrt(3.0)/2-x1;
     y2=1.5-y1;
     if ((x1*x1+y1*y1)>(x2*x2+y2*y2))
