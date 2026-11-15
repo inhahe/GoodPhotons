@@ -828,8 +828,7 @@ inline Vec3 photonGatherSub(const Scene& scene, const PhotonMap& pm, Ray ray, Pc
                                      ? 1.0 / (a * (double)M.nEmitted) : 0.0;
                     }
                     // M-GATHERAREA: divide by the area actually gathered from, not by the whole
-                    // disc. `gatherAreaSamples() == 0` (the default) returns coverage 1 and
-                    // leaves nrmOut untouched, so every existing render is bit-identical.
+                    // disc; `-gatherarea 0` leaves nrmOut the whole disc's.
                     if (const int gaM = gatherAreaSamples())
                         nrmOut *= gatherAreaScale(
                             gatherCoverage(scene, h.p, gn, rq, slack, rng, gaM, h.matId,
@@ -1271,8 +1270,7 @@ inline Vec3 photonGather(const Scene& scene, const PhotonMap& pm, Ray ray, doubl
                                      ? 1.0 / (a * (double)M.nEmitted) : 0.0;
                     }
                     // M-GATHERAREA: divide by the area actually gathered from, not by the whole
-                    // disc. `gatherAreaSamples() == 0` (the default) returns coverage 1 and
-                    // leaves nrmOut untouched, so every existing render is bit-identical.
+                    // disc; `-gatherarea 0` leaves nrmOut the whole disc's.
                     if (const int gaM = gatherAreaSamples())
                         nrmOut *= gatherAreaScale(
                             gatherCoverage(scene, h.p, gn, rq, slack, rng, gaM, h.matId,

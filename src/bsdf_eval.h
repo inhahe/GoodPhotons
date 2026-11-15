@@ -62,6 +62,16 @@ inline bool isFiberMat(const Material& m) { return m.type == MatType::Hair; }
 inline bool storesMergeVertex(const Material& k) {
     return isConnectibleMat(k) && !isFiberMat(k) && !k.reflectsNothing;
 }
+// Whether the light walks of modes J and U leave merge vertices on a face of material `m`
+// (unresolved), a strand's when `fiberRadius` > 0: a lobe storesMergeVertex keeps, or a compound with
+// one (compoundMergeStoreProb stores whatever lobe the pick then takes), never on a strand, which no
+// merge gathers from (surfMergeSite; vcm.h). A glossy face holds them, as it holds no photon of mode
+// M's (holdsPhotons). The merge footprint's test (MergeFootprint). Device twin dHoldsMergeVertex.
+inline bool holdsMergeVertex(const Scene& scene, const Material& m, double fiberRadius) {
+    if (fiberRadius > 0.0) return false;
+    if (m.type == MatType::Mix || m.type == MatType::Layered) return compoundAnyKeeps(scene, m, storesMergeVertex);
+    return storesMergeVertex(m);
+}
 
 // --- Fiber (MatType::Hair) in a bidirectional estimator ---------------------------
 //

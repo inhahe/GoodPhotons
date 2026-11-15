@@ -8012,10 +8012,21 @@ __device__ static bool dHoldsPhotons(const DScene& sc, const DMaterial& m, Real 
         default:               return false;
     }
 }
-// Whether a footprint probe passes through a face of material `m` off a curve: one that holds no
-// photon, a hair fiber aside (host twin probePassesThrough, where the reasoning lives).
-__device__ static bool dProbePassesThrough(const DScene& sc, const DMaterial& m) {
-    return m.type != D_HAIR && !dHoldsPhotons(sc, m, (Real)0);
+// Whether the light walks of modes J and U leave merge vertices on a face of material `m` (host twin
+// holdsMergeVertex); defined with dCompoundMergeStoreProb.
+__device__ static bool dHoldsMergeVertex(const DScene& sc, const DMaterial& m, Real fiberRadius);
+// Which faces a footprint measures (host twin GatherHolds): mode M's and S's photons, or J's and U's
+// merge vertices.
+enum DGatherHolds { DGATHER_PHOTONS = 0, DGATHER_MERGES = 1 };
+__device__ static inline bool dGatherHoldsAt(const DScene& sc, const DMaterial& m, Real fiberRadius,
+                                             int holds) {
+    return holds == DGATHER_MERGES ? dHoldsMergeVertex(sc, m, fiberRadius) : dHoldsPhotons(sc, m, fiberRadius);
+}
+// Whether a footprint probe passes through a face of material `m` off a curve: one that holds none
+// of the gather's photons, a hair fiber aside (host twin probePassesThrough, where the reasoning
+// lives).
+__device__ static bool dProbePassesThrough(const DScene& sc, const DMaterial& m, int holds) {
+    return m.type != D_HAIR && !dGatherHoldsAt(sc, m, (Real)0, holds);
 }
 // Whether light crosses a face of material `m`, so a footprint probe passing it counts no crossing
 // (host twin passesLight, where the reasoning lives).
@@ -8086,9 +8097,11 @@ __device__ static DSegmentCrossings dWalkSegment(const DScene& sc, DVec3 o, cons
     return c;
 }
 
-// `slack`: the gather's plane-test slack (gatherBandSlack at its map's radius), its photon test's.
+// `slack`: the gather's plane-test slack (gatherBandSlack at its map's radius), its photon test's;
+// `holds`, the faces its photons lie on (DGatherHolds).
 __device__ static double dGatherCoverage(const DScene& sc, const DVec3& p, const DVec3& n,
-                                         Real r, Real slack, DRng& rng, int M, Real fiberR = (Real)0) {
+                                         Real r, Real slack, DRng& rng, int M, Real fiberR = (Real)0,
+                                         int holds = DGATHER_PHOTONS) {
     if (M <= 0 || !(r > (Real)0)) return 1.0;
     DVec3 t, b; onb(n, t, b);
     double area = 0.0;                       // in units of the full disc; 1.0 == fully covered
@@ -8155,7 +8168,7 @@ __device__ static double dGatherCoverage(const DScene& sc, const DVec3& p, const
                 const DMaterial& hm = sc.mats[h.matId];
                 // A strand that holds no photon, whatever its lobes: through the tube, for none of
                 // the sixteen faces (host twin).
-                if (h.fiberRadius > (Real)0 && hm.type != D_HAIR && !dHoldsPhotons(sc, hm, h.fiberRadius)) {
+                if (h.fiberRadius > (Real)0 && hm.type != D_HAIR && !dGatherHoldsAt(sc, hm, h.fiberRadius, holds)) {
                     if (skip < 48) ++skip;
                     tAcc = h.t; o = h.p; curveTmin = (Real)2.5 * h.fiberRadius;
                     continue;
@@ -8168,7 +8181,7 @@ __device__ static double dGatherCoverage(const DScene& sc, const DVec3& p, const
                     if (h.solid) lastSolid = ((h.solid > 0) == h.back) ? -1 : 1;   // leaving : entering
                     else ++crossed;
                 };
-                if (dProbePassesThrough(sc, hm) && r - h.t > fmaxf((Real)1e-3 * r, (Real)2 * RAY_EPS)) {
+                if (dProbePassesThrough(sc, hm, holds) && r - h.t > fmaxf((Real)1e-3 * r, (Real)2 * RAY_EPS)) {
                     cross();
                     tAcc = h.t; o = h.p; curveTmin = (Real)0;
                     continue;
@@ -8236,6 +8249,33 @@ __device__ static inline double dGatherAreaScale(int gaBias, double cov) {
     if (gaBias) return (cov > 0.0) ? 1.0 / cov : 1.0;
     return (cov >= 0.05) ? 1.0 / cov : 1.0;  // one stray probe must not become a firefly
 }
+
+// THE MERGE FOOTPRINT of modes J and U (host twin MergeFootprint, where the reasoning lives): the
+// camera vertex `p`, its true normal turned to the side it was reached from `n`, the merge radius
+// `r`, the band's slack (gatherBandSlack at that radius, the vertex's strand radius and its rounding
+// scale), the probes `M` (DScene::gatherArea; 0 off) and whether the lobe is two-sided.
+struct DMergeFootprint {
+    DVec3 p, n;
+    Real r, slack, fiberR;
+    int M;
+    bool twoSided;
+    __device__ DMergeFootprint(const DVec3& p_, const DVec3& n_, Real r_, Real slack_, Real fiberR_, int M_,
+                               bool twoSided_)
+        : p(p_), n(n_), r(r_), slack(slack_), fiberR(fiberR_), M(M_), twoSided(twoSided_) {}
+    __device__ bool on() const { return M > 0; }
+    // Whether the photon at `pp`, its surface's true normal on its light's side `pn`, `d2` = |pp - p|^2,
+    // lies on this surface. Every photon, the footprint off.
+    __device__ bool keeps(const DVec3& pp, const DVec3& pn, Real d2) const {
+        if (!on()) return true;
+        bool farSide;
+        return dOnGatherSurfaceSided(p, n, pp, pn, d2, slack, twoSided, farSide);
+    }
+    // What a nonzero merge sum is multiplied by, its probes drawn from `rng`; 1 off.
+    __device__ double scale(const DScene& sc, DRng& rng) const {
+        return on() ? dGatherAreaScale(sc.gaBias, dGatherCoverage(sc, p, n, r, slack, rng, M, fiberR, DGATHER_MERGES))
+                    : 1.0;
+    }
+};
 
 // A view-independent photon-map query structure on the device (device twin of PhotonMap
 // in photonmap.h): a uniform hash grid (cell size == gather radius) over cell-contiguous
@@ -14501,16 +14541,26 @@ __device__ static inline bool dLvConnects(int tp) {
 __device__ static inline bool dStoresMergeVertex(const DMaterial& m) {
     return dConnectibleType(m.type) && m.type != D_HAIR && !m.matReflectsNothing;
 }
+// Whether some lobe of the compound `m` (a mix's children, a stack's coat) would hold a merge vertex
+// (host twin compoundAnyKeeps).
+__device__ static bool dCompoundAnyMergeLobe(const DScene& sc, const DMaterial& m) {
+    bool any = m.type == D_LAYERED && m.coatChild >= 0 && dStoresMergeVertex(sc.mats[m.coatChild]);
+    for (int k = 0; k < m.mixCount; ++k)
+        any = any || (m.mixChild[k] >= 0 && dStoresMergeVertex(sc.mats[m.mixChild[k]]));
+    return any;
+}
+__device__ static bool dHoldsMergeVertex(const DScene& sc, const DMaterial& m, Real fiberRadius) {
+    if (fiberRadius > (Real)0) return false;
+    if (m.type == D_MIX || m.type == D_LAYERED) return dCompoundAnyMergeLobe(sc, m);
+    return dStoresMergeVertex(m);
+}
 // A light walk's merge vertex at the compound `m`, stored whatever lobe the pick takes: 1 over its
 // share, the chance the pick goes on (the coat with `coatR`); 0 when no lobe of `m` could hold one
 // (host twin compoundMergeStoreProb, COMPOUND-MERGE-PICK, where the reasoning lives).
 __device__ static double dCompoundMergeStoreProb(const DScene& sc, const DMaterial& m, double coatR) {
     if (m.type != D_MIX && m.type != D_LAYERED) return 1.0;
     const bool layered = m.type == D_LAYERED;
-    bool any = layered && m.coatChild >= 0 && dStoresMergeVertex(sc.mats[m.coatChild]);
-    for (int k = 0; k < m.mixCount; ++k)
-        any = any || (m.mixChild[k] >= 0 && dStoresMergeVertex(sc.mats[m.mixChild[k]]));
-    if (!any) return 0.0;
+    if (!dCompoundAnyMergeLobe(sc, m)) return 0.0;
     // dMixResolveChild's chance of a valid child: a slot naming none ends the walk as the leftover does.
     double body = 1.0;
     if (!((m.mixWeightPat >= 0 || m.mixWeightTex >= 0) && m.mixCount == 2 &&
@@ -20365,18 +20415,16 @@ struct DSurfQueue {
 // the host and a second transcription of it is a second chance to disagree.
 struct DSurfSite {
     int ix, iy, iz;
-    DVec3 ngo;
-    bool twoSided;
     double r2;
-    Real slack;   // the footprint's band (gatherBandSlack), for its photon test and its probe alike
-    __device__ DSurfSite(const DScene& sc, const DSurfMap& sm, const DVertex& vk) {
+    DMergeFootprint fp;   // its normal and sidedness (dMergeFromBehind's too), band and probes
+    __device__ DSurfSite(const DScene& sc, const DSurfMap& sm, const DVertex& vk)
+        : fp(vk.p, dVertexGeoN(vk), sm.radius,
+             gatherBandSlack<Real>(sm.radius, vk.fiberR, fmax(vk.pscale, (Real)dMaxAbs(vk.p))), vk.fiberR,
+             sc.gatherArea, dTwoSidedType(sc.mats[vk.matId].type)) {
         r2 = (double)sm.radius * (double)sm.radius;
-        slack = gatherBandSlack<Real>(sm.radius, vk.fiberR, fmax(vk.pscale, (Real)dMaxAbs(vk.p)));
         ix = (int)fmin(fmax(floor(((double)vk.p.x - (double)sm.lo.x) / (double)sm.cell), 0.0), (double)(sm.nx - 1));
         iy = (int)fmin(fmax(floor(((double)vk.p.y - (double)sm.lo.y) / (double)sm.cell), 0.0), (double)(sm.ny - 1));
         iz = (int)fmin(fmax(floor(((double)vk.p.z - (double)sm.lo.z) / (double)sm.cell), 0.0), (double)(sm.nz - 1));
-        ngo = dVertexGeoN(vk);
-        twoSided = dTwoSidedType(sc.mats[vk.matId].type);   // for dMergeFromBehind
     }
     // The dense index of the site's `n`-th neighbour cell (n in 0..26, dz outermost and dx
     // innermost, as the walk visits them), or -1 off the grid.
@@ -20396,19 +20444,14 @@ __device__ static inline void dSurfMergePhoton(const DScene& sc, const DSurfMap&
     const DSurfPhoton& ph = sm.pts[idx];
     const DVec3 dd{vk.p.x - ph.p.x, vk.p.y - ph.p.y, vk.p.z - ph.p.z};
     if (ddot(dd, dd) > site.r2) return;
-    if (dMergeFromBehind(site.twoSided, ph.wo, site.ngo)) return;   // host twin mergeFromBehind
-    if (sc.gatherArea) {   // the footprint: this surface's photons (host twin bdpt.h, surfmerge.h)
-        bool farSide;
-        if (!dOnGatherSurfaceSided(vk.p, site.ngo, ph.p, DVec3(ph.nx, ph.ny, ph.nz), (Real)ddot(dd, dd),
-                                   site.slack, site.twoSided, farSide))
-            return;
-    }
+    if (dMergeFromBehind(site.fp.twoSided, ph.wo, site.fp.n)) return;   // host twin mergeFromBehind
+    if (!site.fp.keeps(ph.p, DVec3(ph.nx, ph.ny, ph.nz), (Real)ddot(dd, dd))) return;   // this surface's
     const DSurfMis& lm = sm.mis[ph.misIdx];
     const Real lam = (Real)ph.lambda;
     // ...times a coated body's coat on the photon's way in: it was stored before its own pick.
     double fCam = dBsdfF(sc, vk, woCam, ph.wo, lam) * dVertCoatF(sc, vk, woCam, ph.wo, lam);
     if (!(fCam > 0.0)) return;
-    fCam *= dArrivalAdjointCorr(ph.wo, vk.ns, site.ngo);   // flux per geometric area -> R's shading
+    fCam *= dArrivalAdjointCorr(ph.wo, vk.ns, site.fp.n);   // flux per geometric area -> R's shading
     const double pdfDirRev = dBsdfPdf(sc, vk, woCam, ph.wo, lam);
     const double pdfDirFwd = dBsdfPdf(sc, vk, ph.wo, woCam, lam);
     const double w = sw(lm, pdfDirRev, pdfDirFwd, (double)lam);
@@ -20424,14 +20467,12 @@ __device__ static inline void dSurfMergePhoton(const DScene& sc, const DSurfMap&
     const double cf = w * fCam * (double)ph.beta * (js ? js->at((double)lam) : 1.0);   // JSPEC
     gX += (double)ph.cx * cf; gY += (double)ph.cy * cf; gZ += (double)ph.cz * cf;
 }
-// The footprint's scale for a merge at `vk` whose sum came out nonzero (host twin: bdpt.h's merge, which
-// probes off the walk's own stream): 1 / the share of the disc that is vk's surface. `seed` was drawn
-// from the walk's stream at the site, so the inline and the queued gather probe alike.
-__device__ static double dSurfFootprint(const DScene& sc, const DSurfMap& sm, const DVertex& vk,
-                                        const DSurfSite& site, unsigned long long seed) {
+// The footprint's scale for a merge at a site whose sum came out nonzero (DMergeFootprint::scale), its
+// probes off a stream of their own seeded by `seed`, which was drawn from the walk's stream at the site,
+// so the inline and the queued gather probe alike (the host probes off the walk's own stream).
+__device__ static double dSurfFootprint(const DScene& sc, const DSurfSite& site, unsigned long long seed) {
     DRng prng; prng.seedUnit(seed, 0x6A09E667F3BCC909ULL);
-    return dGatherAreaScale(sc.gaBias, dGatherCoverage(sc, vk.p, site.ngo, sm.radius, site.slack, prng,
-                                                       sc.gatherArea, vk.fiberR));
+    return site.fp.scale(sc, prng);
 }
 // One camera vertex's gather, by the thread that reached it (the inline path; kWfSurfGather is the
 // wavefront's, a warp a site). Returns the photons it weighed (g_dWork's count).
@@ -20501,7 +20542,7 @@ __global__ void kWfSurfGather(DScene sc, DSurfMap sm, DSurfQueue sq, int n, doub
             gZ += __shfl_down_sync(0xffffffffu, gZ, off);
         }
         if (lane == 0 && (gX != 0.0 || gY != 0.0 || gZ != 0.0)) {
-            const double fa = rq.f * (sc.gatherArea ? dSurfFootprint(sc, sm, rq.vk, site, rq.gaSeed) : 1.0);
+            const double fa = rq.f * (sc.gatherArea ? dSurfFootprint(sc, site, rq.gaSeed) : 1.0);
             atomicAdd(&camFilm[rq.pix + 0], gX * fa);
             atomicAdd(&camFilm[rq.pix + 1], gY * fa);
             atomicAdd(&camFilm[rq.pix + 2], gZ * fa);
@@ -21009,8 +21050,8 @@ kBdptT(DScene sc, const __grid_constant__ DCamera cam, double* camFilm, double* 
 
             // ---- POINT MERGES (`-jsurf`): the half folded in from mode U ------------------
             // Per VERTEX, not per segment -- a point merge happens where the camera walk
-            // actually landed, so there is no ray to march and no rng draw, which is also why
-            // "merges off == mode D bit-for-bit" survives this for free.
+            // actually landed. Its one ray-traced part is the footprint's probe, whose seed it draws
+            // from the walk's stream at every site with the footprint on (dSurfFootprint).
             if (kappaSurf > 0.0 && sm.nPts > 0 && (!routeOn || routeR == 1)) {
                 const double vmNorm = 1.0 / kappaSurf;
                 const int kEnd = (nE < maxDepth + 1) ? nE : maxDepth + 1;   // past it every merge is capped
@@ -21095,7 +21136,7 @@ kBdptT(DScene sc, const __grid_constant__ DCamera cam, double* camFilm, double* 
                     double gX = 0.0, gY = 0.0, gZ = 0.0;
                     work += (unsigned long long)dSurfMergeAt(sc, sm, vk, woCam, sw, gX, gY, gZ, vks);
                     if (gX != 0.0 || gY != 0.0 || gZ != 0.0) {
-                        const double fa = f * (sc.gatherArea ? dSurfFootprint(sc, sm, vk, DSurfSite(sc, sm, vk), gaSeed)
+                        const double fa = f * (sc.gatherArea ? dSurfFootprint(sc, DSurfSite(sc, sm, vk), gaSeed)
                                                              : 1.0);
                         atomicAdd(&camFilm[o + 0], gX * fa);
                         atomicAdd(&camFilm[o + 1], gY * fa);
@@ -23954,8 +23995,9 @@ __global__ void kVcmCameraT(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx
                     double r2 = ctx.radius * ctx.radius;
                     // The footprint (host twin vcm.h): this surface's light vertices over the share of
                     // the disc it covers, at one slack for the test and the probe.
-                    const Real gaSlack = gatherBandSlack<Real>((Real)ctx.radius, h.fiberRadius, dRoundScale(h));
-                    const bool camTwoSidedG = dTwoSidedType(mp->type);
+                    const DMergeFootprint fp(h.p, ngoCam, (Real)ctx.radius,
+                                             gatherBandSlack<Real>((Real)ctx.radius, h.fiberRadius, dRoundScale(h)),
+                                             h.fiberRadius, sc.gatherArea, dTwoSidedType(mp->type));
                     int ix = (int)floor(((double)h.p.x - grid.lo.x) / grid.cell);
                     int iy = (int)floor(((double)h.p.y - grid.lo.y) / grid.cell);
                     int iz = (int)floor(((double)h.p.z - grid.lo.z) / grid.cell);
@@ -23977,15 +24019,10 @@ __global__ void kVcmCameraT(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx
                               if (ddot(d, d) > r2) continue;
                               if (edges + lv.edges > ctx.maxDepth) continue;
                               DVec3 wMerge = lv.wo;
-                              if (dMergeFromBehind(dTwoSidedType(mp->type), wMerge, ngoCam))
+                              if (dMergeFromBehind(fp.twoSided, wMerge, ngoCam))
                                   continue;   // host twin mergeFromBehind
-                              if (sc.gatherArea) {   // its surface's true normal, to its light's side
-                                  const DVec3 pn = (dot(lv.ng, lv.wo) >= (Real)0) ? lv.ng : lv.ng * (Real)-1;
-                                  bool farSide;
-                                  if (!dOnGatherSurfaceSided(h.p, ngoCam, lv.p, pn, (Real)ddot(d, d), gaSlack,
-                                                             camTwoSidedG, farSide))
-                                      continue;
-                              }
+                              // its surface's true normal on its light's side (the hit's, host twin)
+                              if (!fp.keeps(lv.p, lv.back ? lv.ng * (Real)-1 : lv.ng, (Real)ddot(d, d))) continue;
                               Real lam = (Real)lv.lambda;
                               // A MERGE crosses paths, so the two ends carry DIFFERENT bundles
                               // and there is no shared λ set. The estimate therefore stays keyed
@@ -24042,9 +24079,7 @@ __global__ void kVcmCameraT(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx
                           }
                     }}}
                     double bn = (jsOn ? js.beta(beta) : beta) * ctx.vmNorm;
-                    if (sc.gatherArea && (mx != 0.0 || my != 0.0 || mz != 0.0))
-                        bn *= dGatherAreaScale(sc.gaBias, dGatherCoverage(sc, h.p, ngoCam, (Real)ctx.radius, gaSlack,
-                                                                          rng, sc.gatherArea, h.fiberRadius));
+                    if (mx != 0.0 || my != 0.0 || mz != 0.0) bn *= fp.scale(sc, rng);
                     rx += mx * bn; ry += my * bn; rz += mz * bn;
                 }
             }
@@ -26239,7 +26274,7 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
     {   // M-GATHERAREA footprint budget, same environment channel and same default (8) the host
         // uses -- the two MUST agree or -device gpu and -device cpu diverge on truncated geometry.
         const char* e = std::getenv("FTRACE_GATHERAREA");
-        sc.gatherArea = e ? std::atoi(e) : 8;
+        sc.gatherArea = e ? std::max(0, std::atoi(e)) : 8;   // below 0: none, as 0 (host twin)
         // The tangle gate rides the same channel for the same reason: read it anywhere else and
         // the two backends can disagree about whether it is on.
         const char* g = std::getenv("FTRACE_GAREJECT");

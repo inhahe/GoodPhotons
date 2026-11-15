@@ -1,0 +1,10 @@
+# REVIEW-0445: modes J's and U's merges on a concave glossy surface. The room is the inside of a rough
+# glossy sphere, so every merge lands on a surface that rises above its tangent plane across the
+# merge's disc (by r^2 / 2R, past the probe's 1e-3 r at the radius tools/check_merge_glossy.py pins).
+# Glossy faces hold the merges' light vertices, so the footprint's probe must stop on them, not pass
+# through to a miss and read the merge several times too bright.
+scene { units meters }
+material "rough" { type glossy reflect 0.7 roughness 1.2 }
+sphere { center 0 0 0  radius 0.3  material rough }
+light area { origin -0.05 0.2 -0.05  u 0.1 0 0  v 0 0 0.1  normal 0 -1 0  power 5  spd preset:d65 }
+camera "c" { eye 0 0.05 0.2  look_at 0 -0.1 -0.2  up 0 1 0  fov_y 60  film { res 96 72 } }

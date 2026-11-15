@@ -3167,7 +3167,7 @@ inline void traceLightBeamPass(const Scene& scene, const Camera& cam, long long 
                         ph.cy = (float)cieY(ph.lambda);
                         ph.cz = (float)cieZ(ph.lambda);
                         ph.misIdx = (unsigned)sb.mis.size();
-                        const Vec3 pn = vertexGeoN(path[u]);   // the footprint's (surfmerge.h)
+                        const Vec3 pn = vertexGeoN(path[u]);   // the footprint's (MergeFootprint)
                         ph.nx = (float)pn.x; ph.ny = (float)pn.y; ph.nz = (float)pn.z;
                         SurfMis sm;
                         sm.sumC    = accC[u - 1];
@@ -5467,9 +5467,8 @@ struct BdptRenderer {
                         // weight can partition that unity.
                         //
                         // Per VERTEX, not per segment: a point merge happens where the camera
-                        // walk actually landed, so there is no ray to march and no rng draw —
-                        // which also keeps the "merges off == mode D bit-for-bit" gate intact
-                        // for free.
+                        // walk actually landed. Its one ray-traced part is the footprint's probe,
+                        // which draws from the walk's `rng` where a merge sum is nonzero.
                         if (surfOn && (!routeOn || routeR == ROUTE_J)) {
                             const double vmNorm = 1.0 / mk.surf;
                             // A point merge at eye[k] makes depth j + k - 1 with j >= 1 (photons
@@ -5495,10 +5494,8 @@ struct BdptRenderer {
                                 sw.work = &workCam;
                                 const Vec3 ngo = vertexGeoN(vk);
                                 const bool vkTwoSided = isTwoSidedMat(*vk.mat);   // mergeFromBehind
-                                // The footprint (surfmerge.h): this surface's photons over the share
-                                // of the disc it covers, at one slack for the test and the probe.
-                                const int gaM = gatherAreaSamples();
-                                const double gaSlack = gatherBandSlack(photons->radius, vk.hit.fiberRadius);
+                                const MergeFootprint fp(vk.p, ngo, photons->radius, vkTwoSided,
+                                                        vk.hit.matId, vk.hit.fiberRadius);
                                 const JSpec* vkSpec =
                                     (jSpecOn && (size_t)k < jsw.vert.size() && jsw.vert[(size_t)k].on())
                                         ? &jsw.vert[(size_t)k] : nullptr;
@@ -5508,13 +5505,7 @@ struct BdptRenderer {
                                     const SurfMis* lm = photons->misOf((size_t)idx);
                                     if (!lm) return;      // no weight: refuse (see misOf)
                                     if (mergeFromBehind(vkTwoSided, ph.wo, ngo)) return;
-                                    if (gaM) {
-                                        const Vec3 dd = ph.p - vk.p;
-                                        bool farSide;
-                                        if (!onGatherSurfaceSided(vk.p, ngo, ph.p, Vec3{ph.nx, ph.ny, ph.nz},
-                                                                  dot(dd, dd), gaSlack, vkTwoSided, farSide))
-                                            return;
-                                    }
+                                    if (!fp.keeps(ph.p, Vec3{ph.nx, ph.ny, ph.nz})) return;
                                     const double lam = (double)ph.lambda;
                                     // ...times a coated vertex's coat on the photon's way in
                                     // (coatF; a coat copy's reflection too): it was stored before
@@ -5553,10 +5544,7 @@ struct BdptRenderer {
                                 });
                                 if (mergeXYZ.x != 0.0 || mergeXYZ.y != 0.0 ||
                                     mergeXYZ.z != 0.0) {
-                                    const double ga = gaM ? gatherAreaScale(gatherCoverage(
-                                                                scene, vk.p, ngo, photons->radius, gaSlack, rng,
-                                                                gaM, vk.hit.matId, vk.hit.fiberRadius))
-                                                          : 1.0;
+                                    const double ga = fp.scale(scene, rng);
                                     camFilm.add(px, py, mergeXYZ * ((vkSpec ? vkSpec->beta(vk.beta) : vk.beta) *
                                                                     vmNorm * wJ * ga));
                                 }

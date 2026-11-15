@@ -7,15 +7,20 @@
 #include <cmath>
 #include "gatherplane.h"
 
+// Whether a face of material `m` (unresolved; a strand's when `fiberRadius` > 0) holds what a gather
+// sums, which its footprint must measure the surface of: holdsPhotons for the photon maps of modes M
+// and S, holdsMergeVertex for the merges of modes J and U.
+using GatherHolds = bool (*)(const Scene& scene, const Material& m, double fiberRadius);
+
 // Whether a footprint (the probe, or the march below) passes through a face of material `m` off a
-// curve, rather than stopping on it: one no photon is stored on (holdsPhotons), a hair fiber aside,
-// whose opacity coin the probe tosses. The photons near such a face lie on the surface beyond it,
+// curve, rather than stopping on it: one that holds none of the gather's photons (`holds`), a hair
+// fiber aside, whose opacity coin the probe tosses. The photons near such a face lie on the surface beyond it,
 // and a face within the radius above the tangent plane would otherwise be counted and then
 // ball-rejected for its height, though that surface is there (known-issues
 // GATHERAREA-TRANSPARENT). A strand is passed whatever its height (the callers). Device twin
 // dProbePassesThrough.
-inline bool probePassesThrough(const Scene& scene, const Material& m) {
-    return m.type != MatType::Hair && !holdsPhotons(scene, m, 0.0);
+inline bool probePassesThrough(const Scene& scene, const Material& m, GatherHolds holds = holdsPhotons) {
+    return m.type != MatType::Hair && !holds(scene, m, 0.0);
 }
 
 // What a segment from `o` along unit `d`, `len` long, crosses of the faces light does not pass
@@ -87,7 +92,7 @@ inline SegmentCrossings walkSegment(const Scene& sc, Vec3 o, const Vec3& d, doub
 // divide by it.
 inline double gatherFootprintArea(const Scene& sc, const Vec3& p, const Vec3& n,
                                   double r, int kDisc, int maxLayers, double slack,
-                                  bool* incomplete = nullptr) {
+                                  bool* incomplete = nullptr, GatherHolds holds = holdsPhotons) {
     if (incomplete) *incomplete = false;
     if (!(r > 0.0) || kDisc < 1) return 0.0;
     if (maxLayers < 1) maxLayers = 1;
@@ -191,7 +196,7 @@ inline double gatherFootprintArea(const Scene& sc, const Vec3& p, const Vec3& n,
             // A strand that holds no photon is neither area nor a crossing: the probe passes it, and
             // so does this march, through the tube and, like the probe, for none of the column's
             // layers up to 48 strands, so a coat deeper than the layers still reaches the skin.
-            if (mm && h.fiberRadius > 0.0 && mm->type != MatType::Hair && !holdsPhotons(sc, *mm, h.fiberRadius)) {
+            if (mm && h.fiberRadius > 0.0 && mm->type != MatType::Hair && !holds(sc, *mm, h.fiberRadius)) {
                 tBase = h.t; tl = 0.0; ct = 2.5 * h.fiberRadius + eps;
                 if (strandSkips < 48) { ++strandSkips; --layers; }
                 continue;
@@ -217,7 +222,7 @@ inline double gatherFootprintArea(const Scene& sc, const Vec3& p, const Vec3& n,
             // A face that holds no photon is no area above the plane, where the probe passes it (a
             // glossy ball's steep side, which the tilt-widened band takes in); on the plane it is
             // the surface's height, where the probe ends on it.
-            const bool passed = mm && probePassesThrough(sc, *mm) && off > 1e-3 * r;
+            const bool passed = mm && probePassesThrough(sc, *mm, holds) && off > 1e-3 * r;
             if (passed) {
                 if (opaque && !h.solid) ++crossed;
             } else if (h.t <= span && withinGatherBand(std::fabs(off), dot(dh, dh), std::fabs(c), slack)) {

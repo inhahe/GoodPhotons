@@ -4,6 +4,8 @@
 // merges of modes J and U (bdpt.h, vcm.h), which divide their sums by it.
 #include "scene.h"
 #include "geometry.h"
+#include "bsdf_eval.h"    // holdsMergeVertex: the faces a merge footprint measures
+#include "hair_shade.h"   // hairOpacityAt: a strand's coin in the probe
 #include "gatherplane.h"
 #include "gafootprint.h"
 #include "rng.h"
@@ -70,7 +72,7 @@ inline int gaGeomLayers() {
 inline int gatherAreaSamples() {
     static const int m = [] {
         const char* e = std::getenv("FTRACE_GATHERAREA");
-        return e ? std::atoi(e) : 8;
+        return e ? std::max(0, std::atoi(e)) : 8;   // below 0: none, as 0
     }();
     return m;
 }
@@ -250,10 +252,11 @@ inline std::vector<GaDiagMat>& gaDiag() {
 // wrapper exists so that every early return here (flat-interior gate, tangle gate, fiber gate)
 // is histogrammed without editing any of them.
 // `slack` is the gather's plane-test slack (gatherBandSlack at its photon map's radius), the one
-// its photon test takes: the footprint must describe the population the sum counts.
+// its photon test takes, and `holds` the faces its photons lie on: the footprint must describe the
+// population the sum counts.
 inline double gatherCoverageRaw(const Scene& scene, const Vec3& p, const Vec3& n,
                              double r, double slack, Pcg32& rng, int M, int matId = -1,
-                             double fiberR = 0.0) {
+                             double fiberR = 0.0, GatherHolds holds = holdsPhotons) {
     if (M <= 0 || !(r > 0.0)) return 1.0;
     // `-gageom 1`: take the coverage from the GEOMETRY instead of from probe rays. The probe
     // fires M nearest-hit rays and so sees only the first surface along each; the geometric
@@ -277,7 +280,7 @@ inline double gatherCoverageRaw(const Scene& scene, const Vec3& p, const Vec3& n
         // reported footprint 0.0000 on a solid marble cap, which is impossible.
         bool incomplete = false;
         const double raw = gatherFootprintArea(scene, p, n, r, gaGeomDisc(), gaGeomLayers(),
-                                               slack, &incomplete);
+                                               slack, &incomplete, holds);
         if (!incomplete) {
         const double cov = raw / denom;
         // THE COVERAGE MUST BE BOUNDED AWAY FROM ZERO. The estimate divides by it, and a
@@ -446,7 +449,7 @@ inline double gatherCoverageRaw(const Scene& scene, const Vec3& p, const Vec3& n
                 // A strand that holds no photon, whatever its lobes, and the surface the gather's
                 // photons lie on is beyond it: through the tube, for none of the sixteen faces.
                 if (pm && h.fiberRadius > 0.0 && pm->type != MatType::Hair &&
-                    !holdsPhotons(scene, *pm, h.fiberRadius)) {
+                    !holds(scene, *pm, h.fiberRadius)) {
                     if (skip < 48) ++skip;
                     tAcc = h.t;
                     pr = Ray{h.p + pr.d * 1e-9, pr.d, 2.5 * h.fiberRadius + 1e-9};   // through the tube
@@ -456,7 +459,7 @@ inline double gatherCoverageRaw(const Scene& scene, const Vec3& p, const Vec3& n
                 // it (a glass box standing on the floor, coplanar with it) is the surface's own
                 // height, and passing it would skip the surface beside it. An opaque one is a
                 // crossing all the same: a mirror box shadows the floor under it.
-                if (pm && probePassesThrough(scene, *pm) && r - h.t > 1e-3 * r) {
+                if (pm && probePassesThrough(scene, *pm, holds) && r - h.t > 1e-3 * r) {
                     cross(h, pm);
                     tAcc = h.t;
                     pr = Ray{h.p + pr.d * 1e-9, pr.d};
@@ -641,8 +644,8 @@ inline void gaDiagReport(const Scene& scene) {
 
 inline double gatherCoverage(const Scene& scene, const Vec3& p, const Vec3& n,
                              double r, double slack, Pcg32& rng, int M, int matId = -1,
-                             double fiberR = 0.0) {
-    const double cov = gatherCoverageRaw(scene, p, n, r, slack, rng, M, matId, fiberR);
+                             double fiberR = 0.0, GatherHolds holds = holdsPhotons) {
+    const double cov = gatherCoverageRaw(scene, p, n, r, slack, rng, M, matId, fiberR, holds);
     if (gaDiagOn() && matId >= 0 && matId < (int)gaDiag().size()) {
         int b = (int)(cov * 8.0);
         if (b < 0) b = 0;
@@ -658,3 +661,36 @@ inline double gatherAreaScale(double cov) {
     if (gaBiasOn()) return (cov > 0.0) ? 1.0 / cov : 1.0;
     return (cov >= 0.05) ? 1.0 / cov : 1.0;
 }
+
+// THE MERGE FOOTPRINT of modes J and U (J-THIN-GAP-LEAK), at a camera vertex `p` whose true normal,
+// turned to the side it was reached from, is `n`. A merge sums only the photons of its own surface,
+// in the band about its tangent plane and facing its way (`keeps`, onGatherSurfaceSided), and divides
+// by the share of the disc that surface covers (`scale`, gatherCoverage over the faces merge vertices
+// lie on: holdsMergeVertex), the band's slack one value for both, so the light trapped in a
+// millimetre gap under a slab stays off the slab. `-gatherarea 0` turns both off: every photon in the
+// disc, over the whole disc. Host J (bdpt.h) and U (vcm.h); device twin DMergeFootprint.
+struct MergeFootprint {
+    Vec3 p, n;
+    double r = 0.0, slack = 0.0, fiberR = 0.0;   // the merge radius; the band's; the vertex's strand
+    int M = 0, matId = -1;                       // the probes (gatherAreaSamples), 0 off; for -gadiag
+    bool twoSided = false;                       // a two-sided lobe keeps its far side's photons
+    MergeFootprint(const Vec3& p_, const Vec3& n_, double radius, bool twoSided_, int matId_, double fiberR_)
+        : p(p_), n(n_), r(radius), slack(gatherBandSlack(radius, fiberR_)), fiberR(fiberR_),
+          M(gatherAreaSamples()), matId(matId_), twoSided(twoSided_) {}
+    bool on() const { return M > 0; }
+    // Whether the photon at `pp`, whose surface's true normal turned to the side its light came
+    // from is `pn`, lies on this surface. Every photon, the footprint off.
+    bool keeps(const Vec3& pp, const Vec3& pn) const {
+        if (!on()) return true;
+        const Vec3 d = pp - p;
+        bool farSide;
+        return onGatherSurfaceSided(p, n, pp, pn, dot(d, d), slack, twoSided, farSide);
+    }
+    // What a nonzero merge sum is multiplied by: 1 over the share of the disc this surface covers,
+    // its probes drawn from `rng`; 1, drawing nothing, the footprint off.
+    double scale(const Scene& scene, Pcg32& rng) const {
+        return on() ? gatherAreaScale(gatherCoverage(scene, p, n, r, slack, rng, M, matId, fiberR,
+                                                      bdpt::holdsMergeVertex))
+                    : 1.0;
+    }
+};

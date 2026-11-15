@@ -6293,14 +6293,21 @@ inline int mixResolveChild(const Scene& scene, const Material& m, const Hit& h, 
 // bodies with the rest. 0 when no lobe of `m` could hold a merge vertex; 1 off a compound. It reads
 // no weight map, so it costs a sum. (The photon pass of modes M and S deposits before its pick for
 // the same reason, COMPOUND-DOUBLE-PICK.) Device twin dCompoundMergeStoreProb.
+// Whether some lobe of the compound `m` (a mix's children, a stack's coat) would hold a merge vertex
+// (`keep`). Device twin: the `any` of dCompoundMergeStoreProb.
+template <class Keep>
+inline bool compoundAnyKeeps(const Scene& scene, const Material& m, const Keep& keep) {
+    const auto valid = [&](int c) { return c >= 0 && c < (int)scene.mats.size(); };
+    bool any = m.type == MatType::Layered && valid(m.coatChild) && keep(scene.mats[(size_t)m.coatChild]);
+    for (int c : m.mixChildren) any = any || (valid(c) && keep(scene.mats[(size_t)c]));
+    return any;
+}
 template <class Keep>
 inline double compoundMergeStoreProb(const Scene& scene, const Material& m, double coatR, const Keep& keep) {
     if (m.type != MatType::Mix && m.type != MatType::Layered) return 1.0;
+    if (!compoundAnyKeeps(scene, m, keep)) return 0.0;
     const auto valid = [&](int c) { return c >= 0 && c < (int)scene.mats.size(); };
     const bool layered = m.type == MatType::Layered;
-    bool any = layered && valid(m.coatChild) && keep(scene.mats[(size_t)m.coatChild]);
-    for (int c : m.mixChildren) any = any || (valid(c) && keep(scene.mats[(size_t)c]));
-    if (!any) return 0.0;
     // mixResolveChild's chance of a valid child: a slot naming none ends the walk as the leftover does.
     double body = 1.0;
     if (!(m.mixChildren.size() == 2 && (m.mixWeightPat >= 0 || m.mixWeightTex >= 0) &&

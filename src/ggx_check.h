@@ -26,6 +26,7 @@
 //      grazing included, where a cosine draw's weight reaches (1 - E(cos_b)) / (1 - Eavg), tens.
 // ============================================================================================
 #include "ggx.h"
+#include "linalg.h"   // Vec3
 #include "rng.h"
 
 #include <algorithm>

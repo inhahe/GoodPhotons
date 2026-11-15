@@ -5565,9 +5565,9 @@ as the one at fault.
   (`dRadicalInverse2` / `dRadicalInverseB` / `dRot05` / `dWhittedSample` /
   `dWhittedLambdaU` / `dWhittedGlossyUV` / `dWhittedAttenuate` / `dGridUV`) and compute in
   `double` off integer inputs, so the *quadrature points themselves* are bit-exact against
-  the CPU even though the trace around them is not. `render.h`'s `ggxDrawUV` / `ggxDraw`
-  factoring is mirrored on the device so the deterministic and stochastic lobe samplers share
-  one body, and `interfaceStep` / `dDielectricStep` gained the same
+  the CPU even though the trace around them is not. The deterministic and stochastic lobe
+  samplers share one body on both devices, `ggx::drawRough` (its two canonical uniforms off the
+  lattice or the rng), and `interfaceStep` / `dDielectricStep` gained the same
   `whittedWeight` out-param contract.
 
   Two details of the port are load-bearing. (1) **`sIdx` is not `gidx`.** The device seeds
@@ -6299,7 +6299,7 @@ as the one at fault.
   handing `build()` a different radius retunes the estimator *and* its MIS weight together, per
   epoch, with no second source of truth. Epoch 0 gets `r_0` exactly.
 
-  **Sizing (`-jsurf-count`, default `4e6` ≈ 450 MB at 112 B per photon and its `SurfMis`, 72 + 40).** The surface map
+  **Sizing (`-jsurf-count`, default `4e6` ≈ 510 MB at 128 B per photon and its `SurfMis`, 88 + 40).** The surface map
   and the beam map are budgeted by the *same* pilot but with deliberately different authority. The
   beam side names a *beam* ceiling and sizes the pass, because its radius **adapts** to the budget
   and undershooting the `-beamk` knee widens the kernel — a measured bias (+6.4 % on the analytic
@@ -6508,13 +6508,17 @@ as the one at fault.
   surface inside it -- the floor under a table top, once mode M's adaptive radius outgrows the
   table's height -- lent its light to the first (a sheet lit only from below read 21x its top lit
   from above). A mode-J surface merge and a mode-U vertex merge keep the same photons and divide by
-  the same footprint (0.445.3, J-THIN-GAP-LEAK; `surfmerge.h` says how): the rule alone, without the
+  the same footprint (0.445.3, J-THIN-GAP-LEAK; `MergeFootprint` in `gathercoverage.h`, device twin
+  `DMergeFootprint`), its probe stopping on the faces merge vertices lie on (`holdsMergeVertex`, a
+  glossy face among them, where mode M's stops on the faces holding its photons): the rule alone, without the
   footprint (0.442.2-0.443.0), darkened every object's base -- the floor within 2 cm of a box read
   0.64 of mode R at radius 0.1 -- because the merges still divided by the whole disc; with it the
   base reads 0.99-1.00, and the light trapped in a millimetre gap under a plate stays off the
-  plate's top (J 36x mode B before). A merge probes only where its sum found light, from a stream
-  of its own (the device's queued gathers seed it at the site), and `-gatherarea 0` restores the
-  whole disc over every photon, as it does for M and S. A
+  plate's top (J 36x mode B before). A merge probes only where its sum found light -- off the
+  camera walk's own stream on the host, and on the device off a stream seeded from it at the
+  site, so mode J's queued and inline gathers probe alike -- and `-gatherarea 0` restores the
+  whole disc over every photon, as it does for M and S. Solid faces are marked
+  (`markSolidFaces`) whenever a batch has an M, S, J or U camera. A
   mode-M or mode-S gather (`onGatherSurfaceSided`) keeps a photon only if it faces the
   gather point's way (within 60 degrees) and lies near its tangent plane: off it by at most
   sin theta times its distance d, theta the angle between the two normals, plus a rounding slack

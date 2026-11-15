@@ -29156,12 +29156,13 @@ static int run(int argc, char** argv) {
         return 0;
     }
 
-    // The footprint probes of modes M and S read which side of a closed solid a face is met from
-    // (Hit::solid): marked once for the whole batch, before the meter below gathers as the frames
-    // will, and only where a footprint is taken at all.
+    // The footprint probes of modes M and S, and of J's and U's merges, read which side of a closed
+    // solid a face is met from (Hit::solid): marked once for the whole batch, before the meter below
+    // gathers as the frames will, and only where a footprint is taken at all.
     if (gatherAreaSamples() > 0 || gaGeomOn()) {
         bool gathers = false;
-        for (const RenderCam& rc : toRender) gathers = gathers || rc.mode == 'M' || rc.mode == 'S';
+        for (const RenderCam& rc : toRender)
+            gathers = gathers || rc.mode == 'M' || rc.mode == 'S' || rc.mode == 'J' || rc.mode == 'U';
         if (gathers) markSolidFaces(scene);
     }
 
