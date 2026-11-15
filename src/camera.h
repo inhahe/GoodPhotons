@@ -750,8 +750,9 @@ struct Camera {
     // rejects nearly every flight without touching the glass.
     enum { LENS_MISSED = 0, LENS_CAUGHT = 1, LENS_ABSORBED = 2 };
     // The geometric half: does the flight enter the clear cap before hitDist? On success
-    // `o`, `d` are the flight as a lens-local leg started just in front of the glass.
-    bool lensCatchEntry(const Ray& ray, double hitDist, Vec3& o, Vec3& d) const {
+    // `o`, `d` are the flight as a lens-local leg started just in front of the glass, and `tAt`
+    // (when given) the world distance the flight runs to the glass.
+    bool lensCatchEntry(const Ray& ray, double hitDist, Vec3& o, Vec3& d, double* tAt = nullptr) const {
         const LensSystem& L = *lens;
         const Vec3 ol = lensLocalPoint(ray.o);
         d = normalize(lensLocalDir(ray.d));
@@ -766,6 +767,7 @@ struct Camera {
         o = (tc > back) ? ol + d * (tc - back) : ol;
         Vec3 entry, n;
         if (!L.hitSurface(0, o, d, entry, n)) return false;
+        if (tAt) *tAt = length(entry - ol) * 1e-3;
         return length(entry - ol) * 1e-3 < hitDist;          // else the scene was in the way
     }
     // The wavelength half: an entered flight traced onto the sensor at `lambda`.
@@ -774,9 +776,10 @@ struct Camera {
         if (!lens->traceToFilm(o, d, lambda, onFilm, dFilm)) return LENS_ABSORBED;
         return lensFilmToPixel(onFilm, px, py) ? LENS_CAUGHT : LENS_ABSORBED;
     }
-    int lensCatch(const Ray& ray, double hitDist, double lambda, int& px, int& py) const {
+    int lensCatch(const Ray& ray, double hitDist, double lambda, int& px, int& py,
+                  double* tAt = nullptr) const {
         Vec3 o, d;
-        if (!lensCatchEntry(ray, hitDist, o, d)) return LENS_MISSED;
+        if (!lensCatchEntry(ray, hitDist, o, d, tAt)) return LENS_MISSED;
         return lensCatchImage(o, d, lambda, px, py);
     }
 
@@ -938,11 +941,13 @@ struct Camera {
     // Model C brute-force catch: does this photon ray physically pass through the
     // finite aperture disc (before hitting the scene, within hitDist) and land on
     // the film? Pure forward physics — no connect/splat. On success sets px,py.
-    bool catchPhoton(const Ray& ray, double hitDist, int& px, int& py) const {
+    // `tAt` (when given): how far the flight runs to the aperture.
+    bool catchPhoton(const Ray& ray, double hitDist, int& px, int& py, double* tAt = nullptr) const {
         double dw = dot(ray.d, w);
         if (dw >= -1e-9) return false;                       // not heading toward the film
         double tAp = dot(eye - ray.o, w) / dw;
         if (tAp <= 1e-6 || tAp >= hitDist) return false;     // aperture not the first thing hit
+        if (tAt) *tAt = tAp;
         Vec3 P = ray.o + ray.d * tAp;                        // entry point on lens/aperture plane
         Vec3 rho = P - eye;                                  // transverse offset (perp to w)
         if (dot(rho, rho) > apertureR * apertureR) return false; // missed the disc

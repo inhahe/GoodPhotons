@@ -1091,9 +1091,8 @@ inline void randomWalk(const Scene& scene, const Camera& cam, const Renderer& ma
         }
 
         // Beer-Lambert attenuation over the in-glass segment just traversed, up to the
-        // event (surface hit OR medium collision, whichever is nearer). NOTE: this
-        // attenuates only the *subpath walk*; connection edges (connectBDPT) that cross
-        // glass are NOT absorption-weighted (see known-issues.md).
+        // event (surface hit OR medium collision, whichever is nearer). A connection edge
+        // takes its own medium's (connectBDPT, legAbsorption).
         {
             double a = curAbsorb(lambda);
             // Glass absorption is spectral — that is what makes coloured glass coloured — so
@@ -1109,9 +1108,9 @@ inline void randomWalk(const Scene& scene, const Camera& cam, const Renderer& ma
             // standing for wavelengths the glass took away.
             if (a > 0.0) beta *= std::exp(-a * dEvent);
             if (a > 0.0 || glassChroma) retireSpectral(FK_GlassAbsorb);
-            // Per-λ absorption for the bundle. A non-empty stack means we are inside a
-            // dielectric, and entering one de-heros — so nUp is always 1 whenever `a`
-            // can be non-zero and this loop never actually runs. Kept for generality.
+            // Per-λ absorption for the bundle. Entering a dielectric de-heros it, so the one leg
+            // this meets whole is a light subpath born inside a coloured solid (birthStack), on
+            // its way to the solid's wall.
             for (int i = 0; i + 1 < nUp; ++i) {
                 double ai = curAbsorb(hb.lam[i + 1]);
                 if (ai > 0.0) betaSec[i] *= std::exp(-ai * dEvent);

@@ -2437,7 +2437,12 @@ inside a glass block -- sees from inside it the same way (since 0.445.8): its wa
 solids around its eye, and every connection to it, and every light sample inside a coloured solid,
 takes that solid's absorption over its length. (The eye's solids are found once per camera; a lens
 aperture or front element straddling a surface takes the eye's. The interactive viewer's cameras
-start in air.)
+start in air.) Only a closed solid encloses anything (since 0.446.1): a window of one dielectric
+quad, or a glass mesh with a hole, has no inside, so a lamp or camera behind it starts in air. A
+`mix` with a glass part encloses as that glass. At load ftrace says which lights are born inside a
+solid (`[light] light 2 (area at ...) is born inside 'amber'`, or that one straddles a solid's
+surface) and which cameras start inside one (`[camera] 'c' starts inside 'water'`), so you can see
+that a lamp in a globe was found.
 
 Priorities are **opt-in and safe to omit**: a scene that never writes `priority` renders
 exactly as before (each dielectric treated against air). Because that flat model is

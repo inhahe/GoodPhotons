@@ -1389,6 +1389,8 @@ struct BackwardRenderer {
             if (med)
                 Renderer::mediaTransmittanceSpec(scene, h.p + ngo * 1e-6, wiConn, dist,
                                                  lam, KK, Tr, rng);
+            if (h.extMat >= 0)   // the leg inside the vertex's solid (legAbsorption)
+                for (int k = 0; k < KK; ++k) Tr[k] *= legAbsorption(scene, h.extMat, dist, lam[k]);
             const double gWeight = w * selW * wMis * thrScalar * dLam;
             if (!(gWeight > 0.0)) continue;
             // the coat on a coated vertex's lobe (render.h coatF: a body's way in, a coat's
@@ -3189,7 +3191,7 @@ struct BackwardRenderer {
     void radianceHero(const Scene& scene, Ray ray, const double* lamIn,
                       const double* invPdfIn, int C, double* Lout, Pcg32& rng,
                       const SpdCache* spdCache = nullptr, GiCtx gi = GiCtx{}) const {
-        // A fresh camera/gather bundle: unit throughput, empty medium stack, at bounce 0.
+        // A fresh camera/gather bundle at bounce 0: unit throughput, inside gi's solids (stk0, below).
         // A camera ray may see a light directly; a GATHER ray may not -- the vertex it
         // left already NEE'd the direct light, so counting the emitter again here would
         // double it. A specular bounce re-arms this, so gold-bounced light still lands.
@@ -3208,6 +3210,35 @@ struct BackwardRenderer {
         // hero carries the bundle from the start, boosted xC.
         const MediumStack stk0 = gi.stk0 ? *gi.stk0 : MediumStack{};
         const bool whole = (C > 1) && stk0.empty();
+        if (C > 1 && !whole && heroSplit) {
+            // Under `heroSplit` (mode W forces it: its wavelength lattice is every pixel's) the bundle
+            // is not collapsed but split from the start, as a dispersive vertex splits it: each
+            // wavelength its own monochromatic sub-path and its own unboosted estimate in its own
+            // slot, each filing its own first event (firstSec, as the split below does).
+            for (int i = 0; i < C; ++i) {
+                Lout[i] = 0.0;
+                if (invPdfIn[i] == 0.0) continue;
+                double sThr = 1.0, sL = 0.0;
+                SpdCache sCache;
+                const SpdCache* sCp = nullptr;
+                if (spdCache && spdCache->lam && spdCache->base && i < spdCache->C) {
+                    sCache = *spdCache;
+                    sCache.lam  = spdCache->lam + i;
+                    sCache.iOff = spdCache->iOff + i;
+                    sCp = &sCache;
+                }
+                int sFirst = -1;
+                GiCtx gs = gi;
+                if (i > 0) gs.first = gi.firstSec ? &sFirst : nullptr;
+                gs.firstSec = nullptr;
+                radianceHeroLoop(scene, ray, stk0, lamIn + i, invPdfIn + i, &sThr, /*C=*/1,
+                                 /*secAlive=*/false, /*specularArrival=*/(gi.depth == 0),
+                                 /*contBsdfPdf=*/0.0, /*bounce0=*/0, &sL, rng, sCp, gs, rcTrain);
+                Lout[i] = sL;
+                if (i > 0 && gi.firstSec) gi.firstSec[i] = sFirst;
+            }
+            return;
+        }
         if (C > 1 && !whole) thr[0] = (double)C;
         radianceHeroLoop(scene, ray, stk0, lamIn, invPdfIn, thr, C,
                          /*secAlive=*/whole, /*specularArrival=*/(gi.depth == 0),
@@ -4224,6 +4255,9 @@ struct BackwardRenderer {
             Pcg32 rng;
             seedUnit(rng, RadianceCache::mix(((uint64_t)slot << 24) ^ (uint64_t)(round + 1)),
                      0x9E3779B97F4A7C15ULL);
+            // Its rays start inside the solids around the cell, as the camera paths that read it
+            // went in (Scene::eyeStack: none where no walk can be inside anything).
+            const MediumStack stk0 = scene.eyeStack(p + n * 1e-6);
             for (int k = 0; k < nRays; ++k) {
                 const int    b   = rc.scheduleBin(round, k);
                 double       lam = rc.lambdaOfBin(b, rng.uniform());
@@ -4252,7 +4286,7 @@ struct BackwardRenderer {
                 // the wrong way round. Pure path-traced update rays cost more (they run to
                 // full length), but the budget governor already bounds that spend, and an
                 // unbiased number is the only kind worth storing.
-                radianceHeroLoop(scene, ray, MediumStack{}, &lam, &inv, &thr, /*C=*/1,
+                radianceHeroLoop(scene, ray, stk0, &lam, &inv, &thr, /*C=*/1,
                                  /*secAlive=*/false, /*specularArrival=*/false,
                                  /*contBsdfPdf=*/cosT / PI, /*bounce0=*/1, &Lout, rng,
                                  &spdCache, GiCtx{}, /*rcTrain=*/true);

@@ -394,7 +394,7 @@ inline void scatterSample(const Scene& scene, const Renderer& mats, const Materi
             double r = clamp01(reflectSlot(scene, *mp, h, lambda)) * gd.R(lambda);
             pdfW = bsdfPdf(*mp, ns, wo, wi, lambda, scene, &h);
             pdfRevW = bsdfPdf(*mp, ns, wi, wo, lambda, scene, &h);
-            // r times the draw's weight (ggx.h weightAll), from either end: the lobe is
+            // r times the draw's weight (ggx::drawUV's), from either end: the lobe is
             // reciprocal.
             betaFactor = r * gd.w;
             if (pdfW <= 0) terminate = true;      // r <= 0 is caught by the caller's max test

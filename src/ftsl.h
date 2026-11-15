@@ -5355,15 +5355,14 @@ private:
             else m.roughness = dblParam(b, "roughness", 0.0);
         }
         if (m.roughnessPat < 0 && m.roughnessTex < 0 && !(m.roughness > 0.0)) return true;
-        for (double L = LAMBDA_MIN; L <= LAMBDA_MAX; L += 5.0)
-            if (!m.coatOpaque(L)) {
-                fail("material '" + b.name + "': `roughness` needs an opaque " +
-                     (m.type == MatType::ThinFilm ? "thin film" : "multilayer") +
-                     " -- an absorbing substrate (`substrate_k` > 0) or an absorbing layer -- "
-                     "and this one lets light through near " + std::to_string((int)L) +
-                     " nm; a transparent coating has no rough form");
-                return false;
-            }
+        if (const double L = m.firstClearNm(); L >= 0.0) {
+            fail("material '" + b.name + "': `roughness` needs an opaque " +
+                 (m.type == MatType::ThinFilm ? "thin film" : "multilayer") +
+                 " -- an absorbing substrate (`substrate_k` > 0) or an absorbing layer -- "
+                 "and this one lets light through near " + std::to_string((int)L) +
+                 " nm; a transparent coating has no rough form");
+            return false;
+        }
         m.iridescence = (m.type == MatType::ThinFilm) ? 1 : 2;
         m.type = MatType::Glossy;
         // `reflect` tints the lobe, white unless authored. A preset's overrides have parsed the

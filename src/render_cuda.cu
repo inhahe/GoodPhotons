@@ -610,7 +610,7 @@ struct DMaterial {
     // twin of Material::priority.
     int    priority;
     int    solidId;     // Material::solidId: the identity the medium stack knows this solid by
-    int    enterable;   // host enterableSolidMat: a walk goes inside it (dEnclosureAt)
+    int    encSolid;    // host Scene::encSolidOf: the solid a walk inside it holds, or -1 (dEnclosureAt)
     int    routeTo[2];  // Material::routeTo: a tagged instance's routed copies (ROUTE_D, ROUTE_J)
     int    absorbChroma;// Material::absorbChroma: `absorb` varies over the band
     // Parametric-record REFLECT binding (§records stage 6a — device twin of the CPU
@@ -1860,11 +1860,13 @@ struct DCamera {
     // Model C perspective catch: does this photon fly through the finite aperture
     // disc (before hitting the scene, within hitDist) and land on the film? Port of
     // Camera::catchPhoton.
-    HD bool catchPhoton(const DVec3& ro, const DVec3& rd, Real hitDist, int& px, int& py) const {
+    HD bool catchPhoton(const DVec3& ro, const DVec3& rd, Real hitDist, int& px, int& py,
+                        Real* tAt = nullptr) const {
         Real dw = dot(rd, w);
         if (dw >= (Real)-1e-9) return false;
         Real tAp = dot(eye - ro, w) / dw;
         if (tAp <= RAY_EPS || tAp >= hitDist) return false;
+        if (tAt) *tAt = tAp;
         DVec3 P = ro + rd * tAp;
         DVec3 rho = P - eye;
         if (dot(rho, rho) > (Real)(apertureR * apertureR)) return false;
@@ -2841,7 +2843,7 @@ __device__ static bool dLensConnect(const DCamera& cam, const DVec3& p, Real lam
 // inside). The entry is geometry, once per flight; the image is per wavelength.
 enum { DLENS_MISSED = 0, DLENS_CAUGHT = 1, DLENS_ABSORBED = 2 };
 __device__ static bool dLensCatchEntry(const DCamera& cam, const DVec3& ro, const DVec3& rd,
-                                       Real hitDist, D3& o, D3& d) {
+                                       Real hitDist, D3& o, D3& d, double* tAt = nullptr) {
     const DLensSystem& L = cam.lens;
     const double rB = dLensCapRadius(L, 0);
     {   // Cheap reject in Real, world metres: the flight's closest approach to the eye against
@@ -2865,6 +2867,7 @@ __device__ static bool dLensCatchEntry(const DCamera& cam, const DVec3& ro, cons
     o = (tc > back) ? ol + d * (tc - back) : ol;
     D3 entry, n;
     if (!dLensHitSurface(L, 0, o, d, entry, n)) return false;
+    if (tAt) *tAt = length(entry - ol) * 1e-3;
     return length(entry - ol) * 1e-3 < (double)hitDist;
 }
 __device__ static int dLensCatchImage(const DCamera& cam, const D3& o, const D3& d, Real lambda,
@@ -2874,9 +2877,9 @@ __device__ static int dLensCatchImage(const DCamera& cam, const D3& o, const D3&
     return dLensFilmToPixel(cam, onFilm, px, py) ? DLENS_CAUGHT : DLENS_ABSORBED;
 }
 __device__ static int dLensCatch(const DCamera& cam, const DVec3& ro, const DVec3& rd,
-                                 Real hitDist, Real lambda, int& px, int& py) {
+                                 Real hitDist, Real lambda, int& px, int& py, double* tAt = nullptr) {
     D3 o, d;
-    if (!dLensCatchEntry(cam, ro, rd, hitDist, o, d)) return DLENS_MISSED;
+    if (!dLensCatchEntry(cam, ro, rd, hitDist, o, d, tAt)) return DLENS_MISSED;
     return dLensCatchImage(cam, o, d, lambda, px, py);
 }
 // BDPT's camera direction density at front-element point y for direction dir, times
@@ -6341,7 +6344,7 @@ __device__ static inline Real dHalfVectorCos(const DVec3& a, const DVec3& b) {
     return c < (Real)1 ? c : (Real)1;
 }
 // Twin of GlossyDraw (render.h): a direction drawn from a glossy lobe, and the factors the draw
-// leaves beyond the `reflect` slot -- its weight `w` (ggx.h weightAll: wavelength-free, the same from
+// leaves beyond the `reflect` slot -- its weight `w` (ggx::drawUV's: wavelength-free, the same from
 // either end of a path) and R, an iridescent lobe's interference reflectance at the pair's half-vector,
 // exactly 1 on a plain lobe. Every device sampler of a Glossy material's lobe draws through
 // dDrawGlossy or dGlossyDrawUV, and the JSPEC fold (dJFoldLobe) reads the same draw; how to take R
@@ -10389,7 +10392,7 @@ __global__ void kSphScanInit() {
 // refraction) — the path the camera sees flying THROUGH the glass. Port of
 // Renderer::connectSpecularSphereInside.
 __device__ static void dConnectSpecularSphereInside(const DScene& sc, const DCamera& cam,
-        double* film, double* hits, const DSphere& S, const DMaterial& glass, double n,
+        double* film, double* hits, const DSphere& S, const DMaterial& glass, double n, int aroundMat,
         const D3& p, const DSpecVtx& vt, Real lambda, double beta, DRng& rng) {
     D3 O(S.c); double r = S.r; D3 eye(cam.eye);
     double dEyeO = d3len(eye - O);
@@ -10492,7 +10495,7 @@ __device__ static void dConnectSpecularSphereInside(const DScene& sc, const DCam
         double term = vt.term(wP);
         if (term < 0.0) continue;
 
-        double contrib = beta * term * G * ch.Tf / omega;
+        double contrib = beta * term * G * ch.Tf / omega * (n * n);   // n^2: host twin
         if (contrib <= 0.0) continue;
         double aGlass = (double)specLookup(glass.absorb, lambda);
         if (aGlass > 0.0) contrib *= exp(-aGlass * ch.innerLen);
@@ -10501,7 +10504,7 @@ __device__ static void dConnectSpecularSphereInside(const DScene& sc, const DCam
         if (occludedTo(sc, dOffsetAlong(p.toR(), wPR, wPR), p.toR() + wPR * dP, 2e-6)) continue;
         if (sc.mediaN > 0)
             contrib *= (double)dMediaTransmittance(sc, p.toR(), wPR, (Real)dP, lambda, rng);
-        contrib *= dLegAbsorption(sc, cam.enclosure.topMat(), (double)dP, lambda);   // the camera's medium
+        contrib *= dLegAbsorption(sc, aroundMat, (double)dP, lambda);   // the exterior segment's
 
         filmAdd(film, hits, cam.resX, px, py, lambda, (Real)contrib);
     }
@@ -10517,8 +10520,14 @@ __device__ static void dConnectSpecularSphere(const DScene& sc, const DCamera& c
     double dEyeO = d3len(eye - O);
     double dPO   = d3len(p - O);
     if (dPO   <  r * 0.9999) return;                 // vertex inside glass -> skip
+    // `n` relative to what S refracts against (host twin connectSpecularSphere).
+    DMediumStack around = cam.enclosure;
+    around.popMat(sc.mats[S.matId].solidId);
+    int extMat = -1;
+    bool ranked = false;
+    n /= (double)dExteriorIor(sc, glass, around, lambda, extMat, ranked);
     if (dEyeO <= r * 0.9999) {                        // eye inside -> single refraction
-        dConnectSpecularSphereInside(sc, cam, film, hits, S, glass, n, p, vt, lambda, beta, rng);
+        dConnectSpecularSphereInside(sc, cam, film, hits, S, glass, n, around.topMat(), p, vt, lambda, beta, rng);
         return;
     }
     if (dEyeO <= r * 1.0001) return;                  // eye ~on surface -> degenerate
@@ -11681,12 +11690,12 @@ __device__ static double dRecSampleScalar(const DScene& sc, const DRecScalarStop
     double h11 =      t3 -     t2;
     return h00 * vs[i] + h10 * hh * mk + h01 * vs[i + 1] + h11 * hh * mk1;
 }
-// Per-hit roughness from a bound scalar record, if the material binds one (device twin of
-// the record branch of materialRoughness). Returns true + sets `out` (clamped [0,1]).
 // Host twin clampRoughness: the lobe's range [0, kMaxRoughness], NaN to 0.
 __device__ static inline double dClampRoughness(double r) {
     return !(r > 0.0) ? 0.0 : (r > ggx::kMaxRoughness ? ggx::kMaxRoughness : r);
 }
+// Per-hit roughness from a bound scalar record, if the material binds one (device twin of
+// the record branch of materialRoughness). Returns true + sets `out` (dClampRoughness).
 __device__ static bool dRecordRoughness(const DScene& sc, const DMaterial& m, const DHit& h, Real& out) {
     if (m.recRoughMode < 0) return false;
     double v;
@@ -12511,9 +12520,10 @@ __device__ static bool dApplyCausticAim(const DScene& sc, const DCamSet& cs,
 // `spec` (optional out) is the photon's SPECTRAL BUNDLE at birth (DBeamSpec): the extra
 // stratified wavelengths its beams may also carry. It is left empty unless the scene and the
 // emitter both qualify — see the fill site below.
-// Host twin Scene::enclosureAt (BIRTH-EMPTY-STACK, where the why is): the solids containing p, outermost
-// first, by three rays and a two-of-three vote on whether each solid's first face along them is met
-// from inside.
+// Host twin Scene::enclosureAt (BIRTH-EMPTY-STACK, where the why is): the closed solids containing p,
+// outermost first, by three rays and a two-of-three vote on whether each solid's first face along them
+// is left there.
+static_assert(DMediumStack::CAP == Scene::kEnclosureMax, "the host's enclosure keeps what the device's can");
 __device__ static void dEnclosureAt(const DScene& sc, const DVec3& p, DMediumStack& stk) {
     stk.clear();
     const DVec3 dirs[3] = {DVec3(0.267261, 0.534522, 0.801784), DVec3(-0.693889, 0.191741, -0.694108),
@@ -12525,19 +12535,21 @@ __device__ static void dEnclosureAt(const DScene& sc, const DVec3& p, DMediumSta
         const DVec3 d = normalize(dirs[k]);
         DVec3 o = p;
         double tAcc = 0.0;
-        for (int pass = 0; pass < 64; ++pass) {
+        int surfaces = 0, strands = 0;
+        for (;;) {
             const DHit h = closestHit(sc, o, d, RAY_EPS, BIG, /*camHide=*/false);
             if (!h.valid) break;
+            if (h.fiberRadius > (Real)0 ? ++strands > 1024 : ++surfaces > 64) break;
             tAcc += (double)h.t;
-            const DMaterial& m = sc.mats[h.matId];
-            if (m.enterable) {
+            const int si = sc.mats[h.matId].encSolid;
+            if (si >= 0 && h.solid != 0) {
                 bool known = false;
-                for (int i = 0; i < nS[k]; ++i) known = known || sid[k][i] == m.solidId;
+                for (int i = 0; i < nS[k]; ++i) known = known || sid[k][i] == si;
                 if (!known && nS[k] < DMediumStack::CAP) {
-                    sid[k][nS[k]] = m.solidId;
-                    spri[k][nS[k]] = sc.mats[m.solidId].priority;
+                    sid[k][nS[k]] = si;
+                    spri[k][nS[k]] = sc.mats[si].priority;
                     st[k][nS[k]] = tAcc;
-                    sin_[k][nS[k]] = dot(d, h.ng) > (Real)0;
+                    sin_[k][nS[k]] = (h.solid > 0) == h.back;
                     ++nS[k];
                 }
             }
@@ -13207,9 +13219,22 @@ __device__ static int shadeStep(const DScene& sc, const DCamSet& cs,
         // Model C never shares a trace (it consumes the photon), so nCam==1 here. A physical
         // lens catches what enters its front element and reaches the sensor (dLensCatch).
         const DCamera& cc = cs.cam(0);
-        const int lc = cc.hasLens ? dLensCatch(cc, ro, rd, dEvent, lambda, px, py) : DLENS_MISSED;
+        double tCatchD = 0.0;   // how far the flight runs to the aperture
+        Real tCatchR = (Real)0;
+        const int lc = cc.hasLens ? dLensCatch(cc, ro, rd, dEvent, lambda, px, py, &tCatchD) : DLENS_MISSED;
         if (lc == DLENS_ABSORBED) { eAbsorbed += beta; return WF_TERMINATE; }
-        if (cc.hasLens ? lc == DLENS_CAUGHT : cc.catchPhoton(ro, rd, dEvent, px, py)) {
+        if (cc.hasLens ? lc == DLENS_CAUGHT : cc.catchPhoton(ro, rd, dEvent, px, py, &tCatchR)) {
+            // That leg runs in the walk's medium -- a camera inside a solid -- and takes its
+            // absorption (host twin tracePhoton).
+            {
+                const int cm = stk.topMat();
+                const Real a = (cm >= 0) ? (Real)specLookup(sc.mats[cm].absorb, lambda) : (Real)0;
+                if (a > (Real)0) {
+                    const Real tr = exp(-a * (Real)(cc.hasLens ? tCatchD : (double)tCatchR));
+                    eAbsorbed += beta * ((Real)1 - tr);
+                    beta *= tr;
+                }
+            }
             // Flux->film-irradiance normaliser (see host render.h): keep brute-force C
             // on the SAME absolute scale as A/B (per-camera constant; auto-exposed
             // scenes unaffected).
@@ -13807,7 +13832,16 @@ __device__ static int shadeStepHero(const DScene& sc, const DCamSet& cs, int cam
     } else if (camMode == CAM_C) {
         int px, py;
         const DCamera& cc = cs.cam(0);
-        if (cc.catchPhoton(ro, rd, dEvent, px, py)) {
+        Real tCatch = (Real)0;
+        if (cc.catchPhoton(ro, rd, dEvent, px, py, &tCatch)) {
+            {   // the leg to the aperture, inside the walk's medium (scalar twin above)
+                const int cm = stk.topMat();
+                if (cm >= 0)
+                    for (int i = 0; i < nUp; ++i) {
+                        const Real a = (Real)specLookup(sc.mats[cm].absorb, lam[i]);
+                        if (a > (Real)0) beta[i] *= exp(-a * tCatch);
+                    }
+            }
             Real cCell = (Real)1 / (Real)(cc.pixelPlaneArea() * cc.filmDist * cc.filmDist);
             const bool envSeen = pathC && (pathC->bits & PV_BIT_ENVFIRST);   // the env SEEN: bilinear
             DEnvTaps tp;
@@ -16055,6 +16089,8 @@ __device__ static void bkNeeLightSpecGlossy(const DScene& sc, const DHit& h, con
         for (int i = 0; i < KK; ++i) Tr[i] = 1.0;
         if (sc.mediaN > 0)
             dMediaTransmittanceSpec(sc, h.p, g.wi, g.medDist(sc, h.p), lam, KK, Tr, rng);
+        if (h.extMat >= 0)   // the leg inside the vertex's solid (host twin neeLightSpecGlossy)
+            for (int i = 0; i < KK; ++i) Tr[i] *= dLegAbsorption(sc, h.extMat, (double)g.dist, lam[i]);
         // a coated vertex's coat (dCoatF: a body's way in, a coat lobe's reflection)
         const DCoatEval ce = dCoatEval(sc, *nb.m, h, nb.wo, g.wi);
         for (int i = 0; i < KK; ++i) {
@@ -18022,8 +18058,8 @@ __device__ static void bkRadianceHeroLoop(const DScene& sc, int diffraction,
     }
 }
 
-// Entry point for a fresh camera/gather hero bundle: unit throughput, empty medium stack, at
-// bounce 0. A camera ray may see a light directly; a GATHER ray may not — the vertex it left
+// Entry point for a fresh camera/gather hero bundle at bounce 0: unit throughput, inside gi's solids
+// (DGiCtx::stk0). A camera ray may see a light directly; a GATHER ray may not — the vertex it left
 // already NEE'd the direct light, so counting the emitter again here would double it. A
 // specular bounce re-arms this, so gold-bounced light still lands.
 //
@@ -18041,6 +18077,27 @@ __device__ static void bkRadianceHero(const DScene& sc, int diffraction, DVec3 r
     // (host twin radianceHero).
     DMediumStack stk; if (gi.stk0) stk = *gi.stk0; else stk.clear();
     const bool whole = (C > 1) && stk.n == 0;
+    if (C > 1 && !whole && sc.bkHeroSplit) {
+        // Under -herosplit, split from the start rather than collapse: each wavelength its own
+        // monochromatic sub-path, own estimate and own first event (host twin radianceHero).
+        for (int i = 0; i < C; ++i) {
+            Lout[i] = 0.0;
+            if (invPdfIn[i] == 0.0) continue;
+            double sThr = 1.0, sub[hero::kHeroMax];
+            const signed char heroFirst = s_dFirstEv[threadIdx.x];
+            const bool sFiles = i > 0 && heroFirst != (signed char)kDFirstOff;
+            if (sFiles) s_dFirstEv[threadIdx.x] = (signed char)kDFirstUnset;
+            bkRadianceHeroLoop<false, GiDepth>(sc, diffraction, ro, rd, stk, lamIn + i, invPdfIn + i, &sThr,
+                                               /*C=*/1, /*secAlive=*/false, /*specularArrival=*/(gi.depth == 0),
+                                               /*contBsdfPdf=*/0.0, /*bounce0=*/0, sub, rng, gi);
+            Lout[i] = sub[0];
+            if (sFiles) {
+                s_dFirstSec[threadIdx.x][i] = s_dFirstEv[threadIdx.x];
+                s_dFirstEv[threadIdx.x] = heroFirst;
+            }
+        }
+        return;
+    }
     if (C > 1 && !whole) thr[0] = (double)C;
     if (sc.bkHeroSplit)
         bkRadianceHeroLoop<true, GiDepth>(sc, diffraction, ro, rd, stk, lamIn, invPdfIn, thr, C,
@@ -18281,9 +18338,18 @@ __global__ void kBackward(DScene sc, const __grid_constant__ DCamera cam, double
 // Surface NEE, RGB twin of bkNeeLight: connect to every area/sphere/cylinder/spot emitter
 // and accumulate the linear-RGB direct contribution (Lambertian BRDF rhoRGB/pi times the
 // baked emitter radiance). No wavelength / invPdfLambda term (baked into rgbEmit).
+// `legMat`: the solid the vertex lies in (the walk's stack top), or -1, whose 3-tap absorption
+// every light sample's leg takes, as the walk's own segments do.
 __device__ static DVec3 bkNeeLightRGB(const DScene& sc, const DHit& h, const DVec3& rhoRGB,
-                                      DRng& rng) {
+                                      DRng& rng, int legMat = -1) {
     DVec3 total(0, 0, 0);
+    const DVec3 aLeg = legMat >= 0 ? sc.mats[legMat].rgbAbsorb : DVec3(0, 0, 0);
+    const bool legAbs = aLeg.x > 0 || aLeg.y > 0 || aLeg.z > 0;
+    const auto legTr = [&](Real dist) {
+        return legAbs ? DVec3(exp(-(double)aLeg.x * (double)dist), exp(-(double)aLeg.y * (double)dist),
+                              exp(-(double)aLeg.z * (double)dist))
+                      : DVec3(1, 1, 1);
+    };
     DVec3 f = rhoRGB / (Real)DPI;                     // Lambertian BRDF (per channel)
     DVec3 ngo0 = dShadedNg(h);
     DEmitterDraw draw; dPickEmitters(sc, h.p, &h.n, rng, draw);
@@ -18308,7 +18374,7 @@ __device__ static DVec3 bkNeeLightRGB(const DScene& sc, const DHit& h, const DVe
             Real fall = (Real)spotFalloff(dot(wi * (Real)(-1), beam), em.spotCosInner, em.spotCosOuter);
             if (fall <= (Real)0) continue;
             if (occludedTo(sc, dOffsetAlong(h.p, h.ng, wi), h.p + wi * dist, 2 * RAY_EPS)) continue;
-            total = total + hadamard(f * (fall * cosSurf / dist2 * stG * selWr), em.rgbEmit);
+            total = total + hadamard(hadamard(f * (fall * cosSurf / dist2 * stG * selWr), em.rgbEmit), legTr(dist));
             continue;
         }
         if (em.shape == 6) {                           // distant sun: cone NEE, 1/pdfW = Omega
@@ -18320,7 +18386,8 @@ __device__ static DVec3 bkNeeLightRGB(const DScene& sc, const DHit& h, const DVe
             if (stG <= (Real)0) continue;
             Real dist = (Real)(dExitDistance(sc, h.p));
             if (occluded(sc, dOffsetAlong(h.p, h.ng, wi), wi, dist)) continue;
-            total = total + hadamard(f * (Real)((double)(cosSurf * stG) * em.spotOmega * selW), em.rgbEmit);
+            total = total + hadamard(hadamard(f * (Real)((double)(cosSurf * stG) * em.spotOmega * selW), em.rgbEmit),
+                                     legTr(dist));
             continue;
         }
         Real u1 = rng.uniform(), u2 = rng.uniform();
@@ -18343,7 +18410,7 @@ __device__ static DVec3 bkNeeLightRGB(const DScene& sc, const DHit& h, const DVe
         if (occludedTo(sc, dOffsetAlong(h.p, h.ng, wi), h.p + wi * dist, 2 * RAY_EPS)) continue;
         Real G = cosSurf * cosLight / dist2;
         if (epat != 1.0) G = (Real)((double)G * epat);   // no-op without a pattern
-        total = total + hadamard(f * (G * (em.area * areaScale) * stG * selWr), em.rgbEmit);
+        total = total + hadamard(hadamard(f * (G * (em.area * areaScale) * stG * selWr), em.rgbEmit), legTr(dist));
     }
     return total;
 }
@@ -18484,10 +18551,10 @@ __device__ static DVec3 bkRadianceRGB(const DScene& sc, int diffraction, DVec3 r
                 Real s = pR + pT;
                 if (s > (Real)1) { pR /= s; pT /= s; }     // energy guard on the selection probs
                 DVec3 nb = h.n * (Real)(-1);
-                L = L + hadamard(beta, bkNeeLightRGB(sc, h, rhoR, rng));
+                L = L + hadamard(beta, bkNeeLightRGB(sc, h, rhoR, rng, stk.topMat()));
                 if (sc.envIndex >= 0) L = L + hadamard(beta, bkNeeEnvRGB(sc, h, rhoR, rng));
                 const DHit hb = dOtherSide(h);
-                L = L + hadamard(beta, bkNeeLightRGB(sc, hb, rhoT, rng));
+                L = L + hadamard(beta, bkNeeLightRGB(sc, hb, rhoT, rng, stk.topMat()));
                 if (sc.envIndex >= 0) L = L + hadamard(beta, bkNeeEnvRGB(sc, hb, rhoT, rng));
                 if (directOnly) return L;                   // Whitted: no diffuse indirect
                 Real u = rng.uniform();
@@ -18507,7 +18574,7 @@ __device__ static DVec3 bkRadianceRGB(const DScene& sc, int diffraction, DVec3 r
             case D_DIFFUSE:
             default: {
                 DVec3 rho = clampRgb01(mp->rgbAlbedo);
-                L = L + hadamard(beta, bkNeeLightRGB(sc, h, rho, rng));
+                L = L + hadamard(beta, bkNeeLightRGB(sc, h, rho, rng, stk.topMat()));
                 if (sc.envIndex >= 0)
                     L = L + hadamard(beta, bkNeeEnvRGB(sc, h, rho, rng));
                 if (directOnly) return L;                                   // Whitted: no diffuse indirect
@@ -19010,16 +19077,14 @@ __device__ static void dRandomWalk(const DScene& sc, const DCamera& cam, int dif
         }
 
         // Beer-Lambert attenuation over the in-glass segment just traversed, up to the
-        // event (surface hit OR medium collision, whichever is nearer). Mirrors CPU
-        // bdpt.h randomWalk: attenuates only the subpath walk; connection edges that
-        // cross glass are NOT absorption-weighted (see known-issues.md).
+        // event (surface hit OR medium collision, whichever is nearer); a connection edge
+        // takes its own medium's (host twin randomWalk).
         {
             int cm = stk.topMat();
             double a = (cm >= 0) ? (double)specLookup(sc.mats[cm].absorb, lambda) : 0.0;
             if (a > 0.0) beta *= exp(-a * (mediumEvent ? tMed : dSurf));
-            // Per-λ absorption for the bundle. A non-empty stack means we are inside a
-            // dielectric, and entering one de-heros — so nUp is always 1 whenever `a` can be
-            // non-zero and this loop never actually runs. Kept for generality.
+            // Per-λ absorption for the bundle: the one leg it meets whole is a light subpath born
+            // inside a coloured solid on its way to the wall (host twin randomWalk).
             if (cm >= 0) for (int i = 0; i + 1 < nUp; ++i) {
                 double ai = (double)specLookup(sc.mats[cm].absorb, hb.lam[i + 1]);
                 if (ai > 0.0) betaSec[i] *= exp(-ai * (mediumEvent ? tMed : dSurf));
@@ -25874,7 +25939,7 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
         d.rgbIor = m.ior ? m.ior(550.0) : 1.0;
         d.priority = m.priority;        // nested-dielectric priority (INT_MIN == unset)
         d.solidId  = m.solidId((int)i); // routed copies of one material are one solid
-        d.enterable = enterableSolidMat(m) ? 1 : 0;
+        d.encSolid = i < scene.encSolidOf.size() ? scene.encSolidOf[i] : -1;
         d.routeTo[0] = m.routeTo[0]; d.routeTo[1] = m.routeTo[1];
         d.absorbChroma = m.absorbChroma ? 1 : 0;
         d.reflectTex = m.reflectTex;
@@ -26711,17 +26776,16 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
         auto add = [&](const MediumStack& st, bool uniform, std::vector<int>& off, std::vector<int>& cnt) {
             off.push_back((int)(pool.size() / 2));
             if (!uniform) { cnt.push_back(-1); return; }
+            // The innermost, which the walk is in, where the device's stack holds fewer.
             const int n = st.n < gpu::DMediumStack::CAP ? st.n : gpu::DMediumStack::CAP;
-            for (int i = 0; i < n; ++i) { pool.push_back(st.matIdx[i]); pool.push_back(st.pri[i]); }
+            for (int i = st.n - n; i < st.n; ++i) { pool.push_back(st.matIdx[i]); pool.push_back(st.pri[i]); }
             cnt.push_back(n);
         };
         for (size_t i = 0; i < scene.emitterEnclosure.size(); ++i)
             add(scene.emitterEnclosure[i], scene.emitterEnclosureUniform[i] != 0, emOff, emN);
         for (size_t i = 0; i < scene.fireEnclosure.size(); ++i)
             add(scene.fireEnclosure[i], scene.fireEnclosureUniform[i] != 0, fireOff, fireN);
-        bool any = false;
-        for (const Material& m : scene.mats) any = any || enterableSolidMat(m);
-        sc.encAny     = any ? 1 : 0;
+        sc.encAny     = scene.anyEnterable ? 1 : 0;
         sc.encEmOff   = emOff.empty()   ? nullptr : (const int*)keep(uploadVec(emOff));
         sc.encEmN     = emN.empty()     ? nullptr : (const int*)keep(uploadVec(emN));
         sc.encFireOff = fireOff.empty() ? nullptr : (const int*)keep(uploadVec(fireOff));
@@ -26847,8 +26911,8 @@ static gpu::DCamera bakeCamera(const Scene& scene, const Camera& cam, int resX, 
         }
     }
     dc.eye = {cam.eye.x, cam.eye.y, cam.eye.z};
-    dc.enclosure.clear();   // as many of its solids as the device's stack holds, outermost first
-    for (int i = 0; i < cam.enclosure.n && i < DMediumStack::CAP; ++i)
+    dc.enclosure.clear();   // as many of its solids as the device's stack holds, the innermost
+    for (int i = cam.enclosure.n > DMediumStack::CAP ? cam.enclosure.n - DMediumStack::CAP : 0; i < cam.enclosure.n; ++i)
         dc.enclosure.push(cam.enclosure.matIdx[i], cam.enclosure.pri[i]);
     dc.u = {cam.u.x, cam.u.y, cam.u.z};
     dc.v = {cam.v.x, cam.v.y, cam.v.z};

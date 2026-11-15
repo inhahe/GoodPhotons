@@ -10,6 +10,7 @@
 #include <cstdio>
 #include <stdexcept>
 #include <atomic>
+#include <chrono>
 #include <unordered_map>
 #include "geometry.h"
 #include "rng.h"
@@ -17,6 +18,7 @@
 #include "implicit.h"
 #include "curve.h"       // curve / fiber primitive (hair, fur, grass, wire)
 #include "medium_stack.h" // MediumStack: a birth's enclosing solids (BIRTH-EMPTY-STACK)
+#include "watertight.h"   // markSolidFaces: which faces bound a closed solid
 #include "ggx.h"         // ggx::kMaxRoughness (clampRoughness)
 #include "layered.h"     // A3: the stochastic layered model's escape moments
 #include "pattern.h"
@@ -335,6 +337,17 @@ struct Material {
         for (double k : layerK) if (k != 0.0) return true;
         return false;
     }
+    // The first wavelength of the band, on a 1 nm grid, at which a thin film or multilayer stack
+    // lets light into its body (not coatOpaque), or -1 where it never does (and for every other
+    // type). The one scan every "is this coating ever crossed" question reads (bodyClear).
+    double firstClearNm() const {
+        if (type != MatType::ThinFilm && type != MatType::Multilayer) return -1.0;
+        for (double L = LAMBDA_MIN; L <= LAMBDA_MAX; L += 1.0)
+            if (!coatOpaque(L)) return L;
+        return -1.0;
+    }
+    // firstClearNm() >= 0, cached by Scene::finalizePatternSides for the per-hit readers.
+    bool bodyClear = false;
 
     // --- Diffraction grating (MatType::Grating) -----------------------------
     // A reflective diffraction grating with groove period `grooveSpacing` (nm) and
@@ -573,13 +586,11 @@ inline bool isSmoothCoatMat(const Material& m) {
 }
 // A material whose body a walk goes inside, onto its MediumStack (render.h interfaceStep): a
 // dielectric, or a thin film or multilayer whose substrate lets light through at some wavelength (one
-// opaque at every wavelength reflects or absorbs, and is never entered).
+// opaque at every wavelength reflects or absorbs, and is never entered; Material::bodyClear, which
+// Scene::finalizePatternSides sets).
 inline bool enterableSolidMat(const Material& m) {
     if (m.type == MatType::Dielectric) return true;
-    if (m.type != MatType::ThinFilm && m.type != MatType::Multilayer) return false;
-    for (double L = LAMBDA_MIN; L <= LAMBDA_MAX; L += 10.0)
-        if (!m.coatOpaque(L)) return true;
-    return false;
+    return (m.type == MatType::ThinFilm || m.type == MatType::Multilayer) && m.bodyClear;
 }
 
 // What the forward modes' closed-form connections reflect the eye in (Scene::mirrorPlanes,
@@ -1758,6 +1769,9 @@ inline double coatTirSecant(double n) {
 // Forward declaration: shadowTransmittance() below needs the pattern evaluator, which is
 // defined far below this class.
 struct Scene;
+// Defined after the class; Scene::markSolidFaces and Scene::buildEnclosures read them.
+inline bool passesLight(const Scene& scene, const Material& m);
+inline bool glowSamplePoint(const Scene& scene, const Emitter& em, Pcg32& rng, Hit& h, int& k);
 
 // `into` widened to hold box `b` carried by the affine `D`: its eight corners' images, whose box
 // holds the image of every point of `b` (an affine map takes the box's hull to theirs).
@@ -3767,6 +3781,9 @@ struct Scene {
         Vec3   lo{0, 0, 0};     // AABB of the member faces — a cheap reject before the
         Vec3   hi{0, 0, 0};     // BVH query that confirms the mirror is really there
         double area = 0.0;      // total face area (used to rank when capping the list)
+        // A member is a planar mirror (isPlanarMirrorMat), not a smooth coat: such a plane keeps its
+        // place when the list is capped, ahead of any coat's.
+        bool mirror = false;
         // The motion set its member faces share (-1: none moves), or `mixed` when they move
         // differently or deform -- then a path with a time uses its parts instead
         // (mirrorPlaneParts).
@@ -3907,6 +3924,15 @@ struct Scene {
             double nl = length(n);
             if (nl < 1e-12) continue;
             n = n * (1.0 / nl);
+            // A face images the eye in its plane only where it is shaded flat: a smooth-shaded mesh's
+            // walks reflect off its interpolated normals, which no facet's plane is, so it is left to
+            // them -- a tessellated coated body is not 64 flat mirrors and a patchwork of black.
+            bool flat = true;
+            for (const Vec3& vn : {t.n0, t.n1, t.n2}) {
+                const double l = length(vn);
+                flat = flat && l > 0.0 && std::fabs(dot(vn, n)) >= (1.0 - 1e-9) * l;
+            }
+            if (!flat) continue;
             // Canonical orientation: a mirror reflects from either face, so the two
             // sides of one plane must not split into two entries. Flip so the first
             // significant component is positive.
@@ -3932,6 +3958,7 @@ struct Scene {
                 idx = it->second;
             }
             MirrorPlane& mp = mirrorPlanes[(size_t)idx];
+            mp.mirror = mp.mirror || isPlanarMirrorMat(mats[t.matId]);
             if (t.motion != mp.motionSet || t.vkeys >= 0) mp.mixed = true;
             members[(size_t)idx].push_back((int)(&t - tris.data()));
             for (const Vec3& v : {t.v0, t.v1, t.v2}) {
@@ -4020,8 +4047,9 @@ struct Scene {
         }
         for (std::vector<MirrorPlane>* list : {&mirrorPlanes, &mirrorPlaneParts})
             if ((int)list->size() > kMaxMirrorPlanes) {
-                std::sort(list->begin(), list->end(),
-                          [](const MirrorPlane& a, const MirrorPlane& b) { return a.area > b.area; });
+                std::sort(list->begin(), list->end(), [](const MirrorPlane& a, const MirrorPlane& b) {
+                    return a.mirror != b.mirror ? a.mirror : a.area > b.area;
+                });
                 list->resize(kMaxMirrorPlanes);
             }
         // Pad the reject box by a hair so a reflection point landing exactly on an edge
@@ -4564,6 +4592,93 @@ struct Scene {
     // when nothing was dropped, which is the overwhelming majority of scenes.
     Aabb droppedBounds;
 
+    // PROBE-SOLID-SIDE: mark the triangles that bound a closed solid (watertight::markSolidFaces), so a
+    // ray can tell inside a solid from outside off the side it meets a face from (Hit::solid): the
+    // footprint probes of modes M, S, J and U, and enclosureAt. Each mesh object by itself, an asset's
+    // once however many instances place it; then every triangle no mesh object holds -- quads, a
+    // light's own surface -- as one pool, in which a box of six quads meeting edge to edge is a closed
+    // piece as a mesh is. (A sphere's hit says it is solid itself.) Also each isosurface's side, and the
+    // world boxes of the solids light does not pass (solidNear). Once a build: a second call returns
+    // the first's counts.
+    struct SolidMarks { size_t seen = 0, solid = 0, isoSolid = 0; double ms = 0.0; };
+    SolidMarks solidMarks;
+    uint64_t solidMarksBuild = 0;   // the buildCount markSolidFaces last ran at (0: never)
+    const SolidMarks& markSolidFaces() {
+        if (solidMarksBuild == buildCount && buildCount != 0) return solidMarks;
+        const auto t0 = std::chrono::steady_clock::now();
+        SolidMarks sm;
+        std::vector<char> done(blasList.size(), 0), held(tris.size(), 0);
+        // Each closed piece's bounds, for the boxes below: per asset, in its own frame, and in the world.
+        std::vector<std::vector<watertight::PieceBox>> blasPieces(blasList.size());
+        std::vector<watertight::PieceBox> worldPieces;
+        for (const MeshGroup& g : meshGroups) {
+            if (g.shapeOnly) continue;
+            if (g.blasId >= 0 && g.blasId < (int)blasList.size()) {
+                if (done[(size_t)g.blasId]) continue;
+                done[(size_t)g.blasId] = 1;
+                std::vector<Tri>& tr = blasList[(size_t)g.blasId].tris;
+                sm.solid += watertight::markSolidFaces(tr.data(), tr.size(), &blasPieces[(size_t)g.blasId]);
+                sm.seen += tr.size();
+            } else if (g.triStart + g.triCount <= tris.size()) {
+                sm.solid += watertight::markSolidFaces(tris.data() + g.triStart, g.triCount, &worldPieces);
+                sm.seen += g.triCount;
+                std::fill(held.begin() + (std::ptrdiff_t)g.triStart,
+                          held.begin() + (std::ptrdiff_t)(g.triStart + g.triCount), (char)1);
+            }
+        }
+        std::vector<Tri*> loose;
+        for (size_t i = 0; i < tris.size(); ++i)
+            if (!held[i]) loose.push_back(&tris[i]);
+        sm.solid += watertight::markSolidFaces(loose.data(), loose.size(), &worldPieces);
+        sm.seen += loose.size();
+        // An isosurface bounds a closed solid unless an `open` expression's surface may end at its
+        // container (Implicit::solidSide).
+        for (Implicit& im : implicits) {
+            im.solidSide = im.capped || !fieldHasExpr(im.nodes);
+            sm.isoSolid += im.solidSide ? 1 : 0;
+        }
+        // The solids' world boxes (solidNear), those a footprint's segment can meet: every sphere,
+        // closed isosurface and closed piece light does not pass (a piece by one of its faces'
+        // material) -- an asset's under each instance that places it.
+        const auto opaqueMat = [&](int matId) {
+            return !(matId >= 0 && matId < (int)mats.size() && passesLight(*this, mats[(size_t)matId]));
+        };
+        std::vector<Aabb> boxes;
+        for (const Implicit& im : implicits)
+            if (im.solidSide && opaqueMat(im.matId)) boxes.push_back(im.bounds);
+        for (const Sphere& sp : spheres) {
+            if (!opaqueMat(sp.matId)) continue;
+            Aabb b;
+            b.expand(sp.c - Vec3(sp.r, sp.r, sp.r));
+            b.expand(sp.c + Vec3(sp.r, sp.r, sp.r));
+            boxes.push_back(b);
+        }
+        for (const watertight::PieceBox& pb : worldPieces) {
+            if (!opaqueMat(pb.matId)) continue;
+            Aabb b;
+            b.expand(pb.lo);
+            b.expand(pb.hi);
+            boxes.push_back(b);
+        }
+        for (const MeshInstance& inst : instances) {
+            if (inst.blasId < 0 || inst.blasId >= (int)blasPieces.size()) continue;
+            for (const watertight::PieceBox& lb : blasPieces[(size_t)inst.blasId]) {
+                if (!opaqueMat(inst.matOverride >= 0 ? inst.matOverride : lb.matId)) continue;
+                Aabb b;
+                for (int c = 0; c < 8; ++c)
+                    b.expand(inst.toWorld.apply(Vec3((c & 1) ? lb.hi.x : lb.lo.x, (c & 2) ? lb.hi.y : lb.lo.y,
+                                                     (c & 4) ? lb.hi.z : lb.lo.z)));
+                boxes.push_back(b);
+            }
+        }
+        solidBoundsBvh.build(boxes);
+        solidBoundsKnown = !hasMotion();
+        sm.ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        solidMarks = sm;
+        solidMarksBuild = buildCount;
+        return solidMarks;
+    }
+
     // ---- BIRTH-EMPTY-STACK: the solids a light's walks are born inside ----------------------------
     // A walk keeps the dielectric solids it is inside on a MediumStack, pushing a solid as it enters
     // and popping it as it leaves; one born inside a solid -- a lamp in a coloured glass globe, a fire
@@ -4572,59 +4687,70 @@ struct Scene {
     //
     // enclosureAt(p): the solids containing p, outermost first (as a walk coming in would have pushed
     // them). Three rays from p, in fixed directions none of a scene's axes; along each, the first face
-    // of every enterable solid it meets says whether p is inside that solid (met from inside: the ray
-    // leaves it). A solid counts when two of the three agree, so one ray grazing an edge cannot decide.
-    // Order: by the distance at which the ray leaves, farthest (outermost) first.
+    // of every closed solid a walk goes inside (encSolidOf) says whether p is inside that solid: the
+    // ray leaves it there (Hit::solid, read off the face's side). A solid counts when two of the three
+    // agree, so one ray grazing an edge cannot decide. An open sheet -- a pane of one quad, a mesh with
+    // holes -- bounds no inside (markSolidFaces leaves its faces unmarked), so it encloses nothing.
+    // Each ray goes on through 64 surfaces, and strands (which enclose nothing) besides, up to 1024,
+    // keeping the first kEnclosureMax solids it meets. Order: by the distance at which the ray leaves,
+    // farthest (outermost) first. Device twin dEnclosureAt.
+    static constexpr int kEnclosureMax = 8;
     MediumStack enclosureAt(const Vec3& p) const {
         static const Vec3 kDirs[3] = {normalize(Vec3{0.267261, 0.534522, 0.801784}),
                                       normalize(Vec3{-0.693889, 0.191741, -0.694108}),
                                       normalize(Vec3{0.401842, -0.887563, 0.225382})};
         struct Seen { int solid; int pri; double t; bool inside; };
-        Seen seen[3][16];
+        Seen seen[3][kEnclosureMax];
         int nSeen[3] = {0, 0, 0};
         const double eps = 1e-7 * (1.0 + std::max(std::fabs(p.x), std::max(std::fabs(p.y), std::fabs(p.z))));
         for (int k = 0; k < 3; ++k) {
             Ray r{p, kDirs[k]};
             double tAcc = 0.0;
-            for (int pass = 0; pass < 64; ++pass) {
+            int surfaces = 0, strands = 0;
+            for (;;) {
                 const Hit h = closestHit(r, eps);
                 if (!h.valid) break;
+                if (h.fiberRadius > 0.0 ? ++strands > 1024 : ++surfaces > 64) break;
                 tAcc += h.t;
-                if (h.matId >= 0 && h.matId < (int)mats.size() && enterableSolidMat(mats[(size_t)h.matId])) {
-                    const int si = mats[(size_t)h.matId].solidId(h.matId);
+                const int si = (h.matId >= 0 && (size_t)h.matId < encSolidOf.size()) ? encSolidOf[(size_t)h.matId] : -1;
+                if (si >= 0 && h.solid != 0) {
                     bool known = false;
                     for (int i = 0; i < nSeen[k]; ++i) known = known || seen[k][i].solid == si;
-                    if (!known && nSeen[k] < 16)
-                        seen[k][nSeen[k]++] = Seen{si, mats[(size_t)si].priority, tAcc,
-                                                   dot(kDirs[k], h.ng) > 0.0};
+                    if (!known && nSeen[k] < kEnclosureMax)
+                        seen[k][nSeen[k]++] = Seen{si, mats[(size_t)si].priority, tAcc, (h.solid > 0) == h.back};
                 }
                 r = Ray{h.p, kDirs[k]};
             }
         }
-        Seen in[16];
+        Seen in[kEnclosureMax];
         int nIn = 0;
-        for (int i = 0; i < nSeen[0] + nSeen[1] + nSeen[2]; ++i) {
-            const int k = i < nSeen[0] ? 0 : (i < nSeen[0] + nSeen[1] ? 1 : 2);
-            const Seen& c = seen[k][i - (k > 0 ? nSeen[0] : 0) - (k > 1 ? nSeen[1] : 0)];
-            if (!c.inside) continue;
-            bool dup = false;
-            for (int j = 0; j < nIn; ++j) dup = dup || in[j].solid == c.solid;
-            if (dup) continue;
-            int votes = 0;
-            double tMax = 0.0;
-            for (int kk = 0; kk < 3; ++kk)
-                for (int j = 0; j < nSeen[kk]; ++j)
-                    if (seen[kk][j].solid == c.solid && seen[kk][j].inside) {
-                        ++votes;
-                        tMax = std::max(tMax, seen[kk][j].t);
-                    }
-            if (votes >= 2 && nIn < 16) in[nIn++] = Seen{c.solid, c.pri, tMax, true};
-        }
+        for (int k = 0; k < 3; ++k)
+            for (int i = 0; i < nSeen[k]; ++i) {
+                const Seen& c = seen[k][i];
+                if (!c.inside) continue;
+                bool dup = false;
+                for (int j = 0; j < nIn; ++j) dup = dup || in[j].solid == c.solid;
+                if (dup) continue;
+                int votes = 0;
+                double tMax = 0.0;
+                for (int kk = 0; kk < 3; ++kk)
+                    for (int j = 0; j < nSeen[kk]; ++j)
+                        if (seen[kk][j].solid == c.solid && seen[kk][j].inside) {
+                            ++votes;
+                            tMax = std::max(tMax, seen[kk][j].t);
+                        }
+                if (votes >= 2 && nIn < kEnclosureMax) in[nIn++] = Seen{c.solid, c.pri, tMax, true};
+            }
         std::sort(in, in + nIn, [](const Seen& a, const Seen& b) { return a.t > b.t; });
         MediumStack stk;
         for (int i = 0; i < nIn; ++i) stk.push(in[i].solid, in[i].pri);
         return stk;
     }
+    // By material: the solid a walk that went inside a surface of it holds on its stack -- the
+    // material's original (Material::solidId) for a dielectric or a clear coating
+    // (enterableSolidMat), a mix's first such part's for a mix (its walks enter the part it
+    // resolves to) -- or -1. Filled by buildEnclosures; anyEnterable says whether any is not -1.
+    std::vector<int> encSolidOf;
     // Per emitter (index into `emitters`) and per emissive volume: the stack their births start with
     // when it is the same over the whole light (`...Uniform`), probed at a few of its points just off
     // its emitting face; where it is not (a light straddling a solid's boundary), each birth asks
@@ -4642,9 +4768,21 @@ struct Scene {
         emitterEnclosureUniform.assign(emitters.size(), 1);
         fireEnclosure.assign(emissiveVolumes.size(), MediumStack{});
         fireEnclosureUniform.assign(emissiveVolumes.size(), 1);
+        encSolidOf.assign(mats.size(), -1);
         anyEnterable = false;
-        for (const Material& m : mats) anyEnterable = anyEnterable || enterableSolidMat(m);
+        for (size_t i = 0; i < mats.size(); ++i) {
+            const Material& m = mats[i];
+            if (enterableSolidMat(m)) encSolidOf[i] = m.solidId((int)i);
+            else if (m.type == MatType::Mix)
+                for (int c : m.mixChildren)
+                    if (c >= 0 && (size_t)c < mats.size() && enterableSolidMat(mats[(size_t)c])) {
+                        encSolidOf[i] = mats[(size_t)c].solidId(c);
+                        break;
+                    }
+            anyEnterable = anyEnterable || encSolidOf[i] >= 0;
+        }
         if (!anyEnterable) return;                  // nothing to be born inside: every stack empty
+        markSolidFaces();                           // which faces bound a closed solid (Hit::solid)
         std::vector<Vec3> pts;
         auto settle = [&](MediumStack& out, char& uniform) {
             for (size_t i = 0; i < pts.size(); ++i) {
@@ -4680,19 +4818,48 @@ struct Scene {
                     }
                     break;
                 }
+                case EmitterShape::Cylinder: {
+                    // Just off its wall, around it at three heights (`u` and `normal` are its radial
+                    // frame, `v` its axis), and off each cap it has.
+                    for (double a : {0.1, 0.5, 0.9})
+                        for (int q = 0; q < 4; ++q) {
+                            const double phi = 0.5 * PI * q;
+                            const Vec3 rad = e.u * std::cos(phi) + e.normal * std::sin(phi);
+                            pts.push_back(e.origin + e.v * a + rad * (e.radius + off));
+                        }
+                    if (e.caps) {
+                        const double len = length(e.v);
+                        const Vec3 ax = len > 0.0 ? e.v / len : Vec3{0, 1, 0};
+                        pts.push_back(e.origin - ax * off);
+                        pts.push_back(e.origin + e.v + ax * off);
+                    }
+                    break;
+                }
                 case EmitterShape::Spot:
                     pts.push_back(e.origin);
                     break;
                 case EmitterShape::Env:
                 case EmitterShape::Sun:
                     break;                          // born outside the scene's bounds
-                default:                            // a cylinder, a glow: its box's centre and corners
-                    if (e.glowHi.x >= e.glowLo.x) {
+                case EmitterShape::Glow: {
+                    // Points of its surface, drawn as its births are (glowSamplePoint) off a fixed
+                    // stream, each just off its emitting side; its box's centre and corners where no
+                    // draw finds it.
+                    Pcg32 rng;
+                    rng.seed(0x9e3779b97f4a7c15ull ^ (uint64_t)ei, 0x632be59bd9b4e019ull);
+                    for (int d = 0; d < 16 && pts.size() < 6; ++d) {
+                        Hit gh;
+                        int k = 0;
+                        if (glowSamplePoint(*this, e, rng, gh, k)) pts.push_back(gh.p + normalize(gh.ng) * off);
+                    }
+                    if (pts.empty()) {
                         pts.push_back((e.glowLo + e.glowHi) * 0.5);
                         pts.push_back(e.glowLo); pts.push_back(e.glowHi);
-                    } else {
-                        pts.push_back(e.origin);
                     }
+                    break;
+                }
+                default:
+                    pts.push_back(e.origin);
                     break;
             }
             if (!pts.empty()) settle(emitterEnclosure[ei], emitterEnclosureUniform[ei]);
@@ -4700,10 +4867,20 @@ struct Scene {
         for (size_t fi = 0; fi < emissiveVolumes.size(); ++fi) {
             const EmissiveVolume& v = emissiveVolumes[fi];
             pts.clear();
-            pts.push_back((v.bmin + v.bmax) * 0.5);
-            for (int c = 0; c < 8; ++c)
-                pts.push_back(Vec3{(c & 1) ? v.bmax.x : v.bmin.x, (c & 2) ? v.bmax.y : v.bmin.y,
-                                   (c & 4) ? v.bmax.z : v.bmin.z});
+            if (!v.cellCdf.empty()) {
+                // Where it emits, drawn as its births are (cellPoint) off a fixed stream.
+                Pcg32 rng;
+                rng.seed(0x2545f4914f6cdd1dull ^ (uint64_t)fi, 0x9e3779b97f4a7c15ull);
+                for (int d = 0; d < 9; ++d) {
+                    const double u0 = rng.uniform(), u1 = rng.uniform(), u2 = rng.uniform(), u3 = rng.uniform();
+                    pts.push_back(v.cellPoint(u0, u1, u2, u3));
+                }
+            } else {
+                pts.push_back((v.bmin + v.bmax) * 0.5);
+                for (int c = 0; c < 8; ++c)
+                    pts.push_back(Vec3{(c & 1) ? v.bmax.x : v.bmin.x, (c & 2) ? v.bmax.y : v.bmin.y,
+                                       (c & 4) ? v.bmax.z : v.bmin.z});
+            }
             settle(fireEnclosure[fi], fireEnclosureUniform[fi]);
         }
     }
@@ -4872,15 +5049,14 @@ struct Scene {
     // layered stack whose bodies are opaque returns light on the side it came). A part is
     // never a mix or layered stack itself (the loader refuses one), so it decides alone.
     void finalizePatternSides() {
+        for (auto& m : mats) m.bodyClear = m.firstClearNm() >= 0.0;
         auto crosses = [](const Material& m) {
             switch (m.type) {
                 case MatType::Dielectric: case MatType::HalfMirror: case MatType::Filter:
                 case MatType::DiffuseTransmit:
                     return true;
                 case MatType::ThinFilm: case MatType::Multilayer:
-                    for (double L = LAMBDA_MIN; L <= LAMBDA_MAX; L += 1.0)
-                        if (!m.coatOpaque(L)) return true;
-                    return false;
+                    return m.bodyClear;
                 default:
                     return false;
             }
@@ -4953,6 +5129,10 @@ struct Scene {
         for (int& e : sphereEmitter) fix(e);
         for (MeshInstance& in : instances)
             for (auto& [m, e] : in.emitOf) fix(e);
+        // The per-emitter birth stacks (buildEnclosures) move down with their lights.
+        if ((size_t)idx < emitterEnclosure.size()) emitterEnclosure.erase(emitterEnclosure.begin() + idx);
+        if ((size_t)idx < emitterEnclosureUniform.size())
+            emitterEnclosureUniform.erase(emitterEnclosureUniform.begin() + idx);
     }
 
     // Is this curve segment one of the fibers a fur grid summarises? Grass and wire are
@@ -6312,6 +6492,15 @@ inline int mixResolveChild(const Scene& scene, const Material& m, const Hit& h, 
     return mixPickChild(m, u);
 }
 
+// Whether some lobe of the compound `m` (a mix's children, a stack's coat) would hold a merge vertex
+// (`keep`). Device twin: the `any` of dCompoundMergeStoreProb.
+template <class Keep>
+inline bool compoundAnyKeeps(const Scene& scene, const Material& m, const Keep& keep) {
+    const auto valid = [&](int c) { return c >= 0 && c < (int)scene.mats.size(); };
+    bool any = m.type == MatType::Layered && valid(m.coatChild) && keep(scene.mats[(size_t)m.coatChild]);
+    for (int c : m.mixChildren) any = any || (valid(c) && keep(scene.mats[(size_t)c]));
+    return any;
+}
 // COMPOUND-MERGE-PICK: a light walk's merge vertex at the compound `m`. The vertex a merge gathers
 // stands for the flux arriving at the surface whichever lobe the walk's pick then takes (a merge
 // evaluates the camera's lobe, never the light's), so the walk stores it whenever it goes on past the
@@ -6322,15 +6511,6 @@ inline int mixResolveChild(const Scene& scene, const Material& m, const Hit& h, 
 // bodies with the rest. 0 when no lobe of `m` could hold a merge vertex; 1 off a compound. It reads
 // no weight map, so it costs a sum. (The photon pass of modes M and S deposits before its pick for
 // the same reason, COMPOUND-DOUBLE-PICK.) Device twin dCompoundMergeStoreProb.
-// Whether some lobe of the compound `m` (a mix's children, a stack's coat) would hold a merge vertex
-// (`keep`). Device twin: the `any` of dCompoundMergeStoreProb.
-template <class Keep>
-inline bool compoundAnyKeeps(const Scene& scene, const Material& m, const Keep& keep) {
-    const auto valid = [&](int c) { return c >= 0 && c < (int)scene.mats.size(); };
-    bool any = m.type == MatType::Layered && valid(m.coatChild) && keep(scene.mats[(size_t)m.coatChild]);
-    for (int c : m.mixChildren) any = any || (valid(c) && keep(scene.mats[(size_t)c]));
-    return any;
-}
 template <class Keep>
 inline double compoundMergeStoreProb(const Scene& scene, const Material& m, double coatR, const Keep& keep) {
     if (m.type != MatType::Mix && m.type != MatType::Layered) return 1.0;

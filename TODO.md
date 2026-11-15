@@ -294,6 +294,19 @@ Then the rest of 4.2-4.6 in their order, 4.7's bookkeeping alongside whatever to
   memory, so the next GPU render paged (~45x slower); it gives the device back as the render ends.
 - [x] **J-THIN-GAP-LEAK** (0.445.3) — J's and U's merges keep their own surface's photons over its
   share of the disc (the footprint): the gap's light stays off the plate, and object bases read true.
+- [x] **REVIEW-0445B** (0.446.1) — the Opus (max) and Fable (xhigh) reviews of 0.445.4-0.445.9:
+  where walks start (tube lights, `-no-env`, open sheets, mixes, strands, the device's cap), the
+  legs left unabsorbed (mode C, M's glossy NEE, `-rgb`, a glow seen, a camera in a glass ball,
+  `-radcache`, `-herosplit`), flat mirror planes; known-issues REVIEW-0445B.
+- [ ] **BALL-EYE-HALO** — modes R, D and U draw a halo round a lamp seen from inside a glass ball
+  that mode B and the closed form do not (known-issues).
+- [ ] **LEG-TRANSMITTANCE** — one call for a leg's whole transmittance (media and its solid's
+  absorption) at every connection site, host and device, and a walk's starting stack a required
+  argument rather than GiCtx::stk0's pointer (REVIEW-0445B's last two findings).
+- [ ] **EMIT-TWO-SIDED** — `emit_two_sided on` for emissive materials (a glowing quad or mesh sheet
+  lit both ways), the back face decided by material at the hit's finalizer rather than by triangle,
+  so instances take it too; known-issues "a quad's emission is invisible from the side its winding
+  faces away from".
 - [x] **COINCIDENT-LAMP-FACES** (0.446.0) — `light area { two_sided on }`, and a load-time warning
   for area lights overlapping on one plane; `tools/check_two_sided.py`.
 - [ ] **GAP-MERGE-RADIUS** — beside a millimetre gap's mouth a merge's disc averages in the gap's

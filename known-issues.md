@@ -72,6 +72,109 @@ closed entries, where the cost is a broken historical link rather than a blocked
 Three references — `scenes/_gr_fly0.ftsl`, `scenes/silver_sphere_xenon.ftsl`, `scenes/x.ftsl` —
 name files that no longer exist at all, all in closed entries.
 
+## OPEN (2026-11-15): BALL-EYE-HALO — a camera walk from inside a glass ball draws a halo round a lamp it sees
+
+Found checking REVIEW-0445B's glass-sphere connection. The eye at the centre of a small glass ball
+(radius 0.15, `ior 1.5`) in `scenes/_camera_in_water.ftsl`'s room: every ray that reaches the eye
+leaves the ball along a radius, unbent, so the room should look as it does without the ball, n^2 T
+times brighter (the lamp reads that in every mode: mode B 2.07 of the room without the ball, mode R
+2.08, the closed form 2.06). But modes R, D and U draw a speckled, coloured halo round the lamp that
+mode B (the analytic connection) does not, and that nothing physical makes: the walls 7-15 pixels
+from the lamp read 4.4 times the room without the ball in mode R against mode B's 2.08. In air the
+halo is there too, swamped by the brighter walls (mode B 0.91 of mode R there, 0.97 further out); in
+absorbing water, where the walls are dim, it is most of the light near the lamp. Not the camera's
+aperture (`aperture 0` changes nothing) and not the stack (a ball of `ior 1.0` reads 1.042 of the
+room, the closed form 1.046). Suspects: the de-hero'd bundle of a camera inside a solid meeting the
+ball's inside again (internal reflection) and a radiance scale or Fresnel weight taken twice; or the
+lamp reached by a continuation off a wall through the ball, its MIS weight against light sampling
+(which a dielectric blocks) wrong. To narrow: mode R at -max-bounce 3 and 4, `-heroc 1`, and with the
+ball's Fresnel off (`ior 1.0001`).
+
+## DONE (2026-11-15, 0.446.1): REVIEW-0445B — what the Opus (max) and Fable (xhigh) reviews of 0.445.4-0.445.9 found
+
+`/code-review max` (Opus, 15 findings) and `/code-review xhigh` (Fable, 13) of b004c3b..7ba82c0, run
+one after the other in a worktree. Each checked against the code; every one held, though the last few
+are cleanups. Where both found a thing it says (both).
+
+**Where walks start (0.446.1):**
+
+* **A tube light was probed for its birth stack at the world origin (both).** buildEnclosures'
+  default case read a Glow's box, which a Cylinder leaves at its {0,0,0} default, so every `light
+  cylinder`'s walks were born inside whatever solid held (0,0,0), and one inside a glass tube
+  elsewhere in air. A tube now probes points just off its wall at three heights, and off its caps.
+* **`-no-env` left the birth stacks a light behind (both).** eraseEmitter renumbers the lights after
+  the environment it removes and now moves their stacks with them.
+* **An open dielectric sheet enclosed everything behind it (Opus).** enclosureAt took the first face
+  of an enterable material met from behind as "inside", so a window of one quad, or a glass mesh with
+  a hole, put the camera and the lamps behind it inside its glass. It now counts only faces that bound
+  a closed solid (Hit::solid, which markSolidFaces sets -- run by build() wherever a walk can be inside
+  something, Scene::markSolidFaces, where main.cpp ran it only for the gathering modes), and reads the
+  side from it, so an inward-wound closed mesh is right too.
+* **A mix with a glass part was no enclosing solid (Fable).** Its walks enter the part it resolves
+  to; enclosureAt now holds a mix as its first enterable part's solid (Scene::encSolidOf, device
+  DMaterial::encSolid).
+* **Strands spent the probe's budget (Fable).** A probe ray goes on through 64 surfaces and up to 1024
+  strands besides (which enclose nothing), on both devices; the host keeps as many solids per ray as
+  the device can (kEnclosureMax 8, asserted).
+* **A stack deeper than the device holds kept its outermost solids (Fable).** The camera's and the
+  lights' uploads keep the innermost, the one the walk is in.
+* **Three scans for "is this coating ever crossed" (both).** At 10, 5 and 1 nm. One now:
+  Material::firstClearNm (1 nm), cached as Material::bodyClear by finalizePatternSides for the per-hit
+  readers; the device reads scene.anyEnterable.
+* **A glow's or fire's probes were its box's corners (Opus).** So one inside a solid not much larger
+  than it read non-uniform and paid three probe rays a birth. A Glow now probes points of its own
+  surface (glowSamplePoint off a fixed stream) and a fire points where it emits (cellPoint).
+* **The exposure meter's cameras started in air (Fable).** buildMeterCam gives them their eye's
+  stack, as the frames have.
+
+**Legs 0.445.8 left unabsorbed (0.446.1):**
+
+* **Mode C caught a photon before its last leg's absorption (Opus).** The aperture catch, scalar and
+  hero, host and device, ran before the segment's Beer-Lambert; `catchPhoton` / `lensCatch` now say
+  how far the flight ran to the aperture and the catch takes the walk's medium over it.
+* **Mode M's spectral glossy light sample took no leg absorption (Opus).** neeLightSpecGlossy and
+  its device twin now take the vertex's solid over the leg, as the fibre twin did.
+* **The connection from inside a glass sphere absorbed its outer leg by the sphere's glass (both).**
+  It now takes the camera's solids but the sphere (host and device). Checking it found two more, in
+  the same connector, older than the batch: the sphere refracted against vacuum even where the
+  priority rule has the walks refract against the medium around it (exteriorIor), and an eye inside
+  it read the radiance outside 1/n^2 of what it is -- mode B read the room from inside a clear glass
+  ball 0.42 of mode R (0.05 before the leg's fix). Its index is now the walks' (exteriorIor), and the
+  eye inside takes n^2 (the radiance theorem): the lamp seen through the ball agrees with mode R,
+  in water and in air, and with the closed form (2.07 of the room without the ball against 2.06).
+  The walls wait on BALL-EYE-HALO, a halo the camera walks draw round the lamp. What it still leaves to mode B's other paths is the light a
+  camera walk finds reflecting inside the ball before it leaves.
+* **The GPU's `-rgb` mode R sampled lights with no leg absorption (Opus).** bkNeeLightRGB takes the
+  walk's medium, 3-tap.
+* **The forward modes' direct view of a glow took no camera-medium absorption (Opus).**
+  glowSeenXYZ takes the camera's medium, and a camera in a solid draws glows per wavelength.
+* **`-radcache`'s update rays started in air (both).** They start inside the solids around their
+  cell (eyeStack).
+* **Under `-herosplit` a camera inside a solid collapsed its bundle to the hero (Opus).** Mode W
+  forces the split because its wavelength lattice is every pixel's, so one sample's frame was one
+  wavelength. The bundle now splits into a monochromatic sub-path per wavelength from the start, as a
+  dispersive vertex splits it (host and device, each sub-path filing its own first event).
+
+**The rest:**
+
+* **A smooth-coated mesh became up to 64 facet mirrors (both).** mirrorConnectsMat took every face of
+  a roughness-0 coat, so a tessellated, smooth-shaded body was imaged facet by facet, and could evict
+  a real mirror from the 64 planes kept. A face joins a mirror plane only when shaded flat (corner
+  normals along its face normal), for mirrors and coats alike, and planar mirrors are kept ahead of
+  coats when the list is capped.
+* **Stale and detached comments (both).** randomWalk's and dRandomWalk's "connections are not
+  absorption-weighted" and "this loop never runs", radianceHero's "empty medium stack",
+  dRecordRoughness's and compoundMergeStoreProb's docs separated from them, and three references to
+  the removed ggx weightAll / sampleUVAll.
+
+**Not changed in 0.446.1, and why:**
+
+* Leg absorption is a multiply at each of some 40 sites (Opus), and GiCtx::stk0 a pointer each walk
+  entry re-points (Fable): both are design debts the findings above show cost bugs. LEG-TRANSMITTANCE
+  (TODO) folds the leg's medium into the one transmittance call every leg makes, and makes a walk's
+  starting stack an argument the compiler requires.
+* radianceHero copies the 260-byte host stack twice per walk (Fable): folded into the same.
+
 ## DONE (2026-11-15, 0.445.6 and 0.445.7): REVIEW-0445 — what the Opus and Fable reviews of 2613698..b004c3b found
 
 `/code-review max` (Opus, 12 findings) and `/code-review xhigh` (Fable, 14) of the GGX, COAT-FACTOR,

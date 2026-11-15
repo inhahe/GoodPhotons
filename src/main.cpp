@@ -16101,23 +16101,25 @@ static int glowMatSeen(const Scene& scene, const Hit& h, const Vec3& d, double l
 // uniformly over [360, 830] nm (hence that span), dimmed by the media along the ray (drawn from `rng`).
 // `u1` and `u2` draw a compound's coin and child. `perSample`: the sample is filed by its own first
 // surface, as mode P's blurred split files it (BackwardRenderer::noteFirstSurface), so a glow on a
-// specular-type surface is left to the camera side, whose specular film has it.
+// specular-type surface is left to the camera side, whose specular film has it. `camMed`: the solid
+// the camera is in (Camera::medium), or -1, whose absorption the ray takes on its way to the glow.
 static Vec3 glowSeenXYZ(const Scene& scene, const Hit& h, const Ray& r, bool mono, double lambda,
-                        double u1, double u2, Pcg32& rng, double w, bool perSample) {
+                        double u1, double u2, Pcg32& rng, double w, bool perSample, int camMed) {
     constexpr double kLo = 360.0, kHi = 830.0;
     if (perSample && BackwardRenderer::specularFirstSurface(scene, h)) return Vec3{0, 0, 0};
     bool resolved = false;
     const int id = glowMatSeen(scene, h, r.d, lambda, u1, u2, resolved);
     if (id < 0) return Vec3{0, 0, 0};
     const Material& m = scene.mats[(size_t)id];
-    if (!mono && !resolved && scene.media.empty()) {
+    if (!mono && !resolved && scene.media.empty() && camMed < 0) {
         const Vec3 c = scene.glowXYZ[(size_t)id] * (emitHitScale(scene, m, h, r.d * -1.0) * w);
         return (c.x + c.y + c.z > 0.0) ? c : Vec3{0, 0, 0};
     }
     const double T = scene.media.empty() ? 1.0
                    : Renderer::mediaTransmittance(scene, r.o, r.d, h.t, lambda, rng);
     const Vec3 c = Vec3(cieX(lambda), cieY(lambda), cieZ(lambda)) *
-                   (emitSlot(scene, m, h, lambda, r.d * -1.0) * T * w * (kHi - kLo));
+                   (emitSlot(scene, m, h, lambda, r.d * -1.0) * T * legAbsorption(scene, camMed, h.t, lambda) *
+                    w * (kHi - kLo));
     // Nothing for a draw that is not a number (an emit pattern undefined somewhere): the sums it
     // would enter only accumulate.
     return (c.x + c.y + c.z > 0.0) ? c : Vec3{0, 0, 0};
@@ -16150,7 +16152,7 @@ static bool prepareSky(SkyView& view, const Scene& scene, const Camera& cam, int
     const double perPixel = (double)N / ((double)rx * (double)ry);
     // A pinhole's 64 points resolve the sky and a plain glow exactly; a glow seen through a medium or
     // on a compound is a draw a sample (glowXYZAt), so its count grows with the render as a lens's.
-    const bool glowDrawn = haveGlow && (scene.glowCompound || !scene.media.empty());
+    const bool glowDrawn = haveGlow && (scene.glowCompound || !scene.media.empty() || cam.medium() >= 0);
     const long long want = (lensed || glowDrawn)
                          ? std::max(kFirst, std::min(4096LL, (long long)(perPixel / 4.0))) : kFirst;
     // What pinhole sample k of pixel `pix` sees of a glow at its hit (glowMatSeen): a plain glow's XYZ
@@ -16161,7 +16163,8 @@ static bool prepareSky(SkyView& view, const Scene& scene, const Camera& cam, int
         seedUnit(g, pix, 0x61C0FFEE5EE0ULL ^ ((uint64_t)k * 0x9E3779B97F4A7C15ULL));
         const double lambda = kLo + (kHi - kLo) * g.uniform();
         const double u1 = g.uniform(), u2 = g.uniform();
-        return glowSeenXYZ(scene, h, r, /*mono=*/false, lambda, u1, u2, g, 1.0, /*perSample=*/false);
+        return glowSeenXYZ(scene, h, r, /*mono=*/false, lambda, u1, u2, g, 1.0, /*perSample=*/false,
+                           cam.medium());
     };
     // A pinhole pixel's samples [k0, k1), points of its rotated Halton (2,3) lattice, added to `s`
     // in k order. Every one is traced: a feature thinner than the lattice's spacing (a strand, a
@@ -16207,7 +16210,8 @@ static bool prepareSky(SkyView& view, const Scene& scene, const Camera& cam, int
             if (h.valid) {
                 if (!haveGlow) continue;
                 const double u1 = rng.uniform(), u2 = rng.uniform();
-                c = glowSeenXYZ(scene, h, r, /*mono=*/true, lambda, u1, u2, rng, wLens, /*perSample=*/false);
+                c = glowSeenXYZ(scene, h, r, /*mono=*/true, lambda, u1, u2, rng, wLens, /*perSample=*/false,
+                                cam.medium());
                 if (!(c.x + c.y + c.z > 0.0)) continue;
             } else {
                 double L = 0.0;
@@ -16358,7 +16362,7 @@ static void addBlurredSkyRows(Film& film, const Scene& scene, const Camera& cam,
                     const double lam = lensed ? lambda : kLo + (kHi - kLo) * rng.uniform();
                     const double g1 = rng.uniform(), g2 = rng.uniform();
                     acc += glowSeenXYZ(scene, h, r, /*mono=*/lensed, lam, g1, g2, rng, w,
-                                       /*perSample=*/glowsOnly);
+                                       /*perSample=*/glowsOnly, cp.medium());
                     continue;
                 }
                 if (!lensed) {
@@ -19993,87 +19997,14 @@ static void prepareSunAim(const Scene& scene) {
 #endif
 }
 
-// PROBE-SOLID-SIDE: marks the triangles that bound a closed solid (watertight::markSolidFaces), so
-// the footprint probes of modes M and S can tell inside a solid from outside off the side a face is
-// met from (Hit::solid). Each mesh object by itself, an asset's once however many instances place
-// it; then every triangle no mesh object holds -- quads, a light's own surface -- as one pool, in
-// which a box of six quads meeting edge to edge is a closed piece as a mesh is. (A sphere's hit
-// says it is solid itself.)
+// The closed solids' faces for the footprint probes of modes M, S, J and U (Scene::markSolidFaces,
+// which build() has run already where a walk can be inside a solid), and a line saying what it found.
 static void markSolidFaces(Scene& scene) {
-    const auto t0 = std::chrono::steady_clock::now();
-    size_t seen = 0, solid = 0;
-    std::vector<char> done(scene.blasList.size(), 0), held(scene.tris.size(), 0);
-    // Each closed piece's bounds, for the boxes below: per asset, in its own frame, and in the world.
-    std::vector<std::vector<watertight::PieceBox>> blasPieces(scene.blasList.size());
-    std::vector<watertight::PieceBox> worldPieces;
-    for (const MeshGroup& g : scene.meshGroups) {
-        if (g.shapeOnly) continue;
-        if (g.blasId >= 0 && g.blasId < (int)scene.blasList.size()) {
-            if (done[(size_t)g.blasId]) continue;
-            done[(size_t)g.blasId] = 1;
-            std::vector<Tri>& tr = scene.blasList[(size_t)g.blasId].tris;
-            solid += watertight::markSolidFaces(tr.data(), tr.size(), &blasPieces[(size_t)g.blasId]);
-            seen += tr.size();
-        } else if (g.triStart + g.triCount <= scene.tris.size()) {
-            solid += watertight::markSolidFaces(scene.tris.data() + g.triStart, g.triCount, &worldPieces);
-            seen += g.triCount;
-            std::fill(held.begin() + (std::ptrdiff_t)g.triStart,
-                      held.begin() + (std::ptrdiff_t)(g.triStart + g.triCount), (char)1);
-        }
-    }
-    std::vector<Tri*> loose;
-    for (size_t i = 0; i < scene.tris.size(); ++i)
-        if (!held[i]) loose.push_back(&scene.tris[i]);
-    solid += watertight::markSolidFaces(loose.data(), loose.size(), &worldPieces);
-    seen += loose.size();
-    // An isosurface bounds a closed solid unless an `open` expression's surface may end at its
-    // container (Implicit::solidSide).
-    size_t isoSolid = 0;
-    for (Implicit& im : scene.implicits) {
-        im.solidSide = im.capped || !fieldHasExpr(im.nodes);
-        isoSolid += im.solidSide ? 1 : 0;
-    }
-    // The solids' world boxes (Scene::solidNear), those a footprint's segment can meet: every
-    // sphere, closed isosurface and closed piece light does not pass (a piece by one of its faces'
-    // material) -- an asset's under each instance that places it.
-    const auto opaqueMat = [&](int matId) {
-        return !(matId >= 0 && matId < (int)scene.mats.size() && passesLight(scene, scene.mats[(size_t)matId]));
-    };
-    std::vector<Aabb> boxes;
-    for (const Implicit& im : scene.implicits)
-        if (im.solidSide && opaqueMat(im.matId)) boxes.push_back(im.bounds);
-    for (const Sphere& sp : scene.spheres) {
-        if (!opaqueMat(sp.matId)) continue;
-        Aabb b;
-        b.expand(sp.c - Vec3(sp.r, sp.r, sp.r));
-        b.expand(sp.c + Vec3(sp.r, sp.r, sp.r));
-        boxes.push_back(b);
-    }
-    for (const watertight::PieceBox& pb : worldPieces) {
-        if (!opaqueMat(pb.matId)) continue;
-        Aabb b;
-        b.expand(pb.lo);
-        b.expand(pb.hi);
-        boxes.push_back(b);
-    }
-    for (const MeshInstance& inst : scene.instances) {
-        if (inst.blasId < 0 || inst.blasId >= (int)blasPieces.size()) continue;
-        for (const watertight::PieceBox& lb : blasPieces[(size_t)inst.blasId]) {
-            if (!opaqueMat(inst.matOverride >= 0 ? inst.matOverride : lb.matId)) continue;
-            Aabb b;
-            for (int c = 0; c < 8; ++c)
-                b.expand(inst.toWorld.apply(Vec3((c & 1) ? lb.hi.x : lb.lo.x, (c & 2) ? lb.hi.y : lb.lo.y,
-                                                 (c & 4) ? lb.hi.z : lb.lo.z)));
-            boxes.push_back(b);
-        }
-    }
-    scene.solidBoundsBvh.build(boxes);
-    scene.solidBoundsKnown = !scene.hasMotion();
-    if (seen || !scene.implicits.empty())
+    const Scene::SolidMarks& sm = scene.markSolidFaces();
+    if (sm.seen || !scene.implicits.empty())
         std::printf("[gather] %zu of %zu triangles and %zu of %zu isosurfaces bound closed solids, "
-                    "whose side the footprint probe reads (%.0f ms)\n", solid, seen, isoSolid,
-                    scene.implicits.size(),
-                    std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
+                    "whose side the footprint probe reads (%.0f ms)\n", sm.solid, sm.seen, sm.isoSolid,
+                    scene.implicits.size(), sm.ms);
 }
 
 static int runRender(const Scene& scene, const Camera& cam, char mode,
@@ -26513,6 +26444,7 @@ static int run(int argc, char** argv) {
                 m.cam.motion = cs.motion;
             }
             if (cs.lens) { m.cam.lens = cs.lens; m.cam.prepareLensPupil(); }
+            m.cam.enclosure = scene.eyeStack(m.cam.eye);   // as the frames' cameras start (below)
             m.name = cs.name;
             return m;
         };
@@ -29158,6 +29090,51 @@ static int run(int argc, char** argv) {
 
     // Every camera's walks start inside the solids around its eye (CAMERA-EMPTY-STACK).
     for (RenderCam& rc : toRender) rc.cam.enclosure = scene.eyeStack(rc.cam.eye);
+    // Say which lights are born inside solids and which cameras start inside them (Scene::buildEnclosures,
+    // eyeStack), so a lamp in a globe or a camera under water can be seen to be found.
+    {
+        const auto names = [&](const MediumStack& st) {
+            std::string s;
+            for (int i = 0; i < st.n; ++i) {
+                const char* nm = scene.matNameFor(st.matIdx[i]);
+                s += (i ? " in " : "") + (nm ? "'" + std::string(nm) + "'" : "material " + std::to_string(st.matIdx[i]));
+            }
+            return s;
+        };
+        const auto lightName = [&](size_t e) {
+            static const char* const kShape[] = {"area", "sphere", "spot", "env", "cylinder", "mesh", "sun", "glow"};
+            const Emitter& em = scene.emitters[e];
+            const int sh = (int)em.shape;
+            // Where it is: its origin, a glow's box's centre (it has no origin of its own).
+            const Vec3 at = em.shape == EmitterShape::Glow ? (em.glowLo + em.glowHi) * 0.5 : em.origin;
+            char buf[160];
+            std::snprintf(buf, sizeof buf, "light %zu (%s at %g %g %g)", e, sh >= 0 && sh < 8 ? kShape[sh] : "?",
+                          at.x, at.y, at.z);
+            return std::string(buf);
+        };
+        for (size_t e = 0; e < scene.emitterEnclosure.size() && e < scene.emitters.size(); ++e) {
+            if (!scene.emitterEnclosureUniform[e])
+                std::printf("[light] %s straddles a solid's surface: each birth finds the solids around it\n",
+                            lightName(e).c_str());
+            else if (scene.emitterEnclosure[e].n)
+                std::printf("[light] %s is born inside %s\n", lightName(e).c_str(),
+                            names(scene.emitterEnclosure[e]).c_str());
+        }
+        for (size_t f = 0; f < scene.fireEnclosure.size(); ++f) {
+            if (!scene.fireEnclosureUniform[f])
+                std::printf("[light] fire %zu straddles a solid's surface: each birth finds the solids around it\n", f);
+            else if (scene.fireEnclosure[f].n)
+                std::printf("[light] fire %zu is born inside %s\n", f, names(scene.fireEnclosure[f]).c_str());
+        }
+        std::map<std::string, std::vector<std::string>> camsIn;
+        for (const RenderCam& rc : toRender)
+            if (rc.cam.enclosure.n) camsIn[names(rc.cam.enclosure)].push_back(rc.name);
+        for (const auto& [in, cams] : camsIn)
+            std::printf("[camera] %s start%s inside %s\n",
+                        cams.size() == 1 ? ("'" + cams[0] + "'").c_str()
+                                         : (std::to_string(cams.size()) + " cameras").c_str(),
+                        cams.size() == 1 ? "s" : "", in.c_str());
+    }
 
     // The footprint probes of modes M and S, and of J's and U's merges, read which side of a closed
     // solid a face is met from (Hit::solid): marked once for the whole batch, before the meter below

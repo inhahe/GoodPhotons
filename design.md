@@ -3492,43 +3492,64 @@ filled, as its air-equivalent would be.
 A light walk starts inside the solids that enclose its birth (BIRTH-EMPTY-STACK, 0.445.5), so an
 emitter or a fire inside a dielectric -- a lamp in a coloured glass globe, glass in water -- carries
 the solid's absorption from its birth to the wall and leaves into the medium around it, as the
-camera walks that went in after it do. `Scene::enclosureAt(p)` finds the solids containing a point:
-three fixed rays, each walking every face along it; for each enterable solid (`enterableSolidMat`: a
-dielectric, or a coated body clear at some wavelength) the first of its faces met along a ray says
-whether p is inside it (met from inside, the ray leaving), a two-of-three vote settles it, and the
-stack lists them outermost (farthest) first. `Scene::buildEnclosures`, at build, asks it at a few
-points on each emitter's emitting side (a quad's centre and four inset corners, off its face along
-its normal; a sphere's six poles; five of a mesh's triangles; a spot's origin; a glow's box) and at
-each fire's box (centre and corners). Where the points agree, that is every birth's stack
+camera walks that went in after it do. `Scene::enclosureAt(p)` finds the closed solids containing a
+point: three fixed rays, each walking every face along it (64 surfaces, and up to 1024 strands
+besides, which enclose nothing); for each solid a walk goes inside (`Scene::encSolidOf`: a dielectric
+or a coated body clear at some wavelength, `enterableSolidMat`, as its original's solid; a mix as its
+first such part's, since its walks enter the part they resolve to) the first of its faces met along a
+ray says whether p is inside it -- the ray leaves it there, read off the face's side (`Hit::solid`) --
+a two-of-three vote settles it, and the stack lists them outermost (farthest) first, at most
+`kEnclosureMax` (8, the device stack's size). Only a face that bounds a closed solid counts:
+`buildEnclosures` runs `Scene::markSolidFaces` first wherever a walk can be inside anything, so an
+open sheet -- a window of one quad, a glass mesh with a hole -- encloses nothing, and an inward-wound
+closed mesh is read the right way round. `Scene::buildEnclosures`, at build, asks it at a few points
+on each emitter's emitting side (a quad's centre and four inset corners, off its face along its
+normal; a sphere's six poles; five of a mesh's triangles; a tube's wall at three heights and its
+caps; a spot's origin; a glow's own surface, drawn as its births are, its box only where no draw
+finds it) and at each fire's emitting cells (drawn as its births are; its box before the cells
+exist). `eraseEmitter` moves the lights' stacks with them. Where the points agree, that is every birth's stack
 (`emitterEnclosure`, `fireEnclosure`); where they do not -- a light straddling a solid's surface --
 each birth asks (`birthStack`). A sun or an environment is born outside everything. Every light walk
 starts there: the forward tracer's, scalar and hero (and with it the photon passes of M and S), the
-three kinds of BDPT light subpath, and mode U's. The device mirrors it: `DMaterial::enterable`, the
+three kinds of BDPT light subpath, and mode U's. The device mirrors it: `DMaterial::encSolid`, the
 tables `DScene::encEmOff` / `encEmN` / `encFireOff` / `encFireN` / `encPool` (`encAny` 0 when no
-material is enterable), `dEnclosureAt` and `dBirthStack`, called by `kTrace`, `traceHeroPhoton`,
+material is enterable; a stack deeper than the device's keeps its innermost solids, as does the
+camera's), `dEnclosureAt` and `dBirthStack`, called by `kTrace`, `traceHeroPhoton`,
 the wavefront's spawn, `dRandomWalk` (its `stk0`) and mode U's light walk. A hero bundle born inside
 coloured glass is absorbed per wavelength on its first leg (`tracePhotonHeroLoop`,
 `shadeStepHero`), the one leg a whole bundle spends inside glass, since entering a dielectric
 de-heros it. `tools/check_birth_stack.py` holds B, D, J, U, M and S, CPU and GPU, to mode R on two
-lamps inside an amber ball (`scenes/_birth_in_glass.ftsl`).
+lamps inside an amber ball (`scenes/_birth_in_glass.ftsl`). At load ftrace names each light born
+inside a solid (or straddling one's surface) and each camera starting inside one;
+`tools/check_enclosures.py` reads those lines on small scenes, one per way the probe has gone wrong.
 
 The camera side has the same two halves (CAMERA-EMPTY-STACK, 0.445.8). Every camera walk starts inside
 the solids around its eye: `Scene::eyeStack` (enclosureAt at the eye, none where nothing is
-enterable), set once per batch on each `RenderCam`'s `Camera::enclosure` in main.cpp and carried by
-the camera's posed copies; the device's `DCamera::enclosure` mirrors it. Mode R and W take it through
+enterable), set once per batch on each `RenderCam`'s `Camera::enclosure` in main.cpp (and on the
+exposure meter's cameras) and carried by the camera's posed copies; the device's
+`DCamera::enclosure` mirrors it. Mode R and W take it through
 `GiCtx::stk0` (and `DGiCtx::stk0`), which inside a walk points at the walk's own stack so a gather ray
 starts with the vertex's; D and J through randomWalk's `stk0`; U, M (its final gather too), S and the
 denoiser's guide through their own `stk0` parameters. A thin lens's aperture and a physical lens's
 front element are taken to lie in the eye's solids. A camera bundle born inside a solid is one
 wavelength from the start, as one that enters a solid becomes (mode R's hero boosted xC; BDPT and VCM
 average over the wavelengths they carry, so the lone hero needs no boost), so the invariant "inside a
-solid, one wavelength" holds on the camera side too. And every connection runs inside one medium,
+solid, one wavelength" holds on the camera side too -- except under `-herosplit` (which mode W
+forces, its wavelength lattice being every pixel's), where the bundle splits into a monochromatic
+sub-path per wavelength from the start, as a dispersive vertex splits it. And every connection runs
+inside one medium,
 since any dielectric face blocks one: `legAbsorption(scene, medium, dist, lambda)` (device
 `dLegAbsorption`) is that medium's Beer-Lambert over the leg, exactly 1 in air. A light sample takes
 its vertex's (`Hit::extMat`, the stack top the walk reached it through; a BDPT medium vertex records
 it in `hit.extMat` too, the device's in `DVertex::extMat`), as do BDPT's and VCM's connections; a
 forward splat and a light-tracing splat take the camera's (`Camera::medium`), which a leg that reached
-the eye never left; the fire's light sampling takes it along its integral (fireSegment's absorption).
+the eye never left, as do a mode-C photon's last leg to the aperture (`catchPhoton` / `lensCatch`
+say how far it ran) and the forward modes' direct view of a glow (`glowSeenXYZ`); the connection
+from inside a glass sphere takes the medium around the sphere on its outer leg; the fire's light
+sampling takes it along its integral (fireSegment's absorption); `-radcache`'s update rays start
+inside the solids around their cell. `tools/check_camera_legs.py` holds those (mode C, M's glossy
+light sample, `-rgb`, a glow seen, a camera in a glass ball in the water, `-radcache`, mode W's one
+sample) to mode R.
 `tools/check_camera_in_water.py` (`scenes/_camera_in_water.ftsl`, a room under water absorbing 0.3
 per metre): mode R reads the lamp exp(-0.84) of the room dry, and B, D, J, U, M and S, CPU and GPU,
 read the walls and the lamp as mode R does.
@@ -5314,7 +5335,7 @@ as the one at fault.
   decision on the path gets a deterministic replacement: the area-light NEE point
   becomes an N×N lattice (`lightGrid`, `-whitted-grid`); the glossy lobe keeps ONE
   direction, weighted by its reflectance, but takes it from a 2-D radical-inverse lattice on
-  the lobe (`whittedGlossyDraw` → `glossyDrawUV` → `ggx::sampleUVAll`; a coat's sheen
+  the lobe (`whittedGlossyDraw` → `glossyDrawUV` → `ggx::drawUV`; a coat's sheen
   `whittedGlossyDir`) rather than the
   rng — the path is deliberately **not** forked, which would cost N^depth inside a gyroid
   labyrinth. **A glossy vertex also takes the light connection here (0.275.0)**, on the same
@@ -6465,7 +6486,7 @@ as the one at fault.
   always; an isosurface's when it bounds a closed solid, capped or with no expression leaf (an SDF
   or a CSG of them), its gradient pointing out of the f < 0 inside (`Implicit::solidSide`, set by
   the marking pass; an `open` expression's surface may end at its container, and says nothing);
-  and a triangle's when `markSolidFaces` (main.cpp, over `watertight::markSolidFaces`) found
+  and a triangle's when `Scene::markSolidFaces` (over `watertight::markSolidFaces`) found
   its connected piece closed, consistently wound and with every face's corner normals on one side
   of its winding, the whole piece on the same side; the volume says out or in, and a piece of no
   volume (a double-sided card) is no solid. Corners weld at 1e-7 of the piece set's extent, never
@@ -6552,7 +6573,8 @@ as the one at fault.
   but for the sums' order (one probe is `dCoverageProbe`, the gates `dCoverageFinish`, which
   `dGatherCoverage` loops over for every other gather) -- and `-gatherarea 0` restores the
   whole disc over every photon, as it does for M and S. Solid faces are marked
-  (`markSolidFaces`) whenever a batch has an M, S, J or U camera. A
+  (`markSolidFaces`, once a build) whenever a batch has an M, S, J or U camera, and at build wherever
+  a walk can be inside a solid (the enclosure probe reads them). A
   mode-M or mode-S gather (`onGatherSurfaceSided`) keeps a photon only if it faces the
   gather point's way (within 60 degrees) and lies near its tangent plane: off it by at most
   sin theta times its distance d, theta the angle between the two normals, plus a rounding slack
@@ -10888,6 +10910,12 @@ device versions do all the precision-critical math in `double` regardless of the
 | `connectSpecularSphereMirror` / `dConnectSpecularSphereMirror` | `mirror`/`halfmirror`/roughness-0 `glossy` **sphere** | same scan, one reflection instead of two refractions | same, re-expressed as an equivalent unfolded distance `D = 1/√G` so it shares one splat with the plane |
 | `connectSpecularPlane` / `dConnectSpecularPlane` | coplanar **mirror triangles** (a flat panel) | **unfolding** — no root solve at all | exactly `1/D²`, `D = \|p − eye′\|` |
 
+The sphere refracts as a walk's interface does (since 0.446.1): against the camera's solids (but
+the sphere, for an eye inside it) where the priority rule ranks them (`exteriorIor`), else air, so
+`n` is the sphere's index over that; and an eye inside sees the radiance outside `n²` times over
+(the radiance theorem), as a camera walk refracting out of it reads it. It reads only the one refraction out, so the light a
+camera walk finds reflecting inside the sphere before it leaves is mode B's other paths' to find.
+
 **Unfolding** is what makes the flat case closed-form. Mirroring the eye across the plane,
 `eye′ = eye − 2·(dot(n,eye) − d)·n`, turns the bent chain `p → R → eye` into the straight
 segment `p → eye′`; `R` is where that segment crosses the plane, and the specular Jacobian
@@ -10899,8 +10927,11 @@ inverse-square law measured along the folded-out path. So the mirror estimator *
 `Scene::build` because it needs finalized `Tri::gn`) groups mirror-material triangles by a
 quantised `(n, d)` key — normal canonically oriented, since a mirror is two-sided — into
 `Scene::mirrorPlanes`, each carrying the plane, the member AABB and the total area.
+Only a face shaded flat joins (its corner normals all along its face normal): a smooth-shaded
+mesh's walks reflect off interpolated normals no facet's plane is, so it is left to them.
 That makes the per-photon-vertex cost **O(#mirror surfaces)**, not O(#mirror triangles),
-and it is capped at `kMaxMirrorPlanes = 64` (largest-area planes win). The list uploads
+and it is capped at `kMaxMirrorPlanes = 64` (planar mirrors before smooth coats, then the
+largest-area planes win). The list uploads
 verbatim to `DScene::mirrorPlanes` as `DMirrorPlane`. The sphere connectors get the same
 treatment (0.190.4): `buildMirrorPlanes` also fills `Scene::dielSphereIdx` /
 `mirrorSphereIdx` — the ascending indices of the dielectric / planar-mirror spheres — and
