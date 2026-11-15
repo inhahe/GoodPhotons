@@ -1331,6 +1331,15 @@ struct Renderer {
         tHit = best; whichMed = which; return true;
     }
 
+    // The transmittance of a connection's leg from `o` along `dir` over `dist`: the media's along it
+    // (mediaTransmittance, below) times the absorption of the solid it runs in, `medium` (legAbsorption;
+    // -1: none) -- the one factor every forward splat's leg takes, so none takes half of it. Device twin
+    // dLegTransmittance.
+    static double legTransmittance(const Scene& scene, int medium, const Vec3& o, const Vec3& dir,
+                                   double dist, double lambda, Pcg32& rng) {
+        const double T = scene.media.empty() ? 1.0 : mediaTransmittance(scene, o, dir, dist, lambda, rng);
+        return T * legAbsorption(scene, medium, dist, lambda);
+    }
     // Combined transmittance through all media = product of per-medium transmittances.
     static double mediaTransmittance(const Scene& scene, const Vec3& o,
                                      const Vec3& dir, double dist, double lambda, Pcg32& rng,
@@ -1632,9 +1641,7 @@ struct Renderer {
         double contrib = beta * f * g.cosSurf * g.corr / g.denom;
         // Attenuation of the shadow ray through the fog (Beer-Lambert; ratio tracking
         // for a heterogeneous medium, exact exp for a homogeneous one; product over media).
-        if (!scene.media.empty())
-            contrib *= mediaTransmittance(scene, p, g.wdir, g.dist, lambda, rng);
-        contrib *= legAbsorption(scene, cam.medium(), g.dist, lambda);
+        contrib *= legTransmittance(scene, cam.medium(), p, g.wdir, g.dist, lambda, rng);
         film.add(g.px, g.py, Vec3(cieX(lambda), cieY(lambda), cieZ(lambda)) * contrib);
     }
 
@@ -1652,9 +1659,7 @@ struct Renderer {
             double f = gs ? gs->f(g.wdir, lam[i]) : rho[i] / PI;
             f *= coatSplatF(coat, g.wdir, lam[i]);
             double contrib = beta[i] * f * g.cosSurf * g.corr / g.denom;
-            if (!scene.media.empty())
-                contrib *= mediaTransmittance(scene, p, g.wdir, g.dist, lam[i], rng);
-            contrib *= legAbsorption(scene, cam.medium(), g.dist, lam[i]);
+            contrib *= legTransmittance(scene, cam.medium(), p, g.wdir, g.dist, lam[i], rng);
             film.add(g.px, g.py, Vec3(cieX(lam[i]), cieY(lam[i]), cieZ(lam[i])) * contrib);
         }
     }
@@ -1678,8 +1683,7 @@ struct Renderer {
         double Lambda = med.albedo(lambda);
         double omega = cam.pixelSolidAngle(cosCam);         // projection-general pixel solid angle
         double contrib = beta * Lambda * ph / (dist2 * omega);
-        contrib *= mediaTransmittance(scene, p, wdir, dist, lambda, rng);   // fog transmittance (all media)
-        contrib *= legAbsorption(scene, cam.medium(), dist, lambda);
+        contrib *= legTransmittance(scene, cam.medium(), p, wdir, dist, lambda, rng);
         film.add(px, py, Vec3(cieX(lambda), cieY(lambda), cieZ(lambda)) * contrib);
     }
 
@@ -1718,9 +1722,7 @@ struct Renderer {
         const double fcos = (hs ? hairFCos(*hs, wdir)
                                 : (gs ? gs->f(wdir, lambda) : rho / PI) * cosSurf) * coatSplatF(coat, wdir, lambda);
         double contrib = beta * fcos * corr * wgt;
-        if (!scene.media.empty())
-            contrib *= mediaTransmittance(scene, p, wdir, le.dist, lambda, rng);
-        contrib *= legAbsorption(scene, cam.medium(), le.dist, lambda);
+        contrib *= legTransmittance(scene, cam.medium(), p, wdir, le.dist, lambda, rng);
         film.add(px, py, Vec3(cieX(lambda), cieY(lambda), cieZ(lambda)) * contrib);
     }
 
@@ -1755,9 +1757,7 @@ struct Renderer {
             if (!ok[i]) continue;
             double contrib = beta[i] * (gs ? gs->f(wdir, lam[i]) : rho[i] / PI) * cosSurf * corr *
                              wgt[i] * coatSplatF(coat, wdir, lam[i]);
-            if (!scene.media.empty())
-                contrib *= mediaTransmittance(scene, p, wdir, le.dist, lam[i], rng);
-            contrib *= legAbsorption(scene, cam.medium(), le.dist, lam[i]);
+            contrib *= legTransmittance(scene, cam.medium(), p, wdir, le.dist, lam[i], rng);
             film.add(px[i], py[i], Vec3(cieX(lam[i]), cieY(lam[i]), cieZ(lam[i])) * contrib);
         }
     }
@@ -1774,8 +1774,7 @@ struct Renderer {
         double f = phaseW;
         if (med && wIn) f = med->albedo(lambda) * med->phaseValue(dot(*wIn, wdir), lambda);
         double contrib = beta * f * wgt;
-        contrib *= mediaTransmittance(scene, p, wdir, dist, lambda, rng);
-        contrib *= legAbsorption(scene, cam.medium(), dist, lambda);
+        contrib *= legTransmittance(scene, cam.medium(), p, wdir, dist, lambda, rng);
         film.add(px, py, Vec3(cieX(lambda), cieY(lambda), cieZ(lambda)) * contrib);
     }
 
@@ -1853,9 +1852,7 @@ struct Renderer {
         // out) and A stays consistent with C; only ABSOLUTE-EV A/C are corrected to
         // land mid-tone at ABS_EXPOSURE_GAIN, matching B.
         contrib *= 1.0 / (cam.pixelPlaneArea() * cam.filmDist * cam.filmDist);
-        if (!scene.media.empty())
-            contrib *= mediaTransmittance(scene, p, wdir, dist, lambda, rng);
-        contrib *= legAbsorption(scene, cam.medium(), dist, lambda);
+        contrib *= legTransmittance(scene, cam.medium(), p, wdir, dist, lambda, rng);
         film.add(px, py, Vec3(cieX(lambda), cieY(lambda), cieZ(lambda)) * contrib);
     }
 
@@ -1898,9 +1895,7 @@ struct Renderer {
             double contrib = beta[i] * (gs ? PI * gs->f(wdir, lam[i]) : rho[i]) * cosSurf * corr *
                              cosLens * (R * R) / (dist * dist) * coatSplatF(coat, wdir, lam[i]);
             contrib *= cellNorm;
-            if (!scene.media.empty())
-                contrib *= mediaTransmittance(scene, p, wdir, dist, lam[i], rng);
-            contrib *= legAbsorption(scene, cam.medium(), dist, lam[i]);
+            contrib *= legTransmittance(scene, cam.medium(), p, wdir, dist, lam[i], rng);
             film.add(px, py, Vec3(cieX(lam[i]), cieY(lam[i]), cieZ(lam[i])) * contrib);
         }
     }
@@ -1937,8 +1932,7 @@ struct Renderer {
         // matches B's absolute scale in absolute-EV modes (per-camera constant; auto-
         // exposed scenes unaffected).
         contrib *= 1.0 / (cam.pixelPlaneArea() * cam.filmDist * cam.filmDist);
-        contrib *= mediaTransmittance(scene, p, wdir, dist, lambda, rng);   // all media
-        contrib *= legAbsorption(scene, cam.medium(), dist, lambda);
+        contrib *= legTransmittance(scene, cam.medium(), p, wdir, dist, lambda, rng);
         film.add(px, py, Vec3(cieX(lambda), cieY(lambda), cieZ(lambda)) * contrib);
     }
 
@@ -1959,8 +1953,7 @@ struct Renderer {
         if (scene.occluded(p + wdir * 1e-6, wdir, dist - 2e-6, 1e-6, /*camLeg=*/true)) return;
         double omega = cam.pixelSolidAngle(cosCam);
         double contrib = beta * (1.0 / (4.0 * PI)) / (dist2 * omega);
-        contrib *= mediaTransmittance(scene, p, wdir, dist, lambda, rng);
-        contrib *= legAbsorption(scene, cam.medium(), dist, lambda);
+        contrib *= legTransmittance(scene, cam.medium(), p, wdir, dist, lambda, rng);
         film.add(px, py, Vec3(cieX(lambda), cieY(lambda), cieZ(lambda)) * contrib);
     }
 
@@ -1989,8 +1982,7 @@ struct Renderer {
         if (scene.occluded(p + wdir * 1e-6, wdir, dist - 2e-6, 1e-6, /*camLeg=*/true)) return;
         double contrib = beta * (1.0 / (4.0 * PI)) * cosLens * (PI * R * R) / (dist * dist);
         contrib *= 1.0 / (cam.pixelPlaneArea() * cam.filmDist * cam.filmDist);
-        contrib *= mediaTransmittance(scene, p, wdir, dist, lambda, rng);
-        contrib *= legAbsorption(scene, cam.medium(), dist, lambda);
+        contrib *= legTransmittance(scene, cam.medium(), p, wdir, dist, lambda, rng);
         film.add(px, py, Vec3(cieX(lambda), cieY(lambda), cieZ(lambda)) * contrib);
     }
 
@@ -2498,10 +2490,8 @@ struct Renderer {
             // Visibility on the exterior segment p -> P1 only (eye -> P1 is inside glass).
             if (scene.occluded(p + wP * 1e-6, wP, dP - 2e-6)) continue;
 
-            // Fog transmittance on the exterior segment only (interior is solid glass).
-            if (!scene.media.empty())
-                contrib *= mediaTransmittance(scene, p, wP, dP, lambda, rng);
-            contrib *= legAbsorption(scene, aroundMat, dP, lambda);   // the exterior segment's
+            // The exterior segment's fog and medium (the interior's glass is taken above).
+            contrib *= legTransmittance(scene, aroundMat, p, wP, dP, lambda, rng);
 
             film.add(px, py, Vec3(cieX(lambda), cieY(lambda), cieZ(lambda)) * contrib);
         }

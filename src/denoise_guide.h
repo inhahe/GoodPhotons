@@ -136,7 +136,7 @@ inline Vec3 mul(const Vec3& a, const Vec3& b) { return Vec3{a.x * b.x, a.y * b.y
 // escapes, is absorbed, or runs out of depth adds nothing (albedo 0, normal 0, which is
 // what OIDN expects of a background).
 inline void traceGuide(const Scene& scene, const Renderer& rr, Ray ray, Vec3& alb, Vec3& nrm,
-                       const MediumStack& stk0 = MediumStack{}) {
+                       const MediumStack& stk0) {
     Vec3 tint{1, 1, 1};
     MediumStack stk = stk0;   // the camera's (Camera::enclosure)
     Pcg32 rng;   // interfaceStep's signature; the whitted step draws nothing from it

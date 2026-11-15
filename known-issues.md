@@ -72,7 +72,7 @@ closed entries, where the cost is a broken historical link rather than a blocked
 Three references — `scenes/_gr_fly0.ftsl`, `scenes/silver_sphere_xenon.ftsl`, `scenes/x.ftsl` —
 name files that no longer exist at all, all in closed entries.
 
-## OPEN (2026-11-15): BALL-EYE-HALO — a camera walk from inside a glass ball draws a halo round a lamp it sees
+## OPEN (2026-11-15): BALL-EYE-HALO — mode B misses the halo the ball's focusing throws round a lamp seen from inside it
 
 Found checking REVIEW-0445B's glass-sphere connection. The eye at the centre of a small glass ball
 (radius 0.15, `ior 1.5`) in `scenes/_camera_in_water.ftsl`'s room: every ray that reaches the eye
@@ -89,6 +89,18 @@ ball's inside again (internal reflection) and a radiance scale or Fresnel weight
 lamp reached by a continuation off a wall through the ball, its MIS weight against light sampling
 (which a dielectric blocks) wrong. To narrow: mode R at -max-bounce 3 and 4, `-heroc 1`, and with the
 ball's Fresnel off (`ior 1.0001`).
+
+**Narrowed: the halo is real, and mode B is the one missing it.** With the room's front wall (just
+behind the ball) black, modes R and B agree to 0.1 % in every ring round the lamp. So the halo is the
+lamp's light focused by the ball onto the front wall behind it, the bright spot there focused back
+through the ball onto the wall round the lamp: lamp -> ball -> wall -> ball -> wall -> ball -> eye,
+which modes R, D and U find and mode B does not. Not the depth: `-heroc 1` changes nothing, and mode
+R has it from `-max-bounce 5`. A camera outside the ball looking at the front wall behind it
+(`eye 0.9 2.4 0.6  look_at 0 1.5 2.0`): the three modes agree on the frame's mean (R 7.92e-5, B
+7.90e-5, D 7.91e-5), but the ball's focused spot on the wall peaks at 2.7e-4 in mode R and 3.1e-4 in
+D against 0.8e-4 in mode B -- mode B spreads the focus it should make, so its light is there but not
+where the lens puts it. To narrow next: the photon walk's directions through the ball (the spot seen
+directly, not through the ball), and the outside-sphere connection's imaging of a sharp spot.
 
 ## DONE (2026-11-15, 0.446.1): REVIEW-0445B — what the Opus (max) and Fable (xhigh) reviews of 0.445.4-0.445.9 found
 

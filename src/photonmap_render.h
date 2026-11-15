@@ -662,15 +662,15 @@ inline double strandStep(const Scene& scene, const BackwardRenderer& bw, const M
 inline Vec3 photonGatherSub(const Scene& scene, const PhotonMap& pm, Ray ray, Pcg32& rng,
                             bool diffraction, int maxBounce, double lambda, double invPdfL,
                             double norm, const Hit& visHit, const Material& visMat,
-                            const Vec3& visWa, const PhotonMap* pmC = nullptr, double normC = 0.0,
-                            const MediumStack* stk0 = nullptr) {
+                            const Vec3& visWa, const MediumStack& stk0, const PhotonMap* pmC = nullptr,
+                            double normC = 0.0) {
     bdpt::LocalWork work;   // its segments, for the CPU refresh (MODEM-CPU-NONDET)
     Vec3 L{0, 0, 0};
     double thr = 1.0;
     bool specularSeen = false;                           // any specular bounce so far?
     Renderer mats; mats.diffraction = diffraction;
     // nested-dielectric medium stack, from the visible point's (`stk0`)
-    MediumStack stk = stk0 ? *stk0 : MediumStack{};
+    MediumStack stk = stk0;
     const bool grinAny = grin::sceneHasGrin(scene);      // final-gather rays bend too
 
     // GLOSSY-NEE. `bwNee` is the shared direct-lighting estimator (its `neeLight` is what the
@@ -980,7 +980,7 @@ inline Vec3 photonGatherSub(const Scene& scene, const PhotonMap& pm, Ray ray, Pc
 // `lambdaU`, in [0, 1), is the hero wavelength's uniform: renderPhotonCamera's stratified one.
 inline Vec3 photonGather(const Scene& scene, const PhotonMap& pm, Ray ray, double lambdaU,
                          Pcg32& rng, bool diffraction, int maxBounce, int fgRays,
-                         const BeamMap* bm, const PhotonMap* pmC, const MediumStack* stk0 = nullptr) {
+                         const BeamMap* bm, const PhotonMap* pmC, const MediumStack& stk0) {
     bdpt::LocalWork work;   // its segments, for the CPU refresh (MODEM-CPU-NONDET)
     Vec3 L{0, 0, 0};
     double thr = 1.0;
@@ -991,7 +991,7 @@ inline Vec3 photonGather(const Scene& scene, const PhotonMap& pm, Ray ray, doubl
 
     Renderer mats; mats.diffraction = diffraction;
     // nested-dielectric medium stack, from the camera's (`stk0`, Camera::enclosure)
-    MediumStack stk = stk0 ? *stk0 : MediumStack{};
+    MediumStack stk = stk0;
     const double area = PI * pm.radius * pm.radius;
     const double norm = (pm.nEmitted > 0 && area > 0.0)
                             ? 1.0 / (area * (double)pm.nEmitted) : 0.0;
@@ -1247,8 +1247,8 @@ inline Vec3 photonGather(const Scene& scene, const PhotonMap& pm, Ray ray, doubl
                         Ray gr;   // a gather ray across the surface gathers nothing
                         if (!continueAlong(h, cosineHemisphere(h.n, rng), Lobe::Reflect, gr)) continue;
                         fg += photonGatherSub(scene, pm, gr, rng, diffraction, maxBounce,
-                                              lambda, invPdfL, norm, h, m, ray.d * -1.0,
-                                              causOn ? pmC : nullptr, normC, &stk);
+                                              lambda, invPdfL, norm, h, m, ray.d * -1.0, stk,
+                                              causOn ? pmC : nullptr, normC);
                     }
                     L += fg * (thr * (1.0 / (double)fgRays));
                     return L;
@@ -1569,7 +1569,7 @@ inline Film renderPhotonCamera(const Scene& scene, const Camera& cam, int resX, 
                     u -= std::floor(u);
                     const double lambdaU = (u < 1.0) ? u : 0.999999999;
                     f.add(px, py, photonGather(scene, pm, ray, lambdaU, rng, diffraction, maxBounce,
-                                               fgRays, bm, pmC, &c.enclosure));
+                                               fgRays, bm, pmC, c.enclosure));
                 }
             }
         }

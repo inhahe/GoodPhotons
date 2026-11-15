@@ -3342,6 +3342,14 @@ __device__ static Real dMediaTransmittance(const DScene& sc, const DVec3& o,
     }
     return Tr;
 }
+// The transmittance of a connection's leg from `o` along `dir` over `dist`: the media's along it times
+// the absorption of the solid it runs in, `medium` (-1: none) -- the one factor every forward splat's
+// leg takes (host twin Renderer::legTransmittance).
+__device__ static inline Real dLegTransmittance(const DScene& sc, int medium, const DVec3& o, const DVec3& dir,
+                                                double dist, Real lambda, DRng& rng) {
+    const Real T = sc.mediaN > 0 ? dMediaTransmittance(sc, o, dir, (Real)dist, lambda, rng) : (Real)1;
+    return T * (Real)dLegAbsorption(sc, medium, dist, lambda);
+}
 
 // TRANSMITTANCE AT MANY DISTANCES ALONG ONE RAY, FROM ONE WALK (0.386.0). `q` supplies
 // ascending distances q.t(0..n-1) and takes each one's factor through q.mul(k, f) (multiplied in,
@@ -6676,8 +6684,7 @@ __device__ static void connect(const DScene& sc, const DCamera& cam, double* fil
     Real corr = dShadingAdjointCorr(wi, wdir, n, ng);
     double solidAngle = cam.pixelSolidAngle(cosCam);
     Real contrib = beta * f * cosSurf * corr / (Real)((double)dist2 * solidAngle);
-    if (sc.mediaN > 0) contrib *= dMediaTransmittance(sc, p, wdir, dist, lambda, rng);
-    contrib *= dLegAbsorption(sc, cam.enclosure.topMat(), (double)dist, lambda);
+    contrib *= dLegTransmittance(sc, cam.enclosure.topMat(), p, wdir, (double)dist, lambda, rng);
     filmAdd(film, hits, cam.resX, px, py, lambda, contrib);
 }
 // `med` is the medium that scattered the photon (its phase/albedo); transmittance is
@@ -6698,8 +6705,7 @@ __device__ static void connectVolume(const DScene& sc, const DMedium& med, const
     // scattering; normalise by dist^2 * pixelSolidAngle (rectilinear or fisheye).
     double solidAngle = cam.pixelSolidAngle(cosCam);
     Real contrib = beta * Lambda * ph / (Real)((double)dist2 * solidAngle);
-    contrib *= dMediaTransmittance(sc, p, wdir, dist, lambda, rng);
-    contrib *= dLegAbsorption(sc, cam.enclosure.topMat(), (double)dist, lambda);
+    contrib *= dLegTransmittance(sc, cam.enclosure.topMat(), p, wdir, (double)dist, lambda, rng);
     filmAdd(film, hits, cam.resX, px, py, lambda, contrib);
 }
 // Model A (physical camera): next-event splat through the finite lens pupil. Sample a
@@ -6735,8 +6741,7 @@ __device__ static void connectLensPhysical(const DScene& sc, const DCamera& cam,
     const Real corr = dShadingAdjointCorr(wi, wdir, n, ng);
     Real contrib = (Real)((double)beta * (gs ? (double)gs->f(wdir, lambda) : (double)rho / DPI) *
                           (double)cosSurf * (double)corr * wgt * dCoatS(coat, wdir, lambda));
-    if (sc.mediaN > 0) contrib *= dMediaTransmittance(sc, p, wdir, (Real)le.dist, lambda, rng);
-    contrib *= dLegAbsorption(sc, cam.enclosure.topMat(), (double)(Real)le.dist, lambda);
+    contrib *= dLegTransmittance(sc, cam.enclosure.topMat(), p, wdir, (double)(Real)le.dist, lambda, rng);
     filmAdd(film, hits, cam.resX, px, py, lambda, contrib);
 }
 // Volume vertex: `phaseW` replaces f * cosSurf -- the in-scatter albedo * phase of `med`
@@ -6752,8 +6757,7 @@ __device__ static void connectVolumeLensPhysical(const DScene& sc, const DCamera
     Real f = phaseW;
     if (med && wIn) f = medAlbedo(*med, lambda) * dMedPhase(*med, dot(*wIn, wdir), lambda);
     Real contrib = (Real)((double)beta * (double)f * wgt);
-    contrib *= dMediaTransmittance(sc, p, wdir, (Real)dist, lambda, rng);
-    contrib *= dLegAbsorption(sc, cam.enclosure.topMat(), (double)(Real)dist, lambda);
+    contrib *= dLegTransmittance(sc, cam.enclosure.topMat(), p, wdir, (double)(Real)dist, lambda, rng);
     filmAdd(film, hits, cam.resX, px, py, lambda, contrib);
 }
 // Hero bundle: one front-element sample and one scene leg shared by the wavelengths, each
@@ -6788,8 +6792,7 @@ __device__ static void connectLensHeroPhysical(const DScene& sc, const DCamera& 
         Real contrib = (Real)((double)beta[i] *
                               (gs ? (double)gs->f(wdir, lam[i]) : (double)rho[i] / DPI) *
                               (double)cosSurf * (double)corr * wg[i] * dCoatS(coat, wdir, lam[i]));
-        if (sc.mediaN > 0) contrib *= dMediaTransmittance(sc, p, wdir, (Real)dist, lam[i], rng);
-        contrib *= dLegAbsorption(sc, cam.enclosure.topMat(), (double)(Real)dist, lam[i]);
+        contrib *= dLegTransmittance(sc, cam.enclosure.topMat(), p, wdir, (double)(Real)dist, lam[i], rng);
         filmAdd(film, hits, cam.resX, px[i], py[i], lam[i], contrib);
     }
 }
@@ -6826,8 +6829,7 @@ __device__ static void connectLens(const DScene& sc, const DCamera& cam, double*
     // mode B's radiance*camEq absolute scale. Per-camera constant; auto-exposed scenes
     // stay byte-identical, only absolute-EV A/C are re-seated to mid-tone at gain 6.
     contrib *= (Real)1 / (Real)(cam.pixelPlaneArea() * cam.filmDist * cam.filmDist);
-    if (sc.mediaN > 0) contrib *= dMediaTransmittance(sc, p, wdir, dist, lambda, rng);
-    contrib *= dLegAbsorption(sc, cam.enclosure.topMat(), (double)dist, lambda);
+    contrib *= dLegTransmittance(sc, cam.enclosure.topMat(), p, wdir, (double)dist, lambda, rng);
     filmAdd(film, hits, cam.resX, px, py, lambda, contrib);
 }
 // Model A lens splat for a VOLUME scattering vertex (fog). As connectLens but the
@@ -6858,8 +6860,7 @@ __device__ static void connectLensVolume(const DScene& sc, const DMedium& med, c
     // Same flux->film-irradiance normaliser as connectLens (see there); per-camera
     // constant, so auto-exposed scenes are unaffected.
     contrib *= (Real)1 / (Real)(cam.pixelPlaneArea() * cam.filmDist * cam.filmDist);
-    contrib *= dMediaTransmittance(sc, p, wdir, dist, lambda, rng);
-    contrib *= dLegAbsorption(sc, cam.enclosure.topMat(), (double)dist, lambda);
+    contrib *= dLegTransmittance(sc, cam.enclosure.topMat(), p, wdir, (double)dist, lambda, rng);
     filmAdd(film, hits, cam.resX, px, py, lambda, contrib);
 }
 
@@ -7669,8 +7670,7 @@ __device__ static void connectHair(const DScene& sc, const DCamera& cam, double*
     Real f = dHairFCos(hs, wdir);
     double solidAngle = cam.pixelSolidAngle(cosCam);
     Real contrib = beta * f / (Real)((double)dist2 * solidAngle);
-    if (sc.mediaN > 0) contrib *= dMediaTransmittance(sc, p, wdir, dist, lambda, rng);
-    contrib *= dLegAbsorption(sc, cam.enclosure.topMat(), (double)dist, lambda);
+    contrib *= dLegTransmittance(sc, cam.enclosure.topMat(), p, wdir, (double)dist, lambda, rng);
     filmAdd(film, hits, cam.resX, px, py, lambda, contrib);
 }
 // Fiber (D_HAIR) twin of connectLens(): model-A finite-lens next-event splat from a hair
@@ -7694,8 +7694,7 @@ __device__ static void connectLensHairPhysical(const DScene& sc, const DCamera& 
     if (occluded(sc, p + wdir * off, wdir, connMaxT(dist - (double)off, RAY_EPS, dMaxAbs(p)), RAY_EPS,
                  /*camLeg=*/true)) return;
     Real contrib = (Real)((double)beta * (double)dHairFCos(hs, wdir) * wgt);
-    if (sc.mediaN > 0) contrib *= dMediaTransmittance(sc, p, wdir, (Real)dist, lambda, rng);
-    contrib *= dLegAbsorption(sc, cam.enclosure.topMat(), (double)(Real)dist, lambda);
+    contrib *= dLegTransmittance(sc, cam.enclosure.topMat(), p, wdir, (double)(Real)dist, lambda, rng);
     filmAdd(film, hits, cam.resX, px, py, lambda, contrib);
 }
 __device__ static void connectLensHair(const DScene& sc, const DCamera& cam, double* film, double* hits,
@@ -7721,8 +7720,7 @@ __device__ static void connectLensHair(const DScene& sc, const DCamera& cam, dou
     Real contrib = beta * fcos * cosLens * (R * R) / (dist * dist);
     // Same flux -> film-irradiance normaliser as connectLens (see there).
     contrib *= (Real)1 / (Real)(cam.pixelPlaneArea() * cam.filmDist * cam.filmDist);
-    if (sc.mediaN > 0) contrib *= dMediaTransmittance(sc, p, wdir, dist, lambda, rng);
-    contrib *= dLegAbsorption(sc, cam.enclosure.topMat(), (double)dist, lambda);
+    contrib *= dLegTransmittance(sc, cam.enclosure.topMat(), p, wdir, (double)dist, lambda, rng);
     filmAdd(film, hits, cam.resX, px, py, lambda, contrib);
 }
 
@@ -10179,8 +10177,7 @@ __device__ static void connectEmissionVolume(const DScene& sc, const DCamera& ca
     if (occludedTo(sc, p + wdir * RAY_EPS, p + wdir * dist, 2 * RAY_EPS, RAY_EPS, /*camLeg=*/true)) return;  // camera leg: hide_camera applies (Scene::occluded / DMaterial::hideCamera)
     double solidAngle = cam.pixelSolidAngle(cosCam);
     Real contrib = beta * (Real)(1.0 / (4.0 * DPI)) / (Real)((double)dist2 * solidAngle);
-    contrib *= dMediaTransmittance(sc, p, wdir, dist, lambda, rng);
-    contrib *= dLegAbsorption(sc, cam.enclosure.topMat(), (double)dist, lambda);
+    contrib *= dLegTransmittance(sc, cam.enclosure.topMat(), p, wdir, (double)dist, lambda, rng);
     filmAdd(film, hits, cam.resX, px, py, lambda, contrib);
 }
 // Model A (finite-lens) isotropic emission splat — device twin of connectEmissionLensVolume.
@@ -10208,8 +10205,7 @@ __device__ static void connectEmissionLensVolume(const DScene& sc, const DCamera
     if (occludedTo(sc, p + wdir * RAY_EPS, p + wdir * dist, 2 * RAY_EPS, RAY_EPS, /*camLeg=*/true)) return;  // camera leg: hide_camera applies (Scene::occluded / DMaterial::hideCamera)
     Real contrib = beta * (Real)(1.0 / (4.0 * DPI)) * cosLens * (Real)DPI * (R * R) / (dist * dist);
     contrib *= (Real)1 / (Real)(cam.pixelPlaneArea() * cam.filmDist * cam.filmDist);
-    contrib *= dMediaTransmittance(sc, p, wdir, dist, lambda, rng);
-    contrib *= dLegAbsorption(sc, cam.enclosure.topMat(), (double)dist, lambda);
+    contrib *= dLegTransmittance(sc, cam.enclosure.topMat(), p, wdir, (double)dist, lambda, rng);
     filmAdd(film, hits, cam.resX, px, py, lambda, contrib);
 }
 __device__ static void camSplatEmissionAll(const DScene& sc, const DCamSet& cs, int camMode,
@@ -10502,9 +10498,7 @@ __device__ static void dConnectSpecularSphereInside(const DScene& sc, const DCam
 
         DVec3 wPR = wP.toR();
         if (occludedTo(sc, dOffsetAlong(p.toR(), wPR, wPR), p.toR() + wPR * dP, 2e-6)) continue;
-        if (sc.mediaN > 0)
-            contrib *= (double)dMediaTransmittance(sc, p.toR(), wPR, (Real)dP, lambda, rng);
-        contrib *= dLegAbsorption(sc, aroundMat, (double)dP, lambda);   // the exterior segment's
+        contrib *= (double)dLegTransmittance(sc, aroundMat, p.toR(), wPR, dP, lambda, rng);   // the exterior segment's
 
         filmAdd(film, hits, cam.resX, px, py, lambda, (Real)contrib);
     }
@@ -13568,8 +13562,7 @@ __device__ static void connectHero(const DScene& sc, const DCamera& cam, double*
     for (int i = 0; i < nUp; ++i) {
         Real contrib = beta[i] * (gs ? gs->f(wdir, lam[i]) : rho[i] / (Real)DPI) * geo;
         if (coat) contrib *= (Real)dCoatS(coat, wdir, lam[i]);   // a coated body's way out
-        if (sc.mediaN > 0) contrib *= dMediaTransmittance(sc, p, wdir, dist, lam[i], rng);
-        contrib *= dLegAbsorption(sc, cam.enclosure.topMat(), (double)dist, lam[i]);
+        contrib *= dLegTransmittance(sc, cam.enclosure.topMat(), p, wdir, (double)dist, lam[i], rng);
         filmAdd(film, hits, cam.resX, px, py, lam[i], contrib);
     }
 }
@@ -13609,8 +13602,7 @@ __device__ static void connectLensHero(const DScene& sc, const DCamera& cam, dou
     for (int i = 0; i < nUp; ++i) {
         Real contrib = beta[i] * (gs ? (Real)DPI * gs->f(wdir, lam[i]) : rho[i]) * geo;
         if (coat) contrib *= (Real)dCoatS(coat, wdir, lam[i]);   // a coated body's way out
-        if (sc.mediaN > 0) contrib *= dMediaTransmittance(sc, p, wdir, dist, lam[i], rng);
-        contrib *= dLegAbsorption(sc, cam.enclosure.topMat(), (double)dist, lam[i]);
+        contrib *= dLegTransmittance(sc, cam.enclosure.topMat(), p, wdir, (double)dist, lam[i], rng);
         filmAdd(film, hits, cam.resX, px, py, lam[i], contrib);
     }
 }
@@ -16747,9 +16739,9 @@ struct DGiCtx {
     // The coated body a gather leaves from, whose lobe takes the coat on each gather ray's way in
     // (host twin GiCtx::coat). Empty where it is none; a gather ray starts without one.
     DCoatCtx coat;
-    // The stack the walk begins with -- a camera path's camera's, a gather ray's its vertex's -- and
-    // inside a walk the walk's own (host twin GiCtx::stk0). Null for none.
-    const DMediumStack* stk0 = nullptr;
+    // The walk's own stack as it stands, set by the walk before any gather it sends (host twin
+    // GiCtx::walkStk). Where a walk starts is bkRadiance's / bkRadianceHero's `stk0`.
+    const DMediumStack* walkStk = nullptr;
 };
 
 // Mode P's blurred split on the device (host twins BackwardRenderer::GiCtx::first, noteFirst,
@@ -16801,11 +16793,12 @@ __device__ static inline double* dFirstFilm(const DScene& sc, double* film, doub
 // ray's far-field bkAmbient tail — all of which landed with N3a).
 template<int GiDepth>
 __device__ static double bkRadiance(const DScene& sc, int diffraction, DVec3 ro, DVec3 rd,
-                                    Real lambda, double invPdfLambda, DRng& rng, DGiCtx gi);
+                                    Real lambda, double invPdfLambda, DRng& rng, const DMediumStack& stk0,
+                                    DGiCtx gi);
 template<int GiDepth>
 __device__ static void bkRadianceHero(const DScene& sc, int diffraction, DVec3 ro, DVec3 rd,
                                       const Real* lamIn, const double* invPdfIn, int C,
-                                      double* Lout, DRng& rng, DGiCtx gi);
+                                      double* Lout, DRng& rng, const DMediumStack& stk0, DGiCtx gi);
 // Neither gather is templated: a gather only ever happens at depth 0, so its rays are always
 // depth 1 and it can name that instantiation directly.
 __device__ static double bkGiGather(const DScene& sc, int diffraction, const DHit& h, Real rho,
@@ -17216,7 +17209,7 @@ __device__ static bool bkInteract(const DScene& sc, const DMaterial* mp, const D
 template<int GiDepth>
 __device__ static double bkRadiance(const DScene& sc, int diffraction, DVec3 ro, DVec3 rd,
                                     Real lambda, double invPdfLambda, DRng& rng,
-                                    DGiCtx gi) {
+                                    const DMediumStack& stk0, DGiCtx gi) {
     double L = 0.0, thr = 1.0;
     // GLOSSY-NEE: the lobe density of a glossy continuation, carried to whichever emitter site
     // it reaches. Null when the estimator is off, which turns every site below back into its
@@ -17228,9 +17221,9 @@ __device__ static double bkRadiance(const DScene& sc, int diffraction, DVec3 ro,
                                                        // NEE already counted that emitter)
     double contBsdfPdf = 0.0;                           // solid-angle pdf of the current continuation (env MIS)
     double contSoft = 1.0;                              // what the last vertex lends what it reaches (dContSoftening)
-    // nested-dielectric medium stack, from gi's (DGiCtx::stk0); a gather ray takes it as it then is
-    DMediumStack stk; if (gi.stk0) stk = *gi.stk0; else stk.clear();
-    gi.stk0 = &stk;
+    // nested-dielectric medium stack, from `stk0`; a gather ray takes it as it then is (walkStk)
+    DMediumStack stk = stk0;
+    gi.walkStk = &stk;
     const bool whitted = (sc.bkWhitted != 0);
     // Gather rays are bounce-capped (see bkGiBounce). The `min` matters: the host is
     // std::min(maxBounce, giBounce) (backward.h), so without it a `-gi-bounce` larger than
@@ -17507,7 +17500,7 @@ __device__ static void bkRadianceHeroLoop(const DScene& sc, int diffraction,
                                           int bounce0, double* Lout, DRng& rng, DGiCtx gi,
                                           const DGlossyMis* gmis0 = nullptr,
                                           Real curveTmin0 = (Real)0, double contSoft0 = 1.0) {
-    gi.stk0 = &stk;   // a gather ray from this walk starts with its stack as it then is
+    gi.walkStk = &stk;   // a gather ray from this walk starts with its stack as it then is
     Real   lam[hero::kHeroMax];
     double invPdf[hero::kHeroMax], thr[hero::kHeroMax];
     // GLOSSY-NEE: the hero twin of bkRadiance's carrier. Cleared just before the material
@@ -18058,8 +18051,8 @@ __device__ static void bkRadianceHeroLoop(const DScene& sc, int diffraction,
     }
 }
 
-// Entry point for a fresh camera/gather hero bundle at bounce 0: unit throughput, inside gi's solids
-// (DGiCtx::stk0). A camera ray may see a light directly; a GATHER ray may not — the vertex it left
+// Entry point for a fresh camera/gather hero bundle at bounce 0: unit throughput, inside `stk0`'s
+// solids. A camera ray may see a light directly; a GATHER ray may not — the vertex it left
 // already NEE'd the direct light, so counting the emitter again here would double it. A
 // specular bounce re-arms this, so gold-bounced light still lands.
 //
@@ -18069,13 +18062,13 @@ __device__ static void bkRadianceHeroLoop(const DScene& sc, int diffraction,
 template<int GiDepth>
 __device__ static void bkRadianceHero(const DScene& sc, int diffraction, DVec3 ro, DVec3 rd,
                                       const Real* lamIn, const double* invPdfIn, int C,
-                                      double* Lout, DRng& rng, DGiCtx gi) {
+                                      double* Lout, DRng& rng, const DMediumStack& stk0, DGiCtx gi) {
     double thr[hero::kHeroMax];
     for (int i = 0; i < C; ++i) thr[i] = 1.0;
-    // Dielectric priority (Beer-Lambert per λ), from gi's (DGiCtx::stk0). A bundle inside a solid is
-    // one wavelength, as one that enters a solid becomes: the hero carries it from the start, xC
-    // (host twin radianceHero).
-    DMediumStack stk; if (gi.stk0) stk = *gi.stk0; else stk.clear();
+    // Dielectric priority (Beer-Lambert per λ), from `stk0`. A bundle inside a solid is one
+    // wavelength, as one that enters a solid becomes: the hero carries it from the start, xC (host
+    // twin radianceHero).
+    DMediumStack stk = stk0;
     const bool whole = (C > 1) && stk.n == 0;
     if (C > 1 && !whole && sc.bkHeroSplit) {
         // Under -herosplit, split from the start rather than collapse: each wavelength its own
@@ -18138,7 +18131,7 @@ __device__ static void bkGiGatherHero(const DScene& sc, int diffraction, const D
     for (int i = 0; i < nUp; ++i) acc[i] = 0.0;
     double wSum = 0.0;
     DGiCtx sub{gi.depth + 1, gi.sIdx, 0};
-    sub.stk0 = gi.stk0;   // and start inside the vertex's solids
+    const DMediumStack& vertexStk = *gi.walkStk;   // and start inside the vertex's solids (set by the walk)
     for (int j = 0; j < n; ++j) {
         const DVec3 d = dGiDir(j, n, p1, p2);
         const double c = (double)dot(h.n, d);
@@ -18149,7 +18142,7 @@ __device__ static void bkGiGatherHero(const DScene& sc, int diffraction, const D
         wSum += c;
         double Lg[hero::kHeroMax];
         bkRadianceHero<1>(sc, diffraction, dOffsetAlong(h.p, h.ng, d), d, lam, invPdf, nUp, Lg,
-                          rng, sub);
+                          rng, vertexStk, sub);
         // Firefly clamp (see bkGiClamp). NOT applied to wSum: a clamped direction keeps its
         // weight c, so the estimator still normalises by the realised sum of cosines and an
         // unclamped gather is untouched bit-for-bit.
@@ -18175,7 +18168,7 @@ __device__ static double bkGiGather(const DScene& sc, int diffraction, const DHi
     double p1, p2; dGiPhases(gi.sIdx, p1, p2);
     double acc = 0.0, wSum = 0.0;
     DGiCtx sub{gi.depth + 1, gi.sIdx, 0};
-    sub.stk0 = gi.stk0;   // and start inside the vertex's solids
+    const DMediumStack& vertexStk = *gi.walkStk;   // and start inside the vertex's solids (set by the walk)
     for (int j = 0; j < n; ++j) {
         const DVec3 d = dGiDir(j, n, p1, p2);
         const double c = (double)dot(h.n, d);
@@ -18183,7 +18176,7 @@ __device__ static double bkGiGather(const DScene& sc, int diffraction, const DHi
         if (dot(ngo, d) <= 0) continue;
         wSum += c;
         double Lg = bkRadiance<1>(sc, diffraction, dOffsetAlong(h.p, h.ng, d), d, lambda, invPdfLambda,
-                                  rng, sub);
+                                  rng, vertexStk, sub);
         if (sc.bkGiClamp > 0.0 && Lg > sc.bkGiClamp) Lg = sc.bkGiClamp;   // see bkGiClamp
         acc += c * Lg * gi.coat.f(sc, h, d, lambda);   // see the hero twin
     }
@@ -18268,8 +18261,8 @@ __global__ void kBackward(DScene sc, const __grid_constant__ DCamera cam, double
             // deterministic lattice (glossy lobe, gather directions) by it — so, exactly like
             // the subpixel and wavelength lattices, they are progressive and chunk-independent.
             DGiCtx gi0{0, sIdx, 0};
-            gi0.stk0 = &camS.enclosure;   // the walk starts inside the eye's solids
-            bkRadianceHero<0>(sc, diffraction, hro, hrd, lam, invPdf, heroC, Lh, rng, gi0);
+            bkRadianceHero<0>(sc, diffraction, hro, hrd, lam, invPdf, heroC, Lh, rng,
+                              camS.enclosure, gi0);   // the walk starts inside the eye's solids
             for (int i = 0; i < heroC; ++i) {
                 // Each wavelength by its own first event: a split secondary's may not be the hero's.
                 const int fs = s_dFirstSec[threadIdx.x][i];
@@ -18312,8 +18305,8 @@ __global__ void kBackward(DScene sc, const __grid_constant__ DCamera cam, double
         }
         s_dFirstEv[threadIdx.x] = (signed char)(filmSpec ? kDFirstUnset : kDFirstOff);
         DGiCtx gi0{0, sIdx, 0};
-        gi0.stk0 = &camS.enclosure;   // the walk starts inside the eye's solids
-        double Lval = bkRadiance<0>(sc, diffraction, ro, rd, lambda, invPdfLambda, rng, gi0);
+        double Lval = bkRadiance<0>(sc, diffraction, ro, rd, lambda, invPdfLambda, rng,
+                                    camS.enclosure, gi0);   // the walk starts inside the eye's solids
         double w = Lval * wLens * filmWl;
         double* const to = dFirstFilm(sc, film, filmSpec);
         atomicAdd(&to[o + 0], (double)cieX(lambda) * w);
@@ -19014,11 +19007,10 @@ __device__ static void dRandomWalk(const DScene& sc, const DCamera& cam, int dif
                                    const DHeroBundle& hb, int maxDepth, DRng& rng,
                                    DVertex* path, double* pathSec, int secStride, int maxV, int& n,
                                    bool importance, const double* betaSecIn, int nUpIn,
-                                   DEscape* esc = nullptr,
+                                   const DMediumStack& stk0, DEscape* esc = nullptr,
                                    DPathSeg* segs = nullptr, int* nSegs = nullptr,
                                    int maxSegs = 0, DJSpecRun* jrun = nullptr,
-                                   DJSpec* vspec = nullptr, float* compoundMergeW = nullptr,
-                                   const DMediumStack* stk0 = nullptr) {
+                                   DJSpec* vspec = nullptr, float* compoundMergeW = nullptr) {
     // `compoundMergeW`, if given, takes each vertex's share as a compound's merge vertex (host twin
     // Vertex::compoundMergeW): 1 over the chance the pick there went on, or 0 where it is none.
     const Real lambda = hb.lam[0];   // the hero drives geometry, sampling and every pdf
@@ -19030,7 +19022,7 @@ __device__ static void dRandomWalk(const DScene& sc, const DCamera& cam, int dif
     for (int i = 0; i + 1 < nUp; ++i) betaSec[i] = betaSecIn[i];
     // nested-dielectric medium stack for exterior-IOR resolution; a light subpath starts inside its
     // birth's enclosing solids (`stk0`, dBirthStack; BIRTH-EMPTY-STACK)
-    DMediumStack stk; if (stk0) stk = *stk0; else stk.clear();
+    DMediumStack stk = stk0;
     // A fiber's far-side exit clearance for the NEXT hop, curve primitives only (bdpt.h
     // randomWalk's `fiberFar` Ray, kVcmCameraT's twin). 0 everywhere off a strand, so a hair-free
     // walk traces exactly the rays it always did.
@@ -19586,8 +19578,8 @@ __device__ static int dGenCameraSubpath(const DScene& sc, const DCamera& cam, in
         }
         double pdfDir = dLensPdfDir(cam, ro, rd, lambda);
         dRandomWalk(sc, cam, diffraction, ro, rd, (double)wl, pdfDir, hb, maxDepth - 1, rng,
-                    path, pathSec, secStride, maxV, n, false, betaSec0, 1, esc,
-                    segs, nSegs, maxSegs, jrun, vspec, nullptr, &cam.enclosure);
+                    path, pathSec, secStride, maxV, n, false, betaSec0, 1, cam.enclosure, esc,
+                    segs, nSegs, maxSegs, jrun, vspec, nullptr);
         // The light image's pick of the camera vertex depends on eye[1] (host twin
         // generateCameraSubpath); mode J's merges on the first segment take it per merge point.
         if (n > 1) path[1].pdfFwd *= dLensAimRatio(cam, ro, path[1].p);
@@ -19602,8 +19594,8 @@ __device__ static int dGenCameraSubpath(const DScene& sc, const DCamera& cam, in
     double cosCam = ddot(rd, cam.w);
     double pdfDir = dCameraPdfDir(cam, cosCam);
     dRandomWalk(sc, cam, diffraction, cam.eye, rd, 1.0, pdfDir, hb, maxDepth - 1, rng,
-                path, pathSec, secStride, maxV, n, false, betaSec0, nUp0, esc,
-                segs, nSegs, maxSegs, jrun, vspec, nullptr, &cam.enclosure);
+                path, pathSec, secStride, maxV, n, false, betaSec0, nUp0, cam.enclosure, esc,
+                segs, nSegs, maxSegs, jrun, vspec, nullptr);
     return n;
 }
 // Sample a light subpath. path[0] is the light endpoint (beta = Le).
@@ -19715,8 +19707,8 @@ __device__ static int dGenLightSubpath(const DScene& sc, const DCamera& cam, int
         if (isSun) dSkyEntryPastHaze(sc, walkFrom, dir, /*mayDrop=*/false);
         DMediumStack stk0; dBirthStack(sc, ei, -1, walkFrom, stk0);
         dRandomWalk(sc, cam, diffraction, walkFrom, dir, betaWalkD, pdfDirD, hb, maxDepth - 1, rng,
-                    path, pathSec, secStride, maxV, nD, true, betaWalkSecD, hb.C,
-                    nullptr, nullptr, nullptr, 0, nullptr, nullptr, compoundMergeW, &stk0);
+                    path, pathSec, secStride, maxV, nD, true, betaWalkSecD, hb.C, stk0,
+                    nullptr, nullptr, nullptr, 0, nullptr, nullptr, compoundMergeW);
         dSoftenFirstBounce(sc, path, pathSec, secStride, nD, hb.C, compoundMergeW);
         // Infinite-light density patch (PBRT): the first scene vertex was given a
         // solid-angle density converted with 1/dist^2 from the fictitious disc point, but
@@ -19790,8 +19782,8 @@ __device__ static int dGenLightSubpath(const DScene& sc, const DCamera& cam, int
     DVec3 ro = y + nFace * (Real)1e-6;
     DMediumStack stk0; dBirthStack(sc, ei, -1, ro, stk0);
     dRandomWalk(sc, cam, diffraction, ro, dir, betaWalk, pdfDir, hb, maxDepth - 1, rng,
-                path, pathSec, secStride, maxV, n, true, betaWalkSec, hb.C,
-                nullptr, nullptr, nullptr, 0, nullptr, nullptr, compoundMergeW, &stk0);
+                path, pathSec, secStride, maxV, n, true, betaWalkSec, hb.C, stk0,
+                nullptr, nullptr, nullptr, 0, nullptr, nullptr, compoundMergeW);
     dSoftenFirstBounce(sc, path, pathSec, secStride, n, hb.C, compoundMergeW);
     return n;
 }

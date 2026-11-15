@@ -315,11 +315,16 @@ struct BackwardRenderer {
         // set by interactMaterial and the hero walk. Empty off a coated vertex; a gather ray, a
         // re-entry and a split's sub-path start without one.
         CoatCtx coat;
-        // The stack the walk this context starts begins with: a camera path's camera's
-        // (Camera::enclosure), a gather ray's its vertex's. Inside a walk, the walk's own stack, so
-        // that a gather ray it sends takes it. Null for none (air).
-        const MediumStack* stk0 = nullptr;
+        // The walk's own stack as it stands, set by the walk (radiance, radianceHeroLoop) before any
+        // gather it sends: a gather ray starts with it. Null outside a walk, where no gather runs.
+        // (Where a walk STARTS is radiance's / radianceHero's `stk0`, an argument they require.)
+        const MediumStack* walkStk = nullptr;
     };
+    // The stack a gather ray starts with: its vertex's walk's, as the walk then has it.
+    static const MediumStack& walkStackOf(const GiCtx& gi) {
+        if (!gi.walkStk) throw std::logic_error("a gather outside a walk");
+        return *gi.walkStk;
+    }
     // A camera path's first event: the sky (it escaped), a specular-side surface (the rule
     // classifyComposite applies to a pixel: a non-sensor surface whose own material is a
     // specular type), or anything else -- a diffuse or composite surface, or a scatter in a
@@ -1607,7 +1612,7 @@ struct BackwardRenderer {
         for (int i = 0; i < nUp; ++i) acc[i] = 0.0;
         double wSum = 0.0;
         GiCtx sub{gi.depth + 1, gi.sIdx, 0, gi.furTier};   // inherit the fur tier
-        sub.stk0 = gi.stk0;                                  // and start inside the vertex's solids
+        const MediumStack& vertexStk = walkStackOf(gi);      // and start inside the vertex's solids
         for (int j = 0; j < n; ++j) {
             const Vec3 d = giDir(j, n, p1, p2);
             const double c = dot(h.n, d);
@@ -1618,7 +1623,7 @@ struct BackwardRenderer {
             wSum += c;
             double Lg[hero::kHeroMax];
             radianceHero(scene, Ray{h.p + ngo * 1e-6, d}, lam, invPdf, nUp, Lg, rng,
-                         spdCache, sub);
+                         vertexStk, spdCache, sub);
             // Firefly clamp (see giClamp). NOT applied to wSum: the weight of a clamped
             // direction stays c, so the estimator still normalises by the realised sum of
             // cosines and an unclamped gather is untouched bit-for-bit.
@@ -1645,7 +1650,7 @@ struct BackwardRenderer {
         giPhases(gi.sIdx, p1, p2);
         double acc = 0.0, wSum = 0.0;
         GiCtx sub{gi.depth + 1, gi.sIdx, 0, gi.furTier};   // inherit the fur tier
-        sub.stk0 = gi.stk0;                                  // and start inside the vertex's solids
+        const MediumStack& vertexStk = walkStackOf(gi);      // and start inside the vertex's solids
         for (int j = 0; j < n; ++j) {
             const Vec3 d = giDir(j, n, p1, p2);
             const double c = dot(h.n, d);
@@ -1653,7 +1658,7 @@ struct BackwardRenderer {
             if (dot(ngo, d) <= 0.0) continue;
             wSum += c;
             double Lg = radiance(scene, Ray{h.p + ngo * 1e-6, d}, lambda, invPdfLambda,
-                                 rng, spdCache, sub);
+                                 rng, vertexStk, spdCache, sub);
             if (giClamp > 0.0 && Lg > giClamp) Lg = giClamp;   // see giClamp
             acc += c * Lg * gi.coat.f(scene, h, d, lambda);   // see giGatherHero
         }
@@ -2819,9 +2824,11 @@ struct BackwardRenderer {
     // Estimate spectral-weighted radiance for a single wavelength along `ray`.
     // `invPdfLambda` = camG/g(lambda), the reciprocal of the illuminant's wavelength
     // density (Scene::camSampler); an emitter's Le/pdf weight is its SPD(lambda) * invPdfLambda.
+    // `stk0`: the solids the walk starts inside -- a camera's (Camera::enclosure), a gather ray's its
+    // vertex's (walkStackOf).
     double radiance(const Scene& scene, Ray ray, double lambda, double invPdfLambda,
-                    Pcg32& rng, const SpdCache* spdCache = nullptr,
-                    GiCtx gi = GiCtx{}) const {
+                    Pcg32& rng, const MediumStack& stk0, const SpdCache* spdCache,
+                    GiCtx gi) const {
         double L = 0.0, thr = 1.0;
         // Camera ray may see the light directly; a gather ray may not (see radianceHero).
         bool specularArrival = (gi.depth == 0);
@@ -2842,10 +2849,10 @@ struct BackwardRenderer {
         // Nested-dielectric medium stack: the solids the ray is currently inside. The
         // current medium (for Beer-Lambert absorption + the exterior IOR at the next
         // interface) is the highest-priority entry. Replaces the old single `interior`
-        // pointer; behaves identically for a lone dielectric. It starts with gi's (GiCtx::stk0), and
-        // a gather ray this walk sends starts with it as it is then.
-        MediumStack stk = gi.stk0 ? *gi.stk0 : MediumStack{};
-        gi.stk0 = &stk;
+        // pointer; behaves identically for a lone dielectric. It starts as `stk0`, and a gather ray
+        // this walk sends starts with it as it is then (GiCtx::walkStk).
+        MediumStack stk = stk0;
+        gi.walkStk = &stk;
         auto curAbsorb = [&](double lam) -> double {           // sigma_a of the current medium
             int mi = stk.topMat();
             return (mi >= 0) ? scene.mats[mi].absorb(lam) : 0.0;
@@ -3188,10 +3195,11 @@ struct BackwardRenderer {
     // fiber or a rainbow phase, whose lobes move with λ but smoothly, keeps the bundle by
     // spectral MIS instead. The caller restricts this to scenes without GRIN or a physical
     // lens, and whose media all have extinction flat in λ. Fills Lout[0..C).
+    // `stk0`: the solids the walk starts inside (radiance's).
     void radianceHero(const Scene& scene, Ray ray, const double* lamIn,
                       const double* invPdfIn, int C, double* Lout, Pcg32& rng,
-                      const SpdCache* spdCache = nullptr, GiCtx gi = GiCtx{}) const {
-        // A fresh camera/gather bundle at bounce 0: unit throughput, inside gi's solids (stk0, below).
+                      const MediumStack& stk0, const SpdCache* spdCache, GiCtx gi) const {
+        // A fresh camera/gather bundle at bounce 0: unit throughput, inside `stk0`'s solids.
         // A camera ray may see a light directly; a GATHER ray may not -- the vertex it
         // left already NEE'd the direct light, so counting the emitter again here would
         // double it. A specular bounce re-arms this, so gold-bounced light still lands.
@@ -3205,10 +3213,8 @@ struct BackwardRenderer {
         // first estimate.
         const bool rcTrain = rcActive() && radTrainFrac > 0.0
                            && (rng.uniform() < radTrainFrac);
-        // The walk starts inside gi's solids (GiCtx::stk0), and a bundle inside a solid is one
-        // wavelength, as one that enters a solid becomes (the dielectric case's deHero): there the
-        // hero carries the bundle from the start, boosted xC.
-        const MediumStack stk0 = gi.stk0 ? *gi.stk0 : MediumStack{};
+        // A bundle inside a solid is one wavelength, as one that enters a solid becomes (the
+        // dielectric case's deHero): there the hero carries the bundle from the start, boosted xC.
         const bool whole = (C > 1) && stk0.empty();
         if (C > 1 && !whole && heroSplit) {
             // Under `heroSplit` (mode W forces it: its wavelength lattice is every pixel's) the bundle
@@ -3266,7 +3272,7 @@ struct BackwardRenderer {
                           GiCtx gi, bool rcTrain = false,
                           bool firstSegSampled = false, double reentryCoatU = -1.0,
                           const GlossyMis* gmis0 = nullptr, double contSoft0 = 1.0) const {
-        gi.stk0 = &stk;   // a gather ray from this walk starts with its stack as it then is
+        gi.walkStk = &stk;   // a gather ray from this walk starts with its stack as it then is
         // `firstSegSampled`: this call RE-ENTERS a vertex its parent already reached (the
         // chromatic-coat split re-traces the segment that hit the coat), so the free flights
         // along that first segment -- the media collision and the aggregate-fur flight -- were
@@ -4447,10 +4453,9 @@ struct BackwardRenderer {
                         firstEv = -1;
                         for (int i = 0; i < C; ++i) firstSecEv[i] = -2;
                         GiCtx gi0{0, sIdx};
-                        gi0.stk0 = &cam.enclosure;
                         gi0.first = firstOut;
                         gi0.firstSec = firstOut ? firstSecEv : nullptr;
-                        radianceHero(scene, ray, lamA, invA, C, Lh, rng, &spdCache, gi0);
+                        radianceHero(scene, ray, lamA, invA, C, Lh, rng, cam.enclosure, &spdCache, gi0);
                         // Each wavelength by its own first event: a split secondary's may not be
                         // the hero's (P-HEROSPLIT-FIRST).
                         for (int i = 0; i < C; ++i)
@@ -4494,9 +4499,8 @@ struct BackwardRenderer {
                             continue;                       // clipped by an element / the stop
                         firstEv = -1;
                         GiCtx gi0{0, sIdx};
-                        gi0.stk0 = &cam.enclosure;
                         gi0.first = firstOut;
-                        double L = radiance(scene, ray, lambda, invPdfLambda, rng, &spdCache, gi0);
+                        double L = radiance(scene, ray, lambda, invPdfLambda, rng, cam.enclosure, &spdCache, gi0);
                         filmFor(firstEv).add(px, py, Vec3(cieX(lambda), cieY(lambda), cieZ(lambda)) * (L * wLens * filmW));
                         continue;
                     }
@@ -4506,9 +4510,8 @@ struct BackwardRenderer {
                     Ray ray = cam.genRay(px, py, sjx, sjy);
                     firstEv = -1;
                     GiCtx gi0{0, sIdx};
-                    gi0.stk0 = &cam.enclosure;
                     gi0.first = firstOut;
-                    double L = radiance(scene, ray, lambda, invPdfLambda, rng, &spdCache, gi0);
+                    double L = radiance(scene, ray, lambda, invPdfLambda, rng, cam.enclosure, &spdCache, gi0);
                     filmFor(firstEv).add(px, py, Vec3(cieX(lambda), cieY(lambda), cieZ(lambda)) * (L * filmW));
                 }
             }

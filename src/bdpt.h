@@ -941,9 +941,9 @@ inline void beginBeamSpectral(const Scene& scene, const Renderer& mats, const Em
 inline void randomWalk(const Scene& scene, const Camera& cam, const Renderer& mats,
                        Ray ray, double beta, double pdfDir, const HeroBundle& hb,
                        int maxDepth, Mode mode, Pcg32& rng, std::vector<Vertex>& path,
-                       const double* betaSecIn, int nUpIn, Escape* esc = nullptr,
-                       PathSegs* segs = nullptr, const BeamSpectral* bsIn = nullptr,
-                       JSpecWalk* jsw = nullptr, const MediumStack* stk0 = nullptr) {
+                       const double* betaSecIn, int nUpIn, const MediumStack& stk0,
+                       Escape* esc = nullptr, PathSegs* segs = nullptr, const BeamSpectral* bsIn = nullptr,
+                       JSpecWalk* jsw = nullptr) {
     (void)cam;   // cam reserved for future NEE-to-camera use; mode now drives adjoint corr
     const double lambda = hb.lam[0];   // the hero drives geometry, sampling and every pdf
     if (maxDepth == 0) return;
@@ -1002,7 +1002,7 @@ inline void randomWalk(const Scene& scene, const Camera& cam, const Renderer& ma
     // next interface) = the highest-priority entry. Behaves like the old single-pointer
     // `interior` for a lone dielectric. A light subpath starts inside the solids that enclose its
     // birth (`stk0`, Scene::birthStack; BIRTH-EMPTY-STACK).
-    MediumStack stk = stk0 ? *stk0 : MediumStack{};
+    MediumStack stk = stk0;
     auto curAbsorb = [&](double lam) -> double {
         int mi = stk.topMat();
         return (mi >= 0) ? scene.mats[mi].absorb(lam) : 0.0;
@@ -1936,7 +1936,7 @@ inline int generateCameraSubpath(const Scene& scene, const Camera& cam, const Re
         }
         double pdfDir = cam.lensPdfDir(ray.o, ray.d, lambda);
         randomWalk(scene, cam, mats, ray, wLens, pdfDir, hb, maxDepth - 1,
-                   Mode::Radiance, rng, path, betaSec0, 1, esc, segs, nullptr, jsw, &cam.enclosure);
+                   Mode::Radiance, rng, path, betaSec0, 1, cam.enclosure, esc, segs, nullptr, jsw);
         // The light image picks this camera vertex with a density that depends on the vertex
         // it is picked from (lensAimRatio), which was not known until the walk found eye[1].
         // The first segment's pdfDir stays against 1/A_front: mode J's merges along it apply
@@ -1950,7 +1950,7 @@ inline int generateCameraSubpath(const Scene& scene, const Camera& cam, const Re
     double cosCam = dot(ray.d, cam.w);
     double pdfDir = cameraPdfDir(cam, cosCam);
     randomWalk(scene, cam, mats, ray, /*beta*/1.0, pdfDir, hb, maxDepth - 1,
-               Mode::Radiance, rng, path, betaSec0, nUp0, esc, segs, nullptr, jsw, &cam.enclosure);
+               Mode::Radiance, rng, path, betaSec0, nUp0, cam.enclosure, esc, segs, nullptr, jsw);
     return (int)path.size();
 }
 
@@ -2101,7 +2101,7 @@ inline int deltaLightSubpath(const Scene& scene, const Camera& cam, const Render
     if (bs) beginBeamSpectral(scene, mats, em, em.spdFn(lambda) * invPdfLambda, rng, *bs);
     const MediumStack stk0 = scene.birthStack((int)(&em - scene.emitters.data()), -1, ray.o);
     randomWalk(scene, cam, mats, ray, betaWalk, pdfDir, hb, maxDepth - 1,
-               Mode::Importance, rng, path, betaWalkSec, hb.C, nullptr, segs, bs, nullptr, &stk0);
+               Mode::Importance, rng, path, betaWalkSec, hb.C, stk0, nullptr, segs, bs, nullptr);
     softenFirstBounce(path, segs);
     // Infinite-light density patch (PBRT): the first scene vertex was given a solid-angle
     // density converted with 1/dist^2 from the fictitious disc point, but the reverse
@@ -2163,7 +2163,7 @@ inline int fireLightSubpath(const Scene& scene, const Camera& cam, const Rendere
     for (int i = 0; i + 1 < hb.C; ++i) betaWalkSec[i] = L0.betaSec[i] * k;
     const MediumStack stk0 = scene.birthStack(-1, pick.fire, x);
     randomWalk(scene, cam, mats, Ray{x, dir}, L0.beta * k, pdfDir, hb, maxDepth - 1,
-               Mode::Importance, rng, path, betaWalkSec, hb.C, nullptr, nullptr, nullptr, nullptr, &stk0);
+               Mode::Importance, rng, path, betaWalkSec, hb.C, stk0, nullptr, nullptr, nullptr, nullptr);
     softenFirstBounce(path, nullptr);
     return (int)path.size();
 }
@@ -2266,7 +2266,7 @@ inline int generateLightSubpath(const Scene& scene, const Camera& cam, const Ren
     if (bs) beginBeamSpectral(scene, mats, em, em.spdFn(lambda) * invPdfLambda, rng, *bs);
     const MediumStack stk0 = scene.birthStack((int)(&em - scene.emitters.data()), -1, ray.o);
     randomWalk(scene, cam, mats, ray, betaWalk, pdfDir, hb, maxDepth - 1,
-               Mode::Importance, rng, path, betaWalkSec, hb.C, nullptr, segs, bs, nullptr, &stk0);
+               Mode::Importance, rng, path, betaWalkSec, hb.C, stk0, nullptr, segs, bs, nullptr);
     softenFirstBounce(path, segs);
     return (int)path.size();
 }

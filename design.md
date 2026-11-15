@@ -3527,10 +3527,13 @@ The camera side has the same two halves (CAMERA-EMPTY-STACK, 0.445.8). Every cam
 the solids around its eye: `Scene::eyeStack` (enclosureAt at the eye, none where nothing is
 enterable), set once per batch on each `RenderCam`'s `Camera::enclosure` in main.cpp (and on the
 exposure meter's cameras) and carried by the camera's posed copies; the device's
-`DCamera::enclosure` mirrors it. Mode R and W take it through
-`GiCtx::stk0` (and `DGiCtx::stk0`), which inside a walk points at the walk's own stack so a gather ray
-starts with the vertex's; D and J through randomWalk's `stk0`; U, M (its final gather too), S and the
-denoiser's guide through their own `stk0` parameters. A thin lens's aperture and a physical lens's
+`DCamera::enclosure` mirrors it. Every walk entry takes its starting stack as an argument it
+requires -- `radiance` / `radianceHero` (and `bkRadiance` / `bkRadianceHero`) for R and W, whose gather
+rays start with their vertex's walk's stack (`GiCtx::walkStk`, which the walk keeps pointed at its own);
+`randomWalk` (`dRandomWalk`) for D and J; `photonGather`, `photonGatherSub`, `sppmVisiblePoint` and the
+denoiser's `traceGuide` for M, S and the guide -- so none can start in air by leaving it out. Every
+forward splat's leg takes one factor, `legTransmittance` (`dLegTransmittance`): the media along it times
+its solid's absorption. A thin lens's aperture and a physical lens's
 front element are taken to lie in the eye's solids. A camera bundle born inside a solid is one
 wavelength from the start, as one that enters a solid becomes (mode R's hero boosted xC; BDPT and VCM
 average over the wavelengths they carry, so the lone hero needs no boost), so the invariant "inside a

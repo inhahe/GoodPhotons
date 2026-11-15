@@ -298,9 +298,9 @@ Then the rest of 4.2-4.6 in their order, 4.7's bookkeeping alongside whatever to
   where walks start (tube lights, `-no-env`, open sheets, mixes, strands, the device's cap), the
   legs left unabsorbed (mode C, M's glossy NEE, `-rgb`, a glow seen, a camera in a glass ball,
   `-radcache`, `-herosplit`), flat mirror planes; known-issues REVIEW-0445B.
-- [ ] **BALL-EYE-HALO** — modes R, D and U draw a halo round a lamp seen from inside a glass ball
-  that mode B and the closed form do not (known-issues).
-- [ ] **LEG-TRANSMITTANCE** — one call for a leg's whole transmittance (media and its solid's
+- [ ] **BALL-EYE-HALO** — mode B misses the light a glass ball round the camera focuses onto the wall
+  behind it and back round a lamp, which modes R, D and U find (known-issues).
+- [x] **LEG-TRANSMITTANCE** — one call for a leg's whole transmittance (media and its solid's
   absorption) at every connection site, host and device, and a walk's starting stack a required
   argument rather than GiCtx::stk0's pointer (REVIEW-0445B's last two findings).
 - [ ] **EMIT-TWO-SIDED** — `emit_two_sided on` for emissive materials (a glowing quad or mesh sheet
