@@ -17,9 +17,15 @@ check reads those lines:
   * a lamp inside a glowing ball inside glass (a glow's probes are its surface, not its box) is born
     inside the glass, wholly;
   * a lamp in the air cavity of a hollow glass box starts in air, and one in an inward-wound closed
-    glass box starts outside the glass, as the walks read a face's side off its winding;
+    glass box starts outside the glass, as the walks read a face's side off its winding -- and so does
+    one just under that box (a ray leaving it at its bottom enters it again at its far side);
   * a lamp in a box of water whose bottom shares its edges with another quad starts in the water (a
-    solid's faces are a closed piece of their own).
+    solid's faces are a closed piece of their own), as does one in water whose surface, one quad, is
+    closed by white walls (a solid's faces that close nothing alone are pooled with the rest);
+  * a lamp in a glass ball made as an isosurface starts inside it (build()'s marking sets an
+    isosurface's side);
+  * a two-sided lamp lying on a glass slab is reported for its back face, born inside the glass, and
+    not for its front.
 Exits 1 on any failure.
 """
 import argparse
@@ -39,6 +45,24 @@ quad { origin -4 0 -4  u 0 0 8  v 8 0 0  material white }
 camera "c" { eye 0 1 5  look_at 0 1 0  up 0 1 0  fov_y 50  film { res 16 12 } }
 """
 LAMP = "light area { origin %s  u 0.1 0 0  v 0 0 0.1  normal 0 -1 0  spd preset:bb6500  power 10 }"
+# Six quads closing a box of glass, every one wound to face in (a quad's normal is u x v).
+INWARD_BOX = [
+    "quad { origin -0.5 0.5 -0.5  u 0 0 1  v 1 0 0  material glass }",
+    "quad { origin -0.5 1.5 -0.5  u 1 0 0  v 0 0 1  material glass }",
+    "quad { origin -0.5 0.5 -0.5  u 0 1 0  v 0 0 1  material glass }",
+    "quad { origin 0.5 0.5 -0.5  u 0 0 1  v 0 1 0  material glass }",
+    "quad { origin -0.5 0.5 -0.5  u 1 0 0  v 0 1 0  material glass }",
+    "quad { origin -0.5 0.5 0.5  u 0 1 0  v 1 0 0  material glass }",
+]
+# A slab of glass, 0.5 thick with its top at y = 1, its six quads wound to face out.
+GLASS_SLAB = [
+    "quad { origin -1 0.5 -1  u 2 0 0  v 0 0 2  material glass }",
+    "quad { origin -1 1.0 -1  u 0 0 2  v 2 0 0  material glass }",
+    "quad { origin -1 0.5 -1  u 0 0 2  v 0 0.5 0  material glass }",
+    "quad { origin 1 0.5 -1  u 0 0.5 0  v 0 0 2  material glass }",
+    "quad { origin -1 0.5 -1  u 0 0.5 0  v 2 0 0  material glass }",
+    "quad { origin -1 0.5 1  u 2 0 0  v 0 0.5 0  material glass }",
+]
 
 # name: (scene body, extra args, {pattern: should it appear})
 CASES = {
@@ -88,18 +112,38 @@ CASES = {
         NL.join(['quad { origin -1 0 -1  u 2 0 0  v 0 0 2  material water }', 'quad { origin -1 2 -1  u 0 0 2  v 2 0 0  material water }', 'quad { origin -1 0 -1  u 0 0 2  v 0 2 0  material water }', 'quad { origin 1 0 -1  u 0 2 0  v 0 0 2  material water }', 'quad { origin -1 0 -1  u 0 2 0  v 2 0 0  material water }', 'quad { origin -1 0 1  u 2 0 0  v 0 2 0  material water }', 'quad { origin -1 0 -1  u 2 0 0  v 0 0 2  material white }']) + NL + LAMP % "-0.05 1.5 -0.05",
         [], {r"\[light\] light 0 \([^)]*\) is born inside 'water'": True}),
     "inward_box": (
-        # Six quads closing a box, every one wound to face in (a quad's normal is u x v): the walks read
-        # a face's side off its winding (interfaceStep), so to them the lamp inside is outside the
-        # glass, and it starts so.
-        NL.join([
-            "quad { origin -0.5 0.5 -0.5  u 0 0 1  v 1 0 0  material glass }",
-            "quad { origin -0.5 1.5 -0.5  u 1 0 0  v 0 0 1  material glass }",
-            "quad { origin -0.5 0.5 -0.5  u 0 1 0  v 0 0 1  material glass }",
-            "quad { origin 0.5 0.5 -0.5  u 0 0 1  v 0 1 0  material glass }",
-            "quad { origin -0.5 0.5 -0.5  u 1 0 0  v 0 1 0  material glass }",
-            "quad { origin -0.5 0.5 0.5  u 0 1 0  v 1 0 0  material glass }",
-        ]) + NL + LAMP % "-0.05 1.0 -0.05",
+        # The walks read a face's side off its winding (interfaceStep), so to them the lamp inside a box
+        # wound inside out is outside the glass, and it starts so.
+        NL.join(INWARD_BOX) + NL + LAMP % "-0.05 1.0 -0.05",
         [], {r"\[light\] light 0 \([^)]*\) is born inside": False}),
+    "below_inward_box": (
+        # The same box, the lamp just under it, outside: two of the probe's rays meet the box's bottom
+        # from behind, leaving it there, and enter it again at its far side, so it holds the lamp no more
+        # than the walks do.
+        NL.join(INWARD_BOX) + NL + LAMP % "0.05 0.45 -0.05",
+        [], {r"\[light\] light 0 \([^)]*\) is born inside": False}),
+    "iso_ball": (
+        # A glass ball made as an isosurface (an SDF): a closed solid, which build()'s marking says.
+        "isosurface { material glass  sphere { center 0 1 0  radius 0.5 } }" + NL + LAMP % "-0.05 1.0 -0.05",
+        [], {r"\[light\] light 0 \([^)]*\) is born inside 'glass'": True}),
+    "pool": (
+        # Water whose surface is one quad, closed by five white quads (all wound to face out of it): the
+        # water's quad closes no piece alone, but does with the walls.
+        NL.join(['quad { origin -1 0.2 -1  u 2 0 0  v 0 0 2  material white }',
+                 'quad { origin -1 1.2 -1  u 0 0 2  v 2 0 0  material water }',
+                 'quad { origin -1 0.2 -1  u 0 0 2  v 0 1 0  material white }',
+                 'quad { origin 1 0.2 -1  u 0 1 0  v 0 0 2  material white }',
+                 'quad { origin -1 0.2 -1  u 0 1 0  v 2 0 0  material white }',
+                 'quad { origin -1 0.2 1  u 2 0 0  v 0 1 0  material white }']) + NL + LAMP % "-0.05 1.1 -0.05",
+        [], {r"\[light\] light 0 \([^)]*\) is born inside 'water'": True}),
+    "back_face_on_glass": (
+        # A two-sided lamp lying on a glass slab, facing up: its front face's births start in air, its
+        # back face's inside the glass, which the report says of the back face alone.
+        NL.join(GLASS_SLAB) + NL +
+        "light area { origin -0.25 1.000001 -0.25  u 0.5 0 0  v 0 0 0.5  normal 0 1 0  two_sided on  "
+        "spd preset:bb6500  power 10 }",
+        [], {r"\[light\] light 1 \([^)]*\), light 0's back face, is born inside 'glass'": True,
+             r"\[light\] light 0 \(": False}),
 }
 
 

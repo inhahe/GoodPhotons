@@ -5783,8 +5783,8 @@ private:
                 if (c->val.words.empty()) closed = true;
                 else {
                     const std::string& v = c->val.words[0];
-                    if      (v == "on"  || v == "true"  || v == "1" || v == "yes") closed = true;
-                    else if (v == "off" || v == "false" || v == "0" || v == "no")  closed = false;
+                    if      (isOnWord(v))  closed = true;
+                    else if (isOffWord(v)) closed = false;
                     else {
                         fail("curve" + (b.name.empty() ? std::string() : " \"" + b.name + "\"") +
                              ": `closed` takes no value, but found `closed " + v + "` -- put the next key on its own line");
@@ -8309,21 +8309,34 @@ private:
             }
         // A surface emitting from both faces that closes a solid would throw half its light into its own
         // inside, from back faces nothing outside can see: emit_two_sided is a sheet's (watertight's
-        // closed pieces, over the material's triangles, the scene's and each asset's it places).
+        // closed pieces over the material's triangles: the scene's, and each asset's an instance places
+        // with it, once, in the asset's own frame -- its triangles of the material, or all of them
+        // where an instance gives it the material).
         for (size_t m = 0; m < S.mats.size(); ++m) {
             if (!S.mats[m].emitsBack || S.mats[m].reflectsNothing) continue;   // a light block's panel is open
             std::vector<Tri> mine;
+            const auto closes = [&]() {
+                for (Tri& t : mine) { t.solidFace = 0; t.finalize(); }
+                return !mine.empty() && watertight::markSolidFaces(mine.data(), mine.size()) > 0;
+            };
             for (const Tri& t : S.tris)
                 if (S.matBase(t.matId) == (int)m) mine.push_back(t);
+            bool closed = closes();
+            std::vector<char> ownMat(S.blasList.size(), 0), allMat(S.blasList.size(), 0);
             for (const MeshInstance& in : S.instances) {
-                if (in.blasId < 0) continue;
-                for (const Tri& t : S.blasList[(size_t)in.blasId].tris) {
-                    const int placed = in.matOverride >= 0 ? in.matOverride : t.matId;
-                    if (S.matBase(placed) == (int)m) mine.push_back(t);
-                }
+                if (in.blasId < 0 || in.blasId >= (int)S.blasList.size()) continue;
+                if (in.matOverride < 0) ownMat[(size_t)in.blasId] = 1;
+                else if (S.matBase(in.matOverride) == (int)m) allMat[(size_t)in.blasId] = 1;
             }
-            for (Tri& t : mine) { t.solidFace = 0; t.finalize(); }
-            if (!mine.empty() && watertight::markSolidFaces(mine.data(), mine.size()) > 0) {
+            for (size_t bl = 0; bl < S.blasList.size() && !closed; ++bl)
+                for (const bool all : {false, true}) {
+                    if (closed || !(all ? allMat[bl] : ownMat[bl])) continue;
+                    mine.clear();
+                    for (const Tri& t : S.blasList[bl].tris)
+                        if (all || S.matBase(t.matId) == (int)m) mine.push_back(t);
+                    closed = closes();
+                }
+            if (closed) {
                 fail(nameOf((int)m) + " has emit_two_sided on a surface that closes a solid: its back faces "
                      "would light only its inside; two-sided emission is for a sheet (a quad, a polygon, an "
                      "open mesh)");
@@ -8581,13 +8594,16 @@ private:
         }
     }
 
+    // The words a boolean property takes.
+    static bool isOnWord(const std::string& s) { return s == "on" || s == "true" || s == "yes" || s == "1"; }
+    static bool isOffWord(const std::string& s) { return s == "off" || s == "false" || s == "no" || s == "0"; }
     // A boolean property `key`: on / true / yes / 1, or off / false / no / 0; `out` keeps its value where
     // the block does not set it. False, after a reported failure, for any other word.
     bool onOffOf(const Block& b, const char* key, bool& out) {
         if (!find(b, key)) return true;
         const std::string g = strOf(b, key, "off");
-        if (g == "on" || g == "true" || g == "yes" || g == "1") { out = true; return true; }
-        if (g == "off" || g == "false" || g == "no" || g == "0") { out = false; return true; }
+        if (isOnWord(g)) { out = true; return true; }
+        if (isOffWord(g)) { out = false; return true; }
         fail(std::string(key) + " takes on or off (got '" + g + "')");
         return false;
     }
@@ -9071,7 +9087,8 @@ private:
         if (!routeOf(b, med.route)) return false;   // per-object render mode (0.386.0)
         med.g = dblOf(b, "g", 0.0);
         med.beamBlur = dblOf(b, "beam_blur", -1.0);   // per-medium mode-M kernel (see scene.h)
-        bool rayleigh = strOf(b, "rayleigh") == "true" || strOf(b, "rayleigh") == "1";
+        bool rayleigh = false;
+        if (!onOffOf(b, "rayleigh", rayleigh)) return false;
         // Extinction coefficients are per-length (1/authored-unit); divide by L_ to
         // convert to the internal 1/metre so fog reads the same regardless of unit.
         const double invL = 1.0 / L_;
@@ -9525,12 +9542,6 @@ private:
             std::string kind = ph->val.words.empty() ? std::string() : ph->val.words[0];
             if (kind.empty() && ph->val.block && ph->val.block->type != "phase")
                 kind = ph->val.block->type;
-            auto truthy = [](const std::string& s) {
-                return s == "on" || s == "true" || s == "1" || s == "yes";
-            };
-            auto falsy = [](const std::string& s) {
-                return s == "off" || s == "false" || s == "0" || s == "no";
-            };
             if (kind == "rainbow") {
                 rainbow::Params prm;
                 const Block* pb = ph->val.block.get();
@@ -9564,7 +9575,9 @@ private:
                     prm.secondaryRatio  = dblOf(*pb, "secondary_ratio", prm.secondaryRatio);
                     if (const Stmt* s = find(*pb, "secondary")) {
                         std::string v = s->val.words.empty() ? "on" : s->val.words[0];
-                        if (falsy(v)) prm.secondary = false; else if (truthy(v)) prm.secondary = true;
+                        if (isOffWord(v)) prm.secondary = false;
+                        else if (isOnWord(v)) prm.secondary = true;
+                        else { fail("phase rainbow: secondary takes on or off (got '" + v + "')"); return false; }
                     }
                     // DEPRECATED `supernumerary` — see the note above. Kept so old scenes load,
                     // mapped onto the size distribution that actually models what it faked.
@@ -9579,8 +9592,8 @@ private:
                                 hasDisp ? " Ignored here: `dispersion` is set explicitly." : "");
                         }
                         if (!hasDisp) {
-                            if (truthy(v))      prm.dispersion = 0.0;             // full Airy train
-                            else if (falsy(v))  prm.dispersion = 1.0 / std::sqrt(3.0);
+                            if (isOnWord(v))       prm.dispersion = 0.0;             // full Airy train
+                            else if (isOffWord(v)) prm.dispersion = 1.0 / std::sqrt(3.0);
                         }
                     }
                 }
@@ -10287,8 +10300,8 @@ private:
         // possibly-atypical opening frame. `first` is the explicit "expose for frame 0".
         if (w.empty()) { cs.expLockSel = CamSpec::EXPLOCK_AVERAGE; return true; }
         const std::string v0 = w[0];
-        if (v0 == "off" || v0 == "false" || v0 == "0") return false;
-        if (v0 == "on" || v0 == "true" || v0 == "1") {
+        if (isOffWord(v0)) return false;
+        if (isOnWord(v0)) {
             cs.expLockSel = CamSpec::EXPLOCK_AVERAGE; return true;
         }
         if (v0 == "first") { cs.expLockSel = CamSpec::EXPLOCK_FIRST; return true; }

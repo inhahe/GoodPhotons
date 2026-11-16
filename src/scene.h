@@ -4632,11 +4632,12 @@ struct Scene {
     // once however many instances place it; then the triangles no mesh object holds -- quads, a
     // light's own surface -- as pools, in which a box of six quads meeting edge to edge is a closed
     // piece as a mesh is: one per solid a walk can be inside (encSolidOf), so the faces of a water
-    // volume or a glass box are a piece of their own whatever they touch, and one of all the rest.
-    // (A sphere's hit says it is solid itself.) Also each isosurface's side, and the world boxes of the
-    // solids light does not pass (solidNear). `enclosuresOnly`: only the pieces holding a material a
-    // walk can be inside, which is all enclosureAt reads -- what build() asks for, the rest left to
-    // the full pass a footprint needs. Once a build each: a repeated call returns the first's counts.
+    // volume or a glass box are a piece of their own whatever they touch, then one of all the rest
+    // and of those that did not close alone. (A sphere's hit says it is solid itself.) Also each
+    // isosurface's side, and the world boxes of the solids light does not pass (solidNear).
+    // `enclosuresOnly`: only what enclosureAt reads -- the pieces holding a material a walk can be
+    // inside, and the isosurfaces' sides -- which is what build() asks for, the rest left to the full
+    // pass a footprint needs. Once a build each: a repeated call returns the first's counts.
     struct SolidMarks { size_t seen = 0, solid = 0, isoSolid = 0; double ms = 0.0; };
     SolidMarks solidMarks;
     uint64_t solidMarksBuild = 0;       // the buildCount the full pass last ran at (0: never)
@@ -4654,6 +4655,12 @@ struct Scene {
             return false;
         };
         std::vector<char> done(blasList.size(), 0), held(tris.size(), 0);
+        // The assets an instance places with a material a walk can be inside, whatever their own.
+        std::vector<char> placedEnterable(blasList.size(), 0);
+        if (enclosuresOnly)
+            for (const MeshInstance& in : instances)
+                if (in.blasId >= 0 && in.blasId < (int)blasList.size() && solidOf(in.matOverride) >= 0)
+                    placedEnterable[(size_t)in.blasId] = 1;
         // Each closed piece's bounds, for the boxes below: per asset, in its own frame, and in the world.
         std::vector<std::vector<watertight::PieceBox>> blasPieces(blasList.size());
         std::vector<watertight::PieceBox> worldPieces;
@@ -4662,12 +4669,8 @@ struct Scene {
             if (g.blasId >= 0 && g.blasId < (int)blasList.size()) {
                 if (done[(size_t)g.blasId]) continue;
                 std::vector<Tri>& tr = blasList[(size_t)g.blasId].tris;
-                if (enclosuresOnly && !holdsEnterable(tr.data(), tr.size())) {
-                    bool placedEnterable = false;   // or an instance places it with such a material
-                    for (const MeshInstance& in : instances)
-                        placedEnterable = placedEnterable || (in.blasId == g.blasId && solidOf(in.matOverride) >= 0);
-                    if (!placedEnterable) continue;
-                }
+                if (enclosuresOnly && !placedEnterable[(size_t)g.blasId] && !holdsEnterable(tr.data(), tr.size()))
+                    continue;
                 done[(size_t)g.blasId] = 1;
                 sm.solid += watertight::markSolidFaces(tr.data(), tr.size(), &blasPieces[(size_t)g.blasId]);
                 sm.seen += tr.size();
@@ -4679,23 +4682,36 @@ struct Scene {
                 sm.seen += g.triCount;
             }
         }
-        std::map<int, std::vector<Tri*>> looseBySolid;   // -1: the faces of no enterable material
-        for (size_t i = 0; i < tris.size(); ++i)
-            if (!held[i]) looseBySolid[solidOf(tris[i].matId)].push_back(&tris[i]);
+        // The loose faces: each enterable solid's as a pool of its own first, so they close whatever
+        // quads they touch; then every face left -- the rest of the scene's, and a solid's that did
+        // not close alone (a water surface closed by a pool's walls) -- as one pool.
+        std::map<int, std::vector<Tri*>> looseBySolid;
+        std::vector<Tri*> rest;
+        for (size_t i = 0; i < tris.size(); ++i) {
+            if (held[i]) continue;
+            const int sid = solidOf(tris[i].matId);
+            (sid >= 0 ? looseBySolid[sid] : rest).push_back(&tris[i]);
+        }
+        size_t openSolid = 0;   // an enterable solid's faces left open by their own pool
         for (auto& [sid, pool] : looseBySolid) {
-            if (enclosuresOnly && sid < 0) continue;
             sm.solid += watertight::markSolidFaces(pool.data(), pool.size(), &worldPieces);
             sm.seen += pool.size();
+            for (Tri* t : pool)
+                if (!t->solidFace) { rest.push_back(t); ++openSolid; }
         }
-        if (enclosuresOnly) {
-            enclosureMarksBuild = buildCount;
-            return solidMarks;
+        if (!enclosuresOnly || openSolid) {
+            sm.solid += watertight::markSolidFaces(rest.data(), rest.size(), &worldPieces);
+            sm.seen += rest.size() - openSolid;
         }
         // An isosurface bounds a closed solid unless an `open` expression's surface may end at its
         // container (Implicit::solidSide).
         for (Implicit& im : implicits) {
             im.solidSide = im.capped || !fieldHasExpr(im.nodes);
             sm.isoSolid += im.solidSide ? 1 : 0;
+        }
+        if (enclosuresOnly) {
+            enclosureMarksBuild = buildCount;
+            return solidMarks;
         }
         // The solids' world boxes (solidNear), those a footprint's segment can meet: every sphere,
         // closed isosurface and closed piece light does not pass (a piece by one of its faces'
@@ -4746,44 +4762,52 @@ struct Scene {
     // first wall and refracts out into "air" whatever encloses the solid.
     //
     // enclosureAt(p): the solids containing p, outermost first (as a walk coming in would have pushed
-    // them). Three rays from p, in fixed directions none of a scene's axes; along each, the first face
-    // of every closed solid a walk goes inside (encSolidOf) says whether p is inside that solid: met from
-    // behind, the ray leaves it there -- the side a walk reads at a face (interfaceStep's `entering`),
-    // so a walk born at p starts with the stack one coming in would have. A solid counts when two of
-    // the three agree, so one ray grazing an edge cannot decide. An open sheet -- a pane of one quad, a
-    // mesh with holes -- bounds no inside (markSolidFaces leaves its faces unmarked: Hit::solid 0), so
-    // it encloses nothing.
-    // Each ray goes on through 64 surfaces, and 64 strands (which enclose nothing) besides -- a bound a
-    // light straddling a solid's surface pays at each birth -- keeping the first kEnclosureMax solids
-    // it meets. Order: by the distance at which the ray leaves,
-    // farthest (outermost) first. Device twin dEnclosureAt.
+    // them). Three rays from p, in fixed directions none of a scene's axes; along each, the faces of
+    // every closed solid a walk goes inside (encSolidOf) say whether p is inside that solid, by the side
+    // a walk reads at a face (interfaceStep's `entering`): met from behind, the ray leaves the solid
+    // there, met from in front it enters. p is inside when the ray, on its way out of the scene, leaves
+    // the solid more often than it enters it -- so a walk born at p starts with the stack one coming in
+    // would have, a hollow shell's cavity is outside it, and a box wound inside out (whose faces the
+    // walks read backwards) holds nothing, neither inside it nor in front of it. A ray that has not
+    // left the scene after 64 surfaces reads the first face it met instead. A solid counts when two of
+    // the three rays agree, so one ray grazing an edge cannot decide. An open sheet -- a pane of one
+    // quad, a mesh with holes -- bounds no inside (markSolidFaces leaves its faces unmarked: Hit::solid
+    // 0), so it encloses nothing, nor does a strand (the rays pass every curve). The first
+    // kEnclosureMax solids a ray meets are kept. Order: by the distance at which the ray first meets
+    // each, farthest (outermost) first. Device twin dEnclosureAt.
     static constexpr int kEnclosureMax = 8;
     MediumStack enclosureAt(const Vec3& p) const {
         static const Vec3 kDirs[3] = {normalize(Vec3{0.267261, 0.534522, 0.801784}),
                                       normalize(Vec3{-0.693889, 0.191741, -0.694108}),
                                       normalize(Vec3{0.401842, -0.887563, 0.225382})};
-        struct Seen { int solid; int pri; double t; bool inside; };
+        // `net`: the times the ray left the solid less the times it entered it.
+        struct Seen { int solid; int pri; double t; bool inside; int net; };
         Seen seen[3][kEnclosureMax];
         int nSeen[3] = {0, 0, 0};
         const double eps = 1e-7 * (1.0 + std::max(std::fabs(p.x), std::max(std::fabs(p.y), std::fabs(p.z))));
         for (int k = 0; k < 3; ++k) {
             Ray r{p, kDirs[k]};
             double tAcc = 0.0;
-            int surfaces = 0, strands = 0;
-            for (;;) {
-                const Hit h = closestHit(r, eps);
-                if (!h.valid) break;
-                if (h.fiberRadius > 0.0 ? ++strands > 64 : ++surfaces > 64) break;
+            bool left = false;   // the ray left the scene: the counts are complete
+            for (int surfaces = 0; surfaces < 64; ++surfaces) {
+                const Hit h = closestHit(r, eps, nullptr, false, false, DBL_MAX, /*skipCurves=*/true);
+                if (!h.valid) { left = true; break; }
                 tAcc += h.t;
                 const int si = (h.matId >= 0 && (size_t)h.matId < encSolidOf.size()) ? encSolidOf[(size_t)h.matId] : -1;
                 if (si >= 0 && h.solid != 0) {
-                    bool known = false;
-                    for (int i = 0; i < nSeen[k]; ++i) known = known || seen[k][i].solid == si;
-                    if (!known && nSeen[k] < kEnclosureMax)
-                        seen[k][nSeen[k]++] = Seen{si, mats[(size_t)si].priority, tAcc, dot(kDirs[k], h.ng) > 0.0};
+                    const bool behind = dot(kDirs[k], h.ng) > 0.0;
+                    int at = -1;
+                    for (int i = 0; i < nSeen[k]; ++i) if (seen[k][i].solid == si) at = i;
+                    if (at < 0 && nSeen[k] < kEnclosureMax) {
+                        at = nSeen[k]++;
+                        seen[k][at] = Seen{si, mats[(size_t)si].priority, tAcc, behind, 0};
+                    }
+                    if (at >= 0) seen[k][at].net += behind ? 1 : -1;
                 }
                 r = Ray{h.p, kDirs[k]};
             }
+            if (left)
+                for (int i = 0; i < nSeen[k]; ++i) seen[k][i].inside = seen[k][i].net > 0;
         }
         Seen in[kEnclosureMax];
         int nIn = 0;
@@ -5150,11 +5174,13 @@ struct Scene {
             if (!summary.empty()) summary += ", ";
             summary += s;
         };
+        bool removed = false;
         if (noMedia && !media.empty()) {
             note(std::to_string(media.size()) + " medium/media");
             media.clear();
             // The fires index `media`, and the camera's wavelength density counts them.
             finalizeEmissiveVolumes();
+            removed = true;
         }
         if (noEnv && envIndex >= 0) {
             note("environment light");
@@ -5163,11 +5189,11 @@ struct Scene {
             envMap.reset();
             envXYZ = Vec3{0, 0, 0};
             finalizeEmitters();   // rebuild CDF / emission sampler without the env
+            removed = true;
         }
-        // The rainbow tables are by emitter and medium, and either list may have changed; so are the
-        // births' starting stacks.
-        if ((noMedia || noEnv) && !bowLuts.empty()) finalizeBowLuts();
-        if (noMedia || noEnv) buildEnclosures();
+        // The rainbow tables are by emitter and medium, and so are the births' starting stacks.
+        if (removed && !bowLuts.empty()) finalizeBowLuts();
+        if (removed) buildEnclosures();
         if (noFluoro) {
             int n = 0;
             for (auto& m : mats)
@@ -5453,8 +5479,11 @@ struct Scene {
     // off primary visibility would silently change the lighting.
     // `tMaxIn`: the nearest hit closer than this, or none -- a segment's end, so its traversal
     // stops there rather than searching the scene beyond it.
+    // `skipCurves`: pass every curve segment, hair or not (enclosureAt, for which no strand bounds
+    // anything).
     Hit closestHit(const Ray& r, double tmin = 1e-6, TraversalStats* stats = nullptr,
-                   bool skipHair = false, bool skipCamHidden = false, double tMaxIn = DBL_MAX) const {
+                   bool skipHair = false, bool skipCamHidden = false, double tMaxIn = DBL_MAX,
+                   bool skipCurves = false) const {
         ++raystats::tls;
         // Leaving a hair fiber the strand's own body is excluded by `curveTmin`, so the blanket
         // self-intersection tmin has nothing left to protect against and would only re-open the
@@ -5502,7 +5531,7 @@ struct Scene {
                                              if (intersectImplicitNow(r, im, tmin, h, &tabs)) tm = h.t; }
             else if (prim < (int)(nT + nS + nI + nC)) {
                 const CurveSeg& cs = curveSegs[prim - nT - nS - nI];
-                if (skipHair && isHairCurve(cs)) return;
+                if (skipCurves || (skipHair && isHairCurve(cs))) return;
                 if (hidden(cs.matId)) return;
                 if (intersectCurveNow(cray, r, cs, curveMin(r, tmin), h)) tm = h.t;
             }
@@ -5515,7 +5544,7 @@ struct Scene {
                 if (intersectInstanceNow(r, inst, tmin, h, vcolData())) tm = h.t;
             }
         };
-        traverseWorldClosest(r, tmin, tMax, leaf, stats, skipHair);
+        traverseWorldClosest(r, tmin, tMax, leaf, stats, skipHair || skipCurves);
         markBackFace(h);
         markPatSide(h);
         applyNormalMap(h);

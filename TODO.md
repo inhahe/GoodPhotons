@@ -298,8 +298,10 @@ Then the rest of 4.2-4.6 in their order, 4.7's bookkeeping alongside whatever to
   where walks start (tube lights, `-no-env`, open sheets, mixes, strands, the device's cap), the
   legs left unabsorbed (mode C, M's glossy NEE, `-rgb`, a glow seen, a camera in a glass ball,
   `-radcache`, `-herosplit`), flat mirror planes; known-issues REVIEW-0445B.
-- [ ] **BALL-EYE-HALO** — mode B misses the light a glass ball round the camera focuses onto the wall
-  behind it and back round a lamp, which modes R, D and U find (known-issues).
+- [ ] **BALL-EYE-HALO** — mode B's glass-sphere connection draws only the refracted image: add the
+  sphere's Fresnel reflections (outside: the external reflection and one internal; inside: the inner
+  reflection then the refraction out), whose absence is the halo and a dim rim (known-issues).
+- [x] **REVIEW-0447R** (0.447.2) — the Opus (xhigh) review of 0.447.1's fixes; known-issues REVIEW-0447R.
 - [x] **LEG-TRANSMITTANCE** — one call for a leg's whole transmittance (media and its solid's
   absorption) at every connection site, host and device, and a walk's starting stack a required
   argument rather than GiCtx::stk0's pointer (REVIEW-0445B's last two findings).

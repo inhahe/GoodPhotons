@@ -3493,21 +3493,26 @@ A light walk starts inside the solids that enclose its birth (BIRTH-EMPTY-STACK,
 emitter or a fire inside a dielectric -- a lamp in a coloured glass globe, glass in water -- carries
 the solid's absorption from its birth to the wall and leaves into the medium around it, as the
 camera walks that went in after it do. `Scene::enclosureAt(p)` finds the closed solids containing a
-point: three fixed rays, each walking every face along it (64 surfaces, and 64 strands besides,
-which enclose nothing -- a bound a straddling light pays at each birth); for each solid a walk goes
-inside (`Scene::encSolidOf`: a dielectric or a coated body clear at some wavelength,
-`enterableSolidMat`, as its original's solid; a mix as its first such part's, since its walks enter
-the part they resolve to) the first of its faces met along a ray says whether p is inside it -- met
-from behind, the side a walk reads at a face (interfaceStep's `entering`), so a walk born at p starts
-with the stack one coming in would have (a hollow glass shell's cavity is air; an inward-wound box's
-inside is outside its glass, to the walks and so to this) -- a two-of-three vote settles it, and the
-stack lists them outermost (farthest) first, at most `kEnclosureMax` (8, the device stack's size).
-Only a face that bounds a closed solid counts (`Hit::solid` not 0): `buildEnclosures` runs
-`Scene::markSolidFaces(enclosuresOnly)` first wherever a walk can be inside anything -- the mesh
-objects and assets holding such a material, and each such solid's loose faces as a pool of their own
-(so a water box closes whatever quads it touches) -- so an open sheet, a window of one quad or a glass
-mesh with a hole, encloses nothing. The full pass, every piece and the solid boxes, is left to a
-footprint's batch. `Scene::buildEnclosures`, at build, asks it at a few points
+point: three fixed rays, each walking every face along it out of the scene (up to 64 surfaces; it
+passes every curve, `closestHit`'s `skipCurves`, the device's `curveTmin` BIG, since no strand
+encloses anything); for each solid a walk goes inside (`Scene::encSolidOf`: a dielectric or a coated
+body clear at some wavelength, `enterableSolidMat`, as its original's solid; a mix as its first such
+part's, since its walks enter the part they resolve to) p is inside it along a ray when the ray leaves
+it more often than it enters it, by the side a walk reads at a face (interfaceStep's `entering`: met
+from behind, leaving), so a walk born at p starts with the stack one coming in would have. A hollow
+glass shell's cavity is so air, and an inward-wound box, whose faces the walks read backwards, holds
+nothing -- neither the points inside it nor those in front of it, which a ray leaving it at its near
+face enters again at its far one (a rule reading the first face alone called those inside). A ray
+still among faces after 64 reads the first face of each solid instead. A two-of-three vote settles
+it, and the stack lists them outermost first (by where the rays first meet them), at most
+`kEnclosureMax` (8, the device stack's size). Only a face that bounds a closed solid counts
+(`Hit::solid` not 0): `buildEnclosures` runs `Scene::markSolidFaces(enclosuresOnly)` first wherever a
+walk can be inside anything -- the mesh objects and assets holding such a material (an asset an
+instance gives one, too), each such solid's loose faces as a pool of their own (so a water box closes
+whatever quads it touches), then those that closed nothing alone with all the other loose faces (so a
+water surface of one quad closes with a pool's walls), and every isosurface's side -- so an open sheet,
+a window of one quad or a glass mesh with a hole, encloses nothing. The full pass, every piece and the
+solid boxes, is left to a footprint's batch. `Scene::buildEnclosures`, at build, asks it at a few points
 on each emitter's emitting side (a quad's centre and four inset corners, off its face along its
 normal; a sphere's six poles; five of a mesh's triangles; a tube's wall at three heights and its
 caps; a spot's origin; a glow's own surface, drawn as its births are, its box only where no draw
@@ -3526,7 +3531,8 @@ coloured glass is absorbed per wavelength on its first leg (`tracePhotonHeroLoop
 de-heros it. `tools/check_birth_stack.py` holds B, D, J, U, M and S, CPU and GPU, to mode R on two
 lamps inside an amber ball (`scenes/_birth_in_glass.ftsl`). At load ftrace names each light born
 inside a solid (or straddling one's surface) and each camera starting inside one, innermost first
-("'glass' in 'water'"), a two-sided light once, and no more than 16 lights' lines;
+("'glass' in 'water'"), a two-sided light's back face only where it starts otherwise than its front
+(a panel lying on glass), and no more than 16 lights' lines;
 `tools/check_enclosures.py` reads those lines on small scenes, one per way the probe has gone wrong.
 
 The camera side has the same two halves (CAMERA-EMPTY-STACK, 0.445.8). Every camera walk starts inside
@@ -3622,7 +3628,9 @@ was lit differently by every mode (known-issues GLOW-LIGHT-MODES). Now:
   together: ng, `back`, the solid side and the tangent frame's sign (`bitangentSign`, which a normal
   map's frame reads). The loader refuses it on a mix's or stack's layer (the face is settled before
   the compound picks one) and on a surface that closes a solid (watertight's closed pieces over the
-  material's triangles: its back faces would light only its inside). finalizeEmitters checks that
+  material's triangles -- the scene's, and each asset's an instance places with it once, in its own
+  frame, so two placements do not pool into a non-manifold whole: its back faces would light only its
+  inside). finalizeEmitters checks that
   every back face follows a front of its surface and every two-sided surface with a light names a
   front, and eraseEmitter refuses to remove one face; `Scene::addBackFace` adds one. A mesh block's
   `power` on such a material is the two faces' total. `Tri::emitter` is its last field, as `Tri`s are built
@@ -6044,7 +6052,12 @@ as the one at fault.
   cursors, so a resume is the uninterrupted render where an advance serves part of its list; and
   a pass whose cells mean other regions (`keyGuard`: another cell size, the auto one following
   the camera and the resolution) starts the table and the pending batch afresh, a resume's table
-  waiting for the pass whose settings it was saved under.
+  waiting for the pass whose settings it was saved under. Since 0.447.2 the section (`FTRCACH4`)
+  opens with its own length and the size of a cell's record, so a build whose `RadCacheCell` is
+  laid out otherwise passes it whole and still reads the sections after it (mode J's light-side
+  epochs). Each cell also keeps the solids around its point, where its update rays start
+  (`stkN`, found by Scene::eyeStack at its first update), for as long as the scene is the build
+  they were found in; a cell read from a checkpoint finds them again.
 
   **The table is checkpointed (0.190.3), sparsely and under its own guard.** It rides in the
   `.ftbuf` sidecar as a trailing section after the film blobs (`writeRadCacheSection` /
@@ -10934,7 +10947,8 @@ device versions do all the precision-critical math in `double` regardless of the
 The sphere refracts as a walk's interface does (since 0.446.1): against the camera's solids (but
 the sphere, for an eye inside it) where the priority rule ranks them (`exteriorIor`), else air, so
 `n` is the sphere's index over that, and where the rule suppresses its boundary (a sphere of no
-higher priority than the medium around it, which the walks pass straight through) it is that
+higher priority than the medium around it, which the walks pass straight through: one predicate,
+`Renderer::prioritySuppressible` / `dPrioritySuppressible`, decides it for both) it is that
 medium, optically: an index of 1, no reflection, that medium's absorption across it; and an eye inside sees the radiance outside `n²` times over
 (the radiance theorem), as a camera walk refracting out of it reads it. It reads only the one refraction out, so the light a
 camera walk finds reflecting inside the sphere before it leaves is mode B's other paths' to find.

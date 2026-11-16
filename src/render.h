@@ -2213,7 +2213,7 @@ struct Renderer {
         // sphere is then, optically, the medium around it -- an index of 1, no reflection, that medium's
         // absorption across it -- and the connection reads it so. `insideMat`: whose absorption the
         // chord through it takes.
-        const bool suppressed = ranked && around.topMat() >= 0 && glass.priority <= around.topPri();
+        const bool suppressed = prioritySuppressible(glass, around, ranked) && !glass.coatOpaque(lambda);
         if (suppressed) n = 1.0;
         const int insideMat = suppressed ? around.topMat() : S.matId;
         if (dEyeO <= r * 0.9999) {         // eye inside the glass -> single-refraction path
@@ -5059,6 +5059,14 @@ struct Renderer {
         extMat = (rk && top >= 0) ? top : -1;
         return (extMat >= 0) ? scene.mats[(size_t)extMat].ior(lambda) : 1.0;
     }
+    // Whether the priority rule suppresses a boundary of `m` whose far side is the top of `outer`
+    // (`ranked`: exteriorIor's), wherever m's coat is clear (an opaque coat is never suppressed): a
+    // body of no higher priority than the medium it lies in, which the walks pass straight through
+    // (interfaceStep) and the glass-sphere connection reads as that medium. Device twin
+    // dPrioritySuppressible.
+    static bool prioritySuppressible(const Material& m, const MediumStack& outer, bool ranked) {
+        return ranked && outer.topMat() >= 0 && m.priority <= outer.topPri();
+    }
 
     // One surface of a dielectric body -- plain (Dielectric), or coated with a thin film
     // (ThinFilm) or a multilayer stack (Multilayer) -- for every host walk; the twin of the
@@ -5092,7 +5100,7 @@ struct Renderer {
         const MediumStack& outer = st.entering ? stk : after;
         bool ranked = false;
         const double extIor = exteriorIor(scene, m, outer, lambda, st.extMat, &ranked);
-        st.suppressible = ranked && outer.topMat() >= 0 && m.priority <= outer.topPri();
+        st.suppressible = prioritySuppressible(m, outer, ranked);
         if (st.suppressible && !m.coatOpaque(lambda)) {                      // suppressed
             if (st.entering) stk.push(si, m.priority); else stk.popMat(si);
             st.ray = Ray{h.p + d * 1e-6, d};

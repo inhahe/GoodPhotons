@@ -5945,6 +5945,11 @@ __device__ static Real dExteriorIor(const DScene& sc, const DMaterial& m, const 
     extMat = (ranked && top >= 0) ? top : -1;
     return (extMat >= 0) ? specLookup(sc.mats[extMat].ior, lambda) : (Real)1;
 }
+// Whether the priority rule suppresses a boundary of m whose far side is the top of `outer`, wherever
+// m's coat is clear (host twin Renderer::prioritySuppressible, where the why is).
+__device__ static bool dPrioritySuppressible(const DMaterial& m, const DMediumStack& outer, bool ranked) {
+    return ranked && outer.topMat() >= 0 && m.priority <= outer.topPri();
+}
 
 // The square of the index of the medium a path is in (the top of its stack; 1 in air): mode W's
 // cutoff and ambient fill, which are in air units, inside a dielectric (host twin:
@@ -6090,7 +6095,7 @@ __device__ static bool dDielectricStep(const DScene& sc, const DMaterial& m, con
     const DMediumStack& outer = entering ? stk : after;
     int extMat = -1; bool ranked = false;
     const Real extIor = dExteriorIor(sc, m, outer, lambda, extMat, ranked);
-    const bool suppressible = ranked && outer.topMat() >= 0 && m.priority <= outer.topPri();
+    const bool suppressible = dPrioritySuppressible(m, outer, ranked);
     if (rec) rec->suppressible = suppressible;
     if (suppressible && !dCoatOpaque(m, lambda)) {                          // suppressed
         if (entering) stk.push(si, m.priority); else stk.popMat(si);
@@ -10540,7 +10545,7 @@ __device__ static void dConnectSpecularSphere(const DScene& sc, const DCamera& c
     bool ranked = false;
     n /= (double)dExteriorIor(sc, glass, around, lambda, extMat, ranked);
     // A boundary the priority rule suppresses: the medium around it, optically (host twin).
-    const bool suppressed = ranked && around.topMat() >= 0 && glass.priority <= around.topPri();
+    const bool suppressed = dPrioritySuppressible(glass, around, ranked) && !dCoatOpaque(glass, lambda);
     if (suppressed) n = 1.0;
     const int insideMat = suppressed ? around.topMat() : S.matId;
     if (dEyeO <= r * 0.9999) {                        // eye inside -> single refraction
@@ -12538,40 +12543,45 @@ __device__ static bool dApplyCausticAim(const DScene& sc, const DCamSet& cs,
 // stratified wavelengths its beams may also carry. It is left empty unless the scene and the
 // emitter both qualify — see the fill site below.
 // Host twin Scene::enclosureAt (BIRTH-EMPTY-STACK, where the why is): the closed solids containing p,
-// outermost first, by three rays and a two-of-three vote on whether each solid's first face along them
-// is left there.
+// outermost first, by three rays and a two-of-three vote on whether each ray leaves a solid more often
+// than it enters it (or, short of leaving the scene in 64 surfaces, whether it leaves at the first face).
 static_assert(DMediumStack::CAP == Scene::kEnclosureMax, "the host's enclosure keeps what the device's can");
 __device__ static void dEnclosureAt(const DScene& sc, const DVec3& p, DMediumStack& stk) {
     stk.clear();
     const DVec3 dirs[3] = {DVec3(0.267261, 0.534522, 0.801784), DVec3(-0.693889, 0.191741, -0.694108),
                            DVec3(0.401842, -0.887563, 0.225382)};
-    int sid[3][DMediumStack::CAP], spri[3][DMediumStack::CAP], nS[3] = {0, 0, 0};
+    int sid[3][DMediumStack::CAP], spri[3][DMediumStack::CAP], snet[3][DMediumStack::CAP], nS[3] = {0, 0, 0};
     double st[3][DMediumStack::CAP];
     bool sin_[3][DMediumStack::CAP];
     for (int k = 0; k < 3; ++k) {
         const DVec3 d = normalize(dirs[k]);
         DVec3 o = p;
         double tAcc = 0.0;
-        int surfaces = 0, strands = 0;
-        for (;;) {
-            const DHit h = closestHit(sc, o, d, RAY_EPS, BIG, /*camHide=*/false);
-            if (!h.valid) break;
-            if (h.fiberRadius > (Real)0 ? ++strands > 64 : ++surfaces > 64) break;
+        bool left = false;
+        for (int surfaces = 0; surfaces < 64; ++surfaces) {
+            // curveTmin BIG: every curve is passed (no strand bounds anything).
+            const DHit h = closestHit(sc, o, d, RAY_EPS, BIG, /*camHide=*/false, /*curveTmin=*/BIG);
+            if (!h.valid) { left = true; break; }
             tAcc += (double)h.t;
             const int si = sc.mats[h.matId].encSolid;
             if (si >= 0 && h.solid != 0) {
-                bool known = false;
-                for (int i = 0; i < nS[k]; ++i) known = known || sid[k][i] == si;
-                if (!known && nS[k] < DMediumStack::CAP) {
-                    sid[k][nS[k]] = si;
-                    spri[k][nS[k]] = sc.mats[si].priority;
-                    st[k][nS[k]] = tAcc;
-                    sin_[k][nS[k]] = dot(d, h.ng) > (Real)0;   // met from behind: the walks' side
-                    ++nS[k];
+                const bool behind = dot(d, h.ng) > (Real)0;   // the walks' side: leaving
+                int at = -1;
+                for (int i = 0; i < nS[k]; ++i) if (sid[k][i] == si) at = i;
+                if (at < 0 && nS[k] < DMediumStack::CAP) {
+                    at = nS[k]++;
+                    sid[k][at] = si;
+                    spri[k][at] = sc.mats[si].priority;
+                    st[k][at] = tAcc;
+                    sin_[k][at] = behind;
+                    snet[k][at] = 0;
                 }
+                if (at >= 0) snet[k][at] += behind ? 1 : -1;
             }
             o = dOffsetAlong(h.p, h.ng, d);
         }
+        if (left)
+            for (int i = 0; i < nS[k]; ++i) sin_[k][i] = snet[k][i] > 0;
     }
     int inId[DMediumStack::CAP], inPri[DMediumStack::CAP], nIn = 0;
     double inT[DMediumStack::CAP];

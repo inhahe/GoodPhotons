@@ -18266,6 +18266,9 @@ static constexpr char kRadCacheTag[8] = {'F','T','R','C','A','C','H','1'};
 // they drew), the update pass's rotation cursors, and the batch under way (g_rcPending: its marks,
 // its verification records, its tallies). A version 1 section reads as a table alone.
 static constexpr char kRadCacheTag3[8] = {'F','T','R','C','A','C','H','3'};
+// Version 4 is version 3 led by its own length and the size of a cell's record, so a reader whose
+// RadCacheCell is laid out otherwise passes the whole section and still reads the ones after it.
+static constexpr char kRadCacheTag4[8] = {'F','T','R','C','A','C','H','4'};
 
 // Returns false only on a write error. Writes nothing at all (leaving the sidecar byte-for-byte
 // what it has always been) when there is no live table, so a render without -radcache is
@@ -18279,7 +18282,15 @@ static bool writeRadCacheSection(std::ostream& o) {
     const uint32_t pass  = rc.pass;
     const long long ctr[5] = {rc.nSample, rc.nEvicted, rc.nTerm, rc.nMiss, rc.nUpdated};
     const uint64_t layout[3] = {(uint64_t)rc.key.size(), (uint64_t)rc.cursor, (uint64_t)rc.rcursor};
-    o.write(kRadCacheTag3, 8);
+    const uint32_t record = (uint32_t)sizeof(RadCacheCell);
+    // What follows the length: the record size, the header, the cells, the batch's counts and its
+    // marks (a key and six doubles) and records (a key and two doubles).
+    const uint64_t bytes = 4 + 8 + 4 + sizeof ctr + sizeof layout + 8 + n * (16 + (uint64_t)record) +
+                           8 + 8 + 3 * 8 + 3 * 8 +
+                           (uint64_t)g_rcPending.marks.size() * 56 + (uint64_t)g_rcPending.vals.size() * 24;
+    o.write(kRadCacheTag4, 8);
+    o.write((const char*)&bytes, 8);
+    o.write((const char*)&record, 4);
     o.write((const char*)&guard, 8);
     o.write((const char*)&pass, 4);
     o.write((const char*)ctr, sizeof ctr);
@@ -18328,8 +18339,22 @@ static void readRadCacheSection(std::istream& in, bool adopt = true) {
     const std::streampos at = in.tellg();
     char tag[8] = {0};
     in.read(tag, 8);
-    const bool v3 = in && std::memcmp(tag, kRadCacheTag3, 8) == 0;
+    const bool v4 = in && std::memcmp(tag, kRadCacheTag4, 8) == 0;
+    const bool v3 = v4 || (in && std::memcmp(tag, kRadCacheTag3, 8) == 0);   // slots, cursors, batch
     if (!in || (!v3 && std::memcmp(tag, kRadCacheTag, 8) != 0)) { in.clear(); in.seekg(at); return; }
+    if (v4) {   // a table of cells laid out otherwise is passed whole
+        uint64_t bytes = 0;
+        uint32_t record = 0;
+        in.read((char*)&bytes, 8);
+        const std::streampos body = in.tellg();
+        in.read((char*)&record, 4);
+        if (!in || body < 0) { in.clear(); in.seekg(at); return; }
+        in.seekg(0, std::ios::end);
+        const std::streampos fileEnd = in.tellg();
+        if (fileEnd < body || bytes > (uint64_t)(fileEnd - body)) { in.clear(); in.seekg(at); return; }
+        if (record != sizeof(RadCacheCell)) { in.clear(); in.seekg(body + (std::streamoff)bytes); return; }
+        in.seekg(body + (std::streamoff)4);
+    }
     uint64_t guard = 0, n = 0; uint32_t pass = 0; long long ctr[5] = {0,0,0,0,0};
     uint64_t layout[3] = {0, 0, 0};
     in.read((char*)&guard, 8);
@@ -29092,8 +29117,8 @@ static int run(int argc, char** argv) {
     for (RenderCam& rc : toRender) rc.cam.enclosure = scene.eyeStack(rc.cam.eye);
     // Say which lights are born inside solids and which cameras start inside them (Scene::buildEnclosures,
     // eyeStack), so a lamp in a globe or a camera under water can be seen to be found. Innermost first
-    // ("'glass' in 'water'"), a two-sided light once (its back face starts as its front), and no more
-    // than kMaxSaid lines of lights, the rest counted.
+    // ("'glass' in 'water'"), a two-sided light's back face only where it starts otherwise than its
+    // front (a panel in a water surface), and no more than kMaxSaid lines of lights, the rest counted.
     {
         const auto names = [&](const MediumStack& st) {
             std::string s;
@@ -29127,11 +29152,17 @@ static int run(int argc, char** argv) {
             else ++unsaid;
         };
         for (size_t e = 0; e < scene.emitterEnclosure.size() && e < scene.emitters.size(); ++e) {
-            if (scene.emitters[e].backFace) continue;
+            // A back face follows its front (Scene::finalizeEmitters checks it).
+            const bool back = scene.emitters[e].backFace && e > 0;
+            if (back && scene.emitterEnclosureUniform[e] == scene.emitterEnclosureUniform[e - 1] &&
+                (!scene.emitterEnclosureUniform[e] ||
+                 Scene::sameStack(scene.emitterEnclosure[e], scene.emitterEnclosure[e - 1])))
+                continue;
+            const std::string who = lightName(e) + (back ? ", light " + std::to_string(e - 1) + "'s back face," : "");
             if (!scene.emitterEnclosureUniform[e])
-                say("[light] " + lightName(e) + " straddles a solid's surface: each birth finds the solids around it");
+                say("[light] " + who + " straddles a solid's surface: each birth finds the solids around it");
             else if (scene.emitterEnclosure[e].n)
-                say("[light] " + lightName(e) + " is born inside " + names(scene.emitterEnclosure[e]));
+                say("[light] " + who + " is born inside " + names(scene.emitterEnclosure[e]));
         }
         for (size_t f = 0; f < scene.fireEnclosure.size() && f < scene.emissiveVolumes.size(); ++f) {
             if (!scene.fireEnclosureUniform[f])

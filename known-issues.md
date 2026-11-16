@@ -102,6 +102,68 @@ D against 0.8e-4 in mode B -- mode B spreads the focus it should make, so its li
 where the lens puts it. To narrow next: the photon walk's directions through the ball (the spot seen
 directly, not through the ball), and the outside-sphere connection's imaging of a sharp spot.
 
+**Found: mode B's glass-sphere connection draws only the refracted image, not the sphere's Fresnel
+reflections.** That eye looked at the spot past the ball's rim (the line to it runs 0.13 from the
+ball's centre, inside its 0.15). Seen directly instead (`scraps/_spot_direct.ftsl`, `eye 0.8 1.5 1.7`,
+in air), the spot is mode R's in mode B to 1-2 % in every ring (centre 3.07e-2 against R's 3.11e-2,
+D 3.06e-2): the photons focus right. What mode B lacks is all in the ball's image: its body reads 0.87-0.91
+of mode R and its rim 0.17-0.8, mode D matching R there (the frame beyond the spot: R 5.10e-4, D
+5.10e-4, B 4.64e-4). connectSpecularSphere (and its device twin) traces two refractions and the eye-
+inside one a single refraction out; neither has the reflection off the surface -- from outside 4 %
+face-on rising to all of it at the rim, and from inside the inner surface's, which for an eye at the
+centre is a rear-view mirror: looking at the lamp it shows, 4 % bright, the wall behind the eye, and
+there the ball has focused the lamp into a spot twenty times the walls' brightness. That reflected spot
+is the halo. The fix is a feature: the sphere's reflected images in the connection -- for an eye
+outside, the external reflection (connectSpecularSphereMirror's solve with Fresnel's reflectance) and
+the path entering, reflecting once inside and leaving; for an eye inside, the inner reflection then
+the refraction out.
+
+## DONE (2026-11-15, 0.447.2): REVIEW-0447R — what the Opus (xhigh) review of 0.447.1's fixes found
+
+The fixes for REVIEW-0446 grew into a change of their own (the enclosure probe's rule, the solids'
+marking, the glass-sphere connection, the radiance cache), so they had a review of their own:
+`/code-review xhigh` (Opus, 15 findings) of 21f970f..a17b8d0. Each checked against the code; all held.
+
+**Fixed in 0.447.2:**
+
+* **build()'s marking pass left every isosurface open.** The enclosures-only pass returned before
+  setting Implicit::solidSide, so a lamp in a glass SDF ball (or a camera in an isosurface of water)
+  started in air in modes R, A, B, C, D and W. The pass sets every isosurface's side first.
+* **A box wound inside out claimed the points in front of it.** Reading the first face's side alone,
+  a ray from below such a box met its bottom from behind and called the lamp inside the glass. The
+  probe now counts every crossing out of the scene, inside where the ray leaves a solid more often
+  than it enters it (a ray still among faces after 64 reads the first face): a hollow shell's cavity
+  stays air, and an inside-out box holds nothing, inside or in front of it.
+* **Dense fur stopped the probe's rays short.** The strand allowance (64) ended a ray in fur before it
+  met the water around it. The probe passes every curve now (Scene::closestHit's `skipCurves`, the
+  device's `curveTmin` BIG): no strand bounds anything.
+* **Water whose surface is one quad, closed by a pool's walls, closed nothing.** Pooling each solid's
+  loose faces apart left its quad open; the faces that close nothing alone now go on into one pool
+  with all the other loose faces, as before 0.447.1.
+* **The emit_two_sided refusal pooled an asset's triangles once per placement.** Two placements made
+  every edge non-manifold, so a closed glowing asset placed twice loaded, and the pass cost the
+  placements' triangle total. Each asset is checked once, in its own frame.
+* **The load report hid a back face whose stack differs from its front's** (a two-sided panel lying
+  on glass): it is reported, as "light N, light M's back face, ...", where it starts otherwise.
+* **`rayleigh on` was silently off** (only `true` or `1` turned it on). It parses as the other
+  switches do (onOffOf); one pair of word tests (isOnWord, isOffWord) serves `closed`, the rainbow
+  phase's `secondary` and `supernumerary` (`secondary` now refuses another word) and `exposure_lock`.
+* **The suppressed glass-sphere connection had no regression case:** check_camera_legs adds the ball
+  in water ranked above it.
+* **A checkpoint's radiance-cache section could not be skipped by a build whose cell is laid out
+  otherwise**, which then lost the light-epoch section after it. Version 4 (`FTRCACH4`) opens with its
+  length and a cell's record size.
+* **A cell's stack was kept across frames** (the table outlives them): it is kept per scene build
+  (RadCacheCell::stkScene), and a cell read from a checkpoint finds its own.
+* **build()'s marking scanned every instance per asset** (an asset count times an instance count):
+  one pass over the instances flags the assets placed with an enterable material.
+* **The priority-suppression test had three copies** (interfaceStep host and device, the sphere
+  connection): Renderer::prioritySuppressible / dPrioritySuppressible, the sphere connection taking
+  interfaceStep's clear-coat term too.
+* **A cell's stack had room for 4 solids and an overflow path:** it has room for kEnclosureMax (8),
+  the most the probe finds, asserted, and the overflow path is gone.
+* **-no-media and -no-env rebuilt the births' stacks when they removed nothing**: only when they do.
+
 ## DONE (2026-11-15, 0.447.1): REVIEW-0446 — what the Opus (max) and Fable (xhigh) reviews of 0.446.0-0.447.0 found
 
 `/code-review max` (Opus, 14 findings) and `/code-review xhigh` (Fable, 15) of 7ba82c0..21f970f, one

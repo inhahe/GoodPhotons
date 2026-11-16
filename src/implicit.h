@@ -265,7 +265,8 @@ struct Implicit {
     // (Hit::solid +1: the gradient points out of the f < 0 inside, a cap's normal out of the
     // container): capped, or no expression leaf -- an SDF or CSG of them never reaches its bounds.
     // An `open` expression's surface may end at its container. Set by the marking pass
-    // (main.cpp markSolidFaces), which only the footprint probe reads it after.
+    // (Scene::markSolidFaces, build()'s as well as a footprint's), for enclosureAt and the
+    // footprint probe.
     bool      solidSide = false;
     // Lipschitz bound of the field: for a true SDF this is 1, and a sphere-trace
     // step of |f| never overshoots. Fields that aren't unit-Lipschitz (e.g. summed

@@ -17,7 +17,9 @@ named, a region's) within the tolerance and 5 standard errors over the seeds:
   * mode B with the camera inside a glass ball in the water (the two ranked by `priority`, so the
     ball refracts against the water's index), CPU and GPU, the lamp seen through it, in the water and
     in air: the leg outside the ball took the ball's absorption instead of the water's, the ball
-    refracted against vacuum and its inside lacked n^2;
+    refracted against vacuum and its inside lacked n^2; and in water ranked above the ball, which
+    suppresses the ball's boundary: the connection lensed through a ball the walks pass straight
+    through;
   * mode R with `-radcache`: the cache's update rays started in air;
   * mode W at one sample: the hero bundle of a camera inside a solid collapsed to one wavelength for the
     whole frame, where `-herosplit` (which mode W forces) splits it -- one sample's lamp, against the
@@ -176,7 +178,15 @@ def main():
     dry = os.path.join(out, "bubble_dry.ftsl")
     with open(dry, "w", encoding="utf-8", newline="") as g:
         g.write("".join(l + NL for l in wet_src.split(NL) if "material water" not in l))
-    for sc, tag in ((bubble, "in the water"), (dry, "in air")):
+    # The water ranked above the ball: the priority rule suppresses the ball's boundary, which is then
+    # water to the walks and to the sphere connection alike (no lens, no n^2, the water's absorption).
+    ranked_low = "absorb 0.3  priority 1 }"
+    if wet_src.count(ranked_low) != 1:
+        raise SystemExit("the bubble's water is not the one this check re-ranks")
+    sunk = os.path.join(out, "bubble_suppressed.ftsl")
+    with open(sunk, "w", encoding="utf-8", newline="") as g:
+        g.write(wet_src.replace(ranked_low, "absorb 0.3  priority 3 }"))
+    for sc, tag in ((bubble, "in the water"), (dry, "in air"), (sunk, "in water ranked above it")):
         rm, rse = stats(exe, out, sc, "R_ref_bubble_%s" % tag[3:], ["-mode", "R", "-device", refdev, "-spp", "1024"],
                         LAMP, (1, 2))
         for dev in devs:

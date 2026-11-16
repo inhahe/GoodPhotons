@@ -2912,8 +2912,9 @@ medium { sigma_a <spec>  sigma_s <spec>  g 0 }     # spectral form
 
 - `sigma_t` + `albedo` splits into scattering/absorption; or give spectral
   `sigma_a`/`sigma_s` directly (per authored-unit length; converted to 1/metre).
-- `g` is the Henyey-Greenstein anisotropy; `rayleigh true` gives a λ⁻⁴ scattering
-  tilt (blue-sky falloff).
+- `g` is the Henyey-Greenstein anisotropy; `rayleigh true` (or `on`) gives a λ⁻⁴ scattering
+  tilt (blue-sky falloff). It takes on or off (true/false, yes/no, 1/0); any other word is an
+  error (before 0.447.2 anything but `true` or `1`, `on` included, was silently off).
 - `beam_blur <frac>` (since 0.309.0) sets **this medium's** mode-`M` beam-kernel half-width
   as a fraction of its own measured mean free path, overriding the global `-beamblur` for
   it alone. A soft haze that cannot show detail can take a kernel several times wider than

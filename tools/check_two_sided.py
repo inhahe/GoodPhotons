@@ -15,7 +15,8 @@ Four parts:
   * the warning: the same two panels on one plane, back to back and facing alike, warn at load,
     and the two-sided light and the reference do not;
   * the refusal: `two_sided on` with an aimed (leaning) normal fails to load, as does
-    `emit_two_sided on` on a sphere and on a dielectric;
+    `emit_two_sided on` on a sphere, on a dielectric, on six quads closing a box and on a closed mesh
+    asset placed twice (whose placements, pooled, had read as no closed piece);
   * the materials: an `emit_two_sided` glowing quad, the same reflecting half the light that meets it,
     and an instanced glowing mesh, each against two one-sided ones 1 mm apart, in modes R, B, D and M
     on both devices, as the light is.
@@ -72,6 +73,22 @@ def quad(y, ny, mat):
     if ny > 0:
         return "quad { origin -0.25 %s -0.25  u 0 0 0.5  v 0.5 0 0  material %s }" % (y, mat)
     return "quad { origin -0.25 %s -0.25  u 0.5 0 0  v 0 0 0.5  material %s }" % (y, mat)
+
+
+def box_quads(mat, x0=-0.2, y0=0.6, z0=-0.2, x1=0.2, y1=1.0, z1=0.2):
+    # Six quads closing a box, each wound to face out.
+    dx, dy, dz = x1 - x0, y1 - y0, z1 - z0
+    faces = [((x0, y0, z0), (dx, 0, 0), (0, 0, dz)), ((x0, y1, z0), (0, 0, dz), (dx, 0, 0)),
+             ((x0, y0, z0), (0, 0, dz), (0, dy, 0)), ((x1, y0, z0), (0, dy, 0), (0, 0, dz)),
+             ((x0, y0, z0), (0, dy, 0), (dx, 0, 0)), ((x0, y0, z1), (dx, 0, 0), (0, dy, 0))]
+    return ["quad { origin %g %g %g  u %g %g %g  v %g %g %g  material %s }" % (o + u + v + (mat,))
+            for o, u, v in faces]
+
+
+# The unit cube, its twelve triangles wound to face out: a closed asset.
+CUBE_OBJ = NL.join(["v 0 0 0", "v 1 0 0", "v 1 1 0", "v 0 1 0", "v 0 0 1", "v 1 0 1", "v 1 1 1", "v 0 1 1"] +
+                   ["f %d %d %d" % t for q in ((1, 4, 3, 2), (5, 6, 7, 8), (1, 2, 6, 5), (4, 8, 7, 3), (1, 5, 8, 4),
+                                               (2, 3, 7, 6)) for t in ((q[0], q[1], q[2]), (q[0], q[2], q[3]))]) + NL
 
 
 def instance(asset, y, ny):
@@ -178,12 +195,23 @@ def main():
                   % ("FAIL" if bad.any() else "ok", mode, dev.upper(),
                      ", ".join("%s %.4f (+- %.4f)" % (r, x, e) for r, x, e in zip(REGIONS, q, err))), flush=True)
     # The materials: a glowing sheet, one reflecting half the light that meets it, and an instanced one.
-    for name, why in (("sphere", "an inside"), ("dielectric", "light crosses")):
-        bad_scene = {"sphere": MATS + NL + "sphere { center 0 1 0  radius 0.2  material glowpanel }",
-                     "dielectric": 'material "glassglow" { type dielectric  ior 1.5  emit preset:bb6500  '
-                                   'emit_two_sided on }' + NL + quad("1.0", 1, "glassglow")}[name]
-        p = run(exe, ["-in", variant(out, "refuse_" + name, bad_scene), "-o",
-                      os.path.join(out, "load_refuse_%s.png" % name)] + probe)
+    cube = os.path.join(out, "cube.obj")
+    with open(cube, "w", encoding="utf-8", newline="") as f:
+        f.write(CUBE_OBJ)
+    asset = 'mesh_asset "cube" { file "%s"  material glowpanel }' % cube.replace(os.sep, "/")
+    refusals = [
+        ("sphere", "an inside", MATS + NL + "sphere { center 0 1 0  radius 0.2  material glowpanel }"),
+        ("dielectric", "light crosses", 'material "glassglow" { type dielectric  ior 1.5  emit preset:bb6500  '
+                                        'emit_two_sided on }' + NL + quad("1.0", 1, "glassglow")),
+        ("box of quads", "an inside", MATS + NL + NL.join(box_quads("glowpanel"))),
+        ("closed asset placed twice", "an inside",
+         MATS + NL + asset + NL + 'mesh_instance { of "cube"  scale 0.3  translate -0.6 0.6 -0.15 }' + NL +
+         'mesh_instance { of "cube"  scale 0.3  translate 0.3 0.6 -0.15 }'),
+    ]
+    for name, why, bad_scene in refusals:
+        tag = name.replace(" ", "_")
+        p = run(exe, ["-in", variant(out, "refuse_" + tag, bad_scene), "-o",
+                      os.path.join(out, "load_refuse_%s.png" % tag)] + probe)
         good = p.returncode != 0 and "emit_two_sided" in p.stdout + p.stderr
         ok = ok and good
         print("%s: emit_two_sided on a %s (%s) %s" % ("ok" if good else "FAIL", name, why,

@@ -4252,21 +4252,23 @@ struct BackwardRenderer {
             seedUnit(rng, RadianceCache::mix(((uint64_t)slot << 24) ^ (uint64_t)(round + 1)),
                      0x9E3779B97F4A7C15ULL);
             // Its rays start inside the solids around the cell, as the camera paths that read it
-            // went in (Scene::eyeStack: none where no walk can be inside anything), found once a cell.
+            // went in (Scene::eyeStack: none where no walk can be inside anything), found once a cell
+            // and scene build.
             MediumStack stk0;
             if (scene.anyEnterable) {
+                static_assert(RadCacheCell::kStkMax == Scene::kEnclosureMax, "a cell keeps any stack enclosureAt finds");
                 RadCacheCell& cw = rc.cell[slot];
-                if (cw.stkN >= 0 && cw.stkN <= RadCacheCell::kStkMax) {
-                    for (int s = 0; s < cw.stkN; ++s) stk0.push(cw.stkMat[s], cw.stkPri[s]);
-                } else {
+                const uint64_t sceneNow = (scene.generation << 32) ^ scene.buildCount;
+                if (cw.stkN < 0 || cw.stkScene != sceneNow) {
                     stk0 = scene.eyeStack(p + n * 1e-6);
-                    if (cw.stkN < 0) {
-                        cw.stkN = (int8_t)(stk0.n <= RadCacheCell::kStkMax ? stk0.n : RadCacheCell::kStkMax + 1);
-                        for (int s = 0; s < stk0.n && s < RadCacheCell::kStkMax; ++s) {
-                            cw.stkMat[s] = stk0.matIdx[s];
-                            cw.stkPri[s] = stk0.pri[s];
-                        }
+                    cw.stkN = (int8_t)stk0.n;
+                    cw.stkScene = sceneNow;
+                    for (int s = 0; s < stk0.n; ++s) {
+                        cw.stkMat[s] = stk0.matIdx[s];
+                        cw.stkPri[s] = stk0.pri[s];
                     }
+                } else {
+                    for (int s = 0; s < cw.stkN; ++s) stk0.push(cw.stkMat[s], cw.stkPri[s]);
                 }
             }
             for (int k = 0; k < nRays; ++k) {
