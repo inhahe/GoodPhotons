@@ -10997,7 +10997,11 @@ where mode R at 64 bounces read the edge of an off-centre inside eye's view half
 12), each vertex draws one chain (`sphDeepPick`): chain 17 + j with probability proportional to 0.97^j
 (a chain's light falls as R^j there), its images weighted by one over that. It is scanned in a slot of
 its own after the drawn chains, from the same closed form, its turns taken at once as a power of the
-chord's (`sphTurnPow`), so it costs a slot of the scan, not a scan. An image fainter than
+chord's (`sphTurnPow`), so it costs a slot of the scan, not a scan. `-max-bounce` counts a path's
+every scattering vertex in every mode, so a vertex at depth d on its photon path (`SpecVtx::depth`,
+itself among them, 0 at an emitter's own point) draws only the chains that add at most
+maxBounce - d (chain c adds c + 1; a mirror, sphere or flat, one), the deep chain's range cut to it --
+the device reading the cap from `DCamSet::maxBounce`. An image fainter than
 `kSphChainSure` (0.02) is drawn by roulette, its probability its product over that, from a hash of the
 vertex, chain and point (`sphRouletteU`: mode B's connections draw no RNG), so the deep chains'
 occlusion rays stay few. A frosted dielectric (a roughness above the walks' 1e-3, or a roughness map)

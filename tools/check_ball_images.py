@@ -26,7 +26,11 @@ over the seeds:
     the ball's image reads what the walls read (its chains' products sum to one), within 2 % and 5
     standard errors -- with no reference to trust. The ball nearly focuses on a wall that close, and
     by the fold a vertex's two images lie within one step of the connector's scan, where they change
-    no sign: a dark ring there had read 0.82 of the walls.
+    no sign: a dark ring there had read 0.82 of the walls;
+  * the glass ball from outside again at -max-bounce 12, within 0.5 %: the cap cuts the lit room's
+    last bounces, and mode B's connection counts the ball's events against it as mode R's paths do
+    (it had not, and read the ball's body 1.3 % over mode R; MODEB-DEPTH-CONNECT).
+Every other case runs at -max-bounce 64, deep enough that neither mode truncates.
 Exits 1 on any failure.
 """
 import argparse
@@ -88,13 +92,13 @@ def scene(out, name, *parts):
     return path
 
 
-def render(exe, out, scn, tag, args, seed):
+def render(exe, out, scn, tag, args, seed, depth=DEPTH):
     png = os.path.join(out, "%s_s%d.png" % (tag, seed))
     pfm = png[:-4] + ".pfm"
     for f in (png, pfm):
         if os.path.exists(f):
             os.remove(f)
-    cmd = [exe, "-in", scn, "-hdr", "-no-meter", "-seed", str(seed), "-window-min", "-o", png] + DEPTH + args
+    cmd = [exe, "-in", scn, "-hdr", "-no-meter", "-seed", str(seed), "-window-min", "-o", png] + depth + args
     p = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
     if p.returncode != 0 or not os.path.exists(pfm):
         print((p.stdout + p.stderr)[-1500:])
@@ -163,8 +167,8 @@ def main():
     if not body.any() or not rim.any():
         raise SystemExit("the ball's image is empty: the frame is not the one this check reads")
 
-    def stats(scn, tag, args):
-        ims = [render(exe, out, scn, tag, args, s) for s in SEEDS]   # one render a seed
+    def stats(scn, tag, args, depth=DEPTH):
+        ims = [render(exe, out, scn, tag, args, s, depth) for s in SEEDS]   # one render a seed
         v = np.array([[im[reg].mean() for _, reg in regions] for im in ims])
         return v.mean(0), v.std(0, ddof=1) / np.sqrt(len(SEEDS))
 
@@ -221,6 +225,19 @@ def main():
                 ok = ok and not bad
                 print("%s: mode B on the %s, the ball %s, %s: %.4f (+- %.4f) of mode R"
                       % ("FAIL" if bad else "ok", dev.upper(), what, rname, qi, ei), flush=True)
+    # -max-bounce counted alike: at 12, which cuts the lit room's last bounces and the deep chains,
+    # mode B's connection counts the ball's events against the cap as mode R's paths count them.
+    shallow = ["-max-bounce", "12"]
+    regions = [("the ball's body", body), ("its rim", rim)]
+    rm, rse = stats(outside, "R12_outside", ["-mode", "R", "-device", refdev, "-spp", "8192"], shallow)
+    bm, bse = stats(outside, "B12_outside_cpu", ["-mode", "B", "-device", "cpu", "-n", "40000000"], shallow)
+    q = bm / rm
+    err = np.hypot(bse / rm, rse * bm / (rm * rm))
+    for (rname, _), qi, ei in zip(regions, q, err):
+        bad = not (np.isfinite(qi) and np.isfinite(ei)) or (abs(qi - 1.0) > 0.005 and abs(qi - 1.0) > 5.0 * ei)
+        ok = ok and not bad
+        print("%s: at -max-bounce 12, mode B on the CPU, the ball from outside, %s: %.4f (+- %.4f) of mode R"
+              % ("FAIL" if bad else "ok", rname, qi, ei), flush=True)
     print("PASS" if ok else "FAILED")
     return 0 if ok else 1
 

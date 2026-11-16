@@ -100,7 +100,16 @@ offset, 1e-6, is 30 times smaller. Every GPU walk that reflects inside a closed 
 takes the drift (modes R, M, S, D, the photon walks of B). The fix: an origin moved along the ray's
 own direction keeps its line, so where the leaving ray is not grazing the offset can be along it.
 
-## OPEN (2026-11-16): MODEB-DEPTH-CONNECT — mode B's specular connections do not count their vertices against -max-bounce
+## DONE (2026-11-16, 0.448.3): MODEB-DEPTH-CONNECT — mode B's specular connections do not count their vertices against -max-bounce
+
+**Fixed:** a vertex's splats carry its depth on its photon path (`SpecVtx::depth`: the walk's
+bounce + 1, 0 at an emitter's own point; the device's shading steps take it, and `DCamSet::maxBounce`
+the cap), a connection draws nothing where the cap leaves it no vertex, and a glass ball draws the
+chains that fit (chain c adds c + 1), the deep chain's range cut to them. Mode B over mode R, the lit
+glass ball from outside at -max-bounce 12: the body 1.0127 -> 1.0003 (CPU) and 0.9998 (GPU), the rim
+1.016 -> 1.003 and 1.002. check_ball_images holds it to 0.5 % at 12.
+
+The finding:
 
 REFERENCE says every mode counts the scattering vertices on a path against `-max-bounce`. Mode B's
 photon walk does (`for (bounce < maxBounce)` in render.h), but its camera connections through a glass

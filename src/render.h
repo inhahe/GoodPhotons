@@ -2119,6 +2119,10 @@ struct Renderer {
         // A coated body's coat on the way out toward the first specular point, or null.
         const CoatSplat* coat = nullptr;
         double lambda = 0.0;
+        // The vertex's scattering vertices on its photon path, itself among them (0 at an emitter's
+        // own point): a connection may add maxBounce - depth more, -max-bounce counting a path's
+        // every vertex in every mode (a ball's chain c adds c + 1, a mirror one).
+        int depth = 0;
         // Throughput at the vertex for a connection leaving toward `wP` (unit, toward
         // the sphere). Returns <0 to signal "reject" (camera-side behind a surface). A
         // surface vertex takes its camera side as a direct splat does (camSideOk): the
@@ -2548,10 +2552,14 @@ struct Renderer {
         else                ey = perp * (1.0 / perpLen);
         const SphV2 eye2{dot(eye - O, ex), dot(eye - O, ey)}, p2{dot(ap, ex), dot(ap, ey)};
         // (A suppressed boundary, index 1, reflects nothing: the floor leaves its straight chain alone.)
-        const int nC = outside ? kSphChainsMax : kSphReflMax + 1;
+        // Chain c adds c + 1 vertices to the path, and -max-bounce leaves `room` (camSpecularSplatAllVtxN
+        // calls with at least one).
+        const int room = maxBounce - vt.depth;
+        const int nC = std::min(outside ? kSphChainsMax : kSphReflMax + 1, room);
         const auto turn = [](SphV2& v, const SphBase2D& b) { v = SphV2{v.x * b.cd - v.y * b.sd, v.x * b.sd + v.y * b.cd}; };
-        // The deep chain, scanned in slot nC: of those past the drawn ones, to kSphDeepMax reflections.
-        const SphDeep deep = sphDeepPick(nC, outside ? kSphDeepMax + 1 : kSphDeepMax,
+        // The deep chain, scanned in slot nC: of those past the drawn ones, to kSphDeepMax reflections
+        // and the cap.
+        const SphDeep deep = sphDeepPick(nC, std::min(outside ? kSphDeepMax + 1 : kSphDeepMax, room - 1),
                                          sphRouletteU(p, 2000, eye2.x, eye2.y));
         const auto chainOf = [&](int c) { return c == nC ? deep.c : c; };
         // Chain nC - 1's leg (Q, dir) and product f turned on to the deep chain, its k turns at once.
@@ -2995,6 +3003,7 @@ struct Renderer {
                                  Pcg32& rng) const {
         if (lensMode || forwardCatch) return;               // finite-lens/catch not supported
         if (!specularSideSplats) return;                    // mode P's blurred split
+        if (maxBounce - vt.depth < 1) return;               // -max-bounce leaves the connection no vertex
         // Scene::dielSphereIdx / mirrorSphereIdx replace the old scan of EVERY sphere's
         // material per vertex (per λ, for the dielectrics). The lists are ascending, so
         // the visit order — and the film accumulation order — is exactly the old scan's.
@@ -3060,11 +3069,12 @@ struct Renderer {
     // and reflect it in every mirror. `n`, `ng`, `wi`: its shading and geometric normals on the
     // side it lights and the direction toward its light-side vertex, as camSplatAll takes them
     // (`wi` null at an emitter's own point, which has no arrival).
-    void camSpecularSplatAll(const Scene& scene, const CamTarget* cams, int nCam,
+    void camSpecularSplatAll(const Scene& scene, const CamTarget* cams, int nCam, int depth,
                              const Vec3& p, const Vec3& n, const Vec3& ng, const Vec3* wi,
                              double lambda, double beta, double rho, Pcg32& rng,
                              const Vec3* plane = nullptr, const CoatSplat* coat = nullptr) const {
         SpecVtx vt; vt.volume = false; vt.np = n; vt.ng = ng; vt.weight = rho; vt.coat = coat;
+        vt.depth = depth;
         if (wi) { vt.wl = *wi; vt.hasWl = true; }
         if (plane) { vt.gated = true; vt.plane = *plane; }                 // see SpecVtx
         camSpecularSplatAllVtx(scene, cams, nCam, p, vt, lambda, beta, rng);
@@ -3073,13 +3083,13 @@ struct Renderer {
     // sphere, as camSplatAll's `gs` splats it directly. Its value toward the first specular point
     // replaces the Lambertian rho/pi, at each of the `nUp` wavelengths (an iridescent lobe's colour
     // turns with the direction, so it is evaluated per wavelength, not shared).
-    void camSpecularSplatAllGlossy(const Scene& scene, const CamTarget* cams, int nCam,
+    void camSpecularSplatAllGlossy(const Scene& scene, const CamTarget* cams, int nCam, int depth,
                                    const Vec3& p, const Vec3& n, const Vec3& ng, const Vec3& wi,
                                    const double* lam, const double* beta, int nUp,
                                    const GlossySplat& gs, Pcg32& rng,
                                    const CoatSplat* coat = nullptr) const {
         SpecVtx vt; vt.volume = false; vt.np = n; vt.ng = ng; vt.weight = 0.0; vt.glossy = &gs;
-        vt.coat = coat;
+        vt.coat = coat; vt.depth = depth;
         vt.wl = wi; vt.hasWl = true;
         const double w[hero::kHeroMax] = {};   // a glossy vertex's weight is in its lobe
         camSpecularSplatAllVtxN(scene, cams, nCam, p, vt, lam, beta, w, nUp, rng);
@@ -3090,12 +3100,13 @@ struct Renderer {
     // dispersed. A mirror is achromatic, so its geometry IS shared and only the
     // reflectance varies.
     // Draws no RNG (mode B), so the bundle leaves the stream untouched.
-    void camSpecularSplatAllHero(const Scene& scene, const CamTarget* cams, int nCam,
+    void camSpecularSplatAllHero(const Scene& scene, const CamTarget* cams, int nCam, int depth,
                                  const Vec3& p, const Vec3& n, const Vec3& ng, const Vec3* wi,
                                  const double* lam, const double* beta, const double* rho,
                                  int nUp, Pcg32& rng, const Vec3* plane = nullptr,
                                  const CoatSplat* coat = nullptr) const {
         SpecVtx vt; vt.volume = false; vt.np = n; vt.ng = ng; vt.weight = rho[0]; vt.coat = coat;
+        vt.depth = depth;
         if (wi) { vt.wl = *wi; vt.hasWl = true; }
         if (plane) { vt.gated = true; vt.plane = *plane; }                 // see SpecVtx
         camSpecularSplatAllVtxN(scene, cams, nCam, p, vt, lam, beta, rho, nUp, rng);
@@ -3104,9 +3115,10 @@ struct Renderer {
     // glowing haze itself bends through the glass the camera flies through — and shows
     // in the mirrors.
     void camSpecularSplatVolumeAll(const Scene& scene, const Medium& med, const CamTarget* cams,
-                                   int nCam, const Vec3& p, const Vec3& wIn, double lambda,
+                                   int nCam, int depth, const Vec3& p, const Vec3& wIn, double lambda,
                                    double beta, Pcg32& rng) const {
         SpecVtx vt; vt.volume = true; vt.wIn = wIn; vt.g = med.g; vt.weight = med.albedo(lambda);
+        vt.depth = depth;
         camSpecularSplatAllVtx(scene, cams, nCam, p, vt, lambda, beta, rng);
     }
 
@@ -3676,7 +3688,7 @@ struct Renderer {
             const Vec3 face = em.normalTilted ? scene.aimFaceNow(em) : Vec3{0, 0, 0};
             const Vec3* plane = em.normalTilted ? &face : nullptr;
             camSplatAll(scene, cams, nCam, origin, emitN, emitN, emitN, lambda, beta, rhoE, rng, plane);
-            camSpecularSplatAll(scene, cams, nCam, origin, emitN, emitN, nullptr, lambda, beta, rhoE, rng, plane);
+            camSpecularSplatAll(scene, cams, nCam, 0, origin, emitN, emitN, nullptr, lambda, beta, rhoE, rng, plane);
         }
         }   // end emitter-birth branch
 
@@ -4013,7 +4025,7 @@ struct Renderer {
                         const Medium& smc = scene.media[whichC];
                         if (lensCam(*cams[c].cam)) connectLensVolume(scene, smc, *cams[c].cam, *cams[c].film, xc, ray.d, lambda, betaC, crng);
                         else          connectVolume(scene, smc, *cams[c].cam, *cams[c].film, xc, ray.d, lambda, betaC, crng);
-                        camSpecularSplatVolumeAll(scene, smc, &cams[c], 1, xc, ray.d, lambda, betaC, crng);
+                        camSpecularSplatVolumeAll(scene, smc, &cams[c], 1, bounce + 1, xc, ray.d, lambda, betaC, crng);
                     }
                 }
                 // Mode M: store the crossing itself, so every camera of a flyby can gather
@@ -4132,7 +4144,7 @@ struct Renderer {
                 const bool coveredByBeam = beamMS && !marchHit && !sm.grin();
                 if (nCam > 0 && !forwardCatch && !coveredByBeam) {
                     camSplatVolumeAll(scene, sm, cams, nCam, mp, ray.d, lambda, beta, rng);
-                    camSpecularSplatVolumeAll(scene, sm, cams, nCam, mp, ray.d, lambda, beta, rng);
+                    camSpecularSplatVolumeAll(scene, sm, cams, nCam, bounce + 1, mp, ray.d, lambda, beta, rng);
                 }
                 if (coveredByBeam) ++beamScatters;   // this photon just bought one more order
                 // Scatter (prob albedo) or absorb; throughput unchanged on scatter.
@@ -4201,7 +4213,7 @@ struct Renderer {
                     double bS = beta * glossyArrival(h, wl, bounce == 0);
                     camSplatAll(scene, cams, nCam, h.p, h.n, orientedGeoN(h), wl, lambda, bS,
                                 0.0, rng, nullptr, &gsp);
-                    camSpecularSplatAllGlossy(scene, cams, nCam, h.p, h.n, orientedGeoN(h), wl, &lambda, &bS, 1, gsp, rng);
+                    camSpecularSplatAllGlossy(scene, cams, nCam, bounce + 1, h.p, h.n, orientedGeoN(h), wl, &lambda, &bS, 1, gsp, rng);
                 }
                 double R = layeredCoatReflectance(scene, cm, h, ray.d, lambda);
                 if (rng.uniform() < R) {                    // coat reflection
@@ -4310,7 +4322,7 @@ struct Renderer {
                         const CoatSplat* cp = cs.c ? &cs : nullptr;
                         camSplatAll(scene, cams, nCam, h.p, h.n, orientedGeoN(h), wl, lambda, beta,
                                     0.0, rng, nullptr, &gsp, cp);
-                        camSpecularSplatAllGlossy(scene, cams, nCam, h.p, h.n, orientedGeoN(h), wl, &lambda, &beta, 1, gsp, rng, cp);
+                        camSpecularSplatAllGlossy(scene, cams, nCam, bounce + 1, h.p, h.n, orientedGeoN(h), wl, &lambda, &beta, 1, gsp, rng, cp);
                     }
                     bool msBranch = false;   // a draw into the multiple scattering: a scattering
                     if (!interactPhotonSpecular(scene, cams, nCam, m, h, ray, beta, lambda, stk, rng, e,
@@ -4435,8 +4447,8 @@ struct Renderer {
                         const CoatSplat* cp = cs.c ? &cs : nullptr;
                         camSplatAll(scene, cams, nCam, h.p,  h.n,  ngo, wi, lambda, beta, rhoR, rng, nullptr, nullptr, cp);
                         camSplatAll(scene, cams, nCam, h.p, -h.n, -ngo, wi, lambda, beta, rhoT, rng, nullptr, nullptr, cp);
-                        camSpecularSplatAll(scene, cams, nCam, h.p,  h.n,  ngo, &wi, lambda, beta, rhoR, rng, nullptr, cp);
-                        camSpecularSplatAll(scene, cams, nCam, h.p, -h.n, -ngo, &wi, lambda, beta, rhoT, rng, nullptr, cp);
+                        camSpecularSplatAll(scene, cams, nCam, bounce + 1, h.p,  h.n,  ngo, &wi, lambda, beta, rhoR, rng, nullptr, cp);
+                        camSpecularSplatAll(scene, cams, nCam, bounce + 1, h.p, -h.n, -ngo, &wi, lambda, beta, rhoT, rng, nullptr, cp);
                     }
                     // Analog scatter: reflect (prob rhoR), transmit (prob rhoT), else
                     // absorb — throughput unchanged on a scatter (bar the Veach adjoint
@@ -4518,7 +4530,7 @@ struct Renderer {
                         const CoatSplat cs{&scene, &h, CoatCtx(m, wi)};   // a coated body's way out
                         const CoatSplat* cp = cs.c ? &cs : nullptr;
                         camSplatAll(scene, cams, nCam, h.p, h.n, ngo, wi, lambda, beta, rho, rng, nullptr, nullptr, cp);
-                        camSpecularSplatAll(scene, cams, nCam, h.p, h.n, ngo, &wi, lambda, beta, rho, rng, nullptr, cp);
+                        camSpecularSplatAll(scene, cams, nCam, bounce + 1, h.p, h.n, ngo, &wi, lambda, beta, rho, rng, nullptr, cp);
                     }
                     // Russian roulette: absorb with prob (1-rho), else scatter
                     // with beta unchanged. Unbiased; average path length ~1/(1-rho)
@@ -4659,7 +4671,7 @@ struct Renderer {
             double rhoOne[hero::kHeroMax]; for (int i = 0; i < C; ++i) rhoOne[i] = rhoE;
             camSplatAllHero(scene, cams, nCam, origin, emitN, emitN, emitN, lam, beta, rhoOne, C, rng,
                             plane);
-            camSpecularSplatAllHero(scene, cams, nCam, origin, emitN, emitN, nullptr, lam, beta, rhoOne, C, rng, plane);
+            camSpecularSplatAllHero(scene, cams, nCam, 0, origin, emitN, emitN, nullptr, lam, beta, rhoOne, C, rng, plane);
         }
 
         Ray ray{origin + dir * 1e-6, dir};
@@ -4845,7 +4857,7 @@ struct Renderer {
                     for (int i = 0; i < nUp; ++i) bS[i] = beta[i] * sC;
                     camSplatAllHero(scene, cams, nCam, h.p, h.n, orientedGeoN(h), wl, lam, bS,
                                     unused, nUp, rng, nullptr, &gsp);
-                    camSpecularSplatAllGlossy(scene, cams, nCam, h.p, h.n, orientedGeoN(h), wl, lam, bS, nUp, gsp, rng);
+                    camSpecularSplatAllGlossy(scene, cams, nCam, bounce + 1, h.p, h.n, orientedGeoN(h), wl, lam, bS, nUp, gsp, rng);
                 }
                 double Rl[hero::kHeroMax];
                 for (int i = 0; i < nUp; ++i)
@@ -4922,8 +4934,8 @@ struct Renderer {
                         const CoatSplat* cp = cs.c ? &cs : nullptr;
                         camSplatAllHero(scene, cams, nCam, h.p,  h.n,  ngo, wi, lam, beta, rhoR, nUp, rng, nullptr, nullptr, cp);
                         camSplatAllHero(scene, cams, nCam, h.p, -h.n, -ngo, wi, lam, beta, rhoT, nUp, rng, nullptr, nullptr, cp);
-                        camSpecularSplatAllHero(scene, cams, nCam, h.p,  h.n,  ngo, &wi, lam, beta, rhoR, nUp, rng, nullptr, cp);
-                        camSpecularSplatAllHero(scene, cams, nCam, h.p, -h.n, -ngo, &wi, lam, beta, rhoT, nUp, rng, nullptr, cp);
+                        camSpecularSplatAllHero(scene, cams, nCam, bounce + 1, h.p,  h.n,  ngo, &wi, lam, beta, rhoR, nUp, rng, nullptr, cp);
+                        camSpecularSplatAllHero(scene, cams, nCam, bounce + 1, h.p, -h.n, -ngo, &wi, lam, beta, rhoT, nUp, rng, nullptr, cp);
                     }
                     // Lobe pick + RR over the whole bundle (see the Diffuse case): the
                     // reflect/transmit probabilities are the per-lobe MAX over live λ, so no
@@ -4994,7 +5006,7 @@ struct Renderer {
                         const CoatSplat* cp = cs.c ? &cs : nullptr;
                         camSplatAllHero(scene, cams, nCam, h.p, h.n, orientedGeoN(h), wl, lam, beta,
                                         unused, nUp, rng, nullptr, &gsp, cp);
-                        camSpecularSplatAllGlossy(scene, cams, nCam, h.p, h.n, orientedGeoN(h), wl, lam, beta, nUp, gsp, rng, cp);
+                        camSpecularSplatAllGlossy(scene, cams, nCam, bounce + 1, h.p, h.n, orientedGeoN(h), wl, lam, beta, nUp, gsp, rng, cp);
                     }
                     double c[hero::kHeroMax];
                     for (int i = 0; i < nUp; ++i)
@@ -5121,7 +5133,7 @@ struct Renderer {
                         const CoatSplat cs{&scene, &h, CoatCtx(m, wi)};   // a coated body's way out
                         const CoatSplat* cp = cs.c ? &cs : nullptr;
                         camSplatAllHero(scene, cams, nCam, h.p, h.n, ngo, wi, lam, beta, rho, nUp, rng, nullptr, nullptr, cp);
-                        camSpecularSplatAllHero(scene, cams, nCam, h.p, h.n, ngo, &wi, lam, beta, rho, nUp, rng, nullptr, cp);
+                        camSpecularSplatAllHero(scene, cams, nCam, bounce + 1, h.p, h.n, ngo, &wi, lam, beta, rho, nUp, rng, nullptr, cp);
                     }
                     // Continuation RR over the WHOLE bundle: the survival probability is
                     // max_i rho_i, not the hero's own albedo, and every live λ reweights by

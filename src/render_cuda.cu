@@ -7948,6 +7948,9 @@ struct DCamSet {
     // side draws -- no analytic connection through a mirror or glass, and no glossy lobe's on a
     // surface whose own material is a specular type.
     int pSplit = 0;
+    // -max-bounce, which mode B's analytic connections count their own vertices against (host twin
+    // Renderer::maxBounce); launchForward sets it.
+    int maxBounce = 32;
     __device__ const DCamera& cam(int c) const {
         return cams[(size_t)camStride * (blockIdx.x * blockDim.x + threadIdx.x) + c];
     }
@@ -10315,6 +10318,9 @@ struct DSpecVtx {
     const DGlossySplat* glossy = nullptr;
     // A coated body's coat on the way out toward the first specular point (DCoatSplat), or null.
     const DCoatSplat* coat = nullptr;
+    // The vertex's scattering vertices on its photon path, itself among them, 0 at an emitter's own
+    // point (host twin SpecVtx::depth).
+    int depth = 0;
     // Throughput at the vertex for a connection leaving toward `wP` (unit, toward the
     // sphere). Returns <0 to signal "reject" (camera-side behind a surface). A rainbow
     // medium uses its tabulated Airy phase; HG media use the analytic lobe.
@@ -10702,7 +10708,8 @@ __device__ static void dSphScanChains(int nC, const DSphScanEnds& ends, const Ev
 // Renderer::connectSpecularSphere.
 __device__ static void dConnectSpecularSphere(const DScene& sc, const DCamera& cam,
         double* film, double* hits, const DSphere& S, const DSphIndex& ix,
-        const D3& p, const DSpecVtx& vt, const Real* lam, const Real* beta, const Real* w, int nL, DRng& rng) {
+        const D3& p, const DSpecVtx& vt, const Real* lam, const Real* beta, const Real* w, int nL, int room,
+        DRng& rng) {
     D3 O(S.c); const double r = S.r; D3 eye(cam.eye);
     const double dEyeO = d3len(eye - O);
     if (d3len(p - O) < r * 0.9999) return;            // vertex inside glass -> skip
@@ -10719,9 +10726,12 @@ __device__ static void dConnectSpecularSphere(const DScene& sc, const DCamera& c
     if (perpLen < 1e-9) { D3 tb; d3onb(ex, ey, tb); }
     else                ey = perp * (1.0 / perpLen);
     const DSphV2 eye2{d3dot(eye - O, ex), d3dot(eye - O, ey)}, p2{d3dot(ap, ex), d3dot(ap, ey)};
-    const int nC = outside ? kDSphChainsMax : kDSphReflMax + 1;
+    // Chain c adds c + 1 vertices, `room` the cap leaves (host twin).
+    const int nCAll = outside ? kDSphChainsMax : kDSphReflMax + 1;
+    const int nC = nCAll < room ? nCAll : room;
     // The deep chain, scanned in slot nC (host twin).
-    const DSphDeep deep = dSphDeepPick(nC, outside ? kDSphDeepMax + 1 : kDSphDeepMax,
+    const int deepLast = outside ? kDSphDeepMax + 1 : kDSphDeepMax;
+    const DSphDeep deep = dSphDeepPick(nC, deepLast < room - 1 ? deepLast : room - 1,
                                        dSphRouletteU(p, 2000, eye2.x, eye2.y));
     auto chainOf = [&](int c) { return c == nC ? deep.c : c; };
     auto deepen = [&](const DSphBase2D& b, DSphV2& Q, DSphV2& dir, double& f) {
@@ -11264,6 +11274,8 @@ __device__ static void camSpecularSplatAllVtxN(const DScene& sc, const DCamSet& 
         int nUp, DRng& rng) {
     if (camMode != CAM_B) return;
     if (cs.pSplit) return;                          // mode P's blurred split: the camera side's
+    const int room = cs.maxBounce - vt.depth;       // the vertices a connection may add (host twin)
+    if (room < 1) return;
     // sc.dielSph / sc.mirrorSph are the ascending indices of the qualifying spheres
     // (host-precomputed with the same predicates the loops below used to test inline),
     // so iteration — and therefore film accumulation — order is unchanged bit for bit,
@@ -11290,7 +11302,7 @@ __device__ static void camSpecularSplatAllVtxN(const DScene& sc, const DCamSet& 
                             done[j] = true;
                         }
                     dConnectSpecularSphere(sc, cs.cam(c), cs.films[c], cs.hits[c], S, ix[i], pd, vt, gl, gb, gw, m,
-                                           rng);
+                                           room, rng);
                 }
             }
         }
@@ -11328,12 +11340,13 @@ __device__ static void camSpecularSplatAllVtx(const DScene& sc, const DCamSet& c
 }
 // Surface vertex: refract the Lambertian reflection of p through every glass sphere, and
 // reflect it in every mirror.
-__device__ static void camSpecularSplatAll(const DScene& sc, const DCamSet& cs, int camMode,
+__device__ static void camSpecularSplatAll(const DScene& sc, const DCamSet& cs, int camMode, int depth,
                                            const DVec3& p, const DVec3& n, const DVec3& ng,
                                            const DVec3* wi, Real lambda, Real beta, Real rho,
                                            DRng& rng, const DVec3* plane = nullptr,
                                            const DCoatSplat* coat = nullptr) {
     DSpecVtx vt; vt.volume = false; vt.np = D3(n); vt.ng = D3(ng); vt.weight = (double)rho; vt.g = 0;
+    vt.depth = depth;
     if (wi) { vt.wl = D3(*wi); vt.hasWl = true; }
     vt.med = nullptr; vt.lambda = lambda; vt.coat = coat;
     if (plane) { vt.gated = true; vt.plane = D3(*plane); }               // see DSpecVtx
@@ -11341,25 +11354,25 @@ __device__ static void camSpecularSplatAll(const DScene& sc, const DCamSet& cs, 
 }
 // Glossy vertex: the rough lobe seen in a mirror or through a glass sphere (host twin
 // Renderer::camSpecularSplatAllGlossy).
-__device__ static void camSpecularSplatAllGlossy(const DScene& sc, const DCamSet& cs, int camMode,
+__device__ static void camSpecularSplatAllGlossy(const DScene& sc, const DCamSet& cs, int camMode, int depth,
                                                  const DVec3& p, const DVec3& n, const DVec3& ng,
                                                  const DVec3& wi, const Real* lam, const Real* beta,
                                                  int nUp, const DGlossySplat& gs, DRng& rng,
                                                  const DCoatSplat* coat = nullptr) {
     DSpecVtx vt; vt.volume = false; vt.np = D3(n); vt.ng = D3(ng); vt.weight = 0.0; vt.g = 0;
     vt.wl = D3(wi); vt.hasWl = true;
-    vt.med = nullptr; vt.lambda = lam[0]; vt.glossy = &gs; vt.coat = coat;
+    vt.med = nullptr; vt.lambda = lam[0]; vt.glossy = &gs; vt.coat = coat; vt.depth = depth;
     const Real w[hero::kHeroMax] = {};   // a glossy vertex's weight is in its lobe
     camSpecularSplatAllVtxN(sc, cs, camMode, D3(p), vt, lam, beta, w, nUp, rng);
 }
 // Volume vertex: refract the fog in-scatter at p through every glass sphere, so the
 // glowing haze itself bends through the glass the camera flies through.
 __device__ static void camSpecularSplatVolumeAll(const DScene& sc, const DMedium& med,
-                                                 const DCamSet& cs, int camMode, const DVec3& p,
+                                                 const DCamSet& cs, int camMode, int depth, const DVec3& p,
                                                  const DVec3& wIn, Real lambda, Real beta, DRng& rng) {
     DSpecVtx vt; vt.volume = true; vt.wIn = D3(wIn); vt.g = med.g;
     vt.weight = (double)medAlbedo(med, lambda);
-    vt.med = &med; vt.lambda = lambda;
+    vt.med = &med; vt.lambda = lambda; vt.depth = depth;
     camSpecularSplatAllVtx(sc, cs, camMode, D3(p), vt, lambda, beta, rng);
 }
 
@@ -13065,7 +13078,7 @@ __device__ static bool genPhoton(const DScene& sc, const DCamSet& cs,
         const DVec3 face = em.normalTilted ? dAimFaceNow(sc, em) : DVec3{0, 0, 0};
         const DVec3* plane = em.normalTilted ? &face : nullptr;
         splatSurfaceAll(sc, cs, camMode, origin, emitN, emitN, emitN, lambda, beta, rhoE, rng, plane);
-        camSpecularSplatAll(sc, cs, camMode, origin, emitN, emitN, nullptr, lambda, beta, rhoE, rng, plane);
+        camSpecularSplatAll(sc, cs, camMode, 0, origin, emitN, emitN, nullptr, lambda, beta, rhoE, rng, plane);
     }
 
     ro = dOffsetAlong(origin, emitN, dir); rd = dir;
@@ -13131,7 +13144,7 @@ __device__ __noinline__ static int interactHair(const DScene& sc, const DCamSet&
 // the already-resolved material (post-Mix); `matIndex` drives the dielectric priority stack.
 // Mutates ro/rd/beta/lambda (Fluorescent Stokes shift) and returns WF_CONTINUE/WF_TERMINATE.
 __device__ static int interactSpecularLobe(const DScene& sc, const DCamSet& cs, int camMode,
-        int diffraction, const DMaterial& m, int matIndex, const DHit& h,
+        int diffraction, int depth, const DMaterial& m, int matIndex, const DHit& h,
         DVec3& ro, DVec3& rd, Real& beta, Real& lambda, DRng& rng, double& eAbsorbed,
         DMediumStack& stk, Real* curveTminOut, bool firstHit, const DCoatSplat* coat,
         bool* scattered = nullptr);
@@ -13139,20 +13152,20 @@ __device__ static int interactSpecularLobe(const DScene& sc, const DCamSet& cs, 
 // and its continuation take the coat's way out, at the wavelength they leave with. `scattered` (may
 // be null): set where a glossy draw took its multiple scattering's branch (DGlossyDraw::ms).
 __device__ static int interactSpecular(const DScene& sc, const DCamSet& cs, int camMode,
-        int diffraction, const DMaterial& m, int matIndex, const DHit& h,
+        int diffraction, int depth, const DMaterial& m, int matIndex, const DHit& h,
         DVec3& ro, DVec3& rd, Real& beta, Real& lambda, DRng& rng, double& eAbsorbed,
         DMediumStack& stk, Real* curveTminOut = nullptr, bool firstHit = false,
         bool* scattered = nullptr) {
     const DVec3 wa = -rd;   // the arrival
     const DCoatSplat coat{&sc, &h, dCoatCtxOf(m, wa)};
     const DCoatSplat* cp = coat.c.m ? &coat : nullptr;
-    const int r = interactSpecularLobe(sc, cs, camMode, diffraction, m, matIndex, h, ro, rd, beta,
+    const int r = interactSpecularLobe(sc, cs, camMode, diffraction, depth, m, matIndex, h, ro, rd, beta,
                                        lambda, rng, eAbsorbed, stk, curveTminOut, firstHit, cp, scattered);
     if (r == WF_CONTINUE) dCoatContinue(sc, m, h, wa, rd, lambda, beta, eAbsorbed);   // a body's or a coat's
     return r;
 }
 __device__ static int interactSpecularLobe(const DScene& sc, const DCamSet& cs, int camMode,
-        int diffraction, const DMaterial& m, int matIndex, const DHit& h,
+        int diffraction, int depth, const DMaterial& m, int matIndex, const DHit& h,
         DVec3& ro, DVec3& rd, Real& beta, Real& lambda, DRng& rng, double& eAbsorbed,
         DMediumStack& stk, Real* curveTminOut, bool firstHit, const DCoatSplat* coat,
         bool* scattered) {
@@ -13200,7 +13213,7 @@ __device__ static int interactSpecularLobe(const DScene& sc, const DCamSet& cs, 
             const DGlossySplat gsp{&sc, &m, &h, h.n, wl};
             splatSurfaceAll(sc, cs, camMode, h.p, h.n, dShadedNg(h), wl, lambda, beta, (Real)0, rng,
                             nullptr, &gsp, coat);
-            camSpecularSplatAllGlossy(sc, cs, camMode, h.p, h.n, dShadedNg(h), wl, &lambda, &beta, 1, gsp, rng,
+            camSpecularSplatAllGlossy(sc, cs, camMode, depth, h.p, h.n, dShadedNg(h), wl, &lambda, &beta, 1, gsp, rng,
                                       coat);
         }
         Real r = clamp01(dReflectSlot(sc, m, h, lambda));
@@ -13351,7 +13364,7 @@ __device__ static inline int dPhotonVertexBit(const DScene& sc, const DMaterial&
 // this step's beam and then RETIRED, unconditionally, before returning: see the note at the
 // retirement site for why that is the conservative and provably-correct rule.
 __device__ static int shadeStep(const DScene& sc, const DCamSet& cs,
-                                int camMode, int diffraction, const DHit& h,
+                                int camMode, int diffraction, int depth, const DHit& h,
                                 DVec3& ro, DVec3& rd, Real& beta, Real& lambda, DRng& rng,
                                 double& eAbsorbed, double& eSensor, double& eEscaped,
                                 DMediumStack& stk, DRng* crng = nullptr,
@@ -13538,7 +13551,7 @@ __device__ static int shadeStep(const DScene& sc, const DCamSet& cs,
             // a 1-camera slice of the set so the "All" helper targets only camera c.
             DCamSet cs1 = cs; cs1.nCam = 1; cs1.cams = &cc; cs1.camStride = 0;
             cs1.films = &cs.films[c]; cs1.hits = &cs.hits[c];
-            camSpecularSplatVolumeAll(sc, smc, cs1, camMode, xc, rd, lambda, betaC, *crng);
+            camSpecularSplatVolumeAll(sc, smc, cs1, camMode, depth, xc, rd, lambda, betaC, *crng);
         }
         // Mode M: store the crossing itself, so every camera of a flyby can gather from it
         // later without the photon knowing any camera exists.
@@ -13609,7 +13622,7 @@ __device__ static int shadeStep(const DScene& sc, const DCamSet& cs,
         const bool coveredByBeam = beamMS && !marchHit && !(sm.iorN > 0);
         if (!coveredByBeam) {
             splatVolumeAll(sc, sm, cs, camMode, mp, rd, lambda, beta, rng);
-            camSpecularSplatVolumeAll(sc, sm, cs, camMode, mp, rd, lambda, beta, rng);
+            camSpecularSplatVolumeAll(sc, sm, cs, camMode, depth, mp, rd, lambda, beta, rng);
         }
         if (coveredByBeam && beamScat) ++(*beamScat);   // one more scattering order bought
         if (rng.uniform() >= medAlbedo(sm, lambda)) { eAbsorbed += beta; return WF_TERMINATE; }
@@ -13652,7 +13665,7 @@ __device__ static int shadeStep(const DScene& sc, const DCamSet& cs,
         Real bS = beta * dGlossyArrival(h, wl, firstHit);   // host twin
         splatSurfaceAll(sc, cs, camMode, h.p, h.n, dShadedNg(h), wl, lambda, bS, (Real)0, rng,
                         nullptr, &gsp);
-        camSpecularSplatAllGlossy(sc, cs, camMode, h.p, h.n, dShadedNg(h), wl, &lambda, &bS, 1, gsp, rng);
+        camSpecularSplatAllGlossy(sc, cs, camMode, depth, h.p, h.n, dShadedNg(h), wl, &lambda, &bS, 1, gsp, rng);
     }
     // Stochastic mix: resolve to a child lobe (or absorb) before dispatch.
     if (dIsCompound(mptr->type)) {
@@ -13675,7 +13688,7 @@ __device__ static int shadeStep(const DScene& sc, const DCamSet& cs,
         // the hero tracer also calls) leaves exactly one definition of the rule.
         if (pathC) pathC->bits |= dPhotonVertexBit(sc, m, h);
         bool scat = false;   // a glossy draw into its multiple scattering: a scattering
-        const int r = interactSpecular(sc, cs, camMode, diffraction, m, matIndex, h,
+        const int r = interactSpecular(sc, cs, camMode, diffraction, depth, m, matIndex, h,
                                        ro, rd, beta, lambda, rng, eAbsorbed, stk, curveTminOut, firstHit, &scat);
         if (pathC && scat) pathC->bits |= PV_BIT_SCATTER;
         return r;
@@ -13710,8 +13723,8 @@ __device__ static int shadeStep(const DScene& sc, const DCamSet& cs,
         const DCoatSplat* cp = coatS.c.m ? &coatS : nullptr;
         splatSurfaceAll(sc, cs, camMode, h.p, h.n, ngo, wiPrev, lambda, beta, rhoR, rng, nullptr, nullptr, cp);
         splatSurfaceAll(sc, cs, camMode, h.p, nb,  ngo * (Real)(-1), wiPrev, lambda, beta, rhoT, rng, nullptr, nullptr, cp);
-        camSpecularSplatAll(sc, cs, camMode, h.p, h.n, ngo, &wiPrev, lambda, beta, rhoR, rng, nullptr, cp);
-        camSpecularSplatAll(sc, cs, camMode, h.p, nb,  ngo * (Real)(-1), &wiPrev, lambda, beta, rhoT, rng, nullptr, cp);
+        camSpecularSplatAll(sc, cs, camMode, depth, h.p, h.n, ngo, &wiPrev, lambda, beta, rhoR, rng, nullptr, cp);
+        camSpecularSplatAll(sc, cs, camMode, depth, h.p, nb,  ngo * (Real)(-1), &wiPrev, lambda, beta, rhoT, rng, nullptr, cp);
         // Analog scatter: reflect (prob rhoR), transmit (prob rhoT), else absorb — beta
         // unchanged on a scatter (like the diffuse case), plus the adjoint correction.
         Real u = rng.uniform();
@@ -13738,7 +13751,7 @@ __device__ static int shadeStep(const DScene& sc, const DCamSet& cs,
         {   const DCoatSplat coatS{&sc, &h, dCoatCtxOf(m, wiPrev)};   // a coated body's way out (DCoatSplat)
             const DCoatSplat* cp = coatS.c.m ? &coatS : nullptr;
             splatSurfaceAll(sc, cs, camMode, h.p, h.n, ngo, wiPrev, lambda, beta, rho, rng, nullptr, nullptr, cp);
-            camSpecularSplatAll(sc, cs, camMode, h.p, h.n, ngo, &wiPrev, lambda, beta, rho, rng, nullptr, cp); }
+            camSpecularSplatAll(sc, cs, camMode, depth, h.p, h.n, ngo, &wiPrev, lambda, beta, rho, rng, nullptr, cp); }
         if (rng.uniform() >= rho) { eAbsorbed += beta; return WF_TERMINATE; }
         { DVec3 wo;
           beta *= dDiffuseContinuation(h, ngo, wiPrev, rng, wo);
@@ -13857,11 +13870,12 @@ __device__ static void splatSurfaceAllHero(const DScene& sc, const DCamSet& cs, 
 // exactly what makes a glass-sphere caustic chromatically dispersed. A MIRROR is
 // achromatic, so its geometry IS shared across the bundle and only the reflectance varies
 // per λ. Draws no RNG (mode B only inside).
-__device__ static void camSpecularSplatAllHero(const DScene& sc, const DCamSet& cs, int camMode,
+__device__ static void camSpecularSplatAllHero(const DScene& sc, const DCamSet& cs, int camMode, int depth,
         const DVec3& p, const DVec3& n, const DVec3& ng, const DVec3* wi, const Real* lam,
         const Real* beta, const Real* rho, int nUp, DRng& rng, const DVec3* plane = nullptr,
         const DCoatSplat* coat = nullptr) {
     DSpecVtx vt; vt.volume = false; vt.np = D3(n); vt.ng = D3(ng); vt.weight = (double)rho[0]; vt.g = 0;
+    vt.depth = depth;
     if (wi) { vt.wl = D3(*wi); vt.hasWl = true; }
     vt.med = nullptr; vt.lambda = lam[0]; vt.coat = coat;
     if (plane) { vt.gated = true; vt.plane = D3(*plane); }               // see DSpecVtx
@@ -13995,7 +14009,7 @@ __device__ static bool genPhotonHero(const DScene& sc, const DCamSet& cs, int ca
         Real rhoOne[hero::kHeroMax]; for (int i = 0; i < nUp; ++i) rhoOne[i] = rhoE;
         splatSurfaceAllHero(sc, cs, camMode, origin, emitN, emitN, emitN, lam, beta, rhoOne, nUp, rng,
                             plane);
-        camSpecularSplatAllHero(sc, cs, camMode, origin, emitN, emitN, nullptr, lam, beta, rhoOne, nUp, rng, plane);
+        camSpecularSplatAllHero(sc, cs, camMode, 0, origin, emitN, emitN, nullptr, lam, beta, rhoOne, nUp, rng, plane);
     }
 
     ro = dOffsetAlong(origin, emitN, dir); rd = dir;
@@ -14012,7 +14026,7 @@ __device__ static bool genPhotonHero(const DScene& sc, const DCamSet& cs, int ca
 // false) and delegates that same hit to the shared scalar interactSpecular — from then on
 // the caller runs the ordinary single-λ shadeStep. No fog/GRIN here (gated out upstream).
 __device__ static int shadeStepHero(const DScene& sc, const DCamSet& cs, int camMode,
-        int diffraction, int C, const DHit& h, DVec3& ro, DVec3& rd, Real* lam, Real* beta,
+        int diffraction, int depth, int C, const DHit& h, DVec3& ro, DVec3& rd, Real* lam, Real* beta,
         bool& secAlive, DRng& rng, double& eAbsorbed, double& eSensor, double& eEscaped,
         DMediumStack& stk, DPathCaustic* pathC = nullptr, Real* curveTminOut = nullptr,
         bool firstHit = false) {
@@ -14115,7 +14129,7 @@ __device__ static int shadeStepHero(const DScene& sc, const DCamSet& cs, int cam
         for (int i = 0; i < nUp; ++i) bS[i] = beta[i] * sC;
         splatSurfaceAllHero(sc, cs, camMode, h.p, h.n, dShadedNg(h), wl, lam, bS, unused, nUp, rng,
                             nullptr, &gsp);
-        camSpecularSplatAllGlossy(sc, cs, camMode, h.p, h.n, dShadedNg(h), wl, lam, bS, nUp, gsp, rng);
+        camSpecularSplatAllGlossy(sc, cs, camMode, depth, h.p, h.n, dShadedNg(h), wl, lam, bS, nUp, gsp, rng);
     }
     if (dIsCompound(mptr->type)) {
         int cpF = -1; double cRF = 0.0, cCosF = 1.0, cUF = 0.0; Real cThF = (Real)0;
@@ -14168,8 +14182,8 @@ __device__ static int shadeStepHero(const DScene& sc, const DCamSet& cs, int cam
             const DCoatSplat* cp = coatS.c.m ? &coatS : nullptr;
             splatSurfaceAllHero(sc, cs, camMode, h.p, h.n, ngo, wiPrev, lam, beta, rhoR, nUp, rng, nullptr, nullptr, cp);
             splatSurfaceAllHero(sc, cs, camMode, h.p, nb, ngo * (Real)(-1), wiPrev, lam, beta, rhoT, nUp, rng, nullptr, nullptr, cp);
-            camSpecularSplatAllHero(sc, cs, camMode, h.p, h.n, ngo, &wiPrev, lam, beta, rhoR, nUp, rng, nullptr, cp);
-            camSpecularSplatAllHero(sc, cs, camMode, h.p, nb, ngo * (Real)(-1), &wiPrev, lam, beta, rhoT, nUp, rng, nullptr, cp);
+            camSpecularSplatAllHero(sc, cs, camMode, depth, h.p, h.n, ngo, &wiPrev, lam, beta, rhoR, nUp, rng, nullptr, cp);
+            camSpecularSplatAllHero(sc, cs, camMode, depth, h.p, nb, ngo * (Real)(-1), &wiPrev, lam, beta, rhoT, nUp, rng, nullptr, cp);
         }
         // Lobe pick + RR over the whole bundle (see the diffuse tail): the reflect/transmit
         // probabilities are the per-lobe MAX over live λ, so no secondary is ever amplified.
@@ -14240,7 +14254,7 @@ __device__ static int shadeStepHero(const DScene& sc, const DCamSet& cs, int cam
             const DCoatSplat* cp = coatS.c.m ? &coatS : nullptr;
             splatSurfaceAllHero(sc, cs, camMode, h.p, h.n, dShadedNg(h), wl, lam, beta, unused, nUp,
                                 rng, nullptr, &gsp, cp);
-            camSpecularSplatAllGlossy(sc, cs, camMode, h.p, h.n, dShadedNg(h), wl, lam, beta, nUp, gsp, rng, cp);
+            camSpecularSplatAllGlossy(sc, cs, camMode, depth, h.p, h.n, dShadedNg(h), wl, lam, beta, nUp, gsp, rng, cp);
         }
         Real c[hero::kHeroMax];
         Real q = (Real)0;
@@ -14301,7 +14315,7 @@ __device__ static int shadeStepHero(const DScene& sc, const DCamSet& cs, int cam
         if (nUp > 1) beta[0] *= (Real)C;   // not twice: a coat's coin may have de-heroed already
         secAlive = false;
         bool scat = false;   // a glossy draw into its multiple scattering (an iridescent lobe has none)
-        const int r = interactSpecular(sc, cs, camMode, diffraction, m, matIndex, h,
+        const int r = interactSpecular(sc, cs, camMode, diffraction, depth, m, matIndex, h,
                                        ro, rd, beta[0], lam[0], rng, eAbsorbed, stk, curveTminOut, firstHit, &scat);
         if (pathC && scat) pathC->bits |= PV_BIT_SCATTER;
         return r;
@@ -14331,7 +14345,7 @@ __device__ static int shadeStepHero(const DScene& sc, const DCamSet& cs, int cam
         const DCoatSplat coatS{&sc, &h, dCoatCtxOf(m, wiPrev)};   // a coated body's way out (DCoatSplat)
         const DCoatSplat* cp = coatS.c.m ? &coatS : nullptr;
         splatSurfaceAllHero(sc, cs, camMode, h.p, h.n, ngo, wiPrev, lam, beta, rho, nUp, rng, nullptr, nullptr, cp);
-        camSpecularSplatAllHero(sc, cs, camMode, h.p, h.n, ngo, &wiPrev, lam, beta, rho, nUp, rng, nullptr, cp);
+        camSpecularSplatAllHero(sc, cs, camMode, depth, h.p, h.n, ngo, &wiPrev, lam, beta, rho, nUp, rng, nullptr, cp);
     }
     // Continuation RR over the WHOLE bundle: the survival probability is max_i rho_i, not the
     // hero's own albedo, and every live λ reweights by rho_i/q <= 1. Rolling the coin on the
@@ -14385,10 +14399,10 @@ __device__ static void traceHeroPhoton(const DScene& sc, const DCamSet& cs, int 
         curveTmin = (Real)0;
         int r;
         if (secAlive)
-            r = shadeStepHero(sc, cs, camMode, diffraction, C, h, ro, rd, lam, beta, secAlive, rng,
+            r = shadeStepHero(sc, cs, camMode, diffraction, bounce + 1, C, h, ro, rd, lam, beta, secAlive, rng,
                               eAbsorbed, eSensor, eEscaped, stk, &pathC, &curveTmin, bounce == 0);
         else
-            r = shadeStep(sc, cs, camMode, diffraction, h, ro, rd, beta[0], lam[0], rng,
+            r = shadeStep(sc, cs, camMode, diffraction, bounce + 1, h, ro, rd, beta[0], lam[0], rng,
                           eAbsorbed, eSensor, eEscaped, stk, nullptr, -1, 0, nullptr, &pathC,
                           nullptr, -1, nullptr, &curveTmin, bounce == 0);
         if (r == WF_TERMINATE) done = true;
@@ -14471,7 +14485,7 @@ __global__ void kTrace(DScene sc, DCamSet cs, double* energy,
             DHit h = closestHitIn(stk, sc, ro, rd, curveTmin > (Real)0 ? (Real)0 : RAY_EPS, BIG, false,
                                        curveTmin);
             curveTmin = (Real)0;
-            if (shadeStep(sc, cs, camMode, diffraction, h, ro, rd, beta, lambda, rng,
+            if (shadeStep(sc, cs, camMode, diffraction, bounce + 1, h, ro, rd, beta, lambda, rng,
                           eAbsorbed, eSensor, eEscaped, stk, cs.beamsOn() ? &crng : nullptr,
                           gm.hit ? gm.which : -1, gm.arc, &beamScat,
                           &pathC, &spec, srcEm, &nSurf, &curveTmin, bounce == 0) == WF_TERMINATE) done = true;
@@ -14652,7 +14666,7 @@ __global__ void kWfShade(DScene sc, DCamSet cs, double* energy,
     double eAbs = 0, eSen = 0, eEsc = 0;
     DPathCaustic pathC = st.pathC[slot];   // caustic history + MIS weight, from earlier bounces
     Real curveTmin = (Real)0;
-    int res = shadeStep(sc, cs, camMode, diffraction, h, ro, rd, beta, lambda, rng,
+    int res = shadeStep(sc, cs, camMode, diffraction, st.bounce[slot] + 1, h, ro, rd, beta, lambda, rng,
                         eAbs, eSen, eEsc, stk, nullptr,
                         st.gmMed[slot], st.gmArc[slot],   // GRIN pre-pass, from kWfExtend
                         nullptr, &pathC, nullptr, -1, nullptr, &curveTmin,
@@ -27434,6 +27448,7 @@ static void launchForward(DUpload& up, const gpu::DCamSet& cs, double* d_energy,
     // photon's time (DCamSet::cam), one per thread of the launch -- the wavefront's slots, or
     // the megakernel's grid (cudaForwardPosedCameraBytes counts the same).
     DCamSet csRun = cs;
+    csRun.maxBounce = maxBounce;
     DCamera* d_posed = nullptr;
     if (cs.camMoves && cs.nCam > 0) {
         const long long threads = wf ? wavefrontSlots(N) : (long long)kFwdBlockSize * kFwdNumBlocks;
