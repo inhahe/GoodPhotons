@@ -191,8 +191,8 @@ def main():
     regions = (("the lamp", LAMP), ("the walls", WALLS))
 
     def stats2(scene, tag, args):
-        v = np.array([[render(exe, out, scene, tag, args, s)[..., 1][reg].mean() for _, reg in regions]
-                      for s in (1, 2)])
+        ims = [render(exe, out, scene, tag, args, s)[..., 1] for s in (1, 2)]   # one render a seed
+        v = np.array([[im[reg].mean() for _, reg in regions] for im in ims])
         return v.mean(0), v.std(0, ddof=1) / np.sqrt(2)
 
     for sc, tag in ((bubble, "in the water"), (dry, "in air"), (sunk, "in water ranked above it")):

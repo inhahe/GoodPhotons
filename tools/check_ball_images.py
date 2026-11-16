@@ -12,8 +12,14 @@ over the seeds:
   * a glass ball in a lit room, seen from outside: the ball's body and its rim (the surface reflection
     is all of the light at grazing, and the light reflected many times inside carries much of the
     rest there); and a mirror ball in its place, its rim the reflection at grazing;
+  * the same two with every surface black but the wall behind the ball, glowing, and no lamp, where
+    mode R's paths end on the glow and it is exact;
   * the eye at the centre of a small glass ball in the room, looking at the lamp: the rings round the
-    lamp where the inner reflection shows the spot behind the eye, and the walls beyond;
+    lamp where the inner reflection shows the spot behind the eye, and the walls beyond; and the eye
+    off the centre, 0.8 of the radius, where a band of its view is turned back for good past the
+    critical angle and the scan had no sample at that band's edge;
+  * a frosted glass ball (roughness 0.12), which mode B leaves black: no closed form joins a vertex to
+    the eye through a frosted surface, and the connection had drawn it as clear glass;
   * a glass ball 5 cm from the back wall of a room whose walls all glow alike and reflect nothing:
     the ball's image reads what the walls read (its chains' products sum to one), within 2 % and 5
     standard errors -- with no reference to trust. The ball nearly focuses on a wall that close, and
@@ -50,6 +56,9 @@ BALL = "sphere { center 0 1.5 1.8  radius 0.15  material glass }"
 OUTSIDE = "camera \"c\" { eye 0.8 1.5 1.7  look_at 0 1.5 2.0  up 0 1 0  fov_y 12  film { res 96 72 } }"
 # The eye at the ball's centre, looking at the lamp.
 INSIDE = "camera \"c\" { eye 0 1.5 1.8  look_at 0 1.5 -1.0  up 0 1 0  fov_y 50  film { res 96 72 } }"
+# The eye inside the ball 0.8 of its radius from the centre, so a band of its view meets the surface past
+# the critical angle and stays inside for good.
+INSIDE_OFF = "camera \"c\" { eye 0.12 1.5 1.8  look_at 0.12 1.5 -1.0  up 0 1 0  fov_y 60  film { res 96 72 } }"
 # The furnace: every wall glows alike and reflects nothing, the glass ball (no absorption) 5 cm from the
 # back wall, the eye in front of it. Its chains' Fresnel products sum to one, so its image reads exactly
 # what the walls read.
@@ -61,7 +70,11 @@ FURNACE = NL.join([
     "sphere { center 0 1.5 1.65  radius 0.3  material glass }",
     'camera "c" { eye 0 1.5 0.75  look_at 0 1.5 1.65  up 0 1 0  fov_y 50  film { res 96 72 } }',
 ])
-DEPTH = ["-max-bounce", "12"]
+# Deep enough that neither mode truncates: mode R counts the ball's reflections and refractions against
+# -max-bounce and mode B's connection does not, so at a shallow depth mode R loses the lit room's last
+# bounces where it sees them through the ball (1 % of the walls' light at 12), and by the critical angle
+# the chains past it.
+DEPTH = ["-max-bounce", "64"]
 TOL = 0.03
 SEEDS = (1, 2)
 
@@ -115,6 +128,18 @@ def main():
     mirror = scene(out, "mirror", ROOM, 'material "chrome" { type mirror  reflect 0.9 }',
                    BALL.replace("material glass", "material chrome"), OUTSIDE)
     inside = scene(out, "inside", ROOM, BALL, INSIDE)
+    inside_off = scene(out, "inside_off", ROOM, BALL, INSIDE_OFF)
+    frosted = scene(out, "frosted", ROOM, 'material "frost" { type dielectric  ior 1.5  roughness 0.12 }',
+                    BALL.replace("material glass", "material frost"), OUTSIDE)
+    # The outside view with every surface black but the wall behind the ball, glowing, and no lamp:
+    # mode R's paths end on the glow with nothing to sample, so it is exact there.
+    dark = [l.replace("material white", "material glow" if l.startswith("quad { origin -2 0 2  u 0 3 0") else
+                      "material black") for l in ROOM.split(NL) if not l.startswith("light area")]
+    glowing = ['material "glow" { type diffuse  reflect 0  emit preset:bb6500 }', 'material "black" { type diffuse  reflect 0 }',
+               'material "chrome" { type mirror  reflect 0.9 }']
+    backglow = scene(out, "backglow", *(dark + glowing), BALL, OUTSIDE)
+    backglow_m = scene(out, "backglow_mirror", *(dark + glowing), BALL.replace("material glass", "material chrome"),
+                       OUTSIDE)
     # The ball's image, from the same view with the ball glowing and the lamp off.
     glow = scene(out, "outside_mask", ROOM.replace("power 20", "power 0.0001"),
                  'material "ember" { type diffuse  reflect 0  emit preset:bb6500 }',
@@ -126,14 +151,19 @@ def main():
     r2 = (xx - 47.5) ** 2 + (yy - 35.5) ** 2
     cases = [("from outside", outside, [("the ball's body", body), ("its rim", rim)]),
              ("of mirror, from outside", mirror, [("the ball's body", body), ("its rim", rim)]),
+             ("from outside, only the wall behind it glowing", backglow, [("the ball's body", body), ("its rim", rim)]),
+             ("of mirror, only the wall behind it glowing", backglow_m, [("the ball's body", body), ("its rim", rim)]),
              ("from inside", inside, [("rings 4-15 px round the lamp", (r2 >= 4 ** 2) & (r2 < 15 ** 2)),
                                       ("rings 15-25 px", (r2 >= 15 ** 2) & (r2 < 25 ** 2)),
-                                      ("the walls beyond", r2 >= 25 ** 2)])]
+                                      ("the walls beyond", r2 >= 25 ** 2)]),
+             ("from inside, off its centre", inside_off, [("the frame", r2 >= 0), ("its left half", xx < 48),
+                                                       ("its right half", xx >= 48)])]
     if not body.any() or not rim.any():
         raise SystemExit("the ball's image is empty: the frame is not the one this check reads")
 
     def stats(scn, tag, args):
-        v = np.array([[render(exe, out, scn, tag, args, s)[reg].mean() for _, reg in regions] for s in SEEDS])
+        ims = [render(exe, out, scn, tag, args, s) for s in SEEDS]   # one render a seed
+        v = np.array([[im[reg].mean() for _, reg in regions] for im in ims])
         return v.mean(0), v.std(0, ddof=1) / np.sqrt(len(SEEDS))
 
     ok = True
@@ -156,6 +186,15 @@ def main():
             ok = ok and not bad
             print("%s: mode B on the %s, a glass ball in a glowing room, %s: %.4f (+- %.4f) of the walls"
                   % ("FAIL" if bad else "ok", dev.upper(), rname, qi, ei), flush=True)
+    for dev in devs:
+        n = "100000000" if dev == "gpu" else "40000000"
+        b = [render(exe, out, frosted, "B_frosted_%s" % dev, ["-mode", "B", "-device", dev, "-n", n], s)[body].mean()
+             for s in SEEDS]
+        rr = render(exe, out, frosted, "R_frosted", ["-mode", "R", "-device", refdev, "-spp", "1024"], 1)[body].mean()
+        bad = not (np.mean(b) < 0.02 * rr)
+        ok = ok and not bad
+        print("%s: mode B on the %s leaves a frosted ball black: its body %.4f of mode R's"
+              % ("FAIL" if bad else "ok", dev.upper(), np.mean(b) / rr), flush=True)
     for what, scn, regions in cases:
         tag = os.path.splitext(os.path.basename(scn))[0]
         rm, rse = stats(scn, "R_%s" % tag, ["-mode", "R", "-device", refdev, "-spp", "8192"])

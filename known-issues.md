@@ -72,7 +72,44 @@ closed entries, where the cost is a broken historical link rather than a blocked
 Three references — `scenes/_gr_fly0.ftsl`, `scenes/silver_sphere_xenon.ftsl`, `scenes/x.ftsl` —
 name files that no longer exist at all, all in closed entries.
 
-## OPEN (2026-11-16): MODEB-SPHERE-ROOM — mode B reads the lamp-lit room some 1 % over mode R where a sphere shows it
+## OPEN (2026-11-16): GPU-TIR-DRIFT — on the GPU a ray held inside a glass ball by total internal reflection drifts out
+
+Found by check_ball_images at -max-bounce 64 (REVIEW-0448): the eye inside the ball 0.8 of its radius
+off its centre, GPU mode R reads the edges of the view by the critical angle far over CPU mode R
+(the column at the band's edge some three times, the left half 1.22) while the band itself stays
+black on both, and mode B -- whose connection is analytic -- meets CPU mode R. At -max-bounce 12 the two
+devices' mode R agreed to 1.3 %. The cause, by the numbers: the fp32 build moves a new ray's origin
+off the surface by 256 ulps along the normal (`dOffsetComp`), some 3e-5 m at these coordinates, 2e-4
+of the ball's radius; a ray reflected inside starts that much inside the surface, so r sin(theta),
+which a sphere's chords keep, shrinks by that fraction at every reflection, and a ray just past the
+critical angle slides under it in a few dozen reflections and leaves (0.7 degrees in 64). The CPU's
+offset, 1e-6, is 30 times smaller. Every GPU walk that reflects inside a closed curved dielectric
+takes the drift (modes R, M, S, D, the photon walks of B). The fix: an origin moved along the ray's
+own direction keeps its line, so where the leaving ray is not grazing the offset can be along it.
+
+## OPEN (2026-11-16): MODEB-DEPTH-CONNECT — mode B's specular connections do not count their vertices against -max-bounce
+
+REFERENCE says every mode counts the scattering vertices on a path against `-max-bounce`. Mode B's
+photon walk does (`for (bounce < maxBounce)` in render.h), but its camera connections through a glass
+sphere's chains (`connectSpecularSphere`), a mirror sphere and a flat mirror add their own vertices --
+a ball's chain 1 + k adds k + 2 -- uncounted, host and device alike. So at a shallow depth mode B keeps
+paths mode R cuts: at -max-bounce 12 the lit room seen through a glass ball read 1.3 % over mode R
+(MODEB-SPHERE-ROOM, now explained), and by the critical angle the chains past 12. The fix: give the
+connectors the vertex's own count (the photon's bounces so far, plus one) and draw a chain only where
+that and the chain's vertices stay within the cap (the deep chain's range cut to it), on both devices.
+
+## DONE (2026-11-16, 0.448.1): MODEB-SPHERE-ROOM — mode B reads the lamp-lit room some 1 % over mode R where a sphere shows it
+
+**The depth cap (MODEB-DEPTH-CONNECT).** Mode R counts the ball's reflections and refractions against
+-max-bounce and mode B's connection does not, so at the check's -max-bounce 12 mode R lost the lit
+room's last bounces wherever it saw them through the ball, some 1 % of the walls' light at their
+albedo, and the room seen directly lost nothing in either. With only the wall behind the ball
+glowing, light that bounces nowhere, the cap took nothing, which is why those cases agreed. At
+-max-bounce 64 check_ball_images reads, mode B over mode R: the glass ball's body 1.0001 (CPU) and
+0.9997 (GPU), the mirror ball's 1.0029 and 0.9972, the walls from the ball's centre 1.0009 and 1.0005.
+Modes M and S, which read those walls 1.038 of mode R at 12, are re-measured at 64 below.
+
+The investigation as it stood:
 
 check_ball_images' lit room (the camera_in_water room in air, a lamp, a glass or mirror ball 5 cm from
 the back wall): every image the spheres make reads about 1 % over mode R at 8192 spp and 65536 alike
@@ -80,9 +117,10 @@ the back wall): every image the spheres make reads about 1 % over mode R at 8192
 1.012 -- while the room seen directly agrees (0.999-1.009 between seeds), mode D agrees with mode R and
 mode U reads between (1.004, 1.006). Not the connectors: in a furnace (every wall glowing alike) mode
 B's glass ball reads its walls to 0.1-1 %, and with only the wall behind the ball glowing, where mode R
-is exact, both connectors meet mode R to 0.1 %. The walls seen directly, the camera just in front of
+is exact, both connectors meet mode R to 0.1 % (check_ball_images' cases with only the wall behind
+the ball glowing). The walls seen directly, the camera just in front of
 the ball, agree to 0.02 % in modes R, D and B with the ball's caustics and without the ball
-(`scraps/_caustic_walls.py`). And the walls seen from the ball's centre read 1.0125 of mode R in mode
+(`eye 0 1.5 1.55  look_at 0 1.5 -1.0`, fov 50). And the walls seen from the ball's centre read 1.0125 of mode R in mode
 B but 1.038 and 1.039 in modes M and S: the modes part by 1-4 % on a lamp-lit room seen out of a small
 glass ball, and which is right is not settled -- mode D shares mode R's camera paths and shadow rays
 through glass (no light-tracing strategy connects through it), so it cannot arbitrate. To narrow: the
@@ -100,6 +138,80 @@ host. The proper fix is the wavefront shape the camera side already has: queue e
 connections and run them in a kernel of their own, coherent (one thread a vertex and chain), its scan
 in fp32 where the miss's precision allows and fp64 only to refine. Until then mode B with large glass
 spheres in view renders faster with `-device cpu`.
+
+## DONE (2026-11-16, 0.448.1): REVIEW-0448 — what the Opus (max) and Fable (xhigh) reviews of 0.447.2-0.448.0 found
+
+`/code-review max` (Opus, 9 findings) and `/code-review xhigh` (Fable, 15) of a17b8d0..5f9bdc7, one after
+the other in a worktree. Each checked against the code; all held. (both) where both found it.
+
+**Fixed in 0.448.1:**
+
+* **A pool lamp deep in the water started in air (both).** The probe counted only faces of the solid's
+  own material, so a lamp whose rays leave a pool through its white walls and floor read air, and one
+  under a wide shallow pool's floor read water. A closed piece holding an enterable solid's faces
+  bounds that solid on all of its faces now (Tri::boundsSolid; the device's DTri::bounds through the
+  triangle closestHit<true> reports), counted where a face's own material encloses nothing.
+* **An eye inside a glass ball, off its centre, drew a dark band (Opus).** Past the critical angle a
+  ray stays inside for good, and the scan had no sample at that band's edges. A sample just inside each
+  was not enough: toward such an end a chain's leg swings as the root of the distance to it, and the
+  images by it -- a chain's fold among them, two images within one fixed step -- lay between the fixed
+  samples, so an eye 0.8 of the radius off the centre read the edges of its view 0.87 of mode R, in
+  bands (check_ball_images' new case, CPU and GPU alike). sphScanEnds lays a ladder of six samples by
+  each end, even in that root, in place of the fixed ones there, as it does at the silhouette, and
+  sphDipNears fits its parabola on the samples' own coordinates. A root is held to its miss now, so a
+  bracket across such a gap closes on no root rather than a wrong one.
+* **A frosted glass sphere was drawn as clear glass in mode B (Opus)**, now with sharp reflections
+  too, where REFERENCE says it is black: isSmoothDielectricMat keeps it out of the connection.
+* **The scan read b.dir0 uninitialised (both)** where sphBase2D had failed: it reads nothing there now.
+* **The mirror sphere's connector had no dip search (Fable)**, a concave mirror's caustic seen from
+  inside losing its fold as the glass had: both connectors (host and device) share one scan,
+  sphScanChains, with the arcs' ends, the line's miss and the dip search.
+* **The dip search skipped the faint chains (Fable):** it is made there by roulette, its images
+  weighted for it.
+* **Pre-0.447.2 radiance-cache sections were misread (Fable)**, a 0.447.1 sidecar losing its light-epoch
+  count: a version 1 or 3 section is checked to end where the next begins (sectionsTail, found from
+  the file's end), else passed to it. The cells' solid stacks moved beside the table (RadCacheStack:
+  never checkpointed, Fable), so a cell is its 0.447.0 size again and a 0.447.0 table reads.
+* **A bare `rayleigh` (and any on/off key alone) was silently off (Fable):** the key alone means on.
+* **Costs (both):** the splat tests the vertex's side and the frame before its rays and differentials;
+  the scan skips the fixed samples behind the silhouette; the refinement carries each chain's product
+  instead of a `pow` a step (Fable).
+* **The checks rendered each frame once per region (Fable):** check_ball_images and check_camera_legs
+  render once a seed.
+* **Dead and stale (both):** the sphere connection's opaque-coat term and SphIndex::suppressed (a plain
+  dielectric has no coat); design.md's limits, solver and speed, the stale comments; the
+  MODEB-SPHERE-ROOM evidence moved into check_ball_images (the wall behind the ball glowing alone).
+
+**Found checking those fixes, and fixed in 0.448.1:**
+
+* **The connection stopped at 16 reflections inside the ball.** By the critical angle R nears 1, and
+  mode R at 64 bounces reads the edge of an off-centre inside eye's view 6-7 % over mode R at 18 (the
+  chains past 16), its left half 0.85 %. A vertex draws one deeper chain, to 128 reflections
+  (sphDeepPick: chain 17 + j with probability proportional to 0.97^j, its images weighted by one over
+  that), scanned in a slot of its own from the same closed form, its turns taken at once
+  (sphTurnPow).
+* **A faint chain's fold was rouletted twice**, the dip search by roulette and then its images by
+  their own product, so the few found weighed (0.02/F)^2 -- 4·10^4 at the floor -- and lit single
+  pixels 28 times mode R's: an image a roulette found is kept.
+* **check_ball_images compared mode B and mode R at -max-bounce 12**, where mode R counts the ball's
+  reflections and refractions and mode B's connection does not, so mode R lost the lit room's last
+  bounces through the ball and the chains past 12 by the critical angle: it compares at 64. That was
+  MODEB-SPHERE-ROOM (closed); the inconsistency itself is MODEB-DEPTH-CONNECT.
+* **The GPU drew a glass ball's rim 0.91 of mode R with only the wall behind it glowing** (the CPU
+  1.005): in float, the surface point a grazing leg meets rounds inside the sphere as often as out, and
+  the sphere shadowed its own images. The device's shadow rays meet the sphere just outside it along
+  its normal (1e-4 of the radius, no less than float's error at the point): 0.995.
+
+**check_ball_images at -max-bounce 64, mode B over mode R:** every case passes but the eye inside the
+ball off its centre, which reads its left half 0.86 (CPU) and 0.83 (GPU) of GPU mode R -- whose
+reference is GPU-TIR-DRIFT's: against CPU mode R (8192 spp) mode B on either device reads the frame
+1.000, the right half 0.996, the left 1.04 (1.01 but for one fold's firefly). The furnace 0.98-1.01,
+the frosted ball black, the glass ball from outside 1.000 / 0.998 (body / rim, CPU) and 1.000 / 1.002
+(GPU), with only the wall behind it glowing 1.001 / 1.005 and 1.001 / 0.995, the mirror ball
+1.003 / 0.998 and 0.997 / 0.999, from the ball's centre 0.997-1.003.
+
+**Not changed:** GPU-SPHERE-CONNECT-SLOW stays open (Opus), the next work in TODO: a restructuring of
+the device connection into a kernel of its own.
 
 ## DONE (2026-11-16, 0.448.0): BALL-EYE-HALO — mode B misses the halo the ball's focusing throws round a lamp seen from inside it
 
@@ -133,7 +245,7 @@ directly, not through the ball), and the outside-sphere connection's imaging of 
 
 **Found: mode B's glass-sphere connection draws only the refracted image, not the sphere's Fresnel
 reflections.** That eye looked at the spot past the ball's rim (the line to it runs 0.13 from the
-ball's centre, inside its 0.15). Seen directly instead (`scraps/_spot_direct.ftsl`, `eye 0.8 1.5 1.7`,
+ball's centre, inside its 0.15). Seen directly instead (check_ball_images' lit room, `eye 0.8 1.5 1.7`,
 in air), the spot is mode R's in mode B to 1-2 % in every ring (centre 3.07e-2 against R's 3.11e-2,
 D 3.06e-2): the photons focus right. What mode B lacks is all in the ball's image: its body reads 0.87-0.91
 of mode R and its rim 0.17-0.8, mode D matching R there (the frame beyond the spot: R 5.10e-4, D

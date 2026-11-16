@@ -3511,7 +3511,13 @@ walk can be inside anything -- the mesh objects and assets holding such a materi
 instance gives one, too), each such solid's loose faces as a pool of their own (so a water box closes
 whatever quads it touches), then those that closed nothing alone with all the other loose faces (so a
 water surface of one quad closes with a pool's walls), and every isosurface's side -- so an open sheet,
-a window of one quad or a glass mesh with a hole, encloses nothing. The full pass, every piece and the
+a window of one quad or a glass mesh with a hole, encloses nothing. A closed piece holding an enterable
+solid's faces bounds that solid on all of its faces (`Tri::boundsSolid`, `Hit::boundsSolid`; on the
+device `DTri::bounds`, read through the triangle `closestHit<true>` reports, an instance's hit reporting
+none): the probe counts a face by its own material where that is enterable, else by its piece's solid,
+so a lamp deep in a pool, whose rays leave through the walls and floor, is in the water, and one under a
+wide pool's floor, whose rays enter through the floor, is not. An instance's material override is its
+faces' material, the asset's own piece no longer saying. The full pass, every piece and the
 solid boxes, is left to a footprint's batch. `Scene::buildEnclosures`, at build, asks it at a few points
 on each emitter's emitting side (a quad's centre and four inset corners, off its face along its
 normal; a sphere's six poles; five of a mesh's triangles; a tube's wall at three heights and its
@@ -6055,9 +6061,11 @@ as the one at fault.
   waiting for the pass whose settings it was saved under. Since 0.447.2 the section (`FTRCACH4`)
   opens with its own length and the size of a cell's record, so a build whose `RadCacheCell` is
   laid out otherwise passes it whole and still reads the sections after it (mode J's light-side
-  epochs). Each cell also keeps the solids around its point, where its update rays start
-  (`stkN`, found by Scene::eyeStack at its first update), for as long as the scene is the build
-  they were found in; a cell read from a checkpoint finds them again.
+  epochs); a version 1 or 3 section, which says neither, is checked to end where the next section
+  begins (`sectionsTail`, found from the file's end), else passed to it. The solids around each
+  cell's point, where its update rays start (`RadCacheStack`, found by Scene::eyeStack at the cell's
+  first update), are kept beside the cells, by slot, for as long as the scene is the build they were
+  found in: this process's, never checkpointed, and a read-hot cell stays its 0.447.0 size.
 
   **The table is checkpointed (0.190.3), sparsely and under its own guard.** It rides in the
   `.ftbuf` sidecar as a trailing section after the film blobs (`writeRadCacheSection` /
@@ -10940,8 +10948,8 @@ device versions do all the precision-critical math in `double` regardless of the
 
 | Connector (CPU / GPU) | Surface | Reflection point | Geometry factor `G` |
 |---|---|---|---|
-| `connectSpecularSphere` / `dConnectSpecularSphere` | smooth `dielectric` sphere, eye outside or inside, along each drawn chain of surface events (below) | 1-D root scan of a planar miss function + 40-step bisection, per chain (≤4 roots = multiple images) | ray differentials, `eps²/\|dA×dB\|` |
-| `connectSpecularSphereMirror` / `dConnectSpecularSphereMirror` | `mirror`/`halfmirror`/roughness-0 `glossy` **sphere** | same scan, one reflection instead of two refractions | same, re-expressed as an equivalent unfolded distance `D = 1/√G` so it shares one splat with the plane |
+| `connectSpecularSphere` / `dConnectSpecularSphere` | smooth `dielectric` sphere, eye outside or inside, along each drawn chain of surface events (below) | 1-D scan of a planar miss function + Illinois refinement, every chain at once (≤4 roots a chain = multiple images; `sphScanChains`) | ray differentials, `eps²/\|dA×dB\|` |
+| `connectSpecularSphereMirror` / `dConnectSpecularSphereMirror` | `mirror`/`halfmirror`/roughness-0 `glossy` **sphere** | the same scan, one chain: a reflection | same, re-expressed as an equivalent unfolded distance `D = 1/√G` so it shares one splat with the plane |
 | `connectSpecularPlane` / `dConnectSpecularPlane` | coplanar **mirror triangles** (a flat panel) | **unfolding** — no root solve at all | exactly `1/D²`, `D = \|p − eye′\|` |
 
 The sphere refracts as a walk's interface does (since 0.446.1): against the camera's solids (but
@@ -10961,38 +10969,71 @@ inside and refracts out. In a sphere every chord turns the ray about the centre 
 pi - 2 theta (theta its angle to the normal inside), so chain c's last leg is the first one turned c
 chords on, and its Fresnel product is R, then (1 - R)^2 R^(c-1), from outside (the reflectance inside
 is the outside one, by reciprocity) and (1 - R) R^c from inside (`fresnelSplit`). The scan evaluates
-every chain at each sample in that closed form (`sphBase2D`, a turn a chain: a few multiplies), in
-the chains' plane (`SphV2`); a chain's root is bisected and splatted at once, its chief ray and
-differentials followed chord by chord in space (`sphChainFrom`). Drawn: every chain to
-`kSphReflMax` (16) reflections whose product reaches `kSphChainFloor` (1e-4), so the deep chains
-count where they carry light -- by the rim, where R nears 1 at grazing and the angle inside nears
-the critical one, and for an eye inside near the critical angle -- and nowhere else (R^c falls with
-c, so a sample's chains stop at the first below the floor). An image fainter than `kSphChainSure`
-(0.02) is drawn by roulette, its probability its product over that, from a hash of the vertex,
-chain and angle (`sphRouletteU`: mode B's connections draw no RNG), so the deep chains' occlusion
-rays stay few. Two more things the rim needs, which the mirror sphere's connector shares: the scan
-takes one more sample just inside each end of the visible arc (`sphScan`), since the images between
-the last fixed sample and the silhouette are the brightest grazing ones; and the ray differentials
-step 1e-6 rather than 2e-4, a wider step mismeasuring the Jacobian where a ray's course turns fast
-with its direction (22 % at a tenth of a pixel from the rim). The scan brackets the miss of the last
-leg's whole line (a vertex close to the sphere lies ahead of the leg over too narrow a span to
-bracket), and asks of each root whether the vertex is ahead (`splat`, both connectors). A root is
-refined by the Illinois method on the chord between its two samples, normalised back onto the circle
-(`sphRoot`): no trigonometry, where forty bisection steps each took a cosine and a sine -- most of the
-connector's cost on the GPU, so mode B through a glass ball runs some 1.6 times as fast as before
-0.448.0 for all the chains it adds. And where three samples' misses share a sign but the middle one
-dips toward zero, the dip is searched (`sphDip`, golden section): by a caustic -- a ball's focus on
-a wall close behind it -- a vertex's two images come together within one step of the scan and change
-no sign, and those vertices, nearest the fold, are the ones whose images are brightest (G grows
-without bound there): a ball 5 cm from a glowing wall had read a dark ring of 0.36 at its fold. Before 0.448.0 only the refraction was
-drawn, so mode B read a glass ball's body some 10 % under mode R and its rim as little as a fifth,
-and an eye in a glass ball in `scenes/_camera_in_water.ftsl`'s room missed the halo the inner
-surface shows round the lamp (for an eye at the centre a rear-view mirror: the wall behind the eye,
-where the ball focuses the lamp into a spot twenty times the walls' brightness):
-`tools/check_ball_images.py`. A suppressed boundary (index 1, no reflection) leaves the straight
-chain alone above the floor. The wavelengths of a bundle that see the sphere with one index
-(`SphIndex::same`: all of them, through glass that does not disperse) share one geometry, the caller
-grouping them; each takes its own weight, absorption and fog.
+every chain at each sample in that closed form (`sphBase2D`, a turn a chain: a few multiplies, each
+chain's product carried from the last), in the chains' plane (`SphV2`); a chain's root is refined and
+splatted at once, its chief ray and differentials followed chord by chord in space (`sphChainFrom`).
+Drawn: every chain to `kSphReflMax` (16) reflections whose product reaches `kSphChainFloor` (1e-4), so
+the deep chains count where they carry light -- by the rim, where R nears 1 at grazing and the angle
+inside nears the critical one, and for an eye inside near the critical angle -- and nowhere else (R^c
+falls with c, so a sample's chains stop at the first below the floor). Deeper still, to `kSphDeepMax`
+(128) reflections, where R^17 of a ray's light remains (15 % at R 0.9: a ring by the critical angle,
+where mode R at 64 bounces read the edge of an off-centre inside eye's view half again as bright as at
+12), each vertex draws one chain (`sphDeepPick`): chain 17 + j with probability proportional to 0.97^j
+(a chain's light falls as R^j there), its images weighted by one over that. It is scanned in a slot of
+its own after the drawn chains, from the same closed form, its turns taken at once as a power of the
+chord's (`sphTurnPow`), so it costs a slot of the scan, not a scan. An image fainter than
+`kSphChainSure` (0.02) is drawn by roulette, its probability its product over that, from a hash of the
+vertex, chain and point (`sphRouletteU`: mode B's connections draw no RNG), so the deep chains'
+occlusion rays stay few. A frosted dielectric (a roughness above the walks' 1e-3, or a roughness map)
+is left out (`isSmoothDielectricMat`): a connection solved for a delta would draw it clear, and mode B
+leaves it black as it always documented.
+
+**The scan, shared by the glass and mirror spheres (`sphScanChains` / `dSphScanChains`).** The fixed
+samples of `sphScanTab`, but by each end of the arcs where rays from the eye reach the vertex's side a
+ladder of its own (`sphScanEnds`): the silhouette's end from outside, the critical angle's from inside
+(past it a ray is turned back for good, a sphere's chords keeping their angle -- from an eye off the
+centre a band of the view). Toward such an end a chain's leg swings as the square root of the distance
+to it, its cosine to the normal vanishing, so the brightest images there -- the grazing ones of a rim,
+and the folds, a caustic's two images within one fixed step -- lay between the fixed samples: an eye in a
+glass ball 0.8 of its radius off its centre read the edges of its view 0.87 of mode R, in bands where a
+chain's fold lay. Each ladder has `kSphLadder` (6) samples, the first 1e-5 inside the end and the j-th at
+L (j/6)^2 (L one fixed step, or half the arc where it is narrower): even in the root of the distance,
+where the miss is smooth again. It takes the place of the fixed samples within L of its end, and the
+fixed samples beyond the ends, which no ray of the chains meets (behind the silhouette, or where every
+ray is turned back), are skipped, so an eye inside off the centre scans fewer samples than before (81 of
+100 at 0.8 of the radius). A 2D model of the scan, against one of 10^5 samples, finds 99.99 % of the
+images' weight with the ladders and 97.6 % without (vertices at 3 radii). Each chain's miss is the
+signed distance of the vertex from the line of its last leg -- the line, so a vertex close to the sphere,
+ahead of the leg over too narrow a span, is still bracketed; a sign change between two valid samples
+brackets a root, refined by the Illinois method on the chord between them, normalised back onto the
+circle (`sphRoot`: no trigonometry, where forty bisection steps each took a cosine and a sine -- most
+of the connector's cost on the GPU). The connector asks of each root that the vertex lie ahead of the
+leg and that the leg pass through it (a bracket across a gap where the chain is missing closes on no
+root), and tests the cheap things -- the vertex's side toward the leg, the frame -- before the roulette,
+the differentials and the two rays. Where three samples' misses share a sign but the middle one dips
+toward zero enough (`sphDipNears`: the parabola through them comes half the way, on each sample's
+coordinate -- its angle, or along a ladder its even one, the end's angle plus sqrt(offset L)), the dip is searched
+(`sphDip`, golden section): by a caustic -- a ball's focus on a wall close behind it, a concave mirror
+seen from inside -- a vertex's two images come together within one step of the scan and change no sign,
+and those vertices, nearest the fold, are the ones whose images are brightest (G grows without bound
+there); on a chain fainter than `kSphChainSure` by roulette, its images weighted for it and kept
+whatever their own product (the image roulette as well would weight them (0.02/F)^2, 4·10^4 at the
+floor: fireflies). Images by a fold are unbiased but heavy-tailed -- G grows as one over the root of the
+vertex's distance from the caustic -- so a frame with one in view carries the odd bright pixel. The ray
+differentials step 1e-6 rather than 2e-4, a wider step mismeasuring the Jacobian where a ray's course
+turns fast with its direction (22 % at a tenth of a pixel from the rim). Mode B through a glass ball
+runs faster than before 0.448.0 for all the chains it adds (330 s on the GPU for 1e8 photons of
+check_ball_images' outside view, where 0.447.2 took 413; 69 s on the CPU for 4e7).
+
+Before 0.448.0 only the refraction was drawn, so mode B read a glass ball's body some 10 % under mode R
+and its rim as little as a fifth, and an eye in a glass ball in `scenes/_camera_in_water.ftsl`'s room
+missed the halo the inner surface shows round the lamp (for an eye at the centre a rear-view mirror:
+the wall behind the eye, where the ball focuses the lamp into a spot twenty times the walls'
+brightness); a ball 5 cm from a glowing wall read its fold's ring 0.82 of the walls without the dip
+search (0.36 at the ring's darkest pixel): `tools/check_ball_images.py`. A suppressed boundary (index 1,
+no reflection) leaves the straight chain alone above the floor. The wavelengths of a bundle that see
+the sphere with one index (`SphIndex::same`: all of them, through glass that does not disperse) share
+one geometry, the caller grouping them; each takes its own weight, absorption and fog.
 
 **Unfolding** is what makes the flat case closed-form. Mirroring the eye across the plane,
 `eye′ = eye − 2·(dot(n,eye) − d)·n`, turns the bent chain `p → R → eye` into the straight
@@ -11052,7 +11093,8 @@ caustic image chromatic.
 
 **Known limits** — all deliberate, all documented in `REFERENCE.md` and tracked in
 `known-issues.md`: ONE specular object per connection (a mirror inside a mirror is still
-black, and a glass sphere's chains stop at one reflection inside it); **pinhole only** (`lensMode` / `forwardCatch` return early, so `A`/`C` are
+black, and a glass sphere's chains stop at 16 reflections inside it, or where they fall below 1e-4);
+**pinhole only** (`lensMode` / `forwardCatch` return early, so `A`/`C` are
 unchanged); flat mirrors must be authored as world-space triangles (an instanced/BLAS
 mirror is not collected, and beyond `kMaxMirrorPlanes` the surplus planes are dropped);
 only a `halfmirror`'s *reflected* leg is built, so what lies behind a beamsplitter is still

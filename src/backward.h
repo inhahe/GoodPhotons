@@ -4256,19 +4256,19 @@ struct BackwardRenderer {
             // and scene build.
             MediumStack stk0;
             if (scene.anyEnterable) {
-                static_assert(RadCacheCell::kStkMax == Scene::kEnclosureMax, "a cell keeps any stack enclosureAt finds");
-                RadCacheCell& cw = rc.cell[slot];
+                static_assert(RadCacheStack::kMax == Scene::kEnclosureMax, "a cell keeps any stack enclosureAt finds");
+                RadCacheStack& cs = rc.stk[slot];
                 const uint64_t sceneNow = (scene.generation << 32) ^ scene.buildCount;
-                if (cw.stkN < 0 || cw.stkScene != sceneNow) {
+                if (cs.n < 0 || cs.scene != sceneNow) {
                     stk0 = scene.eyeStack(p + n * 1e-6);
-                    cw.stkN = (int8_t)stk0.n;
-                    cw.stkScene = sceneNow;
+                    cs.n = (int8_t)stk0.n;
+                    cs.scene = sceneNow;
                     for (int s = 0; s < stk0.n; ++s) {
-                        cw.stkMat[s] = stk0.matIdx[s];
-                        cw.stkPri[s] = stk0.pri[s];
+                        cs.mat[s] = stk0.matIdx[s];
+                        cs.pri[s] = stk0.pri[s];
                     }
                 } else {
-                    for (int s = 0; s < cw.stkN; ++s) stk0.push(cw.stkMat[s], cw.stkPri[s]);
+                    for (int s = 0; s < cs.n; ++s) stk0.push(cs.mat[s], cs.pri[s]);
                 }
             }
             for (int k = 0; k < nRays; ++k) {

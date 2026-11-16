@@ -17,6 +17,7 @@
 #pragma once
 #include <cstdint>
 #include <cstdlib>
+#include <cassert>
 #include <atomic>
 #include <algorithm>
 #include <complex>
@@ -688,15 +689,7 @@ struct CamTarget {
     Film*         film = nullptr;
 };
 
-// The specular-sphere connectors (connectSpecularSphere, connectSpecularSphereMirror) scan the SAME
-// kSphScanN+1 fixed entry angles on every call, and each scan step used to pay a
-// fresh cos+sin pair — the dominant transcendental cost of the mode-B glass-sphere
-// splat. The angles never change, so evaluate them once at first use, with the same
-// runtime std::cos/std::sin the scan itself called (NOT constant-folded — the loop
-// variable keeps the compiler honest), making table reads bit-identical to the
-// per-step evaluation they replace. Bisection refinement still computes live
-// cos/sin (its midpoints are data-dependent).
-// A 2-vector, for the glass-sphere chains' scan in the plane they lie in (Renderer::sphChainAt).
+// A 2-vector, for the sphere connectors' scan in the plane their paths lie in (Renderer::sphScanChains).
 struct SphV2 {
     double x, y;
     SphV2 operator+(const SphV2& o) const { return {x + o.x, y + o.y}; }
@@ -705,6 +698,10 @@ struct SphV2 {
 };
 inline double dot(const SphV2& a, const SphV2& b) { return a.x * b.x + a.y * b.y; }
 inline SphV2 normalize(const SphV2& a) { return a * (1.0 / std::sqrt(a.x * a.x + a.y * a.y)); }
+// The specular-sphere connectors (connectSpecularSphere, connectSpecularSphereMirror) scan the SAME
+// kSphScanN+1 fixed entry angles on every call, so their cosines and sines are evaluated once, at
+// first use, with the runtime std::cos/std::sin (NOT constant-folded -- the loop variable keeps the
+// compiler honest). The refinement between samples takes none (Renderer::sphRoot).
 inline constexpr int kSphScanN = 96;
 struct SphScanTab { double c[kSphScanN + 1], s[kSphScanN + 1]; };
 inline const SphScanTab& sphScanTab() {
@@ -2163,11 +2160,36 @@ struct Renderer {
     // and its Fresnel product is R, then (1 - R)^2 R^(c - 1), from outside, and (1 - R) R^c from inside.
     // Near the rim, and for an eye inside near the critical angle, R nears 1 and the deep chains carry
     // much of the light: every chain to kSphReflMax reflections whose product reaches kSphChainFloor is
-    // drawn, the ones fainter than kSphChainSure by roulette.
+    // drawn, the ones fainter than kSphChainSure by roulette. Deeper still, to kSphDeepMax reflections,
+    // where R^17 of a ray's light remains (15 % at R 0.9, a ring by the critical angle), a vertex draws one
+    // chain (sphDeepPick), weighted for the rest.
     static constexpr int kSphReflMax = 16;
     static constexpr int kSphChainsMax = kSphReflMax + 2;   // and the surface reflection
+    static constexpr int kSphScanSlots = kSphChainsMax + 1; // and the deep chain
+    static constexpr int kSphDeepMax = 128;
+    static constexpr double kSphDeepRho = 0.97;
     static constexpr double kSphChainFloor = 1e-4;
     static constexpr double kSphChainSure = 0.02;
+    // The deep chain a vertex draws, of the chains first..last (each a reflection more than the one
+    // before): first + j with probability (1 - rho) rho^j / (1 - rho^M), M of them, `u` in [0, 1) the
+    // vertex's own draw (a chain's light falls as R^j there, R the reflectance inside). `w`: 1 / that.
+    struct SphDeep { int c = 0; double w = 0.0; };
+    static SphDeep sphDeepPick(int first, int last, double u) {
+        const int M = last - first + 1;
+        if (M <= 0) return {};
+        const double norm = 1.0 - std::pow(kSphDeepRho, M);
+        const int j = std::clamp((int)std::floor(std::log(1.0 - u * norm) / std::log(kSphDeepRho)), 0, M - 1);
+        return {first + j, norm / ((1.0 - kSphDeepRho) * std::pow(kSphDeepRho, j))};
+    }
+    // (cd, sd)^k: k chords' turn at once, (cd, sd) one chord's (a unit vector), by squaring.
+    static SphV2 sphTurnPow(double cd, double sd, int k) {
+        SphV2 t{1.0, 0.0}, b{cd, sd};
+        for (; k > 0; k >>= 1) {
+            if (k & 1) t = SphV2{t.x * b.x - t.y * b.y, t.x * b.y + t.y * b.x};
+            b = SphV2{b.x * b.x - b.y * b.y, 2.0 * b.x * b.y};
+        }
+        return t;
+    }
 
     // The Fresnel reflectance at a surface between indices n1 (the ray's side) and n2, the ray's
     // cosines cosI and cosT (refracted) to the normal.
@@ -2216,13 +2238,7 @@ struct Renderer {
         b.sd = 2.0 * ct * cosI;
         return true;
     }
-    // Chain c's Fresnel product at a sample (above); 0 where it does not exist.
-    static double sphChainF(const SphBase2D& b, bool outside, int c) {
-        if (!outside) return (1.0 - b.R) * std::pow(b.R, c);
-        if (c == 0) return b.R;
-        return b.totalOut ? 0.0 : (1.0 - b.R) * (1.0 - b.R) * std::pow(b.R, c - 1);
-    }
-    // The number of internal reflections chain c takes, as sphChainAt counts them (-1: off the surface).
+    // The number of internal reflections chain c takes, as sphChainFrom counts them (-1: off the surface).
     static int sphChainRefl(bool outside, int c) { return outside ? c - 1 : c; }
 
     // A chain's course in space, in coordinates centred on S: `first`, where the ray first meets the
@@ -2306,14 +2322,11 @@ struct Renderer {
     // (a sphere of no higher priority than the medium around it, which the walks pass straight
     // through) it is that medium, optically: an index of 1, no reflection, that medium's absorption
     // across it. `insideMat`: whose absorption a leg inside S takes; `aroundMat`: the medium around S
-    // (-1: air).
+    // (-1: air). (A plain dielectric has no coat, so interfaceStep's opaque-coat exception never arises.)
     struct SphIndex {
         double n = 1.0;
         int insideMat = -1, aroundMat = -1;
-        bool suppressed = false;
-        bool same(const SphIndex& o) const {
-            return n == o.n && insideMat == o.insideMat && aroundMat == o.aroundMat && suppressed == o.suppressed;
-        }
+        bool same(const SphIndex& o) const { return n == o.n && insideMat == o.insideMat && aroundMat == o.aroundMat; }
     };
     static SphIndex sphereIndex(const Scene& scene, const Camera& cam, const Sphere& S, const Material& glass,
                                 double lambda) {
@@ -2323,36 +2336,141 @@ struct Renderer {
         int extMat = -1;
         bool ranked = false;
         ix.n = glass.ior(lambda) / exteriorIor(scene, glass, around, lambda, extMat, &ranked);
-        ix.suppressed = prioritySuppressible(glass, around, ranked) && !glass.coatOpaque(lambda);
-        if (ix.suppressed) ix.n = 1.0;
+        const bool suppressed = prioritySuppressible(glass, around, ranked);
+        if (suppressed) ix.n = 1.0;
         ix.aroundMat = around.topMat();
-        ix.insideMat = ix.suppressed ? ix.aroundMat : S.matId;
+        ix.insideMat = suppressed ? ix.aroundMat : S.matId;
         return ix;
     }
 
-    // The scan of a sphere connector: the fixed angles of sphScanTab, and for an eye outside one more
-    // just inside each end of the visible arc (`phiT`: the arc's half-width, 0 for none), where a rim's
-    // grazing images lie. `visit(c, s)`, the angle's cosine and sine, for each in order of angle.
-    template <class Visit>
-    static void sphScan(double phiT, const Visit& visit) {
+    // Where a sphere connector's scan samples by the ends of the arcs where rays from the eye reach the
+    // vertex's side: for an eye outside the silhouette's, for an eye inside the critical angle's (beyond it
+    // every ray is turned back for good, a sphere's chords keeping their angle). Toward such an end a
+    // chain's leg swings as the root of the distance to it (the leg's cosine to the normal vanishing), so
+    // there a fold -- two images within one fixed step, a caustic's -- lies unseen between sphScanTab's
+    // even samples. By each end a ladder of kSphLadder samples, the first 1e-5 inside it and the j-th at
+    // L (j / kSphLadder)^2 (L one fixed step, or half the arc where it is narrower), even in that root,
+    // takes the place of the fixed samples within L of it; the fixed ones beyond the ends (behind the
+    // silhouette, or where every ray is turned back) are skipped. In order of angle: `phi`, its (cos,
+    // sin), and `t`, the sample's coordinate for the dip test (sphDipNears): along a ladder the end's angle
+    // plus sqrt(offset L) inward, even. `skipLo`, `skipHi`: the fixed samples with |phi| between them are
+    // skipped. `r` the radius, `d` the eye's distance from the centre, `n` the index (1: none to cross).
+    static constexpr int kSphLadder = 6;
+    struct SphScanEnds {
+        int n = 0;
+        double phi[4 * kSphLadder] = {}, c[4 * kSphLadder] = {}, s[4 * kSphLadder] = {}, t[4 * kSphLadder] = {};
+        double skipLo = 4.0, skipHi = 4.0;                // (beyond pi: none skipped)
+    };
+    static SphScanEnds sphScanEnds(double r, double d, double n, bool outside) {
+        SphScanEnds e;
+        const double dl = 1e-5, h = 2.0 * PI / kSphScanN;
+        // The ladder by the end at angle E whose free side lies toward sgn, L its span, in order of angle.
+        const auto ladder = [&e, dl](double E, double sgn, double L) {
+            for (int k = 0; k < kSphLadder; ++k) {
+                const int j = sgn > 0.0 ? k : kSphLadder - 1 - k;
+                const double o = j == 0 ? dl : L * (double)(j * j) / (double)(kSphLadder * kSphLadder);
+                const double phi = E + sgn * o;
+                e.phi[e.n] = phi; e.t[e.n] = E + sgn * std::sqrt(o * L);
+                e.c[e.n] = std::cos(phi); e.s[e.n] = std::sin(phi); ++e.n;
+            }
+        };
+        if (outside) {
+            const double t = std::acos(std::min(1.0, r / d));
+            if (t > dl) {
+                const double L = std::min(h, t);
+                ladder(-t, 1.0, L); ladder(t, -1.0, L);
+                e.skipLo = t - L;
+            }
+            return e;
+        }
+        // From inside, the ray to the surface point at phi meets it at theta, n sin(theta) = 1 where
+        // n^2 d^2 sin^2(phi) = r^2 + d^2 - 2 r d cos(phi): total internal reflection for cos(phi) between
+        // the roots (r -+ q) / (n^2 d), the near arc |phi| < a and the far one |phi| > b free of it.
+        if (n <= 1.0 || n * d <= r) return e;
+        const double q = std::sqrt((n * n - 1.0) * (n * n * d * d - r * r));
+        const double a = std::acos(std::min(1.0, (r + q) / (n * n * d)));
+        const double b = std::acos(std::max(-1.0, (r - q) / (n * n * d)));
+        const bool nearArc = a > dl, farArc = b + dl < PI;
+        const double La = std::min(h, a), Lb = std::min(h, PI - b);
+        if (farArc) ladder(-b, -1.0, Lb);
+        if (nearArc) { ladder(-a, 1.0, La); ladder(a, -1.0, La); }
+        if (farArc) ladder(b, 1.0, Lb);
+        e.skipLo = nearArc ? a - La : -1.0;
+        e.skipHi = farArc ? b + Lb : 4.0;
+        return e;
+    }
+
+    // The scan of a sphere connector over nC chains: the fixed angles of sphScanTab (but those `ends`
+    // skips) and the ladders by the arcs' ends, in order of angle. At each, `eval(c1, s1, miss, valid, F)` gives
+    // each chain's miss of the vertex -- the signed distance of p from the line of its last leg: the
+    // line, so a vertex close to the sphere is bracketed, its side asked of the root -- whether the chain
+    // exists there, and its Fresnel product. A sign change between two samples where a chain is valid
+    // brackets a root, refined (sphRoot, by `missOf(c, c1, s1, valid)`) and handed to `root(c, u, w)`,
+    // which says whether it was an image (`w` its weight, beyond 1 for one a roulette found); at most 4 a
+    // chain. Where three samples' misses share a sign but the middle one dips toward zero enough
+    // (sphDipNears, on the samples' coordinates t), the dip is searched (sphDip): by a caustic -- a ball's focus on a wall close behind
+    // it -- a vertex's two images come together within one step and change no sign, and those nearest
+    // the fold are the brightest (G grows without bound there). On a chain fainter than kSphChainSure
+    // the search is made by roulette (`u01(c, u)`, deterministic), its images weighted for it.
+    template <class Eval, class Miss, class Root, class U01>
+    static void sphScanChains(int nC, const SphScanEnds& ends, const Eval& eval, const Miss& missOf,
+                              const Root& root, const U01& u01) {
+        assert(nC <= kSphScanSlots);
+        double prevMiss[kSphScanSlots] = {}, prev2Miss[kSphScanSlots] = {};
+        bool prevValid[kSphScanSlots] = {}, prev2Valid[kSphScanSlots] = {};
+        int found[kSphScanSlots] = {};
+        SphV2 prevU{1.0, 0.0}, prev2U{1.0, 0.0};
+        double prevT = 0.0, prev2T = 0.0;
+        double miss[kSphScanSlots] = {}, F[kSphScanSlots] = {};
+        bool valid[kSphScanSlots] = {};
+        const auto visit = [&](double c1, double s1, double t) {
+            eval(c1, s1, miss, valid, F);
+            const SphV2 u{c1, s1};
+            for (int c = 0; c < nC; ++c) {
+                const auto missC = [&](double cc1, double ss1, bool& vm) { return missOf(c, cc1, ss1, vm); };
+                if (valid[c] && prevValid[c] && found[c] < 4) {
+                    if ((miss[c] < 0.0) != (prevMiss[c] < 0.0)) {
+                        if (root(c, sphRoot(missC, prevU, prevMiss[c], u, miss[c]), 1.0)) ++found[c];
+                    } else if (prev2Valid[c] && (prev2Miss[c] < 0.0) == (miss[c] < 0.0) &&
+                               std::fabs(prevMiss[c]) < std::fabs(prev2Miss[c]) &&
+                               std::fabs(prevMiss[c]) < std::fabs(miss[c]) &&
+                               sphDipNears(prev2T, prevT, t, prev2Miss[c], prevMiss[c], miss[c])) {
+                        const double q = F[c] >= kSphChainSure ? 1.0 : F[c] / kSphChainSure;
+                        SphV2 ue; double fe;
+                        if ((q >= 1.0 || u01(c, prevU) < q) &&
+                            sphDip(missC, prev2U, u, miss[c] < 0.0 ? -1.0 : 1.0, ue, fe) && (fe < 0.0) != (miss[c] < 0.0)) {
+                            if (root(c, sphRoot(missC, prev2U, prev2Miss[c], ue, fe), 1.0 / q)) ++found[c];
+                            if (found[c] < 4 && root(c, sphRoot(missC, ue, fe, u, miss[c]), 1.0 / q)) ++found[c];
+                        }
+                    }
+                }
+                prev2Miss[c] = prevMiss[c]; prev2Valid[c] = prevValid[c];
+                prevMiss[c] = miss[c]; prevValid[c] = valid[c];
+            }
+            prev2U = prevU; prev2T = prevT;
+            prevU = u; prevT = t;
+        };
         const SphScanTab& T = sphScanTab();
-        const double e[2] = {-(phiT - 1e-5), phiT - 1e-5};
-        int next = phiT > 1e-5 ? 0 : 2;
+        int next = 0;
         for (int i = 0; i <= kSphScanN; ++i) {
             const double phi = -PI + (2.0 * PI) * i / kSphScanN;
-            while (next < 2 && e[next] <= phi) { visit(std::cos(e[next]), std::sin(e[next])); ++next; }
-            visit(T.c[i], T.s[i]);
+            while (next < ends.n && ends.phi[next] <= phi) { visit(ends.c[next], ends.s[next], ends.t[next]); ++next; }
+            if (std::fabs(phi) > ends.skipLo && std::fabs(phi) < ends.skipHi) continue;
+            visit(T.c[i], T.s[i], phi);
         }
+        while (next < ends.n) { visit(ends.c[next], ends.s[next], ends.t[next]); ++next; }
     }
 
     // The root of `miss(c, s, valid)` between two scan samples, ua and ub (unit vectors on the circle,
     // the miss fa and fb there, of opposite signs), refined by the Illinois method on the chord between
     // them: a point of the chord, normalised, is a point of the arc between, so it takes no
-    // trigonometry, and it converges in a few steps where bisection took forty. Its (cos, sin).
+    // trigonometry, and it converges in a few steps where bisection took forty. Its (cos, sin) -- the
+    // last valid step's, so a caller holds the root to its miss (a bracket across a gap where the miss
+    // is not valid closes on no root).
     template <class Miss>
     static SphV2 sphRoot(const Miss& miss, SphV2 ua, double fa, SphV2 ub, double fb) {
         int side = 0;
-        SphV2 u = normalize(ua + ub);                    // (where a step lands where the miss is not valid)
+        SphV2 u = normalize(ua + ub);                    // (where the first step lands where the miss is not valid)
         for (int it = 0; it < 40; ++it) {
             const SphV2 m = normalize(ua + (ub - ua) * (fa / (fa - fb)));
             bool v; const double fm = miss(m.x, m.y, v);
@@ -2367,13 +2485,18 @@ struct Renderer {
         return u;
     }
 
-    // Whether three samples' misses (m0, m1, m2: one sign, m1 nearest zero) dip toward zero enough to be
-    // searched: the parabola through them (the samples taken as evenly spaced) comes half the way. By a
-    // fold the miss is that parabola; elsewhere a dip far from zero is spared the search's 32 steps.
-    static bool sphDipNears(double m0, double m1, double m2) {
-        const double den = m0 - 2.0 * m1 + m2;
-        if (den == 0.0) return false;
-        const double ext = m1 - (m2 - m0) * (m2 - m0) / (8.0 * den);
+    // Whether three samples' misses (m0, m1, m2 at coordinates t0 < t1 < t2: one sign, m1 nearest zero)
+    // dip toward zero enough to be searched: the parabola through them comes half the way. By a fold the
+    // miss is that parabola in t (the angle, or along a ladder by an arc's end the root of the distance
+    // to it); elsewhere a dip far from zero is spared the search's 32 steps.
+    static bool sphDipNears(double t0, double t1, double t2, double m0, double m1, double m2) {
+        const double h0 = t1 - t0, h1 = t2 - t1;
+        if (!(h0 > 0.0) || !(h1 > 0.0)) return false;
+        const double d0 = (m1 - m0) / h0, d1 = (m2 - m1) / h1;
+        const double A = (d1 - d0) / (h0 + h1);           // m = m1 + B (t - t1) + A (t - t1)^2
+        if (A == 0.0) return false;
+        const double B = d0 + A * h0;
+        const double ext = m1 - B * B / (4.0 * A);
         return (m1 < 0.0 ? -ext : ext) < 0.5 * std::fabs(m1);
     }
     // Where `miss(c, s, valid)` comes nearest zero between ua and ub (unit vectors on the circle), its
@@ -2402,8 +2525,8 @@ struct Renderer {
     // drawn chain of smooth dielectric sphere S, at the nL wavelengths lam[] that see S alike (`ix`):
     // one geometry serves them all, each taking its own beta[], vt weight w[], absorption and fog.
     // Pinhole (mode B) only. A chain's images are the roots of a planar miss function -- the chain lies
-    // in plane(eye, p, centre) -- found by the scan and bisection; its geometry factor G = dOmega_eye /
-    // dA_p from ray differentials.
+    // in plane(eye, p, centre) -- found by sphScanChains; its geometry factor G = dOmega_eye / dA_p from
+    // ray differentials.
     void connectSpecularSphere(const Scene& scene, const Camera& cam, Film& film, const Sphere& S,
                                const SphIndex& ix, const Vec3& p, const SpecVtx& vt, const double* lam,
                                const double* beta, const double* w, int nL, Pcg32& rng) const {
@@ -2424,25 +2547,69 @@ struct Renderer {
         if (perpLen < 1e-9) { Vec3 tb; onb(ex, ey, tb); }
         else                ey = perp * (1.0 / perpLen);
         const SphV2 eye2{dot(eye - O, ex), dot(eye - O, ey)}, p2{dot(ap, ex), dot(ap, ey)};
-
         // (A suppressed boundary, index 1, reflects nothing: the floor leaves its straight chain alone.)
         const int nC = outside ? kSphChainsMax : kSphReflMax + 1;
+        const auto turn = [](SphV2& v, const SphBase2D& b) { v = SphV2{v.x * b.cd - v.y * b.sd, v.x * b.sd + v.y * b.cd}; };
+        // The deep chain, scanned in slot nC: of those past the drawn ones, to kSphDeepMax reflections.
+        const SphDeep deep = sphDeepPick(nC, outside ? kSphDeepMax + 1 : kSphDeepMax,
+                                         sphRouletteU(p, 2000, eye2.x, eye2.y));
+        const auto chainOf = [&](int c) { return c == nC ? deep.c : c; };
+        // Chain nC - 1's leg (Q, dir) and product f turned on to the deep chain, its k turns at once.
+        const auto deepen = [&](const SphBase2D& b, SphV2& Q, SphV2& dir, double& f) {
+            const int k = deep.c - (nC - 1);
+            f *= std::pow(b.R, k);
+            const SphV2 t = sphTurnPow(b.cd, b.sd, k);
+            Q = SphV2{Q.x * t.x - Q.y * t.y, Q.x * t.y + Q.y * t.x};
+            dir = SphV2{dir.x * t.x - dir.y * t.y, dir.x * t.y + dir.y * t.x};
+        };
 
-        // Chain c's miss of p at the surface point (c1, s1): the signed distance of p from the line of its
-        // last leg; `valid` where the chain exists and reaches the floor. The line, not the leg: a vertex
-        // close to the sphere is ahead of the leg over too narrow a span for the scan to bracket, so
-        // which side of the leg p lies is asked of the root instead (splat).
-        // Chain c's last leg in the plane, for the ray to the surface point (c1, s1): false where the
-        // chain does not exist or falls below the floor.
+        // Every chain at a sample, in closed form: the first leg turned a chord on for each next chain.
+        const auto eval = [&](double c1, double s1, double* miss, bool* valid, double* F) {
+            SphBase2D b;
+            valid[nC] = false; F[nC] = 0.0;                     // (the deep chain's slot)
+            if (!sphBase2D(eye2, r, n, outside, c1, s1, b)) {
+                for (int c = 0; c < nC; ++c) { valid[c] = false; F[c] = 0.0; }
+                return;
+            }
+            SphV2 Q = b.P, dir = b.dir0;
+            double f = 0.0;
+            for (int c = 0; c < nC; ++c) {
+                if (c > 0) { turn(Q, b); turn(dir, b); }
+                if (c == 0) f = outside ? b.R : 1.0 - b.R;
+                else if (outside && c == 1) f = b.totalOut ? 0.0 : (1.0 - b.R) * (1.0 - b.R);
+                else f *= b.R;
+                F[c] = f;
+                valid[c] = f >= kSphChainFloor;
+                if (valid[c]) { const SphV2 q = p2 - Q; miss[c] = dir.x * q.y - dir.y * q.x; }
+                else if (c > 0) {                               // the deeper chains are fainter still (R^c)
+                    for (int cc = c + 1; cc < nC; ++cc) { valid[cc] = false; F[cc] = 0.0; }
+                    return;
+                }
+            }
+            if (deep.w > 0.0) {
+                deepen(b, Q, dir, f);
+                F[nC] = f;
+                valid[nC] = f >= kSphChainFloor;
+                if (valid[nC]) { const SphV2 q = p2 - Q; miss[nC] = dir.x * q.y - dir.y * q.x; }
+            }
+        };
+        // Chain c's last leg in the plane at the surface point (c1, s1): false where it does not exist or
+        // falls below the floor. The deep chain (c beyond the drawn ones) is turned on as eval turns it.
         const auto legOf = [&](int c, double c1, double s1, SphV2& Q, SphV2& dir) -> bool {
             SphBase2D b;
-            if (!sphBase2D(eye2, r, n, outside, c1, s1, b) || sphChainF(b, outside, c) < kSphChainFloor) return false;
+            if (!sphBase2D(eye2, r, n, outside, c1, s1, b)) return false;
+            double f = outside ? b.R : 1.0 - b.R;
             Q = b.P; dir = b.dir0;
-            for (int k = 0; k < c; ++k) {
-                Q = SphV2{Q.x * b.cd - Q.y * b.sd, Q.x * b.sd + Q.y * b.cd};
-                dir = SphV2{dir.x * b.cd - dir.y * b.sd, dir.x * b.sd + dir.y * b.cd};
+            for (int k = 1; k <= std::min(c, nC - 1); ++k) {
+                turn(Q, b); turn(dir, b);
+                f = (outside && k == 1) ? (b.totalOut ? 0.0 : (1.0 - b.R) * (1.0 - b.R)) : f * b.R;
             }
-            return true;
+            if (c >= nC) {                                   // (only deep.c lies beyond)
+                assert(c == deep.c);
+                if (f < kSphChainFloor) return false;
+                deepen(b, Q, dir, f);
+            }
+            return f >= kSphChainFloor;
         };
         const auto missOf = [&](int c, double c1, double s1, bool& valid) -> double {
             SphV2 Q, dir;
@@ -2452,20 +2619,37 @@ struct Renderer {
             return dir.x * q.y - dir.y * q.x;
         };
 
-        // One image: chain c's chief ray to the surface point u (cos, sin), its differentials, the splat.
-        // False where u is no image (its last leg's line passes p behind it).
-        const auto splat = [&](int c, const SphV2& u) -> bool {
-            SphV2 Q2, dir2;                                     // behind p, in the plane: no image
-            if (!legOf(c, u.x, u.y, Q2, dir2) || dot(p2 - Q2, dir2) <= 0.0) return false;
+        // One image: chain c's chief ray to the surface point u (cos, sin), its differentials, the splat,
+        // `w0` the weight of the scan's roulette that found it (a faint chain's dip; 1 if none), `wPick`
+        // the deep chain's pick weight (1 for a drawn chain). False where u is no image: the leg's line
+        // passes p behind it, or the refinement closed on no root.
+        const auto image = [&](int c, const SphV2& u, double w0, double wPick) -> bool {
+            SphV2 Q2, dir2;
+            if (!legOf(c, u.x, u.y, Q2, dir2)) return false;
+            const SphV2 q2 = p2 - Q2;
+            if (dot(q2, dir2) <= 0.0) return false;             // p must be on the forward side
+            if (std::fabs(dir2.x * q2.y - dir2.y * q2.x) > 1e-6 * (r + std::sqrt(dot(q2, q2)))) return false;
             const int refl = sphChainRefl(outside, c);
             const Vec3 P1chief = O + ex * (r * u.x) + ey * (r * u.y);
             const Vec3 d0 = normalize(P1chief - eye);
             SphChain ch;
             if (!sphChainFrom(eye - O, d0, r, n, outside, refl, ch) || ch.F <= 0.0) return false;
-            if (dot(ap - ch.last, ch.dir) <= 0.0) return false;    // p must be on the forward side
-            // The faint images by roulette, before their differentials and visibility.
+            if (dot(ap - ch.last, ch.dir) <= 0.0) return false;    // (in space too)
+            const Vec3 last = O + ch.last, first = O + ch.first;
+            Vec3 wP = last - p; const double dP = length(wP);
+            if (dP < 1e-9) return true;
+            wP = wP * (1.0 / dP);
+            // The cheap tests first: the vertex's side toward the leg (which no wavelength changes) and the
+            // frame, before the roulette, the differentials and the two rays.
+            if (vt.shape(wP) < 0.0) return true;
+            int px, py; double cosCam, dist2e;
+            if (!cam.project(P1chief, px, py, cosCam, dist2e)) return true;
+            const double omega = cam.pixelSolidAngle(cosCam);
+            if (omega <= 0.0) return true;
+            // The faint images by roulette, before their differentials and visibility -- but not one a
+            // roulette already found (two of them would weight it (kSphChainSure / F)^2: fireflies).
             double keep = 1.0;
-            if (ch.F < kSphChainSure) {
+            if (ch.F < kSphChainSure && w0 == 1.0) {
                 keep = ch.F / kSphChainSure;
                 if (sphRouletteU(p, c, u.x, u.y) >= keep) return true;
             }
@@ -2489,21 +2673,11 @@ struct Renderer {
             double ax, ay, bx, by;
             planeOff(rA, ax, ay); planeOff(rB, bx, by);
             const double jac = std::fabs(ax * by - ay * bx);
-            if (jac < 2.5e-17 * eps * eps) return true;              // caustic singularity guard (G over 4e16)
+            if (jac < 2.5e-17 * eps * eps) return true;         // caustic singularity guard (G over 4e16)
             const double G = (eps * eps) / jac;
-
-            int px, py; double cosCam, dist2e;
-            if (!cam.project(P1chief, px, py, cosCam, dist2e)) return true;
-            const double omega = cam.pixelSolidAngle(cosCam);
-            if (omega <= 0.0) return true;
-
-            const Vec3 last = O + ch.last, first = O + ch.first;
-            Vec3 wP = last - p; const double dP = length(wP);
-            if (dP < 1e-9) return true;
-            wP = wP * (1.0 / dP);
             // An eye inside S sees the radiance outside it n^2 times over (the radiance theorem:
             // n^2 L is what a ray keeps across the interface), as a camera walk refracting out reads it.
-            const double geom = G * ch.F / keep / omega * (outside ? 1.0 : n * n);
+            const double geom = G * ch.F * w0 * wPick / keep / omega * (outside ? 1.0 : n * n);
 
             // Visibility: the leg from p, and from outside the eye's leg (an inside eye's is in the
             // glass), each stopping just short of the sphere's own surface.
@@ -2515,10 +2689,8 @@ struct Renderer {
             }
             for (int j = 0; j < nL; ++j) {
                 SpecVtx vj = vt; vj.weight = w[j]; vj.lambda = lam[j];
-                const double term = vj.term(wP);
-                if (term < 0.0) return true;                         // camera side behind the surface
-                double contrib = beta[j] * term * geom;
-                if (contrib <= 0.0) continue;
+                double contrib = beta[j] * vj.term(wP) * geom;
+                if (!(contrib > 0.0)) continue;
                 contrib *= legAbsorption(scene, ix.insideMat, ch.inner, lam[j]);   // Beer-Lambert inside S
                 if (outside) {
                     // The two outer legs, in the camera's medium (fog, and its solid's absorption).
@@ -2534,65 +2706,12 @@ struct Renderer {
             }
             return true;
         };
-
-        // The scan, every chain at once: a sign change of a chain's miss between two samples where it
-        // is valid brackets a root, refined and, where it is an image, splatted at once (at most 4 a
-        // chain). And where three samples' misses share a sign but the middle one dips toward zero,
-        // the dip is searched: a caustic brings a vertex's two images together, and both within one
-        // step of the scan change no sign (a vertex near a ball's focus: by a wall close behind it, a
-        // dark ring of a fifth of the light).
-        double prevMiss[kSphChainsMax] = {}, prev2Miss[kSphChainsMax] = {};
-        SphV2 prevU{1.0, 0.0}, prev2U{1.0, 0.0};
-        bool prevValid[kSphChainsMax] = {}, prev2Valid[kSphChainsMax] = {};
-        int found[kSphChainsMax] = {};
-        const double phiT = outside ? std::acos(std::min(1.0, r / dEyeO)) : 0.0;
-        sphScan(phiT, [&](double c1, double s1) {
-            SphBase2D b;
-            const bool any = sphBase2D(eye2, r, n, outside, c1, s1, b);
-            SphV2 Q = b.P, dir = b.dir0;
-            double F = 0.0;                                     // chain c's Fresnel product (sphChainF)
-            for (int c = 0; c < nC; ++c) {
-                if (c > 0) {                                    // chain c: the previous one a chord on
-                    Q = SphV2{Q.x * b.cd - Q.y * b.sd, Q.x * b.sd + Q.y * b.cd};
-                    dir = SphV2{dir.x * b.cd - dir.y * b.sd, dir.x * b.sd + dir.y * b.cd};
-                }
-                if (!any) F = 0.0;
-                else if (c == 0) F = outside ? b.R : 1.0 - b.R;
-                else if (outside && c == 1) F = b.totalOut ? 0.0 : (1.0 - b.R) * (1.0 - b.R);
-                else F *= b.R;
-                bool v = false;
-                double mss = 0.0;
-                if (F >= kSphChainFloor) {
-                    const SphV2 q = p2 - Q;
-                    v = true;
-                    mss = dir.x * q.y - dir.y * q.x;
-                } else if (c > 0) {
-                    // The deeper chains are fainter still at this sample (R^c falls with c).
-                    for (int cc = c; cc < nC; ++cc) prevValid[cc] = prev2Valid[cc] = false;
-                    break;
-                }
-                const SphV2 u{c1, s1};
-                const auto missC = [&](double cc1, double ss1, bool& vm) { return missOf(c, cc1, ss1, vm); };
-                if (v && prevValid[c] && found[c] < 4) {
-                    if ((mss < 0.0) != (prevMiss[c] < 0.0)) {
-                        if (splat(c, sphRoot(missC, prevU, prevMiss[c], u, mss))) ++found[c];
-                    } else if (prev2Valid[c] && F >= kSphChainSure && (prev2Miss[c] < 0.0) == (mss < 0.0) &&
-                               std::fabs(prevMiss[c]) < std::fabs(prev2Miss[c]) &&
-                               std::fabs(prevMiss[c]) < std::fabs(mss) &&
-                               sphDipNears(prev2Miss[c], prevMiss[c], mss)) {
-                        SphV2 ue; double fe;
-                        if (sphDip(missC, prev2U, u, mss < 0.0 ? -1.0 : 1.0, ue, fe) && (fe < 0.0) != (mss < 0.0)) {
-                            if (splat(c, sphRoot(missC, prev2U, prev2Miss[c], ue, fe))) ++found[c];
-                            if (found[c] < 4 && splat(c, sphRoot(missC, ue, fe, u, mss))) ++found[c];
-                        }
-                    }
-                }
-                prev2Miss[c] = prevMiss[c]; prev2Valid[c] = prevValid[c];
-                prevMiss[c] = mss; prevValid[c] = v;
-            }
-            prev2U = prevU;
-            prevU = SphV2{c1, s1};
-        });
+        sphScanChains(deep.w > 0.0 ? nC + 1 : nC, sphScanEnds(r, dEyeO, n, outside), eval,
+                      [&](int c, double c1, double s1, bool& v) { return missOf(chainOf(c), c1, s1, v); },
+                      [&](int c, const SphV2& u, double w0) {
+                          return c == nC ? image(deep.c, u, w0, deep.w) : image(c, u, w0, 1.0);
+                      },
+                      [&](int c, const SphV2& u) { return sphRouletteU(p, chainOf(c) + 1000, u.x, u.y); });
     }
 
     // ===================================================================
@@ -2790,41 +2909,33 @@ struct Renderer {
             return doutx * (py2 - P1y) - douty * (px2 - P1x);
         };
 
-        // Scan the circle (and, from outside, the rim's ends: sphScan); bisect sign changes into
-        // chief reflection angles.
-        SphV2 roots[8]; int nroot = 0;                    // (the line's roots: an image's and those behind)
-        double prevMiss = 0.0; SphV2 prevU{1.0, 0.0}; bool prevValid = false;
-        sphScan(outside ? std::acos(std::min(1.0, r / dEyeO)) : 0.0, [&](double c1, double s1) {
-            bool v; const double mss = trace2D(c1, s1, v);
-            if (nroot < 8 && v && prevValid && ((mss < 0.0) != (prevMiss < 0.0)))
-                roots[nroot++] = sphRoot(trace2D, prevU, prevMiss, SphV2{c1, s1}, mss);
-            prevMiss = mss; prevValid = v; prevU = SphV2{c1, s1};
-        });
-
-        for (int ri = 0; ri < nroot; ++ri) {
-            const Vec3 P1chief = O + ex * (r * roots[ri].x) + ey * (r * roots[ri].y);
-            // Everything below is pure and RNG-free, so the tests are ordered cheapest
-            // first — an off-frame or backfacing connection rejects before paying for
-            // the two extra differential reflections, and the BVH queries come last,
-            // any-hit before closest-hit.
-            int px, py; double cosCam, dist2e;
-            if (!cam.project(P1chief, px, py, cosCam, dist2e)) continue;
-            const double omega = cam.pixelSolidAngle(cosCam);
-            if (omega <= 0.0) continue;
-
+        // One image, at the surface point u (cos, sin): false where it is none (the reflection's line
+        // passes p behind it, or the refinement closed on no root). Everything below is pure and
+        // RNG-free, so the tests are ordered cheapest first -- an off-frame or backfacing connection
+        // rejects before paying for the two extra differential reflections, and the BVH queries come
+        // last, any-hit before closest-hit.
+        const auto image = [&](int, const SphV2& u, double) -> bool {
+            bool v; const double m = trace2D(u.x, u.y, v);
+            if (!v) return false;
+            const Vec3 P1chief = O + ex * (r * u.x) + ey * (r * u.y);
             const Vec3 d0 = normalize(P1chief - eye);
             SphereRefl ch;
-            if (!reflectOffSphere(eye, d0, S, ch)) continue;
-            if (dot(p - ch.P1, ch.exitDir) <= 0.0) continue;  // p must be on the forward side
+            if (!reflectOffSphere(eye, d0, S, ch)) return false;
+            if (dot(p - ch.P1, ch.exitDir) <= 0.0) return false;   // p must be on the forward side
+            if (std::fabs(m) > 1e-6 * (r + length(p - ch.P1))) return false;
+            int px, py; double cosCam, dist2e;
+            if (!cam.project(P1chief, px, py, cosCam, dist2e)) return true;
+            const double omega = cam.pixelSolidAngle(cosCam);
+            if (omega <= 0.0) return true;
 
             Vec3 wP = ch.P1 - p; const double dP = length(wP);
-            if (dP < 1e-9) continue;
+            if (dP < 1e-9) return true;
             wP = wP * (1.0 / dP);
             const double shape = vt.shape(wP);
-            if (shape < 0.0) continue;
+            if (shape < 0.0) return true;
 
             Vec3 toEye = eye - ch.P1; const double dE = length(toEye);
-            if (dE < 1e-9) continue;
+            if (dE < 1e-9) return true;
             const Vec3 wRE = toEye * (1.0 / dE);
 
             // Ray-differential geometry factor G = dOmega_eye / dA_perp at p (eps small, as the glass
@@ -2832,8 +2943,8 @@ struct Renderer {
             Vec3 a1, a2; onb(d0, a1, a2);
             const double eps = 1e-6;
             SphereRefl rA, rB;
-            if (!reflectOffSphere(eye, normalize(d0 + a1 * eps), S, rA)) continue;
-            if (!reflectOffSphere(eye, normalize(d0 + a2 * eps), S, rB)) continue;
+            if (!reflectOffSphere(eye, normalize(d0 + a1 * eps), S, rA)) return true;
+            if (!reflectOffSphere(eye, normalize(d0 + a2 * eps), S, rB)) return true;
             Vec3 e1, e2; onb(ch.exitDir, e1, e2);
             auto planeOff = [&](const SphereRefl& Rf, double& ox, double& oy) {
                 double den = dot(Rf.exitDir, ch.exitDir);
@@ -2845,20 +2956,30 @@ struct Renderer {
             double ax, ay, bx, by;
             planeOff(rA, ax, ay); planeOff(rB, bx, by);
             const double jac = std::fabs(ax * by - ay * bx);
-            if (jac < 2.5e-17 * eps * eps) continue;      // caustic singularity guard (G over 4e16)
+            if (jac < 2.5e-17 * eps * eps) return true;   // caustic singularity guard (G over 4e16)
             // The same G the flat mirror gets in closed form as 1/D^2; expressed here as
             // an equivalent unfolded distance so both connectors share one splat.
             const double G = (eps * eps) / jac;
             const double D = 1.0 / std::sqrt(G);
 
-            if (scene.occluded(p + wP * 1e-6, wP, dP - 2e-6)) continue;
+            if (scene.occluded(p + wP * 1e-6, wP, dP - 2e-6)) return true;
             Hit hm;
-            if (!mirrorSeenAt(scene, eye, -wRE, dE, hm)) continue;
+            if (!mirrorSeenAt(scene, eye, -wRE, dE, hm)) return true;
 
             splatMirrorLegs(scene, film, scene.mats[hm.matId], hm, px, py, omega,
                             p, wP, dP, ch.P1, wRE, dE, D, shape, lam, beta, w, nUp, cam.medium(), rng,
                             vt.glossy, vt.coat);
-        }
+            return true;
+        };
+        // One chain (the reflection), scanned as the glass sphere's are: the rim's ends from outside, the
+        // dips a concave mirror's caustic makes from inside.
+        sphScanChains(1, sphScanEnds(r, dEyeO, 1.0, outside),
+                      [&](double c1, double s1, double* miss, bool* valid, double* F) {
+                          miss[0] = trace2D(c1, s1, valid[0]);
+                          F[0] = 1.0;
+                      },
+                      [&](int, double c1, double s1, bool& v) { return trace2D(c1, s1, v); }, image,
+                      [](int, const SphV2&) { return 0.0; });
     }
 
     // Splat vertex p to every camera through every smooth dielectric sphere (the

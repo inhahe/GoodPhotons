@@ -355,15 +355,19 @@ struct RadCacheCell {
     double   vTail  = 0.0;          // sum of what those paths' traced tails actually delivered
     double   vTail2 = 0.0;          // ...and of their squares, for the ratio's standard error
     uint32_t vN     = 0;            // validation paths scored against this cell
-    // The solids around the point (Scene::eyeStack), where its update rays start: found at its first
-    // update and kept while the scene is the one they were found in (`stkScene`, of Scene::generation
-    // and buildCount). stkN -1 until found, and for a cell read from a checkpoint.
-    static constexpr int kStkMax = 8;   // Scene::kEnclosureMax, the most enclosureAt finds (backward.h)
-    int8_t   stkN = -1;
-    uint64_t stkScene = 0;
-    int32_t  stkMat[kStkMax] = {}, stkPri[kStkMax] = {};
     Vec3 point()  const { return Vec3{px, py, pz}; }
     Vec3 normal() const { return Vec3{(double)nx, (double)ny, (double)nz}; }
+};
+
+// The solids around a cell's point (Scene::eyeStack), where its update rays start: found at the cell's
+// first update and kept while the scene is the build they were found in (`scene`, of Scene::generation
+// and buildCount); `n` -1 until then. Beside the cell rather than in it: it is this process's, so it is
+// never checkpointed, and a read-hot cell stays its size.
+struct RadCacheStack {
+    static constexpr int kMax = 8;   // Scene::kEnclosureMax, the most enclosureAt finds (backward.h)
+    int8_t   n = -1;
+    uint64_t scene = 0;
+    int32_t  mat[kMax] = {}, pri[kMax] = {};
 };
 
 // Per-cell scratch for one round: the round's samples, kept out of the cell so every ray of a
@@ -552,6 +556,7 @@ struct RadianceCache {
     std::vector<uint64_t>        key;
     std::vector<RadCacheCell>    cell;
     std::vector<RadCacheScratch> scratch;
+    std::vector<RadCacheStack>   stk;      // by slot, as `cell`
     // Slots marked recently enough to still be in play, split into the two service tiers the
     // budget is spent on in order (see the two-tier note above). Rebuilt by mergeMarks().
     std::vector<uint32_t> live;
@@ -666,6 +671,7 @@ struct RadianceCache {
         key.assign(cap, kEmpty);
         cell.assign(cap, RadCacheCell{});
         scratch.assign(cap, RadCacheScratch{});
+        stk.assign(cap, RadCacheStack{});
         live.clear();
         work.clear();
         refine.clear();
@@ -916,6 +922,7 @@ struct RadianceCache {
         key[i] = m.key;
         RadCacheCell& c = cell[i];
         c = RadCacheCell{};
+        stk[i] = RadCacheStack{};
         c.px = m.p.x; c.py = m.p.y; c.pz = m.p.z;
         c.nx = (float)m.n.x; c.ny = (float)m.n.y; c.nz = (float)m.n.z;
         c.lastMark = pass;
@@ -940,7 +947,7 @@ struct RadianceCache {
             ++used;
             key[slot]     = k;
             cell[slot]    = c;
-            cell[slot].stkN = -1;   // its stack is the writing process's scene's
+            stk[slot]     = RadCacheStack{};
             scratch[slot] = RadCacheScratch{};
             return true;
         }
@@ -954,7 +961,7 @@ struct RadianceCache {
                 if (key[i] == kEmpty) ++used;
                 key[i]     = k;
                 cell[i]    = c;
-                cell[i].stkN = -1;                // its stack is the writing process's scene's
+                stk[i]     = RadCacheStack{};
                 scratch[i] = RadCacheScratch{};   // a round's scratch is never checkpointed
                 return true;
             }

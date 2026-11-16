@@ -8597,11 +8597,14 @@ private:
     // The words a boolean property takes.
     static bool isOnWord(const std::string& s) { return s == "on" || s == "true" || s == "yes" || s == "1"; }
     static bool isOffWord(const std::string& s) { return s == "off" || s == "false" || s == "no" || s == "0"; }
-    // A boolean property `key`: on / true / yes / 1, or off / false / no / 0; `out` keeps its value where
-    // the block does not set it. False, after a reported failure, for any other word.
+    // A boolean property `key`: on / true / yes / 1, or off / false / no / 0, or the key alone for on (as
+    // `closed` and a rainbow's `secondary` take it); `out` keeps its value where the block does not set
+    // it. False, after a reported failure, for any other word or value.
     bool onOffOf(const Block& b, const char* key, bool& out) {
-        if (!find(b, key)) return true;
-        const std::string g = strOf(b, key, "off");
+        const Stmt* st = find(b, key);
+        if (!st) return true;
+        if (st->val.words.empty() && !st->val.block && !st->val.array) { out = true; return true; }
+        const std::string g = strOf(b, key, "");
         if (isOnWord(g)) { out = true; return true; }
         if (isOffWord(g)) { out = false; return true; }
         fail(std::string(key) + " takes on or off (got '" + g + "')");

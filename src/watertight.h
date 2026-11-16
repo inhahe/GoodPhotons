@@ -137,9 +137,12 @@ inline Report checkTris(const Tri* tris, size_t n) {
 // the piece's faces 1 (normals out: from behind is leaving), a negative one 2 (normals in, as a
 // room's may be: from behind is entering). Every other face is 0. Returns how many were marked.
 // `boxes`, when given, gets each closed piece's bounds (lo, hi) and the material of one of its faces,
-// so a caller can tell where solids lie without looking at every face.
+// so a caller can tell where solids lie without looking at every face; `pieceOf`, each face's closed
+// piece (a number shared by its faces), -1 for a face of none.
 struct PieceBox { Vec3 lo, hi; int matId = 0; };
-inline size_t markSolidFaces(Tri* const* tris, size_t n, std::vector<PieceBox>* boxes = nullptr) {
+inline size_t markSolidFaces(Tri* const* tris, size_t n, std::vector<PieceBox>* boxes = nullptr,
+                             std::vector<int>* pieceOf = nullptr) {
+    if (pieceOf) pieceOf->assign(n, -1);
     if (n == 0) return 0;
     Vec3 lo = tris[0]->v0, hi = tris[0]->v0;
     for (size_t i = 0; i < n; ++i)
@@ -269,6 +272,7 @@ inline size_t markSolidFaces(Tri* const* tris, size_t n, std::vector<PieceBox>* 
         const unsigned char s = (bad[(size_t)piece] || flat) ? 0 : (v > 0.0 ? 1 : 2);
         tris[i]->solidFace = s;
         marked += s ? 1 : 0;
+        if (pieceOf && s) (*pieceOf)[i] = piece;
         if (boxes && s && boxOf[(size_t)piece] < 0) {
             boxOf[(size_t)piece] = (int)boxes->size();
             boxes->push_back(PieceBox{plo[(size_t)piece], phi[(size_t)piece], tris[i]->matId});
@@ -277,10 +281,11 @@ inline size_t markSolidFaces(Tri* const* tris, size_t n, std::vector<PieceBox>* 
     return marked;
 }
 // The same over a contiguous run.
-inline size_t markSolidFaces(Tri* tris, size_t n, std::vector<PieceBox>* boxes = nullptr) {
+inline size_t markSolidFaces(Tri* tris, size_t n, std::vector<PieceBox>* boxes = nullptr,
+                             std::vector<int>* pieceOf = nullptr) {
     std::vector<Tri*> p(n);
     for (size_t i = 0; i < n; ++i) p[i] = tris + i;
-    return markSolidFaces(p.data(), n, boxes);
+    return markSolidFaces(p.data(), n, boxes, pieceOf);
 }
 
 } // namespace watertight

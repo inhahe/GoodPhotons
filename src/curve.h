@@ -341,6 +341,7 @@ inline bool intersectCurveSeg(const CurveRay& cr, const Ray& r, const CurveSeg& 
     hit.ng = ng;
     hit.back = !(dot(r.d, ng) < 0.0);
     hit.solid = 0;
+    hit.boundsSolid = -1;
     hit.n  = hit.back ? -ng : ng;
 
     // `u` runs along the strand (0 at the root, 1 at the tip) and `v` around the

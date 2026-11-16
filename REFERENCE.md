@@ -1539,8 +1539,9 @@ grouped into planes, and analytic spheres, are collected — an instanced/BLAS m
 not, and at most 64 distinct mirror planes are, largest-area first), **frosted** glass
 (a rough dielectric: no longer a delta, so it needs a real estimator), the **transmitted** side
 of a `halfmirror` (only its reflected leg is built, so whatever is behind a beamsplitter
-stays black), and **more than one specular vertex** in a row — a mirror seen *inside*
-another mirror, or glass in front of a mirror. Fog *inside* a dielectric shell is the
+stays black), and **more than one specular object** in a row — a mirror seen *inside*
+another mirror, or glass in front of a mirror (a glass sphere's own reflections inside it are drawn,
+to 128 of them). Fog *inside* a dielectric shell is the
 same kind of gap. For any of those use `P`, `D`, `R`, or the photon-map family.
 
 The connections are **pinhole-only**: `A` (finite lens) and `C` (forward catch) return

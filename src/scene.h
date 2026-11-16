@@ -589,6 +589,13 @@ inline bool isSmoothCoatMat(const Material& m) {
     return m.type == MatType::Layered && m.roughness <= 0.0 && m.roughnessTex < 0 && m.roughnessPat < 0 &&
            m.recBindingFor(REC_SLOT_ROUGHNESS) == nullptr;
 }
+// A dielectric the glass-sphere connection images (render.h connectSpecularSphere): smooth, with nothing
+// to frost it anywhere -- the walks jitter a dielectric's lobes above a roughness of 1e-3 (interfaceStep),
+// and a connection solved for a delta would draw frosted glass clear.
+inline bool isSmoothDielectricMat(const Material& m) {
+    return m.type == MatType::Dielectric && m.roughness <= 1e-3 && m.roughnessTex < 0 && m.roughnessPat < 0 &&
+           m.recBindingFor(REC_SLOT_ROUGHNESS) == nullptr;
+}
 // A material whose body a walk goes inside, onto its MediumStack (render.h interfaceStep): a
 // dielectric, or a thin film or multilayer whose substrate lets light through at some wavelength (one
 // opaque at every wavelength reflects or absorbs, and is never entered; Material::bodyClear, which
@@ -3899,7 +3906,8 @@ struct Scene {
 
     // Index lists over `spheres` for the per-vertex specular camera connections
     // (render.h camSpecularSplatAllVtxN): which spheres are smooth dielectrics (the
-    // refracted image of a vertex) and which are mirrors (the reflected image).
+    // images of a vertex through and in them, isSmoothDielectricMat) and which are
+    // mirrors (the reflected image).
     // Rebuilt together with the mirror planes, so they follow the same staleness
     // policy. Ascending, so iterating them visits spheres in exactly the order the
     // plain 0..nSph scans they replace did — film accumulation order is unchanged.
@@ -3923,7 +3931,7 @@ struct Scene {
         for (int i = 0; i < (int)spheres.size(); ++i) {
             const int m = spheres[i].matId;
             if (m < 0 || m >= (int)mats.size()) continue;
-            if (mats[m].type == MatType::Dielectric) dielSphereIdx.push_back(i);
+            if (isSmoothDielectricMat(mats[m]))      dielSphereIdx.push_back(i);
             if (mirrorConnectsMat(mats[m]))          mirrorSphereIdx.push_back(i);
         }
         mirrorPlanes.clear();
@@ -4664,6 +4672,27 @@ struct Scene {
         // Each closed piece's bounds, for the boxes below: per asset, in its own frame, and in the world.
         std::vector<std::vector<watertight::PieceBox>> blasPieces(blasList.size());
         std::vector<watertight::PieceBox> worldPieces;
+        // A closed piece holding an enterable solid's faces bounds that solid on all its faces
+        // (Tri::boundsSolid): a pool's walls under a water surface of one quad bound the water too.
+        // `faceAt(i)` the i-th face of the call that filled `pieceOf`.
+        std::vector<int> pieceOf;
+        std::unordered_map<int, int> pieceSolid;
+        const auto bound = [&](const auto& faceAt, size_t nf) {
+            pieceSolid.clear();
+            for (size_t i = 0; i < nf; ++i) {
+                Tri& t = faceAt(i);
+                t.boundsSolid = -1;
+                const int sid = solidOf(t.matId);
+                if (pieceOf[i] >= 0 && sid >= 0) pieceSolid.emplace(pieceOf[i], sid);
+            }
+            if (pieceSolid.empty()) return;
+            for (size_t i = 0; i < nf; ++i) {
+                if (pieceOf[i] < 0) continue;
+                const auto it = pieceSolid.find(pieceOf[i]);
+                if (it != pieceSolid.end()) faceAt(i).boundsSolid = it->second;
+            }
+        };
+        for (Tri& t : tris) t.boundsSolid = -1;   // (an asset's are its own, set where it is marked)
         for (const MeshGroup& g : meshGroups) {
             if (g.shapeOnly) continue;
             if (g.blasId >= 0 && g.blasId < (int)blasList.size()) {
@@ -4672,13 +4701,15 @@ struct Scene {
                 if (enclosuresOnly && !placedEnterable[(size_t)g.blasId] && !holdsEnterable(tr.data(), tr.size()))
                     continue;
                 done[(size_t)g.blasId] = 1;
-                sm.solid += watertight::markSolidFaces(tr.data(), tr.size(), &blasPieces[(size_t)g.blasId]);
+                sm.solid += watertight::markSolidFaces(tr.data(), tr.size(), &blasPieces[(size_t)g.blasId], &pieceOf);
+                bound([&](size_t i) -> Tri& { return tr[i]; }, tr.size());
                 sm.seen += tr.size();
             } else if (g.triStart + g.triCount <= tris.size()) {
                 std::fill(held.begin() + (std::ptrdiff_t)g.triStart,
                           held.begin() + (std::ptrdiff_t)(g.triStart + g.triCount), (char)1);
                 if (enclosuresOnly && !holdsEnterable(tris.data() + g.triStart, g.triCount)) continue;
-                sm.solid += watertight::markSolidFaces(tris.data() + g.triStart, g.triCount, &worldPieces);
+                sm.solid += watertight::markSolidFaces(tris.data() + g.triStart, g.triCount, &worldPieces, &pieceOf);
+                bound([&](size_t i) -> Tri& { return tris[g.triStart + i]; }, g.triCount);
                 sm.seen += g.triCount;
             }
         }
@@ -4694,13 +4725,15 @@ struct Scene {
         }
         size_t openSolid = 0;   // an enterable solid's faces left open by their own pool
         for (auto& [sid, pool] : looseBySolid) {
-            sm.solid += watertight::markSolidFaces(pool.data(), pool.size(), &worldPieces);
+            sm.solid += watertight::markSolidFaces(pool.data(), pool.size(), &worldPieces, &pieceOf);
+            bound([&](size_t i) -> Tri& { return *pool[i]; }, pool.size());
             sm.seen += pool.size();
             for (Tri* t : pool)
                 if (!t->solidFace) { rest.push_back(t); ++openSolid; }
         }
         if (!enclosuresOnly || openSolid) {
-            sm.solid += watertight::markSolidFaces(rest.data(), rest.size(), &worldPieces);
+            sm.solid += watertight::markSolidFaces(rest.data(), rest.size(), &worldPieces, &pieceOf);
+            bound([&](size_t i) -> Tri& { return *rest[i]; }, rest.size());
             sm.seen += rest.size() - openSolid;
         }
         // An isosurface bounds a closed solid unless an `open` expression's surface may end at its
@@ -4793,7 +4826,9 @@ struct Scene {
                 const Hit h = closestHit(r, eps, nullptr, false, false, DBL_MAX, /*skipCurves=*/true);
                 if (!h.valid) { left = true; break; }
                 tAcc += h.t;
-                const int si = (h.matId >= 0 && (size_t)h.matId < encSolidOf.size()) ? encSolidOf[(size_t)h.matId] : -1;
+                // The face's own material's solid, else the one its closed piece bounds (a pool's wall).
+                int si = (h.matId >= 0 && (size_t)h.matId < encSolidOf.size()) ? encSolidOf[(size_t)h.matId] : -1;
+                if (si < 0) si = h.boundsSolid;
                 if (si >= 0 && h.solid != 0) {
                     const bool behind = dot(kDirs[k], h.ng) > 0.0;
                     int at = -1;
@@ -5421,7 +5456,7 @@ struct Scene {
         // anisotropic scale changes the two principal curvatures by DIFFERENT amounts, so
         // no single scalar can be right and this is documented as an approximation.
         lh.curv *= inst.curvScale;
-        if (inst.matOverride >= 0) lh.matId = inst.matOverride;
+        if (inst.matOverride >= 0) { lh.matId = inst.matOverride; lh.boundsSolid = -1; }
         else if (inst.route >= 0 && mats && lh.matId >= 0) {
             const int to = mats[lh.matId].routeTo[inst.route];
             if (to >= 0) lh.matId = to;

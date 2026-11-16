@@ -21,7 +21,9 @@ check reads those lines:
     one just under that box (a ray leaving it at its bottom enters it again at its far side);
   * a lamp in a box of water whose bottom shares its edges with another quad starts in the water (a
     solid's faces are a closed piece of their own), as does one in water whose surface, one quad, is
-    closed by white walls (a solid's faces that close nothing alone are pooled with the rest);
+    closed by white walls (a solid's faces that close nothing alone are pooled with the rest), near its
+    surface and deep down by its floor (the walls bound the water as its surface does), and one just
+    under a wide shallow pool's floor does not;
   * a lamp in a glass ball made as an isosurface starts inside it (build()'s marking sets an
     isosurface's side);
   * a two-sided lamp lying on a glass slab is reported for its back face, born inside the glass, and
@@ -136,6 +138,16 @@ CASES = {
                  'quad { origin -1 0.2 -1  u 0 1 0  v 2 0 0  material white }',
                  'quad { origin -1 0.2 1  u 2 0 0  v 0 1 0  material white }']) + NL + LAMP % "-0.05 1.1 -0.05",
         [], {r"\[light\] light 0 \([^)]*\) is born inside 'water'": True}),
+    "pool_deep": (
+        # The same pool, the lamp near its floor: the rays that leave it leave through its walls and floor,
+        # which bound the water as its surface does.
+        NL.join(['quad { origin -1 0.2 -1  u 2 0 0  v 0 0 2  material white }', 'quad { origin -1 1.2 -1  u 0 0 2  v 2 0 0  material water }', 'quad { origin -1 0.2 -1  u 0 0 2  v 0 1 0  material white }', 'quad { origin 1 0.2 -1  u 0 1 0  v 0 0 2  material white }', 'quad { origin -1 0.2 -1  u 0 1 0  v 2 0 0  material white }', 'quad { origin -1 0.2 1  u 2 0 0  v 0 1 0  material white }']) + NL + LAMP % "-0.05 0.45 -0.05",
+        [], {r"\[light\] light 0 \([^)]*\) is born inside 'water'": True}),
+    "under_wide_pool": (
+        # A wide shallow pool, the lamp just under its floor, outside the water: the rays enter the water
+        # through the floor and leave it through the surface.
+        NL.join(['quad { origin -10 0.5 -10  u 20 0 0  v 0 0 20  material white }', 'quad { origin -10 0.9 -10  u 0 0 20  v 20 0 0  material water }', 'quad { origin -10 0.5 -10  u 0 0 20  v 0 0.4 0  material white }', 'quad { origin 10 0.5 -10  u 0 0.4 0  v 0 0 20  material white }', 'quad { origin -10 0.5 -10  u 0 0.4 0  v 20 0 0  material white }', 'quad { origin -10 0.5 10  u 20 0 0  v 0 0.4 0  material white }']) + NL + LAMP % "-0.05 0.35 -0.05",
+        [], {r"\[light\] light 0 \([^)]*\) is born inside": False}),
     "back_face_on_glass": (
         # A two-sided lamp lying on a glass slab, facing up: its front face's births start in air, its
         # back face's inside the glass, which the report says of the back face alone.

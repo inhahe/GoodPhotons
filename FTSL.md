@@ -1359,8 +1359,8 @@ mesh (or box of quads) that closes a solid (which have an inside), on a material
 faces tell which way a ray goes), and on a layer of a `mix` or `layered` material (which face a ray
 meets is settled before the compound picks its layer). With `glow_only on` it is a glow seen from both
 sides. A `light area`'s `two_sided on` is the same, and is refused on any other kind of light. Both
-take `on` or `off` (or true/false, yes/no, 1/0), as `glow_only`, `hide_camera` and a tube's `caps`
-do: any other word is an error.
+take `on` or `off` (or true/false, yes/no, 1/0), or the key alone for on, as `glow_only`,
+`hide_camera`, a tube's `caps` and a medium's `rayleigh` do: any other word is an error.
 
 ```
 material "sign" { type diffuse  reflect 0.05  emit blackbody 3200  emit_two_sided on }
@@ -2913,8 +2913,9 @@ medium { sigma_a <spec>  sigma_s <spec>  g 0 }     # spectral form
 - `sigma_t` + `albedo` splits into scattering/absorption; or give spectral
   `sigma_a`/`sigma_s` directly (per authored-unit length; converted to 1/metre).
 - `g` is the Henyey-Greenstein anisotropy; `rayleigh true` (or `on`) gives a λ⁻⁴ scattering
-  tilt (blue-sky falloff). It takes on or off (true/false, yes/no, 1/0); any other word is an
-  error (before 0.447.2 anything but `true` or `1`, `on` included, was silently off).
+  tilt (blue-sky falloff). It takes on or off (true/false, yes/no, 1/0), or `rayleigh` alone for on;
+  any other word is an error (before 0.447.2 anything but `true` or `1`, `on` included, was
+  silently off, and before 0.448.1 so was the key alone).
 - `beam_blur <frac>` (since 0.309.0) sets **this medium's** mode-`M` beam-kernel half-width
   as a fraction of its own measured mean free path, overriding the global `-beamblur` for
   it alone. A soft haze that cannot show detail can take a kernel several times wider than

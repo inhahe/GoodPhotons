@@ -127,6 +127,10 @@ struct Tri {
     // closed solids enclose a light or camera: Scene::enclosureAt) and for a footprint's batch, whose
     // probes read it too.
     unsigned char solidFace = 0;
+    // The solid a walk can be inside (Scene::encSolidOf) whose closed piece this face is part of, or -1:
+    // a face of another material closing it -- a pool's wall under a water surface of one quad -- bounds
+    // it as its own faces do (Scene::markSolidFaces, for Scene::enclosureAt).
+    int boundsSolid = -1;
     // triReach of the vertices, baked here for the hit to copy (Hit::pscale).
     double reach = 0.0;
     // The light it is part of (Hit::emitter), or -1. Last: triangles are built positionally
@@ -321,6 +325,9 @@ struct Hit {
     // says nothing of inside and out (an open quad, a curve, an isosurface that may end at its
     // container: Implicit::solidSide). Every intersector writes it (the record is reused).
     signed char solid = 0;
+    // Tri::boundsSolid: the enterable solid a face of another material bounds, or -1 (every
+    // intersector writes it).
+    int boundsSolid = -1;
     // The surface's material lets light cross it (Material::patOwnSide), so its patterns see
     // its own side, ng's: their normal and curvature turned there when `back`, its cavity
     // probed about ng (patCtxFromHit). Decided once, by Scene::markPatSide at the closest-hit
@@ -707,6 +714,7 @@ inline bool intersectTri(const TriShear& sh, const Ray& r, const Tri& tri,
     hit.n = flipped ? -ns : ns;
     hit.back = flipped;
     hit.solid = tri.solidFace == 1 ? 1 : tri.solidFace == 2 ? -1 : 0;
+    hit.boundsSolid = tri.boundsSolid;
     hit.tangent = tri.tangent;             // per-triangle tangent (constant across the face)
     // For tangent-space normal mapping (C6): the frame is built about the normal on ng's side,
     // and the triangle's sign is taken about its winding (Tri::finalize).
@@ -769,6 +777,7 @@ inline bool intersectSphere(const Ray& r, const Sphere& s, double tmin, Hit& hit
     hit.n = sFlipped ? -ng : ng;
     hit.back = sFlipped;
     hit.solid = 1;
+    hit.boundsSolid = -1;
     // Analytic mean curvature of a sphere: 1/R everywhere, negated when seen from
     // inside (a room-sized sphere is concave to anything standing in it).
     hit.curv = (s.r > 1e-12) ? ((sFlipped ? -1.0 : 1.0) / s.r) : 0.0;

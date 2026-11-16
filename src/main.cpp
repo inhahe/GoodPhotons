@@ -18333,6 +18333,7 @@ static bool writeRadCacheSection(std::ostream& o) {
 // was, for the sections that may follow (readLightEpochSection); with one, after it, whether
 // `adopt` (this render's -radcache) took the table or not. Every count the file gives is held
 // to the bytes left in it before anything is sized from it.
+static std::streampos sectionsTail(std::istream& in);
 static void readRadCacheSection(std::istream& in, bool adopt = true) {
     if (adopt) g_pendingRadCache.clear();
     if (!g_radCache) adopt = false;
@@ -18342,16 +18343,19 @@ static void readRadCacheSection(std::istream& in, bool adopt = true) {
     const bool v4 = in && std::memcmp(tag, kRadCacheTag4, 8) == 0;
     const bool v3 = v4 || (in && std::memcmp(tag, kRadCacheTag3, 8) == 0);   // slots, cursors, batch
     if (!in || (!v3 && std::memcmp(tag, kRadCacheTag, 8) != 0)) { in.clear(); in.seekg(at); return; }
+    // A section of ours this build cannot read -- truncated, or before FTRCACH4 written with its cells
+    // laid out otherwise (they then misparse) -- is passed to the sections after it.
+    const auto skipSection = [&in]() { const std::streampos t = sectionsTail(in); in.clear(); in.seekg(t); };
     if (v4) {   // a table of cells laid out otherwise is passed whole
         uint64_t bytes = 0;
         uint32_t record = 0;
         in.read((char*)&bytes, 8);
         const std::streampos body = in.tellg();
         in.read((char*)&record, 4);
-        if (!in || body < 0) { in.clear(); in.seekg(at); return; }
+        if (!in || body < 0) { skipSection(); return; }
         in.seekg(0, std::ios::end);
         const std::streampos fileEnd = in.tellg();
-        if (fileEnd < body || bytes > (uint64_t)(fileEnd - body)) { in.clear(); in.seekg(at); return; }
+        if (fileEnd < body || bytes > (uint64_t)(fileEnd - body)) { skipSection(); return; }
         if (record != sizeof(RadCacheCell)) { in.clear(); in.seekg(body + (std::streamoff)bytes); return; }
         in.seekg(body + (std::streamoff)4);
     }
@@ -18372,7 +18376,7 @@ static void readRadCacheSection(std::istream& in, bool adopt = true) {
         return end > here ? (uint64_t)(end - here) : 0;
     };
     const uint64_t cellBytes = (v3 ? 16 : 8) + sizeof(RadCacheCell);
-    if (!in || n > left() / cellBytes) { in.clear(); in.seekg(at); return; }
+    if (!in || n > left() / cellBytes) { skipSection(); return; }
     PendingRadCache p;
     if (!adopt) {
         in.seekg((std::streamoff)(n * cellBytes), std::ios::cur);
@@ -18395,7 +18399,7 @@ static void readRadCacheSection(std::istream& in, bool adopt = true) {
         in.read((char*)tally, sizeof tally);
         in.read((char*)audit, sizeof audit);
         const uint64_t room = left();
-        if (!in || nm > room / 56 || nv > (room - nm * 56) / 24) { in.clear(); in.seekg(at); return; }
+        if (!in || nm > room / 56 || nv > (room - nm * 56) / 24) { skipSection(); return; }
         if (!adopt) {
             in.seekg((std::streamoff)(nm * 56 + nv * 24), std::ios::cur);
         } else {
@@ -18418,8 +18422,15 @@ static void readRadCacheSection(std::istream& in, bool adopt = true) {
             b.auditCache = audit[0]; b.auditTrace = audit[1]; b.auditTrace2 = audit[2];
         }
     }
-    if (!in) { in.clear(); in.seekg(at); return; }
+    if (!in) { skipSection(); return; }
     in.clear();
+    // Where a section without its own length ends is where the next begins: else it misparsed.
+    if (!v4) {
+        const std::streampos here = in.tellg(), tail = sectionsTail(in);
+        in.clear();
+        in.seekg(tail);
+        if (here != tail) return;
+    }
     if (!adopt) return;
     p.have = true; p.guard = guard; p.pass = pass;
     p.nSample = ctr[0]; p.nEvicted = ctr[1]; p.nTerm = ctr[2];
@@ -18436,6 +18447,32 @@ static void readRadCacheSection(std::istream& in, bool adopt = true) {
 // section, and only when non-zero, so every other sidecar is unchanged; older builds stop reading
 // before it.
 static constexpr char kLightEpochTag[8] = {'F','T','L','S','E','P','O','1'};
+// Where the sections after a radiance-cache section begin, found from the file's end: the light-epoch
+// section if one sits just before the version trailer, else the trailer (or the end, without one).
+static std::streampos sectionsTail(std::istream& in) {
+    in.clear();
+    in.seekg(0, std::ios::end);
+    const std::streamoff size = in.tellg();
+    std::streamoff tail = size < 0 ? 0 : size;
+    if (size >= 12) {
+        char vt[8] = {0};
+        uint32_t n = 0;
+        in.seekg(size - 8);
+        in.read(vt, 8);
+        in.seekg(size - 12);
+        in.read((char*)&n, 4);
+        if (in && std::memcmp(vt, kVersionTag, 8) == 0 && (std::streamoff)n + 12 <= size) tail = size - 12 - n;
+    }
+    in.clear();
+    if (tail >= 16) {
+        char et[8] = {0};
+        in.seekg(tail - 16);
+        in.read(et, 8);
+        if (in && std::memcmp(et, kLightEpochTag, 8) == 0) tail -= 16;
+    }
+    in.clear();
+    return tail;
+}
 static void writeLightEpochSection(std::ostream& o, long long epochs) {
     if (epochs <= 0) return;
     o.write(kLightEpochTag, 8);
