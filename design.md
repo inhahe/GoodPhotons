@@ -10940,7 +10940,7 @@ device versions do all the precision-critical math in `double` regardless of the
 
 | Connector (CPU / GPU) | Surface | Reflection point | Geometry factor `G` |
 |---|---|---|---|
-| `connectSpecularSphere`(`Inside`) / `dConnectSpecularSphere` | smooth `dielectric` sphere, eye outside or inside | 1-D root scan of a planar miss function + 40-step bisection (≤4 roots = multiple refracted images) | ray differentials, `eps²/\|dA×dB\|` |
+| `connectSpecularSphere` / `dConnectSpecularSphere` | smooth `dielectric` sphere, eye outside or inside, along each drawn chain of surface events (below) | 1-D root scan of a planar miss function + 40-step bisection, per chain (≤4 roots = multiple images) | ray differentials, `eps²/\|dA×dB\|` |
 | `connectSpecularSphereMirror` / `dConnectSpecularSphereMirror` | `mirror`/`halfmirror`/roughness-0 `glossy` **sphere** | same scan, one reflection instead of two refractions | same, re-expressed as an equivalent unfolded distance `D = 1/√G` so it shares one splat with the plane |
 | `connectSpecularPlane` / `dConnectSpecularPlane` | coplanar **mirror triangles** (a flat panel) | **unfolding** — no root solve at all | exactly `1/D²`, `D = \|p − eye′\|` |
 
@@ -10949,9 +10949,50 @@ the sphere, for an eye inside it) where the priority rule ranks them (`exteriorI
 `n` is the sphere's index over that, and where the rule suppresses its boundary (a sphere of no
 higher priority than the medium around it, which the walks pass straight through: one predicate,
 `Renderer::prioritySuppressible` / `dPrioritySuppressible`, decides it for both) it is that
-medium, optically: an index of 1, no reflection, that medium's absorption across it; and an eye inside sees the radiance outside `n²` times over
-(the radiance theorem), as a camera walk refracting out of it reads it. It reads only the one refraction out, so the light a
-camera walk finds reflecting inside the sphere before it leaves is mode B's other paths' to find.
+medium, optically: an index of 1, no reflection, that medium's absorption across it (`sphereIndex` /
+`dSphereIndex`); and an eye inside sees the radiance outside `n²` times over (the radiance theorem),
+as a camera walk refracting out of it reads it.
+
+**The chains (since 0.448.0, BALL-EYE-HALO).** A ray from the eye that meets the sphere goes on, by
+the Fresnel split at each surface, along several courses, each an image of what lies outside along
+its last leg. A chain is one: from an eye outside, chain 0 reflects off the surface and chain 1 + k
+refracts in, reflects k times inside and refracts out; from an eye inside, chain k reflects k times
+inside and refracts out. In a sphere every chord turns the ray about the centre by one angle,
+pi - 2 theta (theta its angle to the normal inside), so chain c's last leg is the first one turned c
+chords on, and its Fresnel product is R, then (1 - R)^2 R^(c-1), from outside (the reflectance inside
+is the outside one, by reciprocity) and (1 - R) R^c from inside (`fresnelSplit`). The scan evaluates
+every chain at each sample in that closed form (`sphBase2D`, a turn a chain: a few multiplies), in
+the chains' plane (`SphV2`); a chain's root is bisected and splatted at once, its chief ray and
+differentials followed chord by chord in space (`sphChainFrom`). Drawn: every chain to
+`kSphReflMax` (16) reflections whose product reaches `kSphChainFloor` (1e-4), so the deep chains
+count where they carry light -- by the rim, where R nears 1 at grazing and the angle inside nears
+the critical one, and for an eye inside near the critical angle -- and nowhere else (R^c falls with
+c, so a sample's chains stop at the first below the floor). An image fainter than `kSphChainSure`
+(0.02) is drawn by roulette, its probability its product over that, from a hash of the vertex,
+chain and angle (`sphRouletteU`: mode B's connections draw no RNG), so the deep chains' occlusion
+rays stay few. Two more things the rim needs, which the mirror sphere's connector shares: the scan
+takes one more sample just inside each end of the visible arc (`sphScan`), since the images between
+the last fixed sample and the silhouette are the brightest grazing ones; and the ray differentials
+step 1e-6 rather than 2e-4, a wider step mismeasuring the Jacobian where a ray's course turns fast
+with its direction (22 % at a tenth of a pixel from the rim). The scan brackets the miss of the last
+leg's whole line (a vertex close to the sphere lies ahead of the leg over too narrow a span to
+bracket), and asks of each root whether the vertex is ahead (`splat`, both connectors). A root is
+refined by the Illinois method on the chord between its two samples, normalised back onto the circle
+(`sphRoot`): no trigonometry, where forty bisection steps each took a cosine and a sine -- most of the
+connector's cost on the GPU, so mode B through a glass ball runs some 1.6 times as fast as before
+0.448.0 for all the chains it adds. And where three samples' misses share a sign but the middle one
+dips toward zero, the dip is searched (`sphDip`, golden section): by a caustic -- a ball's focus on
+a wall close behind it -- a vertex's two images come together within one step of the scan and change
+no sign, and those vertices, nearest the fold, are the ones whose images are brightest (G grows
+without bound there): a ball 5 cm from a glowing wall had read a dark ring of 0.36 at its fold. Before 0.448.0 only the refraction was
+drawn, so mode B read a glass ball's body some 10 % under mode R and its rim as little as a fifth,
+and an eye in a glass ball in `scenes/_camera_in_water.ftsl`'s room missed the halo the inner
+surface shows round the lamp (for an eye at the centre a rear-view mirror: the wall behind the eye,
+where the ball focuses the lamp into a spot twenty times the walls' brightness):
+`tools/check_ball_images.py`. A suppressed boundary (index 1, no reflection) leaves the straight
+chain alone above the floor. The wavelengths of a bundle that see the sphere with one index
+(`SphIndex::same`: all of them, through glass that does not disperse) share one geometry, the caller
+grouping them; each takes its own weight, absorption and fog.
 
 **Unfolding** is what makes the flat case closed-form. Mirroring the eye across the plane,
 `eye′ = eye − 2·(dot(n,eye) − d)·n`, turns the bent chain `p → R → eye` into the straight
@@ -11004,17 +11045,14 @@ walks reflect off its shading normal, is imaged flat (NMAP-MIRROR-FLAT: no close
 **Hero bundles.** A mirror is achromatic, so ONE geometry solve serves the whole live-λ
 bundle and only the reflectance varies per λ — hence `camSpecularSplatAllVtxN`
 (`…AllVtx` is now a 1-λ wrapper over it) and the split of `SpecVtx::term()` into a
-λ-independent `shape()` plus the per-λ weight. A dielectric sphere is dispersive and
-**cannot** share geometry: each λ traces its own refracted image, which is exactly what
-makes a glass-orb caustic image chromatic. Its loop nesting (λ → sphere → camera) was
-preserved verbatim through the refactor, and `term()` was left byte-identical rather than
-being expressed through `shape()` (`w*(cos/π) ≠ (w/π)*cos` in floating point), so every
-pre-existing image is bit-for-bit unchanged (verified against a baseline binary built from
-the previous commit, CPU and GPU).
+λ-independent `shape()` plus the per-λ weight. A dielectric sphere disperses where its
+index varies with λ: only the wavelengths that see one index share a geometry (the chains
+above), each other one tracing its own images, which is exactly what makes a glass-orb
+caustic image chromatic.
 
 **Known limits** — all deliberate, all documented in `REFERENCE.md` and tracked in
-`known-issues.md`: ONE specular vertex per connection (a mirror inside a mirror is still
-black); **pinhole only** (`lensMode` / `forwardCatch` return early, so `A`/`C` are
+`known-issues.md`: ONE specular object per connection (a mirror inside a mirror is still
+black, and a glass sphere's chains stop at one reflection inside it); **pinhole only** (`lensMode` / `forwardCatch` return early, so `A`/`C` are
 unchanged); flat mirrors must be authored as world-space triangles (an instanced/BLAS
 mirror is not collected, and beyond `kMaxMirrorPlanes` the surplus planes are dropped);
 only a `halfmirror`'s *reflected* leg is built, so what lies behind a beamsplitter is still

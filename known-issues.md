@@ -72,7 +72,36 @@ closed entries, where the cost is a broken historical link rather than a blocked
 Three references — `scenes/_gr_fly0.ftsl`, `scenes/silver_sphere_xenon.ftsl`, `scenes/x.ftsl` —
 name files that no longer exist at all, all in closed entries.
 
-## OPEN (2026-11-15): BALL-EYE-HALO — mode B misses the halo the ball's focusing throws round a lamp seen from inside it
+## OPEN (2026-11-16): MODEB-SPHERE-ROOM — mode B reads the lamp-lit room some 1 % over mode R where a sphere shows it
+
+check_ball_images' lit room (the camera_in_water room in air, a lamp, a glass or mirror ball 5 cm from
+the back wall): every image the spheres make reads about 1 % over mode R at 8192 spp and 65536 alike
+-- the glass ball's body 1.013, the mirror ball's 1.009, the walls seen from the glass ball's centre
+1.012 -- while the room seen directly agrees (0.999-1.009 between seeds), mode D agrees with mode R and
+mode U reads between (1.004, 1.006). Not the connectors: in a furnace (every wall glowing alike) mode
+B's glass ball reads its walls to 0.1-1 %, and with only the wall behind the ball glowing, where mode R
+is exact, both connectors meet mode R to 0.1 %. The walls seen directly, the camera just in front of
+the ball, agree to 0.02 % in modes R, D and B with the ball's caustics and without the ball
+(`scraps/_caustic_walls.py`). And the walls seen from the ball's centre read 1.0125 of mode R in mode
+B but 1.038 and 1.039 in modes M and S: the modes part by 1-4 % on a lamp-lit room seen out of a small
+glass ball, and which is right is not settled -- mode D shares mode R's camera paths and shadow rays
+through glass (no light-tracing strategy connects through it), so it cannot arbitrate. To narrow: the
+same view in a room whose lamp is replaced by a glowing wall of the same light (where mode R is exact
+and modes B, M and S must meet it), then the lamp back in with each mode's light-side strategy alone.
+
+## OPEN (2026-11-16): GPU-SPHERE-CONNECT-SLOW — GPU mode B through a glass sphere is slower than the CPU
+
+Mode B's glass-sphere connection runs in each photon thread, in double precision, a scan of 99 samples
+a vertex and a root's refinement and three chains in space for each image: on this machine's GPU
+(fp64 at a small fraction of fp32) a ball's furnace ran some 306 thousand photons a second where 16
+CPU threads ran 417 thousand. 0.448.0 made it some 1.6 times as fast as before (the refinement no
+longer takes a cosine and a sine a step) while drawing every chain, but the device still loses to the
+host. The proper fix is the wavefront shape the camera side already has: queue each vertex's sphere
+connections and run them in a kernel of their own, coherent (one thread a vertex and chain), its scan
+in fp32 where the miss's precision allows and fp64 only to refine. Until then mode B with large glass
+spheres in view renders faster with `-device cpu`.
+
+## DONE (2026-11-16, 0.448.0): BALL-EYE-HALO — mode B misses the halo the ball's focusing throws round a lamp seen from inside it
 
 Found checking REVIEW-0445B's glass-sphere connection. The eye at the centre of a small glass ball
 (radius 0.15, `ior 1.5`) in `scenes/_camera_in_water.ftsl`'s room: every ray that reaches the eye
@@ -117,6 +146,28 @@ is the halo. The fix is a feature: the sphere's reflected images in the connecti
 outside, the external reflection (connectSpecularSphereMirror's solve with Fresnel's reflectance) and
 the path entering, reflecting once inside and leaving; for an eye inside, the inner reflection then
 the refraction out.
+
+**Fixed in 0.448.0: the connection draws every chain of surface events.** From an eye outside, the
+surface reflection and the refraction in, k reflections inside and out; from an eye inside, k
+reflections inside and out; to 16 reflections, wherever a chain's Fresnel product reaches 1e-4, the
+faint ones by a deterministic roulette (design.md, "The chains"). A sphere's chords each turn the ray
+by one angle, so the scan evaluates them all in closed form. On the way three more faults showed and
+were fixed, each in the mirror sphere's connector too where it shares them: the scan's last interval
+before the silhouette (the grazing images) had no sample to close it; the ray differentials' 2e-4
+step mismeasured G by the rim (22 % at a tenth of a pixel from it); and by a caustic a vertex's two
+images within one step of the scan were lost (a ball 5 cm from a glowing wall read a dark ring of
+0.36 at its fold) -- the scan searches the dips between samples now. The refinement takes no
+trigonometry, so mode B through a ball runs faster than before (330 s on the GPU for 1e8 photons of
+the outside view where 0.447.2 took 413, 69 s on the CPU for 4e7). Numbers (`tools/check_ball_images.py`,
+CPU / GPU): the ball from outside, its body 0.90 -> 1.013 / 1.012 of mode R and its rim 0.17-0.8 ->
+1.009 / 0.988; a mirror ball 1.009 / 1.003 and its rim 1.003 / 1.004; the eye at the ball's centre,
+the halo's rings (15-25 px) 0.43 -> 1.012 / 1.012 and those inside 0.997; in a glowing room, where the
+answer is exact, every ring within 2 % of the walls (the fold's 1.011 +- 0.027 / 0.981 +- 0.004: the
+fold's G grows without bound, a heavy tail). The lit room's images in either sphere read about 1 %
+over mode R where with only the wall behind the ball glowing -- mode R exact there, its paths ending on
+the glow -- both connectors meet mode R to 0.1 % (the glass ball's body 1.0012, its rim 1.0010; the
+mirror ball's 1.0001, 1.0002): so that percent is the two modes' estimates of the lamp-lit walls the
+spheres show, not the connection (MODEB-SPHERE-ROOM, above).
 
 ## DONE (2026-11-15, 0.447.2): REVIEW-0447R — what the Opus (xhigh) review of 0.447.1's fixes found
 

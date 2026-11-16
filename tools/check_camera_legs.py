@@ -15,9 +15,11 @@ named, a region's) within the tolerance and 5 standard errors over the seeds:
   * mode B with a `glow_only` panel seen directly, CPU and GPU: the forward modes' view of a glow took
     none;
   * mode B with the camera inside a glass ball in the water (the two ranked by `priority`, so the
-    ball refracts against the water's index), CPU and GPU, the lamp seen through it, in the water and
-    in air: the leg outside the ball took the ball's absorption instead of the water's, the ball
-    refracted against vacuum and its inside lacked n^2; and in water ranked above the ball, which
+    ball refracts against the water's index), CPU and GPU, the lamp seen through it and the walls,
+    in the water and in air: the leg outside the ball took the ball's absorption instead of the
+    water's, the ball refracted against vacuum and its inside lacked n^2, and the ball's inner
+    reflection, which shows round the lamp the wall behind the eye, was not drawn (BALL-EYE-HALO);
+    and in water ranked above the ball, which
     suppresses the ball's boundary: the connection lensed through a ball the walks pass straight
     through;
   * mode R with `-radcache`: the cache's update rays started in air;
@@ -170,9 +172,9 @@ def main():
         ok = ok and not bad
         print("%s: %s on the %s: %s %.4f (+- %.4f) of mode %s" % ("FAIL" if bad else "ok", name, dev.upper(), rname,
                                                                q, err, ref[1]), flush=True)
-    # The camera inside a small glass ball in the water: the lamp it sees through the ball, mode B
-    # against mode R, in the water and in air. (The walls are left out: a camera walk from inside a
-    # glass ball draws a halo round the lamp that mode B does not, known-issues BALL-EYE-HALO.)
+    # The camera inside a small glass ball in the water: the lamp it sees through the ball, and the
+    # walls (with the halo the ball's inner surface shows round the lamp), mode B against mode R, in
+    # the water and in air.
     with open(bubble, encoding="utf-8") as f:
         wet_src = f.read()
     dry = os.path.join(out, "bubble_dry.ftsl")
@@ -186,18 +188,24 @@ def main():
     sunk = os.path.join(out, "bubble_suppressed.ftsl")
     with open(sunk, "w", encoding="utf-8", newline="") as g:
         g.write(wet_src.replace(ranked_low, "absorb 0.3  priority 3 }"))
+    regions = (("the lamp", LAMP), ("the walls", WALLS))
+
+    def stats2(scene, tag, args):
+        v = np.array([[render(exe, out, scene, tag, args, s)[..., 1][reg].mean() for _, reg in regions]
+                      for s in (1, 2)])
+        return v.mean(0), v.std(0, ddof=1) / np.sqrt(2)
+
     for sc, tag in ((bubble, "in the water"), (dry, "in air"), (sunk, "in water ranked above it")):
-        rm, rse = stats(exe, out, sc, "R_ref_bubble_%s" % tag[3:], ["-mode", "R", "-device", refdev, "-spp", "1024"],
-                        LAMP, (1, 2))
+        rm, rse = stats2(sc, "R_ref_bubble_%s" % tag[3:], ["-mode", "R", "-device", refdev, "-spp", "4096"])
         for dev in devs:
-            m, se = stats(exe, out, sc, "B_bubble_%s_%s" % (tag[3:], dev),
-                          ["-mode", "B", "-device", dev, "-n", "30000000"], LAMP, (1, 2))
+            m, se = stats2(sc, "B_bubble_%s_%s" % (tag[3:], dev), ["-mode", "B", "-device", dev, "-n", "30000000"])
             q = m / rm
             err = np.hypot(se / rm, rse * m / (rm * rm))
-            bad = not (np.isfinite(q) and np.isfinite(err)) or (abs(q - 1.0) > 0.03 and abs(q - 1.0) > 5.0 * err)
-            ok = ok and not bad
-            print("%s: mode B on the %s, the lamp from inside a glass ball %s: %.4f (+- %.4f) of mode R"
-                  % ("FAIL" if bad else "ok", dev.upper(), tag, q, err), flush=True)
+            for (rname, _), qi, ei in zip(regions, q, err):
+                bad = not (np.isfinite(qi) and np.isfinite(ei)) or (abs(qi - 1.0) > 0.03 and abs(qi - 1.0) > 5.0 * ei)
+                ok = ok and not bad
+                print("%s: mode B on the %s, %s from inside a glass ball %s: %.4f (+- %.4f) of mode R"
+                      % ("FAIL" if bad else "ok", dev.upper(), rname, tag, qi, ei), flush=True)
     # Mode W at one sample against itself at 64: the lamp's colour (r/g and b/g), every device.
     for dev in devs:
         one = render(exe, out, SCENE, "W1_%s" % dev, ["-mode", "W", "-device", dev, "-spp", "1"], 1)[LAMP].mean(0)

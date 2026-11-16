@@ -10243,9 +10243,9 @@ __device__ static void camSplatEmissionAll(const DScene& sc, const DCamSet& cs, 
 }
 
 // ==================== analytic specular sphere connection ====================
-// Device twin of Renderer::connectSpecularSphere / connectSpecularSphereInside
-// (render.h). Restores the paths the SDS limitation makes black: mode B can
-// directly image a smooth glass sphere (and fly the camera THROUGH one). All the
+// Device twin of Renderer::connectSpecularSphere (render.h). Restores the paths the
+// SDS limitation makes black: mode B can directly image a smooth glass sphere -- through
+// it, in its surface and inside it -- and fly the camera THROUGH one. All the
 // precision-critical math (planar root solve, ray-differential Jacobian) runs in
 // DOUBLE regardless of the render Real, so the fp32 GPU build stays robust; only
 // the project()/occluded()/transmittance boundary casts back to Real.
@@ -10300,10 +10300,8 @@ struct DSpecVtx {
     // The WAVELENGTH-INDEPENDENT half of term(): everything but `weight` (the per-λ
     // albedo). The mirror connectors solve ONE shared geometry for a whole hero bundle —
     // a flat/metallic reflection does not disperse — so they evaluate this once and
-    // multiply by each λ's weight. term() keeps its own arithmetic rather than being
-    // expressed through this, so the dielectric-sphere path's float ordering (and
-    // therefore its images) stay bit-identical to before this existed. Device twin of
-    // Renderer::SpecVtx::shape. (A volume vertex only ever reaches the mirrors through
+    // multiply by each λ's weight (and a coat's factor, which term() includes and this
+    // leaves to them). Device twin of Renderer::SpecVtx::shape. (A volume vertex only ever reaches the mirrors through
     // the scalar wrapper, where vt.lambda IS the single live λ, so a rainbow medium's
     // λ-dependent phase is still evaluated at the right wavelength.)
     __device__ double shape(const D3& wP) const {
@@ -10315,77 +10313,169 @@ struct DSpecVtx {
     }
 };
 
-struct DSphereRefr { D3 P1, P2, exitDir; double Tf, innerLen; };
+// A smooth dielectric sphere's chains (host twin Renderer::connectSpecularSphere's, where the why is):
+// from an eye outside, chain 0 reflects off the surface and chain 1 + k refracts in, reflects k times
+// inside and refracts out; from an eye inside, chain k reflects k times inside and refracts out. Every
+// chord turns the ray about the centre by one angle, so chain c's last leg is the first one turned c
+// chords on. Drawn to kDSphReflMax reflections, above the floor, the faint ones by roulette.
+static constexpr int kDSphReflMax = 16;
+static constexpr int kDSphChainsMax = kDSphReflMax + 2;
+static constexpr double kDSphChainFloor = 1e-4;
+static constexpr double kDSphChainSure = 0.02;
 
-// Trace a ray from `o` (outside sphere S) that ENTERS S, crosses the glass, and
-// EXITS. False on miss / TIR. (Port of traceThroughSphere2.)
-__device__ static bool dTraceThroughSphere(const D3& o, const D3& d, const DSphere& S,
-                                           double n, DSphereRefr& out) {
-    D3 O(S.c); double r = S.r;
-    D3 oc = o - O;
-    double b = d3dot(oc, d), c = d3dot(oc, oc) - r * r;
-    double disc = b * b - c;
-    if (disc < 0.0) return false;
-    double sq = sqrt(disc);
-    double t1 = -b - sq;
-    if (t1 < 1e-7) return false;
-    D3 P1 = o + d * t1;
-    D3 N1 = (P1 - O) * (1.0 / r);
-    double cosI = -d3dot(d, N1);
-    if (cosI <= 1e-6) return false;
-    double eta = 1.0 / n;
-    double sin2t = eta * eta * (1.0 - cosI * cosI);
-    if (sin2t >= 1.0) return false;
-    double cosT = sqrt(1.0 - sin2t);
-    D3 tin = d3norm(d * eta + N1 * (eta * cosI - cosT));
-    double rs = (cosI - n * cosT) / (cosI + n * cosT);
-    double rp = (cosT - n * cosI) / (cosT + n * cosI);
-    double Fe = 0.5 * (rs * rs + rp * rp);
-    double sInner = -2.0 * d3dot(P1 - O, tin);
-    if (sInner <= 1e-9) return false;
-    D3 P2 = P1 + tin * sInner;
-    D3 N2 = (P2 - O) * (1.0 / r);
-    double cosI2 = d3dot(tin, N2);
-    if (cosI2 <= 1e-6) return false;
-    double sin2t2 = n * n * (1.0 - cosI2 * cosI2);
-    if (sin2t2 >= 1.0) return false;
-    double cosT2 = sqrt(1.0 - sin2t2);
-    D3 exitDir = d3norm(tin * n - N2 * (n * cosI2 - cosT2));
-    double rs2 = (n * cosI2 - cosT2) / (n * cosI2 + cosT2);
-    double rp2 = (n * cosT2 - cosI2) / (n * cosT2 + cosI2);
-    double Fx = 0.5 * (rs2 * rs2 + rp2 * rp2);
-    out.P1 = P1; out.P2 = P2; out.exitDir = exitDir;
-    out.Tf = (1.0 - Fe) * (1.0 - Fx); out.innerLen = sInner;
-    return true;
+// A 2-vector, for the chains' scan in their plane.
+struct DSphV2 {
+    double x, y;
+    __device__ DSphV2 operator+(const DSphV2& o) const { return {x + o.x, y + o.y}; }
+    __device__ DSphV2 operator-(const DSphV2& o) const { return {x - o.x, y - o.y}; }
+    __device__ DSphV2 operator*(double k) const { return {x * k, y * k}; }
+};
+__device__ static inline double vdot(const DSphV2& a, const DSphV2& b) { return a.x * b.x + a.y * b.y; }
+__device__ static inline DSphV2 dSphTurn(const DSphV2& v, double cd, double sd) {
+    return {v.x * cd - v.y * sd, v.x * sd + v.y * cd};
 }
 
-struct DSphereRefr1 { D3 P1, exitDir; double Tf, innerLen; };
+// The Fresnel reflectance between indices n1 (the ray's side) and n2 (host twin fresnelSplit).
+__device__ static inline double dFresnelSplit(double cosI, double cosT, double n1, double n2) {
+    const double rs = (n1 * cosI - n2 * cosT) / (n1 * cosI + n2 * cosT);
+    const double rp = (n2 * cosI - n1 * cosT) / (n2 * cosI + n1 * cosT);
+    return 0.5 * (rs * rs + rp * rp);
+}
 
-// Trace a ray from `o` INSIDE sphere S to its exit, refracting glass->vacuum.
-// False on TIR / degenerate. (Port of traceOutOfSphere.)
-__device__ static bool dTraceOutOfSphere(const D3& o, const D3& d, const DSphere& S,
-                                         double n, DSphereRefr1& out) {
-    D3 O(S.c); double r = S.r;
-    D3 oc = o - O;
-    double b = d3dot(oc, d), c = d3dot(oc, oc) - r * r;
-    double disc = b * b - c;
-    if (disc <= 0.0) return false;
-    double sq = sqrt(disc);
-    double t1 = -b + sq;
-    if (t1 < 1e-7) return false;
-    D3 P1 = o + d * t1;
-    D3 N1 = (P1 - O) * (1.0 / r);
-    double cosI = d3dot(d, N1);
+// Host twin Renderer::SphBase2D / sphBase2D.
+struct DSphBase2D { DSphV2 P, dir0; double R, cd, sd; bool totalOut; };
+__device__ static bool dSphBase2D(const DSphV2& eye2, double r, double n, bool outside, double c1, double s1,
+                                  DSphBase2D& b) {
+    const DSphV2 N{c1, s1}, T{-s1, c1};
+    b.P = N * r;
+    b.R = 0.0; b.cd = 1.0; b.sd = 0.0; b.totalOut = false;
+    DSphV2 d = b.P - eye2;
+    const double dl = sqrt(vdot(d, d));
+    if (dl < 1e-12) return false;
+    d = d * (1.0 / dl);
+    const double cn = vdot(d, N), ct = vdot(d, T);
+    if (outside) {
+        const double cosI = -cn;
+        if (cosI <= 1e-6) return false;
+        b.dir0 = N * cosI + T * ct;
+        const double sinT = ct / n, s2 = sinT * sinT;
+        b.totalOut = s2 >= 1.0;
+        if (b.totalOut) { b.R = 1.0; return true; }
+        const double cosT = sqrt(1.0 - s2);
+        b.R = dFresnelSplit(cosI, cosT, 1.0, n);
+        b.cd = 2.0 * s2 - 1.0;
+        b.sd = 2.0 * sinT * cosT;
+        return true;
+    }
+    const double cosI = cn;
     if (cosI <= 1e-6) return false;
-    double sin2t = n * n * (1.0 - cosI * cosI);
-    if (sin2t >= 1.0) return false;
-    double cosT = sqrt(1.0 - sin2t);
-    D3 exitDir = d3norm(d * n - N1 * (n * cosI - cosT));
-    double rs = (n * cosI - cosT) / (n * cosI + cosT);
-    double rp = (n * cosT - cosI) / (n * cosT + cosI);
-    double F = 0.5 * (rs * rs + rp * rp);
-    out.P1 = P1; out.exitDir = exitDir; out.Tf = 1.0 - F; out.innerLen = t1;
+    const double sinO = n * ct, s2 = sinO * sinO;
+    if (s2 >= 1.0) return false;
+    const double cosO = sqrt(1.0 - s2);
+    b.dir0 = N * cosO + T * sinO;
+    b.R = dFresnelSplit(cosI, cosO, n, 1.0);
+    b.cd = 2.0 * ct * ct - 1.0;
+    b.sd = 2.0 * ct * cosI;
     return true;
+}
+// Host twin sphChainF.
+__device__ static double dSphChainF(const DSphBase2D& b, bool outside, int c) {
+    if (!outside) return (1.0 - b.R) * pow(b.R, (double)c);
+    if (c == 0) return b.R;
+    return b.totalOut ? 0.0 : (1.0 - b.R) * (1.0 - b.R) * pow(b.R, (double)(c - 1));
+}
+
+// Host twin Renderer::SphChain / sphChainFrom: the chain taking `refl` reflections inside (-1: off the
+// surface), in space, coordinates centred on S.
+struct DSphChain { D3 first, last, dir; double F, inner; };
+__device__ static bool dSphChainFrom(const D3& o, D3 d, double r, double n, bool outside, int refl,
+                                     DSphChain& out) {
+    const double b0 = d3dot(o, d), c0 = d3dot(o, o) - r * r, disc = b0 * b0 - c0;
+    if (disc <= 0.0) return false;
+    const double t0 = outside ? -b0 - sqrt(disc) : -b0 + sqrt(disc);
+    if (t0 < 1e-7) return false;
+    D3 P = o + d * t0;
+    out.first = P;
+    out.F = 1.0;
+    out.inner = outside ? 0.0 : t0;
+    const double invR = 1.0 / r;
+    D3 N = P * invR;
+    if (outside) {
+        const double cosI = -d3dot(d, N);
+        if (cosI <= 1e-6) return false;
+        const double sin2t = (1.0 - cosI * cosI) / (n * n);
+        const double cosT = sin2t < 1.0 ? sqrt(1.0 - sin2t) : 0.0;
+        const double Fr = sin2t < 1.0 ? dFresnelSplit(cosI, cosT, 1.0, n) : 1.0;
+        if (refl < 0) {
+            out.last = P;
+            out.dir = d3norm(d + N * (2.0 * cosI));
+            out.F = Fr;
+            return Fr > 0.0;
+        }
+        if (sin2t >= 1.0) return false;
+        out.F = 1.0 - Fr;
+        const double eta = 1.0 / n;
+        d = d3norm(d * eta + N * (eta * cosI - cosT));
+    }
+    for (int k = 0;; ++k) {
+        if (outside || k > 0) {
+            const double s = -2.0 * d3dot(P, d);
+            if (s <= 1e-9 * r) return false;
+            out.inner += s;
+            P = P + d * s;
+            N = P * invR;
+        }
+        const double cosI = d3dot(d, N);
+        if (cosI <= 1e-6) return false;
+        const double sin2t = n * n * (1.0 - cosI * cosI);
+        const double cosT = sin2t < 1.0 ? sqrt(1.0 - sin2t) : 0.0;
+        const double Fr = sin2t < 1.0 ? dFresnelSplit(cosI, cosT, n, 1.0) : 1.0;
+        if (k >= refl) {
+            if (sin2t >= 1.0) return false;
+            out.F *= 1.0 - Fr;
+            out.last = P;
+            out.dir = d3norm(d * n - N * (n * cosI - cosT));
+            return true;
+        }
+        out.F *= Fr;
+        d = d - N * (2.0 * cosI);
+    }
+}
+
+// Host twin sphRouletteU.
+__device__ static double dSphRouletteU(const D3& p, int c, double uc, double us) {
+    unsigned long long h = 0x9E3779B97F4A7C15ULL ^ (unsigned long long)(unsigned)c;
+    const double v[5] = {p.x, p.y, p.z, uc, us};
+    for (int i = 0; i < 5; ++i) {
+        h ^= (unsigned long long)__double_as_longlong(v[i]);
+        h *= 0xBF58476D1CE4E5B9ULL;
+        h ^= h >> 31;
+    }
+    return (double)(h >> 11) * (1.0 / 9007199254740992.0);
+}
+
+// How a camera sees S at one wavelength (host twin Renderer::sphereIndex).
+struct DSphIndex {
+    double n;
+    int insideMat, aroundMat;
+    bool suppressed;
+    __device__ bool same(const DSphIndex& o) const {
+        return n == o.n && insideMat == o.insideMat && aroundMat == o.aroundMat && suppressed == o.suppressed;
+    }
+};
+__device__ static DSphIndex dSphereIndex(const DScene& sc, const DCamera& cam, const DSphere& S,
+                                         const DMaterial& glass, Real lambda) {
+    DSphIndex ix;
+    DMediumStack around = cam.enclosure;
+    around.popMat(sc.mats[S.matId].solidId);
+    int extMat = -1;
+    bool ranked = false;
+    ix.n = (double)specLookup(glass.ior, lambda) / (double)dExteriorIor(sc, glass, around, lambda, extMat, ranked);
+    ix.suppressed = dPrioritySuppressible(glass, around, ranked) && !dCoatOpaque(glass, lambda);
+    if (ix.suppressed) ix.n = 1.0;
+    ix.aroundMat = around.topMat();
+    ix.insideMat = ix.suppressed ? ix.aroundMat : S.matId;
+    return ix;
 }
 
 // --- specular-sphere scan-angle tables (Opt 3) -------------------------------
@@ -10409,279 +10499,235 @@ __global__ void kSphScanInit() {
     g_sphScanS[i] = sin(phi);
 }
 
-// Connect EXTERIOR vertex p to a pinhole INSIDE dielectric sphere S (single
-// refraction) — the path the camera sees flying THROUGH the glass. Port of
-// Renderer::connectSpecularSphereInside.
-__device__ static void dConnectSpecularSphereInside(const DScene& sc, const DCamera& cam,
-        double* film, double* hits, const DSphere& S, double n, int aroundMat, int insideMat,
-        const D3& p, const DSpecVtx& vt, Real lambda, double beta, DRng& rng) {
-    D3 O(S.c); double r = S.r; D3 eye(cam.eye);
-    double dEyeO = d3len(eye - O);
+// The scan of a sphere connector (host twin Renderer::sphScan): the table's angles, and for an eye
+// outside one more just inside each end of the visible arc (`phiT` its half-width, 0 for none);
+// `visit(c, s)` each angle's cosine and sine.
+template <class Visit>
+__device__ static void dSphScan(double phiT, const Visit& visit) {
+    const double e[2] = {-(phiT - 1e-5), phiT - 1e-5};
+    int next = phiT > 1e-5 ? 0 : 2;
+    for (int i = 0; i <= SPH_SCAN_N; ++i) {
+        const double phi = -DPI + (2.0 * DPI) * i / SPH_SCAN_N;
+        while (next < 2 && e[next] <= phi) { visit(cos(e[next]), sin(e[next])); ++next; }
+        visit(g_sphScanC[i], g_sphScanS[i]);
+    }
+}
+__device__ static inline DSphV2 dSphNorm(const DSphV2& a) { return a * (1.0 / sqrt(a.x * a.x + a.y * a.y)); }
+// The root of `miss(c, s, valid)` between scan samples ua and ub (host twin Renderer::sphRoot).
+template <class Miss>
+__device__ static DSphV2 dSphRoot(const Miss& miss, DSphV2 ua, double fa, DSphV2 ub, double fb) {
+    int side = 0;
+    DSphV2 u = dSphNorm(ua + ub);
+    for (int it = 0; it < 40; ++it) {
+        const DSphV2 m = dSphNorm(ua + (ub - ua) * (fa / (fa - fb)));
+        bool v; const double fm = miss(m.x, m.y, v);
+        if (!v) break;
+        u = m;
+        if (fm == 0.0) break;
+        if ((fm < 0.0) == (fa < 0.0)) { ua = m; fa = fm; if (side == -1) fb *= 0.5; side = -1; }
+        else                          { ub = m; fb = fm; if (side == +1) fa *= 0.5; side = +1; }
+        const DSphV2 w = ub - ua;
+        if (vdot(w, w) < 1e-26) break;
+    }
+    return u;
+}
+
+// Whether three samples' misses dip toward zero enough to be searched (host twin Renderer::sphDipNears).
+__device__ static bool dSphDipNears(double m0, double m1, double m2) {
+    const double den = m0 - 2.0 * m1 + m2;
+    if (den == 0.0) return false;
+    const double ext = m1 - (m2 - m0) * (m2 - m0) / (8.0 * den);
+    return (m1 < 0.0 ? -ext : ext) < 0.5 * fabs(m1);
+}
+// Where `miss` comes nearest zero between ua and ub, its sign `sgn` at both (host twin Renderer::sphDip).
+template <class Miss>
+__device__ static bool dSphDip(const Miss& miss, const DSphV2& ua, const DSphV2& ub, double sgn, DSphV2& ue,
+                               double& fe) {
+    const double g = 0.6180339887498949;
+    auto at = [&](double t, double& f) {
+        const DSphV2 u = dSphNorm(ua + (ub - ua) * t);
+        bool v; f = sgn * miss(u.x, u.y, v);
+        return v;
+    };
+    double a = 0.0, b = 1.0, x1 = 1.0 - g, x2 = g, f1, f2;
+    if (!at(x1, f1) || !at(x2, f2)) return false;
+    for (int it = 0; it < 32; ++it) {
+        if (f1 < f2) { b = x2; x2 = x1; f2 = f1; x1 = b - g * (b - a); if (!at(x1, f1)) return false; }
+        else         { a = x1; x1 = x2; f1 = f2; x2 = a + g * (b - a); if (!at(x2, f2)) return false; }
+    }
+    ue = dSphNorm(ua + (ub - ua) * (0.5 * (a + b)));
+    bool v; fe = miss(ue.x, ue.y, v);
+    return v;
+}
+
+// Connect vertex p to a pinhole through every drawn chain of smooth dielectric sphere S, at the nL
+// wavelengths lam[] that see S alike (`ix`): one geometry for them all. Port of
+// Renderer::connectSpecularSphere.
+__device__ static void dConnectSpecularSphere(const DScene& sc, const DCamera& cam,
+        double* film, double* hits, const DSphere& S, const DSphIndex& ix,
+        const D3& p, const DSpecVtx& vt, const Real* lam, const Real* beta, const Real* w, int nL, DRng& rng) {
+    D3 O(S.c); const double r = S.r; D3 eye(cam.eye);
+    const double dEyeO = d3len(eye - O);
+    if (d3len(p - O) < r * 0.9999) return;            // vertex inside glass -> skip
+    if (fabs(dEyeO - r) <= r * 1e-4) return;          // eye ~on surface -> degenerate
+    const bool outside = dEyeO > r;
+    const double n = ix.n;
 
     D3 ex, ey;
     if (dEyeO < 1e-9) { D3 tb; d3onb(d3norm(p - O), ex, tb); }
     else              ex = (eye - O) * (1.0 / dEyeO);
-    D3 ap = p - O;
-    D3 perp = ap - ex * d3dot(ap, ex);
-    double perpLen = d3len(perp);
+    const D3 ap = p - O;
+    const D3 perp = ap - ex * d3dot(ap, ex);
+    const double perpLen = d3len(perp);
     if (perpLen < 1e-9) { D3 tb; d3onb(ex, ey, tb); }
     else                ey = perp * (1.0 / perpLen);
-    double ex_e = d3dot(eye - O, ex), ey_e = d3dot(eye - O, ey);
-    double px2 = d3dot(ap, ex), py2 = d3dot(ap, ey);
+    const DSphV2 eye2{d3dot(eye - O, ex), d3dot(eye - O, ey)}, p2{d3dot(ap, ex), d3dot(ap, ey)};
+    const int nC = outside ? kDSphChainsMax : kDSphReflMax + 1;
 
-    // In-plane once-refracted exit-ray miss of p. Encoded as a helper via lambda-free
-    // repeated code (no std::function on device): returns miss, sets valid.
-    // Takes the entry angle as its (cos, sin) pair.
-    #define D_TRACE2D_INSIDE(C1, S1, MISS, VALID) do {                                \
-        VALID = false; MISS = 0.0;                                                    \
-        double c1 = (C1), s1 = (S1);                                                  \
-        double P1x = r * c1, P1y = r * s1;                                            \
-        double dinx = P1x - ex_e, diny = P1y - ey_e;                                  \
-        double dl = sqrt(dinx*dinx + diny*diny);                                      \
-        if (dl >= 1e-12) {                                                            \
-            dinx /= dl; diny /= dl;                                                   \
-            double cosI = dinx*c1 + diny*s1;                                          \
-            if (cosI > 1e-6) {                                                        \
-                double sin2t = n*n*(1.0 - cosI*cosI);                                 \
-                if (sin2t < 1.0) {                                                    \
-                    double cosT = sqrt(1.0 - sin2t);                                  \
-                    double kk = n*cosI - cosT;                                        \
-                    double doutx = n*dinx - kk*c1, douty = n*diny - kk*s1;            \
-                    double dl2 = sqrt(doutx*doutx + douty*douty);                     \
-                    doutx /= dl2; douty /= dl2;                                       \
-                    double fw = (px2-P1x)*doutx + (py2-P1y)*douty;                    \
-                    if (fw > 0.0) {                                                   \
-                        VALID = true;                                                 \
-                        MISS = doutx*(py2-P1y) - douty*(px2-P1x);                     \
-                    }                                                                 \
-                }                                                                     \
-            }                                                                         \
-        }                                                                            \
-    } while (0)
+    auto legOf = [&](int c, double c1, double s1, DSphV2& Q, DSphV2& dir) -> bool {
+        DSphBase2D b;
+        if (!dSphBase2D(eye2, r, n, outside, c1, s1, b) || dSphChainF(b, outside, c) < kDSphChainFloor) return false;
+        Q = b.P; dir = b.dir0;
+        for (int k = 0; k < c; ++k) { Q = dSphTurn(Q, b.cd, b.sd); dir = dSphTurn(dir, b.cd, b.sd); }
+        return true;
+    };
+    auto missOf = [&](int c, double c1, double s1, bool& valid) -> double {
+        DSphV2 Q, dir;
+        valid = legOf(c, c1, s1, Q, dir);             // the line's miss: which side, of the root (host twin)
+        if (!valid) return 0.0;
+        const DSphV2 q = p2 - Q;
+        return dir.x * q.y - dir.y * q.x;
+    };
 
-    const int NS = SPH_SCAN_N; double roots[4]; int nroot = 0;
-    double prevMiss = 0.0, prevPhi = 0.0; bool prevValid = false;
-    for (int i = 0; i <= NS && nroot < 4; ++i) {
-        double phi = -DPI + (2.0 * DPI) * i / NS;
-        bool v; double mss; D_TRACE2D_INSIDE(g_sphScanC[i], g_sphScanS[i], mss, v);
-        if (v && prevValid && ((mss < 0.0) != (prevMiss < 0.0))) {
-            double a = prevPhi, b = phi, fa = prevMiss;
-            for (int k = 0; k < 40; ++k) {
-                double mid = 0.5 * (a + b); bool vm; double fm; D_TRACE2D_INSIDE(cos(mid), sin(mid), fm, vm);
-                if (!vm) break;
-                if ((fm < 0.0) != (fa < 0.0)) b = mid; else { a = mid; fa = fm; }
-            }
-            roots[nroot++] = 0.5 * (a + b);
+    auto splat = [&](int c, const DSphV2& u) -> bool {
+        DSphV2 Q2, dir2;                              // behind p, in the plane: no image
+        if (!legOf(c, u.x, u.y, Q2, dir2) || vdot(p2 - Q2, dir2) <= 0.0) return false;
+        const int refl = outside ? c - 1 : c;
+        const D3 P1chief = O + ex * (r * u.x) + ey * (r * u.y);
+        const D3 d0 = d3norm(P1chief - eye);
+        DSphChain ch;
+        if (!dSphChainFrom(eye - O, d0, r, n, outside, refl, ch) || ch.F <= 0.0) return false;
+        if (d3dot(ap - ch.last, ch.dir) <= 0.0) return false;    // p must be on the forward side
+        double keep = 1.0;
+        if (ch.F < kDSphChainSure) {
+            keep = ch.F / kDSphChainSure;
+            if (dSphRouletteU(p, c, u.x, u.y) >= keep) return true;
         }
-        prevMiss = mss; prevValid = v; prevPhi = phi;
-    }
-    #undef D_TRACE2D_INSIDE
-
-    for (int ri = 0; ri < nroot; ++ri) {
-        double phi = roots[ri];
-        D3 P1chief = O + ex * (r * cos(phi)) + ey * (r * sin(phi));
-        D3 d0 = d3norm(P1chief - eye);
-        DSphereRefr1 ch;
-        if (!dTraceOutOfSphere(eye, d0, S, n, ch)) continue;
-
         D3 a1, a2; d3onb(d0, a1, a2);
-        const double eps = 2e-4;
-        DSphereRefr1 rA, rB;
-        if (!dTraceOutOfSphere(eye, d3norm(d0 + a1 * eps), S, n, rA)) continue;
-        if (!dTraceOutOfSphere(eye, d3norm(d0 + a2 * eps), S, n, rB)) continue;
-        D3 e1, e2; d3onb(ch.exitDir, e1, e2);
+        const double eps = 1e-6;
+        DSphChain rA, rB;
+        if (!dSphChainFrom(eye - O, d3norm(d0 + a1 * eps), r, n, outside, refl, rA)) return true;
+        if (!dSphChainFrom(eye - O, d3norm(d0 + a2 * eps), r, n, outside, refl, rB)) return true;
+        D3 e1, e2; d3onb(ch.dir, e1, e2);
         double ax, ay, bx, by;
-        {   double denom = d3dot(rA.exitDir, ch.exitDir);
+        {   double denom = d3dot(rA.dir, ch.dir);
             if (fabs(denom) < 1e-9) denom = (denom < 0 ? -1e-9 : 1e-9);
-            double s = d3dot(p - rA.P1, ch.exitDir) / denom;
-            D3 off = (rA.P1 + rA.exitDir * s) - p;
+            const double s = d3dot(ap - rA.last, ch.dir) / denom;
+            const D3 off = (rA.last + rA.dir * s) - ap;
             ax = d3dot(off, e1); ay = d3dot(off, e2); }
-        {   double denom = d3dot(rB.exitDir, ch.exitDir);
+        {   double denom = d3dot(rB.dir, ch.dir);
             if (fabs(denom) < 1e-9) denom = (denom < 0 ? -1e-9 : 1e-9);
-            double s = d3dot(p - rB.P1, ch.exitDir) / denom;
-            D3 off = (rB.P1 + rB.exitDir * s) - p;
+            const double s = d3dot(ap - rB.last, ch.dir) / denom;
+            const D3 off = (rB.last + rB.dir * s) - ap;
             bx = d3dot(off, e1); by = d3dot(off, e2); }
-        double jac = fabs(ax * by - ay * bx);
-        if (jac < 1e-24) continue;
-        double G = (eps * eps) / jac;
+        const double jac = fabs(ax * by - ay * bx);
+        if (jac < 2.5e-17 * eps * eps) return true;
+        const double G = (eps * eps) / jac;
 
         int px, py; Real cosCam, dist2e;
-        if (!cam.project(P1chief.toR(), px, py, cosCam, dist2e)) continue;
-        double omega = cam.pixelSolidAngle(cosCam);
-        if (omega <= 0.0) continue;
+        if (!cam.project(P1chief.toR(), px, py, cosCam, dist2e)) return true;
+        const double omega = cam.pixelSolidAngle(cosCam);
+        if (omega <= 0.0) return true;
 
-        D3 wP = ch.P1 - p; double dP = d3len(wP);
-        if (dP < 1e-9) continue;
+        const D3 last = O + ch.last, first = O + ch.first;
+        D3 wP = last - p; const double dP = d3len(wP);
+        if (dP < 1e-9) return true;
         wP = wP * (1.0 / dP);
-        double term = vt.term(wP);
-        if (term < 0.0) continue;
+        const double geom = G * ch.F / keep / omega * (outside ? 1.0 : n * n);   // n^2: host twin
 
-        double contrib = beta * term * G * ch.Tf / omega * (n * n);   // n^2: host twin
-        if (contrib <= 0.0) continue;
-        contrib *= dLegAbsorption(sc, insideMat, ch.innerLen, lambda);   // Beer-Lambert inside S
-
-        DVec3 wPR = wP.toR();
-        if (occludedTo(sc, dOffsetAlong(p.toR(), wPR, wPR), p.toR() + wPR * dP, 2e-6)) continue;
-        contrib *= (double)dLegTransmittance(sc, aroundMat, p.toR(), wPR, dP, lambda, rng);   // the exterior segment's
-
-        filmAdd(film, hits, cam.resX, px, py, lambda, (Real)contrib);
-    }
-}
-
-// Connect vertex p to a pinhole OUTSIDE dielectric sphere S, THROUGH the glass
-// (two refractions). Port of Renderer::connectSpecularSphere. Dispatches to the
-// single-refraction path when the eye is inside the glass.
-__device__ static void dConnectSpecularSphere(const DScene& sc, const DCamera& cam,
-        double* film, double* hits, const DSphere& S, const DMaterial& glass, double n,
-        const D3& p, const DSpecVtx& vt, Real lambda, double beta, DRng& rng) {
-    D3 O(S.c); double r = S.r; D3 eye(cam.eye);
-    double dEyeO = d3len(eye - O);
-    double dPO   = d3len(p - O);
-    if (dPO   <  r * 0.9999) return;                 // vertex inside glass -> skip
-    // `n` relative to what S refracts against (host twin connectSpecularSphere).
-    DMediumStack around = cam.enclosure;
-    around.popMat(sc.mats[S.matId].solidId);
-    int extMat = -1;
-    bool ranked = false;
-    n /= (double)dExteriorIor(sc, glass, around, lambda, extMat, ranked);
-    // A boundary the priority rule suppresses: the medium around it, optically (host twin).
-    const bool suppressed = dPrioritySuppressible(glass, around, ranked) && !dCoatOpaque(glass, lambda);
-    if (suppressed) n = 1.0;
-    const int insideMat = suppressed ? around.topMat() : S.matId;
-    if (dEyeO <= r * 0.9999) {                        // eye inside -> single refraction
-        dConnectSpecularSphereInside(sc, cam, film, hits, S, n, around.topMat(), insideMat, p, vt, lambda, beta,
-                                     rng);
-        return;
-    }
-    if (dEyeO <= r * 1.0001) return;                  // eye ~on surface -> degenerate
-
-    D3 ex = (eye - O) * (1.0 / dEyeO);
-    D3 ap = p - O;
-    D3 perp = ap - ex * d3dot(ap, ex);
-    double perpLen = d3len(perp);
-    D3 ey;
-    if (perpLen < 1e-9) { D3 tb; d3onb(ex, ey, tb); }
-    else                ey = perp * (1.0 / perpLen);
-    double ex_e = dEyeO;
-    double px2 = d3dot(ap, ex), py2 = d3dot(ap, ey);
-
-    // Takes the entry angle as its (cos, sin) pair.
-    #define D_TRACE2D_THRU(C1, S1, MISS, VALID) do {                                 \
-        VALID = false; MISS = 0.0;                                                   \
-        double c1 = (C1), s1 = (S1);                                                 \
-        double P1x = r * c1, P1y = r * s1;                                           \
-        double dinx = P1x - ex_e, diny = P1y;                                        \
-        double dl = sqrt(dinx*dinx + diny*diny);                                     \
-        if (dl >= 1e-12) {                                                           \
-            dinx /= dl; diny /= dl;                                                  \
-            double cosI = -(dinx*c1 + diny*s1);                                      \
-            if (cosI > 1e-6) {                                                       \
-                double eta = 1.0/n, sin2t = eta*eta*(1.0 - cosI*cosI);              \
-                if (sin2t < 1.0) {                                                   \
-                    double cosT = sqrt(1.0 - sin2t);                                 \
-                    double tinx = eta*dinx + (eta*cosI - cosT)*c1;                   \
-                    double tiny = eta*diny + (eta*cosI - cosT)*s1;                   \
-                    double tl = sqrt(tinx*tinx + tiny*tiny); tinx/=tl; tiny/=tl;     \
-                    double sInner = -2.0*(P1x*tinx + P1y*tiny);                      \
-                    if (sInner > 1e-9) {                                             \
-                        double P2x = P1x + tinx*sInner, P2y = P1y + tiny*sInner;     \
-                        double n2x = P2x/r, n2y = P2y/r;                             \
-                        double cosI2 = tinx*n2x + tiny*n2y;                          \
-                        if (cosI2 > 1e-6) {                                          \
-                            double sin2t2 = n*n*(1.0 - cosI2*cosI2);                 \
-                            if (sin2t2 < 1.0) {                                      \
-                                double cosT2 = sqrt(1.0 - sin2t2);                   \
-                                double doutx = n*tinx - (n*cosI2 - cosT2)*n2x;       \
-                                double douty = n*tiny - (n*cosI2 - cosT2)*n2y;       \
-                                double dl2 = sqrt(doutx*doutx + douty*douty);        \
-                                doutx/=dl2; douty/=dl2;                              \
-                                double fw = (px2-P2x)*doutx + (py2-P2y)*douty;       \
-                                if (fw > 0.0) {                                      \
-                                    VALID = true;                                    \
-                                    MISS = doutx*(py2-P2y) - douty*(px2-P2x);        \
-                                }                                                    \
-                            }                                                        \
-                        }                                                            \
-                    }                                                                \
-                }                                                                    \
-            }                                                                        \
-        }                                                                           \
-    } while (0)
-
-    const int NS = SPH_SCAN_N; double roots[4]; int nroot = 0;
-    double prevMiss = 0.0, prevPhi = 0.0; bool prevValid = false;
-    for (int i = 0; i <= NS && nroot < 4; ++i) {
-        double phi = -DPI + (2.0 * DPI) * i / NS;
-        bool v; double mss; D_TRACE2D_THRU(g_sphScanC[i], g_sphScanS[i], mss, v);
-        if (v && prevValid && ((mss < 0.0) != (prevMiss < 0.0))) {
-            double a = prevPhi, b = phi, fa = prevMiss;
-            for (int k = 0; k < 40; ++k) {
-                double mid = 0.5 * (a + b); bool vm; double fm; D_TRACE2D_THRU(cos(mid), sin(mid), fm, vm);
-                if (!vm) break;
-                if ((fm < 0.0) != (fa < 0.0)) b = mid; else { a = mid; fa = fm; }
+        const DVec3 wPR = wP.toR();
+        if (occludedTo(sc, dOffsetAlong(p.toR(), wPR, wPR), p.toR() + wPR * dP, 2e-6)) return true;
+        DVec3 wER((Real)0, (Real)0, (Real)0);
+        double dE = 0.0;
+        if (outside) {
+            D3 wE = eye - first; dE = d3len(wE); wE = wE * (1.0 / dE);
+            wER = wE.toR();
+            // camera leg: hide_camera applies (Scene::occluded / DMaterial::hideCamera)
+            if (occludedTo(sc, dOffsetAlong(first.toR(), wER, wER), first.toR() + wER * dE, 2e-6, RAY_EPS,
+                           /*camLeg=*/true)) return true;
+        }
+        for (int j = 0; j < nL; ++j) {
+            DSpecVtx vj = vt; vj.weight = (double)w[j]; vj.lambda = lam[j];
+            const double term = vj.term(wP);
+            if (term < 0.0) return true;
+            double contrib = (double)beta[j] * term * geom;
+            if (contrib <= 0.0) continue;
+            contrib *= dLegAbsorption(sc, ix.insideMat, ch.inner, lam[j]);   // Beer-Lambert inside S
+            if (outside) {
+                if (sc.mediaN > 0) {
+                    contrib *= (double)dMediaTransmittance(sc, p.toR(), wPR, (Real)dP, lam[j], rng);
+                    contrib *= (double)dMediaTransmittance(sc, first.toR(), wER, (Real)dE, lam[j], rng);
+                }
+                contrib *= dLegAbsorption(sc, cam.enclosure.topMat(), dP + dE, lam[j]);   // both the camera's
+            } else {
+                contrib *= (double)dLegTransmittance(sc, ix.aroundMat, p.toR(), wPR, dP, lam[j], rng);
             }
-            roots[nroot++] = 0.5 * (a + b);
+            filmAdd(film, hits, cam.resX, px, py, lam[j], (Real)contrib);
         }
-        prevMiss = mss; prevValid = v; prevPhi = phi;
+        return true;
+    };
+
+    // The scan, every chain at once, and the dips a caustic makes between samples (host twin).
+    double prevMiss[kDSphChainsMax], prev2Miss[kDSphChainsMax];
+    DSphV2 prevU{1.0, 0.0}, prev2U{1.0, 0.0};
+    bool prevValid[kDSphChainsMax], prev2Valid[kDSphChainsMax];
+    int found[kDSphChainsMax];
+    for (int c = 0; c < kDSphChainsMax; ++c) {
+        prevMiss[c] = prev2Miss[c] = 0.0; prevValid[c] = prev2Valid[c] = false; found[c] = 0;
     }
-    #undef D_TRACE2D_THRU
-
-    for (int ri = 0; ri < nroot; ++ri) {
-        double phi = roots[ri];
-        D3 P1chief = O + ex * (r * cos(phi)) + ey * (r * sin(phi));
-        D3 d0 = d3norm(P1chief - eye);
-        DSphereRefr ch;
-        if (!dTraceThroughSphere(eye, d0, S, n, ch)) continue;
-
-        D3 a1, a2; d3onb(d0, a1, a2);
-        const double eps = 2e-4;
-        DSphereRefr rA, rB;
-        if (!dTraceThroughSphere(eye, d3norm(d0 + a1 * eps), S, n, rA)) continue;
-        if (!dTraceThroughSphere(eye, d3norm(d0 + a2 * eps), S, n, rB)) continue;
-        D3 e1, e2; d3onb(ch.exitDir, e1, e2);
-        double ax, ay, bx, by;
-        {   double denom = d3dot(rA.exitDir, ch.exitDir);
-            if (fabs(denom) < 1e-9) denom = (denom < 0 ? -1e-9 : 1e-9);
-            double s = d3dot(p - rA.P2, ch.exitDir) / denom;
-            D3 off = (rA.P2 + rA.exitDir * s) - p;
-            ax = d3dot(off, e1); ay = d3dot(off, e2); }
-        {   double denom = d3dot(rB.exitDir, ch.exitDir);
-            if (fabs(denom) < 1e-9) denom = (denom < 0 ? -1e-9 : 1e-9);
-            double s = d3dot(p - rB.P2, ch.exitDir) / denom;
-            D3 off = (rB.P2 + rB.exitDir * s) - p;
-            bx = d3dot(off, e1); by = d3dot(off, e2); }
-        double jac = fabs(ax * by - ay * bx);
-        if (jac < 1e-24) continue;
-        double G = (eps * eps) / jac;
-
-        int px, py; Real cosCam, dist2e;
-        if (!cam.project(P1chief.toR(), px, py, cosCam, dist2e)) continue;
-        double omega = cam.pixelSolidAngle(cosCam);
-        if (omega <= 0.0) continue;
-
-        D3 wP = ch.P2 - p; double dP2 = d3len(wP);
-        if (dP2 < 1e-9) continue;
-        wP = wP * (1.0 / dP2);
-        double term = vt.term(wP);
-        if (term < 0.0) continue;
-
-        double contrib = beta * term * G * ch.Tf / omega;
-        if (contrib <= 0.0) continue;
-        contrib *= dLegAbsorption(sc, insideMat, ch.innerLen, lambda);   // Beer-Lambert inside S
-
-        DVec3 wPR = wP.toR();
-        if (occludedTo(sc, dOffsetAlong(p.toR(), wPR, wPR), p.toR() + wPR * dP2, 2e-6)) continue;
-        D3 wE = eye - ch.P1; double dE = d3len(wE); wE = wE * (1.0 / dE);
-        DVec3 wER = wE.toR();
-        if (occludedTo(sc, dOffsetAlong(ch.P1.toR(), wER, wER), ch.P1.toR() + wER * dE, 2e-6, RAY_EPS, /*camLeg=*/true)) continue;  // camera leg: hide_camera applies (Scene::occluded / DMaterial::hideCamera)
-
-        if (sc.mediaN > 0) {
-            contrib *= (double)dMediaTransmittance(sc, p.toR(),   wPR, (Real)dP2, lambda, rng);
-            contrib *= (double)dMediaTransmittance(sc, ch.P1.toR(), wER, (Real)dE, lambda, rng);
+    const double phiT = outside ? acos(fmin(1.0, r / dEyeO)) : 0.0;
+    dSphScan(phiT, [&](double c1, double s1) {
+        DSphBase2D b;
+        const bool any = dSphBase2D(eye2, r, n, outside, c1, s1, b);
+        DSphV2 Q = b.P, dir = b.dir0;
+        double F = 0.0;
+        for (int c = 0; c < nC; ++c) {
+            if (c > 0) { Q = dSphTurn(Q, b.cd, b.sd); dir = dSphTurn(dir, b.cd, b.sd); }
+            if (!any) F = 0.0;
+            else if (c == 0) F = outside ? b.R : 1.0 - b.R;
+            else if (outside && c == 1) F = b.totalOut ? 0.0 : (1.0 - b.R) * (1.0 - b.R);
+            else F *= b.R;
+            bool v = false;
+            double mss = 0.0;
+            if (F >= kDSphChainFloor) {
+                const DSphV2 q = p2 - Q;
+                v = true;
+                mss = dir.x * q.y - dir.y * q.x;
+            } else if (c > 0) {
+                for (int cc = c; cc < nC; ++cc) prevValid[cc] = prev2Valid[cc] = false;
+                break;
+            }
+            const DSphV2 u{c1, s1};
+            auto missC = [&](double cc1, double ss1, bool& vm) { return missOf(c, cc1, ss1, vm); };
+            if (v && prevValid[c] && found[c] < 4) {
+                if ((mss < 0.0) != (prevMiss[c] < 0.0)) {
+                    if (splat(c, dSphRoot(missC, prevU, prevMiss[c], u, mss))) ++found[c];
+                } else if (prev2Valid[c] && F >= kDSphChainSure && (prev2Miss[c] < 0.0) == (mss < 0.0) &&
+                           fabs(prevMiss[c]) < fabs(prev2Miss[c]) && fabs(prevMiss[c]) < fabs(mss) &&
+                           dSphDipNears(prev2Miss[c], prevMiss[c], mss)) {
+                    DSphV2 ue; double fe;
+                    if (dSphDip(missC, prev2U, u, mss < 0.0 ? -1.0 : 1.0, ue, fe) && (fe < 0.0) != (mss < 0.0)) {
+                        if (splat(c, dSphRoot(missC, prev2U, prev2Miss[c], ue, fe))) ++found[c];
+                        if (found[c] < 4 && splat(c, dSphRoot(missC, ue, fe, u, mss))) ++found[c];
+                    }
+                }
+            }
+            prev2Miss[c] = prevMiss[c]; prev2Valid[c] = prevValid[c];
+            prevMiss[c] = mss; prevValid[c] = v;
         }
-        contrib *= dLegAbsorption(sc, cam.enclosure.topMat(), (double)(dP2 + dE), lambda);   // both the camera's
-        filmAdd(film, hits, cam.resX, px, py, lambda, (Real)contrib);
-    }
+        prev2U = prevU;
+        prevU = DSphV2{c1, s1};
+    });
 }
 
 // ================== analytic specular connection by REFLECTION ==================
@@ -10966,9 +11012,9 @@ __device__ static void dConnectSpecularSphereMirror(const DScene& sc, const DCam
     const double ex_e = d3dot(eye - O, ex), ey_e = d3dot(eye - O, ey);
     const double px2 = d3dot(ap, ex), py2 = d3dot(ap, ey);
 
-    // Signed perpendicular distance of p from the ray reflected at surface angle phi.
-    // Macro rather than a lambda for the same reason the refraction traces are: no
-    // std::function on device, and this must inline into the scan loop.
+    // Signed distance of p from the line of the ray reflected at the surface point (C1, S1): the
+    // line, so a vertex close to the mirror is bracketed, the side asked of each root (host twin).
+    // A macro, to inline into the scan.
     #define D_TRACE2D_MIRROR(C1, S1, MISS, VALID) do {                               \
         VALID = false; MISS = 0.0;                                                   \
         double c1 = (C1), s1 = (S1);                                                 \
@@ -10982,43 +11028,31 @@ __device__ static void dConnectSpecularSphereMirror(const DScene& sc, const DCam
                from inside the ray always leaves through the far face (cn>0). */     \
             if (fabs(cn) > 1e-6 && (outside == (cn < 0.0))) {                        \
                 double doutx = dinx - 2.0*cn*c1, douty = diny - 2.0*cn*s1;           \
-                double fw = (px2-P1x)*doutx + (py2-P1y)*douty;                       \
-                if (fw > 0.0) {                     /* p on the forward side */      \
-                    VALID = true;                                                    \
-                    MISS = doutx*(py2-P1y) - douty*(px2-P1x);                        \
-                }                                                                    \
+                VALID = true;                                                        \
+                MISS = doutx*(py2-P1y) - douty*(px2-P1x);                            \
             }                                                                        \
         }                                                                            \
     } while (0)
 
-    // Scan the circle; bisect sign changes into chief reflection angles.
-    const int NS = SPH_SCAN_N; double roots[4]; int nroot = 0;
-    double prevMiss = 0.0, prevPhi = 0.0; bool prevValid = false;
-    for (int i = 0; i <= NS && nroot < 4; ++i) {
-        double phi = -DPI + (2.0 * DPI) * i / NS;
-        bool v; double mss; D_TRACE2D_MIRROR(g_sphScanC[i], g_sphScanS[i], mss, v);
-        if (v && prevValid && ((mss < 0.0) != (prevMiss < 0.0))) {
-            double a = prevPhi, b = phi, fa = prevMiss;
-            for (int k = 0; k < 40; ++k) {
-                double mid = 0.5 * (a + b); bool vm; double fm;
-                D_TRACE2D_MIRROR(cos(mid), sin(mid), fm, vm);
-                if (!vm) break;
-                if ((fm < 0.0) != (fa < 0.0)) b = mid; else { a = mid; fa = fm; }
-            }
-            roots[nroot++] = 0.5 * (a + b);
-        }
-        prevMiss = mss; prevValid = v; prevPhi = phi;
-    }
+    // Scan the circle (and, from outside, the rim's ends: dSphScan); bisect sign changes into chief
+    // reflection angles.
+    DSphV2 roots[8]; int nroot = 0;                   // (the line's roots: an image's and those behind)
+    double prevMiss = 0.0; DSphV2 prevU{1.0, 0.0}; bool prevValid = false;
+    const auto missAt = [&](double sc1, double ss1, bool& v) { double mss; D_TRACE2D_MIRROR(sc1, ss1, mss, v); return mss; };
+    dSphScan(outside ? acos(fmin(1.0, r / dEyeO)) : 0.0, [&](double sc1, double ss1) {
+        bool v; const double mss = missAt(sc1, ss1, v);
+        if (nroot < 8 && v && prevValid && ((mss < 0.0) != (prevMiss < 0.0)))
+            roots[nroot++] = dSphRoot(missAt, prevU, prevMiss, DSphV2{sc1, ss1}, mss);
+        prevMiss = mss; prevValid = v; prevU = DSphV2{sc1, ss1};
+    });
     #undef D_TRACE2D_MIRROR
 
     for (int ri = 0; ri < nroot; ++ri) {
-        const double phi = roots[ri];
-        const D3 P1chief = O + ex * (r * cos(phi)) + ey * (r * sin(phi));
+        const D3 P1chief = O + ex * (r * roots[ri].x) + ey * (r * roots[ri].y);
         // Everything below is pure and RNG-free, so the tests are ordered cheapest
         // first — an off-frame or backfacing connection rejects before paying for the
         // two extra differential reflections, and the traversals come last, any-hit
-        // before closest-hit. Every value is computed by the same expression as
-        // before, so the accepted set and the splats are unchanged.
+        // before closest-hit.
         int px, py; Real cosCam, dist2e;
         if (!cam.project(P1chief.toR(), px, py, cosCam, dist2e)) continue;
         const double omega = cam.pixelSolidAngle(cosCam);
@@ -11027,6 +11061,7 @@ __device__ static void dConnectSpecularSphereMirror(const DScene& sc, const DCam
         const D3 d0 = d3norm(P1chief - eye);
         DSphereRefl ch;
         if (!dReflectOffSphere(eye, d0, S, ch)) continue;
+        if (d3dot(p - ch.P1, ch.exitDir) <= 0.0) continue;   // p must be on the forward side
 
         D3 wP = ch.P1 - p; const double dP = d3len(wP);
         if (dP < 1e-9) continue;
@@ -11038,9 +11073,9 @@ __device__ static void dConnectSpecularSphereMirror(const DScene& sc, const DCam
         if (dE < 1e-9) continue;
         const D3 wRE = toEye * (1.0 / dE);
 
-        // Ray-differential geometry factor G = dOmega_eye / dA_perp at p.
+        // Ray-differential geometry factor G = dOmega_eye / dA_perp at p (eps small: host twin).
         D3 a1, a2; d3onb(d0, a1, a2);
-        const double eps = 2e-4;
+        const double eps = 1e-6;
         DSphereRefl rA, rB;
         if (!dReflectOffSphere(eye, d3norm(d0 + a1 * eps), S, rA)) continue;
         if (!dReflectOffSphere(eye, d3norm(d0 + a2 * eps), S, rB)) continue;
@@ -11057,7 +11092,7 @@ __device__ static void dConnectSpecularSphereMirror(const DScene& sc, const DCam
             D3 off = (rB.P1 + rB.exitDir * s) - p;
             bx = d3dot(off, e1); by = d3dot(off, e2); }
         const double jac = fabs(ax * by - ay * bx);
-        if (jac < 1e-24) continue;                    // caustic singularity guard
+        if (jac < 2.5e-17 * eps * eps) continue;      // caustic singularity guard (G over 4e16)
         // The same G the flat mirror gets in closed form as 1/D^2; expressed here as an
         // equivalent unfolded distance so both connectors share one splat.
         const double G = (eps * eps) / jac;
@@ -11077,10 +11112,7 @@ __device__ static void dConnectSpecularSphereMirror(const DScene& sc, const DCam
 // Renderer::camSpecularSplatAllVtxN. Mode B only; draws no aperture RNG.
 //
 // `w[i]` is the vertex's per-λ weight (Lambertian rho / single-scatter albedo); vt.weight
-// is ignored, and vt is copied per λ for the dielectric path. The loop nesting of the
-// dielectric-sphere connection (λ, then sphere, then camera) is the one the scalar and
-// hero wrappers used before this was factored, so its film accumulation order — and
-// therefore its images — are unchanged bit for bit.
+// is ignored, and vt is copied per λ for the dielectric path.
 __device__ static void camSpecularSplatAllVtxN(const DScene& sc, const DCamSet& cs, int camMode,
         const D3& pd, const DSpecVtx& vt, const Real* lam, const Real* beta, const Real* w,
         int nUp, DRng& rng) {
@@ -11091,17 +11123,29 @@ __device__ static void camSpecularSplatAllVtxN(const DScene& sc, const DCamSet& 
     // so iteration — and therefore film accumulation — order is unchanged bit for bit,
     // and a scene with many plain spheres no longer scans them all per vertex per λ.
     if (sc.nDielSph > 0) {
-        for (int i = 0; i < nUp; ++i) {
-            DSpecVtx vi = vt; vi.weight = (double)w[i]; vi.lambda = lam[i];
-            for (int k = 0; k < sc.nDielSph; ++k) {
-                DSphere moved;                         // the sphere, and the camera, at the path's time
-                const DSphere& S = dSphereNow(sc, sc.dielSph[k], moved);
-                const DMaterial& gm = sc.mats[S.matId];
-                double ng = (double)specLookup(gm.ior, lam[i]);
-                for (int c = 0; c < cs.nCam; ++c)
-                    if (!cs.cam(c).hasLens)   // a physical lens has no pinhole to aim at
-                        dConnectSpecularSphere(sc, cs.cam(c), cs.films[c], cs.hits[c], S, gm, ng,
-                                               pd, vi, lam[i], (double)beta[i], rng);
+        for (int k = 0; k < sc.nDielSph; ++k) {
+            DSphere moved;                             // the sphere, and the camera, at the path's time
+            const DSphere& S = dSphereNow(sc, sc.dielSph[k], moved);
+            const DMaterial& gm = sc.mats[S.matId];
+            for (int c = 0; c < cs.nCam; ++c) {
+                if (cs.cam(c).hasLens) continue;       // a physical lens has no pinhole to aim at
+                // The wavelengths by the index they see S with: one geometry each (host twin).
+                DSphIndex ix[hero::kHeroMax];
+                bool done[hero::kHeroMax] = {};
+                const int nB = nUp < hero::kHeroMax ? nUp : hero::kHeroMax;
+                for (int i = 0; i < nB; ++i) ix[i] = dSphereIndex(sc, cs.cam(c), S, gm, lam[i]);
+                for (int i = 0; i < nB; ++i) {
+                    if (done[i]) continue;
+                    Real gl[hero::kHeroMax], gb[hero::kHeroMax], gw[hero::kHeroMax];
+                    int m = 0;
+                    for (int j = i; j < nB; ++j)
+                        if (!done[j] && ix[j].same(ix[i])) {
+                            gl[m] = lam[j]; gb[m] = beta[j]; gw[m] = w[j]; ++m;
+                            done[j] = true;
+                        }
+                    dConnectSpecularSphere(sc, cs.cam(c), cs.films[c], cs.hits[c], S, ix[i], pd, vt, gl, gb, gw, m,
+                                           rng);
+                }
             }
         }
     }

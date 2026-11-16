@@ -29129,9 +29129,9 @@ static int run(int argc, char** argv) {
             }
             return s;
         };
-        const auto lightName = [&](size_t e) {
+        const auto emitterLabel = [&](size_t ei) {
             static const char* const kShape[] = {"area", "sphere", "spot", "env", "cylinder", "mesh", "sun", "glow"};
-            const Emitter& em = scene.emitters[e];
+            const Emitter& em = scene.emitters[ei];
             const int sh = (int)em.shape;
             // Where it is: its origin; a glow's box's centre, a mesh's first triangle's (neither has one).
             Vec3 at = em.origin;
@@ -29141,7 +29141,7 @@ static int run(int argc, char** argv) {
                 at = t.v0 + (t.e1 + t.e2) * (1.0 / 3.0);
             }
             char buf[160];
-            std::snprintf(buf, sizeof buf, "light %zu (%s at %g %g %g)", e, sh >= 0 && sh < 8 ? kShape[sh] : "?",
+            std::snprintf(buf, sizeof buf, "light %zu (%s at %g %g %g)", ei, sh >= 0 && sh < 8 ? kShape[sh] : "?",
                           at.x, at.y, at.z);
             return std::string(buf);
         };
@@ -29158,7 +29158,7 @@ static int run(int argc, char** argv) {
                 (!scene.emitterEnclosureUniform[e] ||
                  Scene::sameStack(scene.emitterEnclosure[e], scene.emitterEnclosure[e - 1])))
                 continue;
-            const std::string who = lightName(e) + (back ? ", light " + std::to_string(e - 1) + "'s back face," : "");
+            const std::string who = emitterLabel(e) + (back ? ", light " + std::to_string(e - 1) + "'s back face," : "");
             if (!scene.emitterEnclosureUniform[e])
                 say("[light] " + who + " straddles a solid's surface: each birth finds the solids around it");
             else if (scene.emitterEnclosure[e].n)

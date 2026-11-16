@@ -688,7 +688,7 @@ struct CamTarget {
     Film*         film = nullptr;
 };
 
-// The specular-sphere connectors (connectSpecularSphere / ...Inside) scan the SAME
+// The specular-sphere connectors (connectSpecularSphere, connectSpecularSphereMirror) scan the SAME
 // kSphScanN+1 fixed entry angles on every call, and each scan step used to pay a
 // fresh cos+sin pair — the dominant transcendental cost of the mode-B glass-sphere
 // splat. The angles never change, so evaluate them once at first use, with the same
@@ -696,6 +696,15 @@ struct CamTarget {
 // variable keeps the compiler honest), making table reads bit-identical to the
 // per-step evaluation they replace. Bisection refinement still computes live
 // cos/sin (its midpoints are data-dependent).
+// A 2-vector, for the glass-sphere chains' scan in the plane they lie in (Renderer::sphChainAt).
+struct SphV2 {
+    double x, y;
+    SphV2 operator+(const SphV2& o) const { return {x + o.x, y + o.y}; }
+    SphV2 operator-(const SphV2& o) const { return {x - o.x, y - o.y}; }
+    SphV2 operator*(double k) const { return {x * k, y * k}; }
+};
+inline double dot(const SphV2& a, const SphV2& b) { return a.x * b.x + a.y * b.y; }
+inline SphV2 normalize(const SphV2& a) { return a * (1.0 / std::sqrt(a.x * a.x + a.y * a.y)); }
 inline constexpr int kSphScanN = 96;
 struct SphScanTab { double c[kSphScanN + 1], s[kSphScanN + 1]; };
 inline const SphScanTab& sphScanTab() {
@@ -2075,18 +2084,16 @@ struct Renderer {
     //
     //  Mode B normally skips specular vertices for the camera connection, so a
     //  directly-viewed clear sphere is black (the SDS limitation). This routine
-    //  restores the missing paths: a diffuse/emissive vertex p that lies behind
-    //  the sphere is connected to the pinhole along the refracted chain
-    //      eye -> P1 -> (glass) -> P2 -> p
-    //  obeying Snell at both interfaces. The chain is found by a 1-D root solve in
-    //  the plane(eye, p, centre) — a sphere's refraction path is planar by
-    //  symmetry — and there may be several roots (multiple refracted images).
-    //  The radiometric weight uses a ray-differential geometry factor (the
-    //  footprint the pixel's beam covers at p), which is the specular Jacobian and
-    //  reduces EXACTLY to connect()'s cosSurf/dist^2 as n->1 (verified in code).
+    //  restores the missing paths: a diffuse/emissive vertex p is connected to the
+    //  pinhole along each chain of surface events the sphere makes -- refracted
+    //  through it, reflected off it, reflected inside it -- obeying Snell and Fresnel
+    //  at every surface. A chain is found by a 1-D root solve in the plane(eye, p,
+    //  centre) -- a sphere's paths are planar by symmetry -- and there may be several
+    //  roots (multiple images). The radiometric weight uses a ray-differential
+    //  geometry factor (the footprint the pixel's beam covers at p), which is the
+    //  specular Jacobian and reduces EXACTLY to connect()'s cosSurf/dist^2 as n->1.
     //  Smooth spheres only (a rough sphere reopens the lobe -> not a point path).
     // ===================================================================
-    struct SphereRefr { Vec3 P1, P2, exitDir; double Tf = 0, innerLen = 0; };
 
     // Describes the photon vertex being connected through the glass: a diffuse
     // surface (Lambertian rho, normal np) or a volume in-scatter (medium albedo,
@@ -2135,9 +2142,8 @@ struct Renderer {
         // The WAVELENGTH-INDEPENDENT half of term(): everything but `weight` (which is
         // the per-λ albedo). The mirror connectors solve one shared geometry for the
         // whole hero bundle — a flat/metallic reflection does not disperse — so they
-        // evaluate this once and multiply by each λ's weight. term() keeps its own
-        // arithmetic rather than being expressed through this, so the dielectric-sphere
-        // path's float ordering (and therefore its images) stay bit-identical.
+        // evaluate this once and multiply by each λ's weight (and a coat's factor, which
+        // term() includes and this leaves to them).
         double shape(const Vec3& wP) const {
             if (volume) return hgPhase(dot(wIn, wP), g);
             if (gated && dot(plane, wP) <= 0.0) return -1.0;
@@ -2147,360 +2153,446 @@ struct Renderer {
         }
     };
 
-    // Trace a ray from `o` (outside sphere S) that ENTERS S, crosses the glass, and
-    // EXITS. Fills P1 (entry), P2 (exit), exitDir (outward), the product of the two
-    // Fresnel transmittances Tf, and the internal path length. False on miss / TIR.
-    static bool traceThroughSphere2(const Vec3& o, const Vec3& d, const Sphere& S,
-                                    double n, SphereRefr& out) {
-        Vec3 oc = o - S.c;
-        double b = dot(oc, d), c = dot(oc, oc) - S.r * S.r;
-        double disc = b * b - c;
-        if (disc < 0.0) return false;
-        double sq = std::sqrt(disc);
-        double t1 = -b - sq;
-        if (t1 < 1e-7) return false;                    // entry must be ahead & outside
-        Vec3 P1 = o + d * t1;
-        Vec3 N1 = (P1 - S.c) * (1.0 / S.r);             // outward normal
-        double cosI = -dot(d, N1);
-        if (cosI <= 1e-6) return false;                 // must hit the front face
-        double eta = 1.0 / n;
-        double sin2t = eta * eta * (1.0 - cosI * cosI);
-        if (sin2t >= 1.0) return false;                 // (cannot TIR entering a denser medium)
-        double cosT = std::sqrt(1.0 - sin2t);
-        Vec3 tin = normalize(d * eta + N1 * (eta * cosI - cosT));
-        double rs = (cosI - n * cosT) / (cosI + n * cosT);
-        double rp = (cosT - n * cosI) / (cosT + n * cosI);
-        double Fe = 0.5 * (rs * rs + rp * rp);          // Fresnel reflectance, entry
-        double sInner = -2.0 * dot(P1 - S.c, tin);      // second intersection param
-        if (sInner <= 1e-9) return false;
-        Vec3 P2 = P1 + tin * sInner;
-        Vec3 N2 = (P2 - S.c) * (1.0 / S.r);             // outward normal at exit
-        double cosI2 = dot(tin, N2);                    // incidence cosine inside (>0)
-        if (cosI2 <= 1e-6) return false;
-        double sin2t2 = n * n * (1.0 - cosI2 * cosI2);
-        if (sin2t2 >= 1.0) return false;                // total internal reflection -> no exit
-        double cosT2 = std::sqrt(1.0 - sin2t2);
-        Vec3 exitDir = normalize(tin * n + N2 * (-(n * cosI2 - cosT2)));
-        double rs2 = (n * cosI2 - cosT2) / (n * cosI2 + cosT2);
-        double rp2 = (n * cosT2 - cosI2) / (n * cosT2 + cosI2);
-        double Fx = 0.5 * (rs2 * rs2 + rp2 * rp2);      // Fresnel reflectance, exit
-        out.P1 = P1; out.P2 = P2; out.exitDir = exitDir;
-        out.Tf = (1.0 - Fe) * (1.0 - Fx);
-        out.innerLen = sInner;
-        return true;
+    // ---- Mode B's images of a vertex in a smooth dielectric sphere --------------------------------
+    // A ray from the eye that meets sphere S goes on, by the Fresnel split at each surface, along
+    // several courses, and each is an image of what lies outside along its last leg. A chain is one
+    // course. From an eye outside, chain 0 reflects off the surface and chain 1 + k refracts in,
+    // reflects k times inside and refracts out; from an eye inside, chain k reflects k times inside and
+    // refracts out. In a sphere every chord turns the ray about the centre by one angle, pi - 2 theta
+    // (theta its angle to the normal inside), so chain c's last leg is the first one turned c chords on,
+    // and its Fresnel product is R, then (1 - R)^2 R^(c - 1), from outside, and (1 - R) R^c from inside.
+    // Near the rim, and for an eye inside near the critical angle, R nears 1 and the deep chains carry
+    // much of the light: every chain to kSphReflMax reflections whose product reaches kSphChainFloor is
+    // drawn, the ones fainter than kSphChainSure by roulette.
+    static constexpr int kSphReflMax = 16;
+    static constexpr int kSphChainsMax = kSphReflMax + 2;   // and the surface reflection
+    static constexpr double kSphChainFloor = 1e-4;
+    static constexpr double kSphChainSure = 0.02;
+
+    // The Fresnel reflectance at a surface between indices n1 (the ray's side) and n2, the ray's
+    // cosines cosI and cosT (refracted) to the normal.
+    static double fresnelSplit(double cosI, double cosT, double n1, double n2) {
+        const double rs = (n1 * cosI - n2 * cosT) / (n1 * cosI + n2 * cosT);
+        const double rp = (n2 * cosI - n1 * cosT) / (n2 * cosI + n1 * cosT);
+        return 0.5 * (rs * rs + rp * rp);
     }
 
-    // Connect vertex p (normal np, Lambertian weight rho) to the pinhole `cam`
-    // THROUGH one smooth dielectric sphere S (glass index n). Adds the refracted
-    // image of p seen in the sphere. Pinhole (mode B) only.
-    void connectSpecularSphere(const Scene& scene, const Camera& cam, Film& film,
-                               const Sphere& S, const Material& glass, double n,
-                               const Vec3& p, const SpecVtx& vt, double lambda,
-                               double beta, Pcg32& rng) const {
-        const Vec3 O = S.c; const double r = S.r; const Vec3 eye = cam.eye;
-        double dEyeO = length(eye - O);
-        double dPO   = length(p - O);
-        if (dPO   <  r * 0.9999) return;   // vertex inside the glass -> skip (MVP)
-        // S lies in the camera's solids (but S itself, the eye inside it), and refracts against them
-        // as a walk's interface does (exteriorIor: their index where both rank by priority, else
-        // air's), so `n` becomes the index relative to that.
+    // What a scan sample's chains share, in their plane, S centred on the origin: the ray from `eye2`
+    // to the surface point P = r (c1, s1). Chain c's last leg is (P, dir0) turned c chords on, each
+    // chord's turn (cd, sd) = (cos, sin); `R` the reflectance of its reflections. False where no chain
+    // exists: a back face seen from outside, total internal reflection for an eye inside (a sphere's
+    // chords keep their angle, so such a ray never leaves).
+    struct SphBase2D { SphV2 P, dir0; double R = 0.0, cd = 1.0, sd = 0.0; bool totalOut = false; };
+    static bool sphBase2D(const SphV2& eye2, double r, double n, bool outside, double c1, double s1,
+                          SphBase2D& b) {
+        const SphV2 N{c1, s1}, T{-s1, c1};
+        b.P = N * r;
+        SphV2 d = b.P - eye2;
+        const double dl = std::sqrt(dot(d, d));
+        if (dl < 1e-12) return false;
+        d = d * (1.0 / dl);
+        const double cn = dot(d, N), ct = dot(d, T);     // ct: the ray's signed tangential part
+        if (outside) {
+            const double cosI = -cn;
+            if (cosI <= 1e-6) return false;              // the front face only
+            b.dir0 = N * cosI + T * ct;                  // the surface reflection
+            const double sinT = ct / n, s2 = sinT * sinT;
+            b.totalOut = s2 >= 1.0;                      // (S less dense than around it) all reflected
+            if (b.totalOut) { b.R = 1.0; return true; }
+            const double cosT = std::sqrt(1.0 - s2);
+            b.R = fresnelSplit(cosI, cosT, 1.0, n);
+            b.cd = 2.0 * s2 - 1.0;                       // the chord's turn: pi - 2 theta_t
+            b.sd = 2.0 * sinT * cosT;
+            return true;
+        }
+        const double cosI = cn;                          // leaving, from inside
+        if (cosI <= 1e-6) return false;
+        const double sinO = n * ct, s2 = sinO * sinO;
+        if (s2 >= 1.0) return false;                     // total internal reflection
+        const double cosO = std::sqrt(1.0 - s2);
+        b.dir0 = N * cosO + T * sinO;                    // the refraction out
+        b.R = fresnelSplit(cosI, cosO, n, 1.0);
+        b.cd = 2.0 * ct * ct - 1.0;
+        b.sd = 2.0 * ct * cosI;
+        return true;
+    }
+    // Chain c's Fresnel product at a sample (above); 0 where it does not exist.
+    static double sphChainF(const SphBase2D& b, bool outside, int c) {
+        if (!outside) return (1.0 - b.R) * std::pow(b.R, c);
+        if (c == 0) return b.R;
+        return b.totalOut ? 0.0 : (1.0 - b.R) * (1.0 - b.R) * std::pow(b.R, c - 1);
+    }
+    // The number of internal reflections chain c takes, as sphChainAt counts them (-1: off the surface).
+    static int sphChainRefl(bool outside, int c) { return outside ? c - 1 : c; }
+
+    // A chain's course in space, in coordinates centred on S: `first`, where the ray first meets the
+    // surface; `last` and `dir`, where and which way it leaves; `F`, its Fresnel product; `inner`, its
+    // length inside the glass (an inside eye's leg included).
+    struct SphChain { Vec3 first, last, dir; double F = 1.0, inner = 0.0; };
+    // The chain of a ray from `o` along unit `d` (coordinates centred on S, radius r) that takes `refl`
+    // reflections inside (-1: off the surface, from outside); `n` S's index over the medium around it.
+    // False where it does not exist: a miss, a back face, total internal reflection where it must leave,
+    // a grazing or degenerate hit.
+    static bool sphChainFrom(const Vec3& o, Vec3 d, double r, double n, bool outside, int refl, SphChain& out) {
+        const double b0 = dot(o, d), c0 = dot(o, o) - r * r, disc = b0 * b0 - c0;
+        if (disc <= 0.0) return false;
+        const double t0 = outside ? -b0 - std::sqrt(disc) : -b0 + std::sqrt(disc);
+        if (t0 < 1e-7) return false;
+        Vec3 P = o + d * t0;
+        out.first = P;
+        out.F = 1.0;
+        out.inner = outside ? 0.0 : t0;
+        const double invR = 1.0 / r;
+        Vec3 N = P * invR;
+        if (outside) {
+            const double cosI = -dot(d, N);
+            if (cosI <= 1e-6) return false;
+            const double sin2t = (1.0 - cosI * cosI) / (n * n);
+            const double cosT = sin2t < 1.0 ? std::sqrt(1.0 - sin2t) : 0.0;
+            const double Fr = sin2t < 1.0 ? fresnelSplit(cosI, cosT, 1.0, n) : 1.0;
+            if (refl < 0) {
+                out.last = P;
+                out.dir = normalize(d + N * (2.0 * cosI));
+                out.F = Fr;
+                return Fr > 0.0;
+            }
+            if (sin2t >= 1.0) return false;
+            out.F = 1.0 - Fr;
+            const double eta = 1.0 / n;
+            d = normalize(d * eta + N * (eta * cosI - cosT));
+        }
+        for (int k = 0;; ++k) {
+            if (outside || k > 0) {                      // across the glass to the next point
+                const double s = -2.0 * dot(P, d);
+                if (s <= 1e-9 * r) return false;
+                out.inner += s;
+                P = P + d * s;
+                N = P * invR;
+            }
+            const double cosI = dot(d, N);               // leaving
+            if (cosI <= 1e-6) return false;
+            const double sin2t = n * n * (1.0 - cosI * cosI);
+            const double cosT = sin2t < 1.0 ? std::sqrt(1.0 - sin2t) : 0.0;
+            const double Fr = sin2t < 1.0 ? fresnelSplit(cosI, cosT, n, 1.0) : 1.0;
+            if (k >= refl) {
+                if (sin2t >= 1.0) return false;          // total internal reflection
+                out.F *= 1.0 - Fr;
+                out.last = P;
+                out.dir = normalize(d * n - N * (n * cosI - cosT));
+                return true;
+            }
+            out.F *= Fr;
+            d = d - N * (2.0 * cosI);                    // reflected back in
+        }
+    }
+
+    // A uniform number in [0, 1) of a vertex, a chain and an image: the faint images' roulette,
+    // deterministic so mode B's connections draw no RNG.
+    static double sphRouletteU(const Vec3& p, int c, double uc, double us) {
+        uint64_t h = 0x9E3779B97F4A7C15ULL ^ (uint64_t)(uint32_t)c;
+        for (const double v : {p.x, p.y, p.z, uc, us}) {
+            uint64_t bits;
+            std::memcpy(&bits, &v, sizeof bits);
+            h ^= bits;
+            h *= 0xBF58476D1CE4E5B9ULL;
+            h ^= h >> 31;
+        }
+        return (double)(h >> 11) * (1.0 / 9007199254740992.0);
+    }
+
+    // How a camera sees smooth dielectric sphere S at one wavelength, as a walk's interface would
+    // (interfaceStep): `n` its index over what it lies in -- the camera's solids but S where the
+    // priority rule ranks them (exteriorIor), else air -- and where the rule suppresses its boundary
+    // (a sphere of no higher priority than the medium around it, which the walks pass straight
+    // through) it is that medium, optically: an index of 1, no reflection, that medium's absorption
+    // across it. `insideMat`: whose absorption a leg inside S takes; `aroundMat`: the medium around S
+    // (-1: air).
+    struct SphIndex {
+        double n = 1.0;
+        int insideMat = -1, aroundMat = -1;
+        bool suppressed = false;
+        bool same(const SphIndex& o) const {
+            return n == o.n && insideMat == o.insideMat && aroundMat == o.aroundMat && suppressed == o.suppressed;
+        }
+    };
+    static SphIndex sphereIndex(const Scene& scene, const Camera& cam, const Sphere& S, const Material& glass,
+                                double lambda) {
+        SphIndex ix;
         MediumStack around = cam.enclosure;
         around.popMat(scene.mats[(size_t)S.matId].solidId(S.matId));
         int extMat = -1;
         bool ranked = false;
-        n /= exteriorIor(scene, glass, around, lambda, extMat, &ranked);
-        // A boundary the priority rule suppresses lets every walk straight through (interfaceStep): the
-        // sphere is then, optically, the medium around it -- an index of 1, no reflection, that medium's
-        // absorption across it -- and the connection reads it so. `insideMat`: whose absorption the
-        // chord through it takes.
-        const bool suppressed = prioritySuppressible(glass, around, ranked) && !glass.coatOpaque(lambda);
-        if (suppressed) n = 1.0;
-        const int insideMat = suppressed ? around.topMat() : S.matId;
-        if (dEyeO <= r * 0.9999) {         // eye inside the glass -> single-refraction path
-            connectSpecularSphereInside(scene, cam, film, S, n, around.topMat(), insideMat, p, vt, lambda,
-                                        beta, rng);
-            return;
-        }
-        if (dEyeO <= r * 1.0001) return;   // eye ~on the surface -> degenerate, skip
+        ix.n = glass.ior(lambda) / exteriorIor(scene, glass, around, lambda, extMat, &ranked);
+        ix.suppressed = prioritySuppressible(glass, around, ranked) && !glass.coatOpaque(lambda);
+        if (ix.suppressed) ix.n = 1.0;
+        ix.aroundMat = around.topMat();
+        ix.insideMat = ix.suppressed ? ix.aroundMat : S.matId;
+        return ix;
+    }
 
-        // Plane(eye, p, O) with ex toward the eye; p has 2-D coords (px2,py2).
-        Vec3 ex = (eye - O) * (1.0 / dEyeO);
-        Vec3 ap = p - O;
-        Vec3 perp = ap - ex * dot(ap, ex);
-        double perpLen = length(perp);
-        Vec3 ey;
-        if (perpLen < 1e-9) { Vec3 tb; onb(ex, ey, tb); }   // axial: pick any perpendicular
-        else                ey = perp * (1.0 / perpLen);
-        double ex_e = dEyeO;                                // eye 2-D = (ex_e, 0)
-        double px2 = dot(ap, ex), py2 = dot(ap, ey);        // p   2-D
-
-        // In-plane trace: signed perpendicular distance of p from the exit ray, for
-        // entry angle phi (measured in (ex,ey), passed as its cos/sin pair). Sets
-        // valid on a real forward exit.
-        auto trace2D = [&](double c1, double s1, bool& valid) -> double {
-            valid = false;
-            double P1x = r * c1, P1y = r * s1;
-            double dinx = P1x - ex_e, diny = P1y;
-            double dl = std::sqrt(dinx * dinx + diny * diny);
-            if (dl < 1e-12) return 0.0;
-            dinx /= dl; diny /= dl;
-            double cosI = -(dinx * c1 + diny * s1);
-            if (cosI <= 1e-6) return 0.0;                   // front-facing entry only
-            double eta = 1.0 / n, sin2t = eta * eta * (1.0 - cosI * cosI);
-            if (sin2t >= 1.0) return 0.0;
-            double cosT = std::sqrt(1.0 - sin2t);
-            double tinx = eta * dinx + (eta * cosI - cosT) * c1;
-            double tiny = eta * diny + (eta * cosI - cosT) * s1;
-            double tl = std::sqrt(tinx * tinx + tiny * tiny); tinx /= tl; tiny /= tl;
-            double sInner = -2.0 * (P1x * tinx + P1y * tiny);
-            if (sInner <= 1e-9) return 0.0;
-            double P2x = P1x + tinx * sInner, P2y = P1y + tiny * sInner;
-            double n2x = P2x / r, n2y = P2y / r;
-            double cosI2 = tinx * n2x + tiny * n2y;
-            if (cosI2 <= 1e-6) return 0.0;
-            double sin2t2 = n * n * (1.0 - cosI2 * cosI2);
-            if (sin2t2 >= 1.0) return 0.0;                  // TIR
-            double cosT2 = std::sqrt(1.0 - sin2t2);
-            double doutx = n * tinx - (n * cosI2 - cosT2) * n2x;
-            double douty = n * tiny - (n * cosI2 - cosT2) * n2y;
-            double dl2 = std::sqrt(doutx * doutx + douty * douty); doutx /= dl2; douty /= dl2;
-            double fw = (px2 - P2x) * doutx + (py2 - P2y) * douty;
-            if (fw <= 0.0) return 0.0;                      // p must be on the forward side
-            valid = true;
-            return doutx * (py2 - P2y) - douty * (px2 - P2x);
-        };
-
-        // Scan the front arc; bisect sign changes into chief entry angles (<=4 roots).
-        const int NS = kSphScanN; double roots[4]; int nroot = 0;
+    // The scan of a sphere connector: the fixed angles of sphScanTab, and for an eye outside one more
+    // just inside each end of the visible arc (`phiT`: the arc's half-width, 0 for none), where a rim's
+    // grazing images lie. `visit(c, s)`, the angle's cosine and sine, for each in order of angle.
+    template <class Visit>
+    static void sphScan(double phiT, const Visit& visit) {
         const SphScanTab& T = sphScanTab();
-        double prevMiss = 0.0, prevPhi = 0.0; bool prevValid = false;
-        for (int i = 0; i <= NS && nroot < 4; ++i) {
-            double phi = -PI + (2.0 * PI) * i / NS;
-            bool v; double mss = trace2D(T.c[i], T.s[i], v);
-            if (v && prevValid && ((mss < 0.0) != (prevMiss < 0.0))) {
-                double a = prevPhi, b = phi, fa = prevMiss;
-                for (int k = 0; k < 40; ++k) {
-                    double mid = 0.5 * (a + b); bool vm; double fm = trace2D(std::cos(mid), std::sin(mid), vm);
-                    if (!vm) break;
-                    if ((fm < 0.0) != (fa < 0.0)) b = mid; else { a = mid; fa = fm; }
-                }
-                roots[nroot++] = 0.5 * (a + b);
-            }
-            prevMiss = mss; prevValid = v; prevPhi = phi;
-        }
-
-        for (int ri = 0; ri < nroot; ++ri) {
-            double phi = roots[ri];
-            Vec3 P1chief = O + ex * (r * std::cos(phi)) + ey * (r * std::sin(phi));
-            Vec3 d0 = normalize(P1chief - eye);
-            SphereRefr ch;
-            if (!traceThroughSphere2(eye, d0, S, n, ch)) continue;
-
-            // Ray-differential geometry factor: perturb the eye direction by eps in
-            // two orthogonal directions, trace both through the same interfaces, and
-            // measure the footprint they cover on the plane through p (normal =
-            // chief exit dir). G = dOmega_eye / dA_p = eps^2 / |dA x dB|.
-            Vec3 a1, a2; onb(d0, a1, a2);
-            const double eps = 2e-4;
-            SphereRefr rA, rB;
-            if (!traceThroughSphere2(eye, normalize(d0 + a1 * eps), S, n, rA)) continue;
-            if (!traceThroughSphere2(eye, normalize(d0 + a2 * eps), S, n, rB)) continue;
-            Vec3 e1, e2; onb(ch.exitDir, e1, e2);
-            auto planeOff = [&](const SphereRefr& R, double& ox, double& oy) {
-                double denom = dot(R.exitDir, ch.exitDir);
-                if (std::fabs(denom) < 1e-9) denom = (denom < 0 ? -1e-9 : 1e-9);
-                double s = dot(p - R.P2, ch.exitDir) / denom;
-                Vec3 off = (R.P2 + R.exitDir * s) - p;
-                ox = dot(off, e1); oy = dot(off, e2);
-            };
-            double ax, ay, bx, by;
-            planeOff(rA, ax, ay); planeOff(rB, bx, by);
-            double jac = std::fabs(ax * by - ay * bx);
-            if (jac < 1e-24) continue;                      // caustic singularity guard
-            double G = (eps * eps) / jac;
-
-            int px, py; double cosCam, dist2e;
-            if (!cam.project(P1chief, px, py, cosCam, dist2e)) continue;
-            double omega = cam.pixelSolidAngle(cosCam);
-            if (omega <= 0.0) continue;
-
-            Vec3 wP = ch.P2 - p; double dP2 = length(wP);
-            if (dP2 < 1e-9) continue;
-            wP = wP * (1.0 / dP2);
-            double term = vt.term(wP);
-            if (term < 0.0) continue;                       // camera side behind the surface
-
-            double contrib = beta * term * G * ch.Tf / omega;
-            if (contrib <= 0.0) continue;
-            contrib *= legAbsorption(scene, insideMat, ch.innerLen, lambda);   // Beer-Lambert inside
-
-            // Visibility on the two outer segments (the connecting sphere's own
-            // surface is excluded by shortening maxDist just short of the endpoint).
-            if (scene.occluded(p + wP * 1e-6, wP, dP2 - 2e-6)) continue;
-            Vec3 wE = eye - ch.P1; double dE = length(wE); wE = wE * (1.0 / dE);
-            if (scene.occluded(ch.P1 + wE * 1e-6, wE, dE - 2e-6, 1e-6, /*camLeg=*/true)) continue;
-
-            // Fog transmittance on the two outer (vacuum-side) segments only; the
-            // interior segment is solid glass (its absorption is the Beer-Lambert above).
-            if (!scene.media.empty()) {
-                contrib *= mediaTransmittance(scene, p,     wP, dP2, lambda, rng);
-                contrib *= mediaTransmittance(scene, ch.P1, wE, dE,  lambda, rng);
-            }
-            contrib *= legAbsorption(scene, cam.medium(), dP2 + dE, lambda);   // both in the camera's
-            film.add(px, py, Vec3(cieX(lambda), cieY(lambda), cieZ(lambda)) * contrib);
+        const double e[2] = {-(phiT - 1e-5), phiT - 1e-5};
+        int next = phiT > 1e-5 ? 0 : 2;
+        for (int i = 0; i <= kSphScanN; ++i) {
+            const double phi = -PI + (2.0 * PI) * i / kSphScanN;
+            while (next < 2 && e[next] <= phi) { visit(std::cos(e[next]), std::sin(e[next])); ++next; }
+            visit(T.c[i], T.s[i]);
         }
     }
 
-    // Single-interface refraction datum: exit surface point, refracted (outward)
-    // direction, Fresnel transmittance, and the interior path length eye->P1.
-    struct SphereRefr1 { Vec3 P1, exitDir; double Tf = 0, innerLen = 0; };
-
-    // Trace a ray from `o` (INSIDE sphere S) to its exit through the surface, refract
-    // glass->vacuum. False on TIR / degenerate. (Sign convention matches the exit
-    // interface of traceThroughSphere2.)
-    static bool traceOutOfSphere(const Vec3& o, const Vec3& d, const Sphere& S,
-                                 double n, SphereRefr1& out) {
-        Vec3 oc = o - S.c;
-        double b = dot(oc, d), c = dot(oc, oc) - S.r * S.r;
-        double disc = b * b - c;
-        if (disc <= 0.0) return false;                  // (o inside => c<0 => disc>0)
-        double sq = std::sqrt(disc);
-        double t1 = -b + sq;                            // far root: the exit ahead
-        if (t1 < 1e-7) return false;
-        Vec3 P1 = o + d * t1;
-        Vec3 N1 = (P1 - S.c) * (1.0 / S.r);             // outward normal
-        double cosI = dot(d, N1);                       // outgoing (>0)
-        if (cosI <= 1e-6) return false;
-        double sin2t = n * n * (1.0 - cosI * cosI);     // glass -> vacuum
-        if (sin2t >= 1.0) return false;                 // total internal reflection
-        double cosT = std::sqrt(1.0 - sin2t);
-        Vec3 exitDir = normalize(d * n - N1 * (n * cosI - cosT));
-        double rs = (n * cosI - cosT) / (n * cosI + cosT);
-        double rp = (n * cosT - cosI) / (n * cosT + cosI);
-        double F = 0.5 * (rs * rs + rp * rp);
-        out.P1 = P1; out.exitDir = exitDir; out.Tf = 1.0 - F; out.innerLen = t1;
-        return true;
+    // The root of `miss(c, s, valid)` between two scan samples, ua and ub (unit vectors on the circle,
+    // the miss fa and fb there, of opposite signs), refined by the Illinois method on the chord between
+    // them: a point of the chord, normalised, is a point of the arc between, so it takes no
+    // trigonometry, and it converges in a few steps where bisection took forty. Its (cos, sin).
+    template <class Miss>
+    static SphV2 sphRoot(const Miss& miss, SphV2 ua, double fa, SphV2 ub, double fb) {
+        int side = 0;
+        SphV2 u = normalize(ua + ub);                    // (where a step lands where the miss is not valid)
+        for (int it = 0; it < 40; ++it) {
+            const SphV2 m = normalize(ua + (ub - ua) * (fa / (fa - fb)));
+            bool v; const double fm = miss(m.x, m.y, v);
+            if (!v) break;
+            u = m;
+            if (fm == 0.0) break;
+            if ((fm < 0.0) == (fa < 0.0)) { ua = m; fa = fm; if (side == -1) fb *= 0.5; side = -1; }
+            else                          { ub = m; fb = fm; if (side == +1) fa *= 0.5; side = +1; }
+            const SphV2 w = ub - ua;
+            if (dot(w, w) < 1e-26) break;                // a bracket under 1e-13
+        }
+        return u;
     }
 
-    // Connect an EXTERIOR vertex p to a pinhole whose eye sits INSIDE dielectric
-    // sphere S: light travels p -> P1 (surface) -> refracts once -> eye. This is the
-    // path the camera sees while flying THROUGH the glass. Planar in plane(eye,p,O).
-    // `n`: S's index relative to the medium it refracts against; `aroundMat` the medium p lies in
-    // (-1: air), whose absorption the leg outside S takes; `insideMat` the one the leg inside it takes.
-    void connectSpecularSphereInside(const Scene& scene, const Camera& cam, Film& film,
-                                     const Sphere& S, double n, int aroundMat, int insideMat,
-                                     const Vec3& p, const SpecVtx& vt, double lambda,
-                                     double beta, Pcg32& rng) const {
+    // Whether three samples' misses (m0, m1, m2: one sign, m1 nearest zero) dip toward zero enough to be
+    // searched: the parabola through them (the samples taken as evenly spaced) comes half the way. By a
+    // fold the miss is that parabola; elsewhere a dip far from zero is spared the search's 32 steps.
+    static bool sphDipNears(double m0, double m1, double m2) {
+        const double den = m0 - 2.0 * m1 + m2;
+        if (den == 0.0) return false;
+        const double ext = m1 - (m2 - m0) * (m2 - m0) / (8.0 * den);
+        return (m1 < 0.0 ? -ext : ext) < 0.5 * std::fabs(m1);
+    }
+    // Where `miss(c, s, valid)` comes nearest zero between ua and ub (unit vectors on the circle), its
+    // sign `sgn` at both: by golden section on the chord between them, as sphRoot goes. `fe` the miss
+    // there; false where the miss is not valid along the way.
+    template <class Miss>
+    static bool sphDip(const Miss& miss, const SphV2& ua, const SphV2& ub, double sgn, SphV2& ue, double& fe) {
+        const double g = 0.6180339887498949;
+        const auto at = [&](double t, double& f) {
+            const SphV2 u = normalize(ua + (ub - ua) * t);
+            bool v; f = sgn * miss(u.x, u.y, v);
+            return v;
+        };
+        double a = 0.0, b = 1.0, x1 = 1.0 - g, x2 = g, f1, f2;
+        if (!at(x1, f1) || !at(x2, f2)) return false;
+        for (int it = 0; it < 32; ++it) {
+            if (f1 < f2) { b = x2; x2 = x1; f2 = f1; x1 = b - g * (b - a); if (!at(x1, f1)) return false; }
+            else         { a = x1; x1 = x2; f1 = f2; x2 = a + g * (b - a); if (!at(x2, f2)) return false; }
+        }
+        ue = normalize(ua + (ub - ua) * (0.5 * (a + b)));
+        bool v; fe = miss(ue.x, ue.y, v);
+        return v;
+    }
+
+    // Connect vertex p (its weight, toward the sphere, vt.term) to the pinhole `cam` through every
+    // drawn chain of smooth dielectric sphere S, at the nL wavelengths lam[] that see S alike (`ix`):
+    // one geometry serves them all, each taking its own beta[], vt weight w[], absorption and fog.
+    // Pinhole (mode B) only. A chain's images are the roots of a planar miss function -- the chain lies
+    // in plane(eye, p, centre) -- found by the scan and bisection; its geometry factor G = dOmega_eye /
+    // dA_p from ray differentials.
+    void connectSpecularSphere(const Scene& scene, const Camera& cam, Film& film, const Sphere& S,
+                               const SphIndex& ix, const Vec3& p, const SpecVtx& vt, const double* lam,
+                               const double* beta, const double* w, int nL, Pcg32& rng) const {
         const Vec3 O = S.c; const double r = S.r; const Vec3 eye = cam.eye;
-        double dEyeO = length(eye - O);
+        const double dEyeO = length(eye - O);
+        if (length(p - O) < r * 0.9999) return;                 // vertex inside the glass: not drawn
+        if (std::fabs(dEyeO - r) <= r * 1e-4) return;           // eye ~on the surface: degenerate
+        const bool outside = dEyeO > r;
+        const double n = ix.n;
 
-        // Plane(eye, p, O): ex toward the eye (or any axis if eye ~at center).
+        // Plane(eye, p, O): ex toward the eye (or any axis if the eye is ~at the centre).
         Vec3 ex, ey;
         if (dEyeO < 1e-9) { Vec3 tb; onb(normalize(p - O), ex, tb); }
         else              ex = (eye - O) * (1.0 / dEyeO);
-        Vec3 ap = p - O;
-        Vec3 perp = ap - ex * dot(ap, ex);
-        double perpLen = length(perp);
+        const Vec3 ap = p - O;
+        const Vec3 perp = ap - ex * dot(ap, ex);
+        const double perpLen = length(perp);
         if (perpLen < 1e-9) { Vec3 tb; onb(ex, ey, tb); }
         else                ey = perp * (1.0 / perpLen);
-        double ex_e = dot(eye - O, ex), ey_e = dot(eye - O, ey);   // eye 2-D
-        double px2 = dot(ap, ex), py2 = dot(ap, ey);               // p   2-D
+        const SphV2 eye2{dot(eye - O, ex), dot(eye - O, ey)}, p2{dot(ap, ex), dot(ap, ey)};
 
-        // In-plane trace: signed perp distance of p from the once-refracted exit ray
-        // leaving the surface point at angle phi (passed as its cos/sin pair). valid
-        // on a real forward exit.
-        auto trace2D = [&](double c1, double s1, bool& valid) -> double {
-            valid = false;
-            double P1x = r * c1, P1y = r * s1;
-            double dinx = P1x - ex_e, diny = P1y - ey_e;
-            double dl = std::sqrt(dinx * dinx + diny * diny);
-            if (dl < 1e-12) return 0.0;
-            dinx /= dl; diny /= dl;
-            double cosI = dinx * c1 + diny * s1;            // outgoing across surface (>0)
-            if (cosI <= 1e-6) return 0.0;
-            double sin2t = n * n * (1.0 - cosI * cosI);
-            if (sin2t >= 1.0) return 0.0;                   // TIR
-            double cosT = std::sqrt(1.0 - sin2t);
-            double k = n * cosI - cosT;
-            double doutx = n * dinx - k * c1, douty = n * diny - k * s1;
-            double dl2 = std::sqrt(doutx * doutx + douty * douty); doutx /= dl2; douty /= dl2;
-            double fw = (px2 - P1x) * doutx + (py2 - P1y) * douty;
-            if (fw <= 0.0) return 0.0;
-            valid = true;
-            return doutx * (py2 - P1y) - douty * (px2 - P1x);
+        // (A suppressed boundary, index 1, reflects nothing: the floor leaves its straight chain alone.)
+        const int nC = outside ? kSphChainsMax : kSphReflMax + 1;
+
+        // Chain c's miss of p at the surface point (c1, s1): the signed distance of p from the line of its
+        // last leg; `valid` where the chain exists and reaches the floor. The line, not the leg: a vertex
+        // close to the sphere is ahead of the leg over too narrow a span for the scan to bracket, so
+        // which side of the leg p lies is asked of the root instead (splat).
+        // Chain c's last leg in the plane, for the ray to the surface point (c1, s1): false where the
+        // chain does not exist or falls below the floor.
+        const auto legOf = [&](int c, double c1, double s1, SphV2& Q, SphV2& dir) -> bool {
+            SphBase2D b;
+            if (!sphBase2D(eye2, r, n, outside, c1, s1, b) || sphChainF(b, outside, c) < kSphChainFloor) return false;
+            Q = b.P; dir = b.dir0;
+            for (int k = 0; k < c; ++k) {
+                Q = SphV2{Q.x * b.cd - Q.y * b.sd, Q.x * b.sd + Q.y * b.cd};
+                dir = SphV2{dir.x * b.cd - dir.y * b.sd, dir.x * b.sd + dir.y * b.cd};
+            }
+            return true;
+        };
+        const auto missOf = [&](int c, double c1, double s1, bool& valid) -> double {
+            SphV2 Q, dir;
+            valid = legOf(c, c1, s1, Q, dir);
+            if (!valid) return 0.0;
+            const SphV2 q = p2 - Q;
+            return dir.x * q.y - dir.y * q.x;
         };
 
-        // Scan the full circle; bisect sign changes into chief exit angles (<=2 roots).
-        const int NS = kSphScanN; double roots[4]; int nroot = 0;
-        const SphScanTab& T = sphScanTab();
-        double prevMiss = 0.0, prevPhi = 0.0; bool prevValid = false;
-        for (int i = 0; i <= NS && nroot < 4; ++i) {
-            double phi = -PI + (2.0 * PI) * i / NS;
-            bool v; double mss = trace2D(T.c[i], T.s[i], v);
-            if (v && prevValid && ((mss < 0.0) != (prevMiss < 0.0))) {
-                double a = prevPhi, b = phi, fa = prevMiss;
-                for (int k = 0; k < 40; ++k) {
-                    double mid = 0.5 * (a + b); bool vm; double fm = trace2D(std::cos(mid), std::sin(mid), vm);
-                    if (!vm) break;
-                    if ((fm < 0.0) != (fa < 0.0)) b = mid; else { a = mid; fa = fm; }
-                }
-                roots[nroot++] = 0.5 * (a + b);
+        // One image: chain c's chief ray to the surface point u (cos, sin), its differentials, the splat.
+        // False where u is no image (its last leg's line passes p behind it).
+        const auto splat = [&](int c, const SphV2& u) -> bool {
+            SphV2 Q2, dir2;                                     // behind p, in the plane: no image
+            if (!legOf(c, u.x, u.y, Q2, dir2) || dot(p2 - Q2, dir2) <= 0.0) return false;
+            const int refl = sphChainRefl(outside, c);
+            const Vec3 P1chief = O + ex * (r * u.x) + ey * (r * u.y);
+            const Vec3 d0 = normalize(P1chief - eye);
+            SphChain ch;
+            if (!sphChainFrom(eye - O, d0, r, n, outside, refl, ch) || ch.F <= 0.0) return false;
+            if (dot(ap - ch.last, ch.dir) <= 0.0) return false;    // p must be on the forward side
+            // The faint images by roulette, before their differentials and visibility.
+            double keep = 1.0;
+            if (ch.F < kSphChainSure) {
+                keep = ch.F / kSphChainSure;
+                if (sphRouletteU(p, c, u.x, u.y) >= keep) return true;
             }
-            prevMiss = mss; prevValid = v; prevPhi = phi;
-        }
-
-        for (int ri = 0; ri < nroot; ++ri) {
-            double phi = roots[ri];
-            Vec3 P1chief = O + ex * (r * std::cos(phi)) + ey * (r * std::sin(phi));
-            Vec3 d0 = normalize(P1chief - eye);
-            SphereRefr1 ch;
-            if (!traceOutOfSphere(eye, d0, S, n, ch)) continue;
-
-            // Ray-differential geometry factor G = dOmega_eye / dA_p.
+            // Ray-differential geometry factor: perturb the eye direction by eps in two orthogonal
+            // directions, follow both along the same chain, and measure the footprint they cover on
+            // the plane through p normal to the chief's last leg. eps is small: by the rim a ray's
+            // course turns fast with its direction, and a wide step mismeasures the Jacobian there.
             Vec3 a1, a2; onb(d0, a1, a2);
-            const double eps = 2e-4;
-            SphereRefr1 rA, rB;
-            if (!traceOutOfSphere(eye, normalize(d0 + a1 * eps), S, n, rA)) continue;
-            if (!traceOutOfSphere(eye, normalize(d0 + a2 * eps), S, n, rB)) continue;
-            Vec3 e1, e2; onb(ch.exitDir, e1, e2);
-            auto planeOff = [&](const SphereRefr1& R, double& ox, double& oy) {
-                double denom = dot(R.exitDir, ch.exitDir);
+            const double eps = 1e-6;
+            SphChain rA, rB;
+            if (!sphChainFrom(eye - O, normalize(d0 + a1 * eps), r, n, outside, refl, rA)) return true;
+            if (!sphChainFrom(eye - O, normalize(d0 + a2 * eps), r, n, outside, refl, rB)) return true;
+            Vec3 e1, e2; onb(ch.dir, e1, e2);
+            const auto planeOff = [&](const SphChain& R, double& ox, double& oy) {
+                double denom = dot(R.dir, ch.dir);
                 if (std::fabs(denom) < 1e-9) denom = (denom < 0 ? -1e-9 : 1e-9);
-                double s = dot(p - R.P1, ch.exitDir) / denom;
-                Vec3 off = (R.P1 + R.exitDir * s) - p;
+                const double s = dot(ap - R.last, ch.dir) / denom;
+                const Vec3 off = (R.last + R.dir * s) - ap;
                 ox = dot(off, e1); oy = dot(off, e2);
             };
             double ax, ay, bx, by;
             planeOff(rA, ax, ay); planeOff(rB, bx, by);
-            double jac = std::fabs(ax * by - ay * bx);
-            if (jac < 1e-24) continue;                      // caustic singularity guard
-            double G = (eps * eps) / jac;
+            const double jac = std::fabs(ax * by - ay * bx);
+            if (jac < 2.5e-17 * eps * eps) return true;              // caustic singularity guard (G over 4e16)
+            const double G = (eps * eps) / jac;
 
             int px, py; double cosCam, dist2e;
-            if (!cam.project(P1chief, px, py, cosCam, dist2e)) continue;
-            double omega = cam.pixelSolidAngle(cosCam);
-            if (omega <= 0.0) continue;
+            if (!cam.project(P1chief, px, py, cosCam, dist2e)) return true;
+            const double omega = cam.pixelSolidAngle(cosCam);
+            if (omega <= 0.0) return true;
 
-            Vec3 wP = ch.P1 - p; double dP = length(wP);
-            if (dP < 1e-9) continue;
+            const Vec3 last = O + ch.last, first = O + ch.first;
+            Vec3 wP = last - p; const double dP = length(wP);
+            if (dP < 1e-9) return true;
             wP = wP * (1.0 / dP);
-            double term = vt.term(wP);
-            if (term < 0.0) continue;
+            // An eye inside S sees the radiance outside it n^2 times over (the radiance theorem:
+            // n^2 L is what a ray keeps across the interface), as a camera walk refracting out reads it.
+            const double geom = G * ch.F / keep / omega * (outside ? 1.0 : n * n);
 
-            // An eye inside S sees the radiance outside it n^2 times over (the radiance theorem: n^2
-            // L is what a ray keeps across the interface), as a camera walk refracting out reads it.
-            double contrib = beta * term * G * ch.Tf / omega * (n * n);
-            if (contrib <= 0.0) continue;
-            contrib *= legAbsorption(scene, insideMat, ch.innerLen, lambda);   // eye -> P1, inside S
+            // Visibility: the leg from p, and from outside the eye's leg (an inside eye's is in the
+            // glass), each stopping just short of the sphere's own surface.
+            if (scene.occluded(p + wP * 1e-6, wP, dP - 2e-6)) return true;
+            Vec3 wE{0, 0, 0}; double dE = 0.0;
+            if (outside) {
+                wE = eye - first; dE = length(wE); wE = wE * (1.0 / dE);
+                if (scene.occluded(first + wE * 1e-6, wE, dE - 2e-6, 1e-6, /*camLeg=*/true)) return true;
+            }
+            for (int j = 0; j < nL; ++j) {
+                SpecVtx vj = vt; vj.weight = w[j]; vj.lambda = lam[j];
+                const double term = vj.term(wP);
+                if (term < 0.0) return true;                         // camera side behind the surface
+                double contrib = beta[j] * term * geom;
+                if (contrib <= 0.0) continue;
+                contrib *= legAbsorption(scene, ix.insideMat, ch.inner, lam[j]);   // Beer-Lambert inside S
+                if (outside) {
+                    // The two outer legs, in the camera's medium (fog, and its solid's absorption).
+                    if (!scene.media.empty()) {
+                        contrib *= mediaTransmittance(scene, p, wP, dP, lam[j], rng);
+                        contrib *= mediaTransmittance(scene, first, wE, dE, lam[j], rng);
+                    }
+                    contrib *= legAbsorption(scene, cam.medium(), dP + dE, lam[j]);
+                } else {
+                    contrib *= legTransmittance(scene, ix.aroundMat, p, wP, dP, lam[j], rng);
+                }
+                film.add(px, py, Vec3(cieX(lam[j]), cieY(lam[j]), cieZ(lam[j])) * contrib);
+            }
+            return true;
+        };
 
-            // Visibility on the exterior segment p -> P1 only (eye -> P1 is inside glass).
-            if (scene.occluded(p + wP * 1e-6, wP, dP - 2e-6)) continue;
-
-            // The exterior segment's fog and medium (the interior's glass is taken above).
-            contrib *= legTransmittance(scene, aroundMat, p, wP, dP, lambda, rng);
-
-            film.add(px, py, Vec3(cieX(lambda), cieY(lambda), cieZ(lambda)) * contrib);
-        }
+        // The scan, every chain at once: a sign change of a chain's miss between two samples where it
+        // is valid brackets a root, refined and, where it is an image, splatted at once (at most 4 a
+        // chain). And where three samples' misses share a sign but the middle one dips toward zero,
+        // the dip is searched: a caustic brings a vertex's two images together, and both within one
+        // step of the scan change no sign (a vertex near a ball's focus: by a wall close behind it, a
+        // dark ring of a fifth of the light).
+        double prevMiss[kSphChainsMax] = {}, prev2Miss[kSphChainsMax] = {};
+        SphV2 prevU{1.0, 0.0}, prev2U{1.0, 0.0};
+        bool prevValid[kSphChainsMax] = {}, prev2Valid[kSphChainsMax] = {};
+        int found[kSphChainsMax] = {};
+        const double phiT = outside ? std::acos(std::min(1.0, r / dEyeO)) : 0.0;
+        sphScan(phiT, [&](double c1, double s1) {
+            SphBase2D b;
+            const bool any = sphBase2D(eye2, r, n, outside, c1, s1, b);
+            SphV2 Q = b.P, dir = b.dir0;
+            double F = 0.0;                                     // chain c's Fresnel product (sphChainF)
+            for (int c = 0; c < nC; ++c) {
+                if (c > 0) {                                    // chain c: the previous one a chord on
+                    Q = SphV2{Q.x * b.cd - Q.y * b.sd, Q.x * b.sd + Q.y * b.cd};
+                    dir = SphV2{dir.x * b.cd - dir.y * b.sd, dir.x * b.sd + dir.y * b.cd};
+                }
+                if (!any) F = 0.0;
+                else if (c == 0) F = outside ? b.R : 1.0 - b.R;
+                else if (outside && c == 1) F = b.totalOut ? 0.0 : (1.0 - b.R) * (1.0 - b.R);
+                else F *= b.R;
+                bool v = false;
+                double mss = 0.0;
+                if (F >= kSphChainFloor) {
+                    const SphV2 q = p2 - Q;
+                    v = true;
+                    mss = dir.x * q.y - dir.y * q.x;
+                } else if (c > 0) {
+                    // The deeper chains are fainter still at this sample (R^c falls with c).
+                    for (int cc = c; cc < nC; ++cc) prevValid[cc] = prev2Valid[cc] = false;
+                    break;
+                }
+                const SphV2 u{c1, s1};
+                const auto missC = [&](double cc1, double ss1, bool& vm) { return missOf(c, cc1, ss1, vm); };
+                if (v && prevValid[c] && found[c] < 4) {
+                    if ((mss < 0.0) != (prevMiss[c] < 0.0)) {
+                        if (splat(c, sphRoot(missC, prevU, prevMiss[c], u, mss))) ++found[c];
+                    } else if (prev2Valid[c] && F >= kSphChainSure && (prev2Miss[c] < 0.0) == (mss < 0.0) &&
+                               std::fabs(prevMiss[c]) < std::fabs(prev2Miss[c]) &&
+                               std::fabs(prevMiss[c]) < std::fabs(mss) &&
+                               sphDipNears(prev2Miss[c], prevMiss[c], mss)) {
+                        SphV2 ue; double fe;
+                        if (sphDip(missC, prev2U, u, mss < 0.0 ? -1.0 : 1.0, ue, fe) && (fe < 0.0) != (mss < 0.0)) {
+                            if (splat(c, sphRoot(missC, prev2U, prev2Miss[c], ue, fe))) ++found[c];
+                            if (found[c] < 4 && splat(c, sphRoot(missC, ue, fe, u, mss))) ++found[c];
+                        }
+                    }
+                }
+                prev2Miss[c] = prevMiss[c]; prev2Valid[c] = prevValid[c];
+                prevMiss[c] = mss; prevValid[c] = v;
+            }
+            prev2U = prevU;
+            prevU = SphV2{c1, s1};
+        });
     }
 
     // ===================================================================
@@ -2678,7 +2770,9 @@ struct Renderer {
         const double ex_e = dot(eye - O, ex), ey_e = dot(eye - O, ey);
         const double px2 = dot(ap, ex), py2 = dot(ap, ey);
 
-        // Signed perpendicular distance of p from the ray reflected at surface angle phi.
+        // Signed distance of p from the line of the ray reflected at the surface point (c1, s1) -- the
+        // line, so a vertex close to the mirror is bracketed; which side of the reflection point p lies
+        // is asked of each root.
         auto trace2D = [&](double c1, double s1, bool& valid) -> double {
             valid = false;
             const double P1x = r * c1, P1y = r * s1;
@@ -2692,40 +2786,27 @@ struct Renderer {
             // from inside the ray always leaves through the far face (cn > 0).
             if (outside != (cn < 0.0)) return 0.0;
             const double doutx = dinx - 2.0 * cn * c1, douty = diny - 2.0 * cn * s1;
-            const double fw = (px2 - P1x) * doutx + (py2 - P1y) * douty;
-            if (fw <= 0.0) return 0.0;                    // p must be on the forward side
             valid = true;
             return doutx * (py2 - P1y) - douty * (px2 - P1x);
         };
 
-        // Scan the circle; bisect sign changes into chief reflection angles.
-        const int NS = kSphScanN; double roots[4]; int nroot = 0;
-        const SphScanTab& T = sphScanTab();
-        double prevMiss = 0.0, prevPhi = 0.0; bool prevValid = false;
-        for (int i = 0; i <= NS && nroot < 4; ++i) {
-            const double phi = -PI + (2.0 * PI) * i / NS;
-            bool v; const double mss = trace2D(T.c[i], T.s[i], v);
-            if (v && prevValid && ((mss < 0.0) != (prevMiss < 0.0))) {
-                double a = prevPhi, b = phi, fa = prevMiss;
-                for (int k = 0; k < 40; ++k) {
-                    const double mid = 0.5 * (a + b);
-                    bool vm; const double fm = trace2D(std::cos(mid), std::sin(mid), vm);
-                    if (!vm) break;
-                    if ((fm < 0.0) != (fa < 0.0)) b = mid; else { a = mid; fa = fm; }
-                }
-                roots[nroot++] = 0.5 * (a + b);
-            }
-            prevMiss = mss; prevValid = v; prevPhi = phi;
-        }
+        // Scan the circle (and, from outside, the rim's ends: sphScan); bisect sign changes into
+        // chief reflection angles.
+        SphV2 roots[8]; int nroot = 0;                    // (the line's roots: an image's and those behind)
+        double prevMiss = 0.0; SphV2 prevU{1.0, 0.0}; bool prevValid = false;
+        sphScan(outside ? std::acos(std::min(1.0, r / dEyeO)) : 0.0, [&](double c1, double s1) {
+            bool v; const double mss = trace2D(c1, s1, v);
+            if (nroot < 8 && v && prevValid && ((mss < 0.0) != (prevMiss < 0.0)))
+                roots[nroot++] = sphRoot(trace2D, prevU, prevMiss, SphV2{c1, s1}, mss);
+            prevMiss = mss; prevValid = v; prevU = SphV2{c1, s1};
+        });
 
         for (int ri = 0; ri < nroot; ++ri) {
-            const double phi = roots[ri];
-            const Vec3 P1chief = O + ex * (r * std::cos(phi)) + ey * (r * std::sin(phi));
+            const Vec3 P1chief = O + ex * (r * roots[ri].x) + ey * (r * roots[ri].y);
             // Everything below is pure and RNG-free, so the tests are ordered cheapest
             // first — an off-frame or backfacing connection rejects before paying for
             // the two extra differential reflections, and the BVH queries come last,
-            // any-hit before closest-hit. Every value is computed by the same
-            // expression as before, so the accepted set and the splats are unchanged.
+            // any-hit before closest-hit.
             int px, py; double cosCam, dist2e;
             if (!cam.project(P1chief, px, py, cosCam, dist2e)) continue;
             const double omega = cam.pixelSolidAngle(cosCam);
@@ -2734,6 +2815,7 @@ struct Renderer {
             const Vec3 d0 = normalize(P1chief - eye);
             SphereRefl ch;
             if (!reflectOffSphere(eye, d0, S, ch)) continue;
+            if (dot(p - ch.P1, ch.exitDir) <= 0.0) continue;  // p must be on the forward side
 
             Vec3 wP = ch.P1 - p; const double dP = length(wP);
             if (dP < 1e-9) continue;
@@ -2745,9 +2827,10 @@ struct Renderer {
             if (dE < 1e-9) continue;
             const Vec3 wRE = toEye * (1.0 / dE);
 
-            // Ray-differential geometry factor G = dOmega_eye / dA_perp at p.
+            // Ray-differential geometry factor G = dOmega_eye / dA_perp at p (eps small, as the glass
+            // sphere's: by the rim a reflection turns fast with the ray's direction).
             Vec3 a1, a2; onb(d0, a1, a2);
-            const double eps = 2e-4;
+            const double eps = 1e-6;
             SphereRefl rA, rB;
             if (!reflectOffSphere(eye, normalize(d0 + a1 * eps), S, rA)) continue;
             if (!reflectOffSphere(eye, normalize(d0 + a2 * eps), S, rB)) continue;
@@ -2762,7 +2845,7 @@ struct Renderer {
             double ax, ay, bx, by;
             planeOff(rA, ax, ay); planeOff(rB, bx, by);
             const double jac = std::fabs(ax * by - ay * bx);
-            if (jac < 1e-24) continue;                    // caustic singularity guard
+            if (jac < 2.5e-17 * eps * eps) continue;      // caustic singularity guard (G over 4e16)
             // The same G the flat mirror gets in closed form as 1/D^2; expressed here as
             // an equivalent unfolded distance so both connectors share one splat.
             const double G = (eps * eps) / jac;
@@ -2784,10 +2867,7 @@ struct Renderer {
     // skipped: these closed-form connections aim at the pinhole, which it does not have.
     //
     // `w[i]` is the vertex's per-λ weight (Lambertian rho / single-scatter albedo);
-    // vt.weight is ignored, and vt is copied per λ for the dielectric path. The loop
-    // nesting of the dielectric-sphere connection (λ, then sphere, then camera) is the
-    // one the scalar and hero wrappers used before this was factored, so its film
-    // accumulation order — and therefore its images — are unchanged bit for bit.
+    // vt.weight is ignored, and vt is copied per λ for the dielectric path.
     void camSpecularSplatAllVtxN(const Scene& scene, const CamTarget* cams, int nCam,
                                  const Vec3& p, const SpecVtx& vt, const double* lam,
                                  const double* beta, const double* w, int nUp,
@@ -2798,17 +2878,30 @@ struct Renderer {
         // material per vertex (per λ, for the dielectrics). The lists are ascending, so
         // the visit order — and the film accumulation order — is exactly the old scan's.
         if (!scene.dielSphereIdx.empty()) {
-            for (int i = 0; i < nUp; ++i) {
-                SpecVtx vi = vt; vi.weight = w[i]; vi.lambda = lam[i];
-                for (int si : scene.dielSphereIdx) {
-                    Sphere moved;
-                    const Sphere& S = scene.sphereNow(scene.spheres[(size_t)si], moved);
-                    const Material& gm = scene.mats[S.matId];
-                    const double ng = gm.ior(lam[i]);
-                    for (int c = 0; c < nCam; ++c)
-                        if (cams[c].cam && cams[c].film && !cams[c].cam->hasLens())
-                            connectSpecularSphere(scene, *cams[c].cam, *cams[c].film, S, gm, ng,
-                                                  p, vi, lam[i], beta[i], rng);
+            if (nUp > hero::kHeroMax) throw std::logic_error("camSpecularSplatAllVtxN: bundle wider than kHeroMax");
+            for (int si : scene.dielSphereIdx) {
+                Sphere moved;
+                const Sphere& S = scene.sphereNow(scene.spheres[(size_t)si], moved);
+                const Material& gm = scene.mats[S.matId];
+                for (int c = 0; c < nCam; ++c) {
+                    if (!cams[c].cam || !cams[c].film || cams[c].cam->hasLens()) continue;
+                    // The wavelengths by the index they see S with: one geometry for each such group
+                    // (one for the whole bundle, through glass that does not disperse).
+                    SphIndex ix[hero::kHeroMax];
+                    bool done[hero::kHeroMax] = {};
+                    for (int i = 0; i < nUp; ++i) ix[i] = sphereIndex(scene, *cams[c].cam, S, gm, lam[i]);
+                    for (int i = 0; i < nUp; ++i) {
+                        if (done[i]) continue;
+                        double gl[hero::kHeroMax], gb[hero::kHeroMax], gw[hero::kHeroMax];
+                        int m = 0;
+                        for (int k = i; k < nUp; ++k)
+                            if (!done[k] && ix[k].same(ix[i])) {
+                                gl[m] = lam[k]; gb[m] = beta[k]; gw[m] = w[k]; ++m;
+                                done[k] = true;
+                            }
+                        connectSpecularSphere(scene, *cams[c].cam, *cams[c].film, S, ix[i], p, vt, gl, gb, gw, m,
+                                              rng);
+                    }
                 }
             }
         }
@@ -2870,10 +2963,11 @@ struct Renderer {
         const double w[hero::kHeroMax] = {};   // a glossy vertex's weight is in its lobe
         camSpecularSplatAllVtxN(scene, cams, nCam, p, vt, lam, beta, w, nUp, rng);
     }
-    // Hero variant. The sphere REFRACTION is dispersive (glass IOR varies per λ), so it
-    // cannot share one geometry — each wavelength traces its own refracted image, which
-    // is exactly what makes the glass-sphere caustic-image chromatically dispersed. A
-    // mirror is achromatic, so its geometry IS shared and only the reflectance varies.
+    // Hero variant. A glass sphere's chains disperse where its index varies with λ, so
+    // only the wavelengths that see one index share a geometry -- each other one traces
+    // its own images, which is what makes the glass-sphere caustic image chromatically
+    // dispersed. A mirror is achromatic, so its geometry IS shared and only the
+    // reflectance varies.
     // Draws no RNG (mode B), so the bundle leaves the stream untouched.
     void camSpecularSplatAllHero(const Scene& scene, const CamTarget* cams, int nCam,
                                  const Vec3& p, const Vec3& n, const Vec3& ng, const Vec3* wi,
