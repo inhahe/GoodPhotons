@@ -72,7 +72,20 @@ closed entries, where the cost is a broken historical link rather than a blocked
 Three references — `scenes/_gr_fly0.ftsl`, `scenes/silver_sphere_xenon.ftsl`, `scenes/x.ftsl` —
 name files that no longer exist at all, all in closed entries.
 
-## OPEN (2026-11-16): GPU-TIR-DRIFT — on the GPU a ray held inside a glass ball by total internal reflection drifts out
+## DONE (2026-11-16, 0.448.2): GPU-TIR-DRIFT — on the GPU a ray held inside a glass ball by total internal reflection drifts out
+
+**Fixed:** every walk's dielectric step (`dDielectricStep`) starts its ray by `dOffsetSpecular`: as
+far off the surface as before, but along the ray itself, so the ray keeps its line, as the host's
+does. GPU over CPU mode R, the off-centre inside eye at 64 bounces: the left half 1.216 -> 1.001, the
+frame 1.034 -> 0.999, the column at the band's edge 3.04 -> 1.10 (which reads 1.11 at 18 bounces
+too, and 0.97-1.14 between depths and seeds: mode R's noise there, where it finds the lamp through
+the glass only by chance, not drift). The bidirectional walks (modes D, J and U), which build their
+continuation's origin after the lobe is chosen and so had passed check_bitid unchanged, start every
+delta continuation along its own direction too, on both devices -- the host's had pushed 1e-6 along
+the normal, a drift of its own on a small ball. check_ball_images holds GPU mode R to CPU mode R on
+that view.
+
+The finding:
 
 Found by check_ball_images at -max-bounce 64 (REVIEW-0448): the eye inside the ball 0.8 of its radius
 off its centre, GPU mode R reads the edges of the view by the critical angle far over CPU mode R

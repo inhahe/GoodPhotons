@@ -90,6 +90,7 @@ namespace vcm {
 using bdpt::bsdfF;
 using bdpt::bsdfFAdjoint;   // particle-vertex connections; see bsdf_eval.h
 using bdpt::bsdfPdf;
+using bdpt::continuationOrigin;
 using bdpt::lambertLit;
 using bdpt::isConnectibleMat;
 using bdpt::isFiberMat;
@@ -944,9 +945,8 @@ inline void traceLightSubpath(const Scene& scene, const Camera& cam, const Rende
         prevP = h.p;
         // A fiber scattering out its far side steps clear of its own tube (see fiberStep).
         const double fstep = fiberStep(h, mp->type == MatType::Hair, wi);
-        double sgn = dot(wi, h.ng) >= 0.0 ? 1.0 : -1.0;
         ray = (fstep > 0.0) ? Ray{h.p + normalize(wi) * 1e-9, normalize(wi), fstep}
-                            : Ray{h.p + h.ng * (sgn * 1e-6), normalize(wi)};
+                            : Ray{continuationOrigin(h.p, h.ng, normalize(wi), delta), normalize(wi)};
     }
 }
 
@@ -1516,9 +1516,8 @@ inline Vec3 traceCameraSubpath(const Scene& scene, const Camera& cam, const Rend
         softNg = orientedGeoN(h);
         // A fiber scattering out its far side steps clear of its own tube (see fiberStep).
         const double fstep = fiberStep(h, mp->type == MatType::Hair, wi);
-        double sgn = dot(wi, h.ng) >= 0.0 ? 1.0 : -1.0;
         ray = (fstep > 0.0) ? Ray{h.p + normalize(wi) * 1e-9, normalize(wi), fstep}
-                            : Ray{h.p + h.ng * (sgn * 1e-6), normalize(wi)};
+                            : Ray{continuationOrigin(h.p, h.ng, normalize(wi), delta), normalize(wi)};
     }
     return result;
 }

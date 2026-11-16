@@ -307,8 +307,8 @@ Then the rest of 4.2-4.6 in their order, 4.7's bookkeeping alongside whatever to
   the sphere connections into a kernel of their own (known-issues).
 - [x] **MODEB-SPHERE-ROOM** (0.448.1) — the check's depth cap, which mode R counts the ball's events
   against and mode B's connection does not (known-issues); modes M and S to re-measure at depth 64.
-- [ ] **GPU-TIR-DRIFT** — on the GPU a ray held inside a glass ball by total internal reflection
-  drifts out, its origin pushed inward at each reflection (known-issues).
+- [x] **GPU-TIR-DRIFT** (0.448.2) — on the GPU a ray held inside a glass ball by total internal
+  reflection drifted out, its origin pushed inward at each reflection (known-issues).
 - [ ] **MODEB-DEPTH-CONNECT** — mode B's specular connections do not count their vertices against
   -max-bounce (known-issues).
 - [x] **REVIEW-0447R** (0.447.2) — the Opus (xhigh) review of 0.447.1's fixes; known-issues REVIEW-0447R.

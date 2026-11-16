@@ -368,6 +368,28 @@ __device__ static inline DVec3 dOffsetAlong(const DVec3& p, const DVec3& ng, con
     if (!(nn > (Real)0)) return dOffsetPoint(p, w);
     return dOffsetPoint(p, (dot(ng, w) >= (Real)0) ? ng : -ng);
 }
+// A dielectric step's new origin (`w` the unit direction it leaves in): as far off the surface as
+// dOffsetAlong puts it, but along the ray itself, so the ray keeps its line -- as the host's
+// interfaceStep starts it, at h.p + out * 1e-6. A ray reflected inside a sphere keeps r sin(theta) from
+// chord to chord, and an origin pushed along the normal starts each chord inside the surface by the
+// offset, shrinking that by the offset's share of the radius at every reflection: in fp32, 2e-4 of a
+// 15 cm ball, so a ray held by total internal reflection slid under the critical angle within a few
+// dozen reflections and left. Grazing (|cos| < 1/4, where the step along the ray would run long) it is
+// dOffsetAlong's.
+__device__ static inline DVec3 dOffsetSpecular(const DVec3& p, const DVec3& ng, const DVec3& w) {
+#if FTRACE_GPU_FP32
+    const DVec3 q = dOffsetAlong(p, ng, w);
+    const Real nn = dot(ng, ng);
+    if (!(nn > (Real)0)) return q;
+    const Real inv = (Real)1 / sqrt(nn);
+    const Real ac = fabs(dot(ng, w)) * inv;
+    if (ac < (Real)0.25) return q;
+    return p + w * (fabs(dot(q - p, ng)) * inv / ac);     // q's clearance, reached along w
+#else
+    (void)ng;
+    return p + w * RAY_EPS;                               // the host's offset
+#endif
+}
 // Componentwise (Hadamard) product — RGB throughput * albedo in the fast RGB backward.
 HD static inline DVec3 hadamard(const DVec3& a, const DVec3& b) { return {a.x*b.x, a.y*b.y, a.z*b.z}; }
 HD static inline DVec3 cross(const DVec3& a, const DVec3& b) {
@@ -6119,7 +6141,7 @@ __device__ static bool dDielectricStep(const DScene& sc, const DMaterial& m, con
     if (suppressible && !dCoatOpaque(m, lambda)) {                          // suppressed
         if (entering) stk.push(si, m.priority); else stk.popMat(si);
         if (rec) rec->pass = true;
-        outD = d; outO = dOffsetAlong(h.p, h.ng, outD); return true;
+        outD = d; outO = dOffsetSpecular(h.p, h.ng, outD); return true;
     }
     if (rec) rec->farMat = extMat;
     const DInterfaceOptics o = dInterfaceOptics(sc, m, h, d, extIor, lambda);
@@ -6127,7 +6149,7 @@ __device__ static bool dDielectricStep(const DScene& sc, const DMaterial& m, con
         if (!o.entering) return false;
         if (whittedWeight) *whittedWeight = (double)o.R;
         else if (rng.uniform() >= o.R) return false;
-        outD = normalize(reflectv(d, o.nl)); outO = dOffsetAlong(h.p, h.ng, outD);
+        outD = normalize(reflectv(d, o.nl)); outO = dOffsetSpecular(h.p, h.ng, outD);
         if (rec) rec->factor = rec->prob = (double)o.R;
         return true;
     }
@@ -6158,7 +6180,7 @@ __device__ static bool dDielectricStep(const DScene& sc, const DMaterial& m, con
         rec->prob = dBranchProb(o, refracted);
     }
     if (refracted) { if (entering) stk.push(si, m.priority); else stk.popMat(si); }
-    outD = out; outO = dOffsetAlong(h.p, h.ng, outD);
+    outD = out; outO = dOffsetSpecular(h.p, h.ng, outD);
     return true;
 }
 // Grating diffraction (port of render.h gratingDiffract). Returns false if absorbed.
@@ -19704,7 +19726,9 @@ __device__ static void dRandomWalk(const DScene& sc, const DCamera& cam, int dif
         // CURVE-ONLY tmin for the next trace (dHairChordExit is 0 on the near side). RAY_EPS is
         // 1e-4 in FP32 -- a whole strand -- and would skip the neighbouring hair too (bdpt.h).
         curveTmin = (mp->type == D_HAIR) ? dHairChordExit(h.fiberRadius, h.n, h.tangent, rd) : (Real)0;
-        ro = (curveTmin > (Real)0) ? dOffsetPoint(h.p, rd) : dOffsetAlong(path[cur].p, path[cur].ng, wi);
+        ro = (curveTmin > (Real)0) ? dOffsetPoint(h.p, rd)
+           : delta ? dOffsetSpecular(path[cur].p, path[cur].ng, rd)      // its line kept (host twin bdpt.h)
+                   : dOffsetAlong(path[cur].p, path[cur].ng, wi);
 #if FTRACE_GPU_FP32
         if (mp->type == D_HAIR && h.fiberRadius > (Real)0) {   // see dStrandStart
             const DStrandStart st = dStrandStart(h.p, h.n, h.tangent, h.fiberRadius, rd);
@@ -23899,7 +23923,9 @@ __global__ void kVcmLightT(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx,
             // RAY_EPS is 1e-4 in FP32, a whole strand, and would skip the neighbour too.
             curveTmin = dFiberStep(h, mp->type == D_HAIR, wi);
             rd = normalize(wi);
-            ro = (curveTmin > (Real)0) ? dOffsetPoint(h.p, rd) : dOffsetAlong(h.p, h.ng, wi);
+            ro = (curveTmin > (Real)0) ? dOffsetPoint(h.p, rd)
+               : delta ? dOffsetSpecular(h.p, h.ng, rd)                      // its line kept (host twin vcm.h)
+                       : dOffsetAlong(h.p, h.ng, wi);
         }
         lvCount[i] = stored;
     }
@@ -24548,7 +24574,9 @@ __global__ void kVcmCameraT(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx
             // RAY_EPS is 1e-4 in FP32, a whole strand, and would skip the neighbour too.
             curveTmin = dFiberStep(h, mp->type == D_HAIR, wi);
             rd = normalize(wi);
-            ro = (curveTmin > (Real)0) ? dOffsetPoint(h.p, rd) : dOffsetAlong(h.p, h.ng, wi);
+            ro = (curveTmin > (Real)0) ? dOffsetPoint(h.p, rd)
+               : delta ? dOffsetSpecular(h.p, h.ng, rd)                      // its line kept (host twin vcm.h)
+                       : dOffsetAlong(h.p, h.ng, wi);
 #if FTRACE_GPU_FP32
             if (mp->type == D_HAIR && h.fiberRadius > (Real)0) {   // see dStrandStart (0.385.0)
                 const DStrandStart st = dStrandStart(h.p, h.n, h.tangent, h.fiberRadius, rd);

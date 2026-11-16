@@ -915,6 +915,20 @@ inline void beginBeamSpectral(const Scene& scene, const Renderer& mats, const Em
     bs.ok   = true;
 }
 
+// A walk's continuation origin off surface point p (`ng` its geometric normal, either orientation;
+// `w` the unit direction it leaves in; `delta` whether a delta lobe chose it -- a dielectric's
+// reflection or refraction, a mirror's, a pass-through). A delta continuation starts along its own
+// direction, so the ray keeps its line, as mode R's interfaceStep starts it: a push along the normal
+// starts each chord inside a sphere by the push, and r sin(theta), which a sphere's chords keep,
+// shrinks by its share of the radius at every reflection, until a ray held by total internal
+// reflection slides under the critical angle and leaves. Grazing (|cos| < 1/4), and for every other
+// lobe, along the normal to w's side.
+inline Vec3 continuationOrigin(const Vec3& p, const Vec3& ng, const Vec3& w, bool delta) {
+    const double c = dot(w, ng);
+    if (delta && std::fabs(c) >= 0.25 * length(ng)) return p + w * 1e-6;
+    return p + ng * ((c >= 0.0 ? 1.0 : -1.0) * 1e-6);
+}
+
 // Continue a subpath whose endpoint is already path[0] (Camera or Light). `ray` is
 // the first ray leaving that endpoint; `beta` the throughput carried along it;
 // `pdfDir` the solid-angle density of that first direction; `mode` the transport
@@ -1853,11 +1867,10 @@ inline void randomWalk(const Scene& scene, const Camera& cam, const Renderer& ma
         // and TRT lobes immediately re-hit the hair they just left (hair_shade.h).
         const bool fiberFar = (mp->type == MatType::Hair) && h.fiberRadius > 0.0 &&
                               dot(wi, cur.ns) < 0.0;
-        double sgn = dot(wi, cur.ng) >= 0.0 ? 1.0 : -1.0;
         ray = fiberFar
                   ? Ray{cur.p + normalize(wi) * 1e-9, normalize(wi),
                         hairChordExit(h.fiberRadius, h.n, h.tangent, normalize(wi))}   // the exact chord (0.364.0)
-                  : Ray{cur.p + cur.ng * (sgn * 1e-6), normalize(wi)};
+                  : Ray{continuationOrigin(cur.p, cur.ng, normalize(wi), delta), normalize(wi)};
         pdfFwd = delta ? 0.0 : pdfW;
     }
 }

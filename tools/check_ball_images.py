@@ -17,7 +17,9 @@ over the seeds:
   * the eye at the centre of a small glass ball in the room, looking at the lamp: the rings round the
     lamp where the inner reflection shows the spot behind the eye, and the walls beyond; and the eye
     off the centre, 0.8 of the radius, where a band of its view is turned back for good past the
-    critical angle and the scan had no sample at that band's edge;
+    critical angle and the images by that band's edge had lain between the scan's samples -- there
+    the reference itself, GPU mode R, is held to CPU mode R too: a ray the ball holds by the critical
+    angle takes dozens of reflections, and the GPU's had drifted out of it (GPU-TIR-DRIFT);
   * a frosted glass ball (roughness 0.12), which mode B leaves black: no closed form joins a vertex to
     the eye through a frosted surface, and the connection had drawn it as clear glass;
   * a glass ball 5 cm from the back wall of a room whose walls all glow alike and reflect nothing:
@@ -198,6 +200,17 @@ def main():
     for what, scn, regions in cases:
         tag = os.path.splitext(os.path.basename(scn))[0]
         rm, rse = stats(scn, "R_%s" % tag, ["-mode", "R", "-device", refdev, "-spp", "8192"])
+        if tag == "inside_off" and refdev == "gpu":
+            # The reference itself, the GPU's mode R against the CPU's: by the critical angle a ray the
+            # ball holds takes dozens of reflections, and on both devices each must keep its angle.
+            cm, cse = stats(scn, "Rcpu_%s" % tag, ["-mode", "R", "-device", "cpu", "-spp", "2048"])
+            q = rm / cm
+            err = np.hypot(rse / cm, cse * rm / (cm * cm))
+            for (rname, _), qi, ei in zip(regions, q, err):
+                bad = not (np.isfinite(qi) and np.isfinite(ei)) or (abs(qi - 1.0) > TOL and abs(qi - 1.0) > 5.0 * ei)
+                ok = ok and not bad
+                print("%s: mode R on the GPU, the ball %s, %s: %.4f (+- %.4f) of the CPU's"
+                      % ("FAIL" if bad else "ok", what, rname, qi, ei), flush=True)
         for dev in devs:
             n = "100000000" if dev == "gpu" else "40000000"
             bm, bse = stats(scn, "B_%s_%s" % (tag, dev), ["-mode", "B", "-device", dev, "-n", n])

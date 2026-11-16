@@ -5813,6 +5813,22 @@ as the one at fault.
   offset; hair fibres keep `dHairExitOffset` (2.5 radii along the exit direction). The
   fp64 device build keeps `p + n*1e-6`, bit-identical to the CPU. `tmin = RAY_EPS` on
   the next trace stays as a second guard, not the first.
+  **A dielectric step leaves by `dOffsetSpecular` instead** (`dDielectricStep`, every walk's
+  interface): the same clearance off the surface, reached along the ray's own direction, so the
+  ray keeps its line -- as the host's `interfaceStep` does (`h.p + out*1e-6`). A push along the
+  normal starts each chord inside a sphere by the push, and `r sin(theta)`, which a sphere's
+  chords keep, shrank by the push's share of the radius at every reflection: 2e-4 of a 15 cm
+  ball, so a ray held by total internal reflection slid under the critical angle within a few
+  dozen reflections and left (GPU-TIR-DRIFT: GPU mode R read the edges of an off-centre inside
+  eye's view 22 % over the CPU at 64 bounces, the column at the band's edge three times; now
+  1.001). Grazing (|cos| < 1/4), where the step along the ray would run long, it is
+  `dOffsetAlong`'s; the fp64 build takes the host's `p + w*1e-6`. The bidirectional walks
+  (modes D, J and U), which build their continuation's origin after the lobe is chosen, start
+  every delta continuation the same way on both devices (`continuationOrigin` in bdpt.h, which
+  vcm.h shares; `delta ? dOffsetSpecular : dOffsetAlong` on the device) -- the host's had pushed
+  1e-6 along the normal, which a small ball's radius makes a drift of its own. A mirror's
+  reflection keeps the push (`dContinueAlong`): a closed mirror has no critical angle to cross,
+  so the drift only bends where its deep reflections go, by milliradians.
   **A scale-correct origin push breaks an invariant the old code relied on**, and the first
   build with it showed how: the far-end shortening (`2*RAY_EPS`) used to be *larger* than the
   origin push (`RAY_EPS`), so a shadow ray that kept the direction and length computed
