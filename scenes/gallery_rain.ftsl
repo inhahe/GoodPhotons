@@ -2836,7 +2836,7 @@ mesh "raincloud" {
 # Reproduce: render this scene three times at `-camera cam -r 480 270 -spp 800 -fireflies 3
 # -no-meter`, editing only the `medium` line below to each row's values, to
 # png/cloud_before.pfm (row 1) / png/cloud_after.pfm (row 2) / png/cloud_de.pfm (row 3), then
-# `python tools/check_cloud.py png/cloud_before.pfm png/cloud_after.pfm png/cloud_de.pfm`.
+# `python tools/measure_cloud.py png/cloud_before.pfm png/cloud_after.pfm png/cloud_de.pfm`.
 #
 # The albedo matters more now than it did. `-mode M -beams` was single-scatter through 0.198.0,
 # so the multiply-scattered interior of this cloud did not exist there at all and a wrong albedo

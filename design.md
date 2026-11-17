@@ -9449,7 +9449,7 @@ as the one at fault.
       underside the bow is read against), is **2.5× noisier** at equal spp, and is the only one
       of the three that emits monochromatic fireflies (8.4 % of cloud pixels over 3:1 channel
       ratio, peaking at 5e29 — logged in `known-issues.md` with the mode-`D` NaNs, likely one
-      bug). Full table in the scene's own `medium` comment; measured by `tools/check_cloud.py`.
+      bug). Full table in the scene's own `medium` comment; measured by `tools/measure_cloud.py`.
       This mattered little before 0.199.0 and matters now: `-beams` was single-scatter through
       0.198.0, so mode `M` had no scattering orders for a wrong albedo to compound over.
     - The sun spent the scene's early versions as a **distant sphere** because mode `D` refused

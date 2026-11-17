@@ -1,7 +1,8 @@
 # Measure the raincloud in a gallery_rain render: crown vs underside vs the rain shaft.
 #
 # Used to choose the 0.199.0 cloud retune (see the `medium` comment in gallery_rain.ftsl).
-# Usage:  python tools/check_cloud.py <ref.pfm> [<cmp.pfm> ...]   -- every row is ratioed
+# A measurement, not a pass/fail check: it takes the renders to compare.
+# Usage:  python tools/measure_cloud.py <ref.pfm> [<cmp.pfm> ...]   -- every row is ratioed
 # against the FIRST file, and every row shares one pixel mask taken from the first file, so
 # no image gets to define the cloud's silhouette differently from the others.
 #

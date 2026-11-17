@@ -32159,7 +32159,7 @@ high `sigma_t` and near-unit albedo, i.e. paths with many scattering vertices, t
 `-fireflies 3` clamps the display but also biases the estimate down, which is measurable: the
 full form reads *dimmer* (1.026x crown) than the reduced form (1.291x) even though it is the
 reduced form that should be the approximation. Reproduce with the table and script named in
-`gallery_rain.ftsl`'s cloud comment (`tools/check_cloud.py`).
+`gallery_rain.ftsl`'s cloud comment (`tools/measure_cloud.py`).
 
 **(b) 705 NaN pixels on `scenes/_beams_ms.ftsl`.** Details below. Same signature at the limit:
 where (a) divides by something tiny, (b) divides by something zero.
@@ -32216,7 +32216,7 @@ Verified, all measured rather than inferred:
   NaN mask is no longer load-bearing.
 - Sub-part (a) was the same bug seen through `-fireflies 3`, not a second one — the entry's own
   "check (a) again once (b) is fixed" resolves in favour of one bug. Same scene, same flags,
-  same mask, before vs after (`tools/check_cloud.py`, which grew a permanent chroma-outlier
+  same mask, before vs after (`tools/measure_cloud.py`, which grew a permanent chroma-outlier
   column for exactly this check):
 
   | full-form cloud (`10.0 / 0.999 / 0.85`) | chroma>3 | >10 | peak max/min |
