@@ -6019,6 +6019,27 @@ throughput by (n(start) / n(end))^2 per march; but mode R's light sampling from 
 uses straight shadow rays through the field, an approximation that would then also need the
 local n^2 on its light, so the two have to change together, with a check against mode B.
 
+## OPEN (2026-11-16): GRIN-STRAIGHT-CONNECT — a straight connection crosses a GRIN region as if it were not there
+
+A GRIN medium (an `ior` field) bends every ray the marcher walks, but a connection -- a shadow ray, a
+forward camera leg -- is a straight segment, and the occlusion queries do not know the region exists:
+- **Mode B (and A, C) draws a GRIN region seen from the camera as if it were absent.** Its camera legs
+  run straight through it: `scenes/_grin_lin.ftsl` in mode B (CPU, 60 s) shows the checker behind the
+  sphere unlensed, where mode R shows it bent. A pinhole cannot be reached through a bending region,
+  exactly as through glass seen directly, which B already renders black and says so.
+- **Mode R lights what sits beyond a GRIN region straight through it.** Its light sampling's shadow
+  rays cross the region unbent, so a point the lens shadows still gets the light's full direct share,
+  and the marched BSDF paths that reach the light through the bend come on top: the bottom corners of
+  `_grin_lin`, whose line to the right-hand lamp crosses the sphere, read 0.81-0.87 of mode R in mode B
+  (which bends the photons), the tiles around the lens 0.72-1.26.
+Fix: a connection that crosses a GRIN region's bound is blocked (host Scene::occluded /
+shadowTransmittance and the device's, for transport only -- the cavity and footprint probes are
+geometry), and a camera path's segment that marched through a GRIN region arrives as a specular one
+(`specularArrival`, the glossy MIS record reset), so the light it reaches counts in full; mode B's
+notice and REFERENCE.md add GRIN seen directly to what B leaves black. GRIN-RADIANCE-SCALE (the n^2
+along a march) goes with it, with checks against mode B on the illumination and mode C (which catches
+photons through its aperture, bent) through the lens.
+
 ## DONE (2026-11-16, 0.448.6): GPU-TMIN-SCALE — the device skips the first 1e-4 of every ray, at any scale
 
 **Fixed in 0.448.6:** a trace given `RAY_TMIN` (the default of closestHit, occluded, shadowTransmittance

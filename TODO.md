@@ -407,6 +407,9 @@ Then the rest of 4.2-4.6 in their order, 4.7's bookkeeping alongside whatever to
   known-issues REVIEW-0445. The lane-0 probes: WARP-PROBES (0.445.9), 2.0-2.2x -> 1.16-1.24x.
 - [ ] **GRIN-RADIANCE-SCALE** — a camera path ending inside a GRIN region misses the n² radiance
   scale.
+- [ ] **GRIN-STRAIGHT-CONNECT** — a straight connection crosses a GRIN region as if it were not there:
+  mode B draws a GRIN lens seen directly as absent, mode R lights what lies beyond one straight
+  through it (known-issues). With GRIN-RADIANCE-SCALE.
 - [x] **GPU-TMIN-SCALE** (0.448.6) — a device trace's tmin is 32 ulps of its origin, not an absolute
   1e-4; fixed STUBBLE-DEVICE-UNDERSIDE (check_modew_fiber's stubble case).
 - [ ] **GPU-MINIATURE-SCALE** — the device's other absolute offsets (WB's near-zero push, the hair
