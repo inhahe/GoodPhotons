@@ -347,8 +347,8 @@ Then the rest of 4.2-4.6 in their order, 4.7's bookkeeping alongside whatever to
 - [x] **PROBE-UNDERSIDE** (0.434.10) — beside a ball resting on the floor the probe ended on the
   ball's tilted underside, seen from inside, where `-gageom`'s march counts the floor under it. It
   passes that face to the floor now; the diffuse ball's mode S 1.08-1.11 -> 1.00.
-- [ ] **MODEM-CPU-DARKGLASS-BLUE** — CPU mode M reads blue 15 % low through strongly absorbing
-  glass, where GPU mode M and both mode S do not.
+- [x] **MODEM-CPU-DARKGLASS-BLUE** (no change) — seeds 1 and 2's noise in mode M and in the mode R
+  reference alike (known-issues); check_dark_glass judges six seeds now.
 - [x] **MODEM-COMPOTE-NAN** (0.433.1) — the spectral carrier's ratio overflowed a float in the
   device's gather (and mode S's per-pixel copy); the float side now takes ratio / peak.
 - [x] **VCOL-BDPT-GPU** (0.433.4) — `DVertex` and `DVcmLV` carry the hit's vertex colour; GPU

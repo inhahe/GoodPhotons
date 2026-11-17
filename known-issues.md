@@ -1505,7 +1505,18 @@ there, so its side is known as a closed piece's is. tools/check_gather_base.py c
 solids, the balls, the open sheets (`mirrorsheet`, `lampsheet`, `tablesheet`) and an open box
 (`openbox`); not an open solid taller than the radius.
 
-## OPEN (2026-11-04, 0.433.1): MODEM-CPU-DARKGLASS-BLUE — CPU mode M reads blue 15 % low through glass that absorbs blue strongly
+## DONE (2026-11-16, no change): MODEM-CPU-DARKGLASS-BLUE — CPU mode M reads blue 15 % low through glass that absorbs blue strongly
+
+**Not a bias: seeds 1 and 2, on both sides of the ratio** (the trap at this file's head). At seeds 3-10
+CPU and GPU mode M read the floor through the slab alike (blue 0.963 +- 0.022 and 0.959 +- 0.014 of
+mode R), and the 2-4 % they shared then was the reference's: mode R, which reaches that floor through
+the glass only by its walk, spreads 2-4 % a seed there, and its seeds 1-2 read R 0.977 / G 0.973 /
+B 1.028 of its seeds 3-10. Against those, GPU mode M at 32 M photons reads 0.998 / 0.999 / 0.990.
+check_dark_glass judges six seeds against a reference over four, within 6 % or 5 standard errors, and
+holds every channel; its KNOWN is gone.
+
+The report:
+
 
 `tools/check_dark_glass.py` (a 0.5 m slab, `absorb rgb 0 0 200`, over a lit floor, 64 x 48): the
 floor seen through the slab reads, against mode R, per channel R / G / B:
