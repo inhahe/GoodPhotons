@@ -395,8 +395,8 @@ Then the rest of 4.2-4.6 in their order, 4.7's bookkeeping alongside whatever to
   bin (SpecThr), and each gathered photon is weighted at its own wavelength.
 - [x] **BIRTH-EMPTY-STACK** (0.445.5) — every light walk starts inside the solids enclosing its
   birth (Scene::birthStack, dBirthStack); `tools/check_birth_stack.py`.
-- [ ] **SPPM-GPU-LAMP** — GPU mode S reads a lamp seen directly 2.5 % bright of mode R (the CPU's
-  1 % dark); pre-existing.
+- [x] **SPPM-GPU-LAMP** (no change) — one fluke at seeds 1-8, measured again at the same seeds:
+  1.006 +- 0.008 over 16 GPU seeds (known-issues).
 - [ ] **GPU-U-GLOSSY-SLOW** — GPU mode U's merges run on the thread that reached the vertex, so at
   a large radius (-pmradius 0.05: 112 s against the CPU's 11) they crawl: give them mode J's queue.
 - [x] **CAMERA-EMPTY-STACK** (0.445.8) — every camera walk starts inside the solids around the eye,

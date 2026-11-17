@@ -62,6 +62,12 @@ and then walked into twice more within the hour**, which is the strongest availa
 stating it once is not enough — it belongs at the point of use, next to each counter, and several
 now carry it.
 
+**A deviation that never moves may be one fluke measured again and again.** A render's seed fixes its
+camera samples, so every run at the same seeds draws the same noise, whatever else it changes -- the
+photons, the radius, even the build. Twice on 2026-11-16 a few-percent "bias" that survived every
+such change (MODEM-BALL-LAMP, SPPM-GPU-LAMP) went away at new seeds: before calling a deviation
+persistent, measure it at seeds it was not found at.
+
 **A repro scene for an OPEN entry must be TRACKED** (`scenes/`, not `scraps/`). `scraps/` is
 git-ignored, so an entry whose repro lives there cannot be re-validated and its drift cannot be
 detected — on 2026-09-10 that nearly produced a false "7× regression" report against the GRIN
@@ -682,7 +688,18 @@ uploaded with the camera; the solid's absorption on every camera leg inside it. 
 with the camera inside an absorbing water tank against Beer-Lambert's closed form (a lamp in the
 water at a known distance) and modes B, D, J, U, M and S against mode R.
 
-## OPEN (2026-11-15): SPPM-GPU-LAMP — GPU mode S reads a lamp seen directly 2.5 % bright
+## DONE (2026-11-16, no change): SPPM-GPU-LAMP — GPU mode S reads a lamp seen directly 2.5 % bright
+
+**Not a bias: one fluke at seeds 1-8, measured again at the same seeds.** Every figure below came from
+seeds 1-8 or a subset of them (check_camera_in_water's, the dry runs', the old build's). The lamp seen
+directly through check_camera_in_water's room dry and with its walls black, mode S over GPU mode R:
+GPU over 16 seeds R 1.003 +- 0.011, G 1.006 +- 0.008, B 0.997 +- 0.010; CPU over 8, 1.013 / 1.002 / 1.002.
+A seed's lamp disc in mode S spreads some 3 % a channel (256 wavelengths a pixel), so seeds 1-8's
++2.5 % is a 2.2-sigma draw. The lead below does not hold either: mode R's camera draw and mode S's
+visible point both integrate the binned density over the exact one, so they agree in expectation.
+
+The report:
+
 
 Found by tools/check_camera_in_water.py, and not of its making. `scenes/_camera_in_water.ftsl`'s lamp
 faces the camera; over a 2.5-pixel disc at its middle GPU mode S (256 spp, -n 200000, -max-bounce 12)
