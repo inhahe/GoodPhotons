@@ -39,7 +39,7 @@ largest change relative to the pixel, and the change of the image's mean. --tol 
 a GPU case whose every pixel is within that relative tolerance: a GPU kernel the change only
 re-compiled can differ in the last bits (instruction scheduling, fused multiply-adds) -- 1e-3,
 say. The CPU cases are always held to bit identity. GPU modes M and S are not bit-deterministic
-at all (atomic deposits), so they are always judged at a floor of 1e-4 (NONDET_FLOOR), the
+at all (atomic deposits), so they are always judged at a floor of 3e-4 (NONDET_FLOOR), the
 determinism pass included. A change meant to alter some renders shows up here as differing
 cases, with the mean change to judge them by. Exits 0 when every case is identical (or within
 its tolerance), 1 otherwise.
@@ -84,9 +84,10 @@ SCENE_MODES = {
                        "-beamepochs", "4", "-max-bounce", "8"])],
 }
 # GPU modes M and S deposit their photons through atomics, so their order -- and the last bits of
-# every sum over them -- varies from run to run: one build differs from itself there by up to a
-# few 1e-5 of a pixel. Those cases are judged at this relative floor, in the determinism pass too.
-NONDET_FLOOR = {"M_gpu": 1e-4, "S_gpu": 1e-4}
+# every sum over them -- varies from run to run: one build differs from itself there by a few 1e-5 of
+# a pixel, and on the coated scene's M by up to 1.1e-4. Those cases are judged at this relative floor,
+# in the determinism pass too.
+NONDET_FLOOR = {"M_gpu": 3e-4, "S_gpu": 3e-4}
 
 
 def write(path, text):
