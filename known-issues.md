@@ -6005,6 +6005,27 @@ on the tank without its pool floor (this repro). Whether a transparent face shou
 the disc is a separate question, open: both backends count it (and the ball test then rejects it
 for being above the plane), so both under-read the coverage there.
 
+## DONE (2026-11-17, 0.449.4): REVIEW-0449B — the Opus (xhigh) review of 3837004..45bca28 (0.449.2, 0.449.3)
+
+Fixed in 0.449.4:
+- **CPU-SMALL-IN-BIG's 0.449.3 fix was position-dependent** (it sized eps by the distance from the origin):
+  reverted and reopened with the per-feature design (above). The device's dEpsAt floor change stays.
+- **The `[grin]` note printed in every mode and named the sun**: it prints for R (a point, spot or
+  collimated light) and W (any light) only; a sun is a finite disc a bent walk meets.
+- **crossesGrin's 64-look cap could skip a thin shell**: back to the march's step; the transport queries
+  test geometry first instead, so a blocked segment never looks.
+- **The step leaving a region took no radiance factor**: it takes it to its last point inside the bound
+  (bisected), host and device, through one helper per side (factorTo).
+- **occludedTo's target-reach floor was 8 ulps (connMaxT's)** against dReachEps's 32: the leg stops
+  dReachEps(targetReach) short at least.
+- **mode P's classifier and the sky probes used an absolute 1e-6**: the scene's tmin; the forward sky
+  splat's probe takes the GRIN rule too.
+- **The index carry missed** the surface branch and the device's driven march: both reuse it now
+  (DGrinMedia::carryM/carryN between driven steps).
+- **A stale fp64 comment**, and **docstrings of the new checks narrating versions**: restated.
+Dismissed: the c_lenScale race between host threads -- a process renders one scene at a time, its
+sessions share its scale, and every pass re-sets it.
+
 ## DONE (2026-11-17, 0.449.2): REVIEW-0449 — the Fable (xhigh) review of ee7c918^..3837004 and the Opus (xhigh) one of 9de6337..3837004
 
 Fixed in 0.449.2 (F Fable, O Opus):
@@ -6069,14 +6090,19 @@ Ten findings; fixed in 0.449.1 unless said:
 10. **Comments that narrated history** (RAY_TMIN, dHairExitOffset, dHairCamLegBlocked) state the
     constraint now.
 
-## DONE (2026-11-17, 0.449.3): CPU-SMALL-IN-BIG — the host's eps is the scene's, so a tiny object in a big scene keeps 1e-6
+## OPEN (2026-11-17, reopened 0.449.4): CPU-SMALL-IN-BIG — the host's eps is the scene's, so a tiny object in a big scene keeps 1e-6
 
-**Fixed in 0.449.3:** the host's distances are taken at the point a ray leaves, `Scene::epsAt(p)` = eps
-shrunk with p's largest coordinate inside 1/16 of the origin (points farther out keep eps exactly), and a
-trace's tmin sentinel resolves from its own origin; the fp64 device build's are the same, and the fp32
-device's `dEpsAt` floor shrinks alike. check_scale_invariance's big-ground case now holds the CPU: x1.0017,
-worst tile 0.98 % (0.449.2: x1.129, 45 %), and the device x1.0001, 0.12 % (0.449.2: x1.0059, 1.7 %, the
-floor); its bounds are 0.5 % / 1.5 % now, which 0.449.2 fails on both devices. The report as filed:
+**0.449.3 tried sizing the host's eps by the distance from the world origin** (`Scene::epsAt`, eps shrunk
+with the point's largest coordinate inside 1/16 of the origin) and 0.449.4 took it back (the Opus review of
+0.449.2-0.449.3): it fixed only an object that sits near the origin -- the same ball 10 cm away keeps 1e-6
+-- and opened new failures there: in a millimetre scene eps fell as S^2, below implicit.h's 1e-12
+refinement bracket, and on a huge primitive near the origin (a radius-1e6 sphere) below its own rounding.
+The fix has to be a per-feature size at each hit -- a sphere's or strand's radius, a triangle's extent
+(a `Hit` field set with the closest hit) -- taking eps x min(1, size), with the next trace's tmin passed
+explicitly from the hit rather than resolved from the scene. The device keeps 0.449.3's floor change:
+`dEpsAt`'s 1e-7 shrinks within 1/16 of the origin, which took the device's own small-in-big case from
+x1.0059 to x1.0001 (fp32's 32-ulp term is the real bound there). check_scale_invariance's big-ground case
+is the device's only until this is done. The report as filed:
 
 `Scene::eps` is 1e-6 x min(1, S) for the whole scene: in a scene of unit size or more it is 1e-6 however
 small the object a ray leaves -- a twelfth of the radius of the 12 um strands check_scale_invariance's

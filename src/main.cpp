@@ -15582,19 +15582,19 @@ static void noteWhittedMediaSpp(const Scene& scene, long long spp) {
 }
 
 // Modes R and W reach the light a gradient-index region bends only along a walk that marches the region
-// and then meets the light (no light sample crosses a bending region: Scene::crossesGrin). A point,
-// spot or sun light is met by no walk, so what such a region bends from one renders black, as a
-// caustic through glass does: said once, with the modes that render it.
-static void noteGrinDeltaLights(const Scene& scene) {
-    if (!scene.bendsAny) return;
+// and then meets the light (no light sample crosses a bending region: Scene::crossesGrin). In mode R no
+// walk meets a point, spot or collimated light, so what such a region bends from one renders black, as a
+// caustic through glass does; mode W's walk ends at its first diffuse vertex, so for it every light the
+// region bends does. Said once, for the render's own mode, with the modes that render it.
+static void noteGrinUnreached(const Scene& scene, char mode) {
+    if (!scene.bendsAny || (mode != 'R' && mode != 'W')) return;
+    bool delta = false;
     for (const Emitter& e : scene.emitters)
-        if (e.shape == EmitterShape::Spot || e.shape == EmitterShape::Sun) {
-            std::printf("[grin] note: a gradient-index region bends rays here, and a spot, point or sun "
-                        "light's light through it is met by no camera path in mode %s: it renders black "
-                        "there, as a caustic through glass does (modes B, M and S render it)\n",
-                        g_whitted ? "W" : "R");
-            return;
-        }
+        delta = delta || e.shape == EmitterShape::Spot || e.collimated;
+    if (mode == 'R' && !delta) return;
+    std::printf("[grin] note: a gradient-index region bends rays here, and %s through it is met by no camera "
+                "path in mode %c: it renders black there, as a caustic through glass does (modes B, M and S "
+                "render it)\n", mode == 'W' ? "a light's light" : "a point, spot or collimated light's light", mode);
 }
 
 // PHOTON-BEAMS gather for the shared multi-camera forward pass (CLI -beams). When set,
@@ -16196,7 +16196,7 @@ static bool prepareSky(SkyView& view, const Scene& scene, const Camera& cam, int
             jx -= std::floor(jx); jy -= std::floor(jy);
             const Ray r = cam.genRay(px, py, jx, jy);
             // A CAMERA ray, so a `hide_camera` flat lets the sky through (Material::hideCamera).
-            const Hit h = scene.closestHit(r, 1e-6, nullptr, /*skipHair=*/false, /*skipCamHidden=*/true);
+            const Hit h = scene.closestHit(r, Scene::kTminEps, nullptr, /*skipHair=*/false, /*skipCamHidden=*/true);
             // Nothing is seen straight through a region that bends rays, as through glass (B, A).
             if (scene.crossesGrin(r.o, r.d, h.valid ? h.t : 1e30)) continue;
             Vec3 c{0, 0, 0};
@@ -16224,7 +16224,7 @@ static bool prepareSky(SkyView& view, const Scene& scene, const Camera& cam, int
             Ray r; double wLens = 0.0;
             if (!cam.genLensRay(px, py, rng.uniform(), rng.uniform(), rng.uniform(),
                                 rng.uniform(), lambda, r, wLens) || !(wLens > 0.0)) continue;
-            const Hit h = scene.closestHit(r, 1e-6, nullptr, /*skipHair=*/false, /*skipCamHidden=*/true);
+            const Hit h = scene.closestHit(r, Scene::kTminEps, nullptr, /*skipHair=*/false, /*skipCamHidden=*/true);
             // Nothing is seen straight through a region that bends rays, as through glass (B, A).
             if (scene.crossesGrin(r.o, r.d, h.valid ? h.t : 1e30)) continue;
             Vec3 c{0, 0, 0};
@@ -16374,7 +16374,9 @@ static void addBlurredSkyRows(Film& film, const Scene& scene, const Camera& cam,
                     r = cp.genRay(px, py, jx, jy);
                 }
                 // A camera ray, so a `hide_camera` flat lets the sky through (Material::hideCamera).
-                const Hit h = scene.closestHit(r, 1e-6, nullptr, /*skipHair=*/false, /*skipCamHidden=*/true);
+                const Hit h = scene.closestHit(r, Scene::kTminEps, nullptr, /*skipHair=*/false, /*skipCamHidden=*/true);
+                // Nothing is seen straight through a region that bends rays, as through glass (prepareSky).
+                if (scene.crossesGrin(r.o, r.d, h.valid ? h.t : 1e30)) continue;
                 if (h.valid) {
                     if (!haveGlow) continue;
                     // A glow it meets, as prepareSky adds it: a pinhole's draws a wavelength of its
@@ -16972,7 +16974,7 @@ static CompositeClass classifyComposite(const Scene& scene, const Camera& cam,
             Ray r = cam.genRay(px, py, 0.5, 0.5);
             // Pixel-centre camera ray again: a hidden flat classifies as whatever is
             // BEHIND it, which is what the composite will actually show there.
-            Hit h = scene.closestHit(r, 1e-6, nullptr, /*skipHair=*/false,
+            Hit h = scene.closestHit(r, Scene::kTminEps, nullptr, /*skipHair=*/false,
                                      /*skipCamHidden=*/true);
             // Through a region that bends rays the forward layer draws nothing (no straight camera
             // leg crosses one): the backward film's, as a specular surface's.
@@ -25486,7 +25488,7 @@ static int run(int argc, char** argv) {
     // Both a real mode-W render and the explorer's T preview (which IS mode W) hit the
     // sealed-light failure, so warn for either -- see warnSealedLights.
     if (g_whitted || wPreview) warnSealedLights(scene);
-    if (!wPreview) noteGrinDeltaLights(scene);
+    if (!wPreview) noteGrinUnreached(scene, mode);
     // Only for a real batch mode-W render: the viewer's T preview keeps accumulating passes
     // (wNeedSpp), so its C=1 image converges rather than staying wrong, and nagging there
     // would fire on every explore run.

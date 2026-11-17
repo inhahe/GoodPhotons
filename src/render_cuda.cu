@@ -362,22 +362,22 @@ __device__ static inline double ddot(const DVec3& a, const DVec3& b) {
 // `dOffsetAlong(p, ng, w)` picks the side from the direction the ray LEAVES in, so a
 // reflected and a transmitted ray both clear the surface without the caller having to
 // know which it is; `ng` should be the geometric normal (either orientation). A zero `ng`
-// (a vertex with no surface) degrades to a push along `w` itself.
+// (a vertex with no surface) steps along `w` by dEpsAt.
 //
-// The fp64 device build keeps the CPU reference's absolute 1e-6 so it stays bit-identical.
+// The fp64 device build keeps the host's Scene::eps (its RAY_EPS times c_lenScale), the CPU
+// reference's twin.
 // The fp32 device's self-intersection distance at point o: 32 float ulps of its largest coordinate, at
-// least 1e-7 times c_lenScale -- shrunk, as the host's Scene::epsAt, with o's coordinates inside 1/16 of
-// the origin, so a small object in a big scene keeps its own -- and at most RAY_EPS. A trace's tmin (RAY_TMIN), and the push of a ray
+// least 1e-7 times c_lenScale (less again within 1/16 of the origin, where a small object in a big scene
+// keeps its own) and at most RAY_EPS. A trace's tmin (RAY_TMIN), and the push of a ray
 // leaving a point that has no surface to clear (a medium vertex, a point light). The fp64 build's is the
-// host's Scene::epsAt: its RAY_EPS (1e-6) times c_lenScale, shrunk inside 1/16 of the origin, as are its
-// offsets.
+// host's Scene::eps: its RAY_EPS (1e-6) times c_lenScale, as are its offsets.
 __device__ static inline Real dEpsAt(const DVec3& o) {
 #if FTRACE_GPU_FP32
     const float m = fmaxf(fabsf(o.x), fmaxf(fabsf(o.y), fabsf(o.z)));
     return fminf(RAY_EPS, fmaxf(1e-7f * fminf((float)c_lenScale, fmaxf(16.0f * m, 1e-5f)), 32.0f * 1.1920929e-7f * m));
 #else
-    const double m = fmax(fabs(o.x), fmax(fabs(o.y), fabs(o.z)));   // the host's Scene::epsAt
-    return RAY_EPS * (Real)c_lenScale * fmin(1.0, fmax(16.0 * m, 1e-5));
+    (void)o;
+    return RAY_EPS * (Real)c_lenScale;
 #endif
 }
 // A hit's float error is a few ulps of the coordinates of the primitive it lies on -- its reach,
@@ -412,12 +412,22 @@ __device__ static inline DVec3 dOffsetPoint(const DVec3& p, const DVec3& n, Real
 #else
 __device__ static inline DVec3 dOffsetPoint(const DVec3& p, const DVec3& n, Real reach = (Real)0) {
     (void)reach;
-    return p + n * dEpsAt(p);
+    return p + n * (RAY_EPS * (Real)c_lenScale);
 }
 #endif
 // A ray leaving surface point p along w: off the surface to w's side of `ng` (its geometric normal,
 // either orientation), by dOffsetPoint (`reach` the primitive's). A zero `ng` is a point with no
 // surface to clear -- a medium vertex, a point, spot or distant light's birth -- which steps by dEpsAt.
+// The float error a hit on a primitive of reach `reach` (DHit::pscale) can carry: 32 ulps of it. The fp64
+// build's is far below its eps and takes none.
+__device__ static inline Real dReachEps(Real reach) {
+#if FTRACE_GPU_FP32
+    return (Real)(32.0 * 1.1920929e-7) * reach;
+#else
+    (void)reach;
+    return (Real)0;
+#endif
+}
 __device__ static inline DVec3 dOffsetAlong(const DVec3& p, const DVec3& ng, const DVec3& w,
                                             Real reach = (Real)0) {
     const Real nn = dot(ng, ng);
@@ -444,7 +454,7 @@ __device__ static inline DVec3 dOffsetSpecular(const DVec3& p, const DVec3& ng, 
     return p + w * (fabs(dot(q - p, ng)) * inv / ac);     // q's clearance, reached along w
 #else
     const Real nn = dot(ng, ng);                          // the host's deltaOrigin
-    if (nn > (Real)0 && fabs(dot(ng, w)) >= (Real)0.25 * sqrt(nn)) return p + w * dEpsAt(p);
+    if (nn > (Real)0 && fabs(dot(ng, w)) >= (Real)0.25 * sqrt(nn)) return p + w * (RAY_EPS * (Real)c_lenScale);
     return dOffsetAlong(p, ng, w, reach);
 #endif
 }
@@ -5684,6 +5694,10 @@ struct DGrinMedia {
     // With `camera`: (n(x_k) / n(x_k+1))^2 over the steps, the radiance factor a camera path owes
     // its bend (host MarchInfo::radScale, GRIN-RADIANCE-SCALE). Accumulates across driven calls.
     double radScale = 1.0;
+    // In and out: the medium (-1 none) whose index at the march's start the last call left, and that
+    // index, so a caller driving one step at a time evaluates each point's once.
+    int    carryM = -1;
+    double carryN = 0.0;
 };
 // `maxSteps` lets a caller drive the march ONE SUB-SEGMENT AT A TIME (maxSteps = 1, loop
 // until !med->stepped), which is how mode M's camera gather feeds a curved ray to the
@@ -5721,8 +5735,9 @@ __device__ static void dGrinMarch(const DScene& sc, DVec3& ro, DVec3& rd,
     // Hoisted out of the (up to 10^5-iteration) march: three pointer copies, so an `ior`
     // field can read a MEASURED index volume (`ior "1 + grid:n(x, y, z)"`).
     const DPatEnv env = dPatEnvOf(sc);
-    int nNextM = -1;          // the medium whose index at the next step's start the last step took
-    double nNext = 0.0;       // (a camera march's factor), so each point's is evaluated once
+    int nNextM = med ? med->carryM : -1;      // the medium whose index at the next step's start the
+    double nNext = med ? med->carryN : 0.0;   // last step took (a camera march's factor), so each point's
+                                              // is evaluated once
     for (int gstep = 0; gstep < GRIN_MAX_STEPS; ++gstep) {
         DVec3 cro{px, py, pz}, crd{dx, dy, dz};   // float snapshot for the geometry queries
         // GRIN region containing ro (first enabled GRIN membership), or -1.
@@ -5755,6 +5770,7 @@ __device__ static void dGrinMarch(const DScene& sc, DVec3& ro, DVec3& rd,
                     med->hit = true; med->which = which; med->arc += (double)t;
                     px += dx * (double)t; py += dy * (double)t; pz += dz * (double)t;
                     ro = DVec3{px, py, pz}; rd = DVec3{dx, dy, dz};
+                    med->carryM = -1;   // stopped mid-step: nothing to carry
                     return;
                 }
                 med->arc += adv;
@@ -5765,6 +5781,28 @@ __device__ static void dGrinMarch(const DScene& sc, DVec3& ro, DVec3& rd,
         }
         const DMedium& g = sc.media[gm];
         double ds = g.iorStep;
+        // The radiance factor (n0 / n(x))^2 from (px,py,pz), of index n0, along (ux,uy,uz) to `t` -- or to
+        // the last point inside g's bound on that span, bisected, when its end lies outside (host twin
+        // grin.h factorTo: the boundary refracts nothing, and past it the field need not be defined).
+        // `pe`: the span's end, exactly as the march will stand there; `nEnd` takes its index when inside.
+        const auto factorTo = [&](double ux, double uy, double uz, double t, const DVec3& pe, double n0,
+                                  double* nEnd) {
+            double n1;
+            if (dMedInside(g, pe, env)) {
+                n1 = dMedNAt(g, pe, env);
+                if (nEnd) *nEnd = n1;
+            } else {
+                double lo = 0.0, hi = t;
+                for (int i = 0; i < 24; ++i) {
+                    const double mid = 0.5 * (lo + hi);
+                    const DVec3 pm{(Real)(px + ux * mid), (Real)(py + uy * mid), (Real)(pz + uz * mid)};
+                    (dMedInside(g, pm, env) ? lo : hi) = mid;
+                }
+                const DVec3 pl{(Real)(px + ux * lo), (Real)(py + uy * lo), (Real)(pz + uz * lo)};
+                n1 = dMedNAt(g, pl, env);
+            }
+            return (n0 > 0.0 && n1 > 0.0) ? (n0 / n1) * (n0 / n1) : 1.0;
+        };
         // Inside a GRIN region the ONLY question is "surface within one step?", so cap
         // the whole BVH walk at one step length: tcap is the smallest Real STRICTLY
         // greater than ds, making "found under the cap" ⟺ "(double)t <= ds" — exactly
@@ -5783,12 +5821,10 @@ __device__ static void dGrinMarch(const DScene& sc, DVec3& ro, DVec3& rd,
             if (med) {
                 med->bent = med->bent || g.bends;
                 if (med->camera) {
+                    const double n0r = (nNextM == gm) ? nNext : dMedNAt(g, cro, env);
                     const DVec3 pe{(Real)(px + dx * (double)hs.t), (Real)(py + dy * (double)hs.t),
                                    (Real)(pz + dz * (double)hs.t)};
-                    if (dMedInside(g, pe, env)) {
-                        const double n0r = dMedNAt(g, cro, env), n1r = dMedNAt(g, pe, env);
-                        if (n0r > 0.0 && n1r > 0.0) med->radScale *= (n0r / n1r) * (n0r / n1r);
-                    }
+                    med->radScale *= factorTo(dx, dy, dz, (double)hs.t, pe, n0r, nullptr);
                 }
             }
             break;
@@ -5806,18 +5842,17 @@ __device__ static void dGrinMarch(const DScene& sc, DVec3& ro, DVec3& rd,
         double tl = sqrt(Tx * Tx + Ty * Ty + Tz * Tz);
         double ndx = dx, ndy = dy, ndz = dz;
         if (tl > 1e-12) { double s = 1.0 / tl; ndx = Tx * s; ndy = Ty * s; ndz = Tz * s; }
-        // The radiance factor of this step, to its end at `t` along the new direction -- taken only to a
-        // point inside the region's bound (host twin grin.h: past it the field need not be defined, and
-        // the boundary refracts nothing). `full`: the step's own end, whose index the next step reuses.
+        // The radiance factor of this step, to `t` along the new direction (factorTo). `full`: the step's
+        // own end, where the next step starts, whose index it reuses.
         const auto stepRad = [&](double t, bool full) {
             if (!med) return;
             med->bent = med->bent || g.bends;
             if (!med->camera) return;
-            const DVec3 pe{(Real)(px + ndx * t), (Real)(py + ndy * t), (Real)(pz + ndz * t)};
-            if (!dMedInside(g, pe, env)) return;
-            const double n1 = dMedNAt(g, pe, env);
-            if (n1 > 0.0) med->radScale *= (n0 / n1) * (n0 / n1);
-            if (full) { nNextM = gm; nNext = n1; }
+            const DVec3 pe = full ? DVec3{(Real)(px + sx), (Real)(py + sy), (Real)(pz + sz)}
+                                  : DVec3{(Real)(px + ndx * t), (Real)(py + ndy * t), (Real)(pz + ndz * t)};
+            double n1 = -1.0;
+            med->radScale *= factorTo(ndx, ndy, ndz, t, pe, n0, full ? &n1 : nullptr);
+            if (n1 > 0.0) { nNextM = gm; nNext = n1; }
         };
         if (doMedia) {
             // The displacement is parallel to T (n0 > 0, ds > 0), so the new direction IS
@@ -5833,6 +5868,7 @@ __device__ static void dGrinMarch(const DScene& sc, DVec3& ro, DVec3& rd,
                     stepRad((double)t, false);
                     ro = DVec3{px + ndx * (double)t, py + ndy * (double)t, pz + ndz * (double)t};
                     rd = sd;
+                    med->carryM = -1;   // stopped mid-step: nothing to carry
                     return;
                 }
                 med->arc += segLen;
@@ -5846,6 +5882,7 @@ __device__ static void dGrinMarch(const DScene& sc, DVec3& ro, DVec3& rd,
             if (!doMedia) med->arc += sqrt(sx * sx + sy * sy + sz * sz);
         }
     }
+    if (med) { med->carryM = nNextM; med->carryN = nNext; }
     ro = DVec3{px, py, pz};
     rd = DVec3{dx, dy, dz};
 }
@@ -5947,7 +5984,7 @@ __device__ static bool dCrossesGrin(const DScene& sc, const DVec3& o, const DVec
         double ta, tb;
         if (!dMedClip(md, o, dir, 0.0, (double)maxDist, ta, tb)) continue;
         if (!md.bounded || md.boundShape == 0 || md.boundShape == 1) return true;
-        const double step = fmax(md.iorStep, (tb - ta) / 64.0);   // at most 64 looks (host twin)
+        const double step = md.iorStep > 0.0 ? md.iorStep : (tb - ta) / 64.0;   // the march's own (host twin)
         for (double t = ta; t <= tb; t += step)
             if (dMedInside(md, o + dir * (Real)t, env)) return true;
         if (dMedInside(md, o + dir * (Real)tb, env)) return true;
@@ -5959,8 +5996,9 @@ __device__ static bool dCrossesGrin(const DScene& sc, const DVec3& o, const DVec
 __device__ static bool occluded(const DScene& sc, const DVec3& o, const DVec3& dir,
                                  Real maxDist, Real tmin = RAY_TMIN, bool camLeg = false,
                                  Real curveTmin = (Real)0, int skipSph = -1) {
-    if (dCrossesGrin(sc, o, dir, maxDist)) return true;
-    return occludedGeometry(sc, o, dir, maxDist, tmin, camLeg, curveTmin, skipSph);
+    // Geometry first: a blocked segment needs no look through the bending regions.
+    return occludedGeometry(sc, o, dir, maxDist, tmin, camLeg, curveTmin, skipSph) ||
+           dCrossesGrin(sc, o, dir, maxDist);
 }
 
 // Fraction of a shadow ray that SURVIVES to maxDist: 1 clear, 0 blocked, in between when it
@@ -5971,9 +6009,8 @@ __device__ static bool occluded(const DScene& sc, const DVec3& o, const DVec3& d
 __device__ static Real shadowTransmittance(const DScene& sc, const DVec3& o, const DVec3& dir,
                                            Real maxDist, Real tmin = RAY_TMIN,
                                            Real curveTmin = (Real)0) {
-    if (dCrossesGrin(sc, o, dir, maxDist)) return (Real)0;
     if (tmin < (Real)0) tmin = dEpsAt(o);
-    if (sc.nNodes == 0) return (Real)1;
+    if (sc.nNodes == 0) return dCrossesGrin(sc, o, dir, maxDist) ? (Real)0 : (Real)1;
     DVec3 invD{(Real)1 / dir.x, (Real)1 / dir.y, (Real)1 / dir.z};
     const DTriShear sh = makeTriShear(dir);
     const DCurveRay cray = sc.nCurveSegs ? makeCurveRay(dir) : DCurveRay{DVec3{(Real)0,(Real)0,(Real)1}, (Real)1};
@@ -5984,7 +6021,7 @@ __device__ static Real shadowTransmittance(const DScene& sc, const DVec3& o, con
     double T = 1.0;
     int stack[64]; int sp = 0;
     if (boxHit(sc.nodes[0], o, invD, tmin, tMax, tRoot)) stack[sp++] = 0;
-    else if (!timed) return (Real)1;
+    else if (!timed) return dCrossesGrin(sc, o, dir, maxDist) ? (Real)0 : (Real)1;
     while (sp) {
         const DNode& n = sc.nodes[stack[--sp]];
         if (n.count > 0) {
@@ -6037,7 +6074,7 @@ __device__ static Real shadowTransmittance(const DScene& sc, const DVec3& o, con
         };
         if (dTimedAny(sc, o, dir, invD, sh, tmin, curveTmin, tMax, false, soft) || T <= 1e-4) return (Real)0;
     }
-    return (Real)T;
+    return (T > 0.0 && dCrossesGrin(sc, o, dir, maxDist)) ? (Real)0 : (Real)T;   // after the geometry
 }
 
 // Largest coordinate magnitude of a point: the scale that sets one float ulp of its position.
@@ -6068,8 +6105,10 @@ __device__ static inline bool occludedTo(const DScene& sc, const DVec3& o, const
     DVec3 tv = target - o;
     const Real td = length(tv);
     if (!(td > (Real)0)) return false;
-    return occluded(sc, o, tv / td, connMaxT((double)td, absEps, fmax(dMaxAbs(target), (double)targetReach)),
-                    tmin, camLeg, curveTmin, skipSph);
+    Real len = connMaxT((double)td, absEps, dMaxAbs(target));
+    const Real lenReach = td - dReachEps(targetReach);   // clear of the target's own primitive's error
+    if (lenReach < len) len = lenReach;
+    return occluded(sc, o, tv / td, len, tmin, camLeg, curveTmin, skipSph);
 }
 // shadowTransmittance to a sampled point, shortened as occludedTo shortens (connMaxT).
 __device__ static inline Real shadowTransmittanceTo(const DScene& sc, const DVec3& o,
@@ -7915,8 +7954,9 @@ __device__ static inline Real dHairExitOffset(const DHairShade& s, const DVec3& 
 #if FTRACE_GPU_FP32
     return dStrandSkip(p, n, s.fr.x, s.radius, w);
 #else
-    if (dot(n, w) >= (Real)0) return dEpsAt(p);        // leaving on the arrival side
-    return fmax(dEpsAt(p), dHairChordExit(s.radius, n, s.fr.x, w));   // the exact chord (0.364.0)
+    (void)p;
+    if (dot(n, w) >= (Real)0) return RAY_EPS * (Real)c_lenScale;        // leaving on the arrival side
+    return fmax(RAY_EPS * (Real)c_lenScale, dHairChordExit(s.radius, n, s.fr.x, w));   // the exact chord (0.364.0)
 #endif
 }
 
@@ -7932,8 +7972,8 @@ __device__ static inline bool dHairCamLegBlocked(const DScene& sc, const DVec3& 
     const DVec3 o = p;
     const Real tmin = dStrandEps(p, hs.radius);
 #else
-    const DVec3 o = p + wdir * dEpsAt(p);          // the host's connect (render.h)
-    const Real tmin = dEpsAt(p);
+    const DVec3 o = p + wdir * (RAY_EPS * (Real)c_lenScale);          // the host's connect (render.h)
+    const Real tmin = RAY_EPS * (Real)c_lenScale;
 #endif
     return occludedTo(sc, o, p + wdir * (Real)dist, 2e-6, tmin, /*camLeg=*/true, off);
 }
@@ -8398,16 +8438,6 @@ __device__ static inline bool dOnGatherSurfaceSided(const DVec3& x, const DVec3&
 // side of the last closed solid's (+1 it ends inside, -1 outside, 0 none) and how many cannot say
 // theirs (up to 15). `eps`: how far past a face crossed it goes on from.
 struct DSegmentCrossings { int side; int open; };
-// The float error a hit on a primitive of reach `reach` (DHit::pscale) can carry: 32 ulps of it. The fp64
-// build's is far below its eps and takes none.
-__device__ static inline Real dReachEps(Real reach) {
-#if FTRACE_GPU_FP32
-    return (Real)(32.0 * 1.1920929e-7) * reach;
-#else
-    (void)reach;
-    return (Real)0;
-#endif
-}
 // The distance a trace that leaves hit h at exactly h.p must skip to clear its own primitive, whose error
 // near the origin outgrows dEpsAt.
 __device__ static inline Real dHitEps(const DHit& h) {
@@ -22565,11 +22595,14 @@ __device__ static void dPhotonGather(const DScene& sc, const DPhotonMap& pm,
         // measures from the sub-segment start).
         if (sc.hasGrin) {
             bool bent = false;
+            int carryM = -1; double carryN = 0.0;  // the marcher's index carry, between driven steps
             for (int gs = 0; gs < 200000; ++gs) {  // same safety cap the marcher applies
                 DVec3 pro = ro;
                 DGrinMedia gm;                     // rng == nullptr: bend only, no collisions
                 gm.camera = true;
+                gm.carryM = carryM; gm.carryN = carryN;
                 dGrinMarch(sc, ro, rd, &gm, 1, /*camHide=*/(b == 0));  // — a camera ray's volume answer IS the
+                carryM = gm.carryM; carryN = gm.carryN;
                 // This step's radiance factor (or the straight remainder's, when the march stopped short
                 // of a surface), before what the walk gathers along it (host twin photonGather, grin.h
                 // MarchInfo); a factor flat in wavelength leaves the spectral carrier as it is.

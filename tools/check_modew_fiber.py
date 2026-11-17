@@ -21,7 +21,7 @@ black there (0.78x and, without glossy light sampling, 0.22x of the host before 
 Last, the device against the host on the fur ball's coat cut to stubble (6 mm strands, 1.2 mm
 thick) seen from 0.2 m, mode W at 16 spp, to the same bounds. The device's traces skipped an absolute
 1e-4 past their origin, so a shadow ray leaving the skin started past the roots of the strands it
-began among: the coat's shadowed underside read 3-10 % over the host (GPU-TMIN-SCALE, 0.448.6).
+began among: the coat's shadowed underside read 3-10 % over the host (GPU-TMIN-SCALE).
 `--no-gpu` skips both. Exits 1 on failure.
 """
 import argparse

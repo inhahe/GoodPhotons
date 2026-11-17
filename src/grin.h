@@ -102,6 +102,26 @@ inline bool marchSegments(const Scene& scene, Ray& ray, SegFn&& onSeg, bool camH
     // factor), so a camera march evaluates each point's index once.
     const Medium* nNextM = nullptr;
     double nNext = 0.0;
+    // The radiance factor (n0 / n(x))^2 from the point o, of index n0, along d to the span's end `pe`
+    // (`t` along) -- or to the last point inside m's bound on that span, bisected, when pe lies outside:
+    // the boundary refracts nothing, and past it the field need not be defined (an index that is no
+    // index there would blow the factor up). `nEnd` takes pe's index when pe is inside.
+    const auto factorTo = [&](const Medium* m, const Vec3& o, const Vec3& d, double t, const Vec3& pe,
+                              double n0, double* nEnd) -> double {
+        double n1;
+        if (m->insideBound(pe, &tabs)) {
+            n1 = m->nAt(pe, &tabs);
+            if (nEnd) *nEnd = n1;
+        } else {
+            double lo = 0.0, hi = t;
+            for (int i = 0; i < 24; ++i) {
+                const double mid = 0.5 * (lo + hi);
+                (m->insideBound(o + d * mid, &tabs) ? lo : hi) = mid;
+            }
+            n1 = m->nAt(o + d * lo, &tabs);
+        }
+        return (n0 > 0.0 && n1 > 0.0) ? (n0 / n1) * (n0 / n1) : 1.0;
+    };
     for (int gstep = 0; gstep < GRIN_MAX_STEPS; ++gstep) {
         const Medium* gm = grinAt(ray.o);
         Hit hs = scene.closestHit(ray, Scene::kTminEps, nullptr, /*skipHair=*/false, /*skipCamHidden=*/camHide);
@@ -134,11 +154,8 @@ inline bool marchSegments(const Scene& scene, Ray& ray, SegFn&& onSeg, bool camH
             // sample reached either (a light sample from inside counts blocked), and the field's index
             // changes along it.
             if (info) {
-                const Vec3 pe = ray.o + ray.d * hs.t;
-                if (gm->insideBound(pe, &tabs)) {
-                    const double n0 = gm->nAt(ray.o, &tabs), n1 = gm->nAt(pe, &tabs);
-                    if (n0 > 0.0 && n1 > 0.0) info->radScale *= (n0 / n1) * (n0 / n1);
-                }
+                const double n0 = (nNextM == gm) ? nNext : gm->nAt(ray.o, &tabs);
+                info->radScale *= factorTo(gm, ray.o, ray.d, hs.t, ray.o + ray.d * hs.t, n0, nullptr);
                 info->bent = info->bent || gm->bends();
             }
             return false;
@@ -157,28 +174,16 @@ inline bool marchSegments(const Scene& scene, Ray& ray, SegFn&& onSeg, bool camH
         double segLen = std::sqrt(dot(disp, disp));
         // The step's factor to its end is in `info` BEFORE the caller sees the step, which it may gather
         // along (mode M's beams); one ended short by the caller takes the factor to where it ended.
-        // The factor is taken only to a point inside the region's bound: past it the field need not be
-        // defined (an index that is no index there would blow the factor up), and the boundary itself
-        // refracts nothing, so the step that leaves the region takes none.
         const double scaleIn = info ? info->radScale : 1.0;
         if (info) {
-            if (gm->insideBound(newPos, &tabs)) {
-                const double n1 = gm->nAt(newPos, &tabs);
-                if (n1 > 0.0) info->radScale *= (n0 / n1) * (n0 / n1);
-                nNextM = gm; nNext = n1;
-            }
+            double n1 = -1.0;
+            info->radScale *= factorTo(gm, ray.o, newDir, segLen, newPos, n0, &n1);
+            if (n1 > 0.0) { nNextM = gm; nNext = n1; }
             info->bent = info->bent || gm->bends();
         }
         double tStop = 0.0;
         if (segLen > 0.0 && onSeg(ray.o, newDir, segLen, tStop)) {
-            if (info) {
-                const Vec3 pe = ray.o + newDir * tStop;
-                info->radScale = scaleIn;
-                if (gm->insideBound(pe, &tabs)) {
-                    const double n1 = gm->nAt(pe, &tabs);
-                    if (n1 > 0.0) info->radScale *= (n0 / n1) * (n0 / n1);
-                }
-            }
+            if (info) info->radScale = scaleIn * factorTo(gm, ray.o, newDir, tStop, ray.o + newDir * tStop, n0, nullptr);
             ray = Ray{ray.o + newDir * tStop, newDir};
             return true;
         }

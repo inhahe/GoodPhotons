@@ -8,12 +8,11 @@ the same numbers, so the same scene a hundredth the size, its strands 12 um thic
 power, so the small scene's radiance is 1e4 times the large one's; scaled back, the two must agree:
 the frame within 0.5 % and each live tile of a 4 x 4 grid within 1.5 %.
 
-A renderer's self-intersection offsets are what break this. The device skipped an absolute 1e-4 at
-the start of every trace and pushed origins by Wachter-Binder's constants for a scene of unit size,
-and in centimetres read x2.5 over its own metre render (GPU-TMIN-SCALE, GPU-MINIATURE-SCALE); the host
-offset everything by an absolute 1e-6, a twelfth of a strand there, and read x1.13, tiles to x1.45
-(CPU-MINIATURE-SCALE). Both now take their distances from the scene's length scale (Scene::lenScale,
-min(1, S); the device's c_lenScale), and from the primitive or point a ray leaves. Exits 1 on failure.
+A renderer's self-intersection offsets are what break this: an absolute distance sized for a scene
+of unit size skips real geometry in one drawn small -- a device tmin of 1e-4 and Wachter-Binder's
+constants read x2.5, a host offset of 1e-6 (a twelfth of a strand there) x1.13. Both take their
+distances from the scene's length scale (Scene::lenScale, min(1, S); the device's c_lenScale), and the
+device from the primitive a ray leaves. Exits 1 on failure.
 """
 import argparse
 import os
@@ -26,12 +25,12 @@ NL = chr(10)
 SCALE = 0.01        # centimetres against metres
 SCENE = [l for l in STUBBLE if not l.startswith("light sun")]
 # The same ball on a ground 400 m across, so that even drawn 100 times smaller the scene reaches past
-# unit size and its scale (c_lenScale) is 1: a small object in a big scene, whose offsets are sized by
-# its own primitives' reach (DHit::pscale) on the device and its points' own coordinates on the host
-# (Scene::epsAt), where the scene's eps alone kept 1e-6 (CPU-SMALL-IN-BIG).
+# unit size and its scale (c_lenScale) is 1: a small object in a big scene, whose offsets the device
+# sizes by its own primitives' reach (DHit::pscale). The device only: the host's eps is the scene's, an
+# absolute 1e-6 here (known-issues CPU-SMALL-IN-BIG).
 BIG = [l.replace("quad { origin -2 0 -2   u 0 0 4   v 4 0 0", "quad { origin -200 0 -200   u 0 0 400   v 400 0 0")
        for l in SCENE]
-CASES = [("ball", SCENE, ("cpu", "gpu")), ("ball_big_ground", BIG, ("cpu", "gpu"))]
+CASES = [("ball", SCENE, ("cpu", "gpu")), ("ball_big_ground", BIG, ("gpu",))]
 
 
 def render(exe, out, name, lines, units, dev):

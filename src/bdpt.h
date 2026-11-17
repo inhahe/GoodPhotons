@@ -1019,7 +1019,7 @@ inline void randomWalk(const Scene& scene, const Camera& cam, const Renderer& ma
         // `hide_camera` is primary visibility only, so it applies to exactly one ray in
         // this walk: the first edge of the RADIANCE (camera) subpath. An importance walk
         // starts at a light and never has a camera ray at all.
-        Hit h = closestHitIn(scene, stk, ray, Scene::kTminEps, nullptr, /*skipHair=*/false,
+        Hit h = closestHitIn(scene, stk, ray, scene.eps, nullptr, /*skipHair=*/false,
                                          /*skipCamHidden=*/(mode == Mode::Radiance && bounces == 0));
         if (h.valid && h.sensorId >= 0) return;      // model-A sensor: not used in BDPT
         double dSurf = h.valid ? h.t : 1e30;
@@ -1691,7 +1691,7 @@ inline void randomWalk(const Scene& scene, const Camera& cam, const Renderer& ma
                 double r = clamp01(reflectSlot(scene, *mp, h, lambda));
                 if (r <= 0) { terminate = true; break; }
                 bool absorbedG; int pickG = 0;
-                Ray nr = mats.gratingDiffract(*mp, h, ray.d, scene.epsAt(h.p), lambda, rng, absorbedG, nullptr,
+                Ray nr = mats.gratingDiffract(*mp, h, ray.d, scene.eps, lambda, rng, absorbedG, nullptr,
                                               jsw ? &pickG : nullptr);
                 if (absorbedG) { terminate = true; break; }
                 wi = nr.d; betaFactor = r; delta = true; lobe = Lobe::Free;   // orders about ng
@@ -1862,9 +1862,9 @@ inline void randomWalk(const Scene& scene, const Camera& cam, const Renderer& ma
         const bool fiberFar = (mp->type == MatType::Hair) && h.fiberRadius > 0.0 &&
                               dot(wi, cur.ns) < 0.0;
         ray = fiberFar
-                  ? Ray{cur.p + normalize(wi) * (1e-3 * scene.epsAt(cur.p)), normalize(wi),
+                  ? Ray{cur.p + normalize(wi) * (1e-3 * scene.eps), normalize(wi),
                         hairChordExit(h.fiberRadius, h.n, h.tangent, normalize(wi))}   // the exact chord (0.364.0)
-                  : Ray{continuationOrigin(cur.p, cur.ng, normalize(wi), delta, scene.epsAt(cur.p)), normalize(wi)};
+                  : Ray{continuationOrigin(cur.p, cur.ng, normalize(wi), delta, scene.eps), normalize(wi)};
         pdfFwd = delta ? 0.0 : pdfW;
     }
 }
@@ -2264,7 +2264,7 @@ inline int generateLightSubpath(const Scene& scene, const Camera& cam, const Ren
     double betaWalkSec[hero::kHeroMax - 1];
     for (int i = 0; i + 1 < hb.C; ++i)
         betaWalkSec[i] = L0.betaSec[i] * cosLight / (pdfChoice * pdfPos * pdfDir);
-    Ray ray{y + nFace * scene.epsAt(y), dir};
+    Ray ray{y + nFace * scene.eps, dir};
     // SPECTRAL-CLAIM BIRTH for the beam deposits (see BeamSpectral; twin of the bundle and
     // achro blocks in render.h's tracePhoton). `Le`'s only λ-dependence is
     // `spdFn(lambda) * invPdfLambda` — `emitPatW`, the cosine and all three pdfs are λ-free —
@@ -2665,7 +2665,7 @@ inline std::unique_ptr<BeamMap::ProbeSet> jProbeSet(const Scene& scene, const Ca
                 const double fx = (i + rng.uniform()) / gx * W, fy = (j + rng.uniform()) / gy * H;
                 const int px = std::min((int)fx, W - 1), py = std::min((int)fy, H - 1);
                 const Ray r = cam.genRay(px, py, fx - px, fy - py);
-                const Hit h = scene.closestHit(r, Scene::kTminEps, nullptr, /*skipHair=*/false,
+                const Hit h = scene.closestHit(r, scene.eps, nullptr, /*skipHair=*/false,
                                                /*skipCamHidden=*/true);
                 set->rays.push_back({r.o, r.d, h.valid ? h.t : 1e30});
             }
@@ -4116,7 +4116,7 @@ inline double connectBDPT(const Scene& scene, const Camera& cam, const Renderer&
         // be the same transport as a sampled path one vertex longer, and MIS cannot pair paths
         // of different lengths -- letting connections through double-counted it (D 0.9450 ->
         // 1.4123 on the invisibility null). Fur-crossing transport is carried by sampling.
-        if (scene.occluded(connOrigin(qs, wcam, scene.epsAt(qs.p)), wcam, dist - 2 * scene.eps, Scene::kTminEps, /*camLeg=*/true,
+        if (scene.occluded(connOrigin(qs, wcam, scene.eps), wcam, dist - 2 * scene.eps, scene.eps, /*camLeg=*/true,
                            connFiberStep(qs, wcam))) return 0.0;
         const double vis = 1.0;
         // Transmittance of the fog the connection ray crosses (1 in vacuum, no RNG).
@@ -4284,7 +4284,7 @@ inline double connectBDPT(const Scene& scene, const Camera& cam, const Renderer&
             for (int i = 0; i + 1 < nUp; ++i) if (fSec[i] > mxF) mxF = fSec[i];
             if (!(mxF > 0.0)) return 0.0;
         }
-        if (scene.occludedTo(connOrigin(pt, wi, scene.epsAt(pt.p)), y, occlEps, Scene::kTminEps, false,
+        if (scene.occludedTo(connOrigin(pt, wi, scene.eps), y, occlEps, scene.eps, false,
                              connFiberStep(pt, wi))) return 0.0;   // hard block: see t=1
         const double vis = 1.0;
         // Hero transmittance, shared by the bundle (flat extinction; see the t==1 branch).
@@ -4377,7 +4377,7 @@ inline double connectBDPT(const Scene& scene, const Camera& cam, const Renderer&
         // Both ENDS can be fibers here, and a connection arriving at a strand from its far
         // side would clip the tube just short of the vertex, so stop the shadow ray early at
         // that end too. Adds an exact 0.0 for every non-fiber pair.
-        if (scene.occludedTo(connOrigin(pt, w, scene.epsAt(pt.p)), qs.p, 2 * scene.eps, Scene::kTminEps, false, connFiberStep(pt, w),
+        if (scene.occludedTo(connOrigin(pt, w, scene.eps), qs.p, 2 * scene.eps, scene.eps, false, connFiberStep(pt, w),
                              connShorten(qs, w * -1.0, 0.0))) return 0.0;   // hard block: see t=1
         const double vis = 1.0;
         // Hero transmittance, shared by the bundle (flat extinction; see the t==1 branch).

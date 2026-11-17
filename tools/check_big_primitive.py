@@ -7,13 +7,12 @@ the origin and a lamp above, rendered in mode W at 16 spp (deterministic) on the
 device's frame within 1 % of the host's and every live tile of a 4 x 4 grid within 3 %. Then in mode D
 (the bidirectional walks, whose continuations and connections leave the ground too), GPU at 1024 spp
 against CPU at 256 (both fixed seeds, so deterministic): the frame within 0.5 % and every live tile
-within 1 % -- 0.449.1, whose BDPT walk left the ground without its reach, read x0.9916 and 1.6 %.
+within 1 % (a BDPT walk leaving the ground without its reach reads x0.9916 and 1.6 %).
 
 A hit on that sphere carries a float error of ulps of its reach (2000), not of the hit's own coordinates
 near the origin: an origin pushed off it by an amount sized at the hit, and a next trace whose tmin is
-too, meets the sphere again, and the ground's light samples shadow themselves -- the GPU read the ground
-dark in speckles after its tmin stopped being an absolute 1e-4 (0.448.6). The push is sized by the
-primitive's reach (DHit::pscale, REVIEW-0448D). Exits 1 on failure.
+too, meets the sphere again, and the ground's light samples shadow themselves (the ground reads x0.83,
+dark in speckles). The push is sized by the primitive's reach (DHit::pscale). Exits 1 on failure.
 """
 import argparse
 import os

@@ -5832,12 +5832,10 @@ as the one at fault.
   `continuationOrigin`, the BDPT/VCM `connOrigin`/`fiberOrigin`, `gratingDiffract`), a trace's tmin
   (`Scene::kTminEps`, the default of `closestHit`, `occluded`, `shadowTransmittance`, `occludedTo`),
   a far end's shortening (2 eps) and a strand's near-side skip (`hairExitOffset`); the helpers with no
-  scene take it as an argument. Every one but the far ends is taken at the point the ray leaves,
-  `Scene::epsAt(p)`: eps shrunk with p's largest coordinate inside 1/16 of the origin (a trace's tmin
-  sentinel resolves from its own origin), so a small object in a big scene keeps distances its size
-  -- in double a hit's error is ~1e-16 of its primitive's coordinates, ten decades below eps at unit
-  size (CPU-SMALL-IN-BIG: the stubble ball 100 times smaller on a 4 m ground read x1.13 of itself on
-  the CPU, now x1.0017). The device's `dEpsAt` floor shrinks the same way. The device's `setSceneScale` reads `Scene::lenScale`, and the fp64
+  scene take it as an argument. eps is the scene's, so a small object in a big scene keeps 1e-6
+  (CPU-SMALL-IN-BIG, open: sizing it by the point's distance from the origin was tried and fixed only
+  what sits near the origin; the fix is a per-feature size at each hit). The device's `dEpsAt` floor
+  shrinks within 1/16 of the origin, where in fp32 the 32-ulp term is the real bound anyway. The device's `setSceneScale` reads `Scene::lenScale`, and the fp64
   device build scales its `RAY_EPS` by it, so it stays the host's twin (CPU-MINIATURE-SCALE: the ball
   100 times smaller read x1.13 of itself on the CPU, tiles to x1.45; now x1.0022).
   It replaced ~100 `p + n*RAY_EPS` bounce and shadow
@@ -7411,14 +7409,18 @@ as the one at fault.
   eye leg (`mirrorSeenAt`, device `dMirrorSeenAt`), and the dual-scatter fibre walk (`walkFibers`).
   Mode P files a pixel whose centre ray crosses one specular (`classifyComposite`), and a sample whose
   camera path bends before its first surface likewise (`noteFirst`). What a region bends from a point,
-  spot or sun light reaches nothing in modes R and W, whose walks never meet such a light: black
-  there, as a caustic through glass, which ftrace notes (`[grin] note`); B, M and S render it.
+  spot or collimated light reaches nothing in mode R, whose walks never meet such a light, and from
+  any light in mode W, whose walk ends at its first diffuse vertex: black there, as a caustic through
+  glass, which ftrace notes for the render's mode (`[grin] note`); B, M and S render it (a sun is a
+  finite disc a bent walk can meet: R renders its light through a region, noisily). The transport
+  queries test geometry first and look through an implicit or mesh bound at the march's own step.
   **Radiance over n^2 along a march (0.449.0, GRIN-RADIANCE-SCALE).** L / n^2 is conserved along a
   ray bending in a continuous field, and a region's boundary refracts nothing here (the march
   crosses it straight, keeping the ray's geometric etendue and so its radiance). A camera walk
   therefore multiplies its throughput by (n(x_k) / n(x_k+1))^2 over the Eikonal steps, the field's
   index at both ends (`MarchInfo::radScale`, device `DGrinMedia::radScale` with `camera` set), each
-  step's before what the walk gathers along it (mode M's beams, on both devices): that is
+  step's before what the walk gathers along it (mode M's beams, on both devices), the step leaving a
+  region to its last point inside the bound (bisected: past it the field need not be defined): that is
   (n entering / n leaving)^2 per region, which a walk ending inside one owes on what it finds there
   and one crossing a field whose index differs at its two sides owes too. A light walk carries flux,
   which the bend conserves, and takes none.

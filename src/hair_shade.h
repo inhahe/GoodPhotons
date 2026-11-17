@@ -524,7 +524,7 @@ inline double hairDualResponse(const HairDualCtx& ctx, const HairShade& s, const
                                const Vec3& wi, double dist, bool& blockedOut) {
     blockedOut = true;
     const Scene& sc = *ctx.scene;
-    const double off = hairExitOffset(s, h.n, wi, sc.epsAt(h.p));
+    const double off = hairExitOffset(s, h.n, wi, sc.eps);
     const double len = dist - off - sc.eps;
     if (!(len > 0.0)) return 0.0;
     HairShadow sh;

@@ -654,7 +654,7 @@ inline double strandStep(const Scene& scene, const BackwardRenderer& bw, const M
     const double d = thr * bw.neeLight(scene, h, rho, invPdfL, lambda, rng, nullptr, coatGi(m, wa));
     thr *= rho;
     if (sthr) sthr->mul([&](double L) { return clamp01(diffuseReflectance(scene, m, h, L)); }, rho);
-    cont = continueAlong(h, cosineHemisphere(h.n, rng), Lobe::Reflect, ray, scene.epsAt(h.p)) && thr > 0.0 &&
+    cont = continueAlong(h, cosineHemisphere(h.n, rng), Lobe::Reflect, ray, scene.eps) && thr > 0.0 &&
            coatWalkOut(scene, m, h, wa, ray.d, lambda, thr, sthr);
     return d;
 }
@@ -863,7 +863,7 @@ inline Vec3 photonGatherSub(const Scene& scene, const PhotonMap& pm, Ray ray, Pc
             }
             case MatType::Mirror: {
                 thr *= clamp01(reflectSlot(scene, m, h, lambda));
-                if (!continueAlong(h, reflect(ray.d, h.n), Lobe::Reflect, ray, scene.epsAt(h.p))) return L;   // across the surface
+                if (!continueAlong(h, reflect(ray.d, h.n), Lobe::Reflect, ray, scene.eps)) return L;   // across the surface
                 break;
             }
             case MatType::Glossy: {
@@ -891,7 +891,7 @@ inline Vec3 photonGatherSub(const Scene& scene, const PhotonMap& pm, Ray ray, Pc
                     gmis.from = h.p;
                     gmis.n = h.n;
                 }
-                if (!continueAlong(h, o, Lobe::Reflect, ray, scene.epsAt(h.p))) return L;
+                if (!continueAlong(h, o, Lobe::Reflect, ray, scene.eps)) return L;
                 contSoft = contSoftening(m, h, ray.d);
                 break;
             }
@@ -910,13 +910,13 @@ inline Vec3 photonGatherSub(const Scene& scene, const PhotonMap& pm, Ray ray, Pc
             }
             case MatType::HalfMirror: {
                 double r = clamp01(reflectSlot(scene, m, h, lambda));
-                if (rng.uniform() < r) { if (!continueAlong(h, reflect(ray.d, h.n), Lobe::Reflect, ray, scene.epsAt(h.p))) return L; }
-                else                   ray = Ray{h.p + ray.d * scene.epsAt(h.p), ray.d};
+                if (rng.uniform() < r) { if (!continueAlong(h, reflect(ray.d, h.n), Lobe::Reflect, ray, scene.eps)) return L; }
+                else                   ray = Ray{h.p + ray.d * scene.eps, ray.d};
                 break;
             }
             case MatType::Filter: {
                 thr *= clamp01(transmitSlot(scene, m, h, lambda));
-                ray = Ray{h.p + ray.d * scene.epsAt(h.p), ray.d};
+                ray = Ray{h.p + ray.d * scene.eps, ray.d};
                 break;
             }
             case MatType::Hair: {
@@ -950,12 +950,12 @@ inline Vec3 photonGatherSub(const Scene& scene, const PhotonMap& pm, Ray ray, Pc
                     if (nullSteps < 256) { --b; ++nullSteps; }   // ...and its bounce refunded
                 }
                 const Vec3 wo = hair::toWorld(hs.fr, wl);
-                ray = Ray{h.p + wo * scene.epsAt(h.p), wo, hairExitOffset(hs, h.n, wo, scene.epsAt(h.p))};
+                ray = Ray{h.p + wo * scene.eps, wo, hairExitOffset(hs, h.n, wo, scene.eps)};
                 break;
             }
             default: {                                   // Grating: approx reflect
                 thr *= clamp01(reflectSlot(scene, m, h, lambda));
-                if (!continueAlong(h, reflect(ray.d, h.n), Lobe::Reflect, ray, scene.epsAt(h.p))) return L;   // across the surface
+                if (!continueAlong(h, reflect(ray.d, h.n), Lobe::Reflect, ray, scene.eps)) return L;   // across the surface
                 break;
             }
         }
@@ -1108,7 +1108,7 @@ inline Vec3 photonGather(const Scene& scene, const PhotonMap& pm, Ray ray, doubl
         // b == 0 is the camera ray photonGather was handed (mode M's eye pass); see
         // Material::hideCamera. photonGatherSub's walk is NOT given this: a final-gather
         // sub-ray leaves a visible point, so it is an indirect ray and must see the flat.
-        Hit h = closestHitIn(scene, stk, ray, Scene::kTminEps, nullptr, /*skipHair=*/false,
+        Hit h = closestHitIn(scene, stk, ray, scene.eps, nullptr, /*skipHair=*/false,
                                          /*skipCamHidden=*/(b == 0));
         // --- Participating media along this segment (mode M with -beams) ---------------
         // Done BEFORE `thr` takes the segment's attenuation, because each gathered beam
@@ -1261,7 +1261,7 @@ inline Vec3 photonGather(const Scene& scene, const PhotonMap& pm, Ray ray, doubl
                     Vec3 fg{0, 0, 0};
                     for (int k = 0; k < fgRays; ++k) {
                         Ray gr;   // a gather ray across the surface gathers nothing
-                        if (!continueAlong(h, cosineHemisphere(h.n, rng), Lobe::Reflect, gr, scene.epsAt(h.p))) continue;
+                        if (!continueAlong(h, cosineHemisphere(h.n, rng), Lobe::Reflect, gr, scene.eps)) continue;
                         fg += photonGatherSub(scene, pm, gr, rng, diffraction, maxBounce,
                                               lambda, invPdfL, norm, h, m, ray.d * -1.0, stk,
                                               causOn ? pmC : nullptr, normC);
@@ -1317,7 +1317,7 @@ inline Vec3 photonGather(const Scene& scene, const PhotonMap& pm, Ray ray, doubl
                 double r = clamp01(reflectSlot(scene, m, h, lambda));
                 thr *= r;
                 sthr.mul([&](double L) { return clamp01(reflectSlot(scene, m, h, L)); }, r);
-                if (!continueAlong(h, reflect(ray.d, h.n), Lobe::Reflect, ray, scene.epsAt(h.p))) return L;   // across the surface
+                if (!continueAlong(h, reflect(ray.d, h.n), Lobe::Reflect, ray, scene.eps)) return L;   // across the surface
                 break;
             }
             case MatType::Glossy: {
@@ -1367,7 +1367,7 @@ inline Vec3 photonGather(const Scene& scene, const PhotonMap& pm, Ray ray, doubl
                     gmis.from = h.p;
                     gmis.n = h.n;
                 }
-                if (!continueAlong(h, o, Lobe::Reflect, ray, scene.epsAt(h.p))) return L;
+                if (!continueAlong(h, o, Lobe::Reflect, ray, scene.eps)) return L;
                 contSoft = contSoftening(m, h, ray.d);
                 break;
             }
@@ -1394,8 +1394,8 @@ inline Vec3 photonGather(const Scene& scene, const PhotonMap& pm, Ray ray, doubl
             case MatType::HalfMirror: {
                 double r = clamp01(reflectSlot(scene, m, h, lambda));
                 const bool refl = rng.uniform() < r;
-                if (refl) { if (!continueAlong(h, reflect(ray.d, h.n), Lobe::Reflect, ray, scene.epsAt(h.p))) return L; }
-                else      ray = Ray{h.p + ray.d * scene.epsAt(h.p), ray.d};
+                if (refl) { if (!continueAlong(h, reflect(ray.d, h.n), Lobe::Reflect, ray, scene.eps)) return L; }
+                else      ray = Ray{h.p + ray.d * scene.eps, ray.d};
                 // SPECGATHER: the coin at each photon's wavelength -- a coloured half mirror
                 // reflects each wavelength by its own reflectance.
                 const double pc = refl ? r : 1.0 - r;
@@ -1409,7 +1409,7 @@ inline Vec3 photonGather(const Scene& scene, const PhotonMap& pm, Ray ray, doubl
                 double t = clamp01(transmitSlot(scene, m, h, lambda));
                 thr *= t;
                 sthr.mul([&](double L) { return clamp01(transmitSlot(scene, m, h, L)); }, t);
-                ray = Ray{h.p + ray.d * scene.epsAt(h.p), ray.d};
+                ray = Ray{h.p + ray.d * scene.eps, ray.d};
                 break;
             }
             case MatType::Hair: {
@@ -1503,14 +1503,14 @@ inline Vec3 photonGather(const Scene& scene, const PhotonMap& pm, Ray ray, doubl
                     }, wCam);
                 }
                 const Vec3 wo = hair::toWorld(hs.fr, wl);
-                ray = Ray{h.p + wo * scene.epsAt(h.p), wo, hairExitOffset(hs, h.n, wo, scene.epsAt(h.p))};
+                ray = Ray{h.p + wo * scene.eps, wo, hairExitOffset(hs, h.n, wo, scene.eps)};
                 break;
             }
             default: {                                   // Grating: approx reflect
                 double r = clamp01(reflectSlot(scene, m, h, lambda));
                 thr *= r;
                 sthr.mul([&](double Lw) { return clamp01(reflectSlot(scene, m, h, Lw)); }, r);
-                if (!continueAlong(h, reflect(ray.d, h.n), Lobe::Reflect, ray, scene.epsAt(h.p))) return L;   // across the surface
+                if (!continueAlong(h, reflect(ray.d, h.n), Lobe::Reflect, ray, scene.eps)) return L;   // across the surface
                 break;
             }
         }

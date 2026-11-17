@@ -409,8 +409,10 @@ Then the rest of 4.2-4.6 in their order, 4.7's bookkeeping alongside whatever to
   GRIN rule's gaps, BDPT big-primitive offsets, mode S's coverage argument, sessions' scale (known-issues).
 - [x] **REVIEW-0448D** (0.449.1) — the Opus (max) review of 0.448.6-0.448.7: big primitives near the
   origin (check_big_primitive), per-primitive offsets, probe tmins, tool gates (known-issues).
-- [x] **CPU-SMALL-IN-BIG** (0.449.3) — the host's distances at the point a ray leaves (Scene::epsAt);
-  the ball 100x smaller on a 4 m ground reads x1.0017 of itself on the CPU (check_scale_invariance).
+- [ ] **CPU-SMALL-IN-BIG** — the host's eps is the scene's: a tiny object in a big scene keeps 1e-6
+  (known-issues). 0.449.3's distance-from-origin eps was taken back; the fix is a per-feature size at
+  each hit (a Hit field) with explicit tmins.
+- [x] **REVIEW-0449B** (0.449.4) — the Opus (xhigh) review of 0.449.2-0.449.3 (known-issues).
 - [x] **GRIN-RADIANCE-SCALE** (0.449.0) — radiance over n² along a camera walk's march.
 - [x] **GRIN-STRAIGHT-CONNECT** (0.449.0) — no straight connection crosses a bending region; mode R
   matches mode B outside the lens and mode C through it (check_grin_connect).

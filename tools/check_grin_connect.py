@@ -4,15 +4,15 @@
 
 scenes/_grin_lin.ftsl (a checkerboard behind a sphere whose index falls linearly with height, lit by two
 sphere lamps above) in mode R and mode B on the GPU, `--secs` each. Outside the lens's own image -- the
-16 border tiles of a 6 x 6 grid it does not reach -- both must agree within 3 %: there the checker is lit, partly through
-the lens, and seen directly. Mode B's photons bend through the field; mode R's light samples are straight
-and must count blocked where they would cross it, the bent light arriving along its walks at full weight
-(GRIN-STRAIGHT-CONNECT). Before 0.449.0 mode R lit the corners the lens shadows straight through it:
-0.81-0.87 of B there. Also requires the lens's middle four tiles black in mode B, which cannot see
-through a bending region (a straight camera leg across one counts blocked). And mode P on every tile
-within 3 % of mode R: its composite files a pixel seen through the lens specular, so the backward film
-shows it -- 0.449.1 filed it diffuse, drew it black and scaled every other pixel x1.40. Exits 1 on
-failure.
+16 border tiles of a 6 x 6 grid it does not reach -- both must agree within 3 %: there the checker is lit,
+partly through the lens, and seen directly. Mode B's photons bend through the field; mode R's light samples
+are straight and must count blocked where they would cross it, the bent light arriving along its walks at
+full weight (GRIN-STRAIGHT-CONNECT) -- a light sample let through straight lights the corners the lens
+shadows (0.81-0.87 of B there). Also requires the lens's middle four tiles black in mode B, which cannot
+see through a bending region (a straight camera leg across one counts blocked). And mode P on every tile
+within 3 % of mode R: its composite must file a pixel seen through the lens specular, so the backward
+film shows it -- filed diffuse, the lens draws black and every other pixel is scaled up (x1.40). Exits 1
+on failure.
 """
 import argparse
 import os
