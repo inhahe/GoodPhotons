@@ -21680,7 +21680,7 @@ beam maps (300 146 chords, 7 257 009 sub-beams) so the bundle is provably the on
 | `-beamspec 1` | 0.08828 | 0.17615 |
 | `-beamspec 4` | **0.08468** (-4.1 %) | **0.16111** (-8.5 %) |
 
-and the MS-bias invariant is unmoved — `tools/check_beams_ms.py`: ball/ref **1.0865** at
+and the MS-bias invariant is unmoved — `tools/measure_beams_ms.py`: ball/ref **1.0865** at
 `-beamspec 1` vs **1.0916** at `-beamspec 4`, rest-of-frame **1.0200** for both, against the
 documented 1.0816–1.0884 plateau. Unbiased, and free.
 
@@ -32175,7 +32175,7 @@ throughput and a very small pdf, and their ratio is where a `0/0` would live.
 
 Not caused by the 0.199.0 beam change (mode D does not use beams at all), and it does not
 affect the PNG, which clamps. It *does* silently poison any numeric comparison against the
-reference — `tools/check_beams_ms.py` had to grow an explicit NaN mask, and a plain `np.mean`
+reference — `tools/measure_beams_ms.py` had to grow an explicit NaN mask, and a plain `np.mean`
 over the reference returns `nan`.
 
 **FIXED in 0.199.1. It was not a vanishing pdf at all — it was `normalize(0)`.** Instrumenting
@@ -32212,7 +32212,7 @@ Verified, all measured rather than inferred:
 - `_beams_ms.ftsl` mode D, **27 NaN px -> 0 on GPU** at 500 spp and **7 -> 0 on CPU** at 300 spp.
 - The exact command in (b) above, re-run to completion (`20000 / 20000 spp, 184.9s`):
   `png/ms_ref.pfm: 192x192  NaN px=0  Inf px=0  max=4.749e+13  mean=7.2019e+11`. **705 -> 0.**
-  A plain `np.mean` over the reference now returns a number, so `tools/check_beams_ms.py`'s
+  A plain `np.mean` over the reference now returns a number, so `tools/measure_beams_ms.py`'s
   NaN mask is no longer load-bearing.
 - Sub-part (a) was the same bug seen through `-fireflies 3`, not a second one — the entry's own
   "check (a) again once (b) is fixed" resolves in favour of one bug. Same scene, same flags,
