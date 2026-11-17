@@ -407,8 +407,11 @@ Then the rest of 4.2-4.6 in their order, 4.7's bookkeeping alongside whatever to
   known-issues REVIEW-0445. The lane-0 probes: WARP-PROBES (0.445.9), 2.0-2.2x -> 1.16-1.24x.
 - [ ] **GRIN-RADIANCE-SCALE** — a camera path ending inside a GRIN region misses the n² radiance
   scale.
-- [ ] **STUBBLE-DEVICE-UNDERSIDE** — mode W on a stubble coat: device and host 9.6 % apart in its
-  dark underside (to investigate).
+- [x] **GPU-TMIN-SCALE** (0.448.6) — a device trace's tmin is 32 ulps of its origin, not an absolute
+  1e-4; fixed STUBBLE-DEVICE-UNDERSIDE (check_modew_fiber's stubble case).
+- [ ] **GPU-MINIATURE-SCALE** — the device's other absolute offsets (WB's near-zero push, the hair
+  exit floor, the `p + w*RAY_EPS` pushes) break a scene a few centimetres across: the stubble coat in
+  centimetres reads x2.50 (known-issues).
 - [x] **SPPM-LOWPASS-DEVHOST** (closed 2026-11-13) — mode S's device read check_coat_modes' coated
   balls 16 % bluer than its host at 16 passes: noise in one tile seen through the thin-film bubble;
   sixteen seeds a backend agree within 0.5 sigma.

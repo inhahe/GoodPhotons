@@ -6019,7 +6019,64 @@ throughput by (n(start) / n(end))^2 per march; but mode R's light sampling from 
 uses straight shadow rays through the field, an approximation that would then also need the
 local n^2 on its light, so the two have to change together, with a check against mode B.
 
-## OPEN (2026-10-13, to investigate): STUBBLE-DEVICE-UNDERSIDE — mode W on a stubble coat, device vs host, 9.6 % apart in its dark underside
+## DONE (2026-11-16, 0.448.6): GPU-TMIN-SCALE — the device skips the first 1e-4 of every ray, at any scale
+
+**Fixed in 0.448.6:** a trace given `RAY_TMIN` (the default of closestHit, occluded, shadowTransmittance
+and occludedTo, and what every call site that passed `RAY_EPS` as a tmin now passes) resolves it from
+its origin by `dTminAt`: 32 float ulps of the origin's largest coordinate, at least 1e-7, at most
+`RAY_EPS` (design.md, the offset rules). The fiber shadow rays, which pushed their origin by `RAY_EPS`
+along the ray, push by `dTminAt` instead. The stubble coat below now reads x1.0000 over the GPU frame
+and 1.000-1.001 in every tile (`tools/check_modew_fiber.py` has it as its third case, which 0.448.5
+fails); check_bitid against 0.448.5: every CPU case bit-identical, and on the GPU a few pixels per
+case, frame means within 0.013 % -- the paths that now meet geometry within 1e-4 of their start; the
+16 GPU checks the sweep reached pass (four timed out sharing the card; the full sweep runs on
+GPU-MINIATURE-SCALE's build, which carries this change). The same scene 100 times smaller still reads x2.50 (x3.53 before): the other
+absolute distances, GPU-MINIATURE-SCALE below. The report as filed:
+
+The fp32 build moves a new ray's origin off its surface scale-correctly (`dOffsetAlong`: 256 ulps of
+the coordinate, design.md), but the trace after it still skips `tmin = RAY_EPS = 1e-4`, an absolute
+distance. In a scene of metres that is a tenth of a millimetre and goes unseen; at a small scale it
+removes real geometry: a stubble coat's 1.2 mm strands lose their roots to the shadow rays leaving the
+skin (STUBBLE-DEVICE-UNDERSIDE, x1.10 in its shadowed corner), and the same scene 100 times smaller
+renders x3.5 over the whole GPU frame. The CPU's 1e-6 is absolute as well, but a hundred times smaller
+and in double. Fix: a scale-correct tmin -- some tens of float ulps of the origin's largest coordinate,
+no more than RAY_EPS -- where the device now passes RAY_EPS as a trace's tmin (44 call sites and the
+defaults of closestHit / occluded / occludedTo), behind dOffsetAlong's push, which stays the first
+guard; then a sweep of the GPU checks for self-intersection (acne) and check_bitid --tol.
+
+## OPEN (2026-11-16): GPU-MINIATURE-SCALE — the device's other offsets assume a scene a few centimetres across or more
+
+The stubble coat of STUBBLE-DEVICE-UNDERSIDE in `units centimeters` -- the same scene 100 times
+smaller, its strands 12 um thick and 60 um long, every coordinate under 1/32 -- renders x2.50 over the
+CPU in mode W after GPU-TMIN-SCALE (x3.53 before; the CPU's own 1e-6 is a twelfth of a strand there).
+A macro scene authored in millimetres (a ring 2 cm across, at the origin) is the same regime. The fp32
+device still sizes these distances absolutely:
+- `dOffsetComp` (every `dOffsetPoint` / `dOffsetAlong` origin): inside |p| < 1/32, a push of 1/65536 =
+  1.5e-5 per unit of the normal -- Wachter-Binder's constants, which assume a scene of unit size;
+  here more than a strand's radius;
+- `dHairExitOffset`: `RAY_EPS` as the near-side curve skip and as the floor of the far-side chord
+  (modes B, R and the forward and backward walks; mode W's and the BDPT's strands start by
+  `dStrandStart`, already scale-correct);
+- `p + w * RAY_EPS`: a medium vertex's shadow rays and continuation, the camera legs of mode B's
+  connections from a medium or sensor point, a point light's photon births;
+- `2 * RAY_EPS` as `connMaxT`'s floor on camera legs and some far ends, and the probes' floors.
+Fix: the WB constants scaled by the scene's coordinate magnitude (cameras included) where it is under
+1, set per upload; the pushes and floors by `dTminAt` of their point; `dHairExitOffset` as
+`dStrandStart`. Then the centimetre stubble within check_modew_fiber's bounds, and the sweep.
+
+## DONE (2026-11-16, 0.448.6): STUBBLE-DEVICE-UNDERSIDE — mode W on a stubble coat, device vs host, 9.6 % apart in its dark underside
+
+**Fixed in 0.448.6, by GPU-TMIN-SCALE's fix:** frame x1.0000, every tile 1.000-1.001, at 16 spp;
+`tools/check_modew_fiber.py` checks it. **The cause: the device skips the first RAY_EPS = 1e-4 of every trace, absolute, whatever the scene's
+scale (GPU-TMIN-SCALE).** It is not sampling: at 128 spp the corner tiles read x1.030 and x1.105 as at 16,
+and the pixels that differ are the coat's shadowed, grazing top, where the GPU is brighter -- light the
+CPU's shadow rays stop at a strand near their origin, and the GPU's start past. The strands are 1.2 mm
+thick and 6 mm long, so a 0.1 mm skip from the skin misses their roots. The same scene in `units
+centimeters`, 100 times smaller, reads x3.53 over the whole GPU frame (x2.50 after the fix:
+GPU-MINIATURE-SCALE).
+
+The report:
+
 
 `tools/check_modew_fiber.py`'s fur ball with the coat cut to stubble (count 60000, length 0.006,
 radius 0.0012) and the camera moved in to 0.2 m, mode W at 16 spp (deterministic on both): the

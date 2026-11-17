@@ -18,7 +18,11 @@ of `opacity 0.3` fur, mode W on the GPU and the CPU, the frame within 1 % and ev
 grid within 3 %. Mode W runs direct-only, which ends a path at a fiber -- but only for light the
 fiber intercepted; the device ended it at every fiber, so the light behind see-through fur went
 black there (0.78x and, without glossy light sampling, 0.22x of the host before 0.377.1).
-`--no-gpu` skips it. Exits 1 on failure.
+Last, the device against the host on the fur ball's coat cut to stubble (6 mm strands, 1.2 mm
+thick) seen from 0.2 m, mode W at 16 spp, to the same bounds. The device's traces skipped an absolute
+1e-4 past their origin, so a shadow ray leaving the skin started past the roots of the strands it
+began among: the coat's shadowed underside read 3-10 % over the host (GPU-TMIN-SCALE, 0.448.6).
+`--no-gpu` skips both. Exits 1 on failure.
 """
 import argparse
 import os
@@ -42,6 +46,10 @@ SCENE = [
     'sphere "b" { center 0 0.13 0  radius 0.10  material skin }',
     'fur "coat" { on "b"  material pale  count 25000  length 0.05  length_jitter 0.3  radius 0.0006  droop 0.5  jitter 0.25  seed 1 }',
 ]
+# The same ball under a stubble coat, the camera moved in (the second device/host comparison).
+STUBBLE = [l.replace("count 25000  length 0.05", "count 60000  length 0.006")
+            .replace("radius 0.0006", "radius 0.0012")
+            .replace("eye 0 0.15 -0.42", "eye 0 0.14 -0.2") for l in SCENE]
 
 
 # A lamp seen in a glossy floor through see-through fur (the device/host comparison).
@@ -56,6 +64,35 @@ SEE_THROUGH = [
     'sphere "ball" { center 0 0.28 1.5  radius 0.02  material core }',
     'fur "coat" { on "ball"  material fur  count 6000  length 0.25  length_jitter 0.2  radius 0.0015  droop 0.0  jitter 0.25  seed 3 }',
 ]
+
+
+def device_vs_host(exe, out, name, lines, what):
+    """Render `lines` in mode W at 16 spp on the GPU and the CPU (both deterministic); True when the
+    device's frame is within 1 % of the host's and each live tile of a 4 x 4 grid within 3 %."""
+    scene = os.path.join(out, name + ".ftsl")
+    with open(scene, "w", encoding="utf-8", newline="") as f:
+        f.write(NL.join(lines) + NL)
+    img = {}
+    for dev in ("cpu", "gpu"):
+        png = os.path.join(out, "%s_%s.png" % (name, dev))
+        cmd = [exe, "-in", scene, "-mode", "W", "-device", dev, "-spp", "16", "-hdr",
+               "-no-meter", "-o", png]
+        r = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
+        pfm = png[:-4] + ".pfm"
+        if r.returncode != 0 or not os.path.exists(pfm):
+            print(r.stdout[-1500:], r.stderr[-1500:])
+            raise SystemExit("render failed: " + " ".join(cmd))
+        img[dev] = read_pfm(pfm, top_down=False).sum(-1)
+    h, w = img["cpu"].shape
+    t = {k: np.array([[v[h * i // 4:h * (i + 1) // 4, w * j // 4:w * (j + 1) // 4].mean()
+                       for j in range(4)] for i in range(4)]) for k, v in img.items()}
+    live = t["cpu"] > 0.02 * t["cpu"].max()
+    worst = float(np.max(np.where(live, np.abs(t["gpu"] / np.maximum(t["cpu"], 1e-30) - 1.0), 0.0)))
+    frame = float(img["gpu"].mean() / max(img["cpu"].mean(), 1e-30))
+    good = abs(frame - 1.0) <= 0.01 and worst <= 0.03
+    print("%s: mode W %s, device / host: frame x%.4f, worst tile off by %.2f %%"
+          % ("ok" if good else "FAIL", what, frame, 100.0 * worst))
+    return good
 
 
 def main():
@@ -87,30 +124,8 @@ def main():
     print("%s: mode W fur chromaticity, 1 spp (r %.3f b %.3f) vs 64 spp (r %.3f b %.3f): off by %.3f"
           % ("ok" if ok else "FAIL", chroma[1][0], chroma[1][2], chroma[64][0], chroma[64][2], d))
     if not a.no_gpu:
-        see = os.path.join(out, "seethrough.ftsl")
-        with open(see, "w", encoding="utf-8", newline="") as f:
-            f.write(NL.join(SEE_THROUGH) + NL)
-        img = {}
-        for dev in ("cpu", "gpu"):
-            png = os.path.join(out, "see_%s.png" % dev)
-            cmd = [a.exe, "-in", see, "-mode", "W", "-device", dev, "-spp", "16", "-hdr",
-                   "-no-meter", "-o", png]
-            r = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
-            pfm = png[:-4] + ".pfm"
-            if r.returncode != 0 or not os.path.exists(pfm):
-                print(r.stdout[-1500:], r.stderr[-1500:])
-                raise SystemExit("render failed: " + " ".join(cmd))
-            img[dev] = read_pfm(pfm, top_down=False).sum(-1)
-        h, w = img["cpu"].shape
-        t = {k: np.array([[v[h * i // 4:h * (i + 1) // 4, w * j // 4:w * (j + 1) // 4].mean()
-                           for j in range(4)] for i in range(4)]) for k, v in img.items()}
-        live = t["cpu"] > 0.02 * t["cpu"].max()
-        worst = float(np.max(np.where(live, np.abs(t["gpu"] / np.maximum(t["cpu"], 1e-30) - 1.0), 0.0)))
-        frame = float(img["gpu"].mean() / max(img["cpu"].mean(), 1e-30))
-        good = abs(frame - 1.0) <= 0.01 and worst <= 0.03
-        ok &= good
-        print("%s: mode W through see-through fur, device / host: frame x%.4f, worst tile off by "
-              "%.2f %%" % ("ok" if good else "FAIL", frame, 100.0 * worst))
+        ok &= device_vs_host(a.exe, out, "see", SEE_THROUGH, "through see-through fur")
+        ok &= device_vs_host(a.exe, out, "stubble", STUBBLE, "on a stubble coat")
     print("PASS" if ok else "FAILED")
     return 0 if ok else 1
 

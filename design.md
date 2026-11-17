@@ -5811,8 +5811,17 @@ as the one at fault.
   `origin + dir*RAY_EPS`, which was along the wrong vector as well as the wrong size:
   births now step along `emitN`. Medium vertices have nothing to clear and are not
   offset; hair fibres keep `dHairExitOffset` (2.5 radii along the exit direction). The
-  fp64 device build keeps `p + n*1e-6`, bit-identical to the CPU. `tmin = RAY_EPS` on
-  the next trace stays as a second guard, not the first.
+  fp64 device build keeps `p + n*1e-6`, bit-identical to the CPU. The next trace's tmin is a
+  second guard, not the first, and it is scale-correct too: a trace given `RAY_TMIN` (a negative
+  sentinel, the default of `closestHit`, `occluded`, `shadowTransmittance` and `occludedTo`)
+  resolves it from its own origin by `dTminAt` -- 32 float ulps of the origin's largest
+  coordinate, at least 1e-7 and at most `RAY_EPS`. An absolute 1e-4 skipped the first tenth of a
+  millimetre of every ray: in a scene of metres that is a stubble coat's roots, and a ray leaving
+  the skin under them missed the strands it started among (GPU-TMIN-SCALE, found as
+  STUBBLE-DEVICE-UNDERSIDE: the coat's underside 3-10 % over the CPU in mode W, now 1.000). The
+  fp64 build's `RAY_TMIN` resolves to its `RAY_EPS`, the host's 1e-6. `RAY_EPS` itself is left
+  where it is a distance rather than a tmin: `connMaxT`'s floor and the camera-leg pushes, which
+  the far-end and connection rules below size.
   **A dielectric step leaves by `dOffsetSpecular` instead** (`dDielectricStep`, every walk's
   interface): the same clearance off the surface, reached along the ray's own direction, so the
   ray keeps its line -- as the host's `interfaceStep` does (`h.p + out*1e-6`). A push along the
