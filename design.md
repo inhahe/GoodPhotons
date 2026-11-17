@@ -11009,19 +11009,26 @@ is left out (`isSmoothDielectricMat`): a connection solved for a delta would dra
 leaves it black as it always documented.
 
 **The scan, shared by the glass and mirror spheres (`sphScanChains` / `dSphScanChains`).** The fixed
-samples of `sphScanTab`, but by each end of the arcs where rays from the eye reach the vertex's side a
-ladder of its own (`sphScanEnds`): the silhouette's end from outside, the critical angle's from inside
-(past it a ray is turned back for good, a sphere's chords keeping their angle -- from an eye off the
-centre a band of the view). Toward such an end a chain's leg swings as the square root of the distance
+samples of `sphScanTab`, but by each end of the arcs where a chain exists a ladder of its own
+(`sphScanEnds`): the silhouette from outside, and for a sphere less dense than around it (a bubble in
+water) where its refracted chains stop, sin(theta) = n, the reflection alone going on; the critical
+angle's from inside (past it a ray is turned back for good, a sphere's chords keeping their angle --
+from an eye off the centre a band of the view). A ladder's samples are its end's (cos, sin), algebraic,
+turned by a table of the offsets' (`sphLadderTab`, the device's filled by `kSphScanInit`), so the ends
+take no trigonometry a call but an acos an end; a 2D model of the scan finds 87 % of a bubble's
+refracted chains' weight seen from 1.3 radii without the bubble's ladders, all of it with them. Toward such an end a chain's leg swings as the square root of the distance
 to it, its cosine to the normal vanishing, so the brightest images there -- the grazing ones of a rim,
 and the folds, a caustic's two images within one fixed step -- lay between the fixed samples: an eye in a
 glass ball 0.8 of its radius off its centre read the edges of its view 0.87 of mode R, in bands where a
-chain's fold lay. Each ladder has `kSphLadder` (6) samples, the first 1e-5 inside the end and the j-th at
-L (j/6)^2 (L one fixed step, or half the arc where it is narrower): even in the root of the distance,
-where the miss is smooth again. It takes the place of the fixed samples within L of its end, and the
-fixed samples beyond the ends, which no ray of the chains meets (behind the silhouette, or where every
-ray is turned back), are skipped, so an eye inside off the centre scans fewer samples than before (81 of
-100 at 0.8 of the radius). A 2D model of the scan, against one of 10^5 samples, finds 99.99 % of the
+chain's fold lay. Each ladder has up to `kSphLadder` (9) samples (`sphLadderOffsets`; L one fixed step,
+or half the arc where it is narrower): 1e-5 inside the end and on by fourfold steps while under L/36,
+then L (j/6)^2 for j = 1..5, even in the root of the distance, where the miss is smooth again. The
+fourfold steps are the deep chain's: (1 - R) R^c reaches the floor only in a band beside the end, where
+1 - R is small but R^c not, and the even rungs stepped over it -- the 2D model found 7.5 % of chains
+17-128's weight without them and 90 % with them (eye 0.8 of the radius off the centre). A ladder takes
+the place of the fixed samples within L of its end, and the fixed samples beyond the ends, which no ray
+of the chains meets (behind the silhouette, or where every ray is turned back), are skipped, so an eye
+inside off the centre scans 93 samples where the fixed ones alone were 100 (0.8 of the radius). A 2D model of the scan, against one of 10^5 samples, finds 99.99 % of the
 images' weight with the ladders and 97.6 % without (vertices at 3 radii). Each chain's miss is the
 signed distance of the vertex from the line of its last leg -- the line, so a vertex close to the sphere,
 ahead of the leg over too narrow a span, is still bracketed; a sign change between two valid samples
@@ -11030,7 +11037,12 @@ circle (`sphRoot`: no trigonometry, where forty bisection steps each took a cosi
 of the connector's cost on the GPU). The connector asks of each root that the vertex lie ahead of the
 leg and that the leg pass through it (a bracket across a gap where the chain is missing closes on no
 root), and tests the cheap things -- the vertex's side toward the leg, the frame -- before the roulette,
-the differentials and the two rays. Where three samples' misses share a sign but the middle one dips
+the differentials and the two rays. On the device those rays skip the sphere itself (`occluded`'s
+`skipSph`, the mirror connector's too): in float a surface point a grazing leg meets rounds inside the
+sphere as often as out, and the sphere shadowed its own rim (0.91 of mode R with only the wall behind
+it glowing), while the legs, on one side of it, cannot meet it otherwise -- ending them lifted off it
+instead lost an eye inside a mirror ball every image (the lift's side) and would carry a leg's end into
+whatever touches the ball. Where three samples' misses share a sign but the middle one dips
 toward zero enough (`sphDipNears`: the parabola through them comes half the way, on each sample's
 coordinate -- its angle, or along a ladder its even one, the end's angle plus sqrt(offset L)), the dip is searched
 (`sphDip`, golden section): by a caustic -- a ball's focus on a wall close behind it, a concave mirror
@@ -11113,7 +11125,8 @@ caustic image chromatic.
 
 **Known limits** — all deliberate, all documented in `REFERENCE.md` and tracked in
 `known-issues.md`: ONE specular object per connection (a mirror inside a mirror is still
-black, and a glass sphere's chains stop at 16 reflections inside it, or where they fall below 1e-4);
+black, and a glass sphere's chains are drawn to 16 reflections inside it and one deeper chain a vertex
+to 128, each only while its product reaches 1e-4 and the path stays within -max-bounce);
 **pinhole only** (`lensMode` / `forwardCatch` return early, so `A`/`C` are
 unchanged); flat mirrors must be authored as world-space triangles (an instanced/BLAS
 mirror is not collected, and beyond `kMaxMirrorPlanes` the surplus planes are dropped);

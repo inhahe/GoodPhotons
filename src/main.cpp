@@ -3522,7 +3522,7 @@ static bool checkPatternNudge() {
 static Hit junkHit() {
     Hit h;
     h.t = 1e30; h.matId = -7; h.pscale = 777.0; h.fiberRadius = 0.5; h.hasVcol = true; h.back = true;
-    h.tangent = Vec3(0, 0, 9); h.bitangentSign = -1.0; h.curv = 99.0; h.solid = 7;
+    h.tangent = Vec3(0, 0, 9); h.bitangentSign = -1.0; h.curv = 99.0; h.solid = 7; h.boundsSolid = 5;
     return h;
 }
 static bool checkHitFieldsWritten() {
@@ -3537,24 +3537,25 @@ static bool checkHitFieldsWritten() {
         Hit h = junkHit();
         const Sphere s{Vec3(0, 0, 0), 0.5, 0};
         expect("a sphere", intersectSphere(down, s, 1e-9, h) && h.pscale == 0.5 && h.fiberRadius == 0.0 &&
-                           !h.hasVcol && !h.back && h.solid == 1);
+                           !h.hasVcol && !h.back && h.solid == 1 && h.boundsSolid == -1);
     }
     {
         Hit h = junkHit();
         Tri t{Vec3(-1, 0, -1), Vec3(-1, 0, 1), Vec3(1, 0, 1), 0, -1, {}};
         t.finalize();
         expect("a triangle", intersectTri(down, t, 1e-9, h) && h.pscale == t.reach && h.fiberRadius == 0.0 &&
-                             !h.hasVcol && !h.back && h.solid == 0);
+                             !h.hasVcol && !h.back && h.solid == 0 && h.boundsSolid == -1);
         Hit hi = junkHit();
         t.solidFace = 2;                       // a closed solid's face, its normal in
-        expect("an inward solid's triangle", intersectTri(down, t, 1e-9, hi) && hi.solid == -1);
+        t.boundsSolid = 3;                     // and bounding solid 3 (a pool's wall)
+        expect("an inward solid's triangle", intersectTri(down, t, 1e-9, hi) && hi.solid == -1 && hi.boundsSolid == 3);
     }
     {
         Hit h = junkHit();
         CurveSeg cs;
         cs.p0 = Vec3(-1, 0, 0); cs.p1 = Vec3(1, 0, 0); cs.r0 = cs.r1 = 0.5;
         expect("a curve", intersectCurveSeg(makeCurveRay(down.d), down, cs, 1e-9, h) && h.pscale == 1.5 &&
-                          !h.hasVcol && !h.back && h.solid == 0);
+                          !h.hasVcol && !h.back && h.solid == 0 && h.boundsSolid == -1);
     }
     {
         ftsl::Loaded L;
@@ -3570,7 +3571,7 @@ static bool checkHitFieldsWritten() {
         expect("an isosurface", loaded && L.scene.implicits.size() == 1 &&
                                 intersectImplicit(down, L.scene.implicits[0], 1e-9, h) && h.pscale == 0.0 &&
                                 h.fiberRadius == 0.0 && !h.hasVcol && !h.back && h.tangent.z == 0.0 &&
-                                h.bitangentSign == 1.0 && h.solid == 0);
+                                h.bitangentSign == 1.0 && h.solid == 0 && h.boundsSolid == -1);
         if (loaded && !L.scene.implicits.empty()) {
             Implicit im = L.scene.implicits[0];
             im.solidSide = true;               // as the marking pass sets it for an SDF
@@ -18206,23 +18207,32 @@ static void writeVersionTrailer(std::ostream& o) {
     o.write((const char*)&n, 4);
     o.write(kVersionTag, 8);
 }
-// The version in a sidecar's trailer, or "" when it has none (written before 0.378.3).
+// Where the version trailer (writeVersionTrailer) of a sidecar `size` bytes long begins in `in`: at
+// size - 12 - n for a trailer whose tag matches and whose length n is 1-64, else `size` (none: written
+// before 0.378.3). Every reader of the trailer finds it here, so they agree on what one is.
+static std::streamoff trailerStart(std::istream& in, std::streamoff size) {
+    if (size < 12) return size < 0 ? 0 : size;
+    char tag[8] = {0};
+    uint32_t n = 0;
+    in.clear();
+    in.seekg(size - 8);
+    in.read(tag, 8);
+    in.seekg(size - 12);
+    in.read((char*)&n, 4);
+    const bool ok = in && std::memcmp(tag, kVersionTag, 8) == 0 && n > 0 && n <= 64 &&
+                    (std::streamoff)n + 12 <= size;
+    in.clear();
+    return ok ? size - 12 - (std::streamoff)n : size;
+}
+// The version in a sidecar's trailer, or "" when it has none.
 static std::string sidecarVersion(const std::string& path) {
     std::ifstream in(path, std::ios::binary | std::ios::ate);
     if (!in) return "";
-    const std::streamoff size = in.tellg();
-    if (size < 12) return "";
-    char tag[8];
-    in.seekg(size - 8);
-    in.read(tag, 8);
-    if (!in || std::memcmp(tag, kVersionTag, 8) != 0) return "";
-    uint32_t n = 0;
-    in.seekg(size - 12);
-    in.read((char*)&n, 4);
-    if (!in || n == 0 || n > 64 || (std::streamoff)n + 12 > size) return "";
-    std::string v(n, '\0');
-    in.seekg(size - 12 - (std::streamoff)n);
-    in.read(&v[0], n);
+    const std::streamoff size = in.tellg(), at = trailerStart(in, size);
+    if (at >= size) return "";
+    std::string v((size_t)(size - 12 - at), '\0');
+    in.seekg(at);
+    in.read(&v[0], (std::streamsize)v.size());
     return in ? v : std::string();
 }
 static void warnIfOtherBuild(const std::string& path) {
@@ -18452,18 +18462,7 @@ static constexpr char kLightEpochTag[8] = {'F','T','L','S','E','P','O','1'};
 static std::streampos sectionsTail(std::istream& in) {
     in.clear();
     in.seekg(0, std::ios::end);
-    const std::streamoff size = in.tellg();
-    std::streamoff tail = size < 0 ? 0 : size;
-    if (size >= 12) {
-        char vt[8] = {0};
-        uint32_t n = 0;
-        in.seekg(size - 8);
-        in.read(vt, 8);
-        in.seekg(size - 12);
-        in.read((char*)&n, 4);
-        if (in && std::memcmp(vt, kVersionTag, 8) == 0 && (std::streamoff)n + 12 <= size) tail = size - 12 - n;
-    }
-    in.clear();
+    std::streamoff tail = trailerStart(in, (std::streamoff)in.tellg());
     if (tail >= 16) {
         char et[8] = {0};
         in.seekg(tail - 16);

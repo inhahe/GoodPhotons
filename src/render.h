@@ -2242,6 +2242,15 @@ struct Renderer {
         b.sd = 2.0 * ct * cosI;
         return true;
     }
+    // Chain c's Fresnel product from chain c - 1's, `f` (unread at c = 0), at a sample whose reflectance
+    // is b.R: R, then (1 - R)^2 R^(c - 1) from outside (0 where nothing refracts in, b.totalOut), and
+    // (1 - R) R^c from inside. The scan (eval) and the refinement (legOf) both step by it, so a chain's
+    // validity is the same to both.
+    static double sphChainStep(bool outside, int c, const SphBase2D& b, double f) {
+        if (c == 0) return outside ? b.R : 1.0 - b.R;
+        if (outside && c == 1) return b.totalOut ? 0.0 : (1.0 - b.R) * (1.0 - b.R);
+        return f * b.R;
+    }
     // The number of internal reflections chain c takes, as sphChainFrom counts them (-1: off the surface).
     static int sphChainRefl(bool outside, int c) { return outside ? c - 1 : c; }
 
@@ -2347,60 +2356,107 @@ struct Renderer {
         return ix;
     }
 
-    // Where a sphere connector's scan samples by the ends of the arcs where rays from the eye reach the
-    // vertex's side: for an eye outside the silhouette's, for an eye inside the critical angle's (beyond it
-    // every ray is turned back for good, a sphere's chords keeping their angle). Toward such an end a
-    // chain's leg swings as the root of the distance to it (the leg's cosine to the normal vanishing), so
-    // there a fold -- two images within one fixed step, a caustic's -- lies unseen between sphScanTab's
-    // even samples. By each end a ladder of kSphLadder samples, the first 1e-5 inside it and the j-th at
-    // L (j / kSphLadder)^2 (L one fixed step, or half the arc where it is narrower), even in that root,
-    // takes the place of the fixed samples within L of it; the fixed ones beyond the ends (behind the
-    // silhouette, or where every ray is turned back) are skipped. In order of angle: `phi`, its (cos,
-    // sin), and `t`, the sample's coordinate for the dip test (sphDipNears): along a ladder the end's angle
-    // plus sqrt(offset L) inward, even. `skipLo`, `skipHi`: the fixed samples with |phi| between them are
-    // skipped. `r` the radius, `d` the eye's distance from the centre, `n` the index (1: none to cross).
-    static constexpr int kSphLadder = 6;
+    // Where a sphere connector's scan samples by the ends of the arcs where a chain exists: for an eye
+    // outside, the silhouette, and -- a sphere less dense than around it (n < 1) -- where the refracted
+    // chains stop, sin(theta) = n, the reflection alone going on; for an eye inside, the critical angle's
+    // (beyond it every ray is turned back for good, a sphere's chords keeping their angle). Toward such an
+    // end a chain's leg swings as the root of the distance to it (the leg's cosine to the normal vanishing),
+    // so there a fold -- two images within one fixed step, a caustic's -- lies unseen between sphScanTab's
+    // even samples. By each end a ladder of up to kSphLadder samples on the side where its chains exist
+    // (sphLadderOffsets) takes the place of the fixed samples within L of it (L one fixed step, or half the
+    // arc where it is narrower): 1e-5 inside the end and on by fourfold steps while under L/36 -- a deep
+    // chain's (1 - R) R^c reaches the floor only in a band that close, where 1 - R is small but R^c not --
+    // then L (j/6)^2 for j = 1..5, even in that root; the fixed
+    // ones beyond the ends where no chain exists (behind the silhouette, or where every ray is turned
+    // back) are skipped. In order of angle: `phi`, its (cos, sin), and `t`, the sample's coordinate for the
+    // dip test (sphDipNears): along a ladder the end's angle plus sqrt(offset L) inward, even. The fixed
+    // samples with |phi| in (skipLo[i], skipHi[i]) are skipped. `r` the radius, `d` the eye's distance
+    // from the centre, `n` the index (1: none to cross).
+    static constexpr int kSphLadder = 9;
+    // A ladder's offsets in from its end at span L, ascending, into `o`; their count.
+    static int sphLadderOffsets(double L, double* o) {
+        int k = 0;
+        o[k++] = 1e-5;
+        for (double g = 4e-5; g < L / 36.0 && k < 4; g *= 4.0) o[k++] = g;
+        for (int j = 1; j <= 5; ++j) o[k++] = L * (double)(j * j) / 36.0;
+        return k;
+    }
+    // A ladder's offsets at a full step's span, and their (cos, sin): a ladder's samples are its end's
+    // (cos, sin), which is algebraic, turned by them -- no trigonometry a call.
+    struct SphLadderTab { int n = 0; double o[kSphLadder] = {}, c[kSphLadder] = {}, s[kSphLadder] = {}; };
+    static const SphLadderTab& sphLadderTab() {
+        static const SphLadderTab tab = [] {
+            SphLadderTab t;
+            t.n = sphLadderOffsets(2.0 * PI / kSphScanN, t.o);
+            for (int j = 0; j < t.n; ++j) { t.c[j] = std::cos(t.o[j]); t.s[j] = std::sin(t.o[j]); }
+            return t;
+        }();
+        return tab;
+    }
     struct SphScanEnds {
         int n = 0;
         double phi[4 * kSphLadder] = {}, c[4 * kSphLadder] = {}, s[4 * kSphLadder] = {}, t[4 * kSphLadder] = {};
-        double skipLo = 4.0, skipHi = 4.0;                // (beyond pi: none skipped)
+        double skipLo[2] = {4.0, 4.0}, skipHi[2] = {4.0, 4.0};   // (beyond pi: none skipped)
+        bool skips(double aphi) const {
+            return (aphi > skipLo[0] && aphi < skipHi[0]) || (aphi > skipLo[1] && aphi < skipHi[1]);
+        }
     };
     static SphScanEnds sphScanEnds(double r, double d, double n, bool outside) {
         SphScanEnds e;
         const double dl = 1e-5, h = 2.0 * PI / kSphScanN;
-        // The ladder by the end at angle E whose free side lies toward sgn, L its span, in order of angle.
-        const auto ladder = [&e, dl](double E, double sgn, double L) {
-            for (int k = 0; k < kSphLadder; ++k) {
-                const int j = sgn > 0.0 ? k : kSphLadder - 1 - k;
-                const double o = j == 0 ? dl : L * (double)(j * j) / (double)(kSphLadder * kSphLadder);
-                const double phi = E + sgn * o;
-                e.phi[e.n] = phi; e.t[e.n] = E + sgn * std::sqrt(o * L);
-                e.c[e.n] = std::cos(phi); e.s[e.n] = std::sin(phi); ++e.n;
+        const SphLadderTab& LT = sphLadderTab();
+        // The ladder by the end at angle E (its cosine cE), its chains toward sgn, L its span.
+        const auto ladder = [&](double E, double cE, double sgn, double L) {
+            const double sE = (E < 0.0 ? -1.0 : 1.0) * std::sqrt(std::max(0.0, 1.0 - cE * cE));
+            double off[kSphLadder];
+            const int nr = L == h ? LT.n : sphLadderOffsets(L, off);
+            for (int j = 0; j < nr; ++j) {
+                double o, co, so;
+                if (L == h) { o = LT.o[j]; co = LT.c[j]; so = LT.s[j]; }
+                else { o = off[j]; co = std::cos(o); so = std::sin(o); }
+                so *= sgn;                                       // E + sgn o
+                e.phi[e.n] = E + sgn * o; e.t[e.n] = E + sgn * std::sqrt(o * L);
+                e.c[e.n] = cE * co - sE * so; e.s[e.n] = sE * co + cE * so; ++e.n;
             }
         };
         if (outside) {
-            const double t = std::acos(std::min(1.0, r / d));
+            const double ct = std::min(1.0, r / d), t = std::acos(ct);
             if (t > dl) {
                 const double L = std::min(h, t);
-                ladder(-t, 1.0, L); ladder(t, -1.0, L);
-                e.skipLo = t - L;
+                ladder(-t, ct, 1.0, L); ladder(t, ct, -1.0, L);
+                e.skipLo[0] = t - L;
+                // Less dense than around it: the ray from the eye meets the surface at sin(theta) = n where
+                // d^2 sin^2(phi) = n^2 (r^2 + d^2 - 2 r d cos(phi)), cos(phi0) = (n^2 r + q) / d on the front.
+                if (n < 1.0) {
+                    const double q = std::sqrt(std::max(0.0, (1.0 - n * n) * (d * d - n * n * r * r)));
+                    const double c0 = std::clamp((n * n * r + q) / d, -1.0, 1.0), p0 = std::acos(c0);
+                    if (p0 > dl && p0 < t - dl) {
+                        const double L0 = std::min(h, p0);
+                        ladder(-p0, c0, 1.0, L0); ladder(p0, c0, -1.0, L0);
+                        e.skipLo[1] = p0 - L0; e.skipHi[1] = p0;
+                    }
+                }
             }
-            return e;
+        } else if (n > 1.0 && n * d > r) {
+            // From inside, the ray to the surface point at phi meets it at theta, n sin(theta) = 1 where
+            // n^2 d^2 sin^2(phi) = r^2 + d^2 - 2 r d cos(phi): total internal reflection for cos(phi) between
+            // the roots (r -+ q) / (n^2 d), the near arc |phi| < a and the far one |phi| > b free of it.
+            const double q = std::sqrt((n * n - 1.0) * (n * n * d * d - r * r));
+            const double ca = std::min(1.0, (r + q) / (n * n * d)), cb = std::max(-1.0, (r - q) / (n * n * d));
+            const double a = std::acos(ca), b = std::acos(cb);
+            const bool nearArc = a > dl, farArc = b + dl < PI;
+            const double La = std::min(h, a), Lb = std::min(h, PI - b);
+            if (farArc) { ladder(-b, cb, -1.0, Lb); ladder(b, cb, 1.0, Lb); }
+            if (nearArc) { ladder(-a, ca, 1.0, La); ladder(a, ca, -1.0, La); }
+            e.skipLo[0] = nearArc ? a - La : -1.0;
+            e.skipHi[0] = farArc ? b + Lb : 4.0;
         }
-        // From inside, the ray to the surface point at phi meets it at theta, n sin(theta) = 1 where
-        // n^2 d^2 sin^2(phi) = r^2 + d^2 - 2 r d cos(phi): total internal reflection for cos(phi) between
-        // the roots (r -+ q) / (n^2 d), the near arc |phi| < a and the far one |phi| > b free of it.
-        if (n <= 1.0 || n * d <= r) return e;
-        const double q = std::sqrt((n * n - 1.0) * (n * n * d * d - r * r));
-        const double a = std::acos(std::min(1.0, (r + q) / (n * n * d)));
-        const double b = std::acos(std::max(-1.0, (r - q) / (n * n * d)));
-        const bool nearArc = a > dl, farArc = b + dl < PI;
-        const double La = std::min(h, a), Lb = std::min(h, PI - b);
-        if (farArc) ladder(-b, -1.0, Lb);
-        if (nearArc) { ladder(-a, 1.0, La); ladder(a, -1.0, La); }
-        if (farArc) ladder(b, 1.0, Lb);
-        e.skipLo = nearArc ? a - La : -1.0;
-        e.skipHi = farArc ? b + Lb : 4.0;
+        // In order of angle (a ladder's own samples are, but two ladders by close ends may interleave).
+        for (int i = 1; i < e.n; ++i)
+            for (int k = i; k > 0 && e.phi[k] < e.phi[k - 1]; --k) {
+                std::swap(e.phi[k], e.phi[k - 1]); std::swap(e.t[k], e.t[k - 1]);
+                std::swap(e.c[k], e.c[k - 1]); std::swap(e.s[k], e.s[k - 1]);
+            }
         return e;
     }
 
@@ -2459,7 +2515,7 @@ struct Renderer {
         for (int i = 0; i <= kSphScanN; ++i) {
             const double phi = -PI + (2.0 * PI) * i / kSphScanN;
             while (next < ends.n && ends.phi[next] <= phi) { visit(ends.c[next], ends.s[next], ends.t[next]); ++next; }
-            if (std::fabs(phi) > ends.skipLo && std::fabs(phi) < ends.skipHi) continue;
+            if (ends.skips(std::fabs(phi))) continue;
             visit(T.c[i], T.s[i], phi);
         }
         while (next < ends.n) { visit(ends.c[next], ends.s[next], ends.t[next]); ++next; }
@@ -2583,9 +2639,7 @@ struct Renderer {
             double f = 0.0;
             for (int c = 0; c < nC; ++c) {
                 if (c > 0) { turn(Q, b); turn(dir, b); }
-                if (c == 0) f = outside ? b.R : 1.0 - b.R;
-                else if (outside && c == 1) f = b.totalOut ? 0.0 : (1.0 - b.R) * (1.0 - b.R);
-                else f *= b.R;
+                f = sphChainStep(outside, c, b, f);
                 F[c] = f;
                 valid[c] = f >= kSphChainFloor;
                 if (valid[c]) { const SphV2 q = p2 - Q; miss[c] = dir.x * q.y - dir.y * q.x; }
@@ -2606,11 +2660,11 @@ struct Renderer {
         const auto legOf = [&](int c, double c1, double s1, SphV2& Q, SphV2& dir) -> bool {
             SphBase2D b;
             if (!sphBase2D(eye2, r, n, outside, c1, s1, b)) return false;
-            double f = outside ? b.R : 1.0 - b.R;
+            double f = sphChainStep(outside, 0, b, 0.0);
             Q = b.P; dir = b.dir0;
             for (int k = 1; k <= std::min(c, nC - 1); ++k) {
                 turn(Q, b); turn(dir, b);
-                f = (outside && k == 1) ? (b.totalOut ? 0.0 : (1.0 - b.R) * (1.0 - b.R)) : f * b.R;
+                f = sphChainStep(outside, k, b, f);
             }
             if (c >= nC) {                                   // (only deep.c lies beyond)
                 assert(c == deep.c);

@@ -368,14 +368,15 @@ __device__ static inline DVec3 dOffsetAlong(const DVec3& p, const DVec3& ng, con
     if (!(nn > (Real)0)) return dOffsetPoint(p, w);
     return dOffsetPoint(p, (dot(ng, w) >= (Real)0) ? ng : -ng);
 }
-// A dielectric step's new origin (`w` the unit direction it leaves in): as far off the surface as
+// A delta continuation's new origin (`w` the unit direction it leaves in): as far off the surface as
 // dOffsetAlong puts it, but along the ray itself, so the ray keeps its line -- as the host's
-// interfaceStep starts it, at h.p + out * 1e-6. A ray reflected inside a sphere keeps r sin(theta) from
-// chord to chord, and an origin pushed along the normal starts each chord inside the surface by the
-// offset, shrinking that by the offset's share of the radius at every reflection: in fp32, 2e-4 of a
-// 15 cm ball, so a ray held by total internal reflection slid under the critical angle within a few
-// dozen reflections and left. Grazing (|cos| < 1/4, where the step along the ray would run long) it is
-// dOffsetAlong's.
+// interfaceStep and continuationOrigin start theirs, at p + w * 1e-6. A ray reflected inside a sphere
+// keeps r sin(theta) from chord to chord; an origin pushed along the normal would start each chord inside
+// the surface by the offset and shrink that by the offset's share of the radius at every reflection --
+// in fp32, 2e-4 of a 15 cm ball, enough to slide a ray held by total internal reflection under the
+// critical angle within a few dozen reflections. Grazing (|cos| < 1/4, where the step along the ray
+// would run long) the fp32 build takes dOffsetAlong's; the fp64 build, whose offset is the host's, never
+// needs to.
 __device__ static inline DVec3 dOffsetSpecular(const DVec3& p, const DVec3& ng, const DVec3& w) {
 #if FTRACE_GPU_FP32
     const DVec3 q = dOffsetAlong(p, ng, w);
@@ -4768,8 +4769,11 @@ HD static inline DVec3 affDir(const double* M, const DVec3& v) {
 // Closest hit inside one BLAS, in its LOCAL space. `h.t` carries the running
 // world(==local) tMax on entry; a closer local hit updates `h` (local normals/UVs).
 // Mirrors Blas::intersectLocal. Returns true if `h` was updated.
+// `kBounds` (closestHit<true> only): `*boundsOut` the hit triangle's DTri::bounds.
+template <bool kBounds = false>
 __device__ static bool blasClosest(const DScene& sc, const DInstance& inst,
-                                    const DVec3& lro, const DVec3& lrd, Real tmin, DHit& h) {
+                                    const DVec3& lro, const DVec3& lrd, Real tmin, DHit& h,
+                                    int* boundsOut = nullptr) {
     const DBlas& bl = sc.blas[inst.blasId];
     const DNode* N = sc.blasNodes + bl.nodeOff;
     const int*   P = sc.blasPrim  + bl.primOff;
@@ -4793,7 +4797,10 @@ __device__ static bool blasClosest(const DScene& sc, const DInstance& inst,
         if (n.count > 0) {
             for (int i = 0; i < n.count; ++i) {
                 int prim = P[n.first + i];
-                if (intersectTri(sh, lro, lrd, T[prim], tmin, h)) { tMax = h.t; found = true; }
+                if (intersectTri(sh, lro, lrd, T[prim], tmin, h)) {
+                    tMax = h.t; found = true;
+                    if constexpr (kBounds) *boundsOut = T[prim].bounds;
+                }
             }
         } else {
             Real tL, tR;
@@ -5440,12 +5447,13 @@ __device__ static inline void dApplyNormalMap(const DScene& sc, DHit& h);
 // forward to do that also hides any non-fiber surface in the gap -- notably the skin the
 // fiber grows from -- and through a dense coat those skips compound until rays tunnel out.
 // Host twin: Ray::curveTmin in geometry.h.
-// `kTri` (dEnclosureAt only, so every other caller compiles as it always did): `*triOut` the world
-// triangle the hit is on, -1 for any other primitive (an instance's, a mover's included).
+// `kTri` (dEnclosureAt only, so every other caller compiles as it always did): `*boundsOut` the solid the
+// hit triangle's closed piece bounds (DTri::bounds), an instance's too unless it overrides the material
+// (host twin: Hit::boundsSolid, instanceHitToWorld); -1 for any other primitive (a mover's included).
 template <bool kTri = false>
 __device__ static DHit closestHit(const DScene& sc, const DVec3& ro, const DVec3& rd,
                                    Real tmin = RAY_EPS, Real tCap = BIG,
-                                   bool camHide = false, Real curveTmin = (Real)0, int* triOut = nullptr) {
+                                   bool camHide = false, Real curveTmin = (Real)0, int* boundsOut = nullptr) {
     DHit h; h.t = tCap; h.valid = false; h.matId = 0; h.sensorId = -1; h.emitter = -1;
     if (sc.nNodes == 0) return h;
     // One uniform test, hoisted out of the leaf loop. `hidden()` is checked BEFORE the
@@ -5485,23 +5493,23 @@ __device__ static DHit closestHit(const DScene& sc, const DVec3& ro, const DVec3
                 if (prim < sc.nTris)              { const DTri& t = sc.tris[prim];
                                                     if (!hidden(t.matId) && intersectTri(sh, ro, rd, t, tmin, h)) {
                                                         tMax = h.t; hInst = -1;
-                                                        if constexpr (kTri) *triOut = prim;
+                                                        if constexpr (kTri) *boundsOut = t.bounds;
                                                     } }
                 else if (prim < sc.nTris + sc.nSph){ const DSphere& s = sc.sph[prim - sc.nTris];
                                                     if (!hidden(s.matId) && intersectSphere(ro, rd, s, tmin, h, s.frame >= 0 ? sc.sphAxes + 3 * s.frame : nullptr)) {
                                                         tMax = h.t; hInst = -1;
                                                         if (sc.sphEmitter) h.emitter = sc.sphEmitter[prim - sc.nTris];
-                                                        if constexpr (kTri) *triOut = -1;
+                                                        if constexpr (kTri) *boundsOut = -1;
                                                     } }
                 else if (prim < sc.nTris + sc.nSph + sc.nImplicits) { const DImplicit& im = sc.implicits[prim - sc.nTris - sc.nSph];
                                                     if (!hidden(im.matId) && intersectImplicit(sc, im, ro, rd, tmin, h)) {
                                                         tMax = h.t; hInst = -1;
-                                                        if constexpr (kTri) *triOut = -1;
+                                                        if constexpr (kTri) *boundsOut = -1;
                                                     } }
                 else if (prim < sc.nTris + sc.nSph + sc.nImplicits + sc.nCurveSegs) { const DCurveSeg& cs = sc.curveSegs[prim - sc.nTris - sc.nSph - sc.nImplicits];
                                                     if (!hidden(cs.matId) && intersectCurveSeg(cray, ro, rd, cs, fmaxf((float)tmin, (float)curveTmin), h)) {
                                                         tMax = h.t; hInst = -1;
-                                                        if constexpr (kTri) *triOut = -1;
+                                                        if constexpr (kTri) *boundsOut = -1;
                                                     } }
                 else {
                     // Instanced meshes are not covered — see the host twin in scene.h for why
@@ -5514,9 +5522,10 @@ __device__ static DHit closestHit(const DScene& sc, const DVec3& ro, const DVec3
                     DVec3 lro = affPoint(inst.Lm, inst.Lt, ro);
                     DVec3 lrd = affDir(inst.Lm, rd);
                     DHit lh; lh.t = h.t; lh.valid = false;
-                    if (blasClosest(sc, inst, lro, lrd, tmin, lh)) {
+                    int lb = -1;
+                    if (blasClosest<kTri>(sc, inst, lro, lrd, tmin, lh, &lb)) {
                     h = lh; tMax = h.t; hInst = ii;
-                    if constexpr (kTri) *triOut = -1;
+                    if constexpr (kTri) *boundsOut = inst.matOverride >= 0 ? -1 : lb;
                 }
                 }
             }
@@ -5535,7 +5544,7 @@ __device__ static DHit closestHit(const DScene& sc, const DVec3& ro, const DVec3
     }
     if (timed && dTimedClosest(sc, ro, rd, invD, sh, tmin, curveTmin, tMax, h, camHideOn)) {
         hInst = -1;                                // a mover's hit, in world space already
-        if constexpr (kTri) *triOut = -1;
+        if constexpr (kTri) *boundsOut = -1;
     }
     if (hInst >= 0) instanceHitToWorld(sc, sc.instances[hInst], h);
     // A surface emitting from both faces met from behind is its back face (host twin Scene::markBackFace).
@@ -5733,9 +5742,11 @@ __device__ static double dHairOpacityAt(const DScene& sc, const DMaterial& m, co
     return op < 0.0 ? 0.0 : (op > 1.0 ? 1.0 : op);
 }
 
+// `skipSph`: a sphere (its index) the ray cannot meet but by rounding -- a sphere connector's leg to the
+// sphere's own surface (dConnectSpecularSphere, dConnectSpecularSphereMirror) -- or -1.
 __device__ static bool occluded(const DScene& sc, const DVec3& o, const DVec3& dir,
                                  Real maxDist, Real tmin = RAY_EPS, bool camLeg = false,
-                                 Real curveTmin = (Real)0) {
+                                 Real curveTmin = (Real)0, int skipSph = -1) {
     if (sc.nNodes == 0) return false;
     // One uniform test, hoisted out of the leaf loop; `hidden()` is checked BEFORE the
     // intersection, so a hidden primitive costs a matId load rather than a full ray test.
@@ -5765,7 +5776,8 @@ __device__ static bool occluded(const DScene& sc, const DVec3& o, const DVec3& d
                 if (prim < sc.nTris)                              { const DTri& t = sc.tris[prim];
                                                                     blocked = !hidden(t.matId) && intersectTri(sh, o, dir, t, tmin, h); }
                 else if (prim < sc.nTris + sc.nSph)               { const DSphere& s = sc.sph[prim - sc.nTris];
-                                                                    blocked = !hidden(s.matId) && intersectSphere(o, dir, s, tmin, h); }
+                                                                    blocked = prim - sc.nTris != skipSph && !hidden(s.matId) &&
+                                                                              intersectSphere(o, dir, s, tmin, h); }
                 else if (prim < sc.nTris + sc.nSph + sc.nImplicits) { const DImplicit& im = sc.implicits[prim - sc.nTris - sc.nSph];
                                                                     blocked = !hidden(im.matId) && intersectImplicit(sc, im, o, dir, tmin, h, /*anyHit=*/true); }
                 else if (prim < sc.nTris + sc.nSph + sc.nImplicits + sc.nCurveSegs) { const DCurveSeg& cs = sc.curveSegs[prim - sc.nTris - sc.nSph - sc.nImplicits];
@@ -5788,8 +5800,11 @@ __device__ static bool occluded(const DScene& sc, const DVec3& o, const DVec3& d
             if (boxHit(sc.nodes[n.right], o, invD, tmin, tMax, tc)) stack[sp++] = n.right;
         }
     }
+    // (A moving skipSph is the movers' to skip: claimed, it is tested no further.)
     return timed && dTimedAny(sc, o, dir, invD, sh, tmin, curveTmin, tMax, camHideOn,
-                              [](int, DHit&, DMotionNow&) { return false; });
+                              [&sc, skipSph](int prim, DHit&, DMotionNow&) {
+                                  return skipSph >= 0 && prim == sc.nTris + skipSph;
+                              });
 }
 
 // Fraction of a shadow ray that SURVIVES to maxDist: 1 clear, 0 blocked, in between when it
@@ -5888,11 +5903,12 @@ __device__ static inline double dMaxAbs(const DVec3& p) {
 // estimator's G, pdfs and directions are untouched.
 __device__ static inline bool occludedTo(const DScene& sc, const DVec3& o, const DVec3& target,
                                          double absEps, Real tmin = RAY_EPS, bool camLeg = false,
-                                         Real curveTmin = (Real)0) {
+                                         Real curveTmin = (Real)0, int skipSph = -1) {
     DVec3 tv = target - o;
     const Real td = length(tv);
     if (!(td > (Real)0)) return false;
-    return occluded(sc, o, tv / td, connMaxT((double)td, absEps, dMaxAbs(target)), tmin, camLeg, curveTmin);
+    return occluded(sc, o, tv / td, connMaxT((double)td, absEps, dMaxAbs(target)), tmin, camLeg, curveTmin,
+                    skipSph);
 }
 // shadowTransmittance to a sampled point, shortened as occludedTo shortens (connMaxT).
 __device__ static inline Real shadowTransmittanceTo(const DScene& sc, const DVec3& o,
@@ -10448,6 +10464,12 @@ __device__ static bool dSphBase2D(const DSphV2& eye2, double r, double n, bool o
     b.sd = 2.0 * ct * cosI;
     return true;
 }
+// Chain c's Fresnel product from chain c - 1's (host twin Renderer::sphChainStep).
+__device__ static inline double dSphChainStep(bool outside, int c, const DSphBase2D& b, double f) {
+    if (c == 0) return outside ? b.R : 1.0 - b.R;
+    if (outside && c == 1) return b.totalOut ? 0.0 : (1.0 - b.R) * (1.0 - b.R);
+    return f * b.R;
+}
 // Host twin Renderer::SphChain / sphChainFrom: the chain taking `refl` reflections inside (-1: off the
 // surface), in space, coordinates centred on S.
 struct DSphChain { D3 first, last, dir; double F, inner; };
@@ -10547,6 +10569,18 @@ __device__ static DSphIndex dSphereIndex(const DScene& sc, const DCamera& cam, c
 static constexpr int SPH_SCAN_N = 96;
 __device__ static double g_sphScanC[SPH_SCAN_N + 1];
 __device__ static double g_sphScanS[SPH_SCAN_N + 1];
+// A ladder's offsets at a full step's span and their (cos, sin) (host twin Renderer::SphLadderTab).
+static constexpr int kDSphLadder = 9;   // host twin Renderer::kSphLadder
+__device__ static double g_sphLadO[kDSphLadder], g_sphLadC[kDSphLadder], g_sphLadS[kDSphLadder];
+__device__ static int g_sphLadN;
+// A ladder's offsets in from its end at span L, ascending; their count (host twin Renderer::sphLadderOffsets).
+__host__ __device__ static inline int dSphLadderOffsets(double L, double* o) {
+    int k = 0;
+    o[k++] = 1e-5;
+    for (double g = 4e-5; g < L / 36.0 && k < 4; g *= 4.0) o[k++] = g;
+    for (int j = 1; j <= 5; ++j) o[k++] = L * (double)(j * j) / 36.0;
+    return k;
+}
 
 __global__ void kSphScanInit() {
     int i = threadIdx.x;
@@ -10555,49 +10589,77 @@ __global__ void kSphScanInit() {
     double phi = -DPI + (2.0 * DPI) * i / NS;
     g_sphScanC[i] = cos(phi);
     g_sphScanS[i] = sin(phi);
+    if (i < kDSphLadder) {
+        double o[kDSphLadder];
+        const int n = dSphLadderOffsets(2.0 * DPI / NS, o);
+        if (i == 0) g_sphLadN = n;
+        if (i < n) { g_sphLadO[i] = o[i]; g_sphLadC[i] = cos(o[i]); g_sphLadS[i] = sin(o[i]); }
+    }
 }
 
-// Host twin Renderer::SphScanEnds / sphScanEnds: the ladders of samples by the arcs' ends -- the
-// silhouette's from outside, the critical angle's from inside -- and which fixed samples are skipped.
-static constexpr int kDSphLadder = 6;   // host twin Renderer::kSphLadder
+// Host twin Renderer::SphScanEnds / sphScanEnds: the ladders of samples by the ends of the arcs where a
+// chain exists -- the silhouette's from outside and, a sphere less dense than around it, where its
+// refracted chains stop; the critical angle's from inside -- and which fixed samples are skipped.
 struct DSphScanEnds {
     int n;
     double phi[4 * kDSphLadder], c[4 * kDSphLadder], s[4 * kDSphLadder], t[4 * kDSphLadder];
-    double skipLo, skipHi;
+    double skipLo[2], skipHi[2];
+    __device__ bool skips(double aphi) const {
+        return (aphi > skipLo[0] && aphi < skipHi[0]) || (aphi > skipLo[1] && aphi < skipHi[1]);
+    }
 };
 __device__ static DSphScanEnds dSphScanEnds(double r, double d, double n, bool outside) {
     DSphScanEnds e;
-    e.n = 0; e.skipLo = e.skipHi = 4.0;
+    e.n = 0; e.skipLo[0] = e.skipLo[1] = e.skipHi[0] = e.skipHi[1] = 4.0;
     const double dl = 1e-5, h = 2.0 * DPI / SPH_SCAN_N;
-    auto ladder = [&e, dl](double E, double sgn, double L) {
-        for (int k = 0; k < kDSphLadder; ++k) {
-            const int j = sgn > 0.0 ? k : kDSphLadder - 1 - k;
-            const double o = j == 0 ? dl : L * (double)(j * j) / (double)(kDSphLadder * kDSphLadder);
-            const double phi = E + sgn * o;
-            e.phi[e.n] = phi; e.t[e.n] = E + sgn * sqrt(o * L);
-            e.c[e.n] = cos(phi); e.s[e.n] = sin(phi); ++e.n;
+    auto ladder = [&](double E, double cE, double sgn, double L) {
+        const double sE = (E < 0.0 ? -1.0 : 1.0) * sqrt(fmax(0.0, 1.0 - cE * cE));
+        double off[kDSphLadder];
+        const int nr = L == h ? g_sphLadN : dSphLadderOffsets(L, off);
+        for (int j = 0; j < nr; ++j) {
+            double o, co, so;
+            if (L == h) { o = g_sphLadO[j]; co = g_sphLadC[j]; so = g_sphLadS[j]; }
+            else { o = off[j]; co = cos(o); so = sin(o); }
+            so *= sgn;
+            e.phi[e.n] = E + sgn * o; e.t[e.n] = E + sgn * sqrt(o * L);
+            e.c[e.n] = cE * co - sE * so; e.s[e.n] = sE * co + cE * so; ++e.n;
         }
     };
     if (outside) {
-        const double t = acos(fmin(1.0, r / d));
+        const double ct = fmin(1.0, r / d), t = acos(ct);
         if (t > dl) {
             const double L = fmin(h, t);
-            ladder(-t, 1.0, L); ladder(t, -1.0, L);
-            e.skipLo = t - L;
+            ladder(-t, ct, 1.0, L); ladder(t, ct, -1.0, L);
+            e.skipLo[0] = t - L;
+            if (n < 1.0) {
+                const double q = sqrt(fmax(0.0, (1.0 - n * n) * (d * d - n * n * r * r)));
+                const double c0 = fmin(1.0, fmax(-1.0, (n * n * r + q) / d)), p0 = acos(c0);
+                if (p0 > dl && p0 < t - dl) {
+                    const double L0 = fmin(h, p0);
+                    ladder(-p0, c0, 1.0, L0); ladder(p0, c0, -1.0, L0);
+                    e.skipLo[1] = p0 - L0; e.skipHi[1] = p0;
+                }
+            }
         }
-        return e;
+    } else if (n > 1.0 && n * d > r) {
+        const double q = sqrt((n * n - 1.0) * (n * n * d * d - r * r));
+        const double ca = fmin(1.0, (r + q) / (n * n * d)), cb = fmax(-1.0, (r - q) / (n * n * d));
+        const double a = acos(ca), b = acos(cb);
+        const bool nearArc = a > dl, farArc = b + dl < DPI;
+        const double La = fmin(h, a), Lb = fmin(h, DPI - b);
+        if (farArc) { ladder(-b, cb, -1.0, Lb); ladder(b, cb, 1.0, Lb); }
+        if (nearArc) { ladder(-a, ca, 1.0, La); ladder(a, ca, -1.0, La); }
+        e.skipLo[0] = nearArc ? a - La : -1.0;
+        e.skipHi[0] = farArc ? b + Lb : 4.0;
     }
-    if (n <= 1.0 || n * d <= r) return e;
-    const double q = sqrt((n * n - 1.0) * (n * n * d * d - r * r));
-    const double a = acos(fmin(1.0, (r + q) / (n * n * d)));
-    const double b = acos(fmax(-1.0, (r - q) / (n * n * d)));
-    const bool nearArc = a > dl, farArc = b + dl < DPI;
-    const double La = fmin(h, a), Lb = fmin(h, DPI - b);
-    if (farArc) ladder(-b, -1.0, Lb);
-    if (nearArc) { ladder(-a, 1.0, La); ladder(a, -1.0, La); }
-    if (farArc) ladder(b, 1.0, Lb);
-    e.skipLo = nearArc ? a - La : -1.0;
-    e.skipHi = farArc ? b + Lb : 4.0;
+    for (int i = 1; i < e.n; ++i)                  // in order of angle (host twin)
+        for (int k = i; k > 0 && e.phi[k] < e.phi[k - 1]; --k) {
+            double x;
+            x = e.phi[k]; e.phi[k] = e.phi[k - 1]; e.phi[k - 1] = x;
+            x = e.t[k];   e.t[k]   = e.t[k - 1];   e.t[k - 1]   = x;
+            x = e.c[k];   e.c[k]   = e.c[k - 1];   e.c[k - 1]   = x;
+            x = e.s[k];   e.s[k]   = e.s[k - 1];   e.s[k - 1]   = x;
+        }
     return e;
 }
 
@@ -10697,7 +10759,7 @@ __device__ static void dSphScanChains(int nC, const DSphScanEnds& ends, const Ev
     for (int i = 0; i <= SPH_SCAN_N; ++i) {
         const double phi = -DPI + (2.0 * DPI) * i / SPH_SCAN_N;
         while (next < ends.n && ends.phi[next] <= phi) { visit(ends.c[next], ends.s[next], ends.t[next]); ++next; }
-        if (fabs(phi) > ends.skipLo && fabs(phi) < ends.skipHi) continue;
+        if (ends.skips(fabs(phi))) continue;
         visit(g_sphScanC[i], g_sphScanS[i], phi);
     }
     while (next < ends.n) { visit(ends.c[next], ends.s[next], ends.t[next]); ++next; }
@@ -10709,7 +10771,7 @@ __device__ static void dSphScanChains(int nC, const DSphScanEnds& ends, const Ev
 __device__ static void dConnectSpecularSphere(const DScene& sc, const DCamera& cam,
         double* film, double* hits, const DSphere& S, const DSphIndex& ix,
         const D3& p, const DSpecVtx& vt, const Real* lam, const Real* beta, const Real* w, int nL, int room,
-        DRng& rng) {
+        int sphIdx, DRng& rng) {
     D3 O(S.c); const double r = S.r; D3 eye(cam.eye);
     const double dEyeO = d3len(eye - O);
     if (d3len(p - O) < r * 0.9999) return;            // vertex inside glass -> skip
@@ -10752,9 +10814,7 @@ __device__ static void dConnectSpecularSphere(const DScene& sc, const DCamera& c
         double f = 0.0;
         for (int c = 0; c < nC; ++c) {
             if (c > 0) { Q = dSphTurn(Q, b.cd, b.sd); dir = dSphTurn(dir, b.cd, b.sd); }
-            if (c == 0) f = outside ? b.R : 1.0 - b.R;
-            else if (outside && c == 1) f = b.totalOut ? 0.0 : (1.0 - b.R) * (1.0 - b.R);
-            else f *= b.R;
+            f = dSphChainStep(outside, c, b, f);
             F[c] = f;
             valid[c] = f >= kDSphChainFloor;
             if (valid[c]) { const DSphV2 q = p2 - Q; miss[c] = dir.x * q.y - dir.y * q.x; }
@@ -10773,12 +10833,12 @@ __device__ static void dConnectSpecularSphere(const DScene& sc, const DCamera& c
     auto legOf = [&](int c, double c1, double s1, DSphV2& Q, DSphV2& dir) -> bool {
         DSphBase2D b;
         if (!dSphBase2D(eye2, r, n, outside, c1, s1, b)) return false;
-        double f = outside ? b.R : 1.0 - b.R;
+        double f = dSphChainStep(outside, 0, b, 0.0);
         Q = b.P; dir = b.dir0;
         const int drawn = c < nC - 1 ? c : nC - 1;
         for (int k = 1; k <= drawn; ++k) {
             Q = dSphTurn(Q, b.cd, b.sd); dir = dSphTurn(dir, b.cd, b.sd);
-            f = (outside && k == 1) ? (b.totalOut ? 0.0 : (1.0 - b.R) * (1.0 - b.R)) : f * b.R;
+            f = dSphChainStep(outside, k, b, f);
         }
         if (c >= nC) {                                // (only deep.c lies beyond)
             if (f < kDSphChainFloor) return false;
@@ -10842,23 +10902,18 @@ __device__ static void dConnectSpecularSphere(const DScene& sc, const DCamera& c
         const double G = (eps * eps) / jac;
         const double geom = G * ch.F * w0 * wPick / keep / omega * (outside ? 1.0 : n * n);   // n^2: host twin
 
-        // The legs' shadow rays meet the sphere just outside it, along its normal: in float a surface
-        // point a grazing leg meets rounds inside as often as out, and the sphere then shadows its own
-        // image (a rim's grazing reflections, 9 % of them).
-        // (1e-4 of the radius, and no less than float's own error at the point.)
-        const auto lifted = [&](const D3& local, const D3& world) {
-            return world + local * (fmax(1e-4 * r, 1e-6 * (1.0 + d3len(world))) / r);
-        };
-        const D3 lastOut = lifted(ch.last, last), firstOut = lifted(ch.first, first);
+        // The legs' shadow rays skip the sphere, which in float a grazing leg's end on it rounds inside as
+        // often as out (and which the legs, outside it, cannot otherwise meet).
         const DVec3 wPR = wP.toR();
-        if (occludedTo(sc, dOffsetAlong(p.toR(), wPR, wPR), lastOut.toR(), 2e-6)) return true;
+        if (occludedTo(sc, dOffsetAlong(p.toR(), wPR, wPR), last.toR(), 2e-6, RAY_EPS, false, (Real)0, sphIdx))
+            return true;
         DVec3 wER((Real)0, (Real)0, (Real)0);
         double dE = 0.0;
         if (outside) {
             D3 wE = eye - first; dE = d3len(wE); wE = wE * (1.0 / dE);
             wER = wE.toR();
             // camera leg: hide_camera applies (Scene::occluded / DMaterial::hideCamera)
-            if (occludedTo(sc, firstOut.toR(), eye.toR(), 2e-6, RAY_EPS, /*camLeg=*/true)) return true;
+            if (occludedTo(sc, first.toR(), eye.toR(), 2e-6, RAY_EPS, /*camLeg=*/true, (Real)0, sphIdx)) return true;
         }
         for (int j = 0; j < nL; ++j) {
             DSpecVtx vj = vt; vj.weight = (double)w[j]; vj.lambda = lam[j];
@@ -11146,7 +11201,7 @@ __device__ static void dConnectSpecularPlane(const DScene& sc, const DCamera& ca
 // place of the two refractions. Twin of Renderer::connectSpecularSphereMirror.
 __device__ static void dConnectSpecularSphereMirror(const DScene& sc, const DCamera& cam,
         double* film, double* hits, const DSphere& S, const D3& p, const DSpecVtx& vt,
-        const Real* lam, const Real* beta, const Real* w, int nUp, DRng& rng) {
+        const Real* lam, const Real* beta, const Real* w, int nUp, int sphIdx, DRng& rng) {
     const D3 O(S.c); const double r = S.r; const D3 eye(cam.eye);
     const double dEyeO = d3len(eye - O);
     const double dPO   = d3len(p - O);
@@ -11243,9 +11298,10 @@ __device__ static void dConnectSpecularSphereMirror(const DScene& sc, const DCam
         const double G = (eps * eps) / jac;
         const double D = 1.0 / sqrt(G);
 
-        // The shadow ray meets the mirror just outside it, along its normal (the glass connector's reason).
-        const D3 P1out = ch.P1 + (ch.P1 - O) * (fmax(1e-4 * r, 1e-6 * (1.0 + d3len(ch.P1))) / r);
-        if (occludedTo(sc, dOffsetAlong(p.toR(), wP.toR(), wP.toR()), P1out.toR(), 2e-6)) return true;
+        // The shadow ray skips the mirror (the glass connector's reason; p is on its side of it, out or in).
+        if (occludedTo(sc, dOffsetAlong(p.toR(), wP.toR(), wP.toR()), ch.P1.toR(), 2e-6, RAY_EPS, false, (Real)0,
+                       sphIdx))
+            return true;
         DHit hm;
         if (!dMirrorSeenAt(sc, eye, D3(0,0,0) - wRE, dE, hm)) return true;
 
@@ -11302,7 +11358,7 @@ __device__ static void camSpecularSplatAllVtxN(const DScene& sc, const DCamSet& 
                             done[j] = true;
                         }
                     dConnectSpecularSphere(sc, cs.cam(c), cs.films[c], cs.hits[c], S, ix[i], pd, vt, gl, gb, gw, m,
-                                           room, rng);
+                                           room, sc.dielSph[k], rng);
                 }
             }
         }
@@ -11314,7 +11370,7 @@ __device__ static void camSpecularSplatAllVtxN(const DScene& sc, const DCamSet& 
         for (int c = 0; c < cs.nCam; ++c)
             if (!cs.cam(c).hasLens)   // a physical lens has no pinhole to aim at
                 dConnectSpecularSphereMirror(sc, cs.cam(c), cs.films[c], cs.hits[c], S,
-                                             pd, vt, lam, beta, w, nUp, rng);
+                                             pd, vt, lam, beta, w, nUp, sc.mirrorSph[k], rng);
     }
     // The planes, at the path's time; one whose faces move differently or deform (mixed) by
     // its parts, each moving as one (host twin camSpecularSplatAllVtxN).
@@ -12762,14 +12818,14 @@ __device__ static void dEnclosureAt(const DScene& sc, const DVec3& p, DMediumSta
         double tAcc = 0.0;
         bool left = false;
         for (int surfaces = 0; surfaces < 64; ++surfaces) {
-            // curveTmin BIG: every curve is passed (no strand bounds anything). `tri`: the world triangle
-            // hit, whose closed piece may bound a solid its own material is not (DTri::bounds).
-            int tri = -1;
-            const DHit h = closestHit<true>(sc, o, d, RAY_EPS, BIG, /*camHide=*/false, /*curveTmin=*/BIG, &tri);
+            // curveTmin BIG: every curve is passed (no strand bounds anything). `bounds`: the solid the hit
+            // triangle's closed piece bounds where its own material encloses none (DTri::bounds).
+            int bounds = -1;
+            const DHit h = closestHit<true>(sc, o, d, RAY_EPS, BIG, /*camHide=*/false, /*curveTmin=*/BIG, &bounds);
             if (!h.valid) { left = true; break; }
             tAcc += (double)h.t;
             int si = sc.mats[h.matId].encSolid;           // else its closed piece's (host twin)
-            if (si < 0 && tri >= 0) si = sc.tris[tri].bounds;
+            if (si < 0) si = bounds;
             if (si >= 0 && h.solid != 0) {
                 const bool behind = dot(d, h.ng) > (Real)0;   // the walks' side: leaving
                 int at = -1;
@@ -25939,7 +25995,7 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
         d.emitter = t.emitter;
         d.curvature = t.curvature;      // O3 per-face mean curvature (from Tri::finalize)
         d.solid = t.solidFace;          // PROBE-SOLID-SIDE (markSolidFaces)
-        d.bounds = (short)(t.boundsSolid >= 0 && t.boundsSolid <= 32767 ? t.boundsSolid : -1);
+        d.bounds = t.boundsSolid;        // (Tri::boundsSolid, a short already)
         d.matId = t.matId; d.sensorId = t.sensorId;
         d.vcol  = t.vcol;               // per-vertex colour (Scene::vertColors), or -1
         d.reach = (Real)t.reach;

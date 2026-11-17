@@ -100,6 +100,17 @@ offset, 1e-6, is 30 times smaller. Every GPU walk that reflects inside a closed 
 takes the drift (modes R, M, S, D, the photon walks of B). The fix: an origin moved along the ray's
 own direction keeps its line, so where the leaving ray is not grazing the offset can be along it.
 
+## OPEN (2026-11-16): MODEM-BALL-LAMP — mode M reads the lamp's surroundings seen from a glass ball's centre 3 % dark
+
+check_ball_images' inside view (the eye at the centre of a 15 cm glass ball, the lamp ahead), at
+-max-bounce 64, mode M on the CPU over mode R: the rings 4-15 px round the lamp 0.967 at 2e6 photons,
+0.967 at 8e6, 0.967 at 8e6 with the radius pinned to 0.006 (-pmradius) -- no kernel blur, which would
+move with them -- while the rings 15-25 px read 1.002 and the walls beyond 1.000, and mode B (0.997) and
+mode S at 1024 spp (1.008) meet mode R there. The ring holds the lamp's own image's edge (the lamp,
+0.3 m at 2.8 m, spans some 6 px) and the halo, the inner surface's reflection of the bright spot the
+ball focuses behind the eye. To narrow: the same view with only the lamp (every wall black), then only
+the walls lit; and GPU mode M (which runs its own -max-bounce, 32).
+
 ## DONE (2026-11-16, 0.448.3): MODEB-DEPTH-CONNECT — mode B's specular connections do not count their vertices against -max-bounce
 
 **Fixed:** a vertex's splats carry its depth on its photon path (`SpecVtx::depth`: the walk's
@@ -129,7 +140,9 @@ albedo, and the room seen directly lost nothing in either. With only the wall be
 glowing, light that bounces nowhere, the cap took nothing, which is why those cases agreed. At
 -max-bounce 64 check_ball_images reads, mode B over mode R: the glass ball's body 1.0001 (CPU) and
 0.9997 (GPU), the mirror ball's 1.0029 and 0.9972, the walls from the ball's centre 1.0009 and 1.0005.
-Modes M and S, which read those walls 1.038 of mode R at 12, are re-measured at 64 below.
+Modes M and S, which read those walls 1.038 of mode R at 12, read them at 64 1.0004 (M, CPU) and 1.0020
+(S, GPU): the same cap. Nearer the lamp S reads 1.041 at 256 spp and 1.008 at 1024 (its shrinking
+radius); M reads 0.967 there whatever its photons and radius -- MODEM-BALL-LAMP.
 
 The investigation as it stood:
 
@@ -160,6 +173,49 @@ host. The proper fix is the wavefront shape the camera side already has: queue e
 connections and run them in a kernel of their own, coherent (one thread a vertex and chain), its scan
 in fp32 where the miss's precision allows and fp64 only to refine. Until then mode B with large glass
 spheres in view renders faster with `-device cpu`.
+
+## DONE (2026-11-16, 0.448.4): REVIEW-0448B — what the Opus (max) and Fable (xhigh) reviews of 0.448.1-0.448.3 found
+
+`/code-review max` (Opus, 15 findings) and `/code-review xhigh` (Fable, 14) of 5f9bdc7..0ee7cd2, one after
+the other in a worktree; ten found by both. Each checked against the code; all but one held.
+
+**Fixed in 0.448.4:**
+
+* **An eye inside a mirror ball lost every image on the GPU (both).** 0.448.1's shadow-ray end, lifted
+  outward off the sphere, lay behind the silvering from inside: GPU mode B read the mirror 0.0001 of
+  CPU mode B. The sphere connectors' shadow rays skip the sphere itself instead (`occluded`'s
+  `skipSph`, Fable's design): exact, one rule for both connectors, and no end carried into geometry
+  touching the ball. check_ball_images' new case: 1.000.
+* **The deep chain found almost nothing (Fable).** Its (1 - R) R^c reaches the floor only in a band
+  beside each end narrower than the ladder's second rung, so a pick rarely had two valid samples to
+  bracket: the 2D model found 7.5 % of chains 17-128's weight. A ladder's rungs nearest its end step
+  fourfold from 1e-5 (sphLadderOffsets): 90 %.
+* **A bubble had no ladder where its refracted chains stop (Opus):** a sphere less dense than around it
+  seen from outside, sin(theta) = n. The 2D model found 87 % of those chains' weight from 1.3 radii,
+  99.6 % from 3; with ladders there, all of it.
+* **sphScanEnds took 12-24 cosines and sines a connection (both):** a ladder's samples are its end's
+  (cos, sin), algebraic, turned by a table (sphLadderTab).
+* **The device probe read no instance's wall (both):** closestHit<true> reports the hit triangle's
+  bounds, an instance's too unless it overrides the material, as the host does. (Not reproduced: an
+  instanced pool with a lamp across its surface rendered alike on both devices before the fix.)
+* **An asset the enclosures-only marking skipped kept a rebuild's stale boundsSolid (Fable):** reset.
+* **The fp64 device and the host's bidirectional walks parted at grazing (both):** continuationOrigin
+  starts every delta continuation along its direction, as interfaceStep does.
+* **Tri grew 8 bytes (both):** boundsSolid is a short in solidFace's padding (a solid past 32767 bounds
+  nothing, as on the device), and a static_assert holds Tri at 328.
+* **The duplicates (both):** a chain's Fresnel step written once a device (sphChainStep), shared by the
+  scan and the refinement, whose validity must agree; one reader of a sidecar's version trailer
+  (trailerStart) for sidecarVersion and sectionsTail, sectionsTail's looser rule gone.
+* **The checks (both):** the -max-bounce 12 case runs GPU mode B too; the frosted reference renders
+  once; the hit-field test covers boundsSolid (Opus); design.md's limits name the deep chain and the
+  cap; the comments that narrated history state their constraint, and DEPTH's no longer claims the
+  modes count the cap apart.
+* **Modes M and S's walls at -max-bounce 64 (Opus)**, which MODEB-SPHERE-ROOM left to re-measure:
+  1.000 and 1.002 of mode R; M's rings round the lamp are MODEM-BALL-LAMP.
+
+**Not changed:** Hit::boundsSolid's store (Fable): one write a candidate hit, beside the intersection's
+own work; the host's probe reads Hit as every other caller does, where a probe-only traversal would
+duplicate closestHit for nothing measurable.
 
 ## DONE (2026-11-16, 0.448.1): REVIEW-0448 — what the Opus (max) and Fable (xhigh) reviews of 0.447.2-0.448.0 found
 

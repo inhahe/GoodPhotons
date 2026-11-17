@@ -129,8 +129,9 @@ struct Tri {
     unsigned char solidFace = 0;
     // The solid a walk can be inside (Scene::encSolidOf) whose closed piece this face is part of, or -1:
     // a face of another material closing it -- a pool's wall under a water surface of one quad -- bounds
-    // it as its own faces do (Scene::markSolidFaces, for Scene::enclosureAt).
-    int boundsSolid = -1;
+    // it as its own faces do (Scene::markSolidFaces, for Scene::enclosureAt). A short, in solidFace's
+    // padding (and DTri::bounds' twin): a solid past 32767 bounds nothing.
+    short boundsSolid = -1;
     // triReach of the vertices, baked here for the hit to copy (Hit::pscale).
     double reach = 0.0;
     // The light it is part of (Hit::emitter), or -1. Last: triangles are built positionally
@@ -190,6 +191,9 @@ struct Tri {
         }
     }
 };
+// Tri sits in the BVH's hot leaf data: a field added takes existing padding or earns its 8 bytes.
+static_assert(sizeof(Tri) == 328, "Tri changed size");
+
 
 struct Sphere {
     Vec3 c; double r = 1.0;

@@ -918,15 +918,14 @@ inline void beginBeamSpectral(const Scene& scene, const Renderer& mats, const Em
 // A walk's continuation origin off surface point p (`ng` its geometric normal, either orientation;
 // `w` the unit direction it leaves in; `delta` whether a delta lobe chose it -- a dielectric's
 // reflection or refraction, a mirror's, a pass-through). A delta continuation starts along its own
-// direction, so the ray keeps its line, as mode R's interfaceStep starts it: a push along the normal
-// starts each chord inside a sphere by the push, and r sin(theta), which a sphere's chords keep,
-// shrinks by its share of the radius at every reflection, until a ray held by total internal
-// reflection slides under the critical angle and leaves. Grazing (|cos| < 1/4), and for every other
-// lobe, along the normal to w's side.
+// direction, so the ray keeps its line, as mode R's interfaceStep starts it (and the device's
+// dOffsetSpecular): a push along the normal would start each chord inside a sphere by the push, and
+// r sin(theta), which a sphere's chords keep, would shrink by its share of the radius at every
+// reflection until a ray held by total internal reflection slid under the critical angle. Every other
+// lobe starts along the normal, to w's side.
 inline Vec3 continuationOrigin(const Vec3& p, const Vec3& ng, const Vec3& w, bool delta) {
-    const double c = dot(w, ng);
-    if (delta && std::fabs(c) >= 0.25 * length(ng)) return p + w * 1e-6;
-    return p + ng * ((c >= 0.0 ? 1.0 : -1.0) * 1e-6);
+    if (delta) return p + w * 1e-6;
+    return p + ng * ((dot(w, ng) >= 0.0 ? 1.0 : -1.0) * 1e-6);
 }
 
 // Continue a subpath whose endpoint is already path[0] (Camera or Light). `ray` is

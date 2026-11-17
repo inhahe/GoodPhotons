@@ -4689,7 +4689,7 @@ struct Scene {
             for (size_t i = 0; i < nf; ++i) {
                 if (pieceOf[i] < 0) continue;
                 const auto it = pieceSolid.find(pieceOf[i]);
-                if (it != pieceSolid.end()) faceAt(i).boundsSolid = it->second;
+                if (it != pieceSolid.end()) faceAt(i).boundsSolid = (short)(it->second <= 32767 ? it->second : -1);
             }
         };
         for (Tri& t : tris) t.boundsSolid = -1;   // (an asset's are its own, set where it is marked)
@@ -4698,8 +4698,10 @@ struct Scene {
             if (g.blasId >= 0 && g.blasId < (int)blasList.size()) {
                 if (done[(size_t)g.blasId]) continue;
                 std::vector<Tri>& tr = blasList[(size_t)g.blasId].tris;
-                if (enclosuresOnly && !placedEnterable[(size_t)g.blasId] && !holdsEnterable(tr.data(), tr.size()))
+                if (enclosuresOnly && !placedEnterable[(size_t)g.blasId] && !holdsEnterable(tr.data(), tr.size())) {
+                    for (Tri& t : tr) t.boundsSolid = -1;     // (no solid now: a rebuild's earlier marks go)
                     continue;
+                }
                 done[(size_t)g.blasId] = 1;
                 sm.solid += watertight::markSolidFaces(tr.data(), tr.size(), &blasPieces[(size_t)g.blasId], &pieceOf);
                 bound([&](size_t i) -> Tri& { return tr[i]; }, tr.size());
