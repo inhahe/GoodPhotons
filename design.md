@@ -5791,10 +5791,10 @@ as the one at fault.
   6325 units away rendered 23.7 % dark on the GPU, 1.6 % at 3162, clean at 1581, and the
   identical scene scaled by 0.1 was clean — a precision failure, not an algorithmic one
   (known-issues.md GPU-NEE-EPS; it had been misfiled for six weeks as a participating-media
-  disagreement). All fourteen sites now go through `connMaxT(dist, 2*RAY_EPS)`, and
-  `tools/check_distant_light.py` renders a far/near scene pair on both devices as a gate.
-  Two gaps remain and are logged: the hair variants (`bkHairBlocked`, `connectHair`,
-  `connectLensHair`) still subtract an absolute `off + RAY_EPS`; and the ray **origins**
+  disagreement). All fourteen sites now go through `connMaxT` (its floor the host's 2e-6 since
+  0.448.7), and `tools/check_distant_light.py` renders a far/near scene pair on both devices as a
+  gate. The hair variants subtracted an absolute `off + RAY_EPS` until 0.448.7
+  (`dHairCamLegBlocked` now); and the ray **origins**
   are all absolute — `p + n*RAY_EPS` (dead past ~1680 units), the BDPT/VCM `ng*1e-6f` and
   the caustic chains' double `1e-6` cast to float (both dead past ~17 units) — which is
   observed in mode `B` as photons re-hitting the emitter they were born on (GPU-ORIGIN-EPS).
@@ -5802,26 +5802,42 @@ as the one at fault.
   Wächter–Binder's integer ulp offset along the departure-side geometric normal.
   0.259.1 made that the rule. `dOffsetAlong(p, ng, w)` (render_cuda.cu, next to `DVec3`) is
   the ONLY way a device ray may leave a surface: it advances `p` by 256 float ulps along
-  `ng` flipped to the side of `w` (Ray Tracing Gems ch. 6), with a 1/65536 absolute push
-  inside |p| < 1/32 where ulps are too fine to matter — scale-correct by construction and
-  bounded in absolute terms (0.25 units at |p| = 10 km, which is also the thinnest wall
-  fp32 can still resolve there). It replaced ~100 `p + n*RAY_EPS` bounce and shadow
+  `ng` flipped to the side of `w` (Ray Tracing Gems ch. 6), with an absolute push of
+  1/65536 per unit of the normal inside |p| < 1/32, where a coordinate's ulps are too
+  fine to clear the error of a hit there — scale-correct by construction and bounded in absolute
+  terms (0.25 units at |p| = 10 km, which is also the thinnest wall fp32 can still resolve
+  there). WB's constants are for a scene of unit size, and so are the device's other absolute
+  floors (`dEpsAt`'s 1e-7, `connMaxT`'s): all of them are multiplied by `c_lenScale` = min(1, S),
+  S the farthest coordinate of the scene's swept bounding sphere (which holds every primitive at
+  every time; a hit's error is a few ulps of its primitive's coordinates, all under S). The host's
+  `setSceneScale` sets it with every upload and before a held scene renders. A scene of unit size
+  or more keeps every floor as written; one smaller renders as the same scene drawn larger does --
+  in a scene a few centimetres across 1/65536 is more than a strand's radius (GPU-MINIATURE-SCALE:
+  the stubble ball in `units centimeters` renders at x1.0001 of its metre twin on the device, every
+  tile within 0.12 %; `tools/check_scale_invariance.py`). The host's absolute 1e-6 does not scale
+  yet (CPU-MINIATURE-SCALE).
+  It replaced ~100 `p + n*RAY_EPS` bounce and shadow
   origins, the BDPT/VCM `ng*1e-6f` connection origins, the caustic chains' double
   `1e-6` (which the cast to float had been discarding), and the photon-birth
   `origin + dir*RAY_EPS`, which was along the wrong vector as well as the wrong size:
-  births now step along `emitN`. Medium vertices have nothing to clear and are not
-  offset; hair fibres keep `dHairExitOffset` (2.5 radii along the exit direction). The
+  births now step along `emitN`, the bidirectional walks' births too (`dOffsetAlong(y, nFace,
+  dir)`). A point with no surface to clear -- a medium vertex, a point or volume light's birth --
+  steps by `dEpsAt` of itself (below). A strand clears its own tube by a curve-only skip,
+  `dStrandSkip` (the exact chord on the far side, a quarter radius on the near, never under
+  `dStrandEps`): `dHairExitOffset` in fp32, and `dHairCamLegBlocked` for mode B's camera legs from
+  a strand, which start at the strand point as the host's `connect` does -- an origin moved by the
+  whole exit distance had passed through the skin a strand near its root grows from. The
   fp64 device build keeps `p + n*1e-6`, bit-identical to the CPU. The next trace's tmin is a
   second guard, not the first, and it is scale-correct too: a trace given `RAY_TMIN` (a negative
   sentinel, the default of `closestHit`, `occluded`, `shadowTransmittance` and `occludedTo`)
-  resolves it from its own origin by `dTminAt` -- 32 float ulps of the origin's largest
+  resolves it from its own origin by `dEpsAt` -- 32 float ulps of the origin's largest
   coordinate, at least 1e-7 and at most `RAY_EPS`. An absolute 1e-4 skipped the first tenth of a
   millimetre of every ray: in a scene of metres that is a stubble coat's roots, and a ray leaving
   the skin under them missed the strands it started among (GPU-TMIN-SCALE, found as
   STUBBLE-DEVICE-UNDERSIDE: the coat's underside 3-10 % over the CPU in mode W, now 1.000). The
-  fp64 build's `RAY_TMIN` resolves to its `RAY_EPS`, the host's 1e-6. `RAY_EPS` itself is left
-  where it is a distance rather than a tmin: `connMaxT`'s floor and the camera-leg pushes, which
-  the far-end and connection rules below size.
+  fp64 build's `dEpsAt` is its `RAY_EPS`, the host's 1e-6. A far end stops the host's 2e-6 short,
+  plus `connMaxT`'s relative and coordinate terms, and the coverage probes' floors are twice the
+  relaunch's `dEpsAt`; `RAY_EPS` is left only as `dEpsAt`'s and `dStrandEps`'s cap.
   **A dielectric step leaves by `dOffsetSpecular` instead** (`dDielectricStep`, every walk's
   interface): the same clearance off the surface, reached along the ray's own direction, so the
   ray keeps its line -- as the host's `interfaceStep` does (`h.p + out*1e-6`). A push along the

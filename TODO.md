@@ -412,9 +412,10 @@ Then the rest of 4.2-4.6 in their order, 4.7's bookkeeping alongside whatever to
   through it (known-issues). With GRIN-RADIANCE-SCALE.
 - [x] **GPU-TMIN-SCALE** (0.448.6) — a device trace's tmin is 32 ulps of its origin, not an absolute
   1e-4; fixed STUBBLE-DEVICE-UNDERSIDE (check_modew_fiber's stubble case).
-- [ ] **GPU-MINIATURE-SCALE** — the device's other absolute offsets (WB's near-zero push, the hair
-  exit floor, the `p + w*RAY_EPS` pushes) break a scene a few centimetres across: the stubble coat in
-  centimetres reads x2.50 (known-issues).
+- [x] **GPU-MINIATURE-SCALE** (0.448.7) — every absolute floor on the device scales with the scene
+  (`c_lenScale`); the stubble ball 100x smaller renders at x1.0001 of itself (check_scale_invariance).
+- [ ] **CPU-MINIATURE-SCALE** — the host's absolute 1e-6 offsets: the same ball 100x smaller reads
+  x1.129 of itself on the CPU, tiles to x1.45 (known-issues). The scene length scale on the host.
 - [x] **SPPM-LOWPASS-DEVHOST** (closed 2026-11-13) — mode S's device read check_coat_modes' coated
   balls 16 % bluer than its host at 16 passes: noise in one tile seen through the thin-film bubble;
   sixteen seeds a backend agree within 0.5 sigma.

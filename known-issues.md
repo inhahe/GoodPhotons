@@ -6065,7 +6065,20 @@ no more than RAY_EPS -- where the device now passes RAY_EPS as a trace's tmin (4
 defaults of closestHit / occluded / occludedTo), behind dOffsetAlong's push, which stays the first
 guard; then a sweep of the GPU checks for self-intersection (acne) and check_bitid --tol.
 
-## OPEN (2026-11-16): GPU-MINIATURE-SCALE — the device's other offsets assume a scene a few centimetres across or more
+## DONE (2026-11-16, 0.448.7): GPU-MINIATURE-SCALE — the device's other offsets assume a scene a few centimetres across or more
+
+**Fixed in 0.448.7:** every absolute floor the fp32 device keeps -- Wachter-Binder's near-zero push and
+its threshold, `dEpsAt`'s 1e-7, `connMaxT`'s -- is multiplied by `c_lenScale` = min(1, S), S the
+farthest coordinate of the scene's swept bounding sphere (the host's `setSceneScale`, with every upload
+and before a held scene renders), so a scene of unit size or more is unchanged; the `p + w * RAY_EPS`
+pushes step by `dEpsAt` of their point; far ends stop the host's 2e-6 short; the light walks' births
+leave by `dOffsetAlong`; and a strand clears its tube by `dStrandSkip` (dStrandStart's rule) in
+`dHairExitOffset`, with mode B's hair camera legs starting at the strand point as the host's do
+(`dHairCamLegBlocked`). The stubble ball lit by its lamp alone, drawn 100 times smaller, now renders on
+the device at x1.0001 of its metre twin, every tile within 0.12 % (`tools/check_scale_invariance.py`;
+0.448.6: x2.83). Mode R on the metre coat, GPU / CPU at 256 spp: x1.0025, the tiles in their noise
+(0.448.6: x1.0021). The same check shows the CPU is now the one that drifts: CPU-MINIATURE-SCALE. The
+report as filed:
 
 The stubble coat of STUBBLE-DEVICE-UNDERSIDE in `units centimeters` -- the same scene 100 times
 smaller, its strands 12 um thick and 60 um long, every coordinate under 1/32 -- renders x2.50 over the
@@ -6084,6 +6097,22 @@ device still sizes these distances absolutely:
 Fix: the WB constants scaled by the scene's coordinate magnitude (cameras included) where it is under
 1, set per upload; the pushes and floors by `dTminAt` of their point; `dHairExitOffset` as
 `dStrandStart`. Then the centimetre stubble within check_modew_fiber's bounds, and the sweep.
+
+## OPEN (2026-11-16): CPU-MINIATURE-SCALE — the host's offsets are an absolute 1e-6, which a scene drawn small outgrows
+
+The host offsets a ray off its surface by 1e-6, skips 1e-6 at the start of a trace, stops a connection
+2e-6 short and clears a strand's near side by 1e-6 -- absolute distances, in roughly 150 places
+(render.h, backward.h, scene.h, geometry.h's deltaOrigin, hair_shade.h's hairExitOffset, the photon
+modes). In a scene of metres that is a thousandth of a millimetre and unseen; in one drawn small it is
+real geometry. `tools/check_scale_invariance.py`'s stubble ball lit by its lamp alone, each render
+against the same device's metre render times s^2 (mode W, 16 spp, deterministic): the CPU reads x1.0021
+in feet, x1.035 in inches and x1.129 in centimetres, tiles to x1.45 (the strands are 12 um thick there,
+and 1e-6 is a twelfth of one); mode R x1.24 in centimetres. The device, whose floors scale with the
+scene since 0.448.7 (GPU-MINIATURE-SCALE), reads x1.0001. So the device and host now disagree on a
+scene a few centimetres across (the coat in centimetres: GPU x0.891 of CPU), and the host is the one
+that is wrong. Fix: the same scene length scale, min(1, S), on the host's epsilons -- a Scene member
+the offset helpers read -- so a scene of unit size or more stays bit-identical; then the CPU joins
+check_scale_invariance's DEVICES.
 
 ## DONE (2026-11-16, 0.448.6): STUBBLE-DEVICE-UNDERSIDE — mode W on a stubble coat, device vs host, 9.6 % apart in its dark underside
 
