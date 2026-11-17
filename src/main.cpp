@@ -4869,7 +4869,7 @@ static int checkGrating() {
 
     // (a) diffraction OFF collapses to specular reflection (m=0 only).
     r.diffraction = false;
-    bool ab; Ray r0 = r.gratingDiffract(m, h, din, lambda, rng, ab);
+    bool ab; Ray r0 = r.gratingDiffract(m, h, din, 1e-6, lambda, rng, ab);
     Vec3 spec = normalize(reflect(din, nl));
     bool passA = !ab && length(r0.d - spec) < 1e-9;
 
@@ -4885,7 +4885,7 @@ static int checkGrating() {
     bool eqOK = true, unitOK = true, sideOK = true;
     const int Ns = 300000;
     for (int i = 0; i < Ns; ++i) {
-        bool a2; Ray v = r.gratingDiffract(m, h, din, lambda, rng, a2);
+        bool a2; Ray v = r.gratingDiffract(m, h, din, 1e-6, lambda, rng, a2);
         if (a2) continue;
         Vec3 vt = v.d - nl * dot(v.d, nl);
         double mrec = dot(vt - ut, t) / lod;

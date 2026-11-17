@@ -1604,9 +1604,9 @@ struct Renderer {
             g.cosSurf = 1.0; g.corr = 1.0;
             double cosCamH, dist2H;
             if (!cam.project(p, g.px, g.py, cosCamH, dist2H)) return false;
-            const double off = hairExitOffset(*hs, n, g.wdir);
+            const double off = hairExitOffset(*hs, n, g.wdir, scene.eps);
             if (off >= g.dist) return false;
-            if (scene.occluded(p + g.wdir * 1e-6, g.wdir, g.dist - off - 1e-6, 1e-6,
+            if (scene.occluded(p + g.wdir * scene.eps, g.wdir, g.dist - off - scene.eps, scene.eps,
                                /*camLeg=*/true, off)) return false;
             g.denom = dist2H * cam.pixelSolidAngle(cosCamH);
             return true;
@@ -1615,7 +1615,7 @@ struct Renderer {
         if (!camSideOk(n, ng, g.wdir, glossy, g.cosSurf)) return false;
         double cosCam, dist2;
         if (!cam.project(p, g.px, g.py, cosCam, dist2)) return false;
-        if (scene.occluded(p + ng * 1e-6, g.wdir, g.dist - 2e-6, 1e-6, /*camLeg=*/true)) return false;
+        if (scene.occluded(p + ng * scene.eps, g.wdir, g.dist - 2 * scene.eps, scene.eps, /*camLeg=*/true)) return false;
         double omega = cam.pixelSolidAngle(cosCam);
         // Veach shading-normal adjoint correction for this particle connection
         // (wi = toward the previous/light-side vertex, wo = wdir toward the camera).
@@ -1683,7 +1683,7 @@ struct Renderer {
         Vec3 wdir = toCam / dist;
         int px, py; double cosCam, dist2;
         if (!cam.project(p, px, py, cosCam, dist2)) return;
-        if (scene.occluded(p + wdir * 1e-6, wdir, dist - 2e-6, 1e-6, /*camLeg=*/true)) return;
+        if (scene.occluded(p + wdir * scene.eps, wdir, dist - 2 * scene.eps, scene.eps, /*camLeg=*/true)) return;
 
         double ph = med.phaseValue(dot(wIn, wdir), lambda); // scattering medium's phase (HG or rainbow)
         double Lambda = med.albedo(lambda);
@@ -1718,11 +1718,11 @@ struct Renderer {
         const Vec3& wdir = le.wdir;
         double cosSurf = dot(n, wdir);
         if (!hs && !camSideOk(n, ng, wdir, gs != nullptr, cosSurf)) return;   // see connectLens
-        const double off = hs ? hairExitOffset(*hs, n, wdir) : 1e-6;
+        const double off = hs ? hairExitOffset(*hs, n, wdir, scene.eps) : scene.eps;
         if (off >= le.dist) return;
         int px, py; double wgt;
         if (!cam.lensEntryImage(le, lambda, px, py, wgt)) return;
-        if (scene.occluded(p + (hs ? wdir : ng) * (hs ? 1e-6 : off), wdir, le.dist - off - 1e-6, 1e-6,
+        if (scene.occluded(p + (hs ? wdir : ng) * (hs ? scene.eps : off), wdir, le.dist - off - scene.eps, scene.eps,
                            /*camLeg=*/true, hs ? off : 0.0)) return;
         const double corr = hs ? 1.0 : shadingAdjointCorr(wi, wdir, n, ng);
         const double fcos = (hs ? hairFCos(*hs, wdir)
@@ -1757,7 +1757,7 @@ struct Renderer {
             any = any || ok[i];
         }
         if (!any) return;
-        if (scene.occluded(p + ng * 1e-6, wdir, le.dist - 2e-6, 1e-6, /*camLeg=*/true)) return;
+        if (scene.occluded(p + ng * scene.eps, wdir, le.dist - 2 * scene.eps, scene.eps, /*camLeg=*/true)) return;
         const double corr = shadingAdjointCorr(wi, wdir, n, ng);
         for (int i = 0; i < nUp; ++i) {
             if (!ok[i]) continue;
@@ -1776,7 +1776,7 @@ struct Renderer {
         const double u1 = rng.uniform(), u2 = rng.uniform();
         Vec3 Y, wdir; double dist, wgt; int px, py;
         if (!cam.lensConnect(p, lambda, u1, u2, Y, wdir, dist, px, py, wgt)) return;
-        if (scene.occluded(p + wdir * 1e-6, wdir, dist - 2e-6, 1e-6, /*camLeg=*/true)) return;
+        if (scene.occluded(p + wdir * scene.eps, wdir, dist - 2 * scene.eps, scene.eps, /*camLeg=*/true)) return;
         double f = phaseW;
         if (med && wIn) f = med->albedo(lambda) * med->phaseValue(dot(*wIn, wdir), lambda);
         double contrib = beta * f * wgt;
@@ -1832,9 +1832,9 @@ struct Renderer {
         if (cosLens <= 1e-6) return;                     // not heading toward the film
         int px, py;
         if (!cam.lensImage(A, wdir, px, py)) return;
-        const double off = hs ? hairExitOffset(*hs, n, wdir) : 1e-6;
+        const double off = hs ? hairExitOffset(*hs, n, wdir, scene.eps) : scene.eps;
         if (off >= dist) return;
-        if (scene.occluded(p + (hs ? wdir : ng) * (hs ? 1e-6 : off), wdir, dist - off - 1e-6, 1e-6,
+        if (scene.occluded(p + (hs ? wdir : ng) * (hs ? scene.eps : off), wdir, dist - off - scene.eps, scene.eps,
                            /*camLeg=*/true, hs ? off : 0.0)) return;
 
         // beta * (rho/pi BRDF) * cosSurf * cosLens / dist^2 * (pi R^2 = 1/pdf_A).
@@ -1894,7 +1894,7 @@ struct Renderer {
         if (cosLens <= 1e-6) return;                     // not heading toward the film
         int px, py;
         if (!cam.lensImage(A, wdir, px, py)) return;
-        if (scene.occluded(p + ng * 1e-6, wdir, dist - 2e-6, 1e-6, /*camLeg=*/true)) return;
+        if (scene.occluded(p + ng * scene.eps, wdir, dist - 2 * scene.eps, scene.eps, /*camLeg=*/true)) return;
         double corr = shadingAdjointCorr(wi, wdir, n, ng);
         double cellNorm = 1.0 / (cam.pixelPlaneArea() * cam.filmDist * cam.filmDist);
         for (int i = 0; i < nUp; ++i) {
@@ -1928,7 +1928,7 @@ struct Renderer {
         if (cosLens <= 1e-6) return;
         int px, py;
         if (!cam.lensImage(A, wdir, px, py)) return;
-        if (scene.occluded(p + wdir * 1e-6, wdir, dist - 2e-6, 1e-6, /*camLeg=*/true)) return;
+        if (scene.occluded(p + wdir * scene.eps, wdir, dist - 2 * scene.eps, scene.eps, /*camLeg=*/true)) return;
 
         double ph = med.phaseValue(dot(wIn, wdir), lambda); // scattering medium's phase (HG or rainbow)
         double Lambda = med.albedo(lambda);
@@ -1956,7 +1956,7 @@ struct Renderer {
         Vec3 wdir = toCam / dist;
         int px, py; double cosCam, dist2;
         if (!cam.project(p, px, py, cosCam, dist2)) return;
-        if (scene.occluded(p + wdir * 1e-6, wdir, dist - 2e-6, 1e-6, /*camLeg=*/true)) return;
+        if (scene.occluded(p + wdir * scene.eps, wdir, dist - 2 * scene.eps, scene.eps, /*camLeg=*/true)) return;
         double omega = cam.pixelSolidAngle(cosCam);
         double contrib = beta * (1.0 / (4.0 * PI)) / (dist2 * omega);
         contrib *= legTransmittance(scene, cam.medium(), p, wdir, dist, lambda, rng);
@@ -1985,7 +1985,7 @@ struct Renderer {
         if (cosLens <= 1e-6) return;
         int px, py;
         if (!cam.lensImage(A, wdir, px, py)) return;
-        if (scene.occluded(p + wdir * 1e-6, wdir, dist - 2e-6, 1e-6, /*camLeg=*/true)) return;
+        if (scene.occluded(p + wdir * scene.eps, wdir, dist - 2 * scene.eps, scene.eps, /*camLeg=*/true)) return;
         double contrib = beta * (1.0 / (4.0 * PI)) * cosLens * (PI * R * R) / (dist * dist);
         contrib *= 1.0 / (cam.pixelPlaneArea() * cam.filmDist * cam.filmDist);
         contrib *= legTransmittance(scene, cam.medium(), p, wdir, dist, lambda, rng);
@@ -2756,11 +2756,11 @@ struct Renderer {
 
             // Visibility: the leg from p, and from outside the eye's leg (an inside eye's is in the
             // glass), each stopping just short of the sphere's own surface.
-            if (scene.occluded(p + wP * 1e-6, wP, dP - 2e-6)) return true;
+            if (scene.occluded(p + wP * scene.eps, wP, dP - 2 * scene.eps)) return true;
             Vec3 wE{0, 0, 0}; double dE = 0.0;
             if (outside) {
                 wE = eye - first; dE = length(wE); wE = wE * (1.0 / dE);
-                if (scene.occluded(first + wE * 1e-6, wE, dE - 2e-6, 1e-6, /*camLeg=*/true)) return true;
+                if (scene.occluded(first + wE * scene.eps, wE, dE - 2 * scene.eps, scene.eps, /*camLeg=*/true)) return true;
             }
             for (int j = 0; j < nL; ++j) {
                 SpecVtx vj = vt; vj.weight = w[j]; vj.lambda = lam[j];
@@ -2851,7 +2851,7 @@ struct Renderer {
         // This leg starts AT THE EYE, so it is a camera ray and a `hide_camera` flat must
         // not answer either of the two questions it asks — it is neither the mirror nor a
         // legitimate blocker of the view. See Material::hideCamera.
-        hm = scene.closestHit(Ray{eye, wE}, 1e-6, nullptr, /*skipHair=*/false,
+        hm = scene.closestHit(Ray{eye, wE}, scene.eps, nullptr, /*skipHair=*/false,
                               /*skipCamHidden=*/true);
         if (!hm.valid) return false;
         if (std::fabs(hm.t - dE) > 1e-4 * (1.0 + dE)) return false;   // something in front
@@ -2927,7 +2927,7 @@ struct Renderer {
         // any-hit occlusion walk is cheaper than the closest-hit that confirms the
         // mirror, so a shadowed connection never pays for the expensive query. Both
         // tests must pass and neither draws RNG, so the order is unobservable.
-        if (scene.occluded(p + wP * 1e-6, wP, dP - 2e-6)) return;
+        if (scene.occluded(p + wP * scene.eps, wP, dP - 2 * scene.eps)) return;
         Hit hm;
         if (!mirrorSeenAt(scene, eye, -wRE, dE, hm) || !scene.mirrorClaims(mp, hm)) return;
 
@@ -3037,7 +3037,7 @@ struct Renderer {
             const double G = (eps * eps) / jac;
             const double D = 1.0 / std::sqrt(G);
 
-            if (scene.occluded(p + wP * 1e-6, wP, dP - 2e-6)) return true;
+            if (scene.occluded(p + wP * scene.eps, wP, dP - 2 * scene.eps)) return true;
             Hit hm;
             if (!mirrorSeenAt(scene, eye, -wRE, dE, hm)) return true;
 
@@ -3273,7 +3273,7 @@ struct Renderer {
                 // beta unchanged. Unbiased and caps path length naturally.
                 if (rng.uniform() >= r) { e.absorbed += beta; return false; }
                 Vec3 o = reflect(ray.d, h.n);
-                if (!continueAlong(h, o, Lobe::Reflect, ray)) { e.absorbed += beta; return false; }   // across the surface
+                if (!continueAlong(h, o, Lobe::Reflect, ray, scene.eps)) { e.absorbed += beta; return false; }   // across the surface
                 return true;
             }
             case MatType::Grating: {
@@ -3284,7 +3284,7 @@ struct Renderer {
                 double r = clamp01(reflectSlot(scene, m, h, lambda));
                 if (rng.uniform() >= r) { e.absorbed += beta; return false; }
                 bool absorbedG;
-                Ray nr = gratingDiffract(m, h, ray.d, lambda, rng, absorbedG);
+                Ray nr = gratingDiffract(m, h, ray.d, scene.eps, lambda, rng, absorbedG);
                 if (absorbedG) { e.absorbed += beta; return false; }
                 ray = nr;
                 return true;                     // beta unchanged on the chosen order
@@ -3293,9 +3293,9 @@ struct Renderer {
                 double r = clamp01(reflectSlot(scene, m, h, lambda)); // reflect probability
                 if (rng.uniform() < r) {
                     Vec3 o = reflect(ray.d, h.n);
-                    if (!continueAlong(h, o, Lobe::Reflect, ray)) { e.absorbed += beta; return false; }
+                    if (!continueAlong(h, o, Lobe::Reflect, ray, scene.eps)) { e.absorbed += beta; return false; }
                 } else {
-                    ray = Ray{h.p + ray.d * 1e-6, ray.d}; // transmit straight
+                    ray = Ray{h.p + ray.d * scene.eps, ray.d}; // transmit straight
                 }
                 return true;                     // lossless split
             }
@@ -3309,7 +3309,7 @@ struct Renderer {
                 // you see the filter's effect on whatever lies behind it.
                 double t = clamp01(transmitSlot(scene, m, h, lambda));
                 if (rng.uniform() >= t) { e.absorbed += beta; return false; }
-                ray = Ray{h.p + ray.d * 1e-6, ray.d}; // transmit straight, unchanged
+                ray = Ray{h.p + ray.d * scene.eps, ray.d}; // transmit straight, unchanged
                 return true;
             }
             case MatType::Glossy: {
@@ -3331,7 +3331,7 @@ struct Renderer {
                 // An iridescent lobe's interference reflectance, known only now that the pair
                 // is: a second roulette, beta unchanged.
                 if (gd.irid && rng.uniform() >= gd.R(lambda)) { e.absorbed += beta; return false; }
-                if (!continueAlong(h, o, Lobe::Reflect, ray)) { e.absorbed += beta; return false; }
+                if (!continueAlong(h, o, Lobe::Reflect, ray, scene.eps)) { e.absorbed += beta; return false; }
                 return true;
             }
             case MatType::Fluorescent: {
@@ -3361,7 +3361,7 @@ struct Renderer {
                 lambda = fr.lambdaOut;              // Stokes-shifted on Reemit
                 Vec3 wo;
                 beta *= diffuseContinuation(h, ngo, wi, rng, wo);
-                if (!continueAlong(h, wo, Lobe::Reflect, ray)) { e.absorbed += beta; return false; }
+                if (!continueAlong(h, wo, Lobe::Reflect, ray, scene.eps)) { e.absorbed += beta; return false; }
                 return true;                        // beta otherwise unchanged (see above)
             }
             case MatType::Hair: {
@@ -3399,7 +3399,7 @@ struct Renderer {
                 // TT and TRT leave through the FAR side of a real solid strand, so step
                 // clear of the tube's own body (hair_shade.h); on the near side this is the
                 // ordinary 1e-6 offset.
-                ray = Ray{h.p + wo * 1e-6, wo, hairExitOffset(hs, h.n, wo)};
+                ray = Ray{h.p + wo * scene.eps, wo, hairExitOffset(hs, h.n, wo, scene.eps)};
                 return true;                        // beta unchanged (RR carried the weight)
             }
             default: return true;                   // unreachable (diffuse handled by callers)
@@ -3759,7 +3759,7 @@ struct Renderer {
         }
         }   // end emitter-birth branch
 
-        Ray ray{origin + dir * 1e-6, dir};
+        Ray ray{origin + dir * scene.eps, dir};
         // Nested-dielectric medium stack: the solids the photon is currently inside.
         // The current medium (for Beer-Lambert absorption and the exterior IOR at the
         // next interface) is the highest-priority entry (Schmidt & Budge 2002). Replaces
@@ -4303,7 +4303,7 @@ struct Renderer {
                     if (!(adj > 0.0)) { e.absorbed += beta; return; }
                     e.absorbed += beta * (1.0 - adj);
                     beta *= adj;
-                    if (!continueAlong(h, o, Lobe::Reflect, ray)) { e.absorbed += beta; return; }
+                    if (!continueAlong(h, o, Lobe::Reflect, ray, scene.eps)) { e.absorbed += beta; return; }
                     // A clearcoat reflection is a mirror lobe: it focuses when tight (the
                     // highlight a polished coat throws IS a caustic), scatters when rough, and
                     // when it took the multiple scattering's branch (a manual coat's), which keeps
@@ -4529,7 +4529,7 @@ struct Renderer {
                         }
                         Vec3 wo;
                         beta *= diffuseContinuation(h, ngo, wi, rng, wo);
-                        if (!continueAlong(h, wo, Lobe::Reflect, ray)) { e.absorbed += beta; return; }
+                        if (!continueAlong(h, wo, Lobe::Reflect, ray, scene.eps)) { e.absorbed += beta; return; }
                         coatContinue(scene, m, h, wi, wo, lambda, beta, e);
                         continue;
                     } else if (u < sum) {
@@ -4539,7 +4539,7 @@ struct Renderer {
                         }
                         Vec3 wo;
                         beta *= diffuseContinuation(h, ngo, wi, rng, wo, /*transmit=*/true);
-                        if (!continueAlong(h, wo, Lobe::Transmit, ray)) { e.absorbed += beta; return; }
+                        if (!continueAlong(h, wo, Lobe::Transmit, ray, scene.eps)) { e.absorbed += beta; return; }
                         coatContinue(scene, m, h, wi, wo, lambda, beta, e);
                         continue;
                     }
@@ -4609,7 +4609,7 @@ struct Renderer {
                     }
                     Vec3 wo;
                     beta *= diffuseContinuation(h, ngo, wi, rng, wo);
-                    if (!continueAlong(h, wo, Lobe::Reflect, ray)) { e.absorbed += beta; return; }
+                    if (!continueAlong(h, wo, Lobe::Reflect, ray, scene.eps)) { e.absorbed += beta; return; }
                     coatContinue(scene, m, h, wi, wo, lambda, beta, e);
                     continue;
                 }
@@ -4741,7 +4741,7 @@ struct Renderer {
             camSpecularSplatAllHero(scene, cams, nCam, 0, origin, emitN, emitN, nullptr, lam, beta, rhoOne, C, rng, plane);
         }
 
-        Ray ray{origin + dir * 1e-6, dir};
+        Ray ray{origin + dir * scene.eps, dir};
         // dielectric priority (Beer-Lambert uses hero λ), born inside its enclosing solids
         MediumStack stk = scene.birthStack(ei, -1, ray.o);
         tracePhotonHeroLoop(scene, cams, nCam, sensorFilm, ray, stk, lam, beta,
@@ -4950,7 +4950,7 @@ struct Renderer {
                     const double adj = glossyPhotonWeight(h, ray.d * -1.0, o, wC);
                     if (!(adj > 0.0)) { e.absorbed += activeSum(); return; }
                     for (int i = 0; i < nUp; ++i) { e.absorbed += beta[i] * (1.0 - adj); beta[i] *= adj; }
-                    if (!continueAlong(h, o, Lobe::Reflect, ray)) { e.absorbed += activeSum(); return; }
+                    if (!continueAlong(h, o, Lobe::Reflect, ray, scene.eps)) { e.absorbed += activeSum(); return; }
                     (cr <= kCausticGlossRoughness && !msC ? sawFocus : sawScatter) = true;  // see scalar twin
                     continue;
                 }
@@ -5024,7 +5024,7 @@ struct Renderer {
                         Vec3 wo;
                         const double corr = diffuseContinuation(h, ngo, wi, rng, wo);
                         for (int i = 0; i < nUp; ++i) beta[i] *= corr;
-                        if (!continueAlong(h, wo, Lobe::Reflect, ray)) { e.absorbed += activeSum(); return; }
+                        if (!continueAlong(h, wo, Lobe::Reflect, ray, scene.eps)) { e.absorbed += activeSum(); return; }
                         coatContinueHero(scene, m, h, wi, wo, lam, beta, nUp, e);
                         continue;
                     } else if (uu < sumHero) {                    // transmit (back)
@@ -5036,7 +5036,7 @@ struct Renderer {
                         Vec3 wo;
                         const double corr = diffuseContinuation(h, ngo, wi, rng, wo, /*transmit=*/true);
                         for (int i = 0; i < nUp; ++i) beta[i] *= corr;
-                        if (!continueAlong(h, wo, Lobe::Transmit, ray)) { e.absorbed += activeSum(); return; }
+                        if (!continueAlong(h, wo, Lobe::Transmit, ray, scene.eps)) { e.absorbed += activeSum(); return; }
                         coatContinueHero(scene, m, h, wi, wo, lam, beta, nUp, e);
                         continue;
                     }
@@ -5087,9 +5087,9 @@ struct Renderer {
                         beta[i] *= w;
                     }
                     if (m.type == MatType::Mirror) {
-                        if (!continueAlong(h, reflect(ray.d, h.n), Lobe::Reflect, ray)) { e.absorbed += activeSum(); return; }
+                        if (!continueAlong(h, reflect(ray.d, h.n), Lobe::Reflect, ray, scene.eps)) { e.absorbed += activeSum(); return; }
                     } else if (m.type == MatType::Filter) {
-                        ray = Ray{h.p + ray.d * 1e-6, ray.d};      // direction unchanged
+                        ray = Ray{h.p + ray.d * scene.eps, ray.d};      // direction unchanged
                     } else {
                         const GlossyDraw gd = drawGlossy(scene, m, h, h.n, ray.d * -1.0, rng);
                         if (gd.ms) sawScatter = true;          // the multiple scattering's branch
@@ -5111,7 +5111,7 @@ struct Renderer {
                                 beta[i] *= w;
                             }
                         }
-                        if (!continueAlong(h, o, Lobe::Reflect, ray)) { e.absorbed += activeSum(); return; }
+                        if (!continueAlong(h, o, Lobe::Reflect, ray, scene.eps)) { e.absorbed += activeSum(); return; }
                     }
                     coatContinueHero(scene, m, h, waG, ray.d, lam, beta, nUp, e);
                     continue;
@@ -5218,7 +5218,7 @@ struct Renderer {
                     Vec3 wo;
                     const double corr = diffuseContinuation(h, ngo, wi, rng, wo);
                     for (int i = 0; i < nUp; ++i) beta[i] *= corr;
-                    if (!continueAlong(h, wo, Lobe::Reflect, ray)) { e.absorbed += activeSum(); return; }
+                    if (!continueAlong(h, wo, Lobe::Reflect, ray, scene.eps)) { e.absorbed += activeSum(); return; }
                     coatContinueHero(scene, m, h, wi, wo, lam, beta, nUp, e);
                     continue;
                 }
@@ -5397,7 +5397,7 @@ struct Renderer {
         st.suppressible = prioritySuppressible(m, outer, ranked);
         if (st.suppressible && !m.coatOpaque(lambda)) {                      // suppressed
             if (st.entering) stk.push(si, m.priority); else stk.popMat(si);
-            st.ray = Ray{deltaOrigin(h.p, h.ng, d), d};
+            st.ray = Ray{deltaOrigin(h.p, h.ng, d, scene.eps), d};
             st.passThrough = true;
             st.extMat = -1;
             return st;
@@ -5408,7 +5408,7 @@ struct Renderer {
             if (whitted) st.whittedWeight = o.R;
             else if (rng.uniform() >= o.R) { st.absorbed = true; return st; }
             const Vec3 out = normalize(reflect(d, o.nl));
-            st.ray = Ray{deltaOrigin(h.p, h.ng, out), out};
+            st.ray = Ray{deltaOrigin(h.p, h.ng, out, scene.eps), out};
             st.factor = st.prob = o.R;
             return st;
         }
@@ -5431,7 +5431,7 @@ struct Renderer {
                 if (st.refracted ? (dot(pert, o.nl) < 0.0) : (dot(pert, o.nl) > 0.0)) out = pert;
             }
         }
-        st.ray = Ray{deltaOrigin(h.p, h.ng, out), out};
+        st.ray = Ray{deltaOrigin(h.p, h.ng, out, scene.eps), out};
         st.factor = branchFactor(o, st.refracted);
         st.prob = branchProb(o, st.refracted);
         // Radiance over n^2 is what a ray conserves across a refraction, so a camera-side walk,
@@ -5526,7 +5526,8 @@ struct Renderer {
         return wsum;
     }
 
-    Ray gratingDiffract(const Material& m, const Hit& h, const Vec3& din,
+    // `eps`: the scene's self-intersection distance (Scene::eps), the diffracted ray's offset.
+    Ray gratingDiffract(const Material& m, const Hit& h, const Vec3& din, double eps,
                         double lambda, Pcg32& rng, bool& absorbed,
                         const double* whittedU = nullptr, int* pickOut = nullptr) const {
         absorbed = false;
@@ -5575,6 +5576,6 @@ struct Renderer {
         Vec3 a = ut + t * ((double)pick * lod);
         Vec3 v = a + nl * std::sqrt(std::max(0.0, 1.0 - dot(a, a)));
         v = normalize(v);
-        return Ray{h.p + nl * 1e-6, v};
+        return Ray{h.p + nl * eps, v};
     }
 };

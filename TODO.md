@@ -414,8 +414,8 @@ Then the rest of 4.2-4.6 in their order, 4.7's bookkeeping alongside whatever to
   1e-4; fixed STUBBLE-DEVICE-UNDERSIDE (check_modew_fiber's stubble case).
 - [x] **GPU-MINIATURE-SCALE** (0.448.7) — every absolute floor on the device scales with the scene
   (`c_lenScale`); the stubble ball 100x smaller renders at x1.0001 of itself (check_scale_invariance).
-- [ ] **CPU-MINIATURE-SCALE** — the host's absolute 1e-6 offsets: the same ball 100x smaller reads
-  x1.129 of itself on the CPU, tiles to x1.45 (known-issues). The scene length scale on the host.
+- [x] **CPU-MINIATURE-SCALE** (0.448.8) — the host's distances read `Scene::eps` (1e-6 x lenScale);
+  the ball 100x smaller reads x1.0022 of itself on the CPU (check_scale_invariance).
 - [x] **SPPM-LOWPASS-DEVHOST** (closed 2026-11-13) — mode S's device read check_coat_modes' coated
   balls 16 % bluer than its host at 16 passes: noise in one tile seen through the thin-film bubble;
   sixteen seeds a backend agree within 0.5 sigma.

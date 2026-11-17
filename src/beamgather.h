@@ -789,8 +789,8 @@ inline Vec3 sunNeeMarch(const Scene& scene, const Renderer& mats, const Vec3& oc
                 const double s1 = rng.uniform(), s2 = rng.uniform();
                 const Vec3 wi = em.sampleCone(em.beamDir * -1.0, s1, s2);   // toward the sun
                 const double dist = length(scene.sceneCenter - p) + scene.sceneRadius;
-                if (scene.occluded(p + wi * 1e-6, wi, dist)) continue;
-                const double Tsun = mats.mediaTransmittance(scene, p + wi * 1e-6, wi, dist, lambda, rng);
+                if (scene.occluded(p + wi * scene.eps, wi, dist)) continue;
+                const double Tsun = mats.mediaTransmittance(scene, p + wi * scene.eps, wi, dist, lambda, rng);
                 if (!(Tsun > 0.0)) continue;
                 // Light travels along -wi and leaves toward the camera along -dc: same argument
                 // the beam gather hands phaseValue (dot(b.d, -dc)).

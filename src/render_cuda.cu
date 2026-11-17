@@ -245,9 +245,9 @@ static constexpr double COORD_REL_EPS = 8.0 / 8388608.0;   // 8 float ulps of th
 static constexpr double CONN_REL_EPS  = 0.0;
 static constexpr double COORD_REL_EPS = 0.0;
 #endif
-// The scene's length scale for the device's absolute floors: min(1, S), S the largest coordinate of the
-// scene's swept bounding sphere (the host's setSceneScale, with every upload and before a held scene
-// renders). 1 for a scene of unit size or more, which keeps every floor as written; a scene smaller than
+// The scene's length scale for the device's absolute floors: Scene::lenScale, min(1, S), S the largest
+// coordinate of the scene's swept bounding sphere (the host's setSceneScale, with every upload and before
+// a held scene renders). 1 for a scene of unit size or more, which keeps every floor as written; a scene smaller than
 // that scales them with it, so it renders as the same scene drawn larger does (GPU-MINIATURE-SCALE).
 __constant__ float c_lenScale = 1.0f;
 // `absEps == 0` means "do not shorten at all": the distant-sun connection's far end is the
@@ -380,20 +380,20 @@ __device__ static inline DVec3 dOffsetPoint(const DVec3& p, const DVec3& n) {
 }
 #else
 __device__ static inline DVec3 dOffsetPoint(const DVec3& p, const DVec3& n) {
-    return p + n * RAY_EPS;
+    return p + n * (RAY_EPS * (Real)c_lenScale);
 }
 #endif
 // The fp32 device's self-intersection distance at point o: 32 float ulps of its largest coordinate, at
 // least 1e-7 times c_lenScale and at most RAY_EPS. A trace's tmin (RAY_TMIN), and the push of a ray
-// leaving a point that has no surface to clear (a medium vertex, a point light). The fp64 build's is its
-// RAY_EPS, the host's.
+// leaving a point that has no surface to clear (a medium vertex, a point light). The fp64 build's is the
+// host's Scene::eps: its RAY_EPS (1e-6) times c_lenScale, as are its offsets.
 __device__ static inline Real dEpsAt(const DVec3& o) {
 #if FTRACE_GPU_FP32
     const float m = fmaxf(fabsf(o.x), fmaxf(fabsf(o.y), fabsf(o.z)));
     return fminf(RAY_EPS, fmaxf(1e-7f * c_lenScale, 32.0f * 1.1920929e-7f * m));
 #else
     (void)o;
-    return RAY_EPS;
+    return RAY_EPS * (Real)c_lenScale;
 #endif
 }
 __device__ static inline DVec3 dOffsetAlong(const DVec3& p, const DVec3& ng, const DVec3& w) {
@@ -420,7 +420,7 @@ __device__ static inline DVec3 dOffsetSpecular(const DVec3& p, const DVec3& ng, 
     return p + w * (fabs(dot(q - p, ng)) * inv / ac);     // q's clearance, reached along w
 #else
     const Real nn = dot(ng, ng);                          // the host's deltaOrigin
-    if (nn > (Real)0 && fabs(dot(ng, w)) >= (Real)0.25 * sqrt(nn)) return p + w * RAY_EPS;
+    if (nn > (Real)0 && fabs(dot(ng, w)) >= (Real)0.25 * sqrt(nn)) return p + w * (RAY_EPS * (Real)c_lenScale);
     return dOffsetAlong(p, ng, w);
 #endif
 }
@@ -7796,15 +7796,15 @@ __device__ static inline DVec3 dFiberConnOrigin(const DHit& h, bool isHair, cons
 // leave the FAR side of a solid tube), or steps, for a caller that moves its origin instead. FP32:
 // dStrandSkip, the skip a strand's walk and shadow rays start with (dStrandStart); an absolute RAY_EPS
 // there was 2.5 radii of a hair on the near side, and a whole strand in a scene drawn small. The fp64
-// build keeps the host's: its RAY_EPS on the near side and as the chord's floor.
+// build keeps the host's: its eps (RAY_EPS times c_lenScale) on the near side and as the chord's floor.
 __device__ static inline Real dHairExitOffset(const DHairShade& s, const DVec3& n, const DVec3& w,
                                               const DVec3& p) {
 #if FTRACE_GPU_FP32
     return dStrandSkip(p, n, s.fr.x, s.radius, w);
 #else
     (void)p;
-    if (dot(n, w) >= (Real)0) return RAY_EPS;        // leaving on the arrival side
-    return fmax(RAY_EPS, dHairChordExit(s.radius, n, s.fr.x, w));   // the exact chord (0.364.0)
+    if (dot(n, w) >= (Real)0) return RAY_EPS * (Real)c_lenScale;        // leaving on the arrival side
+    return fmax(RAY_EPS * (Real)c_lenScale, dHairChordExit(s.radius, n, s.fr.x, w));   // the exact chord (0.364.0)
 #endif
 }
 
@@ -7820,8 +7820,8 @@ __device__ static inline bool dHairCamLegBlocked(const DScene& sc, const DVec3& 
     const DVec3 o = p;
     const Real tmin = dStrandEps(p, hs.radius);
 #else
-    const DVec3 o = p + wdir * (Real)RAY_EPS;          // the host's connect (render.h)
-    const Real tmin = RAY_EPS;
+    const DVec3 o = p + wdir * (RAY_EPS * (Real)c_lenScale);          // the host's connect (render.h)
+    const Real tmin = RAY_EPS * (Real)c_lenScale;
 #endif
     return occludedTo(sc, o, p + wdir * (Real)dist, 2e-6, tmin, /*camLeg=*/true, off);
 }
@@ -26052,18 +26052,11 @@ static size_t surfReqBytes() {
            ((g_jTrSpecHost && g_jChromaHost) ? 2 * DJSPEC_K * sizeof(double) : 0);
 }
 
-// gpu::c_lenScale for `scene`: min(1, S), S the largest coordinate of its swept bounding sphere, which
-// holds every primitive at every time, media included -- a hit's error is a few ulps of its primitive's
-// coordinates, all under S. Set with every upload and before a call renders a held scene (sceneOrHeld),
-// so it is always the scene's being rendered.
+// gpu::c_lenScale for `scene`: its lenScale (Scene::build), so the device's floors and the host's eps
+// scale together. Set with every upload and before a call renders a held scene (sceneOrHeld), so it is
+// always the scene's being rendered.
 static void setSceneScale(const Scene& scene) {
-    double S = 1.0;
-    if (scene.sweptRadius > 0.0) {
-        const Vec3& c = scene.sweptCenter;
-        S = std::max(std::fabs(c.x), std::max(std::fabs(c.y), std::fabs(c.z))) + scene.sweptRadius;
-        S = std::min(1.0, std::max(S, 1e-12));
-    }
-    const float lenScale = (float)S;
+    const float lenScale = (float)scene.lenScale;
     CUDA_CHECK(cudaMemcpyToSymbol(gpu::c_lenScale, &lenScale, sizeof lenScale));
 }
 

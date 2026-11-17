@@ -5814,8 +5814,15 @@ as the one at fault.
   or more keeps every floor as written; one smaller renders as the same scene drawn larger does --
   in a scene a few centimetres across 1/65536 is more than a strand's radius (GPU-MINIATURE-SCALE:
   the stubble ball in `units centimeters` renders at x1.0001 of its metre twin on the device, every
-  tile within 0.12 %; `tools/check_scale_invariance.py`). The host's absolute 1e-6 does not scale
-  yet (CPU-MINIATURE-SCALE).
+  tile within 0.12 %; `tools/check_scale_invariance.py`). The host takes the same scale from where it
+  is computed, `Scene::build`: `Scene::lenScale`, and `Scene::eps` = 1e-6 x lenScale is every host
+  self-intersection distance -- a ray's offset off its surface (`continueAlong`, `deltaOrigin`,
+  `continuationOrigin`, the BDPT/VCM `connOrigin`/`fiberOrigin`, `gratingDiffract`), a trace's tmin
+  (`Scene::kTminEps`, the default of `closestHit`, `occluded`, `shadowTransmittance`, `occludedTo`),
+  a far end's shortening (2 eps) and a strand's near-side skip (`hairExitOffset`); the helpers with no
+  scene take it as an argument. The device's `setSceneScale` reads `Scene::lenScale`, and the fp64
+  device build scales its `RAY_EPS` by it, so it stays the host's twin (CPU-MINIATURE-SCALE: the ball
+  100 times smaller read x1.13 of itself on the CPU, tiles to x1.45; now x1.0022).
   It replaced ~100 `p + n*RAY_EPS` bounce and shadow
   origins, the BDPT/VCM `ng*1e-6f` connection origins, the caustic chains' double
   `1e-6` (which the cast to float had been discarding), and the photon-birth

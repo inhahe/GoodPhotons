@@ -235,9 +235,10 @@ inline double hairChordExit(double r, const Vec3& n, const Vec3& axis, const Vec
     const double cap = 20.0 * r;
     return chord < cap ? chord : cap;
 }
-inline double hairExitOffset(const HairShade& s, const Vec3& n, const Vec3& w) {
-    if (dot(n, w) >= 0.0) return 1e-6;              // leaving on the arrival side: normal case
-    return (s.radius > 0.0) ? hairChordExit(s.radius, n, s.fr.x, w) : 1e-6;
+// `eps`: the scene's self-intersection distance (Scene::eps), the near side's skip.
+inline double hairExitOffset(const HairShade& s, const Vec3& n, const Vec3& w, double eps) {
+    if (dot(n, w) >= 0.0) return eps;               // leaving on the arrival side: normal case
+    return (s.radius > 0.0) ? hairChordExit(s.radius, n, s.fr.x, w) : eps;
 }
 
 // ---- Dual scattering (P3 stage 4) --------------------------------------------------
@@ -523,8 +524,8 @@ inline double hairDualResponse(const HairDualCtx& ctx, const HairShade& s, const
                                const Vec3& wi, double dist, bool& blockedOut) {
     blockedOut = true;
     const Scene& sc = *ctx.scene;
-    const double off = hairExitOffset(s, h.n, wi);
-    const double len = dist - off - 1e-6;
+    const double off = hairExitOffset(s, h.n, wi, sc.eps);
+    const double len = dist - off - sc.eps;
     if (!(len > 0.0)) return 0.0;
     HairShadow sh;
     const Vec3 o = h.p + wi * off;

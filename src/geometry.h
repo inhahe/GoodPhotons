@@ -198,10 +198,11 @@ struct Tri {
 // side where w grazes (|cos| < 1/4), where a step along w clears the surface by |cos| of itself and a chord
 // shorter than the step and the next trace's tmin would be skipped. The device's dOffsetSpecular keeps the
 // same rule.
-inline Vec3 deltaOrigin(const Vec3& p, const Vec3& ng, const Vec3& w) {
+// `eps` is the scene's self-intersection distance (Scene::eps).
+inline Vec3 deltaOrigin(const Vec3& p, const Vec3& ng, const Vec3& w, double eps) {
     const double c = dot(w, ng);
-    if (std::fabs(c) >= 0.25 * length(ng)) return p + w * 1e-6;
-    return p + ng * ((c >= 0.0 ? 1.0 : -1.0) * 1e-6);
+    if (std::fabs(c) >= 0.25 * length(ng)) return p + w * eps;
+    return p + ng * ((c >= 0.0 ? 1.0 : -1.0) * eps);
 }
 
 // Tri sits in the BVH's hot leaf data: a field added takes existing padding or earns its 8 bytes.
@@ -454,15 +455,15 @@ inline bool leavesWrongSide(const Vec3& w, const Vec3& ngo, Lobe lobe) {
 }
 
 // The continuation from hit h along `w`, drawn as a `lobe`: false where it leaves on the wrong
-// side (leavesWrongSide) -- the caller absorbs it -- else `ray`, its origin nudged 1e-6 off the
-// surface toward the side w leaves on: along n where n and the true normal agree about that side,
-// else along the true normal (an origin along n would start behind the surface).
-inline bool continueAlong(const Hit& h, const Vec3& w, Lobe lobe, Ray& ray) {
+// side (leavesWrongSide) -- the caller absorbs it -- else `ray`, its origin nudged `eps` (the scene's,
+// Scene::eps) off the surface toward the side w leaves on: along n where n and the true normal agree
+// about that side, else along the true normal (an origin along n would start behind the surface).
+inline bool continueAlong(const Hit& h, const Vec3& w, Lobe lobe, Ray& ray, double eps) {
     const Vec3 ngo = orientedGeoN(h);
     if (leavesWrongSide(w, ngo, lobe)) return false;
     const bool nAgrees = dot(h.n, ngo) > 0.0 && (dot(w, h.n) > 0.0) == (dot(w, ngo) > 0.0);
     const Vec3 off = nAgrees ? h.n : ngo;
-    ray = Ray{h.p + off * (dot(w, off) > 0.0 ? 1e-6 : -1e-6), w};
+    ray = Ray{h.p + off * (dot(w, off) > 0.0 ? eps : -eps), w};
     return true;
 }
 

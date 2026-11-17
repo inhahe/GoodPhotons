@@ -127,7 +127,7 @@ inline void sppmVisiblePoint(const Scene& scene, Ray ray, Pcg32& rng, bool diffr
             }
         }
         // b == 0 is the camera ray this function was handed; see Material::hideCamera.
-        Hit h = closestHitIn(scene, stk, ray, 1e-6, nullptr, /*skipHair=*/false,
+        Hit h = closestHitIn(scene, stk, ray, scene.eps, nullptr, /*skipHair=*/false,
                                          /*skipCamHidden=*/(b == 0));
         if (h.valid) {
             // Inside a dielectric whatever it absorbs at the walk's own wavelength: a glass clear
@@ -233,7 +233,7 @@ inline void sppmVisiblePoint(const Scene& scene, Ray ray, Pcg32& rng, bool diffr
                 const double r = clamp01(reflectSlot(scene, m, h, lambda));
                 thr *= r;
                 sthr.mul([&](double L) { return clamp01(reflectSlot(scene, m, h, L)); }, r);
-                if (!continueAlong(h, reflect(ray.d, h.n), Lobe::Reflect, ray)) return;   // across the surface
+                if (!continueAlong(h, reflect(ray.d, h.n), Lobe::Reflect, ray, scene.eps)) return;   // across the surface
                 break;
             }
             case MatType::Glossy: {
@@ -269,7 +269,7 @@ inline void sppmVisiblePoint(const Scene& scene, Ray ray, Pcg32& rng, bool diffr
                     gmis.from = h.p;
                     gmis.n = h.n;
                 }
-                if (!continueAlong(h, o, Lobe::Reflect, ray)) return;
+                if (!continueAlong(h, o, Lobe::Reflect, ray, scene.eps)) return;
                 contSoft = contSoftening(m, h, ray.d);
                 break;
             }
@@ -295,8 +295,8 @@ inline void sppmVisiblePoint(const Scene& scene, Ray ray, Pcg32& rng, bool diffr
             case MatType::HalfMirror: {
                 double r = clamp01(reflectSlot(scene, m, h, lambda));
                 const bool refl = rng.uniform() < r;
-                if (refl) { if (!continueAlong(h, reflect(ray.d, h.n), Lobe::Reflect, ray)) return; }
-                else      ray = Ray{h.p + ray.d * 1e-6, ray.d};
+                if (refl) { if (!continueAlong(h, reflect(ray.d, h.n), Lobe::Reflect, ray, scene.eps)) return; }
+                else      ray = Ray{h.p + ray.d * scene.eps, ray.d};
                 // The coin at each photon's wavelength: a coloured half mirror reflects each
                 // wavelength by its own reflectance.
                 const double pc = refl ? r : 1.0 - r;
@@ -310,7 +310,7 @@ inline void sppmVisiblePoint(const Scene& scene, Ray ray, Pcg32& rng, bool diffr
                 const double t = clamp01(transmitSlot(scene, m, h, lambda));
                 thr *= t;
                 sthr.mul([&](double L) { return clamp01(transmitSlot(scene, m, h, L)); }, t);
-                ray = Ray{h.p + ray.d * 1e-6, ray.d};
+                ray = Ray{h.p + ray.d * scene.eps, ray.d};
                 break;
             }
             case MatType::Hair: {
@@ -356,14 +356,14 @@ inline void sppmVisiblePoint(const Scene& scene, Ray ray, Pcg32& rng, bool diffr
                 }
                 const Vec3 wo = hair::toWorld(hs.fr, wl);
                 // TT/TRT leave through the FAR side of a real solid tube.
-                ray = Ray{h.p + wo * 1e-6, wo, hairExitOffset(hs, h.n, wo)};
+                ray = Ray{h.p + wo * scene.eps, wo, hairExitOffset(hs, h.n, wo, scene.eps)};
                 break;
             }
             default: {
                 const double r = clamp01(reflectSlot(scene, m, h, lambda));
                 thr *= r;
                 sthr.mul([&](double L) { return clamp01(reflectSlot(scene, m, h, L)); }, r);
-                if (!continueAlong(h, reflect(ray.d, h.n), Lobe::Reflect, ray)) return;   // across the surface
+                if (!continueAlong(h, reflect(ray.d, h.n), Lobe::Reflect, ray, scene.eps)) return;   // across the surface
                 break;
             }
         }

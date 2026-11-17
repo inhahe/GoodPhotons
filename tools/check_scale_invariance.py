@@ -10,9 +10,10 @@ the frame within 1 % and each live tile of a 4 x 4 grid within 3 %.
 
 A renderer's self-intersection offsets are what break this. The device skipped an absolute 1e-4 at
 the start of every trace and pushed origins by Wachter-Binder's constants for a scene of unit size,
-and in centimetres read x2.5 over its own metre render (GPU-TMIN-SCALE, GPU-MINIATURE-SCALE; every
-absolute floor now scales with the scene, c_lenScale). DEVICES lists the backends checked. Exits 1
-on failure.
+and in centimetres read x2.5 over its own metre render (GPU-TMIN-SCALE, GPU-MINIATURE-SCALE); the host
+offset everything by an absolute 1e-6, a twelfth of a strand there, and read x1.13, tiles to x1.45
+(CPU-MINIATURE-SCALE). Both now take their distances from the scene's length scale (Scene::lenScale,
+min(1, S); the device's c_lenScale). Exits 1 on failure.
 """
 import argparse
 import os
@@ -25,7 +26,7 @@ from check_modew_fiber import STUBBLE  # noqa: E402
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 NL = chr(10)
-DEVICES = ("gpu",)
+DEVICES = ("cpu", "gpu")
 SCALE = 0.01        # centimetres against metres
 SCENE = [l for l in STUBBLE if not l.startswith("light sun")]
 

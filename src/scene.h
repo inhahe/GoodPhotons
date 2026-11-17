@@ -2964,6 +2964,20 @@ struct Scene {
     // The radius of the sphere about sceneCenter that holds the swept one: what the sky's and the
     // suns' entry discs reach to for a path with a time (lightRadius).
     double sweptReach = 0.0;
+    // The scene's length scale for its self-intersection distances: min(1, S), S the farthest
+    // coordinate of the swept bounding sphere (build()). A hit's error is a few ulps of its
+    // primitive's coordinates, all under S, so a scene smaller than unit size can take
+    // proportionally smaller distances -- and must, or a 1e-6 offset is real geometry in it: a
+    // 12 um strand's twelfth (CPU-MINIATURE-SCALE). `eps` is the host's self-intersection distance,
+    // 1e-6 at unit size: every ray's offset off its surface and its tmin, a connection's far-end
+    // shortening (2 eps), a strand's near-side skip. The device scales its own floors by the same
+    // lenScale (render_cuda.cu's c_lenScale).
+    double lenScale = 1.0;
+    double eps = 1e-6;
+    // A trace's tmin as a sentinel the trace resolves to `eps` (closestHit, occluded,
+    // shadowTransmittance, occludedTo, occludedSkipHair, closestHitLinear default to it).
+    static constexpr double kTminEps = -1.0;
+    double tminOr(double tmin) const { return tmin < 0.0 ? eps : tmin; }
     // Whether the current path has a time in a moving scene, and so may meet a mover outside the
     // instant's bounding sphere.
     bool sweptQuery() const { return g_motionU >= 0.0 && hasMotion(); }
@@ -5081,6 +5095,10 @@ struct Scene {
                 sceneRadius = length(b.hi - b.lo) * 0.5 * 1.0001; // tiny margin
                 sceneBoxLo = b.lo; sceneBoxHi = b.hi;
                 sweptReach = std::max(sceneRadius, length(sweptCenter - sceneCenter) + sweptRadius);
+                const double S = std::max(std::fabs(sweptCenter.x),
+                                          std::max(std::fabs(sweptCenter.y), std::fabs(sweptCenter.z))) +
+                                 sweptRadius;
+                lenScale = std::min(1.0, std::max(S, 1e-12));
             } else {
                 // NOTHING to bound -- an environment (or a sun) and a camera, e.g. an HDR opened to
                 // look at. R = 0 gave the env (and a sun) zero phase-space weight, hence zero power,
@@ -5090,7 +5108,9 @@ struct Scene {
                 sceneCenter = Vec3{0, 0, 0};
                 sceneRadius = 1.0;
                 sweptReach = 1.0;
+                lenScale = 1.0;
             }
+            eps = 1e-6 * lenScale;
         }
         {
             double k = kJBeamDomainScale;
@@ -5518,9 +5538,10 @@ struct Scene {
     // stops there rather than searching the scene beyond it.
     // `skipCurves`: pass every curve segment, hair or not (enclosureAt, for which no strand bounds
     // anything).
-    Hit closestHit(const Ray& r, double tmin = 1e-6, TraversalStats* stats = nullptr,
+    Hit closestHit(const Ray& r, double tmin = kTminEps, TraversalStats* stats = nullptr,
                    bool skipHair = false, bool skipCamHidden = false, double tMaxIn = DBL_MAX,
                    bool skipCurves = false) const {
+        tmin = tminOr(tmin);
         ++raystats::tls;
         // Leaving a hair fiber the strand's own body is excluded by `curveTmin`, so the blanket
         // self-intersection tmin has nothing left to protect against and would only re-open the
@@ -5622,8 +5643,9 @@ struct Scene {
     // camera leg plays the part `closestHit`'s primary ray plays in a backward mode, so it
     // is where `Material::hideCamera` has to apply and the only place it may. Pass it false
     // (the default) for an NEE / light-connection segment: a hidden flat still shadows.
-    bool occluded(const Vec3& o, const Vec3& dir, double maxDist, double tmin = 1e-6,
+    bool occluded(const Vec3& o, const Vec3& dir, double maxDist, double tmin = kTminEps,
                   bool camLeg = false, double curveTmin = 0.0) const {
+        tmin = tminOr(tmin);
         ++raystats::tls;
         Ray r{o, dir, curveTmin};
         const size_t nT = tris.size();
@@ -5664,8 +5686,9 @@ struct Scene {
     // reject per fiber would also be unbiased but would put noise into every shadow, and hair
     // shadows are exactly where noise is most visible.
     double shadowTransmittance(const Vec3& o, const Vec3& dir, double maxDist,
-                               double tmin = 1e-6, double curveTmin = 0.0,
+                               double tmin = kTminEps, double curveTmin = 0.0,
                                bool camLeg = false) const {
+        tmin = tminOr(tmin);
         ++raystats::tls;
         Ray r{o, dir, curveTmin};
         const size_t nT = tris.size();
@@ -5731,7 +5754,7 @@ struct Scene {
     // stops it short of a fiber target's tube as well; the other arguments are occluded()'s.
     // Only the query is re-aimed: the estimator keeps its directions, distances and densities.
     // The device's twin is occludedTo.
-    bool occludedTo(const Vec3& o, const Vec3& target, double absEps, double tmin = 1e-6,
+    bool occludedTo(const Vec3& o, const Vec3& target, double absEps, double tmin = kTminEps,
                     bool camLeg = false, double curveTmin = 0.0, double farClear = 0.0) const {
         const Vec3 tv = target - o;
         const double td = length(tv);
@@ -5754,7 +5777,8 @@ struct Scene {
     // it stops at the first strand and reports the coat itself as a blocker. Splitting the
     // question this way is also what makes the grid pay — unlike `walkFibers`, this one CAN
     // early-out on the first opaque hit, and in a coat's own shadow it almost always does.
-    bool occludedSkipHair(const Vec3& o, const Vec3& dir, double maxDist, double tmin = 1e-6) const {
+    bool occludedSkipHair(const Vec3& o, const Vec3& dir, double maxDist, double tmin = kTminEps) const {
+        tmin = tminOr(tmin);
         ++raystats::tls;
         Ray r{o, dir};
         const size_t nT = tris.size();
@@ -5819,7 +5843,7 @@ struct Scene {
     bool walkFibers(const Vec3& o, const Vec3& dir, double maxDist, F&& onFiber,
                     int maxCrossings = 64) const {
         const Ray r{o, dir};
-        const double tmin = 1e-6;
+        const double tmin = eps;
         const double seg  = maxDist - tmin;
         if (!(seg > 0.0)) return true;
         const size_t nT = tris.size();
@@ -5952,7 +5976,8 @@ struct Scene {
     }
 
     // Linear-scan reference (pre-BVH), kept for the -checkbvh self-test.
-    Hit closestHitLinear(const Ray& r, double tmin = 1e-6) const {
+    Hit closestHitLinear(const Ray& r, double tmin = kTminEps) const {
+        tmin = tminOr(tmin);
         Hit h;
         const TriShear sh = makeTriShear(r.d);
         for (const auto& t : tris)     intersectTriNow(sh, r, t, tmin, h);
@@ -6169,7 +6194,7 @@ inline double cavityAt(const Scene& scene, const Hit& h) {
     Vec3 t, b;
     onb(n, t, b);
     // Offset along the normal by a hair to avoid re-hitting the surface we sit on.
-    const Vec3 o = h.p + n * 1e-6;
+    const Vec3 o = h.p + n * scene.eps;
     const double R = scene.cavityRadius;
     // Golden-angle spiral: the standard low-discrepancy hemisphere set, and the reason
     // a mere 16 rays already look even rather than clumped.

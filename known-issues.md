@@ -6098,7 +6098,17 @@ Fix: the WB constants scaled by the scene's coordinate magnitude (cameras includ
 1, set per upload; the pushes and floors by `dTminAt` of their point; `dHairExitOffset` as
 `dStrandStart`. Then the centimetre stubble within check_modew_fiber's bounds, and the sweep.
 
-## OPEN (2026-11-16): CPU-MINIATURE-SCALE — the host's offsets are an absolute 1e-6, which a scene drawn small outgrows
+## DONE (2026-11-17, 0.448.8): CPU-MINIATURE-SCALE — the host's offsets are an absolute 1e-6, which a scene drawn small outgrows
+
+**Fixed in 0.448.8:** `Scene::lenScale` (min(1, S), computed in `Scene::build`, the device's
+`c_lenScale` now read from it) and `Scene::eps` = 1e-6 x lenScale, which every host self-intersection
+distance reads: the offsets (`continueAlong`, `deltaOrigin`, `continuationOrigin`, `connOrigin`,
+`fiberOrigin`, `gratingDiffract`, `fireRay` take it as an argument), the trace tmins (`kTminEps`, the
+entry points' default), the far-end shortenings (2 eps) and `hairExitOffset`'s near side. A scene of
+unit size or more is unchanged (check_bitid against 0.448.7). `tools/check_scale_invariance.py` now
+holds the CPU too: x1.0022 of its metre twin, worst tile 1.07 % (was x1.129, tiles to x1.45); the
+coat in centimetres, GPU / CPU, x0.9978 (was x0.891). The fp64 device build scales its RAY_EPS by the
+same lenScale (not compiled in this change: it is a CMake option). The report as filed:
 
 The host offsets a ray off its surface by 1e-6, skips 1e-6 at the start of a trace, stops a connection
 2e-6 short and clears a strand's near side by 1e-6 -- absolute distances, in roughly 150 places
