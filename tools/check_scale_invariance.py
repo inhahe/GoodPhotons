@@ -17,32 +17,28 @@ min(1, S); the device's c_lenScale). Exits 1 on failure.
 """
 import argparse
 import os
-import subprocess
 import sys
 
-import numpy as np
-from pfm import read_pfm  # noqa: E402
-from check_modew_fiber import STUBBLE  # noqa: E402
+from check_modew_fiber import STUBBLE, compare, render_w  # noqa: E402
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 NL = chr(10)
-DEVICES = ("cpu", "gpu")
 SCALE = 0.01        # centimetres against metres
 SCENE = [l for l in STUBBLE if not l.startswith("light sun")]
+# The same ball on a ground 400 m across, so that even drawn 100 times smaller the scene reaches past
+# unit size and its scale (c_lenScale) is 1: a small object in a big scene, whose offsets are sized by
+# its own primitives' reach (DHit::pscale) or not at all. The device only: the host's floor is an
+# absolute 1e-6 in a scene of unit size or more (known-issues CPU-SMALL-IN-BIG).
+BIG = [l.replace("quad { origin -2 0 -2   u 0 0 4   v 4 0 0", "quad { origin -200 0 -200   u 0 0 400   v 400 0 0")
+       for l in SCENE]
+CASES = [("ball", SCENE, ("cpu", "gpu")), ("ball_big_ground", BIG, ("gpu",))]
 
 
-def render(exe, out, units, dev):
-    scene = os.path.join(out, "ball_%s.ftsl" % units)
+def render(exe, out, name, lines, units, dev):
+    scene = os.path.join(out, "%s_%s.ftsl" % (name, units))
     with open(scene, "w", encoding="utf-8", newline="") as f:
-        f.write(NL.join(l.replace("units meters", "units " + units) for l in SCENE) + NL)
-    png = os.path.join(out, "%s_%s.png" % (units, dev))
-    cmd = [exe, "-in", scene, "-mode", "W", "-device", dev, "-spp", "16", "-hdr", "-no-meter", "-o", png]
-    r = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
-    pfm = png[:-4] + ".pfm"
-    if r.returncode != 0 or not os.path.exists(pfm):
-        print(r.stdout[-1500:], r.stderr[-1500:])
-        raise SystemExit("render failed: " + " ".join(cmd))
-    return read_pfm(pfm, top_down=False).sum(-1)
+        f.write(NL.join(l.replace("units meters", "units " + units) for l in lines) + NL)
+    return render_w(exe, out, scene, "%s_%s_%s" % (name, units, dev), dev)
 
 
 def main():
@@ -54,20 +50,15 @@ def main():
     out = os.path.abspath(a.out)
     os.makedirs(out, exist_ok=True)
     ok = True
-    for dev in DEVICES:
-        big = render(exe, out, "meters", dev)
-        small = render(exe, out, "centimeters", dev) * SCALE ** 2
-        h, w = big.shape
-        tile = lambda v: np.array([[v[h * i // 4:h * (i + 1) // 4, w * j // 4:w * (j + 1) // 4].mean()
-                                    for j in range(4)] for i in range(4)])
-        tb, ts = tile(big), tile(small)
-        live = tb > 0.02 * tb.max()
-        worst = float(np.max(np.where(live, np.abs(ts / np.maximum(tb, 1e-30) - 1.0), 0.0)))
-        frame = float(small.mean() / max(big.mean(), 1e-30))
-        good = abs(frame - 1.0) <= 0.01 and worst <= 0.03
-        ok &= good
-        print("%s: %s, the ball drawn 100x smaller against itself: frame x%.4f, worst tile off by %.2f %%"
-              % ("ok" if good else "FAIL", dev, frame, 100.0 * worst))
+    for name, lines, devices in CASES:
+        for dev in devices:
+            big = render(exe, out, name, lines, "meters", dev)
+            small = render(exe, out, name, lines, "centimeters", dev) * SCALE ** 2
+            frame, worst = compare(small, big)
+            good = abs(frame - 1.0) <= 0.01 and worst <= 0.03
+            ok &= good
+            print("%s: %s, %s drawn 100x smaller against itself: frame x%.4f, worst tile off by %.2f %%"
+                  % ("ok" if good else "FAIL", dev, name, frame, 100.0 * worst))
     print("PASS" if ok else "FAILED")
     return 0 if ok else 1
 

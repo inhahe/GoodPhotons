@@ -12,7 +12,7 @@ take ratio / peak in float and fold the peak into the double throughput (SpecThr
 
 Modes M and S on the CPU and the GPU must write no non-finite pixel, and the floor seen through the
 glass must read mode R per colour channel, over six seeds against a reference over four: within 6 %
-or 5 standard errors -- of the channel, or of a tenth of the three together where the channel is
+or 3 standard errors of the difference -- of the channel, or of a tenth of the three together where the channel is
 smaller (the glass leaves little blue to measure). Both sides are noisy here: one seed of mode M
 spreads some 10 % a channel, and mode R, which reaches the floor through the glass only by its walk
 (no light sample crosses a dielectric), 2-4 %. On 0.433.0 GPU mode M wrote 2433 NaN pixels and mode S
@@ -46,6 +46,7 @@ CASES = [("M_gpu", ["-mode", "M", "-device", "gpu", "-n", "8000000", "-spp", "32
          ("S_gpu", ["-mode", "S", "-device", "gpu", "-spp", "64"]),
          ("S_cpu", ["-mode", "S", "-device", "cpu", "-spp", "16"])]
 TOL = 0.06
+NSIG = 3.0          # standard errors of the difference a channel may also stray by
 SEEDS, REF_SEEDS = tuple(range(1, 7)), (1, 2, 3, 4)
 
 
@@ -77,12 +78,13 @@ def main():
         bad = int(sum((~np.isfinite(im)).any(axis=-1).sum() for im in ims))
         mc, mse = chans(ims)
         q = mc / rc
-        err = np.hypot(mse, rse * mc / rc)          # of the difference, in the channel's units
-        held = [abs(mc[c] - rc[c]) <= max(TOL * max(rc[c], floor), 5.0 * err[c]) for c in range(3)]
+        err = np.hypot(mse, rse)                    # the difference's standard error
+        allow = [max(TOL * max(rc[c], floor), NSIG * err[c]) for c in range(3)]
+        held = [abs(mc[c] - rc[c]) <= allow[c] for c in range(3)]
         good = bad == 0 and all(held)
         ok &= good
-        print("%-6s non-finite px %d; through the glass, of mode R: %.3f %.3f %.3f  %s" % (
-            name, bad, q[0], q[1], q[2], "ok" if good else "FAIL"))
+        print("%-6s non-finite px %d; through the glass, of mode R: %.3f %.3f %.3f (allowed +-%.3f %.3f %.3f)  %s"
+              % (name, bad, q[0], q[1], q[2], *[allow[c] / rc[c] for c in range(3)], "ok" if good else "FAIL"))
     print("PASS" if ok else "FAIL")
     return 0 if ok else 1
 

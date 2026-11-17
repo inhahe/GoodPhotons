@@ -66,29 +66,46 @@ SEE_THROUGH = [
 ]
 
 
+def render_w(exe, out, scene, tag, dev):
+    """Render the scene file `scene` in mode W at 16 spp on `dev` to <out>/<tag>.png; its HDR image
+    summed over the channels. A stale image of the name is removed first, and a GPU render that fell
+    back to the CPU (no "-> GPU" in its log) fails: a device/host comparison would then pass against
+    itself."""
+    png = os.path.join(out, tag + ".png")
+    pfm = png[:-4] + ".pfm"
+    for f in (png, pfm):
+        if os.path.exists(f):
+            os.remove(f)
+    cmd = [exe, "-in", scene, "-mode", "W", "-device", dev, "-spp", "16", "-hdr", "-no-meter", "-o", png]
+    r = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
+    if r.returncode != 0 or not os.path.exists(pfm):
+        print(r.stdout[-1500:], r.stderr[-1500:])
+        raise SystemExit("render failed: " + " ".join(cmd))
+    if dev == "gpu" and "-> GPU" not in r.stdout + r.stderr:
+        raise SystemExit("did not run on the GPU: " + " ".join(cmd))
+    return read_pfm(pfm, top_down=False).sum(-1)
+
+
+def compare(test, ref):
+    """(frame ratio test/ref, worst relative difference over the live tiles of a 4 x 4 grid -- those
+    holding at least 2 % of ref's brightest)."""
+    h, w = ref.shape
+    tile = lambda v: np.array([[v[h * i // 4:h * (i + 1) // 4, w * j // 4:w * (j + 1) // 4].mean()
+                                for j in range(4)] for i in range(4)])
+    tt, tr = tile(test), tile(ref)
+    live = tr > 0.02 * tr.max()
+    worst = float(np.max(np.where(live, np.abs(tt / np.maximum(tr, 1e-30) - 1.0), 0.0)))
+    return float(test.mean() / max(ref.mean(), 1e-30)), worst
+
+
 def device_vs_host(exe, out, name, lines, what):
     """Render `lines` in mode W at 16 spp on the GPU and the CPU (both deterministic); True when the
     device's frame is within 1 % of the host's and each live tile of a 4 x 4 grid within 3 %."""
     scene = os.path.join(out, name + ".ftsl")
     with open(scene, "w", encoding="utf-8", newline="") as f:
         f.write(NL.join(lines) + NL)
-    img = {}
-    for dev in ("cpu", "gpu"):
-        png = os.path.join(out, "%s_%s.png" % (name, dev))
-        cmd = [exe, "-in", scene, "-mode", "W", "-device", dev, "-spp", "16", "-hdr",
-               "-no-meter", "-o", png]
-        r = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
-        pfm = png[:-4] + ".pfm"
-        if r.returncode != 0 or not os.path.exists(pfm):
-            print(r.stdout[-1500:], r.stderr[-1500:])
-            raise SystemExit("render failed: " + " ".join(cmd))
-        img[dev] = read_pfm(pfm, top_down=False).sum(-1)
-    h, w = img["cpu"].shape
-    t = {k: np.array([[v[h * i // 4:h * (i + 1) // 4, w * j // 4:w * (j + 1) // 4].mean()
-                       for j in range(4)] for i in range(4)]) for k, v in img.items()}
-    live = t["cpu"] > 0.02 * t["cpu"].max()
-    worst = float(np.max(np.where(live, np.abs(t["gpu"] / np.maximum(t["cpu"], 1e-30) - 1.0), 0.0)))
-    frame = float(img["gpu"].mean() / max(img["cpu"].mean(), 1e-30))
+    img = {dev: render_w(exe, out, scene, "%s_%s" % (name, dev), dev) for dev in ("cpu", "gpu")}
+    frame, worst = compare(img["gpu"], img["cpu"])
     good = abs(frame - 1.0) <= 0.01 and worst <= 0.03
     print("%s: mode W %s, device / host: frame x%.4f, worst tile off by %.2f %%"
           % ("ok" if good else "FAIL", what, frame, 100.0 * worst))

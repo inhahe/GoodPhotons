@@ -6005,6 +6005,50 @@ on the tank without its pool floor (this repro). Whether a transparent face shou
 the disc is a separate question, open: both backends count it (and the ball test then rejects it
 for being above the plane), so both under-read the coverage there.
 
+## DONE (2026-11-17, 0.449.1): REVIEW-0448D — the Opus (max) review of ee7c918^..9de6337 (0.448.6, 0.448.7, check_dark_glass)
+
+Ten findings; fixed in 0.449.1 unless said:
+1. **A big primitive near the origin self-intersected on the device** (0.448.6's regression): a hit's float
+   error is ulps of its primitive's coordinates, and on a ground sphere of radius 1000 under content at
+   the origin that outgrew both the push sized at the hit and the tmin that replaced the absolute 1e-4.
+   The offset helpers take the primitive's reach (`DHit::pscale`, the vertices', `DSpecVtx::reach`,
+   threaded through the splat wrappers and the connect functions): the push clears at least 4 ulps of
+   it. `tools/check_big_primitive.py`, mode W GPU / CPU on that ground: x1.0000, worst tile 0.02 %
+   (0.449.0: x0.83, 27 %).
+2. **Wachter-Binder's near-origin constants scaled with the whole scene only** (c_lenScale): they scale
+   with min(1, the primitive's reach) now. Measured smaller than the review predicted -- the stubble
+   ball 100 times smaller on a ground 400 m across reads x1.006, worst tile 1.7 %, before and after
+   (check_scale_invariance's second case, kept as a guard) -- because strands start their rays at the
+   exact point and only the skin's push was affected.
+3. **The coverage probes' relaunch from a face's exact hit, and the walks' step past a face**, could fall
+   inside that face's error near the origin: both skip `dHitEps(h)` (the larger of `dEpsAt` and 32 ulps
+   of the reach), and the walks' start off the gather site takes the site's reach (`dGatherCoverage`,
+   `DMergeFootprint::reach`).
+4. **check_modew_fiber's device/host cases did not check the device ran**: one helper (`render_w`, which
+   fails a GPU render that fell back and removes stale images), shared with check_scale_invariance.
+5. **check_dark_glass's gate was 5 standard errors of the wrong quantity** (the ratio's, rescaled): 3 of
+   the difference's now, which allows 6-8 % a channel where it allowed ~20 %; it passes.
+6. **The sphere and plane connectors' legs left a surface vertex along the leg**: off its surface now
+   (`DSpecVtx::ng`, a volume vertex by dEpsAt).
+7. *Dismissed:* connMaxT's c_lenScale under `__CUDA_ARCH__` scales the fp64 build's floor too -- right
+   since 0.448.8, whose host scales its eps alike.
+8. **A point with no surface left by two rules**: dOffsetAlong's zero normal steps by dEpsAt, and a spot,
+   sky or sun birth and the VCM light walk's delta lights pass a zero normal.
+9. **Docs**: the `dTminAt` mentions here; catchPhoton's aperture floor scales with c_lenScale.
+10. **Comments that narrated history** (RAY_TMIN, dHairExitOffset, dHairCamLegBlocked) state the
+    constraint now.
+
+## OPEN (2026-11-17): CPU-SMALL-IN-BIG — the host's eps is the scene's, so a tiny object in a big scene keeps 1e-6
+
+`Scene::eps` is 1e-6 x min(1, S) for the whole scene: in a scene of unit size or more it is 1e-6 however
+small the object a ray leaves -- a twelfth of the radius of the 12 um strands check_scale_invariance's
+second case stands on a 4 m ground (which therefore checks the device only). The device sizes its pushes
+by each primitive's reach (REVIEW-0448D). For real hair (20-40 um radius) 1e-6 is a twentieth of a radius
+or less, so only sub-hair detail in a big scene is affected. Fix: per-hit eps on the host -- the offsets
+from `Hit::pscale` (most sites have the hit), and the next trace's tmin from its origin's magnitude rather
+than the scene's `eps`, as the device's dEpsAt; a change to every CPU render near the origin, to be judged
+by check_bitid and the CPU checks.
+
 ## DONE (2026-11-17, 0.449.0): GRIN-RADIANCE-SCALE — a camera path ending inside a GRIN region misses the n^2 radiance scale
 
 **Fixed in 0.449.0, with GRIN-STRAIGHT-CONNECT:** the marcher reports (n(x_k) / n(x_k+1))^2 over its
@@ -6064,9 +6108,9 @@ photons through its aperture, bent) through the lens.
 
 **Fixed in 0.448.6:** a trace given `RAY_TMIN` (the default of closestHit, occluded, shadowTransmittance
 and occludedTo, and what every call site that passed `RAY_EPS` as a tmin now passes) resolves it from
-its origin by `dTminAt`: 32 float ulps of the origin's largest coordinate, at least 1e-7, at most
+its origin by `dEpsAt` (then `dEpsAt`): 32 float ulps of the origin's largest coordinate, at least 1e-7, at most
 `RAY_EPS` (design.md, the offset rules). The fiber shadow rays, which pushed their origin by `RAY_EPS`
-along the ray, push by `dTminAt` instead. The stubble coat below now reads x1.0000 over the GPU frame
+along the ray, push by `dEpsAt` instead. The stubble coat below now reads x1.0000 over the GPU frame
 and 1.000-1.001 in every tile (`tools/check_modew_fiber.py` has it as its third case, which 0.448.5
 fails); check_bitid against 0.448.5: every CPU case bit-identical, and on the GPU a few pixels per
 case, frame means within 0.013 % -- the paths that now meet geometry within 1e-4 of their start; the
@@ -6115,7 +6159,7 @@ device still sizes these distances absolutely:
   connections from a medium or sensor point, a point light's photon births;
 - `2 * RAY_EPS` as `connMaxT`'s floor on camera legs and some far ends, and the probes' floors.
 Fix: the WB constants scaled by the scene's coordinate magnitude (cameras included) where it is under
-1, set per upload; the pushes and floors by `dTminAt` of their point; `dHairExitOffset` as
+1, set per upload; the pushes and floors by `dEpsAt` of their point; `dHairExitOffset` as
 `dStrandStart`. Then the centimetre stubble within check_modew_fiber's bounds, and the sweep.
 
 ## DONE (2026-11-17, 0.448.8): CPU-MINIATURE-SCALE — the host's offsets are an absolute 1e-6, which a scene drawn small outgrows

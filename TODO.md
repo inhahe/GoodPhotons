@@ -405,6 +405,10 @@ Then the rest of 4.2-4.6 in their order, 4.7's bookkeeping alongside whatever to
   2613698..b004c3b: the J/U probe stops on glossy faces (check_merge_glossy), solid faces marked for
   J/U (check_merge_base's tower), roughness patterns reach 2 (check_rough_range), and the cleanups;
   known-issues REVIEW-0445. The lane-0 probes: WARP-PROBES (0.445.9), 2.0-2.2x -> 1.16-1.24x.
+- [x] **REVIEW-0448D** (0.449.1) — the Opus (max) review of 0.448.6-0.448.7: big primitives near the
+  origin (check_big_primitive), per-primitive offsets, probe tmins, tool gates (known-issues).
+- [ ] **CPU-SMALL-IN-BIG** — the host's eps is the scene's: a tiny object in a big scene keeps 1e-6
+  (known-issues). Per-hit eps on the host.
 - [x] **GRIN-RADIANCE-SCALE** (0.449.0) — radiance over n² along a camera walk's march.
 - [x] **GRIN-STRAIGHT-CONNECT** (0.449.0) — no straight connection crosses a bending region; mode R
   matches mode B outside the lens and mode C through it (check_grin_connect).
