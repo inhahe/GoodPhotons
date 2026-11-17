@@ -77,6 +77,7 @@ material "pale"  { type diffuse reflect rgb 0.8 0.8 0.8 }
 material "dark"  { type diffuse reflect rgb 0.05 0.05 0.05 }
 material "floor" { type mix  layer "pale" 0.5  layer "dark" 0.5  weight_map pattern:p }
 material "glow"  { type diffuse  reflect 0.0  emit blackbody 6500  emit_map pattern:p }
+material "glowc" { type diffuse  reflect 0.0  emit blackbody 6500  emit_map pattern:p  glow_only on }
 light area { %s  u 1 0 0  v 0 0 1  normal 0 -1 0  spd preset:bb6500 }
 camera "top" { %s  film { res %d %d } }
 ''' % (expr, lamp, cam, RES, RES)
@@ -90,8 +91,10 @@ FLOOR_REF = {'quad': 'quad', 'instance': 'quad', 'turned': 'quad', 'upright': 'q
 FLOORS = tuple(FLOOR_REF)
 # The glowing surfaces: each '<name>' (emit_map the step) against '<name>_one' (emit_map 1).
 SPHERE = 'sphere { center 0 0 0  radius 0.5  material glow }'
-# Long enough that its end balls, on which the step reads inside, stay out of the 1.2 m field.
-TUBE_BODY = 'curve { material glow  basis linear  radius 0.5  point -4 0 0  point 4 0 0 }'
+# Long enough that its end balls, on which the step reads inside, stay out of the 1.2 m field. A strand
+# emits only as a glow (no emitter samples one; the loader refuses another): `glow_only`, which the
+# camera sees as it sees the others.
+TUBE_BODY = 'curve { material glowc  basis linear  radius 0.5  point -4 0 0  point 4 0 0 }'
 GLOW = {
     'sphere': (RADIAL, SPHERE, NEAR_CAM),
     'sphere_far': (RADIAL, SPHERE, FAR_CAM),
