@@ -5821,12 +5821,14 @@ as the one at fault.
   ball, so a ray held by total internal reflection slid under the critical angle within a few
   dozen reflections and left (GPU-TIR-DRIFT: GPU mode R read the edges of an off-centre inside
   eye's view 22 % over the CPU at 64 bounces, the column at the band's edge three times; now
-  1.001). Grazing (|cos| < 1/4), where the step along the ray would run long, it is
-  `dOffsetAlong`'s; the fp64 build takes the host's `p + w*1e-6`. The bidirectional walks
-  (modes D, J and U), which build their continuation's origin after the lobe is chosen, start
-  every delta continuation the same way on both devices (`continuationOrigin` in bdpt.h, which
-  vcm.h shares; `delta ? dOffsetSpecular : dOffsetAlong` on the device) -- the host's had pushed
-  1e-6 along the normal, which a small ball's radius makes a drift of its own. A mirror's
+  1.001). Grazing (|cos| < 1/4) it is `dOffsetAlong`'s: a step along the ray clears the surface
+  by |cos| of itself, and a chord shorter than the step and the next trace's tmin would be
+  skipped. The host keeps the same rule in one place, `deltaOrigin` (geometry.h), for mode R's
+  `interfaceStep` and the bidirectional walks' `continuationOrigin`, and the fp64 device build
+  takes the host's offset under it. The bidirectional walks (modes D, J and U), which build their
+  continuation's origin after the lobe is chosen, start every delta continuation by it on both
+  devices (`delta ? dOffsetSpecular : dOffsetAlong` on the device) -- the host's had pushed 1e-6
+  along the normal, which a small ball's radius makes a drift of its own. A mirror's
   reflection keeps the push (`dContinueAlong`): a closed mirror has no critical angle to cross,
   so the drift only bends where its deep reflections go, by milliradians.
   **A scale-correct origin push breaks an invariant the old code relied on**, and the first
@@ -11028,7 +11030,7 @@ fourfold steps are the deep chain's: (1 - R) R^c reaches the floor only in a ban
 17-128's weight without them and 90 % with them (eye 0.8 of the radius off the centre). A ladder takes
 the place of the fixed samples within L of its end, and the fixed samples beyond the ends, which no ray
 of the chains meets (behind the silhouette, or where every ray is turned back), are skipped, so an eye
-inside off the centre scans 93 samples where the fixed ones alone were 100 (0.8 of the radius). A 2D model of the scan, against one of 10^5 samples, finds 99.99 % of the
+inside off the centre scans 93 samples where the fixed ones alone are 97 (0.8 of the radius). A 2D model of the scan, against one of 10^5 samples, finds 99.99 % of the
 images' weight with the ladders and 97.6 % without (vertices at 3 radii). Each chain's miss is the
 signed distance of the vertex from the line of its last leg -- the line, so a vertex close to the sphere,
 ahead of the leg over too narrow a span, is still bracketed; a sign change between two valid samples

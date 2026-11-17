@@ -298,6 +298,7 @@ Then the rest of 4.2-4.6 in their order, 4.7's bookkeeping alongside whatever to
   where walks start (tube lights, `-no-env`, open sheets, mixes, strands, the device's cap), the
   legs left unabsorbed (mode C, M's glossy NEE, `-rgb`, a glow seen, a camera in a glass ball,
   `-radcache`, `-herosplit`), flat mirror planes; known-issues REVIEW-0445B.
+- [x] **REVIEW-0448C** (0.448.5) — the Opus (xhigh) review of 0.448.4; known-issues REVIEW-0448C.
 - [x] **REVIEW-0448B** (0.448.4) — the Opus (max) and Fable (xhigh) reviews of 0.448.1-0.448.3;
   known-issues REVIEW-0448B.
 - [x] **REVIEW-0448** (0.448.1) — the Opus (max) and Fable (xhigh) reviews of 0.447.2-0.448.0;
@@ -309,8 +310,8 @@ Then the rest of 4.2-4.6 in their order, 4.7's bookkeeping alongside whatever to
   the sphere connections into a kernel of their own (known-issues).
 - [x] **MODEB-SPHERE-ROOM** (0.448.1) — the check's depth cap, which mode R counts the ball's events
   against and mode B's connection did not (known-issues).
-- [ ] **MODEM-BALL-LAMP** — mode M reads the lamp's surroundings seen from a glass ball's centre 3 %
-  dark, whatever its photons and radius (known-issues).
+- [x] **MODEM-BALL-LAMP** (no change) — the lamp's edge pixels' coverage noise at 64 spp, the same
+  two seeds' camera samples in every run (known-issues).
 - [x] **GPU-TIR-DRIFT** (0.448.2) — on the GPU a ray held inside a glass ball by total internal
   reflection drifted out, its origin pushed inward at each reflection (known-issues).
 - [x] **MODEB-DEPTH-CONNECT** (0.448.3) — mode B's specular connections count their vertices against

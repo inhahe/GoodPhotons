@@ -191,6 +191,19 @@ struct Tri {
         }
     }
 };
+// A delta continuation's origin off surface point p (`ng` its geometric normal, either orientation; `w` the
+// unit direction it leaves in -- a dielectric's reflection or refraction, a mirror's, a pass-through): along
+// w, so the ray keeps its line, a sphere's chords keeping r sin(theta), which an origin pushed along the
+// normal would shrink by the push's share of the radius at every reflection; but along the normal to w's
+// side where w grazes (|cos| < 1/4), where a step along w clears the surface by |cos| of itself and a chord
+// shorter than the step and the next trace's tmin would be skipped. The device's dOffsetSpecular keeps the
+// same rule.
+inline Vec3 deltaOrigin(const Vec3& p, const Vec3& ng, const Vec3& w) {
+    const double c = dot(w, ng);
+    if (std::fabs(c) >= 0.25 * length(ng)) return p + w * 1e-6;
+    return p + ng * ((c >= 0.0 ? 1.0 : -1.0) * 1e-6);
+}
+
 // Tri sits in the BVH's hot leaf data: a field added takes existing padding or earns its 8 bytes.
 static_assert(sizeof(Tri) == 328, "Tri changed size");
 

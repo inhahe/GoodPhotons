@@ -2376,8 +2376,8 @@ struct Renderer {
     // A ladder's offsets in from its end at span L, ascending, into `o`; their count.
     static int sphLadderOffsets(double L, double* o) {
         int k = 0;
-        o[k++] = 1e-5;
-        for (double g = 4e-5; g < L / 36.0 && k < 4; g *= 4.0) o[k++] = g;
+        o[k++] = std::min(1e-5, L / 72.0);                // (ascending, however narrow the span)
+        for (double g = 4.0 * o[0]; g < L / 36.0 && k < 4; g *= 4.0) o[k++] = g;
         for (int j = 1; j <= 5; ++j) o[k++] = L * (double)(j * j) / 36.0;
         return k;
     }
@@ -2405,37 +2405,49 @@ struct Renderer {
         SphScanEnds e;
         const double dl = 1e-5, h = 2.0 * PI / kSphScanN;
         const SphLadderTab& LT = sphLadderTab();
-        // The ladder by the end at angle E (its cosine cE), its chains toward sgn, L its span.
+        // The ladder by the end at angle E (its cosine cE), its chains toward sgn, L its span, its samples in
+        // order of angle (the rungs ascend from the end, so a ladder whose chains lie below it reads them down).
         const auto ladder = [&](double E, double cE, double sgn, double L) {
             const double sE = (E < 0.0 ? -1.0 : 1.0) * std::sqrt(std::max(0.0, 1.0 - cE * cE));
-            double off[kSphLadder];
-            const int nr = L == h ? LT.n : sphLadderOffsets(L, off);
-            for (int j = 0; j < nr; ++j) {
-                double o, co, so;
-                if (L == h) { o = LT.o[j]; co = LT.c[j]; so = LT.s[j]; }
-                else { o = off[j]; co = std::cos(o); so = std::sin(o); }
-                so *= sgn;                                       // E + sgn o
-                e.phi[e.n] = E + sgn * o; e.t[e.n] = E + sgn * std::sqrt(o * L);
-                e.c[e.n] = cE * co - sE * so; e.s[e.n] = sE * co + cE * so; ++e.n;
+            double off[kSphLadder], oc[kSphLadder], os[kSphLadder];
+            const double *o = LT.o, *co = LT.c, *so = LT.s;
+            int nr = LT.n;
+            if (L != h) {
+                nr = sphLadderOffsets(L, off);
+                for (int j = 0; j < nr; ++j) { oc[j] = std::cos(off[j]); os[j] = std::sin(off[j]); }
+                o = off; co = oc; so = os;
+            }
+            assert(e.n + nr <= 4 * kSphLadder);                   // (four ends at most)
+            for (int k = 0; k < nr; ++k) {
+                const int j = sgn > 0.0 ? k : nr - 1 - k;
+                const double sj = sgn * so[j];                     // E + sgn o
+                e.phi[e.n] = E + sgn * o[j]; e.t[e.n] = E + sgn * std::sqrt(o[j] * L);
+                e.c[e.n] = cE * co[j] - sE * sj; e.s[e.n] = sE * co[j] + cE * sj; ++e.n;
             }
         };
         if (outside) {
             const double ct = std::min(1.0, r / d), t = std::acos(ct);
             if (t > dl) {
-                const double L = std::min(h, t);
-                ladder(-t, ct, 1.0, L); ladder(t, ct, -1.0, L);
-                e.skipLo[0] = t - L;
                 // Less dense than around it: the ray from the eye meets the surface at sin(theta) = n where
                 // d^2 sin^2(phi) = n^2 (r^2 + d^2 - 2 r d cos(phi)), cos(phi0) = (n^2 r + q) / d on the front.
+                double c0 = 1.0, p0 = 0.0;
+                bool bubble = false;
                 if (n < 1.0) {
                     const double q = std::sqrt(std::max(0.0, (1.0 - n * n) * (d * d - n * n * r * r)));
-                    const double c0 = std::clamp((n * n * r + q) / d, -1.0, 1.0), p0 = std::acos(c0);
-                    if (p0 > dl && p0 < t - dl) {
-                        const double L0 = std::min(h, p0);
-                        ladder(-p0, c0, 1.0, L0); ladder(p0, c0, -1.0, L0);
-                        e.skipLo[1] = p0 - L0; e.skipHi[1] = p0;
-                    }
+                    c0 = std::clamp((n * n * r + q) / d, -1.0, 1.0); p0 = std::acos(c0);
+                    bubble = p0 > dl && p0 < t - dl;
                 }
+                // The silhouette's ladder stops short of a bubble's end, whose own ladder lies inside it, so the
+                // two never interleave (nor do their dip coordinates).
+                const double L = std::min(h, bubble ? t - p0 : t);
+                ladder(-t, ct, 1.0, L);
+                if (bubble) {
+                    const double L0 = std::min(h, p0);
+                    ladder(-p0, c0, 1.0, L0); ladder(p0, c0, -1.0, L0);
+                    e.skipLo[1] = p0 - L0; e.skipHi[1] = p0;
+                }
+                ladder(t, ct, -1.0, L);
+                e.skipLo[0] = t - L;
             }
         } else if (n > 1.0 && n * d > r) {
             // From inside, the ray to the surface point at phi meets it at theta, n sin(theta) = 1 where
@@ -2446,12 +2458,13 @@ struct Renderer {
             const double a = std::acos(ca), b = std::acos(cb);
             const bool nearArc = a > dl, farArc = b + dl < PI;
             const double La = std::min(h, a), Lb = std::min(h, PI - b);
-            if (farArc) { ladder(-b, cb, -1.0, Lb); ladder(b, cb, 1.0, Lb); }
+            if (farArc) ladder(-b, cb, -1.0, Lb);
             if (nearArc) { ladder(-a, ca, 1.0, La); ladder(a, ca, -1.0, La); }
+            if (farArc) ladder(b, cb, 1.0, Lb);
             e.skipLo[0] = nearArc ? a - La : -1.0;
             e.skipHi[0] = farArc ? b + Lb : 4.0;
         }
-        // In order of angle (a ladder's own samples are, but two ladders by close ends may interleave).
+        // In order of angle as built; the insertion sort only holds it (a comparison a sample).
         for (int i = 1; i < e.n; ++i)
             for (int k = i; k > 0 && e.phi[k] < e.phi[k - 1]; --k) {
                 std::swap(e.phi[k], e.phi[k - 1]); std::swap(e.t[k], e.t[k - 1]);
@@ -5384,7 +5397,7 @@ struct Renderer {
         st.suppressible = prioritySuppressible(m, outer, ranked);
         if (st.suppressible && !m.coatOpaque(lambda)) {                      // suppressed
             if (st.entering) stk.push(si, m.priority); else stk.popMat(si);
-            st.ray = Ray{h.p + d * 1e-6, d};
+            st.ray = Ray{deltaOrigin(h.p, h.ng, d), d};
             st.passThrough = true;
             st.extMat = -1;
             return st;
@@ -5395,7 +5408,7 @@ struct Renderer {
             if (whitted) st.whittedWeight = o.R;
             else if (rng.uniform() >= o.R) { st.absorbed = true; return st; }
             const Vec3 out = normalize(reflect(d, o.nl));
-            st.ray = Ray{h.p + out * 1e-6, out};
+            st.ray = Ray{deltaOrigin(h.p, h.ng, out), out};
             st.factor = st.prob = o.R;
             return st;
         }
@@ -5418,7 +5431,7 @@ struct Renderer {
                 if (st.refracted ? (dot(pert, o.nl) < 0.0) : (dot(pert, o.nl) > 0.0)) out = pert;
             }
         }
-        st.ray = Ray{h.p + out * 1e-6, out};
+        st.ray = Ray{deltaOrigin(h.p, h.ng, out), out};
         st.factor = branchFactor(o, st.refracted);
         st.prob = branchProb(o, st.refracted);
         // Radiance over n^2 is what a ray conserves across a refraction, so a camera-side walk,

@@ -915,16 +915,11 @@ inline void beginBeamSpectral(const Scene& scene, const Renderer& mats, const Em
     bs.ok   = true;
 }
 
-// A walk's continuation origin off surface point p (`ng` its geometric normal, either orientation;
-// `w` the unit direction it leaves in; `delta` whether a delta lobe chose it -- a dielectric's
-// reflection or refraction, a mirror's, a pass-through). A delta continuation starts along its own
-// direction, so the ray keeps its line, as mode R's interfaceStep starts it (and the device's
-// dOffsetSpecular): a push along the normal would start each chord inside a sphere by the push, and
-// r sin(theta), which a sphere's chords keep, would shrink by its share of the radius at every
-// reflection until a ray held by total internal reflection slid under the critical angle. Every other
-// lobe starts along the normal, to w's side.
+// A walk's continuation origin off surface point p (`ng` its geometric normal, either orientation; `w` the
+// unit direction it leaves in; `delta` whether a delta lobe chose it): a delta continuation's by
+// deltaOrigin, as mode R's interfaceStep starts one; every other lobe's along the normal, to w's side.
 inline Vec3 continuationOrigin(const Vec3& p, const Vec3& ng, const Vec3& w, bool delta) {
-    if (delta) return p + w * 1e-6;
+    if (delta) return deltaOrigin(p, ng, w);
     return p + ng * ((dot(w, ng) >= 0.0 ? 1.0 : -1.0) * 1e-6);
 }
 

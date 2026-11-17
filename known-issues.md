@@ -100,7 +100,17 @@ offset, 1e-6, is 30 times smaller. Every GPU walk that reflects inside a closed 
 takes the drift (modes R, M, S, D, the photon walks of B). The fix: an origin moved along the ray's
 own direction keeps its line, so where the leaving ray is not grazing the offset can be along it.
 
-## OPEN (2026-11-16): MODEM-BALL-LAMP — mode M reads the lamp's surroundings seen from a glass ball's centre 3 % dark
+## DONE (2026-11-16, no change): MODEM-BALL-LAMP — mode M reads the lamp's surroundings seen from a glass ball's centre 3 % dark
+
+**Not a bias: the lamp's edge pixels' coverage noise, the same two seeds every time.** With the walls
+black (the lamp alone, no halo) the deficit stays in the rings 4-8 px, the pixels the lamp's image only
+partly covers, and goes nowhere near its interior (1.004) -- and there mode M's 64 camera samples a
+pixel see the lamp's edge with a spread of some 4 % a seed (0.928-1.037 over seeds 3-6). Every run
+above used seeds 1 and 2, the same camera samples whatever the photons and the radius, which is why
+the 0.967 never moved. Over six seeds: 0.978 +- 0.017.
+
+The report:
+
 
 check_ball_images' inside view (the eye at the centre of a 15 cm glass ball, the lamp ahead), at
 -max-bounce 64, mode M on the CPU over mode R: the rings 4-15 px round the lamp 0.967 at 2e6 photons,
@@ -142,7 +152,8 @@ glowing, light that bounces nowhere, the cap took nothing, which is why those ca
 0.9997 (GPU), the mirror ball's 1.0029 and 0.9972, the walls from the ball's centre 1.0009 and 1.0005.
 Modes M and S, which read those walls 1.038 of mode R at 12, read them at 64 1.0004 (M, CPU) and 1.0020
 (S, GPU): the same cap. Nearer the lamp S reads 1.041 at 256 spp and 1.008 at 1024 (its shrinking
-radius); M reads 0.967 there whatever its photons and radius -- MODEM-BALL-LAMP.
+radius); M's 0.967 there is the lamp's edge pixels' noise at two seeds (MODEM-BALL-LAMP: 0.978 +- 0.017
+over six).
 
 The investigation as it stood:
 
@@ -173,6 +184,30 @@ host. The proper fix is the wavefront shape the camera side already has: queue e
 connections and run them in a kernel of their own, coherent (one thread a vertex and chain), its scan
 in fp32 where the miss's precision allows and fp64 only to refine. Until then mode B with large glass
 spheres in view renders faster with `-device cpu`.
+
+## DONE (2026-11-16, 0.448.5): REVIEW-0448C — what the Opus (xhigh) review of 0.448.4 found
+
+`/code-review xhigh` (Opus, 9 findings) of 0ee7cd2..a91ca7c, in a worktree; each checked against the
+code, all held. **Fixed in 0.448.5:**
+
+* **A bubble's ladder and the silhouette's could interleave** (n just under 1, or an eye very near a
+  bubble), their dip coordinates out of order after the sort, the fold search off where the two ends'
+  folds meet: the silhouette's ladder stops short of the bubble's end.
+* **0.448.4 started a grazing delta continuation along its direction** in the host's bidirectional
+  walks, where a chord shorter than the step and the next trace's tmin (a total internal reflection at
+  |cos| under 1e-6 / r) is skipped: one rule for every delta continuation, `deltaOrigin` (geometry.h),
+  along the ray but along the normal under |cos| 1/4 -- mode R's interfaceStep and the walks'
+  continuationOrigin by it on the host, dOffsetSpecular (fp32 and fp64) on the device.
+* **The device probe read no mover's wall:** dTimedClosest and dIntersectOtherNow report the mover's
+  triangle's bounds, a moving instance's too, to closestHit<true>, as the host's moved copies keep
+  theirs.
+* **The ladders were built out of order**, every connection's insertion sort some 230 swaps across
+  four arrays: each is built in order of angle (a ladder whose chains lie below its end reads its rungs
+  down), the sort a comparison a sample. The ladder picks its rung table once, and the ends' capacity
+  is asserted (a guard on the device); a span under 3.6e-4 had its first rung above its second
+  (sphLadderOffsets: min(1e-5, L/72)).
+* **Stale words:** continuationOrigin's claim of parity with the fp32 device, design.md's 100 fixed
+  samples (97). MODEM-BALL-LAMP, left open, was closed (noise) before the review read it.
 
 ## DONE (2026-11-16, 0.448.4): REVIEW-0448B — what the Opus (max) and Fable (xhigh) reviews of 0.448.1-0.448.3 found
 
