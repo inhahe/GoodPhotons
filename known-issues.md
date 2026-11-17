@@ -6069,7 +6069,14 @@ Ten findings; fixed in 0.449.1 unless said:
 10. **Comments that narrated history** (RAY_TMIN, dHairExitOffset, dHairCamLegBlocked) state the
     constraint now.
 
-## OPEN (2026-11-17): CPU-SMALL-IN-BIG — the host's eps is the scene's, so a tiny object in a big scene keeps 1e-6
+## DONE (2026-11-17, 0.449.3): CPU-SMALL-IN-BIG — the host's eps is the scene's, so a tiny object in a big scene keeps 1e-6
+
+**Fixed in 0.449.3:** the host's distances are taken at the point a ray leaves, `Scene::epsAt(p)` = eps
+shrunk with p's largest coordinate inside 1/16 of the origin (points farther out keep eps exactly), and a
+trace's tmin sentinel resolves from its own origin; the fp64 device build's are the same, and the fp32
+device's `dEpsAt` floor shrinks alike. check_scale_invariance's big-ground case now holds the CPU: x1.0017,
+worst tile 0.98 % (0.449.2: x1.129, 45 %), and the device x1.0001, 0.12 % (0.449.2: x1.0059, 1.7 %, the
+floor); its bounds are 0.5 % / 1.5 % now, which 0.449.2 fails on both devices. The report as filed:
 
 `Scene::eps` is 1e-6 x min(1, S) for the whole scene: in a scene of unit size or more it is 1e-6 however
 small the object a ray leaves -- a twelfth of the radius of the 12 um strands check_scale_invariance's

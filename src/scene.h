@@ -2983,7 +2983,16 @@ struct Scene {
     // A trace's tmin as a sentinel the trace resolves to `eps` (closestHit, occluded,
     // shadowTransmittance, occludedTo, occludedSkipHair, closestHitLinear default to it).
     static constexpr double kTminEps = -1.0;
-    double tminOr(double tmin) const { return tmin < 0.0 ? eps : tmin; }
+    // The self-intersection distance at point p: `eps`, shrunk with p's largest coordinate inside 1/16
+    // of the origin. In double a hit's error is ~1e-16 of its primitive's coordinates, so eps is a
+    // margin of ten decades at unit size; what it must not do is outgrow the detail of a small object
+    // in a big scene, whose `eps` (the scene's) stays 1e-6 -- a twelfth of a 12 um strand
+    // (CPU-SMALL-IN-BIG). Points 1/16 or farther from the origin keep `eps` exactly.
+    double epsAt(const Vec3& p) const {
+        const double m = std::max(std::fabs(p.x), std::max(std::fabs(p.y), std::fabs(p.z)));
+        return eps * std::min(1.0, std::max(16.0 * m, 1e-5));
+    }
+    double tminOr(double tmin, const Vec3& o) const { return tmin < 0.0 ? epsAt(o) : tmin; }
     // Whether the current path has a time in a moving scene, and so may meet a mover outside the
     // instant's bounding sphere.
     bool sweptQuery() const { return g_motionU >= 0.0 && hasMotion(); }
@@ -5549,7 +5558,7 @@ struct Scene {
     Hit closestHit(const Ray& r, double tmin = kTminEps, TraversalStats* stats = nullptr,
                    bool skipHair = false, bool skipCamHidden = false, double tMaxIn = DBL_MAX,
                    bool skipCurves = false) const {
-        tmin = tminOr(tmin);
+        tmin = tminOr(tmin, r.o);
         ++raystats::tls;
         // Leaving a hair fiber the strand's own body is excluded by `curveTmin`, so the blanket
         // self-intersection tmin has nothing left to protect against and would only re-open the
@@ -5687,7 +5696,7 @@ struct Scene {
     // cavity pattern, the gather footprint, the sky's entry past haze) rather than what light reaches.
     bool occludedGeometry(const Vec3& o, const Vec3& dir, double maxDist, double tmin = kTminEps,
                           bool camLeg = false, double curveTmin = 0.0) const {
-        tmin = tminOr(tmin);
+        tmin = tminOr(tmin, o);
         ++raystats::tls;
         Ray r{o, dir, curveTmin};
         const size_t nT = tris.size();
@@ -5731,7 +5740,7 @@ struct Scene {
                                double tmin = kTminEps, double curveTmin = 0.0,
                                bool camLeg = false) const {
         if (crossesGrin(o, dir, maxDist)) return 0.0;
-        tmin = tminOr(tmin);
+        tmin = tminOr(tmin, o);
         ++raystats::tls;
         Ray r{o, dir, curveTmin};
         const size_t nT = tris.size();
@@ -5822,7 +5831,7 @@ struct Scene {
     // early-out on the first opaque hit, and in a coat's own shadow it almost always does.
     bool occludedSkipHair(const Vec3& o, const Vec3& dir, double maxDist, double tmin = kTminEps) const {
         if (crossesGrin(o, dir, maxDist)) return true;
-        tmin = tminOr(tmin);
+        tmin = tminOr(tmin, o);
         ++raystats::tls;
         Ray r{o, dir};
         const size_t nT = tris.size();
@@ -5888,7 +5897,7 @@ struct Scene {
                     int maxCrossings = 64) const {
         if (crossesGrin(o, dir, maxDist)) return false;   // a straight segment across a bending region
         const Ray r{o, dir};
-        const double tmin = eps;
+        const double tmin = epsAt(o);
         const double seg  = maxDist - tmin;
         if (!(seg > 0.0)) return true;
         const size_t nT = tris.size();
@@ -6022,7 +6031,7 @@ struct Scene {
 
     // Linear-scan reference (pre-BVH), kept for the -checkbvh self-test.
     Hit closestHitLinear(const Ray& r, double tmin = kTminEps) const {
-        tmin = tminOr(tmin);
+        tmin = tminOr(tmin, r.o);
         Hit h;
         const TriShear sh = makeTriShear(r.d);
         for (const auto& t : tris)     intersectTriNow(sh, r, t, tmin, h);
@@ -6239,7 +6248,7 @@ inline double cavityAt(const Scene& scene, const Hit& h) {
     Vec3 t, b;
     onb(n, t, b);
     // Offset along the normal by a hair to avoid re-hitting the surface we sit on.
-    const Vec3 o = h.p + n * scene.eps;
+    const Vec3 o = h.p + n * scene.epsAt(h.p);
     const double R = scene.cavityRadius;
     // Golden-angle spiral: the standard low-discrepancy hemisphere set, and the reason
     // a mere 16 rays already look even rather than clumped.

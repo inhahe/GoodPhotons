@@ -366,16 +366,18 @@ __device__ static inline double ddot(const DVec3& a, const DVec3& b) {
 //
 // The fp64 device build keeps the CPU reference's absolute 1e-6 so it stays bit-identical.
 // The fp32 device's self-intersection distance at point o: 32 float ulps of its largest coordinate, at
-// least 1e-7 times c_lenScale and at most RAY_EPS. A trace's tmin (RAY_TMIN), and the push of a ray
+// least 1e-7 times c_lenScale -- shrunk, as the host's Scene::epsAt, with o's coordinates inside 1/16 of
+// the origin, so a small object in a big scene keeps its own -- and at most RAY_EPS. A trace's tmin (RAY_TMIN), and the push of a ray
 // leaving a point that has no surface to clear (a medium vertex, a point light). The fp64 build's is the
-// host's Scene::eps: its RAY_EPS (1e-6) times c_lenScale, as are its offsets.
+// host's Scene::epsAt: its RAY_EPS (1e-6) times c_lenScale, shrunk inside 1/16 of the origin, as are its
+// offsets.
 __device__ static inline Real dEpsAt(const DVec3& o) {
 #if FTRACE_GPU_FP32
     const float m = fmaxf(fabsf(o.x), fmaxf(fabsf(o.y), fabsf(o.z)));
-    return fminf(RAY_EPS, fmaxf(1e-7f * (float)c_lenScale, 32.0f * 1.1920929e-7f * m));
+    return fminf(RAY_EPS, fmaxf(1e-7f * fminf((float)c_lenScale, fmaxf(16.0f * m, 1e-5f)), 32.0f * 1.1920929e-7f * m));
 #else
-    (void)o;
-    return RAY_EPS * (Real)c_lenScale;
+    const double m = fmax(fabs(o.x), fmax(fabs(o.y), fabs(o.z)));   // the host's Scene::epsAt
+    return RAY_EPS * (Real)c_lenScale * fmin(1.0, fmax(16.0 * m, 1e-5));
 #endif
 }
 // A hit's float error is a few ulps of the coordinates of the primitive it lies on -- its reach,
@@ -410,7 +412,7 @@ __device__ static inline DVec3 dOffsetPoint(const DVec3& p, const DVec3& n, Real
 #else
 __device__ static inline DVec3 dOffsetPoint(const DVec3& p, const DVec3& n, Real reach = (Real)0) {
     (void)reach;
-    return p + n * (RAY_EPS * (Real)c_lenScale);
+    return p + n * dEpsAt(p);
 }
 #endif
 // A ray leaving surface point p along w: off the surface to w's side of `ng` (its geometric normal,
@@ -442,7 +444,7 @@ __device__ static inline DVec3 dOffsetSpecular(const DVec3& p, const DVec3& ng, 
     return p + w * (fabs(dot(q - p, ng)) * inv / ac);     // q's clearance, reached along w
 #else
     const Real nn = dot(ng, ng);                          // the host's deltaOrigin
-    if (nn > (Real)0 && fabs(dot(ng, w)) >= (Real)0.25 * sqrt(nn)) return p + w * (RAY_EPS * (Real)c_lenScale);
+    if (nn > (Real)0 && fabs(dot(ng, w)) >= (Real)0.25 * sqrt(nn)) return p + w * dEpsAt(p);
     return dOffsetAlong(p, ng, w, reach);
 #endif
 }
@@ -7913,9 +7915,8 @@ __device__ static inline Real dHairExitOffset(const DHairShade& s, const DVec3& 
 #if FTRACE_GPU_FP32
     return dStrandSkip(p, n, s.fr.x, s.radius, w);
 #else
-    (void)p;
-    if (dot(n, w) >= (Real)0) return RAY_EPS * (Real)c_lenScale;        // leaving on the arrival side
-    return fmax(RAY_EPS * (Real)c_lenScale, dHairChordExit(s.radius, n, s.fr.x, w));   // the exact chord (0.364.0)
+    if (dot(n, w) >= (Real)0) return dEpsAt(p);        // leaving on the arrival side
+    return fmax(dEpsAt(p), dHairChordExit(s.radius, n, s.fr.x, w));   // the exact chord (0.364.0)
 #endif
 }
 
@@ -7931,8 +7932,8 @@ __device__ static inline bool dHairCamLegBlocked(const DScene& sc, const DVec3& 
     const DVec3 o = p;
     const Real tmin = dStrandEps(p, hs.radius);
 #else
-    const DVec3 o = p + wdir * (RAY_EPS * (Real)c_lenScale);          // the host's connect (render.h)
-    const Real tmin = RAY_EPS * (Real)c_lenScale;
+    const DVec3 o = p + wdir * dEpsAt(p);          // the host's connect (render.h)
+    const Real tmin = dEpsAt(p);
 #endif
     return occludedTo(sc, o, p + wdir * (Real)dist, 2e-6, tmin, /*camLeg=*/true, off);
 }

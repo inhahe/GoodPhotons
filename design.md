@@ -5832,7 +5832,12 @@ as the one at fault.
   `continuationOrigin`, the BDPT/VCM `connOrigin`/`fiberOrigin`, `gratingDiffract`), a trace's tmin
   (`Scene::kTminEps`, the default of `closestHit`, `occluded`, `shadowTransmittance`, `occludedTo`),
   a far end's shortening (2 eps) and a strand's near-side skip (`hairExitOffset`); the helpers with no
-  scene take it as an argument. The device's `setSceneScale` reads `Scene::lenScale`, and the fp64
+  scene take it as an argument. Every one but the far ends is taken at the point the ray leaves,
+  `Scene::epsAt(p)`: eps shrunk with p's largest coordinate inside 1/16 of the origin (a trace's tmin
+  sentinel resolves from its own origin), so a small object in a big scene keeps distances its size
+  -- in double a hit's error is ~1e-16 of its primitive's coordinates, ten decades below eps at unit
+  size (CPU-SMALL-IN-BIG: the stubble ball 100 times smaller on a 4 m ground read x1.13 of itself on
+  the CPU, now x1.0017). The device's `dEpsAt` floor shrinks the same way. The device's `setSceneScale` reads `Scene::lenScale`, and the fp64
   device build scales its `RAY_EPS` by it, so it stays the host's twin (CPU-MINIATURE-SCALE: the ball
   100 times smaller read x1.13 of itself on the CPU, tiles to x1.45; now x1.0022).
   It replaced ~100 `p + n*RAY_EPS` bounce and shadow

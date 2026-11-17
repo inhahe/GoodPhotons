@@ -143,7 +143,7 @@ inline void traceGuide(const Scene& scene, const Renderer& rr, Ray ray, Vec3& al
     for (int b = 0; b < kMaxDepth; ++b) {
         // `skipCamHidden` on the camera segment only, as the renderers do: a hide_camera
         // panel is invisible straight on and visible in a reflection.
-        const Hit h = closestHitIn(scene, stk, ray, scene.eps, nullptr, /*skipHair=*/false,
+        const Hit h = closestHitIn(scene, stk, ray, Scene::kTminEps, nullptr, /*skipHair=*/false,
                                    /*skipCamHidden=*/b == 0);
         if (!h.valid) return;
         // Coloured glass: Beer-Lambert over the leg just travelled inside it.
@@ -169,9 +169,9 @@ inline void traceGuide(const Scene& scene, const Renderer& rr, Ray ray, Vec3& al
         // reflection about a tilted or tipped n that leaves behind the surface): black there.
         auto mirror = [&](const Vec3& tintHere) {
             tint = mul(tint, tintHere);
-            return continueAlong(h, normalize(reflect(ray.d, h.n)), Lobe::Reflect, ray, scene.eps);
+            return continueAlong(h, normalize(reflect(ray.d, h.n)), Lobe::Reflect, ray, scene.epsAt(h.p));
         };
-        auto passStraight = [&]() { ray = Ray{h.p + ray.d * scene.eps, ray.d}; };
+        auto passStraight = [&]() { ray = Ray{h.p + ray.d * scene.epsAt(h.p), ray.d}; };
         switch (m.type) {
             case MatType::Dielectric:
             case MatType::ThinFilm:
@@ -197,7 +197,7 @@ inline void traceGuide(const Scene& scene, const Renderer& rr, Ray ray, Vec3& al
                 // About the true normal, as gratingDiffract builds its orders: never behind it.
                 tint = mul(tint, rgbOf([&](double L) { return reflectSlot(scene, m, h, L); }));
                 const Vec3 g = orientedGeoN(h);
-                ray = Ray{h.p + g * scene.eps, normalize(reflect(ray.d, g))};
+                ray = Ray{h.p + g * scene.epsAt(h.p), normalize(reflect(ray.d, g))};
                 continue;
             }
             case MatType::HalfMirror: {
@@ -312,7 +312,7 @@ inline bool motionAovs(const Scene& scene, const Camera& cam, int W, int H, Imag
         for (int px = 0; px < W; ++px) {
             const size_t i = (size_t)py * W + px;
             const Ray r = cam.genRay(px, py, 0.5, 0.5);
-            const Hit h = scene.closestHit(r, scene.eps, nullptr, /*skipHair=*/false, /*skipCamHidden=*/true);
+            const Hit h = scene.closestHit(r, Scene::kTminEps, nullptr, /*skipHair=*/false, /*skipCamHidden=*/true);
             Vec3 pB, pF;
             if (h.valid) {
                 g.depth[i] = (float)dot(h.p - cam.eye, cam.w);
