@@ -2923,7 +2923,13 @@ struct BackwardRenderer {
                 // Radiance over n^2 along the bend, and past a bend the walk's arrival is a
                 // specular one: no light sample crosses a bending region (grin.h MarchInfo).
                 thr *= mInfo.radScale;
-                if (mInfo.bent) { specularArrival = true; gmis.clear(); }
+                // A bend after a diffuse vertex still leaves the path past it: a glow lights nothing.
+                if (mInfo.bent) {
+                    if (!specularArrival) gi.pastDiffuse = true;
+                    specularArrival = true;
+                    gmis.clear();
+                    noteFirst(gi, kFirstSpec);   // mode P: a bend first files the sample specular
+                }
             }
 
             // Which fur tier this path believes in — rolled once, on its first segment, and

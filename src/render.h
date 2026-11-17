@@ -2855,6 +2855,7 @@ struct Renderer {
                               /*skipCamHidden=*/true);
         if (!hm.valid) return false;
         if (std::fabs(hm.t - dE) > 1e-4 * (1.0 + dE)) return false;   // something in front
+        if (scene.crossesGrin(eye, wE, hm.t)) return false;           // a bending region in front
         if (hm.matId < 0 || hm.matId >= (int)scene.mats.size()) return false;
         return mirrorConnectsMat(scene.mats[hm.matId]);
     }

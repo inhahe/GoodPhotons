@@ -5441,7 +5441,7 @@ question of which *mode*:
 
 | mode | GRIN |
 |---|---|
-| `C` (forward, aperture catch), `R` (backward reference) | **full** — photons and camera rays both bend, CPU and GPU alike |
+| `C` (forward, aperture catch), `R` (backward reference) | **full** — photons and camera rays both bend, CPU and GPU alike; but in `R` (and `W`) the light a region bends reaches a surface only along a walk that marches the region and then meets the light, which no walk does for a **point, spot or sun** light: what a region bends from one renders black there, as a caustic through glass does, and ftrace says so (`[grin] note`). `B`, `M` and `S` render it |
 | `A` / `B` (forward, splatting) | the light **bends in full**, but a camera connection is a straight segment, and a straight segment across a bending region is no path: a GRIN region **seen directly renders black**, as glass seen directly does in `B` (before 0.449.0 the connection ran straight through it, so the lens was drawn as if it were not there). What lies outside the region is lit correctly, the light the region bends included |
 | `M` (photon map), `S` (SPPM) | **full** since 0.198.0 — the deposit bends the photons and the gather now bends the camera ray, including the final-gather rays and (for `M` with `-beams`) the volume estimator, which is fed the curve one Eikonal step at a time. Before 0.198.0 only the deposit marched, so a gradient lens rendered **dead flat** and nothing warned |
 | `D` (BDPT) | **refused** — its connection geometry, area-measure pdf conversion and MIS weights all assume straight segments, so a GRIN region would bias the estimator; `-on-unsupported error\|fallback\|strip` picks the policy |

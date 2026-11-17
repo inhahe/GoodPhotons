@@ -9,7 +9,10 @@ the lens, and seen directly. Mode B's photons bend through the field; mode R's l
 and must count blocked where they would cross it, the bent light arriving along its walks at full weight
 (GRIN-STRAIGHT-CONNECT). Before 0.449.0 mode R lit the corners the lens shadows straight through it:
 0.81-0.87 of B there. Also requires the lens's middle four tiles black in mode B, which cannot see
-through a bending region (a straight camera leg across one counts blocked). Exits 1 on failure.
+through a bending region (a straight camera leg across one counts blocked). And mode P on every tile
+within 3 % of mode R: its composite files a pixel seen through the lens specular, so the backward film
+shows it -- 0.449.1 filed it diffuse, drew it black and scaled every other pixel x1.40. Exits 1 on
+failure.
 """
 import argparse
 import os
@@ -47,7 +50,7 @@ def main():
     exe, out = os.path.abspath(a.exe), os.path.abspath(a.out)
     os.makedirs(out, exist_ok=True)
     scene = os.path.join(ROOT, "scenes", "_grin_lin.ftsl")
-    img = {m: render(exe, scene, os.path.join(out, "lin_%s.png" % m), m, a.secs) for m in ("R", "B")}
+    img = {m: render(exe, scene, os.path.join(out, "lin_%s.png" % m), m, a.secs) for m in ("R", "B", "P")}
     h, w = img["R"].shape
     t = {k: np.array([[v[h * i // 6:h * (i + 1) // 6, w * j // 6:w * (j + 1) // 6].mean() for j in range(6)]
                       for i in range(6)]) for k, v in img.items()}
@@ -61,6 +64,12 @@ def main():
     print(np.round(q, 3))
     print("%s: _grin_lin, mode B / mode R outside the lens: worst border tile off by %.2f %%; through the "
           "lens, B at most %.3f of R" % ("ok" if ok else "FAIL", 100.0 * worst, middle))
+    qp = t["P"] / np.maximum(t["R"], 1e-30)
+    worstP = float(np.max(np.abs(qp - 1.0)))
+    good = worstP <= 0.03
+    ok &= good
+    print("%s: mode P / mode R on every tile, the lens's included: worst off by %.2f %%"
+          % ("ok" if good else "FAIL", 100.0 * worstP))
     print("PASS" if ok else "FAILED")
     return 0 if ok else 1
 

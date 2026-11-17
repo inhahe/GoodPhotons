@@ -98,11 +98,16 @@ inline bool marchSegments(const Scene& scene, Ray& ray, SegFn&& onSeg, bool camH
             if (md.enabled && md.grin() && md.insideBound(p, &tabs)) return &md;
         return nullptr;
     };
+    // The field's index at the next step's start when the last step computed it there (`info`'s
+    // factor), so a camera march evaluates each point's index once.
+    const Medium* nNextM = nullptr;
+    double nNext = 0.0;
     for (int gstep = 0; gstep < GRIN_MAX_STEPS; ++gstep) {
         const Medium* gm = grinAt(ray.o);
-        Hit hs = scene.closestHit(ray, 1e-6, nullptr, /*skipHair=*/false, /*skipCamHidden=*/camHide);
+        Hit hs = scene.closestHit(ray, Scene::kTminEps, nullptr, /*skipHair=*/false, /*skipCamHidden=*/camHide);
         double dS = hs.valid ? hs.t : 1e30;
         if (!gm) {
+            nNextM = nullptr;   // a jump: the carried index belongs to a point behind
             // Outside any GRIN region: jump straight to the nearest GRIN entry lying
             // before the next surface, else stop marching (straight body takes over).
             double bestTa = 1e30; const Medium* bestM = nullptr;
@@ -124,10 +129,24 @@ inline bool marchSegments(const Scene& scene, Ray& ray, SegFn&& onSeg, bool camH
             continue;
         }
         double ds = gm->iorStep;
-        if (hs.valid && hs.t <= ds) return false;                // surface within a step
+        if (hs.valid && hs.t <= ds) {                            // surface within a step
+            // The straight remainder to it lies inside the region: what the walk meets there no light
+            // sample reached either (a light sample from inside counts blocked), and the field's index
+            // changes along it.
+            if (info) {
+                const Vec3 pe = ray.o + ray.d * hs.t;
+                if (gm->insideBound(pe, &tabs)) {
+                    const double n0 = gm->nAt(ray.o, &tabs), n1 = gm->nAt(pe, &tabs);
+                    if (n0 > 0.0 && n1 > 0.0) info->radScale *= (n0 / n1) * (n0 / n1);
+                }
+                info->bent = info->bent || gm->bends();
+            }
+            return false;
+        }
         // Symplectic Eikonal step with optical direction T = n·d (|T| = n):
         //   T += ∇n · ds ;  x += (T/n)·ds ;  d = T/|T|.
-        double n0 = gm->nAt(ray.o, &tabs);
+        double n0 = (nNextM == gm) ? nNext : gm->nAt(ray.o, &tabs);
+        nNextM = nullptr;
         Vec3 T = ray.d * n0 + gm->gradNAt(ray.o, 0.5 * ds, &tabs) * ds;
         Vec3 disp = (T / n0) * ds;                    // the displacement, formed exactly as
         Vec3 newPos = ray.o + disp;                   // before so the geometry is unchanged
@@ -136,20 +155,32 @@ inline bool marchSegments(const Scene& scene, Ray& ray, SegFn&& onSeg, bool camH
         // `disp` is parallel to T (n0 > 0, ds > 0), so newDir IS the travel direction of
         // this sub-segment — no separate normalisation needed.
         double segLen = std::sqrt(dot(disp, disp));
+        // The step's factor to its end is in `info` BEFORE the caller sees the step, which it may gather
+        // along (mode M's beams); one ended short by the caller takes the factor to where it ended.
+        // The factor is taken only to a point inside the region's bound: past it the field need not be
+        // defined (an index that is no index there would blow the factor up), and the boundary itself
+        // refracts nothing, so the step that leaves the region takes none.
+        const double scaleIn = info ? info->radScale : 1.0;
+        if (info) {
+            if (gm->insideBound(newPos, &tabs)) {
+                const double n1 = gm->nAt(newPos, &tabs);
+                if (n1 > 0.0) info->radScale *= (n0 / n1) * (n0 / n1);
+                nNextM = gm; nNext = n1;
+            }
+            info->bent = info->bent || gm->bends();
+        }
         double tStop = 0.0;
         if (segLen > 0.0 && onSeg(ray.o, newDir, segLen, tStop)) {
             if (info) {
-                const double n1 = gm->nAt(ray.o + newDir * tStop, &tabs);
-                if (n1 > 0.0) info->radScale *= (n0 / n1) * (n0 / n1);
-                info->bent = info->bent || gm->bends();
+                const Vec3 pe = ray.o + newDir * tStop;
+                info->radScale = scaleIn;
+                if (gm->insideBound(pe, &tabs)) {
+                    const double n1 = gm->nAt(pe, &tabs);
+                    if (n1 > 0.0) info->radScale *= (n0 / n1) * (n0 / n1);
+                }
             }
             ray = Ray{ray.o + newDir * tStop, newDir};
             return true;
-        }
-        if (info) {
-            const double n1 = gm->nAt(newPos, &tabs);
-            if (n1 > 0.0) info->radScale *= (n0 / n1) * (n0 / n1);
-            info->bent = info->bent || gm->bends();
         }
         ray = Ray{newPos, newDir};
     }

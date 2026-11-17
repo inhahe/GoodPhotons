@@ -1067,8 +1067,12 @@ inline Vec3 photonGather(const Scene& scene, const PhotonMap& pm, Ray ray, doubl
         // sub-segment start; the accumulated `thr` supplies everything before it).
         if (grinAny) {
             grin::MarchInfo mInfo;
+            double radIn = 1.0;   // the part of mInfo.radScale already in thr
             grin::marchSegments(scene, ray,
                 [&](const Vec3& so, const Vec3& sd, double slen, double&) -> bool {
+                    // This step's radiance factor before what the walk gathers along it (grin.h
+                    // MarchInfo; device twin dPhotonGather).
+                    if (mInfo.radScale != radIn) { thr *= mInfo.radScale / radIn; radIn = mInfo.radScale; }
                     if (volOn || sunOn) {
                         if (volOn && !tail) { MStatTimer _t(&mStats().beamNs, &mStats().beamN);
                           L += gatherBeams(so, sd, slen, aGlass, cmIdx); }
@@ -1093,10 +1097,10 @@ inline Vec3 photonGather(const Scene& scene, const PhotonMap& pm, Ray ray, doubl
                 // b == 0 is the camera ray; see Material::hideCamera. (photonGatherSub's
                 // march above is a final-gather sub-ray and keeps the default `false`.)
                 /*camHide=*/(b == 0), &mInfo);
-            // Radiance over n^2 along the bend, at every wavelength alike; past a bend the light
-            // the walk meets was reached by no light sample (grin.h MarchInfo).
-            thr *= mInfo.radScale;
-            sthr.mul([&](double) { return mInfo.radScale; }, mInfo.radScale);
+            // What is left of the radiance factor (the straight remainder to a surface within the
+            // last step); past a bend the light the walk meets was reached by no light sample (grin.h
+            // MarchInfo). A factor flat in wavelength leaves the spectral carrier as it is.
+            thr *= mInfo.radScale / radIn;
             if (mInfo.bent) { hairArrival = false; gmis.clear(); }
             if (thr <= 0.0) return L;
         }

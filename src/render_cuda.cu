@@ -249,7 +249,7 @@ static constexpr double COORD_REL_EPS = 0.0;
 // coordinate of the scene's swept bounding sphere (the host's setSceneScale, with every upload and before
 // a held scene renders). 1 for a scene of unit size or more, which keeps every floor as written; a scene smaller than
 // that scales them with it, so it renders as the same scene drawn larger does (GPU-MINIATURE-SCALE).
-__constant__ float c_lenScale = 1.0f;
+__constant__ double c_lenScale = 1.0;   // double: the fp64 build is the host's exact twin
 // `absEps == 0` means "do not shorten at all": the distant-sun connection's far end is the
 // scene EXIT, not a sampled surface point, so it must keep the whole segment (see the
 // shape==6 branch of the s=1 connection, which sets occlEps = 0 for exactly that reason).
@@ -372,7 +372,7 @@ __device__ static inline double ddot(const DVec3& a, const DVec3& b) {
 __device__ static inline Real dEpsAt(const DVec3& o) {
 #if FTRACE_GPU_FP32
     const float m = fmaxf(fabsf(o.x), fmaxf(fabsf(o.y), fabsf(o.z)));
-    return fminf(RAY_EPS, fmaxf(1e-7f * c_lenScale, 32.0f * 1.1920929e-7f * m));
+    return fminf(RAY_EPS, fmaxf(1e-7f * (float)c_lenScale, 32.0f * 1.1920929e-7f * m));
 #else
     (void)o;
     return RAY_EPS * (Real)c_lenScale;
@@ -396,7 +396,7 @@ __device__ static inline Real dOffsetComp(Real p, Real n, float s) {
     return (fabsf(p) < s * (1.0f / 32.0f)) ? p + (s * (1.0f / 65536.0f)) * n : pi;
 }
 __device__ static inline DVec3 dOffsetPoint(const DVec3& p, const DVec3& n, Real reach = (Real)0) {
-    const float s = (reach > 0.0f) ? fminf(1.0f, reach) : c_lenScale;
+    const float s = (reach > 0.0f) ? fminf(1.0f, reach) : (float)c_lenScale;
     DVec3 q{dOffsetComp(p.x, n.x, s), dOffsetComp(p.y, n.y, s), dOffsetComp(p.z, n.z, s)};
     const float need = 4.0f * 1.1920929e-7f * reach;
     const float nn = dot(n, n);
@@ -1190,6 +1190,11 @@ struct DEmitter {
     int    glowPrim, glowSphere;
     DVec3  glowLo, glowHi;
 };
+// Whether an emitter is a surface a photon is born on (not a spot's point, the sky's or a sun's far disc),
+// which the birth's offset and the emitter splat need.
+__device__ static inline bool dEmitterHasSurface(const DEmitter& em) {
+    return em.shape != 2 && em.shape != 3 && em.shape != 6;
+}
 
 // PBRT's IsDeltaLight (device twin of bdpt.h isDeltaEmitter): this emitter's emission
 // carries a Dirac delta, so some BDPT strategies cannot produce it and must be DROPPED
@@ -1615,6 +1620,8 @@ struct DScene {
                                // 0 keeps ordinary scenes bit-identical (march never entered).
     int              bendsAny; // 1 => some enabled medium bends rays (host Scene::bendsAny): the
                                // transport visibility queries' GRIN rule (dCrossesGrin).
+    double           lenScale; // the scene's length scale (host Scene::lenScale), which c_lenScale
+                               // carries to the kernels: dSetLenScale before every launch on it
     DVec3  sensorOrigin, sensorUAxis, sensorVAxis;   // model A contact sensor plane
     DVec3  sceneCenter;              // env (shape==3): bounding-sphere center
     double sceneRadius;              // env (shape==3): bounding-sphere radius
@@ -5712,6 +5719,8 @@ __device__ static void dGrinMarch(const DScene& sc, DVec3& ro, DVec3& rd,
     // Hoisted out of the (up to 10^5-iteration) march: three pointer copies, so an `ior`
     // field can read a MEASURED index volume (`ior "1 + grid:n(x, y, z)"`).
     const DPatEnv env = dPatEnvOf(sc);
+    int nNextM = -1;          // the medium whose index at the next step's start the last step took
+    double nNext = 0.0;       // (a camera march's factor), so each point's is evaluated once
     for (int gstep = 0; gstep < GRIN_MAX_STEPS; ++gstep) {
         DVec3 cro{px, py, pz}, crd{dx, dy, dz};   // float snapshot for the geometry queries
         // GRIN region containing ro (first enabled GRIN membership), or -1.
@@ -5721,6 +5730,7 @@ __device__ static void dGrinMarch(const DScene& sc, DVec3& ro, DVec3& rd,
             if (md.enabled && md.iorN > 0 && dMedInside(md, cro, env)) { gm = mi; break; }
         }
         if (gm < 0) {
+            nNextM = -1;   // a jump: the carried index belongs to a point behind
             // Outside any GRIN region: jump to the nearest GRIN entry before the next
             // surface, else stop (straight-ray body takes over). This branch needs the
             // full-range closest hit (dS bounds the entry search) but runs only at
@@ -5765,10 +5775,26 @@ __device__ static void dGrinMarch(const DScene& sc, DVec3& ro, DVec3& rd,
         tcap = nextafter(tcap, DBL_MAX);
 #endif
         DHit hs = closestHit(sc, cro, crd, RAY_TMIN, tcap, camHide);
-        if (hs.valid && (double)hs.t <= ds) break;   // surface within a step
+        if (hs.valid && (double)hs.t <= ds) {        // surface within a step
+            // The straight remainder to it lies inside the region (host twin grin.h): what the walk meets
+            // there no light sample reached, and the field's index changes along it.
+            if (med) {
+                med->bent = med->bent || g.bends;
+                if (med->camera) {
+                    const DVec3 pe{(Real)(px + dx * (double)hs.t), (Real)(py + dy * (double)hs.t),
+                                   (Real)(pz + dz * (double)hs.t)};
+                    if (dMedInside(g, pe, env)) {
+                        const double n0r = dMedNAt(g, cro, env), n1r = dMedNAt(g, pe, env);
+                        if (n0r > 0.0 && n1r > 0.0) med->radScale *= (n0r / n1r) * (n0r / n1r);
+                    }
+                }
+            }
+            break;
+        }
         // Symplectic Eikonal step with optical direction T = n·d (|T| = n):
         //   T += ∇n·ds ;  x += (T/n)·ds ;  d = T/|T|.
-        double n0 = dMedNAt(g, cro, env);
+        double n0 = (nNextM == gm) ? nNext : dMedNAt(g, cro, env);
+        nNextM = -1;
         DVec3 grad = dMedGradN(g, cro, 0.5 * ds, env);
         double Tx = dx * n0 + (double)grad.x * ds;
         double Ty = dy * n0 + (double)grad.y * ds;
@@ -5778,14 +5804,18 @@ __device__ static void dGrinMarch(const DScene& sc, DVec3& ro, DVec3& rd,
         double tl = sqrt(Tx * Tx + Ty * Ty + Tz * Tz);
         double ndx = dx, ndy = dy, ndz = dz;
         if (tl > 1e-12) { double s = 1.0 / tl; ndx = Tx * s; ndy = Ty * s; ndz = Tz * s; }
-        // The radiance factor of this step, to its end at `t` along the new direction.
-        const auto stepRad = [&](double t) {
+        // The radiance factor of this step, to its end at `t` along the new direction -- taken only to a
+        // point inside the region's bound (host twin grin.h: past it the field need not be defined, and
+        // the boundary refracts nothing). `full`: the step's own end, whose index the next step reuses.
+        const auto stepRad = [&](double t, bool full) {
             if (!med) return;
             med->bent = med->bent || g.bends;
             if (!med->camera) return;
             const DVec3 pe{(Real)(px + ndx * t), (Real)(py + ndy * t), (Real)(pz + ndz * t)};
+            if (!dMedInside(g, pe, env)) return;
             const double n1 = dMedNAt(g, pe, env);
             if (n1 > 0.0) med->radScale *= (n0 / n1) * (n0 / n1);
+            if (full) { nNextM = gm; nNext = n1; }
         };
         if (doMedia) {
             // The displacement is parallel to T (n0 > 0, ds > 0), so the new direction IS
@@ -5798,7 +5828,7 @@ __device__ static void dGrinMarch(const DScene& sc, DVec3& ro, DVec3& rd,
                 if (dMediaSampleCollision(sc, cro, sd, (Real)segLen, med->lambda, *med->rng,
                                           t, which, med->filt)) {
                     med->hit = true; med->which = which; med->arc += (double)t;
-                    stepRad((double)t);
+                    stepRad((double)t, false);
                     ro = DVec3{px + ndx * (double)t, py + ndy * (double)t, pz + ndz * (double)t};
                     rd = sd;
                     return;
@@ -5806,7 +5836,7 @@ __device__ static void dGrinMarch(const DScene& sc, DVec3& ro, DVec3& rd,
                 med->arc += segLen;
             }
         }
-        stepRad(sqrt(sx * sx + sy * sy + sz * sz));
+        stepRad(sqrt(sx * sx + sy * sy + sz * sz), true);
         px += sx; py += sy; pz += sz;
         dx = ndx; dy = ndy; dz = ndz;
         if (med) {
@@ -5915,7 +5945,7 @@ __device__ static bool dCrossesGrin(const DScene& sc, const DVec3& o, const DVec
         double ta, tb;
         if (!dMedClip(md, o, dir, 0.0, (double)maxDist, ta, tb)) continue;
         if (!md.bounded || md.boundShape == 0 || md.boundShape == 1) return true;
-        const double step = md.iorStep > 0.0 ? md.iorStep : (tb - ta) / 64.0;
+        const double step = fmax(md.iorStep, (tb - ta) / 64.0);   // at most 64 looks (host twin)
         for (double t = ta; t <= tb; t += step)
             if (dMedInside(md, o + dir * (Real)t, env)) return true;
         if (dMedInside(md, o + dir * (Real)tb, env)) return true;
@@ -6027,14 +6057,17 @@ __device__ static inline double dMaxAbs(const DVec3& p) {
 // pinhole: clean). The shortening also covers the float quantisation of the target's own
 // coordinates via connMaxT's coordMag term. Only the occlusion query is re-aimed; the
 // estimator's G, pdfs and directions are untouched.
+// `targetReach`: the reach of the primitive the target lies on (DHit::pscale), when it is one -- a
+// connection's far vertex: the target carries an error of ulps of it, which on a big primitive near the
+// origin outgrows ulps of the target's own coordinates.
 __device__ static inline bool occludedTo(const DScene& sc, const DVec3& o, const DVec3& target,
                                          double absEps, Real tmin = RAY_TMIN, bool camLeg = false,
-                                         Real curveTmin = (Real)0, int skipSph = -1) {
+                                         Real curveTmin = (Real)0, int skipSph = -1, Real targetReach = (Real)0) {
     DVec3 tv = target - o;
     const Real td = length(tv);
     if (!(td > (Real)0)) return false;
-    return occluded(sc, o, tv / td, connMaxT((double)td, absEps, dMaxAbs(target)), tmin, camLeg, curveTmin,
-                    skipSph);
+    return occluded(sc, o, tv / td, connMaxT((double)td, absEps, fmax(dMaxAbs(target), (double)targetReach)),
+                    tmin, camLeg, curveTmin, skipSph);
 }
 // shadowTransmittance to a sampled point, shortened as occludedTo shortens (connMaxT).
 __device__ static inline Real shadowTransmittanceTo(const DScene& sc, const DVec3& o,
@@ -8364,14 +8397,20 @@ __device__ static inline bool dOnGatherSurfaceSided(const DVec3& x, const DVec3&
 // side of the last closed solid's (+1 it ends inside, -1 outside, 0 none) and how many cannot say
 // theirs (up to 15). `eps`: how far past a face crossed it goes on from.
 struct DSegmentCrossings { int side; int open; };
-// The distance a trace that leaves hit h at exactly h.p must skip to clear its own primitive: the hit's
-// float error is a few ulps of the primitive's reach (DHit::pscale), which near the origin outgrows dEpsAt.
-__device__ static inline Real dHitEps(const DHit& h) {
+// The float error a hit on a primitive of reach `reach` (DHit::pscale) can carry: 32 ulps of it. The fp64
+// build's is far below its eps and takes none.
+__device__ static inline Real dReachEps(Real reach) {
 #if FTRACE_GPU_FP32
-    return fmax(dEpsAt(h.p), (Real)(32.0 * 1.1920929e-7) * h.pscale);
+    return (Real)(32.0 * 1.1920929e-7) * reach;
 #else
-    return dEpsAt(h.p);
+    (void)reach;
+    return (Real)0;
 #endif
+}
+// The distance a trace that leaves hit h at exactly h.p must skip to clear its own primitive, whose error
+// near the origin outgrows dEpsAt.
+__device__ static inline Real dHitEps(const DHit& h) {
+    return fmax(dEpsAt(h.p), dReachEps(h.pscale));
 }
 __device__ static DSegmentCrossings dWalkSegment(const DScene& sc, DVec3 o, const DVec3& d, Real len, Real eps) {
     DSegmentCrossings c{0, 0};
@@ -8547,13 +8586,13 @@ __device__ static inline int dGateProbes(const DScene& sc, int M) {
 // `holds`, the faces its photons lie on (DGatherHolds).
 __device__ static double dGatherCoverage(const DScene& sc, const DVec3& p, const DVec3& n,
                                          Real r, Real slack, DRng& rng, int M, Real reach,
-                                         Real fiberR = (Real)0, int holds = DGATHER_PHOTONS) {
+                                         Real fiberR, int holds = DGATHER_PHOTONS) {
     if (M <= 0 || !(r > (Real)0)) return 1.0;
     DVec3 t, b; onb(n, t, b);
     double area = 0.0;                       // in units of the full disc; 1.0 == fully covered
     int    nRej = 0;                         // probes that FOUND geometry facing the wrong way
     const int probe0 = dGateProbes(sc, M);
-    const Real pathEps = fmaxf(fmaxf((Real)1e-4 * r, (Real)2 * dEpsAt(p)), (Real)(32.0 * 1.1920929e-7) * reach);
+    const Real pathEps = fmax(fmax((Real)1e-4 * r, (Real)2 * dEpsAt(p)), dReachEps(reach));
     for (int i = 0; i < M; ++i) {
         if (i == probe0 && area >= (double)probe0 * 0.995) return 1.0;
         const DProbe o = dCoverageProbe(sc, p, n, t, b, r, slack, pathEps, rng, holds);
@@ -10512,6 +10551,9 @@ struct DSpecVtx {
     // A coated body's coat on the way out toward the first specular point (DCoatSplat), or null.
     const DCoatSplat* coat = nullptr;
     Real   reach = (Real)0;    // its primitive's reach (DHit::pscale), for its legs' origin (dOffsetAlong)
+    // The normal a leg leaves along: a surface vertex's own, none for a volume vertex (dOffsetAlong's
+    // zero normal: it steps by dEpsAt).
+    __device__ DVec3 legNormal() const { return volume ? DVec3{(Real)0, (Real)0, (Real)0} : ng.toR(); }
     // The vertex's scattering vertices on its photon path, itself among them, 0 at an emitter's own
     // point (host twin SpecVtx::depth).
     int depth = 0;
@@ -11094,7 +11136,7 @@ __device__ static void dConnectSpecularSphere(const DScene& sc, const DCamera& c
         // The legs' shadow rays skip the sphere, which in float a grazing leg's end on it rounds inside as
         // often as out (and which the legs, outside it, cannot otherwise meet).
         const DVec3 wPR = wP.toR();
-        if (occludedTo(sc, dOffsetAlong(p.toR(), vt.volume ? DVec3{(Real)0, (Real)0, (Real)0} : vt.ng.toR(), wPR, vt.reach), last.toR(), 2e-6, RAY_TMIN, false, (Real)0, sphIdx))
+        if (occludedTo(sc, dOffsetAlong(p.toR(), vt.legNormal(), wPR, vt.reach), last.toR(), 2e-6, RAY_TMIN, false, (Real)0, sphIdx))
             return true;
         DVec3 wER((Real)0, (Real)0, (Real)0);
         double dE = 0.0;
@@ -11303,6 +11345,7 @@ __device__ static bool dMirrorSeenAt(const DScene& sc, const D3& eye, const D3& 
     hm = closestHit(sc, eye.toR(), wE.toR(), RAY_TMIN, BIG, /*camHide=*/true);
     if (!hm.valid) return false;
     if (fabs((double)hm.t - dE) > 1e-4 * (1.0 + dE)) return false;   // something in front
+    if (dCrossesGrin(sc, eye.toR(), wE.toR(), hm.t)) return false;    // a bending region in front
     return dMirrorConnectsMat(sc.mats[hm.matId]);
 }
 
@@ -11376,7 +11419,7 @@ __device__ static void dConnectSpecularPlane(const DScene& sc, const DCamera& ca
     // any-hit occlusion walk is cheaper than the closest-hit that confirms the mirror,
     // so a shadowed connection never pays for the expensive query. Both tests must
     // pass and neither draws RNG, so the order is unobservable.
-    if (occludedTo(sc, dOffsetAlong(p.toR(), vt.volume ? DVec3{(Real)0, (Real)0, (Real)0} : vt.ng.toR(), wP.toR(), vt.reach), p.toR() + wP.toR() * dP, 2e-6)) return;
+    if (occludedTo(sc, dOffsetAlong(p.toR(), vt.legNormal(), wP.toR(), vt.reach), p.toR() + wP.toR() * dP, 2e-6)) return;
     DHit hm;
     // ...and the hit must be on this plane's own faces: a part's plane can coincide with another's.
     if (!dMirrorSeenAt(sc, eye, D3(0,0,0) - wRE, dE, hm) || !dMirrorClaims(sc, mp, hm)) return;
@@ -11488,7 +11531,7 @@ __device__ static void dConnectSpecularSphereMirror(const DScene& sc, const DCam
         const double D = 1.0 / sqrt(G);
 
         // The shadow ray skips the mirror (the glass connector's reason; p is on its side of it, out or in).
-        if (occludedTo(sc, dOffsetAlong(p.toR(), vt.volume ? DVec3{(Real)0, (Real)0, (Real)0} : vt.ng.toR(), wP.toR(), vt.reach), ch.P1.toR(), 2e-6, RAY_TMIN, false, (Real)0,
+        if (occludedTo(sc, dOffsetAlong(p.toR(), vt.legNormal(), wP.toR(), vt.reach), ch.P1.toR(), 2e-6, RAY_TMIN, false, (Real)0,
                        sphIdx))
             return true;
         DHit hm;
@@ -13314,7 +13357,7 @@ __device__ static bool genPhoton(const DScene& sc, const DCamSet& cs,
     // C instead catches photons that physically arrive. A spot is a point light
     // with no projected area, so it has no direct term; a distant sun's disc is at
     // infinity, so its direct view is the backend-agnostic addEnvBackground pass.
-    if (em.shape != 2 && em.shape != 3 && em.shape != 6) {
+    if (dEmitterHasSurface(em)) {
         // Emitter vertex: ns==ng==emitN, so the adjoint correction is identically 1
         // (wi is irrelevant here — pass emitN).
         // An aimed quad: rho = PI/aimNorm about the aim, gated by its face (host twin in
@@ -13326,8 +13369,7 @@ __device__ static bool genPhoton(const DScene& sc, const DCamSet& cs,
         camSpecularSplatAll(sc, cs, camMode, 0, origin, emitN, emitN, (Real)0, nullptr, lambda, beta, rhoE, rng, plane);
     }
 
-    ro = dOffsetAlong(origin, (em.shape == 2 || em.shape == 3 || em.shape == 6) ? DVec3{(Real)0, (Real)0, (Real)0}
-                                                                                : emitN, dir); rd = dir;
+    ro = dOffsetAlong(origin, dEmitterHasSurface(em) ? emitN : DVec3{(Real)0, (Real)0, (Real)0}, dir); rd = dir;
     return true;
 }
 
@@ -14248,7 +14290,7 @@ __device__ static bool genPhotonHero(const DScene& sc, const DCamSet& cs, int ca
 
     // Direct emitter->camera connection (area/quad emitters only; spot/env/sun have no
     // direct term). No-op for mode C (splat helpers skip it) and the mode-M deposit pass (nCam==0).
-    if (em.shape != 2 && em.shape != 3 && em.shape != 6) {
+    if (dEmitterHasSurface(em)) {
         const Real rhoE = em.normalTilted ? (Real)(DPI / em.aimNorm) : (Real)1;   // aimed quad
         const DVec3 face = em.normalTilted ? dAimFaceNow(sc, em) : DVec3{0, 0, 0};
         const DVec3* plane = em.normalTilted ? &face : nullptr;
@@ -14258,8 +14300,7 @@ __device__ static bool genPhotonHero(const DScene& sc, const DCamSet& cs, int ca
         camSpecularSplatAllHero(sc, cs, camMode, 0, origin, emitN, emitN, (Real)0, nullptr, lam, beta, rhoOne, nUp, rng, plane);
     }
 
-    ro = dOffsetAlong(origin, (em.shape == 2 || em.shape == 3 || em.shape == 6) ? DVec3{(Real)0, (Real)0, (Real)0}
-                                                                                : emitN, dir); rd = dir;
+    ro = dOffsetAlong(origin, dEmitterHasSurface(em) ? emitN : DVec3{(Real)0, (Real)0, (Real)0}, dir); rd = dir;
     return true;
 }
 
@@ -17735,7 +17776,13 @@ __device__ static double bkRadiance(const DScene& sc, int diffraction, DVec3 ro,
             // Radiance over n^2 along the bend; past a bend the walk's arrival is a specular one
             // (host twin backward.h, grin.h MarchInfo).
             thr *= gmed.radScale;
-            if (gmed.bent) { specularArrival = true; gmis.clear(); }
+            // A bend after a diffuse vertex still leaves the path past it: a glow lights nothing.
+            if (gmed.bent) {
+                if (!specularArrival) gi.pastDiffuse = true;
+                specularArrival = true;
+                gmis.clear();
+                dNoteFirst(gi, kDFirstSpec);   // mode P: a bend first files the sample specular
+            }
         }
         // `b == 0 && gi.depth == 0` is precisely the camera segment (the same test the O8
         // footprint stamp below uses), so it is also precisely where a `hide_camera` surface
@@ -19982,8 +20029,8 @@ __device__ static void dRandomWalk(const DScene& sc, const DCamera& cam, int dif
         // 1e-4 in FP32 -- a whole strand -- and would skip the neighbouring hair too (bdpt.h).
         curveTmin = (mp->type == D_HAIR) ? dHairChordExit(h.fiberRadius, h.n, h.tangent, rd) : (Real)0;
         ro = (curveTmin > (Real)0) ? dOffsetPoint(h.p, rd, h.pscale)
-           : delta ? dOffsetSpecular(path[cur].p, path[cur].ng, rd)      // its line kept (host twin bdpt.h)
-                   : dOffsetAlong(path[cur].p, path[cur].ng, wi);
+           : delta ? dOffsetSpecular(path[cur].p, path[cur].ng, rd, path[cur].pscale)   // its line kept (host twin bdpt.h)
+                   : dOffsetAlong(path[cur].p, path[cur].ng, wi, path[cur].pscale);
 #if FTRACE_GPU_FP32
         if (mp->type == D_HAIR && h.fiberRadius > (Real)0) {   // see dStrandStart
             const DStrandStart st = dStrandStart(h.p, h.n, h.tangent, h.fiberRadius, rd);
@@ -20757,11 +20804,12 @@ __device__ static double dConnectBDPT(const DScene& sc, const DCamera& cam,
 #if FTRACE_GPU_FP32
         if (dVertOnStrand(sc, pt)) {   // see dStrandStart
             const DStrandStart st = dStrandStart(pt.p, pt.ns, pt.tangent, pt.fiberR, w);
-            if (occludedTo(sc, st.o, pt.p + w * (Real)dist, 2e-6, st.tmin, false, st.curveTmin)) return 0.0;
+            if (occludedTo(sc, st.o, pt.p + w * (Real)dist, 2e-6, st.tmin, false, st.curveTmin, -1, qs.pscale))
+                return 0.0;
         } else
 #endif
         if (occludedTo(sc, o, pt.p + w * (Real)dist, 2e-6, RAY_TMIN, false,
-                       (pt.type == BV_MEDIUM) ? (Real)0 : dVertFiberStep(sc, pt, w))) return 0.0;
+                       (pt.type == BV_MEDIUM) ? (Real)0 : dVertFiberStep(sc, pt, w), -1, qs.pscale)) return 0.0;
         double fE, fL;
         double fESec[BDPT_NSEC], fLSec[BDPT_NSEC];
         if (pt.type == BV_MEDIUM) {
@@ -21113,7 +21161,7 @@ __device__ static double dSurfFootprint(const DScene& sc, const DSurfSite& site,
     const DMergeFootprint& fp = site.fp;
     if (!fp.on() || !(fp.r > (Real)0)) return 1.0;
     DVec3 t, b; onb(fp.n, t, b);
-    const Real pathEps = fmaxf(fmaxf((Real)1e-4 * fp.r, (Real)2 * dEpsAt(fp.p)), (Real)(32.0 * 1.1920929e-7) * fp.reach);
+    const Real pathEps = fmax(fmax((Real)1e-4 * fp.r, (Real)2 * dEpsAt(fp.p)), dReachEps(fp.reach));
     const int probe0 = dGateProbes(sc, fp.M);
     double area = 0.0;
     int nRej = 0;
@@ -21133,7 +21181,7 @@ __device__ static double dSurfFootprintWarp(const DScene& sc, const DSurfSite& s
     const DMergeFootprint& fp = site.fp;
     if (!fp.on() || !(fp.r > (Real)0)) return 1.0;
     DVec3 t, b; onb(fp.n, t, b);
-    const Real pathEps = fmaxf(fmaxf((Real)1e-4 * fp.r, (Real)2 * dEpsAt(fp.p)), (Real)(32.0 * 1.1920929e-7) * fp.reach);
+    const Real pathEps = fmax(fmax((Real)1e-4 * fp.r, (Real)2 * dEpsAt(fp.p)), dReachEps(fp.reach));
     const int probe0 = dGateProbes(sc, fp.M);
     double area = 0.0, area0 = 0.0;   // all of this lane's probes; those the early gate reads
     int nRej = 0;
@@ -22521,12 +22569,12 @@ __device__ static void dPhotonGather(const DScene& sc, const DPhotonMap& pm,
                 DGrinMedia gm;                     // rng == nullptr: bend only, no collisions
                 gm.camera = true;
                 dGrinMarch(sc, ro, rd, &gm, 1, /*camHide=*/(b == 0));  // — a camera ray's volume answer IS the
-                if (!gm.stepped) break;            //   beam gather below
-                // This step's radiance factor, at every wavelength alike, before what the walk
-                // gathers past it (host twin photonGather, grin.h MarchInfo).
+                // This step's radiance factor (or the straight remainder's, when the march stopped short
+                // of a surface), before what the walk gathers along it (host twin photonGather, grin.h
+                // MarchInfo); a factor flat in wavelength leaves the spectral carrier as it is.
                 thr *= gm.radScale;
-                sthr.mul(sc, [&](Real) { return gm.radScale; }, gm.radScale);
                 bent = bent || gm.bent;
+                if (!gm.stepped) break;            //   beam gather below
                 const Real slen = (Real)gm.arc;
                 if ((volOn || sunOn) && slen > 0) {
                     double bX = 0.0, bY = 0.0, bZ = 0.0;
@@ -23125,8 +23173,7 @@ __device__ static void dSppmVisiblePoint(const DScene& sc, DVec3 ro, DVec3 rd, R
             dGrinMarch(sc, ro, rd, &gm, 200000, /*camHide=*/(b == 0));  // rng == nullptr: bend only
             // Radiance over n^2 along the bend, at every wavelength alike; past a bend the light the
             // walk meets was reached by no light sample (host twin sppm_render.h).
-            thr *= gm.radScale;
-            sthr.mul(sc, [&](Real) { return gm.radScale; }, gm.radScale);
+            thr *= gm.radScale;   // flat in wavelength: the spectral carrier is unchanged
             if (gm.bent) strandArrival = false;
             const int cm = stk.topMat();                 // Beer-Lambert over the marched arc
             if (cm >= 0 && gm.arc > 0) {
@@ -23426,7 +23473,7 @@ __global__ void kSppmGather(DScene sc, DPhotonMap pm, DSppmState st, int resX, i
                                  + 0x5851F42D4C957F2DULL;
             DRng grng; grng.seedUnit(s, seedBase + 23);
             const double cs = dGatherAreaScale(sc.gaBias,
-                dGatherCoverage(sc, h.p, gn, (Real)R, slkS, grng, sc.gatherArea, h.fiberRadius));
+                dGatherCoverage(sc, h.p, gn, (Real)R, slkS, grng, sc.gatherArea, h.pscale, h.fiberRadius));
             gx = (float)((double)gx * cs);
             gy = (float)((double)gy * cs);
             gz = (float)((double)gz * cs);
@@ -24646,7 +24693,7 @@ __global__ void kVcmCameraT(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx
                     const DStrandStart cst{oo, RAY_TMIN, dFiberStep(h, mp->type == D_HAIR, w)};
 #endif
                     if (occludedTo(sc, cst.o, h.p + w * (Real)(distc - (double)lvStep), 2e-6, cst.tmin, false,
-                                   cst.curveTmin)) continue;
+                                   cst.curveTmin, -1, lv.pscale)) continue;
                     DVertex lvt = dVertFromLV(lv);
                     double adjLit = (double)dShadingAdjointCorr(lv.wo, w * (Real)-1, lv.ns, ngoLit);
                     // Each end a coated vertex's coat along the connection (dCoatF).
@@ -26171,12 +26218,16 @@ static size_t surfReqBytes() {
            ((g_jTrSpecHost && g_jChromaHost) ? 2 * DJSPEC_K * sizeof(double) : 0);
 }
 
-// gpu::c_lenScale for `scene`: its lenScale (Scene::build), so the device's floors and the host's eps
-// scale together. Set with every upload and before a call renders a held scene (sceneOrHeld), so it is
-// always the scene's being rendered.
+// gpu::c_lenScale, a process-wide constant, for the scene about to be rendered: its lenScale
+// (Scene::build), so the device's floors and the host's eps scale together. Set with every upload, before
+// a call renders a held scene (sceneOrHeld), and at every pass of a resident session (dSetLenScale from
+// the uploaded DScene's copy), so a scene uploaded in between cannot leave its own there.
 static void setSceneScale(const Scene& scene) {
-    const float lenScale = (float)scene.lenScale;
+    const double lenScale = scene.lenScale;
     CUDA_CHECK(cudaMemcpyToSymbol(gpu::c_lenScale, &lenScale, sizeof lenScale));
+}
+static void dSetLenScale(const gpu::DScene& sc) {
+    CUDA_CHECK(cudaMemcpyToSymbol(gpu::c_lenScale, &sc.lenScale, sizeof sc.lenScale));
 }
 
 static void buildUploadScene(const Scene& scene, DUpload& up) {
@@ -27303,6 +27354,7 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
     sc.sensorVAxis  = {scene.sensor.vAxis.x,  scene.sensor.vAxis.y,  scene.sensor.vAxis.z};
     sc.sceneCenter = {scene.sceneCenter.x, scene.sceneCenter.y, scene.sceneCenter.z};
     sc.sceneRadius = scene.sceneRadius;
+    sc.lenScale = scene.lenScale;
     sc.jBeamDomR2  = scene.jBeamDomainR2;
     // `cavity` probe settings (O3 stage 2). The host loader has already resolved the
     // radius (explicit `cavity_radius`, else 2% of the scene AABB diagonal) and the
@@ -27917,6 +27969,7 @@ SharedGpuSession* sharedForwardGpuBegin(const Scene& scene,
 void sharedForwardGpuBatch(SharedGpuSession* s, long long N,
                            unsigned long long seedBase, bool diffraction) {
     if (!s || N <= 0) return;
+    dSetLenScale(s->up.sc);
     launchForward(s->up, s->cs, s->d_energy, N, diffraction, seedBase,
                   s->wavefront, s->camModeInt, s->heroC, s->maxBounce, false, &s->d_posed,
                   &s->posedCap);
@@ -30189,6 +30242,7 @@ void backwardRGBSessionSetCamera(BackwardRGBSession* s, const Camera& cam) {
 long long backwardRGBSessionAccumulate(BackwardRGBSession* s, long long spp, bool diffraction) {
     using namespace gpu;
     if (!s || !s->haveCam || spp <= 0) return s ? s->accum : 0;
+    dSetLenScale(s->up.sc);
     const long long base = s->accum;
     const unsigned long long seed = 0x9e3779b97f4a7c15ULL
         ^ (unsigned long long)base * 0x9E3779B97F4A7C15ULL
@@ -31599,6 +31653,7 @@ SppmSession* sppmSessionBegin(const Scene& scene, const Camera& cam, int resX, i
 // emitted, so every pass is an independent photon set) into a bounded map.
 void sppmSessionPass(SppmSession* s, long long photonsPerPass, double alpha) {
     using namespace gpu;
+    dSetLenScale(s->up.sc);
     const long long passIdx = s->passes;                 // 0-based index of THIS pass
 
     // (1) Camera visible-point pass: fresh visible point + direct sample per pixel.
@@ -31963,6 +32018,7 @@ VcmSession* vcmSessionBegin(const Scene& scene, const Camera& cam, int resX, int
 // Run one VCM pass at the given merge `radius`.
 void vcmSessionPass(VcmSession* s, double radius) {
     using namespace gpu;
+    dSetLenScale(s->up.sc);
     const long long passIdx = s->passes;                 // 0-based index of THIS pass
     // Motion blur (host twin vcmPass): the whole pass -- both subpaths, their connections and
     // merges -- at one time, stratified over the passes, the camera posed there, even for a camera

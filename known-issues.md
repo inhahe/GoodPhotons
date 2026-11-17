@@ -6005,6 +6005,37 @@ on the tank without its pool floor (this repro). Whether a transparent face shou
 the disc is a separate question, open: both backends count it (and the ball test then rejects it
 for being above the plane), so both under-read the coverage there.
 
+## DONE (2026-11-17, 0.449.2): REVIEW-0449 — the Fable (xhigh) review of ee7c918^..3837004 and the Opus (xhigh) one of 9de6337..3837004
+
+Fixed in 0.449.2 (F Fable, O Opus):
+- **GPU mode S's coverage took the strand radius for the site's reach** (O; 0.449.1's own): a call with
+  the old argument count still type-checked. `dGatherCoverage`'s `fiberR` has no default now.
+- **The GPU BDPT walk's continuation passed no primitive reach** (F, O): `dRandomWalk` passes the vertex's;
+  `tools/check_big_primitive.py` adds mode D on the radius-1000 ground. A connection whose far end is a
+  vertex is shortened by that vertex's reach too (F; `occludedTo`'s `targetReach`).
+- **The GRIN rule's gaps** (F, O): mode P's composite filed a pixel seen through a bending region DIFF,
+  which its forward layer cannot draw (`classifyComposite` files it SPEC, and a sample bent before its
+  first surface notes itself specular); B's sky probe, the mirror connectors' eye leg and the
+  dual-scatter fibre walk crossed a bending region straight; a march stopping at a surface within its
+  first step was not counted bent (its light sample was blocked, so the light was lost); a bend set the
+  specular arrival before the glow rule marked the path past a diffuse vertex; host mode M took the n^2
+  factor after the march but gathered beams inside it (now per step, as the device); the host marcher's
+  own tmin was an absolute 1e-6.
+- **The factor's end point could lie outside the region** (O), where a field need not be defined: an
+  index floored to 1e-3 blew the factor up by ~1e6. It is taken only to points inside the bound.
+- **A point, spot or sun light through a bending region renders black in R and W** (F, O): as a caustic
+  through glass -- no walk meets such a light. REFERENCE.md says so and ftrace notes it (`[grin] note`).
+- **Resident GPU sessions kept whatever c_lenScale the last upload left** (F): re-set from
+  `DScene::lenScale` every pass. c_lenScale is a double, so the fp64 build is the host's exact twin (O).
+- **Cost** (F, O): `crossesGrin` looks at most 64 times along an implicit or mesh bound; a camera march
+  evaluates each point's index once (carried to the next step); the no-op `sthr.mul`s of a flat factor
+  are gone; `dReachEps`, `DSpecVtx::legNormal` and `dEmitterHasSurface` replace their copies.
+- **check_bitid's floor** (O): 1e-4 again for every GPU M/S case but the coated scene's M (3e-4).
+- **A replace garbled the GPU-TMIN-SCALE entry** (O): restored.
+- CPU-SMALL-IN-BIG (F, O: logged where the rules say fix): fixed next, 0.449.3.
+Dismissed: O's "test geometry before crossesGrin" -- the sphere and box cases cost a clip, and the
+implicit one is capped at 64 looks.
+
 ## DONE (2026-11-17, 0.449.1): REVIEW-0448D — the Opus (max) review of ee7c918^..9de6337 (0.448.6, 0.448.7, check_dark_glass)
 
 Ten findings; fixed in 0.449.1 unless said:
@@ -6108,7 +6139,7 @@ photons through its aperture, bent) through the lens.
 
 **Fixed in 0.448.6:** a trace given `RAY_TMIN` (the default of closestHit, occluded, shadowTransmittance
 and occludedTo, and what every call site that passed `RAY_EPS` as a tmin now passes) resolves it from
-its origin by `dEpsAt` (then `dEpsAt`): 32 float ulps of the origin's largest coordinate, at least 1e-7, at most
+its origin by `dTminAt` (now `dEpsAt`): 32 float ulps of the origin's largest coordinate, at least 1e-7, at most
 `RAY_EPS` (design.md, the offset rules). The fiber shadow rays, which pushed their origin by `RAY_EPS`
 along the ray, push by `dEpsAt` instead. The stubble coat below now reads x1.0000 over the GPU frame
 and 1.000-1.001 in every tile (`tools/check_modew_fiber.py` has it as its third case, which 0.448.5

@@ -5659,9 +5659,11 @@ struct Scene {
     // Does the segment o + t dir, t in [0, maxDist], pass through a region that bends rays (a GRIN
     // medium, Medium::bends)? Every ray through one bends (grin.h), so a straight connection across
     // it -- a shadow ray, a camera leg -- is no path, as one through glass is none, and the transport
-    // visibility queries (occluded, shadowTransmittance, occludedSkipHair) count it blocked: light
-    // reaches through such a region only along a walk that marches it (GRIN-STRAIGHT-CONNECT). A box
-    // or sphere bound is exact; an implicit or mesh one is looked through at the marcher's own step.
+    // visibility queries (occluded, shadowTransmittance, occludedSkipHair, walkFibers) count it
+    // blocked: light reaches through such a region only along a walk that marches it
+    // (GRIN-STRAIGHT-CONNECT). A box or sphere bound is exact; an implicit or mesh one is looked
+    // through at the marcher's own step, at most 64 looks a segment (a sliver thinner than the span
+    // over 64 can be missed).
     bool crossesGrin(const Vec3& o, const Vec3& dir, double maxDist) const {
         if (!bendsAny) return false;
         PatTables tabs{};
@@ -5673,7 +5675,8 @@ struct Scene {
             if (!md.bounded || md.boundShape == MediumBound::Sphere || md.boundShape == MediumBound::Box)
                 return true;
             if (!tabsSet) { tabs = patTables(); tabsSet = true; }
-            const double step = md.iorStep > 0.0 ? md.iorStep : (tb - ta) / 64.0;
+            // At the march's step, but no more than 64 looks a segment: every light sample pays this.
+            const double step = std::max(md.iorStep, (tb - ta) / 64.0);
             for (double t = ta; t <= tb; t += step)
                 if (md.insideBound(o + dir * t, &tabs)) return true;
             if (md.insideBound(o + dir * tb, &tabs)) return true;
@@ -5883,6 +5886,7 @@ struct Scene {
     template <class F>
     bool walkFibers(const Vec3& o, const Vec3& dir, double maxDist, F&& onFiber,
                     int maxCrossings = 64) const {
+        if (crossesGrin(o, dir, maxDist)) return false;   // a straight segment across a bending region
         const Ray r{o, dir};
         const double tmin = eps;
         const double seg  = maxDist - tmin;

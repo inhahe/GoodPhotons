@@ -5819,7 +5819,10 @@ as the one at fault.
   1e-7, `connMaxT`'s, the GRIN entry nudge, catchPhoton's aperture floor) are for a scene of unit size
   too, and are multiplied by `c_lenScale` = min(1, S), S the farthest coordinate of the scene's swept
   bounding sphere (which holds every primitive at every time). The host's
-  `setSceneScale` sets it with every upload and before a held scene renders. A scene of unit size
+  `setSceneScale` sets it with every upload and before a held scene renders, and a resident session
+  (shared forward, SPPM, VCM, backward RGB) re-sets it from its `DScene::lenScale` before every pass,
+  since another scene's upload in between would leave its own. A connection whose far end is another
+  vertex is shortened by that vertex's reach as well (`occludedTo`'s `targetReach`). A scene of unit size
   or more keeps every floor as written; one smaller renders as the same scene drawn larger does --
   in a scene a few centimetres across 1/65536 is more than a strand's radius (GPU-MINIATURE-SCALE:
   the stubble ball in `units centimeters` renders at x1.0001 of its metre twin on the device, every
@@ -7395,12 +7398,22 @@ as the one at fault.
   a camera walk counts what it meets past one as met past a specular interface (mode R's
   `specularArrival`, the gather walk's `specularSeen`, the glossy MIS record cleared), and the
   photon tracer marks a bent photon focused (`sawFocus`, device `PV_BIT_FOCUS`), so mode M's
-  two-map split files it as a caustic.
+  two-map split files it as a caustic. A march that stops short of a surface within its first step
+  is bent too (the straight remainder lies in the region, so no light sample reached what it meets),
+  and a bend after a diffuse vertex still marks the path past it (`pastDiffuse`: a glow lights
+  nothing). The forward modes' other straight camera legs keep the rule: the sky probe (`prepareSky`,
+  so no sky, sun or glow is drawn through a bending region), the planar and sphere mirror connectors'
+  eye leg (`mirrorSeenAt`, device `dMirrorSeenAt`), and the dual-scatter fibre walk (`walkFibers`).
+  Mode P files a pixel whose centre ray crosses one specular (`classifyComposite`), and a sample whose
+  camera path bends before its first surface likewise (`noteFirst`). What a region bends from a point,
+  spot or sun light reaches nothing in modes R and W, whose walks never meet such a light: black
+  there, as a caustic through glass, which ftrace notes (`[grin] note`); B, M and S render it.
   **Radiance over n^2 along a march (0.449.0, GRIN-RADIANCE-SCALE).** L / n^2 is conserved along a
   ray bending in a continuous field, and a region's boundary refracts nothing here (the march
   crosses it straight, keeping the ray's geometric etendue and so its radiance). A camera walk
   therefore multiplies its throughput by (n(x_k) / n(x_k+1))^2 over the Eikonal steps, the field's
-  index at both ends (`MarchInfo::radScale`, device `DGrinMedia::radScale` with `camera` set): that is
+  index at both ends (`MarchInfo::radScale`, device `DGrinMedia::radScale` with `camera` set), each
+  step's before what the walk gathers along it (mode M's beams, on both devices): that is
   (n entering / n leaving)^2 per region, which a walk ending inside one owes on what it finds there
   and one crossing a field whose index differs at its two sides owes too. A light walk carries flux,
   which the bend conserves, and takes none.

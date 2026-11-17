@@ -15581,6 +15581,22 @@ static void noteWhittedMediaSpp(const Scene& scene, long long spp) {
                 kWhittedDeHeroSpp);
 }
 
+// Modes R and W reach the light a gradient-index region bends only along a walk that marches the region
+// and then meets the light (no light sample crosses a bending region: Scene::crossesGrin). A point,
+// spot or sun light is met by no walk, so what such a region bends from one renders black, as a
+// caustic through glass does: said once, with the modes that render it.
+static void noteGrinDeltaLights(const Scene& scene) {
+    if (!scene.bendsAny) return;
+    for (const Emitter& e : scene.emitters)
+        if (e.shape == EmitterShape::Spot || e.shape == EmitterShape::Sun) {
+            std::printf("[grin] note: a gradient-index region bends rays here, and a spot, point or sun "
+                        "light's light through it is met by no camera path in mode %s: it renders black "
+                        "there, as a caustic through glass does (modes B, M and S render it)\n",
+                        g_whitted ? "W" : "R");
+            return;
+        }
+}
+
 // PHOTON-BEAMS gather for the shared multi-camera forward pass (CLI -beams). When set,
 // the shared A/B pass has each camera resample its own medium in-scatter point per beam
 // segment, so a volumetric FLYBY (rainbow/fogbow/fog) gets independent per-frame noise
@@ -16181,6 +16197,8 @@ static bool prepareSky(SkyView& view, const Scene& scene, const Camera& cam, int
             const Ray r = cam.genRay(px, py, jx, jy);
             // A CAMERA ray, so a `hide_camera` flat lets the sky through (Material::hideCamera).
             const Hit h = scene.closestHit(r, 1e-6, nullptr, /*skipHair=*/false, /*skipCamHidden=*/true);
+            // Nothing is seen straight through a region that bends rays, as through glass (B, A).
+            if (scene.crossesGrin(r.o, r.d, h.valid ? h.t : 1e30)) continue;
             Vec3 c{0, 0, 0};
             if (h.valid) {
                 if (!haveGlow) continue;
@@ -16207,6 +16225,8 @@ static bool prepareSky(SkyView& view, const Scene& scene, const Camera& cam, int
             if (!cam.genLensRay(px, py, rng.uniform(), rng.uniform(), rng.uniform(),
                                 rng.uniform(), lambda, r, wLens) || !(wLens > 0.0)) continue;
             const Hit h = scene.closestHit(r, 1e-6, nullptr, /*skipHair=*/false, /*skipCamHidden=*/true);
+            // Nothing is seen straight through a region that bends rays, as through glass (B, A).
+            if (scene.crossesGrin(r.o, r.d, h.valid ? h.t : 1e30)) continue;
             Vec3 c{0, 0, 0};
             if (h.valid) {
                 if (!haveGlow) continue;
@@ -16954,6 +16974,12 @@ static CompositeClass classifyComposite(const Scene& scene, const Camera& cam,
             // BEHIND it, which is what the composite will actually show there.
             Hit h = scene.closestHit(r, 1e-6, nullptr, /*skipHair=*/false,
                                      /*skipCamHidden=*/true);
+            // Through a region that bends rays the forward layer draws nothing (no straight camera
+            // leg crosses one): the backward film's, as a specular surface's.
+            if (scene.crossesGrin(r.o, r.d, h.valid ? h.t : 1e30)) {
+                cc.cls[i] = CompositeClass::SPEC; ++cc.nSpec;
+                continue;
+            }
             if (!h.valid) {
                 if (scene.envIndex >= 0) {
                     cc.cls[i] = CompositeClass::SKY;
@@ -25460,6 +25486,7 @@ static int run(int argc, char** argv) {
     // Both a real mode-W render and the explorer's T preview (which IS mode W) hit the
     // sealed-light failure, so warn for either -- see warnSealedLights.
     if (g_whitted || wPreview) warnSealedLights(scene);
+    if (!wPreview) noteGrinDeltaLights(scene);
     // Only for a real batch mode-W render: the viewer's T preview keeps accumulating passes
     // (wNeedSpp), so its C=1 image converges rather than staying wrong, and nagging there
     // would fire on every explore run.
