@@ -5,7 +5,9 @@ comes out of the medium, and the medium is a 36-px disc in a 192-px frame. This 
 the mean inside a 25-px disc centred on the ball's projection, the frame outside it, and
 the ratio to the reference, so `mode M -beams` vs `mode D` is a single number.
 
-Usage:  python scraps/_ms_ball.py ref.pfm a.pfm [b.pfm ...]
+Usage:  python tools/measure_beams_ms.py ref.pfm a.pfm [b.pfm ...]
+
+A measurement, not a pass/fail check: it takes the renders to compare.
 """
 import numpy as np, sys
 from pfm import read_pfm  # noqa: E402

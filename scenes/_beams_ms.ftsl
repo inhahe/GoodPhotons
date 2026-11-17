@@ -25,10 +25,10 @@
 #          -o png/ms_beams.png -hdr
 #   ftrace -in scenes/_beams_ms.ftsl -mode M -device gpu -beams -beams-order 1 \
 #          -n 40000000 -o png/ms_ss.png -hdr
-#   python tools/check_beams_ms.py png/ms_ref.pfm png/ms_beams.pfm png/ms_ss.pfm
+#   python tools/measure_beams_ms.py png/ms_ref.pfm png/ms_beams.pfm png/ms_ss.pfm
 #
-# Compare with `check_beams_ms.py`, not `tools/pfmcmp.py`: the ball is a 36-px disc in a 192-px frame, so
-# a whole-frame mean dilutes the very thing under test by ~20x. (`check_beams_ms.py` also masks NaNs,
+# Compare with `measure_beams_ms.py`, not `tools/pfmcmp.py`: the ball is a 36-px disc in a 192-px frame, so
+# a whole-frame mean dilutes the very thing under test by ~20x. (`measure_beams_ms.py` also masks NaNs,
 # which mode D emits on this scene -- see known-issues.md, "Mode D emits NaN pixels".)
 #
 # MEASURED 2026-09-01 at 0.199.0 (RTX 4090; ref 20000 spp, beams 40 M photons), mean radiance
