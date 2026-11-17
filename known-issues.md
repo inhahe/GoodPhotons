@@ -2547,7 +2547,16 @@ as plain white. **Proper fix:** one shared "sample the glossy lobe" helper per b
 a weight (multiply, roulette, roulette on a bundle's max), so it returns the weight and leaves
 that choice to them. Check plain glossy's images bit-identical with tools/check_bitid.py.
 
-## OPEN (2026-11-04, 0.422.0; narrowed 0.433.2): MODEM-GPU-CORNER — GPU mode M reads one corner of a box 15 % bright
+## DONE (2026-11-16, no change): MODEM-GPU-CORNER — GPU mode M reads one corner of a box 15 % bright
+
+**The 1 % red residual on `flat` was its seeds' too.** At seeds 11-22, none of the six it was measured
+at, GPU mode M over CPU mode M on check_bitid's `flat` (64 spp, 2e6 photons) reads R 1.0001 +- 0.0027,
+G 0.9977 +- 0.0017, B 0.9988 +- 0.0024: nothing left (the trap at this file's head). The corner went the
+same way in 0.433.2; the smaller one-block residuals below were each one block among many at 2-3
+sigma, and check_motion passes.
+
+The investigation:
+
 
 **The corner was noise; a 1 % red residual on `flat` is what is left (0.433.2).** The same box, the
 same settings, its corner block (row 3, column 10) GPU/CPU: x1.206 at 1.0 sigma with two seeds,

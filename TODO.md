@@ -332,8 +332,8 @@ Then the rest of 4.2-4.6 in their order, 4.7's bookkeeping alongside whatever to
   trapped light at the default radius (J 2-3.6x mode B): the kernel's blur across a 1000x step, a
   bias that converges as E^(-1/4). The remedy, an adaptive merge radius, was put to the user with its
   downsides and recommended against (known-issues GAP-MERGE-RADIUS): left until the user wants it.
-- [ ] **MODEM-GPU-CORNER**, what is left — the corner was noise (0.433.2); GPU mode M reads
-  check_bitid's `flat` red 1 % low against the CPU (3.5 sigma).
+- [x] **MODEM-GPU-CORNER** (no change) — the corner and `flat`'s red residual were noise: at new
+  seeds GPU over CPU mode M reads 1.0001 in red (known-issues).
 - [x] **CURVE-GATHER**, mode U's half (VCM-THIN-CURVES) — 0.439.2: mode U merges at no curve
   vertex (`vcmMergeAt` / `dVcmMergeAt`); its coat 2.10 / 2.36 -> 1.000 / 1.014 of mode R.
 - [ ] **PROBE-PARITY-LIMITS** — the footprint probe's crossing count misreads a photon-holding open
