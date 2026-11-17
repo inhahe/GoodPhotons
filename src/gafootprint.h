@@ -42,7 +42,7 @@ inline bool probePassesThrough(const Scene& scene, const Material& m, GatherHold
 struct SegmentCrossings { int side = 0; int open = 0; };
 inline SegmentCrossings walkSegment(const Scene& sc, Vec3 o, const Vec3& d, double len, double eps) {
     SegmentCrossings c;
-    if (!(len > 0.0) || !sc.occluded(o, d, len, 0.0, false, len)) return c;
+    if (!(len > 0.0) || !sc.occludedGeometry(o, d, len, 0.0, false, len)) return c;
     double done = 0.0;
     for (int k = 0; k < 32 && done < len && c.open < 15; ++k) {
         const Hit h = sc.closestHit(Ray{o, d, len - done}, 0.0, nullptr, false, false, len - done);

@@ -1087,6 +1087,7 @@ struct DMedium {
     const PatNode*    ior;            // compiled n(x,y,z) program (device pool) or null
     int               iorN;           // node count of the ior program (0 => not GRIN)
     double            iorStep;        // Eikonal march step in world units (>0 for GRIN)
+    int               bends;          // 1 => the field bends rays (host Medium::bends): not one constant
     // --- Optional spectral rainbow (Airy droplet) phase table (mirrors host RainbowPhase) ---
     // When `rbPdf` is non-null the angular phase is the tabulated (lambda x mu) Airy
     // droplet function instead of the analytic HG lobe (`g` above), reproducing the
@@ -1590,6 +1591,8 @@ struct DScene {
     int              hasGrin;  // 1 => some enabled medium carries an `ior` (GRIN) field.
                                // Gates the per-bounce Eikonal march (grin::sceneHasGrin twin);
                                // 0 keeps ordinary scenes bit-identical (march never entered).
+    int              bendsAny; // 1 => some enabled medium bends rays (host Scene::bendsAny): the
+                               // transport visibility queries' GRIN rule (dCrossesGrin).
     DVec3  sensorOrigin, sensorUAxis, sensorVAxis;   // model A contact sensor plane
     DVec3  sceneCenter;              // env (shape==3): bounding-sphere center
     double sceneRadius;              // env (shape==3): bounding-sphere radius
@@ -5633,11 +5636,18 @@ struct DGrinMedia {
     DRng* rng    = nullptr;    // null => bend only, integrate nothing (see also maxSteps)
     Real  lambda = 0;
     int   filt   = DMedAll;    // which media to integrate (see DMedFilter)
+    bool  camera = false;      // a camera path's march: accumulate radScale (host grin::MarchInfo)
     // --- outputs ---
     bool  hit     = false;     // a collision happened along the curve
     bool  stepped = false;     // at least one sub-segment was walked (for maxSteps driving)
     int   which   = -1;        // index into sc.media
     Real  arc     = 0;         // arc length actually marched (glass Beer-Lambert, etc.)
+    // A step taken through a region that bends rays: past it the walk meets nothing a light sample
+    // reached (dCrossesGrin), and counts it as met past a specular bounce (host MarchInfo::bent).
+    bool  bent     = false;
+    // With `camera`: (n(x_k) / n(x_k+1))^2 over the steps, the radiance factor a camera path owes
+    // its bend (host MarchInfo::radScale, GRIN-RADIANCE-SCALE). Accumulates across driven calls.
+    double radScale = 1.0;
 };
 // `maxSteps` lets a caller drive the march ONE SUB-SEGMENT AT A TIME (maxSteps = 1, loop
 // until !med->stepped), which is how mode M's camera gather feeds a curved ray to the
@@ -5695,10 +5705,10 @@ __device__ static void dGrinMarch(const DScene& sc, DVec3& ro, DVec3& rd,
                 const DMedium& md = sc.media[mi];
                 if (!(md.enabled && md.iorN > 0)) continue;
                 double ta, tb;
-                if (dMedClip(md, cro, crd, 1e-4, dS, ta, tb) && ta < bestTa) { bestTa = ta; bestM = mi; }
+                if (dMedClip(md, cro, crd, 1e-4 * (double)c_lenScale, dS, ta, tb) && ta < bestTa) { bestTa = ta; bestM = mi; }
             }
             if (bestM < 0) break;
-            double adv = bestTa + 1e-4;
+            double adv = bestTa + 1e-4 * (double)c_lenScale;
             if (doMedia) {
                 Real t; int which;
                 if (dMediaSampleCollision(sc, cro, crd, (Real)adv, med->lambda, *med->rng,
@@ -5741,6 +5751,15 @@ __device__ static void dGrinMarch(const DScene& sc, DVec3& ro, DVec3& rd,
         double tl = sqrt(Tx * Tx + Ty * Ty + Tz * Tz);
         double ndx = dx, ndy = dy, ndz = dz;
         if (tl > 1e-12) { double s = 1.0 / tl; ndx = Tx * s; ndy = Ty * s; ndz = Tz * s; }
+        // The radiance factor of this step, to its end at `t` along the new direction.
+        const auto stepRad = [&](double t) {
+            if (!med) return;
+            med->bent = med->bent || g.bends;
+            if (!med->camera) return;
+            const DVec3 pe{(Real)(px + ndx * t), (Real)(py + ndy * t), (Real)(pz + ndz * t)};
+            const double n1 = dMedNAt(g, pe, env);
+            if (n1 > 0.0) med->radScale *= (n0 / n1) * (n0 / n1);
+        };
         if (doMedia) {
             // The displacement is parallel to T (n0 > 0, ds > 0), so the new direction IS
             // this sub-segment's travel direction; its length is |(T/n)·ds|, which equals
@@ -5752,6 +5771,7 @@ __device__ static void dGrinMarch(const DScene& sc, DVec3& ro, DVec3& rd,
                 if (dMediaSampleCollision(sc, cro, sd, (Real)segLen, med->lambda, *med->rng,
                                           t, which, med->filt)) {
                     med->hit = true; med->which = which; med->arc += (double)t;
+                    stepRad((double)t);
                     ro = DVec3{px + ndx * (double)t, py + ndy * (double)t, pz + ndz * (double)t};
                     rd = sd;
                     return;
@@ -5759,6 +5779,7 @@ __device__ static void dGrinMarch(const DScene& sc, DVec3& ro, DVec3& rd,
                 med->arc += segLen;
             }
         }
+        stepRad(sqrt(sx * sx + sy * sy + sz * sz));
         px += sx; py += sy; pz += sz;
         dx = ndx; dy = ndy; dz = ndz;
         if (med) {
@@ -5791,9 +5812,9 @@ __device__ static double dHairOpacityAt(const DScene& sc, const DMaterial& m, co
 
 // `skipSph`: a sphere (its index) the ray cannot meet but by rounding -- a sphere connector's leg to the
 // sphere's own surface (dConnectSpecularSphere, dConnectSpecularSphereMirror) -- or -1.
-__device__ static bool occluded(const DScene& sc, const DVec3& o, const DVec3& dir,
-                                 Real maxDist, Real tmin = RAY_TMIN, bool camLeg = false,
-                                 Real curveTmin = (Real)0, int skipSph = -1) {
+__device__ static bool occludedGeometry(const DScene& sc, const DVec3& o, const DVec3& dir,
+                                         Real maxDist, Real tmin = RAY_TMIN, bool camLeg = false,
+                                         Real curveTmin = (Real)0, int skipSph = -1) {
     if (tmin < (Real)0) tmin = dEpsAt(o);
     if (sc.nNodes == 0) return false;
     // One uniform test, hoisted out of the leaf loop; `hidden()` is checked BEFORE the
@@ -5854,6 +5875,34 @@ __device__ static bool occluded(const DScene& sc, const DVec3& o, const DVec3& d
                                   return skipSph >= 0 && prim == sc.nTris + skipSph;
                               });
 }
+// Does the segment o + t dir, t in [0, maxDist], pass through a region that bends rays (host twin
+// Scene::crossesGrin)? A straight connection across one is no path (GRIN-STRAIGHT-CONNECT), so the
+// transport visibility queries count it blocked. Box and sphere bounds exactly; an implicit or mesh
+// one is looked through at the marcher's own step.
+__device__ static bool dCrossesGrin(const DScene& sc, const DVec3& o, const DVec3& dir, Real maxDist) {
+    if (!sc.bendsAny) return false;
+    const DPatEnv env = dPatEnvOf(sc);
+    for (int mi = 0; mi < sc.mediaN; ++mi) {
+        const DMedium& md = sc.media[mi];
+        if (!md.enabled || !md.bends) continue;
+        double ta, tb;
+        if (!dMedClip(md, o, dir, 0.0, (double)maxDist, ta, tb)) continue;
+        if (!md.bounded || md.boundShape == 0 || md.boundShape == 1) return true;
+        const double step = md.iorStep > 0.0 ? md.iorStep : (tb - ta) / 64.0;
+        for (double t = ta; t <= tb; t += step)
+            if (dMedInside(md, o + dir * (Real)t, env)) return true;
+        if (dMedInside(md, o + dir * (Real)tb, env)) return true;
+    }
+    return false;
+}
+// The transport visibility query: occludedGeometry, and blocked across a region that bends rays.
+// The probes that ask what geometry is there (dCavityAt) call occludedGeometry.
+__device__ static bool occluded(const DScene& sc, const DVec3& o, const DVec3& dir,
+                                 Real maxDist, Real tmin = RAY_TMIN, bool camLeg = false,
+                                 Real curveTmin = (Real)0, int skipSph = -1) {
+    if (dCrossesGrin(sc, o, dir, maxDist)) return true;
+    return occludedGeometry(sc, o, dir, maxDist, tmin, camLeg, curveTmin, skipSph);
+}
 
 // Fraction of a shadow ray that SURVIVES to maxDist: 1 clear, 0 blocked, in between when it
 // crosses hair whose `opacity` is below 1. Host twin Scene::shadowTransmittance. Opaque
@@ -5863,6 +5912,7 @@ __device__ static bool occluded(const DScene& sc, const DVec3& o, const DVec3& d
 __device__ static Real shadowTransmittance(const DScene& sc, const DVec3& o, const DVec3& dir,
                                            Real maxDist, Real tmin = RAY_TMIN,
                                            Real curveTmin = (Real)0) {
+    if (dCrossesGrin(sc, o, dir, maxDist)) return (Real)0;
     if (tmin < (Real)0) tmin = dEpsAt(o);
     if (sc.nNodes == 0) return (Real)1;
     DVec3 invD{(Real)1 / dir.x, (Real)1 / dir.y, (Real)1 / dir.z};
@@ -6012,7 +6062,7 @@ __device__ static double dCavityAt(const DScene& sc, const DHit& h) {
         const DVec3 d{(Real)(tx * cx + bx * cy + nx * cz),
                       (Real)(ty * cx + by * cy + ny * cz),
                       (Real)(tz * cx + bz * cy + nz * cz)};
-        if (occluded(sc, o, d, (Real)R)) ++blocked;
+        if (occludedGeometry(sc, o, d, (Real)R)) ++blocked;
     }
     return (double)blocked / (double)N;
 }
@@ -14637,6 +14687,7 @@ __global__ void kTrace(DScene sc, DCamSet cs, double* energy,
             // beam and analog sampling gives the same answer a beam would have paid back.
             DGrinMedia gm; gm.rng = &rng; gm.lambda = lambda;
             if (sc.hasGrin) dGrinMarch(sc, ro, rd, &gm);
+            if (gm.bent) pathC.bits |= PV_BIT_FOCUS;   // a bend focuses, as a refraction does (host twin)
             DHit h = closestHitIn(stk, sc, ro, rd, curveTmin > (Real)0 ? (Real)0 : RAY_TMIN, BIG, false,
                                        curveTmin);
             curveTmin = (Real)0;
@@ -14788,6 +14839,7 @@ __global__ void kWfExtend(DScene sc, DCamSet cs, WFState st, int W) {
         DRng rng = st.rng[slot];
         DGrinMedia gm; gm.rng = &rng; gm.lambda = st.lambda[slot];
         dGrinMarch(sc, ro, rd, &gm);
+        if (gm.bent && st.pathC) st.pathC[slot].bits |= PV_BIT_FOCUS;   // a bend focuses (host twin)
         st.rng[slot] = rng;
         st.ro[slot] = ro; st.rd[slot] = rd;
         st.gmMed[slot] = gm.hit ? gm.which : -1;
@@ -17633,11 +17685,16 @@ __device__ static double bkRadiance(const DScene& sc, int diffraction, DVec3 ro,
         // that differed only by a CONSTANT `ior "1.0"` (zero gradient: it bends nothing, it
         // only routes the medium through the marcher), the haze came out 22% dark through
         // its own centre against a 2.2% noise floor, and vanished visually.
-        DGrinMedia gmed; gmed.rng = &rng; gmed.lambda = lambda;
+        DGrinMedia gmed; gmed.rng = &rng; gmed.lambda = lambda; gmed.camera = true;
         // Camera segment: the marcher's own hit test must skip a `hide_camera` surface too,
         // or the bending would stop dead at an invisible flat. See DMaterial::hideCamera.
-        if (sc.hasGrin) dGrinMarch(sc, ro, rd, &gmed, 200000,
-                                   /*camHide=*/(b == 0 && gi.depth == 0));
+        if (sc.hasGrin) {
+            dGrinMarch(sc, ro, rd, &gmed, 200000, /*camHide=*/(b == 0 && gi.depth == 0));
+            // Radiance over n^2 along the bend; past a bend the walk's arrival is a specular one
+            // (host twin backward.h, grin.h MarchInfo).
+            thr *= gmed.radScale;
+            if (gmed.bent) { specularArrival = true; gmis.clear(); }
+        }
         // `b == 0 && gi.depth == 0` is precisely the camera segment (the same test the O8
         // footprint stamp below uses), so it is also precisely where a `hide_camera` surface
         // must be transparent — and nowhere else on the path. See DMaterial::hideCamera.
@@ -21789,10 +21846,15 @@ __device__ static void dPhotonGatherSub(const DScene& sc, const DPhotonMap& pm,
         const bool tail = (b == maxBounce);
         if (sc.hasGrin) {                                // final-gather rays bend too
             DGrinMedia gm;                               // rng == nullptr: bend only
+            gm.camera = true;
             dGrinMarch(sc, ro, rd, &gm);
             int cm = stk.topMat();                       // Beer-Lambert over the marched arc
             Real a = (cm >= 0) ? specLookup(sc.mats[cm].absorb, lambda) : (Real)0;
             if (a > 0 && gm.arc > 0) thr *= exp(-(double)a * (double)gm.arc);
+            // Radiance over n^2 along the bend; past a bend the light the walk meets was reached
+            // by no light sample (host twin photonGatherSub).
+            thr *= gm.radScale;
+            if (gm.bent) { specularSeen = true; hairArrival = false; }
         }
         DHit h = closestHitIn(stk, sc, ro, rd, curveTmin > (Real)0 ? (Real)0 : RAY_TMIN, BIG, false,
                                    curveTmin);
@@ -22411,11 +22473,18 @@ __device__ static void dPhotonGather(const DScene& sc, const DPhotonMap& pm,
         // forward, which is what dGatherPhotonBeams' own Tr_cam(0 -> tCam) assumes (it
         // measures from the sub-segment start).
         if (sc.hasGrin) {
+            bool bent = false;
             for (int gs = 0; gs < 200000; ++gs) {  // same safety cap the marcher applies
                 DVec3 pro = ro;
                 DGrinMedia gm;                     // rng == nullptr: bend only, no collisions
+                gm.camera = true;
                 dGrinMarch(sc, ro, rd, &gm, 1, /*camHide=*/(b == 0));  // — a camera ray's volume answer IS the
                 if (!gm.stepped) break;            //   beam gather below
+                // This step's radiance factor, at every wavelength alike, before what the walk
+                // gathers past it (host twin photonGather, grin.h MarchInfo).
+                thr *= gm.radScale;
+                sthr.mul(sc, [&](Real) { return gm.radScale; }, gm.radScale);
+                bent = bent || gm.bent;
                 const Real slen = (Real)gm.arc;
                 if ((volOn || sunOn) && slen > 0) {
                     double bX = 0.0, bY = 0.0, bZ = 0.0;
@@ -22439,6 +22508,8 @@ __device__ static void dPhotonGather(const DScene& sc, const DPhotonMap& pm,
                     }, exp(-aGlass * arc));
                 }
             }
+            // Past a bend the light the walk meets was reached by no light sample.
+            if (bent) { hairArrival = false; gmis.clear(); }
             if (thr <= 0.0) return;
         }
         // b == 0 is the camera ray dPhotonGather was handed (mode M's eye pass); see
@@ -23008,7 +23079,13 @@ __device__ static void dSppmVisiblePoint(const DScene& sc, DVec3 ro, DVec3 rd, R
         const bool tail = (b == maxBounce);
         if (sc.hasGrin) {                                // GRADIENT-INDEX: the camera ray bends,
             DGrinMedia gm;                               // exactly as the deposit's photons do.
+            gm.camera = true;
             dGrinMarch(sc, ro, rd, &gm, 200000, /*camHide=*/(b == 0));  // rng == nullptr: bend only
+            // Radiance over n^2 along the bend, at every wavelength alike; past a bend the light the
+            // walk meets was reached by no light sample (host twin sppm_render.h).
+            thr *= gm.radScale;
+            sthr.mul(sc, [&](Real) { return gm.radScale; }, gm.radScale);
+            if (gm.bent) strandArrival = false;
             const int cm = stk.topMat();                 // Beer-Lambert over the marched arc
             if (cm >= 0 && gm.arc > 0) {
                 const double arc = (double)gm.arc;
@@ -27060,6 +27137,7 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
             dm.ior     = m.ior.empty() ? nullptr : (const PatNode*)keep(uploadVec(m.ior));
             dm.iorN    = (int)m.ior.size();
             dm.iorStep = m.iorStep;
+            dm.bends   = m.bends() ? 1 : 0;
             // Spectral rainbow (Airy droplet) phase: upload the (lambda x mu) pdf table +
             // per-lambda CDF so the device reproduces the bow instead of the HG lobe.
             if (m.rainbow() && m.rainbowPhase->built()) {
@@ -27125,6 +27203,7 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
             }
         }
         sc.hasGrin = grin::sceneHasGrin(scene) ? 1 : 0;   // gate for dGrinMarch (host twin)
+        sc.bendsAny = scene.bendsAny ? 1 : 0;
         // Emissive "fire" volumes (ROADMAP C3): upload the AABB/meanKe/power + the per-
         // volume Planck-at-emitKelvin wavelength CDF, and the total emission power for the
         // emitter-vs-fire birth split. Empty => emissiveVolumes=null, totalEmissionPower=0.

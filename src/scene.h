@@ -975,6 +975,10 @@ struct Medium {
 
     // --- Gradient-index (GRIN) helpers ---------------------------------------
     bool grin() const { return !ior.empty(); }
+    // Whether the region bends a ray: a GRIN field that is not one constant (a constant index has no
+    // gradient, and the region's boundary refracts nothing -- grin.h), so a straight segment through
+    // one is still a path.
+    bool bends() const { return grin() && !(ior.size() == 1 && ior[0].op == PatOp::Const); }
 
     // Local refractive index n at a world point (>= a small floor). 1 when this
     // is not a GRIN medium. Evaluated by the shared pattern VM (x y z r live).
@@ -2974,6 +2978,8 @@ struct Scene {
     // lenScale (render_cuda.cu's c_lenScale).
     double lenScale = 1.0;
     double eps = 1e-6;
+    // Whether any enabled medium bends rays (Medium::bends), for crossesGrin's early out (build()).
+    bool bendsAny = false;
     // A trace's tmin as a sentinel the trace resolves to `eps` (closestHit, occluded,
     // shadowTransmittance, occludedTo, occludedSkipHair, closestHitLinear default to it).
     static constexpr double kTminEps = -1.0;
@@ -3052,7 +3058,7 @@ struct Scene {
         const double toPlane = -along - sceneRadius;
         if (outside && !mayDrop) return true;
         if (!outside && !(toPlane > 0.0)) return true;
-        if (!outside && !occluded(origin, dir, toPlane, 0.0)) {   // the usual case: nothing upstream
+        if (!outside && !occludedGeometry(origin, dir, toPlane, 0.0)) {   // the usual case: nothing upstream
             origin = origin + dir * toPlane;
             return true;
         }
@@ -5111,6 +5117,8 @@ struct Scene {
                 lenScale = 1.0;
             }
             eps = 1e-6 * lenScale;
+            bendsAny = false;
+            for (const Medium& md : media) bendsAny = bendsAny || (md.enabled && md.bends());
         }
         {
             double k = kJBeamDomainScale;
@@ -5645,6 +5653,37 @@ struct Scene {
     // (the default) for an NEE / light-connection segment: a hidden flat still shadows.
     bool occluded(const Vec3& o, const Vec3& dir, double maxDist, double tmin = kTminEps,
                   bool camLeg = false, double curveTmin = 0.0) const {
+        if (crossesGrin(o, dir, maxDist)) return true;
+        return occludedGeometry(o, dir, maxDist, tmin, camLeg, curveTmin);
+    }
+    // Does the segment o + t dir, t in [0, maxDist], pass through a region that bends rays (a GRIN
+    // medium, Medium::bends)? Every ray through one bends (grin.h), so a straight connection across
+    // it -- a shadow ray, a camera leg -- is no path, as one through glass is none, and the transport
+    // visibility queries (occluded, shadowTransmittance, occludedSkipHair) count it blocked: light
+    // reaches through such a region only along a walk that marches it (GRIN-STRAIGHT-CONNECT). A box
+    // or sphere bound is exact; an implicit or mesh one is looked through at the marcher's own step.
+    bool crossesGrin(const Vec3& o, const Vec3& dir, double maxDist) const {
+        if (!bendsAny) return false;
+        PatTables tabs{};
+        bool tabsSet = false;
+        for (const Medium& md : media) {
+            if (!md.enabled || !md.bends()) continue;
+            double ta, tb;
+            if (!md.clipToBounds(o, dir, 0.0, maxDist, ta, tb)) continue;
+            if (!md.bounded || md.boundShape == MediumBound::Sphere || md.boundShape == MediumBound::Box)
+                return true;
+            if (!tabsSet) { tabs = patTables(); tabsSet = true; }
+            const double step = md.iorStep > 0.0 ? md.iorStep : (tb - ta) / 64.0;
+            for (double t = ta; t <= tb; t += step)
+                if (md.insideBound(o + dir * t, &tabs)) return true;
+            if (md.insideBound(o + dir * tb, &tabs)) return true;
+        }
+        return false;
+    }
+    // occluded() less the GRIN rule: geometry alone, for the probes that ask what is THERE (the
+    // cavity pattern, the gather footprint, the sky's entry past haze) rather than what light reaches.
+    bool occludedGeometry(const Vec3& o, const Vec3& dir, double maxDist, double tmin = kTminEps,
+                          bool camLeg = false, double curveTmin = 0.0) const {
         tmin = tminOr(tmin);
         ++raystats::tls;
         Ray r{o, dir, curveTmin};
@@ -5688,6 +5727,7 @@ struct Scene {
     double shadowTransmittance(const Vec3& o, const Vec3& dir, double maxDist,
                                double tmin = kTminEps, double curveTmin = 0.0,
                                bool camLeg = false) const {
+        if (crossesGrin(o, dir, maxDist)) return 0.0;
         tmin = tminOr(tmin);
         ++raystats::tls;
         Ray r{o, dir, curveTmin};
@@ -5778,6 +5818,7 @@ struct Scene {
     // question this way is also what makes the grid pay — unlike `walkFibers`, this one CAN
     // early-out on the first opaque hit, and in a coat's own shadow it almost always does.
     bool occludedSkipHair(const Vec3& o, const Vec3& dir, double maxDist, double tmin = kTminEps) const {
+        if (crossesGrin(o, dir, maxDist)) return true;
         tmin = tminOr(tmin);
         ++raystats::tls;
         Ray r{o, dir};
@@ -6207,7 +6248,7 @@ inline double cavityAt(const Scene& scene, const Hit& h) {
         const double cz = std::sqrt(1.0 - u);    // cos(theta) — the cosine weight
         const double ph = golden * i;
         const Vec3 d = t * (sr * std::cos(ph)) + b * (sr * std::sin(ph)) + n * cz;
-        if (scene.occluded(o, d, R)) ++blocked;
+        if (scene.occludedGeometry(o, d, R)) ++blocked;
     }
     return (double)blocked / (double)N;
 }

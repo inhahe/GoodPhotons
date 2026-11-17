@@ -115,10 +115,16 @@ inline void sppmVisiblePoint(const Scene& scene, Ray ray, Pcg32& rng, bool diffr
         const bool tail = (b == maxBounce);
         if (grinAny) {
             double arc = 0.0;
+            grin::MarchInfo mInfo;
             grin::marchSegments(scene, ray,
                 [&](const Vec3&, const Vec3&, double slen, double&) { arc += slen; return false; },
                 // b == 0 is the camera ray; see Material::hideCamera.
-                /*camHide=*/(b == 0));
+                /*camHide=*/(b == 0), &mInfo);
+            // Radiance over n^2 along the bend, at every wavelength alike; past a bend the light
+            // the walk meets was reached by no light sample (grin.h MarchInfo).
+            thr *= mInfo.radScale;
+            sthr.mul([&](double) { return mInfo.radScale; }, mInfo.radScale);
+            if (mInfo.bent) { strandArrival = false; gmis.clear(); }
             const int cm = stk.topMat();                 // Beer-Lambert over the marched arc
             if (cm >= 0 && arc > 0.0) {
                 const double T = std::exp(-scene.mats[cm].absorb(lambda) * arc);

@@ -7368,6 +7368,31 @@ as the one at fault.
   thing, so an `ior`-free scene never enters it and stays bit-identical. Marching does **not**
   consume a bounce: it is a pre-pass run before each bounce's `closestHit`, stopping when a
   surface is within one step or the ray has left every GRIN region.
+  **No straight connection crosses a region that bends (0.449.0, GRIN-STRAIGHT-CONNECT).** Every ray
+  through a GRIN region bends, so a straight segment across one is no path. `Scene::crossesGrin`
+  (device `dCrossesGrin`) finds a segment that passes through a region whose index is not one
+  constant (`Medium::bends`; a constant field bends nothing) -- exactly for a box or sphere bound, at
+  the march step for an implicit or mesh one -- and the transport visibility queries (`occluded`,
+  `shadowTransmittance`, `occludedSkipHair`, device `occluded` / `shadowTransmittance`) count it
+  blocked; `occludedGeometry` is the query without the rule, for the probes that ask what geometry
+  is there (the cavity pattern, the gather footprint, the sky's entry past haze). So a forward
+  mode's camera leg does not cross the region -- mode B draws one seen directly black, as glass --
+  and light sampling does not light what lies past one straight through it (before, B drew the
+  lens as absent and R lit `_grin_lin`'s corners, which the lens shadows, at full direct light).
+  The light such a region bends arrives along the walks that march it: the marcher reports
+  (`grin::MarchInfo`, device `DGrinMedia::bent`) whether it stepped through a bending region, and
+  a camera walk counts what it meets past one as met past a specular interface (mode R's
+  `specularArrival`, the gather walk's `specularSeen`, the glossy MIS record cleared), and the
+  photon tracer marks a bent photon focused (`sawFocus`, device `PV_BIT_FOCUS`), so mode M's
+  two-map split files it as a caustic.
+  **Radiance over n^2 along a march (0.449.0, GRIN-RADIANCE-SCALE).** L / n^2 is conserved along a
+  ray bending in a continuous field, and a region's boundary refracts nothing here (the march
+  crosses it straight, keeping the ray's geometric etendue and so its radiance). A camera walk
+  therefore multiplies its throughput by (n(x_k) / n(x_k+1))^2 over the Eikonal steps, the field's
+  index at both ends (`MarchInfo::radScale`, device `DGrinMedia::radScale` with `camera` set): that is
+  (n entering / n leaving)^2 per region, which a walk ending inside one owes on what it finds there
+  and one crossing a field whose index differs at its two sides owes too. A light walk carries flux,
+  which the bend conserves, and takes none.
   **Media along the curve are integrated by the caller, one straight sub-segment at a time
   (0.198.0).** `grin::march` became a no-op-hook wrapper over `grin::marchSegments(scene, ray,
   onSeg)`, which calls back for **every** straight piece of the walked polyline — the Eikonal

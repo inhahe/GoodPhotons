@@ -405,11 +405,9 @@ Then the rest of 4.2-4.6 in their order, 4.7's bookkeeping alongside whatever to
   2613698..b004c3b: the J/U probe stops on glossy faces (check_merge_glossy), solid faces marked for
   J/U (check_merge_base's tower), roughness patterns reach 2 (check_rough_range), and the cleanups;
   known-issues REVIEW-0445. The lane-0 probes: WARP-PROBES (0.445.9), 2.0-2.2x -> 1.16-1.24x.
-- [ ] **GRIN-RADIANCE-SCALE** — a camera path ending inside a GRIN region misses the n² radiance
-  scale.
-- [ ] **GRIN-STRAIGHT-CONNECT** — a straight connection crosses a GRIN region as if it were not there:
-  mode B draws a GRIN lens seen directly as absent, mode R lights what lies beyond one straight
-  through it (known-issues). With GRIN-RADIANCE-SCALE.
+- [x] **GRIN-RADIANCE-SCALE** (0.449.0) — radiance over n² along a camera walk's march.
+- [x] **GRIN-STRAIGHT-CONNECT** (0.449.0) — no straight connection crosses a bending region; mode R
+  matches mode B outside the lens and mode C through it (check_grin_connect).
 - [x] **GPU-TMIN-SCALE** (0.448.6) — a device trace's tmin is 32 ulps of its origin, not an absolute
   1e-4; fixed STUBBLE-DEVICE-UNDERSIDE (check_modew_fiber's stubble case).
 - [x] **GPU-MINIATURE-SCALE** (0.448.7) — every absolute floor on the device scales with the scene

@@ -19178,8 +19178,9 @@ static bool resolveCameraModes(Scene& scene, const std::vector<CamRequest>& cams
         const char* kind = fallback != 'B' ? "backward reference"
                          : c.lens ? "forward light tracer; a mirror or glass seen directly through "
                                     "the lens renders black in it"
-                                  : "forward light tracer; a glass or mirror mesh or a rough "
-                                    "specular surface seen directly renders black in it";
+                                  : "forward light tracer; a glass or mirror mesh, a rough "
+                                    "specular surface or a GRIN region seen directly renders "
+                                    "black in it";
         if (g_onUnsupported == OnUnsupported::Strip)
             std::printf("[on-unsupported=strip] camera '%s': cannot strip %s for mode %c (another "
                         "camera renders it, or the mode lacks more than a strip removes) -> mode "

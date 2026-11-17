@@ -71,8 +71,23 @@ inline bool sceneHasGrin(const Scene& scene) {
 // inside/behind a GRIN region would freeze the bending at its own depth and the caller's
 // own skipCamHidden trace would then resume from the wrong point with the wrong direction.
 // See Material::hideCamera (scene.h).
+//
+// `info`, when given, reports what the march did for a CAMERA path's bookkeeping:
+//   * `bent`: it stepped through a region that bends rays (Medium::bends). Light sampling's straight
+//     connections never cross such a region (Scene::crossesGrin), so whatever the walk meets past
+//     it was reachable by no light sample: the caller counts it as it counts an arrival through a
+//     specular interface (GRIN-STRAIGHT-CONNECT).
+//   * `radScale`: (n(x_k) / n(x_k+1))^2 over every Eikonal step, the field's own index at both ends,
+//     so (n at entry / n at exit)^2 per region crossed. Radiance over n^2 is conserved along a ray
+//     bending in a continuous field, and a region's boundary refracts nothing here (a ray crosses
+//     it straight, keeping its geometric etendue, so its radiance), so a camera path that marched
+//     owes this factor on the radiance it brings back (GRIN-RADIANCE-SCALE). A light path carries
+//     flux, which the bend conserves, and takes none.
+struct MarchInfo { bool bent = false; double radScale = 1.0; };
+
 template <class SegFn>
-inline bool marchSegments(const Scene& scene, Ray& ray, SegFn&& onSeg, bool camHide = false) {
+inline bool marchSegments(const Scene& scene, Ray& ray, SegFn&& onSeg, bool camHide = false,
+                          MarchInfo* info = nullptr) {
     constexpr int GRIN_MAX_STEPS = 200000;   // safety cap on marching steps
     // Sampled tables, so an `ior` field (or the bounding field selecting the region) can
     // read a MEASURED index volume — `ior "grin:n(x, y, z)"` — not just a formula.
@@ -94,12 +109,12 @@ inline bool marchSegments(const Scene& scene, Ray& ray, SegFn&& onSeg, bool camH
             for (const auto& md : scene.media) {
                 if (!(md.enabled && md.grin())) continue;
                 double ta, tb;
-                if (md.clipToBounds(ray.o, ray.d, 1e-4, dS, ta, tb) && ta < bestTa) {
+                if (md.clipToBounds(ray.o, ray.d, 1e-4 * scene.lenScale, dS, ta, tb) && ta < bestTa) {
                     bestTa = ta; bestM = &md;
                 }
             }
             if (!bestM) return false;                            // no GRIN ahead
-            const double adv = bestTa + 1e-4;                    // nudge inside
+            const double adv = bestTa + 1e-4 * scene.lenScale;   // nudge inside
             double tStop = 0.0;
             if (onSeg(ray.o, ray.d, adv, tStop)) {
                 ray = Ray{ray.o + ray.d * tStop, ray.d};
@@ -123,8 +138,18 @@ inline bool marchSegments(const Scene& scene, Ray& ray, SegFn&& onSeg, bool camH
         double segLen = std::sqrt(dot(disp, disp));
         double tStop = 0.0;
         if (segLen > 0.0 && onSeg(ray.o, newDir, segLen, tStop)) {
+            if (info) {
+                const double n1 = gm->nAt(ray.o + newDir * tStop, &tabs);
+                if (n1 > 0.0) info->radScale *= (n0 / n1) * (n0 / n1);
+                info->bent = info->bent || gm->bends();
+            }
             ray = Ray{ray.o + newDir * tStop, newDir};
             return true;
+        }
+        if (info) {
+            const double n1 = gm->nAt(newPos, &tabs);
+            if (n1 > 0.0) info->radScale *= (n0 / n1) * (n0 / n1);
+            info->bent = info->bent || gm->bends();
         }
         ray = Ray{newPos, newDir};
     }

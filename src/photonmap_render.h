@@ -710,11 +710,17 @@ inline Vec3 photonGatherSub(const Scene& scene, const PhotonMap& pm, Ray ray, Pc
         ++work.n;
         if (grinAny) {
             double arc = 0.0;
+            grin::MarchInfo mInfo;
             grin::marchSegments(scene, ray,
-                [&](const Vec3&, const Vec3&, double slen, double&) { arc += slen; return false; });
+                [&](const Vec3&, const Vec3&, double slen, double&) { arc += slen; return false; },
+                false, &mInfo);
             int cm = stk.topMat();                       // Beer-Lambert over the marched arc
             double a = (cm >= 0) ? scene.mats[cm].absorb(lambda) : 0.0;
             if (a > 0.0 && arc > 0.0) thr *= std::exp(-a * arc);
+            // Radiance over n^2 along the bend; past a bend the light the walk meets was reached by
+            // no light sample (grin.h MarchInfo), so it counts as one met past a specular bounce.
+            thr *= mInfo.radScale;
+            if (mInfo.bent) { specularSeen = true; hairArrival = false; gmis.clear(); }
         }
         Hit h = closestHitIn(scene, stk, ray);
         if (h.valid) {                                   // Beer-Lambert in current medium
@@ -1060,6 +1066,7 @@ inline Vec3 photonGather(const Scene& scene, const PhotonMap& pm, Ray ray, doubl
         // gatherPhotonBeams' own per-beam Tr_cam(0 -> tCam) expects (it measures from the
         // sub-segment start; the accumulated `thr` supplies everything before it).
         if (grinAny) {
+            grin::MarchInfo mInfo;
             grin::marchSegments(scene, ray,
                 [&](const Vec3& so, const Vec3& sd, double slen, double&) -> bool {
                     if (volOn || sunOn) {
@@ -1085,7 +1092,12 @@ inline Vec3 photonGather(const Scene& scene, const PhotonMap& pm, Ray ray, doubl
                 },
                 // b == 0 is the camera ray; see Material::hideCamera. (photonGatherSub's
                 // march above is a final-gather sub-ray and keeps the default `false`.)
-                /*camHide=*/(b == 0));
+                /*camHide=*/(b == 0), &mInfo);
+            // Radiance over n^2 along the bend, at every wavelength alike; past a bend the light
+            // the walk meets was reached by no light sample (grin.h MarchInfo).
+            thr *= mInfo.radScale;
+            sthr.mul([&](double) { return mInfo.radScale; }, mInfo.radScale);
+            if (mInfo.bent) { hairArrival = false; gmis.clear(); }
             if (thr <= 0.0) return L;
         }
 

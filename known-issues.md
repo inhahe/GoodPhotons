@@ -6005,7 +6005,18 @@ on the tank without its pool floor (this repro). Whether a transparent face shou
 the disc is a separate question, open: both backends count it (and the ball test then rejects it
 for being above the plane), so both under-read the coverage there.
 
-## OPEN (2026-10-13, scope): GRIN-RADIANCE-SCALE — a camera path ending inside a GRIN region misses the n^2 radiance scale
+## DONE (2026-11-17, 0.449.0): GRIN-RADIANCE-SCALE — a camera path ending inside a GRIN region misses the n^2 radiance scale
+
+**Fixed in 0.449.0, with GRIN-STRAIGHT-CONNECT:** the marcher reports (n(x_k) / n(x_k+1))^2 over its
+steps (`grin::MarchInfo::radScale`, device `DGrinMedia::radScale`), which every camera walk takes on its
+throughput -- (n entering / n leaving)^2 per region, since a region's boundary refracts nothing in this
+model (a ray crosses it straight, keeping its radiance); that covers a walk ending inside a region and one
+crossing a field whose index differs at its two sides (`_grin_lin`'s, a factor near 0.82 through its
+middle). Mode R through `_grin_lin`'s lens against mode C, whose photons bend for real (5 cm aperture, 20
+min on the GPU), normalised on a no-GRIN twin of the scene (the two cameras' falloffs differ): by ring
+from the middle 0.994 +- 0.038, 0.996 +- 0.023, 1.000 +- 0.020, 0.988 +- 0.012. The fix described
+below (light sampling from inside a region) was not needed: such a light sample now counts blocked. The
+report as filed:
 
 RADIANCE-ETA2's factor is applied at discrete interfaces only. In a GRIN medium (an `ior` field)
 the index changes continuously along the camera's march, and radiance over n^2 is conserved along
@@ -6019,7 +6030,16 @@ throughput by (n(start) / n(end))^2 per march; but mode R's light sampling from 
 uses straight shadow rays through the field, an approximation that would then also need the
 local n^2 on its light, so the two have to change together, with a check against mode B.
 
-## OPEN (2026-11-16): GRIN-STRAIGHT-CONNECT — a straight connection crosses a GRIN region as if it were not there
+## DONE (2026-11-17, 0.449.0): GRIN-STRAIGHT-CONNECT — a straight connection crosses a GRIN region as if it were not there
+
+**Fixed in 0.449.0:** a straight segment through a region whose index varies (`Medium::bends`; a
+constant index bends nothing) counts blocked in the transport visibility queries (`Scene::crossesGrin`,
+device `dCrossesGrin`; `occludedGeometry` keeps the probes' geometry-only query); a camera walk that
+marched through one counts what it meets past it as met past a specular interface; the photon tracer
+marks a bent photon focused; and the GRIN entry nudge scales with the scene. `_grin_lin` (GPU, 60 s):
+mode B / mode R on every border tile 0.998-1.007 (was 0.81-0.87 in the corners), the same on
+`grin_lens` (0.991-1.004); mode B draws the region seen directly black, as glass, and says so
+(REFERENCE.md, the fallback notice). `tools/check_grin_connect.py`. The report as filed:
 
 A GRIN medium (an `ior` field) bends every ray the marcher walks, but a connection -- a shadow ray, a
 forward camera leg -- is a straight segment, and the occlusion queries do not know the region exists:

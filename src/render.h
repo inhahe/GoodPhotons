@@ -3907,6 +3907,7 @@ struct Renderer {
             // `-beams` rule below.
             if (grinAny) {
                 double arc = 0.0; int whichC2 = -1;
+                grin::MarchInfo mInfo;
                 const bool hitInMarch = grin::marchSegments(scene, ray,
                     [&](const Vec3& so, const Vec3& sd, double slen, double& tStop) -> bool {
                         double t; int which;
@@ -3916,7 +3917,11 @@ struct Renderer {
                         }
                         arc += slen;
                         return false;
-                    });
+                    }, false, &mInfo);
+                // A bend is a focusing event, as a refraction is: a photon bent through a GRIN
+                // region and not yet scattered deposits as a caustic one. (A light path carries
+                // flux, so it takes no radiance factor -- grin.h MarchInfo.)
+                if (mInfo.bent && !sawScatter) sawFocus = true;
                 // Glass Beer-Lambert over the marched arc: the post-march block below only
                 // covers the straight remainder, so without this a dielectric enclosing a
                 // GRIN region would not attenuate the curved part of the path at all.

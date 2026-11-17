@@ -2899,6 +2899,7 @@ struct BackwardRenderer {
             bool medInMarch = false;
             if (grinAny) {
                 double arc = 0.0;
+                grin::MarchInfo mInfo;
                 medInMarch = grin::marchSegments(scene, ray,
                     [&](const Vec3& so, const Vec3& sd, double slen, double& tStop) -> bool {
                         if (scene.media.empty()) { arc += slen; return false; }
@@ -2912,13 +2913,17 @@ struct BackwardRenderer {
                     },
                     // Camera segment: the marcher's own hit test must skip a `hide_camera`
                     // surface too, or the bending would stop dead at an invisible flat.
-                    /*camHide=*/(b == 0 && gi.depth == 0));
+                    /*camHide=*/(b == 0 && gi.depth == 0), &mInfo);
                 // Glass Beer-Lambert over the marched arc: the block below only charges the
                 // straight remainder, so without this a dielectric enclosing a GRIN region
                 // would not attenuate the curved part of the path at all. The forward tracer
                 // has always done this (render.h); the backward one silently did not.
                 const double aG = curAbsorb(lambda);
                 if (aG > 0.0 && arc > 0.0) thr *= std::exp(-aG * arc);
+                // Radiance over n^2 along the bend, and past a bend the walk's arrival is a
+                // specular one: no light sample crosses a bending region (grin.h MarchInfo).
+                thr *= mInfo.radScale;
+                if (mInfo.bent) { specularArrival = true; gmis.clear(); }
             }
 
             // Which fur tier this path believes in — rolled once, on its first segment, and
