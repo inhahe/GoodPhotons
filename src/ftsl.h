@@ -362,6 +362,14 @@ inline std::string blockLabel(const Block& b) {
     if (!b.name.empty()) s += " \"" + b.name + "\"";
     return s;
 }
+// While a block is built, the assets it names are looked for beside the file it came from
+// (assetbytes::blockDirRef): an `include`d part in a directory of its own finds its own. Scoped to
+// the top-level block; its children inherit it.
+struct BlockDirScope {
+    assetbytes::ScopedBlockDir s;
+    explicit BlockDirScope(const Block& b)
+        : s(b.file.empty() ? std::string() : assetbytes::toPath(b.file).parent_path().string()) {}
+};
 inline std::string strOf(const Block& b, const char* key, const std::string& dflt = "") {
     const Stmt* s = find(b, key);
     return (s && !s->val.words.empty()) ? s->val.words[0] : dflt;
@@ -1181,10 +1189,12 @@ public:
         // and may sample `grid:<name>(…)` / `scatter:<name>(…)`.
         for (const auto& b : blocks) {
             if (b.type != "grid") continue;
+            const BlockDirScope dir(b);
             if (!addGrid(b, L)) return false;
         }
         for (const auto& b : blocks) {
             if (b.type != "scatter") continue;
+            const BlockDirScope dir(b);
             if (!addScatter(b, L)) return false;
         }
         // Pass 1a': `sdf` blocks RESERVE their grid slot here and are BAKED after the
@@ -1196,6 +1206,7 @@ public:
         // explicitly (see rejectUnbakedSdf).
         for (const auto& b : blocks) {
             if (b.type != "sdf") continue;
+            const BlockDirScope dir(b);
             if (!reserveSdf(b, L)) return false;
         }
 
@@ -1203,6 +1214,7 @@ public:
         for (const auto& b : blocks) {
             if (b.type != "texture") continue;
             if (stopped()) return false;
+            const BlockDirScope dir(b);
             if (!addTexture(b, L)) return false;
         }
 
@@ -1210,12 +1222,14 @@ public:
         for (const auto& b : blocks) {
             if (b.type != "pattern") continue;
             if (stopped()) return false;
+            const BlockDirScope dir(b);
             if (!addPattern(b, L)) return false;
         }
 
         // Pass 1d: parametric records (must exist before materials that reference them).
         for (const auto& b : blocks) {
             if (b.type != "record") continue;
+            const BlockDirScope dir(b);
             if (!addRecord(b, L)) return false;
         }
 
@@ -1223,6 +1237,7 @@ public:
         for (const auto& b : blocks) {
             if (b.type != "material") continue;
             if (b.name.empty()) { fail("material needs a \"name\""); return false; }
+            const BlockDirScope dir(b);
             int id = (int)L.scene.mats.size();
             Material m = buildMaterial(b, L);
             if (!err.empty()) return false;
@@ -1237,6 +1252,7 @@ public:
         // resolved by the same second pass as a mix.
         for (const auto& b : blocks) {
             if (b.type != "material") continue;
+            const BlockDirScope dir(b);
             int id = matIndex_[b.name];
             MatType t = L.scene.mats[id].type;
             if (t != MatType::Mix && t != MatType::Layered) continue;
@@ -1249,6 +1265,7 @@ public:
         for (const auto& b : blocks) {
             if (b.type != "mesh_asset") continue;
             if (stopped()) return false;
+            const BlockDirScope dir(b);
             if (!addMeshAsset(b, L)) return false;
         }
 
@@ -1264,6 +1281,7 @@ public:
         std::vector<const Block*> furBlocks;
         for (const auto& b : blocks) {
             if (stopped()) return false;
+            const BlockDirScope dir(b);
             if      (b.type == "sphere")   { if (!routed(b, L, [&] { return addSphere(b, L); })) return false; }
             else if (b.type == "quad")     { if (!routed(b, L, [&] { return addQuad(b, L); })) return false; }
             else if (b.type == "triangle") { if (!routed(b, L, [&] { return addTriangle(b, L); })) return false; }
@@ -1298,11 +1316,13 @@ public:
         // a groom can be grown on a `shape_only` scalp that is then removed from the scene.
         for (const Block* fb : furBlocks) {
             if (stopped()) return false;
+            const BlockDirScope dir(*fb);
             if (!routed(*fb, L, [&] { return addFur(*fb, L); })) return false;
         }
         // Deferred medium sweep (object-name bounds resolve against the registries).
         for (const Block* mb : mediaBlocks) {
             if (stopped()) return false;
+            const BlockDirScope dir(*mb);
             if (!addMedium(*mb, L)) return false;
         }
         // Every consumer of a shape-only mesh's triangles has now run, so drop them
@@ -1836,6 +1856,7 @@ private:
         if (bit == B->spectraBlocks_.end()) return -1;
         const Stmt* e = find(*bit->second, "=");
         if (!e) return -1;
+        const BlockDirScope dir(*bit->second);   // its `csv:` file beside its own source
         Spectrum s = B->evalSpectrum(e->val, 1);
         int idx = (int)B->upsampleSpecs_->size();
         B->upsampleSpecs_->push_back(std::move(s));
@@ -2967,6 +2988,7 @@ private:
             if (it == spectraBlocks_.end()) { fail("unknown spectrum '" + nm + "'"); return constantSpectrum(0); }
             const Stmt* e = find(*it->second, "=");
             if (!e) { fail("spectrum '" + nm + "' has no value"); return constantSpectrum(0); }
+            const BlockDirScope dir(*it->second);   // its `csv:` file beside its own source
             return evalSpectrum(e->val, depth + 1);
         }
         // Common authoring trap: a bare numeric run like `absorb 3 0.5 0.3` looks like

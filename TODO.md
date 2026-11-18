@@ -440,8 +440,8 @@ Then the rest of 4.2-4.6 in their order, 4.7's bookkeeping alongside whatever to
 - [ ] **ALICE2-CHEEK-DOT** — a pinprick dark dot on the Alice2 face in front of each ear.
 - [x] **GLTF-ROUGHNESS-MAP** — a glTF roughness is fed to the Phong lobe raw, so imports render
   rougher than glTF means. 0.434.4.
-- [ ] **"a quad's emission is invisible from the side its winding faces away from"** — re-check
-  against AREA-LIGHT-SIDE (0.377.2), which fixed a neighbouring case.
+- [x] **"a quad's emission is invisible from the side its winding faces away from"** — done in 0.447.0
+  (EMIT-TWO-SIDED, `emit_two_sided on`; check_two_sided).
 - [ ] **"`-dual-scatter` drops the coat's indirect illumination"** (its part 2).
 - [x] **"`curv` reads 0 on an ISOSURFACE"** (0.449.8) — from the field's Hessian, where the material reads it.
 - [x] **"`curv` reads 0 in the PREVIEW rasterizer"** (0.449.8) — per pixel from the vertex normals, both previews.
@@ -470,7 +470,9 @@ Then the rest of 4.2-4.6 in their order, 4.7's bookkeeping alongside whatever to
 - [ ] **"an `sdf` over a self-overlapping mesh is exact outside but not inside"**.
 - [ ] **"`settle.drop()` falls back to the surface's TOP PLANE when the footprint 'misses'"** — find
   why the down-rays miss.
-- [ ] **"an `include`d file's own asset paths resolve through the ROOT scene"**.
+- [x] **"an `include`d file's own asset paths resolve through the ROOT scene"** (0.449.11) — beside the included file.
+- [ ] **loom's reader does not parse `include`** — `tools/loom/loom/grammar/reader.py` parses its own typed
+  `ftsl.epeg`, so a hand-authored scene with an `include` cannot round-trip through loom's editor.
 - [x] **"`tools/_gemsweep.py` — `spread` is not resolution-stable"** — metered on a fixed-world cell
   (`GEMCELL`); the orb's caustic reads alike at 480 and 960 px.
 - [x] **"`tools/_capchroma.py` scores marble VEINS as a caustic"** — meters over the frame's albedo

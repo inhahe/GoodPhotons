@@ -31,6 +31,13 @@ from the four field sites, and the mode-`J` flyby still falls to `restIdx` at `m
 Both belong to the same family as the `cmd /c` failure this script was written for: the harness
 said nothing, and silence was read as information.
 
+**A third, seen twice on 2026-11-17 with no other build alive:** `error C1083: Cannot open compiler
+generated file: '...\Release\main.obj': Permission denied`, on a different `.obj` each time, while
+a file could be created in the same directory. A retry built cleanly. Cause unknown (a scanner holding
+a freshly deleted object is the likeliest); check for a live `cl.exe` first, then just rebuild. And from
+this harness, `cmd /c build.bat` needs `NoDefaultCurrentDirectoryInExePath` unset (`env -u ...`): the
+shell sets it, and cmd then will not run a bare `build.bat` from the current directory.
+
 **THE ONE MEASUREMENT ERROR THIS PROJECT KEEPS MAKING, in the header because it has now caused
 EIGHT wrong conclusions and each was recorded only in its own entry.** Every one has the same
 shape: **the thing measured was not the thing meant**, and in every case the number looked
@@ -35411,7 +35418,14 @@ each site. The 0.323.0 validation was not weak -- it measured the right things t
 had no diffuse/glossy contrast in it, and a four-site change with a three-site edit is exactly what
 that blind spot looks like.
 
-## OPEN (minor, 2026-09-17, v0.325.0): an `include`d file's own asset paths resolve through the ROOT scene, not beside the included file
+## DONE (2026-11-17, 0.449.11; opened v0.325.0): an `include`d file's own asset paths resolve through the ROOT scene, not beside the included file
+
+**Fixed:** blocks already carried their source file (`Block::file`, set at splice time), so the loader scopes each
+top-level block's build -- every pass, the deferred fur and media sweeps, and a spectrum evaluated where a material
+names it -- to the directory of the file it came from (`BlockDirScope`), and `assetbytes::searchRoots` looks there
+right after the working directory (`blockDirRef`). `tools/check_include_assets.py`: a part in `parts/` naming
+`tri.obj` and `file:refl.csv` beside itself loads and renders (0.449.10: `cannot open spectrum file: refl.csv`).
+loom's reader still does not parse `include` (below). The report as filed:
 
 `include "file.ftsl"` (FTSL §1.5) resolves the include path itself beside the including file
 first, but the blocks it splices in carry no provenance, and the Builder that later reads a

@@ -3757,7 +3757,10 @@ was lit differently by every mode (known-issues GLOW-LIGHT-MODES). Now:
   Builder runs — so the Builder never learns the type exists, `prefer` branches get it by
   recursion, and every name crosses file boundaries as if pasted. Resolution is
   beside-the-including-file first, then `assetbytes::resolve`; cycles are caught on the
-  normalised absolute path and reported as the whole chain. Adding the rule meant
+  normalised absolute path and reported as the whole chain. Each spliced block keeps its
+  source file (`Block::file`), and the Builder scopes a top-level block's build to its
+  directory (`BlockDirScope`, `assetbytes::ScopedBlockDir`), which the search path looks in
+  right after the cwd: the assets an included part names resolve beside the part. Adding the rule meant
   regenerating `ftsl_scene.gen.cpp` with `python -m loom.grammar.emit_cpp`. loom parses the
   *same* grammar in Python via the pinned `tools/loom/loom/grammar/_gpda.py`, so
   ftrace and loom cannot disagree about the language. The flip (0.68) was gated on
@@ -5140,7 +5143,7 @@ as the one at fault.
   path by construction.
 - **`assetbytes.h`** (0.148.0) — the three things a scene's asset *bytes* may need that
   aren't parsing: an **overlay**, a **warmer**, and (0.192.0) the **search path** that
-  turns an authored relative path into a real one — `resolve` / `ScopedSceneDir` /
+  turns an authored relative path into a real one — `resolve` / `ScopedSceneDir` / `ScopedBlockDir` /
   `setExeDir`, described in full under *Where a relative asset path is looked for*.
   `Overlay` is a map from `normKey`
   (lowercased, forward-slashed — so loom's `Path.as_posix()` names match ftrace's

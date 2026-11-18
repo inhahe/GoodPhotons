@@ -105,6 +105,9 @@ inline std::string normKey(const std::string& path) {
 //      invocation that works today keeps resolving to exactly the file it resolves
 //      to today, so this change can only turn failures into successes, never move a
 //      load from one file to another.
+//   1b. THE DIRECTORY OF THE FILE THE BLOCK CAME FROM, while an `include`d part's block
+//      is built (blockDirRef): a part kept in a directory of its own names its assets
+//      beside itself. For the scene's own blocks it is (2).
 //   2. THE DIRECTORY OF THE SCENE FILE.  A scene's assets belong to the scene, which
 //      is the rule every other tool that references external files uses (glTF's own
 //      buffer URIs, below, already worked this way).
@@ -128,6 +131,10 @@ inline std::string normKey(const std::string& path) {
 // blindly at any open site without the caller needing to know which it has.
 inline std::string& exeDirRef()   { static std::string d; return d; }
 inline std::string& sceneDirRef() { static std::string d; return d; }
+// The directory of the file the block being built came from: an `include`d part's own, searched
+// before the scene's so a part kept in a directory of its own finds the assets it names beside
+// itself. Scoped per block by the loader (ScopedBlockDir); empty between blocks.
+inline std::string& blockDirRef() { static std::string d; return d; }
 
 // Set once at startup from the real module path (argv[0] is not dependable).
 inline void setExeDir(const std::string& d) { exeDirRef() = d; }
@@ -141,6 +148,13 @@ struct ScopedSceneDir {
     ~ScopedSceneDir() { sceneDirRef() = prev; }
     ScopedSceneDir(const ScopedSceneDir&) = delete;
     ScopedSceneDir& operator=(const ScopedSceneDir&) = delete;
+};
+struct ScopedBlockDir {
+    std::string prev;
+    explicit ScopedBlockDir(const std::string& dir) : prev(blockDirRef()) { blockDirRef() = dir; }
+    ~ScopedBlockDir() { blockDirRef() = prev; }
+    ScopedBlockDir(const ScopedBlockDir&) = delete;
+    ScopedBlockDir& operator=(const ScopedBlockDir&) = delete;
 };
 
 // Join a search-path root to a relative path. The empty root means "as authored".
@@ -161,6 +175,7 @@ inline std::vector<std::string> searchRoots() {
             if (normKey(e) == normKey(s)) return;
         v.push_back(std::move(s));
     };
+    if (!blockDirRef().empty()) add(toPath(blockDirRef()));
     if (!sceneDirRef().empty()) {
         fs::path p = toPath(sceneDirRef());
         add(p);

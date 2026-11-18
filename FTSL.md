@@ -155,12 +155,11 @@ asset search path)`. A cycle is refused with the whole chain:
 `b.ftsl:1: include cycle: a.ftsl -> b.ftsl -> a.ftsl` (on the resolved, normalised path, so
 `./x.ftsl` and `x.ftsl` are the same file).
 
-> **One thing an included file does NOT get: its own asset directory.** A `mesh { file … }`
-> or `texture { file … }` *inside* an included file resolves through the **root scene's**
-> search path, not relative to the included file. That is fine while parts live beside the
-> scene (this repo's layout — `scenes/x.ftsl` including `scenes/x_hair.ftsl`, both naming
-> `meshes/…`); it is the case to know about if you keep a part in a directory of its own.
-> Recorded in `known-issues.md`.
+**Assets an included file names** (a `mesh { file … }`, a `texture`, a `file:` spectrum, a
+medium's grid) are looked for **beside the included file** first, right after the working
+directory and before the root scene's search path (since 0.449.11). So a part kept in a
+directory of its own, with its meshes and curves beside it, loads from anywhere; a part beside
+the scene naming `meshes/…` resolves as it always did. `tools/check_include_assets.py` holds it.
 
 **Opening a part on its own.** A file written to be included usually has no light and no
 camera, because the including scene supplies both. Since 0.369.0 the preview opens it anyway
