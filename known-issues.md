@@ -6005,6 +6005,27 @@ on the tank without its pool floor (this repro). Whether a transparent face shou
 the disc is a separate question, open: both backends count it (and the ball test then rejects it
 for being above the plane), so both under-read the coverage there.
 
+## DONE (2026-11-17, 0.449.10): REVIEW-0449C — the Opus (max) review of e26c216..3e954b8 (0.449.5, 0.449.6)
+
+Fixed in 0.449.10:
+- **`buildPrimNear` ignored a stop and built a second BVH over every small feature** (every strand of a
+  groom: about 1.6 GB more at the load's peak for a 9 M-segment coat, and quadratic over the coarse tree a
+  stop leaves): each small feature now asks the scene's own tree which boxes overlap its own and lowers
+  theirs by an atomic min, in a stoppable loop; a stop leaves primNear empty.
+- **Its size rule left out a strand tip of radius 0 and an asset with one collapsed triangle**: a segment
+  counts by its larger radius, an asset by its smallest triangle of nonzero size.
+- **Radiance-cache update rays left their cell's point with the scene's eps**: a cell keeps its marking
+  hit's (`RadCacheCell::eps`).
+- **Nothing exercised primNear**: `-checkpatops` holds a quad with a 10 um strand on it to the strand's size.
+- **The solid-face gate copied runRender's rule for running a mode-D camera on mode J's renderer** (the
+  drift behind ROUTE-TAG-SOLIDS): both call `cameraRunsOnJ`.
+- **VCM evaluated hitEps up to three times per connection**: once per walk vertex.
+- **Comments still gave a fixed 1e-6** where the code takes the hit's eps, and a check's comment narrated
+  history: restated.
+Dismissed: carrying eps in the Hit, computed once in closestHit, in place of the eps argument of the helpers
+-- a Hit built by hand would then carry an eps nobody set (0, or a stale one: self-intersection), a worse
+failure than a site passing the scene's eps, which keeps the old offset; hitEps itself is a few flops.
+
 ## DONE (2026-11-17, 0.449.5; opened 0.445.6): ROUTE-TAG-SOLIDS — a mode-D camera with objects tagged J merged without the solids' sides
 
 Found by the full check sweep of 0.449.4. Since 0.445.6, `tools/check_route_tags.py` had failed on the
@@ -6120,8 +6141,8 @@ intersector writes it -- and no less than 512 ulps of the hit's coordinates. A s
 not enough: a strand rooted in the skin it leaves is smaller than the skin, and rays leaving the 1 mm
 ball still skipped 1e-6 at its roots (mode D x1.0092 +- 0.0005 over six seeds, against x1.0010 on the
 ball without the big ground). So `closestHit` also lowers the size to the smallest feature whose box
-overlaps the primitive's (`Scene::primNear`, `buildPrimNear`: a tree over the features small enough to
-cap below eps, none in an ordinary scene). The eps is the origin's offset, the strand's near-side skip
+overlaps the primitive's (`Scene::primNear`, `buildPrimNear`: each feature small enough to cap below
+eps queries the scene's own tree for the boxes it overlaps; none in an ordinary scene). The eps is the origin's offset, the strand's near-side skip
 and the next trace's tmin, which a `Ray` now carries (`Ray::tmin`, set by `continueAlong`,
 `passThrough`, `fireRay`, `gratingDiffract` and the delta continuations; `closestHit` given
 `kTminEps` takes it); the visibility queries are passed it, BDPT and VCM take each vertex's

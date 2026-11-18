@@ -345,6 +345,7 @@ struct RadCacheCell {
     uint16_t cnt[kRadCacheBins];    // samples folded into each bin (bounded by maxSamples)
     double   px, py, pz;            // representative surface point (double: it is a ray origin)
     float    nx, ny, nz;            // representative shading normal, unit
+    float    eps = 0.0f;            // the point's self-intersection distance: its update rays' offset and tmin
     uint32_t lastMark = 0;          // pass index at which a path last marked this cell
     uint32_t upRound  = 0;          // update rounds absorbed; drives the per-cell bin schedule
     uint8_t  ok   = 0;              // 1 = confident: may answer, and needs no more samples
@@ -392,6 +393,7 @@ struct RadCacheVal {
 struct RadCacheMark {
     uint64_t key;
     Vec3     p, n;
+    double   eps;   // p's self-intersection distance (Scene::hitEps of its hit)
 };
 // The canonical order of marks: by key, then by point and normal. A key's cell takes the least
 // of its batch's marks (pend), a choice no thread count or chunking can move.
@@ -463,10 +465,10 @@ struct RadCacheBank : RadCacheTally {
     }
 
     // Returns true if this key was not obviously marked already by this thread.
-    bool mark(uint64_t k, size_t slot, const Vec3& p, const Vec3& n) {
+    bool mark(uint64_t k, size_t slot, const Vec3& p, const Vec3& n, double eps) {
         ensure();
         const size_t f = slot & (kFilterSize - 1);
-        const RadCacheMark m{k, p, n};
+        const RadCacheMark m{k, p, n, eps};
         if (seen[f] == k && seenAt[f] < marks.size() && marks[seenAt[f]].key == k) {
             RadCacheMark& kept = marks[seenAt[f]];
             if (radCacheMarkLess(m, kept)) kept = m;
@@ -925,6 +927,7 @@ struct RadianceCache {
         stk[i] = RadCacheStack{};
         c.px = m.p.x; c.py = m.p.y; c.pz = m.p.z;
         c.nx = (float)m.n.x; c.ny = (float)m.n.y; c.nz = (float)m.n.z;
+        c.eps = (float)m.eps;
         c.lastMark = pass;
         scratch[i] = RadCacheScratch{};
     }

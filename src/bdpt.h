@@ -3929,10 +3929,10 @@ inline double vertexEps(const Scene& scene, const Vertex& v) {
 // `eps`: the vertex's self-intersection distance (vertexEps).
 inline Vec3 connOrigin(const Vertex& v, const Vec3& dir, double eps) {
     if (v.type == VType::Medium) return v.p;
-    // FAR-SIDE ORIGIN (0.365.0). A fiber connecting out the FAR side starts 1e-6 ALONG the
-    // connection, inside its own tube, so the tube's far wall lies at chord - 1e-6: inside the
+    // FAR-SIDE ORIGIN (0.365.0). A fiber connecting out the FAR side starts eps ALONG the
+    // connection, inside its own tube, so the tube's far wall lies at chord - eps: inside the
     // curve-only skip the exact chord supplies. Offsetting along the normal instead put the
-    // far wall at chord + 1e-6/cos, BEYOND the skip, for directions more than 45 deg off the
+    // far wall at chord + eps/cos, BEYOND the skip, for directions more than 45 deg off the
     // inward normal -- the strand occluded its own grazing far-side connections, which is
     // where a wide lobe's tail goes: -2 % (beta 0.05) to -5.4 % (beta 0.8) of a strand's
     // direct light against mode R, compounding to -9 % on dense fur. Mode R's shadow rays
@@ -3940,7 +3940,7 @@ inline Vec3 connOrigin(const Vertex& v, const Vec3& dir, double eps) {
     if (v.mat && v.mat->type == MatType::Hair && v.hit.fiberRadius > 0.0 && dot(v.ns, dir) < 0.0)
         return v.p + dir * eps;
     // A fiber connecting out the FAR side has to clear the strand's own body: strand
-    // radii are microns, so ng*1e-6 lands inside the tube and the connection reports
+    // radii are microns, so an offset along ng lands inside the tube and the connection reports
     // itself occluded, deleting exactly the TT glow that makes light hair look lit.
     // The far-side fiber clearance is no longer a displacement of the origin (which hid
     // any non-fiber surface within 2.5r -- the 0.360.2 defect); it travels as the

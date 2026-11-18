@@ -26,10 +26,9 @@ NL = chr(10)
 SCALE = 0.01        # centimetres against metres
 SCENE = [l for l in STUBBLE if not l.startswith("light sun")]
 # The same ball on a ground 400 m across, so that even drawn 100 times smaller the scene reaches past
-# unit size and its scale is 1: a small object in a big scene, whose offsets each backend sizes by the
-# primitive a ray leaves -- the device by its reach (DHit::pscale), the host by its size (Hit::size).
-# With the scene's eps, an absolute 1e-6 here, the host read the small ball x1.129 of the big one, one
-# tile 45 % off (known-issues CPU-SMALL-IN-BIG).
+# unit size and its scale is 1: a small object in a big scene, whose offsets each backend must size by
+# the primitive a ray leaves -- the device by its reach (DHit::pscale), the host by its size
+# (Hit::size) -- since the scene's own distance there (1e-6) is a twelfth of a strand's radius.
 BIG = [l.replace("quad { origin -2 0 -2   u 0 0 4   v 4 0 0", "quad { origin -200 0 -200   u 0 0 400   v 400 0 0")
        for l in SCENE]
 CASES = [("ball", SCENE, ("cpu", "gpu")), ("ball_big_ground", BIG, ("cpu", "gpu"))]

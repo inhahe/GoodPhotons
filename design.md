@@ -5833,8 +5833,9 @@ as the one at fault.
   hit, a triangle's longest edge (`Tri::size`, baked by `finalize`), an isosurface's bound's longest
   side, scaled through an instance or a motion by its mean scale; every intersector writes it, and
   `closestHit` lowers it to the smallest feature whose box overlaps the primitive's (`Scene::primNear`,
-  built by `buildPrimNear` from a tree over the features small enough to cap below eps, empty in a
-  scene with none: a strand rooted in the skin it leaves) -- and no
+  built by `buildPrimNear`: each feature small enough to cap below eps asks the scene's own tree which
+  boxes overlap its own and lowers theirs by an atomic min; empty in a scene with none, and after a
+  stop: a strand rooted in the skin it leaves) -- and no
   less than 512 ulps of its coordinates (`Hit::pscale` or the point's own distance). Never more than
   eps, so a scene whose features are all a thousandth of its size or more keeps eps everywhere and its
   renders. It is the offset off the surface (`continueAlong`, `passThrough`, `deltaOrigin`,

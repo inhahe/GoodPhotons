@@ -2997,7 +2997,7 @@ struct Scene {
     double hitEps(const Hit& h) const {
         return featureEps(h.size, std::max(h.pscale, std::max(std::fabs(h.p.x), std::max(std::fabs(h.p.y), std::fabs(h.p.z)))));
     }
-    // hitEps for a feature of `size` whose coordinates reach `reach` (0 or less: unknown -- `eps`).
+    // hitEps for a feature of `size` (0 or less: unknown, so `eps`) whose coordinates reach `reach`.
     double featureEps(double size, double reach) const {
         if (!(size > 0.0)) return eps;
         return std::min(eps, std::max(1e-3 * size, reach * 0x1p-43));
@@ -5390,18 +5390,23 @@ struct Scene {
 
     // primNear, from each primitive's box at the instant and its feature size (Hit::size's: a
     // triangle's longest edge, a sphere's radius, an isosurface's bound's longest side, a curve
-    // segment's smaller radius, an instance's asset's smallest triangle by its mean scale): a tree
-    // over the small features only, each node holding its smallest, queried with every box.
+    // segment's larger radius, an instance's asset's smallest triangle by its mean scale; a size of
+    // 0, a collapsed triangle or a strand's tip, says nothing). Each small feature asks the scene's
+    // own tree which primitives' boxes overlap its own and lowers theirs to its size (an atomic
+    // min over the float's bits: sizes are positive, so their bit patterns order as the floats
+    // do). A stop leaves primNear empty: every distance is then eps, and the stopped run renders
+    // nothing.
     void buildPrimNear() {
         primNear.clear();
-        std::vector<Aabb> boxes;
-        collectPrimBoxes(boxes, /*dropHair=*/false, nullptr);
         const size_t nT = tris.size(), nS = spheres.size(), nI = implicits.size(), nC = curveSegs.size();
+        const size_t n = nT + nS + nI + nC + instances.size();
+        if (n == 0 || bvh.nodes.empty() || ft::stopRequested()) return;
         std::vector<double> blasMin(blasList.size(), 0.0);
         for (size_t b = 0; b < blasList.size(); ++b) {
             double m = DBL_MAX;
-            for (const Tri& t : blasList[b].tris) m = std::min(m, (double)t.size);
-            blasMin[b] = m;
+            for (const Tri& t : blasList[b].tris)
+                if (t.size > 0.0f) m = std::min(m, (double)t.size);
+            blasMin[b] = (m < DBL_MAX) ? m : 0.0;
         }
         const auto sizeOf = [&](size_t g) -> double {
             if (g < nT) return tris[g].size;
@@ -5413,73 +5418,54 @@ struct Scene {
                 return std::max(b.hi.x - b.lo.x, std::max(b.hi.y - b.lo.y, b.hi.z - b.lo.z));
             }
             g -= nI;
-            if (g < nC) return std::min(curveSegs[g].r0, curveSegs[g].r1);
+            if (g < nC) return std::max(curveSegs[g].r0, curveSegs[g].r1);
             const MeshInstance& inst = instances[g - nC];
             return blasMin[(size_t)inst.blasId] / inst.curvScale;
         };
-        std::vector<Aabb> smallBoxes;
-        std::vector<double> smallSize;
-        for (size_t g = 0; g < boxes.size(); ++g) {
-            const double sz = sizeOf(g);
-            if (sz > 0.0 && 1e-3 * sz < eps) { smallBoxes.push_back(boxes[g]); smallSize.push_back(sz); }
-        }
-        if (smallBoxes.empty()) return;
-        Bvh tree;
-        tree.build(smallBoxes);
-        if (tree.nodes.empty()) return;
-        // Each node's smallest feature, children after parents in the array or not: a post-order walk.
-        std::vector<double> nodeMin(tree.nodes.size(), DBL_MAX);
-        {
-            std::vector<std::pair<int, bool>> st{{0, false}};
-            while (!st.empty()) {
-                const auto [ni, done] = st.back();
-                st.pop_back();
-                const BvhNode& nd = tree.nodes[(size_t)ni];
-                if (nd.isLeaf()) {
-                    for (int k = nd.first; k < nd.first + nd.count; ++k)
-                        nodeMin[(size_t)ni] = std::min(nodeMin[(size_t)ni], smallSize[(size_t)tree.primIdx[(size_t)k]]);
-                } else if (done) {
-                    nodeMin[(size_t)ni] = std::min(nodeMin[(size_t)nd.left], nodeMin[(size_t)nd.right]);
-                } else {
-                    st.push_back({ni, true});
-                    st.push_back({nd.left, false});
-                    st.push_back({nd.right, false});
-                }
+        const auto boxOf = [&](size_t g) -> Aabb {
+            if (g < nT) {
+                const Tri& t = tris[g];
+                Aabb b; b.expand(t.v0); b.expand(t.v1); b.expand(t.v2);
+                return b;
             }
-        }
-        const auto overlaps = [](const Aabb& a, const Aabb& b) {
-            return a.lo.x <= b.hi.x && b.lo.x <= a.hi.x && a.lo.y <= b.hi.y && b.lo.y <= a.hi.y &&
-                   a.lo.z <= b.hi.z && b.lo.z <= a.hi.z;
+            if (g < nT + nS) {
+                const Sphere& sp = spheres[g - nT];
+                const double r = std::fabs(sp.r);
+                Aabb b; b.expand(sp.c - Vec3{r, r, r}); b.expand(sp.c + Vec3{r, r, r});
+                return b;
+            }
+            return otherPrimBox((int)g);
         };
-        primNear.assign(boxes.size(), FLT_MAX);
-        std::atomic<size_t> dropped{0};
-        ft::parallelForAll(boxes.size(), 4096, [&](size_t g) {
-            const Aabb& q = boxes[g];
-            double best = DBL_MAX;
-            constexpr int kStack = 128;      // a depth-first walk holds the tree's depth + 1
-            int st[kStack], n = 0;
-            st[n++] = 0;
-            while (n > 0) {
-                const int ni = st[--n];
-                const BvhNode& nd = tree.nodes[(size_t)ni];
-                if (!(nodeMin[(size_t)ni] < best) || !overlaps(nd.box, q)) continue;
-                if (nd.isLeaf()) {
-                    for (int k = nd.first; k < nd.first + nd.count; ++k) {
-                        const int j = tree.primIdx[(size_t)k];
-                        if (smallSize[(size_t)j] < best && overlaps(smallBoxes[(size_t)j], q)) best = smallSize[(size_t)j];
-                    }
-                } else if (n + 2 <= kStack) {
-                    st[n++] = nd.left; st[n++] = nd.right;
-                } else {
-                    dropped.fetch_add(1, std::memory_order_relaxed);
-                }
-            }
-            if (best < DBL_MAX) primNear[g] = (float)best;
+        std::vector<int> smallFeat;   // (`small` is a macro in the Windows headers)
+        for (size_t g = 0; g < n; ++g) {
+            const double sz = sizeOf(g);
+            if (sz > 0.0 && 1e-3 * sz < eps) smallFeat.push_back((int)g);
+        }
+        if (smallFeat.empty()) return;
+        const auto bitsOf = [](float f) { uint32_t u; std::memcpy(&u, &f, sizeof u); return u; };
+        std::vector<std::atomic<uint32_t>> nearBits(n);
+        const uint32_t none = bitsOf(FLT_MAX);
+        for (auto& a : nearBits) a.store(none, std::memory_order_relaxed);
+        const bool done = ft::parallelFor(smallFeat.size(), 256, [&](size_t k) {
+            const size_t j = (size_t)smallFeat[k];
+            const Aabb bj = boxOf(j);
+            const uint32_t sj = bitsOf((float)sizeOf(j));
+            const Vec3 c = (bj.lo + bj.hi) * 0.5;
+            bvh.traverseSphere(c, 0.5 * length(bj.hi - bj.lo), [&](int g) {
+                const Aabb bg = boxOf((size_t)g);
+                if (bg.lo.x > bj.hi.x || bj.lo.x > bg.hi.x || bg.lo.y > bj.hi.y || bj.lo.y > bg.hi.y ||
+                    bg.lo.z > bj.hi.z || bj.lo.z > bg.hi.z) return;
+                std::atomic<uint32_t>& a = nearBits[(size_t)g];
+                uint32_t cur = a.load(std::memory_order_relaxed);
+                while (sj < cur && !a.compare_exchange_weak(cur, sj, std::memory_order_relaxed)) {}
+            });
         });
-        if (dropped.load())
-            std::fprintf(stderr, "[eps] warning: the small-feature tree is over %d deep; %zu subtrees went "
-                                 "unread, so some surfaces keep a larger self-intersection distance\n",
-                         127, dropped.load());
+        if (!done) return;
+        primNear.resize(n);
+        for (size_t g = 0; g < n; ++g) {
+            const uint32_t u = nearBits[g].load(std::memory_order_relaxed);
+            std::memcpy(&primNear[g], &u, sizeof u);
+        }
     }
 
     void buildBvh() {

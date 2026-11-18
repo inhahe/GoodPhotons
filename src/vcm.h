@@ -106,7 +106,7 @@ inline Vec3 offsetOrigin(const Vec3& p, const Vec3& ng, const Vec3& dir, double 
 
 // Fiber (MatType::Hair) variants of the same thing. A strand is a real solid tube a few
 // microns across, and its TT / TRT lobes leave through the FAR side of it — so the usual
-// ng*1e-6 nudge lands INSIDE the hair and the ray immediately reports itself occluded by
+// nudge along ng lands INSIDE the hair and the ray immediately reports itself occluded by
 // the very strand it left, deleting the forward glow that a pale coat is mostly made of.
 // Stepping a couple of diameters clears the tube and displaces nothing visible. Returns 0
 // (and so degrades to offsetOrigin) for every non-fiber vertex and for the near side.
@@ -122,10 +122,10 @@ inline double fiberStep(const Hit& h, bool isHair, const Vec3& dir) {
     return isHair ? hairChordExit(h.fiberRadius, h.n, h.tangent, dir) : 0.0;   // the exact chord (0.364.0)
 }
 inline Vec3 fiberOrigin(const Hit& h, bool isHair, const Vec3& dir, double eps) {
-    // FAR-SIDE ORIGIN (0.365.0). A fiber connecting out the FAR side starts 1e-6 ALONG the
-    // connection, inside its own tube, so the tube's far wall lies at chord - 1e-6: inside the
+    // FAR-SIDE ORIGIN (0.365.0). A fiber connecting out the FAR side starts eps ALONG the
+    // connection, inside its own tube, so the tube's far wall lies at chord - eps: inside the
     // curve-only skip the exact chord supplies. Offsetting along the normal instead put the
-    // far wall at chord + 1e-6/cos, BEYOND the skip, for directions more than 45 deg off the
+    // far wall at chord + eps/cos, BEYOND the skip, for directions more than 45 deg off the
     // inward normal -- the strand occluded its own grazing far-side connections, which is
     // where a wide lobe's tail goes: -2 % (beta 0.05) to -5.4 % (beta 0.8) of a strand's
     // direct light against mode R, compounding to -9 % on dense fur. Mode R's shadow rays
@@ -738,6 +738,7 @@ inline void traceLightSubpath(const Scene& scene, const Camera& cam, const Rende
     for (int edges = 1; edges <= lastEdge; ++edges) {
         Hit h = closestHitIn(scene, stk, ray);
         if (!h.valid) return;                    // escaped (no env in scope)
+        const double he = scene.hitEps(h);       // its self-intersection distance
         {
             int mi = h.extMat;
             if (mi >= 0) {
@@ -872,8 +873,8 @@ inline void traceLightSubpath(const Scene& scene, const Camera& cam, const Rende
                             // a delta vertex of the sampled path, so a connection through a
                             // fiber would double-count it against the longer sampled path.
                             const double visC = (mxF > 0.0 &&
-                                !scene.occluded(fiberOrigin(h, isHairV, wcam, scene.hitEps(h)), wcam,
-                                                distc - 2 * scene.hitEps(h), scene.hitEps(h), /*camLeg=*/true,
+                                !scene.occluded(fiberOrigin(h, isHairV, wcam, he), wcam,
+                                                distc - 2 * he, he, /*camLeg=*/true,
                                                 fiberStep(h, isHairV, wcam)))
                                 ? 1.0 : 0.0;
                             if (visC > 0.0) {
@@ -946,8 +947,8 @@ inline void traceLightSubpath(const Scene& scene, const Camera& cam, const Rende
         prevP = h.p;
         // A fiber scattering out its far side steps clear of its own tube (see fiberStep).
         const double fstep = fiberStep(h, mp->type == MatType::Hair, wi);
-        ray = (fstep > 0.0) ? Ray{h.p + normalize(wi) * (1e-3 * scene.hitEps(h)), normalize(wi), fstep}
-                            : Ray{continuationOrigin(h.p, h.ng, normalize(wi), delta, scene.hitEps(h)), normalize(wi), 0.0, scene.hitEps(h)};
+        ray = (fstep > 0.0) ? Ray{h.p + normalize(wi) * (1e-3 * he), normalize(wi), fstep}
+                            : Ray{continuationOrigin(h.p, h.ng, normalize(wi), delta, he), normalize(wi), 0.0, he};
     }
 }
 
@@ -1011,6 +1012,7 @@ inline Vec3 traceCameraSubpath(const Scene& scene, const Camera& cam, const Rend
         // Material::hideCamera. (The light subpath walk above never gets this.)
         Hit h = closestHitIn(scene, stk, ray, Scene::kTminEps, nullptr, /*skipHair=*/false,
                                          /*skipCamHidden=*/(edges == 1));
+        const double he = scene.hitEps(h);       // its self-intersection distance
         if (!h.valid) {
             // The ray left the scene. No env map in VCM scope, but a `light sun` is a
             // delta-DIRECTION emitter with no geometry: the s=0 term never fires for it and
@@ -1174,7 +1176,7 @@ inline Vec3 traceCameraSubpath(const Scene& scene, const Camera& cam, const Rend
                         // break the light subpath's matching dVCM).
                         // where the spot is at the path's time, its beam turned with it
                         Vec3 toL = scene.lightPointNow(em, em.origin) - h.p; dist2 = dot(toL, toL);
-                        if (dist2 > scene.hitEps(h) * scene.eps) {
+                        if (dist2 > he * scene.eps) {
                             distL = std::sqrt(dist2); wi = toL / distL;
                             epat = spotFalloff(dot(wi * -1.0, scene.lightDirNow(em, em.beamDir)),
                                                em.spotCosInner, em.spotCosOuter);
@@ -1212,7 +1214,7 @@ inline Vec3 traceCameraSubpath(const Scene& scene, const Camera& cam, const Rend
                         double areaScale = 1.0;   // its area at the pass's time about the point
                         epat = emitterSamplePoint(scene, em, u1, u2, yL, nL, &areaScale, &rng);
                         Vec3 toL = yL - h.p; dist2 = dot(toL, toL);
-                        if (dist2 > scene.hitEps(h) * scene.eps && em.area > 0.0) {
+                        if (dist2 > he * scene.eps && em.area > 0.0) {
                             distL = std::sqrt(dist2); wi = toL / distL;
                             // An aimed quad (Emitter::nGeom): the face's cosine is the
                             // measure, the aimed density the emission's, and its radiance
@@ -1260,8 +1262,8 @@ inline Vec3 traceCameraSubpath(const Scene& scene, const Camera& cam, const Rend
                             }
                             const bool isHairV = (mp->type == MatType::Hair);
                             const double visL = (mxfLe > 0.0 &&
-                                !scene.occludedTo(fiberOrigin(h, isHairV, wi, scene.hitEps(h)), h.p + wi * distL,
-                                                  occlEps, scene.hitEps(h), false, fiberStep(h, isHairV, wi)))
+                                !scene.occludedTo(fiberOrigin(h, isHairV, wi, he), h.p + wi * distL,
+                                                  occlEps, he, false, fiberStep(h, isHairV, wi)))
                                 ? 1.0 : 0.0;   // hard block: see t=1
                             if (visL > 0.0) {
                                 double pdfChoice = em.power / scene.totalPower;
@@ -1298,7 +1300,7 @@ inline Vec3 traceCameraSubpath(const Scene& scene, const Camera& cam, const Rend
                 if (!lightVertexConnects(lv)) continue;              // a merge vertex only
                 if (edges + lv.edges + 1 > ctx.maxDepth) continue;   // full path too long
                 Vec3 d = lv.p - h.p; double dist2 = dot(d, d);
-                if (dist2 <= scene.hitEps(h) * scene.hitEps(lv.hit)) continue;   // the ends coincide
+                if (dist2 <= he * scene.hitEps(lv.hit)) continue;   // the ends coincide
                 double distc = std::sqrt(dist2); Vec3 w = d / distc;   // camera -> light vertex
                 double cosCam = dot(h.n, w);
                 double cosLit = dot(lv.ns, w * -1.0);
@@ -1362,8 +1364,8 @@ inline Vec3 traceCameraSubpath(const Scene& scene, const Camera& cam, const Rend
                 {   // Either end may be a strand; clear both tubes (0 for non-fibers).
                     const bool camHair = (mp->type == MatType::Hair);
                     const bool litHair = (lv.mat && lv.mat->type == MatType::Hair);
-                    if (scene.occludedTo(fiberOrigin(h, camHair, w, scene.hitEps(h)), lv.p, 2 * scene.hitEps(lv.hit),
-                                         scene.hitEps(h), false,
+                    if (scene.occludedTo(fiberOrigin(h, camHair, w, he), lv.p, 2 * scene.hitEps(lv.hit),
+                                         he, false,
                                          fiberStep(h, camHair, w),
                                          fiberStep(lv.hit, litHair, w * -1.0)))
                         continue;   // hard block: see t=1
@@ -1518,8 +1520,8 @@ inline Vec3 traceCameraSubpath(const Scene& scene, const Camera& cam, const Rend
         softNg = orientedGeoN(h);
         // A fiber scattering out its far side steps clear of its own tube (see fiberStep).
         const double fstep = fiberStep(h, mp->type == MatType::Hair, wi);
-        ray = (fstep > 0.0) ? Ray{h.p + normalize(wi) * (1e-3 * scene.hitEps(h)), normalize(wi), fstep}
-                            : Ray{continuationOrigin(h.p, h.ng, normalize(wi), delta, scene.hitEps(h)), normalize(wi), 0.0, scene.hitEps(h)};
+        ray = (fstep > 0.0) ? Ray{h.p + normalize(wi) * (1e-3 * he), normalize(wi), fstep}
+                            : Ray{continuationOrigin(h.p, h.ng, normalize(wi), delta, he), normalize(wi), 0.0, he};
     }
     return result;
 }

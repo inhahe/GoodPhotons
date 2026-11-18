@@ -3410,7 +3410,7 @@ struct Renderer {
                 const Vec3 wo = hair::toWorld(hs.fr, wl);
                 // TT and TRT leave through the FAR side of a real solid strand, so step
                 // clear of the tube's own body (hair_shade.h); on the near side this is the
-                // ordinary 1e-6 offset.
+                // hit's ordinary offset (Scene::hitEps).
                 ray = Ray{h.p + wo * scene.hitEps(h), wo, hairExitOffset(hs, h.n, wo, scene.hitEps(h))};
                 return true;                        // beta unchanged (RR carried the weight)
             }

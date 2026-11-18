@@ -3605,8 +3605,46 @@ static bool checkHitFieldsWritten() {
 // is not knowable from the node alone (Grid/Scatter, whose arity is the named table's
 // dimensionality). Those are counted as SKIPPED rather than quietly passing -- a check that
 // says "all clear" about opcodes it never exercised would be worse than no check.
+// A surface touched by a feature far smaller than itself takes that feature's size at its hits
+// (Scene::primNear, closestHit), so a ray leaving it does not step over the feature (CPU-SMALL-IN-BIG):
+// a quad 4 m across with a strand 10 um thick lying on it reads 1e-5 and an eps of a thousandth of
+// that, where a sphere clear of both keeps its radius and the scene's eps.
+static bool checkPrimNear() {
+    ftsl::Loaded L;
+    std::string e;
+    const bool loaded = ftsl::loadSource(
+        "scene { units meters }\n"
+        "material \"m\" { type diffuse reflect 0.5 }\n"
+        "quad { origin -2 0 -2   u 0 0 4   v 4 0 0   material m }\n"
+        "curve \"s\" { material m  basis linear  radius 0.00001  point -0.5 0.00001 0  point 0.5 0.00001 0 }\n"
+        "sphere { center 0 5 0  radius 0.5  material m }\n"
+        "light area { origin -0.5 8 -0.5  u 1 0 0  v 0 0 1  normal 0 -1 0  spd preset:bb6500 }\n"
+        "camera \"c\" { eye 0 2 3  look_at 0 0 0  up 0 1 0  fov_y 40  film { res 8 8 } }\n",
+        "<checkpatops>", L, e);
+    bool ok = loaded;
+    if (!loaded) std::printf("[checkpatops] near features: scene failed to load: %s FAIL\n", e.c_str());
+    if (ok) {
+        Scene& sc = L.scene;
+        sc.build();
+        const Hit hq = sc.closestHit(Ray{Vec3(0.3, 1, 0.5), Vec3(0, -1, 0)});   // the quad, beside the strand
+        const Hit hs = sc.closestHit(Ray{Vec3(0, 6, 0), Vec3(0, -1, 0)});       // the sphere's top, under the lamp
+        const bool quadOk = hq.valid && std::fabs(hq.size - 1e-5) < 1e-9 && std::fabs(sc.hitEps(hq) - 1e-8) < 1e-12;
+        const bool sphOk = hs.valid && hs.size == 0.5 && sc.hitEps(hs) == sc.eps;
+        if (!quadOk)
+            std::printf("[checkpatops] near features: the quad under a 10 um strand reads size %g, eps %g "
+                        "(want 1e-05, 1e-08) FAIL\n", hq.size, sc.hitEps(hq));
+        if (!sphOk)
+            std::printf("[checkpatops] near features: a sphere clear of it reads size %g, eps %g (want 0.5, %g) FAIL\n",
+                        hs.size, sc.hitEps(hs), sc.eps);
+        ok = quadOk && sphOk;
+    }
+    std::printf("[checkpatops] near features: a surface a strand touches takes the strand's size %s\n",
+                ok ? "ok" : "FAIL");
+    return ok;
+}
+
 static int checkPatOps() {
-    const bool nudgeOk = checkPatternNudge() & checkHitFieldsWritten();
+    const bool nudgeOk = checkPatternNudge() & checkHitFieldsWritten() & checkPrimNear();
     struct Prog { PatOp op; int off, len; };
     std::vector<PatNode> pool;
     std::vector<Prog>    progs;
@@ -20150,6 +20188,28 @@ static void markSolidFaces(Scene& scene) {
                     scene.implicits.size(), sm.ms);
 }
 
+// The per-object mode tags a scene carries (Material::route, Medium::route).
+static void objectModeTags(const Scene& scene, bool& anyD, bool& anyJ) {
+    anyD = anyJ = false;
+    for (const Material& m : scene.mats) { anyD |= (m.route == ROUTE_D); anyJ |= (m.route == ROUTE_J); }
+    for (const Medium& md : scene.media) { anyD |= (md.route == ROUTE_D); anyJ |= (md.route == ROUTE_J); }
+}
+
+// Whether a camera in `mode` renders on mode J's renderer because of those tags: a mode-D camera
+// with anything tagged J, unless -no-modes sets the tags aside or mode J cannot render the scene
+// (then `*jCannot`, if given, names what it cannot). runRender switches such a camera; the batch
+// marks the solids' faces for it, as its merges read them.
+static bool cameraRunsOnJ(const Scene& scene, char mode, int projection, const char** jCannot = nullptr) {
+    if (jCannot) *jCannot = nullptr;
+    if (mode != 'D' || g_noObjectModes) return false;
+    bool anyD, anyJ;
+    objectModeTags(scene, anyD, anyJ);
+    if (!anyJ) return false;
+    const char* why = modeFeatureUnsupported(scene, 'J', projection);
+    if (jCannot) *jCannot = why;
+    return why == nullptr;
+}
+
 static int runRender(const Scene& scene, const Camera& cam, char mode,
                      long long N, int res, int resY, long long spp, int nThreads,
                      const char* device, bool diffraction,
@@ -20169,9 +20229,8 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
     // camera in mode J with things tagged D merges everywhere else. Every other mode has one
     // estimator for the whole frame and ignores the tags, and says so.
     {
-        bool anyD = false, anyJ = false;
-        for (const Material& m : scene.mats) { anyD |= (m.route == ROUTE_D); anyJ |= (m.route == ROUTE_J); }
-        for (const Medium& md : scene.media) { anyD |= (md.route == ROUTE_D); anyJ |= (md.route == ROUTE_J); }
+        bool anyD, anyJ;
+        objectModeTags(scene, anyD, anyJ);
         int on = 0, def = ROUTE_J, anyMedJ = 0;
         if ((anyD || anyJ) && g_noObjectModes) {
             static uint64_t saidFor = 0;   // once per scene, as every note in this block
@@ -20184,8 +20243,8 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
             // the camera's mode was checked against the scene's features (resolveCameraModes),
             // and J renders fewer of them (no fire, for one). Where it cannot, the tags are set
             // aside and the camera's own mode D renders the frame.
-            const char* jCannot = (mode == 'D' && anyJ)
-                                ? modeFeatureUnsupported(scene, 'J', cam.projection) : nullptr;
+            const char* jCannot = nullptr;
+            const bool toJ = cameraRunsOnJ(scene, mode, cam.projection, &jCannot);
             if (jCannot) {
                 static uint64_t saidFor = 0;   // once per scene, as the banner below
                 if (saidFor != scene.generation) {
@@ -20196,7 +20255,7 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
                 }
             } else if (mode == 'D' || mode == 'J') {
                 def = (mode == 'J') ? ROUTE_J : ROUTE_D;
-                if (mode == 'D' && anyJ) mode = 'J';
+                if (toJ) mode = 'J';
                 on = (mode == 'J') ? 1 : 0;
                 for (const Medium& md : scene.media)
                     if ((md.route >= 0 ? md.route : def) == ROUTE_J) anyMedJ = 1;
@@ -29308,19 +29367,12 @@ static int run(int argc, char** argv) {
     // The footprint probes of modes M and S, and of J's and U's merges, read which side of a closed
     // solid a face is met from (Hit::solid): marked once for the whole batch, before the meter below
     // gathers as the frames will, and only where a footprint is taken at all.
-    // A mode-D camera with anything tagged J gathers too: it runs on mode J's renderer, merging on
-    // its J-routed paths, unless -no-modes or mode J's limits set the tags aside (runRender's
-    // per-object modes).
+    // A mode-D camera that per-object tags put on mode J's renderer gathers too (cameraRunsOnJ).
     if (gatherAreaSamples() > 0 || gaGeomOn()) {
-        bool taggedJ = false;
-        if (!g_noObjectModes) {
-            for (const Material& m : scene.mats) taggedJ = taggedJ || m.route == ROUTE_J;
-            for (const Medium& md : scene.media) taggedJ = taggedJ || md.route == ROUTE_J;
-        }
         bool gathers = false;
         for (const RenderCam& rc : toRender)
             gathers = gathers || rc.mode == 'M' || rc.mode == 'S' || rc.mode == 'J' || rc.mode == 'U' ||
-                      (rc.mode == 'D' && taggedJ && !modeFeatureUnsupported(scene, 'J', rc.cam.projection));
+                      cameraRunsOnJ(scene, rc.mode, rc.cam.projection);
         if (gathers) markSolidFaces(scene);
     }
 

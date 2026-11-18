@@ -214,7 +214,7 @@ inline void hairBundleAt(const HairShade* hs, int n, const Vec3& wl, double cosL
 // it just came from and be reported as occluded, deleting the forward glow that dominates
 // a light-coloured coat. Stepping a couple of diameters clears the tube (strand radii are
 // microns, so this displaces nothing visible), and on a non-fiber hit — where fiberRadius
-// is 0 — it degrades to the ordinary 1e-6 surface offset.
+// is 0 — it degrades to the hit's ordinary surface offset (Scene::hitEps).
 // The distance a ray leaving a strand's surface point along `w` travels INSIDE the tube before
 // it exits through the far wall -- the chord of a cylinder of radius r about `axis`, entered at
 // a surface point whose outward radial normal is `n`: 2 r (-n.w) / (1 - (w.axis)^2). This is

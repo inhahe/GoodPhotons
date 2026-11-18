@@ -511,7 +511,7 @@ inline bool intersectImplicit(const Ray& r, const Implicit& im, double tmin, Hit
             // to decide th < hit.t exactly as the full path does.)
             if (anyHit && tn < hit.t) return true;
             // Refine the bracket [t, tn] to a precise root (residual ~1e-12) so the
-            // shared 1e-6 ray-spawn offset lands safely on the correct side. Bisection
+            // hit's ray-spawn offset (Scene::hitEps) lands safely on the correct side. Bisection
             // is the robust default; regula-falsi (Illinois-safeguarded) interpolates.
             double ta = t, tb = tn, fa = f, fb = fn;
             int side = 0;

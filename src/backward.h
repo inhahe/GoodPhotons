@@ -4117,7 +4117,7 @@ struct BackwardRenderer {
                         // direct-mapped filter, so the millionth path across a cell is free.
                         const uint64_t ck  = radCache->cellKey(h.p, h.n);
                         const uint64_t ckm = RadianceCache::mix(ck);
-                        radBank->mark(ck, (size_t)ckm, h.p, h.n);
+                        radBank->mark(ck, (size_t)ckm, h.p, h.n, scene.hitEps(h));
                         double e[hero::kHeroMax];
                         double j0 = 0.0, j1 = 0.0, j2 = 0.0;
                         // Only draw the dither when it is actually enabled: an unused draw
@@ -4258,6 +4258,7 @@ struct BackwardRenderer {
             const uint32_t slot = slots[li];
             const RadCacheCell& c = rc.cell[slot];
             const Vec3 p = c.point();
+            const double ce = c.eps > 0.0f ? (double)c.eps : scene.eps;   // its update rays' offset
             Vec3 n = c.normal();
             const double nl = std::sqrt(dot(n, n));
             if (!(nl > 0.0)) continue;
@@ -4278,7 +4279,7 @@ struct BackwardRenderer {
                 RadCacheStack& cs = rc.stk[slot];
                 const uint64_t sceneNow = (scene.generation << 32) ^ scene.buildCount;
                 if (cs.n < 0 || cs.scene != sceneNow) {
-                    stk0 = scene.eyeStack(p + n * scene.eps);
+                    stk0 = scene.eyeStack(p + n * ce);
                     cs.n = (int8_t)stk0.n;
                     cs.scene = sceneNow;
                     for (int s = 0; s < stk0.n; ++s) {
@@ -4300,7 +4301,7 @@ struct BackwardRenderer {
                 const Vec3 wOut = cosineHemisphere(n, rng);
                 const double cosT = dot(wOut, n);
                 if (!(cosT > 0.0)) continue;
-                Ray ray{p + n * scene.eps, wOut};
+                Ray ray{p + n * ce, wOut, 0.0, ce};
                 // rcTrain=true: the update ray MARKS the cells it crosses (so the cache
                 // grows into geometry only update rays can see) but NEVER READS one. That
                 // distinction is the difference between an unbiased cache and a diverging
