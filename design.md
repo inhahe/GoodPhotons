@@ -3758,9 +3758,11 @@ was lit differently by every mode (known-issues GLOW-LIGHT-MODES). Now:
   recursion, and every name crosses file boundaries as if pasted. Resolution is
   beside-the-including-file first, then `assetbytes::resolve`; cycles are caught on the
   normalised absolute path and reported as the whole chain. Each spliced block keeps its
-  source file (`Block::file`), and the Builder scopes a top-level block's build to its
-  directory (`BlockDirScope`, `assetbytes::ScopedBlockDir`), which the search path looks in
-  right after the cwd: the assets an included part names resolve beside the part. Adding the rule meant
+  source file and its directory (`Block::file`, `Block::dir`, set by `detail::tagSource` with
+  the blocks of its `prefer` branches), and the Builder scopes a top-level block's build to that
+  directory (`BlockDirScope`, `assetbytes::ScopedBlockDir`), which the search path looks in after
+  the scene's own directories: the assets an included part names resolve beside the part. A cache
+  keyed by an asset's name (`spdFileCache_`, `spdMemo_`) keys it with that directory too. Adding the rule meant
   regenerating `ftsl_scene.gen.cpp` with `python -m loom.grammar.emit_cpp`. loom parses the
   *same* grammar in Python via the pinned `tools/loom/loom/grammar/_gpda.py`, so
   ftrace and loom cannot disagree about the language. The flip (0.68) was gated on
@@ -8349,7 +8351,7 @@ as the one at fault.
   That trace must be taken in the **dual basis** — {e₁,e₂} is not orthonormal, so the 2×2
   Gram matrix has to be inverted. A quad/flat facet and a flat-shaded mesh (no normal field
   to differentiate) honestly report 0 rather than guess. An **isosurface** takes H from its
-  field's gradient and Hessian by central differences (`fieldGradientCurvature`, curvature.h's 13-point stencil, its step at least 2^-13 of the coordinates; 13 field
+  field's gradient and Hessian by central differences (`fieldCurvature`, curvature.h's 13-point stencil, its step at least 2^-13 of the coordinates; 13 field
   evaluations), only where its material reads `curv` (`Implicit::readsCurv`, set by the
   loader's `markCurvReaders`): every other isosurface hit pays nothing. The raster previews
   read it per pixel from their triangle's corners and vertex normals with the mesh's formula

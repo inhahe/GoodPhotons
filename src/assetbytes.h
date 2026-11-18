@@ -105,9 +105,6 @@ inline std::string normKey(const std::string& path) {
 //      invocation that works today keeps resolving to exactly the file it resolves
 //      to today, so this change can only turn failures into successes, never move a
 //      load from one file to another.
-//   1b. THE DIRECTORY OF THE FILE THE BLOCK CAME FROM, while an `include`d part's block
-//      is built (blockDirRef): a part kept in a directory of its own names its assets
-//      beside itself. For the scene's own blocks it is (2).
 //   2. THE DIRECTORY OF THE SCENE FILE.  A scene's assets belong to the scene, which
 //      is the rule every other tool that references external files uses (glTF's own
 //      buffer URIs, below, already worked this way).
@@ -118,6 +115,9 @@ inline std::string normKey(const std::string& path) {
 //      layout, and stopping at the scene directory would not fix the bug that
 //      prompted the work. Bounded so a stray name can't be answered from the root of
 //      the drive.
+//   3b. THE DIRECTORY OF THE FILE THE BLOCK CAME FROM, while an `include`d part's block
+//      is built (blockDirRef): a part kept in a directory of its own names its assets
+//      beside itself. After (2) and (3), so no load that resolved before moves.
 //   4. THE DIRECTORY OF ftrace.exe.  Engine data (`data/glass/*`, `data/metal/*`) is
 //      shipped beside the binary and has nothing to do with the scene, so it must
 //      resolve no matter where either the cwd or the scene is.
@@ -132,8 +132,9 @@ inline std::string normKey(const std::string& path) {
 inline std::string& exeDirRef()   { static std::string d; return d; }
 inline std::string& sceneDirRef() { static std::string d; return d; }
 // The directory of the file the block being built came from: an `include`d part's own, searched
-// before the scene's so a part kept in a directory of its own finds the assets it names beside
-// itself. Scoped per block by the loader (ScopedBlockDir); empty between blocks.
+// after the scene's directories (so no load that resolved before moves) so a part kept in a
+// directory of its own finds the assets it names beside itself. Scoped per block by the loader
+// (ScopedBlockDir, from Block::dir); empty between blocks.
 inline std::string& blockDirRef() { static std::string d; return d; }
 
 // Set once at startup from the real module path (argv[0] is not dependable).
@@ -142,20 +143,16 @@ inline void setExeDir(const std::string& d) { exeDirRef() = d; }
 // The scene directory is a property of the load in progress, not of the process, so
 // it is scoped: a nested or subsequent load of a different scene must not inherit it,
 // and a `prefer` block try-building several branches must see the same one throughout.
-struct ScopedSceneDir {
+template <std::string& (*Ref)()>
+struct ScopedDir {
     std::string prev;
-    explicit ScopedSceneDir(const std::string& dir) : prev(sceneDirRef()) { sceneDirRef() = dir; }
-    ~ScopedSceneDir() { sceneDirRef() = prev; }
-    ScopedSceneDir(const ScopedSceneDir&) = delete;
-    ScopedSceneDir& operator=(const ScopedSceneDir&) = delete;
+    explicit ScopedDir(const std::string& dir) : prev(Ref()) { Ref() = dir; }
+    ~ScopedDir() { Ref() = prev; }
+    ScopedDir(const ScopedDir&) = delete;
+    ScopedDir& operator=(const ScopedDir&) = delete;
 };
-struct ScopedBlockDir {
-    std::string prev;
-    explicit ScopedBlockDir(const std::string& dir) : prev(blockDirRef()) { blockDirRef() = dir; }
-    ~ScopedBlockDir() { blockDirRef() = prev; }
-    ScopedBlockDir(const ScopedBlockDir&) = delete;
-    ScopedBlockDir& operator=(const ScopedBlockDir&) = delete;
-};
+using ScopedSceneDir = ScopedDir<sceneDirRef>;
+using ScopedBlockDir = ScopedDir<blockDirRef>;
 
 // Join a search-path root to a relative path. The empty root means "as authored".
 inline std::string joinDir(const std::string& dir, const std::string& rel) {
@@ -175,7 +172,6 @@ inline std::vector<std::string> searchRoots() {
             if (normKey(e) == normKey(s)) return;
         v.push_back(std::move(s));
     };
-    if (!blockDirRef().empty()) add(toPath(blockDirRef()));
     if (!sceneDirRef().empty()) {
         fs::path p = toPath(sceneDirRef());
         add(p);
@@ -187,6 +183,7 @@ inline std::vector<std::string> searchRoots() {
             add(p);
         }
     }
+    if (!blockDirRef().empty()) add(toPath(blockDirRef()));
     if (!exeDirRef().empty()) add(toPath(exeDirRef()));
     return v;
 }

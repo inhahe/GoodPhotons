@@ -6012,6 +6012,34 @@ on the tank without its pool floor (this repro). Whether a transparent face shou
 the disc is a separate question, open: both backends count it (and the ball test then rejects it
 for being above the plane), so both under-read the coverage there.
 
+## DONE (2026-11-18, 0.449.14): REVIEW-0449E — the Opus (xhigh) review of aed3718..9f9a41b (0.449.11-0.449.13, settle.drop)
+
+Fixed in 0.449.14:
+- **An included part's blocks inside a `prefer` branch got no directory**, and **two caches keyed an asset by its
+  name** (`spdFileCache_` by the authored path, `spdMemo_` by the expression), so two parts each naming their own
+  `refl.csv` shared the first: blocks are tagged recursively with their file and its directory at splice time
+  (`detail::tagSource`, `Block::dir`), the file cache keys the resolved path and the memo a `file:` expression's
+  directory.
+- **The part's directory was searched before the scene's**, which could move a load that resolved before to
+  another file: it comes after the scene's own directories now.
+- **Pre-existing: Pass 1 kept pointers into `blocks` that `desugarArrays` then appended to** (a reallocation left
+  them dangling, now read at the spectrum scope): the array literals are desugared first.
+- **`settle.drop()` always lifted the object above the surface's top**, landing it on the topmost layer (a canopy
+  over the floor it was put on): it lifts only when nothing lies under it (check_settle_drop's floor-and-canopy).
+- **A moved or deforming triangle's re-finalised copy lost its mesh's extent** (Tri::size): kept, the motion's
+  scale applied.
+- **The curvature stencil's step also gave the hit's normal**, so an isosurface reading `curv` took its normal at
+  up to 2^-13 of its coordinates and bound: fine relief blurred, a thin shell's normal could flip. The normal is
+  fieldGradient's again (17 evaluations a `curv` hit), and the stencil's step floor is the coordinates' alone.
+- REFERENCE.md's include limit, its asset-path table (row 3b) and its `-spp` row; stale comments; the spectrum
+  directory scope computed once per file (`Block::dir`); `ScopedDir` for both scopes; one `raiseSizesToExtent`
+  and one `includeDirOf`; the viewer's redundant sampler bind; mode R's 256 named (`kDefaultSpp`).
+Dismissed: each camera its own mode's default spp in a mixed run -- spp is one run-wide value threaded through the
+meter, the shared passes and the batch loop; a mixed run renders its mode-W camera correctly at 256, says so,
+and is rare. And moving block-relative resolution from the scoped global into each loader's arguments: with every
+block tagged and the caches keyed by location, the scope covers every asset site, and the rewrite would touch
+every loader for no fault left.
+
 ## DONE (2026-11-18, 0.449.13): REVIEW-0449D — the Fable (xhigh) review of e26c216..aed3718 (0.449.5-0.449.10)
 
 Fixed in 0.449.13:
@@ -6027,8 +6055,8 @@ Fixed in 0.449.13:
 - **`buildPrimNear` needed an exact box overlap**: the query box is padded by eps, as a ray leaving a
   neighbour steps eps; candidates no larger than the querying feature are passed over.
 - **The curvature stencil reused the gradient's step**, down to 1e-6, where a second difference's rounding is
-  4 % of a unit curvature at coordinates of 100: its step is at least 2^-13 of the coordinates (`levelSetStep`),
-  and its 13 values give the normal too, so a `curv` hit evaluates the field 13 times, not 17.
+  4 % of a unit curvature at coordinates of 100: its step is at least 2^-13 of the coordinates (`levelSetStep`).
+  (0.449.13 also took the normal from those 13 values; 0.449.14 took it back, REVIEW-0449E.)
 - **The device twins restated the curvature arithmetic**: `curvature.h` holds it once (`triMeanCurvatureS`,
   `levelSetCurvature`, the stencil's points) for both backends; `primBox` and `Implicit::featureSize` likewise
   replace the near-feature pass's copies of the box and size rules. A comment narrating history: restated.
@@ -24257,7 +24285,7 @@ together — a real refactor, not a tweak, which is why it is logged rather than
 
 ### DONE (2026-11-17, 0.449.8; opened v0.161.0): `curv` reads 0 on an ISOSURFACE, so curvature-driven materials silently flatten there
 
-**Fixed** as proposed below: `fieldGradientCurvature` (implicit.h; device `dFieldGradientCurvature`; the stencil and its arithmetic in curvature.h) takes H from the field's
+**Fixed** as proposed below: `fieldCurvature` (implicit.h; device `dFieldCurvature`; the stencil and its arithmetic in curvature.h) takes H from the field's
 gradient and Hessian by central differences at the gradient's step (13 evaluations), only for an isosurface whose
 material reads `curv` (`Implicit::readsCurv`, set by the loader's scan, now `Builder::markCurvReaders`); a cap reads
 0. `-checkcurv` §10 holds an SDF sphere to +1/R and -1/R within 1e-3. The report as filed:
@@ -35467,7 +35495,7 @@ that blind spot looks like.
 **Fixed:** blocks already carried their source file (`Block::file`, set at splice time), so the loader scopes each
 top-level block's build -- every pass, the deferred fur and media sweeps, and a spectrum evaluated where a material
 names it -- to the directory of the file it came from (`BlockDirScope`), and `assetbytes::searchRoots` looks there
-right after the working directory (`blockDirRef`). `tools/check_include_assets.py`: a part in `parts/` naming
+after the scene's own directories (`blockDirRef`; REVIEW-0449E moved it there and tagged `prefer` branches). `tools/check_include_assets.py`: a part in `parts/` naming
 `tri.obj` and `file:refl.csv` beside itself loads and renders (0.449.10: `cannot open spectrum file: refl.csv`).
 loom's reader still does not parse `include` (below). The report as filed:
 

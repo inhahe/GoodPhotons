@@ -5568,6 +5568,7 @@ looked for in this order, and the **first place it exists wins**:
 | 1 | the **current working directory** (i.e. the path exactly as authored) | so every scene that worked before 0.192.0 still resolves to the identical file |
 | 2 | the **directory holding the `.ftsl` file** | the intuitive base: a scene and its assets travel together |
 | 3 | that directory's **parents, up to 3 levels** | this repo's layout — `scenes/foo.ftsl` naming `textures/bar.png` means `<repo>/textures/bar.png`, a *sibling* of `scenes/`, not a child |
+| 3b | for a block an **`include`d file** holds, **that file's directory** | a part kept in a directory of its own finds the assets it names beside itself; after rows 1-3, so a path that resolved before 0.449.11 still finds the same file |
 | 4 | the directory containing **`ftrace.exe`** | engine data (`data/glass/…`, `data/metal/…`, `data/illuminants/…`) ships beside the binary |
 
 An **absolute** path is used as-is. A path that exists in none of the four is passed
@@ -5867,10 +5868,10 @@ Since 0.325.0 a scene can be split across files: a top-level `include "part.ftsl
 boundary both ways — a `fur` in the main scene can grow `on` a mesh the part defines. The path is
 looked for **beside the including file** first, then on the ordinary asset search path above.
 Includes nest and may sit inside a `prefer` branch; a cycle is refused naming the whole chain, and
-a missing file is refused naming the *including* file and line. One limit: asset paths *inside* an
-included file resolve through the root scene's search path, not relative to the part (fine while
-parts live beside the scene). Grammar and examples: FTSL.md §1.5; regression rig
-`tools/include_rig.py`.
+a missing file is refused naming the *including* file and line. Asset paths *inside* an included
+file are also looked for beside the part (row 3b of the table above), so a part kept in a directory
+of its own carries its meshes, textures and CSVs with it. Grammar and examples: FTSL.md §1.5;
+regression rigs `tools/include_rig.py`, `tools/check_include_assets.py`.
 
 ### Camera animation (`camera_path`, `camera_orbit`)
 
@@ -6788,7 +6789,7 @@ survive exactly.
 | `-fog <σt>` / `-fogalbedo <a>` / `-fogg <g>` / `-fograyleigh` | Fog controls |
 | `-filmthickness <nm>` / `-filmior <n>` | Thin-film iridescence demo params |
 | `-diffraction <mode>` / `-nodiffraction` | Enable/disable grating & thin-film diffraction |
-| `-spp <n>` | Samples per pixel for modes `R`, `D`, `M`, `W` and `V`; **number of passes** for SPPM (`S`) and VCM (`U`). Default `256`, but `16` in mode `W`, whose deterministic estimators converge at 1 and spend more samples only on antialiasing and spectral resolution |
+| `-spp <n>` | Samples per pixel for modes `R`, `D`, `M`, `W` and `V`; **number of passes** for SPPM (`S`) and VCM (`U`). Default `256`, but `16` in mode `W`, whose deterministic estimators converge at 1 and spend more samples only on antialiasing and spectral resolution -- unless the run renders cameras in other modes beside mode W, when all take `256` (one run-wide value; ftrace says so) |
 | `-seed <n>` | **Draw a different realization of the same render** (new in 0.246.0). Everything else about ftrace is deterministic: a fixed set of flags produces one image *bit-for-bit*, across thread counts, `-window`/`-time` chunking and resume boundaries. That is the property every `cmp`-verified refactor and every regression gate in the repo leans on, and it has one cost — with a single realization available there is **no way to separate a systematic bias from the luck of one draw**. Render the same frame at `-seed 1`, `-seed 2`, `-seed 3` and the *spread* between them is the estimator's variance at that sample count; anything they all agree on that an independent reference does not is bias. (This is step 1 of the **UPBP-THICK** diagnosis in `known-issues.md`: mode `J`'s beam map is built once, so an error that shrinks as you add light subpaths could be either.) Implemented as a salt XORed into every seed derivation on **both backends and in every mode** — the CPU's single `seedUnit` funnel, mode `M`'s beam-trim roulette, mode `U`/`S`'s per-pass seeds, and each of the GPU's kernel seed origins. **`-seed 0` is the default and is the historical stream**, bit-for-bit, because XOR by zero is the identity — so adding this flag did not invalidate a single existing reference image, and there is no "default seed that happens to differ from the old one". `n` is run through the SplitMix64 finalizer, so consecutive seeds (the natural way to draw a handful of realizations) give streams differing in every bit rather than in one. A seed is **not** a substitute for `-spp`: two seeds at the same sample count are equally noisy, just differently noisy |
 | `-n <photons>` (mode `S`) | Photons traced **per pass** (SPPM rebuilds a bounded map each pass). *(Mode `U` ignores `-n` — its light-path count follows the film resolution.)* |
 

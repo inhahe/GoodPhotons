@@ -156,10 +156,11 @@ asset search path)`. A cycle is refused with the whole chain:
 `./x.ftsl` and `x.ftsl` are the same file).
 
 **Assets an included file names** (a `mesh { file … }`, a `texture`, a `file:` spectrum, a
-medium's grid) are looked for **beside the included file** first, right after the working
-directory and before the root scene's search path (since 0.449.11). So a part kept in a
-directory of its own, with its meshes and curves beside it, loads from anywhere; a part beside
-the scene naming `meshes/…` resolves as it always did. `tools/check_include_assets.py` holds it.
+medium's grid) are also looked for **beside the included file**, after the root scene's own
+search path (since 0.449.11) -- after it, so no path that resolved before now finds another
+file. So a part kept in a directory of its own, with its meshes and curves beside it, loads from
+anywhere, blocks inside its `prefer` branches included; a part beside the scene naming
+`meshes/…` resolves as it always did. `tools/check_include_assets.py` holds it.
 
 **Opening a part on its own.** A file written to be included usually has no light and no
 camera, because the including scene supplies both. Since 0.369.0 the preview opens it anyway

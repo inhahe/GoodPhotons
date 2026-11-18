@@ -2274,7 +2274,6 @@ static bool drawMeshPane(const std::vector<MeshGeom>& meshes, MeshView& view,
             ctx->DSSetShader(nullptr, nullptr, 0);
             ctx->VSSetConstantBuffers(0, 1, &gpu.cb);
             ctx->PSSetConstantBuffers(0, 1, &gpu.cb);
-            ctx->PSSetSamplers(0, 1, &gpu.samp);
             const float bf[4] = { 0, 0, 0, 0 };
             ctx->OMSetBlendState(gpu.blend, bf, 0xffffffff);
             ctx->RSSetState(gpu.rsSolid);

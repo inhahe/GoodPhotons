@@ -1547,6 +1547,16 @@ struct Emitter {
 // normalize the direction — so the local hit's t equals the world t directly and
 // can be compared against the shared world tMax with no rescaling.
 // ---------------------------------------------------------------------------
+// Raise each of the n triangles' feature size (Tri::size) to the extent of the whole run, its
+// mesh (Scene::bakeMeshSizes, Blas::build say why).
+inline void raiseSizesToExtent(Tri* t, size_t n) {
+    Aabb b;
+    for (size_t i = 0; i < n; ++i) { b.expand(t[i].v0); b.expand(t[i].v1); b.expand(t[i].v2); }
+    if (!(b.lo.x <= b.hi.x)) return;
+    const float ext = (float)length(b.hi - b.lo);
+    for (size_t i = 0; i < n; ++i) t[i].size = std::max(t[i].size, ext);
+}
+
 struct Blas {
     std::vector<Tri> tris;   // in local (authored) space
     Bvh bvh;                 // over the local tris
@@ -1564,11 +1574,7 @@ struct Blas {
             localBounds.expand(b);
             boxes.push_back(b);
         }
-        // A triangle's feature size is its asset's (Tri::size; Scene::bakeMeshSizes says why).
-        if (localBounds.lo.x <= localBounds.hi.x) {
-            const float ext = (float)length(localBounds.hi - localBounds.lo);
-            for (auto& t : tris) t.size = std::max(t.size, ext);
-        }
+        raiseSizesToExtent(tris.data(), tris.size());   // a triangle's feature size is its asset's
         bvh.build(boxes);
     }
     // Closest hit in local space. `h.t` carries the running (world==local) tMax on
@@ -1938,6 +1944,8 @@ struct Scene {
         o.n1 = nrm(t.n1);
         o.n2 = nrm(t.n2);
         o.finalize();
+        bool nonUniform = false;   // its mesh's extent (bakeMeshSizes), which finalize reset, moved
+        o.size = std::max(o.size, (float)(t.size * D.uniformScale(nonUniform)));
         return o;
     }
     // intersectTri / intersectSphere against a primitive as the current path sees it: itself,
@@ -1988,6 +1996,7 @@ struct Scene {
         tt.v0 = p[0]; tt.v1 = p[1]; tt.v2 = p[2];
         tt.n0 = n[0]; tt.n1 = n[1]; tt.n2 = n[2];
         tt.finalize();
+        tt.size = std::max(tt.size, t.size);   // its mesh's extent (bakeMeshSizes), which finalize reset
         if (!intersectTri(sh, r, tt, tmin, h, vcolData())) return false;
         h.deformTri = (int)(&t - tris.data());
         h.deformB1 = x.b1;   // intersectTri's own: the same crossing of the same corners
@@ -5082,15 +5091,9 @@ struct Scene {
     // coincident layers. Only a mesh small as a whole -- a bead in a big scene -- takes smaller
     // offsets; a lone triangle or quad keeps its own extent.
     void bakeMeshSizes() {
-        for (const MeshGroup& g : meshGroups) {
-            if (g.blasId >= 0 || g.triCount == 0 || g.triStart + g.triCount > tris.size()) continue;
-            Aabb b;
-            for (size_t i = g.triStart; i < g.triStart + g.triCount; ++i) {
-                b.expand(tris[i].v0); b.expand(tris[i].v1); b.expand(tris[i].v2);
-            }
-            const float ext = (float)length(b.hi - b.lo);
-            for (size_t i = g.triStart; i < g.triStart + g.triCount; ++i) tris[i].size = std::max(tris[i].size, ext);
-        }
+        for (const MeshGroup& g : meshGroups)
+            if (g.blasId < 0 && g.triCount > 0 && g.triStart + g.triCount <= tris.size())
+                raiseSizesToExtent(tris.data() + g.triStart, g.triCount);
     }
 
     void build() {

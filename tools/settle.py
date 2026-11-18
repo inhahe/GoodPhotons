@@ -99,21 +99,29 @@ def drop(obj, surface, gap):
         return np.array([0.0, dy, 0.0]), np.eye(3)
 
     S = data
-    # The object may start anywhere -- below the surface, or in it (seat_on_stand turns a piece
-    # about the world origin, which can carry it under its stand) -- so it is first lifted clear
-    # of the surface's top; a ray cast down from below the surface would find nothing. Then cast
-    # straight down from every vertex: the object descends by the smallest per-vertex clearance,
-    # which the tightest vertex meets the surface at.
-    lift = max(0.0, float(S.bounds[1][1]) - float(verts[:, 1].min())) + 1e-3 * (float(np.ptp(S.bounds[:, 1])) + 1.0)
-    origins = verts + np.array([0.0, lift, 0.0])
-    dirs = np.tile([0.0, -1.0, 0.0], (len(origins), 1))
-    locs, iray, _ = S.ray.intersects_location(origins, dirs, multiple_hits=True)
-    best = {}
-    eps = 1e-9
-    for loc, ir in zip(locs, iray):
-        vy = origins[ir][1]
-        if loc[1] <= vy + eps:                        # surface point below this vertex
-            best[ir] = max(best.get(ir, -math.inf), loc[1])
+    dirs = np.tile([0.0, -1.0, 0.0], (len(verts), 1))
+
+    def under(lift):
+        """Cast straight down from every vertex raised by `lift`: for each vertex with surface under
+        it, the highest such point (the object descends by the smallest per-vertex clearance, which
+        the tightest vertex meets the surface at)."""
+        origins = verts + np.array([0.0, lift, 0.0])
+        locs, iray, _ = S.ray.intersects_location(origins, dirs, multiple_hits=True)
+        best = {}
+        for loc, ir in zip(locs, iray):
+            if loc[1] <= origins[ir][1] + 1e-9:       # surface point below this vertex
+                best[ir] = max(best.get(ir, -math.inf), loc[1])
+        return origins, best
+
+    # The first surface under the object where it starts. Only where there is none -- it starts
+    # below the surface or inside it (seat_on_stand turns a piece about the world origin, which can
+    # carry it under its stand) -- is it lifted clear of the surface's top first; lifting always
+    # would land it on the topmost layer (a tabletop over the floor it was put on).
+    lift = 0.0
+    origins, best = under(lift)
+    if not best:
+        lift = max(0.0, float(S.bounds[1][1]) - float(verts[:, 1].min())) + 1e-3 * (float(np.ptp(S.bounds[:, 1])) + 1.0)
+        origins, best = under(lift)
     if not best:
         # The footprint lies off the surface altogether: nothing under any vertex.
         top = S.bounds[1][1]

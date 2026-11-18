@@ -2,19 +2,19 @@
 
     python -u tools/check_include_assets.py [--out <dir>] [--exe ftrace.exe]
 
-A scene includes `parts/part.ftsl`, a part kept in a directory of its own, which names a mesh
-(`tri.obj`) and a measured reflectance (`spectrum ... = file:refl.csv`) relative to itself; neither
-file exists beside the scene or in the working directory. The scene must load and render (a 16x16
-mode-W frame on the CPU) with the part's triangle in view and lit by the CSV's reflectance -- its mean
-above the background's. Assets resolve beside the file a block came from before the scene's directory
-(assetbytes::blockDirRef, the loader's BlockDirScope). Exits 1 on failure.
+A scene includes two parts, each kept in a directory of its own and naming a mesh (`tri.obj`) and a
+measured reflectance (`file:refl.csv`) relative to itself -- the same names, different files: the
+left part's reflects 0.8, the right part's 0.2. The left part's mesh sits inside a `prefer` branch.
+Neither file exists beside the scene or in the working directory. The scene must load and render (a
+32x16 mode-W frame on the CPU) with each part's triangle in view, lit by its own CSV: the left half at
+least 2.5 times as bright as the right. Assets resolve beside the file a block came from (Block::dir,
+BlockDirScope), and the loader's spectrum caches key a file by where it resolves. Exits 1 on failure.
 """
 import argparse
 import os
 import subprocess
 import sys
 
-import numpy as np
 from pfm import read_pfm  # noqa: E402
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -22,17 +22,27 @@ NL = chr(10)
 
 SCENE = [
     'scene { units meters }',
-    'camera "c" { eye 0 0 3  look_at 0 0 0  up 0 1 0  fov_y 40  film { res 16 16 } }',
-    'light area { origin -1 2 2  u 2 0 0  v 0 0 1  normal 0 -1 0  power 50  spd preset:d65 }',
-    'include "parts/part.ftsl"',
+    'camera "c" { eye 0 0 4  look_at 0 0 0  up 0 1 0  fov_y 40  film { res 32 16 } }',
+    'light area { origin -2 2 2  u 4 0 0  v 0 0 1  normal 0 -1 0  power 80  spd preset:d65 }',
+    'include "left/part.ftsl"',
+    'include "right/part.ftsl"',
 ]
-PART = [
-    'spectrum "refl" = file:refl.csv',
-    'material "m" { type diffuse  reflect spectrum:refl }',
-    'mesh { file "tri.obj"  material m }',
+LEFT = [
+    'material "ml" { type diffuse  reflect file:refl.csv }',
+    'prefer { mesh { file "tri.obj"  material ml } } else { mesh { file "tri.obj"  material ml } }',
 ]
-OBJ = ["v -1 -1 0", "v 1 -1 0", "v 0 1 0", "f 1 2 3"]
-CSV = ["# wavelength_nm,value", "380,0.8", "780,0.8"]
+RIGHT = [
+    'material "mr" { type diffuse  reflect file:refl.csv }',
+    'mesh { file "tri.obj"  material mr }',
+]
+
+
+def obj(cx):
+    return ["v %g -0.6 0" % (cx - 0.6), "v %g -0.6 0" % (cx + 0.6), "v %g 0.6 0" % cx, "f 1 2 3"]
+
+
+def csv(v):
+    return ["# wavelength_nm,value", "380,%g" % v, "780,%g" % v]
 
 
 def write(path, lines):
@@ -46,32 +56,34 @@ def main():
     ap.add_argument("--exe", default=os.path.join(ROOT, "ftrace.exe"))
     a = ap.parse_args()
     exe, out = os.path.abspath(a.exe), os.path.abspath(a.out)
-    parts = os.path.join(out, "parts")
-    os.makedirs(parts, exist_ok=True)
+    for side, part, cx, refl in (("left", LEFT, -0.9, 0.8), ("right", RIGHT, 0.9, 0.2)):
+        d = os.path.join(out, side)
+        os.makedirs(d, exist_ok=True)
+        write(os.path.join(d, "part.ftsl"), part)
+        write(os.path.join(d, "tri.obj"), obj(cx))
+        write(os.path.join(d, "refl.csv"), csv(refl))
     write(os.path.join(out, "scene.ftsl"), SCENE)
-    write(os.path.join(parts, "part.ftsl"), PART)
-    write(os.path.join(parts, "tri.obj"), OBJ)
-    write(os.path.join(parts, "refl.csv"), CSV)
     png = os.path.join(out, "frame.png")
     pfm = png[:-4] + ".pfm"
     for f in (png, pfm):
         if os.path.exists(f):
             os.remove(f)
-    # Run from the repository root, so neither file is in the working directory either.
+    # Run from the repository root, so neither part's files are in the working directory either.
     cmd = [exe, "-in", os.path.join(out, "scene.ftsl"), "-mode", "W", "-device", "cpu", "-spp", "1",
            "-hdr", "-no-meter", "-o", png]
     r = subprocess.run(cmd, cwd=ROOT, capture_output=True, text=True, encoding="utf-8", errors="replace")
     ok = r.returncode == 0 and os.path.exists(pfm)
     if not ok:
         print(r.stdout[-1500:], r.stderr[-1500:])
-        print("FAIL: the scene with an included part in its own directory did not render (exit %d)" % r.returncode)
+        print("FAIL: the scene with included parts in directories of their own did not render (exit %d)"
+              % r.returncode)
     else:
         img = read_pfm(pfm, top_down=True).sum(-1)
         h, w = img.shape
-        mid, corner = float(img[h // 2 - 2:h // 2 + 2, w // 2 - 2:w // 2 + 2].mean()), float(img[0:3, 0:3].mean())
-        ok = mid > 0.0 and mid > 4.0 * corner
-        print("%s: the included part's mesh and reflectance load beside it (centre %.4g, corner %.4g)"
-              % ("ok" if ok else "FAIL", mid, corner))
+        left, right = float(img[:, :w // 2].mean()), float(img[:, w // 2:].mean())
+        ok = right > 0.0 and left > 2.5 * right
+        print("%s: each part's mesh and its own reflectance load beside it (left %.4g, right %.4g, x%.2f)"
+              % ("ok" if ok else "FAIL", left, right, left / right if right > 0 else float("inf")))
     print("PASS" if ok else "FAILED")
     return 0 if ok else 1
 

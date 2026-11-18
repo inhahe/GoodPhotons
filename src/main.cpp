@@ -14988,6 +14988,8 @@ static bool g_directOnly = false;
 static bool g_whitted = false;
 // Mode W's default -spp (mode R's is 256).
 constexpr long long kWhittedSpp = 16;
+// Every other mode's default -spp.
+constexpr long long kDefaultSpp = 256;
 static int  g_whittedGrid = 4;
 static double g_ambient = 0.0;
 
@@ -18563,7 +18565,7 @@ static void readRadCacheSection(std::istream& in, bool adopt = true) {
                 in.read((char*)pn, (std::streamsize)(markBytes - 8));
                 m.p = Vec3{pn[0], pn[1], pn[2]};
                 m.n = Vec3{pn[3], pn[4], pn[5]};
-                m.eps = pn[6];   // 0 before v5: the update pass then takes the scene's
+                m.eps = pn[6];   // 0 before v5, whose tables configGuard never lets a pass adopt
             }
             for (RadCacheVal& v : b.vals) {
                 in.read((char*)&v.key, 8);
@@ -23832,7 +23834,7 @@ static int run(int argc, char** argv) {
     bool   checkWatertight = false;        // -check-watertight: audit every mesh/isosurface + exit
     bool   checkAirtight = false;          // -check-airtight: ray-parity audit of the marched field + exit
     long long airtightRays = 4000;         // -check-airtight chord count per isosurface
-    long long spp = 256;      // backward reference samples/pixel (modes R and V; W: kWhittedSpp)
+    long long spp = kDefaultSpp;   // backward reference samples/pixel (modes R and V; W: kWhittedSpp)
     bool sppGiven = false;    // -spp named on the command line
     double fogSigmaT = 0.0;   // fog extinction coeff (0 = no fog); at 550nm if Rayleigh
     double fogAlbedo = 0.9;   // single-scattering albedo sigma_s/sigma_t
@@ -26346,10 +26348,10 @@ static int run(int argc, char** argv) {
         bool allW = true;
         for (const RenderCam& rc : toRender) allW = allW && rc.mode == 'R';
         if (!allW) {
-            spp = 256;
+            spp = kDefaultSpp;
             g_fwSpp = spp;
-            std::printf("[spp] 256 (mode R's default): this run renders cameras in other modes beside mode W, "
-                        "whose own default is %lld\n", kWhittedSpp);
+            std::printf("[spp] %lld (mode R's default): this run renders cameras in other modes beside mode W, "
+                        "whose own default is %lld\n", kDefaultSpp, kWhittedSpp);
         }
     }
     if (g_whitted && !wPreview) { warnWhittedDeHeroSpp(scene, spp); noteWhittedMediaSpp(scene, spp); }

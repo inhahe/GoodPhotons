@@ -196,11 +196,12 @@ inline Vec3 fieldGradient(const FieldNode* nodes, int n, const Vec3& p, double e
     return len > 0.0 ? g / len : Vec3{0, 0, 1};
 }
 
-// The unit normal and the mean curvature of the field's level set through p, from the 13 values
-// of curvature.h's stencil at step h (levelSetStep): what a hit on an isosurface whose material
-// reads `curv` takes, in place of fieldGradient's four.
-inline double fieldGradientCurvature(const FieldNode* nodes, int n, const Vec3& p, double h,
-                                     const PatNode* exprPool, const PatTables* tabs, Vec3& normal) {
+// The mean curvature of the field's level set through p, from the 13 values of curvature.h's
+// stencil at step h (levelSetStep). The hit's normal stays fieldGradient's, at the march's own step:
+// the curvature step can span a thin shell's two faces or blur fine relief, which a curvature
+// tolerates and a normal does not.
+inline double fieldCurvature(const FieldNode* nodes, int n, const Vec3& p, double h,
+                             const PatNode* exprPool, const PatTables* tabs) {
     double f[kLevelSetStencil];
     for (int i = 0; i < kLevelSetStencil; ++i) {
         double x, y, z;
@@ -208,10 +209,7 @@ inline double fieldGradientCurvature(const FieldNode* nodes, int n, const Vec3& 
         f[i] = fieldEval(nodes, n, Vec3{p.x + x * h, p.y + y * h, p.z + z * h}, exprPool, tabs);
     }
     double gx, gy, gz;
-    const double H = levelSetCurvature(f, h, gx, gy, gz);
-    const double len = std::sqrt(gx * gx + gy * gy + gz * gz);
-    normal = len > 0.0 ? Vec3{gx / len, gy / len, gz / len} : Vec3{0, 0, 1};
-    return H;
+    return levelSetCurvature(f, h, gx, gy, gz);
 }
 
 // Ray-march strategy for finding the first zero crossing of the field along a ray.
@@ -280,7 +278,7 @@ struct Implicit {
     // opening. Only affects surfaces that actually reach the container.
     bool      capped = false;
     // Whether a pattern its material binds reads `curv` (the loader's scan,
-    // Builder::markCurvReaders), so a hit pays for the field's Hessian (fieldGradientCurvature).
+    // Builder::markCurvReaders), so a hit pays for the field's Hessian (fieldCurvature).
     bool      readsCurv = false;
     // Its feature size (Hit::size): the longest side of its bound.
     double featureSize() const {
@@ -446,7 +444,7 @@ inline bool intersectImplicit(const Ray& r, const Implicit& im, double tmin, Hit
 
     // Commit a hit at parametric `th`, world point `p`, geometric normal `ng`
     // (field gradient for the surface; container outward normal for a cap), and `curvG` the
-    // mean curvature toward ng (fieldGradientCurvature; a cap's is 0).
+    // mean curvature toward ng (fieldCurvature; a cap's is 0).
     auto writeHit = [&](double th, const Vec3& p, const Vec3& ng, double curvG) -> bool {
         hit.t = th; hit.p = p; hit.valid = true;
         hit.ng = ng;
@@ -532,15 +530,12 @@ inline bool intersectImplicit(const Ray& r, const Implicit& im, double tmin, Hit
             if (anyHit) return true;     // boolean only: skip gradient + writeHit
             Vec3 p = r.o + r.d * th;
             double eps = std::fmax(1e-6, 1e-4 * th);
-            // `curv` takes the 13-point stencil (normal and curvature together) only where a pattern
-            // reads it (Implicit::readsCurv); every other hit, the 4-point gradient.
-            Vec3 g;
+            Vec3 g = fieldGradient(nd, N, p, eps, pool, tabs);
+            // `curv` costs the 13-point stencil, so only where a pattern reads it (Implicit::readsCurv).
             double curvG = 0.0;
             if (im.readsCurv) {
-                const double m = std::max(std::max(std::fabs(p.x), std::fabs(p.y)), std::max(std::fabs(p.z), im.featureSize()));
-                curvG = fieldGradientCurvature(nd, N, p, levelSetStep(eps, m), pool, tabs, g);
-            } else {
-                g = fieldGradient(nd, N, p, eps, pool, tabs);
+                const double m = std::max(std::fabs(p.x), std::max(std::fabs(p.y), std::fabs(p.z)));
+                curvG = fieldCurvature(nd, N, p, levelSetStep(eps, m), pool, tabs);
             }
             return writeHit(th, p, g, curvG);   // field surface: geometric normal = gradient
         }

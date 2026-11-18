@@ -956,7 +956,6 @@ struct DImplicit {
     int    capped;           // 1 = draw container caps (closed); 0 = `open`
     int    solidSide;        // 1 = bounds a closed solid, Hit::solid +1 (host Implicit::solidSide)
     int    readsCurv;        // 1 = its material reads `curv`: hits take the Hessian (host Implicit::readsCurv)
-    double featureSize;      // host Implicit::featureSize, the curvature stencil's scale floor
     // Oriented container box — device twin of Implicit::boxOriented/boxInv/boxLo/boxHi.
     // When set, the ray is mapped by boxInv and slab-tested against boxLo/boxHi there
     // instead of against the world AABB, which for a rotated box is strictly larger
@@ -4111,23 +4110,18 @@ __device__ static void dFieldGradient(const DFieldNode* nodes, int n,
     if (len > 0.0) { gx /= len; gy /= len; gz /= len; }
     else           { gx = 0.0; gy = 0.0; gz = 1.0; }
 }
-// The unit normal and mean curvature of the level set through p from curvature.h's 13-point
-// stencil at step h (host twin implicit.h fieldGradientCurvature).
-__device__ static double dFieldGradientCurvature(const DFieldNode* nodes, int n,
-                                                 double px, double py, double pz, double h,
-                                                 const PatNode* exprPool, const DPatEnv& env,
-                                                 double& gx, double& gy, double& gz) {
+// The mean curvature of the level set through p from curvature.h's 13-point stencil at step h
+// (host twin implicit.h fieldCurvature, which says why the normal stays dFieldGradient's).
+__device__ static double dFieldCurvature(const DFieldNode* nodes, int n, double px, double py, double pz,
+                                         double h, const PatNode* exprPool, const DPatEnv& env) {
     double f[kLevelSetStencil];
     for (int i = 0; i < kLevelSetStencil; ++i) {
         double x, y, z;
         levelSetStencilPoint(i, x, y, z);
         f[i] = dFieldEval(nodes, n, px + x * h, py + y * h, pz + z * h, exprPool, env);
     }
-    const double H = levelSetCurvature(f, h, gx, gy, gz);
-    const double len = sqrt(gx * gx + gy * gy + gz * gz);
-    if (len > 0.0) { gx /= len; gy /= len; gz /= len; }
-    else           { gx = 0.0; gy = 0.0; gz = 1.0; }
-    return H;
+    double gx, gy, gz;
+    return levelSetCurvature(f, h, gx, gy, gz);
 }
 // Device twin of geometry.h projectUV: wrap a world point to (u,v) over box lo..hi.
 // proj: 1 planar, 2 spherical, 3 cylindrical. axis 0/1/2 = up/projection axis.
@@ -4372,13 +4366,11 @@ __device__ static bool intersectImplicit(const DScene& sc, const DImplicit& im,
             if (anyHit) return true;   // boolean only: skip gradient + writeHit
             const double px = (double)bxF + dx*sh, py = (double)byF + dy*sh, pz = (double)bzF + dz*sh;
             double eps = fmax(1e-6, 1e-4*th);
-            double gx, gy, gz, curvG = 0.0;   // host twin's rule: the 13-point stencil where `curv` is read
-            if (im.readsCurv) {
-                const double m = fmax(fmax(fabs(px), fabs(py)), fmax(fabs(pz), im.featureSize));
-                curvG = dFieldGradientCurvature(nd, N, px, py, pz, levelSetStep(eps, m), exprPool, env, gx, gy, gz);
-            } else {
-                dFieldGradient(nd, N, px, py, pz, eps, gx, gy, gz, exprPool, env);
-            }
+            double gx, gy, gz; dFieldGradient(nd, N, px, py, pz, eps, gx, gy, gz, exprPool, env);
+            double curvG = 0.0;   // host twin's rule: the 13-point stencil where `curv` is read
+            if (im.readsCurv)
+                curvG = dFieldCurvature(nd, N, px, py, pz, levelSetStep(eps, fmax(fabs(px), fmax(fabs(py), fabs(pz)))),
+                                        exprPool, env);
             return writeHit(th, px, py, pz, gx, gy, gz, curvG);
         }
         if (last) {
@@ -26496,7 +26488,6 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
         d.capped = im.capped ? 1 : 0;
         d.solidSide = im.solidSide ? 1 : 0;
         d.readsCurv = im.readsCurv ? 1 : 0;
-        d.featureSize = im.featureSize();
         d.boxOriented = im.boxOriented ? 1 : 0;
         for (int k = 0; k < 9; ++k) d.boxInvM[k] = im.boxInv.m[k];
         d.boxInvT[0] = im.boxInv.t.x; d.boxInvT[1] = im.boxInv.t.y; d.boxInvT[2] = im.boxInv.t.z;

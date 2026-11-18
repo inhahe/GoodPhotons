@@ -258,6 +258,9 @@ struct Block {
     // The file this block was read from (0.330.0): the scene for its own blocks, the included
     // file for spliced ones. The groom tool writes a curve back to the file it came from.
     std::string file;
+    // `file`'s directory, set with it (detail::tagSource): where the assets the block names are
+    // looked for, after the scene's own directories (BlockDirScope).
+    std::string dir;
 };
 
 }  // namespace ftsl  (temporarily closed so the GPDA front end can see
@@ -362,13 +365,12 @@ inline std::string blockLabel(const Block& b) {
     if (!b.name.empty()) s += " \"" + b.name + "\"";
     return s;
 }
-// While a block is built, the assets it names are looked for beside the file it came from
-// (assetbytes::blockDirRef): an `include`d part in a directory of its own finds its own. Scoped to
-// the top-level block; its children inherit it.
+// While a block is built, the assets it names are also looked for beside the file it came from
+// (Block::dir, assetbytes::blockDirRef): an `include`d part in a directory of its own finds its own.
+// Scoped to the top-level block; its children inherit it.
 struct BlockDirScope {
     assetbytes::ScopedBlockDir s;
-    explicit BlockDirScope(const Block& b)
-        : s(b.file.empty() ? std::string() : assetbytes::toPath(b.file).parent_path().string()) {}
+    explicit BlockDirScope(const Block& b) : s(b.dir) {}
 };
 inline std::string strOf(const Block& b, const char* key, const std::string& dflt = "") {
     const Stmt* s = find(b, key);
@@ -1156,6 +1158,13 @@ public:
             if (cs >= 1.0) L.scene.cavitySamples = (int)(cs + 0.5);
         }
 
+        // Pass 1-arr: desugar inline `[ … ](coords)` array literals into anonymous
+        // `grid` + `pattern` block pairs, APPENDED to `blocks`. Running it before Pass 1a
+        // is what makes an inline literal work at every slot that already accepts a
+        // `pattern:` — the rest of the loader never learns the syntax exists. And before
+        // Pass 1, whose maps keep pointers into `blocks`: nothing appends to it after this.
+        if (!desugarArrays(blocks)) return false;
+
         // Pass 1: collect named spectra (resolve refs lazily), materials, camera.
         for (const auto& b : blocks)
             if (b.type == "spectrum") {
@@ -1178,11 +1187,6 @@ public:
                 markUsed(b, "expr");
             }
 
-        // Pass 1-arr: desugar inline `[ … ](coords)` array literals into anonymous
-        // `grid` + `pattern` block pairs, APPENDED to `blocks`. Running it before Pass 1a
-        // is what makes an inline literal work at every slot that already accepts a
-        // `pattern:` — the rest of the loader never learns the syntax exists.
-        if (!desugarArrays(blocks)) return false;
 
         // Pass 1a: N-D data tables (regular `grid`s and ragged `scatter`s). FIRST of the
         // table passes, because a procedural `texture { rgb "…" }` bakes during Pass 1b
@@ -2764,9 +2768,10 @@ private:
     //
     // Memo over the expression TEXT, wrapping each result in sharedSpectrum() (see
     // spectrum.h). Within one scene load a word-form spectrum expression is a pure
-    // function of its text — every branch below resolves either a literal, a builtin
-    // table, a file, or a `spectrum:` block, none of which depend on where the
-    // expression appears — so returning the same object is not merely an optimisation
+    // function of its text and, for a `file:` path, of the directory of the block it
+    // appears in (an included part's own: Block::dir), which its key then carries -- every
+    // other branch below resolves a literal, a builtin table or a `spectrum:` block (built in
+    // its own block's directory) -- so returning the same object is not merely an optimisation
     // of the parse: it is what gives the RENDERER the right to know that 256 lights
     // saying `spd preset:bb4000` are one curve, and to evaluate Planck once per
     // wavelength instead of 256 times per sample. Block-form values (`table { … }`)
@@ -2777,7 +2782,10 @@ private:
     Spectrum evalSpectrum(const Value& v, int depth = 0) {
         if (v.block || v.words.empty()) return evalSpectrumRaw(v, depth);
         std::string key;
-        for (const auto& w : v.words) { key += w; key += '\x1f'; }
+        for (const auto& w : v.words) {
+            if (w.rfind("file:", 0) == 0) { key += assetbytes::blockDirRef(); key += '\x1e'; }
+            key += w; key += '\x1f';
+        }
         auto it = spdMemo_.find(key);
         if (it != spdMemo_.end()) return it->second;
         const bool hadErr = !err.empty();
@@ -3032,15 +3040,17 @@ private:
     // (no overshoot) when `cubic` is set (`… interp=cubic`). Paths resolve through the
     // shared asset search path — cwd, then the scene's own directory and its parents,
     // then the ftrace directory (assetbytes.h), the same convention as `texture`/`mesh`
-    // file refs — and repeated references to the same (path, interp) share one cache
-    // entry, keyed on the AUTHORED path (resolution is deterministic within a load).
+    // file refs — and repeated references to the same (file, interp) share one cache
+    // entry, keyed on the RESOLVED path: two included parts may each name their own
+    // `refl.csv` (Block::dir).
     Spectrum loadSpdFile(const std::string& path, bool cubic = false) {
-        std::string key = cubic ? path + "\x01cubic" : path;
+        const std::string real = assetbytes::resolve(path);
+        std::string key = cubic ? real + "\x01cubic" : real;
         auto it = spdFileCache_.find(key);
         if (it != spdFileCache_.end()) return it->second;
         std::vector<std::pair<double, double>> pairs;
         std::string ferr;
-        if (!speclib::loadSpdCsv(assetbytes::resolve(path), pairs, ferr)) {
+        if (!speclib::loadSpdCsv(real, pairs, ferr)) {
             fail(ferr); return constantSpectrum(0);
         }
         // Coverage check: warn (once per key) if the file fails to cover the
@@ -11427,11 +11437,9 @@ inline std::vector<Block> flattenPrefer(const std::vector<Block>& blocks,
 // on the resolved, normalised path so `./x.ftsl` and `x.ftsl` are the same file. Depth
 // is also capped, as a belt for the cycle check's braces.
 //
-// KNOWN LIMIT, documented rather than hidden: asset paths INSIDE an included file
-// (`mesh { file ... }`) still resolve through the root scene's search path, not the
-// included file's own directory -- the Builder runs later over the merged list and has
-// no per-block provenance. Fine while parts live beside the scene (this repo's layout);
-// see known-issues for the case it does not cover.
+// Asset paths INSIDE an included file (`mesh { file ... }`) resolve through the root
+// scene's search path and then the included file's own directory: each spliced block keeps
+// its source (tagSource, Block::dir), which the Builder scopes its build to (BlockDirScope).
 namespace detail {
 inline std::string includeDirOf(const std::string& file) {
     std::error_code ec;
@@ -11440,6 +11448,16 @@ inline std::string includeDirOf(const std::string& file) {
     const std::filesystem::path d = p.parent_path();
     if (d.empty() || !std::filesystem::is_directory(d, ec)) return std::string();
     return d.string();
+}
+// Tag blocks read from `file`, and the blocks inside their `prefer` branches, with it and its
+// directory (Block::file, Block::dir). An `include` among them is retagged by its own expansion.
+inline void tagSource(std::vector<Block>& blocks, const std::string& file) {
+    const std::string dir = includeDirOf(file);
+    for (Block& b : blocks) {
+        b.file = file;
+        b.dir = dir;
+        for (auto& branch : b.branches) tagSource(branch, file);
+    }
 }
 inline std::string includeKey(const std::string& file) {
     std::error_code ec;
@@ -11495,7 +11513,7 @@ inline bool expandIncludes(std::vector<Block>& blocks, const std::string& fromFi
         std::vector<Block> sub;
         std::string perr;
         if (!ftsl_gpda::parse(ss.str(), sub, perr)) { err = "in included file " + path + ": " + perr; return false; }
-        for (Block& sb : sub) sb.file = path;                        // nested includes retag their own below
+        detail::tagSource(sub, path);                                // nested includes retag their own below
         chain.push_back(key);
         if (!expandIncludes(sub, path, chain, err, depth + 1)) return false;
         chain.pop_back();
@@ -11522,14 +11540,7 @@ inline bool loadSource(const std::string& src, const std::string& nameForMsgs,
     // placeholder has no parent directory, which simply leaves the search path alone.
     // Scoped rather than global: a later load of a different scene must not inherit
     // this one's directory, and every `prefer` branch must see the same one.
-    assetbytes::ScopedSceneDir _sceneDir([&]() -> std::string {
-        std::error_code ec;
-        const std::filesystem::path p = assetbytes::toPath(nameForMsgs);
-        if (!p.has_parent_path()) return std::string();
-        const std::filesystem::path d = p.parent_path();
-        if (d.empty() || !std::filesystem::is_directory(d, ec)) return std::string();
-        return d.string();
-    }());
+    assetbytes::ScopedSceneDir _sceneDir(detail::includeDirOf(nameForMsgs));
 
     // Report the keys nothing in the loader read. A warning rather than an error:
     // the check is new, and an old scene carrying a stale property should still
@@ -11599,7 +11610,7 @@ inline bool loadSource(const std::string& src, const std::string& nameForMsgs,
     {   // `include "file.ftsl"` blocks become the included files' blocks, in place.
         std::vector<std::string> chain;
         chain.push_back(detail::includeKey(nameForMsgs));
-        for (Block& b : blocks) b.file = nameForMsgs;
+        detail::tagSource(blocks, nameForMsgs);
         if (!expandIncludes(blocks, nameForMsgs, chain, err)) return false;
     }
 
