@@ -229,6 +229,30 @@ int: they never coexist) with the deform barycentrics packed in 16 bits each (as
 `fw` -- and `dVertHit` restores them; and the cavity flag lifts to a layered material's body copies.
 `DVertex` grows by 16 B (its static_assert counts it), which BDPT's local memory pays for.
 
+## DONE (2026-11-18, 0.450.3): REVIEW-0450-FABLE — what the Fable (xhigh) review of 0.450.0 found
+
+`/code-review xhigh` (Fable, 9 findings) of 6779234..9297c3f, the batch's second review, run after
+0.450.1 had answered Opus's; each checked against the code, all held. Four Opus had found too, fixed
+in 0.450.1 (REVIEW-0450): the waves sized by the wave before, the merge's coat off the rebuilt
+vertex, the stale words, the dead `DMergeFootprint::scale`. **Fixed in 0.450.3:**
+
+* **The queue was 1 M requests whatever the memory, its waves never fewer than the camera kernel's
+  resident paths**, so where those paths ask for more -- some 20 sites a path deep in a bright
+  room -- every wave overflowed to the slow inline merge. The queue now holds what its smallest
+  wave may ask for, a site at each of its paths' vertices, where an eighth of the memory left
+  allows. And a remainder under that floor joins the wave before it rather than run alone.
+* **The local-memory preflight had no mode U** (`cudaMegakernelLocalBytes`, main.cpp's preflight):
+  it gives the session's kernels' most (light, camera, merge gather) now, which vcmSessionBegin
+  reads too in place of its own sum, and the preflight passes mode U the hero width.
+* **The gather's tail was mode J's again** (the warp's reduction, the footprint's probes, lane 0's
+  add): one `dWarpSiteAdd` for both. And the session kept the queue's counters twice
+  (`d_mqCounters` beside `mq.nReqs`): once.
+* **A merge's footprint seed was two draws in one expression** (`(next() << 32) | next()`, modes J
+  and U), whose operands' order is the compiler's to choose: `DRng::next64`, the first draw the high
+  word, in statements of their own.
+* **check_bitid held GPU modes J and U to byte identity**, their queued merges summed by atomics:
+  a rounding's floor (1e-5), the determinism pass included.
+
 ## DONE (2026-11-18, 0.450.1): REVIEW-0450 — what the Opus (max) review of 0.450.0 found
 
 `/code-review max` (Opus, 11 findings) of 6779234..9297c3f, in a worktree; each checked against the

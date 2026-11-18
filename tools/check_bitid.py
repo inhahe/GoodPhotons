@@ -40,8 +40,8 @@ a GPU case whose every pixel is within that relative tolerance: a GPU kernel the
 re-compiled can differ in the last bits (instruction scheduling, fused multiply-adds) -- 1e-3,
 say. The CPU cases are always held to bit identity. GPU modes M and S are not bit-deterministic
 at all (atomic deposits), so they are always judged at a floor of 1e-4 (NONDET_FLOOR; 3e-4 for the
-coated scene's M, NONDET_CASE), the
-determinism pass included. A change meant to alter some renders shows up here as differing
+coated scene's M, NONDET_CASE), and GPU modes J and U, whose queued merges are summed by atomics,
+at a rounding (1e-5), the determinism pass included. A change meant to alter some renders shows up here as differing
 cases, with the mean change to judge them by. Exits 0 when every case is identical (or within
 its tolerance), 1 otherwise.
 """
@@ -88,8 +88,10 @@ SCENE_MODES = {
 # every sum over them -- varies from run to run: one build differs from itself there by a few 1e-5 of
 # a pixel. Those cases are judged at this relative floor, in the determinism pass too; a case that
 # strays further keeps its own (NONDET_CASE: the coated scene's M reached 1.1e-4), so the floor of
-# every other stays tight.
-NONDET_FLOOR = {"M_gpu": 1e-4, "S_gpu": 1e-4}
+# every other stays tight. GPU modes J and U add their queued merges to the film by atomics too
+# (SURF-WAVEFRONT, VCM-WAVEFRONT), in doubles, which a float32 pixel almost always hides: a rounding
+# (ORDER_TOL in tools/pfm.py).
+NONDET_FLOOR = {"M_gpu": 1e-4, "S_gpu": 1e-4, "J_gpu": 1e-5, "U_gpu": 1e-5}
 NONDET_CASE = {"coated_M_gpu": 3e-4}
 
 

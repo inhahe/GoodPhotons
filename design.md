@@ -10426,9 +10426,13 @@ as the one at fault.
   resident: a band of sky takes no share of a wave. (0.450.0 sized a wave by the last wave's sites a
   path, so a wave after sky took the rest of the pass and turned most of the floor's sites away,
   every pass.) A session's first pass has no profile: its first wave is that fewest, the next ones
-  as many as the queue holds at the last wave's rate, a quarter high and at least 2.5. The queue
-  holds up to 1 M requests, or what an eighth of the memory left beside the light-vertex store, the
-  kernels' stacks and the grid's worst (its cell table at its cap, the sort's scratch) holds.
+  as many as the queue holds at the last wave's rate, a quarter high and at least 2.5; no wave
+  leaves fewer paths than that floor behind it. The queue holds 1 M requests, or what that
+  smallest wave may ask for where it is more (a site at each of its paths' vertices), within an
+  eighth of the memory left beside the light-vertex store, the kernels' stacks (the session's
+  kernels' most, `cudaMegakernelLocalBytes('U')`, which main.cpp's preflight reads too) and the
+  grid's worst (its cell table at its cap, the sort's scratch). A site's warp ends in
+  `dWarpSiteAdd`, mode J's queue's end too.
   Measured on `_merge_glossy_bowl` at `-max-bounce 24`, wall time before -> queued (inline; the
   CPU): 64 passes at 96x72 at five times its radius 62.5 -> 7.4 s (21.2; 9.5), at its own radius
   7.1 -> 4.6 s (5.1; 2.9 -- 6 912 paths leave the device mostly idle); 16 passes at 320x240

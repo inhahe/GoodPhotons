@@ -20560,7 +20560,7 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
     // the CPU path — merely slow — is strictly better than a GPU path that is 1000x slow.
     // So: measure, and say exactly what is wrong and who to blame.
     if (useGpu) {
-        const int hero = (mode == 'D' || mode == 'J') ? g_heroC : 1;
+        const int hero = (mode == 'D' || mode == 'J' || mode == 'U') ? g_heroC : 1;
         const int mdep = (g_maxBounceOverride >= 1) ? g_maxBounceOverride : 8;
         size_t needLocal = cudaMegakernelLocalBytes(mode, mdep, hero);
         // Memory this process already holds, which `freeB` below is short of and which must not
