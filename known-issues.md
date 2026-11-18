@@ -728,7 +728,20 @@ Beside it, not this: dry, modes S on both devices read the walls 2.25 % bright o
 they agree to 0.05 %. A depth mismatch (the measurement trap at this file's head) until shown
 otherwise.
 
-## OPEN (2026-11-15): GPU-U-GLOSSY-SLOW — GPU mode U's merges run single-lane, ten times the CPU's at a large radius
+## DONE (2026-11-15, 0.450.0): GPU-U-GLOSSY-SLOW — GPU mode U's merges run single-lane, ten times the CPU's at a large radius
+
+**Fixed in 0.450.0 (VCM-WAVEFRONT; design.md, "The merges are queued").** kVcmCameraT queues each
+merge site (DVcmMergeReq) and kVcmMergeGather gathers it with a warp, as mode J's point merges are;
+vcmSessionPass splits a pass's pixels into waves the queue holds. The queued and inline merges share
+dVcmMergeSum and a footprint seed the walk draws at the site, so they render the same image but for
+their sums' order (tools/check_vcm_wavefront.py: bit-identical at 96x72, with the queue full, shrunk
+to 32 requests, split into 45 waves, and through ruby glass at one wavelength). Measured at
+`-max-bounce 24`, wall time before -> after (the CPU's): at `-pmradius 0.05`, 64 passes at 96x72
+62.5 -> 7.4 s (9.5); at the bowl's own radius 7.1 -> 4.6 s (2.9: a 96x72 frame's 6 912 paths leave
+the device mostly idle), 16 passes at 320x240 30.3 -> 11.0 s (24.9), 8 at 640x480 204 -> 50 s (204).
+The rest of the GPU's time at 640x480 is now the gather's (45 of 50 s): VCM-MERGE-LOCALITY (TODO).
+check_bitid against 0.449.14: every case but GPU mode U identical (within its floor for GPU M and
+S); GPU mode U moved by its new random stream (the probes' seed), means -0.013 to +0.27 %.
 
 Found running tools/check_merge_glossy.py (`scenes/_merge_glossy_bowl.ftsl`, a room inside a rough
 glossy sphere, `-max-bounce 24 -pmradius 0.05`, 96 x 72): mode U on the GPU took about 75 s a seed at

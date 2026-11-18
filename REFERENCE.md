@@ -1922,6 +1922,19 @@ machine varied 18.5 s / 25.8 s / 27.2 s.
   to 256 paths, so a small frame takes several waves, or with a tiny `n` turns sites away to the
   inline gather; `tools/check_surf_wavefront.py` uses both, and requires the same image every way
   and waves the queue holds.
+- **`FTRACE_NOVCMWF=1` (diagnostic, mode `U` on the GPU).** Since 0.450.0 mode `U`'s merges are
+  queued as mode `J`'s point merges are: each camera vertex's merge goes to a kernel that gathers it
+  with a whole warp, its light vertices across the lanes, instead of the thread that reached it
+  weighing them one after another while the warp's other paths waited at other depths. The image
+  gets the same terms, summed in another order. Measured on `_merge_glossy_bowl` at `-max-bounce 24`:
+  64 passes at 96x72 at five times its merge radius (`-pmradius 0.05`) 62.5 -> 7.4 s (the CPU 9.5),
+  and 8 passes at 640x480 at its own radius 204 -> 50 s (the CPU 204). Setting this forces the inline
+  merge (the A/B control). The render reports the queue's use and the gather's GPU time in a `mode U
+  merges:` line at its end. `FTRACE_WAVE_DEBUG=1` prints a `[wave] U` line a wave: a pass's pixels
+  are split into waves whose sites the queue holds, sized by the wave before. `FTRACE_VCMWFCAP=<n>`
+  shrinks the queue to `n` requests (at least 16) and lets a wave go down to 256 paths, so a small
+  frame takes several waves, or with a tiny `n` turns sites away to the inline merge;
+  `tools/check_vcm_wavefront.py` uses both, and requires the same image every way.
 - **`FTRACE_JEPOCHKEEP=<k>` (diagnostic, mode `J` flights).** Keeps at most `k` of a batch's
   `-beamepochs` realizations, so its later frames re-trace the rest as a batch too large to keep
   them would; `tools/check_jbeams.py` uses it to show such an epoch is traced as epoch 0 was.

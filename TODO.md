@@ -397,8 +397,14 @@ Then the rest of 4.2-4.6 in their order, 4.7's bookkeeping alongside whatever to
   birth (Scene::birthStack, dBirthStack); `tools/check_birth_stack.py`.
 - [x] **SPPM-GPU-LAMP** (no change) — one fluke at seeds 1-8, measured again at the same seeds:
   1.006 +- 0.008 over 16 GPU seeds (known-issues).
-- [ ] **GPU-U-GLOSSY-SLOW** — GPU mode U's merges run on the thread that reached the vertex, so at
-  a large radius (-pmradius 0.05: 112 s against the CPU's 11) they crawl: give them mode J's queue.
+- [x] **GPU-U-GLOSSY-SLOW** (0.450.0) — GPU mode U's merges are queued for a warp each
+  (VCM-WAVEFRONT): at -pmradius 0.05 62.5 -> 7.4 s (the CPU 9.5), at 640x480 204 -> 50 s;
+  `tools/check_vcm_wavefront.py`.
+- [ ] **VCM-MERGE-LOCALITY** — the GPU mode U gather (45 of 50 s at 640x480 on
+  `_merge_glossy_bowl`) reads each light vertex through `grid.order`, scattered over the whole store
+  in path order: gather the compact array into cell order once a pass, into the light slab's memory
+  (idle after the compaction), so a site's vertices are contiguous and neighbouring sites share
+  cache lines.
 - [x] **CAMERA-EMPTY-STACK** (0.445.8) — every camera walk starts inside the solids around the eye,
   and every connection leg takes its medium's absorption; `tools/check_camera_in_water.py`.
 - [x] **REVIEW-0445** (0.445.6, 0.445.7) — the Opus (max) and Fable (xhigh) reviews of
