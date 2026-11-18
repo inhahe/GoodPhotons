@@ -413,6 +413,11 @@ Then the rest of 4.2-4.6 in their order, 4.7's bookkeeping alongside whatever to
   (known-issues). 0.449.3's distance-from-origin eps was taken back; the fix is a per-feature size at
   each hit (a Hit field) with explicit tmins.
 - [x] **REVIEW-0449B** (0.449.4) — the Opus (xhigh) review of 0.449.2-0.449.3 (known-issues).
+- [x] **ROUTE-TAG-SOLIDS** (0.449.5) — a mode-D camera with objects tagged J merged without the
+  solids' sides marked; check_route_tags had failed since 0.445.6 (known-issues).
+- [ ] **The 0.449 sweep's long checks** — every other check passes on 0.449.4/0.449.5; still to run,
+  one at a time (an hour or more each): check_ball_images, check_motion, check_rough_irid,
+  check_two_sided.
 - [x] **GRIN-RADIANCE-SCALE** (0.449.0) — radiance over n² along a camera walk's march.
 - [x] **GRIN-STRAIGHT-CONNECT** (0.449.0) — no straight connection crosses a bending region; mode R
   matches mode B outside the lens and mode C through it (check_grin_connect).

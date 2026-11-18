@@ -6005,6 +6005,19 @@ on the tank without its pool floor (this repro). Whether a transparent face shou
 the disc is a separate question, open: both backends count it (and the ball test then rejects it
 for being above the plane), so both under-read the coverage there.
 
+## DONE (2026-11-17, 0.449.5; opened 0.445.6): ROUTE-TAG-SOLIDS — a mode-D camera with objects tagged J merged without the solids' sides
+
+Found by the full check sweep of 0.449.4. Since 0.445.6, `tools/check_route_tags.py` had failed on the
+host and the device: with every object tagged J, the mode-D camera's frame differed from the plain mode-J
+frame in about 160 of 3072 pixels, though the means agreed within 0.005 %. A bisect in a separate worktree
+named cc68528 (0.445.6, REVIEW-0445). That commit made the footprint probes of J's and U's merges read
+which side of a closed solid they meet (Hit::solid, PROBE-SOLID-SIDE). The faces are marked once per
+batch, before the exposure meter, and only when some camera gathers; that test read each camera's own
+mode. A mode-D camera with anything tagged J runs on mode J's renderer (runRender's per-object modes), so
+its merges probed unmarked faces, where a mode-J camera's probes read their sides. **Fixed:** the gate
+also counts a mode-D camera when something is tagged J and the tags are in force: no `-no-modes`, and
+mode J can render the scene, as runRender requires. check_route_tags passes again; 0.449.4 fails it.
+
 ## DONE (2026-11-17, 0.449.4): REVIEW-0449B — the Opus (xhigh) review of 3837004..45bca28 (0.449.2, 0.449.3)
 
 Fixed in 0.449.4:

@@ -6682,7 +6682,8 @@ as the one at fault.
   but for the sums' order (one probe is `dCoverageProbe`, the gates `dCoverageFinish`, which
   `dGatherCoverage` loops over for every other gather) -- and `-gatherarea 0` restores the
   whole disc over every photon, as it does for M and S. Solid faces are marked
-  (`markSolidFaces`, once a build) whenever a batch has an M, S, J or U camera, and at build wherever
+  (`markSolidFaces`, once a build) whenever a batch has an M, S, J or U camera, or a D camera that
+  per-object `mode J` tags put on mode J's renderer, and at build wherever
   a walk can be inside a solid (the enclosure probe reads them). A
   mode-M or mode-S gather (`onGatherSurfaceSided`) keeps a photon only if it faces the
   gather point's way (within 60 degrees) and lies near its tangent plane: off it by at most

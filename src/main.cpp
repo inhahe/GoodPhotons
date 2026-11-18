@@ -29250,10 +29250,19 @@ static int run(int argc, char** argv) {
     // The footprint probes of modes M and S, and of J's and U's merges, read which side of a closed
     // solid a face is met from (Hit::solid): marked once for the whole batch, before the meter below
     // gathers as the frames will, and only where a footprint is taken at all.
+    // A mode-D camera with anything tagged J gathers too: it runs on mode J's renderer, merging on
+    // its J-routed paths, unless -no-modes or mode J's limits set the tags aside (runRender's
+    // per-object modes).
     if (gatherAreaSamples() > 0 || gaGeomOn()) {
+        bool taggedJ = false;
+        if (!g_noObjectModes) {
+            for (const Material& m : scene.mats) taggedJ = taggedJ || m.route == ROUTE_J;
+            for (const Medium& md : scene.media) taggedJ = taggedJ || md.route == ROUTE_J;
+        }
         bool gathers = false;
         for (const RenderCam& rc : toRender)
-            gathers = gathers || rc.mode == 'M' || rc.mode == 'S' || rc.mode == 'J' || rc.mode == 'U';
+            gathers = gathers || rc.mode == 'M' || rc.mode == 'S' || rc.mode == 'J' || rc.mode == 'U' ||
+                      (rc.mode == 'D' && taggedJ && !modeFeatureUnsupported(scene, 'J', rc.cam.projection));
         if (gathers) markSolidFaces(scene);
     }
 
