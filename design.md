@@ -10313,6 +10313,11 @@ as the one at fault.
   necessary and not sufficient and the consumers carry explicit guards (see `bdpt.h`).
 - **`render_cuda.cu`** (~7000) — the whole GPU backend: megakernel + wavefront
   forward paths, GPU R and BDPT, M deposit/gather, device twins of hero sampling.
+  **Since 0.450.9 it is five files** (Build & release, "launch-bounded kernels"): the device code
+  in `render_cuda_dev.cuh` (up to kBdptT) and `render_cuda_dev2.cuh` (to kJSurfLightT), kBdptT in
+  `render_cuda_bdpt.cu`, kJSurfLightT in `render_cuda_jsurf.cu`, and the host side with every
+  other kernel in `render_cuda.cu`. This file's older passages say `render_cuda.cu` for any of
+  them.
   GPU backward (`bkRadiance`) supports **participating media** natively since
   0.23.0 (free-flight `dMediaSampleCollision` competing with the surface hit,
   volume NEE `bkNeeVolumeHero`, Beer–Lambert `dMediaTransmittance` on NEE + throughput,
@@ -13243,8 +13248,26 @@ binary is copied aside first (it runs from anywhere: no DLLs beside it). `render
   plain `inline` template in a header, as `dPatternEval` was) can be partitioned away from
   a `__launch_bounds__`-capped caller, and `nvlink` then rejects the link when the callee's
   own register allocation exceeds the cap (169 vs 168 for `kBdptT`). Device helpers must be
-  `static` (internal linkage) so the partitioner keeps them with their callers — already
-  the house style, and now a requirement.
+  `static` (internal linkage) — already the house style, and now a requirement. That did not
+  suffice: see the next item.
+- **The launch-bounded kernels compile in units of their own (0.450.9, GPU-LINK-FRAGILITY).**
+  Under separate compilation (`-rdc`) ptxas compiles a helper it leaves out of line to its own
+  register count, not to its callers' launch bounds, static or not, and which helpers it leaves
+  out depends on the whole unit. So an edit anywhere in `render_cuda.cu`, a host-only one
+  included, could leave kBdptT (`__launch_bounds__(128, 3)`, 168 registers) calling
+  `dReflectPatMul` at 238, and nvlink refused the build. kBdptT is now `render_cuda_bdpt.cu` and
+  kJSurfLightT (`(128, 4)`, 128) `render_cuda_jsurf.cu`, each under `-maxrregcount` at its bounds
+  (CMakeLists.txt), so every function ptxas compiles there fits them; `render_cuda.cu` keeps the
+  host side and the kernels without bounds, uncapped. The device code they share is two headers,
+  `render_cuda_dev.cuh` (up to kBdptT) and `render_cuda_dev2.cuh` (to kJSurfLightT), which keep
+  three constraints: a `__device__` function is static, inline or a template (one definition a
+  unit); a kernel there is inside `#ifndef FT_FAMILY_TU` (render_cuda.cu compiles it, the family
+  units do not); a device global goes through `FT_DEVGLOBAL`, defined in render_cuda.cu and
+  `extern` in the family units, so the device holds one copy that `cudaMemcpyToSymbol` sets for
+  all (the sphere connectors' tables, which were `static`, among them). Whole-program
+  compilation (no `-rdc`) also links, ptxas then seeing every caller, but it compiled the one
+  unit in 77 minutes, exhausting the machine's commit, and rendered no faster (paired against
+  0.450.8: mode J 1.2x slower, modes M and S 0.82x).
 - `build.bat` → CMake x64 Release into `build_cuda3/` (VS 2026 generator first, then VS 2022,
   then CMake's default; the CUDA toolset named explicitly from `CUDA_PATH`, or the VS generator
   quietly configures CPU-only), copies `ftrace.exe` to the repo root, then runs

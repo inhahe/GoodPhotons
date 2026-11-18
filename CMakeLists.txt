@@ -141,7 +141,15 @@ if(CMAKE_CUDA_COMPILER)
     # always double and remains the ground-truth regardless of this switch.
     option(FTRACE_GPU_FP32 "Compute GPU transport in float (mixed precision)" ON)
 
-    target_sources(ftrace PRIVATE src/render_cuda.cu src/raster_cuda.cu)
+    target_sources(ftrace PRIVATE src/render_cuda.cu src/render_cuda_bdpt.cu src/render_cuda_jsurf.cu
+                                  src/raster_cuda.cu)
+    # The launch-bounded kernels compile in units of their own, each under -maxrregcount at its
+    # bounds, so every helper ptxas compiles out of line there fits them: under separate
+    # compilation ptxas does not hold such a helper to its callers' bounds, and the device link
+    # refuses a kernel calling one that takes more (render_cuda_dev.cuh says more). kBdptT's
+    # __launch_bounds__(128, 3) allow 168 registers, kJSurfLightT's (128, 4) 128.
+    set_source_files_properties(src/render_cuda_bdpt.cu PROPERTIES COMPILE_OPTIONS "-maxrregcount=168")
+    set_source_files_properties(src/render_cuda_jsurf.cu PROPERTIES COMPILE_OPTIONS "-maxrregcount=128")
 
     # Header dependencies for the .cu TUs — DO NOT REMOVE.
     #
@@ -184,11 +192,9 @@ if(CMAKE_CUDA_COMPILER)
     # ptxas 52.6 s -> 21.1 s, cicc 64.3 s -> 43.2 s, the whole TU 2:49 -> 1:50. NVIDIA
     # documents "minimal (if any)" effect on the generated code; checked here by an A/B of
     # render speed on the same scenes (design.md, Build & release).
-    # Constraint this adds: every __device__ function must have INTERNAL linkage (static).
-    # A plain `inline` template in a header (dPatternEval, before 0.259.2) can be partitioned
-    # away from a __launch_bounds__-capped kernel, and nvlink then refuses the link when the
-    # callee's own register allocation exceeds the cap (169 vs kBdptT's 168). A global
-    # -maxrregcount is NOT the answer: 35 kernels legitimately use up to 255 registers.
+    # A global -maxrregcount is no answer to a launch-bounded kernel's out-of-line helpers: 35
+    # kernels legitimately use up to 255 registers. Those kernels' own units cap them instead
+    # (render_cuda_bdpt.cu, render_cuda_jsurf.cu, above).
     target_compile_options(ftrace PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--split-compile=0>)
     # CCCL 3.x (the thrust/cub shipped with CUDA 13) requires MSVC's standard-conforming
     # preprocessor; without it the thrust headers #error out. Scoped to the CUDA host

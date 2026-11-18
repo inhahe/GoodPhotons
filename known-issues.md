@@ -201,6 +201,30 @@ to 0.25 renders as a 150 nm one within 2e-3, 1.0e-3 measured (its body's escape 
 on 0.450.1 it rendered as the unmapped 600 nm, 1.9 off), the `thinfilm` control byte for byte, and
 the three misspellings stop the load (on 0.450.1 they loaded).
 
+## DONE (2026-11-18): GPU-LINK-FRAGILITY — an edit anywhere in render_cuda.cu could make the device link refuse kBdptT
+
+The device link checks that a launch-bounded kernel calls no function compiled with more
+registers than its bounds allow: kBdptT's `__launch_bounds__(128, 3)` allow 168, kJSurfLightT's
+`(128, 4)` 128. Under separate compilation (`-rdc`, on since the first CUDA commit) ptxas compiles
+a helper it leaves out of line to the helper's own register count, not to its callers' bounds --
+`static` or not -- and which helpers it leaves out of line depends on the whole translation unit.
+So in the one unit every GPU kernel shared, unrelated edits refused the link: DVertHitState shrunk
+to 8 B and three edits to mode U's camera kernel (REVIEW-0450B, both declined for it), and at last
+0.450.9's review fixes, which in device code changed two comments and kept their line counts --
+kBdptT calling `dReflectPatMul` at 238 registers in each.
+
+**Fixed:** kBdptT is `src/render_cuda_bdpt.cu` and kJSurfLightT `src/render_cuda_jsurf.cu`, each
+compiled under `-maxrregcount` at its bounds (CMakeLists.txt), so every function ptxas compiles
+there fits them (`cuobjdump -res-usage`: none over 168 in kBdptT's unit); `render_cuda.cu` keeps
+the host side and the kernels without bounds. The device code the units share is two headers,
+`render_cuda_dev.cuh` and `render_cuda_dev2.cuh` (design.md, Build & release, for their three
+constraints), written from render_cuda.cu by line range with its kernels guarded and its device
+globals made single-copy. check_bitid against 0.450.8: identical but for GPU modes M and S, at their
+own nondeterminism. Whole-program compilation (no `-rdc`) also linked, ptxas then knowing every
+caller, but it compiled the one unit in 77 minutes, ran the machine out of commit (a sweep's mode-M
+render failed for it), and rendered no faster, paired against 0.450.8: mode J 1.20x slower, modes
+M and S 0.82x, B 0.97x.
+
 ## DONE (2026-11-18, 0.450.6): REVIEW-0450B — what the Opus (max) and Fable (xhigh) reviews of 0.450.1-0.450.4 found
 
 `/code-review max` (Opus, 8 findings) and `/code-review xhigh` (Fable, 14) of 9297c3f..ee08dc1, one

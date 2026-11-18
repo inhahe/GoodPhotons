@@ -419,21 +419,14 @@ Then the rest of 4.2-4.6 in their order, 4.7's bookkeeping alongside whatever to
   (`vramPreflight`: the mode, the render's device buffers, the batch's held scene). Mode M asks it
   once in run() for its largest camera's films (`mGpuOk`), and the seven sites that route a mode-M
   camera to the device (the meter, the budget and blur tests, two notes, the shared path) read it.
-- [ ] **GPU-LINK-FRAGILITY** — an edit far from them can leave kBdptT (launch bounds: 168 registers)
-  or kJSurfLightT (128) calling a helper ptxas compiled out of line without their cap, and the link
-  refuses: 0.450.5's forced inlining (dGlossyF, dPatIn, dPatternScalarAt, dRecordRoughness) answered
-  one round; shrinking DVertHitState to 8 B (REVIEW-0450B) put dReflectPatMul (238) and
-  intersectImplicit (252) out uncapped, which neither more forcing, the merge kernels given bounds,
-  a merge path out of line nor `--split-compile` off cured. Three edits to mode U's camera kernel,
-  which kBdptT never calls (the coat's film read once a vertex, dVertFromLV taking the hit state, the
-  site passed to the merge sum), put dMatRoughness (252) and dReflectPatMul (238) out uncapped too,
-  launch bounds on mode U's kernels or not. 0.450.5 had dReflectPatMul and intersectImplicit out of
-  line capped at 128 (`cuobjdump -res-usage`). Nothing documented says when ptxas caps an out-of-line
-  function by its callers' bounds, and one function has one register count for every caller. The
-  plan: a translation unit per launch-bounded kernel family (kBdptT's; kJSurfLightT's; mode U's) with
-  the shared device code in a header of `static` functions, so each unit compiles its own copies
-  under its own kernels' bounds (`-maxrregcount` per unit where a family wants one) and an edit in
-  one family cannot move another's link; then land the declined edits (known-issues REVIEW-0450B).
+- [x] **GPU-LINK-FRAGILITY** (0.450.9) — kBdptT (`render_cuda_bdpt.cu`) and kJSurfLightT
+  (`render_cuda_jsurf.cu`) compile in units of their own under `-maxrregcount` at their launch
+  bounds (168, 128), the device code they share in `render_cuda_dev.cuh` / `render_cuda_dev2.cuh`
+  (design.md, Build & release). Under `-rdc` ptxas compiles an out-of-line helper to its own count,
+  not its callers' bounds, and an edit anywhere in the one unit -- a host-only one at the end --
+  could put one out at 238; now every function in a capped unit fits it (cuobjdump: none over 168).
+  Whole-program compilation also linked, but in 77 minutes of ptxas, and no faster. Next: land the
+  declined edits (known-issues REVIEW-0450B).
 - [ ] **VCM-GATHER-DIVERGENCE** — the gather keeps 13.7 of 32 lanes active (a lane's candidate refused
   at the distance, sidedness or band test idles while the others evaluate) at 244 registers, a
   sixth of the warps resident: gather the candidates that pass the cheap tests into a warp-wide
