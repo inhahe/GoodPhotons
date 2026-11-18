@@ -406,14 +406,16 @@ Then the rest of 4.2-4.6 in their order, 4.7's bookkeeping alongside whatever to
 - [x] **REVIEW-0450** (0.450.1) — the Opus (max) review of 0.450.0: the merge's coat read at the
   walk's hit, waves sized by the last pass's per-block profile (check_vcm_wavefront's sky case), the
   grid's worst kept free beside the queue, the shared helpers; known-issues REVIEW-0450.
-- [ ] **VCM-GATHER-SPILLS** — Nsight Compute on kVcmMergeGather (640x480, `_merge_glossy_bowl`):
-  255 registers, 16.7 % occupancy, 10.5 G local-memory requests (34 % of its instructions; arrays
-  indexed at run time, `fSec[q]`), 13.5 of 32 lanes active, IPC 0.24, and 26.6 G FP64 instructions
-  to 8.7 G FP32. Each light vertex rebuilds the camera vertex's hit (`dVertHit`) and its roughness
-  in every one of its six `dBsdfF` / `dBsdfPdf` calls (four wavelengths and two pdfs): a site's lobe
-  built once (the hit, the roughness, `ggx::pair` once a light direction, the reflectance alone per
-  wavelength), the secondaries' loops unrolled to compile-time bounds, and the cheap rejections
-  compacted across the warp before the expensive half.
+- [x] **VCM-GATHER-SPILLS** (0.450.5) — a merge site's lobe (DMergeLobe): the hit and roughness once a
+  site, one GGX pair a light direction for its value and both pdfs, the reflectance alone a
+  wavelength; byte for byte 0.450.4's images. 640x480 bowl: gather 43.4 -> 15.7 s; Nsight 10.5 -> 1.5
+  G local requests, 26.6 -> 15.6 G FP64. Its four pattern readers forced inline, which made mode D
+  1.75x faster too (0.450.4 had dGlossyF out of line at 168 registers).
+- [ ] **VCM-GATHER-DIVERGENCE** — the gather keeps 13.7 of 32 lanes active (a lane's candidate refused
+  at the distance, sidedness or band test idles while the others evaluate) at 244 registers, a
+  sixth of the warps resident: gather the candidates that pass the cheap tests into a warp-wide
+  list (ballot and prefix), and evaluate the lobe for full warps from it; then see whether the
+  pair can run in single precision where its double buys nothing (a decision: the images move).
 - [x] **REVIEW-0450-FABLE** (0.450.3) — the Fable (xhigh) review of 0.450.0: the queue sized to its
   smallest wave, mode U in the local-memory preflight, one warp-gather tail, the seed's draws
   sequenced, check_bitid's floor for GPU J and U; known-issues REVIEW-0450-FABLE.

@@ -3081,7 +3081,13 @@ heterogeneous medium folds its Tr ratio from one density integral per segment (`
 midpoints per medium, as `dTrDetMedium`), shared by every bin. The rule that keeps nvlink happy
 is the same everywhere: a factor whose reader is heavy is evaluated in a loop with ONE call site
 (`DJSpecRun::mul`, the fiber's loop shared with the hero bundle's secondaries, the lens trace's
-loop shared with the main trace).
+loop shared with the main trace). Since 0.450.5 four of those readers are `__forceinline__`
+(`dGlossyF`, `dPatIn`, `dPatternScalarAt`, `dRecordRoughness`): the merges' lobe (`DMergeLobe`)
+calls the slot readers itself, which put them out of line at 236-252 registers, kJSurfLightT
+included, which the change never touched. Forcing them converged at those four, and it paid
+besides: 0.450.4's binary already held `dGlossyF` out of line, squeezed to `kBdptT`'s 168
+registers, and `dPatIn` to 128 (`cuobjdump -res-usage`) -- inlined, mode D on the glossy bowl ran
+1.75 times as fast, its image unchanged.
 
 **The ratio is stored normalised, with its magnitude in `logS`.** A camera ray inside glass that
 absorbs at λ_c can leave `beta` at 1e−218 while other wavelengths pass. The ratio then reaches
@@ -10440,6 +10446,25 @@ as the one at fault.
   `tools/check_vcm_wavefront.py` requires the inline merge's image (with the queue shrunk to
   overflow, too, and through ruby glass at one wavelength), and that a shrunk queue splits passes
   into waves that turn nothing away after the first, in the bowl and in a frame half sky.
+
+  **A merge's lobe (0.450.5, `DMergeLobe`).** Every light vertex a merge weighed called `dBsdfF`
+  for each of its wavelengths and `dBsdfPdf` both ways: six rebuilds of the camera vertex's hit
+  (`dVertHit`), six GGX pairs in double precision, the roughness read six times. Nsight Compute had
+  the gather at 255 registers, 10.5 G local-memory requests (34 % of its instructions) and 26.6 G
+  FP64 instructions to 8.7 G FP32. The lobe is made once a site -- the hit rebuilt, the roughness
+  read -- and once a light direction it takes one pair (`at()`): the value over the reflectance,
+  and both pdfs, the reverse being the same pair with its two ends swapped (`dPairSwapped`: the
+  half vector and the distribution are symmetric, so it is what `ggx::pair` computes for the
+  swapped arguments, bit for bit). Each wavelength then reads the reflectance alone. Its
+  arithmetic is `dBsdfF`'s and `dBsdfPdf`'s step for step, so the images are those of 0.450.4,
+  byte for byte (check_bitid); mode J's surface merges take it too (`dSurfMergePhoton`, its coat by
+  `dCoatEvalAt` at a film read once a site). The secondaries' loops run to the hero width, a
+  constant, so their values stay in registers. Measured at 640x480 on `_merge_glossy_bowl`
+  (`-max-bounce 24`, 8 passes): the gather 43.4 -> 15.7 s, the render 49.3 -> 20.6 s; Nsight on one
+  launch, 8.71 -> 1.31 s, local-memory requests 10.5 -> 1.5 G, FP64 instructions 26.6 -> 15.6 G,
+  the SMs' compute 53 -> 84 % busy, DRAM 56 -> 15 %. Still 244 registers (a sixth of the warps
+  resident) and 13.7 of 32 lanes active, the lanes' candidates refused at different tests
+  (VCM-GATHER-DIVERGENCE, TODO).
 
   Since 0.34.0 (M9) the **GPU BDPT** kernel (mode `D`) threads the **per-hit
   surface point** through its connection BSDF: each `DVertex` stores the interpolated texcoords

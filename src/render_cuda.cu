@@ -5921,7 +5921,7 @@ __device__ static void dGrinMarch(const DScene& sc, DVec3& ro, DVec3& rd,
 // Scene::occluded's `camLeg` (scene.h).
 // Forward declaration: both shadowTransmittance below and dhair further down need the
 // pattern evaluator, which is defined ~3800 lines later in this file.
-__device__ static double dPatternScalarAt(const DScene& sc, int pat, const DHit& h);
+__device__ __forceinline__ static double dPatternScalarAt(const DScene& sc, int pat, const DHit& h);
 
 // A fiber's coverage at a hit, clamped to [0,1]: the probability the strand is there, the same at
 // every wavelength (host twin hairOpacityAt).
@@ -6713,8 +6713,12 @@ __device__ static inline DGlossyDraw dWhittedGlossyDraw(const DScene& sc, const 
 }
 // Twin of glossyF: r times the GGX lobe about `ns` (symmetric in the pair), r the reflect slot
 // times an iridescent glossy's interference reflectance; 0 unless both lie above ns. Double, as
-// dBsdfF is.
-__device__ static double dGlossyF(const DScene& sc, const DMaterial& m, const DHit& h,
+// dBsdfF is. Inlined at every call, as are the pattern reads under it (dPatIn, dPatternScalarAt,
+// dRecordRoughness): out of line, each takes more registers than the launch bounds of kernels that
+// call it allow (kBdptT's 168, kJSurfLightT's 128), and nvlink refuses the build. Left to nvcc,
+// whether they are inlined depends on the calls the whole file makes: new calls in mode U's merge
+// (DMergeLobe) put them out of line in kJSurfLightT, which the change never touched.
+__device__ __forceinline__ static double dGlossyF(const DScene& sc, const DMaterial& m, const DHit& h,
                                   const DVec3& ns, const DVec3& wo, const DVec3& wi, Real lambda) {
     const ggx::Pair p = ggx::pair(ns, wo, wi, ggx::alpha((double)dMatRoughness(sc, m, h)));
     if (!p.ok) return 0.0;
@@ -12169,8 +12173,9 @@ __device__ static float dPatternEvalF(const PatNodeF* nodes, int n,
 // there would be, its normal by the inverse transpose of the map from the face now to the face
 // then; a rigid mover by the inverse of its motion. The footprint `fw` and the curvature are
 // lengths at the instant too.
+// Inlined at every call (see dGlossyF).
 struct DPatIn { double x, y, z, r, nx, ny, nz, curv, fw; };
-__device__ static DPatIn dPatIn(const DScene& sc, const DHit& h) {
+__device__ __forceinline__ static DPatIn dPatIn(const DScene& sc, const DHit& h) {
     DPatIn in;
     const double s = (h.back && h.patOwnSide) ? -1.0 : 1.0;
     in.nx = s * (double)h.n.x; in.ny = s * (double)h.n.y; in.nz = s * (double)h.n.z;
@@ -12220,8 +12225,8 @@ __device__ static DPatIn dPatIn(const DScene& sc, const DHit& h) {
 }
 // Evaluate a bound pattern at a hit (device twin of patternScalarAt/patCtxFromHit).
 // The implicit field value f is 0 (like the CPU: intersectImplicit never sets it), so
-// the `f` variable is 0 at surfaces on both backends.
-__device__ static double dPatternScalarAt(const DScene& sc, int pat, const DHit& h) {
+// the `f` variable is 0 at surfaces on both backends. Inlined at every call (see dGlossyF).
+__device__ __forceinline__ static double dPatternScalarAt(const DScene& sc, int pat, const DHit& h) {
     const DPattern& p = sc.patterns[pat];
     const DPatIn in = dPatIn(sc, h);
     return dPatternEval(sc.patNodes + p.off, p.n, in.x, in.y, in.z, 0.0, in.nx, in.ny, in.nz, in.r, h.u, h.v,
@@ -12288,8 +12293,9 @@ __device__ static inline double dClampRoughness(double r) {
     return !(r > 0.0) ? 0.0 : (r > ggx::kMaxRoughness ? ggx::kMaxRoughness : r);
 }
 // Per-hit roughness from a bound scalar record, if the material binds one (device twin of
-// the record branch of materialRoughness). Returns true + sets `out` (dClampRoughness).
-__device__ static bool dRecordRoughness(const DScene& sc, const DMaterial& m, const DHit& h, Real& out) {
+// the record branch of materialRoughness). Returns true + sets `out` (dClampRoughness). Inlined at
+// every call (see dGlossyF).
+__device__ __forceinline__ static bool dRecordRoughness(const DScene& sc, const DMaterial& m, const DHit& h, Real& out) {
     if (m.recRoughMode < 0) return false;
     double v;
     if (m.recRoughMode == 0) {                             // direct scalar expression
@@ -15521,14 +15527,6 @@ __device__ __host__ static inline bool dLambertLit(double cosWi) { return cosWi 
 // Takes the full DVertex so textured/patterned/record-driven albedo & roughness are
 // evaluated per-hit (M9) — the reconstructed DHit feeds dDiffuseRho / dReflectSlot /
 // dMatRoughness exactly as the sampler used them, so MIS densities stay consistent.
-// The coat's factor on a vertex's lobe (dCoatF), for a walk that arrived from `wa` and leaves or
-// connects along `wb`; 1 off a coated material.
-__device__ static double dVertCoatF(const DScene& sc, const DVertex& vt, const DVec3& wa,
-                                    const DVec3& wb, Real lambda) {
-    if (vt.matId < 0 || !dCoatAny(sc.mats[vt.matId])) return 1.0;
-    const DHit h = dVertHit(vt);
-    return dCoatF(sc, sc.mats[vt.matId], h, wa, wb, lambda);
-}
 __device__ static double dBsdfF(const DScene& sc, const DVertex& vt,
                                 const DVec3& wo, const DVec3& wi, Real lambda) {
     const DMaterial& m = sc.mats[vt.matId];
@@ -15593,6 +15591,96 @@ __device__ static double dBsdfPdf(const DScene& sc, const DVertex& vt,
     }
     return 0.0;
 }
+
+// The GGX pair (b, a) from the pair (a, b): the same half vector and distribution, its two ends'
+// cosines and A terms swapped -- what ggx::pair computes for the swapped arguments, bit for bit.
+__device__ static inline ggx::Pair dPairSwapped(const ggx::Pair& p) {
+    ggx::Pair r = p;
+    r.ca = p.cb; r.cb = p.ca;
+    r.Aa = p.Ab; r.Ab = p.Aa;
+    return r;
+}
+
+// A MERGE SITE'S LOBE (modes U and J): camera vertex `vt`'s BSDF toward `wo` and its two
+// directional pdfs, for the many light directions a merge weighs -- dBsdfF's and dBsdfPdf's
+// arithmetic step for step, so a merge reads what they would -- but the vertex's hit rebuilt and its
+// roughness read once a site, and a light direction's geometry (at(): a glossy lobe's GGX pair, whose
+// reverse is the same pair with its ends swapped) once for every wavelength the light vertex
+// carries. Calling them rebuilt the hit and the pair in each call, six a light vertex with the hero
+// bundle (four values and two pdfs), the pair in double precision. A hair fiber's lobe calls them.
+struct DMergeLobe {
+    const DScene& sc;
+    const DVertex& vt;
+    const DMaterial& m;
+    DHit h;                 // vt's hit (dVertHit)
+    DVec3 wo;               // toward the camera side's previous vertex
+    double alpha = 0.0;     // a glossy lobe's: ggx::alpha of its roughness at h
+    bool ms = false;        // ...and whether it adds its multiple scattering (dGlossyMs)
+    double cosWo = 0.0;     // wo's cosine to vt's shading normal
+    // The light direction at() prepared:
+    DVec3 wi;
+    double cosWi = 0.0;
+    ggx::Pair p;            // a glossy lobe's pair (wo, wi)
+    double g = 0.0;         // ...its value over the reflectance, ggx::fAll
+    Real cH = (Real)1;      // ...and its half-vector cosine, which an iridescent lobe's R reads
+    __device__ DMergeLobe(const DScene& sc_, const DVertex& vt_, const DVec3& wo_)
+        : sc(sc_), vt(vt_), m(sc_.mats[vt_.matId]), h(dVertHit(vt_)), wo(wo_) {
+        if (m.type == D_GLOSSY) {
+            alpha = ggx::alpha((double)dMatRoughness(sc, m, h));
+            ms = dGlossyMs(m);
+        }
+        cosWo = ddot(wo, vt.ns);
+    }
+    __device__ void at(const DVec3& wi_) {
+        wi = wi_;
+        cosWi = ddot(wi, vt.ns);
+        if (m.type == D_GLOSSY) {
+            p = ggx::pair(vt.ns, wo, wi, alpha);
+            g = p.ok ? ggx::fAll(p, ms) : 0.0;
+            if (m.iridescence) cH = dHalfVectorCos(wo, wi);
+        }
+    }
+    // dBsdfF(sc, vt, wo, wi, lambda).
+    __device__ double f(Real lambda) const {
+        if (m.type == D_DIFFUSE || m.type == D_FLUORESCENT) {
+            if (!dLambertLit(cosWi)) return 0.0;
+            return clamp01(dDiffuseRho(sc, m, h, lambda)) / DPI;
+        } else if (m.type == D_GLOSSY) {
+            if (!p.ok) return 0.0;
+            double r = clamp01(dReflectSlot(sc, m, h, lambda, nullptr));
+            if (m.iridescence) r *= (double)dIridescenceR(sc, m, &h, lambda, cH);
+            return r * g;
+        } else if (m.type == D_DIFFUSETRANSMIT) {
+            double rhoR, rhoT; dDiffuseTransmitAlbedos(sc, m, h, lambda, rhoR, rhoT);
+            const int lobe = dTranslucentLobe(vt.ns, dVertexGeoN(vt), wo, wi);
+            return (lobe > 0 ? rhoR : (lobe < 0 ? rhoT : 0.0)) / DPI;
+        } else if (m.type == D_HAIR) {
+            return dBsdfF(sc, vt, wo, wi, lambda);
+        }
+        return 0.0;
+    }
+    // dBsdfPdf(sc, vt, wo, wi, lambda), or with `rev` dBsdfPdf(sc, vt, wi, wo, lambda).
+    __device__ double pdf(bool rev, Real lambda) const {
+        const double cosB = rev ? cosWo : cosWi;
+        if (m.type == D_DIFFUSE || m.type == D_FLUORESCENT) {
+            if (!dLambertLit(cosB)) return 0.0;
+            return cosB / DPI;
+        } else if (m.type == D_GLOSSY) {
+            return ggx::pdfAll(rev ? dPairSwapped(p) : p, ms);
+        } else if (m.type == D_DIFFUSETRANSMIT) {
+            double rhoR, rhoT; dDiffuseTransmitAlbedos(sc, m, h, lambda, rhoR, rhoT);
+            const double tot = rhoR + rhoT;
+            if (tot <= 0.0) return 0.0;
+            const int lobe = rev ? dTranslucentLobe(vt.ns, dVertexGeoN(vt), wi, wo)
+                                 : dTranslucentLobe(vt.ns, dVertexGeoN(vt), wo, wi);
+            if (lobe == 0) return 0.0;
+            return (lobe > 0 ? rhoR : rhoT) / tot * fabs(cosB) / DPI;
+        } else if (m.type == D_HAIR) {
+            return rev ? dBsdfPdf(sc, vt, wi, wo, lambda) : dBsdfPdf(sc, vt, wo, wi, lambda);
+        }
+        return 0.0;
+    }
+};
 
 // Camera importance (PBRT imagePlaneArea convention — see bdpt.h cameraWe/PdfDir).
 __device__ static double dCameraPdfDir(const DCamera& cam, double cosCam) {
@@ -21240,12 +21328,14 @@ struct DSurfSite {
         return ((long long)cz * sm.ny + cy) * sm.nx + cx;
     }
 };
-// The merge of photon `sm.order[q]` at the site: its XYZ added to gX, gY, gZ.
-__device__ static inline void dSurfMergePhoton(const DScene& sc, const DSurfMap& sm,
-                                               const DVertex& vk, const DSurfSite& site,
-                                               const DVec3& woCam, const DSurfMergeW& sw, int q,
+// The merge of photon `sm.order[q]` at the site: its XYZ added to gX, gY, gZ. `lobe` is the site's
+// camera vertex's toward the camera side (DMergeLobe), `coatTh` its coat's film there
+// (dCoatThicknessAt).
+__device__ static inline void dSurfMergePhoton(const DScene& sc, const DSurfMap& sm, const DSurfSite& site,
+                                               DMergeLobe& lobe, Real coatTh, const DSurfMergeW& sw, int q,
                                                double& gX, double& gY, double& gZ,
                                                const DJSpec* js) {
+    const DVertex& vk = lobe.vt;
     const int idx = sm.order[q];
     const DSurfPhoton& ph = sm.pts[idx];
     const DVec3 dd{vk.p.x - ph.p.x, vk.p.y - ph.p.y, vk.p.z - ph.p.z};
@@ -21255,11 +21345,12 @@ __device__ static inline void dSurfMergePhoton(const DScene& sc, const DSurfMap&
     const DSurfMis& lm = sm.mis[ph.misIdx];
     const Real lam = (Real)ph.lambda;
     // ...times a coated body's coat on the photon's way in: it was stored before its own pick.
-    double fCam = dBsdfF(sc, vk, woCam, ph.wo, lam) * dVertCoatF(sc, vk, woCam, ph.wo, lam);
+    lobe.at(ph.wo);
+    double fCam = lobe.f(lam) * dCoatEvalAt(sc, lobe.m, vk.ns, coatTh, lobe.wo, ph.wo).at(lam);
     if (!(fCam > 0.0)) return;
     fCam *= dArrivalAdjointCorr(ph.wo, vk.ns, site.fp.n);   // flux per geometric area -> R's shading
-    const double pdfDirRev = dBsdfPdf(sc, vk, woCam, ph.wo, lam);
-    const double pdfDirFwd = dBsdfPdf(sc, vk, ph.wo, woCam, lam);
+    const double pdfDirRev = lobe.pdf(false, lam);
+    const double pdfDirFwd = lobe.pdf(true, lam);
     const double w = sw(lm, pdfDirRev, pdfDirFwd, (double)lam);
     if (!(w > 0.0)) return;
     if (js && js->disp) {   // windowed (DJSpec::disp): light at lambda_c only, coloured there
@@ -21386,8 +21477,10 @@ __device__ static int dSurfMergeAt(const DScene& sc, const DSurfMap& sm, const D
                                    double& gX, double& gY, double& gZ,
                                    const DJSpec* js = nullptr) {
     const DSurfSite site(sc, sm, vk);
+    DMergeLobe lobe(sc, vk, woCam);
+    const Real coatTh = dCoatThicknessAt(sc, lobe.m, lobe.h);
     return dSiteListWalk([&](int n, int& b, int& e) { dSurfSiteCell(sm, site, n, b, e); }, 0, 1,
-                         [&](int q) { dSurfMergePhoton(sc, sm, vk, site, woCam, sw, q, gX, gY, gZ, js); });
+                         [&](int q) { dSurfMergePhoton(sc, sm, site, lobe, coatTh, sw, q, gX, gY, gZ, js); });
 }
 
 // The first `n` queued sites (DSurfQueue), a warp each: the lanes take the site's photons in turn,
@@ -21414,9 +21507,11 @@ __global__ void kWfSurfGather(DScene sc, DSurfMap sm, DSurfQueue sq, int n, doub
         const DJSpec* js = (rq.flags & 1) ? &sq.spec[r] : nullptr;
         const DSurfSite site(sc, sm, rq.vk);
         double gX = 0.0, gY = 0.0, gZ = 0.0;
+        DMergeLobe lobe(sc, rq.vk, rq.woCam);
+        const Real coatTh = dCoatThicknessAt(sc, lobe.m, lobe.h);
         // The site's photons as one list, its cells in walk order, the lanes taking them in turn.
         const int total = dSiteListWalk([&](int c, int& b, int& e) { dSurfSiteCell(sm, site, c, b, e); }, lane, 32,
-                                        [&](int q) { dSurfMergePhoton(sc, sm, rq.vk, site, rq.woCam, sw, q,
+                                        [&](int q) { dSurfMergePhoton(sc, sm, site, lobe, coatTh, sw, q,
                                                                       gX, gY, gZ, js); });
         if (lane == 0) dAddWork((unsigned long long)total);
         dWarpSiteAdd(sc, site.fp, rq.gaSeed, lane, gX, gY, gZ, rq.f, camFilm, rq.pix);
@@ -24480,6 +24575,7 @@ __device__ static void dVcmMergeSum(const DScene& sc, const DVcmCtx& ctx, const 
     const DVec3 ngoCam = fp.n;
     const double r2 = ctx.radius * ctx.radius;
     const DVcmSite site(grid, vt.p);
+    DMergeLobe lobe(sc, vt, wo);
     dSiteListWalk([&](int n, int& b, int& e) { site.cell(grid, n, b, e); }, lane, lanes, [&](int k) {
         const DVcmLV& lv = grid.byCell[k];
         const DVcmSec* row = ((NS > 0) && grid.byCellSec) ? (grid.byCellSec + (size_t)k * secStride) : nullptr;
@@ -24504,17 +24600,21 @@ __device__ static void dVcmMergeSum(const DScene& sc, const DVcmCtx& ctx, const 
         // ...times a coated body's coat on the light's way in: the light vertex was stored before
         // its own pick.
         const DCoatEval ce = dCoatEvalAt(sc, m, vt.ns, coatTh, wo, wMerge);
-        double fCam = dBsdfF(sc, vt, wo, wMerge, lam) * ce.at(lam);
+        lobe.at(wMerge);
+        double fCam = lobe.f(lam) * ce.at(lam);
+        // The secondaries' loops run to SECN, a constant, so fSec stays in registers.
         double fSec[SECN], mxF = fCam;
-        for (int q = 0; q + 1 < lvUp; ++q) {
-            fSec[q] = dBsdfF(sc, vt, wo, wMerge, (Real)row[q].lam) * ce.at((Real)row[q].lam);
+#pragma unroll
+        for (int q = 0; q < SECN; ++q) {
+            if (q + 1 >= lvUp) break;
+            fSec[q] = lobe.f((Real)row[q].lam) * ce.at((Real)row[q].lam);
             if (fSec[q] > mxF) mxF = fSec[q];
         }
         if (!(mxF > 0.0)) return;   // == `fCam <= 0` at lvUp == 1
         const double gcorr = dArrivalAdjointCorr(wMerge, vt.ns, ngoCam);
         fCam *= gcorr;
-        const double camDirPdfW = dBsdfPdf(sc, vt, wo, wMerge, lam);
-        const double camRevPdfW = dBsdfPdf(sc, vt, wMerge, wo, lam);
+        const double camDirPdfW = lobe.pdf(false, lam);
+        const double camRevPdfW = lobe.pdf(true, lam);
         const double wLight = lv.dVCM * ctx.misVcWeight + lv.dVM * camDirPdfW;
         const double wCamera = dVCM * ctx.misVcWeight + dVM * camRevPdfW;
         const double misW = 1.0 / (wLight + 1.0 + wCamera);
@@ -24526,7 +24626,9 @@ __device__ static void dVcmMergeSum(const DScene& sc, const DVcmCtx& ctx, const 
         double ax = lv.cx * wgt, ay = lv.cy * wgt, az = lv.cz * wgt;
         if (win) ax = ay = az = 0.0;
         double wWin = win ? wgt : 0.0;
-        for (int q = 0; q + 1 < lvUp; ++q) {
+#pragma unroll
+        for (int q = 0; q < SECN; ++q) {
+            if (q + 1 >= lvUp) break;
             double wq = misW * fSec[q] * gcorr * row[q].beta;
             const Real lq = (Real)row[q].lam;
             if (js) wq *= win ? js->winW((double)lq) : js->at((double)lq);
