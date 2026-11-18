@@ -400,11 +400,23 @@ Then the rest of 4.2-4.6 in their order, 4.7's bookkeeping alongside whatever to
 - [x] **GPU-U-GLOSSY-SLOW** (0.450.0) — GPU mode U's merges are queued for a warp each
   (VCM-WAVEFRONT): at -pmradius 0.05 62.5 -> 7.4 s (the CPU 9.5), at 640x480 204 -> 50 s;
   `tools/check_vcm_wavefront.py`.
-- [ ] **VCM-MERGE-LOCALITY** — the GPU mode U gather (45 of 50 s at 640x480 on
-  `_merge_glossy_bowl`) reads each light vertex through `grid.order`, scattered over the whole store
-  in path order: gather the compact array into cell order once a pass, into the light slab's memory
-  (idle after the compaction), so a site's vertices are contiguous and neighbouring sites share
-  cache lines.
+- [x] **VCM-MERGE-LOCALITY** (0.450.1) — the merges read the light vertices in cell order, a copy
+  in the light slab's memory (`DVcmGrid::byCell`); bit-identical. On an idle GPU it moved the
+  640x480 gather little (44.6 -> 43.8 s), the gather being bound elsewhere (VCM-GATHER-SPILLS).
+- [x] **REVIEW-0450** (0.450.1) — the Opus (max) review of 0.450.0: the merge's coat read at the
+  walk's hit, waves sized by the last pass's per-block profile (check_vcm_wavefront's sky case), the
+  grid's worst kept free beside the queue, the shared helpers; known-issues REVIEW-0450.
+- [ ] **VCM-GATHER-SPILLS** — Nsight Compute on kVcmMergeGather (640x480, `_merge_glossy_bowl`):
+  255 registers, 16.7 % occupancy, 10.5 G local-memory requests (34 % of its instructions; arrays
+  indexed at run time, `fSec[q]`), 13.5 of 32 lanes active, IPC 0.24, and 26.6 G FP64 instructions
+  to 8.7 G FP32. Each light vertex rebuilds the camera vertex's hit (`dVertHit`) and its roughness
+  in every one of its six `dBsdfF` / `dBsdfPdf` calls (four wavelengths and two pdfs): a site's lobe
+  built once (the hit, the roughness, `ggx::pair` once a light direction, the reflectance alone per
+  wavelength), the secondaries' loops unrolled to compile-time bounds, and the cheap rejections
+  compacted across the warp before the expensive half.
+- [ ] **GPU-DVERTEX-HIT-STATE** — a GPU connection's rebuilt hit lacks the walk's time (motion set,
+  deforming triangle), cavity and footprint, so patterns on movers slide and cavity re-probes or reads
+  0 (known-issues).
 - [x] **CAMERA-EMPTY-STACK** (0.445.8) — every camera walk starts inside the solids around the eye,
   and every connection leg takes its medium's absorption; `tools/check_camera_in_water.py`.
 - [x] **REVIEW-0445** (0.445.6, 0.445.7) — the Opus (max) and Fable (xhigh) reviews of

@@ -6697,8 +6697,8 @@ as the one at fault.
   0.64 of mode R at radius 0.1 -- because the merges still divided by the whole disc; with it the
   base reads 0.99-1.00, and the light trapped in a millimetre gap under a plate stays off the
   plate's top (J 36x mode B before). A merge probes only where its sum found light -- off the
-  camera walk's own stream on the host and in the device's mode U; in the device's mode J each probe
-  off a stream of its own seeded from the walk's at the site (`dMergeProbeRng`), so the queued
+  camera walk's own stream on the host; on the device (modes J and U, the latter since 0.450.0) each
+  probe off a stream of its own seeded from the walk's at the site (`dMergeProbeRng`), so the queued
   gather runs a site's probes across the warp (`dSurfFootprintWarp`, lane l taking probes l, l + 32,
   ..., their areas summed by shuffles) and the inline one in turn (`dSurfFootprint`), the two alike
   but for the sums' order (one probe is `dCoverageProbe`, the gates `dCoverageFinish`, which
@@ -10401,29 +10401,41 @@ as the one at fault.
   A merge weighs every light vertex in the radius -- a BSDF and two pdfs each -- and a warp's camera
   paths reach their merge sites at different depths, so the thread that reached a site weighed its
   vertices one after another with most of the warp idle: at five times the glossy bowl's radius
-  (`_merge_glossy_bowl`, `-pmradius 0.05`), some 25 times the vertices a site, the GPU ran ten times
+  (`_merge_glossy_bowl`, `-pmradius 0.05`), some 25 times the vertices a site, the GPU ran 6.6 times
   slower than the CPU (GPU-U-GLOSSY-SLOW). `kVcmCameraT` now writes the site (`DVcmMergeReq`: the
   camera vertex as `dVertFromHit` makes it, the direction back, its MIS partials and edge count, its
-  scale, the footprint probe's seed, the accumulator offset; a VCM-SPEC carrier in a side table) to
-  a `DVcmMergeQueue`, and after the camera wave `kVcmMergeGather` gathers each with a whole warp:
-  the lanes take the site's light vertices in turn, its 27 cells as one list, and lane 0 adds the
-  sum to `accum` by atomics. The per-vertex work is `dVcmMergeSum`, which the inline merge (a site
-  the full queue turns away, or `FTRACE_NOVCMWF=1`) calls with one lane. Both read the coat through
-  `dVertHit(vt)` and draw the footprint's probes off a seed the walk draws at the site
+  scale, the footprint probe's seed, its coat's film thickness, the accumulator offset; a VCM-SPEC
+  carrier in a side table) to a `DVcmMergeQueue`, and after the camera wave `kVcmMergeGather`
+  gathers each with a whole warp: the lanes take the site's light vertices in turn, its 27 cells as
+  one list (`dSiteListWalk`, mode J's walk too), and lane 0 adds the sum to `accum` by atomics. The
+  per-vertex work is `dVcmMergeSum`, which the inline merge calls with one lane: a site the full
+  queue turns away, a site whose 27 cells hold at most 32 light vertices (`kVcmInlineMax`: a warp
+  would idle on it, and its request costs more than its merge), or every site under
+  `FTRACE_NOVCMWF=1`; a site whose cells hold none is skipped. Both take the coat's film thickness
+  read at the walk's own hit (`dCoatThicknessAt`, and `dCoatEvalAt` a light vertex), as NEE and the
+  connections take it, and draw the footprint's probes off a seed the walk draws at the site
   (`dSurfFootprint`, each probe a stream of its own), so a queued site and an inline one agree but
-  for their sums' order. `vcmSessionPass` splits the pass's pixels into waves (`kVcmCameraT` takes
-  a pixel range; a path's stream is seeded by its pixel, so the waves leave each path as it was):
-  n paths a wave with n x 1.25 x the last wave's sites a path within the queue, never fewer than
-  the camera kernel's resident threads, the rest of the pass in waves of one size; a session's
-  first wave, with no rate yet, is that fewest. The queue holds up to 1 M requests, or what an
-  eighth of the memory left beside the light-vertex store and the kernels' stacks holds.
+  for their sums' order. The merges read the pass's light vertices in cell order, a copy
+  (`DVcmGrid::byCell`, `kVcmCellGather`) that the grid build writes into the light slab, idle once
+  the compaction has read it. `vcmSessionPass` splits the pass's pixels into waves (`kVcmCameraT`
+  takes a pixel range; a path's stream is seeded by its pixel, so the waves leave each path as it
+  was). The camera kernel counts the sites asking for the queue a block of 256 pixels
+  (`DVcmMergeQueue::profile`), and the last pass's counts -- the same camera and scene, the radius a
+  little smaller -- split the next pass into the fewest waves whose predicted sites, a quarter high,
+  the queue holds, of like predicted sites each, never fewer paths than the camera kernel keeps
+  resident: a band of sky takes no share of a wave. (0.450.0 sized a wave by the last wave's sites a
+  path, so a wave after sky took the rest of the pass and turned most of the floor's sites away,
+  every pass.) A session's first pass has no profile: its first wave is that fewest, the next ones
+  as many as the queue holds at the last wave's rate, a quarter high and at least 2.5. The queue
+  holds up to 1 M requests, or what an eighth of the memory left beside the light-vertex store, the
+  kernels' stacks and the grid's worst (its cell table at its cap, the sort's scratch) holds.
   Measured on `_merge_glossy_bowl` at `-max-bounce 24`, wall time before -> queued (inline; the
   CPU): 64 passes at 96x72 at five times its radius 62.5 -> 7.4 s (21.2; 9.5), at its own radius
   7.1 -> 4.6 s (5.1; 2.9 -- 6 912 paths leave the device mostly idle); 16 passes at 320x240
   30.3 -> 11.0 s (13.2; 24.9); 8 at 640x480 204 -> 50 s (74; 204), the gather 45 s of it.
-  `tools/check_vcm_wavefront.py` requires the inline merge's image (with the
-  queue shrunk to overflow, too, and through ruby glass at one wavelength), and that a shrunk queue
-  splits passes into waves that turn nothing away after the first.
+  `tools/check_vcm_wavefront.py` requires the inline merge's image (with the queue shrunk to
+  overflow, too, and through ruby glass at one wavelength), and that a shrunk queue splits passes
+  into waves that turn nothing away after the first, in the bowl and in a frame half sky.
 
   Since 0.34.0 (M9) the **GPU BDPT** kernel (mode `D`) threads the **per-hit
   surface point** through its connection BSDF: each `DVertex` stores the interpolated texcoords

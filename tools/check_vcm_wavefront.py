@@ -17,7 +17,11 @@ at most (ORDER_TOL). So it requires, against the inline merge's image of the sam
     to the inline merge every wave;
   - the waves' sizes (vcmSessionPass): with the queue shrunk to 4096 requests and
     FTRACE_WAVE_DEBUG's line a wave, every pass split into several waves, and no wave after the
-    first pass turning away more than a tenth of its sites -- each is sized by the wave before;
+    first pass turning a site away -- each is sized by the last pass's profile of its pixels;
+  - the same of a frame whose top half is sky over a glossy floor (512 requests): a wave of sky
+    queues nothing, and the floor's waves after it must still hold their sites, every pass after the
+    first (0.450.0 sized a wave by the last wave's sites a path, so the floor's waves after the sky
+    turned most of their sites away);
   - the bowl with a ball of ruby glass in it, seen through by the camera, at one wavelength a
     path (`-heroc 1`: the kernels' other instantiation; the bowl's runs take the default hero
     bundle, whose light vertices' secondary rows the merge reads): the walks behind the glass carry
@@ -40,8 +44,9 @@ from pfm import ORDER_TOL, image_diff, read_pfm  # noqa: E402
 
 LINE = re.compile(r"mode U merges: (\d+) sites gathered a warp each \(([\d.]+) a path\) "
                   r"in [\d.]+ s of GPU time, (\d+) inline")
+# (0.450.0 said "merged inline" for "turned away".)
 WAVE = re.compile(r"\[wave\] U pass (\d+) paths (\d+)\.\.(\d+) \(\d+\), (\d+) merge sites "
-                  r"\((\d+) merged inline\)")
+                  r"\((\d+) (?:turned away|merged inline)\)")
 
 RUBY = """scene { units meters }
 material "rough" { type glossy reflect 0.7 roughness 1.2 }
@@ -50,6 +55,13 @@ sphere { center 0 0 0  radius 0.3  material rough }
 sphere { center 0 -0.1 -0.12  radius 0.08  material ruby }
 light area { origin -0.05 0.2 -0.05  u 0.1 0 0  v 0 0 0.1  normal 0 -1 0  power 5  spd preset:d65 }
 camera "c" { eye 0 0.05 0.2  look_at 0 -0.1 -0.2  up 0 1 0  fov_y 60  film { res 96 72 } }
+"""
+# A glossy floor a metre square, lit from above, seen level from its edge: the frame's top half is sky.
+SKY = """scene { units meters }
+material "rough" { type glossy reflect 0.7 roughness 1.2 }
+quad { origin -0.5 0 -0.5  u 0 0 1  v 1 0 0  material rough }
+light area { origin -0.1 0.6 -0.1  u 0.2 0 0  v 0 0 0.2  normal 0 -1 0  power 5  spd preset:d65 }
+camera "c" { eye 0 0.25 1.2  look_at 0 0.25 0  up 0 1 0  fov_y 50  film { res 96 72 } }
 """
 
 
@@ -60,9 +72,10 @@ def main():
     a = ap.parse_args()
     exe, d = os.path.abspath(a.exe), os.path.abspath(a.out)
     os.makedirs(d, exist_ok=True)
-    ruby = os.path.join(d, "ruby.ftsl")
-    with open(ruby, "w", encoding="utf-8", newline="") as f:
-        f.write(RUBY)
+    ruby, sky = os.path.join(d, "ruby.ftsl"), os.path.join(d, "sky.ftsl")
+    for path, text in ((ruby, RUBY), (sky, SKY)):
+        with open(path, "w", encoding="utf-8", newline="") as f:
+            f.write(text)
     BOWL = [os.path.join(ROOT, "scenes", "_merge_glossy_bowl.ftsl"), "-spp", "4", "-max-bounce", "8",
             "-pmradius", "0.05"]
     RUBYARGS = [ruby, "-spp", "4", "-max-bounce", "8", "-pmradius", "0.03", "-heroc", "1"]
@@ -112,18 +125,24 @@ def main():
         check("bowl: ...and renders the same image", r < ORDER_TOL,
               "largest change %.2g of the pixel, %d values differ" % (r, n))
 
-    rc3, log3, _ = run("bowl_sized", BOWL, {"FTRACE_VCMWFCAP": "4096", "FTRACE_WAVE_DEBUG": "1"})
-    waves = [tuple(int(g) for g in m.groups()) for m in WAVE.finditer(log3)]
-    passes = sorted({w[0] for w in waves})
-    check("bowl: a 4096-request queue splits every pass into waves",
-          rc3 == 0 and len(passes) == 4 and all(sum(1 for w in waves if w[0] == p) >= 2 for p in passes),
-          "rc %d, %d waves in %d passes" % (rc3, len(waves), len(passes)))
-    later = [w for w in waves if w[0] > 0]
-    worst = max((w[4] / max(w[3], 1) for w in later), default=1.0)
-    check("...none after the first pass turning a tenth of its sites away",
-          len(later) > 0 and worst <= 0.1,
-          "the worst wave turned %.1f %% of its sites away (the first pass: %d of %d)"
-          % (100 * worst, sum(w[4] for w in waves if w[0] == 0), sum(w[3] for w in waves if w[0] == 0)))
+    def sized(name, args, cap):
+        """With the queue shrunk to `cap` requests: every pass in waves, none after the first
+        turning a site away."""
+        rc, log, _ = run(name + "_sized", args, {"FTRACE_VCMWFCAP": str(cap), "FTRACE_WAVE_DEBUG": "1"})
+        waves = [tuple(int(g) for g in m.groups()) for m in WAVE.finditer(log)]
+        passes = sorted({w[0] for w in waves})
+        check("%s: a %d-request queue splits every pass into waves" % (name, cap),
+              rc == 0 and len(passes) == 4 and all(sum(1 for w in waves if w[0] == p) >= 2 for p in passes),
+              "rc %d, %d waves in %d passes" % (rc, len(waves), len(passes)))
+        later = [w for w in waves if w[0] > 0]
+        check("...none after the first pass turning a site away",
+              len(later) > 0 and sum(w[4] for w in later) == 0 and sum(w[3] for w in later) > 0,
+              "%d of %d sites turned away after the first pass (in it: %d of %d)"
+              % (sum(w[4] for w in later), sum(w[3] for w in later),
+                 sum(w[4] for w in waves if w[0] == 0), sum(w[3] for w in waves if w[0] == 0)))
+
+    sized("bowl", BOWL, 4096)
+    sized("sky", [sky, "-spp", "4", "-max-bounce", "8", "-pmradius", "0.1"], 512)
 
     pair("ruby", RUBYARGS)
     return check.verdict(NL.join(logs[-3:]))

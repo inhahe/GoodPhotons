@@ -186,6 +186,71 @@ through glass (no light-tracing strategy connects through it), so it cannot arbi
 same view in a room whose lamp is replaced by a glowing wall of the same light (where mode R is exact
 and modes B, M and S must meet it), then the lamp back in with each mode's light-side strategy alone.
 
+## OPEN (2026-11-18): GPU-DVERTEX-HIT-STATE — a GPU connection rebuilds its vertex's hit without the hit's time, cavity or footprint
+
+Found by the Opus (max) review of 0.450.0 (REVIEW-0450). The device's bidirectional modes (D, J, U)
+keep a path's vertices as `DVertex`, and every BSDF, pdf and coat evaluated at a connection or a
+merge rebuilds a `DHit` from it (`dVertHit`). The rebuilt hit lacks what the walk's own hit carried
+for its patterns, where the host's `Vertex` keeps the whole `Hit`:
+
+* **Its time.** `motionSet`, `deformTri` and `deformB1/B2` stay -1/0, so `dPatIn` does not carry a
+  moving or deforming primitive's point back to the instant: under a shutter, a pattern (a reflect
+  or roughness pattern, a coat's film thickness) on a mover is read where the mover sits at the
+  pass's time at every connection vertex, and where it sat at the instant by the walk's own
+  scatter -- the strategies weigh different integrands.
+* **Its cavity.** `cavityDone` is false, so a material that reads `cavity` re-runs the cavity probe
+  (N occlusion rays) in every `dBsdfF` / `dBsdfPdf` / coat call -- six a light vertex in mode U's
+  merge with the hero bundle. And `dCavityOf` gates on the rebuilt hit's `matId`, the resolved body
+  of a `layered` material, which `ftsl::markCavityReaders` never flags (it lifts the flag from mix
+  children to parents only): such a body reads cavity 0 at a connection, the true cavity at the walk.
+* **Its footprint** (`fw`, a pattern's filter width), left at its default.
+
+Mode U's merge reads its coat's film thickness at the walk's hit since 0.450.1 (`dCoatThicknessAt`),
+the one place 0.450.0 had moved off the walk's hit; the rest is as it was before 0.450.0.
+
+**The fix:** `DVertex` carries the state a faithful rebuild needs -- the hit's cavity (computed once,
+at the walk, where `cavityDone`), its motion reference (a motion set or a deforming triangle, one
+int: they never coexist) with the deform barycentrics packed in 16 bits each (as `vb0q/vb1q`), and
+`fw` -- and `dVertHit` restores them; and the cavity flag lifts to a layered material's body copies.
+`DVertex` grows by 16 B (its static_assert counts it), which BDPT's local memory pays for.
+
+## DONE (2026-11-18, 0.450.1): REVIEW-0450 — what the Opus (max) review of 0.450.0 found
+
+`/code-review max` (Opus, 11 findings) of 6779234..9297c3f, in a worktree; each checked against the
+code, all held. **Fixed in 0.450.1:**
+
+* **The merge's coat was read off the rebuilt vertex** (`dVertHit(vt)`), not the walk's hit as NEE
+  and the connections read it: no time for a mover's film-thickness pattern, and a layered body
+  copy's matId, which reads cavity 0. The camera kernel reads the film at the walk's hit
+  (`dCoatThicknessAt`) into the request, and a light vertex's factor is `dCoatEvalAt` with it --
+  which also stops the per-vertex rebuild and re-read of the site's film. `dCoatEval` is the two.
+  The rebuilt hit's wider gap, every GPU connection's: GPU-DVERTEX-HIT-STATE (open).
+* **A wave was sized by the wave before**, so a wave of sky sized the next to the rest of the pass
+  and its floor turned most of its sites away, every pass. The camera kernel counts the sites asking
+  for the queue a block of 256 pixels, and the last pass's counts split the next into waves of like
+  predicted sites; the first pass, with none, floors the rate at 2.5 sites a path.
+  check_vcm_wavefront's new sky case: 1 399 of 3 715 sites turned away after the first pass on
+  0.450.0, none now.
+* **The queue took memory the passes' grid allocations need**, which end the render when they fail
+  (the cell table growing toward its cap, the sort's arena): their worst is kept free beside it.
+* **Stale words:** design.md and the dMergeProbeRng comment still had the device's mode U probe off
+  the walk's own stream.
+* **Dead code:** `DMergeFootprint::scale` lost its caller, and with it `dGatherCoverage`'s `holds`.
+* **Duplicates of mode J:** the queue's capacity rule and the resident-thread floor
+  (`mergeQueueCap`, `residentThreadsOf`), the site's footprint (`dVertexMergeFootprint`) and the
+  27-cell list walk (`dSiteListWalk`, now kWfSurfGather's, dSurfMergeAt's and dVcmMergeSum's) are
+  one each. The waves' sizing stays each mode's own: mode U's profile is the device's count a
+  pixel block, mode J's the band profile its beam queue shares.
+* **Every site was queued, empty ones included:** a site whose cells hold no light vertex is
+  skipped, and one with at most 32 (`kVcmInlineMax`) merged where it was found.
+* **FTRACE_VCMWFCAP lowered the waves' floor even where it was not applied** (below 16, or not
+  below the cap): only where it shrinks the queue -- and the same for mode J's FTRACE_SURFWFCAP.
+
+With these, VCM-MERGE-LOCALITY (TODO): the merges read the light vertices in cell order, a copy in
+the light slab (`DVcmGrid::byCell`). check_vcm_wavefront passes (its images bit-identical, queued
+or inline); check_bitid against 0.450.0: every case identical but GPU modes M and S (within their floor)
+and coated_U_gpu, 3 pixels off by 1.0e-7 (the merges' sums in another order).
+
 ## OPEN (2026-11-16): GPU-SPHERE-CONNECT-SLOW — GPU mode B through a glass sphere is slower than the CPU
 
 Mode B's glass-sphere connection runs in each photon thread, in double precision, a scan of 99 samples
