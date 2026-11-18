@@ -419,9 +419,9 @@ Then the rest of 4.2-4.6 in their order, 4.7's bookkeeping alongside whatever to
   sequenced, check_bitid's floor for GPU J and U; known-issues REVIEW-0450-FABLE.
 - [x] **LAYERED-FILM-PATTERN** (0.450.2) — a layered coat's `film_thickness_map pattern:` was dropped,
   and a map naming neither a pattern nor a texture loaded; `tools/check_layered_film_map.py`.
-- [ ] **GPU-DVERTEX-HIT-STATE** — a GPU connection's rebuilt hit lacks the walk's time (motion set,
-  deforming triangle), cavity and footprint, so patterns on movers slide and cavity re-probes or reads
-  0 (known-issues).
+- [x] **GPU-DVERTEX-HIT-STATE** (0.450.4) — a GPU connection's rebuilt hit carries the walk's
+  time and cavity (DVertHitState): patterns on movers stay put, the cavity is probed once;
+  `tools/check_vertex_hit_state.py`.
 - [x] **CAMERA-EMPTY-STACK** (0.445.8) — every camera walk starts inside the solids around the eye,
   and every connection leg takes its medium's absorption; `tools/check_camera_in_water.py`.
 - [x] **REVIEW-0445** (0.445.6, 0.445.7) — the Opus (max) and Fable (xhigh) reviews of

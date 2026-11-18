@@ -10443,7 +10443,11 @@ as the one at fault.
 
   Since 0.34.0 (M9) the **GPU BDPT** kernel (mode `D`) threads the **per-hit
   surface point** through its connection BSDF: each `DVertex` stores the interpolated texcoords
-  (`u,v`) and `dVertHit` reconstructs a minimal `DHit`, so `dBsdfF`/`dBsdfPdf` and the random
+  (`u,v`) and `dVertHit` reconstructs a minimal `DHit` (since 0.450.4 with the walk's hit's pattern
+  state, `DVertHitState`: its cavity, probed once, and where a moving or deforming primitive's point
+  sat at the instant, so a connection reads a pattern on a mover where the walk read it; mode U's
+  stored light vertices keep it in a side slab where the scene moves or reads `cavity`), so
+  `dBsdfF`/`dBsdfPdf` and the random
   walk evaluate per-hit-driven throughput slots consistently in BOTH the sampler and the
   pdf/eval (MIS-safe: a textured albedo changes only `f`, not the cosine pdf; per-hit glossy
   roughness feeds the same `dMatRoughness` into sampler and pdf). On-device now: textured/

@@ -6202,8 +6202,12 @@ __device__ static inline double dCavityOf(const DScene& sc, const DHit& h) {
     // `cavity` — then per-material, so a patterned surface that does not read it pays
     // nothing even in a scene that does.
     if (!sc.needsCavity) return 0.0;
+    // A hit rebuilt from a path vertex (dVertHit) brings the walk's own reading, which stands
+    // whatever material it names now -- a layered surface's resolved body, where the walk's hit
+    // named the layered material whose coat reads cavity.
+    if (h.cavityDone) return (double)h.cavity;
     if (h.matId < 0 || !sc.mats[h.matId].readsCavity) return 0.0;
-    if (!h.cavityDone) { h.cavity = (Real)dCavityAt(sc, h); h.cavityDone = true; }
+    h.cavity = (Real)dCavityAt(sc, h); h.cavityDone = true;
     return (double)h.cavity;
 }
 
@@ -15091,6 +15095,30 @@ enum { BV_CAMERA = 0, BV_LIGHT = 1, BV_SURFACE = 2, BV_MEDIUM = 3 };
 // lightIdx into sc.emitters) instead of pointers, and drops the Hit field (the GPU
 // rejects textured scenes, so albedo needs no surface-local (u,v)). pdfFwd/pdfRev/
 // beta stay double for MIS stability; geometry (p/ns/ng) is Real.
+// What a path vertex keeps of its walk's hit for the patterns a connection reads there, which a hit
+// rebuilt from the vertex (dVertHit) would otherwise lack (the host's vertices keep the whole Hit):
+// the hit's cavity, and where a moving or deforming primitive's point sat at the instant (dPatIn).
+struct DVertHitState {
+    Real cavity = (Real)-1;     // its cavity probe's, run where its material reads one (dCavityOf); < 0 none
+    int  motionRef = -1;        // its motion set (>= 0), or -2 - its deforming triangle; -1 neither
+    Real deformB1 = (Real)0, deformB2 = (Real)0;   // the intersector's barycentrics there (DHit's)
+};
+// The state of the walk's hit `h` (DVertHitState), its cavity probed now if its material reads one.
+__device__ static inline DVertHitState dHitStateOf(const DScene& sc, const DHit& h) {
+    DVertHitState s;
+    if (sc.needsCavity && h.matId >= 0 && sc.mats[h.matId].readsCavity) s.cavity = (Real)dCavityOf(sc, h);
+    s.motionRef = (h.deformTri >= 0) ? -2 - h.deformTri : h.motionSet;
+    s.deformB1 = h.deformB1; s.deformB2 = h.deformB2;
+    return s;
+}
+// ...and back onto a rebuilt hit.
+__device__ static inline void dRestoreHitState(DHit& h, const DVertHitState& s) {
+    h.motionSet = (s.motionRef >= 0) ? s.motionRef : -1;
+    h.deformTri = (s.motionRef <= -2) ? -2 - s.motionRef : -1;
+    h.deformB1 = s.deformB1; h.deformB2 = s.deformB2;
+    if (s.cavity >= (Real)0) { h.cavity = s.cavity; h.cavityDone = true; }
+}
+
 struct DVertex {
     int   type;                 // BV_CAMERA / BV_LIGHT / BV_SURFACE / BV_MEDIUM
     DVec3 p, ns, ng;            // position, shading normal, geometric normal
@@ -15132,12 +15160,14 @@ struct DVertex {
     // (VCOL-BDPT-GPU). The quantum, 1.5e-5 of a barycentric, is far below a colour's.
     int   vcol = -1;
     unsigned short vb0q = 0, vb1q = 0;
+    DVertHitState hs;           // where the walk's hit read its patterns (dHitStateOf)
 };
 #if FTRACE_GPU_FP32
 // BDPT holds 2 * BDPT_MAXV of these per thread in local memory: a field that grows it costs
 // occupancy. No padding is left (back filled the hole after lightIdx; nUp, patOwnSide and
-// extMat share 8 B, the vertex colour the next 8 B), so a new field grows it by 8 B.
-static_assert(sizeof(DVertex) == 144, "DVertex changed size");
+// extMat share 8 B, the vertex colour the next 8 B, the hit's pattern state 16 B), so a new
+// field grows it by 8 B.
+static_assert(sizeof(DVertex) == 160, "DVertex changed size");
 #endif
 // dShadedNg of the hit a vertex was made at; a light or camera vertex (back 0) keeps its ng.
 __device__ static inline DVec3 dVertexGeoN(const DVertex& v) { return v.back ? v.ng * (Real)(-1) : v.ng; }
@@ -15210,6 +15240,7 @@ __device__ static inline DHit dVertHit(const DVertex& vt) {
     h.vcol = vt.vcol; h.vb0 = dUnpackBary(vt.vb0q); h.vb1 = dUnpackBary(vt.vb1q);
     h.bitangentSign = (Real)1;
     h.extMat = (short)vt.extMat;
+    dRestoreHitState(h, vt.hs);
     return h;
 }
 
@@ -19813,6 +19844,7 @@ __device__ static void dRandomWalk(const DScene& sc, const DCamera& cam, int dif
         // dSurfMergeSite knows a vertex sits on ANY curve primitive. 0 off a curve (DHit default).
         v.tangent = h.tangent; v.fiberR = h.fiberRadius; v.pscale = h.pscale;
         v.back = h.back ? 1 : 0; v.patOwnSide = h.patOwnSide ? 1 : 0;
+        v.hs = dHitStateOf(sc, h);   // where a connection reads its patterns
         v.nUp = nUp;
         v.pdfFwd = dConvertDensity(pdfFwd, path[n - 1], v);
         path[n] = v; int cur = n; n++;
@@ -23713,8 +23745,8 @@ struct DVcmCtx {
 };
 
 // Reconstruct a minimal DVertex for the per-hit BSDF helpers (dBsdfF / dBsdfPdf reconstruct a
-// DHit from it — they read p/ns/ng/matId/u/v).
-__device__ static inline DVertex dVertFromHit(const DHit& h, int matId) {
+// DHit from it — they read p/ns/ng/matId/u/v and the hit's pattern state, DVertHitState).
+__device__ static inline DVertex dVertFromHit(const DScene& sc, const DHit& h, int matId) {
     DVertex v; v.type = BV_SURFACE; v.p = h.p; v.ns = h.n; v.ng = h.ng;
     v.beta = 0; v.pdfFwd = 0; v.pdfRev = 0; v.delta = 0; v.matId = matId; v.lightIdx = -1;
     v.emitPatW = (Real)1;   // BSDF-only helper vertex; never read for emission
@@ -23723,6 +23755,7 @@ __device__ static inline DVertex dVertFromHit(const DHit& h, int matId) {
     v.extMat = h.extMat;
     v.tangent = h.tangent; v.fiberR = h.fiberRadius; v.pscale = h.pscale;
     v.back = h.back ? 1 : 0; v.patOwnSide = h.patOwnSide ? 1 : 0;
+    v.hs = dHitStateOf(sc, h);   // where a connection or a merge reads its patterns
     return v;
 }
 __device__ static inline DVertex dVertFromLV(const DVcmLV& lv) {
@@ -23773,7 +23806,7 @@ __device__ static void dVcmScatter(const DScene& sc, const DMaterial& m, const D
     if (radianceScale) *radianceScale = 1.0;
     // The light walk is the one that passes no radianceScale (host twin: Transport::Flux).
     const bool importance = radianceScale == nullptr;
-    DVertex vt = dVertFromHit(h, matId);
+    DVertex vt = dVertFromHit(sc, h, matId);
     const DVec3& ns = h.n;
     DVec3 wo = normalize(rd * (Real)(-1));
     wi = DVec3(0, 0, 0); betaFactor = 0; pdfW = 0; pdfRevW = 0; cosThetaOut = 0;
@@ -23996,7 +24029,8 @@ __global__ void kVcmLightT(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx,
                            DVcmLV* lvSlab, DVcmSec* lvSec, int secStride, int heroC,
                            int* lvCount, double* splat,
                            Real* lamBuf, double* invLamBuf, int resX, int resY, int vcmCap,
-                           long long nPaths, unsigned long long seedBase, long long passIdx) {
+                           long long nPaths, unsigned long long seedBase, long long passIdx,
+                           DVertHitState* lvHs) {
     D_MOTION_CLEAR();   // this thread's time: the launch's (passU) until a path sets one
     constexpr int SECN = (NS > 0) ? NS : 1;
     const int C = (NS > 0) ? heroC : 1;
@@ -24235,6 +24269,7 @@ __global__ void kVcmLightT(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx,
                     lv.back = h.back ? 1u : 0u; lv.patOwnSide = h.patOwnSide ? 1u : 0u;
                     lv.nUp = (unsigned)nUp;
                     lvSlab[i * vcmCap + stored] = lv;
+                    if (lvHs) lvHs[i * vcmCap + stored] = dHitStateOf(sc, h);   // a connection's patterns
                     if (NS > 0 && lvSec) {
                         DVcmSec* row = lvSec + (size_t)(i * vcmCap + stored) * secStride;
                         for (int k = 0; k + 1 < nUp; ++k) { row[k].beta = betaSec[k]; row[k].lam = (float)lamAll[k + 1]; }
@@ -24261,7 +24296,7 @@ __global__ void kVcmLightT(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx,
                                                                 DVec3 oo = dFiberConnOrigin(h, mp->type == D_HAIR, wcam);
                                 if (!occludedTo(sc, oo, h.p + wcam * (Real)distc, 2e-6, RAY_TMIN, /*camLeg=*/true,
                                                 dFiberStep(h, mp->type == D_HAIR, wcam))) {  // camera leg: hide_camera applies (Scene::occluded / DMaterial::hideCamera)
-                                    DVertex vt = dVertFromHit(h, matId);
+                                    DVertex vt = dVertFromHit(sc, h, matId);
                                     // The adjoint correction and shadow-terminator G are purely
                                     // geometric, so they scale every λ the same way.
                                     double geo = (double)dShadingAdjointCorr(wo, wcam, h.n, ngo);
@@ -24535,14 +24570,16 @@ __global__ void kVcmMergeGather(DScene sc, DVcmCtx ctx, DVcmGrid grid, int secSt
 // vertex connection to the PAIRED light subpath lp = i % nLight, [pathBegin[lp],pathEnd[lp]), and
 // merging over the grid -- queued in `mq` for kVcmMergeGather where it holds them -- then adds this
 // pass's per-pixel radiance (camera result + the light splat) into the persistent `accum` sum.
-// Device twin of vcm.h traceCameraSubpath. `grid.lv` is the compact light-vertex array.
+// Device twin of vcm.h traceCameraSubpath. `grid.lv` is the compact light-vertex array, `lvHs` its
+// vertices' hit states (null where the session keeps none: no motion, no cavity).
 template <int NS>
 __global__ void kVcmCameraT(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx, DVcmGrid grid,
                             const DVcmSec* lvSec, int secStride, int heroC,
                             const int* pathBegin, const int* pathEnd, const double* splat,
                             double* accum, const Real* lamBuf, const double* invLamBuf,
                             int resX, int resY, long long nLight, unsigned long long seedBase,
-                            long long passIdx, DVcmMergeQueue mq, long long pixBegin, long long pixEnd) {
+                            long long passIdx, DVcmMergeQueue mq, long long pixBegin, long long pixEnd,
+                            const DVertHitState* lvHs) {
     D_MOTION_CLEAR();   // this thread's time: the launch's (passU) until a path sets one
     constexpr int SECN = (NS > 0) ? NS : 1;
     const int C = (NS > 0) ? heroC : 1;
@@ -24749,7 +24786,7 @@ __global__ void kVcmCameraT(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx
             }
 
             if (dConnectibleType(mp->type)) {
-                DVertex vt = dVertFromHit(h, matId);
+                DVertex vt = dVertFromHit(sc, h, matId);
                 DVec3 ngoCam = dShadedNg(h);
                 bool twoSidedCam = dTwoSidedType(mp->type);
 
@@ -24972,6 +25009,7 @@ __global__ void kVcmCameraT(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx
                     if (occludedTo(sc, cst.o, h.p + w * (Real)(distc - (double)lvStep), 2e-6, cst.tmin, false,
                                    cst.curveTmin, -1, lv.pscale)) continue;
                     DVertex lvt = dVertFromLV(lv);
+                    if (lvHs) lvt.hs = lvHs[j];   // where its patterns were read (DVertHitState)
                     double adjLit = (double)dShadingAdjointCorr(lv.wo, w * (Real)-1, lv.ns, ngoLit);
                     // Each end a coated vertex's coat along the connection (dCoatF).
                     const DCoatEval ceCam = dCoatEval(sc, *mp, h, wo, w);
@@ -25209,15 +25247,19 @@ struct MaxD { HD double operator()(double a, double b) const { return a < b ? b 
 // Scatter each light path's stored slab vertices into the compact array at its scanned
 // offset (device twin of the old host compaction loop; per-path order preserved). The hero
 // secondary rows ride along in lockstep so `secCompact[j*secStride + q]` stays paired with
-// `compact[j]`; `secSlab == nullptr` (a `-heroc 1` session) skips that entirely.
+// `compact[j]`; `secSlab == nullptr` (a `-heroc 1` session) skips that entirely. So do the
+// vertices' hit states (`hsSlab`, null where the session keeps none).
 __global__ void kVcmCompactScatter(const DVcmLV* slab, const DVcmSec* secSlab, int secStride,
                                    const int* lvCount, const int* pathBegin,
-                                   DVcmLV* compact, DVcmSec* secCompact, int npix, int vcmCap) {
+                                   DVcmLV* compact, DVcmSec* secCompact, int npix, int vcmCap,
+                                   const DVertHitState* hsSlab, DVertHitState* hsCompact) {
     int stride = gridDim.x * blockDim.x;
     for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < npix; i += stride) {
         int cnt = lvCount[i], b = pathBegin[i];
         const DVcmLV* src = slab + (size_t)i * vcmCap;
         for (int k = 0; k < cnt; ++k) compact[b + k] = src[k];
+        if (hsSlab)
+            for (int k = 0; k < cnt; ++k) hsCompact[b + k] = hsSlab[(size_t)i * vcmCap + k];
         if (secSlab) {
             const DVcmSec* ssrc = secSlab + (size_t)i * vcmCap * secStride;
             for (int k = 0; k < cnt; ++k) {
@@ -32150,6 +32192,11 @@ struct VcmSession {
     // the cell table and the thrust arena grow with the grid:
     gpu::DVcmLV* d_lvCompact = nullptr; size_t lvCompactCap = 0;
     gpu::DVcmSec* d_lvSecCompact = nullptr; size_t lvSecCompactCap = 0;
+    // The stored vertices' hit states (gpu::DVertHitState), slab and compact copy, nLight * vcmCap
+    // each, kept where a connection's patterns need them -- a scene that moves or reads `cavity`
+    // (null otherwise, so the common scene pays nothing).
+    gpu::DVertHitState* d_lvHsSlab = nullptr;
+    gpu::DVertHitState* d_lvHsCompact = nullptr;
     int*    d_cellKey   = nullptr;      size_t cellKeyCap = 0;
     int*    d_order     = nullptr;      size_t orderCap = 0;
     int*    d_cellStart = nullptr;      size_t cellStartCap = 0;  // entries (nCells+1)
@@ -32238,8 +32285,10 @@ VcmSession* vcmSessionBegin(const Scene& scene, const Camera& cam, int resX, int
         if (const char* e = std::getenv("FTRACE_VCM_BUDGET_MB"))
             if (std::atoll(e) > 0) budget = std::min(budget, (size_t)std::atoll(e) << 20);
     }
+    const bool keepHs = !scene.motionSets.empty() || !scene.vertexKeys.empty() || scene.needsCavity;
     const size_t perPath = (size_t)s->vcmCap *
-        (2 * sizeof(gpu::DVcmLV) + 2 * (size_t)s->secStride * sizeof(gpu::DVcmSec) + 2 * sizeof(int));
+        (2 * sizeof(gpu::DVcmLV) + 2 * (size_t)s->secStride * sizeof(gpu::DVcmSec) + 2 * sizeof(int) +
+         (keepHs ? 2 * sizeof(gpu::DVertHitState) : 0));
     size_t nl = std::max<size_t>(1, std::min(np, budget / perPath));
     // Allocation failures cost light subpaths (variance), not the run: the budget is an estimate.
     auto tryAlloc = [](auto** p, size_t bytes) {
@@ -32270,7 +32319,9 @@ VcmSession* vcmSessionBegin(const Scene& scene, const Camera& cam, int resX, int
             (s->secStride == 0 ||
              tryAlloc(&s->d_lvSecCompact, lv * (size_t)s->secStride * sizeof(gpu::DVcmSec))) &&
             tryAlloc(&s->d_cellKey, lv * sizeof(int)) &&
-            tryAlloc(&s->d_order, lv * sizeof(int))) {
+            tryAlloc(&s->d_order, lv * sizeof(int)) &&
+            (!keepHs || (tryAlloc(&s->d_lvHsSlab, lv * sizeof(gpu::DVertHitState)) &&
+                         tryAlloc(&s->d_lvHsCompact, lv * sizeof(gpu::DVertHitState))))) {
             s->lvCompactCap = lv;
             s->lvSecCompactCap = lv * (size_t)s->secStride;
             s->cellKeyCap = s->orderCap = lv;
@@ -32279,12 +32330,12 @@ VcmSession* vcmSessionBegin(const Scene& scene, const Camera& cam, int resX, int
         for (void* q : {(void*)s->d_lvSlab, (void*)s->d_lvSecSlab, (void*)s->d_lvCount,
                         (void*)s->d_lamBuf, (void*)s->d_invLam, (void*)s->d_pathBegin,
                         (void*)s->d_pathEnd, (void*)s->d_lvCompact, (void*)s->d_lvSecCompact,
-                        (void*)s->d_cellKey, (void*)s->d_order})
+                        (void*)s->d_cellKey, (void*)s->d_order, (void*)s->d_lvHsSlab, (void*)s->d_lvHsCompact})
             cudaFree(q);
         s->d_lvSlab = nullptr; s->d_lvSecSlab = nullptr; s->d_lvCount = nullptr;
         s->d_lamBuf = nullptr; s->d_invLam = nullptr; s->d_pathBegin = nullptr; s->d_pathEnd = nullptr;
         s->d_lvCompact = nullptr; s->d_lvSecCompact = nullptr; s->d_cellKey = nullptr;
-        s->d_order = nullptr;
+        s->d_order = nullptr; s->d_lvHsSlab = nullptr; s->d_lvHsCompact = nullptr;
         if (nl == 1) {
             std::fprintf(stderr, "[mode U] no room on the GPU for the light-vertex store\n");
             vcmSessionEnd(s);
@@ -32392,13 +32443,13 @@ void vcmSessionPass(VcmSession* s, double radius) {
                                  s->d_lvSlab, s->d_lvSecSlab, s->secStride, s->heroC,
                                  s->d_lvCount, s->d_splat,
                                  s->d_lamBuf, s->d_invLam, W, H, s->vcmCap, (long long)nl,
-                                 seedL, passIdx);
+                                 seedL, passIdx, s->d_lvHsSlab);
     else
         kVcmLightT<0><<<2048, 128>>>(s->up.sc, camPass, s->diffraction, ctx,
                                  s->d_lvSlab, nullptr, 0, 1,
                                  s->d_lvCount, s->d_splat,
                                  s->d_lamBuf, s->d_invLam, W, H, s->vcmCap, (long long)nl,
-                                 seedL, passIdx);
+                                 seedL, passIdx, s->d_lvHsSlab);
     cudaCheckKernel("vcm-light");
 
     // (2) Compact the slab ON DEVICE into contiguous per-path ranges: exclusive-scan the
@@ -32420,7 +32471,8 @@ void vcmSessionPass(VcmSession* s, double radius) {
             ensureDevCap(s->d_lvSecCompact, s->lvSecCompactCap, nLV * (size_t)s->secStride);
         kVcmCompactScatter<<<2048, 128>>>(s->d_lvSlab, s->d_lvSecSlab, s->secStride,
                                           s->d_lvCount, s->d_pathBegin,
-                                          s->d_lvCompact, s->d_lvSecCompact, (int)nl, s->vcmCap);
+                                          s->d_lvCompact, s->d_lvSecCompact, (int)nl, s->vcmCap,
+                                          s->d_lvHsSlab, s->d_lvHsCompact);
         cudaCheckKernel("vcm-compact");
     }
 
@@ -32503,13 +32555,13 @@ void vcmSessionPass(VcmSession* s, double radius) {
                                   lvSec, s->secStride, s->heroC,
                                   s->d_pathBegin, s->d_pathEnd, s->d_splat, s->d_accum,
                                   s->d_lamBuf, s->d_invLam, W, H, (long long)nl, seedC, passIdx,
-                                  mq, p0, p1);
+                                  mq, p0, p1, (nLV > 0) ? s->d_lvHsCompact : nullptr);
         else
             kVcmCameraT<0><<<2048, 128>>>(s->up.sc, camPass, s->diffraction, ctx, grid,
                                   nullptr, 0, 1,
                                   s->d_pathBegin, s->d_pathEnd, s->d_splat, s->d_accum,
                                   s->d_lamBuf, s->d_invLam, W, H, (long long)nl, seedC, passIdx,
-                                  mq, p0, p1);
+                                  mq, p0, p1, (nLV > 0) ? s->d_lvHsCompact : nullptr);
         cudaCheckKernel("vcm-camera");
     };
     // With the merges' queue, the pixels in waves whose merge sites it holds, each wave's sites
@@ -32640,6 +32692,8 @@ void vcmSessionEnd(VcmSession* s) {
     if (s->d_lvCompact) cudaFree(s->d_lvCompact);
     if (s->d_cellKey)   cudaFree(s->d_cellKey);
     if (s->d_cellStart) cudaFree(s->d_cellStart);
+    if (s->d_lvHsSlab)    cudaFree(s->d_lvHsSlab);
+    if (s->d_lvHsCompact) cudaFree(s->d_lvHsCompact);
     if (s->d_order)     cudaFree(s->d_order);
     s->arena.release();
     freeUpload(s->up);

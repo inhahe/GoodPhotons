@@ -201,33 +201,41 @@ to 0.25 renders as a 150 nm one within 1e-3 (its body's escape read off rows int
 on 0.450.1 it rendered as the unmapped 600 nm, 1.9 off), the `thinfilm` control byte for byte, and
 the three misspellings stop the load (on 0.450.1 they loaded).
 
-## OPEN (2026-11-18): GPU-DVERTEX-HIT-STATE — a GPU connection rebuilds its vertex's hit without the hit's time, cavity or footprint
+## DONE (2026-11-18, 0.450.4): GPU-DVERTEX-HIT-STATE — a GPU connection rebuilt its vertex's hit without the hit's time or cavity
 
 Found by the Opus (max) review of 0.450.0 (REVIEW-0450). The device's bidirectional modes (D, J, U)
 keep a path's vertices as `DVertex`, and every BSDF, pdf and coat evaluated at a connection or a
-merge rebuilds a `DHit` from it (`dVertHit`). The rebuilt hit lacks what the walk's own hit carried
+merge rebuilds a `DHit` from it (`dVertHit`). The rebuilt hit lacked what the walk's own hit carried
 for its patterns, where the host's `Vertex` keeps the whole `Hit`:
 
-* **Its time.** `motionSet`, `deformTri` and `deformB1/B2` stay -1/0, so `dPatIn` does not carry a
-  moving or deforming primitive's point back to the instant: under a shutter, a pattern (a reflect
-  or roughness pattern, a coat's film thickness) on a mover is read where the mover sits at the
-  pass's time at every connection vertex, and where it sat at the instant by the walk's own
-  scatter -- the strategies weigh different integrands.
-* **Its cavity.** `cavityDone` is false, so a material that reads `cavity` re-runs the cavity probe
-  (N occlusion rays) in every `dBsdfF` / `dBsdfPdf` / coat call -- six a light vertex in mode U's
-  merge with the hero bundle. And `dCavityOf` gates on the rebuilt hit's `matId`, the resolved body
-  of a `layered` material, which `ftsl::markCavityReaders` never flags (it lifts the flag from mix
-  children to parents only): such a body reads cavity 0 at a connection, the true cavity at the walk.
-* **Its footprint** (`fw`, a pattern's filter width), left at its default.
+* **Its time.** `motionSet`, `deformTri` and `deformB1/B2` stayed -1/0, so `dPatIn` did not carry a
+  moving or deforming primitive's point back to the instant: under a shutter, a pattern on a mover
+  was read where the mover sat at the path's time at every connection vertex, and where it sat at
+  the instant by the walk's own scatter. A ball striped in its own space, held sharp after half a
+  stripe's travel, came out with its stripes washed out in GPU modes D, J and U (the connections'
+  light striped out of phase), where mode R on both devices drew them sharp. `check_motion`'s GPU
+  mode D case blurs that ball over five stripes, which averages either way to grey.
+* **Its cavity.** `cavityDone` was false, so a material reading `cavity` re-ran the probe (N
+  occlusion rays) in every `dBsdfF` / `dBsdfPdf` / coat call at a connection -- six a light vertex in
+  mode U's merge with the hero bundle. And `dCavityOf` gated on the rebuilt hit's `matId`, a layered
+  material's resolved body, which `ftsl::markCavityReaders` (run before the build makes the body
+  copies) leaves unflagged unless the body reads cavity itself: such a body read its coat's
+  cavity-driven film as 0 at a connection. Measured, that moved nothing visible: the coat's factor
+  on a body is a ratio of its transmissions at one thickness (a titania film whose thickness
+  followed `cavity` stayed within the noise, where the film itself changes the image 13 %), and the
+  coat lobe, a copy of the layered material, is flagged.
+* Its footprint (`fw`) is 0 in these modes anyway (only modes R and W stamp one).
 
-Mode U's merge reads its coat's film thickness at the walk's hit since 0.450.1 (`dCoatThicknessAt`),
-the one place 0.450.0 had moved off the walk's hit; the rest is as it was before 0.450.0.
-
-**The fix:** `DVertex` carries the state a faithful rebuild needs -- the hit's cavity (computed once,
-at the walk, where `cavityDone`), its motion reference (a motion set or a deforming triangle, one
-int: they never coexist) with the deform barycentrics packed in 16 bits each (as `vb0q/vb1q`), and
-`fw` -- and `dVertHit` restores them; and the cavity flag lifts to a layered material's body copies.
-`DVertex` grows by 16 B (its static_assert counts it), which BDPT's local memory pays for.
+**Fixed in 0.450.4:** `DVertex` keeps the walk's hit's pattern state (`DVertHitState`, 16 B: the
+cavity, probed once at the walk where its material reads one; a motion reference, a motion set or
+-2 minus a deforming triangle, which never coexist; the deform barycentrics), made by `dHitStateOf`
+where a vertex is made from a hit (the BDPT walk, `dVertFromHit`) and restored by `dVertHit`;
+`dCavityOf` takes a restored reading before its material gate. Mode U's stored light vertices keep
+it in a side slab (`d_lvHsSlab`, compacted beside them, read by the connections), allocated only
+where the scene moves or reads `cavity`, as the secondary-wavelength rows are only for the hero
+bundle. `DVertex` is 160 B (its static_assert). `tools/check_vertex_hit_state.py`: the sharp striped
+mover in GPU modes D, J and U against mode R on the CPU, 8x8 blocks -- on 0.450.2, 5-6 blocks out at
+z 20-28 in each mode.
 
 ## DONE (2026-11-18, 0.450.3): REVIEW-0450-FABLE — what the Fable (xhigh) review of 0.450.0 found
 
