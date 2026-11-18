@@ -14882,6 +14882,8 @@ static bool g_directOnly = false;
 // without which a CLOSED room previews with black shadows, since everything there that
 // isn't facing the key light is lit purely by the bounce this mode drops.
 static bool g_whitted = false;
+// Mode W's default -spp (mode R's is 256).
+constexpr long long kWhittedSpp = 16;
 static int  g_whittedGrid = 4;
 static double g_ambient = 0.0;
 
@@ -23699,7 +23701,8 @@ static int run(int argc, char** argv) {
     bool   checkWatertight = false;        // -check-watertight: audit every mesh/isosurface + exit
     bool   checkAirtight = false;          // -check-airtight: ray-parity audit of the marched field + exit
     long long airtightRays = 4000;         // -check-airtight chord count per isosurface
-    long long spp = 256;      // backward reference samples/pixel (modes R and V)
+    long long spp = 256;      // backward reference samples/pixel (modes R and V; W: kWhittedSpp)
+    bool sppGiven = false;    // -spp named on the command line
     double fogSigmaT = 0.0;   // fog extinction coeff (0 = no fog); at 550nm if Rayleigh
     double fogAlbedo = 0.9;   // single-scattering albedo sigma_s/sigma_t
     double fogG = 0.0;        // Henyey-Greenstein anisotropy
@@ -24543,7 +24546,7 @@ static int run(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "-check-airtight")) checkAirtight = true;
         else if (!std::strcmp(argv[i], "-check-airtight-rays") && i + 1 < argc) airtightRays = std::atoll(argv[++i]);
         else if (!std::strcmp(argv[i], "-mesh-decimate") && i + 1 < argc) { exportMeshDecimate = std::atof(argv[++i]); exportMeshAdaptive = true; }
-        else if (!std::strcmp(argv[i], "-spp") && i + 1 < argc) spp = std::atoll(argv[++i]);
+        else if (!std::strcmp(argv[i], "-spp") && i + 1 < argc) { spp = std::atoll(argv[++i]); sppGiven = true; }
         // Draw a DIFFERENT realization of the same render. Everything else about ftrace is
         // deterministic, so without this there is exactly one sample of every estimator and
         // no way to separate a bias from the luck of one draw — see the block comment over
@@ -25457,6 +25460,10 @@ static int run(int argc, char** argv) {
     // camera, so it also overrides the scene's choice of W — otherwise `-mode R` on a W
     // scene would silently still render the biased preview.
     if (ftslScene.whitted && !modeFromCli) g_whitted = true;
+    // Mode W's estimators are deterministic, so its samples buy only antialiasing and spectral
+    // resolution (its wavelengths are a lattice over the sample index): mode R's 256 would be
+    // sixteen times the work for no less noise. An explicit -spp wins.
+    if (g_whitted && !sppGiven) spp = kWhittedSpp;
     g_directOnly = directOnly || g_whitted;   // -mode W implies it
     g_fwSpp = spp > 0 ? spp : 1;              // latch the footprint's spp (see g_fwSpp)
     if (maxBounceOverride >= 1) std::printf("[ignore] max bounce = %d\n", maxBounceOverride);

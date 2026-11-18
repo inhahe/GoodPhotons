@@ -25562,7 +25562,12 @@ This also strengthens improvement 2 above rather than weakening it: the CPU-fall
 heuristic is worth having *because* the GPU path is healthy — the fallback should key on measured
 foreign load, never on a belief that the GPU code is slow.
 
-### PERF (2026-08-06): `-mode W` inherits mode R's `-spp 256` default, but is deterministic at 1 spp
+### DONE (2026-11-17, 0.449.7; PERF 2026-08-06): `-mode W` inherits mode R's `-spp 256` default, but is deterministic at 1 spp
+
+**Fixed:** mode W defaults to `-spp 16` (`kWhittedSpp`, main.cpp), sixteen times less work than mode R's 256: enough to
+antialias edges and to spread its wavelength lattice over 128 wavelengths at the default bundle of 8. An explicit
+`-spp` wins, and a scene that needs more (a medium, GRIN, dispersion) still gets its `[mode W]` note or warning.
+The report as filed:
 
 Independent of the contention above, and cheap to fix. `spp = 256` is the backward-reference
 default (`main.cpp:6545`) and mode W inherits it, yet W exists precisely because its deterministic

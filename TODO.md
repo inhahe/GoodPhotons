@@ -642,7 +642,7 @@ Then the rest of 4.2-4.6 in their order, 4.7's bookkeeping alongside whatever to
 - [ ] **"the beam-map build is host-only and single-threaded"**.
 - [ ] **"a mesh-bound medium's voxelisation is 86 % of `gallery_rain`'s load"** — its triangle pass
   is serial.
-- [ ] **"`-mode W` inherits mode R's `-spp 256` default"**, though deterministic at 1.
+- [x] **"`-mode W` inherits mode R's `-spp 256` default"** (0.449.7) — mode W defaults to 16.
 - [ ] **"a GPU render can be starved to a standstill by ANOTHER process"** (and its RECURRENCE entry,
   which has the detector) — no way to yield today.
 - [ ] **"on `gallery_rain` the aimed caustic pass cannot concentrate"**.
