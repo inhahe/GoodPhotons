@@ -414,6 +414,8 @@ Then the rest of 4.2-4.6 in their order, 4.7's bookkeeping alongside whatever to
   built once (the hit, the roughness, `ggx::pair` once a light direction, the reflectance alone per
   wavelength), the secondaries' loops unrolled to compile-time bounds, and the cheap rejections
   compacted across the warp before the expensive half.
+- [x] **LAYERED-FILM-PATTERN** (0.450.2) — a layered coat's `film_thickness_map pattern:` was dropped,
+  and a map naming neither a pattern nor a texture loaded; `tools/check_layered_film_map.py`.
 - [ ] **GPU-DVERTEX-HIT-STATE** — a GPU connection's rebuilt hit lacks the walk's time (motion set,
   deforming triangle), cavity and footprint, so patterns on movers slide and cavity re-probes or reads
   0 (known-issues).

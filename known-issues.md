@@ -186,6 +186,21 @@ through glass (no light-tracing strategy connects through it), so it cannot arbi
 same view in a room whose lamp is replaced by a glowing wall of the same light (where mode R is exact
 and modes B, M and S must meet it), then the lamp back in with each mode's light-side strategy alone.
 
+## DONE (2026-11-18, 0.450.2): LAYERED-FILM-PATTERN — a layered coat's thin film dropped a pattern thickness map without a word
+
+Found writing GPU-DVERTEX-HIT-STATE's check, whose coat's thickness was to follow `cavity`: the
+render did not change when the pattern did. FTSL.md has `film_thickness_map` take `pattern:<name>`
+or `texture:<name>`, and the `thinfilm` material bound both, but `layered`'s `coat { reflectance
+thinfilm ... }` bound a texture only, so a pattern there was dropped and the coat rendered at its
+full `film_thickness` everywhere (the scene build and both devices' thickness reads took a pattern
+all along). And any `film_thickness_map` or `weight_map` value naming neither a pattern nor a
+texture -- a misspelt `patern:` -- was dropped the same way. **Fixed in 0.450.2:** one binder
+(`bindScalarMap`) takes either and refuses anything else, naming the key, at every
+`film_thickness_map` and at `weight_map`. `tools/check_layered_film_map.py`: a 600 nm coat mapped
+to 0.25 renders as a 150 nm one within 1e-3 (its body's escape read off rows interpolated at 0.25;
+on 0.450.1 it rendered as the unmapped 600 nm, 1.9 off), the `thinfilm` control byte for byte, and
+the three misspellings stop the load (on 0.450.1 they loaded).
+
 ## OPEN (2026-11-18): GPU-DVERTEX-HIT-STATE — a GPU connection rebuilds its vertex's hit without the hit's time, cavity or footprint
 
 Found by the Opus (max) review of 0.450.0 (REVIEW-0450). The device's bidirectional modes (D, J, U)

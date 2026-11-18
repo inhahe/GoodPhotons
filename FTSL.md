@@ -1269,7 +1269,8 @@ Fills a complete material; a few knobs may be overridden afterward
 | `layered` | specular coat over a weighted body — see §7.4 |
 
 Scalar-parameter maps: `roughness` / `film_thickness_map` / `weight_map` accept
-`pattern:<name>` (math over x,y,z,normal,u,v) or `texture:<name>` (grayscale UV map).
+`pattern:<name>` (math over x,y,z,normal,u,v) or `texture:<name>` (grayscale UV map); a
+`film_thickness_map` or `weight_map` that names neither is an error.
 
 **Pattern-driven reflectance, transmittance and emission.** The `reflect`, `transmit` and
 `emit` slots take a pattern too, and a scalar in a spectral slot is a per-hit **multiplier**
@@ -1406,7 +1407,8 @@ material "carpaint" {
         ior glass:BK7             # coat index (fresnel/thinfilm)
         film_ior 1.30  film_thickness 300  film_thickness_map texture:t   # thinfilm coat
                                   # (film_ior a spectrum too: glass:titania is a titania coat;
-                                  # the map is a 0..1 profile of film_thickness, held to 0..1)
+                                  # the map, pattern:<n> or texture:<n>, is a 0..1 profile of
+                                  # film_thickness, held to 0..1)
         specular 0.05             # flat reflectance (manual model)
         absorb rgb 400 2600 5200  # TINTED lacquer: sigma_a inside the layer, 1/m
         depth 0.0001              # layer thickness in METRES (needed by `absorb`)

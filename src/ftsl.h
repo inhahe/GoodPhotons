@@ -3589,6 +3589,14 @@ private:
     // NON-albedo scalar material parameter (spec §9.4) and return true; otherwise
     // false (the caller reads a numeric value instead). Used for roughness /
     // film-thickness maps. Sampled via Texture::scalarAt at the hit UV.
+    // A scalar map, `<key> pattern:<n>` (or what bindScalarPattern takes besides) or `texture:<n>`,
+    // into patOut or texOut. A key whose value is neither is an error: a map silently left out
+    // renders a surface uniform, with nothing to say why.
+    void bindScalarMap(const Block& b, const char* key, int& patOut, int& texOut) {
+        if (!find(b, key)) return;
+        if (bindScalarPattern(b, key, patOut) || bindScalarTexture(b, key, texOut)) return;
+        fail(std::string("`") + key + "` takes pattern:<name> or texture:<name>");
+    }
     bool bindScalarTexture(const Block& b, const char* key, int& texOut) {
         const Stmt* s = find(b, key);
         if (!s || s->val.words.empty()) return false;
@@ -5046,8 +5054,7 @@ private:
             }
             if (find(b, "film_ior"))       m.filmIor       = filmIorParam(b, b.name, m.filmIor);
             if (find(b, "film_thickness")) m.filmThickness = dblParam(b, "film_thickness", m.filmThickness);
-            if (!bindScalarPattern(b, "film_thickness_map", m.filmThicknessPat))
-                bindScalarTexture(b, "film_thickness_map", m.filmThicknessTex);
+            bindScalarMap(b, "film_thickness_map", m.filmThicknessPat, m.filmThicknessTex);
             if (find(b, "reflect") || find(b, "reflect_map"))
                 m.reflect = reflectParam(b, m, m.reflect);
             if (find(b, "ior"))            m.ior           = spectrumParam(b, "ior", m.ior);
@@ -5125,8 +5132,7 @@ private:
             // `film_thickness <nm>` is the peak/scale; `film_thickness_map texture:<n>`
             // binds a 0..1 profile scaled by it (spatially-varying iridescence, §9.4).
             m.filmThickness = dblParam(b, "film_thickness", 300.0);
-            if (!bindScalarPattern(b, "film_thickness_map", m.filmThicknessPat))
-                bindScalarTexture(b, "film_thickness_map", m.filmThicknessTex);
+            bindScalarMap(b, "film_thickness_map", m.filmThicknessPat, m.filmThicknessTex);
             // Substrate extinction kappa (spectral): 0 = transparent dielectric
             // (lossless, default). Non-zero -> absorbing/metallic substrate giving
             // opaque structural colour; a spectral kappa (e.g. a gaussian) tints it
@@ -5286,7 +5292,7 @@ private:
             if (find(cb, "ior")) m.ior = spectrumParam(cb, "ior", m.ior);
             m.filmIor = filmIorParam(cb, b.name, constantSpectrum(1.30));
             m.filmThickness = dblOf(cb, "film_thickness", 300.0);
-            bindScalarTexture(cb, "film_thickness_map", m.filmThicknessTex);
+            bindScalarMap(cb, "film_thickness_map", m.filmThicknessPat, m.filmThicknessTex);
             if (m.coatModel == 2) m.coatSpecular = dblOf(cb, "specular", 0.05);
             // A2 -- a TINTED lacquer: Beer-Lambert absorption inside the layer itself.
             // `absorb` is sigma_a in 1/m, `depth` the layer thickness in METRES. Deliberately
@@ -5526,8 +5532,7 @@ private:
             if (m.mixChildren.size() != 2) {
                 fail("mix weight_map requires exactly 2 layers (a binary A/B blend)"); return false;
             }
-            if (!bindScalarPattern(b, "weight_map", m.mixWeightPat))
-                bindScalarTexture(b, "weight_map", m.mixWeightTex);
+            bindScalarMap(b, "weight_map", m.mixWeightPat, m.mixWeightTex);
         }
         return true;
     }
