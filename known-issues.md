@@ -1514,7 +1514,13 @@ drive `enclosureAt` (a camera or light born inside a solid takes its medium) and
 `emit_two_sided` refusal, and a single-surface open bowl closed by its rim's plane would make its
 cavity a solid of its material -- a camera in it starting inside glass, a glowing bowl refused. So it
 needs a face state of its own (a `solidFace` value the probes read and the enclosures do not, on the
-host and in DTri). tools/check_gather_base.py covers the closed
+host and in DTri; `Hit::solid` +-2 would do, the probes reading only its sign). **And a planar rim is
+not enough even for the probes:** an open-topped cup's rim is planar too, and capping it makes the
+cup's cavity a solid, so the gather on its inner floor -- which takes light through the opening, and
+which check_gather_base's open shells hold -- would read itself inside. The cap is right only where
+the hole rests on another surface (a statue's open base on the floor it stands on): the rim must lie
+in a face that closes it, which wants a test of its own (the rim's plane against the faces that
+touch it). tools/check_gather_base.py covers the closed
 solids, the balls, the open sheets (`mirrorsheet`, `lampsheet`, `tablesheet`) and an open box
 (`openbox`); not an open solid taller than the radius.
 
