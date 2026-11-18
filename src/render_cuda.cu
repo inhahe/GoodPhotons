@@ -956,6 +956,7 @@ struct DImplicit {
     int    capped;           // 1 = draw container caps (closed); 0 = `open`
     int    solidSide;        // 1 = bounds a closed solid, Hit::solid +1 (host Implicit::solidSide)
     int    readsCurv;        // 1 = its material reads `curv`: hits take the Hessian (host Implicit::readsCurv)
+    double featureSize;      // host Implicit::featureSize, the curvature stencil's scale floor
     // Oriented container box — device twin of Implicit::boxOriented/boxInv/boxLo/boxHi.
     // When set, the ray is mapped by boxInv and slab-tested against boxLo/boxHi there
     // instead of against the world AABB, which for a rotated box is strictly larger
@@ -4110,30 +4111,23 @@ __device__ static void dFieldGradient(const DFieldNode* nodes, int n,
     if (len > 0.0) { gx /= len; gy /= len; gz /= len; }
     else           { gx = 0.0; gy = 0.0; gz = 1.0; }
 }
-// Mean curvature of the level set through p, from the field's gradient and Hessian by central
-// differences of step h. Mirrors implicit.h fieldMeanCurvature (its sign and stencil).
-__device__ static double dFieldMeanCurvature(const DFieldNode* nodes, int n,
-                                             double px, double py, double pz, double h,
-                                             const PatNode* exprPool, const DPatEnv& env) {
-    auto f = [&](double x, double y, double z) {
-        return dFieldEval(nodes, n, px + x * h, py + y * h, pz + z * h, exprPool, env);
-    };
-    const double f0 = f(0, 0, 0);
-    const double fxp = f(1, 0, 0), fxm = f(-1, 0, 0), fyp = f(0, 1, 0), fym = f(0, -1, 0);
-    const double fzp = f(0, 0, 1), fzm = f(0, 0, -1);
-    const double fxy = f(1, 1, 0), fxyN = f(-1, -1, 0), fxz = f(1, 0, 1), fxzN = f(-1, 0, -1);
-    const double fyz = f(0, 1, 1), fyzN = f(0, -1, -1);
-    const double gx = (fxp - fxm) / (2 * h), gy = (fyp - fym) / (2 * h), gz = (fzp - fzm) / (2 * h);
-    const double h2 = h * h;
-    const double hxx = (fxp - 2 * f0 + fxm) / h2, hyy = (fyp - 2 * f0 + fym) / h2, hzz = (fzp - 2 * f0 + fzm) / h2;
-    const double hxy = (fxy + fxyN - 2 * f0) / (2 * h2) - 0.5 * (hxx + hyy);
-    const double hxz = (fxz + fxzN - 2 * f0) / (2 * h2) - 0.5 * (hxx + hzz);
-    const double hyz = (fyz + fyzN - 2 * f0) / (2 * h2) - 0.5 * (hyy + hzz);
-    const double g2 = gx * gx + gy * gy + gz * gz;
-    if (!(g2 > 0.0)) return 0.0;
-    const double gHg = gx * gx * hxx + gy * gy * hyy + gz * gz * hzz +
-                       2.0 * (gx * gy * hxy + gx * gz * hxz + gy * gz * hyz);
-    return (g2 * (hxx + hyy + hzz) - gHg) / (2.0 * g2 * sqrt(g2));
+// The unit normal and mean curvature of the level set through p from curvature.h's 13-point
+// stencil at step h (host twin implicit.h fieldGradientCurvature).
+__device__ static double dFieldGradientCurvature(const DFieldNode* nodes, int n,
+                                                 double px, double py, double pz, double h,
+                                                 const PatNode* exprPool, const DPatEnv& env,
+                                                 double& gx, double& gy, double& gz) {
+    double f[kLevelSetStencil];
+    for (int i = 0; i < kLevelSetStencil; ++i) {
+        double x, y, z;
+        levelSetStencilPoint(i, x, y, z);
+        f[i] = dFieldEval(nodes, n, px + x * h, py + y * h, pz + z * h, exprPool, env);
+    }
+    const double H = levelSetCurvature(f, h, gx, gy, gz);
+    const double len = sqrt(gx * gx + gy * gy + gz * gz);
+    if (len > 0.0) { gx /= len; gy /= len; gz /= len; }
+    else           { gx = 0.0; gy = 0.0; gz = 1.0; }
+    return H;
 }
 // Device twin of geometry.h projectUV: wrap a world point to (u,v) over box lo..hi.
 // proj: 1 planar, 2 spherical, 3 cylindrical. axis 0/1/2 = up/projection axis.
@@ -4378,8 +4372,13 @@ __device__ static bool intersectImplicit(const DScene& sc, const DImplicit& im,
             if (anyHit) return true;   // boolean only: skip gradient + writeHit
             const double px = (double)bxF + dx*sh, py = (double)byF + dy*sh, pz = (double)bzF + dz*sh;
             double eps = fmax(1e-6, 1e-4*th);
-            double gx, gy, gz; dFieldGradient(nd, N, px, py, pz, eps, gx, gy, gz, exprPool, env);
-            const double curvG = im.readsCurv ? dFieldMeanCurvature(nd, N, px, py, pz, eps, exprPool, env) : 0.0;
+            double gx, gy, gz, curvG = 0.0;   // host twin's rule: the 13-point stencil where `curv` is read
+            if (im.readsCurv) {
+                const double m = fmax(fmax(fabs(px), fabs(py)), fmax(fabs(pz), im.featureSize));
+                curvG = dFieldGradientCurvature(nd, N, px, py, pz, levelSetStep(eps, m), exprPool, env, gx, gy, gz);
+            } else {
+                dFieldGradient(nd, N, px, py, pz, eps, gx, gy, gz, exprPool, env);
+            }
             return writeHit(th, px, py, pz, gx, gy, gz, curvG);
         }
         if (last) {
@@ -26497,6 +26496,7 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
         d.capped = im.capped ? 1 : 0;
         d.solidSide = im.solidSide ? 1 : 0;
         d.readsCurv = im.readsCurv ? 1 : 0;
+        d.featureSize = im.featureSize();
         d.boxOriented = im.boxOriented ? 1 : 0;
         for (int k = 0; k < 9; ++k) d.boxInvM[k] = im.boxInv.m[k];
         d.boxInvT[0] = im.boxInv.t.x; d.boxInvT[1] = im.boxInv.t.y; d.boxInvT[2] = im.boxInv.t.z;

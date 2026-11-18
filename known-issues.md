@@ -6012,6 +6012,32 @@ on the tank without its pool floor (this repro). Whether a transparent face shou
 the disc is a separate question, open: both backends count it (and the ball test then rejects it
 for being above the plane), so both under-read the coverage there.
 
+## DONE (2026-11-18, 0.449.13): REVIEW-0449D — the Fable (xhigh) review of e26c216..aed3718 (0.449.5-0.449.10)
+
+Fixed in 0.449.13:
+- **A triangle's feature size was its own longest edge**, so a dense imported mesh (0.1 mm edges) took offsets
+  of 1e-7, under the noise of an export's near-coincident layers: a mesh triangle now takes its whole mesh's
+  extent (`Scene::bakeMeshSizes`, `Blas::build`), and only a mesh small as a whole shrinks its offsets.
+- **`RadCacheCell::eps` took former padding**, so an older cache checkpoint passed both size checks and misread
+  every cell: the field is a double (the size changes), and `configGuard` mixes a layout version
+  (`kRadCacheCellLayout`) that a same-size change must bump. A checkpoint's pending marks dropped their eps:
+  section `FTRCACH5` writes it.
+- **Mode W's 16-spp default was run-wide**: a run that renders a camera in another mode beside a mode-W one
+  keeps 256 for all (and says so).
+- **`buildPrimNear` needed an exact box overlap**: the query box is padded by eps, as a ray leaving a
+  neighbour steps eps; candidates no larger than the querying feature are passed over.
+- **The curvature stencil reused the gradient's step**, down to 1e-6, where a second difference's rounding is
+  4 % of a unit curvature at coordinates of 100: its step is at least 2^-13 of the coordinates (`levelSetStep`),
+  and its 13 values give the normal too, so a `curv` hit evaluates the field 13 times, not 17.
+- **The device twins restated the curvature arithmetic**: `curvature.h` holds it once (`triMeanCurvatureS`,
+  `levelSetCurvature`, the stencil's points) for both backends; `primBox` and `Implicit::featureSize` likewise
+  replace the near-feature pass's copies of the box and size rules. A comment narrating history: restated.
+- `-checkcurv` §10 adds a sphere 100 m out and a ray from 1 mm off its surface.
+Dismissed: the far end's shortening (`connMaxT`'s 1e-5 x the distance) still covers up to 10 um at a 1 m BDPT
+connection's far vertex. Its relative term guards a curved far surface's grazing mismatch, the strand scene the
+per-hit eps was for reads mode D x0.9999 +- 0.0002 over six seeds, and changing it would move every BDPT and
+VCM render for no measured gain.
+
 ## DONE (2026-11-17, 0.449.10): REVIEW-0449C — the Opus (max) review of e26c216..3e954b8 (0.449.5, 0.449.6)
 
 Fixed in 0.449.10:
@@ -6142,8 +6168,9 @@ itself in mode W, one tile 45 % off**, and on the CPU's other modes (fixed seeds
 only an object near it, and 0.449.4 took that back.)
 
 **Fixed:** a host ray's distances come from the feature it leaves. `Scene::hitEps(h)` is eps, but no
-more than a thousandth of `Hit::size` -- a sphere's radius, a strand's at the hit, a triangle's longest
-edge (`Tri::size`), an isosurface's bound's longest side, scaled through instances and motion; every
+more than a thousandth of `Hit::size` -- a sphere's radius, a strand's at the hit, a mesh triangle's
+whole mesh's extent (`Tri::size`; 0.449.6 took its own longest edge, REVIEW-0449D), an isosurface's
+bound's longest side, scaled through instances and motion; every
 intersector writes it -- and no less than 512 ulps of the hit's coordinates. A surface's own size is
 not enough: a strand rooted in the skin it leaves is smaller than the skin, and rays leaving the 1 mm
 ball still skipped 1e-6 at its roots (mode D x1.0092 +- 0.0005 over six seeds, against x1.0010 on the
@@ -24230,7 +24257,7 @@ together — a real refactor, not a tweak, which is why it is logged rather than
 
 ### DONE (2026-11-17, 0.449.8; opened v0.161.0): `curv` reads 0 on an ISOSURFACE, so curvature-driven materials silently flatten there
 
-**Fixed** as proposed below: `fieldMeanCurvature` (implicit.h; device `dFieldMeanCurvature`) takes H from the field's
+**Fixed** as proposed below: `fieldGradientCurvature` (implicit.h; device `dFieldGradientCurvature`; the stencil and its arithmetic in curvature.h) takes H from the field's
 gradient and Hessian by central differences at the gradient's step (13 evaluations), only for an isosurface whose
 material reads `curv` (`Implicit::readsCurv`, set by the loader's scan, now `Builder::markCurvReaders`); a cap reads
 0. `-checkcurv` §10 holds an SDF sphere to +1/R and -1/R within 1e-3. The report as filed:

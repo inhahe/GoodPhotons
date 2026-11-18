@@ -9480,8 +9480,8 @@ static int checkCurv() {
     // finite facet. That error shrinks with the facet, so the tolerance is relative and
     // generous rather than tight — the point is the 1/R LAW, checked over 4 decades.
     {
-        // 1e-7 too: a facet that small has a Gram determinant near 1e-32, which a degenerate test
-        // taken in absolute units read as a sliver, curvature 0.
+        // 1e-7 and 1e7 too: the degenerate-sliver test must hold at any size (a facet of 1e-8 has a
+        // Gram determinant near 1e-32).
         const double radii[] = { 1e-7, 0.01, 0.1, 1.0, 10.0, 100.0, 1e7 };
         for (double R : radii) {
             const int NLAT = 24, NLON = 48;
@@ -9749,46 +9749,63 @@ static int checkCurv() {
     // ---- §10: an isosurface's curvature from its field's Hessian ----------------
     // An SDF sphere of radius R through the real intersectImplicit, its material marked as reading
     // `curv`: +1/R from outside, -1/R from inside, as the analytic sphere of §3; and 0 where
-    // nothing reads it (the Hessian is skipped).
-    {
+    // nothing reads it (the Hessian is skipped). An SDF sphere near the origin, and 100 m from it a
+    // polynomial field whose terms run to 1e4 (|p - c|^2 - R^2, expanded), from far and from just off
+    // the surface: a hit a millimetre away takes its gradient at the step's smallest, and the
+    // stencil's own step must keep that field's rounding (about 1e-12) out of a second difference.
+    for (const double cx : { 0.2, 100.2 }) {
         const double R = 0.7;
         ftsl::Loaded L;
         std::string e;
-        const bool loaded = ftsl::loadSource(
+        const std::string field = cx < 50.0
+            ? std::string("sphere { center 0.2 -0.1 0.3  radius 0.7 }")
+            : std::string("function { expr \"x*x - 200.4*x + 10040.04 + (y+0.1)^2 + (z-0.3)^2 - 0.49\" }  "
+                          "contained_by { min 99.2 -1.1 -0.7  max 101.2 0.9 1.3 }  max_gradient 4");
+        const std::string src =
             "scene { units meters }\n"
             "material \"m\" { type diffuse reflect 0.5 }\n"
-            "isosurface { material m  sphere { center 0.2 -0.1 0.3  radius 0.7 } }\n"
+            "isosurface { material m  " + field + " }\n"
             "light area { origin -0.5 2.5 -0.5  u 1 0 0  v 0 0 1  normal 0 -1 0  spd preset:bb6500 }\n"
-            "camera \"c\" { eye 0 2 3  look_at 0 0 0  up 0 1 0  fov_y 40  film { res 8 8 } }\n",
-            "<checkcurv>", L, e);
+            "camera \"c\" { eye 0 2 3  look_at 0 0 0  up 0 1 0  fov_y 40  film { res 8 8 } }\n";
+        const bool loaded = ftsl::loadSource(src, "<checkcurv>", L, e);
+        char lbl[96];
         if (!loaded || L.scene.implicits.size() != 1) {
             std::printf("[checkcurv] S10 isosurface scene failed to load: %s  BAD\n", e.c_str());
             ok = false;
-        } else {
-            Implicit im = L.scene.implicits[0];
-            const Vec3 c{0.2, -0.1, 0.3};
-            double wOut = 0.0, wIn = 0.0, wOff = 0.0;
-            for (int i = 0; i < 32; ++i) {
-                double z = frand() * 2 - 1, ph = frand() * 2 * M_PI, sr = std::sqrt(std::fmax(0.0, 1 - z * z));
-                const Vec3 d{ sr * std::cos(ph), sr * std::sin(ph), z };
-                im.readsCurv = true;
-                Hit ho; ho.t = DBL_MAX;
-                if (intersectImplicit(Ray{ c + d * (R * 1.9), d * -1.0 }, im, 1e-9, ho) && ho.valid)
-                    wOut = std::fmax(wOut, std::fabs(ho.curv - 1.0 / R) * R);
-                else { std::printf("[checkcurv] S10 outside ray missed  BAD\n"); ok = false; }
-                Hit hi; hi.t = DBL_MAX;
-                if (intersectImplicit(Ray{ c, d }, im, 1e-9, hi) && hi.valid)
-                    wIn = std::fmax(wIn, std::fabs(hi.curv + 1.0 / R) * R);
-                else { std::printf("[checkcurv] S10 inside ray missed  BAD\n"); ok = false; }
-                im.readsCurv = false;
-                Hit hz; hz.t = DBL_MAX; hz.curv = 9.0;
-                if (intersectImplicit(Ray{ c + d * (R * 1.9), d * -1.0 }, im, 1e-9, hz) && hz.valid)
-                    wOff = std::fmax(wOff, std::fabs(hz.curv));
-            }
-            ok &= chk("S10 isosurface sphere from outside -> +1/R (rel)", wOut, 0.0, 1e-3);
-            ok &= chk("S10 isosurface sphere from inside  -> -1/R (rel)", wIn,  0.0, 1e-3);
-            ok &= chk("S10 isosurface not reading curv -> 0", wOff, 0.0, 0.0);
+            continue;
         }
+        Implicit im = L.scene.implicits[0];
+        const Vec3 c{cx, -0.1, 0.3};
+        double wOut = 0.0, wNear = 0.0, wIn = 0.0, wOff = 0.0;
+        for (int i = 0; i < 32; ++i) {
+            double z = frand() * 2 - 1, ph = frand() * 2 * M_PI, sr = std::sqrt(std::fmax(0.0, 1 - z * z));
+            const Vec3 d{ sr * std::cos(ph), sr * std::sin(ph), z };
+            im.readsCurv = true;
+            Hit ho; ho.t = DBL_MAX;
+            if (intersectImplicit(Ray{ c + d * (R * 1.9), d * -1.0 }, im, 1e-9, ho) && ho.valid)
+                wOut = std::fmax(wOut, std::fabs(ho.curv - 1.0 / R) * R);
+            else { std::printf("[checkcurv] S10 outside ray missed  BAD\n"); ok = false; }
+            Hit hn; hn.t = DBL_MAX;
+            if (intersectImplicit(Ray{ c + d * (R + 1e-3), d * -1.0 }, im, 1e-9, hn) && hn.valid)
+                wNear = std::fmax(wNear, std::fabs(hn.curv - 1.0 / R) * R);
+            else { std::printf("[checkcurv] S10 near ray missed  BAD\n"); ok = false; }
+            Hit hi; hi.t = DBL_MAX;
+            if (intersectImplicit(Ray{ c, d }, im, 1e-9, hi) && hi.valid)
+                wIn = std::fmax(wIn, std::fabs(hi.curv + 1.0 / R) * R);
+            else { std::printf("[checkcurv] S10 inside ray missed  BAD\n"); ok = false; }
+            im.readsCurv = false;
+            Hit hz; hz.t = DBL_MAX; hz.curv = 9.0;
+            if (intersectImplicit(Ray{ c + d * (R * 1.9), d * -1.0 }, im, 1e-9, hz) && hz.valid)
+                wOff = std::fmax(wOff, std::fabs(hz.curv));
+        }
+        std::snprintf(lbl, sizeof lbl, "S10 isosurface at x=%g from outside -> +1/R (rel)", cx);
+        ok &= chk(lbl, wOut, 0.0, 1e-3);
+        std::snprintf(lbl, sizeof lbl, "S10 isosurface at x=%g from 1 mm off  -> +1/R (rel)", cx);
+        ok &= chk(lbl, wNear, 0.0, 1e-3);
+        std::snprintf(lbl, sizeof lbl, "S10 isosurface at x=%g from inside  -> -1/R (rel)", cx);
+        ok &= chk(lbl, wIn, 0.0, 1e-3);
+        std::snprintf(lbl, sizeof lbl, "S10 isosurface at x=%g not reading curv -> 0", cx);
+        ok &= chk(lbl, wOff, 0.0, 0.0);
     }
 
     std::printf("[checkcurv] worst absolute error = %.3g\n", worst);
@@ -18398,6 +18415,9 @@ static constexpr char kRadCacheTag3[8] = {'F','T','R','C','A','C','H','3'};
 // Version 4 is version 3 led by its own length and the size of a cell's record, so a reader whose
 // RadCacheCell is laid out otherwise passes the whole section and still reads the ones after it.
 static constexpr char kRadCacheTag4[8] = {'F','T','R','C','A','C','H','4'};
+// Version 5 is version 4 whose batch marks carry their point's eps (RadCacheMark::eps) after the
+// point and normal: seven doubles a mark, not six.
+static constexpr char kRadCacheTag5[8] = {'F','T','R','C','A','C','H','5'};
 
 // Returns false only on a write error. Writes nothing at all (leaving the sidecar byte-for-byte
 // what it has always been) when there is no live table, so a render without -radcache is
@@ -18413,11 +18433,11 @@ static bool writeRadCacheSection(std::ostream& o) {
     const uint64_t layout[3] = {(uint64_t)rc.key.size(), (uint64_t)rc.cursor, (uint64_t)rc.rcursor};
     const uint32_t record = (uint32_t)sizeof(RadCacheCell);
     // What follows the length: the record size, the header, the cells, the batch's counts and its
-    // marks (a key and six doubles) and records (a key and two doubles).
+    // marks (a key and seven doubles) and records (a key and two doubles).
     const uint64_t bytes = 4 + 8 + 4 + sizeof ctr + sizeof layout + 8 + n * (16 + (uint64_t)record) +
                            8 + 8 + 3 * 8 + 3 * 8 +
-                           (uint64_t)g_rcPending.marks.size() * 56 + (uint64_t)g_rcPending.vals.size() * 24;
-    o.write(kRadCacheTag4, 8);
+                           (uint64_t)g_rcPending.marks.size() * 64 + (uint64_t)g_rcPending.vals.size() * 24;
+    o.write(kRadCacheTag5, 8);
     o.write((const char*)&bytes, 8);
     o.write((const char*)&record, 4);
     o.write((const char*)&guard, 8);
@@ -18441,7 +18461,7 @@ static bool writeRadCacheSection(std::ostream& o) {
     o.write((const char*)tally, sizeof tally);
     o.write((const char*)audit, sizeof audit);
     for (const RadCacheMark& m : b.marks) {
-        const double pn[6] = {m.p.x, m.p.y, m.p.z, m.n.x, m.n.y, m.n.z};
+        const double pn[7] = {m.p.x, m.p.y, m.p.z, m.n.x, m.n.y, m.n.z, m.eps};
         o.write((const char*)&m.key, 8);
         o.write((const char*)pn, sizeof pn);
     }
@@ -18469,8 +18489,10 @@ static void readRadCacheSection(std::istream& in, bool adopt = true) {
     const std::streampos at = in.tellg();
     char tag[8] = {0};
     in.read(tag, 8);
-    const bool v4 = in && std::memcmp(tag, kRadCacheTag4, 8) == 0;
+    const bool v5 = in && std::memcmp(tag, kRadCacheTag5, 8) == 0;
+    const bool v4 = v5 || (in && std::memcmp(tag, kRadCacheTag4, 8) == 0);
     const bool v3 = v4 || (in && std::memcmp(tag, kRadCacheTag3, 8) == 0);   // slots, cursors, batch
+    const uint64_t markBytes = v5 ? 64 : 56;   // a key and the point, normal (and from v5 eps)
     if (!in || (!v3 && std::memcmp(tag, kRadCacheTag, 8) != 0)) { in.clear(); in.seekg(at); return; }
     // A section of ours this build cannot read -- truncated, or before FTRCACH4 written with its cells
     // laid out otherwise (they then misparse) -- is passed to the sections after it.
@@ -18528,19 +18550,20 @@ static void readRadCacheSection(std::istream& in, bool adopt = true) {
         in.read((char*)tally, sizeof tally);
         in.read((char*)audit, sizeof audit);
         const uint64_t room = left();
-        if (!in || nm > room / 56 || nv > (room - nm * 56) / 24) { skipSection(); return; }
+        if (!in || nm > room / markBytes || nv > (room - nm * markBytes) / 24) { skipSection(); return; }
         if (!adopt) {
-            in.seekg((std::streamoff)(nm * 56 + nv * 24), std::ios::cur);
+            in.seekg((std::streamoff)(nm * markBytes + nv * 24), std::ios::cur);
         } else {
             RadCacheBank& b = p.batch;
             b.marks.resize((size_t)nm);
             b.vals.resize((size_t)nv);
             for (RadCacheMark& m : b.marks) {
-                double pn[6] = {0, 0, 0, 0, 0, 0};
+                double pn[7] = {0, 0, 0, 0, 0, 0, 0};
                 in.read((char*)&m.key, 8);
-                in.read((char*)pn, sizeof pn);
+                in.read((char*)pn, (std::streamsize)(markBytes - 8));
                 m.p = Vec3{pn[0], pn[1], pn[2]};
                 m.n = Vec3{pn[3], pn[4], pn[5]};
+                m.eps = pn[6];   // 0 before v5: the update pass then takes the scene's
             }
             for (RadCacheVal& v : b.vals) {
                 in.read((char*)&v.key, 8);
@@ -25613,7 +25636,8 @@ static int run(int argc, char** argv) {
     // Same "only a real batch render" gate, for the OTHER way mode W stops being exact at
     // low spp: a de-hero'd path plus a pixel-shared wavelength lattice = a global colour
     // cast. See warnWhittedDeHeroSpp for the measurement this threshold comes from.
-    if (g_whitted && !wPreview) { warnWhittedDeHeroSpp(scene, spp); noteWhittedMediaSpp(scene, spp); }
+    // (warnWhittedDeHeroSpp and noteWhittedMediaSpp, the low-spp notes, run once the cameras are
+    // chosen: the spp they judge is settled there.)
     // Kept out of the chain above: rejecting -gi is independent of whether the run is
     // also direct-only, and folding it in would swallow that notice when both are given.
     // Mode R already carries real multi-bounce GI; the gather is mode W's substitute for
@@ -26314,6 +26338,21 @@ static int run(int argc, char** argv) {
         }
         toRender.push_back({"", c, mode, fresX, fresY, (exposureCli > 0.0 ? exposureCli : 0.0), forceExposureLock ? 0 : -1, cLook, cUp, cFov});
     }
+
+    // Mode W's default spp (kWhittedSpp, above) is one run-wide value: a camera in another mode
+    // in the same run -- a scene's `mode W` preview camera beside a `mode D` one -- would render
+    // at it too, so such a run keeps mode R's default for all.
+    if (g_whitted && !sppGiven) {
+        bool allW = true;
+        for (const RenderCam& rc : toRender) allW = allW && rc.mode == 'R';
+        if (!allW) {
+            spp = 256;
+            g_fwSpp = spp;
+            std::printf("[spp] 256 (mode R's default): this run renders cameras in other modes beside mode W, "
+                        "whose own default is %lld\n", kWhittedSpp);
+        }
+    }
+    if (g_whitted && !wPreview) { warnWhittedDeHeroSpp(scene, spp); noteWhittedMediaSpp(scene, spp); }
 
     // -roiboxes: derive per-material ROIs from primary visibility, print them, exit.
     // Placed HERE, after `toRender` is final, so the boxes come from exactly the camera

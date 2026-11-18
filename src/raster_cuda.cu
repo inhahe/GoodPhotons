@@ -124,6 +124,7 @@
 #include "raster_cuda.h"
 #include "camera.h"    // Camera, CAM_RECTILINEAR
 #include "pattern_device.cuh"   // DPattern / DPatEnvT / dPatternEval — shared with render_cuda.cu
+#include "curvature.h"          // triMeanCurvatureS: `curv` per pixel (dRasterCurv)
 #include "stochtile.h"          // O7: the host/device-shared histogram-preserving tiling operator
 
 namespace raster_cuda {
@@ -937,20 +938,12 @@ __device__ inline void dRasterPatPoint(const DPTri& t, float3 wpos, double& qx, 
 }
 
 // `curv` at this preview pixel before its side's sign: the mean curvature source triangle t's
-// vertex normals imply, in double (host twin: geometry.h triMeanCurvature, which raster.h ctx()
-// reads the same way).
+// vertex normals imply, in double (curvature.h triMeanCurvatureS; host twin raster.h ctx()).
 __device__ inline double dRasterCurv(const DPTri& t) {
-    const double e1x = (double)t.p1.x - t.p0.x, e1y = (double)t.p1.y - t.p0.y, e1z = (double)t.p1.z - t.p0.z;
-    const double e2x = (double)t.p2.x - t.p0.x, e2y = (double)t.p2.y - t.p0.y, e2z = (double)t.p2.z - t.p0.z;
-    const double d1x = (double)t.n1.x - t.n0.x, d1y = (double)t.n1.y - t.n0.y, d1z = (double)t.n1.z - t.n0.z;
-    const double d2x = (double)t.n2.x - t.n0.x, d2y = (double)t.n2.y - t.n0.y, d2z = (double)t.n2.z - t.n0.z;
-    const double gA = e1x * e1x + e1y * e1y + e1z * e1z, gB = e1x * e2x + e1y * e2y + e1z * e2z,
-                 gC = e2x * e2x + e2y * e2y + e2z * e2z;
-    const double gdet = gA * gC - gB * gB;
-    if (!(gdet > 1e-12 * gA * gC)) return 0.0;
-    const double e1d1 = e1x * d1x + e1y * d1y + e1z * d1z, e2d1 = e2x * d1x + e2y * d1y + e2z * d1z;
-    const double e1d2 = e1x * d2x + e1y * d2y + e1z * d2z, e2d2 = e2x * d2x + e2y * d2y + e2z * d2z;
-    return 0.5 * (gC * e1d1 - gB * e2d1 - gB * e1d2 + gA * e2d2) / gdet;
+    return triMeanCurvatureS((double)t.p1.x - t.p0.x, (double)t.p1.y - t.p0.y, (double)t.p1.z - t.p0.z,
+                             (double)t.p2.x - t.p0.x, (double)t.p2.y - t.p0.y, (double)t.p2.z - t.p0.z,
+                             (double)t.n1.x - t.n0.x, (double)t.n1.y - t.n0.y, (double)t.n1.z - t.n0.z,
+                             (double)t.n2.x - t.n0.x, (double)t.n2.y - t.n0.y, (double)t.n2.z - t.n0.z);
 }
 
 // ---------------------------------------------------------------------------

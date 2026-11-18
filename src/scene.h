@@ -1564,6 +1564,11 @@ struct Blas {
             localBounds.expand(b);
             boxes.push_back(b);
         }
+        // A triangle's feature size is its asset's (Tri::size; Scene::bakeMeshSizes says why).
+        if (localBounds.lo.x <= localBounds.hi.x) {
+            const float ext = (float)length(localBounds.hi - localBounds.lo);
+            for (auto& t : tris) t.size = std::max(t.size, ext);
+        }
         bvh.build(boxes);
     }
     // Closest hit in local space. `h.t` carries the running (world==local) tMax on
@@ -5071,9 +5076,27 @@ struct Scene {
 
     // Finalize triangle normals and build the BVH. Call after all geometry is
     // added. Primitive index i: i < tris.size() -> tris[i]; else spheres[i-nTris].
+    // A mesh triangle's feature size (Tri::size, Hit::size) is its whole mesh's extent, not its own
+    // longest edge: a dense mesh's tessellation says nothing of how near other geometry can lie,
+    // and sizing its offsets by a 0.1 mm edge put them under the noise of an export's near-
+    // coincident layers. Only a mesh small as a whole -- a bead in a big scene -- takes smaller
+    // offsets; a lone triangle or quad keeps its own extent.
+    void bakeMeshSizes() {
+        for (const MeshGroup& g : meshGroups) {
+            if (g.blasId >= 0 || g.triCount == 0 || g.triStart + g.triCount > tris.size()) continue;
+            Aabb b;
+            for (size_t i = g.triStart; i < g.triStart + g.triCount; ++i) {
+                b.expand(tris[i].v0); b.expand(tris[i].v1); b.expand(tris[i].v2);
+            }
+            const float ext = (float)length(b.hi - b.lo);
+            for (size_t i = g.triStart; i < g.triStart + g.triCount; ++i) tris[i].size = std::max(tris[i].size, ext);
+        }
+    }
+
     void build() {
         ++buildCount;
         for (auto& t : tris) t.finalize();
+        bakeMeshSizes();
         for (auto& bl : blasList) bl.build();   // shared instanced assets (local space)
         buildBvh();
         buildMirrorPlanes();   // needs the finalized geometric normals
@@ -5344,15 +5367,12 @@ struct Scene {
         if (remap) { remap->clear(); remap->reserve(boxes.capacity()); }
         int g = 0;                     // running GLOBAL prim index
         const auto keep = [&](const Aabb& b) { boxes.push_back(b); if (remap) remap->push_back(g); };
-        for (const auto& t : tris) {
-            Aabb b; b.expand(t.v0); b.expand(t.v1); b.expand(t.v2);
+        for (size_t i = 0; i < tris.size(); ++i) {
+            Aabb b = primBox(i);
             b.lo = b.lo - Vec3{pad, pad, pad}; b.hi = b.hi + Vec3{pad, pad, pad};
             keep(b); ++g;
         }
-        for (const auto& s : spheres) {
-            Aabb b; b.expand(s.c - Vec3{s.r, s.r, s.r}); b.expand(s.c + Vec3{s.r, s.r, s.r});
-            keep(b); ++g;
-        }
+        for (size_t i = 0; i < spheres.size(); ++i) { keep(primBox(tris.size() + i)); ++g; }
         for (const auto& im : implicits) { keep(im.bounds); ++g; }
         // One leaf per round cone, NOT per strand: a whole hair's box is mostly empty,
         // and a BVH over long thin near-collinear boxes is exactly the degeneracy
@@ -5365,6 +5385,22 @@ struct Scene {
         // world space (union of its 8 transformed corners — the tightest world AABB
         // of a rotated box short of re-bounding the actual triangles).
         for (const auto& inst : instances) { keep(instanceBox(inst)); ++g; }
+    }
+    // Global primitive g's box at the instant (tris, spheres, isosurfaces, curve segments, instances,
+    // in that order), unpadded: what collectPrimBoxes boxes (it pads a triangle's) and buildPrimNear
+    // compares.
+    Aabb primBox(size_t g) const {
+        if (g < tris.size()) {
+            const Tri& t = tris[g];
+            Aabb b; b.expand(t.v0); b.expand(t.v1); b.expand(t.v2);
+            return b;
+        }
+        if (g < tris.size() + spheres.size()) {
+            const Sphere& sp = spheres[g - tris.size()];
+            Aabb b; b.expand(sp.c - Vec3{sp.r, sp.r, sp.r}); b.expand(sp.c + Vec3{sp.r, sp.r, sp.r});
+            return b;
+        }
+        return otherPrimBox((int)g);
     }
     // An instance's world box at the instant: its asset's local box carried by toWorld (the union
     // of the 8 carried corners -- the tightest box of a turned box short of re-bounding its
@@ -5389,7 +5425,7 @@ struct Scene {
     }
 
     // primNear, from each primitive's box at the instant and its feature size (Hit::size's: a
-    // triangle's longest edge, a sphere's radius, an isosurface's bound's longest side, a curve
+    // triangle's Tri::size (its mesh's extent), a sphere's radius, an isosurface's bound's longest side, a curve
     // segment's larger radius, an instance's asset's smallest triangle by its mean scale; a size of
     // 0, a collapsed triangle or a strand's tip, says nothing). Each small feature asks the scene's
     // own tree which primitives' boxes overlap its own and lowers theirs to its size (an atomic
@@ -5413,28 +5449,11 @@ struct Scene {
             g -= nT;
             if (g < nS) return std::fabs(spheres[g].r);
             g -= nS;
-            if (g < nI) {
-                const Aabb& b = implicits[g].bounds;
-                return std::max(b.hi.x - b.lo.x, std::max(b.hi.y - b.lo.y, b.hi.z - b.lo.z));
-            }
+            if (g < nI) return implicits[g].featureSize();
             g -= nI;
             if (g < nC) return std::max(curveSegs[g].r0, curveSegs[g].r1);
             const MeshInstance& inst = instances[g - nC];
             return blasMin[(size_t)inst.blasId] / inst.curvScale;
-        };
-        const auto boxOf = [&](size_t g) -> Aabb {
-            if (g < nT) {
-                const Tri& t = tris[g];
-                Aabb b; b.expand(t.v0); b.expand(t.v1); b.expand(t.v2);
-                return b;
-            }
-            if (g < nT + nS) {
-                const Sphere& sp = spheres[g - nT];
-                const double r = std::fabs(sp.r);
-                Aabb b; b.expand(sp.c - Vec3{r, r, r}); b.expand(sp.c + Vec3{r, r, r});
-                return b;
-            }
-            return otherPrimBox((int)g);
         };
         std::vector<int> smallFeat;   // (`small` is a macro in the Windows headers)
         for (size_t g = 0; g < n; ++g) {
@@ -5448,11 +5467,17 @@ struct Scene {
         for (auto& a : nearBits) a.store(none, std::memory_order_relaxed);
         const bool done = ft::parallelFor(smallFeat.size(), 256, [&](size_t k) {
             const size_t j = (size_t)smallFeat[k];
-            const Aabb bj = boxOf(j);
-            const uint32_t sj = bitsOf((float)sizeOf(j));
+            // Padded by eps: a ray leaving a neighbour steps eps off it, so a feature that only
+            // touches it to within rounding, or lies within eps of it, is one it must not step over.
+            Aabb bj = primBox(j);
+            bj.lo = bj.lo - Vec3{eps, eps, eps}; bj.hi = bj.hi + Vec3{eps, eps, eps};
+            const double szj = sizeOf(j);
+            const uint32_t sj = bitsOf((float)szj);
             const Vec3 c = (bj.lo + bj.hi) * 0.5;
             bvh.traverseSphere(c, 0.5 * length(bj.hi - bj.lo), [&](int g) {
-                const Aabb bg = boxOf((size_t)g);
+                const double szg = sizeOf((size_t)g);
+                if (szg > 0.0 && szg <= szj) return;   // no smaller than this feature: nothing to lower
+                const Aabb bg = primBox((size_t)g);
                 if (bg.lo.x > bj.hi.x || bj.lo.x > bg.hi.x || bg.lo.y > bj.hi.y || bj.lo.y > bg.hi.y ||
                     bg.lo.z > bj.hi.z || bj.lo.z > bg.hi.z) return;
                 std::atomic<uint32_t>& a = nearBits[(size_t)g];

@@ -338,14 +338,18 @@ static constexpr int kRadCacheMaxUnused = 16;
 // the cell, and are where the update pass launches from. Storing a REAL surface point rather
 // than the cell centre matters: a cell centre is usually inside or behind geometry, and a ray
 // from there starts occluded.
+// The cell's field layout, mixed into configGuard: bump it whenever a field moves or changes
+// meaning, even where sizeof(RadCacheCell) stays the same (a field taking former padding), or a
+// checkpoint of the old layout passes the size checks and misparses.
+constexpr uint64_t kRadCacheCellLayout = 2;   // 2: eps
 struct RadCacheCell {
     float    mean[kRadCacheBins];   // E/pi per wavelength bin (the value a reader multiplies)
     float    sumsq[kRadCacheBins];  // sum of squares, for the standard-error gate
     float    mx[kRadCacheBins];     // largest single sample, for the heavy-tail guard
     uint16_t cnt[kRadCacheBins];    // samples folded into each bin (bounded by maxSamples)
     double   px, py, pz;            // representative surface point (double: it is a ray origin)
+    double   eps = 0.0;             // the point's self-intersection distance: its update rays' offset and tmin
     float    nx, ny, nz;            // representative shading normal, unit
-    float    eps = 0.0f;            // the point's self-intersection distance: its update rays' offset and tmin
     uint32_t lastMark = 0;          // pass index at which a path last marked this cell
     uint32_t upRound  = 0;          // update rounds absorbed; drives the per-cell bin schedule
     uint8_t  ok   = 0;              // 1 = confident: may answer, and needs no more samples
@@ -664,6 +668,7 @@ struct RadianceCache {
         mixd(tol);
         mix64((uint64_t)kRadCacheBins);
         mix64((uint64_t)sizeof(RadCacheCell));
+        mix64(kRadCacheCellLayout);
         return h;
     }
 
@@ -927,7 +932,7 @@ struct RadianceCache {
         stk[i] = RadCacheStack{};
         c.px = m.p.x; c.py = m.p.y; c.pz = m.p.z;
         c.nx = (float)m.n.x; c.ny = (float)m.n.y; c.nz = (float)m.n.z;
-        c.eps = (float)m.eps;
+        c.eps = m.eps;
         c.lastMark = pass;
         scratch[i] = RadCacheScratch{};
     }

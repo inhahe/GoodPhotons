@@ -1,6 +1,7 @@
 // Rays, triangles, spheres, intersection. Brute-force closest-hit for now;
 // a SAH BVH replaces the linear scan later (it must not change the image).
 #pragma once
+#include "curvature.h"   // triMeanCurvatureS (Tri::curvature)
 #include <vector>
 #include <cfloat>
 #include <cmath>
@@ -60,20 +61,10 @@ inline Vec3 faceNormalToward(const Vec3& a, const Vec3& b, const Vec3& c, const 
     return (l > 0.0) ? fc * ((dot(fc, nsum) < 0.0 ? -1.0 : 1.0) / l) : Vec3{0, 0, 0};
 }
 
-// The mean curvature H a triangle's vertex normals imply: half the trace of the map dn that takes
-// its edges e1 = v1 - v0, e2 = v2 - v0 to dn1 = n1 - n0, dn2 = n2 - n0 (barycentric interpolation
-// is linear, so these fix dn on the whole plane), taken in the dual basis of {e1, e2} through
-// their Gram matrix -- which drops dn's out-of-plane part. A unit sphere with exact normals reads
-// 1, a plane 0, and scaling a mesh by s scales H by 1/s. 0 on a degenerate sliver (its edges'
-// sine under 1e-6, at any size). Positive where the normals spread apart (a bulge on their side).
-// Tri::curvature, and the preview's per pixel.
+// The mean curvature H a triangle's vertex normals imply (curvature.h triMeanCurvatureS, which says
+// what it is): Tri::curvature, and the raster preview's per pixel.
 inline double triMeanCurvature(const Vec3& e1, const Vec3& e2, const Vec3& dn1, const Vec3& dn2) {
-    const double gA = dot(e1, e1), gB = dot(e1, e2), gC = dot(e2, e2);
-    const double gdet = gA * gC - gB * gB;                 // = 4 * area^2 = gA gC sin^2
-    if (!(gdet > 1e-12 * gA * gC)) return 0.0;
-    const double trace = (gC * dot(e1, dn1) - gB * dot(e2, dn1)
-                        - gB * dot(e1, dn2) + gA * dot(e2, dn2)) / gdet;
-    return 0.5 * trace;
+    return triMeanCurvatureS(e1.x, e1.y, e1.z, e2.x, e2.y, e2.z, dn1.x, dn1.y, dn1.z, dn2.x, dn2.y, dn2.z);
 }
 
 struct Tri {
@@ -157,7 +148,8 @@ struct Tri {
     // The light it is part of (Hit::emitter), or -1. Last: triangles are built positionally
     // (`Tri{v0, v1, v2, mat, -1, {}, uv0, uv1, uv2}`), and a field among those would take their values.
     int emitter = -1;
-    // Its longest edge, baked for the hit to copy (Hit::size). In emitter's padding.
+    // Its feature size, for the hit to copy (Hit::size): its longest edge, raised by Scene::bakeMeshSizes
+    // (or Blas::build) to its whole mesh's extent. In emitter's padding.
     float size = 0.0f;
     void finalize() {
         gn = normalize(cross(v1 - v0, v2 - v0));
@@ -332,7 +324,7 @@ struct Hit {
     double pscale = 0.0;
     // The size of the feature the hit lies on, which bounds how close other geometry can be
     // that a ray leaving it must not step over (Scene::hitEps): a sphere's radius, a strand's
-    // at the hit, a triangle's longest edge (Tri::size), an isosurface's bound's longest side;
+    // at the hit, a mesh triangle's whole mesh's extent (Tri::size), an isosurface's bound's longest side;
     // through an instance or a motion, scaled by its mean scale. Every intersector writes it, and
     // Scene::closestHit lowers it to the smallest feature touching the primitive (Scene::primNear).
     double size = 0.0;

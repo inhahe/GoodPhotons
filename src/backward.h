@@ -4258,7 +4258,7 @@ struct BackwardRenderer {
             const uint32_t slot = slots[li];
             const RadCacheCell& c = rc.cell[slot];
             const Vec3 p = c.point();
-            const double ce = c.eps > 0.0f ? (double)c.eps : scene.eps;   // its update rays' offset
+            const double ce = c.eps > 0.0 ? c.eps : scene.eps;   // its update rays' offset
             Vec3 n = c.normal();
             const double nl = std::sqrt(dot(n, n));
             if (!(nl > 0.0)) continue;

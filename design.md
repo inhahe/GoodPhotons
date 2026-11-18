@@ -5833,7 +5833,8 @@ as the one at fault.
   is computed, `Scene::build`: `Scene::lenScale`, and `Scene::eps` = 1e-6 x lenScale. A ray leaving
   a surface takes its distances from the feature it leaves (CPU-SMALL-IN-BIG): `Scene::hitEps(h)` is
   eps, but no more than a thousandth of the hit's `Hit::size` -- a sphere's radius, a strand's at the
-  hit, a triangle's longest edge (`Tri::size`, baked by `finalize`), an isosurface's bound's longest
+  hit, a mesh triangle's whole mesh's extent (`Tri::size`: `Scene::bakeMeshSizes`, `Blas::build`; a dense
+  mesh's edges say nothing of how near other geometry lies), an isosurface's bound's longest
   side, scaled through an instance or a motion by its mean scale; every intersector writes it, and
   `closestHit` lowers it to the smallest feature whose box overlaps the primitive's (`Scene::primNear`,
   built by `buildPrimNear`: each feature small enough to cap below eps asks the scene's own tree which
@@ -8348,7 +8349,7 @@ as the one at fault.
   That trace must be taken in the **dual basis** — {e₁,e₂} is not orthonormal, so the 2×2
   Gram matrix has to be inverted. A quad/flat facet and a flat-shaded mesh (no normal field
   to differentiate) honestly report 0 rather than guess. An **isosurface** takes H from its
-  field's gradient and Hessian by central differences (`fieldMeanCurvature`, 13 field
+  field's gradient and Hessian by central differences (`fieldGradientCurvature`, curvature.h's 13-point stencil, its step at least 2^-13 of the coordinates; 13 field
   evaluations), only where its material reads `curv` (`Implicit::readsCurv`, set by the
   loader's `markCurvReaders`): every other isosurface hit pays nothing. The raster previews
   read it per pixel from their triangle's corners and vertex normals with the mesh's formula
