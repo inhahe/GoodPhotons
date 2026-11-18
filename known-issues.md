@@ -1508,7 +1508,13 @@ rule:
 Proper fix, for open meshes whose holes are planar (a statue's bottom left open on the floor): take a
 consistently wound piece whose boundary edges all lie in one plane as closed by that plane. Its
 volume taken about a point in the plane is the closed solid's, the cap's own tetrahedra vanishing
-there, so its side is known as a closed piece's is. tools/check_gather_base.py covers the closed
+there, so its side is known as a closed piece's is. **It must stay the footprint probe's alone**
+(tried 2026-11-18 in watertight::markSolidFaces and taken back): `Tri::solidFace` / `Hit::solid` also
+drive `enclosureAt` (a camera or light born inside a solid takes its medium) and the load's
+`emit_two_sided` refusal, and a single-surface open bowl closed by its rim's plane would make its
+cavity a solid of its material -- a camera in it starting inside glass, a glowing bowl refused. So it
+needs a face state of its own (a `solidFace` value the probes read and the enclosures do not, on the
+host and in DTri). tools/check_gather_base.py covers the closed
 solids, the balls, the open sheets (`mirrorsheet`, `lampsheet`, `tablesheet`) and an open box
 (`openbox`); not an open solid taller than the radius.
 
