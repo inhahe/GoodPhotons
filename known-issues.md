@@ -211,7 +211,7 @@ after the other in a worktree; five found by both. Each checked against the code
   under `useGpu`, which mode U never sets, since it resolves its device in its own dispatch. The
   preflight is a function of the mode now (`vramAffords`), which the shared path calls as before and
   mode U's dispatch calls before its session starts. GPU modes M and S skip it the same way:
-  VRAM-PREFLIGHT-MS (TODO).
+  VRAM-PREFLIGHT-MS, closed for mode S in 0.450.7 and for mode M in 0.450.8.
 * **The beam photon's stream was still seeded by unsequenced draws** (Opus): `next64` on the device
   and in its host twin (`Pcg32::next64` new), in statements of their own.
 * **check_vertex_hit_state did not require the GPU** (both): it requires `-> GPU` in each GPU

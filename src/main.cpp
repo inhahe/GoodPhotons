@@ -20235,6 +20235,96 @@ static bool cameraRunsOnJ(const Scene& scene, char mode, int projection, const c
     return why == nullptr;
 }
 
+#ifdef HAVE_CUDA
+// ---- device-memory preflight (see cudaMegakernelLocalBytes) ----------------------
+// Having decided WHICH device can run this scene, check whether the card can still
+// afford to. Every megakernel here launches a fixed 2048x128 grid, and its per-thread
+// local storage is real VRAM measured in gigabytes; if the card is already full because
+// some UNRELATED process on the machine took it, the driver does not fail the launch,
+// it backs the spill with host memory over PCIe. The render then crawls by 2-3 orders
+// of magnitude at 100% reported GPU utilisation, and because every poll of `-interval`,
+// `-time` and `-stop` happens between chunks, none of them ever gets a turn: the render
+// looks hung, writes nothing, and cannot be stopped except by killing it.
+//
+// That is a miserable thing to debug from the outside (it cost a full session once), and
+// the CPU path — merely slow — is strictly better than a GPU path that is 1000x slow.
+// So: measure, and say exactly what is wrong and who to blame.
+//
+// Whether the card can afford mode `m`'s kernels (cudaMegakernelLocalBytes(m)) beside `buffers`
+// bytes of the render's own device buffers -- its films, queues, posed cameras: false, the reason
+// printed, where `-device auto` should fall back to the CPU. `heldScene` is the batch's device copy
+// of the scene that this render reuses (BatchCache::sceneHold): the card is short of it, but it is
+// ours. `forced` (-device gpu) prints the same warning and answers true. Every site that decides a
+// device asks this once for the kernels it will launch: runRender for its own modes, its mode S and
+// U dispatches, and run()'s mode-M routes (mGpuOk).
+static bool vramPreflight(char m, size_t buffers, size_t heldScene, bool forced) {
+    const int hero = (m == 'D' || m == 'J' || m == 'U') ? g_heroC : 1;
+    const int mdep = (g_maxBounceOverride >= 1) ? g_maxBounceOverride : 8;
+    const size_t needLocal = cudaMegakernelLocalBytes(m, mdep, hero);
+    // Memory this process already holds, which `freeB` below is short of and which must not
+    // be blamed on another program: the local reservation its context keeps from whatever
+    // kernel of ours ran before (cudaLocalReservedBytes, measured), and what OIDN may hold
+    // on the same GPU. A launch that fits in the reservation reuses it and needs none of
+    // `needLocal` anew; one that does not is counted as needing all of it, since nothing
+    // says the driver grows the old block in place rather than holding both while it swaps.
+    const size_t held   = cudaLocalReservedBytes();
+    const size_t reused = (held >= needLocal) ? needLocal : 0;
+    const size_t ours   = held + oidnrt::deviceMemoryAllowance() + heldScene;
+    size_t freeB = 0, totalB = 0;
+    if (!cudaMemInfo(&freeB, &totalB)) return true;
+    // FTRACE_VRAMFREE=<GB> (a check's knob): the card reads as having no more than that free, so
+    // every mode's fallback can be exercised without another program filling it.
+    if (const char* e = std::getenv("FTRACE_VRAMFREE"))
+        freeB = std::min(freeB, (size_t)(std::max(0.0, std::atof(e)) * 1024.0 * 1024.0 * 1024.0));
+    // Headroom on top of the local-memory reservation and the buffers for the scene upload and
+    // the driver's own context: 256 MB covers them with room to spare.
+    const size_t needAll = needLocal - reused + buffers + (size_t)256 * 1024 * 1024;
+    const double toGB = 1.0 / (1024.0 * 1024.0 * 1024.0);
+    // Always say what the card looks like. This one line is what turns "the render
+    // is mysteriously hung" into "something else is holding 20 of my 24 GB", which
+    // is otherwise only visible from outside the process (nvidia-smi reports it as
+    // 100% busy either way, and per-process VRAM is N/A under WDDM).
+    std::printf("[vram] %.2f GB free of %.2f GB on %s; mode-%c kernel wants "
+                "%.2f GB local (%.2f GB of it already reserved by this process) + "
+                "%.2f GB film/scene/queues/context\n",
+                freeB * toGB, totalB * toGB, cudaDeviceName(), m,
+                needLocal * toGB, reused * toGB, (needAll - (needLocal - reused)) * toGB);
+    // Fall back on either signal: the explicit budget, or a card so nearly full
+    // that whatever we failed to account for will certainly not fit.
+    //
+    // CAVEAT, measured: this test is WEAK on Windows. Under WDDM the driver
+    // overcommits and pages rather than failing, so cudaMemGetInfo happily reports
+    // gigabytes "free" on a card nvidia-smi shows at 96% used — in the case that
+    // motivated all of this it did not trip at all. Treat a trip as conclusive, but
+    // NOT tripping as meaningless. The reliable detector is the runtime one:
+    // gpuSppChunks' stall watchdog, which measures the chunk that is actually in
+    // flight and can therefore see contention this query is blind to.
+    // Both tests count what is ours as ours: `needAll` leaves out what is reused, and
+    // the near-full test, which is about OTHER programs, adds all of it back.
+    const bool tooTight = freeB + heldScene < needAll;
+    const bool nearFull = totalB && (double)(freeB + ours) < 0.12 * (double)totalB;
+    if (tooTight || nearFull) {
+        std::fprintf(stderr,
+            "[device] NOT ENOUGH FREE VRAM for the GPU path (%s): the mode-%c "
+            "megakernel reserves %.2f GB of per-thread local memory (%.2f GB of it "
+            "already this process's, +%.2f GB film/scene/queues/context) but only %.2f GB of "
+            "%.2f GB is free on %s.\n"
+            "[device] Some other process on this machine is holding the card. Running "
+            "on the GPU anyway would spill that local memory to host RAM over PCIe and "
+            "render 100-1000x slower at 100%% reported GPU load, with -interval, -time "
+            "and -stop all inert. Using the CPU instead (-device gpu forces the GPU).\n",
+            tooTight ? "over budget" : "card is >88% full",
+            m, needLocal * toGB, reused * toGB,
+            (needAll - (needLocal - reused)) * toGB,
+            freeB * toGB, totalB * toGB, cudaDeviceName());
+        if (!forced) return false;        // `auto`: fall back, which is the whole point
+        std::fprintf(stderr, "[device] -device gpu given explicitly; proceeding "
+                             "anyway. Expect the render to appear hung.\n");
+    }
+    return true;
+}
+#endif
+
 static int runRender(const Scene& scene, const Camera& cam, char mode,
                      long long N, int res, int resY, long long spp, int nThreads,
                      const char* device, bool diffraction,
@@ -20546,35 +20636,10 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
     }
 
 #ifdef HAVE_CUDA
-    // ---- device-memory preflight (see cudaMegakernelLocalBytes) ----------------------
-    // Having decided WHICH device can run this scene, check whether the card can still
-    // afford to. Every megakernel here launches a fixed 2048x128 grid, and its per-thread
-    // local storage is real VRAM measured in gigabytes; if the card is already full because
-    // some UNRELATED process on the machine took it, the driver does not fail the launch,
-    // it backs the spill with host memory over PCIe. The render then crawls by 2-3 orders
-    // of magnitude at 100% reported GPU utilisation, and because every poll of `-interval`,
-    // `-time` and `-stop` happens between chunks, none of them ever gets a turn: the render
-    // looks hung, writes nothing, and cannot be stopped except by killing it.
-    //
-    // That is a miserable thing to debug from the outside (it cost a full session once), and
-    // the CPU path — merely slow — is strictly better than a GPU path that is 1000x slow.
-    // So: measure, and say exactly what is wrong and who to blame.
-    // Whether the card can afford mode `m`'s kernels: false, the reason printed, where `-device auto`
-    // should fall back to the CPU. Modes S and U resolve their device in their own dispatch below and
-    // ask there (their sessions' kernels: cudaMegakernelLocalBytes('S'), ('U')).
+    // Whether the card can afford mode `m`'s kernels and this render's films (vramPreflight). Modes S
+    // and U resolve their device in their own dispatch below and ask there.
     const auto vramAffords = [&](char m) -> bool {
-        const int hero = (m == 'D' || m == 'J' || m == 'U') ? g_heroC : 1;
-        const int mdep = (g_maxBounceOverride >= 1) ? g_maxBounceOverride : 8;
-        size_t needLocal = cudaMegakernelLocalBytes(m, mdep, hero);
-        // Memory this process already holds, which `freeB` below is short of and which must not
-        // be blamed on another program: the local reservation its context keeps from whatever
-        // kernel of ours ran before (cudaLocalReservedBytes, measured), and what OIDN may hold
-        // on the same GPU. A launch that fits in the reservation reuses it and needs none of
-        // `needLocal` anew; one that does not is counted as needing all of it, since nothing
-        // says the driver grows the old block in place rather than holding both while it swaps.
-        const size_t held   = cudaLocalReservedBytes();
-        const size_t reused = (held >= needLocal) ? needLocal : 0;
-        // The batch's device copy of the scene (BatchCache::sceneHold) is ours too. A mode-D/J
+        // The batch's device copy of the scene (BatchCache::sceneHold) is ours. A mode-D/J
         // render reuses it, so what it takes from the card is not missing from this render; any
         // other mode uploads its own scene, so the copy goes first rather than sit beside it.
         size_t heldScene = 0;
@@ -20584,65 +20649,16 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
             else
                 batch->releaseHold();
         }
-        const size_t ours   = held + oidnrt::deviceMemoryAllowance() + heldScene;
-        size_t freeB = 0, totalB = 0;
-        if (cudaMemInfo(&freeB, &totalB)) {
-            // Headroom on top of the local-memory reservation for the scene upload, the
-            // film buffers and the driver's own context. The film pair is known exactly
-            // (two double3 images); 256 MB covers the rest with room to spare.
-            // A blurred forward render of a moving camera: each thread's posed copy of it.
-            const size_t film   = (size_t)res * resY * 3 * sizeof(double) * 2 +
-                                  ((gpuForwardMode && cam.seesMotion(scene) && cam.moves())
-                                       ? cudaForwardPosedCameraBytes(scene, wavefront, g_heroC, N) : 0);
-            // Mode J's beam queue, allocated beside the kernel once the render starts.
-            const size_t queues =
-                (m == 'J' && jBeamsChoice().rule != JBeams::Off && !scene.media.empty())
-                    ? cudaModeJBeamQueueBytes() : 0;
-            const size_t needAll = needLocal - reused + film + queues + (size_t)256 * 1024 * 1024;
-            const double toGB = 1.0 / (1024.0 * 1024.0 * 1024.0);
-            // Always say what the card looks like. This one line is what turns "the render
-            // is mysteriously hung" into "something else is holding 20 of my 24 GB", which
-            // is otherwise only visible from outside the process (nvidia-smi reports it as
-            // 100% busy either way, and per-process VRAM is N/A under WDDM).
-            std::printf("[vram] %.2f GB free of %.2f GB on %s; mode-%c kernel wants "
-                        "%.2f GB local (%.2f GB of it already reserved by this process) + "
-                        "%.2f GB film/scene/queues/context\n",
-                        freeB * toGB, totalB * toGB, cudaDeviceName(), m,
-                        needLocal * toGB, reused * toGB, (needAll - (needLocal - reused)) * toGB);
-            // Fall back on either signal: the explicit budget, or a card so nearly full
-            // that whatever we failed to account for will certainly not fit.
-            //
-            // CAVEAT, measured: this test is WEAK on Windows. Under WDDM the driver
-            // overcommits and pages rather than failing, so cudaMemGetInfo happily reports
-            // gigabytes "free" on a card nvidia-smi shows at 96% used — in the case that
-            // motivated all of this it did not trip at all. Treat a trip as conclusive, but
-            // NOT tripping as meaningless. The reliable detector is the runtime one:
-            // gpuSppChunks' stall watchdog, which measures the chunk that is actually in
-            // flight and can therefore see contention this query is blind to.
-            // Both tests count what is ours as ours: `needAll` leaves out what is reused, and
-            // the near-full test, which is about OTHER programs, adds all of it back.
-            const bool tooTight = freeB + heldScene < needAll;
-            const bool nearFull = totalB && (double)(freeB + ours) < 0.12 * (double)totalB;
-            if (tooTight || nearFull) {
-                std::fprintf(stderr,
-                    "[device] NOT ENOUGH FREE VRAM for the GPU path (%s): the mode-%c "
-                    "megakernel reserves %.2f GB of per-thread local memory (%.2f GB of it "
-                    "already this process's, +%.2f GB film/scene/queues/context) but only %.2f GB of "
-                    "%.2f GB is free on %s.\n"
-                    "[device] Some other process on this machine is holding the card. Running "
-                    "on the GPU anyway would spill that local memory to host RAM over PCIe and "
-                    "render 100-1000x slower at 100%% reported GPU load, with -interval, -time "
-                    "and -stop all inert. Using the CPU instead (-device gpu forces the GPU).\n",
-                    tooTight ? "over budget" : "card is >88% full",
-                    m, needLocal * toGB, reused * toGB,
-                    (needAll - (needLocal - reused)) * toGB,
-                    freeB * toGB, totalB * toGB, cudaDeviceName());
-                if (!wantGpu) return false;        // `auto`: fall back, which is the whole point
-                std::fprintf(stderr, "[device] -device gpu given explicitly; proceeding "
-                                     "anyway. Expect the render to appear hung.\n");
-            }
-        }
-        return true;
+        // The film pair (two double3 images), and a blurred forward render of a moving camera's
+        // posed copy of it, one a thread.
+        const size_t film   = (size_t)res * resY * 3 * sizeof(double) * 2 +
+                              ((gpuForwardMode && cam.seesMotion(scene) && cam.moves())
+                                   ? cudaForwardPosedCameraBytes(scene, wavefront, g_heroC, N) : 0);
+        // Mode J's beam queue, allocated beside the kernel once the render starts.
+        const size_t queues =
+            (m == 'J' && jBeamsChoice().rule != JBeams::Off && !scene.media.empty())
+                ? cudaModeJBeamQueueBytes() : 0;
+        return vramPreflight(m, film + queues, heldScene, wantGpu);
     };
     if (useGpu && !vramAffords(mode)) useGpu = false;
 #endif
@@ -29462,6 +29478,21 @@ static int run(int argc, char** argv) {
 #else
     const bool meterGpu = false;
 #endif
+    // Whether mode M may take the device: asked for, the scene within the device's photon map, and
+    // the card affording its kernels beside the largest mode-M camera's films (renderPhotonMapShared-
+    // Cuda holds one camera's at a time: the film and hit map, and the chunk's scratch pair, 64 B a
+    // pixel). Asked once, here, and read by every site below that routes a mode-M camera to the
+    // device -- the meter, the budget and blur tests, the shared path itself -- so that sites which
+    // mirror each other cannot disagree.
+    bool mGpuOk = false;
+#ifdef HAVE_CUDA
+    if (meterGpu && cudaPhotonMapSupported(scene)) {
+        size_t mFilm = 0;
+        for (const RenderCam& rc : toRender)
+            if (rc.mode == 'M') mFilm = std::max(mFilm, (size_t)rc.res * rc.resY * 64);
+        mGpuOk = mFilm > 0 && vramPreflight('M', mFilm, 0, !std::strcmp(device, "gpu"));
+    }
+#endif
     auto meterAnchor = [&](const MeterCam& mc) -> double {
         const int W = mc.res, H = mc.resY;
         // Reduced budgets: enough coverage for a clean p99 without paying for a full render.
@@ -29626,7 +29657,7 @@ static int run(int argc, char** argv) {
         // fallback here would meter the identical image far more slowly. What the meter must
         // match is the RENDER, and it does.
         const bool meterBeamsGpu = g_beamGather && !scene.media.empty();
-        if (meterGpu && cudaPhotonMapSupported(scene)) {
+        if (mGpuOk) {
                 volCacheHostGather() = true;    // 0.310.0: the device gather marches the cache too
             bool allM = true, allPinhole = true;
             for (const auto& mc : cams) {
@@ -29813,9 +29844,8 @@ static int run(int argc, char** argv) {
     // whatever the group.)
     bool gpuBlurM = false;
 #ifdef HAVE_CUDA
-    gpuBlurM = g_pmapLoad.empty() && g_pmapSave.empty() &&
-               (!std::strcmp(device, "gpu") || !std::strcmp(device, "auto")) &&
-               cudaAvailable() && cudaPhotonMapSupported(scene) && !cudaBlurUnsupported(scene, Camera{}, 'M');
+    gpuBlurM = g_pmapLoad.empty() && g_pmapSave.empty() && mGpuOk &&
+               !cudaBlurUnsupported(scene, Camera{}, 'M');
 #endif
     bool budgetedGpuM = false;
 #ifdef HAVE_CUDA
@@ -29823,9 +29853,7 @@ static int run(int argc, char** argv) {
     // moving scene the loop sets it aside (each epoch is one time in the shutter).
     budgetedGpuM = (timeBudgetSec > 0.0 || runForever || noiseTarget > 0.0) &&
                    mModeCams == 1 && (!g_beamFreeze || mBlurMoving) &&
-                   g_pmapLoad.empty() && g_pmapSave.empty() &&
-                   (!std::strcmp(device, "gpu") || !std::strcmp(device, "auto")) &&
-                   cudaAvailable() && cudaPhotonMapSupported(scene);
+                   g_pmapLoad.empty() && g_pmapSave.empty() && mGpuOk;
     if (budgetedGpuM)
         for (const RenderCam& rc : toRender)
             if (rc.mode == 'M' && (rc.cam.hasLens() || (rc.cam.seesMotion(scene) && !gpuBlurM)))
@@ -29888,8 +29916,7 @@ static int run(int argc, char** argv) {
         }
     }
 #ifdef HAVE_CUDA
-    if (mBlurApart && (!std::strcmp(device, "gpu") || !std::strcmp(device, "auto")) &&
-        cudaAvailable() && cudaPhotonMapSupported(scene)) {
+    if (mBlurApart && mGpuOk) {
         // The device renders a moving scene's blur in mode M as epochs of its refresh loop, each
         // map at one time, each camera with maps of its own.
         const char* blurWhy = cudaBlurUnsupported(scene, Camera{}, 'M');
@@ -29939,8 +29966,7 @@ static int run(int argc, char** argv) {
     // uses when it cannot honour a flag on the device.
     if (mModeBudgeted) {
 #ifdef HAVE_CUDA
-        if ((!std::strcmp(device, "gpu") || !std::strcmp(device, "auto")) &&
-            cudaAvailable() && cudaPhotonMapSupported(scene))
+        if (mGpuOk)
             std::printf("[camera] NOTE: this budgeted mode-M render is on the single-camera "
                         "progressive driver, which is CPU-only, so it will NOT use %s. "
                         "-time, -forever and -noise DO run on the device now (0.295.0); "
@@ -29981,9 +30007,7 @@ static int run(int argc, char** argv) {
         bool gpuRoute = false;
 #ifdef HAVE_CUDA
         // Mirrors runSharedPhotonMap's own gate exactly; if that changes, this must too.
-        gpuRoute = (!std::strcmp(device, "gpu") || !std::strcmp(device, "auto")) &&
-                   !toRender[groupM[0]].cam.hasLens() &&
-                   cudaAvailable() && cudaPhotonMapSupported(scene);
+        gpuRoute = mGpuOk && !toRender[groupM[0]].cam.hasLens();
 #endif
         if (!gpuRoute) { restIdx.push_back(groupM[0]); groupM.clear(); }
     }
@@ -30465,8 +30489,7 @@ static int run(int argc, char** argv) {
             // the per-medium `grin()` skip). Falling back would therefore buy a much slower
             // render of the *identical* image, which is a worse answer, not a safer one. The
             // user is told what is actually happening by warnBeamsGrinMedia() instead.
-            if ((wantGpu || wantAuto) && allPinhole && !blurWhy &&
-                cudaAvailable() && cudaPhotonMapSupported(scene)) {
+            if (mGpuOk && allPinhole && !blurWhy) {
                 volCacheHostGather() = true;    // 0.310.0: the device gather marches the cache too
                 g_windowBackend = backendLabel(true, nThreads);   // the title names the card
                 std::vector<Camera> cams; std::vector<int> rxs, rys;

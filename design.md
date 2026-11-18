@@ -2802,12 +2802,19 @@ needs none of its local memory anew; one that does not is charged all of it, sin
 the driver grows the old block in place. The near-full test, which is about *other* programs,
 adds back everything that is ours (the reservation and OIDN's memory cap).
 
-**Which renders it covers.** The preflight is a function of the mode (`vramAffords` in runRender).
-The shared device decision calls it for the modes it resolves; modes U and S resolve their device
-in their own dispatch and call it there before their sessions start (0.450.6, 0.450.7), their
-kernels' most read by `cudaMegakernelLocalBytes('U')` (the session's light, camera and merge
-kernels) and `('S')` (the photon walk, the visible points and the gather). Mode M's GPU decisions,
-a dozen sites in run(), do not ask it yet (VRAM-PREFLIGHT-MS); its entry exists.
+**Which renders it covers.** The preflight is a free function of the mode, the render's own device
+buffers and the batch's held scene (`vramPreflight`); runRender's `vramAffords` supplies them for
+its frame. The shared device decision calls it for the modes it resolves; modes U and S resolve
+their device in their own dispatch and call it there before their sessions start (0.450.6,
+0.450.7), their kernels' most read by `cudaMegakernelLocalBytes('U')` (the session's light, camera
+and merge kernels) and `('S')` (the photon walk, the visible points and the gather). Mode M, which
+never reaches runRender on the device, asks once in run() for the largest mode-M camera's films
+(`mGpuOk`, 0.450.8: the device holds one camera's at a time, 64 B a pixel), and every site that
+routes a mode-M camera to the device reads that one answer — the batched meter, the budget and
+blur tests, the notes that say the device was lost, and the shared path — so the sites that
+mirror each other cannot disagree. `FTRACE_VRAMFREE=<GB>` caps the free memory the preflight
+reads, and `tools/check_vram_preflight.py` uses it to require of every mode (R, B, D, J, S, U, M
+and a mode-M flight) that it asks, falls back under `-device auto`, and is forced under `gpu`.
 
 **The bug the gates caught.** Gate 1a — mode `J` == mode `D` bit-for-bit on a media-free scene —
 failed on the first build, and not for any reason involving merges: mode `J` was passing `heroC = 1`

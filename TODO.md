@@ -412,12 +412,13 @@ Then the rest of 4.2-4.6 in their order, 4.7's bookkeeping alongside whatever to
   G local requests, 26.6 -> 15.6 G FP64. Its four pattern readers forced inline, which made mode D
   1.75x faster too (0.450.4 had dGlossyF out of line at 168 registers).
 - [x] **REVIEW-0450B** (0.450.6) — the Opus (max) review of 0.450.1-0.450.4: mode U's VRAM preflight,
-  the beam seed's draws sequenced, the checks' GPU and history fixes, DVertHitState 8 B, an empty
-  site skipped first; known-issues REVIEW-0450B.
-- [ ] **VRAM-PREFLIGHT-MS** — mode S asks the VRAM preflight since 0.450.7. GPU mode M resolves its
-  device in a dozen sites in run() (shared passes, flybys, the meter, the blurred epochs) and never
-  asks it: make the preflight a free function of its inputs and ask it where mode M decides (its
-  entry in cudaMegakernelLocalBytes exists), keeping the sites that mirror each other agreeing.
+  the beam seed's draws sequenced, the checks' GPU and history fixes, an empty site skipped first;
+  DVertHitState stays 16 B and three of Fable's camera-kernel edits were declined, each breaking the
+  device link (GPU-LINK-FRAGILITY); known-issues REVIEW-0450B.
+- [x] **VRAM-PREFLIGHT-MS** (0.450.7 mode S, 0.450.8 mode M) — the preflight is a free function
+  (`vramPreflight`: the mode, the render's device buffers, the batch's held scene). Mode M asks it
+  once in run() for its largest camera's films (`mGpuOk`), and the seven sites that route a mode-M
+  camera to the device (the meter, the budget and blur tests, two notes, the shared path) read it.
 - [ ] **GPU-LINK-FRAGILITY** — an edit far from them can leave kBdptT (launch bounds: 168 registers)
   or kJSurfLightT (128) calling a helper ptxas compiled out of line without their cap, and the link
   refuses: 0.450.5's forced inlining (dGlossyF, dPatIn, dPatternScalarAt, dRecordRoughness) answered
