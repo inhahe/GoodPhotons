@@ -20559,10 +20559,13 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
     // That is a miserable thing to debug from the outside (it cost a full session once), and
     // the CPU path — merely slow — is strictly better than a GPU path that is 1000x slow.
     // So: measure, and say exactly what is wrong and who to blame.
-    if (useGpu) {
-        const int hero = (mode == 'D' || mode == 'J' || mode == 'U') ? g_heroC : 1;
+    // Whether the card can afford mode `m`'s kernels: false, the reason printed, where `-device auto`
+    // should fall back to the CPU. Mode U resolves its device in its own dispatch below and asks
+    // there (its session's kernels: cudaMegakernelLocalBytes('U')).
+    const auto vramAffords = [&](char m) -> bool {
+        const int hero = (m == 'D' || m == 'J' || m == 'U') ? g_heroC : 1;
         const int mdep = (g_maxBounceOverride >= 1) ? g_maxBounceOverride : 8;
-        size_t needLocal = cudaMegakernelLocalBytes(mode, mdep, hero);
+        size_t needLocal = cudaMegakernelLocalBytes(m, mdep, hero);
         // Memory this process already holds, which `freeB` below is short of and which must not
         // be blamed on another program: the local reservation its context keeps from whatever
         // kernel of ours ran before (cudaLocalReservedBytes, measured), and what OIDN may hold
@@ -20576,7 +20579,7 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
         // other mode uploads its own scene, so the copy goes first rather than sit beside it.
         size_t heldScene = 0;
         if (batch) {
-            if (mode == 'D' || mode == 'J')
+            if (m == 'D' || m == 'J')
                 heldScene = cudaSceneHoldFits(batch->held, scene) ? batch->heldBytes() : 0;
             else
                 batch->releaseHold();
@@ -20593,7 +20596,7 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
                                        ? cudaForwardPosedCameraBytes(scene, wavefront, g_heroC, N) : 0);
             // Mode J's beam queue, allocated beside the kernel once the render starts.
             const size_t queues =
-                (mode == 'J' && jBeamsChoice().rule != JBeams::Off && !scene.media.empty())
+                (m == 'J' && jBeamsChoice().rule != JBeams::Off && !scene.media.empty())
                     ? cudaModeJBeamQueueBytes() : 0;
             const size_t needAll = needLocal - reused + film + queues + (size_t)256 * 1024 * 1024;
             const double toGB = 1.0 / (1024.0 * 1024.0 * 1024.0);
@@ -20604,7 +20607,7 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
             std::printf("[vram] %.2f GB free of %.2f GB on %s; mode-%c kernel wants "
                         "%.2f GB local (%.2f GB of it already reserved by this process) + "
                         "%.2f GB film/scene/queues/context\n",
-                        freeB * toGB, totalB * toGB, cudaDeviceName(), mode,
+                        freeB * toGB, totalB * toGB, cudaDeviceName(), m,
                         needLocal * toGB, reused * toGB, (needAll - (needLocal - reused)) * toGB);
             // Fall back on either signal: the explicit budget, or a card so nearly full
             // that whatever we failed to account for will certainly not fit.
@@ -20631,15 +20634,17 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
                     "render 100-1000x slower at 100%% reported GPU load, with -interval, -time "
                     "and -stop all inert. Using the CPU instead (-device gpu forces the GPU).\n",
                     tooTight ? "over budget" : "card is >88% full",
-                    mode, needLocal * toGB, reused * toGB,
+                    m, needLocal * toGB, reused * toGB,
                     (needAll - (needLocal - reused)) * toGB,
                     freeB * toGB, totalB * toGB, cudaDeviceName());
-                if (!wantGpu) useGpu = false;      // `auto`: fall back, which is the whole point
-                else std::fprintf(stderr, "[device] -device gpu given explicitly; proceeding "
-                                          "anyway. Expect the render to appear hung.\n");
+                if (!wantGpu) return false;        // `auto`: fall back, which is the whole point
+                std::fprintf(stderr, "[device] -device gpu given explicitly; proceeding "
+                                     "anyway. Expect the render to appear hung.\n");
             }
         }
-    }
+        return true;
+    };
+    if (useGpu && !vramAffords(mode)) useGpu = false;
 #endif
 
     // Now that the device is resolved, tell the title bar which one won. This is the single
@@ -22546,7 +22551,7 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
             const bool wantAuto = !std::strcmp(device, "auto");
             if ((wantGpu || wantAuto) && !cam.hasLens() &&
                 (!cam.seesMotion(scene) || !cudaBlurUnsupported(scene, cam, 'U')) &&
-                cudaAvailable() && cudaVcmSupported(scene)) {
+                cudaAvailable() && cudaVcmSupported(scene) && vramAffords('U')) {
                 VcmSession* sess = vcmSessionBegin(scene, cam, res, resY, diffraction, maxEdges,
                                                    vcmHeroC);
                 if (sess) {

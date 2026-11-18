@@ -5,17 +5,24 @@ that names neither a pattern nor a texture is refused.
 
 FTSL.md: `film_thickness_map` takes `pattern:<name>` or `texture:<name>`, a 0..1 profile of
 `film_thickness`. A `layered` material's `coat { reflectance thinfilm ... }` bound only a texture
-there, and dropped a pattern without a word (LAYERED-FILM-PATTERN). It requires, in mode R on the
-CPU:
+there, and dropped a pattern without a word (LAYERED-FILM-PATTERN). It requires:
 
   * a layered ball whose coat is 600 nm thick under a map that is everywhere 0.25 renders as the
     same ball with a 150 nm coat and no map, every pixel within 2e-3 -- a mapped coat's body reads
     its escape (T-bar) from rows across the map's range, interpolated at 0.25, where the unmapped
-    one has a row at 150 nm exactly -- and not as the unmapped 600 nm one (some pixel 10 % off);
-  * a `thinfilm` material's mapped film byte for byte as its 150 nm one (it always bound a pattern,
-    and reads no rows: the control);
+    one has a row at 150 nm exactly -- and not as the unmapped 600 nm one (some pixel 10 % off): in
+    mode R on the CPU; and in mode R and mode D on the GPU (its connections read the film through
+    the rebuilt vertex, DVertHitState) within 1e-2, the interpolated rows parting the device's paths
+    a little more (4.3e-3 and 2.7e-3 measured), where a map left out reads 1.8 off. Each render is
+    of one seed, whose coat coins the equal reflectances keep in step;
+  * a `thinfilm` material's mapped film byte for byte as its 150 nm one in mode R on the CPU (it
+    always bound a pattern, and reads no rows: the control);
   * `film_thickness_map` and a mix's `weight_map` given a value that is neither a pattern nor a
-    texture (a misspelt `patern:`) stop the load, naming the key.
+    texture (a misspelt `patern:`) stop the load, naming the key, and so do `reflect_map`,
+    `transmit_map` and `emit_map`, which take a pattern only;
+  * a map that names another material's property holding no map (`film_thickness_map
+    other.film_thickness`, a constant there) loads, with no map: one that follows a source with
+    none is none.
 
 Exits 1 on any failure.
 """
@@ -67,7 +74,7 @@ def main():
     os.makedirs(out, exist_ok=True)
     ok = True
 
-    def run(tag, text):
+    def run(tag, text, mode="R", device="cpu"):
         path = os.path.join(out, tag + ".ftsl")
         with open(path, "w", encoding="utf-8", newline="") as f:
             f.write(text)
@@ -76,37 +83,55 @@ def main():
         for f in (png, pfm):
             if os.path.exists(f):
                 os.remove(f)
-        p = subprocess.run([exe, "-in", path, "-mode", "R", "-device", "cpu", "-spp", "4", "-seed", "1", "-hdr",
+        p = subprocess.run([exe, "-in", path, "-mode", mode, "-device", device, "-spp", "4", "-seed", "1", "-hdr",
                             "-no-meter", "-window-min", "-o", png], cwd=ROOT, capture_output=True, text=True, encoding="utf-8",
                            errors="replace")
-        img = read_pfm(pfm, top_down=True) if (p.returncode == 0 and os.path.exists(pfm)) else None
-        return p.returncode, p.stdout + p.stderr, img
+        log = p.stdout + p.stderr
+        ran = p.returncode == 0 and os.path.exists(pfm) and (device == "cpu" or "-> GPU" in log)
+        return p.returncode, log, (read_pfm(pfm, top_down=True) if ran else None)
 
-    for kind, make, tol in (("layered", layered, 2e-3), ("thinfilm", thinfilm, 0.0)):
-        _, _, mapped = run(kind + "_mapped", scene(make(600, "pattern:quarter")))
-        _, _, thin = run(kind + "_150", scene(make(150)))
-        _, _, thick = run(kind + "_600", scene(make(600)))
+    for kind, make, tol, mode, device in (("layered", layered, 2e-3, "R", "cpu"), ("layered", layered, 1e-2, "R", "gpu"),
+                                          ("layered", layered, 1e-2, "D", "gpu"), ("thinfilm", thinfilm, 0.0, "R", "cpu")):
+        tag = "%s_%s_%s" % (kind, mode, device)
+        _, _, mapped = run(tag + "_mapped", scene(make(600, "pattern:quarter")), mode, device)
+        _, _, thin = run(tag + "_150", scene(make(150)), mode, device)
+        _, _, thick = run(tag + "_600", scene(make(600)), mode, device)
         if mapped is None or thin is None or thick is None:
             ok = False
-            print("FAIL %s: a render failed" % kind, flush=True)
+            print("FAIL %s, mode %s on the %s: a render failed or left the device" % (kind, mode, device.upper()),
+                  flush=True)
             continue
         r150, _ = image_diff(mapped, thin)
         r600, _ = image_diff(mapped, thick)
         good = r150 <= tol and r600 > 0.1
         ok &= good
-        print("%-4s %s: a 600 nm film mapped to 0.25 renders as a 150 nm one   %.2g of the pixel off it "
-              "(%.2g off the unmapped 600 nm)" % ("ok" if good else "FAIL", kind, r150, r600), flush=True)
+        print("%-4s %s, mode %s on the %s: a 600 nm film mapped to 0.25 renders as a 150 nm one   %.2g of the "
+              "pixel off it (%.2g off the unmapped 600 nm)" % ("ok" if good else "FAIL", kind, mode, device.upper(),
+                                                              r150, r600), flush=True)
 
-    bad = [("film_thickness_map", scene(layered(600, "patern:quarter"))),
-           ("film_thickness_map", scene(thinfilm(600, "patern:quarter"))),
+    bad = [("film_thickness_map", scene(layered(600, "patern:quarter")), True),
+           ("film_thickness_map", scene(thinfilm(600, "patern:quarter")), True),
            ("weight_map", scene('material "film" { type mix  layer "base" 0.5  layer "white" 0.5'
-                                '  weight_map patern:quarter }'))]
-    for i, (key, text) in enumerate(bad):
+                                '  weight_map patern:quarter }'), True),
+           ("reflect_map", scene('material "film" { type diffuse reflect 0.6  reflect_map patern:quarter }'), False),
+           ("transmit_map", scene('material "film" { type translucent reflect 0.3  transmit 0.4'
+                                  '  transmit_map patern:quarter }'), False),
+           ("emit_map", scene('material "film" { type diffuse reflect 0.1  emit blackbody 5200'
+                              '  emit_map patern:quarter }'), False)]
+    for i, (key, text, tex) in enumerate(bad):
         rc, log, _ = run("bad_%d" % i, text)
-        good = rc != 0 and key in log and "pattern:<name> or texture:<name>" in log
+        says = "pattern:<name> or texture:<name>" if tex else "`%s` takes pattern:<name>" % key
+        good = rc != 0 and key in log and says in log
         ok &= good
         print("%-4s `%s patern:quarter` stops the load, naming the key%s"
               % ("ok" if good else "FAIL", key, "" if good else " (exit %d)" % rc), flush=True)
+    other = 'material "other" { type thinfilm  ior 1.5  film_ior 1.3  film_thickness 150  substrate_k 2 }'
+    rc, log, img = run("propref", scene(layered(600, "other.film_thickness"), extra=other))
+    _, _, plain = run("propref_none", scene(layered(600), extra=other))
+    good = rc == 0 and img is not None and plain is not None and image_diff(img, plain)[0] == 0.0
+    ok &= good
+    print("%-4s a film map naming a constant property loads, and renders as no map%s"
+          % ("ok" if good else "FAIL", "" if good else " (exit %d): %s" % (rc, log[-300:])), flush=True)
     print("PASS" if ok else "FAILED")
     return 0 if ok else 1
 

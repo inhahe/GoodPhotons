@@ -411,6 +411,24 @@ Then the rest of 4.2-4.6 in their order, 4.7's bookkeeping alongside whatever to
   wavelength; byte for byte 0.450.4's images. 640x480 bowl: gather 43.4 -> 15.7 s; Nsight 10.5 -> 1.5
   G local requests, 26.6 -> 15.6 G FP64. Its four pattern readers forced inline, which made mode D
   1.75x faster too (0.450.4 had dGlossyF out of line at 168 registers).
+- [x] **REVIEW-0450B** (0.450.6) — the Opus (max) review of 0.450.1-0.450.4: mode U's VRAM preflight,
+  the beam seed's draws sequenced, the checks' GPU and history fixes, DVertHitState 8 B, an empty
+  site skipped first; known-issues REVIEW-0450B.
+- [ ] **VRAM-PREFLIGHT-MS** — GPU modes M and S resolve their device in their own dispatch, as mode U
+  did, and never ask main.cpp's VRAM preflight (`vramAffords`): give their kernels an entry in
+  cudaMegakernelLocalBytes and ask it before their sessions start.
+- [ ] **GPU-LINK-FRAGILITY** — an edit far from them can leave kBdptT (launch bounds: 168 registers)
+  or kJSurfLightT (128) calling a helper ptxas compiled out of line without their cap, and the link
+  refuses: 0.450.5's forced inlining (dGlossyF, dPatIn, dPatternScalarAt, dRecordRoughness) answered
+  one round; shrinking DVertHitState to 8 B (REVIEW-0450B) put dReflectPatMul (238) and
+  intersectImplicit (252) out uncapped, which neither more forcing, the merge kernels given bounds,
+  a merge path out of line nor `--split-compile` off cured. Three edits to mode U's camera kernel,
+  which kBdptT never calls (the coat's film read once a vertex, dVertFromLV taking the hit state, the
+  site passed to the merge sum), put dMatRoughness (252) and dReflectPatMul (238) out uncapped too,
+  launch bounds on mode U's kernels or not. 0.450.5 had dReflectPatMul and intersectImplicit out of
+  line capped at 128 (`cuobjdump -res-usage`). Find what ptxas caps an out-of-line function by, make
+  the heavy pattern readers' placement deliberate rather than the inliner's, and then land the
+  declined edits (known-issues REVIEW-0450B).
 - [ ] **VCM-GATHER-DIVERGENCE** — the gather keeps 13.7 of 32 lanes active (a lane's candidate refused
   at the distance, sidedness or band test idles while the others evaluate) at 244 registers, a
   sixth of the warps resident: gather the candidates that pass the cheap tests into a warp-wide

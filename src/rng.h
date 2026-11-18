@@ -18,6 +18,13 @@ struct Pcg32 {
         uint32_t rot = static_cast<uint32_t>(old >> 59u);
         return (xorshifted >> rot) | (xorshifted << ((~rot + 1u) & 31));
     }
+    // Two draws as one 64-bit word, the first the high half: in statements of their own, since
+    // the order an expression evaluates its operands in is the compiler's to choose. Device twin
+    // DRng::next64.
+    uint64_t next64() {
+        const uint64_t hi = next();
+        return (hi << 32) | next();
+    }
     // Uniform double in [0,1).
     double uniform() { return (next() >> 8) * (1.0 / 16777216.0); }
     // Uniform double in the OPEN interval (0,1) — for inverse-CDF draws whose transform

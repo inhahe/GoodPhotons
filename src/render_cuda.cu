@@ -14837,8 +14837,10 @@ __global__ void kTrace(DScene sc, DCamSet cs, double* energy,
         // stream so it is unique per photon/thread, and drawn from nowhere else, so non-beam
         // renders are unchanged and the surface photon map is independent of the beam rate.
         DRng crng;
-        if (cs.beamsOn()) crng.seed(((unsigned long long)rng.next() << 32) ^ rng.next(),
-                                    ((unsigned long long)rng.next() << 32) ^ rng.next());
+        if (cs.beamsOn()) {
+            const unsigned long long seq = rng.next64();   // sequenced: DRng::next64
+            crng.seed(seq, rng.next64());
+        }
         // How many times this photon has scattered inside a beam-carried medium, so the
         // -beams-order cap can retire multiple scattering mid-path (host twin: `beamScatters`
         // in Renderer::tracePhoton).
@@ -24505,9 +24507,10 @@ __global__ void kVcmLightT(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx,
 // ran at single-lane speed. kVcmCameraT therefore queues the site (DVcmMergeReq), and after the
 // camera wave kVcmMergeGather gathers it with a whole warp, its vertices across the lanes, and adds
 // it to the accumulator by atomics: the same terms as the inline merge's, summed in another order.
-// A site the full queue turns away is merged inline and counted.
+// The camera kernel merges where it is a site with few light vertices (inlineMax), and one the full
+// queue turns away, which it counts (`overflow`); a site with none it skips.
 struct DVcmMergeReq {
-    DVertex vt;            // the camera vertex merged at (dVertFromHit; its coat through dVertHit)
+    DVertex vt;            // the camera vertex merged at (dVertFromHit), its lobe's (DMergeLobe)
     DVec3   wo;            // toward the camera walk's previous vertex
     double  dVCM, dVM;     // the camera walk's MIS partials on arrival there
     double  f;             // the site's scale: its throughput (the VCM-SPEC carrier's) * vmNorm
@@ -24520,7 +24523,7 @@ struct DVcmMergeReq {
 struct DVcmMergeQueue {
     DVcmMergeReq* reqs; int* nReqs; int cap;   // null reqs: merge inline
     DJSpec* spec;          // per slot when the carrier is on (c_jSpecOn), else null
-    int*    overflow;      // sites merged inline: the queue full, or no `spec` for a carrier
+    int*    overflow;      // sites turned away and merged inline: the queue full, or no `spec` for a carrier
     // The sites that asked for the queue, a count per kVcmProfBlock pixels over the pass, by which
     // vcmSessionPass sizes the next pass's waves.
     int*    profile;
@@ -25170,43 +25173,46 @@ __global__ void kVcmCameraT(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx
                 // queued for kVcmMergeGather (DVcmMergeQueue), or here where the site holds few
                 // vertices (inlineMax) or the queue is full.
                 if (ctx.vmNorm > 0.0 && grid.nLV > 0 && dVcmMergeAt(*mp, h.fiberRadius)) {   // not AT a curve (vcm.h)
-                    DJSpec js;
-                    if (jOn) jrun.snap(js);
-                    const DJSpec* jsp = (jOn && js.on()) ? &js : nullptr;   // the carrier arriving here (VCM-SPEC)
-                    const double f = (jsp ? js.beta(beta) : beta) * ctx.vmNorm;
-                    // The footprint probe's stream, off the walk's (dSurfFootprint): one draw whether
-                    // the site is queued or merged here, so the two agree.
+                    // The footprint probe's stream, off the walk's (dSurfFootprint): one draw at
+                    // every site, so the stream past it is the same whether the site is queued,
+                    // merged here or empty.
                     unsigned long long gaSeed = 0;
                     if (sc.gatherArea) gaSeed = rng.next64();
-                    // Its coat's film, read here at the walk's hit, as NEE and the connections read it.
-                    const Real coatTh = dCoatThicknessAt(sc, *mp, h);
                     const int pop = DVcmSite(grid, vt.p).count(grid);   // the light vertices it weighs
-                    bool done = pop == 0;   // nothing to merge with
-                    // nReqs counts the sites turned away as well (they size the next wave), so past
-                    // 2^31 of them it wraps negative: slot >= 0. A carrier with no table to ride in
-                    // is turned away and counted, which tools/check_vcm_wavefront.py fails.
-                    if (mq.reqs && pop > mq.inlineMax) {
-                        atomicAdd(&mq.profile[i / kVcmProfBlock], 1);
-                        const int slot = (!jsp || mq.spec) ? atomicAdd(mq.nReqs, 1) : -1;
-                        if (slot >= 0 && slot < mq.cap) {
-                            DVcmMergeReq& rq = mq.reqs[slot];
-                            rq.vt = vt; rq.wo = wo; rq.dVCM = dVCM; rq.dVM = dVM; rq.f = f;
-                            rq.pix = i * 3; rq.gaSeed = gaSeed; rq.edges = edges; rq.flags = 0;
-                            rq.coatTh = coatTh;
-                            if (jsp) { mq.spec[slot] = js; rq.flags = 1; }
-                            done = true;
-                        } else {
-                            atomicAdd(mq.overflow, 1);
+                    if (pop > 0) {
+                        DJSpec js;
+                        if (jOn) jrun.snap(js);
+                        const DJSpec* jsp = (jOn && js.on()) ? &js : nullptr;   // the carrier arriving here (VCM-SPEC)
+                        const double f = (jsp ? js.beta(beta) : beta) * ctx.vmNorm;
+                        // Its coat's film, read here at the walk's hit, as NEE and the connections read it.
+                        const Real coatTh = dCoatThicknessAt(sc, *mp, h);
+                        bool queued = false;
+                        // nReqs counts the sites turned away as well (they size the next wave), so
+                        // past 2^31 of them it wraps negative: slot >= 0. A carrier with no table to
+                        // ride in is turned away and counted, which tools/check_vcm_wavefront.py fails.
+                        if (mq.reqs && pop > mq.inlineMax) {
+                            atomicAdd(&mq.profile[i / kVcmProfBlock], 1);
+                            const int slot = (!jsp || mq.spec) ? atomicAdd(mq.nReqs, 1) : -1;
+                            if (slot >= 0 && slot < mq.cap) {
+                                DVcmMergeReq& rq = mq.reqs[slot];
+                                rq.vt = vt; rq.wo = wo; rq.dVCM = dVCM; rq.dVM = dVM; rq.f = f;
+                                rq.pix = i * 3; rq.gaSeed = gaSeed; rq.edges = edges; rq.flags = 0;
+                                rq.coatTh = coatTh;
+                                if (jsp) { mq.spec[slot] = js; rq.flags = 1; }
+                                queued = true;
+                            } else {
+                                atomicAdd(mq.overflow, 1);
+                            }
                         }
-                    }
-                    if (!done) {
-                        const DMergeFootprint fp = dVertexMergeFootprint(sc, vt, (Real)ctx.radius);
-                        double mx = 0.0, my = 0.0, mz = 0.0;
-                        dVcmMergeSum<NS>(sc, ctx, grid, secStride, vt, coatTh, fp, wo, dVCM, dVM, edges, jsp,
-                                         0, 1, mx, my, mz);
-                        if (mx != 0.0 || my != 0.0 || mz != 0.0) {
-                            const double fa = f * (sc.gatherArea ? dSurfFootprint(sc, fp, gaSeed) : 1.0);
-                            rx += mx * fa; ry += my * fa; rz += mz * fa;
+                        if (!queued) {
+                            const DMergeFootprint fp = dVertexMergeFootprint(sc, vt, (Real)ctx.radius);
+                            double mx = 0.0, my = 0.0, mz = 0.0;
+                            dVcmMergeSum<NS>(sc, ctx, grid, secStride, vt, coatTh, fp, wo, dVCM, dVM, edges,
+                                             jsp, 0, 1, mx, my, mz);
+                            if (mx != 0.0 || my != 0.0 || mz != 0.0) {
+                                const double fa = f * (sc.gatherArea ? dSurfFootprint(sc, fp, gaSeed) : 1.0);
+                                rx += mx * fa; ry += my * fa; rz += mz * fa;
+                            }
                         }
                     }
                 }
@@ -28728,6 +28734,20 @@ struct ThrustArenaAlloc {
     void deallocate(char*, size_t) {}
 };
 
+// ensureDevCap where the device may refuse: false, the buffer released (p null, cap 0), where neither
+// the grown capacity nor `need` itself can be had.
+template <class T>
+static bool tryDevCap(T*& p, size_t& cap, size_t need) {
+    if (need <= cap) return true;
+    if (p) { cudaFree(p); p = nullptr; }
+    cap = 0;
+    for (size_t want : {std::max(need, cap + cap / 2), need}) {
+        if (cudaMalloc(&p, want * sizeof(T)) == cudaSuccess) { cap = want; return true; }
+        (void)cudaGetLastError();
+        p = nullptr;
+    }
+    return false;
+}
 // Grow-only device buffer: (re)allocates only when `need` exceeds the current capacity
 // (1.5x growth), so per-pass session buffers stop churning cudaMalloc/cudaFree.
 template <class T>
@@ -32304,12 +32324,11 @@ struct VcmSession {
     int*    d_cellStart = nullptr;      size_t cellStartCap = 0;  // entries (nCells+1)
     ThrustArena arena;                  // thrust temp storage (scan/sort/reduce)
     // The merges' queue (gpu::DVcmMergeQueue, VCM-WAVEFRONT; null reqs: merged inline; its two
-    // counters, sites asked for and sites merged inline, in one allocation at nReqs) and its profile (d_mqProfile, and the last
+    // counters, sites asked for and sites merged inline, in one allocation at nReqs) and its profile (mq.profile, and the last
     // pass's on the host: mqProfile, empty before the first pass has run), and how its waves went:
     // the last wave's sites a camera path (< 0 before the first), the fewest paths a wave holds
     // (the camera kernel's resident threads), and the totals vcmSessionEnd reports.
     gpu::DVcmMergeQueue mq{};
-    int*    d_mqProfile = nullptr;
     std::vector<int> mqProfile;
     cudaEvent_t mqEv[2] = {nullptr, nullptr};
     double  mqRate = -1.0;
@@ -32458,15 +32477,14 @@ VcmSession* vcmSessionBegin(const Scene& scene, const Camera& cam, int resX, int
         const void* camFn = (C > 1) ? (const void*)gpu::kVcmCameraT<BDPT_NSEC> : (const void*)gpu::kVcmCameraT<0>;
         const size_t local = cudaMegakernelLocalBytes('U', s->maxDepth, C);
         // The stacks are reserved at the kernels' first launch, after this, unless an earlier
-        // launch's reservation already holds them. And the passes grow the grid's cell table up to
-        // kVcmMaxCells (by half again at a time, ensureDevCap) and the thrust arena with its sort,
-        // through allocations that end the render if they fail: their worst stays free too.
+        // launch's reservation already holds them. And the passes grow the thrust arena with their
+        // sort, through allocations that end the render if they fail: its worst stays free too.
+        // (The grid's cell table coarsens where the memory is short: vcmSessionPass.)
         const size_t pending = (cudaLocalReservedBytes() >= local) ? 0 : local;
-        const size_t gridWorst = (size_t)(kVcmMaxCells + kVcmMaxCells / 2 + 1) * sizeof(int) +
-                                 nl * (size_t)s->vcmCap * 24;
+        const size_t sortWorst = nl * (size_t)s->vcmCap * 24;
         size_t freeB = 0, totalB = 0;
         if (cudaMemGetInfo(&freeB, &totalB) != cudaSuccess) { cudaGetLastError(); freeB = 0; }
-        const size_t room = (freeB > pending + gridWorst) ? freeB - pending - gridWorst : 0;
+        const size_t room = (freeB > pending + sortWorst) ? freeB - pending - sortWorst : 0;
         // A wave holds at least the camera kernel's resident paths (no fewer than its launch where the
         // runtime cannot say), so the queue holds at least what they may ask for -- a site at each of
         // their vertices -- where the memory allows, past kVcmReqCap.
@@ -32484,18 +32502,16 @@ VcmSession* vcmSessionBegin(const Scene& scene, const Camera& cam, int resX, int
             tryAlloc(&s->mq.reqs, (size_t)cap * sizeof(gpu::DVcmMergeReq)) &&
             (!g_jSpecHost || tryAlloc(&s->mq.spec, (size_t)cap * sizeof(gpu::DJSpec))) &&
             tryAlloc(&s->mq.nReqs, 2 * sizeof(int)) &&
-            tryAlloc(&s->d_mqProfile, nProf * sizeof(int))) {
+            tryAlloc(&s->mq.profile, nProf * sizeof(int))) {
             s->mq.cap = (int)cap;
             s->mq.overflow = s->mq.nReqs + 1;
-            s->mq.profile = s->d_mqProfile;
             s->mq.inlineMax = kVcmInlineMax;
             for (auto& e : s->mqEv) CUDA_CHECK(cudaEventCreate(&e));
             s->mqLeast = shrunk ? 256 : least;
         } else {
-            for (void* q : {(void*)s->mq.reqs, (void*)s->mq.spec, (void*)s->mq.nReqs, (void*)s->d_mqProfile})
+            for (void* q : {(void*)s->mq.reqs, (void*)s->mq.spec, (void*)s->mq.nReqs, (void*)s->mq.profile})
                 cudaFree(q);
             s->mq = gpu::DVcmMergeQueue{};
-            s->d_mqProfile = nullptr;
             std::printf("[gpu] no room on the device for mode U's merge queue (%.0f MB free beside "
                         "the light-vertex store): the merges are gathered inline -- slower, the "
                         "same estimator\n", room / 1048576.0);
@@ -32598,16 +32614,26 @@ void vcmSessionPass(VcmSession* s, double radius) {
         // pass. Past kVcmMaxCells (256 MB of ints, and int-indexed) the cells grow instead: the
         // camera's 3x3x3 lookup tests distance against the radius, not the cell, so a cell
         // bigger than the radius only adds candidates.
+        // So do they where the device will not hold the table (the merges' queue takes its share of
+        // the memory first): the pass renders, its merges weighing more candidates.
         long long nCells = 0;
-        for (int grow = 0; grow < 8; ++grow) {
+        for (int grow = 0;; ++grow) {
             gLo = DVec3(bb.mnx - cell * 0.5, bb.mny - cell * 0.5, bb.mnz - cell * 0.5);
             DVec3 ext(bb.mxx - gLo.x + cell * 0.5, bb.mxy - gLo.y + cell * 0.5, bb.mxz - gLo.z + cell * 0.5);
             gnx = std::max(1, (int)std::ceil(std::min((double)ext.x / cell, 2e6)));
             gny = std::max(1, (int)std::ceil(std::min((double)ext.y / cell, 2e6)));
             gnz = std::max(1, (int)std::ceil(std::min((double)ext.z / cell, 2e6)));
             nCells = (long long)gnx * gny * gnz;
-            if (nCells <= kVcmMaxCells) break;
-            cell *= std::cbrt((double)nCells / (double)kVcmMaxCells) * 1.01;
+            if (nCells > kVcmMaxCells && grow < 8) {
+                cell *= std::cbrt((double)nCells / (double)kVcmMaxCells) * 1.01;
+                continue;
+            }
+            if (tryDevCap(s->d_cellStart, s->cellStartCap, (size_t)nCells + 1)) break;
+            if (nCells <= 1) {
+                std::fprintf(stderr, "[mode U] no room on the GPU for the merges' grid\n");
+                std::exit(EXIT_FAILURE);
+            }
+            cell *= 1.26;   // half the cells
         }
         ensureDevCap(s->d_cellKey, s->cellKeyCap, nLV);
         ensureDevCap(s->d_order,   s->orderCap,   nLV);
@@ -32617,7 +32643,6 @@ void vcmSessionPass(VcmSession* s, double radius) {
         thrust::device_ptr<int> tKey(s->d_cellKey), tOrd(s->d_order);
         thrust::sequence(pol, tOrd, tOrd + nLV);
         thrust::stable_sort_by_key(pol, tKey, tKey + nLV, tOrd);
-        ensureDevCap(s->d_cellStart, s->cellStartCap, (size_t)nCells + 1);
         thrust::lower_bound(pol, tKey, tKey + nLV,
                             thrust::counting_iterator<int>(0),
                             thrust::counting_iterator<int>((int)(nCells + 1)),
@@ -32719,7 +32744,7 @@ void vcmSessionPass(VcmSession* s, double radius) {
             if (left - n < s->mqLeast) n = left;
             return p0 + n;
         };
-        CUDA_CHECK(cudaMemset(s->d_mqProfile, 0, nProf * sizeof(int)));
+        CUDA_CHECK(cudaMemset(s->mq.profile, 0, nProf * sizeof(int)));
         for (long long p0 = 0; p0 < (long long)np;) {
             const long long n = waveEnd(p0) - p0;
             CUDA_CHECK(cudaMemset(s->mq.nReqs, 0, 2 * sizeof(int)));
@@ -32752,7 +32777,7 @@ void vcmSessionPass(VcmSession* s, double radius) {
             p0 += n;
         }
         s->mqProfile.resize(nProf);
-        CUDA_CHECK(cudaMemcpy(s->mqProfile.data(), s->d_mqProfile, nProf * sizeof(int), cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpy(s->mqProfile.data(), s->mq.profile, nProf * sizeof(int), cudaMemcpyDeviceToHost));
     }
 
     s->passes += 1;
@@ -32785,7 +32810,7 @@ void vcmSessionEnd(VcmSession* s) {
     if (s->mq.reqs) cudaFree(s->mq.reqs);
     if (s->mq.spec) cudaFree(s->mq.spec);
     if (s->mq.nReqs) cudaFree(s->mq.nReqs);
-    if (s->d_mqProfile) cudaFree(s->d_mqProfile);
+    if (s->mq.profile) cudaFree(s->mq.profile);
     for (auto& e : s->mqEv) if (e) cudaEventDestroy(e);
     cudaFree(s->d_lvSlab); cudaFree(s->d_lvCount); cudaFree(s->d_splat); cudaFree(s->d_accum);
     cudaFree(s->d_lamBuf); cudaFree(s->d_invLam); cudaFree(s->d_pathBegin); cudaFree(s->d_pathEnd);

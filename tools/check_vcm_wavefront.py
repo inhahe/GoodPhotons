@@ -10,7 +10,7 @@ vertices, their weights, the footprint's probes and the pixel's terms are the in
 at most (ORDER_TOL). So it requires, against the inline merge's image of the same scene:
 
   - in scenes/_merge_glossy_bowl.ftsl at five times its merge radius (`-pmradius 0.05`, the case
-    that ran ten times slower than the CPU before the queue): every site through the queue (the
+    that ran 6.6 times slower than the CPU before the queue): every site through the queue (the
     run's merge line, none inline) and the inline merge's image; the inline run itself printing no
     merge line, i.e. bypassing the queue;
   - the same image with the queue shrunk to 32 requests (FTRACE_VCMWFCAP), which turns sites away
@@ -19,9 +19,8 @@ at most (ORDER_TOL). So it requires, against the inline merge's image of the sam
     FTRACE_WAVE_DEBUG's line a wave, every pass split into several waves, and no wave after the
     first pass turning a site away -- each is sized by the last pass's profile of its pixels;
   - the same of a frame whose top half is sky over a glossy floor (512 requests): a wave of sky
-    queues nothing, and the floor's waves after it must still hold their sites, every pass after the
-    first (0.450.0 sized a wave by the last wave's sites a path, so the floor's waves after the sky
-    turned most of their sites away);
+    queues nothing, and the floor's waves beside it must still hold their sites, every pass after
+    the first -- a wave sized by the wave before it would take the rest of the pass after the sky;
   - the bowl with a ball of ruby glass in it, seen through by the camera, at one wavelength a
     path (`-heroc 1`: the kernels' other instantiation; the bowl's runs take the default hero
     bundle, whose light vertices' secondary rows the merge reads): the walks behind the glass carry
@@ -44,9 +43,8 @@ from pfm import ORDER_TOL, image_diff, read_pfm  # noqa: E402
 
 LINE = re.compile(r"mode U merges: (\d+) sites gathered a warp each \(([\d.]+) a path\) "
                   r"in [\d.]+ s of GPU time, (\d+) inline")
-# (0.450.0 said "merged inline" for "turned away".)
 WAVE = re.compile(r"\[wave\] U pass (\d+) paths (\d+)\.\.(\d+) \(\d+\), (\d+) merge sites "
-                  r"\((\d+) (?:turned away|merged inline)\)")
+                  r"\((\d+) turned away\)")
 
 RUBY = """scene { units meters }
 material "rough" { type glossy reflect 0.7 roughness 1.2 }

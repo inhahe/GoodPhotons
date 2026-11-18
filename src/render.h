@@ -3841,8 +3841,10 @@ struct Renderer {
         // gated on beamGather && nCam>1 to keep every other mode bit-for-bit unchanged.
         const bool doBeamGather = beamGather && nCam > 1 && !forwardCatch && !scene.media.empty();
         Pcg32 crng;
-        if (doBeamGather) crng.seed(((uint64_t)rng.next() << 32) ^ rng.next(),
-                                    ((uint64_t)rng.next() << 32) ^ rng.next());
+        if (doBeamGather) {
+            const uint64_t seq = rng.next64();   // sequenced: Pcg32::next64
+            crng.seed(seq, rng.next64());
+        }
 
         // GRADIENT-INDEX (GRIN): if any medium carries an `ior` field, photons bend
         // through it via the shared Eikonal marcher (grin.h) — the same curved geometry

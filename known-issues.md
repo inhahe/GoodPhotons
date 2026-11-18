@@ -197,9 +197,57 @@ all along). And any `film_thickness_map` or `weight_map` value naming neither a 
 texture -- a misspelt `patern:` -- was dropped the same way. **Fixed in 0.450.2:** one binder
 (`bindScalarMap`) takes either and refuses anything else, naming the key, at every
 `film_thickness_map` and at `weight_map`. `tools/check_layered_film_map.py`: a 600 nm coat mapped
-to 0.25 renders as a 150 nm one within 1e-3 (its body's escape read off rows interpolated at 0.25;
+to 0.25 renders as a 150 nm one within 2e-3, 1.0e-3 measured (its body's escape read off rows interpolated at 0.25;
 on 0.450.1 it rendered as the unmapped 600 nm, 1.9 off), the `thinfilm` control byte for byte, and
 the three misspellings stop the load (on 0.450.1 they loaded).
+
+## DONE (2026-11-18, 0.450.6): REVIEW-0450B — what the Opus (max) and Fable (xhigh) reviews of 0.450.1-0.450.4 found
+
+`/code-review max` (Opus, 8 findings) and `/code-review xhigh` (Fable, 14) of 9297c3f..ee08dc1, one
+after the other in a worktree; five found by both. Each checked against the code; all held.
+**Fixed in 0.450.6:**
+
+* **Mode U's VRAM preflight never ran** (both; REVIEW-0450-FABLE's fix): main.cpp's preflight sits
+  under `useGpu`, which mode U never sets, since it resolves its device in its own dispatch. The
+  preflight is a function of the mode now (`vramAffords`), which the shared path calls as before and
+  mode U's dispatch calls before its session starts. GPU modes M and S skip it the same way:
+  VRAM-PREFLIGHT-MS (TODO).
+* **The beam photon's stream was still seeded by unsequenced draws** (Opus): `next64` on the device
+  and in its host twin (`Pcg32::next64` new), in statements of their own.
+* **check_vertex_hit_state did not require the GPU** (both): it requires `-> GPU` in each GPU
+  render's log. And it covered the rigid mover only (Fable): a panel a deformer slides takes the
+  deforming-triangle branch too.
+* **check_layered_film_map rendered on the CPU only**, its tolerance stated as 1e-3 where it holds
+  2e-3 (Opus): mode R and mode D render on the GPU too, within 1e-2 there (4.3e-3 and 2.7e-3
+  measured, where a map left out reads 1.8).
+* **The map binder refused a property reference to a constant** (Fable): `film_thickness_map
+  gold.film_thickness`, gold's a constant, loads as no map, as before 0.450.2. **And `reflect_map`,
+  `transmit_map` and `emit_map` still dropped a value naming no pattern** (Fable): the same binder,
+  pattern-only, refuses it.
+* **An empty merge site read its coat's film and snapshotted the carrier** before it was found
+  empty (Opus): both after the empty test now (the seed's draw stays before it).
+* **The profile's device pointer was kept twice** (Fable): `mq.profile` only.
+* **The queue's room was cut by the grid's absolute worst** (Fable), which on a small card left no
+  queue: the cell table coarsens where the device refuses it (`tryDevCap`), and only the sort's
+  scratch stays reserved.
+* **Stale words** (both): DVcmMergeReq's vertex comment, the queue's `overflow` (only the sites the
+  full queue turned away), a split doc comment (DVertex's), the REVIEW-0450 entry's "(open)",
+  check_vcm_wavefront's "ten times", and the checks' comments narrating history.
+
+**Not changed, three of Fable's in the camera kernel** -- NEE and every connection re-reading the
+coat's film the merge reads once, dVertFromLV leaving the hit state to its caller, an inline-merged
+site finding its cells twice. Each is right, and each left the device link refusing: with the three,
+ptxas compiled `dMatRoughness` (252 registers) and `dReflectPatMul` (238) out of line uncapped where
+kBdptT's launch bounds allow 168, though the edits are in mode U's kernel, which kBdptT never
+calls; giving mode U's kernels launch bounds did not help. GPU-LINK-FRAGILITY (TODO).
+
+**Not changed: DVertHitState stays 16 B** (both found the deform barycentrics duplicate the hit's own,
+which the vertex keeps for its vertex colour, so 8 B would do). The 8-B form, the barycentrics
+restored from `vb0q/vb1q`, left the device link refusing: ptxas compiled `dReflectPatMul` and
+`intersectImplicit` out of line uncapped (238, 252 registers) where kBdptT's launch bounds allow 168,
+in every variant tried -- forcing more inline, a merge path out of line, the merge kernels given
+bounds, `--split-compile` off (where ptxas refused it itself). 0.450.5's layout links; a bisection
+pinned it on the shrink alone. GPU-LINK-FRAGILITY (TODO) records what is known.
 
 ## DONE (2026-11-18, 0.450.4): GPU-DVERTEX-HIT-STATE — a GPU connection rebuilt its vertex's hit without the hit's time or cavity
 
@@ -271,7 +319,7 @@ code, all held. **Fixed in 0.450.1:**
   copy's matId, which reads cavity 0. The camera kernel reads the film at the walk's hit
   (`dCoatThicknessAt`) into the request, and a light vertex's factor is `dCoatEvalAt` with it --
   which also stops the per-vertex rebuild and re-read of the site's film. `dCoatEval` is the two.
-  The rebuilt hit's wider gap, every GPU connection's: GPU-DVERTEX-HIT-STATE (open).
+  The rebuilt hit's wider gap, every GPU connection's: GPU-DVERTEX-HIT-STATE (fixed in 0.450.4).
 * **A wave was sized by the wave before**, so a wave of sky sized the next to the rest of the pass
   and its floor turned most of its sites away, every pass. The camera kernel counts the sites asking
   for the queue a block of 256 pixels, and the last pass's counts split the next into waves of like
