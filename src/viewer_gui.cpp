@@ -1744,6 +1744,10 @@ struct MeshGpu {
     ID3D11BlendState*        blendNoColor = nullptr;   // colour writes off: a depth-only pre-pass (the groom
                                                        // tool's hidden-line grid outlines, 0.373.0)
     ID3D11SamplerState*      samp    = nullptr;
+    // A skin's own sampler, by its TexWrap (repeat, clamp, mirror) and TexFilter (nearest, bilinear),
+    // so a sidecar texture declared `wrap="clamp"` or `"mirror"` does not tile where a mesh's UVs run
+    // past [0,1], and a `nearest` one stays blocky, as a render samples them.
+    ID3D11SamplerState*      skinSamp[3][2] = {};
     bool                     pipeReady = false;
 
     // geometry (rebuilt only when the sidecar hands over a new tessellation)
@@ -1803,6 +1807,8 @@ struct MeshGpu {
         releaseGeom();
         releaseTargets();
         if (samp)    { samp->Release();    samp = nullptr; }
+        for (auto& row : skinSamp)
+            for (auto& sp : row) if (sp) { sp->Release(); sp = nullptr; }
         if (blend)   { blend->Release();   blend = nullptr; }
         if (blendNoColor) { blendNoColor->Release(); blendNoColor = nullptr; }
         if (dsWire)  { dsWire->Release();  dsWire = nullptr; }
@@ -2006,6 +2012,17 @@ float4 main(VSOut i) : SV_Target {
         sd.ComparisonFunc = D3D11_COMPARISON_ALWAYS;
         sd.MaxLOD = D3D11_FLOAT32_MAX;
         if (FAILED(dev->CreateSamplerState(&sd, &samp))) return fail("CreateSamplerState failed", nullptr);
+        const D3D11_TEXTURE_ADDRESS_MODE addr[3] = { D3D11_TEXTURE_ADDRESS_WRAP, D3D11_TEXTURE_ADDRESS_CLAMP,
+                                                     D3D11_TEXTURE_ADDRESS_MIRROR };
+        const D3D11_FILTER filt[2] = { D3D11_FILTER_MIN_MAG_MIP_POINT, D3D11_FILTER_MIN_MAG_MIP_LINEAR };
+        for (int w = 0; w < 3; ++w)
+            for (int f = 0; f < 2; ++f) {
+                D3D11_SAMPLER_DESC k = sd;
+                k.Filter = filt[f];
+                k.AddressU = k.AddressV = k.AddressW = addr[w];
+                if (FAILED(dev->CreateSamplerState(&k, &skinSamp[w][f])))
+                    return fail("CreateSamplerState(skin) failed", nullptr);
+            }
 
         err.clear();
         pipeReady = true;
@@ -2276,11 +2293,15 @@ static bool drawMeshPane(const std::vector<MeshGeom>& meshes, MeshView& view,
                 // Which skin this mesh wears (mesh -> material -> texture). A mesh
                 // with no UVs can't be textured however good its skin, so it stays grey.
                 ID3D11ShaderResourceView* skinSrv = nullptr;
+                ID3D11SamplerState* sampler = gpu.samp;
                 if (view.colorBy == 3) {
                     const Skin* sk = skins.skinFor(meshes[mi].material);
-                    if (sk && sk->srv && (int)meshes[mi].uvs.size() >= 2 * meshes[mi].nverts)
+                    if (sk && sk->srv && (int)meshes[mi].uvs.size() >= 2 * meshes[mi].nverts) {
                         skinSrv = sk->srv;
+                        sampler = gpu.skinSamp[(int)sk->tex.wrap][sk->tex.filter == TexFilter::Nearest ? 0 : 1];
+                    }
                 }
+                ctx->PSSetSamplers(0, 1, &sampler);
                 float rgba[4] = { 180 / 255.0f, 185 / 255.0f, 195 / 255.0f, 1.0f };
                 float mode = 0.0f;
                 if (skinSrv) {

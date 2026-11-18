@@ -462,7 +462,8 @@ Then the rest of 4.2-4.6 in their order, 4.7's bookkeeping alongside whatever to
   monodisperse supernumeraries read as a white arc.
 - [ ] **"forward mode B barely converges the water-droplet rainbow"**.
 - [ ] **"interactive raster fly-viewer can peg all cores / grow RAM when orphaned"**.
-- [ ] **"native `-viewer` Meshes tab ignores a skin's `clamp`/`mirror` wrap mode"**.
+- [x] **"native `-viewer` Meshes tab ignores a skin's `clamp`/`mirror` wrap mode"** (0.449.12) — a sampler per
+  wrap/filter; built, still to be seen in a live viewer.
 - [ ] **"Mode M renders Alice ... far from mode D, differently on each device"** — 20 M photons
   closed most of it (the GPU still ~9 % dark): re-measure, then fix or close.
 - [ ] **"Residual: hue lost at true underflow"** — see-through on a very deep stack (minor).

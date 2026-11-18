@@ -34945,7 +34945,15 @@ in `run()` (src/main.cpp): tokens containing `e`/`E`/`.` are now parsed as a dou
 rounded to the nearest count; plain integers still go through `atoll` exactly. Found while
 validating `-stereo`.
 
-## OPEN (minor, 2026-07-26): native `-viewer` Meshes tab ignores a skin's `clamp`/`mirror` wrap mode
+## FIXED (2026-11-17, 0.449.12; unverified in a live viewer; opened 2026-07-26): native `-viewer` Meshes tab ignores a skin's `clamp`/`mirror` wrap mode
+
+**Fixed** more simply than proposed below: the Meshes tab no longer draws through ImGui's backend but through its
+own D3D11 pass (`MeshGpu`), whose one sampler was WRAP + linear. It now keeps a sampler per wrap mode and filter
+(`MeshGpu::skinSamp[TexWrap][nearest|bilinear]`) and binds the skin's own for each skinned mesh, so a `clamp` or
+`mirror` skin no longer tiles and a `nearest` one stays blocky. Built, not yet seen: the viewer has no headless
+capture. To check, open a loom sidecar whose skin is `wrap="clamp"` on a mesh with UVs past [0,1] (F4, colour
+by skin). The report as filed:
+
 The F4 texture display (`SkinLib` in `src/viewer_gui.cpp`) uploads each skin as a plain
 D3D11 texture and lets **ImGui's own DX11 backend sampler** do the filtering — and that
 sampler is created once, with `D3D11_TEXTURE_ADDRESS_WRAP` on all three axes
