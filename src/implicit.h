@@ -449,6 +449,8 @@ inline bool intersectImplicit(const Ray& r, const Implicit& im, double tmin, Hit
         hit.curv = 0.0;
         hit.tangent = Vec3{1, 0, 0}; hit.bitangentSign = 1.0;
         hit.fiberRadius = 0.0; hit.hasVcol = false; hit.pscale = 0.0;
+        hit.size = std::max(im.bounds.hi.x - im.bounds.lo.x,
+                            std::max(im.bounds.hi.y - im.bounds.lo.y, im.bounds.hi.z - im.bounds.lo.z));
         hit.motionSet = -1; hit.deformTri = -1; hit.patFrame = im.patFrame;
         return true;
     };

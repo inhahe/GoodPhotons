@@ -5827,17 +5827,32 @@ as the one at fault.
   in a scene a few centimetres across 1/65536 is more than a strand's radius (GPU-MINIATURE-SCALE:
   the stubble ball in `units centimeters` renders at x1.0001 of its metre twin on the device, every
   tile within 0.12 %; `tools/check_scale_invariance.py`). The host takes the same scale from where it
-  is computed, `Scene::build`: `Scene::lenScale`, and `Scene::eps` = 1e-6 x lenScale is every host
-  self-intersection distance -- a ray's offset off its surface (`continueAlong`, `deltaOrigin`,
-  `continuationOrigin`, the BDPT/VCM `connOrigin`/`fiberOrigin`, `gratingDiffract`), a trace's tmin
-  (`Scene::kTminEps`, the default of `closestHit`, `occluded`, `shadowTransmittance`, `occludedTo`),
-  a far end's shortening (2 eps) and a strand's near-side skip (`hairExitOffset`); the helpers with no
-  scene take it as an argument. eps is the scene's, so a small object in a big scene keeps 1e-6
-  (CPU-SMALL-IN-BIG, open: sizing it by the point's distance from the origin was tried and fixed only
-  what sits near the origin; the fix is a per-feature size at each hit). The device's `dEpsAt` floor
+  is computed, `Scene::build`: `Scene::lenScale`, and `Scene::eps` = 1e-6 x lenScale. A ray leaving
+  a surface takes its distances from the feature it leaves (CPU-SMALL-IN-BIG): `Scene::hitEps(h)` is
+  eps, but no more than a thousandth of the hit's `Hit::size` -- a sphere's radius, a strand's at the
+  hit, a triangle's longest edge (`Tri::size`, baked by `finalize`), an isosurface's bound's longest
+  side, scaled through an instance or a motion by its mean scale; every intersector writes it, and
+  `closestHit` lowers it to the smallest feature whose box overlaps the primitive's (`Scene::primNear`,
+  built by `buildPrimNear` from a tree over the features small enough to cap below eps, empty in a
+  scene with none: a strand rooted in the skin it leaves) -- and no
+  less than 512 ulps of its coordinates (`Hit::pscale` or the point's own distance). Never more than
+  eps, so a scene whose features are all a thousandth of its size or more keeps eps everywhere and its
+  renders. It is the offset off the surface (`continueAlong`, `passThrough`, `deltaOrigin`,
+  `continuationOrigin`, `fireRay`, the BDPT/VCM `connOrigin`/`fiberOrigin` with `vertexEps`,
+  `gratingDiffract`), the strand's near-side skip (`hairExitOffset`), and the next trace's tmin: a
+  `Ray` carries it (`Ray::tmin`, set by the helpers that build one off a hit), and `closestHit` given
+  the sentinel `Scene::kTminEps` takes the ray's own, else eps; the visibility queries with no Ray
+  (`occluded`, `shadowTransmittance(To)`, `occludedTo`, `occludedSkipHair`, `walkFibers`) are passed it.
+  The camera connections (`connectGeom` .. `camSplatAll*`, `camSpecularSplatAll*` through
+  `SpecVtx::eps`) take the point's as `pe`. A far end's shortening is the far end's own: a light's
+  surface, a medium point, the camera and a light's emission point keep eps. 1e-6 was a twelfth of
+  the 12 um strands of check_scale_invariance's ball on a 400 m ground, which read x1.129 of itself
+  drawn 100 times larger in mode W and x1.15-1.26 in modes R, D, J, U and M; now x1.0001 in W. The
+  device's `dEpsAt` floor
   shrinks within 1/16 of the origin, where in fp32 the 32-ulp term is the real bound anyway. The device's `setSceneScale` reads `Scene::lenScale`, and the fp64
   device build scales its `RAY_EPS` by it, so it stays the host's twin (CPU-MINIATURE-SCALE: the ball
-  100 times smaller read x1.13 of itself on the CPU, tiles to x1.45; now x1.0022).
+  100 times smaller read x1.13 of itself on the CPU, tiles to x1.45; x1.0022 with the scene's eps, x1.0001
+  with each hit's).
   It replaced ~100 `p + n*RAY_EPS` bounce and shadow
   origins, the BDPT/VCM `ng*1e-6f` connection origins, the caustic chains' double
   `1e-6` (which the cast to float had been discarding), and the photon-birth

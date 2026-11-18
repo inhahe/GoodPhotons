@@ -6103,28 +6103,37 @@ Ten findings; fixed in 0.449.1 unless said:
 10. **Comments that narrated history** (RAY_TMIN, dHairExitOffset, dHairCamLegBlocked) state the
     constraint now.
 
-## OPEN (2026-11-17, reopened 0.449.4): CPU-SMALL-IN-BIG — the host's eps is the scene's, so a tiny object in a big scene keeps 1e-6
+## DONE (2026-11-17, 0.449.6; reopened 0.449.4): CPU-SMALL-IN-BIG — the host's eps was the scene's, so a tiny object in a big scene kept 1e-6
 
-**0.449.3 tried sizing the host's eps by the distance from the world origin** (`Scene::epsAt`, eps shrunk
-with the point's largest coordinate inside 1/16 of the origin) and 0.449.4 took it back (the Opus review of
-0.449.2-0.449.3): it fixed only an object that sits near the origin -- the same ball 10 cm away keeps 1e-6
--- and opened new failures there: in a millimetre scene eps fell as S^2, below implicit.h's 1e-12
-refinement bracket, and on a huge primitive near the origin (a radius-1e6 sphere) below its own rounding.
-The fix has to be a per-feature size at each hit -- a sphere's or strand's radius, a triangle's extent
-(a `Hit` field set with the closest hit) -- taking eps x min(1, size), with the next trace's tmin passed
-explicitly from the hit rather than resolved from the scene. The device keeps 0.449.3's floor change:
-`dEpsAt`'s 1e-7 shrinks within 1/16 of the origin, which took the device's own small-in-big case from
-x1.0059 to x1.0001 (fp32's 32-ulp term is the real bound there). check_scale_invariance's big-ground case
-is the device's only until this is done. The report as filed:
+`Scene::eps` is 1e-6 x min(1, S) for the whole scene, so in a scene of unit size or more a ray leaving a
+12 um strand skipped 1e-6, a twelfth of its radius, of everything it then met. check_scale_invariance's
+fur ball on a ground 400 m across, drawn 100 times smaller (so its scale stays 1), read **x1.129 of
+itself in mode W, one tile 45 % off**, and on the CPU's other modes (fixed seeds, 8 spp) x1.26 (R), x1.23
+(D), x1.24 (J), x1.15 (U), x1.17 (M). The device sizes its pushes by each primitive's reach
+(REVIEW-0448D) and read x1.0001. (0.449.3 sized eps by the point's distance from the origin, fixing
+only an object near it, and 0.449.4 took that back.)
 
-`Scene::eps` is 1e-6 x min(1, S) for the whole scene: in a scene of unit size or more it is 1e-6 however
-small the object a ray leaves -- a twelfth of the radius of the 12 um strands check_scale_invariance's
-second case stands on a 4 m ground (which therefore checks the device only). The device sizes its pushes
-by each primitive's reach (REVIEW-0448D). For real hair (20-40 um radius) 1e-6 is a twentieth of a radius
-or less, so only sub-hair detail in a big scene is affected. Fix: per-hit eps on the host -- the offsets
-from `Hit::pscale` (most sites have the hit), and the next trace's tmin from its origin's magnitude rather
-than the scene's `eps`, as the device's dEpsAt; a change to every CPU render near the origin, to be judged
-by check_bitid and the CPU checks.
+**Fixed:** a host ray's distances come from the feature it leaves. `Scene::hitEps(h)` is eps, but no
+more than a thousandth of `Hit::size` -- a sphere's radius, a strand's at the hit, a triangle's longest
+edge (`Tri::size`), an isosurface's bound's longest side, scaled through instances and motion; every
+intersector writes it -- and no less than 512 ulps of the hit's coordinates. A surface's own size is
+not enough: a strand rooted in the skin it leaves is smaller than the skin, and rays leaving the 1 mm
+ball still skipped 1e-6 at its roots (mode D x1.0092 +- 0.0005 over six seeds, against x1.0010 on the
+ball without the big ground). So `closestHit` also lowers the size to the smallest feature whose box
+overlaps the primitive's (`Scene::primNear`, `buildPrimNear`: a tree over the features small enough to
+cap below eps, none in an ordinary scene). The eps is the origin's offset, the strand's near-side skip
+and the next trace's tmin, which a `Ray` now carries (`Ray::tmin`, set by `continueAlong`,
+`passThrough`, `fireRay`, `gratingDiffract` and the delta continuations; `closestHit` given
+`kTminEps` takes it); the visibility queries are passed it, BDPT and VCM take each vertex's
+(`vertexEps`, VCM's coincidence guards their product), the camera connections and the specular-chain
+splats take the point's (`pe`, `SpecVtx::eps`). A light's surface, a medium point and the camera keep
+eps. It never exceeds eps, so every render whose features are a thousandth of its scene or more is
+byte-identical (check_bitid against 0.449.5). Now, on the CPU: mode W x1.0001 (the ball without the big
+ground x1.0022 -> x1.0001), D x0.9999 +- 0.0002 (six seeds), U x1.0022 +- 0.0026, R x1.004, J x0.994,
+B x1.005 (200 M photons; 0.449.5 x1.018), M x1.004. Mode S's frame moves by up to 7 % from seed to
+seed at the budget measured, which settles nothing either way. check_scale_invariance runs the
+big-ground case on the CPU too. Strand renders change: their offsets shrank from 1e-6 to a thousandth
+of a radius, real hair's (20-40 um) from a twentieth or more.
 
 ## DONE (2026-11-17, 0.449.0): GRIN-RADIANCE-SCALE — a camera path ending inside a GRIN region misses the n^2 radiance scale
 

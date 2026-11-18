@@ -409,9 +409,9 @@ Then the rest of 4.2-4.6 in their order, 4.7's bookkeeping alongside whatever to
   GRIN rule's gaps, BDPT big-primitive offsets, mode S's coverage argument, sessions' scale (known-issues).
 - [x] **REVIEW-0448D** (0.449.1) — the Opus (max) review of 0.448.6-0.448.7: big primitives near the
   origin (check_big_primitive), per-primitive offsets, probe tmins, tool gates (known-issues).
-- [ ] **CPU-SMALL-IN-BIG** — the host's eps is the scene's: a tiny object in a big scene keeps 1e-6
-  (known-issues). 0.449.3's distance-from-origin eps was taken back; the fix is a per-feature size at
-  each hit (a Hit field) with explicit tmins.
+- [x] **CPU-SMALL-IN-BIG** (0.449.6) — a host ray's offset and tmin come from the feature it leaves
+  (Scene::hitEps over Hit::size; Ray::tmin carries it): the stubble ball 100x smaller on a 400 m
+  ground reads x1.0001 of itself in mode W on the CPU, was x1.129 (check_scale_invariance; known-issues).
 - [x] **REVIEW-0449B** (0.449.4) — the Opus (xhigh) review of 0.449.2-0.449.3 (known-issues).
 - [x] **ROUTE-TAG-SOLIDS** (0.449.5) — a mode-D camera with objects tagged J merged without the
   solids' sides marked; check_route_tags had failed since 0.445.6 (known-issues).

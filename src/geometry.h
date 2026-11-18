@@ -17,7 +17,11 @@ constexpr double PI = 3.141592653589793;
 // fiber grows out of. Carrying the distance as a curve-only tmin skips exactly the fibers
 // it was meant to skip. Zero on every ordinary ray, and a fresh Ray is built per bounce,
 // so it resets itself.
-struct Ray { Vec3 o, d; double curveTmin = 0.0; };
+// `tmin`: the tmin a trace of this ray takes where its caller names none (Scene::kTminEps) --
+// the self-intersection distance of the surface it leaves (Scene::hitEps), so that a ray off a
+// feature far smaller than the scene skips no more than that feature allows -- or, below 0, the
+// scene's own (Scene::eps).
+struct Ray { Vec3 o, d; double curveTmin = 0.0; double tmin = -1.0; };
 
 inline double curveMin(const Ray& r, double tmin) {
     return tmin > r.curveTmin ? tmin : r.curveTmin;
@@ -137,9 +141,13 @@ struct Tri {
     // The light it is part of (Hit::emitter), or -1. Last: triangles are built positionally
     // (`Tri{v0, v1, v2, mat, -1, {}, uv0, uv1, uv2}`), and a field among those would take their values.
     int emitter = -1;
+    // Its longest edge, baked for the hit to copy (Hit::size). In emitter's padding.
+    float size = 0.0f;
     void finalize() {
         gn = normalize(cross(v1 - v0, v2 - v0));
         reach = triReach(v0, v1, v2);
+        size = (float)std::sqrt(std::max(dot(v1 - v0, v1 - v0),
+                                         std::max(dot(v2 - v1, v2 - v1), dot(v0 - v2, v0 - v2))));
         if (dot(n0, n0) < 1e-12) n0 = gn;
         if (dot(n1, n1) < 1e-12) n1 = gn;
         if (dot(n2, n2) < 1e-12) n2 = gn;
@@ -198,7 +206,7 @@ struct Tri {
 // side where w grazes (|cos| < 1/4), where a step along w clears the surface by |cos| of itself and a chord
 // shorter than the step and the next trace's tmin would be skipped. The device's dOffsetSpecular keeps the
 // same rule.
-// `eps` is the scene's self-intersection distance (Scene::eps).
+// `eps` is the hit's self-intersection distance (Scene::hitEps).
 inline Vec3 deltaOrigin(const Vec3& p, const Vec3& ng, const Vec3& w, double eps) {
     const double c = dot(w, ng);
     if (std::fabs(c) >= 0.25 * length(ng)) return p + w * eps;
@@ -329,6 +337,12 @@ struct Hit {
     // be far smaller on a big triangle; and over one primitive the reach is constant, so the
     // hair is too. Every intersector writes it (the record is reused across candidates).
     double pscale = 0.0;
+    // The size of the feature the hit lies on, which bounds how close other geometry can be
+    // that a ray leaving it must not step over (Scene::hitEps): a sphere's radius, a strand's
+    // at the hit, a triangle's longest edge (Tri::size), an isosurface's bound's longest side;
+    // through an instance or a motion, scaled by its mean scale. Every intersector writes it, and
+    // Scene::closestHit lowers it to the smallest feature touching the primitive (Scene::primNear).
+    double size = 0.0;
     // The ray arrived from behind ng, so the intersector turned n (and curv) to face it. The
     // intersector's own decision, which every intersector writes (the record is reused): read
     // back off n and ng it would be wrong wherever a normal map has tipped n across the
@@ -455,17 +469,22 @@ inline bool leavesWrongSide(const Vec3& w, const Vec3& ngo, Lobe lobe) {
 }
 
 // The continuation from hit h along `w`, drawn as a `lobe`: false where it leaves on the wrong
-// side (leavesWrongSide) -- the caller absorbs it -- else `ray`, its origin nudged `eps` (the scene's,
-// Scene::eps) off the surface toward the side w leaves on: along n where n and the true normal agree
-// about that side, else along the true normal (an origin along n would start behind the surface).
+// side (leavesWrongSide) -- the caller absorbs it -- else `ray`, its origin nudged `eps` (the hit's,
+// Scene::hitEps) off the surface toward the side w leaves on: along n where n and the true normal
+// agree about that side, else along the true normal (an origin along n would start behind the
+// surface); its tmin `eps` too.
 inline bool continueAlong(const Hit& h, const Vec3& w, Lobe lobe, Ray& ray, double eps) {
     const Vec3 ngo = orientedGeoN(h);
     if (leavesWrongSide(w, ngo, lobe)) return false;
     const bool nAgrees = dot(h.n, ngo) > 0.0 && (dot(w, h.n) > 0.0) == (dot(w, ngo) > 0.0);
     const Vec3 off = nAgrees ? h.n : ngo;
-    ray = Ray{h.p + off * (dot(w, off) > 0.0 ? eps : -eps), w};
+    ray = Ray{h.p + off * (dot(w, off) > 0.0 ? eps : -eps), w, 0.0, eps};
     return true;
 }
+
+// The ray passing straight through hit h along its arrival direction d (a filter, a half mirror's
+// transmission): its origin `eps` (the hit's, Scene::hitEps) on along d, its tmin `eps` too.
+inline Ray passThrough(const Hit& h, const Vec3& d, double eps) { return Ray{h.p + d * eps, d, 0.0, eps}; }
 
 // Veach shading-normal ADJOINT correction factor (Veach §5.3; PBRT
 // `CorrectShadingNormal`, importance/light-transport mode). A BSDF evaluated with
@@ -679,7 +698,7 @@ inline bool intersectTri(const TriShear& sh, const Ray& r, const Tri& tri,
     // also scales with the vertices rather than with the ray's travel. (Not
     // b0 v0 + b1 v1 + b2 v2: the b's need not sum to exactly 1, which breaks the exactness.)
     hit.t = t; hit.p = tri.v0 + (tri.v1 - tri.v0) * b1 + (tri.v2 - tri.v0) * b2; hit.valid = true;
-    hit.pscale = tri.reach;
+    hit.pscale = tri.reach; hit.size = tri.size;
     hit.motionSet = -1; hit.deformTri = -1; hit.patFrame = tri.patFrame;
     hit.matId = tri.matId; hit.sensorId = tri.sensorId; hit.emitter = tri.emitter;
     // Barycentric-interpolated UV and shading normal (matches the old M-T convention:
@@ -789,6 +808,7 @@ inline bool intersectSphere(const Ray& r, const Sphere& s, double tmin, Hit& hit
     // |r|: the quadratic only sees r^2, so a negative radius traces as its absolute value.
     hit.p = s.c + ng * std::fabs(s.r);
     hit.pscale = std::sqrt(dot(s.c, s.c)) + std::fabs(s.r);
+    hit.size = std::fabs(s.r);
     hit.motionSet = -1; hit.deformTri = -1; hit.patFrame = s.patFrame;
     hit.ng = ng;
     bool sFlipped = !(dot(r.d, ng) < 0.0);

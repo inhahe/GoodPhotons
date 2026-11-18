@@ -379,6 +379,7 @@ inline bool intersectCurveSeg(const CurveRay& cr, const Ray& r, const CurveSeg& 
     double hSign = (dot(r.d, ng) < 0.0) ? 1.0 : -1.0;
     hit.curv = (rLoc > 1e-12) ? hSign * 0.5 / rLoc : 0.0;
     hit.fiberRadius = rLoc;    // §P3: lets a hair connection step past the strand's own body
+    hit.size = rLoc;
     hit.hasVcol = false;       // `hit` is a reused record: no vertex colours here
     return true;
 }

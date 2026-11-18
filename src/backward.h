@@ -554,6 +554,7 @@ struct BackwardRenderer {
                      double* pdfWOut = nullptr,
                      bool hairUnit = false) const {
         if (pdfWOut) *pdfWOut = 0.0;                     // delta unless a branch says otherwise
+        const double he = scene.hitEps(h);               // the shadow ray's start off h
         // Dual scattering (P3 stage 4) makes the shadow ray part of the SHADING: what it
         // counts on the way to the light is the forward-scattering transmittance, so the
         // response and the visibility test stop being separable. `response` therefore
@@ -599,18 +600,18 @@ struct BackwardRenderer {
             // (Scene::occludedTo, connMaxT). `shorten == 0` means "do not shorten at all": the
             // distant sun's far end is the scene EXIT, not a sampled surface point.
             if (!hs) {
-                vis = scene.shadowTransmittanceTo(h.p + ngo * scene.eps, h.p + wi * d, shorten);
+                vis = scene.shadowTransmittanceTo(h.p + ngo * he, h.p + wi * d, shorten, he);
                 return !(vis > 0.0);
             }
-            const double off = hairExitOffset(*hs, h.n, wi, scene.eps);
-            const double len = d - off - scene.eps;
+            const double off = hairExitOffset(*hs, h.n, wi, he);
+            const double len = d - off - scene.eps;          // short of the light's surface
             if (len <= 0.0) return true;
             // Aggregate: the coat is optical depth, not geometry (it was already applied in
             // `response`), so only a WALL blocks. Calling `occluded` here would report the
             // very strands the far tier is pretending not to have as blockers and make the
             // whole coat self-shadow to black.
-            if (hs->aggregate) return scene.occludedSkipHair(h.p + wi * off, wi, len);
-            vis = scene.shadowTransmittance(h.p + wi * scene.eps, wi, len, scene.eps, off);
+            if (hs->aggregate) return scene.occludedSkipHair(h.p + wi * off, wi, len, he);
+            vis = scene.shadowTransmittance(h.p + wi * he, wi, len, he, off);
             return !(vis > 0.0);
         };
         if (em.collimated) return false;                  // beams aren't area-samplable
@@ -1189,7 +1190,7 @@ struct BackwardRenderer {
         if (!(op < 1.0) || rng.uniform() >= 1.0 - op) return false;
         const HairShade hs = hairShadeAt(scene, m, h, lambda, ray.d * -1.0);   // its exit offset
         const Vec3 d = ray.d;
-        ray = Ray{h.p + d * (1e-3 * scene.eps), d, hairExitOffset(hs, h.n, d, scene.eps)};
+        ray = Ray{h.p + d * (1e-3 * scene.hitEps(h)), d, hairExitOffset(hs, h.n, d, scene.hitEps(h))};
         return true;
     }
 
@@ -1304,7 +1305,7 @@ struct BackwardRenderer {
                 // vector and each medium's own bounds/density field (see mediaTr). The
                 // shadow ray starts at the same offset point `blocked` used, so the two
                 // measure the same segment.
-                if (med) contrib *= mediaTr(scene, h.p + ngo * scene.eps, wiConn, sunMediaDist(scene, em, h.p, dist),
+                if (med) contrib *= mediaTr(scene, h.p + ngo * scene.hitEps(h), wiConn, sunMediaDist(scene, em, h.p, dist),
                                             lambda, rng);
                 contrib *= legAbsorption(scene, h.extMat, dist, lambda);   // the vertex's solid, if any
                 acc += contrib;
@@ -1325,7 +1326,7 @@ struct BackwardRenderer {
                         if (!dirResponse(scene, h, wi, hs, nb, cosSurf, stG, pdfB)) return false;
                         f[0] = (nb ? bdpt::bsdfF(*nb->m, h.n, nb->wo, wi, lambda, scene, &h)
                                    : rho / PI) * cosSurf * stG * gi.coat.f(scene, h, wi, lambda);
-                        r = fireRay(h, ngo, hs, wi, scene.eps);
+                        r = fireRay(h, ngo, hs, wi, scene.hitEps(h));
                         return true;
                     });
         }
@@ -1335,11 +1336,11 @@ struct BackwardRenderer {
     // The ray a fire light-sampling integral runs along from a surface or fiber vertex: offset
     // as that vertex's shadow rays are (envGeom) -- along the oriented geometric normal off a
     // surface, by the hair exit offset off a fiber (as the curve tmin of a strand's ray, as a
-    // plain step out of an aggregate coat's). `eps`: the scene's (Scene::eps).
+    // plain step out of an aggregate coat's). `eps`: the hit's (Scene::hitEps), its tmin too.
     static Ray fireRay(const Hit& h, const Vec3& ngo, const HairShade* hs, const Vec3& wi, double eps) {
-        if (!hs) return Ray{h.p + ngo * eps, wi};
+        if (!hs) return Ray{h.p + ngo * eps, wi, 0.0, eps};
         const double off = hairExitOffset(*hs, h.n, wi, eps);
-        return hs->aggregate ? Ray{h.p + wi * off, wi} : Ray{h.p + wi * eps, wi, off};
+        return hs->aggregate ? Ray{h.p + wi * off, wi, 0.0, eps} : Ray{h.p + wi * eps, wi, off, eps};
     }
 
     // SPECTRAL surface NEE for mode M's gather (0.341.0). Same emitter loop, same rng order and
@@ -1392,7 +1393,7 @@ struct BackwardRenderer {
             const int KK = (K < 64) ? K : 64;
             for (int k = 0; k < KK; ++k) Tr[k] = 1.0;
             if (med)
-                Renderer::mediaTransmittanceSpec(scene, h.p + ngo * scene.eps, wiConn, dist,
+                Renderer::mediaTransmittanceSpec(scene, h.p + ngo * scene.hitEps(h), wiConn, dist,
                                                  lam, KK, Tr, rng);
             if (h.extMat >= 0)   // the leg inside the vertex's solid (legAbsorption)
                 for (int k = 0; k < KK; ++k) Tr[k] *= legAbsorption(scene, h.extMat, dist, lam[k]);
@@ -1456,7 +1457,7 @@ struct BackwardRenderer {
             const int KK = (K < 64) ? K : 64;
             for (int k = 0; k < KK; ++k) Tr[k] = 1.0;
             if (med)
-                Renderer::mediaTransmittanceSpec(scene, h.p + ngo * scene.eps, wiConn, dist,
+                Renderer::mediaTransmittanceSpec(scene, h.p + ngo * scene.hitEps(h), wiConn, dist,
                                                  lam, KK, Tr, rng);
             if (h.extMat >= 0)   // the leg inside the vertex's solid (legAbsorption)
                 for (int k = 0; k < KK; ++k) Tr[k] *= legAbsorption(scene, h.extMat, dist, lam[k]);
@@ -1517,7 +1518,7 @@ struct BackwardRenderer {
                 // gate), so one transmittance estimate serves every wavelength. A vacuum scene
                 // skips it without touching the rng.
                 if (!scene.media.empty())
-                    ws *= mediaTr(scene, h.p + ngo * scene.eps, wiConn, sunMediaDist(scene, em, h.p, dist), lam[0], rng);
+                    ws *= mediaTr(scene, h.p + ngo * scene.hitEps(h), wiConn, sunMediaDist(scene, em, h.p, dist), lam[0], rng);
                 // Inside a solid the leg takes its absorption (legAbsorption), per wavelength: on the
                 // throughput each branch below reads.
                 double thrLeg[hero::kHeroMax];
@@ -1576,7 +1577,7 @@ struct BackwardRenderer {
                             f[i] = (nb ? bdpt::bsdfF(*nb->m, h.n, nb->wo, wi, lam[i], scene, &h)
                                        : rho[i] / PI) * cosSurf * stG * ce.at(lam[i]);
                         }
-                        r = fireRay(h, ngo, nullptr, wi, scene.eps);
+                        r = fireRay(h, ngo, nullptr, wi, scene.hitEps(h));
                         return true;
                     });
     }
@@ -1613,6 +1614,7 @@ struct BackwardRenderer {
         double wSum = 0.0;
         GiCtx sub{gi.depth + 1, gi.sIdx, 0, gi.furTier};   // inherit the fur tier
         const MediumStack& vertexStk = walkStackOf(gi);      // and start inside the vertex's solids
+        const double he = scene.hitEps(h);
         for (int j = 0; j < n; ++j) {
             const Vec3 d = giDir(j, n, p1, p2);
             const double c = dot(h.n, d);
@@ -1622,7 +1624,7 @@ struct BackwardRenderer {
             if (dot(ngo, d) <= 0.0) continue;
             wSum += c;
             double Lg[hero::kHeroMax];
-            radianceHero(scene, Ray{h.p + ngo * scene.eps, d}, lam, invPdf, nUp, Lg, rng,
+            radianceHero(scene, Ray{h.p + ngo * he, d, 0.0, he}, lam, invPdf, nUp, Lg, rng,
                          vertexStk, spdCache, sub);
             // Firefly clamp (see giClamp). NOT applied to wSum: the weight of a clamped
             // direction stays c, so the estimator still normalises by the realised sum of
@@ -1651,13 +1653,14 @@ struct BackwardRenderer {
         double acc = 0.0, wSum = 0.0;
         GiCtx sub{gi.depth + 1, gi.sIdx, 0, gi.furTier};   // inherit the fur tier
         const MediumStack& vertexStk = walkStackOf(gi);      // and start inside the vertex's solids
+        const double he = scene.hitEps(h);
         for (int j = 0; j < n; ++j) {
             const Vec3 d = giDir(j, n, p1, p2);
             const double c = dot(h.n, d);
             if (c <= 0.0) continue;
             if (dot(ngo, d) <= 0.0) continue;
             wSum += c;
-            double Lg = radiance(scene, Ray{h.p + ngo * scene.eps, d}, lambda, invPdfLambda,
+            double Lg = radiance(scene, Ray{h.p + ngo * he, d, 0.0, he}, lambda, invPdfLambda,
                                  rng, vertexStk, spdCache, sub);
             if (giClamp > 0.0 && Lg > giClamp) Lg = giClamp;   // see giClamp
             acc += c * Lg * gi.coat.f(scene, h, d, lambda);   // see giGatherHero
@@ -1810,26 +1813,27 @@ struct BackwardRenderer {
         double pdfBsdf = 0.0;
         if (!dirResponse(scene, h, wi, hs, nb, cosSurf, stG, pdfBsdf)) return false;
         farDist = scene.exitDistance(h.p);
+        const double he = scene.hitEps(h);
         if (hs) {
             // Aggregate fiber: coat transmittance instead of strand geometry, and only walls
             // occlude. Same substitution as emitterGeom — see the comments there.
             if (hs->aggregate && furVol)
                 cosSurf *= furVol->transmittance(h.p, wi, farDist);
             if (!(cosSurf > 0.0)) return false;
-            const double off = hairExitOffset(*hs, h.n, wi, scene.eps);
+            const double off = hairExitOffset(*hs, h.n, wi, he);
             if (hs->aggregate) {
-                if (scene.occludedSkipHair(h.p + wi * off, wi, farDist)) return false;
+                if (scene.occludedSkipHair(h.p + wi * off, wi, farDist, he)) return false;
             } else {
                 // Partial, not yes/no: hair below opacity 1 attenuates the sky rather than
                 // hiding it. Folded into cosSurf, which both callers already multiply by.
-                const double vis = scene.shadowTransmittance(h.p + wi * scene.eps, wi, farDist, scene.eps, off);
+                const double vis = scene.shadowTransmittance(h.p + wi * he, wi, farDist, he, off);
                 if (!(vis > 0.0)) return false;
                 cosSurf *= vis;
             }
         } else {
             // As at a fiber: a transparent coat between a surface and the sky attenuates it
             // instead of blocking it.
-            const double vis = scene.shadowTransmittance(h.p + orientedGeoN(h) * scene.eps, wi, farDist);
+            const double vis = scene.shadowTransmittance(h.p + orientedGeoN(h) * he, wi, farDist, he);
             if (!(vis > 0.0)) return false;
             cosSurf *= vis;
         }
@@ -1894,7 +1898,7 @@ struct BackwardRenderer {
         double contrib = fVal * Lenv * cosSurf * invPdfLambda / pdfW * wMis * stG;
         if (coat) contrib *= coat->f(scene, h, wi, lambda);
         if (!scene.media.empty())        // media attenuation out to the scene exit
-            contrib *= mediaTr(scene, h.p + orientedGeoN(h) * scene.eps, wi, scene.mediaExitDistance(h.p), lambda, rng);
+            contrib *= mediaTr(scene, h.p + orientedGeoN(h) * scene.hitEps(h), wi, scene.mediaExitDistance(h.p), lambda, rng);
         return contrib;
     }
 
@@ -1910,7 +1914,7 @@ struct BackwardRenderer {
                      nullptr, nullptr, nb)) return;
         // Flat-extinction media only (renderRows' gate): one estimate for the whole bundle.
         if (!scene.media.empty())
-            cosSurf *= mediaTr(scene, h.p + orientedGeoN(h) * scene.eps, wi, scene.mediaExitDistance(h.p), lam[0], rng);
+            cosSurf *= mediaTr(scene, h.p + orientedGeoN(h) * scene.hitEps(h), wi, scene.mediaExitDistance(h.p), lam[0], rng);
         for (int i = 0; i < nUp; ++i) {
             double Lenv = scene.envRadiance(wi, lam[i]);
             if (Lenv <= 0.0) continue;
@@ -1951,7 +1955,7 @@ struct BackwardRenderer {
                              /*hairUnit=*/true)) continue;
             // The bundle rides only through media whose extinction is the same at every
             // wavelength (renderRows' gate), so one transmittance estimate serves all of it.
-            if (med) w *= mediaTr(scene, h.p + ngo * scene.eps, wiConn, sunMediaDist(scene, em, h.p, dist), lam[0], rng);
+            if (med) w *= mediaTr(scene, h.p + ngo * scene.hitEps(h), wiConn, sunMediaDist(scene, em, h.p, dist), lam[0], rng);
             w *= selW;
             if (!(w > 0.0)) continue;
             const Vec3 wl = hair::toLocal(hs[0].fr, wiConn);
@@ -1975,7 +1979,7 @@ struct BackwardRenderer {
                                      hair::safeSqrt(1.0 - hair::sqr(hair::clampd(wl.x, -1.0, 1.0))),
                                      f, nullptr);
                         pdfB = 0.0;
-                        r = fireRay(h, ngo, &hs[0], wi, scene.eps);
+                        r = fireRay(h, ngo, &hs[0], wi, scene.hitEps(h));
                         return true;
                     });
     }
@@ -1998,11 +2002,12 @@ struct BackwardRenderer {
         const double farDist = scene.exitDistance(h.p);
         // envGeom's strand shadow ray. Never an aggregate fiber's: `hs` comes from hairShadeAt,
         // and an aggregate collision leaves the bundle (furInteract) before any fiber vertex.
-        double vis = scene.shadowTransmittance(h.p + wi * scene.eps, wi, farDist, scene.eps,
-                                               hairExitOffset(hs[0], h.n, wi, scene.eps));
+        const double he = scene.hitEps(h);
+        double vis = scene.shadowTransmittance(h.p + wi * he, wi, farDist, he,
+                                               hairExitOffset(hs[0], h.n, wi, he));
         if (!(vis > 0.0)) return;
         if (!scene.media.empty())
-            vis *= mediaTr(scene, h.p + orientedGeoN(h) * scene.eps, wi, scene.mediaExitDistance(h.p), lam[0], rng);
+            vis *= mediaTr(scene, h.p + orientedGeoN(h) * he, wi, scene.mediaExitDistance(h.p), lam[0], rng);
         if (!(vis > 0.0)) return;
         const Vec3 wl = hair::toLocal(hs[0].fr, wi);
         double resp[hero::kHeroMax], pdfJ[hero::kHeroMax];
@@ -2178,13 +2183,14 @@ struct BackwardRenderer {
     // lam[0]: a bundle rides only grey media), the aggregate coat's when `coat`, the strands' per
     // `vis` (which also ends the integral at an opaque surface) -- so the estimate is unbiased.
     // `curveTmin0`: the hair exit
-    // offset of a ray leaving a fiber, measured from `o`. `absorb`: the Beer-Lambert
+    // offset of a ray leaving a fiber, measured from `o`; `tmin0`: its tmin there (Ray::tmin, the
+    // surface it leaves), for the sub-segment that starts at `o`. `absorb`: the Beer-Lambert
     // coefficient of the dielectric the segment runs inside (0 outside one; a bundle is never
     // inside one, every dielectric entry splitting or de-heroing it).
     template <class W>
     void fireSegment(const Scene& scene, const Vec3& o, const Vec3& d, double len,
                      const double* lam, int n, bool coat, FireVis vis, double curveTmin0,
-                     double absorb, Pcg32& rng, double* E, W&& w, int only = -1) const {
+                     double tmin0, double absorb, Pcg32& rng, double* E, W&& w, int only = -1) const {
         for (int vi = 0; vi < (int)scene.emissiveVolumes.size(); ++vi) {
             if (only >= 0 && vi != only) continue;
             const Scene::EmissiveVolume& v = scene.emissiveVolumes[(size_t)vi];
@@ -2199,10 +2205,11 @@ struct BackwardRenderer {
                     if (coat && furVol && furVol->valid()) T *= furVol->transmittance(a, d, seg);
                     // The fiber's exit clearance runs from the segment's origin, so a
                     // sub-segment that starts inside it still skips the strand it leaves.
+                    const double tmin = s0 > 0.0 ? Scene::kTminEps : tmin0;
                     if (vis == FireVis::Strands && T > 0.0)
-                        T *= scene.shadowTransmittance(a, d, seg, scene.eps,
+                        T *= scene.shadowTransmittance(a, d, seg, tmin,
                                                        curveTmin0 > s0 ? curveTmin0 - s0 : 0.0);
-                    else if (vis == FireVis::SkipHair && T > 0.0 && scene.occludedSkipHair(a, d, seg))
+                    else if (vis == FireVis::SkipHair && T > 0.0 && scene.occludedSkipHair(a, d, seg, tmin))
                         T = 0.0;
                 },
                 [&](double, double Ts, double kelvin, double dt) {
@@ -2264,7 +2271,7 @@ struct BackwardRenderer {
         double E[hero::kHeroMax] = {0};
         // Unbounded: the clip to the box the fire emits in ends it, and that box can reach past the
         // scene sphere (a `temperature` grid wider than the medium's `density` bound).
-        fireSegment(scene, r.o, r.d, 1e30, lam, n, coat, vis, r.curveTmin,
+        fireSegment(scene, r.o, r.d, 1e30, lam, n, coat, vis, r.curveTmin, r.tmin,
                     (solid >= 0) ? scene.mats[(size_t)solid].absorb(lam[0]) : 0.0, rng, E,
                     [](int) { return 1.0; }, vi);
         const double den = sel * pdfDir + (mis ? pdfB : 0.0);
@@ -2469,7 +2476,7 @@ struct BackwardRenderer {
                 // deterministic preview converges at 1 spp where RR needs tens.
                 if (whitted) { if (!wAtt(r)) return false; }
                 else if (rng.uniform() >= r) return false;      // RR absorb
-                if (!continueAlong(h, reflect(ray.d, h.n), Lobe::Reflect, ray, scene.eps)) return false;   // across the surface
+                if (!continueAlong(h, reflect(ray.d, h.n), Lobe::Reflect, ray, scene.hitEps(h))) return false;   // across the surface
                 specularArrival = true; return true;
             }
             case MatType::Grating: {
@@ -2483,7 +2490,7 @@ struct BackwardRenderer {
                 // the rng, so every pixel picks the same order and the preview is noise-free
                 // (see whittedOrderU / gratingDiffract).
                 const double uOrd = whitted ? whittedOrderU(gi.sIdx, gi.bounce) : 0.0;
-                Ray nr = mats.gratingDiffract(m, h, ray.d, scene.eps, lambda, rng, absorbedG,
+                Ray nr = mats.gratingDiffract(m, h, ray.d, scene.hitEps(h), lambda, rng, absorbedG,
                                               whitted ? &uOrd : nullptr);
                 if (absorbedG) return false;
                 ray = nr; specularArrival = true; return true;
@@ -2498,11 +2505,11 @@ struct BackwardRenderer {
                 if (whitted) {
                     const bool refl = (r >= 0.5);
                     if (!wAtt(refl ? r : 1.0 - r)) return false;
-                    if (!refl) ray = Ray{h.p + ray.d * scene.eps, ray.d};
-                    else if (!continueAlong(h, reflect(ray.d, h.n), Lobe::Reflect, ray, scene.eps)) return false;
+                    if (!refl) ray = passThrough(h, ray.d, scene.hitEps(h));
+                    else if (!continueAlong(h, reflect(ray.d, h.n), Lobe::Reflect, ray, scene.hitEps(h))) return false;
                 } else if (rng.uniform() < r) {
-                    if (!continueAlong(h, reflect(ray.d, h.n), Lobe::Reflect, ray, scene.eps)) return false;
-                } else ray = Ray{h.p + ray.d * scene.eps, ray.d};
+                    if (!continueAlong(h, reflect(ray.d, h.n), Lobe::Reflect, ray, scene.hitEps(h))) return false;
+                } else ray = passThrough(h, ray.d, scene.hitEps(h));
                 specularArrival = true; return true;
             }
             case MatType::Filter: {
@@ -2510,7 +2517,7 @@ struct BackwardRenderer {
                 double t = clamp01(transmitSlot(scene, m, h, lambda));
                 if (whitted) { if (!wAtt(t)) return false; }
                 else if (rng.uniform() >= t) return false;      // absorbed
-                ray = Ray{h.p + ray.d * scene.eps, ray.d};      // direction unchanged
+                ray = passThrough(h, ray.d, scene.hitEps(h));      // direction unchanged
                 specularArrival = true; return true;
             }
             case MatType::Glossy: {
@@ -2569,7 +2576,7 @@ struct BackwardRenderer {
                         gm->from = h.p;
                         gm->n = h.n;
                     }
-                    if (!continueAlong(h, o, Lobe::Reflect, ray, scene.eps)) return false;
+                    if (!continueAlong(h, o, Lobe::Reflect, ray, scene.hitEps(h))) return false;
                     specularArrival = true; return true;
                 }
                 if (rng.uniform() >= r) return false;
@@ -2585,7 +2592,7 @@ struct BackwardRenderer {
                     gm->from = h.p;
                     gm->n = h.n;
                 }
-                if (!continueAlong(h, o, Lobe::Reflect, ray, scene.eps)) return false;
+                if (!continueAlong(h, o, Lobe::Reflect, ray, scene.hitEps(h))) return false;
                 specularArrival = true; return true;
             }
             case MatType::Fluorescent: {
@@ -2657,7 +2664,7 @@ struct BackwardRenderer {
                 if (u < rhoEl) {                             // elastic continuation
                     Vec3 wOut = cosineHemisphere(h.n, rng);
                     contBsdfPdf = std::max(0.0, dot(wOut, h.n)) / PI;
-                    if (!continueAlong(h, wOut, Lobe::Reflect, ray, scene.eps)) return false;
+                    if (!continueAlong(h, wOut, Lobe::Reflect, ray, scene.hitEps(h))) return false;
                     specularArrival = false; return true;
                 } else if (u < rhoEl + pF) {                 // fluoro (wavelength-switched)
                     thr *= wFluo / pF * tbShift;
@@ -2665,7 +2672,7 @@ struct BackwardRenderer {
                     invPdfLambda = invPdfIn;
                     Vec3 wOut = cosineHemisphere(h.n, rng);
                     contBsdfPdf = std::max(0.0, dot(wOut, h.n)) / PI;
-                    if (!continueAlong(h, wOut, Lobe::Reflect, ray, scene.eps)) return false;
+                    if (!continueAlong(h, wOut, Lobe::Reflect, ray, scene.hitEps(h))) return false;
                     specularArrival = false; return true;
                 }
                 return false;                                // absorbed / terminated
@@ -2753,7 +2760,7 @@ struct BackwardRenderer {
                 if (!passThru) contBsdfPdf = pdfH;     // real pdf -> env-miss MIS is exact
                 else if (gm) *gm = gmIn;
                 // Step clear of the strand's own body: TT/TRT exit the far side.
-                ray = Ray{h.p + wOut * (1e-3 * scene.eps), wOut, hairExitOffset(hs, h.n, wOut, scene.eps)};
+                ray = Ray{h.p + wOut * (1e-3 * scene.hitEps(h)), wOut, hairExitOffset(hs, h.n, wOut, scene.hitEps(h))};
                 if (!passThru) specularArrival = false;   // pass-through: inherit, do not set
                 return true;
             }
@@ -2786,12 +2793,12 @@ struct BackwardRenderer {
                 if (u < rhoR) {                          // reflect continuation (front)
                     Vec3 wOut = cosineHemisphere(h.n, rng);
                     contBsdfPdf = std::max(0.0, dot(wOut, h.n)) / PI;
-                    if (!continueAlong(h, wOut, Lobe::Reflect, ray, scene.eps)) return false;
+                    if (!continueAlong(h, wOut, Lobe::Reflect, ray, scene.hitEps(h))) return false;
                     specularArrival = false; return true;
                 } else if (u < sum) {                    // transmit continuation (back)
                     Vec3 wOut = cosineHemisphere(-h.n, rng);
                     contBsdfPdf = std::max(0.0, dot(wOut, -h.n)) / PI;
-                    if (!continueAlong(h, wOut, Lobe::Transmit, ray, scene.eps)) return false;
+                    if (!continueAlong(h, wOut, Lobe::Transmit, ray, scene.hitEps(h))) return false;
                     specularArrival = false; return true;
                 }
                 return false;                            // absorbed / terminated
@@ -2814,7 +2821,7 @@ struct BackwardRenderer {
                 if (rng.uniform() >= rho) return false;
                 Vec3 wOut = cosineHemisphere(h.n, rng);
                 contBsdfPdf = std::max(0.0, dot(wOut, h.n)) / PI;
-                if (!continueAlong(h, wOut, Lobe::Reflect, ray, scene.eps)) return false;
+                if (!continueAlong(h, wOut, Lobe::Reflect, ray, scene.hitEps(h))) return false;
                 specularArrival = false; return true;
             }
         }
@@ -2944,7 +2951,7 @@ struct BackwardRenderer {
             // `b == 0 && gi.depth == 0` is precisely the camera segment (the same test the
             // footprint below uses), so it is also precisely where a `hide_camera` surface
             // must be transparent — and nowhere else on the path.
-            Hit h = closestHitIn(scene, stk, ray, scene.eps, nullptr, /*skipHair=*/useVol,
+            Hit h = closestHitIn(scene, stk, ray, Scene::kTminEps, nullptr, /*skipHair=*/useVol,
                                              /*skipCamHidden=*/(b == 0 && gi.depth == 0));
             if (b == 0 && gi.depth == 0 && h.valid)         // camera segment only — see fwPerDist
                 h.fw = patShadingFootprint(fwPerDist, h.t, dot(ray.d, h.n));
@@ -2955,7 +2962,7 @@ struct BackwardRenderer {
             if (!scene.emissiveVolumes.empty()) {
                 double Ef = 0.0;
                 fireSegment(scene, ray.o, ray.d, dSurf, &lambda, 1, useVol, FireVis::None, 0.0,
-                            curAbsorb(lambda), rng, &Ef, [&](int vi) {
+                            Scene::kTminEps, curAbsorb(lambda), rng, &Ef, [&](int vi) {
                                 return fireSegmentWeight(scene, vi, gmis, specularArrival, ray.d);
                             });
                 L += thr * Ef * invPdfLambda * contSoft;
@@ -3116,7 +3123,7 @@ struct BackwardRenderer {
                         if (dot(o, h.n) <= 0) return L;
                         // reciprocal, and the coat lobe's masking
                         thr *= coatEvalSheen(scene, cm, h, ray.d * -1.0, o).at(lambda) * wC;
-                        if (!continueAlong(h, o, Lobe::Reflect, ray, scene.eps)) return L;
+                        if (!continueAlong(h, o, Lobe::Reflect, ray, scene.hitEps(h))) return L;
                         specularArrival = true;
                         gmis.clear();      // the sheen does no NEE: its arrival is unweighted
                         contSoft = coatContSoftening(h, ray.d);
@@ -3135,7 +3142,7 @@ struct BackwardRenderer {
                     // the reciprocal coat's reflection over the coin's R (render.h coatEvalSheen),
                     // and the coat lobe's masking
                     thr *= coatEvalSheen(scene, cm, h, ray.d * -1.0, o).at(lambda) * wC;
-                    if (!continueAlong(h, o, Lobe::Reflect, ray, scene.eps)) return L;
+                    if (!continueAlong(h, o, Lobe::Reflect, ray, scene.hitEps(h))) return L;
                     specularArrival = true;
                     // The sheen does no NEE, so what it reaches counts at full weight: an earlier
                     // glossy bounce's MIS record must not outlive it (interactMaterial, which
@@ -3407,7 +3414,7 @@ struct BackwardRenderer {
             const bool useVol = furVol && gi.furTier == 2;
             // Camera segment only, exactly as the footprint test below (and `b == 0`, not
             // `b == bounce0`, for the same heroSplit reason it gives).
-            Hit h = closestHitIn(scene, stk, ray, scene.eps, nullptr, /*skipHair=*/useVol,
+            Hit h = closestHitIn(scene, stk, ray, Scene::kTminEps, nullptr, /*skipHair=*/useVol,
                                              /*skipCamHidden=*/(b == 0 && gi.depth == 0));
             // Camera segment only — see fwPerDist. `b == 0` and not `b == bounce0`: a
             // heroSplit re-entry resumes this loop at a DEEPER bounce, and that segment
@@ -3428,7 +3435,7 @@ struct BackwardRenderer {
                 double Ef[hero::kHeroMax] = {0};
                 const int mi = stk.topMat();      // only ever set for a lone wavelength
                 fireSegment(scene, ray.o, ray.d, dSurf, lam, nUp, useVol, FireVis::None, 0.0,
-                            (mi >= 0) ? scene.mats[mi].absorb(lam[0]) : 0.0, rng, Ef,
+                            Scene::kTminEps, (mi >= 0) ? scene.mats[mi].absorb(lam[0]) : 0.0, rng, Ef,
                             [&](int vi) {
                                 return fireSegmentWeight(scene, vi, gmis, specularArrival, ray.d);
                             });
@@ -3696,7 +3703,7 @@ struct BackwardRenderer {
                     const CoatEval ceS = coatEvalSheen(scene, cm, h, ray.d * -1.0, o);
                     for (int i = 0; i < nUp; ++i)    // the reciprocal coat's reflection (scalar twin)
                         thr[i] *= ceS.at(lam[i]) * wC;
-                    if (!continueAlong(h, o, Lobe::Reflect, ray, scene.eps)) { finish(); return; }
+                    if (!continueAlong(h, o, Lobe::Reflect, ray, scene.hitEps(h))) { finish(); return; }
                     specularArrival = true;
                     gmis.clear();                // no NEE here: see the scalar twin
                     contSoft = coatContSoftening(h, ray.d);   // a glossy lobe
@@ -3806,13 +3813,13 @@ struct BackwardRenderer {
                         for (int i = 0; i < nUp; ++i) thr[i] *= rhoR[i] / qR;
                         Vec3 wOut = cosineHemisphere(h.n, rng);
                         contBsdfPdf = std::max(0.0, dot(wOut, h.n)) / PI;
-                        if (!continueAlong(h, wOut, Lobe::Reflect, ray, scene.eps)) { finish(); return; }
+                        if (!continueAlong(h, wOut, Lobe::Reflect, ray, scene.hitEps(h))) { finish(); return; }
                         specularArrival = false; break;
                     } else if (u < sumHero) {                    // transmit (back)
                         for (int i = 0; i < nUp; ++i) thr[i] *= rhoT[i] / qT;
                         Vec3 wOut = cosineHemisphere(-h.n, rng);
                         contBsdfPdf = std::max(0.0, dot(wOut, -h.n)) / PI;
-                        if (!continueAlong(h, wOut, Lobe::Transmit, ray, scene.eps)) { finish(); return; }
+                        if (!continueAlong(h, wOut, Lobe::Transmit, ray, scene.hitEps(h))) { finish(); return; }
                         specularArrival = false; break;
                     }
                     finish(); return;                            // absorbed
@@ -3863,9 +3870,9 @@ struct BackwardRenderer {
                         for (int i = 0; i < nUp; ++i) thr[i] *= c[i] / q;
                     }
                     if (m.type == MatType::Mirror) {
-                        if (!continueAlong(h, reflect(ray.d, h.n), Lobe::Reflect, ray, scene.eps)) { finish(); return; }
+                        if (!continueAlong(h, reflect(ray.d, h.n), Lobe::Reflect, ray, scene.hitEps(h))) { finish(); return; }
                     } else if (m.type == MatType::Filter) {
-                        ray = Ray{h.p + ray.d * scene.eps, ray.d};       // direction unchanged
+                        ray = passThrough(h, ray.d, scene.hitEps(h));       // direction unchanged
                     } else if (whitted) {
                         // Glossy: the lobe off the deterministic lattice (mirror at sample 0).
                         const GlossyDraw gd = whittedGlossyDraw(scene, m, h, ray.d * -1.0, gi.sIdx, b);
@@ -3881,7 +3888,7 @@ struct BackwardRenderer {
                             gmis.from = h.p;
                             gmis.n = h.n;
                         }
-                        if (!continueAlong(h, o, Lobe::Reflect, ray, scene.eps)) { finish(); return; }
+                        if (!continueAlong(h, o, Lobe::Reflect, ray, scene.hitEps(h))) { finish(); return; }
                     } else {
                         const GlossyDraw gd = drawGlossy(scene, m, h, h.n, ray.d * -1.0, rng);
                         const Vec3& o = gd.o;
@@ -3893,7 +3900,7 @@ struct BackwardRenderer {
                             gmis.from = h.p;
                             gmis.n = h.n;
                         }
-                        if (!continueAlong(h, o, Lobe::Reflect, ray, scene.eps)) { finish(); return; }
+                        if (!continueAlong(h, o, Lobe::Reflect, ray, scene.hitEps(h))) { finish(); return; }
                     }
                     specularArrival = true;
                     break;
@@ -3964,7 +3971,7 @@ struct BackwardRenderer {
                         if (!(q > 0.0) || rng.uniform() >= q) { finish(); return; }
                         for (int i = 0; i < nUp; ++i) thr[i] *= fac[i] / q;
                         const Vec3 wOut = hair::toWorld(hsB[0].fr, wl);
-                        ray = Ray{h.p + wOut * (1e-3 * scene.eps), wOut, hairExitOffset(hsB[0], h.n, wOut, scene.eps)};
+                        ray = Ray{h.p + wOut * (1e-3 * scene.hitEps(h)), wOut, hairExitOffset(hsB[0], h.n, wOut, scene.hitEps(h))};
                         if (passThru) {
                             passedThrough();
                         } else {
@@ -4181,7 +4188,7 @@ struct BackwardRenderer {
                     for (int i = 0; i < nUp; ++i) thr[i] *= rho[i] / q;   // bounded reweight
                     Vec3 wOut = cosineHemisphere(h.n, rng);
                     contBsdfPdf = std::max(0.0, dot(wOut, h.n)) / PI;
-                    if (!continueAlong(h, wOut, Lobe::Reflect, ray, scene.eps)) { finish(); return; }
+                    if (!continueAlong(h, wOut, Lobe::Reflect, ray, scene.hitEps(h))) { finish(); return; }
                     specularArrival = false; break;
                 }
             }

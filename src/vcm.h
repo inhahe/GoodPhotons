@@ -573,7 +573,7 @@ inline void scatterSample(const Scene& scene, const Renderer& mats, const Materi
             double r = clamp01(reflectSlot(scene, *mp, h, lambda));
             if (r <= 0) { terminate = true; break; }
             bool absorbedG; int pickG = 0;
-            Ray nr = mats.gratingDiffract(*mp, h, rayDir, scene.eps, lambda, rng, absorbedG, nullptr,
+            Ray nr = mats.gratingDiffract(*mp, h, rayDir, scene.hitEps(h), lambda, rng, absorbedG, nullptr,
                                           jr ? &pickG : nullptr);
             if (absorbedG) { terminate = true; break; }
             wi = nr.d; betaFactor = r; delta = true; lobe = Lobe::Free;   // orders about ng
@@ -872,8 +872,9 @@ inline void traceLightSubpath(const Scene& scene, const Camera& cam, const Rende
                             // a delta vertex of the sampled path, so a connection through a
                             // fiber would double-count it against the longer sampled path.
                             const double visC = (mxF > 0.0 &&
-                                !scene.occluded(fiberOrigin(h, isHairV, wcam, scene.eps), wcam, distc - 2 * scene.eps,
-                                                scene.eps, /*camLeg=*/true, fiberStep(h, isHairV, wcam)))
+                                !scene.occluded(fiberOrigin(h, isHairV, wcam, scene.hitEps(h)), wcam,
+                                                distc - 2 * scene.hitEps(h), scene.hitEps(h), /*camLeg=*/true,
+                                                fiberStep(h, isHairV, wcam)))
                                 ? 1.0 : 0.0;
                             if (visC > 0.0) {
                                 double bsdfRevPdfW = bsdfPdf(*mp, h.n, wcam, wo, lambda, scene, &h);
@@ -945,8 +946,8 @@ inline void traceLightSubpath(const Scene& scene, const Camera& cam, const Rende
         prevP = h.p;
         // A fiber scattering out its far side steps clear of its own tube (see fiberStep).
         const double fstep = fiberStep(h, mp->type == MatType::Hair, wi);
-        ray = (fstep > 0.0) ? Ray{h.p + normalize(wi) * (1e-3 * scene.eps), normalize(wi), fstep}
-                            : Ray{continuationOrigin(h.p, h.ng, normalize(wi), delta, scene.eps), normalize(wi)};
+        ray = (fstep > 0.0) ? Ray{h.p + normalize(wi) * (1e-3 * scene.hitEps(h)), normalize(wi), fstep}
+                            : Ray{continuationOrigin(h.p, h.ng, normalize(wi), delta, scene.hitEps(h)), normalize(wi), 0.0, scene.hitEps(h)};
     }
 }
 
@@ -1008,7 +1009,7 @@ inline Vec3 traceCameraSubpath(const Scene& scene, const Camera& cam, const Rend
     for (int edges = 1; edges <= ctx.maxDepth; ++edges) {
         // edges == 1 is the camera-to-first-vertex edge — the primary ray; see
         // Material::hideCamera. (The light subpath walk above never gets this.)
-        Hit h = closestHitIn(scene, stk, ray, scene.eps, nullptr, /*skipHair=*/false,
+        Hit h = closestHitIn(scene, stk, ray, Scene::kTminEps, nullptr, /*skipHair=*/false,
                                          /*skipCamHidden=*/(edges == 1));
         if (!h.valid) {
             // The ray left the scene. No env map in VCM scope, but a `light sun` is a
@@ -1173,7 +1174,7 @@ inline Vec3 traceCameraSubpath(const Scene& scene, const Camera& cam, const Rend
                         // break the light subpath's matching dVCM).
                         // where the spot is at the path's time, its beam turned with it
                         Vec3 toL = scene.lightPointNow(em, em.origin) - h.p; dist2 = dot(toL, toL);
-                        if (dist2 > 1e-12) {
+                        if (dist2 > scene.hitEps(h) * scene.eps) {
                             distL = std::sqrt(dist2); wi = toL / distL;
                             epat = spotFalloff(dot(wi * -1.0, scene.lightDirNow(em, em.beamDir)),
                                                em.spotCosInner, em.spotCosOuter);
@@ -1211,7 +1212,7 @@ inline Vec3 traceCameraSubpath(const Scene& scene, const Camera& cam, const Rend
                         double areaScale = 1.0;   // its area at the pass's time about the point
                         epat = emitterSamplePoint(scene, em, u1, u2, yL, nL, &areaScale, &rng);
                         Vec3 toL = yL - h.p; dist2 = dot(toL, toL);
-                        if (dist2 > 1e-12 && em.area > 0.0) {
+                        if (dist2 > scene.hitEps(h) * scene.eps && em.area > 0.0) {
                             distL = std::sqrt(dist2); wi = toL / distL;
                             // An aimed quad (Emitter::nGeom): the face's cosine is the
                             // measure, the aimed density the emission's, and its radiance
@@ -1259,8 +1260,8 @@ inline Vec3 traceCameraSubpath(const Scene& scene, const Camera& cam, const Rend
                             }
                             const bool isHairV = (mp->type == MatType::Hair);
                             const double visL = (mxfLe > 0.0 &&
-                                !scene.occludedTo(fiberOrigin(h, isHairV, wi, scene.eps), h.p + wi * distL,
-                                                  occlEps, scene.eps, false, fiberStep(h, isHairV, wi)))
+                                !scene.occludedTo(fiberOrigin(h, isHairV, wi, scene.hitEps(h)), h.p + wi * distL,
+                                                  occlEps, scene.hitEps(h), false, fiberStep(h, isHairV, wi)))
                                 ? 1.0 : 0.0;   // hard block: see t=1
                             if (visL > 0.0) {
                                 double pdfChoice = em.power / scene.totalPower;
@@ -1297,7 +1298,7 @@ inline Vec3 traceCameraSubpath(const Scene& scene, const Camera& cam, const Rend
                 if (!lightVertexConnects(lv)) continue;              // a merge vertex only
                 if (edges + lv.edges + 1 > ctx.maxDepth) continue;   // full path too long
                 Vec3 d = lv.p - h.p; double dist2 = dot(d, d);
-                if (dist2 <= 1e-12) continue;
+                if (dist2 <= scene.hitEps(h) * scene.hitEps(lv.hit)) continue;   // the ends coincide
                 double distc = std::sqrt(dist2); Vec3 w = d / distc;   // camera -> light vertex
                 double cosCam = dot(h.n, w);
                 double cosLit = dot(lv.ns, w * -1.0);
@@ -1361,7 +1362,8 @@ inline Vec3 traceCameraSubpath(const Scene& scene, const Camera& cam, const Rend
                 {   // Either end may be a strand; clear both tubes (0 for non-fibers).
                     const bool camHair = (mp->type == MatType::Hair);
                     const bool litHair = (lv.mat && lv.mat->type == MatType::Hair);
-                    if (scene.occludedTo(fiberOrigin(h, camHair, w, scene.eps), lv.p, 2 * scene.eps, scene.eps, false,
+                    if (scene.occludedTo(fiberOrigin(h, camHair, w, scene.hitEps(h)), lv.p, 2 * scene.hitEps(lv.hit),
+                                         scene.hitEps(h), false,
                                          fiberStep(h, camHair, w),
                                          fiberStep(lv.hit, litHair, w * -1.0)))
                         continue;   // hard block: see t=1
@@ -1516,8 +1518,8 @@ inline Vec3 traceCameraSubpath(const Scene& scene, const Camera& cam, const Rend
         softNg = orientedGeoN(h);
         // A fiber scattering out its far side steps clear of its own tube (see fiberStep).
         const double fstep = fiberStep(h, mp->type == MatType::Hair, wi);
-        ray = (fstep > 0.0) ? Ray{h.p + normalize(wi) * (1e-3 * scene.eps), normalize(wi), fstep}
-                            : Ray{continuationOrigin(h.p, h.ng, normalize(wi), delta, scene.eps), normalize(wi)};
+        ray = (fstep > 0.0) ? Ray{h.p + normalize(wi) * (1e-3 * scene.hitEps(h)), normalize(wi), fstep}
+                            : Ray{continuationOrigin(h.p, h.ng, normalize(wi), delta, scene.hitEps(h)), normalize(wi), 0.0, scene.hitEps(h)};
     }
     return result;
 }

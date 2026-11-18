@@ -1019,7 +1019,7 @@ inline void randomWalk(const Scene& scene, const Camera& cam, const Renderer& ma
         // `hide_camera` is primary visibility only, so it applies to exactly one ray in
         // this walk: the first edge of the RADIANCE (camera) subpath. An importance walk
         // starts at a light and never has a camera ray at all.
-        Hit h = closestHitIn(scene, stk, ray, scene.eps, nullptr, /*skipHair=*/false,
+        Hit h = closestHitIn(scene, stk, ray, Scene::kTminEps, nullptr, /*skipHair=*/false,
                                          /*skipCamHidden=*/(mode == Mode::Radiance && bounces == 0));
         if (h.valid && h.sensorId >= 0) return;      // model-A sensor: not used in BDPT
         double dSurf = h.valid ? h.t : 1e30;
@@ -1691,7 +1691,7 @@ inline void randomWalk(const Scene& scene, const Camera& cam, const Renderer& ma
                 double r = clamp01(reflectSlot(scene, *mp, h, lambda));
                 if (r <= 0) { terminate = true; break; }
                 bool absorbedG; int pickG = 0;
-                Ray nr = mats.gratingDiffract(*mp, h, ray.d, scene.eps, lambda, rng, absorbedG, nullptr,
+                Ray nr = mats.gratingDiffract(*mp, h, ray.d, scene.hitEps(h), lambda, rng, absorbedG, nullptr,
                                               jsw ? &pickG : nullptr);
                 if (absorbedG) { terminate = true; break; }
                 wi = nr.d; betaFactor = r; delta = true; lobe = Lobe::Free;   // orders about ng
@@ -1862,9 +1862,10 @@ inline void randomWalk(const Scene& scene, const Camera& cam, const Renderer& ma
         const bool fiberFar = (mp->type == MatType::Hair) && h.fiberRadius > 0.0 &&
                               dot(wi, cur.ns) < 0.0;
         ray = fiberFar
-                  ? Ray{cur.p + normalize(wi) * (1e-3 * scene.eps), normalize(wi),
+                  ? Ray{cur.p + normalize(wi) * (1e-3 * scene.hitEps(h)), normalize(wi),
                         hairChordExit(h.fiberRadius, h.n, h.tangent, normalize(wi))}   // the exact chord (0.364.0)
-                  : Ray{continuationOrigin(cur.p, cur.ng, normalize(wi), delta, scene.eps), normalize(wi)};
+                  : Ray{continuationOrigin(cur.p, cur.ng, normalize(wi), delta, scene.hitEps(h)), normalize(wi),
+                        0.0, scene.hitEps(h)};
         pdfFwd = delta ? 0.0 : pdfW;
     }
 }
@@ -3916,10 +3917,16 @@ inline Vec3 offsetOrigin(const Vertex& v, const Vec3& dir, double eps) {
     return v.p + v.ng * (sgn * eps);
 }
 
+// A vertex's self-intersection distance, its connections' offset, tmin and shortening at that
+// end: its hit's (Scene::hitEps) -- the scene's at a medium point, a light's or the camera's.
+inline double vertexEps(const Scene& scene, const Vertex& v) {
+    return v.type == VType::Surface ? scene.hitEps(v.hit) : scene.eps;
+}
+
 // Connection-ray origin at a connectible vertex. A surface offsets off its geometric
 // normal (above); a medium in-scatter point has no surface to self-occlude against, so
 // the exact point is used (the transmittance factor accounts for the fog it sits in).
-// `eps`: the scene's self-intersection distance (Scene::eps).
+// `eps`: the vertex's self-intersection distance (vertexEps).
 inline Vec3 connOrigin(const Vertex& v, const Vec3& dir, double eps) {
     if (v.type == VType::Medium) return v.p;
     // FAR-SIDE ORIGIN (0.365.0). A fiber connecting out the FAR side starts 1e-6 ALONG the
@@ -4116,7 +4123,8 @@ inline double connectBDPT(const Scene& scene, const Camera& cam, const Renderer&
         // be the same transport as a sampled path one vertex longer, and MIS cannot pair paths
         // of different lengths -- letting connections through double-counted it (D 0.9450 ->
         // 1.4123 on the invisibility null). Fur-crossing transport is carried by sampling.
-        if (scene.occluded(connOrigin(qs, wcam, scene.eps), wcam, dist - 2 * scene.eps, scene.eps, /*camLeg=*/true,
+        const double qe = vertexEps(scene, qs);
+        if (scene.occluded(connOrigin(qs, wcam, qe), wcam, dist - 2 * qe, qe, /*camLeg=*/true,
                            connFiberStep(qs, wcam))) return 0.0;
         const double vis = 1.0;
         // Transmittance of the fog the connection ray crosses (1 in vacuum, no RNG).
@@ -4284,7 +4292,8 @@ inline double connectBDPT(const Scene& scene, const Camera& cam, const Renderer&
             for (int i = 0; i + 1 < nUp; ++i) if (fSec[i] > mxF) mxF = fSec[i];
             if (!(mxF > 0.0)) return 0.0;
         }
-        if (scene.occludedTo(connOrigin(pt, wi, scene.eps), y, occlEps, scene.eps, false,
+        const double pe = vertexEps(scene, pt);
+        if (scene.occludedTo(connOrigin(pt, wi, pe), y, occlEps, pe, false,
                              connFiberStep(pt, wi))) return 0.0;   // hard block: see t=1
         const double vis = 1.0;
         // Hero transmittance, shared by the bundle (flat extinction; see the t==1 branch).
@@ -4377,7 +4386,8 @@ inline double connectBDPT(const Scene& scene, const Camera& cam, const Renderer&
         // Both ENDS can be fibers here, and a connection arriving at a strand from its far
         // side would clip the tube just short of the vertex, so stop the shadow ray early at
         // that end too. Adds an exact 0.0 for every non-fiber pair.
-        if (scene.occludedTo(connOrigin(pt, w, scene.eps), qs.p, 2 * scene.eps, scene.eps, false, connFiberStep(pt, w),
+        const double pe = vertexEps(scene, pt), qe = vertexEps(scene, qs);
+        if (scene.occludedTo(connOrigin(pt, w, pe), qs.p, 2 * qe, pe, false, connFiberStep(pt, w),
                              connShorten(qs, w * -1.0, 0.0))) return 0.0;   // hard block: see t=1
         const double vis = 1.0;
         // Hero transmittance, shared by the bundle (flat extinction; see the t==1 branch).

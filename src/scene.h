@@ -2099,6 +2099,7 @@ struct Scene {
         const double s = std::cbrt(std::fabs(det));
         if (s > 0.0) h.curv /= s;
         h.fiberRadius *= s;
+        h.size *= s;
         double f2 = 0.0;
         for (double m : D.m) f2 += m * m;
         h.pscale = std::sqrt(f2) * h.pscale + length(D.t);
@@ -2981,9 +2982,33 @@ struct Scene {
     // Whether any enabled medium bends rays (Medium::bends), for crossesGrin's early out (build()).
     bool bendsAny = false;
     // A trace's tmin as a sentinel the trace resolves to `eps` (closestHit, occluded,
-    // shadowTransmittance, occludedTo, occludedSkipHair, closestHitLinear default to it).
+    // shadowTransmittance, occludedTo, occludedSkipHair, closestHitLinear default to it) -- or,
+    // for a trace given a Ray, to the ray's own (Ray::tmin) where it has one.
     static constexpr double kTminEps = -1.0;
     double tminOr(double tmin) const { return tmin < 0.0 ? eps : tmin; }
+    double tminOr(double tmin, const Ray& r) const { return tmin >= 0.0 ? tmin : r.tmin >= 0.0 ? r.tmin : eps; }
+    // The self-intersection distance of a ray leaving hit h, for its origin's offset, its tmin
+    // and a connection's shortening at that end: `eps`, but no more than a thousandth of the
+    // feature the hit lies on (Hit::size) -- 1e-6 is a twelfth of a strand 12 um thick, which a
+    // scene of unit size around it would otherwise step through (CPU-SMALL-IN-BIG) -- and no less
+    // than 512 ulps of the coordinates the hit was computed from (its primitive's reach, or its
+    // own distance), the rounding the offset is there to clear. Never more than `eps`: a scene
+    // whose features are all a thousandth of its size or more takes `eps` everywhere.
+    double hitEps(const Hit& h) const {
+        return featureEps(h.size, std::max(h.pscale, std::max(std::fabs(h.p.x), std::max(std::fabs(h.p.y), std::fabs(h.p.z)))));
+    }
+    // hitEps for a feature of `size` whose coordinates reach `reach` (0 or less: unknown -- `eps`).
+    double featureEps(double size, double reach) const {
+        if (!(size > 0.0)) return eps;
+        return std::min(eps, std::max(1e-3 * size, reach * 0x1p-43));
+    }
+    // Per global primitive (tris, spheres, isosurfaces, curve segments, instances, in that order):
+    // the smallest feature whose box overlaps its own, of those small enough for their hitEps to
+    // fall below eps (a thousandth of their size under it); FLT_MAX where none does, and empty in a
+    // scene with none (buildPrimNear). closestHit lowers a hit's Hit::size to its primitive's, so a
+    // ray leaving a surface does not step over a smaller feature touching it: a strand rooted in the
+    // skin it leaves, whose own size says nothing of the strands (CPU-SMALL-IN-BIG).
+    std::vector<float> primNear;
     // Whether the current path has a time in a moving scene, and so may meet a mover outside the
     // instant's bounding sphere.
     bool sweptQuery() const { return g_motionU >= 0.0 && hasMotion(); }
@@ -5120,6 +5145,7 @@ struct Scene {
             bendsAny = false;
             for (const Medium& md : media) bendsAny = bendsAny || (md.enabled && md.bends());
         }
+        buildPrimNear();   // reads eps
         {
             double k = kJBeamDomainScale;
             if (const char* e = std::getenv("FTRACE_JBEAMDOMAIN")) {
@@ -5362,6 +5388,100 @@ struct Scene {
         return instanceBox(instances[(size_t)g]);
     }
 
+    // primNear, from each primitive's box at the instant and its feature size (Hit::size's: a
+    // triangle's longest edge, a sphere's radius, an isosurface's bound's longest side, a curve
+    // segment's smaller radius, an instance's asset's smallest triangle by its mean scale): a tree
+    // over the small features only, each node holding its smallest, queried with every box.
+    void buildPrimNear() {
+        primNear.clear();
+        std::vector<Aabb> boxes;
+        collectPrimBoxes(boxes, /*dropHair=*/false, nullptr);
+        const size_t nT = tris.size(), nS = spheres.size(), nI = implicits.size(), nC = curveSegs.size();
+        std::vector<double> blasMin(blasList.size(), 0.0);
+        for (size_t b = 0; b < blasList.size(); ++b) {
+            double m = DBL_MAX;
+            for (const Tri& t : blasList[b].tris) m = std::min(m, (double)t.size);
+            blasMin[b] = m;
+        }
+        const auto sizeOf = [&](size_t g) -> double {
+            if (g < nT) return tris[g].size;
+            g -= nT;
+            if (g < nS) return std::fabs(spheres[g].r);
+            g -= nS;
+            if (g < nI) {
+                const Aabb& b = implicits[g].bounds;
+                return std::max(b.hi.x - b.lo.x, std::max(b.hi.y - b.lo.y, b.hi.z - b.lo.z));
+            }
+            g -= nI;
+            if (g < nC) return std::min(curveSegs[g].r0, curveSegs[g].r1);
+            const MeshInstance& inst = instances[g - nC];
+            return blasMin[(size_t)inst.blasId] / inst.curvScale;
+        };
+        std::vector<Aabb> smallBoxes;
+        std::vector<double> smallSize;
+        for (size_t g = 0; g < boxes.size(); ++g) {
+            const double sz = sizeOf(g);
+            if (sz > 0.0 && 1e-3 * sz < eps) { smallBoxes.push_back(boxes[g]); smallSize.push_back(sz); }
+        }
+        if (smallBoxes.empty()) return;
+        Bvh tree;
+        tree.build(smallBoxes);
+        if (tree.nodes.empty()) return;
+        // Each node's smallest feature, children after parents in the array or not: a post-order walk.
+        std::vector<double> nodeMin(tree.nodes.size(), DBL_MAX);
+        {
+            std::vector<std::pair<int, bool>> st{{0, false}};
+            while (!st.empty()) {
+                const auto [ni, done] = st.back();
+                st.pop_back();
+                const BvhNode& nd = tree.nodes[(size_t)ni];
+                if (nd.isLeaf()) {
+                    for (int k = nd.first; k < nd.first + nd.count; ++k)
+                        nodeMin[(size_t)ni] = std::min(nodeMin[(size_t)ni], smallSize[(size_t)tree.primIdx[(size_t)k]]);
+                } else if (done) {
+                    nodeMin[(size_t)ni] = std::min(nodeMin[(size_t)nd.left], nodeMin[(size_t)nd.right]);
+                } else {
+                    st.push_back({ni, true});
+                    st.push_back({nd.left, false});
+                    st.push_back({nd.right, false});
+                }
+            }
+        }
+        const auto overlaps = [](const Aabb& a, const Aabb& b) {
+            return a.lo.x <= b.hi.x && b.lo.x <= a.hi.x && a.lo.y <= b.hi.y && b.lo.y <= a.hi.y &&
+                   a.lo.z <= b.hi.z && b.lo.z <= a.hi.z;
+        };
+        primNear.assign(boxes.size(), FLT_MAX);
+        std::atomic<size_t> dropped{0};
+        ft::parallelForAll(boxes.size(), 4096, [&](size_t g) {
+            const Aabb& q = boxes[g];
+            double best = DBL_MAX;
+            constexpr int kStack = 128;      // a depth-first walk holds the tree's depth + 1
+            int st[kStack], n = 0;
+            st[n++] = 0;
+            while (n > 0) {
+                const int ni = st[--n];
+                const BvhNode& nd = tree.nodes[(size_t)ni];
+                if (!(nodeMin[(size_t)ni] < best) || !overlaps(nd.box, q)) continue;
+                if (nd.isLeaf()) {
+                    for (int k = nd.first; k < nd.first + nd.count; ++k) {
+                        const int j = tree.primIdx[(size_t)k];
+                        if (smallSize[(size_t)j] < best && overlaps(smallBoxes[(size_t)j], q)) best = smallSize[(size_t)j];
+                    }
+                } else if (n + 2 <= kStack) {
+                    st[n++] = nd.left; st[n++] = nd.right;
+                } else {
+                    dropped.fetch_add(1, std::memory_order_relaxed);
+                }
+            }
+            if (best < DBL_MAX) primNear[g] = (float)best;
+        });
+        if (dropped.load())
+            std::fprintf(stderr, "[eps] warning: the small-feature tree is over %d deep; %zu subtrees went "
+                                 "unread, so some surfaces keep a larger self-intersection distance\n",
+                         127, dropped.load());
+    }
+
     void buildBvh() {
         std::vector<Aabb> boxes;
         collectPrimBoxes(boxes, /*dropHair=*/false, nullptr);
@@ -5486,6 +5606,7 @@ struct Scene {
         // anisotropic scale changes the two principal curvatures by DIFFERENT amounts, so
         // no single scalar can be right and this is documented as an approximation.
         lh.curv *= inst.curvScale;
+        lh.size /= inst.curvScale;   // 1 / the mean linear scale
         if (inst.matOverride >= 0) { lh.matId = inst.matOverride; lh.boundsSolid = -1; }
         else if (inst.route >= 0 && mats && lh.matId >= 0) {
             const int to = mats[lh.matId].routeTo[inst.route];
@@ -5549,7 +5670,7 @@ struct Scene {
     Hit closestHit(const Ray& r, double tmin = kTminEps, TraversalStats* stats = nullptr,
                    bool skipHair = false, bool skipCamHidden = false, double tMaxIn = DBL_MAX,
                    bool skipCurves = false) const {
-        tmin = tminOr(tmin);
+        tmin = tminOr(tmin, r);
         ++raystats::tls;
         // Leaving a hair fiber the strand's own body is excluded by `curveTmin`, so the blanket
         // self-intersection tmin has nothing left to protect against and would only re-open the
@@ -5585,21 +5706,22 @@ struct Scene {
         const auto hidden = [&](int matId) {
             return camHide && matId >= 0 && matId < (int)mats.size() && mats[matId].hideCamera;
         };
+        int win = -1;                          // the global prim of the nearest hit so far
         const auto leaf = [&](int prim, double& tm) {
             if (prim < (int)nT)            { const Tri& t = tris[prim];
                                              if (hidden(t.matId)) return;
-                                             if (intersectTriNow(sh, r, t, tmin, h)) tm = h.t; }
+                                             if (intersectTriNow(sh, r, t, tmin, h)) { tm = h.t; win = prim; } }
             else if (prim < (int)(nT + nS)){ const Sphere& s = spheres[prim - nT];
                                              if (hidden(s.matId)) return;
-                                             if (intersectSphereNow(r, s, tmin, h)) tm = h.t; }
+                                             if (intersectSphereNow(r, s, tmin, h)) { tm = h.t; win = prim; } }
             else if (prim < (int)(nT + nS + nI)) { const Implicit& im = implicits[prim - nT - nS];
                                              if (hidden(im.matId)) return;
-                                             if (intersectImplicitNow(r, im, tmin, h, &tabs)) tm = h.t; }
+                                             if (intersectImplicitNow(r, im, tmin, h, &tabs)) { tm = h.t; win = prim; } }
             else if (prim < (int)(nT + nS + nI + nC)) {
                 const CurveSeg& cs = curveSegs[prim - nT - nS - nI];
                 if (skipCurves || (skipHair && isHairCurve(cs))) return;
                 if (hidden(cs.matId)) return;
-                if (intersectCurveNow(cray, r, cs, curveMin(r, tmin), h)) tm = h.t;
+                if (intersectCurveNow(cray, r, cs, curveMin(r, tmin), h)) { tm = h.t; win = prim; }
             }
             else {
                 // Instanced meshes are NOT covered: their materials live per-BLAS-triangle,
@@ -5607,10 +5729,11 @@ struct Scene {
                 // `light area`'s two world tris) is ever instanced. If a future `hide_camera`
                 // on a mesh block needs it, the test belongs inside Blas::intersectLocal.
                 const MeshInstance& inst = instances[prim - nT - nS - nI - nC];
-                if (intersectInstanceNow(r, inst, tmin, h, vcolData())) tm = h.t;
+                if (intersectInstanceNow(r, inst, tmin, h, vcolData())) { tm = h.t; win = prim; }
             }
         };
         traverseWorldClosest(r, tmin, tMax, leaf, stats, skipHair || skipCurves);
+        if (h.valid && win >= 0 && !primNear.empty()) h.size = std::min(h.size, (double)primNear[(size_t)win]);
         markBackFace(h);
         markPatSide(h);
         applyNormalMap(h);
@@ -5804,11 +5927,12 @@ struct Scene {
         return occluded(o, tv / td, connMaxT(td, absEps) - farClear, tmin, camLeg, curveTmin);
     }
     // shadowTransmittance() to a target point, aimed and shortened as occludedTo() does.
-    double shadowTransmittanceTo(const Vec3& o, const Vec3& target, double absEps) const {
+    double shadowTransmittanceTo(const Vec3& o, const Vec3& target, double absEps,
+                                 double tmin = kTminEps) const {
         const Vec3 tv = target - o;
         const double td = length(tv);
         if (!(td > 0.0)) return 1.0;
-        return shadowTransmittance(o, tv / td, connMaxT(td, absEps));
+        return shadowTransmittance(o, tv / td, connMaxT(td, absEps), tmin);
     }
 
     // Like occluded(), but fibers are INVISIBLE to it: only non-hair geometry blocks.
@@ -5880,12 +6004,12 @@ struct Scene {
     //
     // `maxCrossings` bounds the cost: a dense coat's transmittance is a product of numbers
     // below 1, so by the time this many strands have been crossed there is nothing left to
-    // carry and stopping early is a rounding error, not a cutoff artefact.
+    // carry and stopping early is a rounding error, not a cutoff artefact. `tmin0`: as occluded()'s.
     template <class F>
     bool walkFibers(const Vec3& o, const Vec3& dir, double maxDist, F&& onFiber,
-                    int maxCrossings = 64) const {
+                    int maxCrossings = 64, double tmin0 = kTminEps) const {
         const Ray r{o, dir};
-        const double tmin = eps;
+        const double tmin = tminOr(tmin0);
         const double seg  = maxDist - tmin;
         if (!(seg > 0.0)) return true;
         const size_t nT = tris.size();
@@ -6019,7 +6143,7 @@ struct Scene {
 
     // Linear-scan reference (pre-BVH), kept for the -checkbvh self-test.
     Hit closestHitLinear(const Ray& r, double tmin = kTminEps) const {
-        tmin = tminOr(tmin);
+        tmin = tminOr(tmin, r);
         Hit h;
         const TriShear sh = makeTriShear(r.d);
         for (const auto& t : tris)     intersectTriNow(sh, r, t, tmin, h);
@@ -6236,7 +6360,8 @@ inline double cavityAt(const Scene& scene, const Hit& h) {
     Vec3 t, b;
     onb(n, t, b);
     // Offset along the normal by a hair to avoid re-hitting the surface we sit on.
-    const Vec3 o = h.p + n * scene.eps;
+    const double he = scene.hitEps(h);
+    const Vec3 o = h.p + n * he;
     const double R = scene.cavityRadius;
     // Golden-angle spiral: the standard low-discrepancy hemisphere set, and the reason
     // a mere 16 rays already look even rather than clumped.
@@ -6249,7 +6374,7 @@ inline double cavityAt(const Scene& scene, const Hit& h) {
         const double cz = std::sqrt(1.0 - u);    // cos(theta) — the cosine weight
         const double ph = golden * i;
         const Vec3 d = t * (sr * std::cos(ph)) + b * (sr * std::sin(ph)) + n * cz;
-        if (scene.occludedGeometry(o, d, R)) ++blocked;
+        if (scene.occludedGeometry(o, d, R, he)) ++blocked;
     }
     return (double)blocked / (double)N;
 }

@@ -3521,7 +3521,7 @@ static bool checkPatternNudge() {
 // a ray from behind among them.
 static Hit junkHit() {
     Hit h;
-    h.t = 1e30; h.matId = -7; h.pscale = 777.0; h.fiberRadius = 0.5; h.hasVcol = true; h.back = true;
+    h.t = 1e30; h.matId = -7; h.pscale = 777.0; h.size = 555.0; h.fiberRadius = 0.5; h.hasVcol = true; h.back = true;
     h.tangent = Vec3(0, 0, 9); h.bitangentSign = -1.0; h.curv = 99.0; h.solid = 7; h.boundsSolid = 5;
     return h;
 }
@@ -3536,14 +3536,15 @@ static bool checkHitFieldsWritten() {
     {
         Hit h = junkHit();
         const Sphere s{Vec3(0, 0, 0), 0.5, 0};
-        expect("a sphere", intersectSphere(down, s, 1e-9, h) && h.pscale == 0.5 && h.fiberRadius == 0.0 &&
+        expect("a sphere", intersectSphere(down, s, 1e-9, h) && h.pscale == 0.5 && h.size == 0.5 && h.fiberRadius == 0.0 &&
                            !h.hasVcol && !h.back && h.solid == 1 && h.boundsSolid == -1);
     }
     {
         Hit h = junkHit();
         Tri t{Vec3(-1, 0, -1), Vec3(-1, 0, 1), Vec3(1, 0, 1), 0, -1, {}};
         t.finalize();
-        expect("a triangle", intersectTri(down, t, 1e-9, h) && h.pscale == t.reach && h.fiberRadius == 0.0 &&
+        expect("a triangle", intersectTri(down, t, 1e-9, h) && h.pscale == t.reach &&
+                             h.size == (double)(float)std::sqrt(8.0) && h.fiberRadius == 0.0 &&
                              !h.hasVcol && !h.back && h.solid == 0 && h.boundsSolid == -1);
         Hit hi = junkHit();
         t.solidFace = 2;                       // a closed solid's face, its normal in
@@ -3554,7 +3555,7 @@ static bool checkHitFieldsWritten() {
         Hit h = junkHit();
         CurveSeg cs;
         cs.p0 = Vec3(-1, 0, 0); cs.p1 = Vec3(1, 0, 0); cs.r0 = cs.r1 = 0.5;
-        expect("a curve", intersectCurveSeg(makeCurveRay(down.d), down, cs, 1e-9, h) && h.pscale == 1.5 &&
+        expect("a curve", intersectCurveSeg(makeCurveRay(down.d), down, cs, 1e-9, h) && h.pscale == 1.5 && h.size == 0.5 &&
                           !h.hasVcol && !h.back && h.solid == 0 && h.boundsSolid == -1);
     }
     {
@@ -3570,6 +3571,7 @@ static bool checkHitFieldsWritten() {
         Hit h = junkHit();
         expect("an isosurface", loaded && L.scene.implicits.size() == 1 &&
                                 intersectImplicit(down, L.scene.implicits[0], 1e-9, h) && h.pscale == 0.0 &&
+                                h.size > 0.9 && h.size < 1.1 &&
                                 h.fiberRadius == 0.0 && !h.hasVcol && !h.back && h.tangent.z == 0.0 &&
                                 h.bitangentSign == 1.0 && h.solid == 0 && h.boundsSolid == -1);
         if (loaded && !L.scene.implicits.empty()) {

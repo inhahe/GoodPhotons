@@ -235,7 +235,7 @@ inline double hairChordExit(double r, const Vec3& n, const Vec3& axis, const Vec
     const double cap = 20.0 * r;
     return chord < cap ? chord : cap;
 }
-// `eps`: the scene's self-intersection distance (Scene::eps), the near side's skip.
+// `eps`: the hit's self-intersection distance (Scene::hitEps), the near side's skip.
 inline double hairExitOffset(const HairShade& s, const Vec3& n, const Vec3& w, double eps) {
     if (dot(n, w) >= 0.0) return eps;               // leaving on the arrival side: normal case
     return (s.radius > 0.0) ? hairChordExit(s.radius, n, s.fr.x, w) : eps;
@@ -485,7 +485,7 @@ struct HairDualCtx {
 // not have, and is the reason `-dual-grid` is opt-in rather than the default.
 inline bool hairShadowGrid(HairShadow& sh, const HairDualCtx& ctx, const Scene& sc,
                            const Hit& shadingHit, const Vec3& o, const Vec3& wi, double len) {
-    if (sc.occludedSkipHair(o, wi, len)) { sh.blocked = true; return false; }
+    if (sc.occludedSkipHair(o, wi, len, sc.hitEps(shadingHit))) { sh.blocked = true; return false; }
     const FurMarch fm = ctx.grid->march(o, wi, len);
     if (!(fm.tau > 0.0) || fm.matId < 0 || fm.matId >= (int)sc.mats.size()) return true;
     // `maxCross` keeps its meaning: past this many crossings there is nothing left to carry,
@@ -524,8 +524,9 @@ inline double hairDualResponse(const HairDualCtx& ctx, const HairShade& s, const
                                const Vec3& wi, double dist, bool& blockedOut) {
     blockedOut = true;
     const Scene& sc = *ctx.scene;
-    const double off = hairExitOffset(s, h.n, wi, sc.eps);
-    const double len = dist - off - sc.eps;
+    const double he = sc.hitEps(h);
+    const double off = hairExitOffset(s, h.n, wi, he);
+    const double len = dist - off - sc.eps;                // short of the light's surface
     if (!(len > 0.0)) return 0.0;
     HairShadow sh;
     const Vec3 o = h.p + wi * off;
@@ -537,7 +538,7 @@ inline double hairDualResponse(const HairDualCtx& ctx, const HairShade& s, const
             const hair::Dual* d = hairDualFor(sc, sc.mats[fh.matId], fh.matId, fh, ctx.lambda);
             hairShadowCross(sh, *d, fh, wi,
                             hairOpacityAt(sc, sc.mats[fh.matId], fh));
-        }, ctx.maxCross);
+        }, ctx.maxCross, he);
     }
     if (!reached) return 0.0;
     blockedOut = false;
