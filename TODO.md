@@ -744,15 +744,15 @@ Then the rest of 4.2-4.6 in their order, 4.7's bookkeeping alongside whatever to
 
 Verify each against the code, then mark it DONE (or retitle it) in `known-issues.md`.
 
-- [ ] Both **`camera_curve` frame-range** entries in "Open bugs" — `-frames A B` shipped in 0.337.0.
-- [ ] **"`-savemap` / `-loadmap` are silently ignored on the CPU"** — `photonmap_io.h` serves both.
-- [ ] **"an emissive mesh that is not PLANAR is silently re-oriented OUTWARD"** — its own body says
+- [x] Both **`camera_curve` frame-range** entries in "Open bugs" — `-frames A B` shipped in 0.337.0.
+- [x] **"`-savemap` / `-loadmap` are silently ignored on the CPU"** — `photonmap_io.h` serves both.
+- [x] **"an emissive mesh that is not PLANAR is silently re-oriented OUTWARD"** — its own body says
   FIXED (0.338.0, `emit_orient`).
-- [ ] **VOLCACHE** (2026-09-06) — the deposit split shipped in 0.300.0.
-- [ ] **"a mesh area light is sampled UNIFORMLY BY AREA"** — the penalty no longer reproduces; the
-  emitter-level tree shipped in 0.187.0.
-- [ ] **BVH-BUILD** — its heading says not worth parallelising; its body says done in 0.292.0.
-- [ ] **UPBP-CONV** (claims overturned), **FURDIM** (dissolved), and the **PLANNED UPBP** entry (first
+- [x] **VOLCACHE** (2026-09-06) — the deposit split shipped in 0.300.0.
+- [x] **"a mesh area light is sampled UNIFORMLY BY AREA"** — the penalty no longer reproduces; the
+  emitter-level tree shipped in 0.270.0; measured ~1 % at 90 % waste, retitled not worth the fix.
+- [x] **BVH-BUILD** — its heading says not worth parallelising; its body says done in 0.292.0.
+- [x] **UPBP-CONV** (claims overturned), **FURDIM** (dissolved), and the **PLANNED UPBP** entry (first
   half done in 0.214.0 — check what is left of the second).
 - [ ] **"the `gallery_rain` 600-frame mode-M flyby cannot start — the machine's COMMIT limit"** —
   re-test on the frame-at-a-time GPU path; it may be closed.

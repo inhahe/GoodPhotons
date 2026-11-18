@@ -15070,7 +15070,7 @@ knee's own variance is understood — shrinking the pilot on a scene where the e
 unstable would make the map size *more* random, not less. `FTRACE_JPILOT=<n>` overrides the size
 for exactly this investigation.
 
-### FURDIM — ~~OPEN~~ **LARGELY DISSOLVED (2026-09-13): it is not a fur defect.** Filed 2026-09-12 (v0.278.4) as a fur normalisation error, after `gallery_rain`'s `creature` was measured getting **worse as the gather radius shrinks**. A controlled sweep on the SAME creature asset with the rain medium removed **flips the sign**, so the effect belongs to the volumetric beam gather at large `r/R`, and fur at its own adaptive radius is accurate to **0.1 %**
+### FURDIM — CLOSED (retitled 2026-11-18): **DISSOLVED (2026-09-13), it is not a fur defect**; the fur residual that remains is M-GATHERAREA's "Remaining: fur" (the gather ball reaching across strands), tracked there. Filed 2026-09-12 (v0.278.4) as a fur normalisation error, after `gallery_rain`'s `creature` was measured getting **worse as the gather radius shrinks**. A controlled sweep on the SAME creature asset with the rain medium removed **flips the sign**, so the effect belongs to the volumetric beam gather at large `r/R`, and fur at its own adaptive radius is accurate to **0.1 %**
 
 **Measured with the photon count held FIXED and only the radius moving** (`-pmradius` with
 `-pmadaptive 0`, so the beam map, the photon map and every sample are identical between arms;
@@ -15411,7 +15411,13 @@ result is scene-dependent by nature — `gallery_rain` stores ~27 k chords again
 millions, so the capacity loss cannot bite; a scene that actually saturates `beamCap` would lose
 ~1 % of it.
 
-### VOLCACHE — OPEN (2026-09-06, v0.257.0): the radiance cache covers diffuse *surfaces* only, so the volumetric gather — which is where ~all of a `gallery_rain` frame's time actually goes — is recomputed in full every frame of a flyby
+### VOLCACHE — DONE (deposit split 0.300.0, device 0.311.0, `-volcache` 0.315.0; closed 2026-11-18; filed 2026-09-06, v0.257.0): the radiance cache covered diffuse *surfaces* only, so the volumetric gather — which is where ~all of a `gallery_rain` frame's time actually goes — was recomputed in full every frame of a flyby
+
+> **Shipped.** `-volcache [res|off]` (`src/volcache.h`) routes every order ≥ 2 beam chord into a
+> per-medium spherical-harmonic fluence grid at map-build time and the gather marches that field
+> instead, on both backends: measured 64 % faster and energy-correct to 0.2-0.4 % on thick media
+> (the "DEPOSIT SPLIT BUILT AND MEASURED" entry above; REFERENCE.md, `-volcache`). The entry below
+> is the motivation and design as filed.
 
 **The measurement that motivates this.** A flyby amortises the forward pass across frames, and
 that is a real saving, but it is the wrong 2 %. From `png/barsdiag/R_mverify_s11.log` (mode `M`,
@@ -19488,7 +19494,7 @@ volumetric caustic seen through fog: it loses the merge technique and falls back
 noise there. **The fix** is a genuine solid-angle density for the specular lobe, which is the same
 change VCM would need and which no ftrace mode currently has.
 
-### UPBP-CONV — ~~OPEN~~ **BOTH HEADLINE CLAIMS OVERTURNED BY LATER WORK IN THIS SAME FILE (re-audited 2026-09-12)** (filed 2026-09-02, v0.218.0; measured on a thick medium 2026-09-03, v0.219.1): the entry was filed because `-spp` did not converge mode `J`'s merge half at all, and mode `J` lost to mode `D` at equal time on per-sample COST
+### UPBP-CONV — CLOSED (retitled 2026-11-18): **BOTH HEADLINE CLAIMS OVERTURNED BY LATER WORK IN THIS SAME FILE (re-audited 2026-09-12)**; the connection residual left over is TODO.md's "Mode D's heavy noise tail" (filed 2026-09-02, v0.218.0; measured on a thick medium 2026-09-03, v0.219.1): the entry was filed because `-spp` did not converge mode `J`'s merge half at all, and mode `J` lost to mode `D` at equal time on per-sample COST
 
 > **Neither is still true, and the evidence for both is already in this file.**
 > * **"Loses to mode `D` at equal time"** — (2g) measures the opposite: on every statistic not at the mercy of the tail, mode `J` *beats* mode `D` at equal time by **1.37x / 1.28x / 1.52x**. The entry's own later section says so, while its header still says it loses.
@@ -20129,7 +20135,13 @@ solution is — which is the accepted trade there and should be the accepted tra
 re-uploads the whole scene once per frame"*) is the same shape of problem on the other half of mode
 `J`, and a mode-`J` flyby pays both.
 
-### PLANNED (2026-09-02, v0.213.0): **UPBP** — MIS-combine mode `D`'s BDPT connections with the `-beams` beam×ray estimator, so a volumetric scene stops having to choose between mode M's permanent noise floor and mode D's per-frame cost
+### BUILT — it is mode `J` (landed in phases from v0.214.0; retitled 2026-11-18; planned 2026-09-02, v0.213.0): **UPBP** — MIS-combine mode `D`'s BDPT connections with the `-beams` beam×ray estimator, so a volumetric scene stops having to choose between mode M's permanent noise floor and mode D's per-frame cost
+
+> **Status, 2026-11-18.** Nothing of this plan is outstanding. Gate (1)'s second half
+> ("connections off reproduces mode `M -beams`") was never run as written, and need not be: mode
+> `M` gathers only at the first diffuse hit and mode `J` along every camera segment, so the two
+> are not like for like (see gate (1) below). Phase 2's substitute gates replaced it, and
+> `FTRACE_J_HALF=merges` (`bdpt.h`) now renders the merge half alone for whoever wants to compare.
 
 **The gap this closes.** On `gallery_rain` the two available estimators each fail in a way the
 other doesn't. Mode `M -beams` amortises one view-independent forward pass over all 600 flyby
@@ -23522,7 +23534,12 @@ threshold rather than assuming it went away. A cheap runtime net would be a GPU
 self-test at init (trace one known photon, compare against the CPU) — worth doing if
 this class of failure recurs.
 
-### OPEN — **but the measured penalty no longer reproduces** (re-tested 2026-09-12, v0.273.10; filed 2026-08-15, v0.186.0): a mesh area light is sampled UNIFORMLY BY AREA, so every occluded or backfacing part of the emitter still costs samples
+### MEASURED MINOR, NOT WORTH THE FIX (retitled 2026-11-18; re-tested 2026-09-12, v0.273.10; filed 2026-08-15, v0.186.0): a mesh area light is sampled UNIFORMLY BY AREA, so every occluded or backfacing part of the emitter still costs samples — **~1 % of noise at 90 % waste**
+
+> **Status, 2026-11-18.** The mechanism is still in the code (`Emitter::samplePoint` still draws
+> from the area CDF), but its cost, measured on the entry's own rig and on a 90 %-waste one, is
+> 0.14 % and 1.2 % of high-frequency noise. A per-triangle light tree with a device mirror does
+> not pay for that. Reopen it only with a scene where the penalty is large, shown first.
 
 > **RE-TESTED ON THIS ENTRY'S OWN RIG AND THE 1.31x IS GONE.** `scraps/occl_one.ftsl` vs
 > `scraps/occl_two.ftsl`, mode `R`, GPU, **512 spp x 4 seeds** (the originals were 32 spp):
@@ -32365,7 +32382,9 @@ one host core pegged at ~100 % — that is **not** the beam build. ftrace never 
 Combined with the stale caption of (3) above, that is what made a 23.7 s build look like a
 25-minute single-threaded one.
 
-### OPEN (minor, 2026-09-02, NARROWED 2026-09-17): no CLI flag renders a RANGE of a `camera_curve` — a single frame is selectable after all
+### DONE (0.337.0, closed 2026-11-18): no CLI flag renders a RANGE of a `camera_curve` — a single frame is selectable after all
+
+**Shipped in 0.337.0:** `-camera <path> -frames A B` renders the path's frames A..B (REFERENCE.md, `-frames`).
 
 **Correction (2026-09-17).** A single frame does NOT need a scratch scene. A `camera_curve`'s frames
 are ordinary named cameras, so `-camera fly0555` selects one and renders just it. The flyby's
@@ -32382,7 +32401,9 @@ the 1147-frame `gallery_rain` run (see the COMMIT-limit entry, and the silent
 
 The original entry follows.
 
-### OPEN (minor, 2026-09-02): no CLI flag renders a single frame (or a range) of a `camera_curve`
+### DONE (0.337.0, closed 2026-11-18): no CLI flag renders a single frame (or a range) of a `camera_curve`
+
+**Shipped in 0.337.0:** `-camera fly0555` renders one frame, `-camera fly -frames A B` a range.
 
 There is no `-frame N` / `-frames A B`. To render one frame of a 600-frame flyby — the normal
 thing to want when debugging what is *in* a flyby frame — the scene file must be edited to change
@@ -32832,7 +32853,12 @@ each one parse the scene rather than embed a copy of its numbers. Anything genui
 should have its *result* written into the scene comment and the citation dropped, rather than
 pointing at a file that isn't there.
 
-### `-savemap` / `-loadmap` are silently ignored on the CPU (GPU-only) — 2026-07-26
+### DONE (0.195.0, closed 2026-11-18): `-savemap` / `-loadmap` are silently ignored on the CPU (GPU-only) — 2026-07-26
+
+**Fixed in 0.195.0** (the FIXED entry of 2026-08-31 above): the serialiser is `photonmap_io.h`, host code both
+paths call, and a single-camera mode M render given either flag takes the shared path, which loads and
+saves surface photons and beams alike.
+
 The photon-map disk cache is wired into `renderPhotonMapSharedCuda` only. `main.cpp`
 passes `g_pmapSave`/`g_pmapLoad` at exactly one call site (~line 6638, inside the
 `#ifdef`-guarded GPU branch of the shared-camera mode-M path); the CPU shared path
@@ -35752,7 +35778,7 @@ exactly once; a top-level definition instanced in a group moves with it).
 `group { rotate 0 20 0 }` puts +z at (sin 20, 0, cos 20)); `scenes/gallery_rain.ftsl`'s Alice
 siting note says the opposite, and the hair placement uses the measured sign.
 
-## OPEN (2026-09-17): an emissive mesh that is not PLANAR is silently re-oriented OUTWARD, so an emissive enclosure renders black
+## DONE (0.338.0, closed 2026-11-18): an emissive mesh that is not PLANAR is silently re-oriented OUTWARD, so an emissive enclosure renders black
 
 **Repro.** A cube of six inward-facing emissive quads, as one mesh, with the camera inside: the whole
 frame is exactly 0. Split the same six quads into six `mesh` blocks and it renders correctly.
@@ -37852,7 +37878,7 @@ a separately renormalised hue alongside the magnitude. Both cost work in the hot
 loop and in the device atomics, which is why neither is done yet. Not worth it until someone
 actually needs see-through on a stack this deep.
 
-### BVH-BUILD — single-threaded scene BVH build: **MEASURED AND NOT WORTH PARALLELISING** (2026-09-13)
+### DONE (v0.292.0, closed 2026-11-18): BVH-BUILD — single-threaded scene BVH build: measured, then parallelised for the beam BVH's sake (2026-09-13)
 
 Recorded earlier in the 2026-09-13 session as a target ("reuse buffers across rebuilds; parallelise
 the build, 12 cores vs 1; shrink `BuildPrim` from 80 B"), on the strength of `Bvh::build()` being
