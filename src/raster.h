@@ -2594,9 +2594,9 @@ inline std::vector<uint8_t> renderFrame(const PreviewGeom& geom, const Camera& c
             bool   pcReady = false;
             auto   ctx = [&]() -> const PatCtx& {
                 if (!pcReady) {
-                    // curv/cavity stay 0 (see the CUDA twin: no per-face curvature and no
-                    // BVH to probe), but `fw` IS known here — a rasterizer knows its own
-                    // pixel footprint exactly.
+                    // cavity stays 0 (there is no BVH to probe), but `fw` IS known here -- a
+                    // rasterizer knows its own pixel footprint exactly -- and `curv` from the
+                    // triangle's vertex normals.
                     const Vec3 dv = g.wpos[i] - cam.eye;
                     const double dist = length(dv);
                     const double cs = dist > 0.0 ? dot(dv, N0) / dist : 0.0;
@@ -2612,17 +2612,25 @@ inline std::vector<uint8_t> renderFrame(const PreviewGeom& geom, const Camera& c
                     // The normal a pattern sees: the shaded side's (N0, already turned to face
                     // the eye on a triangle seen from behind), or on a surface light can cross
                     // the surface's own side's, as patCtxFromHit has it.
-                    const bool own = pt.patOwnSide && seenFromBehind(pt, cam.eye);
+                    const bool back = seenFromBehind(pt, cam.eye);
+                    const bool own = pt.patOwnSide && back;
                     Vec3 pn = own ? N0 * -1.0 : N0;
+                    // `curv` as the tracers read it: the mean curvature the vertex normals imply
+                    // (Tri::curvature's, a tessellated sphere's 1/r, a tube's 1/2r), negated on
+                    // the side the normals face away from, and back on a crossable surface's.
+                    double curv = triMeanCurvature(pt.p1 - pt.p0, pt.p2 - pt.p0, pt.n1 - pt.n0, pt.n2 - pt.n0);
+                    if (back != own) curv = -curv;
                     double pfw = patShadingFootprint(fwPerDist, dist, cs);
                     if (pt.patFrame >= 0) {   // as patCtxFromHit reads the traced hit
                         const Scene::PatFrame& f = scenePtr->patFrames[(size_t)pt.patFrame];
                         q = f.toObj.apply(q);
                         pn = normalize(f.toWorld.applyDirTranspose(pn));
                         bool nonUniform = false;
-                        pfw *= f.toObj.uniformScale(nonUniform);
+                        const double k = f.toObj.uniformScale(nonUniform);   // group units per metre
+                        pfw *= k;
+                        if (k > 0.0) curv /= k;
                     }
-                    pc = makePatCtx(q, 0.0, pn, g.uv[i].x, g.uv[i].y, 0.0, 0.0, pfw);
+                    pc = makePatCtx(q, 0.0, pn, g.uv[i].x, g.uv[i].y, curv, 0.0, pfw);
                     bindPatScene(pc, *scenePtr);
                     pcReady = true;
                 }

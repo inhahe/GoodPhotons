@@ -5032,7 +5032,7 @@ outside's, whichever way the ray came, so light crossing it either way sees the 
 | mesh **with** `vn` | per-face, from the interpolated shading-normal field |
 | mesh **without** `vn` | `0` — a flat-shaded mesh has no normal field to differentiate, so it honestly reads zero rather than guessing |
 | `quad` / flat facet | `0` |
-| `isosurface` | `0` (would need the field's Hessian; see `known-issues.md`) |
+| `isosurface` | from the field's Hessian at the hit (13 more field evaluations, paid only where the material reads `curv`); `0` on a container cap |
 
 Two things to get right. First, **the mesh must carry vertex normals** — generate one
 with `tools/make_mesh.py --smooth`, or the whole material collapses to a flat colour.
@@ -5056,7 +5056,8 @@ mask to a `mix` `weight_map` gives the usual dirt / edge-wear pass, driven by ac
 differential geometry instead of a painted or baked mask. Note that a dirt mask usually
 wants "least convex", not strictly "negative" — grime collects wherever the form turns
 away and nothing wipes it. Same values on CPU and GPU, including through the instance
-rescale. Deterministic self-test `ftrace -checkcurv`, worked example
+rescale, and in the raster preview (`-explore`), which reads it per pixel from the
+tessellation's vertex normals. Deterministic self-test `ftrace -checkcurv`, worked example
 `scenes/pattern_curvature.ftsl`.
 
 **Enclosure-driven patterns — `cavity`.** `curv` makes a pattern follow the shape of

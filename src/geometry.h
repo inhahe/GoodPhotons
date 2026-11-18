@@ -60,6 +60,22 @@ inline Vec3 faceNormalToward(const Vec3& a, const Vec3& b, const Vec3& c, const 
     return (l > 0.0) ? fc * ((dot(fc, nsum) < 0.0 ? -1.0 : 1.0) / l) : Vec3{0, 0, 0};
 }
 
+// The mean curvature H a triangle's vertex normals imply: half the trace of the map dn that takes
+// its edges e1 = v1 - v0, e2 = v2 - v0 to dn1 = n1 - n0, dn2 = n2 - n0 (barycentric interpolation
+// is linear, so these fix dn on the whole plane), taken in the dual basis of {e1, e2} through
+// their Gram matrix -- which drops dn's out-of-plane part. A unit sphere with exact normals reads
+// 1, a plane 0, and scaling a mesh by s scales H by 1/s. 0 on a degenerate sliver (its edges'
+// sine under 1e-6, at any size). Positive where the normals spread apart (a bulge on their side).
+// Tri::curvature, and the preview's per pixel.
+inline double triMeanCurvature(const Vec3& e1, const Vec3& e2, const Vec3& dn1, const Vec3& dn2) {
+    const double gA = dot(e1, e1), gB = dot(e1, e2), gC = dot(e2, e2);
+    const double gdet = gA * gC - gB * gB;                 // = 4 * area^2 = gA gC sin^2
+    if (!(gdet > 1e-12 * gA * gC)) return 0.0;
+    const double trace = (gC * dot(e1, dn1) - gB * dot(e2, dn1)
+                        - gB * dot(e1, dn2) + gA * dot(e2, dn2)) / gdet;
+    return 0.5 * trace;
+}
+
 struct Tri {
     Vec3 v0, v1, v2;
     int matId = 0;
@@ -173,30 +189,7 @@ struct Tri {
                 bitangentSign = (dot(cross(gn, tangent), B) < 0.0) ? -1.0 : 1.0;
             } else { Vec3 bb; onb(gn, tangent, bb); bitangentSign = 1.0; }
         } else { Vec3 bb; onb(gn, tangent, bb); bitangentSign = 1.0; }
-        // Mean curvature H = 1/2 * trace(dn restricted to the tangent plane).
-        // dn maps e1 -> n1-n0 and e2 -> n2-n0 (barycentric interpolation is linear, so
-        // this determines dn on the whole tangent plane). The trace of a linear map is
-        // basis-independent but must be taken in a DUAL basis, since {e1,e2} is not
-        // orthonormal: trace = e1*·dn(e1) + e2*·dn(e2) where {e1*,e2*} is dual to
-        // {e1,e2}. Inverting the 2x2 Gram matrix gives the closed form below, which
-        // also drops dn's out-of-plane component automatically (the dual vectors are
-        // in-plane), so no explicit projection is needed.
-        //
-        // Sanity anchors: a unit sphere with exact outward vertex normals has
-        // n = p, so dn = identity, trace = 2, H = 1. A plane has n0==n1==n2, so
-        // dn = 0 and H = 0. Scaling the mesh by s scales H by 1/s, as curvature must.
-        {
-            Vec3 dn1 = n1 - n0, dn2 = n2 - n0;
-            double gA = dot(e1, e1), gB = dot(e1, e2), gC = dot(e2, e2);
-            double gdet = gA * gC - gB * gB;                 // = 4 * area^2 > 0
-            if (gdet > 1e-24) {
-                double trace = (gC * dot(e1, dn1) - gB * dot(e2, dn1)
-                              - gB * dot(e1, dn2) + gA * dot(e2, dn2)) / gdet;
-                curvature = 0.5 * trace;
-            } else {
-                curvature = 0.0;                             // degenerate sliver
-            }
-        }
+        curvature = triMeanCurvature(e1, e2, n1 - n0, n2 - n0);   // from the normals finalized above
     }
 };
 // A delta continuation's origin off surface point p (`ng` its geometric normal, either orientation; `w` the

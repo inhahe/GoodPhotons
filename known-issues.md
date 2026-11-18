@@ -24200,7 +24200,12 @@ representable at finite coordinates. Both change `upsample::fit`'s coefficient c
 touch the CPU/CUDA/raster reflectance evaluators and the on-disk `.ftbuf` assumptions
 together — a real refactor, not a tweak, which is why it is logged rather than done.
 
-### OPEN (2026-08-09, v0.161.0): `curv` reads 0 on an ISOSURFACE, so curvature-driven materials silently flatten there
+### DONE (2026-11-17, 0.449.8; opened v0.161.0): `curv` reads 0 on an ISOSURFACE, so curvature-driven materials silently flatten there
+
+**Fixed** as proposed below: `fieldMeanCurvature` (implicit.h; device `dFieldMeanCurvature`) takes H from the field's
+gradient and Hessian by central differences at the gradient's step (13 evaluations), only for an isosurface whose
+material reads `curv` (`Implicit::readsCurv`, set by the loader's scan, now `Builder::markCurvReaders`); a cap reads
+0. `-checkcurv` §10 holds an SDF sphere to +1/R and -1/R within 1e-3. The report as filed:
 
 `curv` (O3 stage 1) is analytic on a `sphere`, per-radius on a `curve`, and per-face on a
 mesh that carries `vn` — but an **implicit isosurface always reports 0**, because the ray
@@ -24233,7 +24238,14 @@ material shared with a smooth mesh stays quiet) and it costs nothing on a scene 
 does not read `curv`. That turns a silent flat render into a named diagnostic, but it
 is a *diagnostic*, not the fix — the Hessian work above is still open.
 
-### OPEN (2026-08-09, v0.161.0): `curv` reads 0 in the PREVIEW rasterizer, so `-explore` misrepresents a curvature-driven material
+### DONE (2026-11-17, 0.449.8; opened v0.161.0): `curv` reads 0 in the PREVIEW rasterizer, so `-explore` misrepresents a curvature-driven material
+
+**Fixed** without the per-triangle float proposed below (a fur preview's triangles make that gigabytes): both preview
+rasterizers compute it per pixel, only for a pixel a pattern reads, from the source triangle's corners and vertex
+normals (`triMeanCurvature`, factored out of `Tri::finalize`; device `dRasterCurv`), signed as the tracers sign it and,
+on the CPU, scaled by a pattern frame. Its degenerate-sliver test is now relative (the edges' sine under 1e-6), where
+an absolute 1e-24 on the Gram determinant read every facet under a micron as a sliver (`-checkcurv` §1 at R = 1e-7).
+The report as filed:
 
 `raster.h:~1608` builds its shading context with
 `makePatCtx(g.wpos[i], 0.0, N0, g.uv[i].x, g.uv[i].y)` — no curvature argument — so
@@ -30657,6 +30669,19 @@ instance's `geometry_to_world`. It does **not** yet consume:
 These are additive follow-ups; the geometry path is validated (`scenes/cube.fbx` →
 8 verts / 12 tris, `scenes/fbxcube.ftsl`). The proper fix for materials is a
 `ufbx_material` → spectral-BSDF mapping mirroring `gltf.h`'s material import.
+
+### OPEN (2026-11-17): RASTER-GPU-ISO-FLAT — `-raster-gpu` shades every material by its flat albedo: patterns and mixes go missing
+
+The no-tessellation GPU preview (`-raster-gpu`, `kIsoPreview` in render_cuda.cu) colours a hit by its material's
+flat albedo or skin (`matCol`, `matTex`) and the preview's diffuse light, and nothing else: no `reflect pattern:`, no
+`mix` weight map, no normal map, no glossy lobe. So `scenes/pattern_curvature.ftsl` -- three instanced tori, each a
+`mix` whose weight is a curvature pattern -- previews as three plain grey tori under `-raster-gpu`, where `-raster`
+(CPU or the GPU triangle rasterizer, which agree to one 8-bit level) shows the ramp, the grime and the wear. Found
+checking 0.449.8's preview `curv`. REFERENCE.md describes it as "the same preview model's diffuse half", which is
+true but not a warning. **Proper fix:** shade the hit with the triangle rasterizer's per-pixel model -- its mix
+resolution, pattern sites (`dPatternEval` with the hit's u, v, n and `curv`), normal map and PBR lobe, factored out
+of `raster_cuda.cu`'s kShade so both kernels share one routine -- and fill its pattern context from the DHit (p,
+n, u, v, curv, the pixel footprint).
 
 ### TECH DEBT (2026-07-17): GPU preview rasterizer — feature parity with the CPU rasterizer
 

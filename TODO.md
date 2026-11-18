@@ -443,8 +443,8 @@ Then the rest of 4.2-4.6 in their order, 4.7's bookkeeping alongside whatever to
 - [ ] **"a quad's emission is invisible from the side its winding faces away from"** — re-check
   against AREA-LIGHT-SIDE (0.377.2), which fixed a neighbouring case.
 - [ ] **"`-dual-scatter` drops the coat's indirect illumination"** (its part 2).
-- [ ] **"`curv` reads 0 on an ISOSURFACE"** — a diagnostic names it now; the Hessian is the fix.
-- [ ] **"`curv` reads 0 in the PREVIEW rasterizer"** — mechanical.
+- [x] **"`curv` reads 0 on an ISOSURFACE"** (0.449.8) — from the field's Hessian, where the material reads it.
+- [x] **"`curv` reads 0 in the PREVIEW rasterizer"** (0.449.8) — per pixel from the vertex normals, both previews.
 - [ ] **"`cavity` reads 0 in BOTH preview rasterizers"** — not mechanical.
 - [ ] **"mode `W` is NOT noise-free at `-spp 1` when the scene has a medium"** — the fog term is
   still a Monte-Carlo free flight.
@@ -574,6 +574,8 @@ Then the rest of 4.2-4.6 in their order, 4.7's bookkeeping alongside whatever to
 - [ ] **"GPU BDPT (mode D) can't texture"**.
 - [ ] **"GPU preview rasterizer — feature parity with the CPU rasterizer"** — what that entry lists
   as left.
+- [ ] **RASTER-GPU-ISO-FLAT** — `-raster-gpu`'s primary-ray preview shades by flat albedo: no patterns,
+  mixes, normal maps or gloss (known-issues).
 - [ ] **"loom preview server (`-serve`) is resident-process only"**.
 - [ ] **"HIP alias block deliberately omits `__shfl_sync`"** (HIP is untested anyway).
 

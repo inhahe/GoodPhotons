@@ -9413,6 +9413,8 @@ static int checkReaction() {
 //   §8 a curve segment through the real intersectCurveSeg: a fiber of radius r is a
 //      surface of revolution with H = 1/(2r), which is enormous for hair-scale radii —
 //      the honest answer, and worth pinning so nobody "fixes" it to 1/r.
+//   §10 an SDF sphere through the real intersectImplicit: +1/R and -1/R from the field's
+//      Hessian where the material reads `curv` (Implicit::readsCurv), 0 where it does not.
 static int checkCurv() {
     double worst = 0.0;
     bool ok = true;
@@ -9440,7 +9442,9 @@ static int checkCurv() {
     // finite facet. That error shrinks with the facet, so the tolerance is relative and
     // generous rather than tight — the point is the 1/R LAW, checked over 4 decades.
     {
-        const double radii[] = { 0.01, 0.1, 1.0, 10.0, 100.0 };
+        // 1e-7 too: a facet that small has a Gram determinant near 1e-32, which a degenerate test
+        // taken in absolute units read as a sliver, curvature 0.
+        const double radii[] = { 1e-7, 0.01, 0.1, 1.0, 10.0, 100.0, 1e7 };
         for (double R : radii) {
             const int NLAT = 24, NLON = 48;
             double wrel = 0.0;
@@ -9701,6 +9705,51 @@ static int checkCurv() {
         if (!std::isfinite(mi.curvScale)) {
             std::printf("[checkcurv] S9 degenerate instance curvScale is not finite  BAD\n");
             ok = false;
+        }
+    }
+
+    // ---- §10: an isosurface's curvature from its field's Hessian ----------------
+    // An SDF sphere of radius R through the real intersectImplicit, its material marked as reading
+    // `curv`: +1/R from outside, -1/R from inside, as the analytic sphere of §3; and 0 where
+    // nothing reads it (the Hessian is skipped).
+    {
+        const double R = 0.7;
+        ftsl::Loaded L;
+        std::string e;
+        const bool loaded = ftsl::loadSource(
+            "scene { units meters }\n"
+            "material \"m\" { type diffuse reflect 0.5 }\n"
+            "isosurface { material m  sphere { center 0.2 -0.1 0.3  radius 0.7 } }\n"
+            "light area { origin -0.5 2.5 -0.5  u 1 0 0  v 0 0 1  normal 0 -1 0  spd preset:bb6500 }\n"
+            "camera \"c\" { eye 0 2 3  look_at 0 0 0  up 0 1 0  fov_y 40  film { res 8 8 } }\n",
+            "<checkcurv>", L, e);
+        if (!loaded || L.scene.implicits.size() != 1) {
+            std::printf("[checkcurv] S10 isosurface scene failed to load: %s  BAD\n", e.c_str());
+            ok = false;
+        } else {
+            Implicit im = L.scene.implicits[0];
+            const Vec3 c{0.2, -0.1, 0.3};
+            double wOut = 0.0, wIn = 0.0, wOff = 0.0;
+            for (int i = 0; i < 32; ++i) {
+                double z = frand() * 2 - 1, ph = frand() * 2 * M_PI, sr = std::sqrt(std::fmax(0.0, 1 - z * z));
+                const Vec3 d{ sr * std::cos(ph), sr * std::sin(ph), z };
+                im.readsCurv = true;
+                Hit ho; ho.t = DBL_MAX;
+                if (intersectImplicit(Ray{ c + d * (R * 1.9), d * -1.0 }, im, 1e-9, ho) && ho.valid)
+                    wOut = std::fmax(wOut, std::fabs(ho.curv - 1.0 / R) * R);
+                else { std::printf("[checkcurv] S10 outside ray missed  BAD\n"); ok = false; }
+                Hit hi; hi.t = DBL_MAX;
+                if (intersectImplicit(Ray{ c, d }, im, 1e-9, hi) && hi.valid)
+                    wIn = std::fmax(wIn, std::fabs(hi.curv + 1.0 / R) * R);
+                else { std::printf("[checkcurv] S10 inside ray missed  BAD\n"); ok = false; }
+                im.readsCurv = false;
+                Hit hz; hz.t = DBL_MAX; hz.curv = 9.0;
+                if (intersectImplicit(Ray{ c + d * (R * 1.9), d * -1.0 }, im, 1e-9, hz) && hz.valid)
+                    wOff = std::fmax(wOff, std::fabs(hz.curv));
+            }
+            ok &= chk("S10 isosurface sphere from outside -> +1/R (rel)", wOut, 0.0, 1e-3);
+            ok &= chk("S10 isosurface sphere from inside  -> -1/R (rel)", wIn,  0.0, 1e-3);
+            ok &= chk("S10 isosurface not reading curv -> 0", wOff, 0.0, 0.0);
         }
     }
 

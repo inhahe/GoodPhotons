@@ -936,6 +936,23 @@ __device__ inline void dRasterPatPoint(const DPTri& t, float3 wpos, double& qx, 
     r = sqrt(qx * qx + qy * qy + qz * qz);
 }
 
+// `curv` at this preview pixel before its side's sign: the mean curvature source triangle t's
+// vertex normals imply, in double (host twin: geometry.h triMeanCurvature, which raster.h ctx()
+// reads the same way).
+__device__ inline double dRasterCurv(const DPTri& t) {
+    const double e1x = (double)t.p1.x - t.p0.x, e1y = (double)t.p1.y - t.p0.y, e1z = (double)t.p1.z - t.p0.z;
+    const double e2x = (double)t.p2.x - t.p0.x, e2y = (double)t.p2.y - t.p0.y, e2z = (double)t.p2.z - t.p0.z;
+    const double d1x = (double)t.n1.x - t.n0.x, d1y = (double)t.n1.y - t.n0.y, d1z = (double)t.n1.z - t.n0.z;
+    const double d2x = (double)t.n2.x - t.n0.x, d2y = (double)t.n2.y - t.n0.y, d2z = (double)t.n2.z - t.n0.z;
+    const double gA = e1x * e1x + e1y * e1y + e1z * e1z, gB = e1x * e2x + e1y * e2y + e1z * e2z,
+                 gC = e2x * e2x + e2y * e2y + e2z * e2z;
+    const double gdet = gA * gC - gB * gB;
+    if (!(gdet > 1e-12 * gA * gC)) return 0.0;
+    const double e1d1 = e1x * d1x + e1y * d1y + e1z * d1z, e2d1 = e2x * d1x + e2y * d1y + e2z * d1z;
+    const double e1d2 = e1x * d2x + e1y * d2y + e1z * d2z, e2d2 = e2x * d2x + e2y * d2y + e2z * d2z;
+    return 0.5 * (gC * e1d1 - gB * e2d1 - gB * e1d2 + gA * e2d2) / gdet;
+}
+
 // ---------------------------------------------------------------------------
 // Pass C: resolve + shade each pixel once. Decode the winning slot, recompute barycentrics
 // at the pixel centre (same float math as kRaster, so the winner's 1/depth reproduces),
@@ -1180,6 +1197,18 @@ __global__ void kShade(const DPTri* tris, const DGeo* geos, const DAttr* attrs,
     auto patPoint = [&]() {
         if (!qReady) { dRasterPatPoint(vsrc, wpos, qx, qy, qz, qr); qReady = true; }
     };
+    // `curv`, negated on the side the normals face away from and back on a crossable surface's
+    // (host twin raster.h ctx()); made once per pixel by the first pattern that reads it.
+    double curvPx = 0.0;
+    bool curvReady = false;
+    auto curvAt = [&]() {
+        if (!curvReady) {
+            curvPx = dRasterCurv(vsrc);
+            if ((flags[slot] & kSlotBack) && !vsrc.patOwnSide) curvPx = -curvPx;
+            curvReady = true;
+        }
+        return curvPx;
+    };
 
     // Per-hit `mix`: a `weight_map` selects between two whole material payloads at every
     // point, so it must be resolved before anything below reads one. The mix index is
@@ -1194,15 +1223,12 @@ __global__ void kShade(const DPTri* tris, const DGeo* geos, const DAttr* attrs,
             const DPattern& wp = patterns[mx.weightPat];
             float3 pn = normalize3(wn) * patSide;
             patPoint();
-            // curv = 0: the raster preview shades a VERTEX BUFFER, not a ray-triangle
-            // hit, so no per-face curvature is in hand here. The CPU raster twin passes
-            // none either, so the two previews agree; `curv` is a tracer-only input.
-            // cavity = 0 for a stronger reason: the probe needs whole-scene ray
-            // traversal, and the raster preview has no BVH at all — it exists precisely
-            // to avoid one. Both are logged in known-issues.md. `fw` (O8 stage 2), by
-            // contrast, IS filled: a rasterizer knows its own pixel footprint exactly.
+            // cavity = 0: the probe needs whole-scene ray traversal, and the raster preview
+            // has no BVH at all -- it exists precisely to avoid one (known-issues.md).
+            // `curv` comes from the triangle's vertex normals, and `fw` (O8 stage 2) is
+            // exact: a rasterizer knows its own pixel footprint.
             wt = dPatternEval(patNodes + wp.off, wp.n, qx, qy, qz, 0.0,
-                              pn.x, pn.y, pn.z, qr, (double)uu, (double)vv, 0.0, 0.0,
+                              pn.x, pn.y, pn.z, qr, (double)uu, (double)vv, curvAt(), 0.0,
                               dRasterFw(cam, wpos, wn), patEnv);
         } else if (mx.weightTex >= 0 && mx.weightTex < nTex) {
             wt = texMeta[mx.weightTex].patScalarAt((double)uu, (double)vv);
@@ -1242,9 +1268,9 @@ __global__ void kShade(const DPTri* tris, const DGeo* geos, const DAttr* attrs,
         patPoint();
         // f = 0: the implicit field value is exactly 0 on the level set the marched mesh
         // approximates, matching both the CPU preview and the tracer's own hit context.
-        // curv/cavity = 0 here for the same reason as the mix-weight site above.
+        // curv and cavity as at the mix-weight site above.
         double s = dPatternEval(patNodes + pp.off, pp.n, qx, qy, qz, 0.0,
-                                pn.x, pn.y, pn.z, qr, (double)uu, (double)vv, 0.0, 0.0,
+                                pn.x, pn.y, pn.z, qr, (double)uu, (double)vv, curvAt(), 0.0,
                                 dRasterFw(cam, wpos, wn), patEnv);
         col = col * (float)fmin(1.0, fmax(0.0, s));
     }
@@ -1290,7 +1316,7 @@ __global__ void kShade(const DPTri* tris, const DGeo* geos, const DAttr* attrs,
             patPoint();
             rough = previewRoughD((float)dPatternEval(patNodes + rp.off, rp.n, qx, qy, qz, 0.0,
                                                       pn.x, pn.y, pn.z, qr, (double)uu, (double)vv,
-                                                      0.0, 0.0, dRasterFw(cam, wpos, wn), patEnv));
+                                                      curvAt(), 0.0, dRasterFw(cam, wpos, wn), patEnv));
         } else if (shRTex >= 0 && shRTex < nTex) {
             rough = previewRoughD((float)texMeta[shRTex].patScalarAt((double)uu, (double)vv));
         }

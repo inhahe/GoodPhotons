@@ -955,6 +955,7 @@ struct DImplicit {
     double sphereRadius;     // world radius for Container::Sphere
     int    capped;           // 1 = draw container caps (closed); 0 = `open`
     int    solidSide;        // 1 = bounds a closed solid, Hit::solid +1 (host Implicit::solidSide)
+    int    readsCurv;        // 1 = its material reads `curv`: hits take the Hessian (host Implicit::readsCurv)
     // Oriented container box — device twin of Implicit::boxOriented/boxInv/boxLo/boxHi.
     // When set, the ray is mapped by boxInv and slab-tested against boxLo/boxHi there
     // instead of against the world AABB, which for a rotated box is strictly larger
@@ -4109,6 +4110,31 @@ __device__ static void dFieldGradient(const DFieldNode* nodes, int n,
     if (len > 0.0) { gx /= len; gy /= len; gz /= len; }
     else           { gx = 0.0; gy = 0.0; gz = 1.0; }
 }
+// Mean curvature of the level set through p, from the field's gradient and Hessian by central
+// differences of step h. Mirrors implicit.h fieldMeanCurvature (its sign and stencil).
+__device__ static double dFieldMeanCurvature(const DFieldNode* nodes, int n,
+                                             double px, double py, double pz, double h,
+                                             const PatNode* exprPool, const DPatEnv& env) {
+    auto f = [&](double x, double y, double z) {
+        return dFieldEval(nodes, n, px + x * h, py + y * h, pz + z * h, exprPool, env);
+    };
+    const double f0 = f(0, 0, 0);
+    const double fxp = f(1, 0, 0), fxm = f(-1, 0, 0), fyp = f(0, 1, 0), fym = f(0, -1, 0);
+    const double fzp = f(0, 0, 1), fzm = f(0, 0, -1);
+    const double fxy = f(1, 1, 0), fxyN = f(-1, -1, 0), fxz = f(1, 0, 1), fxzN = f(-1, 0, -1);
+    const double fyz = f(0, 1, 1), fyzN = f(0, -1, -1);
+    const double gx = (fxp - fxm) / (2 * h), gy = (fyp - fym) / (2 * h), gz = (fzp - fzm) / (2 * h);
+    const double h2 = h * h;
+    const double hxx = (fxp - 2 * f0 + fxm) / h2, hyy = (fyp - 2 * f0 + fym) / h2, hzz = (fzp - 2 * f0 + fzm) / h2;
+    const double hxy = (fxy + fxyN - 2 * f0) / (2 * h2) - 0.5 * (hxx + hyy);
+    const double hxz = (fxz + fxzN - 2 * f0) / (2 * h2) - 0.5 * (hxx + hzz);
+    const double hyz = (fyz + fyzN - 2 * f0) / (2 * h2) - 0.5 * (hyy + hzz);
+    const double g2 = gx * gx + gy * gy + gz * gz;
+    if (!(g2 > 0.0)) return 0.0;
+    const double gHg = gx * gx * hxx + gy * gy * hyy + gz * gz * hzz +
+                       2.0 * (gx * gy * hxy + gx * gz * hxz + gy * gz * hyz);
+    return (g2 * (hxx + hyy + hzz) - gHg) / (2.0 * g2 * sqrt(g2));
+}
 // Device twin of geometry.h projectUV: wrap a world point to (u,v) over box lo..hi.
 // proj: 1 planar, 2 spherical, 3 cylindrical. axis 0/1/2 = up/projection axis.
 __device__ static inline double dNorm01(double val, double lo, double hi) {
@@ -4264,9 +4290,10 @@ __device__ static bool intersectImplicit(const DScene& sc, const DImplicit& im,
     const float fixedStepF = (float)fixedStep;
     const float t1F = (float)t1;
 
-    // Commit a hit at parametric `th`, world point (px,py,pz), geometric normal (gx,gy,gz).
+    // Commit a hit at parametric `th`, world point (px,py,pz), geometric normal (gx,gy,gz), and
+    // `curvG` the mean curvature toward it (a cap's 0).
     auto writeHit = [&](double th, double px, double py, double pz,
-                        double gx, double gy, double gz) -> bool {
+                        double gx, double gy, double gz, double curvG) -> bool {
         hit.t = (Real)th; hit.p = DVec3(px, py, pz); hit.valid = true;
         hit.ng = DVec3(gx, gy, gz);
         double side = dx*gx + dy*gy + dz*gz;
@@ -4279,7 +4306,7 @@ __device__ static bool intersectImplicit(const DScene& sc, const DImplicit& im,
             dProjectUV(px, py, pz, im.uvLo, im.uvHi, im.uvProj, im.uvAxis, uu, vv);
             hit.u = (Real)uu; hit.v = (Real)vv;
         } else { hit.u = 0; hit.v = 0; }
-        hit.curv = (Real)0;   // O3: isosurface curvature needs the Hessian — see implicit.h
+        hit.curv = (Real)(hit.back ? -curvG : curvG);   // O3, on the shaded side
         // `hit` is a reused record: every field a primitive owns is written (host twin says so).
         hit.tangent = DVec3{(Real)1, (Real)0, (Real)0}; hit.bitangentSign = (Real)1;
         hit.fiberRadius = (Real)0; hit.vcol = -1; hit.vb0 = hit.vb1 = (Real)0; hit.pscale = (Real)0;
@@ -4291,7 +4318,7 @@ __device__ static bool intersectImplicit(const DScene& sc, const DImplicit& im,
     // NEAR CAP: ray enters the container already inside the solid (f<0); the container
     // face is the nearest surface. `open` skips this to reveal the cut edge.
     if (capped && tEnter >= tmin && tEnter < (double)hit.t && f < 0.0f)
-        return anyHit ? true : writeHit(tEnter, ox + dx*tEnter, oy + dy*tEnter, oz + dz*tEnter, neX, neY, neZ);
+        return anyHit ? true : writeHit(tEnter, ox + dx*tEnter, oy + dy*tEnter, oz + dz*tEnter, neX, neY, neZ, 0.0);
     for (int i = 0; i < MAX_STEP; ++i) {
         float step = sampleMode ? fixedStepF : fmaxf(fabsf(f) * invLipF, minStepF) / dlenF;
         float tn = t + step;
@@ -4352,13 +4379,14 @@ __device__ static bool intersectImplicit(const DScene& sc, const DImplicit& im,
             const double px = (double)bxF + dx*sh, py = (double)byF + dy*sh, pz = (double)bzF + dz*sh;
             double eps = fmax(1e-6, 1e-4*th);
             double gx, gy, gz; dFieldGradient(nd, N, px, py, pz, eps, gx, gy, gz, exprPool, env);
-            return writeHit(th, px, py, pz, gx, gy, gz);
+            const double curvG = im.readsCurv ? dFieldMeanCurvature(nd, N, px, py, pz, eps, exprPool, env) : 0.0;
+            return writeHit(th, px, py, pz, gx, gy, gz, curvG);
         }
         if (last) {
             // FAR CAP: reached the container exit still inside the solid (fn<0), and the
             // far clip is the container itself — seal the sawn-off solid.
             if (capped && exitIsContainer && fn < 0.0f && tExit >= tmin && tExit < (double)hit.t)
-                return anyHit ? true : writeHit(tExit, ox + dx*tExit, oy + dy*tExit, oz + dz*tExit, nxX, nxY, nxZ);
+                return anyHit ? true : writeHit(tExit, ox + dx*tExit, oy + dy*tExit, oz + dz*tExit, nxX, nxY, nxZ, 0.0);
             return false;
         }
         t = tn; f = fn;
@@ -26457,6 +26485,7 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
         d.sphereRadius = im.sphereRadius;
         d.capped = im.capped ? 1 : 0;
         d.solidSide = im.solidSide ? 1 : 0;
+        d.readsCurv = im.readsCurv ? 1 : 0;
         d.boxOriented = im.boxOriented ? 1 : 0;
         for (int k = 0; k < 9; ++k) d.boxInvM[k] = im.boxInv.m[k];
         d.boxInvT[0] = im.boxInv.t.x; d.boxInvT[1] = im.boxInv.t.y; d.boxInvT[2] = im.boxInv.t.z;

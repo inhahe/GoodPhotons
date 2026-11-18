@@ -1453,11 +1453,11 @@ public:
         // material on its geometry, so this is the first moment the SHAPE of every
         // emission pattern's emitter is known. Reject the shapes that cannot honour one.
         if (!checkEmitPatsSupported(L)) return false;
-        // Diagnostic only (never fails a load): a curv-driven material whose geometry
-        // can only report 0 would otherwise render flat with no explanation at all.
+        // Never fails a load: it marks the isosurfaces whose hits read `curv`, and a curv-driven
+        // material whose geometry can only report 0 would otherwise render flat unexplained.
         // Publish the authored material names before anything that might want to report one.
         // The parser is the only place they exist -- a Material carries no name -- and until
-        // 0.278.3 the only consumer was a local reversal inside warnCurvOnFlatGeometry below.
+        // 0.278.3 the only consumer was a local reversal inside markCurvReaders below.
         L.scene.matNames.assign(L.scene.mats.size(), std::string());
         for (const auto& kv : matIndex_)
             if (kv.second >= 0 && kv.second < (int)L.scene.matNames.size())
@@ -1470,7 +1470,7 @@ public:
                                                    ? std::string("material ") + std::to_string(kv.first.first)
                                                    : L.scene.matNames[kv.first.first]) +
                                               (kv.first.second == ROUTE_J ? " [mode J]" : " [mode D]");
-        warnCurvOnFlatGeometry(L);
+        markCurvReaders(L);
         if (cavityDerived && L.scene.needsCavity)
             std::fprintf(stderr,
                 "[ftsl] cavity: probe radius %.4g m derived from the scene bounds "
@@ -1496,7 +1496,7 @@ public:
     //
     // WHY LAST. It runs after every pass that INSPECTS a compiled program — markCavityReaders
     // (does any pattern read `cavity`),
-    // warnCurvOnFlatGeometry, checkEmitPatsSupported, rejectUnbakedSdf. CSE keeps the
+    // markCurvReaders, checkEmitPatsSupported, rejectUnbakedSdf. CSE keeps the
     // first occurrence of every op and only rewrites LATER ones, so those analyses would
     // still be correct afterwards, but ordering them before it means none of them has to
     // know that — a future analysis can be added anywhere above without a hidden
@@ -1673,7 +1673,7 @@ public:
     // that spends RAYS (cavitySamples occlusion queries per shading point), so anything
     // that does not write `cavity` must pay literally nothing — hence a single scan for
     // PatOp::VarCavity over every bound pattern, exactly mirroring the VarCurv scan in
-    // warnCurvOnFlatGeometry.
+    // markCurvReaders.
     //
     // The gate is PER MATERIAL (Material::readsCavity), not merely per scene, and that
     // distinction matters: the probe is fired lazily from patCtxFromHit, which runs for
@@ -1696,7 +1696,7 @@ public:
         // A `mix` is referenced by geometry by NAME, not by its layers, so a cavity-
         // reading LAYER has to lift to its parent: the probe is triggered off the hit's
         // own material id, which is the parent's. Fixed point, for nested mixes. (Same
-        // propagation as warnCurvOnFlatGeometry — see the note there.)
+        // propagation as markCurvReaders — see the note there.)
         for (size_t pass = 0; pass < nm; ++pass) {
             bool changed = false;
             for (size_t i = 0; i < nm; ++i) {
@@ -1712,12 +1712,13 @@ public:
             if (sc.mats[i].readsCavity) { sc.needsCavity = true; break; }
     }
 
-    // A `curv`-driven material placed on geometry that can only ever report curvature 0
-    // renders as a FLAT COLOUR with no error of any kind — the single easiest way to
-    // waste an hour on this feature, and the reason `scenes/pattern_curvature.ftsl` has
-    // a paragraph of its header devoted to it. Three ways to land there: a flat-shaded
-    // mesh (no `vn`, so there is no normal field to differentiate), an isosurface (would
-    // need the field Hessian — see known-issues.md), and a plain quad/flat facet.
+    // Marks each isosurface whose material reads `curv` (Implicit::readsCurv: its hits then pay
+    // for the field's Hessian), and warns of a `curv`-driven material placed on geometry that
+    // can only ever report curvature 0, which renders as a FLAT COLOUR with no error of any kind
+    // -- the single easiest way to waste an hour on this feature, and the reason
+    // `scenes/pattern_curvature.ftsl` has a paragraph of its header devoted to it. Two ways to
+    // land there: a flat-shaded mesh (no `vn`, so there is no normal field to differentiate)
+    // and a plain quad/flat facet.
     //
     // This is a WARNING, not a `fail`: every one of those is a legal scene, and a
     // material may deliberately be shared between a smooth mesh and a flat backdrop. So
@@ -1727,7 +1728,7 @@ public:
     //
     // Costs nothing on a scene that does not use `curv`: the geometry scan is skipped
     // entirely unless some material actually reads it.
-    void warnCurvOnFlatGeometry(Loaded& L) {
+    void markCurvReaders(Loaded& L) {
         Scene& sc = L.scene;
         const size_t nm = sc.mats.size();
         if (nm == 0) return;
@@ -1765,7 +1766,12 @@ public:
         for (const Tri& t : sc.tris)           note(t.matId, t.curvature != 0.0);
         for (const Sphere& s : sc.spheres)     note(s.matId, s.r > 0.0);
         for (const CurveSeg& c : sc.curveSegs) note(c.matId, true);
-        for (const Implicit& im : sc.implicits) note(im.matId, false);
+        // An isosurface's curvature comes from its field's Hessian, which a hit pays for only
+        // where the material reads it.
+        for (Implicit& im : sc.implicits) {
+            im.readsCurv = im.matId >= 0 && im.matId < (int)nm && readsCurv[(size_t)im.matId];
+            note(im.matId, true);
+        }
         for (const MeshInstance& mi : sc.instances) {
             if (mi.blasId < 0 || mi.blasId >= (int)sc.blasList.size()) continue;
             for (const Tri& t : sc.blasList[mi.blasId].tris)
@@ -1782,8 +1788,8 @@ public:
             if (!readsCurv[i] || !users[i] || canCurve[i]) continue;
             std::fprintf(stderr,
                 "[ftsl] warning: material '%s' reads `curv`, but every piece of geometry "
-                "using it reports curvature 0 (a flat-shaded mesh, an isosurface, or a "
-                "flat facet), so the pattern will render as a flat colour. A mesh needs "
+                "using it reports curvature 0 (a flat-shaded mesh or a flat facet), so the "
+                "pattern will render as a flat colour. A mesh needs "
                 "vertex normals — regenerate it with `tools/make_mesh.py --smooth`, or "
                 "export with smoothing on.\n",
                 matName[i] ? matName[i]->c_str() : "<unnamed>");

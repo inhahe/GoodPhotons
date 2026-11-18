@@ -196,6 +196,35 @@ inline Vec3 fieldGradient(const FieldNode* nodes, int n, const Vec3& p, double e
     return len > 0.0 ? g / len : Vec3{0, 0, 1};
 }
 
+// The mean curvature of the field's level set through p, H = 1/2 div(grad f / |grad f|) =
+// (|g|^2 tr(Hs) - g.Hs.g) / (2 |g|^3), g and Hs the gradient and Hessian by central differences
+// of step h (13 evaluations: p, its six axis neighbours, and six diagonals). Positive where the
+// level set bulges toward +gradient -- out of an f < 0 inside: a sphere SDF of radius R reads 1/R.
+// 0 where the gradient vanishes.
+inline double fieldMeanCurvature(const FieldNode* nodes, int n, const Vec3& p, double h,
+                                 const PatNode* exprPool, const PatTables* tabs = nullptr) {
+    const auto f = [&](double x, double y, double z) {
+        return fieldEval(nodes, n, Vec3{p.x + x * h, p.y + y * h, p.z + z * h}, exprPool, tabs);
+    };
+    const double f0 = f(0, 0, 0);
+    const double fxp = f(1, 0, 0), fxm = f(-1, 0, 0), fyp = f(0, 1, 0), fym = f(0, -1, 0);
+    const double fzp = f(0, 0, 1), fzm = f(0, 0, -1);
+    const double fxy = f(1, 1, 0), fxyN = f(-1, -1, 0), fxz = f(1, 0, 1), fxzN = f(-1, 0, -1);
+    const double fyz = f(0, 1, 1), fyzN = f(0, -1, -1);
+    const double gx = (fxp - fxm) / (2 * h), gy = (fyp - fym) / (2 * h), gz = (fzp - fzm) / (2 * h);
+    const double h2 = h * h;
+    const double hxx = (fxp - 2 * f0 + fxm) / h2, hyy = (fyp - 2 * f0 + fym) / h2, hzz = (fzp - 2 * f0 + fzm) / h2;
+    // f(p + h(ei + ej)) + f(p - h(ei + ej)) = 2 f0 + h^2 (Hii + Hjj + 2 Hij) + O(h^4).
+    const double hxy = (fxy + fxyN - 2 * f0) / (2 * h2) - 0.5 * (hxx + hyy);
+    const double hxz = (fxz + fxzN - 2 * f0) / (2 * h2) - 0.5 * (hxx + hzz);
+    const double hyz = (fyz + fyzN - 2 * f0) / (2 * h2) - 0.5 * (hyy + hzz);
+    const double g2 = gx * gx + gy * gy + gz * gz;
+    if (!(g2 > 0.0)) return 0.0;
+    const double gHg = gx * gx * hxx + gy * gy * hyy + gz * gz * hzz +
+                       2.0 * (gx * gy * hxy + gx * gz * hxz + gy * gz * hyz);
+    return (g2 * (hxx + hyy + hzz) - gHg) / (2.0 * g2 * std::sqrt(g2));
+}
+
 // Ray-march strategy for finding the first zero crossing of the field along a ray.
 //   Adaptive — step by max(|f|/lipschitz, minStep). For a true SDF (lipschitz=1) this
 //     is sphere-tracing; for a Lipschitz-bounded arbitrary field it is a provably
@@ -261,6 +290,9 @@ struct Implicit {
     // `open` (capped=false) omits it, leaving the surface's cut edge / a see-through
     // opening. Only affects surfaces that actually reach the container.
     bool      capped = false;
+    // Whether a pattern its material binds reads `curv` (the loader's scan,
+    // Builder::markCurvReaders), so a hit pays for the field's Hessian (fieldMeanCurvature).
+    bool      readsCurv = false;
     // Whether its surface bounds a closed solid, so a hit says which side it was met from
     // (Hit::solid +1: the gradient points out of the f < 0 inside, a cap's normal out of the
     // container): capped, or no expression leaf -- an SDF or CSG of them never reaches its bounds.
@@ -420,8 +452,9 @@ inline bool intersectImplicit(const Ray& r, const Implicit& im, double tmin, Hit
     const bool  regulaFalsi = (im.refine == RootRefine::RegulaFalsi);
 
     // Commit a hit at parametric `th`, world point `p`, geometric normal `ng`
-    // (field gradient for the surface; container outward normal for a cap).
-    auto writeHit = [&](double th, const Vec3& p, const Vec3& ng) -> bool {
+    // (field gradient for the surface; container outward normal for a cap), and `curvG` the
+    // mean curvature toward ng (fieldMeanCurvature; a cap's is 0).
+    auto writeHit = [&](double th, const Vec3& p, const Vec3& ng, double curvG) -> bool {
         hit.t = th; hit.p = p; hit.valid = true;
         hit.ng = ng;
         hit.back = !(dot(r.d, ng) < 0.0);
@@ -435,18 +468,11 @@ inline bool intersectImplicit(const Ray& r, const Implicit& im, double tmin, Hit
             Vec3 uv = projectUV(p, b.lo, b.hi, ctr, im.uvProj, im.uvAxis);
             hit.u = uv.x; hit.v = uv.y;
         } else { hit.u = 0.0; hit.v = 0.0; }
-        // Curvature (O3) reads 0 on an isosurface for now. NOT because an isosurface has
-        // no curvature — it has a perfectly well-defined one — but because recovering it
-        // needs the field's HESSIAN (six more field evaluations per hit, on top of the
-        // three the gradient already costs), and the sphere-trace inner loop is the
-        // hottest path in the renderer. Taxing every implicit scene for a feature almost
-        // none of them use is the wrong trade until there is a "does any bound pattern
-        // actually read curv?" gate. Written EXPLICITLY rather than left alone because
-        // `hit` is a REUSED record: skipping the store would leak the previously-tested
-        // primitive's curvature into this hit. Logged in known-issues.md. The same goes for
-        // every other field a primitive owns: no tangent frame, strand or vertex colours here,
-        // and the pattern hair's scale is the point's own distance (Hit::pscale = 0).
-        hit.curv = 0.0;
+        // Curvature (O3) on the shaded side, as every primitive turns it. Every field a
+        // primitive owns is written, `hit` being a REUSED record: no tangent frame, strand or
+        // vertex colours here, and the pattern hair's scale is the point's own distance
+        // (Hit::pscale = 0).
+        hit.curv = hit.back ? -curvG : curvG;
         hit.tangent = Vec3{1, 0, 0}; hit.bitangentSign = 1.0;
         hit.fiberRadius = 0.0; hit.hasVcol = false; hit.pscale = 0.0;
         hit.size = std::max(im.bounds.hi.x - im.bounds.lo.x,
@@ -462,7 +488,7 @@ inline bool intersectImplicit(const Ray& r, const Implicit& im, double tmin, Hit
     // ray — the nearest possible hit — so cap it and return. `open` surfaces skip this
     // and let the march reveal the field (a see-through opening / cut edge).
     if (capped && tEnter >= tmin && tEnter < hit.t && f < 0.0)
-        return anyHit ? true : writeHit(tEnter, r.o + r.d * tEnter, nEnter);
+        return anyHit ? true : writeHit(tEnter, r.o + r.d * tEnter, nEnter, 0.0);
     for (int i = 0; i < MAX_STEP; ++i) {
         double step = sampleMode ? fixedStep
                                  : std::fmax(std::fabs(f) * invLip, minStep) / dlen;
@@ -515,7 +541,9 @@ inline bool intersectImplicit(const Ray& r, const Implicit& im, double tmin, Hit
             Vec3 p = r.o + r.d * th;
             double eps = std::fmax(1e-6, 1e-4 * th);
             Vec3 g = fieldGradient(nd, N, p, eps, pool, tabs);
-            return writeHit(th, p, g);   // field surface: geometric normal = gradient
+            // `curv` costs 13 more evaluations, so only where a pattern reads it (Implicit::readsCurv).
+            const double curvG = im.readsCurv ? fieldMeanCurvature(nd, N, p, eps, pool, tabs) : 0.0;
+            return writeHit(th, p, g, curvG);   // field surface: geometric normal = gradient
         }
         if (last) {
             // FAR CAP: reached the container exit still inside the solid (fn<0) — the
@@ -523,7 +551,7 @@ inline bool intersectImplicit(const Ray& r, const Implicit& im, double tmin, Hit
             // container itself (not a nearer surface via hit.t). Handles rays that
             // originate inside the solid (bounce/transmission/shadow) and exit a cap.
             if (capped && exitIsContainer && fn < 0.0 && tExit >= tmin && tExit < hit.t)
-                return anyHit ? true : writeHit(tExit, r.o + r.d * tExit, nExit);
+                return anyHit ? true : writeHit(tExit, r.o + r.d * tExit, nExit, 0.0);
             return false;
         }
         t = tn; f = fn;

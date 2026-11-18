@@ -8340,10 +8340,15 @@ as the one at fault.
   Where the number comes from, per primitive: `sphere` is analytic (±1/R); a `curve`
   round-cone is a surface of revolution, k = 1/R and ~0 along the axis, so H = 1/(2R) at
   the interpolated radius; a **mesh** is per-face in `Tri::finalize()`, H = ½·trace of
-  the shading-normal differential restricted to the tangent plane. That trace must be
-  taken in the **dual basis** — {e₁,e₂} is not orthonormal, so the 2×2 Gram matrix has to
-  be inverted. A quad/flat facet, a flat-shaded mesh (no normal field to differentiate)
-  and an isosurface all honestly report 0 rather than guess.
+  the shading-normal differential restricted to the tangent plane (`triMeanCurvature`).
+  That trace must be taken in the **dual basis** — {e₁,e₂} is not orthonormal, so the 2×2
+  Gram matrix has to be inverted. A quad/flat facet and a flat-shaded mesh (no normal field
+  to differentiate) honestly report 0 rather than guess. An **isosurface** takes H from its
+  field's gradient and Hessian by central differences (`fieldMeanCurvature`, 13 field
+  evaluations), only where its material reads `curv` (`Implicit::readsCurv`, set by the
+  loader's `markCurvReaders`): every other isosurface hit pays nothing. The raster previews
+  read it per pixel from their triangle's corners and vertex normals with the mesh's formula
+  (`raster.h` ctx(), `raster_cuda.cu` `dRasterCurv`) rather than store a float per triangle.
 
   Two invariants the rest of the system has to respect. **Sign** is relative to the side
   being shaded: every intersector negates `curv` when it flips the normal toward the ray,
@@ -8558,7 +8563,7 @@ as the one at fault.
     rows also gained `curv`/`cavity` columns for the same reason: a variable left at 0 is
     a variable the comparison is not exercising.
   * `Builder::optimizePatterns` runs **last** in `build()` — after `markCavityReaders`,
-    `warnCurvOnFlatGeometry`, `checkEmitPatsSupported` — over every `Scene::patterns`
+    `markCurvReaders`, `checkEmitPatsSupported` — over every `Scene::patterns`
     program and every `Medium::density`/`ior`. CSE preserves the first occurrence of every
     op, so those analyses would still be correct if reordered, but running it last means
     no future analysis has to know that `LdReg` exists.
