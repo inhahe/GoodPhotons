@@ -20560,8 +20560,8 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
     // the CPU path — merely slow — is strictly better than a GPU path that is 1000x slow.
     // So: measure, and say exactly what is wrong and who to blame.
     // Whether the card can afford mode `m`'s kernels: false, the reason printed, where `-device auto`
-    // should fall back to the CPU. Mode U resolves its device in its own dispatch below and asks
-    // there (its session's kernels: cudaMegakernelLocalBytes('U')).
+    // should fall back to the CPU. Modes S and U resolve their device in their own dispatch below and
+    // ask there (their sessions' kernels: cudaMegakernelLocalBytes('S'), ('U')).
     const auto vramAffords = [&](char m) -> bool {
         const int hero = (m == 'D' || m == 'J' || m == 'U') ? g_heroC : 1;
         const int mdep = (g_maxBounceOverride >= 1) ? g_maxBounceOverride : 8;
@@ -22451,7 +22451,7 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
             const bool wantAuto = !std::strcmp(device, "auto");
             if ((wantGpu || wantAuto) && !cam.hasLens() &&
                 (!cam.seesMotion(scene) || !cudaBlurUnsupported(scene, cam, 'S')) &&
-                cudaAvailable() && cudaSppmSupported(scene)) {
+                cudaAvailable() && cudaSppmSupported(scene) && vramAffords('S')) {
                 SppmSession* sess = sppmSessionBegin(scene, cam, res, resY, R0, diffraction,
                                                      effMaxBounce(), g_heroC);
                 if (sess) {

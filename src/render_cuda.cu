@@ -30345,6 +30345,19 @@ size_t cudaMegakernelLocalBytes(char mode, int maxDepth, int heroC) {
                 fm.localSizeBytes > fc.localSizeBytes) fn = mfn;
             cudaGetLastError();
         }
+    } else if (mode == 'S' || mode == 'M') {
+        // The photon walks (kTrace, which takes the hero bundle in itself) and the pass's own kernels:
+        // mode S's visible points and gather, mode M's gather. The most of them.
+        size_t most = 0;
+        const void* own[2] = {mode == 'S' ? (const void*)kSppmVisiblePoint : (const void*)kGather,
+                              mode == 'S' ? (const void*)kSppmGather : nullptr};
+        for (const void* k : {(const void*)kTrace, own[0], own[1]}) {
+            if (!k) continue;
+            cudaFuncAttributes fa{};
+            if (cudaFuncGetAttributes(&fa, k) == cudaSuccess) most = std::max(most, (size_t)fa.localSizeBytes);
+            cudaGetLastError();
+        }
+        return most * residentThreads();
     } else if (mode == 'U') {
         // The resident session's kernels (vcmSessionBegin), the hero instantiation where it runs:
         // the most of them, which the context's reservation must hold.

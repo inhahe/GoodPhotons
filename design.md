@@ -2802,6 +2802,13 @@ needs none of its local memory anew; one that does not is charged all of it, sin
 the driver grows the old block in place. The near-full test, which is about *other* programs,
 adds back everything that is ours (the reservation and OIDN's memory cap).
 
+**Which renders it covers.** The preflight is a function of the mode (`vramAffords` in runRender).
+The shared device decision calls it for the modes it resolves; modes U and S resolve their device
+in their own dispatch and call it there before their sessions start (0.450.6, 0.450.7), their
+kernels' most read by `cudaMegakernelLocalBytes('U')` (the session's light, camera and merge
+kernels) and `('S')` (the photon walk, the visible points and the gather). Mode M's GPU decisions,
+a dozen sites in run(), do not ask it yet (VRAM-PREFLIGHT-MS); its entry exists.
+
 **The bug the gates caught.** Gate 1a — mode `J` == mode `D` bit-for-bit on a media-free scene —
 failed on the first build, and not for any reason involving merges: mode `J` was passing `heroC = 1`
 to `renderBdptCuda` where mode `D` passes `g_heroC`, so mode `D` ran the hero-wavelength bundle and

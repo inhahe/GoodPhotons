@@ -414,9 +414,10 @@ Then the rest of 4.2-4.6 in their order, 4.7's bookkeeping alongside whatever to
 - [x] **REVIEW-0450B** (0.450.6) — the Opus (max) review of 0.450.1-0.450.4: mode U's VRAM preflight,
   the beam seed's draws sequenced, the checks' GPU and history fixes, DVertHitState 8 B, an empty
   site skipped first; known-issues REVIEW-0450B.
-- [ ] **VRAM-PREFLIGHT-MS** — GPU modes M and S resolve their device in their own dispatch, as mode U
-  did, and never ask main.cpp's VRAM preflight (`vramAffords`): give their kernels an entry in
-  cudaMegakernelLocalBytes and ask it before their sessions start.
+- [ ] **VRAM-PREFLIGHT-MS** — mode S asks the VRAM preflight since 0.450.7. GPU mode M resolves its
+  device in a dozen sites in run() (shared passes, flybys, the meter, the blurred epochs) and never
+  asks it: make the preflight a free function of its inputs and ask it where mode M decides (its
+  entry in cudaMegakernelLocalBytes exists), keeping the sites that mirror each other agreeing.
 - [ ] **GPU-LINK-FRAGILITY** — an edit far from them can leave kBdptT (launch bounds: 168 registers)
   or kJSurfLightT (128) calling a helper ptxas compiled out of line without their cap, and the link
   refuses: 0.450.5's forced inlining (dGlossyF, dPatIn, dPatternScalarAt, dRecordRoughness) answered
@@ -426,9 +427,12 @@ Then the rest of 4.2-4.6 in their order, 4.7's bookkeeping alongside whatever to
   which kBdptT never calls (the coat's film read once a vertex, dVertFromLV taking the hit state, the
   site passed to the merge sum), put dMatRoughness (252) and dReflectPatMul (238) out uncapped too,
   launch bounds on mode U's kernels or not. 0.450.5 had dReflectPatMul and intersectImplicit out of
-  line capped at 128 (`cuobjdump -res-usage`). Find what ptxas caps an out-of-line function by, make
-  the heavy pattern readers' placement deliberate rather than the inliner's, and then land the
-  declined edits (known-issues REVIEW-0450B).
+  line capped at 128 (`cuobjdump -res-usage`). Nothing documented says when ptxas caps an out-of-line
+  function by its callers' bounds, and one function has one register count for every caller. The
+  plan: a translation unit per launch-bounded kernel family (kBdptT's; kJSurfLightT's; mode U's) with
+  the shared device code in a header of `static` functions, so each unit compiles its own copies
+  under its own kernels' bounds (`-maxrregcount` per unit where a family wants one) and an edit in
+  one family cannot move another's link; then land the declined edits (known-issues REVIEW-0450B).
 - [ ] **VCM-GATHER-DIVERGENCE** — the gather keeps 13.7 of 32 lanes active (a lane's candidate refused
   at the distance, sidedness or band test idles while the others evaluate) at 244 registers, a
   sixth of the warps resident: gather the candidates that pass the cheap tests into a warp-wide
