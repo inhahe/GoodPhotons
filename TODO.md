@@ -469,8 +469,8 @@ Then the rest of 4.2-4.6 in their order, 4.7's bookkeeping alongside whatever to
 - [ ] **"Residual: hue lost at true underflow"** — see-through on a very deep stack (minor).
 - [ ] **"a `curve`'s azimuthal `v` is a PER-SEGMENT frame, not parallel-transported"**.
 - [ ] **"an `sdf` over a self-overlapping mesh is exact outside but not inside"**.
-- [ ] **"`settle.drop()` falls back to the surface's TOP PLANE when the footprint 'misses'"** — find
-  why the down-rays miss.
+- [x] **"`settle.drop()` falls back to the surface's TOP PLANE when the footprint 'misses'"** — the piece
+  started under its stand; drop() lifts it clear first (check_settle_drop).
 - [x] **"an `include`d file's own asset paths resolve through the ROOT scene"** (0.449.11) — beside the included file.
 - [ ] **loom's reader does not parse `include`** — `tools/loom/loom/grammar/reader.py` parses its own typed
   `ftsl.epeg`, so a hand-authored scene with an `include` cannot round-trip through loom's editor.

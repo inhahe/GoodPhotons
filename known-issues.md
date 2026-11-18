@@ -26923,7 +26923,16 @@ Also fixed in the same change: the canonical bake command in `scenes/gallery.fts
 carries `--tether --seat heart:stand_heart` (it had neither), with a comment saying what breaks
 without each. The bake is now `OK` for all five pieces on the first attempt.
 
-### TECH DEBT (2026-08-03): `settle.drop()` falls back to the surface's TOP PLANE when the footprint "misses" the mesh
+### DONE (2026-11-17): `settle.drop()` falls back to the surface's TOP PLANE when the footprint "misses" the mesh
+
+**Cause:** `settle_scene.py`'s `seat_on_stand` turns a piece about the WORLD origin and cancels only the X and Z
+drift that leaves, so a piece a few metres out ends up far below its stand; `drop()` cast its rays down from the
+vertices, and from under the stand they found nothing. **Fixed** in `drop()`: the object is first lifted clear
+of the surface's top, then cast down, so it lands on the surface under it wherever it starts. The fallback now
+means what it says (the footprint lies off the surface). `tools/check_settle_drop.py`: a ball dropped onto a
+dome's flank from above and from 5 m below rests touching it (the old code: 0.23 m above the flank). The report
+as filed:
+
 
 Seating the heart prints `[settle] warning: object footprint misses the surface mesh; resting on
 the surface top plane instead.` even though the rotated heart's footprint is comfortably inside

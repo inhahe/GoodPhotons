@@ -99,9 +99,13 @@ def drop(obj, surface, gap):
         return np.array([0.0, dy, 0.0]), np.eye(3)
 
     S = data
-    # Cast a ray straight down from every object vertex; the object can descend by
-    # the smallest per-vertex clearance before the tightest vertex meets the surface.
-    origins = verts.copy()
+    # The object may start anywhere -- below the surface, or in it (seat_on_stand turns a piece
+    # about the world origin, which can carry it under its stand) -- so it is first lifted clear
+    # of the surface's top; a ray cast down from below the surface would find nothing. Then cast
+    # straight down from every vertex: the object descends by the smallest per-vertex clearance,
+    # which the tightest vertex meets the surface at.
+    lift = max(0.0, float(S.bounds[1][1]) - float(verts[:, 1].min())) + 1e-3 * (float(np.ptp(S.bounds[:, 1])) + 1.0)
+    origins = verts + np.array([0.0, lift, 0.0])
     dirs = np.tile([0.0, -1.0, 0.0], (len(origins), 1))
     locs, iray, _ = S.ray.intersects_location(origins, dirs, multiple_hits=True)
     best = {}
@@ -111,13 +115,14 @@ def drop(obj, surface, gap):
         if loc[1] <= vy + eps:                        # surface point below this vertex
             best[ir] = max(best.get(ir, -math.inf), loc[1])
     if not best:
+        # The footprint lies off the surface altogether: nothing under any vertex.
         top = S.bounds[1][1]
         sys.stderr.write('[settle] warning: object footprint misses the surface mesh; '
                          'resting on the surface top plane instead.\n')
         dy = (top + gap) - verts[:, 1].min()
         return np.array([0.0, dy, 0.0]), np.eye(3)
     clearance = min(origins[ir][1] - by for ir, by in best.items())
-    dy = -clearance + gap
+    dy = lift - clearance + gap
     return np.array([0.0, dy, 0.0]), np.eye(3)
 
 
