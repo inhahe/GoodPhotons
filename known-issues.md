@@ -30670,7 +30670,13 @@ These are additive follow-ups; the geometry path is validated (`scenes/cube.fbx`
 8 verts / 12 tris, `scenes/fbxcube.ftsl`). The proper fix for materials is a
 `ufbx_material` → spectral-BSDF mapping mirroring `gltf.h`'s material import.
 
-### OPEN (2026-11-17): RASTER-GPU-ISO-FLAT — `-raster-gpu` shades every material by its flat albedo: patterns and mixes go missing
+### DONE (2026-11-17, 0.449.9): RASTER-GPU-ISO-FLAT — `-raster-gpu` shades every material by its flat albedo: patterns and mixes go missing
+
+**Fixed** with the tracer's own machinery rather than a port of kShade: `kIsoPreview` resolves a pattern- or
+texture-driven two-way `mix` to the child dominant at the hit (`dMixResolveDominant`, mode W's, whose 0.5 threshold is
+-raster's), nested mixes in turn, and takes that child's colour, emission and skin, scaled by its `reflect pattern:`
+(`dReflectPatMul`). The normal map and the glossy lobe stay out: this preview is the diffuse half by design
+(REFERENCE.md says so now). The report as filed:
 
 The no-tessellation GPU preview (`-raster-gpu`, `kIsoPreview` in render_cuda.cu) colours a hit by its material's
 flat albedo or skin (`matCol`, `matTex`) and the preview's diffuse light, and nothing else: no `reflect pattern:`, no

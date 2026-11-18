@@ -19322,8 +19322,18 @@ __global__ void kIsoPreview(DScene sc, DCamera cam, DPreviewLight pl,
             zbuf[idx] = 0.0f; emis[idx] = 0;
             continue;
         }
-        DVec3 col = (h.matId >= 0 && h.matId < nMats) ? matCol[h.matId] : DVec3(0.6, 0.6, 0.6);
-        int   em  = (h.matId >= 0 && h.matId < nMats) ? matEmit[h.matId] : 0;
+        // A pattern- or texture-driven two-way mix shows the child dominant at the hit (the 0.5
+        // threshold -raster's per-pixel mix takes), nested mixes in turn; that material's colour,
+        // emission, skin and reflect pattern then shade the pixel.
+        int mi = h.matId;
+        for (int depth = 0; depth < 8 && mi >= 0 && mi < nMats; ++depth) {
+            const DMaterial& m = sc.mats[mi];
+            if (m.type != D_MIX || m.mixCount != 2 || (m.mixWeightPat < 0 && m.mixWeightTex < 0)) break;
+            mi = dMixResolveDominant(sc, m, h);
+        }
+        const bool known = mi >= 0 && mi < nMats;
+        DVec3 col = known ? matCol[mi] : DVec3(0.6, 0.6, 0.6);
+        int   em  = known ? matEmit[mi] : 0;
         zbuf[idx] = (float)h.t;
         if (em) {   // emitter: raw tinted glow, boosted so it clips to white (matches CPU)
             accum[o + 0] = col.x * emisBoost;
@@ -19336,12 +19346,13 @@ __global__ void kIsoPreview(DScene sc, DCamera cam, DPreviewLight pl,
         // Image/formula skin: replace the flat material albedo with the texture's linear
         // RGB, sampled at the interpolated (u,v) or by world triplanar (device twin of
         // raster.h's textured-preview path; matTex encodes raster.h's binding rule).
-        int ti = (matTex && h.matId >= 0 && h.matId < nMats) ? matTex[h.matId] : -1;
+        int ti = (matTex && known) ? matTex[mi] : -1;
         if (ti >= 0) {
-            double tri = matTri[h.matId];
+            double tri = matTri[mi];
             col = (tri > 0.0) ? dSkinTri(texMeta, texels, ti, h.p, h.n, tri)
                               : dSkinRgb(texMeta, texels, ti, h.u, h.v);
         }
+        if (known) col = col * dReflectPatMul(sc, sc.mats[mi], h);   // `reflect pattern:`
         // Two-sided preview, oriented from the GEOMETRIC normal.
         //
         // `intersectTri` orients hit.n by the *interpolated* normal

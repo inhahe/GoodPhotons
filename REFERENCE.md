@@ -503,7 +503,9 @@ ftrace -in scenes/cornell.ftsl -mode W -spp 1 -ambient 0.05 -gi 32 -window -keep
 > pixel** on the device and finds the nearest surface with the shared `closestHit`,
 > which **sphere-traces implicit isosurfaces directly** (no mesh). It shades with the
 > same preview model's diffuse half (per-material albedo — or a sampled **image/procedural
-> skin**, at the hit UV or by world triplanar — lit by the scene's calibrated lights, the
+> skin**, at the hit UV or by world triplanar; a pattern- or texture-driven `mix` shows its
+> child dominant at the hit and a `reflect pattern:` scales it, as in `-raster`; no normal
+> map or glossy lobe — lit by the scene's calibrated lights, the
 > surroundings' ambient and a faint headlight fill) and runs the **same** shared
 > auto-exposure + sRGB tone map on the
 > host, so the image matches `-raster` (surfaces are actually *cleaner* — no marching-

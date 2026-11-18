@@ -574,8 +574,7 @@ Then the rest of 4.2-4.6 in their order, 4.7's bookkeeping alongside whatever to
 - [ ] **"GPU BDPT (mode D) can't texture"**.
 - [ ] **"GPU preview rasterizer — feature parity with the CPU rasterizer"** — what that entry lists
   as left.
-- [ ] **RASTER-GPU-ISO-FLAT** — `-raster-gpu`'s primary-ray preview shades by flat albedo: no patterns,
-  mixes, normal maps or gloss (known-issues).
+- [x] **RASTER-GPU-ISO-FLAT** (0.449.9) — `-raster-gpu` resolves pattern-driven mixes and reflect patterns.
 - [ ] **"loom preview server (`-serve`) is resident-process only"**.
 - [ ] **"HIP alias block deliberately omits `__shfl_sync`"** (HIP is untested anyway).
 
