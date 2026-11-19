@@ -5715,6 +5715,10 @@ std::vector<Film> renderPhotonMapSharedCuda(const Scene& scene, const std::vecto
                 ++w;
             }
         }
+        // The maps hold what was written: their arrays leave what a resize adds unwritten (BulkVec),
+        // so a count the flags did not meet must not leave slots behind.
+        pm.photons.resize(wg); pm.pos.resize(wg);
+        pmC.photons.resize(wc); pmC.pos.resize(wc);
     }
     if (d_photons) cudaFree(d_photons);
     d_photons = nullptr;

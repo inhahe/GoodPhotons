@@ -28,9 +28,12 @@
 #pragma once
 #include <cstddef>
 #include <cstdio>
+#include <memory>
 #include <new>
 #include <stdexcept>
 #include <string>
+#include <utility>
+#include <vector>
 
 namespace ftalloc {
 
@@ -128,5 +131,24 @@ inline void reserve(V& v, size_t n, const char* what, const char* flags) {
     catch (const std::bad_alloc&) { reportOom(what, n, sizeof(typename V::value_type), flags); }
     catch (const std::length_error&) { reportOom(what, n, sizeof(typename V::value_type), flags); }
 }
+
+// An allocator whose value-initialisation constructs nothing: a vector of it resized leaves its new
+// elements as the storage holds them. For bulk arrays of trivially copyable records that a pass
+// writes in full before anything reads them -- the photon map's: zeroing a 129 M-photon map's 7 GB
+// binning destination took 0.8 s on one thread, every byte then overwritten by threads that could
+// have taken the pages themselves. (Vec3 zeroes its members in its default constructor, which even
+// default-initialisation would run, so nothing short of constructing nothing skips it.) Every other
+// construction -- a copy, an emplace with arguments -- is std::allocator's.
+template <class T>
+struct NoInit : std::allocator<T> {
+    template <class U> struct rebind { using other = NoInit<U>; };
+    NoInit() noexcept = default;
+    template <class U> NoInit(const NoInit<U>&) noexcept {}
+    template <class U> void construct(U*) noexcept {}
+    template <class U, class... A> void construct(U* p, A&&... a) { ::new ((void*)p) U(std::forward<A>(a)...); }
+};
+// A vector whose resize leaves new elements unwritten (NoInit): a caller must write every element it
+// resizes into before reading one.
+template <class T> using BulkVec = std::vector<T, NoInit<T>>;
 
 }  // namespace ftalloc

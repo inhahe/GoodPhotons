@@ -201,6 +201,22 @@ to 0.25 renders as a 150 nm one within 2e-3, 1.0e-3 measured (its body's escape 
 on 0.450.1 it rendered as the unmapped 600 nm, 1.9 off), the `thinfilm` control byte for byte, and
 the three misspellings stop the load (on 0.450.1 they loaded).
 
+## DONE (2026-11-19, 0.450.28): PM-BUILD-NOINIT — the photon map's arrays were zero-filled on one thread before every write
+
+`PhotonMap`'s `pos`, `photons` and `cie` and the binning's destination were `std::vector`s of
+`Vec3`-bearing records, which zero their members in their default constructor, so every resize
+zero-filled on one thread what the next pass overwrote in full: 0.8 s for the first binning's 7 GB
+destination and 0.3 s for the CIE table at 129 M photons (PM-BUILD-PARALLEL). **Fixed:** they are
+`ftalloc::BulkVec`s (allocreport.h), whose allocator constructs nothing on a resize, and every
+writer fills what it resizes -- the deposit's concatenation, `-loadmap`'s read, the binning,
+`fillCie`, and the device's download, which is now trimmed to the records it wrote (it relied on
+the caustic count meeting the flags; a short count had left zero photons behind).
+
+**Verified:** check_bitid against 0.450.27 identical; check_merge_table, `-checkpmgrid` and a
+`-savemap` / `-loadmap` round trip pass. The 20 M-photon CPU map phase 7.3-7.6 s -> 6.5-6.7 s
+(10.3-12.8 s before PM-BUILD-PARALLEL); paired, GPU mode M at 20 M photons 11.63 s -> 10.89 s, CPU
+mode M at 4 M unchanged (1.84 s).
+
 ## DONE (2026-11-19, 0.450.27): PM-PROBE-GEOMETRY — mode M's automatic radius moved with the table
 
 `PhotonMap::medianNeighborCount`, the probe behind mode M's automatic radius, sampled the map by

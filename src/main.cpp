@@ -5252,7 +5252,7 @@ static int checkPmGrid() {
         pm.photons[i] = Photon{Vec3{0, 1, 0}, (float)(0.5 + rng.uniform()),
                                (float)(400.0 + 300.0 * rng.uniform())};
     }
-    const std::vector<Vec3> posRef = pm.pos;   // brute force must not read the permuted array
+    const std::vector<Vec3> posRef(pm.pos.begin(), pm.pos.end());   // brute force must not read the permuted array
 
     // 1. EXACT AGREEMENT WITH BRUTE FORCE. Not "similar counts" — the same SET of photons.
     // Identity is by position (the build permutes indices), and positions here are distinct
@@ -5411,7 +5411,7 @@ static int checkPmGrid() {
         // destroy, so the old lattice's answer is computed alongside for contrast.
         for (double kAt1M : {4.0, 0.02}) {
             double nProbe = 0, kTarget = 0;
-            PhotonMap pm2; pm2.pos = posRef; pm2.photons = pm.photons;
+            PhotonMap pm2; pm2.pos.assign(posRef.begin(), posRef.end()); pm2.photons = pm.photons;
             const double got = pm2.buildAuto(r0, kAt1M, &nProbe, &kTarget);
             const double wanted = std::min(std::max(r0 * std::sqrt(kTarget / nProbe), r0 / 64.0),
                                            r0 * 4.0);
@@ -5440,8 +5440,8 @@ static int checkPmGrid() {
     // order-independent if the binning is.
     {
         PhotonMap a, b;
-        a.pos = posRef; a.photons = pm.photons;
-        b.pos = posRef; b.photons = pm.photons;
+        a.pos.assign(posRef.begin(), posRef.end()); a.photons = pm.photons;
+        b.pos.assign(posRef.begin(), posRef.end()); b.photons = pm.photons;
         std::reverse(b.pos.begin(), b.pos.end());       // feed the SAME set in a different order
         std::reverse(b.photons.begin(), b.photons.end());
         a.build(r); b.build(r);

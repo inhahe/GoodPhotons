@@ -10547,7 +10547,12 @@ as the one at fault.
   them in order (`place` called from several threads, for distinct positions). The photon map's
   binnings move the photons into a destination kept between them (`binPh`, `binPos`), so
   `buildAuto`'s second finds it allocated. A 129 M-photon map's two binnings, probe and CIE pass
-  went from 7.3 s to 4.5-4.9 s (synthetic photons over a box's walls). `FTRACE_MERGE_TABLE=<k>` holds the slots to at most `k` (1: one
+  went from 7.3 s to 4.5-4.9 s (synthetic photons over a box's walls). The photon map's bulk arrays
+  (`pos`, `photons`, `cie` and the binning's destination) are `ftalloc::BulkVec`s, whose resize
+  constructs nothing (`NoInit`; `Vec3` would zero itself), so the passes that write every element
+  -- the deposit's concatenation, `-loadmap`'s read, the device's download (trimmed to what it
+  wrote), the binning, `fillCie` -- are not preceded by a one-thread zero fill of what they
+  overwrite. `FTRACE_MERGE_TABLE=<k>` holds the slots to at most `k` (1: one
   block of 27 buckets that every block shares), which `tools/check_merge_table.py` uses to hold
   the renders to the default table's. Host and device compute a cell alike (`mergeCellCoord`, in
   double, by the width's reciprocal, held to ±2^30), the site's in `DGridCell`,

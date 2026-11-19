@@ -137,8 +137,11 @@ struct PhotonBank {
 // gather is DRAM-bandwidth-bound and the win is close to the bandwidth ratio. Keep `pos`
 // separate, and keep `Photon` free of anything the gather doesn't read.
 struct PhotonMap {
-    std::vector<Vec3>   pos;       // deposit positions (world); the distance-test stream
-    std::vector<Photon> photons;   // payloads, parallel to pos[]; reordered by build()
+    // The bulk arrays are BulkVecs: a resize leaves new elements unwritten, so whatever resizes one
+    // writes every element before a read -- the deposit's concatenation, -loadmap's read, the
+    // device's download, the binning, fillCie.
+    ftalloc::BulkVec<Vec3>   pos;       // deposit positions (world); the distance-test stream
+    ftalloc::BulkVec<Photon> photons;   // payloads, parallel to pos[]; reordered by build()
     // Per-photon CIE XYZ response at photons[i].lambda, filled by build(). The gather
     // estimate weights every photon by cie(lambda_p); evaluating the analytic CIE
     // multi-Gaussians (several exp() each) per photon PER QUERY dominated mode-M render
@@ -146,7 +149,7 @@ struct PhotonMap {
     // queries index cie[k] instead. The stored values are the exact same doubles the
     // direct call produced (same function, same float->double promoted lambda), so
     // gather results are bit-identical.
-    std::vector<Vec3>   cie;
+    ftalloc::BulkVec<Vec3>   cie;
     long long nEmitted = 0;        // total photons EMITTED in the pass (normalization)
     double    radius   = 0.02;     // gather radius (world units); == grid cell size
 
@@ -180,10 +183,11 @@ struct PhotonMap {
 
     // The binning's destination, the photons' size, kept from one buildGrid to the next: what a
     // binning moves the photons into it swaps with photons[] and pos[], so the next binning (buildAuto
-    // bins twice) finds it allocated and filled -- at 129 M photons 7 GB that it would otherwise zero
-    // again (0.8 s). Freed once the map is built (releaseBinning).
-    std::vector<Photon> binPh;
-    std::vector<Vec3>   binPos;
+    // bins twice) finds it allocated -- at 129 M photons 7 GB that it would otherwise fault in again.
+    // Every element is written by the binning (BulkVec: a resize leaves them as they were). Freed once
+    // the map is built (releaseBinning).
+    ftalloc::BulkVec<Photon> binPh;
+    ftalloc::BulkVec<Vec3>   binPos;
     void releaseBinning() { binPh = {}; binPos = {}; }
 
     void buildGrid(double r) {

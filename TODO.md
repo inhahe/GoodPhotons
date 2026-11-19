@@ -432,7 +432,8 @@ Then the rest of 4.2-4.6 in their order, 4.7's bookkeeping alongside whatever to
 - [x] **MIRROR-BASE-GPU** — not the renderer: the check's mirror ring held the pixels straddling the
   box top's edge (the lamp in the mirror, 14x the floor), whose 16-sample noise 8 seeds did not
   average away; the box rings leave them out (`box_floor`), and the devices agree to 0.1 %.
-- [ ] **PM-BUILD-NOINIT** — the photon map's arrays (`pos`, `photons`, `cie`, the binning's
+- [x] **PM-BUILD-NOINIT** (0.450.28) — the photon map's bulk arrays are `ftalloc::BulkVec`s, whose
+  resize constructs nothing; known-issues. The entry as logged: the photon map's arrays (`pos`, `photons`, `cie`, the binning's
   destination) are `std::vector`s of types whose members zero themselves, so each resize zero-fills
   on one thread what the next pass overwrites: 0.8 s for the first binning's 7 GB destination and
   0.3 s for the CIE table at 129 M photons. An allocator that leaves elements unconstructed (the
