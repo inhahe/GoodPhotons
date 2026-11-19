@@ -1270,7 +1270,11 @@ Fills a complete material; a few knobs may be overridden afterward
 
 Scalar-parameter maps: `roughness` / `film_thickness_map` / `weight_map` accept
 `pattern:<name>` (math over x,y,z,normal,u,v) or `texture:<name>` (grayscale UV map); a
-`film_thickness_map` or `weight_map` that names neither is an error.
+`film_thickness_map` or `weight_map` that names neither is an error, and so is a `reflect_map`,
+`transmit_map`, `emit_map` or a light's `spd_map` that names no pattern (they take no texture).
+A map may also name another material's scalar property (`film_thickness_map gold.film_thickness`,
+§3.2): its pattern, or no map where it holds a constant. A spectral property (`gold.reflect`) is
+no scalar map, and is refused.
 
 **Pattern-driven reflectance, transmittance and emission.** The `reflect`, `transmit` and
 `emit` slots take a pattern too, and a scalar in a spectral slot is a per-hit **multiplier**
@@ -1293,7 +1297,7 @@ material "strip" { type diffuse reflect 0.0 emit blackbody 5200        # a lamp'
 A pattern written *into* `reflect` is alone in the slot, so the base spectrum becomes a flat
 1.0 and the albedo is the pattern's own value — a greyscale reflectance, and the reason
 `reflect [0 1](u)` (§6.1) means what it looks like. `reflect_map` instead modulates an
-authored spectrum or texture. Because the pattern is a scalar it can only ever darken or
+authored spectrum or texture, or a pattern written into `reflect` (the two multiply). Because the pattern is a scalar it can only ever darken or
 brighten: **colour comes from the spectrum/texture, never from the pattern.** The multiplier
 is clamped to [0,1], so a runaway formula cannot manufacture energy.
 

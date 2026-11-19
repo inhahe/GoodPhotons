@@ -201,6 +201,49 @@ to 0.25 renders as a 150 nm one within 2e-3, 1.0e-3 measured (its body's escape 
 on 0.450.1 it rendered as the unmapped 600 nm, 1.9 off), the `thinfilm` control byte for byte, and
 the three misspellings stop the load (on 0.450.1 they loaded).
 
+## DONE (2026-11-18, 0.450.9): REVIEW-0450C — what the Opus (max) and Fable (xhigh) reviews of 0.450.5-0.450.6 found
+
+`/code-review max` (Opus, 15 findings) and `/code-review xhigh` (Fable, 13) of ee08dc1..aaf7cef, one
+after the other in a worktree; ten found by both. Each checked against the code. **Fixed in 0.450.9:**
+
+* **A map naming another material's SPECTRAL property loaded as no map** (both): bindScalarMap's
+  exception for a property reference took any property that resolved, so `film_thickness_map
+  other.reflect` (other's reflect a pattern) dropped the pattern without a word, where 0.450.2-0.450.5
+  refused it. bindScalarPattern now says itself when the value is a scalar property holding no
+  pattern (`noMap`), and that is the only exception: the second resolution and its copied predicate
+  are gone (Opus).
+* **`reflect pattern:p` beside `reflect_map pattern:q` kept p alone** (both; also `transmit`, `emit`
+  and a light's `spd`): the slot's own pattern overwrote the map's. They compose, as FTSL.md says a
+  map does.
+* **tryDevCap never grew** (both): it zeroed the capacity before taking 1.5x of it, so mode U's cell
+  table was reallocated at exactly its size nearly every pass. ensureDevCap is tryDevCap's fatal form
+  now (Opus), one growth policy.
+* **The cell table could take the memory the sort and the stacks need** (both): it was allocated
+  greedily, coarsened only when the device refused, which under WDDM it does not -- it pages. The
+  pass now bounds the table by the memory free past the sort's worst (less what the arena holds) and
+  the kernels' local memory until a launch has reserved it, the old table counted free.
+* **The light-vertex store's budget, half the free memory, did not set the kernels' stacks aside**
+  (Opus): it does now, so the preflight's verdict (the stacks fit) still holds once the store is up.
+* **Modes M and S skipped the VRAM preflight** (both): fixed in 0.450.7 (S) and 0.450.8 (M).
+* **FTSL.md gave the old rule for map values** (Fable): which keys refuse, the property-reference
+  form, the spectral refusal, and the composition.
+* **Stale words**: TODO's REVIEW-0450B line (both; fixed in 0.450.8, its credit here), comments
+  narrating history in dGlossyF, DMergeLobe and check_vcm_wavefront (both), check_layered_film_map's
+  loose message match and its missing spectral case (Opus), check_vertex_hit_state's copy of
+  check_motion.render (Fable), which lacked the shared helper's retrying delete;
+  check_motion.render passes `-window-min` now.
+
+**Next, each its own change now the device link holds (GPU-LINK-FRAGILITY):** mode J building a
+site's lobe before any photon is tested (both), the translucent lobe's albedos read three times at
+the hero wavelength (both), and DMergeLobe's copy of dBsdfF/dBsdfPdf (both: MERGE-LOBE-SHARED, TODO).
+**Tracked:** the RNG draws passed as arguments of one call (both: RNG-ARG-ORDER, TODO; 67 calls, two
+in device code), a sweep of its own since it moves every render's noise realization.
+
+check_layered_film_map: on 0.450.8 its three new cases fail (`film_thickness_map other.reflect` and
+`weight_map other.reflect` load; the composed slot renders as the pattern alone), on 0.450.9 all
+pass, the composed slot exactly `reflect 0.0625`. check_bitid against 0.450.8: identical but for GPU
+modes M and S at their nondeterminism floor.
+
 ## DONE (2026-11-18): GPU-LINK-FRAGILITY — an edit anywhere in render_cuda.cu could make the device link refuse kBdptT
 
 The device link checks that a launch-bounded kernel calls no function compiled with more

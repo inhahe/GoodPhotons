@@ -6748,8 +6748,8 @@ __device__ static inline DGlossyDraw dWhittedGlossyDraw(const DScene& sc, const 
 // dBsdfF is. Inlined at every call, as are the pattern reads under it (dPatIn, dPatternScalarAt,
 // dRecordRoughness): out of line, each takes more registers than the launch bounds of kernels that
 // call it allow (kBdptT's 168, kJSurfLightT's 128), and nvlink refuses the build. Left to nvcc,
-// whether they are inlined depends on the calls the whole file makes: new calls in mode U's merge
-// (DMergeLobe) put them out of line in kJSurfLightT, which the change never touched.
+// whether they are inlined depends on the calls the whole file makes, so a call added in another
+// kernel can put them out of line in these (GPU-LINK-FRAGILITY, TODO.md).
 __device__ __forceinline__ static double dGlossyF(const DScene& sc, const DMaterial& m, const DHit& h,
                                   const DVec3& ns, const DVec3& wo, const DVec3& wi, Real lambda) {
     const ggx::Pair p = ggx::pair(ns, wo, wi, ggx::alpha((double)dMatRoughness(sc, m, h)));
@@ -15659,8 +15659,8 @@ __device__ static inline ggx::Pair dPairSwapped(const ggx::Pair& p) {
 // arithmetic step for step, so a merge reads what they would -- but the vertex's hit rebuilt and its
 // roughness read once a site, and a light direction's geometry (at(): a glossy lobe's GGX pair, whose
 // reverse is the same pair with its ends swapped) once for every wavelength the light vertex
-// carries. Calling them rebuilt the hit and the pair in each call, six a light vertex with the hero
-// bundle (four values and two pdfs), the pair in double precision. A hair fiber's lobe calls them.
+// carries, where each call to them rebuilds both. A change to either must be made here too: nothing
+// but the merges' images checks that the two agree. A hair fiber's lobe calls them.
 struct DMergeLobe {
     const DScene& sc;
     const DVertex& vt;

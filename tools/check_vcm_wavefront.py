@@ -9,8 +9,8 @@ vertices, their weights, the footprint's probes and the pixel's terms are the in
 (FTRACE_NOVCMWF=1); only the order of the sums differs, which moves a float32 pixel by a rounding
 at most (ORDER_TOL). So it requires, against the inline merge's image of the same scene:
 
-  - in scenes/_merge_glossy_bowl.ftsl at five times its merge radius (`-pmradius 0.05`, the case
-    that ran 6.6 times slower than the CPU before the queue): every site through the queue (the
+  - in scenes/_merge_glossy_bowl.ftsl at five times its merge radius (`-pmradius 0.05`, a wide
+    merge, each site gathering many light vertices): every site through the queue (the
     run's merge line, none inline) and the inline merge's image; the inline run itself printing no
     merge line, i.e. bypassing the queue;
   - the same image with the queue shrunk to 32 requests (FTRACE_VCMWFCAP), which turns sites away

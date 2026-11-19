@@ -641,7 +641,7 @@ def render(exe, out, path, tag, args, seed=1, want_gpu=False):
     pfm = png[:-4] + ".pfm"
     for f in (png, pfm):
         remove(f)
-    cmd = [exe, "-in", path, "-seed", str(seed), "-hdr", "-no-meter", "-o", png] + args
+    cmd = [exe, "-in", path, "-seed", str(seed), "-hdr", "-no-meter", "-window-min", "-o", png] + args
     rc, log = run(cmd)
     if rc != 0 or not os.path.exists(pfm):
         print(log[-2000:])

@@ -411,7 +411,11 @@ Then the rest of 4.2-4.6 in their order, 4.7's bookkeeping alongside whatever to
   wavelength; byte for byte 0.450.4's images. 640x480 bowl: gather 43.4 -> 15.7 s; Nsight 10.5 -> 1.5
   G local requests, 26.6 -> 15.6 G FP64. Its four pattern readers forced inline, which made mode D
   1.75x faster too (0.450.4 had dGlossyF out of line at 168 registers).
-- [x] **REVIEW-0450B** (0.450.6) — the Opus (max) review of 0.450.1-0.450.4: mode U's VRAM preflight,
+- [x] **REVIEW-0450C** (0.450.9) — the Opus (max) and Fable (xhigh) reviews of 0.450.5-0.450.6: a
+  spectral property refused as a scalar map, a slot's pattern composed with its map, tryDevCap's
+  growth, the cell table and the store kept off the sort's and the stacks' memory, FTSL.md's map
+  rule, stale words; known-issues REVIEW-0450C.
+- [x] **REVIEW-0450B** (0.450.6) — the Opus (max) and Fable (xhigh) reviews of 0.450.1-0.450.4: mode U's VRAM preflight,
   the beam seed's draws sequenced, the checks' GPU and history fixes, an empty site skipped first;
   DVertHitState stays 16 B and three of Fable's camera-kernel edits were declined, each breaking the
   device link (GPU-LINK-FRAGILITY); known-issues REVIEW-0450B.
@@ -426,7 +430,20 @@ Then the rest of 4.2-4.6 in their order, 4.7's bookkeeping alongside whatever to
   not its callers' bounds, and an edit anywhere in the one unit -- a host-only one at the end --
   could put one out at 238; now every function in a capped unit fits it (cuobjdump: none over 168).
   Whole-program compilation also linked, but in 77 minutes of ptxas, and no faster. Next: land the
-  declined edits (known-issues REVIEW-0450B).
+  declined edits (known-issues REVIEW-0450B) and the two below.
+- [ ] **MERGE-LOBE-SHARED** — DMergeLobe repeats dBsdfF's and dBsdfPdf's arithmetic step for step,
+  kept equal by hand (the Opus review of 0.450.5): make the two thin wrappers over a prepared lobe,
+  so the merges and the connections are one implementation, and kVcmCameraT's connection loop (six
+  rebuilds of the hit and the pair a light vertex, as the merges had) takes the lobe too; with it a
+  translucent lobe's two albedos read once at the hero wavelength rather than at f and at each pdf.
+- [ ] **RNG-ARG-ORDER** — 67 calls pass two or more RNG draws as arguments of one call
+  (`cam.genRay(px, py, rng.uniform(), rng.uniform())` and `hair::sample(...)` in the renderers, the
+  lens's draws, main.cpp's self-test scenes, and the device's caustic-aim samplers with their host
+  twins in render.h), whose order of evaluation is the compiler's: an image depends on the compiler
+  that built it, and a host twin and its device twin may take one stream's draws in opposite orders.
+  (A declaration list, `Real u1 = rng.uniform(), u2 = rng.uniform();`, and a braced initializer are
+  sequenced, and not counted.) Sequence them (a two-draw helper, `rng.uniform2()`) in one
+  sweep: every render's noise realization moves once, by design (both reviews of 0.450.5-0.450.6).
 - [ ] **VCM-GATHER-DIVERGENCE** — the gather keeps 13.7 of 32 lanes active (a lane's candidate refused
   at the distance, sidedness or band test idles while the others evaluate) at 244 registers, a
   sixth of the warps resident: gather the candidates that pass the cheap tests into a warp-wide

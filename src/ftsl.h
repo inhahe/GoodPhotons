@@ -3495,12 +3495,12 @@ private:
         // table's own values are the greyscale albedo. Handled here rather than in
         // evalSpectrum because this is the only spectral site with somewhere to put a
         // per-hit multiplier.
-        if (s && !s->val.words.empty() && isTableCallHead(s->val.words[0])) {
-            if (!bindScalarPattern(b, key, patOut)) return dflt;   // fail() already set
-            return constantSpectrum(1.0);
-        }
-        if (s && !s->val.words.empty() && s->val.words[0].rfind("pattern:", 0) == 0) {
-            if (!bindScalarPattern(b, key, patOut)) return dflt;   // unknown name: failed
+        // Either way `<key>`'s pattern composes with `<mapKey>`'s, both being multipliers on the slot.
+        if (s && !s->val.words.empty() &&
+            (isTableCallHead(s->val.words[0]) || s->val.words[0].rfind("pattern:", 0) == 0)) {
+            int p = -1;
+            if (!bindScalarPattern(b, key, p)) return dflt;       // fail() already set
+            patOut = loadedRef_ ? composePatterns(patOut, p, *loadedRef_) : p;
             return constantSpectrum(1.0);
         }
         // §3.2 per-property access at a PATTERN-AWARE spectral slot: `reflect gold.reflect`
@@ -3605,17 +3605,16 @@ private:
     // A map, `<key> pattern:<n>` (or what bindScalarPattern takes besides) or, where `texOut` is
     // given, `texture:<n>`, into patOut or *texOut. A value that is neither is an error -- a map
     // silently left out renders a surface uniform, with nothing to say why -- except another
-    // material's property that holds no map (`film_thickness_map gold.film_thickness`, gold's a
-    // constant): a map that follows a source with none is none.
+    // material's scalar property that holds no map (`film_thickness_map gold.film_thickness`,
+    // gold's a constant): a map that follows a source with none is none. A spectral property is
+    // no scalar map, whatever it holds.
     void bindScalarMap(const Block& b, const char* key, int& patOut, int* texOut) {
-        const Stmt* s = find(b, key);
-        if (!s) return;
-        if (bindScalarPattern(b, key, patOut) || (texOut && bindScalarTexture(b, key, *texOut))) return;
-        if (!err.empty()) return;   // a binder has said what is wrong
-        const std::string w0 = s->val.words.empty() ? std::string() : s->val.words[0];
-        MatProp mp;
-        if (w0.find('.') != std::string::npos && !isNumber(w0) && loadedRef_ && materialPropRef(w0, mp) && mp.ok)
+        if (!find(b, key)) return;
+        bool noMap = false;
+        if (bindScalarPattern(b, key, patOut, &noMap) || noMap ||
+            (texOut && bindScalarTexture(b, key, *texOut)))
             return;
+        if (!err.empty()) return;   // a binder has said what is wrong
         fail(std::string("`") + key + (texOut ? "` takes pattern:<name> or texture:<name>" : "` takes pattern:<name>"));
     }
 
@@ -3623,8 +3622,10 @@ private:
     // material parameter (§4) and return true; otherwise false (the caller reads a
     // numeric value or tries bindScalarTexture instead). Patterns are evaluated at
     // the hit's (x,y,z,f,normal,r) — the mechanism that gives UV-less implicit
-    // surfaces spatially-varying roughness / thickness / material selection.
-    bool bindScalarPattern(const Block& b, const char* key, int& patOut) {
+    // surfaces spatially-varying roughness / thickness / material selection. `*noMap` (where given)
+    // is set when the value is another material's scalar property that carries no pattern, a
+    // constant the caller may read instead.
+    bool bindScalarPattern(const Block& b, const char* key, int& patOut, bool* noMap = nullptr) {
         const Stmt* s = find(b, key);
         if (!s || s->val.words.empty()) return false;
         const std::string& w0 = s->val.words[0];
@@ -3647,7 +3648,10 @@ private:
             !isNumber(w0) && loadedRef_) {
             MatProp mp;
             if (materialPropRef(w0, mp)) {
-                if (!mp.ok || mp.spectral || mp.pat < 0) return false;
+                if (!mp.ok || mp.spectral || mp.pat < 0) {
+                    if (noMap) *noMap = mp.ok && !mp.spectral;
+                    return false;
+                }
                 patOut = composePatterns(patOut, mp.pat, *loadedRef_);
                 return true;
             }

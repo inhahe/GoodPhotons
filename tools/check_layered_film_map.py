@@ -18,11 +18,16 @@ there, and dropped a pattern without a word (LAYERED-FILM-PATTERN). It requires:
   * a `thinfilm` material's mapped film byte for byte as its 150 nm one in mode R on the CPU (it
     always bound a pattern, and reads no rows: the control);
   * `film_thickness_map` and a mix's `weight_map` given a value that is neither a pattern nor a
-    texture (a misspelt `patern:`) stop the load, naming the key, and so do `reflect_map`,
-    `transmit_map` and `emit_map`, which take a pattern only;
-  * a map that names another material's property holding no map (`film_thickness_map
+    texture (a misspelt `patern:`) stop the load, naming the key and both forms, and so do
+    `reflect_map`, `transmit_map` and `emit_map`, naming the pattern alone (they take no texture);
+    and so do a film map and a weight map naming another material's SPECTRAL property
+    (`other.reflect`, patterned there), which is no scalar map;
+  * a map that names another material's scalar property holding no map (`film_thickness_map
     other.film_thickness`, a constant there) loads, with no map: one that follows a source with
-    none is none.
+    none is none;
+  * a diffuse ball's `reflect pattern:quarter` beside `reflect_map pattern:quarter` renders as
+    `reflect 0.0625`, the two multipliers composed (within 1e-3, mode R on the CPU), not as one of
+    them alone.
 
 Exits 1 on any failure.
 """
@@ -118,13 +123,18 @@ def main():
                                   '  transmit_map patern:quarter }'), False),
            ("emit_map", scene('material "film" { type diffuse reflect 0.1  emit blackbody 5200'
                               '  emit_map patern:quarter }'), False)]
+    spectral = 'material "other" { type diffuse  reflect pattern:quarter }'
+    bad += [("film_thickness_map", scene(layered(600, "other.reflect"), extra=spectral), True),
+            ("weight_map", scene('material "film" { type mix  layer "base" 0.5  layer "white" 0.5'
+                                 '  weight_map other.reflect }', extra=spectral), True)]
     for i, (key, text, tex) in enumerate(bad):
         rc, log, _ = run("bad_%d" % i, text)
-        says = "pattern:<name> or texture:<name>" if tex else "`%s` takes pattern:<name>" % key
-        good = rc != 0 and key in log and says in log
+        says = "`%s` takes pattern:<name>%s" % (key, " or texture:<name>" if tex else "")
+        good = rc != 0 and says in log and (tex or "takes pattern:<name> or" not in log)
         ok &= good
-        print("%-4s `%s patern:quarter` stops the load, naming the key%s"
-              % ("ok" if good else "FAIL", key, "" if good else " (exit %d)" % rc), flush=True)
+        word = "other.reflect" if "other.reflect" in text else "patern:quarter"
+        print("%-4s `%s %s` stops the load, naming the key%s"
+              % ("ok" if good else "FAIL", key, word, "" if good else " (exit %d): %s" % (rc, log[-200:])), flush=True)
     other = 'material "other" { type thinfilm  ior 1.5  film_ior 1.3  film_thickness 150  substrate_k 2 }'
     rc, log, img = run("propref", scene(layered(600, "other.film_thickness"), extra=other))
     _, _, plain = run("propref_none", scene(layered(600), extra=other))
@@ -132,6 +142,20 @@ def main():
     ok &= good
     print("%-4s a film map naming a constant property loads, and renders as no map%s"
           % ("ok" if good else "FAIL", "" if good else " (exit %d): %s" % (rc, log[-300:])), flush=True)
+    diffuse = 'material "film" { type diffuse  %s }'
+    _, _, both = run("compose_both", scene(diffuse % "reflect pattern:quarter  reflect_map pattern:quarter"))
+    _, _, flat = run("compose_flat", scene(diffuse % "reflect 0.0625"))
+    _, _, one = run("compose_one", scene(diffuse % "reflect pattern:quarter"))
+    if both is None or flat is None or one is None:
+        ok = False
+        print("FAIL a slot's pattern and its map's: a render failed", flush=True)
+    else:
+        rf, _ = image_diff(both, flat)
+        r1, _ = image_diff(both, one)
+        good = rf <= 1e-3 and r1 > 0.1
+        ok &= good
+        print("%-4s `reflect pattern:quarter` with `reflect_map pattern:quarter` renders as `reflect 0.0625`   "
+              "%.2g of the pixel off it (%.2g off the pattern alone)" % ("ok" if good else "FAIL", rf, r1), flush=True)
     print("PASS" if ok else "FAILED")
     return 0 if ok else 1
 

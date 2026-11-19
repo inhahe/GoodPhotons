@@ -23,16 +23,13 @@ Exits 1 on any failure.
 """
 import argparse
 import os
-import subprocess
 import sys
 
-import numpy as np
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 NL = chr(10)
 sys.path.insert(0, os.path.join(ROOT, "tools"))
 from check_motion import agree, lum, stripe_scene  # noqa: E402
-from pfm import read_pfm  # noqa: E402
 import check_motion  # noqa: E402
 
 W, H = 96, 72
@@ -78,19 +75,8 @@ def deform_scene(obj, shutter):
 
 
 def render(exe, out, path, tag, args, seed, want_gpu=False):
-    png = os.path.join(out, tag + ".png")
-    pfm = png[:-4] + ".pfm"
-    for f in (png, pfm):
-        if os.path.exists(f):
-            os.remove(f)
-    cmd = [exe, "-in", path, "-seed", str(seed), "-hdr", "-no-meter", "-window-min", "-o", png] + args
-    p = subprocess.run(cmd, cwd=ROOT, capture_output=True, text=True, encoding="utf-8", errors="replace")
-    if p.returncode != 0 or not os.path.exists(pfm):
-        print((p.stdout + p.stderr)[-2000:])
-        raise SystemExit("render failed (exit %d): %s" % (p.returncode, " ".join(cmd)))
-    if want_gpu and "-> GPU" not in p.stdout + p.stderr:
-        raise SystemExit("did not run on the GPU: " + " ".join(cmd))
-    return lum(read_pfm(pfm, top_down=True))
+    """check_motion.render's image, as luminance."""
+    return lum(check_motion.render(exe, out, path, tag, args, seed, want_gpu)[0])
 
 
 def main():

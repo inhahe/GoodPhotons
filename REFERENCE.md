@@ -4973,7 +4973,8 @@ a *spectral* slot is a per-hit **multiplier** on whatever the slot otherwise hol
 spellings, one mechanism: `reflect pattern:<name>` (or `reflect [0 1](u)`) leaves the
 pattern alone in the slot, so the base spectrum is a flat 1.0 and the albedo is the
 pattern's own value — a **greyscale reflectance**; `reflect_map pattern:<name>` written
-beside a spectrum or a `reflect texture:<name>` **modulates that** instead. So colour always
+beside a spectrum or a `reflect texture:<name>` **modulates that** instead (beside a
+`reflect pattern:`, the two multiply, since 0.450.9). So colour always
 comes from the spectrum or texture and variation from the pattern — a scalar can't invent a
 hue — and the multiplier is clamped to [0,1] so a formula can't manufacture energy. Works
 on `diffuse`, `translucent`, `mirror`, `halfmirror`, `glossy` and `grating`; on the families
