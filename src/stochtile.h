@@ -47,6 +47,7 @@
 // last bits differ between a CPU libm and a GPU, which would put the three backends on
 // different crops of the image.
 #pragma once
+#include "unit_linkage.h"   // FT_UNIT_INLINE
 #include <cstdint>
 #include <cmath>
 
@@ -142,7 +143,7 @@
 // [r][g][b][coeff]. Clamps to the cube: an out-of-gamut blend (possible, since the
 // operator amplifies deviations) gets the nearest representable colour's spectrum
 // rather than an extrapolated one.
-STOCH_HD inline void stochJhCoeff(const float* lut, double r, double g, double b,
+STOCH_HD FT_UNIT_INLINE void stochJhCoeff(const float* lut, double r, double g, double b,
                                   double* c /*[3]*/) {
     const int N = STOCH_JH_N;
     int i0[3], i1[3];
@@ -177,7 +178,7 @@ STOCH_HD inline void stochJhCoeff(const float* lut, double r, double g, double b
 // Reflectance at one wavelength from coefficients — the device twin of
 // upsample::reflAt, duplicated here (three lines) so the device path does not have to
 // include the host-only upsampling header.
-STOCH_HD inline double stochReflAt(const double* c, double lambda) {
+STOCH_HD FT_UNIT_INLINE double stochReflAt(const double* c, double lambda) {
     const double t = (lambda - 595.0) / 235.0;
     const double p = c[0] * t * t + c[1] * t + c[2];
     return 0.5 + 0.5 * p / STOCH_SQRT(1.0 + p * p);
@@ -259,7 +260,7 @@ inline double stochForward(size_t rank, size_t count) {
 // Two independent uniforms in [0,1) from a lattice vertex + seed. Same integer-mix shape
 // as pattern.h's patHash3 (deliberately: this project's noise all agrees bit-for-bit
 // across backends because none of it hashes through transcendentals).
-STOCH_HD inline void stochHash2(int ix, int iy, unsigned seed, double& a, double& b) {
+STOCH_HD FT_UNIT_INLINE void stochHash2(int ix, int iy, unsigned seed, double& a, double& b) {
     uint32_t h = (uint32_t)ix * 374761393u + (uint32_t)iy * 668265263u
                + seed * 2147483647u + 2166136261u;
     h = (h ^ (h >> 13)) * 1274126177u;
@@ -274,7 +275,7 @@ STOCH_HD inline void stochHash2(int ix, int iy, unsigned seed, double& a, double
 // Barycentric weights and the three random UV offsets at (u,v). Exactly three lattice
 // cells cover any point, and the weights sum to 1, which is what makes the variance
 // restoration below a closed form rather than a fit.
-STOCH_HD inline void stochTriGrid(double u, double v, double patch, unsigned seed,
+STOCH_HD FT_UNIT_INLINE void stochTriGrid(double u, double v, double patch, unsigned seed,
                                   double w[3], double offU[3], double offV[3]) {
     const double s = 3.4641016151377544 / (patch > 1e-6 ? patch : 1e-6);   // 2*sqrt(3)
     const double su = u * s, sv = v * s;
@@ -302,7 +303,7 @@ STOCH_HD inline void stochTriGrid(double u, double v, double patch, unsigned see
 
 // Variance-restoring blend of three Gaussianized samples. sum(w) == 1 by construction, so
 // the mean is already right; only the spread has to be undone.
-STOCH_HD inline double stochBlend(const double g[3], const double w[3]) {
+STOCH_HD FT_UNIT_INLINE double stochBlend(const double g[3], const double w[3]) {
     const double m = w[0] * g[0] + w[1] * g[1] + w[2] * g[2];
     const double n = STOCH_SQRT(w[0] * w[0] + w[1] * w[1] + w[2] * w[2]);
     return (n > 0.0) ? ((m - STOCH_G_MEAN) / n + STOCH_G_MEAN) : m;
@@ -311,7 +312,7 @@ STOCH_HD inline double stochBlend(const double g[3], const double w[3]) {
 // T^-1 from the per-channel LUT, linearly interpolated over [STOCH_G_LO, STOCH_G_HI].
 // `g` outside that clamps to the image's own extremes — 6 sigma out, which is where the
 // source image had no data either.
-STOCH_HD inline double stochInvT(const float* lut, double g) {
+STOCH_HD FT_UNIT_INLINE double stochInvT(const float* lut, double g) {
     if (!lut) return g;
     const double t = (g - STOCH_G_LO) * ((double)(STOCH_LUT_N - 1) / (STOCH_G_HI - STOCH_G_LO));
     if (!(t > 0.0)) return (double)lut[0];
@@ -329,12 +330,12 @@ STOCH_HD inline double stochInvT(const float* lut, double g) {
 // Always Repeat: the lattice offsets push the fetch UV arbitrarily far outside [0,1], so
 // a stochastic texture has no border to clamp or mirror against. The texture's own `wrap`
 // is meaningless here and the loader warns if it was set to anything else.
-STOCH_HD inline int stochWrapIdx(int i, int n) { int m = i % n; return (m < 0) ? m + n : m; }
+STOCH_HD FT_UNIT_INLINE int stochWrapIdx(int i, int n) { int m = i % n; return (m < 0) ? m + n : m; }
 
 // Bilinear (or nearest) fetch of `nch` interleaved float channels, with the same v flip
 // and texel centring as Texture::bilerpSetup, so the Gaussianized planes are addressed
 // exactly like the images they came from.
-STOCH_HD inline void stochFetch(const float* data, int nch, int w, int h, int filter,
+STOCH_HD FT_UNIT_INLINE void stochFetch(const float* data, int nch, int w, int h, int filter,
                                 double u, double v, double* out) {
     if (filter == 0) {
         int x = stochWrapIdx((int)STOCH_FLOOR(u * w), w);
@@ -362,7 +363,7 @@ STOCH_HD inline void stochFetch(const float* data, int nch, int w, int h, int fi
 // The whole operator: three offset fetches of the Gaussianized plane set, one
 // variance-restoring blend per channel, one LUT inversion per channel. `lut` is
 // nch * STOCH_LUT_N floats, channel-major. Writes nch values (nch <= 4).
-STOCH_HD inline void stochSample(const StochTile& st, const float* gauss, const float* lut,
+STOCH_HD FT_UNIT_INLINE void stochSample(const StochTile& st, const float* gauss, const float* lut,
                                  int nch, int w, int h, int filter,
                                  double u, double v, double* out) {
     double wgt[3], offU[3], offV[3];

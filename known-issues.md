@@ -201,6 +201,60 @@ to 0.25 renders as a 150 nm one within 2e-3, 1.0e-3 measured (its body's escape 
 on 0.450.1 it rendered as the unmapped 600 nm, 1.9 off), the `thinfilm` control byte for byte, and
 the three misspellings stop the load (on 0.450.1 they loaded).
 
+## DONE (2026-11-18, 0.450.14): REVIEW-0450E — what the Opus (max) and Fable (xhigh) reviews of 0.450.10-0.450.11 found
+
+`/code-review max` (Opus, 11 findings) and `/code-review xhigh` (Fable, 15) of dbf75e8..504fb37, one
+after the other in a worktree; nine found by both. Each checked against the code. **Fixed in
+0.450.14:**
+
+* **RNG-ARG-ORDER left draws in an order the compiler chooses** (both): `Emitter::selW`'s measuring
+  loop (`emitterSamplePoint(..., (k + rng.uniform()) / kN, rng.uniform(), ...)`, which every scene
+  with a patterned or glow area light reads), the curve and Gabor self-tests' and the BVH test's.
+  check_rng_args.py credited a draw only to its innermost bracket and never looked at an operator's
+  operands, so it passed them all. It now counts a draw for every bracket up to its statement,
+  flags two draws in one operand with nothing to sequence them, tells a function body from a
+  braced initializer, knows `uniformOpen` and calls through `)(` and `](`, runs 23 cases of its
+  own first, and runs from build.bat. On 0.450.13's source it lists the six sites; 0.450.13's own
+  version listed none. The selW draws keep the order MSVC gave them, so a patterned light's renders
+  are unchanged.
+* **Modes V and P were weighed wrongly** (both): V at 0, P by kBackwardRGB, a kernel it never
+  launches. V weighs its forward walk, P that and kBackward; the walk's backend is the one it runs
+  (`cudaForwardRunsWavefront`), where the A/B/C entry had charged the larger of the megakernel and
+  the wavefront (Fable), and every entry reads through `mostLocalOf`, whose tail had left a sticky
+  error uncleared (Fable). check_vram_preflight gains V and P; V's forward pass and P's start line
+  now say where they rendered.
+* **The meter weighed the render's kernel, not its frame's, and asked before its own tests** (both):
+  a D or J frame meters with kBdptT scalar at depth 8, which vramPreflight now weighs, after the
+  frame's support and blur tests, once a kernel set and frame size. check_vram_preflight: under
+  `-heroc 4 -max-bounce 20` the meter wants 4.12 GB (a scalar depth-8 render's) and the frames 8.72.
+* **Two rules for the reservation still to come** (both): the cell table counted only the growth,
+  everything else all of it. One conservative rule now (`pendingLocalBytes`, all of it until held).
+* **A blurred shared flight's posed cameras were not counted** (Fable): the flight's preflight adds
+  them (`cudaSharedFlightPosedBytes`, the session's own sizing), and the session sets the walk's
+  stacks aside before it sizes them.
+* **The linkage check compared each capped unit with render_cuda.obj only** (both): it compares
+  each with every other GPU object, the other capped unit and raster_cuda.obj included.
+* **The same hazard stayed open outside the helpers the check had named** (Fable): `stochtile.h`'s
+  and `pattern.h`'s helpers are `FT_UNIT_INLINE`, and twenty more device structs with member
+  functions (DGridCell, DSurfSite, DVcmSite, DMergeFootprint, DCoatEval, DSpecVtx...) sit in unnamed
+  namespaces; the structs the units share keep members ptxas inlines.
+* **The helpers were `static` on the host too** (Opus): an external inline host function calling one
+  meant a different function in each TU. `FT_UNIT_INLINE` is `static` only in a capped GPU unit.
+* **Mode U's connections and merges rebuilt lobes they had** (both): the light end builds one lobe
+  for its value at every wavelength and both pdfs; the inline merge uses the camera vertex's lobe;
+  a translucent lobe keeps its hero albedo past the bundle's others; the queued merge's lobe is
+  prepared at once again, the warp converged.
+* **The store's message blamed 0 MB of stacks** (both): it prints only where they caused the shortage.
+* **Doc comments separated from their functions** (both): mostLocalOf's, dGlossyR's; REFERENCE.md's
+  `-device` row (Fable).
+
+**Not changed.** One lazy coat-film read for modes U and J (Fable): U reads it off the walk's own
+hit, which it has; a lobe member would rebuild the hit where nothing else needs it. Overloads that
+take the rng, in place of declaration lists (Fable): the lists are the rule, and the scanner holds
+them. The conservative reservation rule undersizes a buffer where the driver does grow in place
+(Fable): it is the direction that cannot hang a render. fff8a5c's VERSION (Fable): history, and the
+next commit bumped it.
+
 ## DONE (2026-11-18, 0.450.10): REVIEW-0450D — what the Opus (max) and Fable (xhigh) reviews of 0.450.7-0.450.9 found
 
 `/code-review max` (Opus, 10 findings) and `/code-review xhigh` (Fable, 14) of aaf7cef..dbf75e8, one

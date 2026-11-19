@@ -574,7 +574,8 @@ inline bool bvhParallelSelfTest() {
     for (int i = 0; i < N; ++i) {
         const double cluster = (i % 7 == 0) ? 40.0 : 1.0;      // lopsided, so splits are uneven
         const Vec3 c{(rnd() - 0.5) * cluster, (rnd() - 0.5) * cluster, (rnd() - 0.5) * cluster};
-        const double r = 0.001 + rnd() * rnd() * 1.0;          // three decades of size
+        const double s0 = rnd(), s1 = rnd();
+        const double r = 0.001 + s0 * s1 * 1.0;               // three decades of size
         boxes[i].expand(Vec3{c.x - r, c.y - r, c.z - r});
         boxes[i].expand(Vec3{c.x + r, c.y + r, c.z + r});
     }

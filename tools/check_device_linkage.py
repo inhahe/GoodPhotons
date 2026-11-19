@@ -1,5 +1,5 @@
 """Build check: no function the register-capped GPU units compile out of line can be bound, at the
-device link, to render_cuda.cu's copy of it.
+device link, to another unit's copy of it.
 
     python tools/check_device_linkage.py [--objdir build_cuda3/ftrace.dir/Release]
 
@@ -7,18 +7,20 @@ render_cuda_bdpt.cu (kBdptT, -maxrregcount=168) and render_cuda_jsurf.cu (kJSurf
 compile their own copies of the device code they call, so that every function ptxas leaves out of
 line there fits their kernels' launch bounds (render_cuda_dev.cuh). That holds for a function with
 internal linkage. One with EXTERNAL linkage -- a non-static inline function, a template, a class's
-member function -- that is out of line in a capped unit AND in render_cuda.cu becomes a weak
-definition in both objects, and nvlink keeps one of them for every caller: render_cuda.cu's,
-compiled without the cap, may be the one, and then the link refuses kBdptT once that copy -- or a
-function it calls, render_cuda.cu's own (DVertexLobe::pdf, at 76 registers, bound kJSurfLightT to
-render_cuda.cu's dMatRoughness at 252) -- needs more registers than the bounds allow: after an edit
-anywhere in render_cuda.cu.
+member function -- that is out of line in a capped unit AND in another unit becomes a weak
+definition in both objects, and nvlink keeps one of them for every caller: the other unit's,
+compiled without the cap or to another one, may be the one, and then the link refuses kBdptT once
+that copy -- or a function it calls, that unit's own (DVertexLobe::pdf, at 76 registers, bound
+kJSurfLightT to render_cuda.cu's dMatRoughness at 252) -- needs more registers than the bounds
+allow: after an edit anywhere in that unit.
 
-So it lists, from `cuobjdump -res-usage` of the three objects, every externally linked function
-other than the unit's own kernels that a capped unit keeps out of line and render_cuda.obj does
-too, with both register counts -- every one a hazard, whatever its count, for what it calls. The fix
-is internal linkage: `static` for a function, an unnamed namespace for a struct's members. Exits 1 when there is one (or when an object or cuobjdump is missing); build.bat runs it
-after every build.
+So it lists, from `cuobjdump -res-usage` of the GPU objects, every externally linked function other
+than the units' own kernels that a capped unit keeps out of line and another object does too --
+render_cuda.obj and raster_cuda.obj, uncapped, or the other capped unit, whose copy is held to ITS
+cap -- with both register counts: every one a hazard, whatever its count, for what it calls. The
+fix is internal linkage: `static` (FT_UNIT_INLINE in a shared header, unit_linkage.h) for a
+function, an unnamed namespace for a struct's members. Exits 1 when there is one (or when an object
+or cuobjdump is missing); build.bat runs it after every build, failed ones included.
 """
 import argparse
 import os
@@ -29,6 +31,7 @@ import sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 UNITS = [("render_cuda_bdpt", 168, "kBdptT"), ("render_cuda_jsurf", 128, "kJSurfLightT")]
+UNCAPPED = ["render_cuda", "raster_cuda"]
 FUNC = re.compile(r"Function ([^:\s]+):")
 REG = re.compile(r"REG:(\d+)")
 
@@ -72,23 +75,31 @@ def main():
     if not tool:
         print("cuobjdump not found (PATH, CUDA_PATH)")
         return 1
-    objs = {n: os.path.join(a.objdir, n + ".obj") for n in ["render_cuda"] + [u[0] for u in UNITS]}
+    capped = [u[0] for u in UNITS]
+    objs = {n: os.path.join(a.objdir, n + ".obj") for n in UNCAPPED + capped}
     missing = [o for o in objs.values() if not os.path.exists(o)]
     if missing:
         print("missing object: " + ", ".join(missing))
         return 1
-    main_fns = external_functions(tool, objs["render_cuda"])
+    fns = {n: external_functions(tool, o) for n, o in objs.items()}
+    kernels = [u[2] for u in UNITS]
     bad = 0
+    # Each capped unit against every other object: the uncapped ones, and the other capped unit,
+    # whose copy is held to ITS cap -- kBdptT's 168 binding kJSurfLightT's calls at 128 refuses the
+    # link as surely as an uncapped one. Each pair of capped units once.
     for unit, cap, kernel in UNITS:
-        fns = external_functions(tool, objs[unit])
-        shared = sorted((n for n in fns if n in main_fns and kernel not in n), key=lambda n: -main_fns[n])
-        for n in shared:
-            bad += 1
-            print("%s: %s is out of line with external linkage here (%d registers) and in render_cuda.cu (%d%s)"
-                  % (unit, n, fns[n], main_fns[n], ", over the cap %d" % cap if main_fns[n] > cap else ""))
+        for other in objs:
+            if other == unit or (other in capped and other < unit):
+                continue
+            shared = sorted((n for n in fns[unit] if n in fns[other] and not any(k in n for k in kernels)),
+                            key=lambda n: -fns[other][n])
+            for n in shared:
+                bad += 1
+                print("%s: %s is out of line with external linkage here (%d registers) and in %s.cu (%d)"
+                      % (unit, n, fns[unit][n], other, fns[other][n]))
     if bad:
-        print("%d function(s) the device link may bind to render_cuda.cu's uncapped copy: give them internal "
-              "linkage (static; a struct's members, an unnamed namespace)" % bad)
+        print("%d function(s) the device link may bind to another unit's copy, held to another cap or none: "
+              "give them internal linkage (static; a struct's members, an unnamed namespace)" % bad)
         return 1
     print("ok: every function the capped units keep out of line is their own")
     return 0

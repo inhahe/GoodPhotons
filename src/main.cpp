@@ -144,6 +144,7 @@
 #include <mutex>               // guards the live-window title (the deposit monitor re-titles)
 #include <filesystem>          // -review: scan a directory of rendered frames
 #include <optional>
+#include <tuple>               // the meter's VRAM verdicts, keyed by kernel set and frame size
 #include <ctime>               // -checkdevhits: a temp file name
 
 #include "version.h"          // ftraceVersion(): the repo-root VERSION string, baked into one tiny TU
@@ -649,7 +650,8 @@ static int checkCurve(long long rays) {
         for (long long i = 0; i < rays; ++i) {
             CurveSeg s;
             s.p0 = Vec3{rng.uniform() * 2 - 1, rng.uniform() * 2 - 1, rng.uniform() * 2 - 1};
-            s.p1 = s.p0 + unitDir() * (0.05 + rng.uniform() * 1.2);
+            const Vec3 axis = unitDir();
+            s.p1 = s.p0 + axis * (0.05 + rng.uniform() * 1.2);
             s.r0 = 0.005 + rng.uniform() * 0.35;
             s.r1 = 0.005 + rng.uniform() * 0.35;
             s.u0 = 0.25f; s.u1 = 0.75f;
@@ -659,8 +661,10 @@ static int checkCurve(long long rays) {
             // the aim point by up to ~2.5 radii keeps a healthy mix of hits, near-misses
             // and grazes — including every cap-vs-lateral boundary, which is where the
             // band classification could be wrong.
-            const Vec3 target = s.p0 + (s.p1 - s.p0) * rng.uniform()
-                              + unitDir() * ((s.r0 + s.r1) * 0.5 * rng.uniform() * 2.5);
+            const double along = rng.uniform();
+            const Vec3 off = unitDir();
+            const Vec3 target = s.p0 + (s.p1 - s.p0) * along
+                              + off * ((s.r0 + s.r1) * 0.5 * rng.uniform() * 2.5);
             const Vec3 d = unitDir();
             const Vec3 o = target - d * (1.0 + rng.uniform() * 3.0);
             const double sdo = sdRoundCone(o, s.p0, s.p1, s.r0, s.r1);
@@ -777,12 +781,18 @@ static int checkCurve(long long rays) {
         for (long long i = 0; i < rays / 4; ++i) {
             CurveSeg s;
             s.p0 = Vec3{rng.uniform() - 0.5, rng.uniform() - 0.5, rng.uniform() - 0.5};
-            s.p1 = s.p0 + unitDir() * (0.05 + rng.uniform() * 1.0);
+            const Vec3 axis = unitDir();
+            s.p1 = s.p0 + axis * (0.05 + rng.uniform() * 1.0);
             s.r0 = 0.01 + rng.uniform() * 0.3;
             s.r1 = 0.01 + rng.uniform() * 0.3;
             // Half the origins deliberately INSIDE the fiber.
             Vec3 o;
-            if (i & 1) { o = s.p0 + (s.p1 - s.p0) * rng.uniform() + unitDir() * (rng.uniform() * s.r0 * 0.5); ++inside; }
+            if (i & 1) {
+                const double along = rng.uniform();
+                const Vec3 off = unitDir();
+                o = s.p0 + (s.p1 - s.p0) * along + off * (rng.uniform() * s.r0 * 0.5);
+                ++inside;
+            }
             else       { o = Vec3{rng.uniform() * 4 - 2, rng.uniform() * 4 - 2, rng.uniform() * 4 - 2}; }
             const Vec3 d = unitDir();
             const CurveRay cr = makeCurveRay(d);
@@ -818,7 +828,8 @@ static int checkCurve(long long rays) {
         for (long long i = 0; i < rays / 4; ++i) {
             // Aim at a random point near a joint, from a random direction.
             const Vec3 j = pts[1 + (int)(rng.uniform() * 2.999)];
-            const Vec3 target = j + unitDir() * (rng.uniform() * 0.02);
+            const Vec3 off = unitDir();
+            const Vec3 target = j + off * (rng.uniform() * 0.02);
             const Vec3 d = unitDir();
             const Vec3 o = target - d * 3.0;
             const double truth = chainSd(o + d * 3.0);   // is `target` inside the chain?
@@ -925,8 +936,9 @@ static int checkCurve(long long rays) {
                 s.r0 = c.radius;
                 s.r1 = c.radius * (0.3 + 0.7 * rng.uniform());
                 // Aim at a jittered point on the fiber (nothing random hits a 1 mm strand).
-                const Vec3 target = s.p0 + (s.p1 - s.p0) * rng.uniform()
-                                  + unitDir() * (c.radius * 1.6 * rng.uniform());
+                const double along = rng.uniform();
+                const Vec3 off = unitDir();
+                const Vec3 target = s.p0 + (s.p1 - s.p0) * along + off * (c.radius * 1.6 * rng.uniform());
                 const Vec3 o = target + unitDir() * c.dist;
                 const Vec3 d = normalize(target - o);
 
@@ -6505,10 +6517,9 @@ static int checkGabor() {
         for (const Cfg& c : cfgs) {
             double s = 0.0, s2 = 0.0;
             for (int i = 0; i < N; ++i) {
-                const double g = patGaborRaw((frand() - 0.5) * 400.0,
-                                             (frand() - 0.5) * 400.0,
-                                             (frand() - 0.5) * 400.0,
-                                             c.f, c.wx, c.wy, c.wz);
+                const double x = (frand() - 0.5) * 400.0, y = (frand() - 0.5) * 400.0,
+                             z = (frand() - 0.5) * 400.0;
+                const double g = patGaborRaw(x, y, z, c.f, c.wx, c.wy, c.wz);
                 s += g; s2 += g * g;
             }
             const double mean = s / N, var = s2 / N - mean * mean;
@@ -19773,7 +19784,7 @@ static int runCompositeProgressive(
     std::printf("mode P: forward+camera-side composite, target %lld photons / %lld spp "
                 "at %dx%d on %s (light=%s)%s ...\n",
                 acc.N + Nreq, acc.spp + sppReq, res, resY,   // -resume adds to what it loaded
-                useGpu ? "GPU" : (std::to_string(nThreads) + " threads").c_str(),
+                useGpu ? "GPU" : (std::to_string(nThreads) + " CPU threads").c_str(),
                 scene.envIndex >= 0 ? "env" : "lit",
                 (resume && (acc.N > 0 || acc.spp > 0)) ? " [resuming]" : "");
 
@@ -20272,13 +20283,18 @@ static bool cameraRunsOnJ(const Scene& scene, char mode, int projection, const c
 // bytes of the render's own device buffers -- its films, queues, posed cameras: false, the reason
 // printed, where `-device auto` should fall back to the CPU. `heldScene` is the batch's device copy
 // of the scene that this render reuses (BatchCache::sceneHold): the card is short of it, but it is
-// ours. `forced` (-device gpu) prints the same warning and answers true. Every site that decides a
-// device asks this once for the kernels it will launch: runRender for its own modes, its mode S and
-// U dispatches, and run()'s mode-M routes (mGpuOk).
-static bool vramPreflight(char m, size_t buffers, size_t heldScene, bool forced) {
-    const int hero = (m == 'D' || m == 'J' || m == 'U') ? g_heroC : 1;
-    const int mdep = (g_maxBounceOverride >= 1) ? g_maxBounceOverride : 8;
-    const size_t needLocal = cudaMegakernelLocalBytes(m, mdep, hero);
+// ours. `forced` (-device gpu) prints the same warning and answers true. `maxDepth` and `heroC`, where
+// positive, name an instantiation other than the render's (the meter's scalar depth-8 kBdptT); 0 is
+// the render's own: -max-bounce's depth (8 without it), and -heroc's bundle in D, J and U.
+// `wavefront`: a forward walk runs on the wavefront backend (cudaForwardRunsWavefront). Every site
+// that decides a device asks this once for the kernels it will launch: runRender for its own modes,
+// its mode S and U dispatches, run()'s mode-M routes (mGpuOk), the shared forward flight and the
+// meter (meterAffords).
+static bool vramPreflight(char m, size_t buffers, size_t heldScene, bool forced, int maxDepth = 0,
+                          int heroC = 0, bool wavefront = false) {
+    const int hero = (heroC > 0) ? heroC : (m == 'D' || m == 'J' || m == 'U') ? g_heroC : 1;
+    const int mdep = (maxDepth > 0) ? maxDepth : (g_maxBounceOverride >= 1) ? g_maxBounceOverride : 8;
+    const size_t needLocal = cudaMegakernelLocalBytes(m, mdep, hero, wavefront);
     // Memory this process already holds, which `freeB` below is short of and which must not
     // be blamed on another program: the local reservation its context keeps from whatever
     // kernel of ours ran before (cudaLocalReservedBytes, measured), and what OIDN may hold
@@ -20667,17 +20683,21 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
             else
                 batch->releaseHold();
         }
+        // The forward walk's backend, where -wavefront asks for it: mode P's layers trace with a
+        // stable seed, which keeps them on the megakernel (launchForward).
+        const bool wfAsked = wavefront && m != 'P';
         // The film pair (two double3 images), and a blurred forward render of a moving camera's
         // posed copy of it, one a thread; mode S's session keeps its own state a pixel instead.
         const size_t film   = (m == 'S') ? (size_t)res * resY * cudaSppmPixelBytes()
                             : (size_t)res * resY * 3 * sizeof(double) * 2 +
                               ((gpuForwardMode && cam.seesMotion(scene) && cam.moves())
-                                   ? cudaForwardPosedCameraBytes(scene, wavefront, g_heroC, N) : 0);
+                                   ? cudaForwardPosedCameraBytes(scene, wfAsked, g_heroC, N) : 0);
         // Mode J's beam queue, allocated beside the kernel once the render starts.
         const size_t queues =
             (m == 'J' && jBeamsChoice().rule != JBeams::Off && !scene.media.empty())
                 ? cudaModeJBeamQueueBytes() : 0;
-        return vramPreflight(m, film + queues, heldScene, wantGpu);
+        return vramPreflight(m, film + queues, heldScene, wantGpu, 0, 0,
+                             gpuForwardMode && cudaForwardRunsWavefront(scene, wfAsked, g_heroC));
     };
     if (useGpu && !vramAffords(mode)) useGpu = false;
 #endif
@@ -20800,7 +20820,8 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
                     spp, res, resY, nThreads, lightLabel);
         Film ref = renderBackward(scene, cam, res, resY, spp, nThreads, diffraction);
 
-        std::printf("mode V: forward light tracer %lld photons for cross-check ...\n", N);
+        std::printf("mode V: forward light tracer %lld photons for cross-check on %s ...\n", N,
+                    useGpu ? "GPU" : (std::to_string(nThreads) + " CPU threads").c_str());
         EnergyReport e;
         Film fwd = renderForward(scene, &cam, res, resY, N, nThreads,
                                  /*forwardCatch*/false, /*lensMode*/false, /*useCamera*/true, e,
@@ -29514,18 +29535,20 @@ static int run(int argc, char** argv) {
 #endif
     (void)mGpuOk;   // read only by the device routes (HAVE_CUDA): keep CPU-only builds warning-clean
 #ifdef HAVE_CUDA
-    // Whether a meter frame in mode `m` (meterAnchor's: its rendered mode) may take the device: the
-    // card's room for the kernels that frame runs -- the backward ones in R and P, kBdptT in D and J,
-    // the forward walk otherwise (modes S, U and V meter by mode B's light trace; mode M's frames are
-    // on the CPU and never ask) -- and a frame's film pair (vramPreflight). Asked once a mode.
-    std::map<char, bool> meterRoom;
-    const auto meterAffords = [&](char m, int W, int H) -> bool {
-        if (m == 'M') return false;
-        const char k = std::strchr("RDJABCP", m) ? m : 'B';
-        auto it = meterRoom.find(k);
+    // Whether a W x H meter frame may run the kernels of mode `k` (cudaMegakernelLocalBytes's) on the
+    // device: the card's room for them beside a frame's film pair (vramPreflight), at the instantiation
+    // the frame launches -- the render's, except that a D or J frame runs kBdptT scalar at depth 8
+    // (meterAnchor's renderBdptCuda call), so `k` is 'D' for both. Asked once a kernel set and frame
+    // size, and only by a frame its own tests have already sent to the device, so that one bound for
+    // the CPU anyway prints no verdict.
+    std::map<std::tuple<char, int, int>, bool> meterRoom;
+    const auto meterAffords = [&](char k, int W, int H) -> bool {
+        auto it = meterRoom.find({k, W, H});
         if (it == meterRoom.end())
-            it = meterRoom.emplace(k, vramPreflight(k, (size_t)W * H * 3 * sizeof(double) * 2, 0,
-                                                    !std::strcmp(device, "gpu"))).first;
+            it = meterRoom.emplace(std::make_tuple(k, W, H),
+                                   vramPreflight(k, (size_t)W * H * 3 * sizeof(double) * 2, 0,
+                                                 !std::strcmp(device, "gpu"), k == 'D' ? 8 : 0,
+                                                 k == 'D' ? 1 : 0)).first;
         return it->second;
     };
 #endif
@@ -29535,13 +29558,18 @@ static int run(int argc, char** argv) {
         const long long meterN   = std::clamp((long long)W * H * 40LL, 500000LL, 4000000LL);
         const long long meterSpp = 16;
         const char mode = mc.mode;      // already the rendered mode (renderedMode)
-        // A blurred frame meters where it renders: on the device in the modes that blur there, where
-        // the card holds the kernels the frame runs (meterAffords).
+        // A frame may meter on the device where asked and where its blur runs there (a blurred frame
+        // meters where it renders); each case then adds its mode's own support test and, last, the
+        // card's room for the kernels it launches (meterAffords).
 #ifdef HAVE_CUDA
-        const bool onDevice = meterGpu && meterAffords(mode, W, H) &&
-                              (!mc.cam.seesMotion(scene) || !cudaBlurUnsupported(scene, mc.cam, mode));
+        const bool onDevice = meterGpu && (!mc.cam.seesMotion(scene) || !cudaBlurUnsupported(scene, mc.cam, mode));
+        // The forward walk's device route, gated as renderForward gates it, with room for mode `k`'s
+        // kernels.
+        const auto fwdOnDevice = [&](char k) {
+            return onDevice && cudaForwardSupported(scene) && meterAffords(k, W, H);
+        };
 #else
-        const bool onDevice = meterGpu;
+        const auto fwdOnDevice = [&](char) { return meterGpu; };
 #endif
         Film mf; double eAuto = 0.0;
         switch (mode) {
@@ -29550,7 +29578,7 @@ static int run(int argc, char** argv) {
                 // renderForward self-gates on cudaForwardSupported and falls back to CPU.
                 mf = renderForward(scene, &mc.cam, W, H, meterN, nThreads,
                                    /*forwardCatch*/mode == 'C', /*lensMode*/mode == 'A',
-                                   /*useCamera*/true, e, diffraction, /*useGpu*/onDevice);
+                                   /*useCamera*/true, e, diffraction, /*useGpu*/fwdOnDevice(mode));
                 // Mode C's film already holds the sky: its env photons thread the pupil and are
                 // caught. The render gates this pass on !forwardCatch; the meter did not, and so
                 // metered C's sky twice (0.370.0).
@@ -29561,7 +29589,7 @@ static int run(int argc, char** argv) {
             case 'R': {
                 bool onGpu = false;
 #ifdef HAVE_CUDA
-                if (onDevice && backwardOnGpuOk(scene, mc.cam)) {
+                if (onDevice && backwardOnGpuOk(scene, mc.cam) && meterAffords('R', W, H)) {
                     mf = renderBackwardCuda(scene, mc.cam, W, H, meterSpp, diffraction, nullptr,
                                             g_maxBounceOverride, g_directOnly, g_heroC);
                     onGpu = true;
@@ -29580,7 +29608,7 @@ static int run(int argc, char** argv) {
             case 'D': case 'J': {
                 bool onGpu = false;
 #ifdef HAVE_CUDA
-                if (onDevice && cudaBdptSupported(scene)) {
+                if (onDevice && cudaBdptSupported(scene) && meterAffords('D', W, H)) {
                     mf = renderBdptCuda(scene, mc.cam, W, H, meterSpp, /*maxDepth*/8, diffraction);
                     onGpu = true;
                 }
@@ -29635,17 +29663,18 @@ static int run(int argc, char** argv) {
             }
             case 'P': {
                 // Composite = forward (model B) + backward, combined at radiance scale 1.0.
+                // The card's room is weighed for both layers' kernels at once (mode P's).
                 CompositeClass cc = classifyComposite(scene, mc.cam, W, H);
                 EnergyReport e;
                 Film fwd = renderForward(scene, &mc.cam, W, H, meterN, nThreads,
-                                         false, false, true, e, diffraction, onDevice);
+                                         false, false, true, e, diffraction, fwdOnDevice('P'));
                 SkyView glowView;   // the glows the camera sees, as the render's compose adds them
                 const bool glows = scene.glowAny &&
                                    prepareSky(glowView, scene, mc.cam, W, H, meterN, /*glowsOnly=*/true);
                 Film ref;
                 bool refGpu = false;
 #ifdef HAVE_CUDA
-                if (onDevice && backwardOnGpuOk(scene, mc.cam)) {
+                if (onDevice && backwardOnGpuOk(scene, mc.cam) && meterAffords('P', W, H)) {
                     ref = renderBackwardCuda(scene, mc.cam, W, H, meterSpp, diffraction, nullptr,
                                              g_maxBounceOverride, g_directOnly, g_heroC);
                     refGpu = true;
@@ -29661,7 +29690,7 @@ static int run(int argc, char** argv) {
             default: {   // S/U/V and any future mode: general forward mode-B light-trace
                 EnergyReport e;
                 mf = renderForward(scene, &mc.cam, W, H, meterN, nThreads,
-                                   false, false, true, e, diffraction, onDevice);
+                                   false, false, true, e, diffraction, fwdOnDevice('B'));
                 addEnvBackground(mf, scene, mc.cam, meterN);
                 eAuto = autoExposureOf(filmToLinear(mf, (double)meterN));
                 break;
@@ -30091,12 +30120,18 @@ static int run(int argc, char** argv) {
                 else                             std::printf("[device] auto -> CPU (%s)\n", why);
             }
         }
-        // The card's room for the flight (vramPreflight): its kernels, and every camera's film and
-        // hit map, which the device holds the whole flight (sharedForwardGpuBegin).
+        // The card's room for the flight (vramPreflight): its kernels, every camera's film and hit
+        // map, which the device holds the whole flight, and under a blur of a moving camera every
+        // camera's posed copies (sharedForwardGpuBegin).
         if (groupGpu) {
             size_t films = 0;
             for (int c = 0; c < nc; ++c) films += (size_t)rxs[c] * rys[c] * 4 * sizeof(double);
-            groupGpu = vramPreflight(groupMode, films, 0, !std::strcmp(device, "gpu"));
+            const bool setMoves = std::any_of(cams.begin(), cams.end(), [&](const Camera& c) {
+                return c.seesMotion(scene) && c.moves();
+            });
+            if (setMoves) films += cudaSharedFlightPosedBytes(scene, nc, wavefront, g_heroC, g_beamGather);
+            groupGpu = vramPreflight(groupMode, films, 0, !std::strcmp(device, "gpu"), 0, 0,
+                                     cudaForwardRunsWavefront(scene, wavefront, g_heroC, g_beamGather, nc));
         }
 #endif
         (void)groupGpu;

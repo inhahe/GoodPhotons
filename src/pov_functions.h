@@ -15,6 +15,7 @@
 // EXCLUDED (need POV's Perlin-noise / pattern / pigment / spline engine, not yet
 // ported): f_pattern(77).
 #pragma once
+#include "unit_linkage.h"   // FT_UNIT_INLINE
 
 #if defined(__CUDACC__)
   #ifndef POV_HD
@@ -59,7 +60,7 @@
 // Evaluate POV internal function `id` with args _pp[] (_pp[0..2]=x,y,z,
 // _pp[3..]=P0..).  The param is named `_pp` (not `p`) to avoid colliding with POV
 // bodies that declare a local `p` (e.g. f_superellipsoid).
-POV_HD static inline double povFnEval(int id, const double* _pp) {
+POV_HD FT_UNIT_INLINE double povFnEval(int id, const double* _pp) {
     double X = _pp[0], Y = _pp[1], Z = _pp[2];
 #define PARAM_X X
 #define PARAM_Y Y
@@ -784,7 +785,7 @@ POV_HD static inline double povFnEval(int id, const double* _pp) {
 
 // Total argument count (including x,y,z) for POV internal function `id`, or 0 if
 // unsupported.  Device-safe so the VM can pop the right number of stack slots.
-POV_HD static inline int povFnArity(int id) {
+POV_HD FT_UNIT_INLINE int povFnArity(int id) {
     switch (id) {
     case 0: return 8; // f_algbr_cyl1
     case 1: return 8; // f_algbr_cyl2

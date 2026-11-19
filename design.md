@@ -2813,17 +2813,25 @@ never reaches runRender on the device, asks once in run() for the largest mode-M
 routes a mode-M camera to the device reads that one answer — the batched meter, the budget and
 blur tests, the notes that say the device was lost, and the shared path — so the sites that
 mirror each other cannot disagree. Since 0.450.10 a forward mode's shared flight (A, B: every
-camera's film and hit map, held the whole flight) and the exposure meter's frames (once a mode, for
-the kernels the frame runs) ask too, the forward modes' kernels (kTrace and the wavefront's) have
-an entry in `cudaMegakernelLocalBytes`, and a mode-S frame is charged its session's own state a
-pixel (`cudaSppmPixelBytes`, ~200 B) rather than a film pair. A buffer a session sizes from the
-free memory before its kernels' first launch -- mode U's light-vertex store, mode M's and mode S's
-photon deposits -- sets those kernels' stacks aside first (`pendingLocalBytes`); where they do
-not fit at all, mode U's store keeps half the free memory and says the stacks will spill, rather
+camera's film and hit map, held the whole flight, and under a blur of a moving camera every
+camera's posed copies, `cudaSharedFlightPosedBytes`) and the exposure meter's frames ask too, the
+forward modes' kernels have an entry in `cudaMegakernelLocalBytes` -- the walk on the backend it
+runs (`cudaForwardRunsWavefront`: kTrace, or the wavefront's three kernels where `-wavefront` is
+asked and nothing keeps the megakernel) for A, B, C and V, kTrace and kBackward for P, whose layers'
+stable seed keeps the megakernel -- and a mode-S frame is charged its session's own state a pixel
+(`cudaSppmPixelBytes`, ~200 B) rather than a film pair. A
+meter frame asks after its own support tests, so one bound for the CPU anyway prints no verdict,
+and for the instantiation it launches (`meterAffords`, once a kernel set and frame size): a D or J
+frame meters with kBdptT scalar at depth 8 whatever the render's `-heroc` and `-max-bounce`, which
+`vramPreflight`'s `maxDepth` and `heroC` name. A buffer a session sizes from the free memory
+before its kernels' first launch -- mode U's light-vertex store and cell table, mode M's and mode
+S's photon deposits -- sets those kernels' stacks aside first (`pendingLocalBytes`, by the rule
+above: none where the reservation already holds them, all of them where it must grow); where they
+do not fit at all, mode U's store keeps half the free memory and says the stacks will spill, rather
 than shrink to one light subpath a pass. `FTRACE_VRAMFREE=<GB>` caps the free memory the preflight
-reads, and `tools/check_vram_preflight.py` uses it to require of every mode (R, B, D, J, S, U, M,
-a mode-M flight and a mode-B flight) that it asks, falls back under `-device auto`, and is forced
-under `gpu`.
+reads, and `tools/check_vram_preflight.py` uses it to require of every mode (R, B, V, P, D, J, S,
+U, M, a mode-M flight and a mode-B flight) that it asks, falls back under `-device auto`, and is
+forced under `gpu`, and of the meter that it weighs its own kernel.
 
 **The bug the gates caught.** Gate 1a — mode `J` == mode `D` bit-for-bit on a media-free scene —
 failed on the first build, and not for any reason involving merges: mode `J` was passing `heroC = 1`
@@ -13063,9 +13071,14 @@ Every such call -- 89 of them: the camera's jitter and lens draws, the hair fibe
 traces, the layered body's, the self-tests' -- now draws its uniforms into a declaration list first
 (`const double u = rng.uniform(), v = rng.uniform();`, whose declarators are sequenced) or a braced
 initializer (`Vec3{...}`, likewise); `hair::sampleWith` draws the fiber's four. A new draw is
-written the same way: never two in one argument list. `tools/check_rng_args.py` scans the source
-for any call whose arguments hold two draws (`x.uniform()` and its kin, or `rng()`, `frand()`,
-`uni()`...); it found 89 before the change, and none after.
+written the same way: never two in one argument list, nor two in one operand (`a * rng.uniform() +
+b * rng.uniform()`), and a helper that draws (`unitDir()`) is called into a local first. The
+scene's emitter weights (`Emitter::selW`), the curve and Gabor self-tests and the BVH test's boxes
+were the last sites (0.450.14). `tools/check_rng_args.py` scans the source for any call whose
+arguments hold draws in two of them (`x.uniform()` and its kin, or `rng()`, `frand()`, `uni()`...),
+a draw counting for every bracket around it, and any operand holding two draws with no `&&`, `||`
+or conditional between them; a brace holding a statement is a block, not a braced initializer. It
+runs its own cases first (exit 2 where the scanner itself is wrong).
 
 ## Scene-authoring tools (`tools/`)
 
@@ -13295,14 +13308,20 @@ for any call whose arguments hold two draws (`x.uniform()` and its kin, or `rng(
   `render_cuda_dev.cuh` (up to kBdptT) and `render_cuda_dev2.cuh` (to kJSurfLightT), which keep
   three constraints: a `__device__` function ptxas may keep out of line has internal linkage
   (`static`) -- one with external linkage, a plain `inline` function, a template or a class's
-  member, that a capped unit and render_cuda.cu both keep out of line is a weak definition in each
-  object, and nvlink binds every call to one of them, render_cuda.cu's uncapped copy maybe, so the
-  link could again refuse after an edit there (0.450.10 made the pattern helpers of
-  `pov_functions.h`, `pov_noise.h` and `bluenoise.h`, and `ggx.h`'s, `static`; a struct whose
-  members are out of line goes in an unnamed namespace, as `DVertexLobe` did in 0.450.11 when its
-  `pdf` bound kJSurfLightT to render_cuda.cu's `dMatRoughness` at 252 registers -- a shared function
-  breaks the link through what it calls, whatever its own count; `tools/check_device_linkage.py`,
-  run by build.bat after every build and after a failed one, lists any left); a kernel there is inside `#ifndef FT_FAMILY_TU` (render_cuda.cu compiles it, the family
+  member, that a capped unit and another unit both keep out of line is a weak definition in each
+  object, and nvlink binds every call to one of them -- render_cuda.cu's or raster_cuda.cu's
+  uncapped copy, or the other capped unit's, held to its cap -- so the link could again refuse
+  after an edit there (the helpers of `pov_functions.h`, `pov_noise.h`, `bluenoise.h`, `ggx.h`,
+  `pattern.h` and `stochtile.h` are `FT_UNIT_INLINE`, `unit_linkage.h`: `static` in a capped unit,
+  plain `inline` elsewhere, so that a host TU's external inline caller means one function
+  everywhere -- `static` for all, as 0.450.10 had it, broke the ODR; a struct with member functions
+  goes in an unnamed namespace, as `DVertexLobe` did in 0.450.11 when its `pdf` bound kJSurfLightT
+  to render_cuda.cu's `dMatRoughness` at 252 registers, and twenty more did in 0.450.14 -- all but
+  those the units share, a kernel's parameter, a device global, a field of either, a type the host
+  uploads (`DVec3`, `DCamera`, `DCamSet`, `DBeamMap`...), whose members stay small enough that
+  ptxas inlines them. A shared function breaks the link through what it calls, whatever its own
+  count; `tools/check_device_linkage.py`, run by build.bat after every build and after a failed
+  one, lists any left, against every other GPU object); a kernel there is inside `#ifndef FT_FAMILY_TU` (render_cuda.cu compiles it, the family
   units do not); a device global goes through `FT_DEVGLOBAL`, defined in render_cuda.cu and
   `extern` in the family units, so the device holds one copy that `cudaMemcpyToSymbol` sets for
   all (the sphere connectors' tables, which were `static`, among them). Whole-program

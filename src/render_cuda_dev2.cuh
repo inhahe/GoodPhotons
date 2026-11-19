@@ -2436,6 +2436,7 @@ constexpr int kVcmProfBlock = 256;
 
 // A merge site's place in the pass's grid (DVcmGrid): the cell holding camera vertex `p`, clamped to the
 // grid as the build clamps a light vertex's.
+namespace {
 struct DVcmSite {
     DGridCell g;
     __device__ DVcmSite(const DVcmGrid& grid, const DVec3& p)
@@ -2453,26 +2454,29 @@ struct DVcmSite {
         return n;
     }
 };
+}  // namespace
 
-// Vertex merging, strategy (d), at camera vertex `vt` (host twin vcm.h), whose cell in the grid is
-// `site`: every light vertex of the pass within the radius, its XYZ weighted and added to mx, my,
-// mz -- before the site's scale and its footprint's (fp, dVertexMergeFootprint's at the pass's
-// radius). `wo` points back along the camera walk, which reached `vt` over `edges` edges with MIS
-// partials dVCM and dVM; `coatTh` is its coat's film there (dCoatThicknessAt at the walk's hit);
+// Vertex merging, strategy (d), at the camera vertex of `lobe` (its BSDF toward the walk's side,
+// DVertexLobe; host twin vcm.h), whose cell in the grid is `site`: every light vertex of the pass
+// within the radius, its XYZ weighted and added to mx, my, mz -- before the site's scale and its
+// footprint's (fp, dVertexMergeFootprint's at the pass's radius). The walk reached the vertex over
+// `edges` edges with MIS partials dVCM and dVM; `coatTh` is its coat's film there (dCoatThicknessAt at
+// the walk's hit);
 // `js` is the VCM-SPEC carrier arriving there, null when off. The site's vertices are one list
 // (dSiteListWalk), of which this caller takes entries lane, lane + lanes, ...: (0, 1) is the inline
 // merge, (lane, 32) a warp's.
 template <int NS>
 __device__ static void dVcmMergeSum(const DScene& sc, const DVcmCtx& ctx, const DVcmGrid& grid,
-                                    const DVcmSite& site, int secStride, const DVertex& vt, Real coatTh,
-                                    const DMergeFootprint& fp, const DVec3& wo, double dVCM, double dVM,
+                                    const DVcmSite& site, int secStride, DVertexLobe& lobe, Real coatTh,
+                                    const DMergeFootprint& fp, double dVCM, double dVM,
                                     int edges, const DJSpec* js, int lane, int lanes,
                                     double& mx, double& my, double& mz) {
     constexpr int SECN = (NS > 0) ? NS : 1;
-    const DMaterial& m = sc.mats[vt.matId];
+    const DVertex& vt = lobe.vt;
+    const DVec3& wo = lobe.wo;
+    const DMaterial& m = lobe.m;
     const DVec3 ngoCam = fp.n;
     const double r2 = ctx.radius * ctx.radius;
-    DVertexLobe lobe(sc, vt, wo);
     dSiteListWalk([&](int n, int& b, int& e) { site.cell(grid, n, b, e); }, lane, lanes, [&](int k) {
         const DVcmLV& lv = grid.byCell[k];
         const DVcmSec* row = ((NS > 0) && grid.byCellSec) ? (grid.byCellSec + (size_t)k * secStride) : nullptr;
@@ -2560,7 +2564,10 @@ __global__ void kVcmMergeGather(DScene sc, DVcmCtx ctx, DVcmGrid grid, int secSt
         const DJSpec* js = (rq.flags & 1) ? &mq.spec[r] : nullptr;
         const DMergeFootprint fp = dVertexMergeFootprint(sc, rq.vt, (Real)ctx.radius);
         double mx = 0.0, my = 0.0, mz = 0.0;
-        dVcmMergeSum<NS>(sc, ctx, grid, DVcmSite(grid, rq.vt.p), secStride, rq.vt, rq.coatTh, fp, rq.wo,
+        // Prepared now: a queued site holds vertices, and the warp's lanes then read the hit once,
+        // together, rather than each at its own first candidate.
+        DVertexLobe lobe(sc, rq.vt, rq.wo, true);
+        dVcmMergeSum<NS>(sc, ctx, grid, DVcmSite(grid, rq.vt.p), secStride, lobe, rq.coatTh, fp,
                          rq.dVCM, rq.dVM, rq.edges, js, lane, 32, mx, my, mz);
         dWarpSiteAdd(sc, fp, rq.gaSeed, lane, mx, my, mz, rq.f, accum, rq.pix);
     }
@@ -3025,12 +3032,18 @@ __global__ void kVcmCameraT(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx
                     double adjLit = (double)dShadingAdjointCorr(lv.wo, w * (Real)-1, lv.ns, ngoLit);
                     // Each end a coated vertex's coat along the connection (dCoatF).
                     const DCoatEval ceCam = dCoatEvalAt(sc, *mp, h.n, camCoatTh(), wo, w);
-                    const DCoatEval ceLit = (lvt.matId >= 0) ? dCoatEval(sc, sc.mats[lvt.matId], dVertHit(lvt),
-                                                                         lv.wo, w * (Real)-1)
+                    // The light vertex's lobe from the connection's side, at its walk's direction: its
+                    // value there is dBsdfFAdjoint's at every wavelength, its two pdfs the connection's
+                    // reversed (dPairSwapped), its hit the coat's. A fiber is never a light vertex:
+                    // its value is held at 0, as dBsdfFAdjoint holds it.
+                    DVertexLobe litLobe(sc, lvt, w * (Real)-1, true);
+                    litLobe.at(lv.wo);
+                    const bool litFiber = (litLobe.m.type == D_HAIR);
+                    const DCoatEval ceLit = (lvt.matId >= 0) ? dCoatEval(sc, litLobe.m, litLobe.h, lv.wo, w * (Real)-1)
                                                              : DCoatEval{};
                     camLobe.at(w);
                     double fCam = camLobe.f(lambda) * ceCam.at(lambda);
-                    double fLit = dBsdfFAdjoint(sc, lvt, lv.wo, w * (Real)-1, lambda) * ceLit.at(lambda);
+                    double fLit = (litFiber ? 0.0 : litLobe.f(lambda)) * ceLit.at(lambda);
                     fLit *= adjLit;
                     // The camera path and the stored light path share this pass's bundle (same
                     // path index i), so a connection is EXACT per-λ over the wavelengths still
@@ -3041,8 +3054,7 @@ __global__ void kVcmCameraT(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx
                     const DVcmSec* lsRow = ((NS > 0) && lvSec) ? (lvSec + (size_t)j * secStride) : nullptr;
                     for (int k = 0; k + 1 < nUpConn; ++k) {
                         double fc = camLobe.f(lamAll[k + 1]) * ceCam.at(lamAll[k + 1]);
-                        double fl = dBsdfFAdjoint(sc, lvt, lv.wo, w * (Real)-1,
-                                                  lamAll[k + 1]) * adjLit * ceLit.at(lamAll[k + 1]);
+                        double fl = (litFiber ? 0.0 : litLobe.f(lamAll[k + 1])) * adjLit * ceLit.at(lamAll[k + 1]);
                         fProdSec[k] = fc * fl;
                         if (fProdSec[k] > mxProd) mxProd = fProdSec[k];
                     }
@@ -3051,10 +3063,8 @@ __global__ void kVcmCameraT(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx
                     if (mxProd <= 0.0) continue;
                     double camDirPdfW = camLobe.pdf(false, lambda);
                     double camRevPdfW = camLobe.pdf(true, lambda);
-                    DVertexLobe litLobe(sc, lvt, lv.wo);   // the light vertex's, from its walk's side
-                    litLobe.at(w * (Real)-1);
-                    double litDirPdfW = litLobe.pdf(false, lambda);
-                    double litRevPdfW = litLobe.pdf(true, lambda);
+                    double litDirPdfW = litLobe.pdf(true, lambda);    // -w drawn from lv.wo
+                    double litRevPdfW = litLobe.pdf(false, lambda);   // lv.wo drawn from -w
                     double camDirPdfA = camDirPdfW * fabs(cosLit) / dist2;
                     double litDirPdfA = litDirPdfW * fabs(cosCam) / dist2;
                     // No merge AT a curve, at either end.
@@ -3117,7 +3127,7 @@ __global__ void kVcmCameraT(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx
                         if (!queued) {
                             const DMergeFootprint fp = dVertexMergeFootprint(sc, vt, (Real)ctx.radius);
                             double mx = 0.0, my = 0.0, mz = 0.0;
-                            dVcmMergeSum<NS>(sc, ctx, grid, site, secStride, vt, coatTh, fp, wo, dVCM, dVM, edges,
+                            dVcmMergeSum<NS>(sc, ctx, grid, site, secStride, camLobe, coatTh, fp, dVCM, dVM, edges,
                                              jsp, 0, 1, mx, my, mz);
                             if (mx != 0.0 || my != 0.0 || mz != 0.0) {
                                 const double fa = f * (sc.gatherArea ? dSurfFootprint(sc, fp, gaSeed) : 1.0);

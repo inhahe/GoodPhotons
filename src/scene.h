@@ -3574,8 +3574,8 @@ struct Scene {
             double s = 0.0;
             for (int k = 0; k < kN; ++k) {
                 Vec3 y, n;
-                const double v = emitterSamplePoint(*this, e, (k + rng.uniform()) / kN, rng.uniform(), y, n,
-                                                    nullptr, &rng);
+                const double w = rng.uniform(), u = (k + rng.uniform()) / kN;
+                const double v = emitterSamplePoint(*this, e, u, w, y, n, nullptr, &rng);
                 if (std::isfinite(v)) s += v;
             }
             e.selW = std::max(s / kN, 0.5 / kN);

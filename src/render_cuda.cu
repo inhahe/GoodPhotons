@@ -75,6 +75,10 @@ __global__ void kDeviceProbe(unsigned long long* sizes, double* math, const doub
 // Of `local` bytes of per-thread local memory a family of kernels reserves at its first launch, what
 // is still to be reserved: all of it until a launch of ours has reserved as much, then none
 // (cudaLocalReservedBytes). A buffer allocated before that launch leaves this much free beside it.
+// All of it, not the growth past a smaller reservation held: nothing says the driver frees the old
+// block before taking the new one rather than holding both while it swaps (vramPreflight's rule
+// too). The one rule for every session budget: the store, the queues, the photon buffers, the
+// cell table.
 static size_t pendingLocalBytes(size_t local) {
     return (cudaLocalReservedBytes() >= local) ? 0 : local;
 }
@@ -2522,6 +2526,13 @@ struct SharedGpuSession {
     int  nc = 0;
 };
 
+// Whether a shared forward flight of `nCam` cameras gathers photon beams (`beamGather`, -beams):
+// only several cameras sharing one flight through a participating medium (the device gates the
+// per-step branch on the same).
+static bool sharedFlightGathersBeams(const Scene& scene, bool beamGather, int nCam) {
+    return beamGather && nCam > 1 && !scene.media.empty();
+}
+
 SharedGpuSession* sharedForwardGpuBegin(const Scene& scene,
                                         const std::vector<Camera>& cams,
                                         const std::vector<int>& resX,
@@ -2575,30 +2586,30 @@ SharedGpuSession* sharedForwardGpuBegin(const Scene& scene,
     CUDA_CHECK(cudaMemcpy(s->d_energy, e0, sizeof e0, cudaMemcpyHostToDevice));
 
     s->cs = makeCamSet(s->up, s->hcams, s->d_films, s->d_hits);
-    // Photon-beams gather: only meaningful with several cameras sharing one flight and a
-    // participating medium present (the device gates the per-step branch on the same).
-    s->cs.beamGather = beamGather && nc > 1 && !scene.media.empty();
+    s->cs.beamGather = sharedFlightGathersBeams(scene, beamGather, nc);
     s->cs.beamOrderMax = pbeams::gOrderMax;   // -beams-order (host twin: Renderer::beamOrderMax)
     // A moving camera set, under a blur: every thread poses its own copy of every camera at its
     // photon's time, a buffer of threads x cameras that a big flight can make larger than the card
     // has free. Made once for the session, here, where the flight can still fly on the CPU.
+    // The walk's stacks, reserved at its first launch, after this, are set aside first.
     if (s->cs.camMoves) {
-        const int effHeroC = forwardHeroC(heroC, s->up.sc.mediaN != 0, s->up.sc.hasGrin != 0);
-        const long long threads = forwardRunsWavefront(wavefront, effHeroC, s->cs.beamsOn())
-                                ? (long long)wavefrontSlots(1ll << 40) : (long long)kFwdBlockSize * kFwdNumBlocks;
-        const size_t need = (size_t)threads * (size_t)nc;
+        const size_t needB = cudaSharedFlightPosedBytes(scene, nc, wavefront, heroC, beamGather);
         size_t freeB = 0, totalB = 0;
         cudaMemGetInfo(&freeB, &totalB);
-        if (need * sizeof(DCamera) > freeB / 2 || cudaMalloc(&s->d_posed, need * sizeof(DCamera)) != cudaSuccess) {
+        const size_t pending = pendingLocalBytes(cudaMegakernelLocalBytes(
+            camMode, maxBounce, heroC, cudaForwardRunsWavefront(scene, wavefront, heroC, beamGather, nc)));
+        const size_t room = (freeB > pending) ? freeB - pending : 0;
+        if (needB > room / 2 || cudaMalloc(&s->d_posed, needB) != cudaSuccess) {
             cudaGetLastError();
             s->d_posed = nullptr;
             std::fprintf(stderr, "[device] a blurred shared flight poses its %d cameras at each photon's time in "
-                                 "%.2f GB of device memory, more than half the %.2f GB free; using CPU\n",
-                         nc, (double)(need * sizeof(DCamera)) / 1e9, (double)freeB / 1e9);
+                                 "%.2f GB of device memory, more than half the %.2f GB free beside the walk's "
+                                 "stacks; using CPU\n",
+                         nc, (double)needB / 1e9, (double)room / 1e9);
             sharedForwardGpuEnd(s);
             return nullptr;
         }
-        s->posedCap = need;
+        s->posedCap = needB / sizeof(DCamera);
     }
     return s;
 }
@@ -4537,16 +4548,12 @@ bool cudaMemInfo(size_t* freeB, size_t* totalB) {
     return true;
 }
 
-// Bytes of device memory the megakernel for `mode` reserves purely for per-thread local
-// storage, at the instantiation this render will actually launch. `maxDepth`/`heroC` pick
-// the same four-way BDPT branch renderBdptCuda picks, so the number is the one that will
-// really be reserved rather than a worst case. Returns 0 when unknown (no device, or a
-// mode with no megakernel), which callers must treat as "no opinion", not as "free".
 // The local memory a launch of the most demanding of kernels `ks` reserves: its per-thread local size
-// on every resident thread (0 for a kernel the runtime cannot describe).
+// on every resident thread (0 for a kernel the runtime cannot describe; a null entry is skipped).
 static size_t mostLocalOf(std::initializer_list<const void*> ks) {
     size_t most = 0;
     for (const void* k : ks) {
+        if (!k) continue;
         cudaFuncAttributes fa{};
         if (cudaFuncGetAttributes(&fa, k) == cudaSuccess) most = std::max(most, (size_t)fa.localSizeBytes);
         cudaGetLastError();
@@ -4554,10 +4561,15 @@ static size_t mostLocalOf(std::initializer_list<const void*> ks) {
     return most * residentThreads();
 }
 
-size_t cudaMegakernelLocalBytes(char mode, int maxDepth, int heroC) {
-    using namespace gpu;                      // the megakernels live there
+// Bytes of device memory the kernels of `mode` reserve purely for per-thread local storage, at the
+// instantiation this render will actually launch: `maxDepth`/`heroC` pick the same four-way BDPT
+// branch renderBdptCuda picks, and `wavefront` (cudaForwardRunsWavefront's answer) the forward walk's
+// backend in modes A, B, C, V and P, so the number is the one that will really be reserved rather
+// than a worst case. Returns 0 when unknown (no device, or a mode with no kernel of its own), which
+// callers must treat as "no opinion", not as "free".
+size_t cudaMegakernelLocalBytes(char mode, int maxDepth, int heroC, bool wavefront) {
+    using namespace gpu;                      // the kernels live there
     if (!cudaAvailable()) return 0;
-    const void* fn = nullptr;
     if (mode == 'D' || mode == 'J') {
         // Mirrors renderBdptCuda's dispatch exactly (deep = maxDepth past the default
         // instantiation; hero = the multi-wavelength bundle). The deep variant is the
@@ -4572,45 +4584,43 @@ size_t cudaMegakernelLocalBytes(char mode, int maxDepth, int heroC) {
         // render start and then thrash on host memory over PCIe).
         const bool deep = (maxDepth > BDPT_MAXDEPTH);
         const bool hero = (heroC > 1);
-        if (hero && deep)      fn = (const void*)kBdptT<BDPT_NSEC, BDPT_DEEPDEPTH, false, false>;
-        else if (hero)         fn = (const void*)kBdptT<BDPT_NSEC, BDPT_MAXDEPTH, false, false>;
-        else if (deep)         fn = (const void*)kBdptT<0, BDPT_DEEPDEPTH, false, false>;
-        else                   fn = (const void*)kBdptT<0, BDPT_MAXDEPTH, false, false>;
-        if (mode == 'J') {
-            const void* mfn = deep ? (const void*)kBdptT<0, BDPT_DEEPDEPTH, true, false>
-                                   : (const void*)kBdptT<0, BDPT_MAXDEPTH, true, false>;
-            cudaFuncAttributes fm{}, fc{};
-            if (cudaFuncGetAttributes(&fm, mfn) == cudaSuccess &&
-                cudaFuncGetAttributes(&fc, fn)  == cudaSuccess &&
-                fm.localSizeBytes > fc.localSizeBytes) fn = mfn;
-            cudaGetLastError();
-        }
-    } else if (mode == 'S' || mode == 'M' || mode == 'A' || mode == 'B' || mode == 'C') {
-        // The photon walks (kTrace, which takes the hero bundle in itself) and the pass's own kernels:
-        // mode S's visible points and gather, mode M's gather, the forward modes' wavefront (which
-        // runs in kTrace's stead where it is on). The most of them.
-        if (mode == 'S')
-            return mostLocalOf({(const void*)kTrace, (const void*)kSppmVisiblePoint, (const void*)kSppmGather});
-        if (mode == 'M')
-            return mostLocalOf({(const void*)kTrace, (const void*)kGather});
-        return mostLocalOf({(const void*)kTrace, (const void*)kWfInit, (const void*)kWfExtend, (const void*)kWfShade});
-    } else if (mode == 'U') {
+        const void* fn = (hero && deep) ? (const void*)kBdptT<BDPT_NSEC, BDPT_DEEPDEPTH, false, false>
+                       : hero           ? (const void*)kBdptT<BDPT_NSEC, BDPT_MAXDEPTH, false, false>
+                       : deep           ? (const void*)kBdptT<0, BDPT_DEEPDEPTH, false, false>
+                       :                  (const void*)kBdptT<0, BDPT_MAXDEPTH, false, false>;
+        if (mode == 'D') return mostLocalOf({fn});
+        return mostLocalOf({fn, deep ? (const void*)kBdptT<0, BDPT_DEEPDEPTH, true, false>
+                                     : (const void*)kBdptT<0, BDPT_MAXDEPTH, true, false>});
+    }
+    // The photon walks (kTrace, which takes the hero bundle in itself) and the pass's own kernels:
+    // mode S's visible points and gather, mode M's gather. The most of them.
+    if (mode == 'S')
+        return mostLocalOf({(const void*)kTrace, (const void*)kSppmVisiblePoint, (const void*)kSppmGather});
+    if (mode == 'M')
+        return mostLocalOf({(const void*)kTrace, (const void*)kGather});
+    // The forward modes' walk, on the backend it runs: the megakernel, or the wavefront's three
+    // kernels in its stead; mode P's camera-side layers add the backward kernel.
+    if (std::strchr("ABCVP", mode)) {
+        const void* bk = (mode == 'P') ? (const void*)kBackward : nullptr;
+        if (wavefront)
+            return mostLocalOf({(const void*)kWfInit, (const void*)kWfExtend, (const void*)kWfShade, bk});
+        return mostLocalOf({(const void*)kTrace, bk});
+    }
+    if (mode == 'U') {
         // The resident session's kernels (vcmSessionBegin), the hero instantiation where it runs:
         // the most of them, which the context's reservation must hold.
         const bool hero = heroC > 1;
         return mostLocalOf({hero ? (const void*)kVcmLightT<BDPT_NSEC> : (const void*)kVcmLightT<0>,
                             hero ? (const void*)kVcmCameraT<BDPT_NSEC> : (const void*)kVcmCameraT<0>,
                             hero ? (const void*)kVcmMergeGather<BDPT_NSEC> : (const void*)kVcmMergeGather<0>});
-    } else if (mode == 'R' || mode == 'W') {
-        fn = (const void*)kBackward;
-    } else if (mode == 'P') {
-        fn = (const void*)kBackwardRGB;
     }
-    if (!fn) return 0;
-    cudaFuncAttributes fa{};
-    if (cudaFuncGetAttributes(&fa, fn) != cudaSuccess) return 0;
-    cudaGetLastError();                       // don't leave a sticky error for the next launch
-    return (size_t)fa.localSizeBytes * residentThreads();
+    if (mode == 'R' || mode == 'W') return mostLocalOf({(const void*)kBackward});
+    return 0;
+}
+
+bool cudaForwardRunsWavefront(const Scene& scene, bool wavefront, int heroC, bool beamGather, int nCam) {
+    const int effHeroC = forwardHeroC(heroC, !scene.media.empty(), grin::sceneHasGrin(scene));
+    return forwardRunsWavefront(wavefront, effHeroC, sharedFlightGathersBeams(scene, beamGather, nCam));
 }
 
 size_t cudaModeJBeamQueueBytes() {
@@ -4621,12 +4631,21 @@ size_t cudaModeJBeamQueueBytes() {
 
 // --------------------- backward reference (mode R) host ----------------------
 
+// The posed copies a blurred forward launch keeps of a moving set of `nCam` cameras (DCamSet::cam):
+// one of each camera a thread, on the backend launchForward picks -- the wavefront's slots for an
+// N-photon trace (`runsWavefront`, cudaForwardRunsWavefront's answer), or the megakernel's grid.
+static size_t forwardPosedBytes(bool runsWavefront, long long N, int nCam) {
+    const long long threads = runsWavefront ? (long long)wavefrontSlots(N) : (long long)kFwdBlockSize * kFwdNumBlocks;
+    return (size_t)threads * (size_t)nCam * sizeof(gpu::DCamera);
+}
+
 size_t cudaForwardPosedCameraBytes(const Scene& scene, bool wavefront, int heroC, long long N) {
-    // launchForward's choice for renderForwardCuda's one camera, which carries no beams
-    const int effHeroC = forwardHeroC(heroC, !scene.media.empty(), grin::sceneHasGrin(scene));
-    const long long threads = forwardRunsWavefront(wavefront, effHeroC, false)
-                            ? (long long)wavefrontSlots(N) : (long long)kFwdBlockSize * kFwdNumBlocks;
-    return (size_t)threads * sizeof(gpu::DCamera);
+    return forwardPosedBytes(cudaForwardRunsWavefront(scene, wavefront, heroC), N, 1);
+}
+
+size_t cudaSharedFlightPosedBytes(const Scene& scene, int nCam, bool wavefront, int heroC, bool beamGather) {
+    // made once for the session, so for its largest batch: the wavefront's pool at its fullest
+    return forwardPosedBytes(cudaForwardRunsWavefront(scene, wavefront, heroC, beamGather, nCam), 1ll << 40, nCam);
 }
 
 const char* cudaBlurUnsupported(const Scene& /*scene*/, const Camera& /*cam*/, char mode) {
@@ -6664,7 +6683,9 @@ VcmSession* vcmSessionBegin(const Scene& scene, const Camera& cam, int resX, int
             const size_t floorB = budget;
             if (freeB > pending) {
                 budget = std::min(std::max(totalB / 8, budget), (freeB - pending) / 2);
-                if (budget < floorB)
+                // Said where the stacks are why: some still to reserve, and the free memory's half
+                // alone would have met the floor (other programs' shortage is not theirs).
+                if (budget < floorB && pending > 0 && freeB / 2 >= floorB)
                     std::printf("[mode U] the kernels' stacks (%zu MB, reserved at their first launch) leave "
                                 "the light-vertex store %zu MB of the %zu MB free\n",
                                 pending >> 20, budget >> 20, freeB >> 20);
@@ -6894,19 +6915,18 @@ void vcmSessionPass(VcmSession* s, double radius) {
         // So do they where the device will not hold the table (the merges' queue takes its share of
         // the memory first): the pass renders, its merges weighing more candidates. The table takes
         // no more than the memory free past what the passes must leave -- VcmSession::sortWorst,
-        // past what the arena holds already, and of localNeed what a reservation of ours does not
-        // hold yet, the part already held having left the free memory -- the table it replaces
-        // counted free: the device refuses an allocation only once the card is full, and under
-        // WDDM not even then, it pages. Asked only where the table must grow.
+        // past what the arena holds already, and the kernels' stacks until a launch has reserved
+        // them (pendingLocalBytes, the preflight's own rule) -- the table it replaces counted free:
+        // the device refuses an allocation only once the card is full, and under WDDM not even
+        // then, it pages. Asked only where the table must grow; a coarsening it forces is said.
         size_t mostCells = 0;   // 0: not asked yet
         const auto cellRoom = [&]() -> size_t {
             if (mostCells) return mostCells;
             mostCells = SIZE_MAX;
             size_t arenaHeld = 0;
             for (const ThrustArena::Block& blk : s->arena.blocks) arenaHeld += blk.cap;
-            const size_t held = cudaLocalReservedBytes();
             const size_t keep = (s->sortWorst > arenaHeld ? s->sortWorst - arenaHeld : 0) +
-                                (s->localNeed > held ? s->localNeed - held : 0);
+                                pendingLocalBytes(s->localNeed);
             size_t freeB = 0, totalB = 0;
             if (cudaMemGetInfo(&freeB, &totalB) == cudaSuccess) {
                 freeB += s->cellStartCap * sizeof(int);

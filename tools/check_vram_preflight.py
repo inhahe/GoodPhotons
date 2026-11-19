@@ -6,8 +6,8 @@ to the CPU when the card cannot afford its kernels.
 The preflight (main.cpp, vramPreflight) weighs a mode's kernels' local memory
 (cudaMegakernelLocalBytes) and its films against the card's free memory, and under `-device auto`
 sends a render that would not fit to the CPU, where a GPU launch would spill to host memory and
-look hung. Each mode decides its device in its own place -- runRender's shared decision (R, B, D,
-J), mode S's and mode U's dispatches, run()'s mode-M routes for one camera and for a flight of
+look hung. Each mode decides its device in its own place -- runRender's shared decision (R, B, V,
+P, D, J), mode S's and mode U's dispatches, run()'s mode-M routes for one camera and for a flight of
 them, the shared forward flight of mode B's cameras, the exposure meter's frames -- and each must
 ask. FTRACE_VRAMFREE=<GB> makes the card read as having no more than that
 free. For each mode, on a small room:
@@ -19,8 +19,13 @@ free. For each mode, on a small room:
     the GPU;
   - with FTRACE_VRAMFREE=0 under `-device gpu`: the refusal, and the GPU taken anyway, as asked.
 
+Modes V and P launch kernels other modes do, so V weighs what B weighs (the forward walk), and P
+the more of B's and R's (that walk, and the backward kernel of its camera-side layers).
+
 And of a locked two-frame path metered in mode D: its [vram] line ahead of the meter's, and with the
-card read as full a refusal (or a forced warning) for the meter as well as each frame.
+card read as full a refusal (or a forced warning) for the meter as well as each frame; and, under
+-heroc 4 -max-bounce 20, the meter weighing the scalar depth-8 kernel its frames launch, not the
+render's.
 
 Exits 1 on any failure.
 """
@@ -49,6 +54,8 @@ camera_path "fly" { look_at 0 0.3 0  up 0 1 0  fov_y 45  frames 2  film { res 64
 CASES = [
     ("R", "R", ["-camera", "a", "-spp", "4"], False),
     ("B", "B", ["-camera", "a", "-n", "200000"], False),
+    ("V", "V", ["-camera", "a", "-n", "200000"], False),
+    ("P", "P", ["-camera", "a", "-spp", "4", "-n", "200000"], False),
     ("D", "D", ["-camera", "a", "-spp", "4"], False),
     ("J", "J", ["-camera", "a", "-spp", "4"], False),
     ("S", "S", ["-camera", "a", "-spp", "4", "-n", "200000"], True),
@@ -62,18 +69,20 @@ FORCED = "-device gpu given explicitly; proceeding"
 # The device a render took: the dispatch's announcement, or a shared forward flight's start line,
 # which names its backend (the card, or "N CPU threads").
 ON_GPU = re.compile(r"\[device\] (auto|gpu) -> GPU|shared model-\w pass: .* on (?!\d+ CPU threads)")
-# Where a mode announcing its device before it asks (R, B, D, J) really rendered: its start line's,
-# mode J's camera pass's.
+# Where a mode announcing its device before it asks (R, B, V, P, D, J) really rendered: its last start
+# line's -- mode J's camera pass's, mode V's forward pass's (its backward reference is on the CPU by
+# design).
 RAN = re.compile(r"^mode (\w): [^\n]*?\bon (GPU|\d+ CPU threads)", re.M)
 WANTS = re.compile(r"kernel wants ([\d.]+) GB local")
 
 
 def ran_on(log, mode):
-    """'GPU' or 'CPU' as the mode's start line says, or None."""
+    """'GPU' or 'CPU' as the mode's last start line says, or None."""
+    where = None
     for m in RAN.finditer(log):
         if m.group(1) == mode:
-            return "GPU" if m.group(2) == "GPU" else "CPU"
-    return None
+            where = "GPU" if m.group(2) == "GPU" else "CPU"
+    return where
 
 
 def main():
@@ -87,6 +96,7 @@ def main():
     with open(room, "w", encoding="utf-8", newline="") as f:
         f.write(ROOM)
     check = fogbox.Checks(66)
+    weights = {}   # tag -> the GB its kernels want, on the card as it is
     logs = []
 
     def run(tag, mode, args, device, free, scene=room, meter=False):
@@ -113,6 +123,8 @@ def main():
         rc, log, wrote = run(tag, mode, args, "auto", None)
         w = WANTS.search(log)
         weighed = w is not None and float(w.group(1)) > 0.0   # the mode's kernels weighed, not taken as 0
+        if w:
+            weights[tag] = float(w.group(1))
         where = ran_on(log, mode)
         check("%s: asks the preflight, and renders on the GPU" % tag,
               rc == 0 and wrote and kernel in log and weighed and REFUSED not in log
@@ -136,6 +148,14 @@ def main():
               "rc %d, %s, %s" % (rc, "forced" if FORCED in log else "not forced",
                                  "GPU" if ON_GPU.search(log) and where in (None, "GPU") else "not on the GPU"))
 
+    # Modes V and P launch kernels other modes do: V the forward walk B runs, P that and R's backward
+    # kernel for its camera-side layers, so each weighs what those weigh -- not 0, nor one layer's.
+    b_, r_ = weights.get("B"), weights.get("R")
+    check("V weighs the forward walk, as B does", weights.get("V") is not None and weights.get("V") == b_,
+          "V %s GB, B %s GB" % (weights.get("V"), b_))
+    check("P weighs both layers' kernels, the more of B's and R's",
+          None not in (weights.get("P"), b_, r_) and weights.get("P") == max(b_, r_),
+          "P %s GB, B %s GB, R %s GB" % (weights.get("P"), b_, r_))
     # The exposure meter's frames: a locked path of two frames, its exposure automatic (no light's
     # `power`), metered in mode D before its first frame renders. The meter must ask before it meters:
     # its [vram] line ahead of the meter's own (both on stdout, whose order the log keeps); and with the
@@ -154,6 +174,19 @@ def main():
               "rc %d, %s%s" % (rc, "no meter line" if mt < 0 else "asked first" if 0 <= at < mt
                                else "never asked" if at < 0 else "asked after metering",
                                (", %d of 3 %s" % (n, "refusals" if word == REFUSED else "forced")) if word else ""))
+    # A D frame meters with kBdptT scalar at depth 8 whatever the render's -heroc and -max-bounce, and
+    # the meter weighs that kernel: its [vram] line (the first) wants what a scalar depth-8 render's
+    # does, the frames' what the render's own hero, deep instantiation does.
+    _, slog, _ = run("scalar", "D", ["-camera", "a", "-spp", "4", "-heroc", "1"], "auto", None)
+    scalar = WANTS.search(slog)
+    rc, log, _ = run("metered deep", "D", ["-camera", "fly", "-spp", "4", "-heroc", "4", "-max-bounce", "20"],
+                     "auto", None, metered, meter=True)
+    wants = WANTS.findall(log)
+    check("D metered: the meter weighs the kernel a meter frame launches, not the render's",
+          rc == 0 and scalar is not None and len(wants) >= 2 and wants[0] == scalar.group(1)
+          and wants[-1] != wants[0],
+          "rc %d, the meter wants %s GB, a scalar depth-8 render %s GB, the frames %s GB"
+          % (rc, wants[0] if wants else "?", scalar.group(1) if scalar else "?", wants[-1] if wants else "?"))
     return check.verdict(NL.join(logs[-3:]))
 
 

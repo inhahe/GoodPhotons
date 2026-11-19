@@ -412,6 +412,11 @@ Then the rest of 4.2-4.6 in their order, 4.7's bookkeeping alongside whatever to
   wavelength; byte for byte 0.450.4's images. 640x480 bowl: gather 43.4 -> 15.7 s; Nsight 10.5 -> 1.5
   G local requests, 26.6 -> 15.6 G FP64. Its four pattern readers forced inline, which made mode D
   1.75x faster too (0.450.4 had dGlossyF out of line at 168 registers).
+- [x] **REVIEW-0450E** (0.450.14) — the Opus (max) and Fable (xhigh) reviews of 0.450.10-0.450.11: the
+  last unsequenced draws (selW's among them) and a scanner that sees them, modes V and P and the
+  meter weighed by the kernels they launch, a flight's posed cameras, one reservation rule, the
+  linkage check over every GPU object and twenty more structs unit-local, mode U's lobes shared;
+  known-issues REVIEW-0450E.
 - [x] **REVIEW-0450D** (0.450.10) — the Opus (max) and Fable (xhigh) reviews of 0.450.7-0.450.9: the
   split's linkage rule (static helpers, tools/check_device_linkage.py in build.bat), the preflight for
   shared flights and the meter, modes A/B/C weighed, mode S charged its session, the M/S deposits and

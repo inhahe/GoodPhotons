@@ -16,6 +16,7 @@
 // evaluated by a tiny scalar stack — no pointers, no recursion, trivially GPU-
 // portable (the CUDA backend iterates the same array).
 #pragma once
+#include "unit_linkage.h"   // FT_UNIT_INLINE
 #include <vector>
 #include <string>
 #include <cmath>
@@ -378,7 +379,7 @@ struct PatGrid {
 
 // Lower cell index + in-cell fraction on one axis. Device-safe (no std::, no throw).
 // Twin of loom's `interp._cell_base_frac`.
-PATTERN_HD inline void patGridCellFrac(const PatGrid& g, int axis, double coord,
+PATTERN_HD FT_UNIT_INLINE void patGridCellFrac(const PatGrid& g, int axis, double coord,
                                        int& i0, double& fr) {
     const int n = g.shape[axis];
     if (n <= 1) { i0 = 0; fr = 0.0; return; }
@@ -413,7 +414,7 @@ PATTERN_HD inline void patGridCellFrac(const PatGrid& g, int axis, double coord,
 // Separable N-linear sample over the 2^ndim corners of the containing cell.
 // `pool` is the shared sample pool; `coords` holds one coordinate per axis, in axis
 // order. `poolN` bounds every read so a malformed header can never walk off the end.
-PATTERN_HD inline double patGridSample(const PatGrid& g, const float* pool, int poolN,
+PATTERN_HD FT_UNIT_INLINE double patGridSample(const PatGrid& g, const float* pool, int poolN,
                                        const double* coords) {
     if (!pool || g.count <= 0) return 0.0;
     int    base[PAT_ND_MAX_DIM];
@@ -474,7 +475,7 @@ struct PatScatter {
 // Shepard inverse-distance sample. Device-safe; `poolN` bounds every read so a
 // malformed header can never walk off the end. Twin of loom's `_shepard_weights`
 // + `ScatterField._eval`.
-PATTERN_HD inline double patScatterSample(const PatScatter& s, const float* pool,
+PATTERN_HD FT_UNIT_INLINE double patScatterSample(const PatScatter& s, const float* pool,
                                           int poolN, const double* q) {
     if (!pool || s.count <= 0) return 0.0;
     const int nd = (s.ndim < 1) ? 1 : (s.ndim > PAT_ND_MAX_DIM ? PAT_ND_MAX_DIM : s.ndim);
@@ -680,7 +681,7 @@ struct PatTableScope {
 // Shared by every surface pattern read: host patCtxFromHit, emitterPatMulAt and the
 // rasterizer, and their device twins.
 constexpr double kPatNudge = 2e-6, kPatNudgeFloor = 1e-2;
-PATTERN_HD inline void patNudgedPoint(double px, double py, double pz, double gx, double gy, double gz,
+PATTERN_HD FT_UNIT_INLINE void patNudgedPoint(double px, double py, double pz, double gx, double gy, double gz,
                                       double scale, double& ox, double& oy, double& oz) {
     double r = sqrt(px * px + py * py + pz * pz);
     if (r < scale) r = scale;
@@ -705,14 +706,14 @@ inline PatCtx makePatCtx(const Vec3& p, double f, const Vec3& n, double u = 0, d
 
 // ---- 3-D value noise (hash lattice + trilinear smoothstep fade) -------------
 // Deterministic integer hash so CPU and GPU agree bit-for-bit. Output in [0,1].
-PATTERN_HD inline double patHash3(int ix, int iy, int iz) {
+PATTERN_HD FT_UNIT_INLINE double patHash3(int ix, int iy, int iz) {
     uint32_t h = (uint32_t)ix * 374761393u + (uint32_t)iy * 668265263u
                + (uint32_t)iz * 2147483647u;
     h = (h ^ (h >> 13)) * 1274126177u;
     h ^= (h >> 16);
     return (double)h / 4294967295.0;   // [0,1]
 }
-PATTERN_HD inline double patValueNoise(double x, double y, double z) {
+PATTERN_HD FT_UNIT_INLINE double patValueNoise(double x, double y, double z) {
     double fx = PAT_FLOOR(x), fy = PAT_FLOOR(y), fz = PAT_FLOOR(z);
     int ix = (int)fx, iy = (int)fy, iz = (int)fz;
     double tx = x - fx, ty = y - fy, tz = z - fz;
@@ -811,7 +812,7 @@ PATTERN_HD inline double patValueNoise(double x, double y, double z) {
 // footprint is a function of the CAMERA, so the contour swims as the camera moves.
 // a'(0) = 0 (the fit has no linear term — a is even in s, the footprint being centred),
 // and the window's derivative vanishes at both of its ends.
-PATTERN_HD inline double patOctaveFade(double freq, double w) {
+PATTERN_HD FT_UNIT_INLINE double patOctaveFade(double freq, double w) {
     if (!(w > 0.0)) return 1.0;                  // w <= 0 (and NaN) => unfiltered
     const double s = freq * w;
     if (s >= PAT_FNOISE_S_MAX) return 0.0;       // octave is skippable, exactly
@@ -840,7 +841,7 @@ PATTERN_HD inline double patOctaveFade(double freq, double w) {
 // With octaves = 1 and w = 0 this reproduces `noise(x, y, z)` to within one ulp (the
 // value makes a round trip through the zero-mean form `0.5 + (n - 0.5)`, which is exact
 // for n >= 0.25 and off by at most an ulp of 0.5 below it).
-PATTERN_HD inline double patFilteredNoise(double x, double y, double z,
+PATTERN_HD FT_UNIT_INLINE double patFilteredNoise(double x, double y, double z,
                                           double w, double octaves) {
     int no = (int)octaves;
     if (no < 1) no = 1;
@@ -878,7 +879,7 @@ PATTERN_HD inline double patFilteredNoise(double x, double y, double z,
 // because a too-small `w` merely under-filters while a too-large one destroys detail the
 // sample genuinely resolved — see patOctaveFade on why that asymmetry decides ties.
 #define PAT_FW_COS_MIN 0.02
-PATTERN_HD inline double patShadingFootprint(double perDist, double dist, double cosSurf) {
+PATTERN_HD FT_UNIT_INLINE double patShadingFootprint(double perDist, double dist, double cosSurf) {
     if (!(dist > 0.0) || !(perDist > 0.0)) return 0.0;   // unknown => unfiltered
     double c = cosSurf < 0.0 ? -cosSurf : cosSurf;
     if (!(c > PAT_FW_COS_MIN)) c = PAT_FW_COS_MIN;       // also catches NaN

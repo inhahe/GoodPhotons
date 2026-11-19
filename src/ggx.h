@@ -1,4 +1,5 @@
 #pragma once
+#include "unit_linkage.h"   // FT_UNIT_INLINE (GGX_HD)
 // ============================================================================================
 //  ggx.h -- the glossy lobe: a GGX (Trowbridge-Reitz) microfacet reflector, host and device.
 // ============================================================================================
@@ -65,13 +66,13 @@
   #else
     #define GGX_V _Pragma("nv_exec_check_disable")
   #endif
-  #define GGX_HD __host__ __device__ static inline
+  #define GGX_HD __host__ __device__ FT_UNIT_INLINE
   #define GGX_SQRT(x) ::sqrt(x)
   #define GGX_COS(x) ::cos(x)
   #define GGX_SIN(x) ::sin(x)
 #else
   #define GGX_V
-  #define GGX_HD static inline
+  #define GGX_HD FT_UNIT_INLINE
   #define GGX_SQRT(x) std::sqrt(x)
   #define GGX_COS(x) std::cos(x)
   #define GGX_SIN(x) std::sin(x)

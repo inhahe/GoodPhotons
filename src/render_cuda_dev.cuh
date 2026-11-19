@@ -4,13 +4,17 @@
 // with more registers than its bounds allow, and under separate compilation (-rdc) ptxas does
 // not hold such a helper to its callers' bounds. So each launch-bounded kernel family compiles
 // in a unit of its own, under -maxrregcount at its bounds (CMakeLists.txt), each with its own
-// copies of the helpers it calls -- every function here has internal linkage -- and an edit
-// elsewhere cannot move its link. Constraints this keeps:
+// copies of the helpers it calls -- every function here that ptxas may keep out of line has
+// internal linkage -- and an edit elsewhere cannot move its link. Constraints this keeps:
 //   * every __device__ function static, a template or a class's member function included where
 //     ptxas may keep it out of line: one with external linkage (plain `inline`, a template, a
-//     member) that a capped unit and render_cuda.cu both keep out of line is a weak definition
-//     in each, and nvlink binds every call to one of them -- render_cuda.cu's, uncapped, maybe.
-//     tools/check_device_linkage.py, run by build.bat, lists any;
+//     member) that two units keep out of line is a weak definition in each, and nvlink binds
+//     every call to one of them -- render_cuda.cu's, uncapped, or the other capped unit's, held
+//     to its cap. A struct with member functions sits in an unnamed namespace, unless the units
+//     share it -- a kernel's parameter, a device global, a field of either, a type the host
+//     uploads (DVec3, DCamera, DCamSet, DBeamMap...) -- when its members must stay small enough
+//     that ptxas inlines them; the shared headers' helpers are FT_UNIT_INLINE (unit_linkage.h).
+//     tools/check_device_linkage.py, run by build.bat, lists any function this misses;
 //   * a kernel here inside #ifndef FT_FAMILY_TU: render_cuda.cu compiles it, the family units
 //     do not;
 //   * a device global through FT_DEVGLOBAL: one copy, defined in render_cuda.cu.
@@ -1042,6 +1046,7 @@ struct DMajorant {
 // twin of Renderer::majorantWalk; the two must step identically or CPU and GPU renders of
 // the same heterogeneous medium would disagree by more than noise. Doubles throughout,
 // matching the host walk (the tracking loops are double on the device already).
+namespace {
 struct DMajWalk {
     int    c[3], step[3], nn[3];
     double tNext[3], tDelta[3];
@@ -1096,6 +1101,7 @@ struct DMajWalk {
         }
     }
 };
+}  // namespace
 
 struct DMedium {
     int    enabled;
@@ -2478,6 +2484,7 @@ __device__ static inline double dLegAbsorption(const DScene& sc, int medium, dou
 }
 // A double-precision device vector, for the math that must not round to the render's Real:
 // the analytic specular connections (below) and the physical lens traced from the scene.
+namespace {
 struct D3 {
     double x, y, z;
     __device__ D3() : x(0), y(0), z(0) {}
@@ -2490,6 +2497,7 @@ struct D3 {
     __device__ D3 operator-()           const { return {-x, -y, -z}; }
     __device__ DVec3 toR() const { return DVec3(x, y, z); }
 };
+}  // namespace
 __device__ static inline double d3dot(const D3& a, const D3& b) { return a.x*b.x + a.y*b.y + a.z*b.z; }
 __device__ static inline double d3len(const D3& a) { return sqrt(d3dot(a, a)); }
 __device__ static inline D3 d3norm(const D3& a) { double l = 1.0 / d3len(a); return {a.x*l, a.y*l, a.z*l}; }
@@ -3676,11 +3684,13 @@ __device__ static void dMediaTransmittanceSpec(const DScene& sc, const DVec3& o,
 }
 
 // Minimal device complex (host uses std::complex; not available in device code).
+namespace {
 struct DCplx {
     Real re, im;
     __device__ DCplx() : re(0), im(0) {}
     __device__ DCplx(Real r, Real i) : re(r), im(i) {}
 };
+}  // namespace
 __device__ static inline DCplx cadd(DCplx a, DCplx b) { return DCplx(a.re + b.re, a.im + b.im); }
 __device__ static inline DCplx csub(DCplx a, DCplx b) { return DCplx(a.re - b.re, a.im - b.im); }
 __device__ static inline DCplx cmul(DCplx a, DCplx b) {
@@ -5093,6 +5103,7 @@ __device__ static inline double dAffScale(const DAff& a) {
 }
 // The motion of one set at the path's time, and its inverse, made once per query and kept while
 // the movers it meets share the set (the host keeps it per thread: Scene::motionCache).
+namespace {
 struct DMotionNow {
     int set = -1; bool inv = false;
     DAff D, Di;
@@ -5106,6 +5117,7 @@ struct DMotionNow {
         return Di;
     }
 };
+}  // namespace
 // A light as the current path sees it (host twins Scene::lightMoves / lightPointNow / lightDirNow):
 // whether it moves at the path's time, and its motion there. A light moves only rigidly, so a
 // sample taken where it sits at the instant -- a point, a normal, a direction -- is carried out
@@ -6710,6 +6722,7 @@ __device__ static inline Real dHalfVectorCos(const DVec3& a, const DVec3& b) {
 __device__ static inline bool dGlossyMs(const DMaterial& m) {
     return m.iridescence == 0 && (!m.coatLobe || m.coatModel == 2);
 }
+namespace {
 struct DGlossyDraw {
     DVec3 o;
     Real w;    // the draw's weight (0 where o is not above the normal)
@@ -6721,6 +6734,7 @@ struct DGlossyDraw {
     const DHit* h;
     __device__ Real R(Real lambda) const { return irid ? dIridescenceR(*sc, *m, h, lambda, cH) : (Real)1; }
 };
+}  // namespace
 // Host twins glossyDrawUV / drawGlossy: a draw from m's lobe at h about the shading normal `n` for
 // the arrival `wo`, from canonical uniforms (u1 == 1 the mirror) or off the stream.
 __device__ static inline DGlossyDraw dGlossyDrawUV(const DScene& sc, const DMaterial& m, const DHit& h,
@@ -6749,12 +6763,6 @@ __device__ static inline DGlossyDraw dWhittedGlossyDraw(const DScene& sc, const 
     dWhittedGlossyUV(sIdx, bounce, u1, u2);
     return dGlossyDrawUV(sc, m, h, h.n, wo, (Real)u1, (Real)u2);
 }
-// Twin of glossyF: r times the GGX lobe about `ns` (symmetric in the pair), r the reflect slot
-// times an iridescent glossy's interference reflectance; 0 unless both lie above ns. Double, as
-// dBsdfF is. Inlined at every call, as are the pattern reads under it (dPatIn, dPatternScalarAt,
-// dRecordRoughness), for speed: out of line, a capped unit (render_cuda_bdpt.cu, render_cuda_jsurf.cu)
-// holds each to its kernels' bounds and the calls spill, and inline, mode D runs 1.75 times faster.
-// Left to nvcc, whether they are inlined depends on every call the unit makes.
 // A glossy lobe's reflectance at `lambda`: its reflect slot, times an iridescent glossy's interference
 // reflectance at the pair's half-vector cosine `cH`. Times ggx::fAll of the pair, the lobe's value
 // (dGlossyF; DVertexLobe::f, which keeps fAll from wavelength to wavelength).
@@ -6764,6 +6772,12 @@ __device__ __forceinline__ static double dGlossyR(const DScene& sc, const DMater
     if (m.iridescence) r *= (double)dIridescenceR(sc, m, &h, lambda, cH);
     return r;
 }
+// Twin of glossyF: r times the GGX lobe about `ns` (symmetric in the pair), r the reflect slot
+// times an iridescent glossy's interference reflectance; 0 unless both lie above ns. Double, as
+// dBsdfF is. Inlined at every call, as are the pattern reads under it (dPatIn, dPatternScalarAt,
+// dRecordRoughness), for speed: out of line, a capped unit (render_cuda_bdpt.cu, render_cuda_jsurf.cu)
+// holds each to its kernels' bounds and the calls spill, and inline, mode D runs 1.75 times faster.
+// Left to nvcc, whether they are inlined depends on every call the unit makes.
 __device__ __forceinline__ static double dGlossyF(const DScene& sc, const DMaterial& m, const DHit& h,
                                   const DVec3& ns, const DVec3& wo, const DVec3& wi, Real lambda) {
     const ggx::Pair p = ggx::pair(ns, wo, wi, ggx::alpha((double)dMatRoughness(sc, m, h)));
@@ -6828,6 +6842,7 @@ __device__ static inline bool dCoatLambertBody(const DMaterial& m) {
 __device__ static inline bool dCoatAny(const DMaterial& m) { return m.coatStack >= 0 || m.coatParent >= 0; }
 // Host twin render.h CoatEval: the coat's factor for one pair with everything but the wavelength read
 // once (the film's thickness, the pair's cosines), for a caller that takes it at several wavelengths.
+namespace {
 struct DCoatEval {
     int kind = 0;                    // 0 one, 1 Lambertian body, 2 directional body, 3 coat lobe, 4 zero
     const DMaterial* st = nullptr;
@@ -6853,6 +6868,7 @@ struct DCoatEval {
         }
     }
 };
+}  // namespace
 __device__ static inline double dCoatCos(const DVec3& a, const DVec3& b) {
     const double c = fabs((double)dot(a, b));
     return c > 1.0 ? 1.0 : c;
@@ -7000,6 +7016,7 @@ __device__ static inline void dCoatContinue(const DScene& sc, const DMaterial& m
 // A glossy photon vertex's camera splat (host twin GlossySplat): the splats evaluate the ADJOINT
 // lobe toward the camera point they find, which is dGlossyF with the pair swapped. `stack`: the
 // layered stack whose coat `m` is, whose coat reflectance toward the camera the lobe then carries.
+namespace {
 struct DGlossySplat {
     const DScene*    sc;
     const DMaterial* m;
@@ -7012,6 +7029,7 @@ struct DGlossySplat {
         return stack ? v * (Real)dCoatSheenR(*sc, *stack, *h, wl, wc, lambda) : v;
     }
 };
+}  // namespace
 // Twin of glossySplats: a glossy lobe with a finite value splats in the forward modes. The one
 // without, roughness pinned at 0 with nothing to vary it, is the analytic planar-mirror
 // connection's (dIsPlanarMirrorMat), and splatting it too would count it twice. A layered
@@ -8747,6 +8765,7 @@ __device__ static inline double dGatherAreaScale(int gaBias, double cov) {
 // camera vertex `p`, its true normal turned to the side it was reached from `n`, the merge radius
 // `r`, the band's slack (gatherBandSlack at that radius, the vertex's strand radius and its rounding
 // scale), the probes `M` (DScene::gatherArea; 0 off) and whether the lobe is two-sided.
+namespace {
 struct DMergeFootprint {
     DVec3 p, n;
     Real r, slack, fiberR, reach;   // reach: the site's primitive's (DHit::pscale), for its probes
@@ -8764,6 +8783,7 @@ struct DMergeFootprint {
         return dOnGatherSurfaceSided(p, n, pp, pn, d2, slack, twoSided, farSide);
     }
 };
+}  // namespace
 
 // A view-independent photon-map query structure on the device (device twin of PhotonMap
 // in photonmap.h): a uniform hash grid (cell size == gather radius) over cell-contiguous
@@ -9613,6 +9633,7 @@ __device__ __forceinline__ bool dGatherStopped() {
 // 16 steps: the flag is mapped host memory, a PCIe round trip that a dense map's long walks
 // (J-FIELD-SLOW) cannot hide every few dozen nodes. Kept across a thread's walks, so many short
 // ones still poll; and once it has seen the stop it stays stopped.
+namespace {
 struct DStopPoll {
     long long next = 0;   // the clock at which to poll; 0 until the first check sets it
     unsigned steps = 0;
@@ -9628,6 +9649,7 @@ struct DStopPoll {
         return hit;
     }
 };
+}  // namespace
 
 // ---- intra-launch PROGRESS for the mode-M gather ----
 //
@@ -10285,12 +10307,14 @@ struct DWfQueue {
 };
 
 // The sub-beams of ONE parent beam, ascending in s0: the query view kBeamTr0 walks.
+namespace {
 struct DQBeamTr0 {
     const DBeamRec* b; float* tr0; int i0, n;
     __device__ int  count() const { return n; }
     __device__ Real t(int k) const { return (Real)b[i0 + k].s0; }
     __device__ void mul(int k, double f) { tr0[i0 + k] = (float)((double)tr0[i0 + k] * f); }
 };
+}  // namespace
 // One thread per PARENT beam: one ratio-tracking walk down it, read off at each sub-beam's s0
 // (see DBeamRec::tr0). `pStart` is the CSR of parents over the sub-beam array.
 #ifndef FT_FAMILY_TU
@@ -10666,6 +10690,7 @@ __device__ static void camSplatEmissionAll(const DScene& sc, const DCamSet& cs, 
 // Describes the photon vertex being connected through the glass: a diffuse
 // surface (Lambertian weight=rho, normal np) or a volume in-scatter (weight=albedo,
 // HG phase g, incoming dir wIn). Device twin of Renderer::SpecVtx.
+namespace {
 struct DSpecVtx {
     bool   volume;
     D3     np;                 // surface normal (surface vertices)
@@ -10731,6 +10756,7 @@ struct DSpecVtx {
         return cosSurf * adjoint(wP) / DPI;
     }
 };
+}  // namespace
 
 // A smooth dielectric sphere's chains (host twin Renderer::connectSpecularSphere's, where the why is):
 // from an eye outside, chain 0 reflects off the surface and chain 1 + k refracts in, reflects k times
@@ -10747,12 +10773,14 @@ static constexpr double kDSphChainFloor = 1e-4;
 static constexpr double kDSphChainSure = 0.02;
 
 // A 2-vector, for the chains' scan in their plane.
+namespace {
 struct DSphV2 {
     double x, y;
     __device__ DSphV2 operator+(const DSphV2& o) const { return {x + o.x, y + o.y}; }
     __device__ DSphV2 operator-(const DSphV2& o) const { return {x - o.x, y - o.y}; }
     __device__ DSphV2 operator*(double k) const { return {x * k, y * k}; }
 };
+}  // namespace
 __device__ static inline double vdot(const DSphV2& a, const DSphV2& b) { return a.x * b.x + a.y * b.y; }
 // The deep chain a vertex draws, of first..last, and 1 / its probability (host twin Renderer::sphDeepPick).
 struct DSphDeep { int c; double w; };
@@ -10896,6 +10924,7 @@ __device__ static double dSphRouletteU(const D3& p, int c, double uc, double us)
 }
 
 // How a camera sees S at one wavelength (host twin Renderer::sphereIndex).
+namespace {
 struct DSphIndex {
     double n;
     int insideMat, aroundMat;
@@ -10903,6 +10932,7 @@ struct DSphIndex {
         return n == o.n && insideMat == o.insideMat && aroundMat == o.aroundMat;
     }
 };
+}  // namespace
 __device__ static DSphIndex dSphereIndex(const DScene& sc, const DCamera& cam, const DSphere& S,
                                          const DMaterial& glass, Real lambda) {
     DSphIndex ix;
@@ -10960,6 +10990,7 @@ __global__ void kSphScanInit() {
 // Host twin Renderer::SphScanEnds / sphScanEnds: the ladders of samples by the ends of the arcs where a
 // chain exists -- the silhouette's from outside and, a sphere less dense than around it, where its
 // refracted chains stop; the critical angle's from inside -- and which fixed samples are skipped.
+namespace {
 struct DSphScanEnds {
     int n;
     double phi[4 * kDSphLadder], c[4 * kDSphLadder], s[4 * kDSphLadder], t[4 * kDSphLadder];
@@ -10968,6 +10999,7 @@ struct DSphScanEnds {
         return (aphi > skipLo[0] && aphi < skipHi[0]) || (aphi > skipLo[1] && aphi < skipHi[1]);
     }
 };
+}  // namespace
 __device__ static DSphScanEnds dSphScanEnds(double r, double d, double n, bool outside) {
     DSphScanEnds e;
     e.n = 0; e.skipLo[0] = e.skipLo[1] = e.skipHi[0] = e.skipHi[1] = 4.0;
@@ -15626,9 +15658,12 @@ struct DVertexLobe {
     ggx::Pair p;            // a glossy lobe's pair (wo, wi)
     double g = 0.0;         // ...its value over the reflectance, ggx::fAll
     Real cH = (Real)1;      // ...and its half-vector cosine, which an iridescent lobe's R reads
-    // A translucent lobe's two albedos (dDiffuseTransmitAlbedos) at rhoLam, which every direction
-    // shares: read again only at another wavelength.
-    Real rhoLam = (Real)-1;
+    // A translucent lobe's two albedos (dDiffuseTransmitAlbedos), which every direction shares, at the
+    // wavelength albedos() last asked for (rhoR, rhoT). Two are kept: the first wavelength asked -- a
+    // connection's hero, whose pdfs ask again after its bundle's other wavelengths -- and the latest
+    // other, so a bundle reads each wavelength's once.
+    Real rhoLam0 = (Real)-1, rhoLam1 = (Real)-1;
+    double rhoR0 = 0.0, rhoT0 = 0.0, rhoR1 = 0.0, rhoT1 = 0.0;
     double rhoR = 0.0, rhoT = 0.0;
     __device__ DVertexLobe(const DScene& sc_, const DVertex& vt_, const DVec3& wo_, bool now = false)
         : sc(sc_), vt(vt_), m(sc_.mats[vt_.matId]), wo(wo_), cosWo(ddot(wo_, vt_.ns)) {
@@ -15654,9 +15689,11 @@ struct DVertexLobe {
     }
     __device__ void albedos(Real lambda) {
         if (!ready) prepare();
-        if (lambda == rhoLam) return;
+        if (lambda == rhoLam0) { rhoR = rhoR0; rhoT = rhoT0; return; }
+        if (lambda == rhoLam1) { rhoR = rhoR1; rhoT = rhoT1; return; }
         dDiffuseTransmitAlbedos(sc, m, h, lambda, rhoR, rhoT);
-        rhoLam = lambda;
+        if (rhoLam0 < (Real)0) { rhoLam0 = lambda; rhoR0 = rhoR; rhoT0 = rhoT; }
+        else                   { rhoLam1 = lambda; rhoR1 = rhoR; rhoT1 = rhoT; }
     }
     // f(wo -> wi) at `lambda` (double, for a connection's radiance).
     __device__ double f(Real lambda) {
@@ -16064,12 +16101,14 @@ struct DNeeBsdf { const DMaterial* m; DVec3 wo; };
 // The other half of the weight, carried one bounce forward: how likely the lobe was to produce
 // the continuation, and where it left from. `pdf > 0` is the flag, and every delta bounce
 // leaves it clear -- so a mirror or dielectric chain keeps full-weight emission as before.
+namespace {
 struct DGlossyMis {
     double pdf;
     DVec3  from;
     DVec3  n;        // the glossy vertex's shading normal -- dLightSelPdf re-walks from there
     __device__ void clear() { pdf = 0.0; }
 };
+}  // namespace
 
 // ---- VOLUMETRIC EMISSION ("fire") in the backward walk (host twin: backward.h's fire block) ---
 // A fire emits j(x, lambda) per unit length, isotropically (dMedEmissionAt): the density the
@@ -16418,6 +16457,7 @@ __device__ static inline double dSunRadianceMis(const DScene& sc, const DGlossyM
 // rho/PI and the emitter SPD. The final product is deliberately left to the caller
 // rather than fused into one weight here, so the scalar path's float rounding is
 // unchanged by this refactor (device `Real` is fp32 by default — see FTRACE_GPU_FP32).
+namespace {
 struct BkNeeGeom {
     DVec3 wi;        // unit direction surface -> sampled light point
     Real  dist;      // shadow-ray length
@@ -16443,6 +16483,7 @@ struct BkNeeGeom {
         return sun ? (Real)dMediaExitDistance(sc, p) : dist;
     }
 };
+}  // namespace
 // Does this emitter consume its two sample coordinates? A collimated beam and a point-spot
 // are deterministic connections and draw nothing; every area shape (and the sun's cone)
 // draws two. Device twin of backward.h's emitterNeedsUV, and the reason (u1,u2) are
@@ -16614,6 +16655,7 @@ __device__ static bool bkEmitterGeom(const DScene& sc, const DHit& h, const DVec
 // to connect to plus 1/p(e) for each, turning `sum_e w_e` into `sum_selected w_e / p(e)`.
 //
 
+namespace {
 struct DEmitterDraw {
     int  n;             // number of connections to make
     bool all;           // true: entries are emitters 0..n-1, each with weight 1 (the old loop)
@@ -16628,6 +16670,7 @@ struct DEmitterDraw {
     // The selection probability the draw already knows -- the weight's numerator.
     __device__ double selPdf(int i) const { return all ? 1.0 : s[i].pdf; }
 };
+}  // namespace
 
 // `nrm` is the receiver normal, or null at a volume vertex (which has none to bound with).
 // Mode W keeps the exact path: its deterministic G x G lattice has no variance to trade.
@@ -21366,6 +21409,7 @@ __device__ static inline DMergeFootprint dVertexMergeFootprint(const DScene& sc,
 // surface map, DSurfSite; mode U's grid, DVcmSite): the cell holding p, its coordinates clamped into
 // the grid in double, before the conversion, so that a point far outside is clamped rather than
 // overflowed; and the dense index of its 27 neighbours in the merges' walk order.
+namespace {
 struct DGridCell {
     int ix, iy, iz;
     __device__ DGridCell(const DVec3& p, double lx, double ly, double lz, double cell, int nx, int ny, int nz) {
@@ -21381,10 +21425,12 @@ struct DGridCell {
         return ((long long)cz * ny + cy) * nx + cx;
     }
 };
+}  // namespace
 // One gather site's fixed part: its cell, the vertex's oriented geometric normal and sidedness,
 // and the radius squared. Mirrors SurfMap::query's 3x3x3 walk EXACTLY -- same clamped cell
 // coordinate, same dense index, same `<= r^2` test -- because the map was binned by that rule on
 // the host and a second transcription of it is a second chance to disagree.
+namespace {
 struct DSurfSite {
     DGridCell g;
     double r2;
@@ -21397,6 +21443,7 @@ struct DSurfSite {
     // The dense index of the site's `n`-th neighbour cell, or -1 off the grid.
     __device__ long long cell(const DSurfMap& sm, int n) const { return g.neighbour(n, sm.nx, sm.ny, sm.nz); }
 };
+}  // namespace
 // The merge of photon `sm.order[q]` at the site: its XYZ added to gX, gY, gZ. `lobe` is the site's
 // camera vertex's toward the camera side (DVertexLobe), `coatTh` its coat's film there
 // (dCoatThicknessAt).

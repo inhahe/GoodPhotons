@@ -33,15 +33,21 @@ const char* cudaDeviceName();
 // with every other process on the machine, not just this one.
 bool cudaMemInfo(size_t* freeB, size_t* totalB);
 
-// Bytes of device memory the megakernel for render `mode` reserves for per-thread LOCAL
-// storage alone, at the instantiation this render will launch (`maxDepth` / `heroC` select
-// the same BDPT variant renderBdptCuda does): its local size times the threads the card
-// holds resident. This is real VRAM and it is often gigabytes, and the context keeps it
-// after the kernel returns, for the next launch to reuse. If the card cannot hold it, the
+// Bytes of device memory the kernels of render `mode` reserve for per-thread LOCAL storage
+// alone, at the instantiation this render will launch (`maxDepth` / `heroC` select the same
+// BDPT variant renderBdptCuda does; `wavefront`, cudaForwardRunsWavefront's answer, the forward
+// walk's backend in modes A, B, C, V and P): the most of their local sizes times the threads
+// the card holds resident. This is real VRAM and it is often gigabytes, and the context keeps
+// it after the kernel returns, for the next launch to reuse. If the card cannot hold it, the
 // driver silently spills it to host RAM over PCIe and the kernel runs 2-3 orders of
 // magnitude slower at 100% reported utilisation — see the comment on the definition.
-// Returns 0 for "unknown" (no device, or a mode with no megakernel).
-size_t cudaMegakernelLocalBytes(char mode, int maxDepth, int heroC);
+// Returns 0 for "unknown" (no device, or a mode with no kernel of its own).
+size_t cudaMegakernelLocalBytes(char mode, int maxDepth, int heroC, bool wavefront = false);
+// Whether a forward trace of `scene` runs on the wavefront backend: asked (`wavefront`, -wavefront)
+// and nothing the megakernel alone carries -- `heroC`'s bundle where the scene keeps it, or a
+// shared flight's photon beams (`beamGather` for `nCam` cameras).
+bool cudaForwardRunsWavefront(const Scene& scene, bool wavefront, int heroC, bool beamGather = false,
+                              int nCam = 1);
 
 // Device memory mode J's beam queue takes beside the kernel's local memory, where beams gather.
 // (The point merges' queue sizes itself to the room left, or stays off.)
@@ -454,6 +460,9 @@ const char* cudaBlurUnsupported(const Scene& scene, const Camera& cam, char mode
 // the megakernel's grid, or one a slot of the wavefront's pool for an N-photon trace -- for the
 // VRAM preflight.
 size_t cudaForwardPosedCameraBytes(const Scene& scene, bool wavefront, int heroC, long long N);
+// The same for a blurred shared forward flight of `nCam` cameras (sharedForwardGpuBegin's arguments)
+// whose set moves: every camera a thread, sized once for the session's largest batch.
+size_t cudaSharedFlightPosedBytes(const Scene& scene, int nCam, bool wavefront, int heroC, bool beamGather);
 
 // ---- Mode W (deterministic Whitted / POV-Ray-style preview) ----------------------------
 // Device twin of BackwardRenderer's mode-W fields (src/backward.h). Passing a non-null
