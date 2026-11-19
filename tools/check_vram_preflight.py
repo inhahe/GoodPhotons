@@ -3,8 +3,8 @@ to the CPU when the card cannot afford its kernels.
 
     python -u tools/check_vram_preflight.py [--out png/check_vram_preflight] [--exe ftrace.exe]
 
-The preflight (main.cpp, vramPreflight) weighs a mode's kernels' local memory
-(cudaMegakernelLocalBytes) and its films against the card's free memory, and under `-device auto`
+The preflight (main.cpp, vramPreflight) weighs a mode's kernels' local memory (cudaRouteLocalBytes,
+the kernels its launchers will run) and its films against the card's free memory, and under `-device auto`
 sends a render that would not fit to the CPU, where a GPU launch would spill to host memory and
 look hung. Each mode decides its device in its own place -- runRender's shared decision (R, B, V,
 P, D, J), mode S's and mode U's dispatches, run()'s mode-M routes for one camera and for a flight of
@@ -20,7 +20,9 @@ free. For each mode, on a small room:
   - with FTRACE_VRAMFREE=0 under `-device gpu`: the refusal, and the GPU taken anyway, as asked.
 
 Modes V and P launch kernels other modes do, so V weighs what B weighs (the forward walk), and P
-the more of B's and R's (that walk, and the backward kernel of its camera-side layers).
+the more of B's and R's (that walk, and the backward kernel of its camera-side layers) -- B's alone
+where those layers stay on the CPU (a collimated light); R under -rgb weighs the RGB previewer's
+kernel, less than its own.
 
 And of a locked two-frame path metered in mode D: its [vram] line ahead of the meter's, and with the
 card read as full a refusal (or a forced warning) for the meter as well as each frame; and, under
@@ -156,6 +158,27 @@ def main():
     check("P weighs both layers' kernels, the more of B's and R's",
           None not in (weights.get("P"), b_, r_) and weights.get("P") == max(b_, r_),
           "P %s GB, B %s GB, R %s GB" % (weights.get("P"), b_, r_))
+    # Each weighs the kernels its launchers will run (render_cuda.h, routes): mode P's camera-side
+    # layers stay on the CPU where a light the backward walk cannot sample (a collimated beam) is in
+    # the scene, and P then weighs its forward walk alone, B's; mode R under -rgb runs the RGB
+    # previewer's kernel, which reserves less than the spectral walk's.
+    beam = os.path.join(d, "beam.ftsl")
+    with open(beam, "w", encoding="utf-8", newline="") as f:
+        f.write(ROOM + "light collimated { origin 0 1.4 0  dir 0 -1 0  spd preset:d65  power 5 }" + NL)
+    rc, plog, _ = run("P beam", "P", ["-camera", "a", "-spp", "4", "-n", "200000"], "auto", None, beam)
+    pw = WANTS.search(plog)
+    cpu_side = "camera-side stays CPU" in plog
+    check("P with its camera-side layers on the CPU weighs its walk alone",
+          rc == 0 and cpu_side and pw is not None and float(pw.group(1)) == b_,
+          "rc %d, %s, P %s GB, B %s GB" % (rc, "camera-side on the CPU" if cpu_side else "camera-side not on the CPU",
+                                         pw.group(1) if pw else "?", b_))
+    rc, rlog, _ = run("R rgb", "R", ["-camera", "a", "-spp", "4", "-rgb"], "auto", None)
+    rw = WANTS.search(rlog)
+    rgb = "RGB fast preview" in rlog
+    check("R under -rgb weighs the RGB previewer's kernel, less than its own",
+          rc == 0 and rgb and rw is not None and r_ is not None and float(rw.group(1)) < r_,
+          "rc %d, %s, R -rgb %s GB, R %s GB" % (rc, "the previewer" if rgb else "not the previewer",
+                                               rw.group(1) if rw else "?", r_))
     # The exposure meter's frames: a locked path of two frames, its exposure automatic (no light's
     # `power`), metered in mode D before its first frame renders. The meter must ask before it meters:
     # its [vram] line ahead of the meter's own (both on stdout, whose order the log keeps); and with the

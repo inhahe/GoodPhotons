@@ -15503,6 +15503,20 @@ static bool backwardOnGpuOk(const Scene& scene, const Camera& cam) {
             if (m.type == MatType::Hair) return false;
     return cudaBackwardSupported(scene, cam);
 }
+
+// Whether mode P's camera-side layers trace on the device, its forward layer being there: in the
+// backward walk's scope, and blurred only where the device blurs mode P. runCompositeProgressive
+// sends them there by it, and the preflight weighs their kernel by it.
+static bool pBackwardOnGpu(const Scene& scene, const Camera& cam) {
+    return (!cam.seesMotion(scene) || !cudaBlurUnsupported(scene, cam, 'P')) && backwardOnGpuOk(scene, cam);
+}
+
+// Whether a device mode-R render takes the RGB previewer: asked (-rgb), outside mode W (whose
+// estimator the previewer has no twin of), the scene in its scope. runRender's mode R takes it by
+// this, and the preflight weighs its kernel by it.
+static bool rRunsRgb(const Scene& scene, const Camera& cam, bool rgbBackward) {
+    return rgbBackward && !g_whitted && cudaBackwardRGBSupported(scene, cam);
+}
 #endif
 
 // Mode W lights a surface ONLY by next-event estimation, and a shadow ray is blocked by
@@ -19751,8 +19765,7 @@ static int runCompositeProgressive(
     // of the instant's per-pixel classification; the sky comes from the backward misses.
     const bool blurP = cam.seesMotion(scene);
 #ifdef HAVE_CUDA
-    const bool gpuBackward = useGpu && (!blurP || !cudaBlurUnsupported(scene, cam, 'P')) &&
-                             backwardOnGpuOk(scene, cam);
+    const bool gpuBackward = useGpu && pBackwardOnGpu(scene, cam);
 #else
     const bool gpuBackward = false;
 #endif
@@ -20266,7 +20279,7 @@ static bool cameraRunsOnJ(const Scene& scene, char mode, int projection, const c
 }
 
 #ifdef HAVE_CUDA
-// ---- device-memory preflight (see cudaMegakernelLocalBytes) ----------------------
+// ---- device-memory preflight (see cudaRouteLocalBytes) ----------------------------
 // Having decided WHICH device can run this scene, check whether the card can still
 // afford to. Every megakernel here launches a fixed 2048x128 grid, and its per-thread
 // local storage is real VRAM measured in gigabytes; if the card is already full because
@@ -20280,22 +20293,16 @@ static bool cameraRunsOnJ(const Scene& scene, char mode, int projection, const c
 // the CPU path — merely slow — is strictly better than a GPU path that is 1000x slow.
 // So: measure, and say exactly what is wrong and who to blame.
 //
-// Whether the card can afford mode `m`'s kernels (cudaMegakernelLocalBytes(m)) beside `buffers`
-// bytes of the render's own device buffers -- its films, queues, posed cameras: false, the reason
-// printed, where `-device auto` should fall back to the CPU. `heldScene` is the batch's device copy
-// of the scene that this render reuses (BatchCache::sceneHold): the card is short of it, but it is
-// ours. `forced` (-device gpu) prints the same warning and answers true. `maxDepth` and `heroC`, where
-// positive, name an instantiation other than the render's (the meter's scalar depth-8 kBdptT); 0 is
-// the render's own: -max-bounce's depth (8 without it), and -heroc's bundle in D, J and U.
-// `wavefront`: a forward walk runs on the wavefront backend (cudaForwardRunsWavefront). Every site
-// that decides a device asks this once for the kernels it will launch: runRender for its own modes,
-// its mode S and U dispatches, run()'s mode-M routes (mGpuOk), the shared forward flight and the
-// meter (meterAffords).
-static bool vramPreflight(char m, size_t buffers, size_t heldScene, bool forced, int maxDepth = 0,
-                          int heroC = 0, bool wavefront = false) {
-    const int hero = (heroC > 0) ? heroC : (m == 'D' || m == 'J' || m == 'U') ? g_heroC : 1;
-    const int mdep = (maxDepth > 0) ? maxDepth : (g_maxBounceOverride >= 1) ? g_maxBounceOverride : 8;
-    const size_t needLocal = cudaMegakernelLocalBytes(m, mdep, hero, wavefront);
+// Whether the card can afford a mode-`m` render's kernels, `route` (render_cuda.h: the kernels its
+// launchers will run, as they choose them), beside `buffers` bytes of the render's own device
+// buffers -- its films, queues, posed cameras: false, the reason printed, where `-device auto`
+// should fall back to the CPU. `heldScene` is the batch's device copy of the scene that this render
+// reuses (BatchCache::sceneHold): the card is short of it, but it is ours. `forced` (-device gpu)
+// prints the same warning and answers true. Every site that decides a device asks this once for the
+// kernels it will launch: runRender for its own modes (vramAffords), its mode S and U dispatches,
+// run()'s mode-M routes (mGpuOk), the shared forward flight and the meter (meterAffords).
+static bool vramPreflight(char m, const GpuRoute& route, size_t buffers, size_t heldScene, bool forced) {
+    const size_t needLocal = cudaRouteLocalBytes(route);
     // Memory this process already holds, which `freeB` below is short of and which must not
     // be blamed on another program: the local reservation its context keeps from whatever
     // kernel of ours ran before (cudaLocalReservedBytes, measured), and what OIDN may hold
@@ -20703,12 +20710,27 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
                             : (size_t)res * resY * 3 * sizeof(double) * 2 +
                               ((gpuForwardMode && cam.seesMotion(scene) && cam.moves())
                                    ? cudaForwardPosedCameraBytes(scene, wfAsked, g_heroC, N) : 0);
-        // Mode J's beam queue, allocated beside the kernel once the render starts.
-        const size_t queues =
-            (m == 'J' && jBeamsChoice().rule != JBeams::Off && !scene.media.empty())
-                ? cudaModeJBeamQueueBytes() : 0;
-        return vramPreflight(m, film + queues, heldScene, wantGpu, 0, 0,
-                             gpuForwardMode && cudaForwardRunsWavefront(scene, wfAsked, g_heroC));
+        // Mode J's beams, through a medium, and its beam queue, allocated beside the kernel once the
+        // render starts.
+        const bool jBeams = m == 'J' && jBeamsChoice().rule != JBeams::Off && !scene.media.empty();
+        const size_t queues = jBeams ? cudaModeJBeamQueueBytes() : 0;
+        // The kernels the render's launchers will run, chosen as they choose them (render_cuda.h).
+        GpuRoute route;
+        const int depth = (g_maxBounceOverride >= 1) ? g_maxBounceOverride : 8;
+        switch (m) {
+            case 'R': case 'W': route = cudaBackwardRoute(m == 'R' && rRunsRgb(scene, cam, rgbBackward)); break;
+            case 'D': route = cudaBdptRoute(scene, cam.hasLens(), depth, g_heroC); break;
+            case 'J': route = cudaBdptRoute(scene, cam.hasLens(), depth, g_heroC, jBeams || g_jSurf, jBeams,
+                                            g_jSurf); break;
+            case 'S': route = cudaSppmRoute(); break;
+            case 'U': route = cudaVcmRoute(g_heroC); break;
+            case 'P':
+                route = cudaForwardRoute(scene, wavefront, g_heroC, false, 1, /*stableSeed*/true);
+                if (pBackwardOnGpu(scene, cam)) route += cudaBackwardRoute(false);
+                break;
+            default: route = cudaForwardRoute(scene, wfAsked, g_heroC); break;   // A, B, C, V
+        }
+        return vramPreflight(m, route, film + queues, heldScene, wantGpu);
     };
     if (useGpu && !vramAffords(mode)) useGpu = false;
 #endif
@@ -20778,7 +20800,7 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
                 std::fprintf(stderr, "[render] -rgb ignored in -mode W: the fast RGB backward "
                                      "has no deterministic estimator; using the spectral "
                                      "mode-W tracer\n");
-            else if (gpuBackward && cudaBackwardRGBSupported(scene, cam)) rgbFast = true;
+            else if (gpuBackward && rRunsRgb(scene, cam, rgbBackward)) rgbFast = true;
             else std::fprintf(stderr, "[render] -rgb (fast RGB backward) not applicable to this "
                                       "render (%s); using the spectral backward tracer\n",
                               gpuBackward ? "scene outside the RGB fast-path scope"
@@ -29541,7 +29563,7 @@ static int run(int argc, char** argv) {
         size_t mFilm = 0;
         for (const RenderCam& rc : toRender)
             if (rc.mode == 'M') mFilm = std::max(mFilm, (size_t)rc.res * rc.resY * 64);
-        mGpuOk = mFilm > 0 && vramPreflight('M', mFilm, 0, !std::strcmp(device, "gpu"));
+        mGpuOk = mFilm > 0 && vramPreflight('M', cudaPhotonMapRoute(), mFilm, 0, !std::strcmp(device, "gpu"));
     }
 #endif
     (void)mGpuOk;   // read only by the device routes (HAVE_CUDA): keep CPU-only builds warning-clean
@@ -29550,21 +29572,26 @@ static int run(int argc, char** argv) {
     constexpr int kMeterBdptDepth = 8, kMeterBdptHeroC = 1;
     (void)kMeterBdptHeroC;   // read only by the device routes
 #ifdef HAVE_CUDA
-    // Whether a W x H meter frame may run the kernels of mode `k` (cudaMegakernelLocalBytes's) on the
-    // device: the card's room for them beside a frame's film pair (vramPreflight), at the instantiation
-    // the frame launches -- the render's, except that a D or J frame runs kBdptT at kMeterBdptDepth
-    // with kMeterBdptHeroC (meterAnchor's renderBdptCuda call), so `k` is 'D' for both. `extra`:
-    // device bytes the frame takes beside its films (a blurred forward frame's posed cameras). Asked
-    // once a kernel set, frame size and extra, and only by a frame its own tests have already sent
-    // to the device, so that one bound for the CPU anyway prints no verdict.
+    // Whether a W x H meter frame may run its kernels on the device: the card's room for them beside a
+    // frame's film pair (vramPreflight), as the frame launches them -- `k` 'D' kBdptT at
+    // kMeterBdptDepth with kMeterBdptHeroC (meterAnchor's renderBdptCuda call, a J frame's too), 'R'
+    // the spectral backward walk, 'P' that and the forward walk (a mode-P frame's two layers), any
+    // other the forward walk, which the meter's renderForward runs on the megakernel. `extra`: device
+    // bytes the frame takes beside its films (a blurred forward frame's posed cameras). Asked once a
+    // kernel set, frame size and extra, and only by a frame its own tests have already sent to the
+    // device, so that one bound for the CPU anyway prints no verdict.
     std::map<std::tuple<char, int, int, size_t>, bool> meterRoom;
     const auto meterAffords = [&](char k, int W, int H, size_t extra = 0) -> bool {
         auto it = meterRoom.find({k, W, H, extra});
-        if (it == meterRoom.end())
+        if (it == meterRoom.end()) {
+            GpuRoute route = (k == 'D') ? cudaBdptRoute(scene, false, kMeterBdptDepth, kMeterBdptHeroC)
+                           : (k == 'R') ? cudaBackwardRoute(false)
+                           :              cudaForwardRoute(scene, false, g_heroC);
+            if (k == 'P') route += cudaBackwardRoute(false);
             it = meterRoom.emplace(std::make_tuple(k, W, H, extra),
-                                   vramPreflight(k, (size_t)W * H * 3 * sizeof(double) * 2 + extra, 0,
-                                                 !std::strcmp(device, "gpu"), k == 'D' ? kMeterBdptDepth : 0,
-                                                 k == 'D' ? kMeterBdptHeroC : 0)).first;
+                                   vramPreflight(k, route, (size_t)W * H * 3 * sizeof(double) * 2 + extra, 0,
+                                                 !std::strcmp(device, "gpu"))).first;
+        }
         return it->second;
     };
 #endif
@@ -29683,11 +29710,13 @@ static int run(int argc, char** argv) {
             }
             case 'P': {
                 // Composite = forward (model B) + backward, combined at radiance scale 1.0.
-                // The card's room is weighed for both layers' kernels at once (mode P's).
+                // The card's room is weighed for both layers' kernels at once (meterAffords' 'P'), the
+                // forward layer's alone where the camera-side layers stay on the CPU.
                 CompositeClass cc = classifyComposite(scene, mc.cam, W, H);
                 EnergyReport e;
                 Film fwd = renderForward(scene, &mc.cam, W, H, meterN, nThreads,
-                                         false, false, true, e, diffraction, fwdOnDevice('P'));
+                                         false, false, true, e, diffraction,
+                                         fwdOnDevice(backwardOnGpuOk(scene, mc.cam) ? 'P' : 'B'));
                 SkyView glowView;   // the glows the camera sees, as the render's compose adds them
                 const bool glows = scene.glowAny &&
                                    prepareSky(glowView, scene, mc.cam, W, H, meterN, /*glowsOnly=*/true);
@@ -30150,8 +30179,8 @@ static int run(int argc, char** argv) {
                 return c.seesMotion(scene) && c.moves();
             });
             if (setMoves) films += cudaSharedFlightPosedBytes(scene, nc, wavefront, g_heroC, g_beamGather);
-            groupGpu = vramPreflight(groupMode, films, 0, !std::strcmp(device, "gpu"), 0, 0,
-                                     cudaForwardRunsWavefront(scene, wavefront, g_heroC, g_beamGather, nc));
+            groupGpu = vramPreflight(groupMode, cudaForwardRoute(scene, wavefront, g_heroC, g_beamGather, nc),
+                                     films, 0, !std::strcmp(device, "gpu"));
         }
 #endif
         (void)groupGpu;

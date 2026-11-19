@@ -201,7 +201,19 @@ to 0.25 renders as a 150 nm one within 2e-3, 1.0e-3 measured (its body's escape 
 on 0.450.1 it rendered as the unmapped 600 nm, 1.9 off), the `thinfilm` control byte for byte, and
 the three misspellings stop the load (on 0.450.1 they loaded).
 
-## OPEN (2026-11-19, tech debt): PREFLIGHT-ROUTE-PLAN — the VRAM preflight re-derives which kernels each launcher runs
+## DONE (2026-11-19, 0.450.16): PREFLIGHT-ROUTE-PLAN — the VRAM preflight re-derives which kernels each launcher runs
+
+**Done.** The preflight weighs routes (render_cuda.h, `GpuRoute`): each lists the kernels its
+launcher will run, from the decision the launcher itself runs -- `cudaForwardRunsWavefront` (the
+stable seed now inside it), `bdptPick` (renderBdptCuda's hero gate), `vcmSessionHeroC`, and main.cpp's
+`rRunsRgb` and `pBackwardOnGpu`, which runRender's mode R and runCompositeProgressive take their
+device paths by. `cudaMegakernelLocalBytes` and its per-mode table are gone, the sessions' own
+stack set-asides read routes too, and the meter weighs a mode-P frame's forward layer alone where
+its camera-side layers stay on the CPU. check_vram_preflight: P with a collimated light weighs B's
+4.20 GB, where 0.450.15 weighed 4.86; R under `-rgb` 2.65 GB against its own 4.86 (0.450.15: 4.86).
+
+**The entry as filed:**
+
 
 `cudaMegakernelLocalBytes` (render_cuda.cu) holds a second copy of every launcher's kernel choice --
 launchForward's backend (with its stable-seed exception), renderBackwardCuda's `-rgb` kernel,

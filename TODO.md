@@ -412,9 +412,9 @@ Then the rest of 4.2-4.6 in their order, 4.7's bookkeeping alongside whatever to
   wavelength; byte for byte 0.450.4's images. 640x480 bowl: gather 43.4 -> 15.7 s; Nsight 10.5 -> 1.5
   G local requests, 26.6 -> 15.6 G FP64. Its four pattern readers forced inline, which made mode D
   1.75x faster too (0.450.4 had dGlossyF out of line at 168 registers).
-- [ ] **PREFLIGHT-ROUTE-PLAN** — one route-plan function per GPU launcher, read by the launcher and by
-  the VRAM preflight, in place of the preflight's second copy of every kernel choice (mode P's
-  camera-side layers, `-rgb`, D's gated hero bundle, J's other kernels); known-issues.
+- [x] **PREFLIGHT-ROUTE-PLAN** (0.450.16) — the preflight weighs routes, each the kernels its launcher
+  will run from the launcher's own decision (render_cuda.h `GpuRoute`); mode P's camera-side layers
+  and `-rgb` weighed as they run; known-issues.
 - [ ] **VCM-SPARSE-LATTICE** — size mode U's merge lattice by the vertex density too, on both devices
   (vcm_lattice.h), measured on a dense and a sparse scene; known-issues.
 - [x] **REVIEW-0450F** (0.450.15) — the Opus (max) and Fable (xhigh) reviews of 0.450.12-0.450.14, and

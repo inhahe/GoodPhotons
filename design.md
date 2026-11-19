@@ -2780,12 +2780,18 @@ free-flight draw, and consuming no RNG, so a mode-`J` walk draws the identical r
 walk does. That array is the port's whole VRAM delta: the preflight reports mode `D`'s kernel at
 4.36 GB local and mode `J`'s at 4.58 GB.
 
-**The preflight has to guess which kernel will launch.** `cudaMegakernelLocalBytes` is called before
-the beam map exists, and mode `J` can launch either instantiation — a media-free scene is mode `D`
-exactly, hero-wavelength bundle and all, while a scene *with* a medium has the hero bundle gated off
-by the medium and takes the scalar merge kernel with the `DPathSeg` array on top. Under-reporting is
-the failure that matters (it is what lets a render start and then thrash on host memory over PCIe),
-so it reports the **larger** of the two.
+**The preflight weighs the kernels the launchers will run (routes, 0.450.16).** Each launcher's
+choice of kernel is a decision function the launcher itself runs -- the forward walk's backend
+(`cudaForwardRunsWavefront`, the stable seed of mode P's layers included), BDPT's instantiation
+(`bdptPick`: the hero bundle off through a medium, GRIN or a lens; the deep stack), mode U's bundle
+(`vcmSessionHeroC`), mode R's RGB previewer and mode P's camera-side layers on the device (main.cpp's
+`rRunsRgb`, `pBackwardOnGpu`) -- and a route (`GpuRoute`, render_cuda.h: `cudaForwardRoute`,
+`cudaBackwardRoute`, `cudaBdptRoute`, `cudaPhotonMapRoute`, `cudaSppmRoute`, `cudaVcmRoute`) lists
+the kernels that decision launches, which `cudaRouteLocalBytes` weighs: what is weighed and what
+launches cannot part. Mode `J` is asked before its beam map exists: it merges where its beams
+(through a medium) or `-jsurf` (on by default) will, which is the merge instantiation, with the
+beam queue's variant and kernels and `-jsurf`'s light pass and gather; where neither, it is mode
+`D` exactly, hero bundle and all.
 
 **The reservation is per RESIDENT thread, and the context keeps it (0.389.5).** The driver backs a
 kernel's local memory for every thread the card holds at once (SMs × max threads per SM: 196608
@@ -2806,8 +2812,8 @@ adds back everything that is ours (the reservation and OIDN's memory cap).
 buffers and the batch's held scene (`vramPreflight`); runRender's `vramAffords` supplies them for
 its frame. The shared device decision calls it for the modes it resolves; modes U and S resolve
 their device in their own dispatch and call it there before their sessions start (0.450.6,
-0.450.7), their kernels' most read by `cudaMegakernelLocalBytes('U')` (the session's light, camera
-and merge kernels) and `('S')` (the photon walk, the visible points and the gather). Mode M, which
+0.450.7), their kernels' most read by `cudaVcmRoute` (the session's light, camera and merge
+kernels) and `cudaSppmRoute` (the photon walk, the visible points and the gather). Mode M, which
 never reaches runRender on the device, asks once in run() for the largest mode-M camera's films
 (`mGpuOk`, 0.450.8: the device holds one camera's at a time, 64 B a pixel), and every site that
 routes a mode-M camera to the device reads that one answer — the batched meter, the budget and
@@ -2815,10 +2821,9 @@ blur tests, the notes that say the device was lost, and the shared path — so t
 mirror each other cannot disagree. Since 0.450.10 a forward mode's shared flight (A, B: every
 camera's film and hit map, held the whole flight, and under a blur of a moving camera every
 camera's posed copies, `cudaSharedFlightPosedBytes`) and the exposure meter's frames ask too, the
-forward modes' kernels have an entry in `cudaMegakernelLocalBytes` -- the walk on the backend it
-runs (`cudaForwardRunsWavefront`: kTrace, or the wavefront's three kernels where `-wavefront` is
-asked and nothing keeps the megakernel) for A, B, C and V, kTrace and kBackward for P, whose layers'
-stable seed keeps the megakernel -- and a mode-S frame is charged its session's own state a pixel
+forward modes weigh their walk on the backend it runs (kTrace, or the wavefront's three kernels
+where `-wavefront` is asked and nothing keeps the megakernel), mode P that and, where its
+camera-side layers run on the device, kBackward, and a mode-S frame is charged its session's own state a pixel
 (`cudaSppmPixelBytes`, ~200 B) rather than a film pair. A
 meter frame asks after its own support tests, so one bound for the CPU anyway prints no verdict,
 and for the instantiation it launches (`meterAffords`, once a kernel set and frame size): a D or J
@@ -10473,7 +10478,7 @@ as the one at fault.
   leaves fewer paths than that floor behind it. The queue holds 1 M requests, or what that
   smallest wave may ask for where it is more (a site at each of its paths' vertices), within an
   eighth of the memory left beside the light-vertex store, the kernels' stacks (the session's
-  kernels' most, `cudaMegakernelLocalBytes('U')`, which main.cpp's preflight reads too, through
+  kernels' most, `cudaVcmRoute`'s, which main.cpp's preflight reads too, through
   `vramAffords` before the session starts) and the sort's scratch; the grid's cell table takes
   coarser cells where the device refuses it (`tryDevCap`), its merges then weighing more
   candidates. The lattice itself -- cells the radius wide over the light vertices' box, at most 2e6

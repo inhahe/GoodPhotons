@@ -33,21 +33,47 @@ const char* cudaDeviceName();
 // with every other process on the machine, not just this one.
 bool cudaMemInfo(size_t* freeB, size_t* totalB);
 
-// Bytes of device memory the kernels of render `mode` reserve for per-thread LOCAL storage
-// alone, at the instantiation this render will launch (`maxDepth` / `heroC` select the same
-// BDPT variant renderBdptCuda does; `wavefront`, cudaForwardRunsWavefront's answer, the forward
-// walk's backend in modes A, B, C, V and P): the most of their local sizes times the threads
-// the card holds resident. This is real VRAM and it is often gigabytes, and the context keeps
-// it after the kernel returns, for the next launch to reuse. If the card cannot hold it, the
-// driver silently spills it to host RAM over PCIe and the kernel runs 2-3 orders of
-// magnitude slower at 100% reported utilisation — see the comment on the definition.
-// Returns 0 for "unknown" (no device, or a mode with no kernel of its own).
-size_t cudaMegakernelLocalBytes(char mode, int maxDepth, int heroC, bool wavefront = false);
-// Whether a forward trace of `scene` runs on the wavefront backend: asked (`wavefront`, -wavefront)
-// and nothing the megakernel alone carries -- `heroC`'s bundle where the scene keeps it, or a
-// shared flight's photon beams (`beamGather` for `nCam` cameras).
+// THE KERNELS A GPU RENDER LAUNCHES, for the VRAM preflight to weigh. A route lists them as its
+// launcher chooses them, each from the decision the launcher itself runs (render_cuda.cu: the forward
+// walk's backend, BDPT's instantiation, mode U's bundle), so that what is weighed and what launches
+// cannot part. Routes add (mode P's two layers).
+struct GpuRoute {
+    std::vector<const void*> kernels;
+    GpuRoute& operator+=(const GpuRoute& o) {
+        kernels.insert(kernels.end(), o.kernels.begin(), o.kernels.end());
+        return *this;
+    }
+};
+// The device memory a route's kernels reserve for per-thread LOCAL storage alone: the most of their
+// local sizes times the threads the card holds resident. This is real VRAM and it is often
+// gigabytes, and the context keeps it after the kernel returns, for the next launch to reuse. If the
+// card cannot hold it, the driver silently spills it to host RAM over PCIe and the kernel runs 2-3
+// orders of magnitude slower at 100% reported utilisation -- see main.cpp's vramPreflight. Returns
+// 0 for "unknown" (no device, or an empty route), which callers treat as no opinion, not as free.
+size_t cudaRouteLocalBytes(const GpuRoute& r);
+// The forward photon walk (modes A, B, C, V, mode P's forward layer, a shared flight of `nCam`
+// cameras gathering photon beams by `beamGather`): the megakernel, or the wavefront's three kernels
+// where `wavefront` (-wavefront) is asked and nothing keeps the megakernel -- the hero bundle the
+// scene keeps of `heroC`, a flight's beams, mode P's stable seed (`stableSeed`).
+GpuRoute cudaForwardRoute(const Scene& scene, bool wavefront, int heroC, bool beamGather = false,
+                          int nCam = 1, bool stableSeed = false);
+// Whether that walk runs on the wavefront backend (cudaForwardRoute's choice).
 bool cudaForwardRunsWavefront(const Scene& scene, bool wavefront, int heroC, bool beamGather = false,
-                              int nCam = 1);
+                              int nCam = 1, bool stableSeed = false);
+// The backward walk (modes R and W, mode P's camera-side layers): the RGB previewer's kernel where
+// `rgb` (-rgb, in its scope on the device), the spectral one otherwise.
+GpuRoute cudaBackwardRoute(bool rgb);
+// BDPT (modes D and J, the meter's D and J frames): renderBdptCuda's instantiation for `maxDepth`
+// and `heroC` (the bundle off through a medium, GRIN or a camera `lens`: bdptPick) or, where mode J
+// merges (`merging`), the merge instantiation -- with the beam queue's variant and kernels where the
+// beams queue (`beamQueue`), and -jsurf's light pass and surface gather (`surfMerge`).
+GpuRoute cudaBdptRoute(const Scene& scene, bool lens, int maxDepth, int heroC, bool merging = false,
+                       bool beamQueue = false, bool surfMerge = false);
+// Mode M: the photon walk and the gather. Mode S: the walk, the visible points and the gather.
+GpuRoute cudaPhotonMapRoute();
+GpuRoute cudaSppmRoute();
+// Mode U: the session's light, camera and merge kernels, at the bundle it carries for `heroC`.
+GpuRoute cudaVcmRoute(int heroC);
 
 // Device memory mode J's beam queue takes beside the kernel's local memory, where beams gather.
 // (The point merges' queue sizes itself to the room left, or stays off.)
