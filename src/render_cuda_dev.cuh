@@ -6,7 +6,11 @@
 // in a unit of its own, under -maxrregcount at its bounds (CMakeLists.txt), each with its own
 // copies of the helpers it calls -- every function here has internal linkage -- and an edit
 // elsewhere cannot move its link. Constraints this keeps:
-//   * every __device__ function static (or inline, or a template): one definition a unit;
+//   * every __device__ function static, a template or a class's member function included where
+//     ptxas may keep it out of line: one with external linkage (plain `inline`, a template, a
+//     member) that a capped unit and render_cuda.cu both keep out of line is a weak definition
+//     in each, and nvlink binds every call to one of them -- render_cuda.cu's, uncapped, maybe.
+//     tools/check_device_linkage.py, run by build.bat, lists any;
 //   * a kernel here inside #ifndef FT_FAMILY_TU: render_cuda.cu compiles it, the family units
 //     do not;
 //   * a device global through FT_DEVGLOBAL: one copy, defined in render_cuda.cu.
@@ -6746,10 +6750,9 @@ __device__ static inline DGlossyDraw dWhittedGlossyDraw(const DScene& sc, const 
 // Twin of glossyF: r times the GGX lobe about `ns` (symmetric in the pair), r the reflect slot
 // times an iridescent glossy's interference reflectance; 0 unless both lie above ns. Double, as
 // dBsdfF is. Inlined at every call, as are the pattern reads under it (dPatIn, dPatternScalarAt,
-// dRecordRoughness): out of line, each takes more registers than the launch bounds of kernels that
-// call it allow (kBdptT's 168, kJSurfLightT's 128), and nvlink refuses the build. Left to nvcc,
-// whether they are inlined depends on the calls the whole file makes, so a call added in another
-// kernel can put them out of line in these (GPU-LINK-FRAGILITY, TODO.md).
+// dRecordRoughness), for speed: out of line, a capped unit (render_cuda_bdpt.cu, render_cuda_jsurf.cu)
+// holds each to its kernels' bounds and the calls spill, and inline, mode D runs 1.75 times faster.
+// Left to nvcc, whether they are inlined depends on every call the unit makes.
 __device__ __forceinline__ static double dGlossyF(const DScene& sc, const DMaterial& m, const DHit& h,
                                   const DVec3& ns, const DVec3& wo, const DVec3& wi, Real lambda) {
     const ggx::Pair p = ggx::pair(ns, wo, wi, ggx::alpha((double)dMatRoughness(sc, m, h)));

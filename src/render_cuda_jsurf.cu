@@ -110,10 +110,8 @@ kJSurfLightT(DScene sc, DCamera cam, int diffraction, int maxDepth,
     dAddWork(work);
 }
 
-// Forced instantiation of both depth variants (BDPT_MAXDEPTH / BDPT_DEEPDEPTH, the same pair
-// kBdptT ships). Without this an unreferenced template is not compiled at all, so the step
-// that "adds the kernel only" would compile trivially and prove nothing -- which is the exact
-// opposite of the point.
+// Both depth variants render_cuda.cu launches (its declaration there): it holds no definition, so
+// its launches link against these.
 template __global__ void kJSurfLightT<BDPT_MAXDEPTH>(
     DScene, DCamera, int, int, long long, unsigned long long, DJSurfOut);
 template __global__ void kJSurfLightT<BDPT_DEEPDEPTH>(

@@ -2812,9 +2812,18 @@ never reaches runRender on the device, asks once in run() for the largest mode-M
 (`mGpuOk`, 0.450.8: the device holds one camera's at a time, 64 B a pixel), and every site that
 routes a mode-M camera to the device reads that one answer — the batched meter, the budget and
 blur tests, the notes that say the device was lost, and the shared path — so the sites that
-mirror each other cannot disagree. `FTRACE_VRAMFREE=<GB>` caps the free memory the preflight
-reads, and `tools/check_vram_preflight.py` uses it to require of every mode (R, B, D, J, S, U, M
-and a mode-M flight) that it asks, falls back under `-device auto`, and is forced under `gpu`.
+mirror each other cannot disagree. Since 0.450.10 a forward mode's shared flight (A, B: every
+camera's film and hit map, held the whole flight) and the exposure meter's frames (once a mode, for
+the kernels the frame runs) ask too, the forward modes' kernels (kTrace and the wavefront's) have
+an entry in `cudaMegakernelLocalBytes`, and a mode-S frame is charged its session's own state a
+pixel (`cudaSppmPixelBytes`, ~200 B) rather than a film pair. A buffer a session sizes from the
+free memory before its kernels' first launch -- mode U's light-vertex store, mode M's and mode S's
+photon deposits -- sets those kernels' stacks aside first (`pendingLocalBytes`); where they do
+not fit at all, mode U's store keeps half the free memory and says the stacks will spill, rather
+than shrink to one light subpath a pass. `FTRACE_VRAMFREE=<GB>` caps the free memory the preflight
+reads, and `tools/check_vram_preflight.py` uses it to require of every mode (R, B, D, J, S, U, M,
+a mode-M flight and a mode-B flight) that it asks, falls back under `-device auto`, and is forced
+under `gpu`.
 
 **The bug the gates caught.** Gate 1a — mode `J` == mode `D` bit-for-bit on a media-free scene —
 failed on the first build, and not for any reason involving merges: mode `J` was passing `heroC = 1`
@@ -13260,8 +13269,13 @@ binary is copied aside first (it runs from anywhere: no DLLs beside it). `render
   (CMakeLists.txt), so every function ptxas compiles there fits them; `render_cuda.cu` keeps the
   host side and the kernels without bounds, uncapped. The device code they share is two headers,
   `render_cuda_dev.cuh` (up to kBdptT) and `render_cuda_dev2.cuh` (to kJSurfLightT), which keep
-  three constraints: a `__device__` function is static, inline or a template (one definition a
-  unit); a kernel there is inside `#ifndef FT_FAMILY_TU` (render_cuda.cu compiles it, the family
+  three constraints: a `__device__` function ptxas may keep out of line has internal linkage
+  (`static`) -- one with external linkage, a plain `inline` function, a template or a class's
+  member, that a capped unit and render_cuda.cu both keep out of line is a weak definition in each
+  object, and nvlink binds every call to one of them, render_cuda.cu's uncapped copy maybe, so the
+  link could again refuse after an edit there (0.450.10 made the pattern helpers of
+  `pov_functions.h`, `pov_noise.h` and `bluenoise.h`, and `ggx.h`'s, `static`;
+  `tools/check_device_linkage.py`, run by build.bat, lists any left); a kernel there is inside `#ifndef FT_FAMILY_TU` (render_cuda.cu compiles it, the family
   units do not); a device global goes through `FT_DEVGLOBAL`, defined in render_cuda.cu and
   `extern` in the family units, so the device holds one copy that `cudaMemcpyToSymbol` sets for
   all (the sphere connectors' tables, which were `static`, among them). Whole-program

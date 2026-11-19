@@ -27,7 +27,9 @@ there, and dropped a pattern without a word (LAYERED-FILM-PATTERN). It requires:
     none is none;
   * a diffuse ball's `reflect pattern:quarter` beside `reflect_map pattern:quarter` renders as
     `reflect 0.0625`, the two multipliers composed (within 1e-3, mode R on the CPU), not as one of
-    them alone.
+    them alone; each clamped to [0,1] before the product, as a slot's multiplier is: `pattern:four`
+    (4) with `reflect_map pattern:quarter` renders as `reflect 0.25`, not 1, and two negative
+    factors (`pattern:neg`, -0.5) render black, not as 0.25.
 
 Exits 1 on any failure.
 """
@@ -46,6 +48,8 @@ def scene(material, extra=""):
     return NL.join([
         "scene { units meters }",
         'pattern "quarter" { expr "0.25" }',
+        'pattern "four" { expr "4" }',
+        'pattern "neg" { expr "-0.5" }',
         'material "white" { type diffuse reflect 0.7 }',
         'material "base" { type diffuse reflect 0.6 }',
         extra,
@@ -156,6 +160,20 @@ def main():
         ok &= good
         print("%-4s `reflect pattern:quarter` with `reflect_map pattern:quarter` renders as `reflect 0.0625`   "
               "%.2g of the pixel off it (%.2g off the pattern alone)" % ("ok" if good else "FAIL", rf, r1), flush=True)
+    _, _, big = run("compose_big", scene(diffuse % "reflect pattern:four  reflect_map pattern:quarter"))
+    _, _, q = run("compose_q", scene(diffuse % "reflect 0.25"))
+    _, _, negs = run("compose_neg", scene(diffuse % "reflect pattern:neg  reflect_map pattern:neg"))
+    _, _, blk = run("compose_black", scene(diffuse % "reflect 0"))
+    if big is None or q is None or negs is None or blk is None:
+        ok = False
+        print("FAIL a clamped composition: a render failed", flush=True)
+    else:
+        rq, _ = image_diff(big, q)
+        rb, _ = image_diff(negs, blk)
+        good = rq <= 1e-3 and rb <= 1e-3
+        ok &= good
+        print("%-4s each factor clamped first: 4 x 0.25 renders as `reflect 0.25` (%.2g off), -0.5 x -0.5 as "
+              "black (%.2g off)" % ("ok" if good else "FAIL", rq, rb), flush=True)
     print("PASS" if ok else "FAILED")
     return 0 if ok else 1
 

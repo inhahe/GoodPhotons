@@ -353,8 +353,9 @@ Then the rest of 4.2-4.6 in their order, 4.7's bookkeeping alongside whatever to
   device's gather (and mode S's per-pixel copy); the float side now takes ratio / peak.
 - [x] **VCOL-BDPT-GPU** (0.433.4) — `DVertex` and `DVcmLV` carry the hit's vertex colour; GPU
   modes D, J and U had read a vertex-coloured sphere near grey.
-- [ ] **GPU-PHOTON-LAUNCH-FAIL** — one GPU photon pass died with "unspecified launch failure"
-  (mode M, a mix wall, beside another GPU process); six reruns clean. Watch for a recurrence.
+- [ ] **GPU-PHOTON-LAUNCH-FAIL** — the forward photon kernel died with "unspecified launch failure"
+  three times (modes M and B, 0.433.10, 0.434.8, 0.450.0), each beside another process's GPU
+  renders; reruns alone clean, memcheck clean. Reproduce under the same load, then memcheck it there.
 - [x] **COMPOUND-MERGE-PICK** (0.434.3) — modes U and J's merges took a compound's lobe probability
   twice (a half-weight mix wall 0.71-0.75 of mode R in mode U, 0.63 in mode J); each stored vertex now
   carries the merges' share of it.
@@ -411,6 +412,11 @@ Then the rest of 4.2-4.6 in their order, 4.7's bookkeeping alongside whatever to
   wavelength; byte for byte 0.450.4's images. 640x480 bowl: gather 43.4 -> 15.7 s; Nsight 10.5 -> 1.5
   G local requests, 26.6 -> 15.6 G FP64. Its four pattern readers forced inline, which made mode D
   1.75x faster too (0.450.4 had dGlossyF out of line at 168 registers).
+- [x] **REVIEW-0450D** (0.450.10) — the Opus (max) and Fable (xhigh) reviews of 0.450.7-0.450.9: the
+  split's linkage rule (static helpers, tools/check_device_linkage.py in build.bat), the preflight for
+  shared flights and the meter, modes A/B/C weighed, mode S charged its session, the M/S deposits and
+  mode U's store and cell table kept off the stacks' memory, a composed slot clamped per factor;
+  known-issues REVIEW-0450D.
 - [x] **REVIEW-0450C** (0.450.9) — the Opus (max) and Fable (xhigh) reviews of 0.450.5-0.450.6: a
   spectral property refused as a scalar map, a slot's pattern composed with its map, tryDevCap's
   growth, the cell table and the store kept off the sort's and the stacks' memory, FTSL.md's map
@@ -436,6 +442,14 @@ Then the rest of 4.2-4.6 in their order, 4.7's bookkeeping alongside whatever to
   so the merges and the connections are one implementation, and kVcmCameraT's connection loop (six
   rebuilds of the hit and the pair a light vertex, as the merges had) takes the lobe too; with it a
   translucent lobe's two albedos read once at the hero wavelength rather than at f and at each pdf.
+- [ ] **DVERTHITSTATE-8B** — DVertHitState is 16 B in every DVertex of modes D and J (352 B of local
+  memory a thread in kBdptT, 2.1 KB in the deep variant), half of it the deform barycentrics the
+  vertex keeps as vb0q/vb1q (both reviews of 0.450.1-0.450.4). Declined then for the link
+  (GPU-LINK-FRAGILITY, fixed): restore the barycentrics from vb0q/vb1q (1.5e-5 quantisation, so a
+  deforming mesh's pattern at a connection moves by that), measure kBdptT paired, and keep it if
+  the occupancy pays.
+- [ ] **MERGE-LAZY-TIMING** — time fab8da8's lazy lobe against 0.450.9 paired, on the case 0.450.5
+  measured its cost on (mode J, _fog_cornell: 5.48 -> 5.71 s median), on an idle GPU.
 - [ ] **RNG-ARG-ORDER** — 67 calls pass two or more RNG draws as arguments of one call
   (`cam.genRay(px, py, rng.uniform(), rng.uniform())` and `hair::sample(...)` in the renderers, the
   lens's draws, main.cpp's self-test scenes, and the device's caustic-aim samplers with their host

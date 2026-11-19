@@ -137,7 +137,7 @@
 #define PAT_BN_SID 0xfd7046c5u
 
 // murmur3 fmix32: full-avalanche 32-bit finalizer.
-PAT_BN_HD inline unsigned int patBNMix(unsigned int h) {
+PAT_BN_HD static inline unsigned int patBNMix(unsigned int h) {
     h ^= h >> 16; h *= 0x85ebca6bu;
     h ^= h >> 13; h *= 0xc2b2ae35u;
     h ^= h >> 16;
@@ -146,7 +146,7 @@ PAT_BN_HD inline unsigned int patBNMix(unsigned int h) {
 
 // Cell -> base hash. Doubles as the candidate's RANK, which is what makes the
 // rank-before-position early-out free.
-PAT_BN_HD inline unsigned int patBNCellHash(int cx, int cy, int cz) {
+PAT_BN_HD static inline unsigned int patBNCellHash(int cx, int cy, int cz) {
     unsigned int h = (unsigned int)cx * 2135587861u
                    ^ (unsigned int)cy * 805459861u
                    ^ (unsigned int)cz * 3266489917u;
@@ -154,7 +154,7 @@ PAT_BN_HD inline unsigned int patBNCellHash(int cx, int cy, int cz) {
 }
 
 // Candidate position: uniform in its cell.
-PAT_BN_HD inline void patBNPos(unsigned int h0, int cx, int cy, int cz,
+PAT_BN_HD static inline void patBNPos(unsigned int h0, int cx, int cy, int cz,
                                double& px, double& py, double& pz) {
     px = (double)cx + (double)patBNMix(h0 ^ PAT_BN_SX) * (1.0 / 4294967296.0);
     py = (double)cy + (double)patBNMix(h0 ^ PAT_BN_SY) * (1.0 / 4294967296.0);
@@ -166,7 +166,7 @@ PAT_BN_HD inline void patBNPos(unsigned int h0, int cx, int cy, int cz,
 // merely partial order two candidates with colliding ranks (probability ~n/2^32,
 // i.e. certain somewhere in an unbounded domain) could each fail to outrank the
 // other and both be accepted while overlapping.
-PAT_BN_HD inline bool patBNPrecedes(unsigned int ra, int ax, int ay, int az,
+PAT_BN_HD static inline bool patBNPrecedes(unsigned int ra, int ax, int ay, int az,
                                     unsigned int rb, int bx, int by, int bz) {
     if (ra != rb) return ra < rb;
     if (az != bz) return az < bz;
@@ -176,7 +176,7 @@ PAT_BN_HD inline bool patBNPrecedes(unsigned int ra, int ax, int ay, int az,
 
 // Distance from a point to the nearest point of the unit cell based at c, per
 // axis. Zero when the coordinate is already inside the slab.
-PAT_BN_HD inline double patBNAxisGap(double v, int c) {
+PAT_BN_HD static inline double patBNAxisGap(double v, int c) {
     const double lo = (double)c;
     if (v < lo) return lo - v;
     const double hi = lo + 1.0;
@@ -185,7 +185,7 @@ PAT_BN_HD inline double patBNAxisGap(double v, int c) {
 
 // Is the candidate of cell (cx,cy,cz) — base hash h0, position p — accepted?
 // Exact for r in [0,1]: a candidate two cells out is > 1 >= r away in one axis.
-PAT_BN_HD PAT_BN_NOINLINE inline bool patBNAccept(int cx, int cy, int cz, unsigned int h0,
+PAT_BN_HD PAT_BN_NOINLINE static inline bool patBNAccept(int cx, int cy, int cz, unsigned int h0,
                                                   double px, double py, double pz, double r) {
     if (!(r > 0.0)) return true;               // r = 0: the jittered lattice
     const double r2 = r * r;
@@ -213,7 +213,7 @@ PAT_BN_HD PAT_BN_NOINLINE inline bool patBNAccept(int cx, int cy, int cz, unsign
 // Blue-noise query. out[0] = F1, out[1] = F2, out[2] = id of the F1 point.
 // `visited`, when non-null, receives the number of cells whose candidate was
 // hashed (the cost metric §8 reports); pass null in the renderer.
-PAT_BN_HD PAT_BN_NOINLINE inline void patBlueNoiseC(double x, double y, double z, double r,
+PAT_BN_HD PAT_BN_NOINLINE static inline void patBlueNoiseC(double x, double y, double z, double r,
                                                     double out[3], int* visited) {
     if (visited) *visited = 0;
     // Non-finite guard. Every comparison against a NaN is false, so without
@@ -264,7 +264,7 @@ PAT_BN_HD PAT_BN_NOINLINE inline void patBlueNoiseC(double x, double y, double z
     out[2] = (double)idH * (1.0 / 4294967296.0);
 }
 
-PAT_BN_HD PAT_BN_NOINLINE inline void patBlueNoise(double x, double y, double z, double r,
+PAT_BN_HD PAT_BN_NOINLINE static inline void patBlueNoise(double x, double y, double z, double r,
                                                    double out[3]) {
     patBlueNoiseC(x, y, z, r, out, (int*)0);
 }

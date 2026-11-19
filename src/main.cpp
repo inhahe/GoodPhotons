@@ -20650,8 +20650,9 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
                 batch->releaseHold();
         }
         // The film pair (two double3 images), and a blurred forward render of a moving camera's
-        // posed copy of it, one a thread.
-        const size_t film   = (size_t)res * resY * 3 * sizeof(double) * 2 +
+        // posed copy of it, one a thread; mode S's session keeps its own state a pixel instead.
+        const size_t film   = (m == 'S') ? (size_t)res * resY * cudaSppmPixelBytes()
+                            : (size_t)res * resY * 3 * sizeof(double) * 2 +
                               ((gpuForwardMode && cam.seesMotion(scene) && cam.moves())
                                    ? cudaForwardPosedCameraBytes(scene, wavefront, g_heroC, N) : 0);
         // Mode J's beam queue, allocated beside the kernel once the render starts.
@@ -29493,15 +29494,34 @@ static int run(int argc, char** argv) {
         mGpuOk = mFilm > 0 && vramPreflight('M', mFilm, 0, !std::strcmp(device, "gpu"));
     }
 #endif
+    (void)mGpuOk;   // read only by the device routes (HAVE_CUDA): keep CPU-only builds warning-clean
+#ifdef HAVE_CUDA
+    // Whether a meter frame in mode `m` (meterAnchor's: its rendered mode) may take the device: the
+    // card's room for the kernels that frame runs -- the backward ones in R and P, kBdptT in D and J,
+    // the forward walk otherwise (modes S, U and V meter by mode B's light trace; mode M's frames are
+    // on the CPU and never ask) -- and a frame's film pair (vramPreflight). Asked once a mode.
+    std::map<char, bool> meterRoom;
+    const auto meterAffords = [&](char m, int W, int H) -> bool {
+        if (m == 'M') return false;
+        const char k = std::strchr("RDJABCP", m) ? m : 'B';
+        auto it = meterRoom.find(k);
+        if (it == meterRoom.end())
+            it = meterRoom.emplace(k, vramPreflight(k, (size_t)W * H * 3 * sizeof(double) * 2, 0,
+                                                    !std::strcmp(device, "gpu"))).first;
+        return it->second;
+    };
+#endif
     auto meterAnchor = [&](const MeterCam& mc) -> double {
         const int W = mc.res, H = mc.resY;
         // Reduced budgets: enough coverage for a clean p99 without paying for a full render.
         const long long meterN   = std::clamp((long long)W * H * 40LL, 500000LL, 4000000LL);
         const long long meterSpp = 16;
         const char mode = mc.mode;      // already the rendered mode (renderedMode)
-        // A blurred frame meters where it renders: on the device in the modes that blur there.
+        // A blurred frame meters where it renders: on the device in the modes that blur there, where
+        // the card holds the kernels the frame runs (meterAffords).
 #ifdef HAVE_CUDA
-        const bool onDevice = meterGpu && (!mc.cam.seesMotion(scene) || !cudaBlurUnsupported(scene, mc.cam, mode));
+        const bool onDevice = meterGpu && meterAffords(mode, W, H) &&
+                              (!mc.cam.seesMotion(scene) || !cudaBlurUnsupported(scene, mc.cam, mode));
 #else
         const bool onDevice = meterGpu;
 #endif
@@ -30052,6 +30072,13 @@ static int run(int argc, char** argv) {
                 if (!std::strcmp(device, "gpu")) std::fprintf(stderr, "[device] %s; using CPU\n", why);
                 else                             std::printf("[device] auto -> CPU (%s)\n", why);
             }
+        }
+        // The card's room for the flight (vramPreflight): its kernels, and every camera's film and
+        // hit map, which the device holds the whole flight (sharedForwardGpuBegin).
+        if (groupGpu) {
+            size_t films = 0;
+            for (int c = 0; c < nc; ++c) films += (size_t)rxs[c] * rys[c] * 4 * sizeof(double);
+            groupGpu = vramPreflight(groupMode, films, 0, !std::strcmp(device, "gpu"));
         }
 #endif
         (void)groupGpu;

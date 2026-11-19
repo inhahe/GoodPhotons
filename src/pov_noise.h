@@ -2956,10 +2956,10 @@ POVN_MEM double g_povGrad[12294] = {
 };
 
 // ---- SolidNoise (Perlin, gen 3) ---------------------------------------------
-POV_HD inline double povSCurve(double t) { return t * t * (3.0 - 2.0 * t); }
-POV_HD inline double povLerp(double t, double a, double b) { return a + t * (b - a); }
+POV_HD static inline double povSCurve(double t) { return t * t * (3.0 - 2.0 * t); }
+POV_HD static inline double povLerp(double t, double a, double b) { return a + t * (b - a); }
 
-POV_HD inline double povSolidNoise(double px, double py, double pz) {
+POV_HD static inline double povSolidNoise(double px, double py, double pz) {
     const int NE = 2048;
     const double ROLLOVER = 10000000.023157213;
     double P[3] = { px, py, pz };
@@ -3002,7 +3002,7 @@ POV_HD inline double povSolidNoise(double px, double py, double pz) {
 
 // ---- PortableNoise (gens 1 & 2) + generator dispatch ------------------------
 // povNoise: POV's Noise(EPoint, noise_generator).  Returns a value in ~[0,1].
-POV_HD inline double povNoise(double x, double y, double z, int gen) {
+POV_HD static inline double povNoise(double x, double y, double z, int gen) {
     const double POV_EPS = 1.0e-10;
     if (gen == 3) { // kNoiseGen_Perlin
         double sum = 0.5 * (1.59 * povSolidNoise(x, y, z) + 0.985);
@@ -3066,7 +3066,7 @@ POV_HD inline double povNoise(double x, double y, double z, int gen) {
 // with the record's 0.5-bias term, exactly as POV returns it (turbulence warps
 // consume it raw). This is the primitive behind domain warping:
 //   noise(x + k*dnoisex(x,y,z), y + k*dnoisey(...), z + k*dnoisez(...)).
-POV_HD inline void povDNoise(double x, double y, double z, double out[3]) {
+POV_HD static inline void povDNoise(double x, double y, double z, double out[3]) {
     const double POV_EPS = 1.0e-10;
     int tmp;
     tmp = (x >= 0) ? (int)x : (int)(x - (1 - POV_EPS));
@@ -3136,7 +3136,7 @@ POV_HD inline void povDNoise(double x, double y, double z, double out[3]) {
 // vector (`warp { turbulence <k> }` displaces by k * DTurbulence(p)) — exposed
 // because the pattern VM has no loops, so the octave sum cannot be authored
 // from dnoise* alone.
-POV_HD inline void povDTurbulence(double x, double y, double z,
+POV_HD static inline void povDTurbulence(double x, double y, double z,
                                   double octaves, double lambda, double omega,
                                   double out[3]) {
     int oct = (int)octaves;

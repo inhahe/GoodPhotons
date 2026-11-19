@@ -1297,7 +1297,8 @@ material "strip" { type diffuse reflect 0.0 emit blackbody 5200        # a lamp'
 A pattern written *into* `reflect` is alone in the slot, so the base spectrum becomes a flat
 1.0 and the albedo is the pattern's own value — a greyscale reflectance, and the reason
 `reflect [0 1](u)` (§6.1) means what it looks like. `reflect_map` instead modulates an
-authored spectrum or texture, or a pattern written into `reflect` (the two multiply). Because the pattern is a scalar it can only ever darken or
+authored spectrum or texture, or a pattern written into `reflect` (the two multiply, each clamped to
+[0,1] first, as every slot multiplier is). Because the pattern is a scalar it can only ever darken or
 brighten: **colour comes from the spectrum/texture, never from the pattern.** The multiplier
 is clamped to [0,1], so a runaway formula cannot manufacture energy.
 

@@ -201,6 +201,50 @@ to 0.25 renders as a 150 nm one within 2e-3, 1.0e-3 measured (its body's escape 
 on 0.450.1 it rendered as the unmapped 600 nm, 1.9 off), the `thinfilm` control byte for byte, and
 the three misspellings stop the load (on 0.450.1 they loaded).
 
+## DONE (2026-11-18, 0.450.10): REVIEW-0450D — what the Opus (max) and Fable (xhigh) reviews of 0.450.7-0.450.9 found
+
+`/code-review max` (Opus, 10 findings) and `/code-review xhigh` (Fable, 14) of aaf7cef..dbf75e8, one
+after the other in a worktree; seven found by both. Each checked against the code. **Fixed in
+0.450.10:**
+
+* **The split's linkage rule was wrong** (both): a `__device__` function with external linkage -- a
+  plain `inline` one, a template, a class's member -- that a capped unit and render_cuda.cu both
+  keep out of line is a weak definition in each object, and nvlink binds every call to one of
+  them, render_cuda.cu's uncapped copy maybe: the link could again refuse after an edit there. On
+  the 0.450.9 objects `tools/check_device_linkage.py` (new; build.bat runs it after every build)
+  finds 18 such functions in each capped unit, the POV and blue-noise pattern helpers and
+  `ggx::drawUV`, all then under the caps by luck. Those headers' helpers are `static` now; CUDA's own
+  math slow paths (`__internal_*`, 44-52 registers) are not ours to change and are exempt.
+* **A shared forward flight and the exposure meter took the device without the preflight** (both):
+  runSharedGroup's flight asks for its kernels and every camera's film and hit map; the meter asks
+  once a mode, for the kernels its frame runs.
+* **Modes A, B and C weighed their kernels at 0** (both): cudaMegakernelLocalBytes has kTrace and the
+  forward wavefront for them (4.2 GB on the 4090 where it printed 0.00).
+* **Mode S was charged a film pair a pixel, 48 B, where its session keeps ~200** (Opus):
+  `cudaSppmPixelBytes`.
+* **Modes M and S sized their photon buffers to half the free memory before the walk's stacks were
+  reserved** (both): the stacks are set aside first (`pendingLocalBytes`), as 0.450.9 did for mode U.
+* **Mode U's store fell to one light subpath where the stacks did not fit** (both): it keeps half
+  the free memory then, and says the stacks will spill; where they fit but leave less than its 768
+  MB floor, it says so.
+* **The cell table's room counted a reservation already held as still to come** (Fable): on pass 0,
+  after the light kernel reserved its stacks, a tight card could coarsen the grid to one cell, every
+  site then weighing every light vertex, in silence. The table counts only the reservation still to
+  grow, is asked only where it must grow (Fable), and a coarsening the memory forces is said once.
+* **`reflect pattern:p` with `reflect_map pattern:q` clamped the product, not each factor** (Fable):
+  two negative factors made a bright patch, and 4 x 0.25 gave 1. composePatterns saturates each.
+* **ensureDevCap reported every refusal as out of memory** (Fable): it prints the CUDA error.
+* **check_vram_preflight could not tell a refused R/B/D/J render from one left on the GPU, and took
+  a kernel weighed at 0 for asked** (Fable): each mode's start line says where it rendered, and the
+  weight must be positive; and it gains a mode-B flight and a metered path (both).
+* **Stale and repeated words**: kJSurfLightT's instantiation comment (Opus), dGlossyF's, which still
+  gave the fixed link fragility as its reason (Fable); the pending-stacks rule written four times
+  and the kernel-list loop twice (both: `pendingLocalBytes`, `mostLocalOf`); `mGpuOk` unreferenced
+  in a CPU-only build (both).
+
+**Not changed: check_motion's renders pass `-window-min`** (Fable): the project's rule for every
+render. Its forward cases take the chunked path, a different realization of the same estimator.
+
 ## DONE (2026-11-18, 0.450.9): REVIEW-0450C — what the Opus (max) and Fable (xhigh) reviews of 0.450.5-0.450.6 found
 
 `/code-review max` (Opus, 15 findings) and `/code-review xhigh` (Fable, 13) of ee08dc1..aaf7cef, one
@@ -1669,6 +1713,14 @@ another process's GPU renders (memcheck serialises the kernels, which may be wha
 occurrences were the forward photon kernel, beside another process's GPU renders, so: run GPU
 checks one at a time, and read a lone launch failure beside another GPU job as this entry until
 it reproduces alone.
+
+**Seen a third time, on 0.450.0 (2026-11-18)**: check_rough_irid's GPU mode B on its glass scene
+(`glass.ftsl -mode B -device gpu -n 120000000 -seed 2`), run from a sweep while two or three other
+processes rendered on the GPU (check_bitid, check_motion, paired timings) and a whole-program nvcc
+build had run the machine out of commit an hour before: `[cuda] forward kernel failed: unspecified
+launch failure`, exit 0xC0000409, after about an hour (under the same load, a rerun traces at about
+45 k photons a second and the card holds 10 of 24 GB, so memory was not short). Three times now, the forward photon kernel, each time beside another GPU process; a rerun
+of the exact command on 0.450.9 beside two other GPU processes is in progress.
 
 ## OPEN (2026-11-04, 0.433.6): CURVE-CAUSTIC — modes M and S light a `type diffuse` strand only by NEE and its diffuse continuation, so a caustic from a point or spot light misses it
 

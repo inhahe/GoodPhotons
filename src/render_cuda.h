@@ -51,6 +51,8 @@ size_t cudaModeJBeamQueueBytes();
 // (which the driver raises to the largest kernel launched so far) times the threads the card
 // holds resident. A kernel launched later reuses it. 0 if unknown.
 size_t cudaLocalReservedBytes();
+// The device memory a mode-S session keeps a pixel (sppmSessionBegin), for the VRAM preflight.
+size_t cudaSppmPixelBytes();
 
 // Orderly CUDA teardown: synchronize any outstanding device work, then destroy the
 // primary context (cudaDeviceReset) while the process is still in a clean, quiescent

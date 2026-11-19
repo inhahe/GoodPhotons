@@ -72,6 +72,13 @@ __global__ void kDeviceProbe(unsigned long long* sizes, double* math, const doub
 
 // ============================ host: bake + launch ============================
 
+// Of `local` bytes of per-thread local memory a family of kernels reserves at its first launch, what
+// is still to be reserved: all of it until a launch of ours has reserved as much, then none
+// (cudaLocalReservedBytes). A buffer allocated before that launch leaves this much free beside it.
+static size_t pendingLocalBytes(size_t local) {
+    return (cudaLocalReservedBytes() >= local) ? 0 : local;
+}
+
 // THE DEVICE'S VIEW OF `-stop`. A kernel cannot ask ft::stopRequested(), and the thread that
 // launched it is parked in a synchronize and can issue no CUDA call, so the device keeps its own
 // copy of the flag: one int of MAPPED PINNED host memory, allocated once and kept for the life of
@@ -2954,26 +2961,30 @@ struct ThrustArenaAlloc {
 // Grow-only device buffer of `cap` elements: reallocated only when `need` passes it, to 1.5x the old
 // capacity (no more than `most`, and no less than `need`), so per-pass session buffers stop
 // churning cudaMalloc/cudaFree; `need` alone where the device refuses the growth. False, the buffer
-// released (p null, cap 0), where the device refuses `need` too.
+// released (p null, cap 0), where the device refuses `need` too; then `*why` (where given) is the
+// refusal's error, which need not be a shortage (a context a driver reset left broken).
 template <class T>
-static bool tryDevCap(T*& p, size_t& cap, size_t need, size_t most = SIZE_MAX) {
+static bool tryDevCap(T*& p, size_t& cap, size_t need, size_t most = SIZE_MAX, cudaError_t* why = nullptr) {
     if (need <= cap) return true;
     const size_t grown = std::max(need, std::min(cap + cap / 2, most));
     if (p) { cudaFree(p); p = nullptr; }
     cap = 0;
     for (size_t want : {grown, need}) {
-        if (cudaMalloc(&p, want * sizeof(T)) == cudaSuccess) { cap = want; return true; }
+        const cudaError_t e = cudaMalloc(&p, want * sizeof(T));
+        if (e == cudaSuccess) { cap = want; return true; }
+        if (why) *why = e;
         (void)cudaGetLastError();
         p = nullptr;
     }
     return false;
 }
-// tryDevCap where the render cannot go on without the buffer: a refusal ends the run.
+// tryDevCap where the render cannot go on without the buffer: a refusal ends the run, saying why.
 template <class T>
 static void ensureDevCap(T*& p, size_t& cap, size_t need) {
-    if (tryDevCap(p, cap, need)) return;
-    std::fprintf(stderr, "[cuda] out of device memory: a buffer of %zu x %zu B could not be had\n",
-                 need, sizeof(T));
+    cudaError_t why = cudaSuccess;
+    if (tryDevCap(p, cap, need, SIZE_MAX, &why)) return;
+    std::fprintf(stderr, "[cuda] a device buffer of %zu x %zu B could not be allocated: %s\n",
+                 need, sizeof(T), cudaGetErrorString(why));
     std::fflush(stderr);
     std::exit(EXIT_FAILURE);
 }
@@ -4034,7 +4045,7 @@ Film renderBdptCuda(const Scene& scene, const Camera& cam, int resX, int resY,
         // The camera kernel's first launch reserves its local memory after this, unless an
         // earlier launch's reservation already holds it.
         const size_t local = cudaMegakernelLocalBytes('J', maxDepth, 1);
-        const size_t pending = (cudaLocalReservedBytes() >= local) ? 0 : local;
+        const size_t pending = pendingLocalBytes(local);
         const size_t room = (freeB > pending) ? freeB - pending : 0;
         // FTRACE_SURFWFCAP=<n> (diagnostic) shrinks the queue to n requests (at least 16), so a
         // small frame takes several waves, or with a tiny n turns sites away every wave:
@@ -4086,13 +4097,12 @@ Film renderBdptCuda(const Scene& scene, const Camera& cam, int resX, int resY,
         g_wfProfile.clear();
         g_wfProfileResX = resX; g_wfProfileResY = resY; g_wfProfileDepth = maxDepth;
     }
-    std::vector<WfBand>& wfProfilePrev = g_wfProfile;
     const bool mergeAny = mergeOn || dsm.kappaS > 0.0;   // either kind wants MERGE=true
     std::vector<WfBand> wfProfileCur;
     // Whether the PROFILE measured a queue's field: a chunk's bands share their call's queues,
     // so the first band speaks for all of them.
-    auto beamProfiled = [&] { return !wfProfilePrev.empty() && wfProfilePrev.front().segsPerPath >= 0.0; };
-    auto surfProfiled = [&] { return !wfProfilePrev.empty() && wfProfilePrev.front().sitesPerPath >= 0.0; };
+    auto beamProfiled = [&] { return !g_wfProfile.empty() && g_wfProfile.front().segsPerPath >= 0.0; };
+    auto surfProfiled = [&] { return !g_wfProfile.empty() && g_wfProfile.front().sitesPerPath >= 0.0; };
     static const bool waveDebug = std::getenv("FTRACE_WAVE_DEBUG") != nullptr;   // a line a wave
     // The fewest paths a point-merge wave holds: the camera kernel's resident threads, below
     // which a wave idles it, and that costs more than gathering the excess inline. Under
@@ -4126,7 +4136,7 @@ Film renderBdptCuda(const Scene& scene, const Camera& cam, int resX, int resY,
         if (!surfProfiled()) {
             s = std::max(s, 2.5);
         } else {
-            for (const WfBand& w : wfProfilePrev) {   // in path order
+            for (const WfBand& w : g_wfProfile) {   // in path order
                 const long long o0 = w.px0 * c - from, o1 = w.px1 * c - from;   // from `from` on
                 if (o1 <= 0) continue;
                 if (o0 >= n) break;
@@ -4276,7 +4286,7 @@ Film renderBdptCuda(const Scene& scene, const Camera& cam, int resX, int resY,
                 for (int it = 0; it < 8; ++it) {
                     const long long p0 = from / c, p1 = (from + cand + c - 1) / c;   // slots the wave would cover
                     double h = hpp, sg = spp;
-                    for (const WfBand& w : wfProfilePrev)
+                    for (const WfBand& w : g_wfProfile)
                         if (w.px1 > p0 && w.px0 < p1) {
                             if (w.hitsPerPath > h) h = w.hitsPerPath;
                             if (w.segsPerPath > sg) sg = w.segsPerPath;
@@ -4401,7 +4411,7 @@ Film renderBdptCuda(const Scene& scene, const Camera& cam, int resX, int resY,
             // either way, and its bands are an under-count).
             if ((wq.segs || sq.reqs) && !wfProfileCur.empty() && !leftEarly &&
                 !(abortable && DeviceStopScope::seen()))
-                wfProfilePrev.swap(wfProfileCur);
+                g_wfProfile.swap(wfProfileCur);
         }
         else if (useHero && deep)
             kBdptT<BDPT_NSEC, BDPT_DEEPDEPTH, false, false><<<2048, 128>>>(up.sc, up.dc, d_cam, d_splat, totalSamples, c, sppTotal, base,
@@ -4532,6 +4542,18 @@ bool cudaMemInfo(size_t* freeB, size_t* totalB) {
 // the same four-way BDPT branch renderBdptCuda picks, so the number is the one that will
 // really be reserved rather than a worst case. Returns 0 when unknown (no device, or a
 // mode with no megakernel), which callers must treat as "no opinion", not as "free".
+// The local memory a launch of the most demanding of kernels `ks` reserves: its per-thread local size
+// on every resident thread (0 for a kernel the runtime cannot describe).
+static size_t mostLocalOf(std::initializer_list<const void*> ks) {
+    size_t most = 0;
+    for (const void* k : ks) {
+        cudaFuncAttributes fa{};
+        if (cudaFuncGetAttributes(&fa, k) == cudaSuccess) most = std::max(most, (size_t)fa.localSizeBytes);
+        cudaGetLastError();
+    }
+    return most * residentThreads();
+}
+
 size_t cudaMegakernelLocalBytes(char mode, int maxDepth, int heroC) {
     using namespace gpu;                      // the megakernels live there
     if (!cudaAvailable()) return 0;
@@ -4563,32 +4585,22 @@ size_t cudaMegakernelLocalBytes(char mode, int maxDepth, int heroC) {
                 fm.localSizeBytes > fc.localSizeBytes) fn = mfn;
             cudaGetLastError();
         }
-    } else if (mode == 'S' || mode == 'M') {
+    } else if (mode == 'S' || mode == 'M' || mode == 'A' || mode == 'B' || mode == 'C') {
         // The photon walks (kTrace, which takes the hero bundle in itself) and the pass's own kernels:
-        // mode S's visible points and gather, mode M's gather. The most of them.
-        size_t most = 0;
-        const void* own[2] = {mode == 'S' ? (const void*)kSppmVisiblePoint : (const void*)kGather,
-                              mode == 'S' ? (const void*)kSppmGather : nullptr};
-        for (const void* k : {(const void*)kTrace, own[0], own[1]}) {
-            if (!k) continue;
-            cudaFuncAttributes fa{};
-            if (cudaFuncGetAttributes(&fa, k) == cudaSuccess) most = std::max(most, (size_t)fa.localSizeBytes);
-            cudaGetLastError();
-        }
-        return most * residentThreads();
+        // mode S's visible points and gather, mode M's gather, the forward modes' wavefront (which
+        // runs in kTrace's stead where it is on). The most of them.
+        if (mode == 'S')
+            return mostLocalOf({(const void*)kTrace, (const void*)kSppmVisiblePoint, (const void*)kSppmGather});
+        if (mode == 'M')
+            return mostLocalOf({(const void*)kTrace, (const void*)kGather});
+        return mostLocalOf({(const void*)kTrace, (const void*)kWfInit, (const void*)kWfExtend, (const void*)kWfShade});
     } else if (mode == 'U') {
         // The resident session's kernels (vcmSessionBegin), the hero instantiation where it runs:
         // the most of them, which the context's reservation must hold.
         const bool hero = heroC > 1;
-        size_t most = 0;
-        for (const void* k : {hero ? (const void*)kVcmLightT<BDPT_NSEC> : (const void*)kVcmLightT<0>,
-                              hero ? (const void*)kVcmCameraT<BDPT_NSEC> : (const void*)kVcmCameraT<0>,
-                              hero ? (const void*)kVcmMergeGather<BDPT_NSEC> : (const void*)kVcmMergeGather<0>}) {
-            cudaFuncAttributes fa{};
-            if (cudaFuncGetAttributes(&fa, k) == cudaSuccess) most = std::max(most, (size_t)fa.localSizeBytes);
-            cudaGetLastError();
-        }
-        return most * residentThreads();
+        return mostLocalOf({hero ? (const void*)kVcmLightT<BDPT_NSEC> : (const void*)kVcmLightT<0>,
+                            hero ? (const void*)kVcmCameraT<BDPT_NSEC> : (const void*)kVcmCameraT<0>,
+                            hero ? (const void*)kVcmMergeGather<BDPT_NSEC> : (const void*)kVcmMergeGather<0>});
     } else if (mode == 'R' || mode == 'W') {
         fn = (const void*)kBackward;
     } else if (mode == 'P') {
@@ -5478,9 +5490,12 @@ std::vector<Film> renderPhotonMapSharedCuda(const Scene& scene, const std::vecto
     // Same seed every pass => identical deposits regardless of which path executes.
     pm.nEmitted = N;
     unsigned long long cap = (unsigned long long)((double)N * 2.5) + (1ull << 20);
+    // Half the memory free once the walks' stacks are set aside: kTrace reserves them at its first
+    // launch, after this, unless an earlier launch holds them (pendingLocalBytes).
     { size_t freeB = 0, totalB = 0;
       if (cudaMemGetInfo(&freeB, &totalB) == cudaSuccess) {
-          unsigned long long fit = (unsigned long long)(freeB / 2 / sizeof(DPhoton));
+          const size_t pending = pendingLocalBytes(cudaMegakernelLocalBytes('M', 8, 1));
+          unsigned long long fit = (unsigned long long)((freeB > pending ? freeB - pending : 0) / 2 / sizeof(DPhoton));
           if (cap > fit) cap = fit; } }
     DPhoton* d_photons = nullptr;
     while (cap >= (1ull << 22) &&
@@ -6272,6 +6287,13 @@ bool cudaSppmSupported(const Scene& scene) {
     return cudaPhotonMapSupported(scene);
 }
 
+// The device memory a mode-S session keeps a pixel (sppmSessionBegin's state and film): what the VRAM
+// preflight charges a mode-S frame (main.cpp, vramAffords).
+size_t cudaSppmPixelBytes() {
+    // tau, directSum and the film (3 doubles each); nAcc, vpThr and radius; vpValid and vpSpec;
+    // vpHit; vpRatio's spectral bins.
+    return 12 * sizeof(double) + 2 * sizeof(unsigned char) + sizeof(gpu::DHit) + gpu::DSpecThr::K * sizeof(float);
+}
 SppmSession* sppmSessionBegin(const Scene& scene, const Camera& cam, int resX, int resY,
                               double R0, bool diffraction, int maxBounce, int heroC) {
     if (!cudaAvailable() || !cudaSppmSupported(scene)) return nullptr;
@@ -6347,9 +6369,12 @@ void sppmSessionPass(SppmSession* s, long long photonsPerPass, double alpha) {
     if (cap > s->photonsCap) {
         { size_t freeB = 0, totalB = 0;
           if (cudaMemGetInfo(&freeB, &totalB) == cudaSuccess) {
-              // Budget half the free VRAM, counting what the current buffer already holds.
-              unsigned long long fit = (unsigned long long)(
-                  (freeB + s->photonsCap * sizeof(DPhoton)) / 2 / sizeof(DPhoton));
+              // Budget half the free VRAM, counting what the current buffer already holds, once the
+              // walk's and the gather's stacks are set aside: the first pass allocates this before
+              // kTrace and kSppmGather have launched (pendingLocalBytes).
+              const size_t pending = pendingLocalBytes(cudaMegakernelLocalBytes('S', 8, s->heroC));
+              const size_t avail = freeB + s->photonsCap * sizeof(DPhoton);
+              unsigned long long fit = (unsigned long long)((avail > pending ? avail - pending : 0) / 2 / sizeof(DPhoton));
               if (cap > fit) cap = fit; } }
         if (cap > s->photonsCap) {
             if (s->d_photons) { cudaFree(s->d_photons); s->d_photons = nullptr; s->photonsCap = 0; }
@@ -6558,6 +6583,7 @@ struct VcmSession {
     // arena grows to it through allocations that end the render if refused) and the kernels' local
     // memory (cudaMegakernelLocalBytes('U')), reserved at their first launch.
     size_t sortWorst = 0, localNeed = 0;
+    bool gridCoarseSaid = false;   // vcmSessionPass has said the memory coarsened its grid
     // The merges' queue (gpu::DVcmMergeQueue, VCM-WAVEFRONT; null reqs: merged inline; its two
     // counters, sites asked for and sites merged inline, in one allocation at nReqs) and its profile (mq.profile, and the last
     // pass's on the host: mqProfile, empty before the first pass has run), and how its waves went:
@@ -6632,12 +6658,28 @@ VcmSession* vcmSessionBegin(const Scene& scene, const Camera& cam, int resX, int
     size_t budget = (size_t)768 << 20;
     s->localNeed = cudaMegakernelLocalBytes('U', s->maxDepth, C);
     {
-        const size_t pending = (cudaLocalReservedBytes() >= s->localNeed) ? 0 : s->localNeed;
+        const size_t pending = pendingLocalBytes(s->localNeed);
         size_t freeB = 0, totalB = 0;
-        if (cudaMemGetInfo(&freeB, &totalB) == cudaSuccess)
-            budget = std::min(std::max(totalB / 8, budget), (freeB > pending ? freeB - pending : 0) / 2);
-        else
+        if (cudaMemGetInfo(&freeB, &totalB) == cudaSuccess) {
+            const size_t floorB = budget;
+            if (freeB > pending) {
+                budget = std::min(std::max(totalB / 8, budget), (freeB - pending) / 2);
+                if (budget < floorB)
+                    std::printf("[mode U] the kernels' stacks (%zu MB, reserved at their first launch) leave "
+                                "the light-vertex store %zu MB of the %zu MB free\n",
+                                pending >> 20, budget >> 20, freeB >> 20);
+            } else {
+                // The stacks do not fit whatever the store takes (-device gpu past the preflight, or
+                // memory another program took since): they spill to host memory either way, so the
+                // store keeps half the free memory rather than shrink to one subpath a pass.
+                budget = std::min(std::max(totalB / 8, budget), freeB / 2);
+                std::fprintf(stderr, "[mode U] the kernels' stacks (%zu MB) exceed the %zu MB free: they "
+                                     "will spill to host memory, and the render crawl\n",
+                             pending >> 20, freeB >> 20);
+            }
+        } else {
             cudaGetLastError();
+        }
         // FTRACE_VCM_BUDGET_MB caps it, so a check can make a frame overflow on any card
         // (tools/check_vcm_store.py).
         if (const char* e = std::getenv("FTRACE_VCM_BUDGET_MB"))
@@ -6716,7 +6758,7 @@ VcmSession* vcmSessionBegin(const Scene& scene, const Camera& cam, int resX, int
         // The stacks are reserved at the kernels' first launch, after this, unless an earlier
         // launch's reservation already holds them; the sort's worst stays free too. (The grid's cell
         // table coarsens where the memory is short: vcmSessionPass.)
-        const size_t pending = (cudaLocalReservedBytes() >= s->localNeed) ? 0 : s->localNeed;
+        const size_t pending = pendingLocalBytes(s->localNeed);
         size_t freeB = 0, totalB = 0;
         if (cudaMemGetInfo(&freeB, &totalB) != cudaSuccess) { cudaGetLastError(); freeB = 0; }
         const size_t room = (freeB > pending + s->sortWorst) ? freeB - pending - s->sortWorst : 0;
@@ -6851,16 +6893,20 @@ void vcmSessionPass(VcmSession* s, double radius) {
         // bigger than the radius only adds candidates.
         // So do they where the device will not hold the table (the merges' queue takes its share of
         // the memory first): the pass renders, its merges weighing more candidates. The table takes
-        // no more than the memory free past what the passes must leave (VcmSession::sortWorst, past
-        // what the arena holds already, and localNeed until a launch has reserved it), the table it
-        // replaces counted free: the device refuses an allocation only once the card is full, and
-        // under WDDM not even then -- it pages.
-        size_t mostCells = SIZE_MAX;
-        {
+        // no more than the memory free past what the passes must leave -- VcmSession::sortWorst,
+        // past what the arena holds already, and of localNeed what a reservation of ours does not
+        // hold yet, the part already held having left the free memory -- the table it replaces
+        // counted free: the device refuses an allocation only once the card is full, and under
+        // WDDM not even then, it pages. Asked only where the table must grow.
+        size_t mostCells = 0;   // 0: not asked yet
+        const auto cellRoom = [&]() -> size_t {
+            if (mostCells) return mostCells;
+            mostCells = SIZE_MAX;
             size_t arenaHeld = 0;
             for (const ThrustArena::Block& blk : s->arena.blocks) arenaHeld += blk.cap;
+            const size_t held = cudaLocalReservedBytes();
             const size_t keep = (s->sortWorst > arenaHeld ? s->sortWorst - arenaHeld : 0) +
-                                (cudaLocalReservedBytes() >= s->localNeed ? 0 : s->localNeed);
+                                (s->localNeed > held ? s->localNeed - held : 0);
             size_t freeB = 0, totalB = 0;
             if (cudaMemGetInfo(&freeB, &totalB) == cudaSuccess) {
                 freeB += s->cellStartCap * sizeof(int);
@@ -6870,7 +6916,9 @@ void vcmSessionPass(VcmSession* s, double radius) {
             } else {
                 cudaGetLastError();
             }
-        }
+            return mostCells;
+        };
+        bool roomCoarsened = false;
         long long nCells = 0;
         for (int grow = 0;; ++grow) {
             gLo = DVec3(bb.mnx - cell * 0.5, bb.mny - cell * 0.5, bb.mnz - cell * 0.5);
@@ -6883,13 +6931,23 @@ void vcmSessionPass(VcmSession* s, double radius) {
                 cell *= std::cbrt((double)nCells / (double)kVcmMaxCells) * 1.01;
                 continue;
             }
-            if ((size_t)nCells + 1 <= mostCells &&
-                tryDevCap(s->d_cellStart, s->cellStartCap, (size_t)nCells + 1, mostCells)) break;
+            if ((size_t)nCells + 1 <= s->cellStartCap ||
+                ((size_t)nCells + 1 <= cellRoom() &&
+                 tryDevCap(s->d_cellStart, s->cellStartCap, (size_t)nCells + 1, cellRoom()))) break;
             if (nCells <= 1) {
                 std::fprintf(stderr, "[mode U] no room on the GPU for the merges' grid\n");
                 std::exit(EXIT_FAILURE);
             }
             cell *= 1.26;   // half the cells
+            roomCoarsened = true;
+        }
+        // Said once a session: a pass whose grid the memory coarsened weighs more candidates a site,
+        // which is slower, and otherwise silent.
+        if (roomCoarsened && !s->gridCoarseSaid) {
+            s->gridCoarseSaid = true;
+            std::printf("[mode U] the merges' grid coarsened to %lld cells (%.3g wide, the radius %.3g): the "
+                        "card holds no larger a table beside the sort's scratch and the kernels' stacks\n",
+                        nCells, cell, radius);
         }
         ensureDevCap(s->d_cellKey, s->cellKeyCap, nLV);
         ensureDevCap(s->d_order,   s->orderCap,   nLV);

@@ -65,13 +65,13 @@
   #else
     #define GGX_V _Pragma("nv_exec_check_disable")
   #endif
-  #define GGX_HD __host__ __device__ inline
+  #define GGX_HD __host__ __device__ static inline
   #define GGX_SQRT(x) ::sqrt(x)
   #define GGX_COS(x) ::cos(x)
   #define GGX_SIN(x) ::sin(x)
 #else
   #define GGX_V
-  #define GGX_HD inline
+  #define GGX_HD static inline
   #define GGX_SQRT(x) std::sqrt(x)
   #define GGX_COS(x) std::cos(x)
   #define GGX_SIN(x) std::sin(x)

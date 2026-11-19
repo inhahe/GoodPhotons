@@ -2592,12 +2592,14 @@ private:
     }
 
     // Combine two per-hit scalar patterns into one. Both spellings a pattern index can
-    // arrive from — the source slot of a property reference and the consumer's own
-    // `<slot>_map` — mean "a multiplier on whatever the slot otherwise evaluates to", so
-    // the composition of the two IS their product. Appending `[a…, b…, Mul]` is valid
-    // postfix because each program pushes exactly one value (the same invariant that
-    // makes §3.3's substitution a pure splice). Returns the surviving index when only
-    // one is real, so the common case allocates nothing.
+    // arrive from — the source slot of a property reference, a slot's own pattern, and the
+    // consumer's `<slot>_map` — mean "a multiplier on whatever the slot otherwise evaluates
+    // to", and a slot's multiplier is clamped to [0,1] (slotPatMul), so the composition is
+    // the product of the two clamped: two negative factors stay dark, and 4 times 0.25 is
+    // 0.25, not 1. Appending `[a…, Saturate, b…, Saturate, Mul]` is valid postfix because
+    // each program pushes exactly one value (the same invariant that makes §3.3's
+    // substitution a pure splice). Returns the surviving index when only one is real, so
+    // the common case allocates nothing.
     int composePatterns(int a, int b, Loaded& L) {
         if (a < 0) return b;
         if (b < 0) return a;
@@ -2605,9 +2607,12 @@ private:
         Pattern np;
         const std::vector<PatNode>& pa = L.scene.patterns[a].nodes;
         const std::vector<PatNode>& pb = L.scene.patterns[b].nodes;
-        np.nodes.reserve(pa.size() + pb.size() + 1);
+        np.nodes.reserve(pa.size() + pb.size() + 3);
+        PatNode sat; sat.op = PatOp::Saturate;
         np.nodes.insert(np.nodes.end(), pa.begin(), pa.end());
+        np.nodes.push_back(sat);
         np.nodes.insert(np.nodes.end(), pb.begin(), pb.end());
+        np.nodes.push_back(sat);
         PatNode mul; mul.op = PatOp::Mul;
         np.nodes.push_back(mul);
         int id = (int)L.scene.patterns.size();
