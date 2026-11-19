@@ -33,7 +33,8 @@ inline VcmLattice<S> vcmLattice(const double mn[3], const double mx[3], double c
     for (;;) {
         for (int a = 0; a < 3; ++a) {
             g.lo[a] = (S)(mn[a] - cell * 0.5);
-            const S ext = (S)(mx[a] - (double)g.lo[a] + cell * 0.5);
+            // the far side less the corner in S, as a float grid has always subtracted them
+            const S ext = (S)((double)((S)mx[a] - g.lo[a]) + cell * 0.5);
             g.n[a] = std::max(1, (int)std::ceil(std::min((double)ext / cell, 2e6)));
         }
         g.cell = cell;

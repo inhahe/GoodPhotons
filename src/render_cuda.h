@@ -51,6 +51,9 @@ struct GpuRoute {
 // orders of magnitude slower at 100% reported utilisation -- see main.cpp's vramPreflight. Returns
 // 0 for "unknown" (no device, or an empty route), which callers treat as no opinion, not as free.
 size_t cudaRouteLocalBytes(const GpuRoute& r);
+// The headroom the preflight keeps beside a render's kernels and buffers for the scene upload and the
+// driver's own context, and a session sizing a buffer from the free memory keeps too.
+constexpr size_t kVramHeadroomBytes = (size_t)256 * 1024 * 1024;
 // The forward photon walk (modes A, B, C, V, mode P's forward layer, a shared flight of `nCam`
 // cameras gathering photon beams by `beamGather`): the megakernel, or the wavefront's three kernels
 // where `wavefront` (-wavefront) is asked and nothing keeps the megakernel -- the hero bundle the
@@ -485,7 +488,12 @@ const char* cudaBlurUnsupported(const Scene& scene, const Camera& cam, char mode
 // renderForwardCuda will run (`wavefront` asked, `heroC` the hero bundle asked): one a thread of
 // the megakernel's grid, or one a slot of the wavefront's pool for an N-photon trace -- for the
 // VRAM preflight.
-size_t cudaForwardPosedCameraBytes(const Scene& scene, bool wavefront, int heroC, long long N);
+size_t cudaForwardPosedCameraBytes(const Scene& scene, bool wavefront, int heroC, long long N,
+                                   bool stableSeed = false);
+// Device memory the wavefront backend's photon pool takes for an N-photon trace, where the forward
+// walk runs there (cudaForwardRunsWavefront's arguments), else 0 -- for the VRAM preflight.
+size_t cudaForwardWavefrontBytes(const Scene& scene, bool wavefront, int heroC, long long N,
+                                 bool beamGather = false, int nCam = 1);
 // The same for a blurred shared forward flight of `nCam` cameras (sharedForwardGpuBegin's arguments)
 // whose set moves: every camera a thread, sized once for the session's largest batch.
 size_t cudaSharedFlightPosedBytes(const Scene& scene, int nCam, bool wavefront, int heroC, bool beamGather);

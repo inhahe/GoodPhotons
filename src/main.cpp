@@ -15517,6 +15517,8 @@ static bool pBackwardOnGpu(const Scene& scene, const Camera& cam) {
 static bool rRunsRgb(const Scene& scene, const Camera& cam, bool rgbBackward) {
     return rgbBackward && !g_whitted && cudaBackwardRGBSupported(scene, cam);
 }
+#else
+static bool pBackwardOnGpu(const Scene&, const Camera&) { return false; }   // no device to take
 #endif
 
 // Mode W lights a surface ONLY by next-event estimation, and a shadow ray is blocked by
@@ -20320,7 +20322,7 @@ static bool vramPreflight(char m, const GpuRoute& route, size_t buffers, size_t 
         freeB = std::min(freeB, (size_t)(std::max(0.0, std::atof(e)) * 1024.0 * 1024.0 * 1024.0));
     // Headroom on top of the local-memory reservation and the buffers for the scene upload and
     // the driver's own context: 256 MB covers them with room to spare.
-    const size_t needAll = needLocal - reused + buffers + (size_t)256 * 1024 * 1024;
+    const size_t needAll = needLocal - reused + buffers + kVramHeadroomBytes;
     const double toGB = 1.0 / (1024.0 * 1024.0 * 1024.0);
     // Always say what the card looks like. This one line is what turns "the render
     // is mysteriously hung" into "something else is holding 20 of my 24 GB", which
@@ -20345,9 +20347,10 @@ static bool vramPreflight(char m, const GpuRoute& route, size_t buffers, size_t 
     // the near-full test, which is about OTHER programs, adds all of it back.
     const bool tooTight = freeB + heldScene < needAll;
     const bool nearFull = totalB && (double)(freeB + ours) < 0.12 * (double)totalB;
-    // The render's own need past what the whole card holds: no other program is to blame, and
-    // forcing the card cannot make it fit.
-    const bool ownTooBig = totalB && needAll > totalB;
+    // The render's own need past what the whole card holds -- its stacks counted whether or not
+    // this process holds them already: no other program is to blame, and forcing the card cannot
+    // make it fit.
+    const bool ownTooBig = totalB && needLocal + buffers + kVramHeadroomBytes > totalB;
     if (tooTight || nearFull) {
         std::fprintf(stderr,
             "[device] NOT ENOUGH FREE VRAM for the GPU path (%s): the mode-%c "
@@ -20368,8 +20371,8 @@ static bool vramPreflight(char m, const GpuRoute& route, size_t buffers, size_t 
         if (!forced) return false;        // `auto`: fall back, which is the whole point
         std::fprintf(stderr, ownTooBig
             ? "[device] -device gpu given explicitly; proceeding anyway, though the card cannot "
-              "hold it: a buffer it cannot allocate sends that part to the CPU, and the rest may "
-              "appear hung.\n"
+              "hold it: the render will likely stop where a buffer cannot be allocated, or page "
+              "and appear hung.\n"
             : "[device] -device gpu given explicitly; proceeding anyway. Expect the render to "
               "appear hung.\n");
     }
@@ -20701,15 +20704,16 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
             else
                 batch->releaseHold();
         }
-        // The forward walk's backend, where -wavefront asks for it: mode P's layers trace with a
-        // stable seed, which keeps them on the megakernel (launchForward).
-        const bool wfAsked = wavefront && m != 'P';
-        // The film pair (two double3 images), and a blurred forward render of a moving camera's
-        // posed copy of it, one a thread; mode S's session keeps its own state a pixel instead.
+        // The film pair (two double3 images), a blurred forward render of a moving camera's posed
+        // copy of it, one a thread, and the wavefront's photon pool where the walk runs there --
+        // mode P's layers trace with a stable seed, which keeps them on the megakernel; mode S's
+        // session keeps its own state a pixel instead.
         const size_t film   = (m == 'S') ? (size_t)res * resY * cudaSppmPixelBytes()
                             : (size_t)res * resY * 3 * sizeof(double) * 2 +
                               ((gpuForwardMode && cam.seesMotion(scene) && cam.moves())
-                                   ? cudaForwardPosedCameraBytes(scene, wfAsked, g_heroC, N) : 0);
+                                   ? cudaForwardPosedCameraBytes(scene, wavefront, g_heroC, N, m == 'P') : 0) +
+                              ((gpuForwardMode && m != 'P')
+                                   ? cudaForwardWavefrontBytes(scene, wavefront, g_heroC, N) : 0);
         // Mode J's beams, through a medium, and its beam queue, allocated beside the kernel once the
         // render starts.
         const bool jBeams = m == 'J' && jBeamsChoice().rule != JBeams::Off && !scene.media.empty();
@@ -20728,7 +20732,7 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
                 route = cudaForwardRoute(scene, wavefront, g_heroC, false, 1, /*stableSeed*/true);
                 if (pBackwardOnGpu(scene, cam)) route += cudaBackwardRoute(false);
                 break;
-            default: route = cudaForwardRoute(scene, wfAsked, g_heroC); break;   // A, B, C, V
+            default: route = cudaForwardRoute(scene, wavefront, g_heroC); break;   // A, B, C, V
         }
         return vramPreflight(m, route, film + queues, heldScene, wantGpu);
     };
@@ -29567,8 +29571,9 @@ static int run(int argc, char** argv) {
     }
 #endif
     (void)mGpuOk;   // read only by the device routes (HAVE_CUDA): keep CPU-only builds warning-clean
-    // The instantiation a D or J meter frame launches: what meterAffords weighs and both its BDPT
-    // calls below (device and host) render, one name so that they cannot part.
+    // The instantiation a D or J meter frame launches: kMeterBdptDepth what meterAffords weighs and
+    // both its BDPT calls below render, kMeterBdptHeroC the device call's bundle, which meterAffords
+    // weighs (the host's renderBdpt carries the render's own, -heroc's).
     constexpr int kMeterBdptDepth = 8, kMeterBdptHeroC = 1;
     (void)kMeterBdptHeroC;   // read only by the device routes
 #ifdef HAVE_CUDA
@@ -29716,14 +29721,14 @@ static int run(int argc, char** argv) {
                 EnergyReport e;
                 Film fwd = renderForward(scene, &mc.cam, W, H, meterN, nThreads,
                                          false, false, true, e, diffraction,
-                                         fwdOnDevice(backwardOnGpuOk(scene, mc.cam) ? 'P' : 'B'));
+                                         fwdOnDevice(pBackwardOnGpu(scene, mc.cam) ? 'P' : 'B'));
                 SkyView glowView;   // the glows the camera sees, as the render's compose adds them
                 const bool glows = scene.glowAny &&
                                    prepareSky(glowView, scene, mc.cam, W, H, meterN, /*glowsOnly=*/true);
                 Film ref;
                 bool refGpu = false;
 #ifdef HAVE_CUDA
-                if (onDevice && backwardOnGpuOk(scene, mc.cam) && meterAffords('P', W, H, posed)) {
+                if (onDevice && pBackwardOnGpu(scene, mc.cam) && meterAffords('P', W, H, posed)) {
                     ref = renderBackwardCuda(scene, mc.cam, W, H, meterSpp, diffraction, nullptr,
                                              g_maxBounceOverride, g_directOnly, g_heroC);
                     refGpu = true;
@@ -30170,8 +30175,8 @@ static int run(int argc, char** argv) {
             }
         }
         // The card's room for the flight (vramPreflight): its kernels, every camera's film and hit
-        // map, which the device holds the whole flight, and under a blur of a moving camera every
-        // camera's posed copies (sharedForwardGpuBegin).
+        // map, which the device holds the whole flight, under a blur of a moving camera every
+        // camera's posed copies (sharedForwardGpuBegin), and on the wavefront its photon pool.
         if (groupGpu) {
             size_t films = 0;
             for (int c = 0; c < nc; ++c) films += (size_t)rxs[c] * rys[c] * 4 * sizeof(double);
@@ -30179,6 +30184,7 @@ static int run(int argc, char** argv) {
                 return c.seesMotion(scene) && c.moves();
             });
             if (setMoves) films += cudaSharedFlightPosedBytes(scene, nc, wavefront, g_heroC, g_beamGather);
+            films += cudaForwardWavefrontBytes(scene, wavefront, g_heroC, 1ll << 40, g_beamGather, nc);
             groupGpu = vramPreflight(groupMode, cudaForwardRoute(scene, wavefront, g_heroC, g_beamGather, nc),
                                      films, 0, !std::strcmp(device, "gpu"));
         }

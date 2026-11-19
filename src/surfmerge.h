@@ -256,8 +256,7 @@ struct SurfMap {
         // (through `maxCells`) decides how many cells there are. Name it, so an OOM says
         // which knob to turn instead of "bad allocation" between two progress lines.
         cellStart.clear();
-        ftalloc::resize(cellStart, (size_t)nCells + 1, "the surface-merge grid", "-jsurf-radius");
-        std::fill(cellStart.begin(), cellStart.end(), 0);
+        ftalloc::resize(cellStart, (size_t)nCells + 1, "the surface-merge grid", "-jsurf-radius", "Raise");   // zeroed
         for (size_t i = 0; i < n; ++i) {
             long long ix, iy, iz; cellCoord(pts[i].p, ix, iy, iz);
             const long long c = cellIndex(ix, iy, iz);

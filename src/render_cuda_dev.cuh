@@ -15668,8 +15668,7 @@ struct DVertexLobe {
     // A translucent lobe's two albedos (dDiffuseTransmitAlbedos) at rhoLam, which every direction
     // shares: read again only at another wavelength. One slot, and no field the lobe can do
     // without: a lobe sits in the stack frame of every site that inlines one, so each byte here is
-    // some thirty in kBdptT's and the mode-U kernels' stacks (36 more, a second slot, were ~1 KB a
-    // thread there, and mode U some 12 % slower).
+    // some thirty in kBdptT's and the mode-U kernels' stacks.
     Real rhoLam = (Real)-1;
     double rhoR = 0.0, rhoT = 0.0;
     __device__ DVertexLobe(const DScene& sc_, const DVertex& vt_, const DVec3& wo_, bool now = false)

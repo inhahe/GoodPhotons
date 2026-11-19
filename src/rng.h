@@ -1,5 +1,6 @@
 // PCG32 RNG + sampling helpers. Small state -> trivially GPU-portable later.
 #pragma once
+#include "unit_linkage.h"   // FT_UNIT_INLINE (goldenFrac)
 #include <cstdint>
 #include "linalg.h"
 
@@ -186,7 +187,7 @@ inline double passTime(uint64_t k, uint64_t salt) {
 #ifdef __CUDACC__
 __host__ __device__
 #endif
-inline double goldenFrac(uint64_t k) {
+FT_UNIT_INLINE double goldenFrac(uint64_t k) {
     return (double)((k * 0x9E3779B97F4A7C15ULL) >> 11) * (1.0 / 9007199254740992.0);
 }
 

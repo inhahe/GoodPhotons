@@ -5611,7 +5611,8 @@ happened to load first. A name the library cannot find where its directory is in
 place (a copy of `ftrace.exe` run elsewhere) says so — `unknown glass 'BK7': the spectral
 library's data/glass is in neither the working directory nor the executable's` — rather than
 reading as a misspelling; so do `metal:`, `reflectance:`, `filter:`, `preset:` (data/light and
-data/illuminant) and `-light` (since 0.450.15).
+data/illuminant) and `-light` (since 0.450.15), and a material's `preset` (data/material) and a
+library bundle's own references (since 0.450.17).
 
 ### Conditional blocks (`prefer { … } else { … }`)
 

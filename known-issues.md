@@ -201,6 +201,48 @@ to 0.25 renders as a 150 nm one within 2e-3, 1.0e-3 measured (its body's escape 
 on 0.450.1 it rendered as the unmapped 600 nm, 1.9 off), the `thinfilm` control byte for byte, and
 the three misspellings stop the load (on 0.450.1 they loaded).
 
+## DONE (2026-11-19, 0.450.17): REVIEW-0450G — what the Opus (max) and Fable (xhigh) reviews of 0.450.15-0.450.16 found
+
+`/code-review max` (Opus, 15 findings) and `/code-review xhigh` (Fable, 15) of f8d518b..2816cd6, one
+after the other in a worktree; nine found by both. Each checked against the code. **Fixed:**
+
+* **`FT_UNIT_INLINE` and the host noise tables chose their linkage by `__CUDA_ARCH__`** (Fable), which
+  NVIDIA's rules for separate compilation forbid: a definition with external linkage must not be
+  present in one pass and absent in the other. Keyed by the unit again (`FT_FAMILY_TU`, the same in
+  both passes), the tables `static const` -- their host ODR nit (REVIEW-0450F) stays, being the
+  lesser; and `curvature.h`'s and `rng.h`'s device helpers, which the sweep missed, take it too.
+
+* **Mode J's route dropped the plain kernel** its launcher falls back to where the maps come out empty
+  (an under-count, the dangerous direction): the route holds it beside the merge instantiation.
+* **The routes were still a hand copy of the BDPT launch ladder**: renderBdptCuda launches through
+  `bdptKernelFor(pick, merge, strat)`, one typed kernel pointer, which the route weighs too; the
+  STRAT variant is listed only under `FTRACE_WFSTRAT` (`wfStratOn`, which the launcher reads as
+  well), -jsurf's light pass only where the device runs it, its gather only where it queues
+  (`surfGatherQueued`).
+* **The wavefront's photon pool was counted nowhere**: the preflight adds it where a forward render
+  or flight runs the wavefront (`cudaForwardWavefrontBytes`, sized beside the allocations it
+  mirrors), the flight session sets it aside, and the 256 MB headroom is one constant.
+* **Mode P's posed cameras rested on a caller's special case** (`m != 'P'`): the stable seed is an
+  argument of `cudaForwardPosedCameraBytes`; the meter's P frame decides its camera-side layers by
+  `pBackwardOnGpu` too. That call also broke a CPU-only build (found fixing it): a host stub.
+* **The shared lattice subtracted in double** where the float device grid subtracted in float: in
+  the corner's own scalar again, so a box at a float ulp's edge rounds as before.
+* **The too-big test left out a stack reservation already held** (Fable): a render too big for the
+  card was blamed on another program once this process held its stacks. **The grids' OOM message
+  said lower the radius**, which grows them (Fable): `ftalloc::reportOom` takes the direction.
+  **check_preset_library deleted whatever `--out` named** (Fable): only a directory it made. **The
+  scanner never closed a top-level block** (Fable): a 35th case, which HEAD's scanner fails.
+* **check_device_linkage exited 1 on a cuobjdump failure** under `--warn-only`, failing a build that
+  linked (both); **VcmGrid and SurfMap zeroed their tables twice**; **the forced too-big message** promised
+  a CPU fallback most buffers lack; **the library note** reached neither the library's own reference
+  errors (`glass:`... in a bundle) nor `unknown material preset`; **the meter's heroC comment** claimed
+  the host call shares it; two comments narrated history; the noise header's "static const".
+
+**Not changed.** The scanner's per-character regex (Opus): guarded to the four characters it can
+start on, but the scan's ~2 s is Python's loop, not the regex. The flight gate's headroom asked
+after the scene and films are resident (Opus): stricter than the preflight by the scene's upload,
+the conservative direction.
+
 ## DONE (2026-11-19, 0.450.16): PREFLIGHT-ROUTE-PLAN — the VRAM preflight re-derives which kernels each launcher runs
 
 **Done.** The preflight weighs routes (render_cuda.h, `GpuRoute`): each lists the kernels its
@@ -1879,6 +1921,20 @@ build had run the machine out of commit an hour before: `[cuda] forward kernel f
 launch failure`, exit 0xC0000409, after about an hour (under the same load, a rerun traces at about
 45 k photons a second and the card holds 10 of 24 GB, so memory was not short). Three times now, the forward photon kernel, each time beside another GPU process; a rerun
 of the exact command on 0.450.9 beside two other GPU processes is in progress.
+
+**A fourth time, on 0.450.15 (2026-11-19), and now as a memory fault**: check_coat_modes' GPU mode S
+on its `partial` scene (`partial.ftsl -device gpu -seed 3 -hdr -spp 256 -mode S -n 2000000`), run
+from a sweep while paired timings rendered modes R, B, M on the GPU from another process, printed
+`[cuda] forward kernel failed: an illegal memory access was encountered` at pass ~84 of 256 (46 s
+in) and exited 0xC0000409. The earlier three said "unspecified launch failure"; this one names an
+out-of-bounds access, in the same kernel (launchForward's photon walk, here mode S's deposit), and
+again only beside another process's GPU work. One hypothesis fits all four: the photon buffers of
+modes M and S are sized from the card's free memory, which another process shrinks, so the
+deposit's overflow path (count past capacity, regrow, rerun) runs only under contention -- read that
+path for a write past `depCap` first, then rerun the command alone with the buffer forced small.
+Read since: `depositPhoton` counts every photon and writes only those under `depCap`, and the host
+regrows by checked allocations, so the deposit's own bounds hold; the fault is elsewhere in the
+walk, and the next step is a reproduction, alone and beside a GPU load, under memcheck.
 
 ## OPEN (2026-11-04, 0.433.6): CURVE-CAUSTIC — modes M and S light a `type diffuse` strand only by NEE and its diffuse continuation, so a caustic from a point or spot light misses it
 
@@ -6138,7 +6194,25 @@ in the first draws off a fresh generator, at the resolution of a 2000-cell table
 self-test's kernel seeds the same way, so `check_rainbow_sampler.py` guards it: a build whose
 `seedUnit` seeds from the raw index fails at 501.25 and 650 nm (chi^2/dof 1.270, 1.327).
 
-## OPEN (2026-10-14, tech debt): GPU-STACK-DRIFT — every kernel's stack reservation moves when unrelated device code changes
+## OPEN (2026-11-19): J-NOSPLIT — mode J renders 16 % slower built without `--split-compile`
+
+Dropping `--split-compile` (GPU-STACK-DRIFT, 0.450.17) made modes R, D and U 12-24 % faster and mode
+J 16 % slower (cornell / _fog_cornell, idle card, three pairs: J 19.2 -> 22.3 s). The builds are
+deterministic now, so this can be chased: compare the merge instantiations' registers and stacks
+(`cuobjdump -res-usage`, kBdptT<0,8,true,false> and the jsurf kernels) between the two builds, and
+see which of mode J's kernels lost time (its passes' own timings), then pin that kernel's inlining
+or its unit's cap. The other modes are not to be given back for it.
+
+## DONE (2026-11-19, 0.450.17; opened 2026-10-14, tech debt): GPU-STACK-DRIFT — every kernel's stack reservation moves when unrelated device code changes
+
+**Settled.** `--split-compile` was the nondeterminism: render_cuda_bdpt.cu compiled twice with it
+from one source gave two functions different register counts (dTrDet 116 / 160, dMergeGeo 146 /
+168); compiled twice without it, every function's resources were alike. Dropped in 0.450.17
+(CMakeLists.txt has the measurements). A device change still moves other kernels' stacks through
+ordinary inlining, but a build is now repeatable, so its effect can be measured.
+
+**The entry as filed:**
+
 
 Each megakernel reserves its per-thread stack (`cudaFuncAttributes::localSizeBytes`, the
 `[vram] mode-X kernel wants N GB local` line) times ~262 k resident threads of VRAM, and that

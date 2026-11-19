@@ -2477,8 +2477,7 @@ __device__ static void dVcmMergeSum(const DScene& sc, const DVcmCtx& ctx, const 
     // Its own lobe, prepared now: a site here holds vertices (the camera kernel counts them first),
     // and a warp's lanes then read the hit once, together, rather than each at its own first
     // candidate. Never a caller's lobe by reference: a lobe whose address leaves its kernel for a
-    // call ptxas keeps out of line lives in local memory there, every query of it a load (the
-    // camera kernel's camLobe so taken cost mode U ~10 %).
+    // call ptxas keeps out of line lives in local memory there, every query of it a load.
     DVertexLobe lobe(sc, vt, wo, true);
     dSiteListWalk([&](int n, int& b, int& e) { site.cell(grid, n, b, e); }, lane, lanes, [&](int k) {
         const DVcmLV& lv = grid.byCell[k];

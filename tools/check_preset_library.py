@@ -15,7 +15,8 @@ resolvePreset). The copy runs from a scratch directory holding:
   - and the repository's own binary, from the repository: a misspelt `preset:daylite` is a plain
     "unknown preset" too, and `preset:daylight` loads.
 
-Exits 1 on any failure; the scratch directory, the copy included, is deleted at the end.
+Exits 1 on any failure; the scratch directory (--out: one this check made, or a new one -- any other
+is refused), the copy included, is deleted at the end.
 """
 import argparse
 import os
@@ -39,8 +40,15 @@ def main():
     ap.add_argument("--out", default=os.path.join(ROOT, "scraps", "check_preset_library"))
     a = ap.parse_args()
     exe, d = os.path.abspath(a.exe), os.path.abspath(a.out)
+    # The scratch directory is emptied before and deleted after, so only one this check made -- marked
+    # as its own -- is ever deleted; any other existing directory is refused, not emptied.
+    mark = os.path.join(d, ".check_preset_library")
+    if os.path.isdir(d) and os.listdir(d) and not os.path.exists(mark):
+        print("--out %s exists and is not this check's scratch directory: name a new one" % d)
+        return 1
     shutil.rmtree(d, ignore_errors=True)
     os.makedirs(d)
+    open(mark, "w").close()
     copy = os.path.join(d, "ftrace.exe")
     shutil.copy2(exe, copy)
     fails = []

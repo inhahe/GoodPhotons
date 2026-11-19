@@ -412,6 +412,11 @@ Then the rest of 4.2-4.6 in their order, 4.7's bookkeeping alongside whatever to
   wavelength; byte for byte 0.450.4's images. 640x480 bowl: gather 43.4 -> 15.7 s; Nsight 10.5 -> 1.5
   G local requests, 26.6 -> 15.6 G FP64. Its four pattern readers forced inline, which made mode D
   1.75x faster too (0.450.4 had dGlossyF out of line at 168 registers).
+- [x] **REVIEW-0450G** (0.450.17) — the Opus (max) and Fable (xhigh) reviews of 0.450.15-0.450.16:
+  `FT_UNIT_INLINE` keyed by the unit again (separate compilation forbids `__CUDA_ARCH__` there),
+  renderBdptCuda launching through the route's own kernel pointer, mode J's fallback weighed, the
+  wavefront pool counted, the lattice's float rounding, and the gates' and messages' slips;
+  known-issues REVIEW-0450G.
 - [x] **PREFLIGHT-ROUTE-PLAN** (0.450.16) — the preflight weighs routes, each the kernels its launcher
   will run from the launcher's own decision (render_cuda.h `GpuRoute`); mode P's camera-side layers
   and `-rgb` weighed as they run; known-issues.
@@ -635,9 +640,10 @@ Then the rest of 4.2-4.6 in their order, 4.7's bookkeeping alongside whatever to
 - [x] **REMAP0-IMPOSSIBLE** (0.439.7) — the MIS sums read a zero density as a delta's, whatever
   made it zero (only the sun's was special-cased).
 
-- [ ] **GPU-STACK-DRIFT** — every kernel's stack reservation moves when unrelated device code changes,
-  and with none (2026-11-19: the device build is not deterministic; mode D's speed moved 11 % between
-  two builds of one source): settle `--split-compile`'s part, builds compared byte for byte.
+- [x] **GPU-STACK-DRIFT** (0.450.17) — `--split-compile` made the device build nondeterministic (mode D 11 %
+  between two builds of one source); dropped: repeatable builds, R/D/U 12-24 % faster.
+- [ ] **J-NOSPLIT** — mode J renders 16 % slower without `--split-compile`: find the kernel that lost
+  it (now measurable) and pin its inlining or cap; known-issues.
 - [ ] **SLAB-DDA-COPIES** — the box clip and the grid walk are written out several times.
 - [x] **GMIS-NULL-BY-HAND** (0.450.15) — one pass-through restore a walk: the scalar walks' interaction
   functions, one `passedThrough` per hero loop (the device's three sites folded), each mode-M walk's

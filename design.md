@@ -2827,8 +2827,8 @@ camera-side layers run on the device, kBackward, and a mode-S frame is charged i
 (`cudaSppmPixelBytes`, ~200 B) rather than a film pair. A
 meter frame asks after its own support tests, so one bound for the CPU anyway prints no verdict,
 and for the instantiation it launches (`meterAffords`, once a kernel set and frame size): a D or J
-frame meters with kBdptT scalar at depth 8 whatever the render's `-heroc` and `-max-bounce`, which
-`vramPreflight`'s `maxDepth` and `heroC` name. A buffer a session sizes from the free memory
+frame meters on the device with kBdptT at `kMeterBdptDepth` (8) and `kMeterBdptHeroC` (scalar)
+whatever the render's `-heroc` and `-max-bounce`, its route built from those. A buffer a session sizes from the free memory
 before its kernels' first launch -- mode U's light-vertex store and cell table, mode M's and mode
 S's photon deposits -- sets those kernels' stacks aside first (`pendingLocalBytes`, by the rule
 above: none where the reservation already holds them, all of them where it must grow); where they
@@ -12843,7 +12843,10 @@ Two deliberate scoping decisions:
 - **Engine data does not consult the scene directory** (`speclib::categoryDir`). `speclib::index()`
   caches a name→path map per category for the process lifetime, so a scene-dependent answer
   there would be frozen at whichever scene happened to load first. It tries cwd, then the
-  executable's directory, both of which are process-constant.
+  executable's directory, both of which are process-constant. A lookup that finds no name where
+  its category's directory is in neither place says so (`speclib::missingLibraryNote`: the
+  library references, `preset:`, `-light`, material presets), rather than read as a misspelling;
+  `tools/check_preset_library.py` runs a copy of the binary where the directories are missing.
 
 `assetbytes::readFile` resolves internally, so every loader reading bytes through it
 (OBJ/PLY/STL/`.ftmesh`) inherits the policy without a call site. The loaders that open files
@@ -13296,9 +13299,11 @@ runs its own cases first (exit 2 where the scanner itself is wrong), and runs af
   that recompiles only `render_cuda.cu` is ~3:37 through MSBuild — CudaCompile 174 s, host
   link 30 s, device link 6 s — so the build system adds ~40 s and the rest is nvcc on one
   18k-line TU, whose optimiser (`cicc`) and assembler (`ptxas`) are single-threaded per TU.
-  Three changes: (1) `--split-compile=0` partitions that TU's device code across all cores
-  (ptxas 52.6 → 21.1 s, cicc 64.3 → 43.2 s, the TU 2:49 → 1:50; codegen checked by a render
-  speed A/B); (2) `/MP` for the host TUs, which only matters on a full rebuild; (3) the
+  Three changes: (1) `--split-compile=0` partitioned that TU's device code across all cores
+  (ptxas 52.6 → 21.1 s, cicc 64.3 → 43.2 s, the TU 2:49 → 1:50) -- dropped in 0.450.17: its
+  partitioning made the device code depend on the run, so no two builds could be compared, and
+  without it the code is the same every time and modes R, D and U render 12-24 % faster (J 16 %
+  slower, J-NOSPLIT; CMakeLists.txt has the numbers); (2) `/MP` for the host TUs, which only matters on a full rebuild; (3) the
   version string moved into `src/version.cpp`, the only TU with `FTRACE_VERSION` defined —
   it used to be target-wide, so every `VERSION` bump rebuilt *everything*, which is what
   made the "15-minute builds" of 2026-09-06: bumps plus foreign CPU load, not the compiler.
@@ -13328,10 +13333,13 @@ runs its own cases first (exit 2 where the scanner itself is wrong), and runs af
   uncapped copy, or the other capped unit's, held to its cap -- so the link could again refuse
   after an edit there (the shared headers' host-and-device helpers -- `ggx.h`, `bluenoise.h`,
   `pov_noise.h`, `pov_functions.h`, `pattern.h`, `stochtile.h`, `worley.h`, `gabor.h`,
-  `lighttree.h`, `gatherplane.h`, `photonmap.h`, `lens.h` -- are `FT_UNIT_INLINE`, `unit_linkage.h`: `static` in
-  every device pass, plain `inline` in every host pass, so that a host TU's external inline caller
-  means one function everywhere -- `static` for all, as 0.450.10 had it, broke the host's ODR; the
-  generators of the two POV headers emit it. A struct with member functions goes in an unnamed
+  `lighttree.h`, `gatherplane.h`, `photonmap.h`, `lens.h`, `curvature.h`, `rng.h` -- are
+  `FT_UNIT_INLINE`, `unit_linkage.h`: `static` in a capped unit, plain `inline` in every other, so
+  that a host TU's external inline caller means one function everywhere -- `static` for all, as
+  0.450.10 had it, broke the host's ODR -- and keyed by the unit, the same in its host and device
+  passes, because under separate compilation a definition with external linkage must not be
+  present in one pass and absent in the other (`__CUDA_ARCH__` chose it in 0.450.15, which that
+  rule forbids); the generators of the two POV headers emit it. A struct with member functions goes in an unnamed
   namespace, as `DVertexLobe` did in 0.450.11 when its `pdf` bound kJSurfLightT to render_cuda.cu's
   `dMatRoughness` at 252 registers -- all but those the units share, a kernel's parameter, a device
   global, a field or member's return type of either, a type the host uploads (`DVec3`, `DCamera`,
@@ -13353,7 +13361,8 @@ runs its own cases first (exit 2 where the scanner itself is wrong), and runs af
   The build itself (CMakeLists.txt, POST_BUILD, whatever drives it) runs two gates after every
   link, warning rather than failing: `tools/check_rng_args.py` and, with the CUDA backend,
   `tools/check_device_linkage.py` on the target's objects (`$<TARGET_OBJECTS:ftrace>`); a link
-  that fails runs no post-build step, so build.bat's failure branch runs the linkage check itself.
+  that fails runs no post-build step, so run the linkage check by hand then, on the objects it
+  left, to name the function behind the refusal (this machine's local build.bat does).
   The "freshly-configured build dirs produce a GPU-silently-dead exe" problem (known-issues,
   2026-07-22 and 2026-08-16) was MSVC 14.5x's float `copysign` returning 0 in nvcc's device pass,
   fixed in `render_cuda.cu` in 0.385.0; the probe exists because that class of bug -- a host-header

@@ -12,7 +12,7 @@
 //
 // Storage: under nvcc device passes the tables live in ordinary device GLOBAL
 // memory (__device__), so they are not subject to the 64 KB constant-memory
-// limit.  On the host (and nvcc host pass) they are plain static const.  The
+// limit.  On the host (and nvcc host pass) they are static const.  The
 // single povNoise() body reads whichever is in scope for the current pass.
 #pragma once
 #include "unit_linkage.h"   // FT_UNIT_INLINE
@@ -32,7 +32,7 @@
 #ifdef __CUDA_ARCH__
   #define POVN_MEM __device__ const
 #else
-  #define POVN_MEM inline const   // one table across the host's units, as its readers are one
+  #define POVN_MEM static const
 #endif
 
 // ---- baked tables -----------------------------------------------------------

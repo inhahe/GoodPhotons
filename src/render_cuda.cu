@@ -2320,6 +2320,16 @@ static int forwardHeroC(int heroC, bool media, bool grin) {
 static bool forwardRunsWavefront(bool wavefront, int effHeroC, bool beams, bool stableSeed) {
     return wavefront && effHeroC == 1 && !beams && !stableSeed;
 }
+// The device memory the wavefront's SoA photon pool takes for an N-photon trace: a slot's arrays,
+// one term each, as wavefrontTrace allocates them below.
+static size_t wavefrontPoolBytes(long long N) {
+    using namespace gpu;
+    const size_t slot = 2 * sizeof(DVec3) + 2 * sizeof(Real) + sizeof(DRng) + 2 * sizeof(int) +
+                        2 * DMediumStack::CAP * sizeof(int) + sizeof(int) + sizeof(DHit) + sizeof(int) +
+                        sizeof(Real) + sizeof(DPathCaustic) + sizeof(Real) + sizeof(float);
+    return (size_t)wavefrontSlots(N) * slot;
+}
+
 // Host driver for the wavefront backend. Allocates the SoA photon pool, seeds it, then
 // runs extend/shade passes until every slot has drained the N-photon budget. Writes into
 // the same d_film / d_hits / d_energy buffers as the megakernel path.
@@ -2595,21 +2605,23 @@ SharedGpuSession* sharedForwardGpuBegin(const Scene& scene,
     // photon's time, a buffer of threads x cameras that a big flight can make larger than the card
     // has free. Made once for the session, here, where the flight can still fly on the CPU, by the
     // preflight's own rule (vramPreflight, which counted it: cudaSharedFlightPosedBytes): the walk's
-    // stacks, reserved at its first launch, after this, set aside, and 256 MB of headroom kept.
+    // stacks, reserved at its first launch, after this, set aside, and its headroom kept.
     if (s->cs.camMoves) {
         const size_t needB = cudaSharedFlightPosedBytes(scene, nc, wavefront, heroC, beamGather);
         size_t freeB = 0, totalB = 0;
         cudaMemGetInfo(&freeB, &totalB);
         const size_t pending = pendingLocalBytes(cudaRouteLocalBytes(
             cudaForwardRoute(scene, wavefront, heroC, beamGather, nc)));
-        const size_t headroom = (size_t)256 * 1024 * 1024;
-        const size_t room = (freeB > pending + headroom) ? freeB - pending - headroom : 0;
+        // ...and the wavefront's photon pool, which each batch allocates beside it.
+        const size_t keep = pending + kVramHeadroomBytes +
+                            cudaForwardWavefrontBytes(scene, wavefront, heroC, 1ll << 40, beamGather, nc);
+        const size_t room = (freeB > keep) ? freeB - keep : 0;
         if (needB > room || cudaMalloc(&s->d_posed, needB) != cudaSuccess) {
             cudaGetLastError();
             s->d_posed = nullptr;
             std::fprintf(stderr, "[device] a blurred shared flight poses its %d cameras at each photon's time in "
                                  "%.2f GB of device memory, more than the %.2f GB free beside the walk's "
-                                 "stacks and the headroom; using CPU\n",
+                                 "stacks, its photon pool and the headroom; using CPU\n",
                          nc, (double)needB / 1e9, (double)room / 1e9);
             sharedForwardGpuEnd(s);
             return nullptr;
@@ -3700,6 +3712,31 @@ struct BdptPick { bool hero, deep; };
 static BdptPick bdptPick(int heroC, bool media, bool grin, bool lens, int maxDepth) {
     return BdptPick{heroC > 1 && !media && !grin && !lens, maxDepth > BDPT_MAXDEPTH};
 }
+// The kBdptT instantiation a pick runs: renderBdptCuda launches through it and cudaBdptRoute weighs
+// it, so the two name one kernel. `merge`: mode J's merges are on (the scalar merge instantiation);
+// `strat`: the beam queue's stratified wave order (wfStratOn).
+using BdptKernelFn = decltype(&gpu::kBdptT<0, BDPT_MAXDEPTH, false, false>);
+static BdptKernelFn bdptKernelFor(const BdptPick& p, bool merge, bool strat) {
+    using namespace gpu;
+    if (merge)
+        return p.deep ? (strat ? kBdptT<0, BDPT_DEEPDEPTH, true, true> : kBdptT<0, BDPT_DEEPDEPTH, true, false>)
+                      : (strat ? kBdptT<0, BDPT_MAXDEPTH, true, true> : kBdptT<0, BDPT_MAXDEPTH, true, false>);
+    if (p.hero)
+        return p.deep ? kBdptT<BDPT_NSEC, BDPT_DEEPDEPTH, false, false> : kBdptT<BDPT_NSEC, BDPT_MAXDEPTH, false, false>;
+    return p.deep ? kBdptT<0, BDPT_DEEPDEPTH, false, false> : kBdptT<0, BDPT_MAXDEPTH, false, false>;
+}
+// Whether mode J's beam queue takes its waves in stratified order (FTRACE_WFSTRAT=1, a diagnostic;
+// bands by default), which the STRAT instantiation runs.
+static bool wfStratOn() {
+    const char* e = std::getenv("FTRACE_WFSTRAT");
+    return e && std::atoi(e) != 0;
+}
+// Whether -jsurf's point merges queue for kWfSurfGather (the default) rather than all merging inline
+// (FTRACE_NOSURFWF=1, a diagnostic).
+static bool surfGatherQueued() {
+    const char* e = std::getenv("FTRACE_NOSURFWF");
+    return !(e && std::atoi(e) != 0);
+}
 
 Film renderBdptCuda(const Scene& scene, const Camera& cam, int resX, int resY,
                     long long spp, int maxDepth, bool diffraction, const SppProgress* prog,
@@ -3753,7 +3790,7 @@ Film renderBdptCuda(const Scene& scene, const Camera& cam, int resX, int resY,
     int C = heroC;
     if (C > hero::kHeroMax) C = hero::kHeroMax;
     if (C < 1) C = 1;
-    const bool useHero = bdptPick(C, up.sc.mediaN != 0, up.sc.hasGrin != 0, cam.hasLens(), maxDepth).hero;
+    const BdptPick pick = bdptPick(C, up.sc.mediaN != 0, up.sc.hasGrin != 0, cam.hasLens(), maxDepth);
 
     const size_t npix = (size_t)resX * resY;
     double* d_cam   = nullptr; CUDA_CHECK(cudaMalloc(&d_cam,   npix * 3 * sizeof(double)));
@@ -4049,8 +4086,7 @@ Film renderBdptCuda(const Scene& scene, const Camera& cam, int resX, int resY,
             unsigned dom = 1u;
             while (dom < wq.nRuns) dom <<= 1;
             wq.runMask = dom - 1u;
-            const char* e = std::getenv("FTRACE_WFSTRAT");
-            wq.runMul = (e && std::atoi(e) != 0) ? ((unsigned)(0.6180339887498949 * (double)dom) | 1u) : 0u;
+            wq.runMul = wfStratOn() ? ((unsigned)(0.6180339887498949 * (double)dom) | 1u) : 0u;
         }
     }
     // THE POINT MERGES' QUEUE (DSurfQueue, SURF-WAVEFRONT): wherever a surface map gathers.
@@ -4062,8 +4098,7 @@ Film renderBdptCuda(const Scene& scene, const Camera& cam, int resX, int resY,
     int* d_sqCounters = nullptr;
     cudaEvent_t sqEv[2] = {nullptr, nullptr};
     bool sqShrunk = false;   // FTRACE_SURFWFCAP took effect
-    if (dsm.kappaS > 0.0 &&
-        !(std::getenv("FTRACE_NOSURFWF") && std::atoi(std::getenv("FTRACE_NOSURFWF")) != 0)) {
+    if (dsm.kappaS > 0.0 && surfGatherQueued()) {
         size_t freeB = 0, totalB = 0;
         (void)cudaMemGetInfo(&freeB, &totalB);
         // The camera kernel's first launch reserves its local memory after this, unless an
@@ -4139,8 +4174,7 @@ Film renderBdptCuda(const Scene& scene, const Camera& cam, int resX, int resY,
         static long long resident[2] = {-1, -1};   // kBdptT's, at BDPT_MAXDEPTH and DEEPDEPTH
         long long& t = resident[deep ? 1 : 0];
         if (t < 0)
-            t = residentThreadsOf(deep ? (const void*)kBdptT<0, BDPT_DEEPDEPTH, true, false>
-                                       : (const void*)kBdptT<0, BDPT_MAXDEPTH, true, false>);
+            t = residentThreadsOf((const void*)bdptKernelFor(pick, true, false));
         surfLeast = std::max<long long>(surfLeast, t);
     }
     // A point-merge wave's paths from path `from` on, at most `cand` (DSurfQueue): the largest
@@ -4263,7 +4297,7 @@ Film renderBdptCuda(const Scene& scene, const Camera& cam, int resX, int resY,
         pos = subEnd;
 
         long long totalSamples = (long long)npix * c;
-        // Mode J only ever instantiates the scalar (NS == 0) kernel: `useHero` is already
+        // Mode J only ever instantiates the scalar (NS == 0) kernel: `pick.hero` is already
         // false for any scene with a participating medium, and a mode-J scene without one
         // has nothing to merge.
         // EITHER merge kind needs the MERGE=true instantiation, not just the beams: SEGN --
@@ -4349,18 +4383,9 @@ Film renderBdptCuda(const Scene& scene, const Camera& cam, int resX, int resY,
                     CUDA_CHECK(cudaEventRecord(wfEv[0]));
                 }
                 if (sq.reqs) CUDA_CHECK(cudaMemsetAsync(sq.nReqs, 0, sizeof(int)));
-                if (deep && wq.runMul != 0u)
-                    kBdptT<0, BDPT_DEEPDEPTH, true, true><<<2048, 128>>>(up.sc, up.dc, d_cam, d_splat, totalSamples, c, sppTotal, base,
-                                                                         resX, maxDepth, diffraction ? 1 : 0, seed, 1, dbm, dsm, wq, b0, b1, sq);
-                else if (deep)
-                    kBdptT<0, BDPT_DEEPDEPTH, true, false><<<2048, 128>>>(up.sc, up.dc, d_cam, d_splat, totalSamples, c, sppTotal, base,
-                                                                          resX, maxDepth, diffraction ? 1 : 0, seed, 1, dbm, dsm, wq, b0, b1, sq);
-                else if (wq.runMul != 0u)
-                    kBdptT<0, BDPT_MAXDEPTH, true, true><<<2048, 128>>>(up.sc, up.dc, d_cam, d_splat, totalSamples, c, sppTotal, base,
-                                                                        resX, maxDepth, diffraction ? 1 : 0, seed, 1, dbm, dsm, wq, b0, b1, sq);
-                else
-                    kBdptT<0, BDPT_MAXDEPTH, true, false><<<2048, 128>>>(up.sc, up.dc, d_cam, d_splat, totalSamples, c, sppTotal, base,
-                                                                         resX, maxDepth, diffraction ? 1 : 0, seed, 1, dbm, dsm, wq, b0, b1, sq);
+                bdptKernelFor(pick, true, wq.runMul != 0u)<<<2048, 128>>>(
+                    up.sc, up.dc, d_cam, d_splat, totalSamples, c, sppTotal, base, resX, maxDepth,
+                    diffraction ? 1 : 0, seed, 1, dbm, dsm, wq, b0, b1, sq);
                 if (wq.segs) {
                     cudaCheckKernel("bdpt");
                     CUDA_CHECK(cudaEventRecord(wfEv[1]));
@@ -4438,18 +4463,10 @@ Film renderBdptCuda(const Scene& scene, const Camera& cam, int resX, int resY,
                 !(abortable && DeviceStopScope::seen()))
                 g_wfProfile.swap(wfProfileCur);
         }
-        else if (useHero && deep)
-            kBdptT<BDPT_NSEC, BDPT_DEEPDEPTH, false, false><<<2048, 128>>>(up.sc, up.dc, d_cam, d_splat, totalSamples, c, sppTotal, base,
-                                                             resX, maxDepth, diffraction ? 1 : 0, seed, C, dbm, dsm, DWfQueue{}, 0, totalSamples, DSurfQueue{});
-        else if (useHero)
-            kBdptT<BDPT_NSEC, BDPT_MAXDEPTH, false, false><<<2048, 128>>>(up.sc, up.dc, d_cam, d_splat, totalSamples, c, sppTotal, base,
-                                                            resX, maxDepth, diffraction ? 1 : 0, seed, C, dbm, dsm, DWfQueue{}, 0, totalSamples, DSurfQueue{});
-        else if (deep)
-            kBdptT<0, BDPT_DEEPDEPTH, false, false><<<2048, 128>>>(up.sc, up.dc, d_cam, d_splat, totalSamples, c, sppTotal, base,
-                                                     resX, maxDepth, diffraction ? 1 : 0, seed, 1, dbm, dsm, DWfQueue{}, 0, totalSamples, DSurfQueue{});
         else
-            kBdptT<0, BDPT_MAXDEPTH, false, false><<<2048, 128>>>(up.sc, up.dc, d_cam, d_splat, totalSamples, c, sppTotal, base,
-                                                    resX, maxDepth, diffraction ? 1 : 0, seed, 1, dbm, dsm, DWfQueue{}, 0, totalSamples, DSurfQueue{});
+            bdptKernelFor(pick, false, false)<<<2048, 128>>>(
+                up.sc, up.dc, d_cam, d_splat, totalSamples, c, sppTotal, base, resX, maxDepth,
+                diffraction ? 1 : 0, seed, pick.hero ? C : 1, dbm, dsm, DWfQueue{}, 0, totalSamples, DSurfQueue{});
         cudaCheckKernel("bdpt");
       }
       if (!leftEarly) settleBlock();   // a chunk of one sample
@@ -4604,28 +4621,21 @@ GpuRoute cudaBdptRoute(const Scene& scene, bool lens, int maxDepth, int heroC, b
                        bool surfMerge) {
     using namespace gpu;
     const BdptPick p = bdptPick(heroC, !scene.media.empty(), grin::sceneHasGrin(scene), lens, maxDepth);
-    GpuRoute r;
-    if (!merging) {
-        r.kernels.push_back((p.hero && p.deep) ? (const void*)kBdptT<BDPT_NSEC, BDPT_DEEPDEPTH, false, false>
-                            : p.hero           ? (const void*)kBdptT<BDPT_NSEC, BDPT_MAXDEPTH, false, false>
-                            : p.deep           ? (const void*)kBdptT<0, BDPT_DEEPDEPTH, false, false>
-                            :                    (const void*)kBdptT<0, BDPT_MAXDEPTH, false, false>);
-        return r;
-    }
-    // Mode J's merges: the scalar merge instantiation, with the beam queue's variant (STRAT) and its
-    // two kernels where the beams queue, and -jsurf's light pass and surface gather.
-    r.kernels.push_back(p.deep ? (const void*)kBdptT<0, BDPT_DEEPDEPTH, true, false>
-                               : (const void*)kBdptT<0, BDPT_MAXDEPTH, true, false>);
+    // The plain instantiation: mode D's, and mode J's where its maps come out empty, which
+    // renderBdptCuda then renders as mode D.
+    GpuRoute r{{(const void*)bdptKernelFor(p, false, false)}};
+    if (!merging) return r;
+    // Mode J's merges: the merge instantiation, in the beam queue's stratified order where that is on
+    // and with the queue's two kernels where the beams queue; -jsurf's light pass where the device
+    // runs it, and its surface gather where it queues.
+    r.kernels.push_back((const void*)bdptKernelFor(p, true, beamQueue && wfStratOn()));
     if (beamQueue) {
-        r.kernels.push_back(p.deep ? (const void*)kBdptT<0, BDPT_DEEPDEPTH, true, true>
-                                   : (const void*)kBdptT<0, BDPT_MAXDEPTH, true, true>);
         r.kernels.push_back((const void*)kWfBeamHits);
         r.kernels.push_back((const void*)kWfBeamEval);
     }
-    if (surfMerge) {
+    if (surfMerge && cudaJSurfOnDevice())
         r.kernels.push_back(p.deep ? (const void*)kJSurfLightT<BDPT_DEEPDEPTH> : (const void*)kJSurfLightT<BDPT_MAXDEPTH>);
-        r.kernels.push_back((const void*)kWfSurfGather);
-    }
+    if (surfMerge && surfGatherQueued()) r.kernels.push_back((const void*)kWfSurfGather);
     return r;
 }
 
@@ -4670,8 +4680,13 @@ static size_t forwardPosedBytes(bool runsWavefront, long long N, int nCam) {
     return (size_t)threads * (size_t)nCam * sizeof(gpu::DCamera);
 }
 
-size_t cudaForwardPosedCameraBytes(const Scene& scene, bool wavefront, int heroC, long long N) {
-    return forwardPosedBytes(cudaForwardRunsWavefront(scene, wavefront, heroC), N, 1);
+size_t cudaForwardPosedCameraBytes(const Scene& scene, bool wavefront, int heroC, long long N, bool stableSeed) {
+    return forwardPosedBytes(cudaForwardRunsWavefront(scene, wavefront, heroC, false, 1, stableSeed), N, 1);
+}
+
+size_t cudaForwardWavefrontBytes(const Scene& scene, bool wavefront, int heroC, long long N, bool beamGather,
+                                 int nCam) {
+    return cudaForwardRunsWavefront(scene, wavefront, heroC, beamGather, nCam) ? wavefrontPoolBytes(N) : 0;
 }
 
 size_t cudaSharedFlightPosedBytes(const Scene& scene, int nCam, bool wavefront, int heroC, bool beamGather) {

@@ -66,6 +66,7 @@ CASES = [
     ("for (double t = rng.uniform(); t < 1; t += rng.uniform()) x = 1;", False),
     ("T v{{rng.uniform(), rng.uniform()}, {0.0, 1.0}};", False),
     ("if (a) { x = 1; } y = f(rng.uniform(), rng.uniform());", True),
+    ("void a() { x = 1; } u = rng.uniform(); v = rng.uniform();", False),
     ("void g() const { x = rnd() * rnd(); }", True),
     ("auto l = [&]() -> Vec3 { return f(rng.uniform(), rng.uniform()); };", True),
     ("auto l = [&] { return rng.uniform() + rng.uniform(); };", True),
@@ -194,7 +195,7 @@ def offenders(raw):
                 item = fr.pos
             i = draws[i]
             continue
-        seq = SEQ.match(s, i)
+        seq = SEQ.match(s, i) if s[i] in "&|?:" else None   # the only characters it starts on
         if seq:
             stack[-1].add("s", i)
             i = seq.end()
@@ -234,14 +235,14 @@ def offenders(raw):
                     close(stack.pop())
                     stack.append(Frame("stmt", i, False))
         elif c == "}":
-            while len(stack) > 2 and stack[-1].kind not in ("{", "block"):
+            # the root block (stack[0]) is never closed: a stray `}` leaves it holding the next statement
+            while len(stack) > 1 and stack[-1].kind not in ("{", "block"):
                 close(stack.pop())
-            if len(stack) > 2:
-                fr = stack.pop()
-                close(fr)
-                # the enclosing block's next statement; a lambda's body returns to its expression
-                if fr.kind == "block" and stack[-1].kind == "block":
-                    stack.append(Frame("stmt", i, False))
+            if len(stack) > 1:
+                close(stack.pop())
+            # the enclosing block's next statement; a lambda's body returns to its expression
+            if stack[-1].kind == "block":
+                stack.append(Frame("stmt", i, False))
         elif c == ";":
             # a statement ends; a for header's `;` separates its parenthesis's slots
             if stack[-1].kind == "stmt":

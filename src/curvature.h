@@ -5,6 +5,7 @@
 // their own data -- a triangle's corners, a field at the stencil's points -- and hand the numbers
 // here, so the arithmetic exists once.
 #pragma once
+#include "unit_linkage.h"   // FT_UNIT_INLINE
 
 #include <cmath>
 
@@ -20,7 +21,7 @@
 // Gram matrix -- which drops dn's out-of-plane part. A unit sphere with exact normals reads 1, a
 // plane 0, and scaling a mesh by s scales H by 1/s. Positive where the normals spread apart (a bulge
 // on their side). 0 on a degenerate sliver: the sine between its edges under 1e-6, at any size.
-CURV_HD inline double triMeanCurvatureS(double e1x, double e1y, double e1z, double e2x, double e2y, double e2z,
+CURV_HD FT_UNIT_INLINE double triMeanCurvatureS(double e1x, double e1y, double e1z, double e2x, double e2y, double e2z,
                                         double d1x, double d1y, double d1z, double d2x, double d2y, double d2z) {
     const double gA = e1x * e1x + e1y * e1y + e1z * e1z;
     const double gB = e1x * e2x + e1y * e2y + e1z * e2z;
@@ -36,7 +37,7 @@ CURV_HD inline double triMeanCurvatureS(double e1x, double e1y, double e1z, doub
 // The level-set stencil: point i of 13 at p + h * (x, y, z) -- p, its six axis neighbours (+x, -x,
 // +y, -y, +z, -z) and six diagonals (+x+y, -x-y, +x+z, -x-z, +y+z, -y-z).
 constexpr int kLevelSetStencil = 13;
-CURV_HD inline void levelSetStencilPoint(int i, double& x, double& y, double& z) {
+CURV_HD FT_UNIT_INLINE void levelSetStencilPoint(int i, double& x, double& y, double& z) {
     x = y = z = 0.0;
     switch (i) {
         case 1: x = 1; break;            case 2: x = -1; break;
@@ -52,7 +53,7 @@ CURV_HD inline void levelSetStencilPoint(int i, double& x, double& y, double& z)
 // The stencil's step at a point whose coordinates reach `m`, for a field whose gradient is taken at
 // `gradEps`: a second difference divides the field's rounding (about eps * m) by h^2, so h stays at
 // least eps^(1/4) * m (2^-13 m), where that error is 1e-7 of a unit curvature at m = 1.
-CURV_HD inline double levelSetStep(double gradEps, double m) {
+CURV_HD FT_UNIT_INLINE double levelSetStep(double gradEps, double m) {
     const double h = m * 0x1p-13;
     return h > gradEps ? h : gradEps;
 }
@@ -61,7 +62,7 @@ CURV_HD inline double levelSetStep(double gradEps, double m) {
 // (|g|^2 tr(Hs) - g.Hs.g) / (2 |g|^3), from the field's values f[i] at the stencil's points (step
 // h); `g` its central-difference gradient. Positive where the level set bulges toward +gradient
 // (out of an f < 0 inside: a sphere SDF of radius R reads 1/R). 0 where the gradient vanishes.
-CURV_HD inline double levelSetCurvature(const double* f, double h, double& gx, double& gy, double& gz) {
+CURV_HD FT_UNIT_INLINE double levelSetCurvature(const double* f, double h, double& gx, double& gy, double& gz) {
     gx = (f[1] - f[2]) / (2 * h); gy = (f[3] - f[4]) / (2 * h); gz = (f[5] - f[6]) / (2 * h);
     const double h2 = h * h;
     const double hxx = (f[1] - 2 * f[0] + f[2]) / h2, hyy = (f[3] - 2 * f[0] + f[4]) / h2;

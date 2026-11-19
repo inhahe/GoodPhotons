@@ -251,29 +251,36 @@ inline bool resolveSpectrumTokens(const std::vector<std::string>& w, Spectrum& o
     auto require = [](bool ok, const std::string& msg) {
         if (!ok) throw std::runtime_error(msg);
     };
+    // "unknown <kind> reference '<token>'" and why: its category's directory missing
+    // (missingLibraryNote), or no file or alias in it.
+    auto unknown = [](const char* cat, const std::string& token) {
+        const std::string note = missingLibraryNote({cat});
+        return "unknown " + std::string(cat) + " reference '" + token + "'" +
+               (note.empty() ? " — no matching file/alias in data/" + std::string(cat) + "/" : note);
+    };
     if (h.rfind("glass:", 0) == 0) {
         require(loadGlass(h.substr(6), out),
-                "unknown glass reference 'glass:" + h.substr(6) + "' — no matching file/alias in data/glass/");
+                unknown("glass", h));
         return true;
     }
     if (h.rfind("metal:", 0) == 0) {
         require(loadCurve("metal", h.substr(6), out),
-                "unknown metal reference 'metal:" + h.substr(6) + "' — no matching file/alias in data/metal/");
+                unknown("metal", h));
         return true;
     }
     if (h.rfind("reflectance:", 0) == 0) {
         require(loadCurve("reflectance", h.substr(12), out),
-                "unknown reflectance reference 'reflectance:" + h.substr(12) + "' — no matching file/alias in data/reflectance/");
+                unknown("reflectance", h));
         return true;
     }
     if (h.rfind("illuminant:", 0) == 0) {
         require(loadCurve("illuminant", h.substr(11), out),
-                "unknown illuminant reference 'illuminant:" + h.substr(11) + "' — no matching file/alias in data/illuminant/");
+                unknown("illuminant", h));
         return true;
     }
     if (h.rfind("filter:", 0) == 0) {
         require(loadCurve("filter", h.substr(7), out),
-                "unknown filter reference 'filter:" + h.substr(7) + "' — no matching file/alias in data/filter/");
+                unknown("filter", h));
         return true;
     }
     if (h.rfind("file:", 0) == 0) {

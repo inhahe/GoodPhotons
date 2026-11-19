@@ -185,16 +185,18 @@ if(CMAKE_CUDA_COMPILER)
     # lets compute-sanitizer / cuda-gdb map GPU faults back to file:line — the
     # difference between "an OOB happened somewhere" and "OOB at render_cuda.cu:1234".
     target_compile_options(ftrace PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo>)
-    # nvcc's optimiser (cicc) and assembler (ptxas) are single-threaded per translation unit,
-    # and render_cuda.cu holds most of the device code's kernels in one. --split-compile
-    # partitions its device code so those phases use every core. Measured 2026-09-06 (i7-8700K, ~3 cores of other load):
-    # ptxas 52.6 s -> 21.1 s, cicc 64.3 s -> 43.2 s, the whole TU 2:49 -> 1:50. NVIDIA
-    # documents "minimal (if any)" effect on the generated code; checked here by an A/B of
-    # render speed on the same scenes (design.md, Build & release).
+    # No --split-compile. It partitions a unit's device code across threads, so cicc and ptxas use
+    # every core (render_cuda.cu 2:49 -> 1:50, 2026-09-06), but the partitioning makes the code
+    # depend on the run: render_cuda_bdpt.cu compiled twice from one source gave two functions
+    # different register counts and kBdptT a different stack, and mode D ran 14.6 s on one build and
+    # 16.2 s on the other, so no two builds could be compared (GPU-STACK-DRIFT, 2026-11-19). Without
+    # it the device code is the same every time. It also changed the code far from NVIDIA's "minimal
+    # (if any)": kBdptT took its 168-register cap with it and 146-152 without, and, same source,
+    # idle card, cornell: mode R 6.43 -> 5.34 s, D 16.3 -> 12.4, U 4.43 -> 3.89, M 4.87 -> 4.11,
+    # S 8.76 -> 7.14, B 560 -> 523, and J 19.2 -> 22.3 without it (J-NOSPLIT).
     # A global -maxrregcount is no answer to a launch-bounded kernel's out-of-line helpers: 35
     # kernels legitimately use up to 255 registers. Those kernels' own units cap them instead
     # (render_cuda_bdpt.cu, render_cuda_jsurf.cu, above).
-    target_compile_options(ftrace PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--split-compile=0>)
     # CCCL 3.x (the thrust/cub shipped with CUDA 13) requires MSVC's standard-conforming
     # preprocessor; without it the thrust headers #error out. Scoped to the CUDA host
     # pass-through so plain C++ TUs keep their default flags.

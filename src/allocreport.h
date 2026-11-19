@@ -97,18 +97,19 @@ inline std::string memAdvice(double failedBytes) {
 }
 
 // The message. `what` names the buffer ("the photon map"), `flags` names the knobs that
-// size it ("-n"), and the count x element size is spelled out so the user can scale the
-// flag by arithmetic instead of by bisection.
+// size it ("-n"), `verb` which way they shrink it ("Lower" -n; "Raise" a radius a grid's cells
+// are sized by), and the count x element size is spelled out so the user can scale the flag by
+// arithmetic instead of by bisection.
 [[noreturn]] inline void reportOom(const char* what, size_t count, size_t elemBytes,
-                                   const char* flags) {
+                                   const char* flags, const char* verb = "Lower") {
     const double bytes = (double)count * (double)elemBytes;
     const std::string note = memAdvice(bytes);
     char buf[1536];
     std::snprintf(buf, sizeof(buf),
                   "out of memory allocating %s: %zu x %zu B = %s.%s\n"
-                  "       Lower %s and re-run. (Host RAM, not VRAM — this buffer lives on "
+                  "       %s %s and re-run. (Host RAM, not VRAM — this buffer lives on "
                   "the CPU side\n       even when the trace ran on the GPU.)",
-                  what, count, elemBytes, humanBytes(bytes).c_str(), note.c_str(), flags);
+                  what, count, elemBytes, humanBytes(bytes).c_str(), note.c_str(), verb, flags);
     throw std::runtime_error(buf);
 }
 
@@ -116,10 +117,10 @@ inline std::string memAdvice(double failedBytes) {
 // whose growth is bounded by a command-line flag should go through one of these; a small
 // or scene-sized one need not.
 template <class V>
-inline void resize(V& v, size_t n, const char* what, const char* flags) {
+inline void resize(V& v, size_t n, const char* what, const char* flags, const char* verb = "Lower") {
     try { v.resize(n); }
-    catch (const std::bad_alloc&) { reportOom(what, n, sizeof(typename V::value_type), flags); }
-    catch (const std::length_error&) { reportOom(what, n, sizeof(typename V::value_type), flags); }
+    catch (const std::bad_alloc&) { reportOom(what, n, sizeof(typename V::value_type), flags, verb); }
+    catch (const std::length_error&) { reportOom(what, n, sizeof(typename V::value_type), flags, verb); }
 }
 
 template <class V>

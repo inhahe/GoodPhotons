@@ -50,11 +50,13 @@ def cuobjdump():
 
 
 def external_functions(tool, obj):
-    """{mangled name: registers} of the externally linked functions `obj`'s device code holds."""
+    """{mangled name: registers} of the externally linked functions `obj`'s device code holds, or None
+    where cuobjdump cannot read it (the reason printed)."""
     p = subprocess.run([tool, "-res-usage", obj], capture_output=True, text=True, encoding="utf-8",
                        errors="replace")
     if p.returncode != 0:
-        raise SystemExit("cuobjdump failed on %s: %s" % (obj, (p.stdout + p.stderr)[-300:]))
+        print("cuobjdump failed on %s: %s" % (obj, (p.stdout + p.stderr)[-300:]))
+        return None
     out, name = {}, None
     for line in p.stdout.splitlines():
         m = FUNC.search(line)
@@ -97,6 +99,8 @@ def main():
         print("missing object: " + ", ".join(missing))
         return fail
     fns = {n: external_functions(tool, o) for n, o in objs.items()}
+    if any(f is None for f in fns.values()):
+        return fail
     kernels = [u[2] for u in UNITS]
     bad = 0
     # Each capped unit against every other object: the uncapped ones, and the other capped unit,

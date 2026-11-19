@@ -232,8 +232,7 @@ struct VcmGrid {
         std::vector<int> cellOf(n);
         // Sized by the merge radius (-pmradius), not by the scene: named, so an OOM says which knob.
         cellStart.clear();
-        ftalloc::resize(cellStart, (size_t)nCells + 1, "the vertex-merge grid", "-pmradius");
-        std::fill(cellStart.begin(), cellStart.end(), 0);
+        ftalloc::resize(cellStart, (size_t)nCells + 1, "the vertex-merge grid", "-pmradius", "Raise");   // zeroed
         for (size_t i = 0; i < n; ++i) {
             int ix, iy, iz; cellCoord(v[i].p, ix, iy, iz);
             int c = cellIndex(ix, iy, iz);
