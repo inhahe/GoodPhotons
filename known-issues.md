@@ -201,6 +201,26 @@ to 0.25 renders as a 150 nm one within 2e-3, 1.0e-3 measured (its body's escape 
 on 0.450.1 it rendered as the unmapped 600 nm, 1.9 off), the `thinfilm` control byte for byte, and
 the three misspellings stop the load (on 0.450.1 they loaded).
 
+## DONE (2026-11-19, 0.450.27): PM-PROBE-GEOMETRY — mode M's automatic radius moved with the table
+
+`PhotonMap::medianNeighborCount`, the probe behind mode M's automatic radius, sampled the map by
+occupied BUCKET, so every change to the table's size or hash re-drew the sample and moved the
+radius of every render that leaves it automatic: 0.450.23 and 0.450.24 did (flat on the CPU 0.05517
+-> 0.05527), and `FTRACE_MERGE_TABLE` did, so check_merge_table had to pin mode M's radius (the
+review of 0.450.22-0.450.24). **Fixed:** it samples CELLS -- the 4096 occupied cells whose
+coordinates hash lowest (a bottom-k sample under a 64-bit mix), each represented by its
+lexicographically smallest photon -- a function of the positions alone, so neither the array's
+order (`-loadmap` must reproduce `-savemap`) nor the table moves it; on every core (each thread the
+bottom k of its share's cells, whose union holds the whole bottom k; the counts split among them).
+
+**Verified:** check_merge_table now renders mode M at its automatic radius: byte-identical at one
+slot of 27 buckets and at the default table on the CPU, the GPU within 1.4e-6 of a pixel; with the
+old probe (0.450.26) the same check fails both (CPU mean x0.99981, GPU up to 58 % on a pixel).
+`-savemap` then `-loadmap` render byte-identically; `-checkpmgrid` (its order-independence test
+among them) passes. check_bitid against 0.450.26: identical but mode M's coated (CPU) and flat
+(GPU) scenes, +0.012 % and +0.010 % in the mean -- the new sample's radius; the 20 M-photon map's
+0.00349 -> 0.003498.
+
 ## DONE (2026-11-19, 0.450.26): PM-BUILD-PARALLEL — a large photon map was binned on one thread
 
 At 129 M photons (mode M, `_caustic_box` at `-n 20M`) `buildAuto`'s two binnings, radius probe and

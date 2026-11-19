@@ -48,12 +48,13 @@ sphere { center 0.1 0.35 0.1  radius 0.35  material g }
 light area { origin -0.2 1.98 -0.2  u 0.4 0 0  v 0 0 0.4  normal 0 -1 0  power 30  spd preset:d65 }
 camera "c" { eye 0 1 3.2  look_at 0 0.7 0  up 0 1 0  fov_y 45  film { res 64 48 } }
 """
-# Mode J redraws its light side at epochs paced by the work it counts, the gather's candidates among
-# it, which a smaller table's strays raise: -beamfreeze holds it to one realization. Mode M chooses
-# its radius from a median over a sample of the map's buckets, which the table's size reorders:
-# -pmradius pins it.
+# Mode J redraws its light side at epochs paced by the work it counts, the gather's entries among it,
+# which a smaller table's strays raise (those whose block's tag matches the cell's, one in 256 of
+# them): -beamfreeze holds it to one realization. Mode M chooses its radius at the automatic setting,
+# from a median over the cells the geometry alone picks (PhotonMap::medianNeighborCount), so the
+# table must not move that either.
 MODES = {"U": ["-mode", "U", "-spp", "4"], "J": ["-mode", "J", "-spp", "4", "-beamfreeze"],
-         "M": ["-mode", "M", "-n", "400000", "-spp", "2", "-beamfreeze", "-pmradius", "0.05"],
+         "M": ["-mode", "M", "-n", "400000", "-spp", "2", "-beamfreeze"],
          "S": ["-mode", "S", "-spp", "4"]}
 GPU_TOL = {"U": 1e-5, "J": 1e-5, "M": 3e-4, "S": 3e-4}
 GPU_TOKENS = ("-> GPU", "[gpu]", "VCM/UPS on ", "SPPM on ")

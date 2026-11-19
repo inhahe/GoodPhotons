@@ -25,7 +25,9 @@
 #include <cstdint>
 #include <cstdlib>          // photonMaxBounce: std::getenv
 #include <utility>
+#include <queue>
 #include <thread>
+#include <unordered_map>
 #include "linalg.h"
 #include "gatherplane.h"   // onGatherSurfaceSided: which photons a gather keeps
 #include "merge_grid.h"    // mergeLatticeKey: the hashed lattice
@@ -252,66 +254,119 @@ struct PhotonMap {
     // the radius until the dim parts of the image went to noise. Median asks "how dense is it
     // where photons typically are", which is the quantity the estimator is tuned on.
     //
-    // THE SAMPLE MUST NOT DEPEND ON ARRAY ORDER. The obvious implementation — stride over
-    // photons[] and query around every n-th one — is order-dependent: the counting sort is
-    // stable, so photons within a cell keep their arrival order, and a map that has been
-    // saved (already sorted at one radius) and reloaded re-sorts to a different within-cell
-    // order than the original deposit did. Same photons, same grid, different sample, and
-    // hence a slightly different chosen radius — so `-loadmap` would no longer reproduce the
-    // `-savemap` run that wrote the file. (Caught 2026-07-26: 1401 vs 1402 median, r
-    // 0.008981 vs 0.008977, images differed.)
+    // THE SAMPLE IS A FUNCTION OF THE PHOTONS' POSITIONS ALONE: not of their order in the array,
+    // nor of the table they are binned in. Not of the order, because the counting sort is stable,
+    // so photons within a cell keep their arrival order, and a map that has been saved (already
+    // sorted at one radius) and reloaded re-sorts to a different within-cell order than the
+    // original deposit did: a sample that strided over photons[] would differ, and `-loadmap`
+    // would no longer reproduce the `-savemap` run that wrote the file. (Caught 2026-07-26: 1401
+    // vs 1402 median, r 0.008981 vs 0.008977, images differed.) Not of the table, because then
+    // every change to the table's size or hash would move the chosen radius, and every render
+    // that leaves it automatic with it.
     //
-    // So sample by BUCKET — bucket membership is a pure function of the bbox, the cell size and
-    // the hash, i.e. of geometry alone — striding over occupied buckets, and inside each take
-    // the lexicographically smallest position as the representative. That is a set-minimum, so
-    // it names the same photon no matter how the array is ordered (coincident positions would
-    // tie, but then the neighbour count is identical anyway). Querying an actual photon rather
-    // than the cell centre matters: a cell the surface merely clips at a corner has its centre
-    // off the surface and would report a spuriously empty neighbourhood.
+    // So it samples CELLS: the `sampleTarget` occupied cells whose coordinates hash lowest (a
+    // bottom-k sample of the cells mergeCellCoord places the photons in, under a 64-bit mix), each
+    // represented by its lexicographically smallest photon. Both are set functions of the
+    // positions (coincident positions would tie, but then the neighbour count is identical
+    // anyway). Querying an actual photon rather than the cell centre matters: a cell the surface
+    // merely clips at a corner has its centre off the surface and would report a spuriously empty
+    // neighbourhood.
     //
-    // (Before 0.199.6 a bucket WAS a cell, one-to-one. Hashing lets a bucket hold photons from
-    // a few unrelated cells, which changes only which photons are sampled, not the
-    // order-independence the note above is about — and the statistic is a median over
-    // thousands of samples, so it is insensitive to that reshuffle.)
-    //
-    // Cell-striding also makes the statistic area-weighted rather than photon-weighted, which
+    // Cell sampling also makes the statistic area-weighted rather than photon-weighted, which
     // is if anything the better match: camera gathers land on visible surface points, spread
     // over area, not in proportion to local photon density.
+    //
+    // On every core: each thread keeps the bottom k of the cells its share of the photons lies in
+    // -- a cell of the whole bottom k is in the bottom k of every share it appears in, so the
+    // shares' union holds it, its representative the least of theirs -- and the k queries are
+    // split among the threads, their candidates added to this thread's tally as one walk adds them.
     double medianNeighborCount(int sampleTarget = 4096) const {
-        const long long nCells = bucketCount();
-        if (photons.empty() || nCells <= 0) return 0.0;
-
-        // How many buckets actually hold photons — needed to pick a stride that lands near
-        // sampleTarget. O(tableSize) over a flat int array, and since 0.199.6 the table is
-        // sized from the photon count rather than the cell volume, so this walk no longer
-        // grows with how fine the lattice is.
-        long long occupied = 0;
-        for (long long c = 0; c < nCells; ++c)
-            if (cellStart[c + 1] > cellStart[c]) ++occupied;
-        if (occupied == 0) return 0.0;
-
-        const long long stride = std::max<long long>(1, occupied / std::max(1, sampleTarget));
-        std::vector<int> counts;
-        counts.reserve((size_t)(occupied / stride) + 1);
-        long long seenOccupied = 0;
-        for (long long c = 0; c < nCells; ++c) {
-            const int b = cellStart[c], e = cellStart[c + 1];
-            if (e <= b) continue;
-            if ((seenOccupied++ % stride) != 0) continue;
-            int rep = b;
-            for (int k = b + 1; k < e; ++k) {
-                const Vec3& a = pos[k];
-                const Vec3& m = pos[rep];
-                if (a.x != m.x ? a.x < m.x
-                  : a.y != m.y ? a.y < m.y
-                               : a.z <  m.z) rep = k;
+        const size_t n = photons.size();
+        if (n == 0 || sampleTarget <= 0) return 0.0;
+        struct Key { int c[3]; unsigned long long h; };
+        struct KeyHash { size_t operator()(const Key& k) const { return (size_t)k.h; } };
+        struct KeyEq {
+            bool operator()(const Key& a, const Key& b) const {
+                return a.c[0] == b.c[0] && a.c[1] == b.c[1] && a.c[2] == b.c[2];
             }
-            // drop the representative itself (dist2 == 0)
-            counts.push_back(countR(pos[rep], radius) - 1);
-        }
-        if (counts.empty()) return 0.0;
+        };
+        // The sample's order: by hash, a tie (two cells mixing alike) by the cell.
+        auto after = [](const Key& a, const Key& b) {
+            if (a.h != b.h) return a.h > b.h;
+            if (a.c[0] != b.c[0]) return a.c[0] > b.c[0];
+            if (a.c[1] != b.c[1]) return a.c[1] > b.c[1];
+            return a.c[2] > b.c[2];
+        };
+        auto lexLess = [](const Vec3& a, const Vec3& m) {
+            return a.x != m.x ? a.x < m.x : a.y != m.y ? a.y < m.y : a.z < m.z;
+        };
+        auto keyOf = [&](const Vec3& p) {
+            Key k;
+            k.c[0] = mergeCellCoord(p.x, lat.lo[0], lat.invCell);
+            k.c[1] = mergeCellCoord(p.y, lat.lo[1], lat.invCell);
+            k.c[2] = mergeCellCoord(p.z, lat.lo[2], lat.invCell);
+            unsigned long long h = (unsigned long long)(unsigned int)k.c[0] * 0x9E3779B97F4A7C15ull ^
+                                   (unsigned long long)(unsigned int)k.c[1] * 0xC2B2AE3D27D4EB4Full ^
+                                   (unsigned long long)(unsigned int)k.c[2] * 0x165667B19E3779F9ull;
+            h ^= h >> 30; h *= 0xBF58476D1CE4E5B9ull;
+            h ^= h >> 27; h *= 0x94D049BB133111EBull;
+            h ^= h >> 31;
+            k.h = h;
+            return k;
+        };
+        using Reps = std::unordered_map<Key, Vec3, KeyHash, KeyEq>;
+        const size_t K = (size_t)sampleTarget;
+        const unsigned hw = std::max(1u, std::thread::hardware_concurrency());
+        const unsigned T = (n >= kMergeBinThreadsFrom) ? std::min(hw, 64u) : 1u;
+        std::vector<Reps> kept(T);
+        mergeOnThreads(T, [&](unsigned t) {
+            Reps& reps = kept[t];
+            reps.reserve(2 * K);
+            // The share's bottom k so far, its greatest (by `after`'s order) on top.
+            std::priority_queue<Key, std::vector<Key>, decltype(after)> heap(after);
+            for (size_t i = n * t / T, e = n * (t + 1) / T; i < e; ++i) {
+                const Vec3& p = pos[i];
+                const Key k = keyOf(p);
+                if (heap.size() == K && after(k, heap.top())) continue;   // past the bottom k
+                const auto it = reps.find(k);
+                if (it != reps.end()) {
+                    if (lexLess(p, it->second)) it->second = p;
+                    continue;
+                }
+                reps.emplace(k, p);
+                heap.push(k);
+                if (heap.size() > K) {
+                    reps.erase(heap.top());
+                    heap.pop();
+                }
+            }
+        });
+        Reps all = std::move(kept[0]);
+        for (unsigned t = 1; t < T; ++t)
+            for (const auto& kv : kept[t]) {
+                const auto it = all.find(kv.first);
+                if (it == all.end()) all.emplace(kv.first, kv.second);
+                else if (lexLess(kv.second, it->second)) it->second = kv.second;
+            }
+        std::vector<std::pair<Key, Vec3>> cells(all.begin(), all.end());
+        const size_t m = std::min(K, cells.size());
+        std::partial_sort(cells.begin(), cells.begin() + (ptrdiff_t)m, cells.end(),
+                          [&](const std::pair<Key, Vec3>& a, const std::pair<Key, Vec3>& b) {
+                              return after(b.first, a.first);
+                          });
+        if (m == 0) return 0.0;
+        std::vector<int> counts(m);
+        std::vector<long long> cand(T, 0);
+        const unsigned Tq = (m >= 64) ? T : 1u;
+        mergeOnThreads(Tq, [&](unsigned t) {
+            const long long before = bdpt::tlCandidates();
+            for (size_t j = m * t / Tq, e = m * (t + 1) / Tq; j < e; ++j)
+                counts[j] = countR(cells[j].second, radius) - 1;   // not the representative itself
+            cand[t] = bdpt::tlCandidates() - before;
+        });
+        for (unsigned t = 1; t < Tq; ++t) bdpt::tlCandidates() += cand[t];
         const size_t mid = counts.size() / 2;
-        std::nth_element(counts.begin(), counts.begin() + mid, counts.end());
+        std::nth_element(counts.begin(), counts.begin() + (ptrdiff_t)mid, counts.end());
         return (double)counts[mid];
     }
 

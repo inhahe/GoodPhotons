@@ -437,7 +437,9 @@ Then the rest of 4.2-4.6 in their order, 4.7's bookkeeping alongside whatever to
   on one thread what the next pass overwrites: 0.8 s for the first binning's 7 GB destination and
   0.3 s for the CIE table at 129 M photons. An allocator that leaves elements unconstructed (the
   storage written before it is read) lets the parallel passes take the pages themselves.
-- [ ] **PM-PROBE-GEOMETRY** — mode M's automatic radius samples the map by occupied BUCKET
+- [x] **PM-PROBE-GEOMETRY** (0.450.27) — the radius probe samples the cells the geometry picks (the
+  lowest-hashed 4096), not the table's buckets, on every core; check_merge_table renders mode M
+  unpinned; known-issues. The entry as logged: mode M's automatic radius samples the map by occupied BUCKET
   (`medianNeighborCount`), so every change to the table's size or hash moves it and every unpinned
   mode M render with it (0.450.23 and 0.450.24 did; `FTRACE_MERGE_TABLE` does, so
   check_merge_table pins the radius). Sample by CELL instead, with a set the geometry alone

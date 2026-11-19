@@ -1955,9 +1955,9 @@ machine varied 18.5 s / 25.8 s / 27.2 s.
   at most `k` (`1` leaves one block of 27 buckets that every block shares). A merge
   never reads a bucket twice, so the merges are the same at any table size: the CPU's renders are
   byte-identical, the GPU's equal to rounding, and `tools/check_merge_table.py` requires both. Mode
-  `M`'s own radius choice samples the map bucket by bucket and so moves with the table (pin it with
-  `-pmradius`), and mode `J` paces its light-side redraws by the work it counts, which a small
-  table's strays raise (hold it with `-beamfreeze`).
+  `M`'s automatic radius samples the map's cells, not its buckets, so it stays put too (since
+  0.450.27); mode `J` paces its light-side redraws by the work it counts, which a small table's
+  strays raise (hold it with `-beamfreeze`).
 - **`FTRACE_JEPOCHKEEP=<k>` (diagnostic, mode `J` flights).** Keeps at most `k` of a batch's
   `-beamepochs` realizations, so its later frames re-trace the rest as a batch too large to keep
   them would; `tools/check_jbeams.py` uses it to show such an epoch is traced as epoch 0 was.

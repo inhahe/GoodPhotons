@@ -6625,14 +6625,17 @@ as the one at fault.
   to run off, clamping was actively slightly wrong (a query just outside got folded onto the
   edge cell and lost the far row of its neighbourhood). `-checkpmgrid` validates the query
   against brute force on exactly the configuration the dense lattice could not represent.
-  **`medianNeighborCount` samples by bucket, not by array index** — bucket membership is fixed
-  by the bbox, cell size and hash, i.e. by geometry, whereas the counting sort is stable and so
-  preserves a within-cell order that differs between a fresh deposit and a `-loadmap` of the
-  same map. Sampling by array position therefore made `-loadmap` stop reproducing its
-  `-savemap` run. Within a sampled bucket the representative is the lexicographically smallest
-  position (a set-minimum, hence order-free); the cell *centre* would not do, because a cell
-  that the surface merely clips has its centre off-surface and reports a spuriously empty
-  neighbourhood.
+  **`medianNeighborCount` samples by cell, not by array index nor by bucket** — the
+  `sampleTarget` occupied cells whose coordinates hash lowest (a bottom-k sample under a 64-bit
+  mix), fixed by the photons' positions alone. The counting sort is stable and so preserves a
+  within-cell order that differs between a fresh deposit and a `-loadmap` of the same map:
+  sampling by array position made `-loadmap` stop reproducing its `-savemap` run. And sampling by
+  bucket (0.199.6 to 0.450.26) moved the chosen radius with every change to the table's size or
+  hash. Within a sampled cell the representative is the lexicographically smallest position (a
+  set-minimum, hence order-free); the cell *centre* would not do, because a cell that the surface
+  merely clips has its centre off-surface and reports a spuriously empty neighbourhood. It runs on
+  every core: each thread keeps the bottom k of its share's cells, whose union holds the whole
+  bottom k, and the k neighbour counts are split among the threads.
   The GPU shared path gets the same treatment via `renderPhotonMapSharedCuda`'s `autoK`
   argument (0 = off) — it must, since that is the high-photon-count path where a
   count-independent radius collapses worst. The gather reads `pm.radius` after the build, so
