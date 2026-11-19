@@ -1546,8 +1546,7 @@ inline void randomWalk(const Scene& scene, const Camera& cam, const Renderer& ma
                 const HairShade hs = hairAt(scene, *mp, h, lambda, wo);
                 double pdfH = 0.0, fv = 0.0;
                 hair::LobeAngular la;                // the angular half of fv, for the secondaries
-                const Vec3 wl = hair::sample(hs.b, hs.woLocal, rng.uniform(), rng.uniform(),
-                                             rng.uniform(), rng.uniform(), pdfH, fv, &la);
+                const Vec3 wl = hair::sampleWith(hs.b, hs.woLocal, rng, pdfH, fv, &la);
                 if (!(pdfH > 0.0) || !(fv > 0.0)) { terminate = true; break; }
                 wi = hair::toWorld(hs.fr, wl); lobe = Lobe::Free;
                 // A coverage pass-through returns EXACTLY -wo: the ray was never intercepted.
@@ -1912,7 +1911,8 @@ inline int generateCameraSubpath(const Scene& scene, const Camera& cam, const Re
         // the same four numbers into the same four slots.
         const Pcg32 rngLens = rng;
         auto genLens = [&](Pcg32& r, double L, Ray& ry, double& w) {
-            return cam.genLensRay(px, py, r.uniform(), r.uniform(), r.uniform(), r.uniform(), L, ry, w);
+            const double jx = r.uniform(), jy = r.uniform(), u1 = r.uniform(), u2 = r.uniform();   // in order
+            return cam.genLensRay(px, py, jx, jy, u1, u2, L, ry, w);
         };
         if (!genLens(rng, lambda, ray, wLens) || wLens <= 0.0) {
             // Vignetted (clipped by an element / the stop, or TIR): no camera path this
@@ -1954,7 +1954,8 @@ inline int generateCameraSubpath(const Scene& scene, const Camera& cam, const Re
     }
     c.p = cam.eye;
     path.push_back(c);
-    Ray ray = cam.genRay(px, py, rng.uniform(), rng.uniform());
+    const double pjx = rng.uniform(), pjy = rng.uniform();   // in order: an argument list's is the compiler's
+    Ray ray = cam.genRay(px, py, pjx, pjy);
     double cosCam = dot(ray.d, cam.w);
     double pdfDir = cameraPdfDir(cam, cosCam);
     randomWalk(scene, cam, mats, ray, /*beta*/1.0, pdfDir, hb, maxDepth - 1,

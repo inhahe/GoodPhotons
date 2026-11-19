@@ -13055,6 +13055,18 @@ them as differing cases, each with its mean change. build.bat replaces ftrace.ex
 binary is copied aside first (it runs from anywhere: no DLLs beside it). `render <label>` and
 `compare <a> <b>` are the halves. Output in png/check_bitid/<label>/.
 
+**The draws a render takes are in an order the source fixes (0.450.11, RNG-ARG-ORDER).** C++ leaves
+the order in which a call evaluates its arguments to the compiler, so `f(rng.uniform(),
+rng.uniform())` let the image depend on the compiler that built it, and a host twin and its device
+twin (the caustic aim's disc and cone samplers) could take one stream's draws in opposite orders.
+Every such call -- 89 of them: the camera's jitter and lens draws, the hair fiber's four, the lens
+traces, the layered body's, the self-tests' -- now draws its uniforms into a declaration list first
+(`const double u = rng.uniform(), v = rng.uniform();`, whose declarators are sequenced) or a braced
+initializer (`Vec3{...}`, likewise); `hair::sampleWith` draws the fiber's four. A new draw is
+written the same way: never two in one argument list. `tools/check_rng_args.py` scans the source
+for any call whose arguments hold two draws (`x.uniform()` and its kin, or `rng()`, `frand()`,
+`uni()`...); it found 89 before the change, and none after.
+
 ## Scene-authoring tools (`tools/`)
 
 - **`settle.py`** — rests a *single* object on a surface by lowering it vertically.

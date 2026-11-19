@@ -935,8 +935,7 @@ inline Vec3 photonGatherSub(const Scene& scene, const PhotonMap& pm, Ray ray, Pc
                     hairArrival = true;
                 }
                 double pdfH = 0.0, fv = 0.0;
-                const Vec3 wl = hair::sample(hs.b, hs.woLocal, rng.uniform(), rng.uniform(),
-                                             rng.uniform(), rng.uniform(), pdfH, fv);
+                const Vec3 wl = hair::sampleWith(hs.b, hs.woLocal, rng, pdfH, fv);
                 if (!(pdfH > 0.0) || !(fv > 0.0)) return L;
                 const double cosLong =
                     hair::safeSqrt(1.0 - hair::sqr(hair::clampd(wl.x, -1.0, 1.0)));
@@ -1451,8 +1450,7 @@ inline Vec3 photonGather(const Scene& scene, const PhotonMap& pm, Ray ray, doubl
                 }
                 double pdfH = 0.0, fv = 0.0;
                 hair::LobeAngular la;                              // filled by the sample's own f()
-                const Vec3 wl = hair::sample(hs.b, hs.woLocal, rng.uniform(), rng.uniform(),
-                                             rng.uniform(), rng.uniform(), pdfH, fv, &la);
+                const Vec3 wl = hair::sampleWith(hs.b, hs.woLocal, rng, pdfH, fv, &la);
                 if (!(pdfH > 0.0) || !(fv > 0.0)) return L;
                 const double cosLong =
                     hair::safeSqrt(1.0 - hair::sqr(hair::clampd(wl.x, -1.0, 1.0)));
@@ -1580,7 +1578,8 @@ inline Film renderPhotonCamera(const Scene& scene, const Camera& cam, int resX, 
                     seedUnit(rng, unit, 0xA24BAED4963EE407ULL);
                     const Camera& c = perSample ? posed.at(cam.shutterTime(unitTime(unit, 0x5851F42D4C957F2DULL)))
                                                 : cam;
-                    Ray ray = c.genRay(px, py, rng.uniform(), rng.uniform());
+                    const double pjx = rng.uniform(), pjy = rng.uniform();   // in order
+                    Ray ray = c.genRay(px, py, pjx, pjy);
                     double u = lambdaRot + goldenFrac(sampleBase + (uint64_t)s);
                     u -= std::floor(u);
                     const double lambdaU = (u < 1.0) ? u : 0.999999999;

@@ -795,7 +795,8 @@ inline bool fitRegion(Pcg32& rng, U&& uniformRay, A&& aimRay, double scale, Lens
     // uniform ones, measured over the same points.
     long long nE = 0, okE = 0;
     for (int k = 0; k < 1024; ++k) {
-        const Vec3 X = pupilRegionSample(R, 1.0, 0.0, rng.uniform(), rng.uniform(), 0.0);
+        const double pu = rng.uniform(), pv = rng.uniform();   // in order: an argument list's is the compiler's
+        const Vec3 X = pupilRegionSample(R, 1.0, 0.0, pu, pv, 0.0);
         const int r = aimRay(X.x, X.y);
         if (r < 0) continue;
         ++nE; okE += r;
@@ -921,7 +922,8 @@ inline std::shared_ptr<const LensPupil> buildLensPupil(const LensSystem& L, doub
             Vec3 p;
             if (!point(p)) return -1;
             Vec3 Y, nY, o, d;
-            if (!L.frontLeg(p, rng.uniform(), rng.uniform(), Y, nY, o, d)) return 0;
+            const double fu = rng.uniform(), fv = rng.uniform();   // in order
+            if (!L.frontLeg(p, fu, fv, Y, nY, o, d)) return 0;
             if (!reaches(o, d)) return 0;
             X = Y + d * ((zRef - Y.z) / d.z);
             X.y = std::fabs(X.y);
@@ -979,7 +981,8 @@ inline std::shared_ptr<const LensPupil> buildLensPupil(const LensSystem& L, doub
             const Vec3 f = filmPoint();
             Vec3 d;
             double w;
-            if (!L.rearDir(f, rng.uniform(), rng.uniform(), d, w)) return 0;
+            const double ru = rng.uniform(), rv = rng.uniform();   // in order
+            if (!L.rearDir(f, ru, rv, d, w)) return 0;
             if (!getsOut(f, d)) return 0;
             X = f + d * ((zExit - f.z) / d.z);
             X.y = std::fabs(X.y);

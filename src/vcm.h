@@ -461,8 +461,7 @@ inline void scatterSample(const Scene& scene, const Renderer& mats, const Materi
             const HairShade hs = hairShadeAt(scene, *mp, h, lambda, wo);
             double pdfH = 0.0, fv = 0.0;
             hair::LobeAngular la;                              // filled by the sample's own f()
-            const Vec3 wl = hair::sample(hs.b, hs.woLocal, rng.uniform(), rng.uniform(),
-                                         rng.uniform(), rng.uniform(), pdfH, fv, &la);
+            const Vec3 wl = hair::sampleWith(hs.b, hs.woLocal, rng, pdfH, fv, &la);
             if (!(pdfH > 0.0) || !(fv > 0.0)) { terminate = true; break; }
             wi = hair::toWorld(hs.fr, wl); lobe = Lobe::Free;
             // A coverage pass-through returns EXACTLY -wo: the ray was never intercepted.
@@ -976,7 +975,8 @@ inline Vec3 traceCameraSubpath(const Scene& scene, const Camera& cam, const Rend
     }
     const Vec3 cie(cieX(lambda), cieY(lambda), cieZ(lambda));
 
-    Ray ray = cam.genRay(px, py, rng.uniform(), rng.uniform());
+    const double pjx = rng.uniform(), pjy = rng.uniform();   // in order: an argument list's is the compiler's
+    Ray ray = cam.genRay(px, py, pjx, pjy);
     double cosAtCamera = dot(ray.d, cam.w);
     if (cosAtCamera <= 1e-9) return result;
     double cameraPdfW = ctx.imagePlaneDist * ctx.imagePlaneDist / (cosAtCamera * cosAtCamera * cosAtCamera);

@@ -69,7 +69,8 @@ inline int run() {
                     const Vec3 a = dirAt(ca, 0.7);
                     for (int i = 0; i < 20000; ++i) {
                         double w = 0.0;
-                        const Vec3 b = drawUV(n, a, al, ms, rng(), rng(), w);
+                        const double d0 = rng(), d1 = rng();   // in order: an argument list's is the compiler's
+                        const Vec3 b = drawUV(n, a, al, ms, d0, d1, w);
                         const Pair p = pair(n, a, b, al), q = pair(n, b, a, al);
                         if (!p.ok) continue;
                         const double fa = fAll(p, ms), fb = fAll(q, ms);
@@ -118,7 +119,8 @@ inline int run() {
                     double s[3] = {0, 0, 0}, s2[3] = {0, 0, 0}, sw = 0.0, sw2 = 0.0;
                     for (int k = 0; k < N; ++k) {
                         double w = 0.0;
-                        const Vec3 b = drawUV(n, a, al, ms, rng(), rng(), w);
+                        const double d0 = rng(), d1 = rng();   // in order: an argument list's is the compiler's
+                        const Vec3 b = drawUV(n, a, al, ms, d0, d1, w);
                         const Pair p = pair(n, a, b, al);
                         if (!p.ok) continue;
                         const double g[3] = {1.0, p.cb, dot(b, lean)};
@@ -174,7 +176,8 @@ inline int run() {
                     double sw = 0.0;
                     for (int k = 0; k < N; ++k) {
                         double w = 0.0;
-                        drawUV(n, a, al, true, rng(), rng(), w);   // w is 0 for a draw below n
+                        const double d0 = rng(), d1 = rng();   // in order: an argument list's is the compiler's
+                        drawUV(n, a, al, true, d0, d1, w);   // w is 0 for a draw below n
                         sw += w;
                     }
                     const double e = std::fabs(sw / N - 1.0);
@@ -205,7 +208,8 @@ inline int run() {
                 exact &= (m0.x == mirror.x && m0.y == mirror.y && m0.z == mirror.z);
                 for (double& x : ang) {
                     double w = 0.0;
-                    x = std::acos(std::min(1.0, dot(drawUV(n, a, al, ms, rng(), rng(), w), mirror)));
+                    const double d0 = rng(), d1 = rng();   // in order: an argument list's is the compiler's
+                    x = std::acos(std::min(1.0, dot(drawUV(n, a, al, ms, d0, d1, w), mirror)));
                 }
                 std::nth_element(ang.begin(), ang.begin() + 99000, ang.end());
                 worst = std::max(worst, ang[99000]);

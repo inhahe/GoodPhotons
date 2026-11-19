@@ -762,6 +762,18 @@ inline Vec3 sample(const Bcsdf& b, const Vec3& wo, double u0, double u1, double 
     return wi;
 }
 
+// sample() with its four uniforms drawn from `rng` in order, one statement each: in an argument
+// list their order would be the compiler's to choose, and the image with it.
+template <class Rng>
+inline Vec3 sampleWith(const Bcsdf& b, const Vec3& wo, Rng& rng, double& pdfOut, double& fOut,
+                       LobeAngular* la = nullptr) {
+    const double u0 = rng.uniform();
+    const double u1 = rng.uniform();
+    const double u2 = rng.uniform();
+    const double u3 = rng.uniform();
+    return sample(b, wo, u0, u1, u2, u3, pdfOut, fOut, la);
+}
+
 // --- Roughness from a measured angle ------------------------------------------
 // `betaM` / `betaN` are Chiang's PERCEPTUAL [0, 1] knobs, chosen so equal steps look like
 // equal steps. Every measurement in the fur literature — Yan et al. (2017) Table 4, and

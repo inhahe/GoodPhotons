@@ -886,8 +886,9 @@ struct Renderer {
             if (!(da.sumR2 > 0.0)) return true;
             double x, y;
             if (aimEmission) {
-                if (!caim::discSample(*aimMap, da, scene.sceneCenter, t, b,
-                                      rng.uniform(), rng.uniform(), rng.uniform(), x, y))
+                // The draws in order, as the device twin takes them (dAimDiscSample).
+                const double a0 = rng.uniform(), a1 = rng.uniform(), a2 = rng.uniform();
+                if (!caim::discSample(*aimMap, da, scene.sceneCenter, t, b, a0, a1, a2, x, y))
                     return true;
                 origin = base + t * x + b * y;
             } else {
@@ -911,8 +912,8 @@ struct Renderer {
             if (!(ca.sumOmega > 0.0)) return true;
             if (aimEmission) {
                 Vec3 w;
-                if (!caim::coneSample(*aimMap, ca, origin,
-                                      rng.uniform(), rng.uniform(), rng.uniform(), w))
+                const double c0 = rng.uniform(), c1 = rng.uniform(), c2 = rng.uniform();   // in order
+                if (!caim::coneSample(*aimMap, ca, origin, c0, c1, c2, w))
                     return true;
                 dir = w;
                 if (em && em->shape == EmitterShape::Spot) {
@@ -3395,8 +3396,7 @@ struct Renderer {
                                     lambda, beta, hs, rng);
 
                 double pdf = 0.0, fv = 0.0;
-                const Vec3 wl = hair::sample(hs.b, hs.woLocal, rng.uniform(), rng.uniform(),
-                                             rng.uniform(), rng.uniform(), pdf, fv);
+                const Vec3 wl = hair::sampleWith(hs.b, hs.woLocal, rng, pdf, fv);
                 if (!(pdf > 0.0) || !(fv > 0.0)) { e.absorbed += beta; return false; }
                 // The BCSDF is built so this ratio is EXACTLY T = sum_p A_p <= 1 (the total
                 // Fresnel/Beer attenuation over the lobes) — the per-lobe pdf weights are

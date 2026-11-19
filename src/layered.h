@@ -132,7 +132,8 @@ inline bool sample(const Params& P, const Body& body, const Vec3& wi, Rng& rng,
     for (int k = 0; k < P.maxBounce; ++k) {
         Vec3 b;
         double w = 0.0;
-        if (!body.sample(a, rng(), rng(), b, w)) return false;
+        const double s0 = rng(), s1 = rng();   // in order: an argument list's is the compiler's
+        if (!body.sample(a, s0, s1, b, w)) return false;
         thr *= w;
         if (!(thr > 0.0)) return false;
 
@@ -201,7 +202,8 @@ inline double f(const Params& P, const Body& body, const Vec3& wi, const Vec3& w
         // ... and continue the walk for the next order
         Vec3 b;
         double w = 0.0;
-        if (!body.sample(a, rng(), rng(), b, w)) break;
+        const double s0 = rng(), s1 = rng();   // in order: an argument list's is the compiler's
+        if (!body.sample(a, s0, s1, b, w)) break;
         thr *= w;
         if (!(thr > 0.0)) break;
         Vec3 up = b;
@@ -255,7 +257,8 @@ inline void escapeMoments(const Params& P, const Body& body, double cosI, int K,
         for (int k = 0; k < K; ++k) {
             Vec3 b;
             double w = 0.0;
-            if (!body.sample(a, rng(), rng(), b, w)) break;
+            const double s0 = rng(), s1 = rng();   // in order: an argument list's is the compiler's
+            if (!body.sample(a, s0, s1, b, w)) break;
             thr *= w;
             if (!(thr > 0.0)) break;
             const double F2 = fresnel(b.z, 1.0 / P.eta);

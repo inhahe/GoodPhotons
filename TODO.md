@@ -449,14 +449,11 @@ Then the rest of 4.2-4.6 in their order, 4.7's bookkeeping alongside whatever to
   the occupancy pays.
 - [ ] **MERGE-LAZY-TIMING** — time fab8da8's lazy lobe against 0.450.9 paired, on the case 0.450.5
   measured its cost on (mode J, _fog_cornell: 5.48 -> 5.71 s median), on an idle GPU.
-- [ ] **RNG-ARG-ORDER** — 67 calls pass two or more RNG draws as arguments of one call
-  (`cam.genRay(px, py, rng.uniform(), rng.uniform())` and `hair::sample(...)` in the renderers, the
-  lens's draws, main.cpp's self-test scenes, and the device's caustic-aim samplers with their host
-  twins in render.h), whose order of evaluation is the compiler's: an image depends on the compiler
-  that built it, and a host twin and its device twin may take one stream's draws in opposite orders.
-  (A declaration list, `Real u1 = rng.uniform(), u2 = rng.uniform();`, and a braced initializer are
-  sequenced, and not counted.) Sequence them (a two-draw helper, `rng.uniform2()`) in one
-  sweep: every render's noise realization moves once, by design (both reviews of 0.450.5-0.450.6).
+- [x] **RNG-ARG-ORDER** (0.450.11) — every call that took two or more RNG draws as arguments (89,
+  the renderers' camera, lens and hair draws, the layered body's, the caustic aim's twins, the
+  self-tests') draws them first into a declaration list or a braced initializer, which C++
+  sequences; hair::sampleWith draws a fiber's four (design.md, "The draws a render takes"). Every
+  render's noise realization moved once.
 - [ ] **VCM-GATHER-DIVERGENCE** — the gather keeps 13.7 of 32 lanes active (a lane's candidate refused
   at the distance, sidedness or band test idles while the others evaluate) at 244 registers, a
   sixth of the warps resident: gather the candidates that pass the cheap tests into a warp-wide

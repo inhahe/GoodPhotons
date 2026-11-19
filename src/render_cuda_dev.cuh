@@ -157,6 +157,7 @@ const std::vector<VolCache>* g_volCachesForUpload = nullptr;
 // After a kernel launch, check both the launch (cudaGetLastError) and the execution
 // (cudaDeviceSynchronize) status; abort loudly on either. `what` names the kernel for
 // the diagnostic. A display-driver TDR or an out-of-resources launch surfaces here.
+#ifndef FT_FAMILY_TU   // the host's launches are all render_cuda.cu's
 static void cudaCheckKernel(const char* what) {
     cudaError_t e = cudaGetLastError();
     if (e == cudaSuccess) e = cudaDeviceSynchronize();
@@ -166,6 +167,7 @@ static void cudaCheckKernel(const char* what) {
         std::exit(EXIT_FAILURE);
     }
 }
+#endif
 
 // ============================ device-side scene ============================
 
@@ -13107,9 +13109,9 @@ __device__ static bool dApplyCausticAim(const DScene& sc, const DCamSet& cs,
         if (!(am.sumR2 > 0.0)) return true;
         double x, y;
         if (am.aimed) {
-            if (!dAimDiscSample(am, sc.sceneCenter, t, b,
-                                (double)rng.uniform(), (double)rng.uniform(),
-                                (double)rng.uniform(), x, y))
+            // The draws in order, as the host twin takes them (caim::discSample).
+            const double a0 = (double)rng.uniform(), a1 = (double)rng.uniform(), a2 = (double)rng.uniform();
+            if (!dAimDiscSample(am, sc.sceneCenter, t, b, a0, a1, a2, x, y))
                 return true;
             origin = base + t * (Real)x + b * (Real)y;
         } else {
@@ -13129,8 +13131,8 @@ __device__ static bool dApplyCausticAim(const DScene& sc, const DCamSet& cs,
         if (!(sumOmega > 0.0)) return true;
         if (am.aimed) {
             DVec3 w;
-            if (!dAimConeSample(am, sumOmega, origin, (double)rng.uniform(),
-                                (double)rng.uniform(), (double)rng.uniform(), w))
+            const double c0 = (double)rng.uniform(), c1 = (double)rng.uniform(), c2 = (double)rng.uniform();
+            if (!dAimConeSample(am, sumOmega, origin, c0, c1, c2, w))   // in order, as caim::coneSample
                 return true;
             dir = w;
             if (em && em->shape == 2) {                       // spot, its axis now (emitN)

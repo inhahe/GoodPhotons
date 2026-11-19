@@ -333,8 +333,7 @@ inline void sppmVisiblePoint(const Scene& scene, Ray ray, Pcg32& rng, bool diffr
                 const HairShade hs = hairShadeAt(scene, m, h, lambda, wPrev);
                 double pdfH = 0.0, fv = 0.0;
                 hair::LobeAngular la;                              // filled by the sample's own f()
-                const Vec3 wl = hair::sample(hs.b, hs.woLocal, rng.uniform(), rng.uniform(),
-                                             rng.uniform(), rng.uniform(), pdfH, fv, &la);
+                const Vec3 wl = hair::sampleWith(hs.b, hs.woLocal, rng, pdfH, fv, &la);
                 if (!(pdfH > 0.0) || !(fv > 0.0)) return;
                 // Exactly T = sum_p A_p, the total lobe attenuation (see render.h's Hair
                 // case for why the ratio collapses to a deterministic number).
@@ -418,7 +417,8 @@ inline void sppmPass(const Scene& scene, const Camera& cam, SPPMState& st,
                     const Camera& c = perPixel ? posed.at(cam.shutterTime(unitTime(
                                           ((uint64_t)st.passes << 32) ^ ((uint64_t)y * W + x), 0x6C62272E07BB0142ULL)))
                                                : camAt;
-                    Ray ray = c.genRay(x, y, rng.uniform(), rng.uniform());
+                    const double pjx = rng.uniform(), pjy = rng.uniform();   // in order
+                    Ray ray = c.genRay(x, y, pjx, pjy);
                     Vec3 directL;
                     SpecThr sthr(scene.emitSampler);
                     sppmVisiblePoint(scene, ray, rng, diffraction, maxBounce,

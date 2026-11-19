@@ -376,7 +376,8 @@ inline Images render(const Scene& scene, const Camera& cam, int W, int H, int si
                     Ray ray;
                     if (c.hasLens()) {
                         double w = 0.0;
-                        if (!c.genLensRay(px, py, jx, jy, rng.uniform(), rng.uniform(),
+                        const double lu1 = rng.uniform(), lu2 = rng.uniform();   // in order
+                        if (!c.genLensRay(px, py, jx, jy, lu1, lu2,
                                           kGuideLambda, ray, w) || !(w > 0.0))
                             continue;            // vignetted: contributes black, as in the render
                     } else {

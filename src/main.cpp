@@ -1497,8 +1497,8 @@ static int checkFurGrid() {
         double analytic = 0.0;
         for (int i = 0; i < 4000; ++i) {
             CurveSeg s;
-            s.p0 = Vec3(rng.uniform(), rng.uniform(), rng.uniform());
-            s.p1 = s.p0 + Vec3(rng.uniform() - 0.5, rng.uniform() - 0.5, rng.uniform() - 0.5) * 0.15;
+            s.p0 = Vec3{rng.uniform(), rng.uniform(), rng.uniform()};
+            s.p1 = s.p0 + Vec3{rng.uniform() - 0.5, rng.uniform() - 0.5, rng.uniform() - 0.5} * 0.15;
             s.r0 = 0.0004 + 0.0002 * rng.uniform();
             s.r1 = 0.0004 + 0.0002 * rng.uniform();
             segs.push_back(s);
@@ -1529,7 +1529,7 @@ static int checkFurGrid() {
         std::vector<CurveSeg> segs;
         for (int i = 0; i < 3000; ++i) {
             CurveSeg s;
-            s.p0 = Vec3(rng.uniform(), rng.uniform(), rng.uniform());
+            s.p0 = Vec3{rng.uniform(), rng.uniform(), rng.uniform()};
             s.p1 = s.p0 + t * 0.05;
             s.r0 = s.r1 = 5e-4;
             segs.push_back(s);
@@ -1537,7 +1537,7 @@ static int checkFurGrid() {
         FurGrid g; g.build(segs, anyFiber, 16 * 16 * 16);
         double worst = 0.0;
         for (int k = 0; k < 64; ++k) {
-            const Vec3 d = normalize(Vec3(rng.uniform() - 0.5, rng.uniform() - 0.5, rng.uniform() - 0.5));
+            const Vec3 d = normalize(Vec3{rng.uniform() - 0.5, rng.uniform() - 0.5, rng.uniform() - 0.5});
             const double want = dot(d, t) * dot(d, t);
             for (const FurCell& fc : g.cells) {
                 if (fc.c <= 0.0f) continue;
@@ -1566,7 +1566,7 @@ static int checkFurGrid() {
             const double s = std::sqrt(std::max(0.0, 1.0 - z * z));
             const Vec3 t(s * std::cos(phi), s * std::sin(phi), z);
             CurveSeg cs;
-            cs.p0 = Vec3(rng.uniform(), rng.uniform(), rng.uniform());
+            cs.p0 = Vec3{rng.uniform(), rng.uniform(), rng.uniform()};
             cs.p1 = cs.p0 + t * 0.02;
             cs.r0 = cs.r1 = 5e-4;
             segs.push_back(cs); tangents.push_back(t);
@@ -1575,7 +1575,7 @@ static int checkFurGrid() {
         FurGrid g; g.build(segs, anyFiber, 1);
         double ratioSum = 0.0; int n = 0;
         for (int k = 0; k < 32; ++k) {
-            const Vec3 d = normalize(Vec3(rng.uniform() - 0.5, rng.uniform() - 0.5, rng.uniform() - 0.5));
+            const Vec3 d = normalize(Vec3{rng.uniform() - 0.5, rng.uniform() - 0.5, rng.uniform() - 0.5});
             double exact = 0.0;
             for (const Vec3& t : tangents) {
                 const double c = dot(d, t);
@@ -1646,7 +1646,7 @@ static int checkFurGrid() {
             const double z = 2.0 * rng.uniform() - 1.0, phi = 2.0 * PI * rng.uniform();
             const double s = std::sqrt(std::max(0.0, 1.0 - z * z));
             CurveSeg cs;
-            cs.p0 = Vec3(rng.uniform(), rng.uniform(), rng.uniform());
+            cs.p0 = Vec3{rng.uniform(), rng.uniform(), rng.uniform()};
             cs.p1 = cs.p0 + Vec3(s * std::cos(phi), s * std::sin(phi), z) * segLen;
             cs.r0 = cs.r1 = 3e-4;                          // 2r/l = 0.4%: caps negligible
             segs.push_back(cs);
@@ -1656,8 +1656,8 @@ static int checkFurGrid() {
         const int NR = 5000;
         double sumFine = 0.0, sumCoarse = 0.0, sumHits = 0.0;
         for (int k = 0; k < NR; ++k) {
-            const Vec3 o(-1.0, 0.35 + 0.3 * rng.uniform(), 0.35 + 0.3 * rng.uniform());
-            const Vec3 tgt(2.0, 0.35 + 0.3 * rng.uniform(), 0.35 + 0.3 * rng.uniform());
+            const Vec3 o{-1.0, 0.35 + 0.3 * rng.uniform(), 0.35 + 0.3 * rng.uniform()};
+            const Vec3 tgt{2.0, 0.35 + 0.3 * rng.uniform(), 0.35 + 0.3 * rng.uniform()};
             const Vec3 d = normalize(tgt - o);
             const double maxD = length(tgt - o);
             sumFine   += fine.march(o, d, maxD).tau;
@@ -1781,7 +1781,7 @@ static int checkFurVol() {
             const int n = 40;
             // A deliberately degenerate mix: a third of the trials are axially symmetric.
             const bool axial = (trial % 3) == 0;
-            const Vec3 ax = normalize(Vec3(rng.uniform() - 0.5, rng.uniform() - 0.5, rng.uniform() - 0.5));
+            const Vec3 ax = normalize(Vec3{rng.uniform() - 0.5, rng.uniform() - 0.5, rng.uniform() - 0.5});
             for (int i = 0; i < n; ++i) {
                 Vec3 t;
                 if (axial) {
@@ -1790,7 +1790,7 @@ static int checkFurVol() {
                     const double r = std::sqrt(std::max(0.0, 1.0 - u * u)), ph = 2.0 * PI * rng.uniform();
                     t = normalize(ax * u + a * (r * std::cos(ph)) + b * (r * std::sin(ph)));
                 } else {
-                    t = normalize(Vec3(rng.uniform() - 0.5, rng.uniform() - 0.5, rng.uniform() - 0.5));
+                    t = normalize(Vec3{rng.uniform() - 0.5, rng.uniform() - 0.5, rng.uniform() - 0.5});
                 }
                 m[0] += t.x * t.x; m[1] += t.y * t.y; m[2] += t.z * t.z;
                 m[3] += t.x * t.y; m[4] += t.x * t.z; m[5] += t.y * t.z;
@@ -1946,8 +1946,8 @@ static int checkFurVol() {
         Pcg32 rng; rng.seed(606, 1);
         double worst = 0.0;
         for (int i = 0; i < 200000; ++i) {
-            const Vec3 t  = normalize(Vec3(rng.uniform() - 0.5, rng.uniform() - 0.5, rng.uniform() - 0.5));
-            const Vec3 wo = normalize(Vec3(rng.uniform() - 0.5, rng.uniform() - 0.5, rng.uniform() - 0.5));
+            const Vec3 t  = normalize(Vec3{rng.uniform() - 0.5, rng.uniform() - 0.5, rng.uniform() - 0.5});
+            const Vec3 wo = normalize(Vec3{rng.uniform() - 0.5, rng.uniform() - 0.5, rng.uniform() - 0.5});
             if (std::fabs(dot(t, wo)) > 0.999) continue;      // end-on: h is undefined, not wrong
             const double h = 2.0 * rng.uniform() - 1.0;
             const Vec3 n = furvol::fiberNormalFor(t, wo, h);
@@ -1998,8 +1998,8 @@ static int checkFurVol() {
             double sumTrue = 0.0, sumGrid = 0.0;
             const int NDIR = 24, NT = 20000;
             for (int d = 0; d < NDIR; ++d) {
-                const Vec3 dir = normalize(Vec3(rng.uniform() - 0.5, rng.uniform() - 0.5,
-                                                rng.uniform() - 0.5));
+                const Vec3 dir = normalize(Vec3{rng.uniform() - 0.5, rng.uniform() - 0.5,
+                                                rng.uniform() - 0.5});
                 double acc = 0.0;
                 for (int i = 0; i < NT; ++i) {
                     const Vec3 t = odf.sample(rng);
@@ -2126,8 +2126,8 @@ static int checkFurVol() {
 
             double worstShape = 0.0, worstEnergy = 0.0;
             for (int pass = 0; pass < 3; ++pass) {
-                const Vec3 d  = normalize(Vec3(rng.uniform() - 0.5, rng.uniform() - 0.5,
-                                               rng.uniform() - 0.5));
+                const Vec3 d  = normalize(Vec3{rng.uniform() - 0.5, rng.uniform() - 0.5,
+                                               rng.uniform() - 0.5});
                 const Vec3 wo = d * -1.0;                        // arrival direction, reversed
                 std::vector<double> truth((size_t)NW, 0.0), agg((size_t)NW, 0.0);
                 for (int i = 0; i < NF; ++i) {
@@ -2193,13 +2193,13 @@ static int checkFurVol() {
         Pcg32 rng; rng.seed(31337, 5);
         std::vector<CurveSeg> segs;
         for (int c = 0; c < 900; ++c) {
-            const Vec3 root(rng.uniform(), 0.02 * rng.uniform(), rng.uniform());
-            const Vec3 comb = normalize(Vec3(0.25 + 0.1 * rng.uniform(), 1.0, 0.1 * rng.uniform()));
+            const Vec3 root{rng.uniform(), 0.02 * rng.uniform(), rng.uniform()};
+            const Vec3 comb = normalize(Vec3{0.25 + 0.1 * rng.uniform(), 1.0, 0.1 * rng.uniform()});
             Vec3 p = root;
             for (int k = 0; k < 8; ++k) {
                 CurveSeg s;
                 s.p0 = p;
-                const Vec3 jit(rng.uniform() - 0.5, rng.uniform() - 0.5, rng.uniform() - 0.5);
+                const Vec3 jit{rng.uniform() - 0.5, rng.uniform() - 0.5, rng.uniform() - 0.5};
                 p = p + (comb + jit * 0.35) * 0.03;
                 s.p1 = p;
                 s.r0 = 0.0006; s.r1 = 0.0005;
@@ -2288,8 +2288,8 @@ static int checkFurVol() {
         double worst = 0.0, worstAt = 0.0;
         int    zeroHits = 0;
         for (int r = 0; r < NR; ++r) {
-            const Vec3 o(rng.uniform() * 0.8 + 0.1, -0.05, rng.uniform() * 0.8 + 0.1);
-            const Vec3 d = normalize(Vec3(rng.uniform() - 0.5, 1.0, rng.uniform() - 0.5));
+            const Vec3 o{rng.uniform() * 0.8 + 0.1, -0.05, rng.uniform() * 0.8 + 0.1};
+            const Vec3 d = normalize(Vec3{rng.uniform() - 0.5, 1.0, rng.uniform() - 0.5});
             const double L = 0.35;
             const double tau = coat.march(o, d, L).tau;
             if (!(tau > 0.05)) continue;                  // a ray that saw no coat proves nothing
@@ -2309,8 +2309,8 @@ static int checkFurVol() {
         // collision beyond the segment, and never inside an empty cell.
         bool clean = true;
         for (int s = 0; s < 20000 && clean; ++s) {
-            const Vec3 o(rng.uniform(), rng.uniform() * 0.4 - 0.1, rng.uniform());
-            const Vec3 d = normalize(Vec3(rng.uniform() - 0.5, rng.uniform() - 0.5, rng.uniform() - 0.5));
+            const Vec3 o{rng.uniform(), rng.uniform() * 0.4 - 0.1, rng.uniform()};
+            const Vec3 d = normalize(Vec3{rng.uniform() - 0.5, rng.uniform() - 0.5, rng.uniform() - 0.5});
             const double L = 0.2 + 0.3 * rng.uniform();
             const auto f = vol.sampleFlight(o, d, L, rng.uniform());
             if (!f.hit) continue;
@@ -2343,10 +2343,10 @@ static int checkFurVol() {
         double worstGap = 0.0;         // fiber mass found strictly before entryDist
         int    misses = 0, inside = 0, hits = 0;
         for (int s = 0; s < 20000; ++s) {
-            const Vec3 o(rng.uniform() * 3.0 - 1.0, rng.uniform() * 3.0 - 1.0,
-                         rng.uniform() * 3.0 - 1.0);
-            const Vec3 d = normalize(Vec3(rng.uniform() - 0.5, rng.uniform() - 0.5,
-                                          rng.uniform() - 0.5));
+            const Vec3 o{rng.uniform() * 3.0 - 1.0, rng.uniform() * 3.0 - 1.0,
+                         rng.uniform() * 3.0 - 1.0};
+            const Vec3 d = normalize(Vec3{rng.uniform() - 0.5, rng.uniform() - 0.5,
+                                          rng.uniform() - 0.5});
             const double te = vol.entryDist(o, d);
             if (te < 0.0) {   // claimed miss: the whole ray must be empty
                 ++misses;
@@ -2429,11 +2429,11 @@ static int checkFurVol() {
 
         // The coat: hair curves that must become invisible.
         for (int c = 0; c < 700; ++c) {
-            Vec3 p(rng.uniform(), 0.02 * rng.uniform(), rng.uniform());
+            Vec3 p{rng.uniform(), 0.02 * rng.uniform(), rng.uniform()};
             const Vec3 comb = normalize(Vec3(0.25, 1.0, 0.1));
             for (int k = 0; k < 8; ++k) {
                 CurveSeg s; s.p0 = p;
-                const Vec3 jit(rng.uniform() - 0.5, rng.uniform() - 0.5, rng.uniform() - 0.5);
+                const Vec3 jit{rng.uniform() - 0.5, rng.uniform() - 0.5, rng.uniform() - 0.5};
                 p = p + (comb + jit * 0.35) * 0.03;
                 s.p1 = p; s.r0 = 0.0006; s.r1 = 0.0005; s.matId = 0;
                 sc.curveSegs.push_back(s);
@@ -2442,11 +2442,11 @@ static int checkFurVol() {
         // Wire: curves that are NOT hair and must keep blocking, threaded through the same
         // space so a remap error cannot hide behind them being somewhere else.
         for (int c = 0; c < 40; ++c) {
-            Vec3 p(rng.uniform(), 0.4 * rng.uniform(), rng.uniform());
+            Vec3 p{rng.uniform(), 0.4 * rng.uniform(), rng.uniform()};
             for (int k = 0; k < 6; ++k) {
                 CurveSeg s; s.p0 = p;
-                p = p + normalize(Vec3(rng.uniform() - 0.5, rng.uniform() - 0.5,
-                                       rng.uniform() - 0.5)) * 0.05;
+                p = p + normalize(Vec3{rng.uniform() - 0.5, rng.uniform() - 0.5,
+                                       rng.uniform() - 0.5}) * 0.05;
                 s.p1 = p; s.r0 = s.r1 = 0.004; s.matId = 1;
                 sc.curveSegs.push_back(s);
             }
@@ -2467,10 +2467,10 @@ static int checkFurVol() {
         int diffs = 0, occDiffs = 0, solidHits = 0, wireHits = 0, blocked = 0;
         const bool built = sc.hasNoHairBvh();
         for (int s = 0; s < 20000 && built; ++s) {
-            const Vec3 o(rng.uniform() * 2.0 - 0.5, rng.uniform() * 1.2 - 0.1,
-                         rng.uniform() * 2.0 - 0.5);
-            const Vec3 dir = normalize(Vec3(rng.uniform() - 0.5, rng.uniform() - 0.5,
-                                            rng.uniform() - 0.5));
+            const Vec3 o{rng.uniform() * 2.0 - 0.5, rng.uniform() * 1.2 - 0.1,
+                         rng.uniform() * 2.0 - 0.5};
+            const Vec3 dir = normalize(Vec3{rng.uniform() - 0.5, rng.uniform() - 0.5,
+                                            rng.uniform() - 0.5});
             const Ray r{o, dir};
             const Hit got = sc.closestHit(r, 1e-6, nullptr, /*skipHair=*/true);
             const bool occGot = sc.occludedSkipHair(o, dir, 2.0);
@@ -2663,7 +2663,8 @@ static bool checkLensPhysicalOne(const char* preset, LensSystem L, LensShareTall
     for (int k = 0; k < nCam; ++k) {
         const int px = (int)(rng.uniform() * 64), py = (int)(rng.uniform() * 43);
         Ray r; double wgt;
-        if (!cam.genLensRay(px, py, rng.uniform(), rng.uniform(), rng.uniform(), rng.uniform(),
+        const double ur0 = rng.uniform(), ur1 = rng.uniform(), ur2 = rng.uniform(), ur3 = rng.uniform();   // in order: an argument list's is the compiler's
+        if (!cam.genLensRay(px, py, ur0, ur1, ur2, ur3,
                             lambda, r, wgt) || !(wgt > 0.0)) continue;
         ++ok;
         if (!(cam.lensPdfDir(r.o, r.d, lambda) > 0.0)) ++zeroBack;   // (2)
@@ -2676,7 +2677,8 @@ static bool checkLensPhysicalOne(const char* preset, LensSystem L, LensShareTall
     double acc = 0.0, acc2 = 0.0;
     for (int k = 0; k < nInt; ++k) {
         Vec3 n;
-        const Vec3 yl = L.sampleSurface(0, rng.uniform(), rng.uniform(), n);
+        const double ur0 = rng.uniform(), ur1 = rng.uniform();   // in order: an argument list's is the compiler's
+        const Vec3 yl = L.sampleSurface(0, ur0, ur1, n);
         const double cz = 1.0 - rng.uniform() * (1.0 - cosC), ph = 2.0 * PI * rng.uniform();
         const double sz = std::sqrt(std::max(0.0, 1.0 - cz * cz));
         const Vec3 dl(sz * std::cos(ph), sz * std::sin(ph), cz);
@@ -2701,7 +2703,8 @@ static bool checkLensPhysicalOne(const char* preset, LensSystem L, LensShareTall
         const double aCell = 1.0 / cam.lensCellNorm();
         for (int k = 0; k < nConn; ++k) {
             Vec3 Y, wd; double dist, wgt; int px, py;
-            if (!cam.lensConnect(X, lambda, rng.uniform(), rng.uniform(), Y, wd, dist, px, py, wgt)) continue;
+            const double ur0 = rng.uniform(), ur1 = rng.uniform();   // in order: an argument list's is the compiler's
+            if (!cam.lensConnect(X, lambda, ur0, ur1, Y, wd, dist, px, py, wgt)) continue;
             sumConn += wgt * aCell; cxC += wgt * aCell * px; cyC += wgt * aCell * py;
         }
         const double omegaConn = sumConn / nConn;
@@ -2760,7 +2763,8 @@ static bool checkLensPhysicalOne(const char* preset, LensSystem L, LensShareTall
         const Vec3 X = cam.eye + (cam.w * std::cos(th) + (cam.u * std::cos(ph) + cam.v * std::sin(ph)) *
                                   std::sin(th)) * range;
         Camera::LensEntry e;
-        if (!camF.lensEntry(X, rng.uniform(), rng.uniform(), e)) continue;
+        const double ur0 = rng.uniform(), ur1 = rng.uniform();   // in order: an argument list's is the compiler's
+        if (!camF.lensEntry(X, ur0, ur1, e)) continue;
         Vec3 onFilm, dFilm; int px, py;
         const double lam4 = LAMBDA_MIN + (LAMBDA_MAX - LAMBDA_MIN) * rng.uniform();   // the tables hold every wavelength
         if (!CL.traceToFilm(e.o, e.d, lam4, onFilm, dFilm) || !cam.lensFilmToPixel(onFilm, px, py)) continue;
@@ -2803,7 +2807,8 @@ static bool checkLensPhysicalOne(const char* preset, LensSystem L, LensShareTall
         double cphi, sphi;
         if (P->classify(cam.lensLocalPoint(X), cphi, sphi) == -1) continue;   // table bins only
         Camera::LensEntry e;
-        if (!cam.lensEntry(X, rng.uniform(), rng.uniform(), e)) continue;
+        const double ur0 = rng.uniform(), ur1 = rng.uniform();   // in order: an argument list's is the compiler's
+        if (!cam.lensEntry(X, ur0, ur1, e)) continue;
         ++nAimed;
         const double dXY = length(cam.lensLocalPoint(e.Y) - cam.lensLocalPoint(X));
         const double qDrawn = CL.frontArea() * e.cosY / (e.omega * dXY * dXY);
@@ -2827,7 +2832,8 @@ static bool checkLensPhysicalOne(const char* preset, LensSystem L, LensShareTall
             const Camera& cc = which ? camF : cam;
             for (int k = 0; k < n; ++k) {
                 Vec3 Y, wd; double dist, wgt; int px, py;
-                if (!cc.lensConnect(X, lambda, rng.uniform(), rng.uniform(), Y, wd, dist, px, py, wgt)) continue;
+                const double ur0 = rng.uniform(), ur1 = rng.uniform();   // in order: an argument list's is the compiler's
+                if (!cc.lensConnect(X, lambda, ur0, ur1, Y, wd, dist, px, py, wgt)) continue;
                 const double v = wgt * aCell;
                 s[which] += v; s2[which] += v * v; ++hit[which];
             }
@@ -2854,10 +2860,12 @@ static bool checkLensPhysicalOne(const char* preset, LensSystem L, LensShareTall
     long long out7 = 0, outside7 = 0, rejected7 = 0, aimed7 = 0;
     double worstOut7 = 0.0;
     for (int k = 0; k < 2000000; ++k) {
-        const Vec3 f = filmPoint(rng.uniform(), rng.uniform());
+        const double ur0 = rng.uniform(), ur1 = rng.uniform();   // in order: an argument list's is the compiler's
+        const Vec3 f = filmPoint(ur0, ur1);
         Vec3 d;
         double w;
-        if (!CL.rearDir(f, rng.uniform(), rng.uniform(), d, w)) continue;
+        const double ur2 = rng.uniform(), ur3 = rng.uniform();   // in order: an argument list's is the compiler's
+        if (!CL.rearDir(f, ur2, ur3, d, w)) continue;
         Ray o;
         if (!CL.trace(f, d, LAMBDA_MIN + (LAMBDA_MAX - LAMBDA_MIN) * rng.uniform(), /*sensorToScene=*/true, o)) continue;
         ++out7;
@@ -2894,7 +2902,8 @@ static bool checkLensPhysicalOne(const char* preset, LensSystem L, LensShareTall
     for (int k = 0; k < 400000; ++k) {
         const int px = (int)(rng.uniform() * 64), py = (int)(rng.uniform() * 43);
         Ray r; double wgt;
-        if (!cam.genLensRay(px, py, rng.uniform(), rng.uniform(), rng.uniform(), rng.uniform(),
+        const double ur0 = rng.uniform(), ur1 = rng.uniform(), ur2 = rng.uniform(), ur3 = rng.uniform();   // in order: an argument list's is the compiler's
+        if (!cam.genLensRay(px, py, ur0, ur1, ur2, ur3,
                             lambda, r, wgt) || !(wgt > 0.0)) continue;
         ++n8;
         const Vec3 yl = cam.lensLocalPoint(r.o), wl = cam.lensLocalDir(r.d);
@@ -2919,7 +2928,8 @@ static bool checkLensPhysicalOne(const char* preset, LensSystem L, LensShareTall
             const Camera& cc = which ? camF : cam;
             for (int k = 0; k < n; ++k) {
                 Ray r; double wgt;
-                if (!cc.genLensRay(px, py, 0.5, 0.5, rng.uniform(), rng.uniform(), lambda, r, wgt) ||
+                const double ur0 = rng.uniform(), ur1 = rng.uniform();   // in order: an argument list's is the compiler's
+                if (!cc.genLensRay(px, py, 0.5, 0.5, ur0, ur1, lambda, r, wgt) ||
                     !(wgt > 0.0)) continue;
                 s[which] += wgt; s2[which] += wgt * wgt; ++hit[which];
             }
@@ -2979,7 +2989,8 @@ static bool checkLensPhysicalOne(const char* preset, LensSystem L, LensShareTall
             auto connect = [&](const Camera& cc) {
                 return [&cc, &X, &rng, lambda, aCell](double& v) {
                     Vec3 Y, wd; double dist, wgt; int px, py;
-                    if (!cc.lensConnect(X, lambda, rng.uniform(), rng.uniform(), Y, wd, dist, px, py, wgt)) return false;
+                    const double ur0 = rng.uniform(), ur1 = rng.uniform();   // in order: an argument list's is the compiler's
+                    if (!cc.lensConnect(X, lambda, ur0, ur1, Y, wd, dist, px, py, wgt)) return false;
                     v = wgt * aCell;
                     return true;
                 };
@@ -3011,7 +3022,8 @@ static bool checkLensPhysicalOne(const char* preset, LensSystem L, LensShareTall
             auto ray = [&](const Camera& cc) {
                 return [&cc, &rng, px, py, lambda](double& v) {
                     Ray r; double wgt;
-                    if (!cc.genLensRay(px, py, 0.5, 0.5, rng.uniform(), rng.uniform(), lambda, r, wgt) ||
+                    const double ur0 = rng.uniform(), ur1 = rng.uniform();   // in order: an argument list's is the compiler's
+                    if (!cc.genLensRay(px, py, 0.5, 0.5, ur0, ur1, lambda, r, wgt) ||
                         !(wgt > 0.0)) return false;
                     v = wgt;
                     return true;
@@ -3884,12 +3896,12 @@ static int checkDevHits() {
         const bool tube = (c.y == -2.0);
         for (int k = 0; k < 24; ++k) {
             const Vec3 d = dirRand();
-            Vec3 aim = c + Vec3(uni() - 0.5, uni() - 0.5, uni() - 0.5) * 0.3;
+            Vec3 aim = c + Vec3{uni() - 0.5, uni() - 0.5, uni() - 0.5} * 0.3;
             if (tube) aim.x = c.x + (uni() - 0.5) * 1.2;
             add(aim - d * 3.0, d);                                   // from outside
             const Vec3 across = (d.y * d.y + d.z * d.z > 0.01) ? Vec3(0, d.y, d.z) : Vec3(0, 1, 0);
             add(tube ? Vec3(aim.x, c.y, c.z) : c, tube ? across : d);   // from inside
-            add(c + farOff + Vec3(uni(), uni(), uni()), aim - (c + farOff));    // from 3 km
+            add(c + farOff + Vec3{uni(), uni(), uni()}, aim - (c + farOff));    // from 3 km
         }
     }
     // The quads, facing down (u x v): from below (front) and from above (behind), in pairs aimed
@@ -3897,8 +3909,8 @@ static int checkDevHits() {
     const size_t quadRays = rays.size();
     for (const double qx : {0.0, 2.0, 4.0})
         for (int k = 0; k < 16; ++k) {
-            const Vec3 p(qx - 0.4 + 0.8 * uni(), -1.0, 4.1 + 0.8 * uni());
-            const Vec3 d = normalize(Vec3(uni() - 0.5, 1.0, uni() - 0.5));
+            const Vec3 p{qx - 0.4 + 0.8 * uni(), -1.0, 4.1 + 0.8 * uni()};
+            const Vec3 d = normalize(Vec3{uni() - 0.5, 1.0, uni() - 0.5});
             add(p - d * 2.0, d);
             add(p + d * 2.0, d * -1.0);
         }
@@ -3922,7 +3934,7 @@ static int checkDevHits() {
         const Vec3 at = inst.toWorld.apply(Vec3(0, 0, 0));
         for (int j = 0; j < 48; ++j) {
             const Vec3 d = dirRand();
-            add(at + Vec3(uni() - 0.5, (uni() - 0.5) * (k ? 0.1 : 1.0), uni() - 0.5) * 0.6 - d * 3.0, d);
+            add(at + Vec3{uni() - 0.5, (uni() - 0.5) * (k ? 0.1 : 1.0), uni() - 0.5} * 0.6 - d * 3.0, d);
         }
     }
     const size_t nClosest = rays.size();
@@ -4616,7 +4628,7 @@ static int checkDenoise() {
         double worst = 0.0;
         for (int t = 0; t < 200000; ++t) {
             double s = std::pow(10.0, rng.uniform() * 6.0 - 3.0);
-            Vec3 c(rng.uniform() * s, rng.uniform() * s, rng.uniform() * s);
+            Vec3 c{rng.uniform() * s, rng.uniform() * s, rng.uniform() * s};
             Vec3 r = denoise::fromYcc(denoise::toYcc(c));
             worst = std::max({worst, std::fabs(r.x - c.x) / s, std::fabs(r.y - c.y) / s,
                               std::fabs(r.z - c.z) / s});
@@ -7491,8 +7503,8 @@ static int checkStochTile() {
             double a[1], b[1], c[1];
             stochSample(st, gauss.data(), lut.data(), 1, TW, TH, 1, u, v, a);
             stochSample(st, gauss.data(), lut.data(), 1, TW, TH, 1, u + 1.0, v, b);
-            stochSample(st, gauss.data(), lut.data(), 1, TW, TH, 1,
-                        frand() * 16.0, frand() * 16.0, c);
+            const double cu = frand() * 16.0, cv = frand() * 16.0;   // in order
+            stochSample(st, gauss.data(), lut.data(), 1, TW, TH, 1, cu, cv, c);
             dRepeat += std::fabs(a[0] - b[0]);
             dRandom += std::fabs(a[0] - c[0]);
             // Plain tiling: exactly periodic, so this difference is identically zero and
@@ -7836,8 +7848,8 @@ static int checkHair() {
                     double sum = 0.0;
                     for (int i = 0; i < N; ++i) {
                         double pd = 0.0, fv = 0.0;
-                        const Vec3 wi = hair::sample(b, wo, frand(), frand(), frand(),
-                                                     frand(), pd, fv);
+                        const double f0 = frand(), f1 = frand(), f2 = frand(), f3 = frand();   // in order: an argument list's is the compiler's
+                        const Vec3 wi = hair::sample(b, wo, f0, f1, f2, f3, pd, fv);
                         if (pd > 0.0)
                             sum += fv * std::sqrt(std::max(0.0, 1.0 - wi.x * wi.x)) / pd;
                     }
@@ -7954,7 +7966,8 @@ static int checkHair() {
         int bad = 0;
         for (int i = 0; i < 20000; ++i) {
             double pd = 0.0, fv = 0.0;
-            const Vec3 wi = hair::sample(b, wo, frand(), frand(), frand(), frand(), pd, fv);
+            const double f0 = frand(), f1 = frand(), f2 = frand(), f3 = frand();   // in order: an argument list's is the compiler's
+            const Vec3 wi = hair::sample(b, wo, f0, f1, f2, f3, pd, fv);
             if (!(std::isfinite(wi.x) && std::isfinite(wi.y) && std::isfinite(wi.z))) {
                 ++bad; continue;
             }
@@ -7982,14 +7995,16 @@ static int checkHair() {
         int kept = 0;
         for (int i = 0; i < NS; ++i) {
             double pd = 0.0, fv = 0.0;
-            const Vec3 wi = hair::sample(b, wo, frand(), frand(), frand(), frand(), pd, fv);
+            const double f0 = frand(), f1 = frand(), f2 = frand(), f3 = frand();   // in order: an argument list's is the compiler's
+            const Vec3 wi = hair::sample(b, wo, f0, f1, f2, f3, pd, fv);
             if (!(pd > 0.0)) continue;
             histo[binOf(wi)] += 1.0;
             ++kept;
         }
         const int NM = 400000;
         for (int i = 0; i < NM; ++i) {
-            const Vec3 wi = sphereDir(frand(), frand());
+            const double f0 = frand(), f1 = frand();   // in order: an argument list's is the compiler's
+            const Vec3 wi = sphereDir(f0, f1);
             model[binOf(wi)] += hair::pdf(b, wo, wi);
         }
         double mtot = 0.0;
@@ -8085,7 +8100,8 @@ static int checkHair() {
             const int N = 120000;
             double sum = 0.0;
             for (int i = 0; i < N; ++i) {
-                const Vec3 wi = sphereDir(frand(), frand());
+                const double f0 = frand(), f1 = frand();   // in order: an argument list's is the compiler's
+                const Vec3 wi = sphereDir(f0, f1);
                 sum += hair::f(b, wo, wi) * std::sqrt(std::max(0.0, 1.0 - wi.x * wi.x));
             }
             const double e = sum / N * 4.0 * hair::kPi;
@@ -8225,7 +8241,8 @@ static int checkHair() {
             Vec3 a, bb; onb(ax, a, bb);
             const double g = frand() * 2.0 * hair::kPi;
             const hair::Frame fr = hair::frameFromHit(a * std::cos(g) + bb * std::sin(g), ax);
-            const Vec3 w = sphereDir(frand(), frand());
+            const double f0 = frand(), f1 = frand();   // in order: an argument list's is the compiler's
+            const Vec3 w = sphereDir(f0, f1);
             worstF = std::max(worstF, length(hair::toWorld(fr, hair::toLocal(fr, w)) - w));
             worstF = std::max(worstF, std::fabs(hair::toLocal(fr, ax).x - 1.0));
         }
@@ -8495,7 +8512,8 @@ static int checkHair() {
             pr.specR = specR; pr.opacity = 0.7;
             pr.betaM = 0.1 + 0.6 * frand(); pr.betaN = 0.1 + 0.6 * frand();
             const hair::Bcsdf b = hair::make(pr, 2.0 * frand() - 1.0, sigA);
-            const Vec3 wo = sphereDir(frand(), frand()), wi = sphereDir(frand(), frand());
+            const double f0 = frand(), f1 = frand(), f2 = frand(), f3 = frand();   // in order: an argument list's is the compiler's
+            const Vec3 wo = sphereDir(f0, f1), wi = sphereDir(f2, f3);
             hair::LobeAngular la;
             const double fv = hair::f(b, wo, wi, &la), pv = hair::pdf(b, wo, wi);
             const bool valid = want("S12 a solid fiber's LobeAngular is not valid", la.valid);
@@ -11318,7 +11336,7 @@ static int checkTriNormal() {
                 for (int k = 0; k < 200; ++k) {
                     const double b1 = 0.05 + 0.6 * uni(), b2 = 0.05 + 0.3 * uni();
                     const Vec3 target = tri.v0 + (tri.v1 - tri.v0) * b1 + (tri.v2 - tri.v0) * b2;
-                    Vec3 o = target + Vec3(uni() - 0.5, uni() - 0.5, uni() - 0.5) * 40.0;
+                    Vec3 o = target + Vec3{uni() - 0.5, uni() - 0.5, uni() - 0.5} * 40.0;
                     o[axis] = c + (k % 2 ? 1.0 : -1.0) * (0.5 + 20.0 * uni());   // either side
                     const Ray r{o, normalize(target - o)};
                     Hit h; h.t = 1e30;
@@ -16332,8 +16350,8 @@ static bool prepareSky(SkyView& view, const Scene& scene, const Camera& cam, int
             uu -= std::floor(uu);
             const double lambda = kLo + (kHi - kLo) * uu;
             Ray r; double wLens = 0.0;
-            if (!cam.genLensRay(px, py, rng.uniform(), rng.uniform(), rng.uniform(),
-                                rng.uniform(), lambda, r, wLens) || !(wLens > 0.0)) continue;
+            const double ur0 = rng.uniform(), ur1 = rng.uniform(), ur2 = rng.uniform(), ur3 = rng.uniform();   // in order
+            if (!cam.genLensRay(px, py, ur0, ur1, ur2, ur3, lambda, r, wLens) || !(wLens > 0.0)) continue;
             const Hit h = scene.closestHit(r, Scene::kTminEps, nullptr, /*skipHair=*/false, /*skipCamHidden=*/true);
             // Nothing is seen straight through a region that bends rays, as through glass (B, A).
             if (scene.crossesGrin(r.o, r.d, h.valid ? h.t : 1e30)) continue;

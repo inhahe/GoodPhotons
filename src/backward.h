@@ -2414,8 +2414,7 @@ struct BackwardRenderer {
             L += thr * neeEnv(scene, vh, 1.0, invPdfLambda, lambda, rng, &hs);
         if (directOnly) return false;      // Whitted: single scatter only
         double pdfH = 0.0, fv = 0.0;
-        const Vec3 wl = hair::sample(hs.b, hs.woLocal, rng.uniform(), rng.uniform(),
-                                     rng.uniform(), rng.uniform(), pdfH, fv);
+        const Vec3 wl = hair::sampleWith(hs.b, hs.woLocal, rng, pdfH, fv);
         if (!(pdfH > 0.0) || !(fv > 0.0)) return false;
         const double cosLong = hair::safeSqrt(1.0 - hair::sqr(hair::clampd(wl.x, -1.0, 1.0)));
         const double Tlobe = clamp01(fv * cosLong / pdfH);      // == sum_p A_p
@@ -2723,8 +2722,7 @@ struct BackwardRenderer {
                 // short-circuit keeps today's RNG stream byte-for-byte.
                 if (dualScatter && hs.b.opacity >= 1.0) return false;
                 double pdfH = 0.0, fv = 0.0;
-                const Vec3 wl = hair::sample(hs.b, hs.woLocal, rng.uniform(), rng.uniform(),
-                                             rng.uniform(), rng.uniform(), pdfH, fv);
+                const Vec3 wl = hair::sampleWith(hs.b, hs.woLocal, rng, pdfH, fv);
                 if (!(pdfH > 0.0) || !(fv > 0.0)) return false;
                 // A coverage pass-through returns EXACTLY -wo (negation is exact in IEEE).
                 // Anything else was intercepted, and under dual scattering the analytic terms
@@ -3930,9 +3928,7 @@ struct BackwardRenderer {
                             neeEnvHeroHair(scene, h, hsB, L, thr, lam, invPdf, nUp, specR, specTech, rng);
                         double pdf0 = 0.0, f0 = 0.0;
                         hair::LobeAngular la;            // the angular half of f0, for the others
-                        const Vec3 wl = hair::sample(hsB[0].b, hsB[0].woLocal, rng.uniform(),
-                                                     rng.uniform(), rng.uniform(), rng.uniform(),
-                                                     pdf0, f0, &la);
+                        const Vec3 wl = hair::sampleWith(hsB[0].b, hsB[0].woLocal, rng, pdf0, f0, &la);
                         if (!(pdf0 > 0.0)) { finish(); return; }
                         // A coverage pass-through returns exactly -wo: a DISCRETE event, of mass
                         // (1 - opacity) for each wavelength, where a scatter is a direction density.

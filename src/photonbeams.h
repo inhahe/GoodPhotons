@@ -1373,9 +1373,8 @@ struct BeamMap {
         // retired more firmly than the stride-1 test alone retired it.
         Pcg32 prng; prng.seed(0x9E3779B97F4A7C15ULL, 0xBF58476D1CE4E5B9ULL);
         auto randPt = [&]() {
-            return Vec3(bb.lo.x + ext.x * prng.uniform(),
-                        bb.lo.y + ext.y * prng.uniform(),
-                        bb.lo.z + ext.z * prng.uniform());
+            const double ux = prng.uniform(), uy = prng.uniform(), uz = prng.uniform();   // in order
+            return Vec3(bb.lo.x + ext.x * ux, bb.lo.y + ext.y * uy, bb.lo.z + ext.z * uz);
         };
         double hits = 0.0;
         for (size_t q = 0; q < kProbeRays; ++q) {
