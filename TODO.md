@@ -412,6 +412,9 @@ Then the rest of 4.2-4.6 in their order, 4.7's bookkeeping alongside whatever to
   wavelength; byte for byte 0.450.4's images. 640x480 bowl: gather 43.4 -> 15.7 s; Nsight 10.5 -> 1.5
   G local requests, 26.6 -> 15.6 G FP64. Its four pattern readers forced inline, which made mode D
   1.75x faster too (0.450.4 had dGlossyF out of line at 168 registers).
+- [x] **REVIEW-0450H** (0.450.18) — the Opus (max) and Fable (xhigh) reviews of 0.450.17: the wavefront
+  pool by the batch traced and one list, mode J's plain merge kernel kept, the noise tables in ggx.h's
+  layout, the library note's reach and cost; known-issues REVIEW-0450H.
 - [x] **REVIEW-0450G** (0.450.17) — the Opus (max) and Fable (xhigh) reviews of 0.450.15-0.450.16:
   `FT_UNIT_INLINE` keyed by the unit again (separate compilation forbids `__CUDA_ARCH__` there),
   renderBdptCuda launching through the route's own kernel pointer, mode J's fallback weighed, the
@@ -542,8 +545,8 @@ Then the rest of 4.2-4.6 in their order, 4.7's bookkeeping alongside whatever to
   (compare CLAUDE.md's note on the sandbox's non-interactive window station).
 - [ ] **"`scenes/gallery_settled.ftsl` OOMs — but ONLY when the 600-frame flyby is in the camera
   selection"** — re-test: the GPU path now renders a frame at a time; the CPU path may not.
-- [ ] **"Forward modes render ~5% brighter than the backward reference (`R`)"** — from 2026-07-12;
-  re-measure first, then reconcile the constant.
+- [x] **"Forward modes render ~5% brighter than the backward reference (`R`)"** — re-measured
+  2026-11-19: B / R x1.0001, M / R x1.0005; D's 0.2 % is its default 8-bounce depth (x1.0003 at 32).
 - [ ] **"rainbow phase — `SpecVtx::term` ... is HG-only"**.
 - [ ] **"`phase rainbow` — the 2048-bin uniform-in-mu table under-resolves large droplets"**, and
   monodisperse supernumeraries read as a white arc.

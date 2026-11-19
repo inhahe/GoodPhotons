@@ -33517,7 +33517,15 @@ and a mirror): GPU mode B matches CPU backward reference mode R at Pearson r=0.9
 still render correctly (the leaf-dispatch bounds change is a no-op with no instances).
 Device geometry memory is now flat in instance count.
 
-### Forward modes render ~5% brighter than the backward reference (`R`) — 2026-07-12
+### Forward modes render ~5% brighter than the backward reference (`R`) — 2026-07-12 — RESOLVED, re-measured 2026-11-19 (0.450.18)
+
+> **Re-measured** on `scenes/_cornell_diffuse.ftsl` (tools' tile statistics, four seeds a mode, the
+> GPU): mode B / R x1.0001 (1.0 sigma), mode M / R x1.0005 (0.9 sigma) -- the forward modes agree
+> with the backward reference now; the July gap went with the fixes since (MODEB-SPHERE-ROOM,
+> MODEB-DEPTH-CONNECT and their kin). Mode D / R came out x0.9983 (11 sigma; the CPU x0.9976), which
+> is its depth, not a bias: D stops at 8 bounces by default where R goes to 32, and at
+> `-max-bounce 32` D / R is x1.0003 (1.4 sigma). (`scraps/_fwd_vs_r.py` did the measuring.)
+
 On a pure-diffuse Cornell box (`scraps/cornell_diffuse.ftsl`) the forward splat modes
 and the new photon-map mode agree with each other but sit **~5% brighter** than the
 backward path tracer:
