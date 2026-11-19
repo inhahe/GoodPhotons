@@ -5449,6 +5449,80 @@ static int checkPmGrid() {
             a.medianNeighborCount() == b.medianNeighborCount());
     }
 
+    // 5. THE RADIUS PROBE'S SAMPLE IS THE GEOMETRY'S. The map above is too sparse to show it (its
+    // probe counts 0 wherever it looks). medianNeighborCount takes the 4096 occupied cells whose
+    // coordinates hash lowest, each by its lexicographically smallest photon, whatever the array's
+    // order, the table or the threads. Two dense maps of photons on a floor, ~1 cm cells, many more
+    // cells than the sample -- one probed on one thread, one past kMergeBinThreadsFrom on many, its
+    // threads' shares each past 4096 cells too -- each given in two orders: the probe's median must
+    // be a brute-force one over every cell.
+    {
+        bool ok = true;
+        for (const size_t np : {(size_t)300000, (size_t)1300000}) {
+            const double side = (np < kMergeBinThreadsFrom) ? 1.2 : 4.0;   // m: 14 k cells and 160 k
+            const double rr = 0.01;
+            std::vector<Vec3> P(np);
+            Pcg32 g; g.seed(0xB0770Bu, (uint64_t)np);
+            for (Vec3& p : P) {
+                const double a = g.uniform(), b = g.uniform();
+                p = Vec3{a * side, 0.0, b * side};
+            }
+            double got[2] = {0, 0}, want = -1;
+            size_t nCells = 0;
+            std::vector<std::pair<PhotonMap::ProbeCell, Vec3>> sample[2], wantSample;
+            for (int order = 0; order < 2; ++order) {
+                PhotonMap m;
+                if (order == 0) m.pos.assign(P.begin(), P.end());
+                else            m.pos.assign(P.rbegin(), P.rend());
+                m.photons.assign(np, Photon{Vec3{0, 1, 0}, 1.0f, 550.0f});
+                m.buildGrid(rr);
+                got[order] = m.medianNeighborCount();
+                sample[order] = m.probeSample();
+                if (order != 0) continue;
+                std::map<std::array<int, 3>, std::pair<PhotonMap::ProbeCell, Vec3>> cells;
+                for (const Vec3& p : P) {
+                    const PhotonMap::ProbeCell k = m.probeCellOf(p);
+                    const std::array<int, 3> c{k.c[0], k.c[1], k.c[2]};
+                    const auto it = cells.find(c);
+                    if (it == cells.end()) cells.emplace(c, std::make_pair(k, p));
+                    else if (PhotonMap::probeLexLess(p, it->second.second)) it->second.second = p;
+                }
+                std::vector<std::pair<PhotonMap::ProbeCell, Vec3>> all;
+                all.reserve(cells.size());
+                for (const auto& kv : cells) all.push_back(kv.second);
+                std::sort(all.begin(), all.end(), [](const auto& x, const auto& y) {
+                    return PhotonMap::probeBefore(x.first, y.first);
+                });
+                nCells = all.size();
+                wantSample.assign(all.begin(), all.begin() + (ptrdiff_t)std::min<size_t>(4096, all.size()));
+                std::vector<int> counts;
+                for (size_t j = 0; j < std::min<size_t>(4096, all.size()); ++j)
+                    counts.push_back(m.countR(all[j].second, m.radius) - 1);
+                std::nth_element(counts.begin(), counts.begin() + (ptrdiff_t)(counts.size() / 2), counts.end());
+                want = counts[counts.size() / 2];
+            }
+            std::printf("[checkpmgrid] radius probe, %zu photons over %zu cells: median %.0f and %.0f "
+                        "(the array reversed), brute force over every cell %.0f\n",
+                        np, nCells, got[0], got[1], want);
+            // The sample itself, cell by cell and representative by representative: a median of a
+            // uniform floor is the same over any 4096 of its cells.
+            auto same = [&](const std::vector<std::pair<PhotonMap::ProbeCell, Vec3>>& a) {
+                if (a.size() != wantSample.size()) return false;
+                for (size_t j = 0; j < a.size(); ++j) {
+                    const auto& x = a[j]; const auto& y = wantSample[j];
+                    if (x.first.c[0] != y.first.c[0] || x.first.c[1] != y.first.c[1] || x.first.c[2] != y.first.c[2] ||
+                        x.second.x != y.second.x || x.second.y != y.second.y || x.second.z != y.second.z) return false;
+                }
+                return true;
+            };
+            const bool sameCells = same(sample[0]) && same(sample[1]);
+            std::printf("[checkpmgrid]   its %zu sampled cells and their photons %s the brute force's, in both orders\n",
+                        sample[0].size(), sameCells ? "are" : "are NOT");
+            ok = ok && nCells > 4096 && want > 0 && got[0] == want && got[1] == want && sameCells;
+        }
+        chk("the radius probe samples the geometry's cells, whatever the order or the threads", ok);
+    }
+
     std::printf("[checkpmgrid] %s\n", pass ? "PASS" : "FAIL");
     return pass ? 0 : 1;
 }
@@ -25497,6 +25571,8 @@ static int run(int argc, char** argv) {
         }   // end segment 3
     }
     if (nThreads < 1) nThreads = 1;
+    // The load's and the map builds' threads (parallel.h) hold to -t as the renderers do.
+    ft::setThreadCap((unsigned)nThreads);
     // -oidn's device follows -device unless -oidn-device names one: a render sent to the CPU
     // (often to keep off a GPU something else is saturating) must not denoise on that GPU,
     // synchronously, at every write and repaint.

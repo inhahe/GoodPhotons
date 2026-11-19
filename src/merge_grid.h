@@ -26,9 +26,9 @@
 #include <cstdlib>
 #include <memory>
 #include <new>
-#include <thread>
 #include <vector>
 #include "allocreport.h"    // ftalloc::resize: a table too large names itself
+#include "parallel.h"      // ft::parallelForAll, ft::workerCount: a large binning's threads
 
 // Forced inline: left to itself MSVC keeps mergeCellKey out of line in mergeBin's count loop, a call
 // a point, and the count of a large map's binning takes half as long again or more.
@@ -150,36 +150,29 @@ inline MergeLattice mergeLatticeOver(double mnx, double mny, double mnz, double 
     return mergeLatticeAt(mnx - cell * 0.5, mny - cell * 0.5, mnz - cell * 0.5, cell, mergeSlotCount(n));
 }
 
-// From this many points a binning (mergeBin) runs on every core; below it the threads' start would cost
-// more than they save -- mode U's CPU passes bin a few thousand light vertices each.
+// From this many points a binning (mergeBin) runs on the threads the program may use (ft::workerCount);
+// below it the threads' start would cost more than they save -- mode U's CPU passes bin a few thousand
+// light vertices each.
 constexpr size_t kMergeBinThreadsFrom = (size_t)1 << 20;
 
-// f(t) for each t in [0, T), each on a thread of its own (t = 0 on the caller's).
-template <class F>
-inline void mergeOnThreads(unsigned T, F&& f) {
-    std::vector<std::thread> pool;
-    pool.reserve(T > 0 ? T - 1 : 0);
-    for (unsigned t = 1; t < T; ++t) pool.emplace_back([&f, t] { f(t); });
-    f(0);
-    for (auto& th : pool) th.join();
-}
-
-// The counting sort of `n` points into lattice `L`: `cellStart` (mergeBucketCount(L.slots) + 1 entries,
-// bucket b holding positions cellStart[b] .. cellStart[b + 1]), `place(i, k)` for each point, to put
-// point i at position k (bucket-contiguous, each bucket's points in index order), and, where `tag` is
-// given, (*tag)[k] that point's tag (MergeKey). `posOf(i)` is point i's position (x, y, z); `what` and
-// `flags` name the table, and what sizes the point count, to an out-of-memory report. From
-// kMergeBinThreadsFrom points it runs on every core, in the same order to the point: `posOf` and
-// `place` are then called from several threads at once, `place` for distinct k.
-template <class PosOf, class Place>
-inline void mergeBin(const MergeLattice& L, size_t n, PosOf&& posOf, Place&& place, std::vector<int>& cellStart,
+// The counting sort of `n` points into lattice `L`: `cellStart` (a vector of int, mergeBucketCount(L.slots)
+// + 1 entries, bucket b holding positions cellStart[b] .. cellStart[b + 1]), `place(i, k)` for each point,
+// to put point i at position k (bucket-contiguous, each bucket's points in index order), and, where `tag`
+// is given, (*tag)[k] that point's tag (MergeKey). `posOf(i)` is point i's position (x, y, z); `what`
+// and `flags` name the table, and what sizes the point count, to an out-of-memory report. From
+// kMergeBinThreadsFrom points it runs on ft::workerCount() threads, in the same order to the point:
+// `posOf` and `place` are then called from several threads at once, `place` for distinct k.
+template <class PosOf, class Place, class CellStart>
+inline void mergeBin(const MergeLattice& L, size_t n, PosOf&& posOf, Place&& place, CellStart& cellStart,
                      std::vector<unsigned char>* tag, const char* what, const char* flags) {
     const size_t nBuckets = mergeBucketCount(L.slots);
-    const unsigned hw = std::thread::hardware_concurrency();
-    const unsigned T = (n >= kMergeBinThreadsFrom && hw > 1) ? std::min(hw, 64u) : 1u;
+    const unsigned T = (n >= kMergeBinThreadsFrom) ? std::min(ft::workerCount(), 64u) : 1u;
     cellStart.clear();
-    // On one thread one entry over, dropped at the end: the table is its own cursor (below).
-    ftalloc::resize(cellStart, nBuckets + (T > 1 ? 1 : 2), what, flags);   // zeroed
+    // On one thread one entry over, dropped at the end: the table is its own cursor (below), its counts
+    // zeroed first. On several every entry is written (4), so a table that leaves a resize's elements
+    // unwritten (ftalloc::BulkVec, the photon map's) is not zero-filled for nothing.
+    ftalloc::resize(cellStart, nBuckets + (T > 1 ? 1 : 2), what, flags);
+    if (T == 1) std::fill(cellStart.begin(), cellStart.end(), 0);
     // Each point's key, computed once, in scratch of four bytes a point (five with tags) left unfilled:
     // a map of a hundred million photons bins twice in buildAuto.
     std::unique_ptr<unsigned int[]> bucketOf;
@@ -223,14 +216,30 @@ inline void mergeBin(const MergeLattice& L, size_t n, PosOf&& posOf, Place&& pla
     // (3) and (4) read their lists in order and write four bytes a point; only (5) moves the points,
     // reading them in order.
     const size_t P = (size_t)T * 64;
-    auto partOf = [&](unsigned int b) { return (size_t)(((unsigned long long)b * P) / nBuckets); };
-    auto partLo = [&](size_t p) { return (p * nBuckets + P - 1) / P; };   // its first bucket
+    // A bucket's part by a multiply, not a division a point (twice a point, in (1) and (3)): any
+    // non-decreasing map of buckets to parts keeps the order, and each part's first bucket is found
+    // from that same map, by bisection, so the two agree whatever the rounding.
+    const double partScale = (double)P / (double)nBuckets;
+    auto partOf = [&](unsigned int b) {
+        const size_t p = (size_t)((double)b * partScale);
+        return p < P ? p : P - 1;
+    };
+    std::vector<size_t> partFirst(P + 1);   // part p's buckets: [partFirst[p], partFirst[p + 1])
+    for (size_t p = 0; p <= P; ++p) {
+        size_t lo = 0, hi = nBuckets;       // the first bucket whose part is p or later
+        while (lo < hi) {
+            const size_t mid = lo + (hi - lo) / 2;
+            if (partOf((unsigned int)mid) >= p) hi = mid; else lo = mid + 1;
+        }
+        partFirst[p] = lo;
+    }
+    auto partLo = [&](size_t p) { return partFirst[p]; };
     std::vector<size_t> cnt((size_t)T * P, 0), pStart(P + 1, 0);
     struct Filed { unsigned int i, bucket; };
     std::unique_ptr<Filed[]> list;
     try { list.reset(new Filed[n]); }
     catch (const std::bad_alloc&) { ftalloc::reportOom("a binning's list of the points", n, sizeof(Filed), flags); }
-    mergeOnThreads(T, [&](unsigned t) {                                                       // (1)
+    ft::parallelForAll(T, 1, [&](size_t t) {                                                       // (1)
         size_t* c = cnt.data() + (size_t)t * P;
         for (size_t i = n * t / T, e = n * (t + 1) / T; i < e; ++i) {
             const auto& p = posOf(i);
@@ -249,7 +258,7 @@ inline void mergeBin(const MergeLattice& L, size_t n, PosOf&& posOf, Place&& pla
         }
         pStart[p + 1] = at;
     }
-    mergeOnThreads(T, [&](unsigned t) {                                                       // (3)
+    ft::parallelForAll(T, 1, [&](size_t t) {                                                       // (3)
         size_t* at = cnt.data() + (size_t)t * P;
         for (size_t i = n * t / T, e = n * (t + 1) / T; i < e; ++i) {
             const unsigned int b = bucketOf[i];
@@ -258,7 +267,7 @@ inline void mergeBin(const MergeLattice& L, size_t n, PosOf&& posOf, Place&& pla
     });
     unsigned int* const dest = bucketOf.get();   // a point's position, once (4) has given it one
     std::atomic<size_t> nextPart{0};
-    mergeOnThreads(T, [&](unsigned) {                                                         // (4)
+    ft::parallelForAll(T, 1, [&](size_t) {                                                         // (4)
         std::vector<int> local;
         for (size_t p; (p = nextPart.fetch_add(1, std::memory_order_relaxed)) < P;) {
             const size_t b0 = partLo(p), b1 = partLo(p + 1);
@@ -272,7 +281,7 @@ inline void mergeBin(const MergeLattice& L, size_t n, PosOf&& posOf, Place&& pla
             for (size_t j = 0; j < m; ++j) dest[li[j].i] = (unsigned int)local[li[j].bucket - b0]++;
         }
     });
-    mergeOnThreads(T, [&](unsigned t) {                                                       // (5)
+    ft::parallelForAll(T, 1, [&](size_t t) {                                                       // (5)
         for (size_t i = n * t / T, e = n * (t + 1) / T; i < e; ++i) {
             const size_t k = dest[i];
             if (tag) (*tag)[k] = tagOf[i];

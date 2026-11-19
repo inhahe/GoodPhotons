@@ -201,6 +201,56 @@ to 0.25 renders as a 150 nm one within 2e-3, 1.0e-3 measured (its body's escape 
 on 0.450.1 it rendered as the unmapped 600 nm, 1.9 off), the `thinfilm` control byte for byte, and
 the three misspellings stop the load (on 0.450.1 they loaded).
 
+## DONE (2026-11-19, 0.450.29): REVIEW-0450L — what the Opus (max) and Fable (xhigh) reviews of 8851601..0.450.28 found
+
+`/code-review max` (Opus, 8 findings) and `/code-review xhigh` (Fable, 11) of ef166cf..3f51557, one
+after the other in the review worktree; seven found by both, among them two real bugs in this
+batch's own new code. Each checked against the code. **Fixed in 0.450.29:**
+
+* **The radius probe's heap was upside down** (both). `std::priority_queue` keeps the GREATEST by
+  its order on top, and it was given a greater-than, so the top was the lowest-hashed cell: once a
+  thread's share had 4096 cells its sample froze to the first 4096 in array order, and their
+  representatives stopped updating -- the radius again following the table, the array's order
+  and the core count, all that 0.450.27 meant to remove. Its checks passed only because on 32
+  threads no share reached 4096 cells. The heap takes probeBefore now.
+* **The binning's destination was never freed** (both): `binPh = {}` is an assignment of an empty
+  initializer list, which keeps the capacity -- 7 GB held through the render at 129 M photons
+  since 0.450.26. The scratch is a local of `build` and `buildAuto` now (`BinScratch`, Fable's
+  shape), freed on every way out; the members and their release are gone.
+* **No test could see either** (both): -checkpmgrid's order test compared two medians of 0. It
+  has a test of the probe on two dense floors (14 k and 160 k cells; one on one thread, one
+  threaded with each share past 4096 cells), each in two orders: the 4096 sampled cells and their
+  photons, exactly, against a brute-force bottom-k over every cell. With the heap reversed it reads
+  BAD (the medians alone did not: a uniform floor's median is the same over any of its cells, so
+  the test holds the sample itself); a capacity check, BAD with `= {}` back, stood until the
+  scratch became a local.
+* **Threads** (both): `mergeOnThreads` is gone for parallel.h's `parallelForAll`, which the probe
+  and `fillCie` take too. parallel.h's passes rethrow a worker's exception (or a failed thread
+  start's) on the caller after joining every thread, rather than `std::terminate`, and hold to
+  `-t` (`setThreadCap`, `workerCount`), as the scene load's passes now do too.
+* **The threaded binning zero-filled its table** (Opus): the photon map's `cellStart` is a
+  `BulkVec`, and `mergeBin` takes any vector of int, zeroing it only on one thread.
+* **A division a point, twice** (Fable): a bucket's part by a multiply, each part's first bucket
+  found from that same map by bisection.
+* **tools/time_merge.py** (both): an odd `--rounds` is taken up to even, so each order runs as
+  often; the default is 6.
+* **Stale and historical text** (Fable): design.md's "SplitMix64" mix (murmur3's 32-bit
+  finaliser), and two comments that narrated how a bug was found.
+
+Freeing the scratch, once it was freed, showed what 0.450.28's leak had hidden: the system releases
+7 GB of pages on the freeing thread in 0.6-0.9 s. A large buffer a caller is done with is now freed
+on a thread of its own (`ftalloc::releaseInBackground`, `BinScratch`'s destructor), so the build
+does not wait for it.
+
+**Not changed:** nothing; every finding was taken.
+
+**Verified:** -checkpmgrid (default table and one slot), check_merge_table, a `-savemap` /
+`-loadmap` round trip, and mode M on `-t 4` -- the review's case, its shares past 4096 cells --
+byte-identical at one slot and at the default table, its radius automatic. check_bitid against
+0.450.28: identical but smooth on the CPU's mode M, -0.052 % in the mean, the corrected sample's
+radius. The 20 M-photon CPU map phase 6.24-6.28 s (0.450.28, which leaked its scratch, 6.5-6.7 s);
+paired, GPU mode M at 20 M photons 11.22 s -> 10.10 s, CPU mode M at 4 M unchanged.
+
 ## DONE (2026-11-19, 0.450.28): PM-BUILD-NOINIT — the photon map's arrays were zero-filled on one thread before every write
 
 `PhotonMap`'s `pos`, `photons` and `cie` and the binning's destination were `std::vector`s of
@@ -228,6 +278,8 @@ coordinates hash lowest (a bottom-k sample under a 64-bit mix), each represented
 lexicographically smallest photon -- a function of the positions alone, so neither the array's
 order (`-loadmap` must reproduce `-savemap`) nor the table moves it; on every core (each thread the
 bottom k of its share's cells, whose union holds the whole bottom k; the counts split among them).
+(As 0.450.27 shipped it the threads' heaps were upside down and the sample was not this; fixed,
+with a test that holds the sample itself, in 0.450.29: REVIEW-0450L.)
 
 **Verified:** check_merge_table now renders mode M at its automatic radius: byte-identical at one
 slot of 27 buckets and at the default table on the CPU, the GPU within 1.4e-6 of a pixel; with the
@@ -246,8 +298,8 @@ from a million points (`kMergeBinThreadsFrom`) `mergeBin` runs on every core and
 one-thread sort's order to the point -- keys by point range, the points filed by bucket range in
 index order, each range's positions given in that order, then one pass that moves the points,
 reading them in order (the first try, which moved them range by range, read them at random and won
-little) -- and the photon map's second binning reuses the first's destination (`binPh`,
-`binPos`). Modes U and J take the same path for maps of a million points or more.
+little) -- and the photon map's second binning reuses the first's destination (since 0.450.29 a
+local `BinScratch`). Modes U and J take the same path for maps of a million points or more.
 
 **Verified:** `-checkpmgrid` holds a binning of 1.5 M points (the threaded path) to an independent
 stable sort by key -- table, order and tags; with the parts' lists walked backwards (a bucket's

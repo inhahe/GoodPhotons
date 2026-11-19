@@ -21,6 +21,7 @@
 #include <atomic>
 #include <condition_variable>
 #include <cstdint>
+#include <exception>
 #include <functional>
 #include <mutex>
 #include <thread>
@@ -82,11 +83,32 @@ inline void setStopMirror(volatile int* m) {
         while (stopMirrorWriters().load() != 0) std::this_thread::yield();
 }
 
+// --- The threads the program may use (`-t`) ---------------------------------------
+// main.cpp sets the cap from `-t` once the command line is read; 0 (the default) leaves
+// it at the machine's. Every pass here takes at most workerCount() threads, the caller's
+// among them, so a run asked for one thread stays on one and a sweep of small -t
+// processes is not oversubscribed by their map builds and loads.
+inline std::atomic<unsigned>& threadCapSlot() {
+    static std::atomic<unsigned> c{0};
+    return c;
+}
+inline void setThreadCap(unsigned n) { threadCapSlot().store(n, std::memory_order_relaxed); }
+// The threads a pass may run on: the machine's, or the cap where one is set; at least 1.
+inline unsigned workerCount() {
+    unsigned hw = std::thread::hardware_concurrency();
+    if (hw == 0) hw = 4;
+    const unsigned cap = threadCapSlot().load(std::memory_order_relaxed);
+    return std::max(1u, cap > 0 ? std::min(hw, cap) : hw);
+}
+
 // Run fn(i) for i in [0, n), in parallel when that is worth the thread setup.
 // `grain` is the chunk size handed to a worker at a time AND the serial cutoff: fewer
 // than 2*grain items runs inline. fn must be safe to call concurrently for distinct i.
 // Returns true if every i ran; false if a stop was requested and the remaining range
 // was abandoned (see above — the output is then partial and must be thrown away).
+// An exception from fn -- or from starting a thread -- stops the claiming of further
+// chunks, waits for every worker, and is rethrown on the caller's thread (the first, if
+// several threw): never a std::terminate from a thread left running or a throw escaping one.
 namespace detail {
 // The loop on the caller's thread alone, still chunked to poll the stop flag (`stoppable`).
 template <class Fn>
@@ -116,18 +138,33 @@ inline void cursorWorker(size_t n, size_t grain, Fn& fn, std::atomic<size_t>& cu
 template <class Fn>
 inline bool threadedFor(size_t n, size_t grain, Fn& fn, bool stoppable) {
     if (grain == 0) grain = 1;
-    unsigned hw = std::thread::hardware_concurrency();
-    if (hw == 0) hw = 4;
+    const unsigned hw = workerCount();
     if (n < 2 * grain || hw < 2) return serialFor(n, grain, fn, stoppable);   // not worth a thread
     unsigned nt = (unsigned)std::min<size_t>(hw, (n + grain - 1) / grain);
     std::atomic<size_t> cursor{0};
     std::atomic<bool> cancelled{false};
+    std::exception_ptr err;   // the first exception any worker threw
+    std::mutex errM;
+    auto worker = [&] {
+        try {
+            cursorWorker(n, grain, fn, cursor, cancelled, stoppable);
+        } catch (...) {
+            cursor.store(n, std::memory_order_relaxed);   // no worker claims another chunk
+            std::lock_guard<std::mutex> g(errM);
+            if (!err) err = std::current_exception();
+        }
+    };
     std::vector<std::thread> pool;
+    // Joined on every way out, a failed thread start's included.
+    struct JoinAll {
+        std::vector<std::thread>& p;
+        ~JoinAll() { for (auto& t : p) if (t.joinable()) t.join(); }
+    } joinAll{pool};
     pool.reserve(nt - 1);
-    auto worker = [&] { cursorWorker(n, grain, fn, cursor, cancelled, stoppable); };
     for (unsigned t = 0; t + 1 < nt; ++t) pool.emplace_back(worker);
     worker();                                       // the caller is a worker too
     for (auto& t : pool) t.join();
+    if (err) std::rethrow_exception(err);
     return !cancelled.load(std::memory_order_relaxed);
 }
 }  // namespace detail

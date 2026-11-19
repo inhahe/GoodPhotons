@@ -1,6 +1,6 @@
 """Wall time of the merge modes (U, J, M, S), two builds paired and interleaved, on the CPU and the GPU.
 
-    python -u tools/time_merge.py --old <exe> [--new ftrace.exe] [--rounds 5] [--only <substring>]
+    python -u tools/time_merge.py --old <exe> [--new ftrace.exe] [--rounds 6] [--only <substring>]
 
 The cases: each merge at its own radius on a dense scene (scenes/_merge_glossy_bowl.ftsl for mode U,
 scenes/_caustic_box.ftsl for J, M and S; mode M at 4 M photons on the CPU and 20 M on the GPU, where
@@ -9,9 +9,10 @@ building the 129 M-photon map is most of the time), and modes U and J at a fine 
 skipped without it). Mode J takes -beamfreeze, so its light side does not pace by the work it counts.
 
 A case runs its rounds before the next case begins, each round once with each build, the order
-alternating (old first in the even rounds, new first in the odd), so whatever the second of two
-runs gains or loses (the first's teardown still in flight, clocks ramping) falls on both builds
-alike; prints each case's median per build and the ratio new / old, with every run's time. Run it on an idle machine: a check sweep's load moves the
+alternating (old first in the even rounds, new first in the odd; an odd --rounds is taken up to the
+next even one), so whatever the second of two runs gains or loses (the first's teardown still in
+flight, clocks ramping) falls on both builds alike; prints each case's median per build and the
+ratio new / old, with every run's time. Run it on an idle machine: a check sweep's load moves the
 times by more than most changes it is meant to measure (known-issues MERGE-HASH-TIMING).
 """
 import argparse
@@ -45,7 +46,7 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--old", required=True, help="the build to time against")
     ap.add_argument("--new", default=os.path.join(ROOT, "ftrace.exe"), help="the build to time")
-    ap.add_argument("--rounds", type=int, default=5)
+    ap.add_argument("--rounds", type=int, default=6)
     ap.add_argument("--only", default="", help="run only the cases whose name holds this")
     ap.add_argument("--out", default=os.path.join(ROOT, "png", "time_merge"))
     a = ap.parse_args()
@@ -63,7 +64,7 @@ def main():
                                               " (tools/check_vcm_grid_cap.py writes it)" if scene == BOX else ""))
             continue
         t = {"old": [], "new": []}
-        for rnd in range(a.rounds):
+        for rnd in range(a.rounds + a.rounds % 2):   # as many old-first rounds as new-first
             for lab in (("old", "new") if rnd % 2 == 0 else ("new", "old")):
                 png = os.path.join(a.out, "%s_%s.png" % (tag, lab))
                 cmd = [exe[lab], "-in", scene, "-no-meter", "-seed", "7", "-window-min", "-o", png] + args

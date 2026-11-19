@@ -26,11 +26,11 @@
 #include <cstdlib>          // photonMaxBounce: std::getenv
 #include <utility>
 #include <queue>
-#include <thread>
 #include <unordered_map>
 #include "linalg.h"
 #include "gatherplane.h"   // onGatherSurfaceSided: which photons a gather keeps
 #include "merge_grid.h"    // mergeLatticeKey: the hashed lattice
+#include "parallel.h"      // ft::parallelForAll, ft::workerCount: the build's threads
 #include "color.h"
 #include "allocreport.h"   // OOM that names the buffer, its size and the flag that sizes it
 #include "workcount.h"    // tlWork: a query's candidates, for the CPU refresh (MODEM-CPU-NONDET)
@@ -167,8 +167,9 @@ struct PhotonMap {
     // buildAuto still reads them as the measured bbox EXTENT in cells, and the mode-M log
     // prints them so "how fine is the lattice" stays visible.
     int    nx = 1, ny = 1, nz = 1;
-    // Bucket runs: bucket b occupies [cellStart[b], cellStart[b+1]). Size bucketCount() + 1.
-    std::vector<int> cellStart;
+    // Bucket runs: bucket b occupies [cellStart[b], cellStart[b+1]). Size bucketCount() + 1. A BulkVec,
+    // as the arrays above: a binning on several threads writes every entry.
+    ftalloc::BulkVec<int> cellStart;
 
     long long bucketCount() const { return (long long)mergeBucketCount(lat.slots); }
 
@@ -179,18 +180,26 @@ struct PhotonMap {
     // Split into buildGrid + fillCie because buildAuto() below needs to bin TWICE (once at
     // the probe radius, once at the chosen one) but only ever needs the CIE pass once —
     // and on a large map that pass is several exp() per photon, i.e. the expensive half.
-    void build(double r) { buildGrid(r); releaseBinning(); fillCie(); }
+    void build(double r) {
+        { BinScratch s; buildGrid(r, s); }   // the scratch freed before the CIE table is made
+        fillCie();
+    }
 
-    // The binning's destination, the photons' size, kept from one buildGrid to the next: what a
-    // binning moves the photons into it swaps with photons[] and pos[], so the next binning (buildAuto
-    // bins twice) finds it allocated -- at 129 M photons 7 GB that it would otherwise fault in again.
-    // Every element is written by the binning (BulkVec: a resize leaves them as they were). Freed once
-    // the map is built (releaseBinning).
-    ftalloc::BulkVec<Photon> binPh;
-    ftalloc::BulkVec<Vec3>   binPos;
-    void releaseBinning() { binPh = {}; binPos = {}; }
+    // A binning's destination, the photons' size: what buildGrid moves the photons into it swaps with
+    // photons[] and pos[], so a second binning given the same scratch (buildAuto bins twice) finds it
+    // allocated -- at 129 M photons 7 GB it would otherwise fault in again. Every element is written by
+    // the binning (BulkVec: a resize leaves them as they were). A local of build and buildAuto, so it
+    // goes on every way out.
+    struct BinScratch {
+        ftalloc::BulkVec<Photon> ph;
+        ftalloc::BulkVec<Vec3>   pos;
+        // Freed in the background (ftalloc::releaseInBackground): the build does not wait the
+        // 0.6-0.9 s the system takes to release 7 GB of pages.
+        ~BinScratch() { ftalloc::releaseInBackground(ph); ftalloc::releaseInBackground(pos); }
+    };
 
-    void buildGrid(double r) {
+    void buildGrid(double r) { BinScratch s; buildGrid(r, s); }
+    void buildGrid(double r, BinScratch& s) {
         radius = r;
         const double cellSize = (r > 0.0) ? r : 1e-6;
         if (photons.empty()) {
@@ -218,13 +227,13 @@ struct PhotonMap {
 
         // Bin, scattering pos[] and photons[] to the SAME positions, so index k keeps
         // addressing one photon across both.
-        ftalloc::resize(binPh, photons.size(), "the photon map payloads (binning)", "-n");
-        ftalloc::resize(binPos, pos.size(), "the photon map positions (binning)", "-n");
+        ftalloc::resize(s.ph, photons.size(), "the photon map payloads (binning)", "-n");
+        ftalloc::resize(s.pos, pos.size(), "the photon map positions (binning)", "-n");
         mergeBin(lat, photons.size(), [&](size_t i) -> const Vec3& { return pos[i]; },
-                 [&](size_t i, size_t k) { binPh[k] = photons[i]; binPos[k] = pos[i]; }, cellStart, nullptr,
+                 [&](size_t i, size_t k) { s.ph[k] = photons[i]; s.pos[k] = pos[i]; }, cellStart, nullptr,
                  "the photon grid bucket table", "-n");
-        photons.swap(binPh);
-        pos.swap(binPos);
+        photons.swap(s.ph);
+        pos.swap(s.pos);
     }
 
     // Precompute each (sorted) photon's CIE XYZ triple once — see `cie` above.
@@ -233,21 +242,10 @@ struct PhotonMap {
     void fillCie() {
         const size_t nPh = photons.size();
         ftalloc::resize(cie, nPh, "the photon CIE table", "-n");
-        auto fill = [&](size_t i0, size_t i1) {
-            for (size_t i = i0; i < i1; ++i) {
-                const double l = photons[i].lambda;
-                cie[i] = Vec3{cieX(l), cieY(l), cieZ(l)};
-            }
-        };
-        unsigned nT = std::max(1u, std::thread::hardware_concurrency());
-        if (nPh < 65536 || nT == 1) {
-            fill(0, nPh);
-        } else {
-            std::vector<std::thread> pool;
-            for (unsigned t = 0; t < nT; ++t)
-                pool.emplace_back(fill, nPh * t / nT, nPh * (t + 1) / nT);
-            for (auto& th : pool) th.join();
-        }
+        ft::parallelForAll(nPh, 32768, [&](size_t i) {
+            const double l = photons[i].lambda;
+            cie[i] = Vec3{cieX(l), cieY(l), cieZ(l)};
+        });
     }
 
     // MEDIAN number of OTHER photons inside the current gather radius of a deposited
@@ -263,8 +261,7 @@ struct PhotonMap {
     // so photons within a cell keep their arrival order, and a map that has been saved (already
     // sorted at one radius) and reloaded re-sorts to a different within-cell order than the
     // original deposit did: a sample that strided over photons[] would differ, and `-loadmap`
-    // would no longer reproduce the `-savemap` run that wrote the file. (Caught 2026-07-26: 1401
-    // vs 1402 median, r 0.008981 vs 0.008977, images differed.) Not of the table, because then
+    // would no longer reproduce the `-savemap` run that wrote the file. Not of the table, because then
     // every change to the table's size or hash would move the chosen radius, and every render
     // that leaves it automatic with it.
     //
@@ -284,57 +281,61 @@ struct PhotonMap {
     // -- a cell of the whole bottom k is in the bottom k of every share it appears in, so the
     // shares' union holds it, its representative the least of theirs -- and the k queries are
     // split among the threads, their candidates added to this thread's tally as one walk adds them.
-    double medianNeighborCount(int sampleTarget = 4096) const {
+    // The radius probe's cell of a point (medianNeighborCount): its coordinates in the lattice and their
+    // 64-bit mix, which orders the probe's sample (probeBefore).
+    struct ProbeCell { int c[3]; unsigned long long h; };
+    ProbeCell probeCellOf(const Vec3& p) const {
+        ProbeCell k;
+        k.c[0] = mergeCellCoord(p.x, lat.lo[0], lat.invCell);
+        k.c[1] = mergeCellCoord(p.y, lat.lo[1], lat.invCell);
+        k.c[2] = mergeCellCoord(p.z, lat.lo[2], lat.invCell);
+        unsigned long long h = (unsigned long long)(unsigned int)k.c[0] * 0x9E3779B97F4A7C15ull ^
+                               (unsigned long long)(unsigned int)k.c[1] * 0xC2B2AE3D27D4EB4Full ^
+                               (unsigned long long)(unsigned int)k.c[2] * 0x165667B19E3779F9ull;
+        h ^= h >> 30; h *= 0xBF58476D1CE4E5B9ull;
+        h ^= h >> 27; h *= 0x94D049BB133111EBull;
+        h ^= h >> 31;
+        k.h = h;
+        return k;
+    }
+    // The sample's order: by the mix, a tie (two cells mixing alike) by the cell.
+    static bool probeBefore(const ProbeCell& a, const ProbeCell& b) {
+        if (a.h != b.h) return a.h < b.h;
+        if (a.c[0] != b.c[0]) return a.c[0] < b.c[0];
+        if (a.c[1] != b.c[1]) return a.c[1] < b.c[1];
+        return a.c[2] < b.c[2];
+    }
+    static bool probeLexLess(const Vec3& a, const Vec3& m) {
+        return a.x != m.x ? a.x < m.x : a.y != m.y ? a.y < m.y : a.z < m.z;
+    }
+    // The probe's sample: the `sampleTarget` occupied cells whose coordinates hash lowest, in
+    // probeBefore's order, each with its representative, its lexicographically smallest photon.
+    std::vector<std::pair<ProbeCell, Vec3>> probeSample(int sampleTarget = 4096) const {
         const size_t n = photons.size();
-        if (n == 0 || sampleTarget <= 0) return 0.0;
-        struct Key { int c[3]; unsigned long long h; };
-        struct KeyHash { size_t operator()(const Key& k) const { return (size_t)k.h; } };
-        struct KeyEq {
-            bool operator()(const Key& a, const Key& b) const {
+        if (n == 0 || sampleTarget <= 0) return {};
+        struct CellHash { size_t operator()(const ProbeCell& k) const { return (size_t)k.h; } };
+        struct CellEq {
+            bool operator()(const ProbeCell& a, const ProbeCell& b) const {
                 return a.c[0] == b.c[0] && a.c[1] == b.c[1] && a.c[2] == b.c[2];
             }
         };
-        // The sample's order: by hash, a tie (two cells mixing alike) by the cell.
-        auto after = [](const Key& a, const Key& b) {
-            if (a.h != b.h) return a.h > b.h;
-            if (a.c[0] != b.c[0]) return a.c[0] > b.c[0];
-            if (a.c[1] != b.c[1]) return a.c[1] > b.c[1];
-            return a.c[2] > b.c[2];
-        };
-        auto lexLess = [](const Vec3& a, const Vec3& m) {
-            return a.x != m.x ? a.x < m.x : a.y != m.y ? a.y < m.y : a.z < m.z;
-        };
-        auto keyOf = [&](const Vec3& p) {
-            Key k;
-            k.c[0] = mergeCellCoord(p.x, lat.lo[0], lat.invCell);
-            k.c[1] = mergeCellCoord(p.y, lat.lo[1], lat.invCell);
-            k.c[2] = mergeCellCoord(p.z, lat.lo[2], lat.invCell);
-            unsigned long long h = (unsigned long long)(unsigned int)k.c[0] * 0x9E3779B97F4A7C15ull ^
-                                   (unsigned long long)(unsigned int)k.c[1] * 0xC2B2AE3D27D4EB4Full ^
-                                   (unsigned long long)(unsigned int)k.c[2] * 0x165667B19E3779F9ull;
-            h ^= h >> 30; h *= 0xBF58476D1CE4E5B9ull;
-            h ^= h >> 27; h *= 0x94D049BB133111EBull;
-            h ^= h >> 31;
-            k.h = h;
-            return k;
-        };
-        using Reps = std::unordered_map<Key, Vec3, KeyHash, KeyEq>;
+        using Reps = std::unordered_map<ProbeCell, Vec3, CellHash, CellEq>;
         const size_t K = (size_t)sampleTarget;
-        const unsigned hw = std::max(1u, std::thread::hardware_concurrency());
-        const unsigned T = (n >= kMergeBinThreadsFrom) ? std::min(hw, 64u) : 1u;
+        const unsigned T = (n >= kMergeBinThreadsFrom) ? std::min(ft::workerCount(), 64u) : 1u;
         std::vector<Reps> kept(T);
-        mergeOnThreads(T, [&](unsigned t) {
+        ft::parallelForAll(T, 1, [&](size_t t) {
             Reps& reps = kept[t];
             reps.reserve(2 * K);
-            // The share's bottom k so far, its greatest (by `after`'s order) on top.
-            std::priority_queue<Key, std::vector<Key>, decltype(after)> heap(after);
+            // The share's bottom k so far, the last of them in probeBefore's order on top (a priority
+            // queue keeps its greatest by the order it is given at the top).
+            std::priority_queue<ProbeCell, std::vector<ProbeCell>, decltype(&probeBefore)> heap(&probeBefore);
             for (size_t i = n * t / T, e = n * (t + 1) / T; i < e; ++i) {
                 const Vec3& p = pos[i];
-                const Key k = keyOf(p);
-                if (heap.size() == K && after(k, heap.top())) continue;   // past the bottom k
+                const ProbeCell k = probeCellOf(p);
+                if (heap.size() == K && probeBefore(heap.top(), k)) continue;   // past the bottom k
                 const auto it = reps.find(k);
                 if (it != reps.end()) {
-                    if (lexLess(p, it->second)) it->second = p;
+                    if (probeLexLess(p, it->second)) it->second = p;
                     continue;
                 }
                 reps.emplace(k, p);
@@ -350,25 +351,35 @@ struct PhotonMap {
             for (const auto& kv : kept[t]) {
                 const auto it = all.find(kv.first);
                 if (it == all.end()) all.emplace(kv.first, kv.second);
-                else if (lexLess(kv.second, it->second)) it->second = kv.second;
+                else if (probeLexLess(kv.second, it->second)) it->second = kv.second;
             }
-        std::vector<std::pair<Key, Vec3>> cells(all.begin(), all.end());
+        std::vector<std::pair<ProbeCell, Vec3>> cells(all.begin(), all.end());
         const size_t m = std::min(K, cells.size());
         std::partial_sort(cells.begin(), cells.begin() + (ptrdiff_t)m, cells.end(),
-                          [&](const std::pair<Key, Vec3>& a, const std::pair<Key, Vec3>& b) {
-                              return after(b.first, a.first);
+                          [](const std::pair<ProbeCell, Vec3>& a, const std::pair<ProbeCell, Vec3>& b) {
+                              return probeBefore(a.first, b.first);
                           });
+        cells.resize(m);
+        return cells;
+    }
+    double medianNeighborCount(int sampleTarget = 4096) const {
+        const std::vector<std::pair<ProbeCell, Vec3>> cells = probeSample(sampleTarget);
+        const size_t m = cells.size();
         if (m == 0) return 0.0;
+        const unsigned T = (photons.size() >= kMergeBinThreadsFrom) ? std::min(ft::workerCount(), 64u) : 1u;
         std::vector<int> counts(m);
-        std::vector<long long> cand(T, 0);
         const unsigned Tq = (m >= 64) ? T : 1u;
-        mergeOnThreads(Tq, [&](unsigned t) {
+        std::vector<long long> cand(Tq, 0);
+        const bool onCaller = Tq == 1;
+        ft::parallelForAll(Tq, 1, [&](size_t t) {
             const long long before = bdpt::tlCandidates();
             for (size_t j = m * t / Tq, e = m * (t + 1) / Tq; j < e; ++j)
                 counts[j] = countR(cells[j].second, radius) - 1;   // not the representative itself
             cand[t] = bdpt::tlCandidates() - before;
+            if (!onCaller) bdpt::tlCandidates() = before;   // the caller's tally takes them all, below
         });
-        for (unsigned t = 1; t < Tq; ++t) bdpt::tlCandidates() += cand[t];
+        if (!onCaller)
+            for (unsigned t = 0; t < Tq; ++t) bdpt::tlCandidates() += cand[t];
         const size_t mid = counts.size() / 2;
         std::nth_element(counts.begin(), counts.begin() + (ptrdiff_t)mid, counts.end());
         return (double)counts[mid];
@@ -423,30 +434,32 @@ struct PhotonMap {
                      double* kTargetOut = nullptr, double rMax = 0.0) {
         if (photons.empty()) { build(r0 > 0.0 && rMax > 0.0 ? std::min(r0, rMax) : r0);
                                return radius; }
-        buildGrid(r0);
-        const double n0 = medianNeighborCount();
-        const double k  = kAt1M * std::cbrt((double)photons.size() / 1.0e6);
-        if (nProbeOut)  *nProbeOut  = n0;
-        if (kTargetOut) *kTargetOut = k;
-        if (n0 <= 0.0 || k <= 0.0) { releaseBinning(); fillCie(); return radius; }   // too sparse to judge
-
-        double r1 = r0 * std::sqrt(k / n0);
-        // Never wander more than a couple of octaves from what was asked for: the probe is
-        // a median over a sample, and a pathological scene (all photons in one caustic, or
-        // a single lit texel) shouldn't be allowed to pick an absurd grid.
-        r1 = std::min(std::max(r1, r0 / 64.0), r0 * 4.0);
-        if (rMax > 0.0 && r1 > rMax) r1 = rMax;   // see the rMax note above
-        // NO MEMORY GUARD ANY MORE (removed 0.199.6). While the lattice was dense, cellStart
-        // held one int per CELL, so a fine radius over a large scene asked for an array that
-        // grew as (L/r)^3 and had to be defended by growing r1 back until the grid fit. That
-        // guard was the binding constraint on every large scene — on gallery_rain it inflated
-        // a requested 0.031 m to 0.094 m, three times too coarse to resolve a caustic — and it
-        // bound hardest exactly where a fine radius was most wanted. The hashed lattice
-        // (merge_grid.h) sizes the table from the PHOTON COUNT instead, so r is now free to be
-        // whatever the measured density asks for and the only limit left is the deliberate
-        // two-octave clamp above.
-        if (std::abs(r1 / r0 - 1.0) > 0.05) buildGrid(r1);   // else keep the probe binning
-        releaseBinning();
+        {
+            BinScratch s;   // both binnings', freed before the CIE table is made
+            buildGrid(r0, s);
+            const double n0 = medianNeighborCount();
+            const double k  = kAt1M * std::cbrt((double)photons.size() / 1.0e6);
+            if (nProbeOut)  *nProbeOut  = n0;
+            if (kTargetOut) *kTargetOut = k;
+            if (n0 > 0.0 && k > 0.0) {   // else too sparse to judge: the probe binning stays
+                double r1 = r0 * std::sqrt(k / n0);
+                // Never wander more than a couple of octaves from what was asked for: the probe is
+                // a median over a sample, and a pathological scene (all photons in one caustic, or
+                // a single lit texel) shouldn't be allowed to pick an absurd grid.
+                r1 = std::min(std::max(r1, r0 / 64.0), r0 * 4.0);
+                if (rMax > 0.0 && r1 > rMax) r1 = rMax;   // see the rMax note above
+                // NO MEMORY GUARD ANY MORE (removed 0.199.6). While the lattice was dense, cellStart
+                // held one int per CELL, so a fine radius over a large scene asked for an array that
+                // grew as (L/r)^3 and had to be defended by growing r1 back until the grid fit. That
+                // guard was the binding constraint on every large scene — on gallery_rain it inflated
+                // a requested 0.031 m to 0.094 m, three times too coarse to resolve a caustic — and it
+                // bound hardest exactly where a fine radius was most wanted. The hashed lattice
+                // (merge_grid.h) sizes the table from the PHOTON COUNT instead, so r is now free to be
+                // whatever the measured density asks for and the only limit left is the deliberate
+                // two-octave clamp above.
+                if (std::abs(r1 / r0 - 1.0) > 0.05) buildGrid(r1, s);   // else keep the probe binning
+            }
+        }
         fillCie();
         return radius;
     }

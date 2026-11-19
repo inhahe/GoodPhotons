@@ -698,8 +698,8 @@ static void bakeSpec(const Spectrum& s, double* tab) {
     }
 }
 
-template <class T>
-static T* uploadVec(const std::vector<T>& v) {
+template <class T, class A>
+static T* uploadVec(const std::vector<T, A>& v) {   // any allocator's (ftalloc::BulkVec too)
     T* d = nullptr;
     CUDA_CHECK(cudaMalloc(&d, v.size() * sizeof(T)));
     CUDA_CHECK(cudaMemcpy(d, v.data(), v.size() * sizeof(T), cudaMemcpyHostToDevice));

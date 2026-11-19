@@ -6616,8 +6616,8 @@ as the one at fault.
   neighbourhood; but a gather must never read one bucket twice, so the cells go in hashed 3×3×3
   blocks with a cell's place in its block as the bucket's low part, and a gather's 27 cells
   always take 27 different buckets (`pmCellHash`, hashing each cell alone, let two of them
-  share one, whose photons then counted twice -- PM-BUCKET-TWICE). The mix is SplitMix64's
-  finaliser over three odd-constant products rather than the classic XOR-of-three-primes,
+  share one, whose photons then counted twice -- PM-BUCKET-TWICE). The mix (`mergeMix`) is
+  murmur3's 32-bit finaliser over three odd-constant products rather than the classic XOR-of-three-primes,
   because the XOR form leaves *neighbouring* blocks correlated in the low bits. Host and device
   share the one function (`mergeCellKey`), and the device's three traversals (mode-M gather, its final-gather
   sub-ray, SPPM) now go through one `dPmNeighborhood` helper instead of three hand-copied
@@ -6634,7 +6634,7 @@ as the one at fault.
   hash. Within a sampled cell the representative is the lexicographically smallest position (a
   set-minimum, hence order-free); the cell *centre* would not do, because a cell that the surface
   merely clips has its centre off-surface and reports a spuriously empty neighbourhood. It runs on
-  every core: each thread keeps the bottom k of its share's cells, whose union holds the whole
+  the threads `-t` allows: each thread keeps the bottom k of its share's cells, whose union holds the whole
   bottom k, and the k neighbour counts are split among the threads.
   The GPU shared path gets the same treatment via `renderPhotonMapSharedCuda`'s `autoK`
   argument (0 = off) — it must, since that is the high-photon-count path where a
@@ -10541,12 +10541,14 @@ as the one at fault.
   merges are bit-identical to it. The cell and key helpers are forced inline on the host: MSVC
   otherwise left the key out of line in the count loop, and a 129 M-photon map's two counts took
   1.33 s and 0.98 s for 0.72 s and 0.69 s. From a million points (`kMergeBinThreadsFrom`) the host's
-  counting sort runs on every core and leaves the one-thread sort's order to the point: the keys
+  counting sort runs on the threads `-t` allows (`ft::workerCount`) and leaves the one-thread sort's order to the point: the keys
   by point range, the points filed by bucket range in index order, each range's positions given in
   that order, then one pass moving the points -- only that pass touches the points' records, reading
   them in order (`place` called from several threads, for distinct positions). The photon map's
-  binnings move the photons into a destination kept between them (`binPh`, `binPos`), so
-  `buildAuto`'s second finds it allocated. A 129 M-photon map's two binnings, probe and CIE pass
+  binnings move the photons into a destination kept between them (`BinScratch`, a local of `build`
+  and `buildAuto`, so it is freed on every way out), so `buildAuto`'s second finds it allocated;
+  it is freed on a thread of its own (`ftalloc::releaseInBackground`), since the system takes
+  0.6-0.9 s to release 7 GB of pages on the thread that frees them. A 129 M-photon map's two binnings, probe and CIE pass
   went from 7.3 s to 4.5-4.9 s (synthetic photons over a box's walls). The photon map's bulk arrays
   (`pos`, `photons`, `cie` and the binning's destination) are `ftalloc::BulkVec`s, whose resize
   constructs nothing (`NoInit`; `Vec3` would zero itself), so the passes that write every element

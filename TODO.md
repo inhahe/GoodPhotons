@@ -686,6 +686,10 @@ Then the rest of 4.2-4.6 in their order, 4.7's bookkeeping alongside whatever to
   between two builds of one source); dropped: repeatable builds, R/D/U 12-24 % faster.
 - [ ] **J-NOSPLIT** — mode J renders 16 % slower without `--split-compile`: find the kernel that lost
   it (now measurable) and pin its inlining or cap; known-issues.
+- [x] **REVIEW-0450L** (0.450.29) — the Opus (max) and Fable (xhigh) reviews of 8851601..0.450.28: the
+  radius probe's upside-down heap and the binning scratch never freed (both this batch's), a test
+  that holds the probe's sample itself, parallel.h's passes exception-safe and held to `-t`, the
+  photon map's table unfilled; known-issues.
 - [x] **REVIEW-0450K** (0.450.25) — the Opus (max) and Fable (xhigh) reviews of 0.450.22-0.450.24: mode
   U's budget counting its table and tags, SurfMap's accounting, the capped site count, a bin with no
   copy of its table, the host's 27 keys in the caller's array (a shared device tag filter measured

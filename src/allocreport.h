@@ -32,6 +32,7 @@
 #include <new>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -150,5 +151,21 @@ struct NoInit : std::allocator<T> {
 // A vector whose resize leaves new elements unwritten (NoInit): a caller must write every element it
 // resizes into before reading one.
 template <class T> using BulkVec = std::vector<T, NoInit<T>>;
+
+// Frees `v`'s storage (leaving it empty) on a thread of its own when it is large: the system releases
+// a large allocation's pages on the freeing thread, 0.6-0.9 s for the 7 GB a 129 M-photon map bins
+// through, which a caller done with it need not wait for. Small ones are freed here, and so is one
+// whose thread cannot start (the lambda holding it dies with the failed start).
+template <class V>
+inline void releaseInBackground(V& v) noexcept {
+    if (v.capacity() * sizeof(typename V::value_type) < ((size_t)256 << 20)) {
+        V().swap(v);
+        return;
+    }
+    try {
+        std::thread([buf = V(std::move(v))]() mutable { V().swap(buf); }).detach();
+    } catch (...) {
+    }
+}
 
 }  // namespace ftalloc

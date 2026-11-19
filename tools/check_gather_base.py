@@ -295,8 +295,8 @@ def scene(obj_lines, cam):
     ] + obj_lines) + NL
 REF = ["-mode", "R", "-device", "gpu", "-spp", "512"]
 CASES = [("M_gpu", ["-mode", "M", "-device", "gpu", "-n", "8000000", "-spp", "16", "-pmradius", "0.1"]),
-         # 16 samples, as the GPU case takes: at 4 one seed read the mirror box's 0-2 cm ring 0.92-1.06,
-         # most of that the pixels straddling the box top's edge, which box_floor now leaves out.
+         # 16 samples, as the GPU case takes: the floor beside a box is drawn per camera sample, and
+         # at 4 its ring's mean swings by several percent from seed to seed.
          ("M_cpu", ["-mode", "M", "-device", "cpu", "-n", "2000000", "-spp", "16", "-pmradius", "0.1"]),
          ("S_gpu", ["-mode", "S", "-device", "gpu", "-spp", "32", "-pmradius", "0.1"]),
          ("S_cpu", ["-mode", "S", "-device", "cpu", "-spp", "8", "-pmradius", "0.1"]),
