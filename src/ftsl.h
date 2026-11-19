@@ -3084,7 +3084,16 @@ private:
     Spectrum resolvePreset(const std::string& nm) {
         Spectrum s;
         if (resolveLightPreset(nm, s)) return s;
-        fail("unknown preset '" + nm + "'"); return blackbody(6500.0);
+        // The tabulated presets are engine data, found in data/ under the working directory or
+        // beside the executable (speclib::categoryDir): a copy of ftrace.exe elsewhere, run from
+        // elsewhere, has none, which is no misspelling and must not read as one.
+        std::error_code ec;
+        if (!std::filesystem::is_directory(speclib::categoryDir("illuminant"), ec))
+            fail("unknown preset '" + nm + "': the spectral library (data/illuminant) is in neither the "
+                 "working directory nor the executable's, so its presets cannot be read");
+        else
+            fail("unknown preset '" + nm + "'");
+        return blackbody(6500.0);
     }
 
     // Fetch a spectral-typed material parameter (inline expr or spectrum:ref).
