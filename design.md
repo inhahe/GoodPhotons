@@ -10537,7 +10537,14 @@ as the one at fault.
   order, so a site meets its cells' vertices in the order the dense lattice gave, and the CPU's
   merges are bit-identical to it. The cell and key helpers are forced inline on the host: MSVC
   otherwise left the key out of line in the count loop, and a 129 M-photon map's two counts took
-  1.33 s and 0.98 s for 0.72 s and 0.69 s. `FTRACE_MERGE_TABLE=<k>` holds the slots to at most `k` (1: one
+  1.33 s and 0.98 s for 0.72 s and 0.69 s. From a million points (`kMergeBinThreadsFrom`) the host's
+  counting sort runs on every core and leaves the one-thread sort's order to the point: the keys
+  by point range, the points filed by bucket range in index order, each range's positions given in
+  that order, then one pass moving the points -- only that pass touches the points' records, reading
+  them in order (`place` called from several threads, for distinct positions). The photon map's
+  binnings move the photons into a destination kept between them (`binPh`, `binPos`), so
+  `buildAuto`'s second finds it allocated. A 129 M-photon map's two binnings, probe and CIE pass
+  went from 7.3 s to 4.5-4.9 s (synthetic photons over a box's walls). `FTRACE_MERGE_TABLE=<k>` holds the slots to at most `k` (1: one
   block of 27 buckets that every block shares), which `tools/check_merge_table.py` uses to hold
   the renders to the default table's. Host and device compute a cell alike (`mergeCellCoord`, in
   double, by the width's reciprocal, held to ±2^30), the site's in `DGridCell`,

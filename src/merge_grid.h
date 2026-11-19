@@ -19,11 +19,14 @@
 #pragma once
 #include "unit_linkage.h"   // FT_UNIT_INLINE
 
+#include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstddef>
 #include <cstdlib>
 #include <memory>
 #include <new>
+#include <thread>
 #include <vector>
 #include "allocreport.h"    // ftalloc::resize: a table too large names itself
 
@@ -147,18 +150,36 @@ inline MergeLattice mergeLatticeOver(double mnx, double mny, double mnz, double 
     return mergeLatticeAt(mnx - cell * 0.5, mny - cell * 0.5, mnz - cell * 0.5, cell, mergeSlotCount(n));
 }
 
+// From this many points a binning (mergeBin) runs on every core; below it the threads' start would cost
+// more than they save -- mode U's CPU passes bin a few thousand light vertices each.
+constexpr size_t kMergeBinThreadsFrom = (size_t)1 << 20;
+
+// f(t) for each t in [0, T), each on a thread of its own (t = 0 on the caller's).
+template <class F>
+inline void mergeOnThreads(unsigned T, F&& f) {
+    std::vector<std::thread> pool;
+    pool.reserve(T > 0 ? T - 1 : 0);
+    for (unsigned t = 1; t < T; ++t) pool.emplace_back([&f, t] { f(t); });
+    f(0);
+    for (auto& th : pool) th.join();
+}
+
 // The counting sort of `n` points into lattice `L`: `cellStart` (mergeBucketCount(L.slots) + 1 entries,
 // bucket b holding positions cellStart[b] .. cellStart[b + 1]), `place(i, k)` for each point, to put
 // point i at position k (bucket-contiguous, each bucket's points in index order), and, where `tag` is
 // given, (*tag)[k] that point's tag (MergeKey). `posOf(i)` is point i's position (x, y, z); `what` and
-// `flags` name the table, and what sizes the point count, to an out-of-memory report.
+// `flags` name the table, and what sizes the point count, to an out-of-memory report. From
+// kMergeBinThreadsFrom points it runs on every core, in the same order to the point: `posOf` and
+// `place` are then called from several threads at once, `place` for distinct k.
 template <class PosOf, class Place>
 inline void mergeBin(const MergeLattice& L, size_t n, PosOf&& posOf, Place&& place, std::vector<int>& cellStart,
                      std::vector<unsigned char>* tag, const char* what, const char* flags) {
     const size_t nBuckets = mergeBucketCount(L.slots);
+    const unsigned hw = std::thread::hardware_concurrency();
+    const unsigned T = (n >= kMergeBinThreadsFrom && hw > 1) ? std::min(hw, 64u) : 1u;
     cellStart.clear();
-    // One entry over, dropped at the end: the table is its own cursor (below).
-    ftalloc::resize(cellStart, nBuckets + 2, what, flags);   // zeroed
+    // On one thread one entry over, dropped at the end: the table is its own cursor (below).
+    ftalloc::resize(cellStart, nBuckets + (T > 1 ? 1 : 2), what, flags);   // zeroed
     // Each point's key, computed once, in scratch of four bytes a point (five with tags) left unfilled:
     // a map of a hundred million photons bins twice in buildAuto.
     std::unique_ptr<unsigned int[]> bucketOf;
@@ -170,24 +191,95 @@ inline void mergeBin(const MergeLattice& L, size_t n, PosOf&& posOf, Place&& pla
         ftalloc::reportOom("a binning's key of each point", n, tag ? 5 : 4, flags);
     }
     int* const cs = cellStart.data();
-    // Bucket b's points counted at cs[b + 2], so that after the prefix sum cs[b + 1] is where bucket b
-    // begins: the scatter takes it as b's next position, which leaves it where bucket b + 1 begins --
-    // every start in its place, with no copy of the table to scatter through.
-    for (size_t i = 0; i < n; ++i) {
-        const auto& p = posOf(i);
-        const MergeKey key = mergeLatticeKey(L, p.x, p.y, p.z);
-        bucketOf[i] = key.bucket;
-        if (tag) tagOf[i] = key.tag;
-        ++cs[(size_t)key.bucket + 2];
-    }
-    for (size_t b = 2; b < nBuckets + 2; ++b) cs[b] += cs[b - 1];
     if (tag) ftalloc::resize(*tag, n, "a binning's tags", flags);
-    for (size_t i = 0; i < n; ++i) {
-        const size_t k = (size_t)cs[(size_t)bucketOf[i] + 1]++;
-        if (tag) (*tag)[k] = tagOf[i];
-        place(i, k);
+    if (T == 1) {
+        // Bucket b's points counted at cs[b + 2], so that after the prefix sum cs[b + 1] is where bucket b
+        // begins: the scatter takes it as b's next position, which leaves it where bucket b + 1 begins --
+        // every start in its place, with no copy of the table to scatter through.
+        for (size_t i = 0; i < n; ++i) {
+            const auto& p = posOf(i);
+            const MergeKey key = mergeLatticeKey(L, p.x, p.y, p.z);
+            bucketOf[i] = key.bucket;
+            if (tag) tagOf[i] = key.tag;
+            ++cs[(size_t)key.bucket + 2];
+        }
+        for (size_t b = 2; b < nBuckets + 2; ++b) cs[b] += cs[b - 1];
+        for (size_t i = 0; i < n; ++i) {
+            const size_t k = (size_t)cs[(size_t)bucketOf[i] + 1]++;
+            if (tag) (*tag)[k] = tagOf[i];
+            place(i, k);
+        }
+        cellStart.pop_back();
+        return;
     }
-    cellStart.pop_back();
+    // On T threads, in the one-thread sort's order exactly. The buckets go in P contiguous ranges
+    // ("parts"); thread t takes points [n t / T, n (t + 1) / T). (1) Each thread computes its points'
+    // keys and counts them by part. (2) The parts' starts, and each thread's place within each part, by
+    // a prefix over (part, thread). (3) Each thread files its points (index and bucket) into their
+    // parts in index order, so a part's list runs thread by thread, which is index order. (4) Each
+    // part, by one thread, counts its list by bucket, writes its buckets' starts and gives its points
+    // their positions in list order -- a bucket's points in index order, as the one-thread sort leaves
+    // them -- in the key scratch, which (3) is done with. (5) Each thread places its points there.
+    // (3) and (4) read their lists in order and write four bytes a point; only (5) moves the points,
+    // reading them in order.
+    const size_t P = (size_t)T * 64;
+    auto partOf = [&](unsigned int b) { return (size_t)(((unsigned long long)b * P) / nBuckets); };
+    auto partLo = [&](size_t p) { return (p * nBuckets + P - 1) / P; };   // its first bucket
+    std::vector<size_t> cnt((size_t)T * P, 0), pStart(P + 1, 0);
+    struct Filed { unsigned int i, bucket; };
+    std::unique_ptr<Filed[]> list;
+    try { list.reset(new Filed[n]); }
+    catch (const std::bad_alloc&) { ftalloc::reportOom("a binning's list of the points", n, sizeof(Filed), flags); }
+    mergeOnThreads(T, [&](unsigned t) {                                                       // (1)
+        size_t* c = cnt.data() + (size_t)t * P;
+        for (size_t i = n * t / T, e = n * (t + 1) / T; i < e; ++i) {
+            const auto& p = posOf(i);
+            const MergeKey key = mergeLatticeKey(L, p.x, p.y, p.z);
+            bucketOf[i] = key.bucket;
+            if (tag) tagOf[i] = key.tag;
+            ++c[partOf(key.bucket)];
+        }
+    });
+    for (size_t p = 0, at = 0; p < P; ++p) {                                                   // (2)
+        pStart[p] = at;
+        for (unsigned t = 0; t < T; ++t) {
+            const size_t c = cnt[(size_t)t * P + p];
+            cnt[(size_t)t * P + p] = at;
+            at += c;
+        }
+        pStart[p + 1] = at;
+    }
+    mergeOnThreads(T, [&](unsigned t) {                                                       // (3)
+        size_t* at = cnt.data() + (size_t)t * P;
+        for (size_t i = n * t / T, e = n * (t + 1) / T; i < e; ++i) {
+            const unsigned int b = bucketOf[i];
+            list[at[partOf(b)]++] = Filed{(unsigned int)i, b};
+        }
+    });
+    unsigned int* const dest = bucketOf.get();   // a point's position, once (4) has given it one
+    std::atomic<size_t> nextPart{0};
+    mergeOnThreads(T, [&](unsigned) {                                                         // (4)
+        std::vector<int> local;
+        for (size_t p; (p = nextPart.fetch_add(1, std::memory_order_relaxed)) < P;) {
+            const size_t b0 = partLo(p), b1 = partLo(p + 1);
+            local.assign(b1 - b0 + 1, 0);
+            const Filed* li = list.get() + pStart[p];
+            const size_t m = pStart[p + 1] - pStart[p];
+            for (size_t j = 0; j < m; ++j) ++local[li[j].bucket - b0 + 1];
+            int run = (int)pStart[p];
+            for (size_t b = b0; b < b1; ++b) { run += local[b - b0]; local[b - b0] = run; cs[b] = run; }
+            // local[b - b0] is now bucket b's start: the next position of its points.
+            for (size_t j = 0; j < m; ++j) dest[li[j].i] = (unsigned int)local[li[j].bucket - b0]++;
+        }
+    });
+    mergeOnThreads(T, [&](unsigned t) {                                                       // (5)
+        for (size_t i = n * t / T, e = n * (t + 1) / T; i < e; ++i) {
+            const size_t k = dest[i];
+            if (tag) (*tag)[k] = tagOf[i];
+            place(i, k);
+        }
+    });
+    cs[nBuckets] = (int)n;
 }
 
 // The keys of the 27 cells around the cell holding (x, y, z) in lattice `L`, into `keys` in walk order

@@ -174,7 +174,15 @@ struct PhotonMap {
     // Split into buildGrid + fillCie because buildAuto() below needs to bin TWICE (once at
     // the probe radius, once at the chosen one) but only ever needs the CIE pass once —
     // and on a large map that pass is several exp() per photon, i.e. the expensive half.
-    void build(double r) { buildGrid(r); fillCie(); }
+    void build(double r) { buildGrid(r); releaseBinning(); fillCie(); }
+
+    // The binning's destination, the photons' size, kept from one buildGrid to the next: what a
+    // binning moves the photons into it swaps with photons[] and pos[], so the next binning (buildAuto
+    // bins twice) finds it allocated and filled -- at 129 M photons 7 GB that it would otherwise zero
+    // again (0.8 s). Freed once the map is built (releaseBinning).
+    std::vector<Photon> binPh;
+    std::vector<Vec3>   binPos;
+    void releaseBinning() { binPh = {}; binPos = {}; }
 
     void buildGrid(double r) {
         radius = r;
@@ -204,13 +212,13 @@ struct PhotonMap {
 
         // Bin, scattering pos[] and photons[] to the SAME positions, so index k keeps
         // addressing one photon across both.
-        std::vector<Photon> sorted(photons.size());
-        std::vector<Vec3>   sortedPos(pos.size());
+        ftalloc::resize(binPh, photons.size(), "the photon map payloads (binning)", "-n");
+        ftalloc::resize(binPos, pos.size(), "the photon map positions (binning)", "-n");
         mergeBin(lat, photons.size(), [&](size_t i) -> const Vec3& { return pos[i]; },
-                 [&](size_t i, size_t k) { sorted[k] = photons[i]; sortedPos[k] = pos[i]; }, cellStart, nullptr,
+                 [&](size_t i, size_t k) { binPh[k] = photons[i]; binPos[k] = pos[i]; }, cellStart, nullptr,
                  "the photon grid bucket table", "-n");
-        photons.swap(sorted);
-        pos.swap(sortedPos);
+        photons.swap(binPh);
+        pos.swap(binPos);
     }
 
     // Precompute each (sorted) photon's CIE XYZ triple once — see `cie` above.
@@ -361,7 +369,7 @@ struct PhotonMap {
         const double k  = kAt1M * std::cbrt((double)photons.size() / 1.0e6);
         if (nProbeOut)  *nProbeOut  = n0;
         if (kTargetOut) *kTargetOut = k;
-        if (n0 <= 0.0 || k <= 0.0) { fillCie(); return radius; }   // too sparse to judge
+        if (n0 <= 0.0 || k <= 0.0) { releaseBinning(); fillCie(); return radius; }   // too sparse to judge
 
         double r1 = r0 * std::sqrt(k / n0);
         // Never wander more than a couple of octaves from what was asked for: the probe is
@@ -379,6 +387,7 @@ struct PhotonMap {
         // whatever the measured density asks for and the only limit left is the deliberate
         // two-octave clamp above.
         if (std::abs(r1 / r0 - 1.0) > 0.05) buildGrid(r1);   // else keep the probe binning
+        releaseBinning();
         fillCie();
         return radius;
     }

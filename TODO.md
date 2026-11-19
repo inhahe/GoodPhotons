@@ -432,6 +432,11 @@ Then the rest of 4.2-4.6 in their order, 4.7's bookkeeping alongside whatever to
 - [x] **MIRROR-BASE-GPU** — not the renderer: the check's mirror ring held the pixels straddling the
   box top's edge (the lamp in the mirror, 14x the floor), whose 16-sample noise 8 seeds did not
   average away; the box rings leave them out (`box_floor`), and the devices agree to 0.1 %.
+- [ ] **PM-BUILD-NOINIT** — the photon map's arrays (`pos`, `photons`, `cie`, the binning's
+  destination) are `std::vector`s of types whose members zero themselves, so each resize zero-fills
+  on one thread what the next pass overwrites: 0.8 s for the first binning's 7 GB destination and
+  0.3 s for the CIE table at 129 M photons. An allocator that leaves elements unconstructed (the
+  storage written before it is read) lets the parallel passes take the pages themselves.
 - [ ] **PM-PROBE-GEOMETRY** — mode M's automatic radius samples the map by occupied BUCKET
   (`medianNeighborCount`), so every change to the table's size or hash moves it and every unpinned
   mode M render with it (0.450.23 and 0.450.24 did; `FTRACE_MERGE_TABLE` does, so
@@ -492,7 +497,9 @@ Then the rest of 4.2-4.6 in their order, 4.7's bookkeeping alongside whatever to
   idle machine: no dense case slower by more than GPU U's 1.3 %, the sparse box 5.5x faster on the
   CPU; on the way, modes U and J tag each point's block (the strays out of the counts), exact
   slots, the key forced inline and the radius probe counted in a register; known-issues.
-- [ ] **PM-BUILD-PARALLEL** — a large photon map is built on one thread: at 129 M photons (mode M,
+- [x] **PM-BUILD-PARALLEL** (0.450.26) — from a million points the host's binning runs on every core in
+  the one-thread sort's order exactly, and the photon map's second binning reuses the first's
+  destination; known-issues. The entry as logged: a large photon map is built on one thread: at 129 M photons (mode M,
   _caustic_box at -n 20M) buildAuto's two binnings, probe and CIE pass take about 6.5 s of an 11 s
   map phase whose tracing takes 3.5 s on 32 threads. Each binning zero-fills two fresh scatter
   buffers (7 GB, 0.8 s: Vec3's member initialisers), counts its keys (0.7 s) and scatters (0.75 s

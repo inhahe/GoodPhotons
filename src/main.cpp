@@ -5354,6 +5354,35 @@ static int checkPmGrid() {
             missed == 0 && own > 0 && let * 64 <= strays + 256);
     }
 
+    // 1c. A BINNING ON EVERY CORE IS THE ONE-THREAD SORT. From kMergeBinThreadsFrom points mergeBin
+    // splits the work by bucket range and by point range, and must still leave each bucket's points
+    // in index order, which the gathers sum in. 1.5 M points (the map's, each repeated at three
+    // offsets, so the buckets hold runs to keep in order), binned with tags, against an independent
+    // stable sort by key: the table, the order and the tags exactly.
+    {
+        std::vector<Vec3> big;
+        big.reserve(posRef.size() * 13);
+        for (int rep = 0; big.size() < 1500000; ++rep)
+            for (const Vec3& p : posRef) big.push_back(p + Vec3{0.001 * (rep % 3), 0.0, 0.002 * (rep % 5)});
+        const MergeLattice bl = mergeLatticeOver(-31.0, -1.0, -31.0, r, big.size());
+        std::vector<int> cs, ord(big.size());
+        std::vector<unsigned char> tg;
+        mergeBin(bl, big.size(), [&](size_t i) -> const Vec3& { return big[i]; },
+                 [&](size_t i, size_t k) { ord[k] = (int)i; }, cs, &tg, "the check's bins", "-");
+        std::vector<MergeKey> key(big.size());
+        for (size_t i = 0; i < big.size(); ++i) key[i] = mergeLatticeKey(bl, big[i].x, big[i].y, big[i].z);
+        std::vector<int> want(big.size());
+        for (size_t i = 0; i < big.size(); ++i) want[i] = (int)i;
+        std::stable_sort(want.begin(), want.end(), [&](int a, int b) { return key[a].bucket < key[b].bucket; });
+        bool ok = big.size() >= kMergeBinThreadsFrom && ord == want &&
+                  cs.size() == mergeBucketCount(bl.slots) + 1 && cs.front() == 0 && cs.back() == (int)big.size();
+        for (size_t k = 0; k < big.size() && ok; ++k) {
+            const MergeKey& c = key[(size_t)want[k]];
+            if (tg[k] != c.tag || (int)k < cs[c.bucket] || (int)k >= cs[c.bucket + 1]) ok = false;
+        }
+        chk("a binning on every core (1.5 M points) is the one-thread sort: table, order and tags", ok);
+    }
+
     // 2. THE PARTITION IS COMPLETE. Every photon lands in exactly one bucket run, and the
     // runs tile [0, N) — a counting sort that drops or duplicates a photon would still pass
     // most spot queries.

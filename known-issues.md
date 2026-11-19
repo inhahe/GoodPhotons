@@ -201,6 +201,28 @@ to 0.25 renders as a 150 nm one within 2e-3, 1.0e-3 measured (its body's escape 
 on 0.450.1 it rendered as the unmapped 600 nm, 1.9 off), the `thinfilm` control byte for byte, and
 the three misspellings stop the load (on 0.450.1 they loaded).
 
+## DONE (2026-11-19, 0.450.26): PM-BUILD-PARALLEL — a large photon map was binned on one thread
+
+At 129 M photons (mode M, `_caustic_box` at `-n 20M`) `buildAuto`'s two binnings, radius probe and
+CIE pass took about 6.5 s of an 11 s map phase whose tracing took 3.5 s on 32 threads: each binning
+zero-filled a fresh 7 GB destination (0.8 s) and counted and scattered on one thread. **Fixed:**
+from a million points (`kMergeBinThreadsFrom`) `mergeBin` runs on every core and leaves the
+one-thread sort's order to the point -- keys by point range, the points filed by bucket range in
+index order, each range's positions given in that order, then one pass that moves the points,
+reading them in order (the first try, which moved them range by range, read them at random and won
+little) -- and the photon map's second binning reuses the first's destination (`binPh`,
+`binPos`). Modes U and J take the same path for maps of a million points or more.
+
+**Verified:** `-checkpmgrid` holds a binning of 1.5 M points (the threaded path) to an independent
+stable sort by key -- table, order and tags; with the parts' lists walked backwards (a bucket's
+points out of index order) it reads BAD. check_bitid against 0.450.25 identical, check_merge_table
+and check_vcm_store pass, and the 20 M-photon CPU mode M image is byte-identical. The map phase
+there 10.3-12.8 s -> 7.5-8.1 s; paired (tools/time_merge.py), CPU mode M at 4 M photons 2.34 s ->
+1.84 s and GPU mode M at 20 M 14.12 s -> 11.89 s. Left on one thread: the bbox, the radius probe
+(PM-PROBE-GEOMETRY makes it parallel) and the zero-filling of the first binning's destination and
+of the CIE table, 0.8 s and 0.3 s there, which a `std::vector` of `Vec3` does on every resize
+(PM-BUILD-NOINIT).
+
 ## DONE (2026-11-19, 0.450.25): REVIEW-0450K — what the Opus (max) and Fable (xhigh) reviews of 0.450.22-0.450.24 found
 
 `/code-review max` (Opus, 12 findings) and `/code-review xhigh` (Fable, 11) of d05c0f0..ef166cf,
