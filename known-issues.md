@@ -6998,15 +6998,30 @@ strand crossings (each with its distance), and one ratio-tracking walk that repo
 each stratum point (`mediumTransmittance` would gain a "T at these sorted distances" form). Not yet
 measured how much of a fire scene's render time this is.
 
-## OPEN (2026-10-13, tech debt): SLAB-DDA-COPIES — the box clip and the grid walk are written out several times
+## DONE (2026-11-19, no render change): SLAB-DDA-COPIES — the box clip and the grid walk were written out several times
 
-`clipRayBox` (`geometry.h`, 0.377.3) is the ray-box slab clip of a medium's box bound and of the
-fires; three more copies remain in the fur code -- `FurVolume::entryDist` and
-`FurVolume::sampleFlight` (`fur_volume.h`) and `FurGrid`'s march (`fur_grid.h`) -- with a 1e-15
-parallel-axis epsilon where `clipRayBox` has 1e-12. The Amanatides-Woo cell walk exists three times
-(`firePointPdf`, `sampleFlight`, the march), each with its own per-cell action; one cell-walk
-template taking the per-cell action would serve all three. The fur renders should be checked
-bit-for-bit when the epsilons are unified.
+The ray-box slab clip existed five times -- `clipRayBox` (`geometry.h`), its device twin
+`dClipRayBox`, `dMedClip`'s box branch, and the fur code's `FurVolume::entryDist`,
+`FurVolume::sampleFlight` and `FurGrid::march` (those three at a 1e-15 parallel-axis epsilon where
+the others had 1e-12) -- and the Amanatides-Woo cell walk six times: `Renderer::majorantWalk` and
+the device's `DMajWalk`, `firePointPdf` and its device twin, `sampleFlight` and the march (the fur
+two with a 1e-9 entry nudge and a step guard, the fire two computing each plane crossing from the
+entry point rather than the origin). **Fixed:** one host-and-device header, `cell_walk.h`:
+`rayBoxClip`, and `CellWalk` (`cellWalkInit` / `cellWalkNext`, one cell and its span at a time --
+the device's iterator form, which the host's callback `majorantWalk` wraps), the majorant walk's
+arithmetic kept exactly. Everything above runs through them. A parallel axis is the clip's
+(`|d| < 1e-12`) and its next crossing is at infinity rather than 1e300, so a zero or NaN direction
+ends after one span instead of stepping 1e300 at a time to an infinite `tEnd` (the fur's guard
+covered that for the fur alone).
+
+**Verified:** `check_bitid` against the binary before (128 cases; its fog scene is the majorant
+walk on both devices) passes, identical but for GPU M and S inside their own floor; the fur --
+`_dual_pale_lamp`'s hair coat at 128x96 under `-fur-volume` (modes R and D), `-dual-scatter
+-dual-grid` and `-fur-lod` -- and `check_fire_r`'s fire (a vdb density with fire light sampling:
+CPU R and B, GPU R and D) are byte-identical before and after; `-checkfurgrid` (its DDA coverage
+test included) and `-checkfurvol` pass. Per-kernel resources: stack the same or 16-448 B smaller,
+registers of the out-of-line radiance functions within -11/+2. Wall time, interleaved before/after: CPU
+fire R, fur-volume R and dual-grid R within 2 % of each other; GPU fire R 32.1 s against 32.1 s.
 
 ## OPEN (2026-10-12; mode R done in 0.375.0): SPECTRAL-BUNDLE — media and fibers rendered at one wavelength per path
 

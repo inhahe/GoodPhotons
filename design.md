@@ -4038,6 +4038,15 @@ was lit differently by every mode (known-issues GLOW-LIGHT-MODES). Now:
   D/R/M-gpu/M-cpu, and `_cornell_diffuse.ftsl` holds D vs R at 1.2/255 mean abs difference
   with matching auto-exposure. Scenes authored against the old darkening need their albedo
   re-tuned — `gallery_rain`'s ground went 5 % → 1 % in the same commit.
+- **`cell_walk.h`** — the ray-box slab clip (`rayBoxClip`) and the Amanatides-Woo walk through
+  a regular lattice of cells (`CellWalk`: `cellWalkInit`, then `cellWalkNext` hands back each cell
+  and the stretch of the ray inside it), host-and-device (`FT_UNIT_INLINE`). Every box clip
+  (`clipRayBox`, `dClipRayBox`, `dMedClip`'s box) and every lattice march takes these: the media's
+  majorant grid (`Renderer::majorantWalk`, `dMajWalk`), the fur coat's grid (`FurGrid::march`,
+  `FurVolume::sampleFlight`/`entryDist`) and a fire's emission grid (`firePointPdf` and its device
+  twin), so host and device cut a ray into the same spans. A parallel axis (`|d| < 1e-12`, the
+  clip's test) is never stepped and its next crossing is at infinity, so a degenerate direction
+  ends after one span.
 - **`geometry.h` / `bvh.h`** — primitives + SAH BVH (split plane by SAH, always
   recurse to LEAF_SIZE, median fallback; front-to-back traversal, ray-slab test
   unrolled; `tEnter` pruning). Triangles use the **Woop watertight** test (JCGT 2013):
@@ -9362,7 +9371,8 @@ as the one at fault.
   piecewise-constant **control** density, and `res`, a majorant of `|density − ctrl|` over the
   cell. `Medium::majorant` is a `shared_ptr`, uploaded to the device as `DMajorant` (two float
   arrays + the lattice transform) and walked by a 3-D DDA (`Renderer::majorantWalk` on the host,
-  `DMajWalk` on the device) that hands each traversed cell's `[t0,t1]` to the estimator.
+  `dMajWalk` on the device, both the one `CellWalk` of `cell_walk.h`) that hands each traversed
+  cell's `[t0,t1]` to the estimator.
   - **What it fixes, and the counterintuitive reason a plain local majorant does NOT.** The
     obvious use of a majorant grid is to tighten `σ_max` for ratio tracking. Measured (a Python
     sim of `gallery_rain`'s cloud), that buys **exactly nothing**: ratio tracking's
@@ -13339,7 +13349,7 @@ runs its own cases first (exit 2 where the scanner itself is wrong), and runs af
   uncapped copy, or the other capped unit's, held to its cap -- so the link could again refuse
   after an edit there (the shared headers' host-and-device helpers -- `ggx.h`, `bluenoise.h`,
   `pov_noise.h`, `pov_functions.h`, `pattern.h`, `stochtile.h`, `worley.h`, `gabor.h`,
-  `lighttree.h`, `gatherplane.h`, `photonmap.h`, `lens.h`, `curvature.h`, `rng.h` -- are
+  `lighttree.h`, `gatherplane.h`, `photonmap.h`, `lens.h`, `curvature.h`, `cell_walk.h`, `rng.h` -- are
   `FT_UNIT_INLINE`, `unit_linkage.h`: `static` in a capped unit, plain `inline` in every other, so
   that a host TU's external inline caller means one function everywhere -- `static` for all, as
   0.450.10 had it, broke the host's ODR -- and keyed by the unit, the same in its host and device

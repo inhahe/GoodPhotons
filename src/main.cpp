@@ -1708,7 +1708,7 @@ static int checkFurGrid() {
     // deliberately stupid reference that shares no bookkeeping with the DDA, so agreement
     // means the DDA's cell-by-cell accounting is right rather than that both are wrong the
     // same way. Directions include the axis-aligned degenerate ones, where a component of
-    // `dir` is zero and the DDA has to take its `1e300` branch instead of dividing.
+    // `dir` is zero and the walk has to take its parallel-axis branch instead of dividing.
     //
     // (An earlier draft compared against `sigma_t * clipped length` on a "uniform" lattice
     // instead. It failed by exactly 50%, and the DDA was innocent: the grid's AABB is

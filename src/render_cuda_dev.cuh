@@ -118,6 +118,7 @@
 #include "render_progress.h"
 #include "pattern_device.cuh"   // DPattern / DPatEnvT / dPatternEval — shared with raster_cuda.cu
 #include "stochtile.h"    // O7: the host/device-shared histogram-preserving tiling operator
+#include "cell_walk.h"   // rayBoxClip / CellWalk: the box clip and lattice walk the host takes too
 #include "grin.h"         // grin::sceneHasGrin (host gate mirrored into DScene::hasGrin)
 #include "surfmerge.h"   // SurfMap/SurfPhoton/SurfMis: mode J's point x point merges
 #include "photonmap.h"    // host PhotonMap::build reused for the mode-M grid (GPU gather)
@@ -1043,66 +1044,21 @@ struct DMajorant {
     int          nx, ny, nz;
 };
 
-// 3D DDA over a DMajorant, handing back one [t0,t1] span and cell index at a time. Device
-// twin of Renderer::majorantWalk; the two must step identically or CPU and GPU renders of
-// the same heterogeneous medium would disagree by more than noise. Doubles throughout,
-// matching the host walk (the tracking loops are double on the device already).
-namespace {
-struct DMajWalk {
-    int    c[3], step[3], nn[3];
-    double tNext[3], tDelta[3];
-    double t0, tEnd;
-    double ox[3], dx[3];
-
-    __device__ void init(const DMajorant& g, const DVec3& o, const DVec3& d,
-                         double ta, double tb) {
-        ox[0] = o.x; ox[1] = o.y; ox[2] = o.z;
-        dx[0] = d.x; dx[1] = d.y; dx[2] = d.z;
-        const double lo[3] = {g.wmin.x, g.wmin.y, g.wmin.z};
-        const double cs[3] = {g.cell.x, g.cell.y, g.cell.z};
-        const double ic[3] = {g.invCell.x, g.invCell.y, g.invCell.z};
-        nn[0] = g.nx; nn[1] = g.ny; nn[2] = g.nz;
-        for (int k = 0; k < 3; ++k) {
-            double p = ox[k] + dx[k] * ta;
-            int i = (int)floor((p - lo[k]) * ic[k]);
-            c[k] = i < 0 ? 0 : (i >= nn[k] ? nn[k] - 1 : i);
-            if (dx[k] > 1e-12) {
-                step[k] = 1;
-                tNext[k] = (lo[k] + (c[k] + 1) * cs[k] - ox[k]) / dx[k];
-                tDelta[k] = cs[k] / dx[k];
-            } else if (dx[k] < -1e-12) {
-                step[k] = -1;
-                tNext[k] = (lo[k] + c[k] * cs[k] - ox[k]) / dx[k];
-                tDelta[k] = -cs[k] / dx[k];
-            } else {
-                step[k] = 0; tNext[k] = 1e300; tDelta[k] = 1e300;
-            }
-        }
-        t0 = ta; tEnd = tb;
-    }
-    // Advance to the next non-empty span. Returns false when the segment (or the grid) is
-    // exhausted; `ci` is the flat cell index, [a,b] the span within it.
-    __device__ bool next(const DMajorant& g, size_t& ci, double& a, double& b) {
-        for (;;) {
-            if (t0 >= tEnd) return false;
-            int axis = (tNext[0] < tNext[1]) ? ((tNext[0] < tNext[2]) ? 0 : 2)
-                                             : ((tNext[1] < tNext[2]) ? 1 : 2);
-            double t1 = tNext[axis] < tEnd ? tNext[axis] : tEnd;
-            size_t cell = ((size_t)c[2] * g.ny + c[1]) * g.nx + c[0];
-            double s0 = t0;
-            if (t1 >= tEnd) { t0 = tEnd; }
-            else {
-                t0 = t1;
-                c[axis] += step[axis];
-                if (c[axis] < 0 || c[axis] >= nn[axis]) t0 = tEnd;   // left the grid
-                else tNext[axis] += tDelta[axis];
-            }
-            if (t1 > s0) { ci = cell; a = s0; b = t1; return true; }
-            if (t0 >= tEnd) return false;
-        }
-    }
-};
-}  // namespace
+// The walk of o + t d, t in [ta, tb], through a DMajorant's cells (cell_walk.h, the stepping
+// Renderer::majorantWalk takes on the host, so CPU and GPU renders of the same heterogeneous
+// medium cut its rays into the same spans): cellWalkNext hands back one cell and its span at a
+// time. Doubles throughout, as the tracking loops are.
+__device__ static CellWalk dMajWalk(const DMajorant& g, const DVec3& o, const DVec3& d,
+                                    double ta, double tb) {
+    const double lo[3] = {g.wmin.x, g.wmin.y, g.wmin.z};
+    const double cs[3] = {g.cell.x, g.cell.y, g.cell.z};
+    const double ic[3] = {g.invCell.x, g.invCell.y, g.invCell.z};
+    const int    n[3]  = {g.nx, g.ny, g.nz};
+    const double ox[3] = {o.x, o.y, o.z}, dx[3] = {d.x, d.y, d.z};
+    CellWalk w;
+    cellWalkInit(w, lo, cs, ic, n, ox, dx, ta, tb);
+    return w;
+}
 
 struct DMedium {
     int    enabled;
@@ -3295,21 +3251,11 @@ __device__ static bool dMedClip(const DMedium& m, const DVec3& o, const DVec3& d
         if (lo > hi) return false;
         ta = lo; tb = hi; return tb > ta;
     }
-    double lo = t0, hi = t1;
     const double oo[3] = { (double)o.x, (double)o.y, (double)o.z };
     const double dd[3] = { (double)dir.x, (double)dir.y, (double)dir.z };
     const double mn[3] = { (double)m.bmin.x, (double)m.bmin.y, (double)m.bmin.z };
     const double mx[3] = { (double)m.bmax.x, (double)m.bmax.y, (double)m.bmax.z };
-    for (int a = 0; a < 3; ++a) {
-        double oa = oo[a], da = dd[a];
-        if (fabs(da) < 1e-12) { if (oa < mn[a] || oa > mx[a]) return false; continue; }
-        double inv = 1.0 / da;
-        double s0 = (mn[a] - oa) * inv, s1 = (mx[a] - oa) * inv;
-        if (s0 > s1) { double tmp = s0; s0 = s1; s1 = tmp; }
-        lo = fmax(lo, s0); hi = fmin(hi, s1);
-        if (lo > hi) return false;
-    }
-    ta = lo; tb = hi; return tb > ta;
+    return rayBoxClip(mn, mx, oo, dd, t0, t1, ta, tb);
 }
 
 // ============================ GRIN (gradient-index) marching ==================
@@ -3381,9 +3327,9 @@ __device__ static bool dMedSampleCollision(const DMedium& m, const DVec3& o, con
     // so use the tight local sup (ctrl + res) — far fewer null collisions, and a vacuum
     // cell is skipped with no RNG draw at all. Host twin: Renderer::sampleMediumCollision.
     if (m.majorant.ctrl) {
-        DMajWalk w; w.init(m.majorant, o, dir, ta, tb);
+        CellWalk w = dMajWalk(m.majorant, o, dir, ta, tb);
         size_t ci; double a, b;
-        while (w.next(m.majorant, ci, a, b)) {
+        while (cellWalkNext(w, ci, a, b)) {
             double sigMax = stBase * ((double)m.majorant.ctrl[ci] + (double)m.majorant.res[ci]);
             if (sigMax <= 0.0) continue;              // vacuum cell
             double t = a;
@@ -3429,9 +3375,9 @@ __device__ static Real dMedTransmittance(const DMedium& m, const DVec3& o, const
     if (!dMedClip(m, o, dir, 0.0, (double)dist, ta, tb)) return (Real)1;
     if (!m.heterogeneous) return (Real)exp(-stBase * (tb - ta));
     if (m.majorant.ctrl) {
-        DMajWalk w; w.init(m.majorant, o, dir, ta, tb);
+        CellWalk w = dMajWalk(m.majorant, o, dir, ta, tb);
         size_t ci; double a, b; double Tr = 1.0;
-        while (w.next(m.majorant, ci, a, b)) {
+        while (cellWalkNext(w, ci, a, b)) {
             const double sigC = stBase * (double)m.majorant.ctrl[ci];
             const double sigR = stBase * (double)m.majorant.res[ci];
             if (sigC > 0.0) Tr *= exp(-sigC * (b - a));      // control term, analytic
@@ -3556,9 +3502,9 @@ __device__ static void dMedTransmittanceMulti(const DMedium& m, const DVec3& o, 
     }
     double Tr = 1.0;
     if (m.majorant.ctrl) {
-        DMajWalk w; w.init(m.majorant, o, dir, ta, tb);
+        CellWalk w = dMajWalk(m.majorant, o, dir, ta, tb);
         size_t ci; double a, b;
-        while (k < n && w.next(m.majorant, ci, a, b)) {
+        while (k < n && cellWalkNext(w, ci, a, b)) {
             const double sigC = stBase * (double)m.majorant.ctrl[ci];
             const double sigR = stBase * (double)m.majorant.res[ci];
             if (sigR > 0.0) {
@@ -3641,9 +3587,9 @@ __device__ static void dMedTransmittanceSpec(const DMedium& m, const DVec3& o, c
         return;
     }
     if (m.majorant.ctrl) {
-        DMajWalk w; w.init(m.majorant, o, dir, ta, tb);
+        CellWalk w = dMajWalk(m.majorant, o, dir, ta, tb);
         size_t ci; double a, b;
-        while (w.next(m.majorant, ci, a, b)) {
+        while (cellWalkNext(w, ci, a, b)) {
             const double cC = (double)m.majorant.ctrl[ci], cR = (double)m.majorant.res[ci];
             for (int i = 0; i < K; ++i)
                 if (stB[i] * cC > 0.0) Tr[i] *= exp(-stB[i] * cC * (b - a));
@@ -16125,18 +16071,9 @@ struct DGlossyMis {
 // point (host twin: clipRayBox).
 __device__ static bool dClipRayBox(const DVec3& lo, const DVec3& hi, const DVec3& o, const DVec3& d,
                                    double t0, double t1, double& ta, double& tb) {
-    for (int a = 0; a < 3; ++a) {
-        const double oa = (double)(&o.x)[a], da = (double)(&d.x)[a];
-        const double mn = (double)(&lo.x)[a], mx = (double)(&hi.x)[a];
-        if (fabs(da) < 1e-12) { if (oa < mn || oa > mx) return false; continue; }
-        const double inv = 1.0 / da;
-        double s0 = (mn - oa) * inv, s1 = (mx - oa) * inv;
-        if (s0 > s1) { const double t = s0; s0 = s1; s1 = t; }
-        t0 = fmax(t0, s0); t1 = fmin(t1, s1);
-        if (t0 > t1) return false;
-    }
-    ta = t0; tb = t1;
-    return tb > ta;
+    const double l[3] = {lo.x, lo.y, lo.z}, h[3] = {hi.x, hi.y, hi.z};
+    const double ox[3] = {o.x, o.y, o.z}, dx[3] = {d.x, d.y, d.z};
+    return rayBoxClip(l, h, ox, dx, t0, t1, ta, tb);
 }
 
 // The fire `u` picks in proportion to power (host twin: Scene::pickFire).
@@ -16211,34 +16148,20 @@ __device__ static DVec3 dFireConeSample(const DEmissiveVolume& v, const DVec3& x
 __device__ static double dFirePointPdf(const DEmissiveVolume& v, const DVec3& x, const DVec3& d) {
     double t0, t1;
     if (v.nCells == 0 || !dClipRayBox(v.bmin, v.bmax, x, d, 0.0, 1e300, t0, t1)) return 0.0;
+    const double lo[3] = {v.bmin.x, v.bmin.y, v.bmin.z};
     const double ext[3] = {(double)v.bmax.x - v.bmin.x, (double)v.bmax.y - v.bmin.y,
                            (double)v.bmax.z - v.bmin.z};
-    const double lo3[3] = {(double)v.bmin.x, (double)v.bmin.y, (double)v.bmin.z};
-    const double xo[3] = {(double)x.x, (double)x.y, (double)x.z};
-    const double dd[3] = {(double)d.x, (double)d.y, (double)d.z};
-    const double cellVol = (ext[0] / v.gres[0]) * (ext[1] / v.gres[1]) * (ext[2] / v.gres[2]);
-    const double norm = 1.0 / (v.cellSum * cellVol);       // point density = cellW * norm
-    int c[3], step[3];
-    double tNext[3], tDelta[3];
-    for (int a = 0; a < 3; ++a) {
-        const double w = ext[a] / v.gres[a], da = dd[a];
-        const double pa = xo[a] + da * t0;                 // the entry point
-        int ci = (int)floor((pa - lo3[a]) / w);
-        c[a] = ci < 0 ? 0 : (ci > v.gres[a] - 1 ? v.gres[a] - 1 : ci);
-        if (da > 0.0)      { step[a] = 1;  tNext[a] = t0 + (lo3[a] + (c[a] + 1) * w - pa) / da; tDelta[a] = w / da; }
-        else if (da < 0.0) { step[a] = -1; tNext[a] = t0 + (lo3[a] + c[a] * w - pa) / da;       tDelta[a] = -w / da; }
-        else               { step[a] = 0;  tNext[a] = 1e300;                                    tDelta[a] = 1e300; }
-    }
-    double t = t0, pdf = 0.0;
-    while (t < t1) {
-        const int a = (tNext[0] < tNext[1]) ? (tNext[0] < tNext[2] ? 0 : 2) : (tNext[1] < tNext[2] ? 1 : 2);
-        const double tOut = fmin(tNext[a], t1);
-        const double w = v.cellW[((size_t)c[2] * v.gres[1] + c[1]) * v.gres[0] + c[0]];
-        if (w > 0.0) pdf += w * norm * (tOut * tOut * tOut - t * t * t) / 3.0;
-        t = tOut;
-        c[a] += step[a];
-        if (c[a] < 0 || c[a] >= v.gres[a]) break;
-        tNext[a] += tDelta[a];
+    double cs[3], ic[3];
+    for (int a = 0; a < 3; ++a) { cs[a] = ext[a] / v.gres[a]; ic[a] = v.gres[a] / ext[a]; }
+    const double norm = 1.0 / (v.cellSum * (cs[0] * cs[1] * cs[2]));   // point density = cellW * norm
+    const double xo[3] = {x.x, x.y, x.z}, dd[3] = {d.x, d.y, d.z};
+    CellWalk w;
+    cellWalkInit(w, lo, cs, ic, v.gres, xo, dd, t0, t1);
+    double pdf = 0.0;
+    size_t ci; double a, b;
+    while (cellWalkNext(w, ci, a, b)) {
+        const double cw = v.cellW[ci];
+        if (cw > 0.0) pdf += cw * norm * (b * b * b - a * a * a) / 3.0;
     }
     return pdf;
 }

@@ -2137,28 +2137,16 @@ struct BackwardRenderer {
         double t0, t1;
         if (!clipRayBox(v.bmin, v.bmax, x, d, 0.0, 1e300, t0, t1)) return 0.0;
         const Vec3 ext = v.bmax - v.bmin;
-        const double cellVol = (ext.x / v.gres[0]) * (ext.y / v.gres[1]) * (ext.z / v.gres[2]);
-        const double norm = 1.0 / (v.cellSum * cellVol);    // point density = cellW * norm
-        int c[3], step[3];
-        double tNext[3], tDelta[3];
-        for (int a = 0; a < 3; ++a) {
-            const double lo = (&v.bmin.x)[a], w = (&ext.x)[a] / v.gres[a], da = (&d.x)[a];
-            const double pa = (&x.x)[a] + da * t0;               // the entry point
-            c[a] = std::clamp((int)std::floor((pa - lo) / w), 0, v.gres[a] - 1);
-            if (da > 0.0)      { step[a] = 1;  tNext[a] = t0 + (lo + (c[a] + 1) * w - pa) / da; tDelta[a] = w / da; }
-            else if (da < 0.0) { step[a] = -1; tNext[a] = t0 + (lo + c[a] * w - pa) / da;       tDelta[a] = -w / da; }
-            else               { step[a] = 0;  tNext[a] = 1e300;                                tDelta[a] = 1e300; }
-        }
-        double t = t0, pdf = 0.0;
-        while (t < t1) {
-            const int a = (tNext[0] < tNext[1]) ? (tNext[0] < tNext[2] ? 0 : 2) : (tNext[1] < tNext[2] ? 1 : 2);
-            const double tOut = std::min(tNext[a], t1);
-            const double w = v.cellW[((size_t)c[2] * v.gres[1] + c[1]) * v.gres[0] + c[0]];
-            if (w > 0.0) pdf += w * norm * (tOut * tOut * tOut - t * t * t) / 3.0;
-            t = tOut;
-            c[a] += step[a];
-            if (c[a] < 0 || c[a] >= v.gres[a]) break;
-            tNext[a] += tDelta[a];
+        double cs[3], ic[3];
+        for (int a = 0; a < 3; ++a) { cs[a] = (&ext.x)[a] / v.gres[a]; ic[a] = v.gres[a] / (&ext.x)[a]; }
+        const double norm = 1.0 / (v.cellSum * (cs[0] * cs[1] * cs[2]));   // point density = cellW * norm
+        CellWalk w;
+        cellWalkInit(w, &v.bmin.x, cs, ic, v.gres, &x.x, &d.x, t0, t1);
+        double pdf = 0.0;
+        size_t ci; double a, b;
+        while (cellWalkNext(w, ci, a, b)) {
+            const double cw = v.cellW[ci];
+            if (cw > 0.0) pdf += cw * norm * (b * b * b - a * a * a) / 3.0;
         }
         return pdf;
     }

@@ -325,6 +325,15 @@ struct FurGrid {
         return fc ? sigmaT(*fc, d) : 0.0;
     }
 
+    // The walk of `o + t*d`, t in [t0, t1] -- the ray's clip to the box [lo, hi] -- through the
+    // cells (cell_walk.h): what the march and FurVolume::sampleFlight step through.
+    CellWalk walk(const Vec3& o, const Vec3& d, double t0, double t1) const {
+        const int n[3] = {nx, ny, nz};
+        CellWalk w;
+        cellWalkInit(w, &lo.x, &cell.x, &invCell.x, n, &o.x, &d.x, t0, t1);
+        return w;
+    }
+
     // -----------------------------------------------------------------------------------
     // MARCH.  Amanatides-Woo 3D-DDA from `o` along unit `dir` for at most `maxDist`,
     // accumulating optical depth and the depth-weighted mean `sin^2 theta`.
@@ -338,62 +347,22 @@ struct FurGrid {
     // sampling noise.  That identity is what lets this replace `Scene::walkFibers`.
     FurMarch march(const Vec3& o, const Vec3& dir, double maxDist) const {
         FurMarch m;
-        if (!valid || !(maxDist > 0.0)) return m;
-        // Slab clip against the grid box.
-        double t0 = 0.0, t1 = maxDist;
-        for (int a = 0; a < 3; ++a) {
-            const double od = (&dir.x)[a], oo = (&o.x)[a];
-            const double bl = (&lo.x)[a], bh = (&hi.x)[a];
-            if (std::fabs(od) < 1e-15) { if (oo < bl || oo > bh) return m; continue; }
-            const double inv = 1.0 / od;
-            double na = (bl - oo) * inv, fa = (bh - oo) * inv;
-            if (na > fa) std::swap(na, fa);
-            t0 = std::max(t0, na); t1 = std::min(t1, fa);
-            if (t0 > t1) return m;
-        }
+        double t0, t1;
+        if (!valid || !(maxDist > 0.0) || !clipRayBox(lo, hi, o, dir, 0.0, maxDist, t0, t1)) return m;
         m.hit = true;
-        // Start cell: nudge inside so a ray entering exactly on a face lands in the box.
-        const Vec3 pe = o + dir * (t0 + 1e-9);
-        int ix = std::min(nx - 1, std::max(0, (int)((pe.x - lo.x) * invCell.x)));
-        int iy = std::min(ny - 1, std::max(0, (int)((pe.y - lo.y) * invCell.y)));
-        int iz = std::min(nz - 1, std::max(0, (int)((pe.z - lo.z) * invCell.z)));
-        int step[3]; double tMax[3], tDelta[3];
-        for (int a = 0; a < 3; ++a) {
-            const double od = (&dir.x)[a];
-            const int    ii = (a == 0 ? ix : a == 1 ? iy : iz);
-            const double cs = (&cell.x)[a], bl = (&lo.x)[a];
-            if (std::fabs(od) < 1e-15) { step[a] = 0; tMax[a] = 1e300; tDelta[a] = 1e300; continue; }
-            step[a]   = od > 0.0 ? 1 : -1;
-            tDelta[a] = cs / std::fabs(od);
-            const double bound = bl + (ii + (od > 0.0 ? 1 : 0)) * cs;
-            tMax[a]   = (bound - (&o.x)[a]) / od;
-        }
-        double t = t0;
+        CellWalk w = walk(o, dir, t0, t1);
         double bestMat = 0.0;   // depth of the leading material, as a winner-take-all margin
         double s2Acc = 0.0;
-        int    guard = 4 * (nx + ny + nz) + 8;   // DDA cannot outlive the lattice; belt and braces
-        while (t < t1 && guard-- > 0) {
-            const int    axis = (tMax[0] < tMax[1]) ? ((tMax[0] < tMax[2]) ? 0 : 2)
-                                                    : ((tMax[1] < tMax[2]) ? 1 : 2);
-            const double tNext = std::min(tMax[axis], t1);
-            const double seg   = tNext - t;
-            if (seg > 0.0) {
-                const FurCell& fc = cells[(size_t)index(ix, iy, iz)];
-                if (fc.c > 0.0f) {
-                    const double s2 = furSin2(fc, dir);
-                    const double dt = fc.c * std::sqrt(std::max(0.0, 1.0 - s2)) * seg;
-                    m.tau  += dt;
-                    s2Acc  += dt * s2;
-                    if (m.matId == fc.matId || m.matId < 0) { m.matId = fc.matId; bestMat += dt; }
-                    else if ((bestMat -= dt) < 0.0) { m.matId = fc.matId; bestMat = -bestMat; }
-                }
-            }
-            t = tNext;
-            if (t >= t1) break;
-            const int i = (axis == 0 ? (ix += step[0]) : axis == 1 ? (iy += step[1]) : (iz += step[2]));
-            const int n = (axis == 0 ? nx : axis == 1 ? ny : nz);
-            if (i < 0 || i >= n) break;
-            tMax[axis] += tDelta[axis];
+        size_t ci; double a, b;
+        while (cellWalkNext(w, ci, a, b)) {
+            const FurCell& fc = cells[ci];
+            if (!(fc.c > 0.0f)) continue;
+            const double s2 = furSin2(fc, dir);
+            const double dt = fc.c * std::sqrt(std::max(0.0, 1.0 - s2)) * (b - a);
+            m.tau  += dt;
+            s2Acc  += dt * s2;
+            if (m.matId == fc.matId || m.matId < 0) { m.matId = fc.matId; bestMat += dt; }
+            else if ((bestMat -= dt) < 0.0) { m.matId = fc.matId; bestMat = -bestMat; }
         }
         m.sin2 = m.tau > 0.0 ? std::min(1.0, std::max(0.0, s2Acc / m.tau)) : 0.0;
         return m;

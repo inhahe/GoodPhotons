@@ -1012,58 +1012,22 @@ struct Renderer {
     // and to the single global majorant sigma_max = sigmaT(lambda) * densityMax when it
     // does not (an unbounded density field).
     //
-    // WALKING THE MAJORANT GRID. Both estimators below step the ray cell by cell with a
-    // 3D DDA and run their per-cell tracking loop over [tEnter, tExit] with THAT cell's
-    // coefficients. The two share `majorantWalk`, which calls `body(cellIndex, t0, t1)`
-    // for each cell the segment crosses and stops early when the body returns false. The
-    // walk is in the grid's own AABB, which is the medium bound's AABB, so `clipToBounds`
-    // has already trimmed the segment to it — but a ray can still start on/outside a face
-    // by an epsilon, so the entry cell is clamped rather than assumed in range.
+    // WALKING THE MAJORANT GRID. The estimators below step the ray cell by cell (cell_walk.h,
+    // the stepping the device's tracking loops take too) and run their per-cell tracking loop
+    // over [tEnter, tExit] with THAT cell's coefficients. They share `majorantWalk`, which calls
+    // `body(cellIndex, t0, t1)` for each cell the segment crosses and stops early when the body
+    // returns false. The walk is in the grid's own AABB, which is the medium bound's AABB, so
+    // `clipToBounds` has already trimmed the segment to it -- but a ray can still start on or
+    // outside a face by an epsilon, which the walk's clamped entry cell absorbs.
     template <class Body>
     static void majorantWalk(const MajorantGrid& g, const Vec3& o, const Vec3& dir,
                              double ta, double tb, Body&& body) {
-        auto cellOf = [&](double t, int a[3]) {
-            Vec3 p = o + dir * t;
-            double f[3] = {(p.x - g.wmin.x) * g.invCell.x,
-                           (p.y - g.wmin.y) * g.invCell.y,
-                           (p.z - g.wmin.z) * g.invCell.z};
-            int n[3] = {g.nx, g.ny, g.nz};
-            for (int k = 0; k < 3; ++k) {
-                int i = (int)std::floor(f[k]);
-                a[k] = i < 0 ? 0 : (i >= n[k] ? n[k] - 1 : i);
-            }
-        };
-        int c[3]; cellOf(ta, c);
-        const double d[3] = {dir.x, dir.y, dir.z};
-        const double cs[3] = {g.cell.x, g.cell.y, g.cell.z};
-        const double lo[3] = {g.wmin.x, g.wmin.y, g.wmin.z};
-        const int    nn[3] = {g.nx, g.ny, g.nz};
-        int step[3]; double tNext[3], tDelta[3];
-        for (int k = 0; k < 3; ++k) {
-            if (d[k] > 1e-12) {
-                step[k] = 1;
-                tNext[k] = (lo[k] + (c[k] + 1) * cs[k] - (k == 0 ? o.x : k == 1 ? o.y : o.z)) / d[k];
-                tDelta[k] = cs[k] / d[k];
-            } else if (d[k] < -1e-12) {
-                step[k] = -1;
-                tNext[k] = (lo[k] + c[k] * cs[k] - (k == 0 ? o.x : k == 1 ? o.y : o.z)) / d[k];
-                tDelta[k] = -cs[k] / d[k];
-            } else {
-                step[k] = 0; tNext[k] = 1e300; tDelta[k] = 1e300;
-            }
-        }
-        double t0 = ta;
-        for (;;) {
-            int axis = (tNext[0] < tNext[1]) ? ((tNext[0] < tNext[2]) ? 0 : 2)
-                                             : ((tNext[1] < tNext[2]) ? 1 : 2);
-            double t1 = std::min(tNext[axis], tb);
-            if (t1 > t0 && !body(g.idx(c[0], c[1], c[2]), t0, t1)) return;
-            if (t1 >= tb) return;
-            t0 = t1;
-            c[axis] += step[axis];
-            if (c[axis] < 0 || c[axis] >= nn[axis]) return;   // left the grid
-            tNext[axis] += tDelta[axis];
-        }
+        const int n[3] = {g.nx, g.ny, g.nz};
+        CellWalk w;
+        cellWalkInit(w, &g.wmin.x, &g.cell.x, &g.invCell.x, n, &o.x, &dir.x, ta, tb);
+        size_t ci; double a, b;
+        while (cellWalkNext(w, ci, a, b))
+            if (!body(ci, a, b)) return;
     }
 
     // Sample the next real collision along (o,dir) within [0,dMax]. Returns true and

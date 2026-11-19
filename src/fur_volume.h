@@ -613,19 +613,8 @@ struct FurVolume {
     // fiber means the BVH traversal the far tier exists to avoid, and the difference between
     // the two is at most the coat's own depth, far below the octave-wide transition band.
     double entryDist(const Vec3& o, const Vec3& d) const {
-        if (!valid()) return -1.0;
-        double t0 = 0.0, t1 = 1e300;
-        for (int a = 0; a < 3; ++a) {
-            const double od = (&d.x)[a], oo = (&o.x)[a];
-            const double bl = (&grid->lo.x)[a], bh = (&grid->hi.x)[a];
-            if (std::fabs(od) < 1e-15) { if (oo < bl || oo > bh) return -1.0; continue; }
-            const double inv = 1.0 / od;
-            double na = (bl - oo) * inv, fa = (bh - oo) * inv;
-            if (na > fa) std::swap(na, fa);
-            t0 = std::max(t0, na); t1 = std::min(t1, fa);
-            if (t0 > t1) return -1.0;
-        }
-        return t1 < 0.0 ? -1.0 : t0;
+        double ta, tb;
+        return valid() && clipRayBox(grid->lo, grid->hi, o, d, 0.0, 1e300, ta, tb) ? ta : -1.0;
     }
 
     // What a free-flight draw found.
@@ -642,61 +631,25 @@ struct FurVolume {
     // cell segment's optical depth from the target and stop inside the cell that exhausts it.
     Flight sampleFlight(const Vec3& o, const Vec3& d, double maxDist, double u) const {
         Flight f;
-        if (!valid() || !(maxDist > 0.0)) return f;
+        double t0, t1;
+        if (!valid() || !(maxDist > 0.0) || !clipRayBox(grid->lo, grid->hi, o, d, 0.0, maxDist, t0, t1))
+            return f;
         const double want = -std::log(std::max(1e-300, 1.0 - u));
-        double t0 = 0.0, t1 = maxDist;
-        for (int a = 0; a < 3; ++a) {                       // slab clip against the grid box
-            const double od = (&d.x)[a], oo = (&o.x)[a];
-            const double bl = (&grid->lo.x)[a], bh = (&grid->hi.x)[a];
-            if (std::fabs(od) < 1e-15) { if (oo < bl || oo > bh) return f; continue; }
-            const double inv = 1.0 / od;
-            double na = (bl - oo) * inv, fa = (bh - oo) * inv;
-            if (na > fa) std::swap(na, fa);
-            t0 = std::max(t0, na); t1 = std::min(t1, fa);
-            if (t0 > t1) return f;
-        }
-        const Vec3 pe = o + d * (t0 + 1e-9);
-        int ix = std::min(grid->nx - 1, std::max(0, (int)((pe.x - grid->lo.x) * grid->invCell.x)));
-        int iy = std::min(grid->ny - 1, std::max(0, (int)((pe.y - grid->lo.y) * grid->invCell.y)));
-        int iz = std::min(grid->nz - 1, std::max(0, (int)((pe.z - grid->lo.z) * grid->invCell.z)));
-        int step[3]; double tMax[3], tDelta[3];
-        for (int a = 0; a < 3; ++a) {
-            const double od = (&d.x)[a];
-            const int    ii = (a == 0 ? ix : a == 1 ? iy : iz);
-            const double cs = (&grid->cell.x)[a], bl = (&grid->lo.x)[a];
-            if (std::fabs(od) < 1e-15) { step[a] = 0; tMax[a] = 1e300; tDelta[a] = 1e300; continue; }
-            step[a]   = od > 0.0 ? 1 : -1;
-            tDelta[a] = cs / std::fabs(od);
-            tMax[a]   = (bl + (ii + (od > 0.0 ? 1 : 0)) * cs - (&o.x)[a]) / od;
-        }
-        double t = t0, acc = 0.0;
-        int guard = 4 * (grid->nx + grid->ny + grid->nz) + 8;
-        while (t < t1 && guard-- > 0) {
-            const int    axis = (tMax[0] < tMax[1]) ? ((tMax[0] < tMax[2]) ? 0 : 2)
-                                                    : ((tMax[1] < tMax[2]) ? 1 : 2);
-            const double tNext = std::min(tMax[axis], t1);
-            const double seg   = tNext - t;
-            if (seg > 0.0) {
-                const size_t ci = (size_t)grid->index(ix, iy, iz);
-                const double st = FurGrid::sigmaT(grid->cells[ci], d);
-                if (st > 0.0) {
-                    const double add = st * seg;
-                    if (acc + add >= want) {                 // the collision is in this cell
-                        f.hit = true;
-                        f.t   = t + (want - acc) / st;
-                        f.tau = want;
-                        f.ci  = ci;
-                        return f;
-                    }
-                    acc += add;
-                }
+        CellWalk w = grid->walk(o, d, t0, t1);
+        double acc = 0.0;
+        size_t ci; double a, b;
+        while (cellWalkNext(w, ci, a, b)) {
+            const double st = FurGrid::sigmaT(grid->cells[ci], d);
+            if (!(st > 0.0)) continue;
+            const double add = st * (b - a);
+            if (acc + add >= want) {                         // the collision is in this cell
+                f.hit = true;
+                f.t   = a + (want - acc) / st;
+                f.tau = want;
+                f.ci  = ci;
+                return f;
             }
-            t = tNext;
-            if (t >= t1) break;
-            const int i = (axis == 0 ? (ix += step[0]) : axis == 1 ? (iy += step[1]) : (iz += step[2]));
-            const int n = (axis == 0 ? grid->nx : axis == 1 ? grid->ny : grid->nz);
-            if (i < 0 || i >= n) break;
-            tMax[axis] += tDelta[axis];
+            acc += add;
         }
         f.tau = acc;
         return f;
