@@ -5300,6 +5300,53 @@ static int checkPmGrid() {
     std::printf("[checkpmgrid] brute-force cross-check visited %zu photons across the probes\n",
                 totalFound);
 
+    // 1b. A TAGGED MAP'S QUERY WEIGHS ITS OWN CELLS' POINTS (modes U and J: VcmGrid, SurfMap). A
+    // bucket also holds one cell of every other block hashed to its slot (merge_grid.h); the points'
+    // tags keep those from the distance test and from the counts the merges are gated and paced by.
+    // The same points binned with tags (mergeBin) and walked as those maps walk them
+    // (mergeForEachEntry): every point of the query's 27 cells must be among the entries, and of the
+    // strays in their buckets only those whose block's tag matches the cell's (one in 256) may be.
+    // The bound, one in 64 of the strays present, is four times that rate, so it holds at any table
+    // size (FTRACE_MERGE_TABLE=1, every block in one slot, has six thousand times the strays).
+    {
+        std::vector<int> cs, ord(posRef.size());
+        std::vector<unsigned char> tg;
+        mergeBin(pm.lat, posRef.size(), [&](size_t i) -> const Vec3& { return posRef[i]; },
+                 [&](size_t i, size_t k) { ord[k] = (int)i; }, cs, &tg, "the check's bins", "-");
+        std::vector<unsigned char> seen(posRef.size(), 0);
+        std::vector<int> hit;
+        Pcg32 qr; qr.seed(0x5EEDu, 0x77u);
+        long long own = 0, inBuckets = 0, let = 0, missed = 0;
+        for (int q = 0; q < 400; ++q) {
+            const Vec3 p = posRef[(size_t)(qr.uniform() * (N - 1))];
+            mergeForEachBucket(pm.lat, p.x, p.y, p.z,
+                               [&](unsigned int c, unsigned char) { inBuckets += cs[c + 1] - cs[c]; });
+            hit.clear();
+            mergeForEachEntry(pm.lat, cs.data(), tg.data(), p.x, p.y, p.z, [&](int k) {
+                hit.push_back(ord[k]);
+                seen[(size_t)ord[k]] = 1;
+            });
+            int ix, iy, iz; pm.cellCoord(p, ix, iy, iz);
+            long long mine = 0;
+            for (size_t i = 0; i < posRef.size(); ++i) {
+                int cx, cy, cz; pm.cellCoord(posRef[i], cx, cy, cz);
+                if (std::abs(cx - ix) <= 1 && std::abs(cy - iy) <= 1 && std::abs(cz - iz) <= 1) {
+                    ++mine;
+                    if (!seen[i]) ++missed;
+                }
+            }
+            own += mine;
+            let += (long long)hit.size() - mine;
+            for (int i : hit) seen[(size_t)i] = 0;
+        }
+        const long long strays = inBuckets - own;
+        std::printf("[checkpmgrid] a tagged walk over 400 probes: their 27 cells' %lld points, %lld missed; "
+                    "of the %lld strays in their buckets %lld let through (1 in %.0f)\n",
+                    own, missed, strays, let, let > 0 ? (double)strays / (double)let : 0.0);
+        chk("a tagged map's query weighs its 27 cells' points, and few of the strays",
+            missed == 0 && own > 0 && let * 64 <= strays + 256);
+    }
+
     // 2. THE PARTITION IS COMPLETE. Every photon lands in exactly one bucket run, and the
     // runs tile [0, N) — a counting sort that drops or duplicates a photon would still pass
     // most spot queries.

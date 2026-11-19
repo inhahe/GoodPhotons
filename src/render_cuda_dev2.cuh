@@ -1723,8 +1723,9 @@ struct DVcmSec {
 struct DVcmGrid {
     const DVcmLV* lv;       // compact light-vertex array (path order)
     int    nLV;
-    const int* cellStart;   // mergeBucketCount(mask) + 1
+    const int* cellStart;   // mergeBucketCount(lat.slots) + 1
     const DVcmLV* byCell;   // nLV vertices, bucket-contiguous
+    const unsigned char* tag;   // byCell[k]'s block's tag (MergeKey)
     const DVcmSec* byCellSec;
     MergeLattice lat;       // the lattice, its cells the merge radius wide (merge_grid.h)
 };
@@ -2440,15 +2441,20 @@ struct DVcmSite {
     DGridCell g;
     __device__ DVcmSite(const DVcmGrid& grid, const DVec3& p)
         : g(p, grid.lat) {}
-    // The light vertices [b, e) of its neighbour cell n's bucket (dSiteListWalk's `cell`).
-    __device__ void cell(const DVcmGrid& grid, int n, int& b, int& e) const {
-        const unsigned int c = g.neighbour(n, grid.lat.mask);
-        b = grid.cellStart[c]; e = grid.cellStart[c + 1];
+    // The light vertices [b, e) of its neighbour cell n's bucket and the cell's tag t (dSiteListWalk's
+    // `cell`).
+    __device__ void cell(const DVcmGrid& grid, int n, int& b, int& e, unsigned char& t) const {
+        const MergeKey c = g.neighbour(n, grid.lat.slots);
+        b = grid.cellStart[c.bucket]; e = grid.cellStart[c.bucket + 1]; t = c.tag;
     }
-    // The light vertices of its 27 cells: the list a merge there walks.
+    // The light vertices of its 27 cells, theirs alone (their tags): what a merge there weighs.
     __device__ int count(const DVcmGrid& grid) const {
         int n = 0;
-        for (int c = 0; c < 27; ++c) { int b, e; cell(grid, c, b, e); n += e - b; }
+        for (int c = 0; c < 27; ++c) {
+            int b, e; unsigned char t;
+            cell(grid, c, b, e, t);
+            for (int k = b; k < e; ++k) n += grid.tag[k] == t;
+        }
         return n;
     }
 };
@@ -2472,12 +2478,14 @@ __device__ static void dVcmMergeSum(const DScene& sc, const DVcmCtx& ctx, const 
     const DMaterial& m = sc.mats[vt.matId];
     const DVec3 ngoCam = fp.n;
     const double r2 = ctx.radius * ctx.radius;
-    // Its own lobe, prepared now: a site here holds candidates (the camera kernel counts its buckets'
-    // entries first, strays among them), and a warp's lanes then read the hit once, together, rather than each at its own first
+    // Its own lobe, prepared now: a site here holds vertices (the camera kernel counts its cells' own
+    // first), and a warp's lanes then read the hit once, together, rather than each at its own first
     // candidate. Never a caller's lobe by reference: a lobe whose address leaves its kernel for a
     // call ptxas keeps out of line lives in local memory there, every query of it a load.
     DVertexLobe lobe(sc, vt, wo, true);
-    dSiteListWalk([&](int n, int& b, int& e) { site.cell(grid, n, b, e); }, lane, lanes, [&](int k) {
+    dSiteListWalk([&](int n, int& b, int& e, unsigned char& t) { site.cell(grid, n, b, e, t); }, lane, lanes,
+                  [&](int k, unsigned char t) {
+        if (grid.tag[k] != t) return;   // another block's
         const DVcmLV& lv = grid.byCell[k];
         const DVcmSec* row = ((NS > 0) && grid.byCellSec) ? (grid.byCellSec + (size_t)k * secStride) : nullptr;
         // Never merge with a vertex stored ON a strand (vcm.h, 0.362.0): the merge evaluates the

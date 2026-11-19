@@ -162,9 +162,10 @@ struct SurfMap {
     long long devPaths = 0;
     long long devCap = 0;
 
-    MergeLattice lat{{0, 0, 0}, 1.0, 0};   // cells the gather radius wide
+    MergeLattice lat = mergeLatticeAt(0, 0, 0, 1.0, 1);   // cells the gather radius wide
     std::vector<int> cellStart;   // bucket b's photons are order[cellStart[b] .. cellStart[b + 1])
     std::vector<int> order;       // photon indices, bucket-contiguous
+    std::vector<unsigned char> tag;   // order[k]'s block's tag (MergeKey)
     // Bytes held by the containers above (their capacity), for a cache that budgets maps by size.
     size_t heapBytes() const {
         return pts.capacity() * sizeof(SurfPhoton) + mis.capacity() * sizeof(SurfMis) +
@@ -197,7 +198,7 @@ struct SurfMap {
     // cudaJSurfOnDevice), which reads only its photon count, emission count and radius.
     void radiusOnly(double r) {
         radius = (r > 0.0) ? r : 1e-6;
-        lat = MergeLattice{{0, 0, 0}, radius, 0};
+        lat = mergeLatticeAt(0, 0, 0, radius, 1);
         cellStart.clear(); cellStart.shrink_to_fit();
         order.clear(); order.shrink_to_fit();
     }
@@ -210,7 +211,9 @@ struct SurfMap {
             mn.x = std::min(mn.x, q.p.x); mn.y = std::min(mn.y, q.p.y); mn.z = std::min(mn.z, q.p.z);
         }
         lat = mergeLatticeOver(mn.x, mn.y, mn.z, radius, n);
-        mergeBin(lat, n, [&](size_t i) -> const Vec3& { return pts[i].p; }, cellStart, order,
+        order.assign(n, 0);
+        mergeBin(lat, n, [&](size_t i) -> const Vec3& { return pts[i].p; },
+                 [&](size_t i, size_t k) { order[k] = (int)i; }, cellStart, &tag,
                  "the surface-merge grid", "-jsurf-count");
     }
 
@@ -219,12 +222,11 @@ struct SurfMap {
     void query(const Vec3& p, F&& fn) const {
         if (order.empty()) return;
         const double r2 = radius * radius;
-        mergeForEachBucket(lat, p.x, p.y, p.z, [&](unsigned int c) {
-            for (int k = cellStart[c]; k < cellStart[(size_t)c + 1]; ++k) {
-                const int idx = order[(size_t)k];
-                const Vec3 d = p - pts[(size_t)idx].p;
-                if (dot(d, d) <= r2) fn(idx);
-            }
+        const int* ord = order.data();
+        mergeForEachEntry(lat, cellStart.data(), tag.data(), p.x, p.y, p.z, [&](int k) {
+            const int idx = ord[k];
+            const Vec3 d = p - pts[(size_t)idx].p;
+            if (dot(d, d) <= r2) fn(idx);
         });
     }
 };

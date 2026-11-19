@@ -480,10 +480,19 @@ Then the rest of 4.2-4.6 in their order, 4.7's bookkeeping alongside whatever to
   the occupancy pays.
 - [ ] **MERGE-LAZY-TIMING** — time fab8da8's lazy lobe against 0.450.9 paired, on the case 0.450.5
   measured its cost on (mode J, _fog_cornell: 5.48 -> 5.71 s median), on an idle GPU.
-- [ ] **MERGE-HASH-TIMING** — time 0.450.19's hashed merge lattice against the dense one (0.450.18)
-  paired on an idle machine: modes U and J, CPU and GPU, on a dense scene at its own radius
-  (_merge_glossy_bowl, _caustic_box; scraps/_mergegrid_time.py). Measured only under a check
-  sweep's load: CPU U single-threaded within the noise (-8 % to +3 %), the sparse box 6x faster.
+- [x] **MERGE-HASH-TIMING** (0.450.24) — the hashed merge lattice paired against the dense one on an
+  idle machine: no dense case slower by more than GPU U's 1.3 %, the sparse box 5.5x faster on the
+  CPU; on the way, modes U and J tag each point's block (the strays out of the counts), exact
+  slots, the key forced inline and the radius probe counted in a register; known-issues.
+- [ ] **PM-BUILD-PARALLEL** — a large photon map is built on one thread: at 129 M photons (mode M,
+  _caustic_box at -n 20M) buildAuto's two binnings, probe and CIE pass take about 6.5 s of an 11 s
+  map phase whose tracing takes 3.5 s on 32 threads. Each binning zero-fills two fresh scatter
+  buffers (7 GB, 0.8 s: Vec3's member initialisers), counts its keys (0.7 s) and scatters (0.75 s
+  to 1.25 s) serially, and the second allocates all of it again. Make it parallel and keep its
+  order -- keys computed in parallel, then a two-level counting sort (each thread's range split by
+  the bucket's high bits, each part sorted on its own), which is the serial sort's order, so no
+  render moves -- and let the second binning reuse the first's buffers unfilled. The same helps
+  mode U's CPU passes, which bin their light vertices every pass.
 - [x] **RNG-ARG-ORDER** (0.450.11) — every call that took two or more RNG draws as arguments (89,
   the renderers' camera, lens and hair draws, the layered body's, the caustic aim's twins, the
   self-tests') draws them first into a declaration list or a braced initializer, which C++

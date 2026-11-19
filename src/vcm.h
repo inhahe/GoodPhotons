@@ -195,9 +195,10 @@ struct LightVertexSec {
 // the 3x3x3 neighbourhood, and buckets about two a vertex, whatever box the vertices span. The
 // device's grid (vcmSessionPass, DVcmGrid) is the same lattice.
 struct VcmGrid {
-    MergeLattice lat{{0, 0, 0}, 1e-4, 0};   // cells the merge radius wide
+    MergeLattice lat = mergeLatticeAt(0, 0, 0, 1e-4, 1);   // cells the merge radius wide
     std::vector<int> cellStart;   // bucket b's vertices are order[cellStart[b] .. cellStart[b + 1])
     std::vector<int> order;       // vertex indices in bucket-contiguous order
+    std::vector<unsigned char> tag;   // order[k]'s block's tag (MergeKey)
 
     void build(const std::vector<LightVertex>& v, double radius) {
         const double cell = radius > 0.0 ? radius : 1e-6;
@@ -207,7 +208,9 @@ struct VcmGrid {
             mn.x = std::min(mn.x, lv.p.x); mn.y = std::min(mn.y, lv.p.y); mn.z = std::min(mn.z, lv.p.z);
         }
         lat = mergeLatticeOver(mn.x, mn.y, mn.z, cell, n);
-        mergeBin(lat, n, [&](size_t i) -> const Vec3& { return v[i].p; }, cellStart, order,
+        order.assign(n, 0);
+        mergeBin(lat, n, [&](size_t i) -> const Vec3& { return v[i].p; },
+                 [&](size_t i, size_t k) { order[k] = (int)i; }, cellStart, &tag,
                  "the vertex-merge grid", "-max-bounce");
     }
 
@@ -216,12 +219,11 @@ struct VcmGrid {
     void query(const std::vector<LightVertex>& v, const Vec3& p, double r, F&& fn) const {
         if (order.empty()) return;
         const double r2 = r * r;
-        mergeForEachBucket(lat, p.x, p.y, p.z, [&](unsigned int c) {
-            for (int k = cellStart[c]; k < cellStart[(size_t)c + 1]; ++k) {
-                int idx = order[k];
-                Vec3 d = p - v[idx].p;
-                if (dot(d, d) <= r2) fn(idx);
-            }
+        const int* ord = order.data();
+        mergeForEachEntry(lat, cellStart.data(), tag.data(), p.x, p.y, p.z, [&](int k) {
+            const int idx = ord[k];
+            const Vec3 d = p - v[idx].p;
+            if (dot(d, d) <= r2) fn(idx);
         });
     }
 };

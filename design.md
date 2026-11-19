@@ -6608,7 +6608,7 @@ as the one at fault.
   exactly where a fine radius was most wanted: on `gallery_rain` (scene radius 32.7 m) a
   requested 0.031 m was inflated to 0.094 m, three times too coarse to resolve a caustic —
   which is what smeared the scene's caustics into a colourless grey veil. Hashing sizes the
-  bucket table from the **photon count** (`mergeBucketMask`, about 2 buckets a photon, i.e.
+  bucket table from the **photon count** (`mergeSlotCount`, 2 buckets a photon, i.e.
   a flat ~8 B/photon against the map's 56), so the volume term disappears and `r` is free to
   follow the measured density; the only limit left is the deliberate two-octave clamp. Cells
   that share a bucket are not a correctness problem — the query already distance-tests
@@ -10508,8 +10508,10 @@ as the one at fault.
   `vramAffords` before the session starts) and the sort's scratch.
   **The merge grid is hashed** (`merge_grid.h`, since 0.450.19; mode `J`'s surface map takes the
   same, and since 0.450.21 the photon map of modes `M` and `S`): cells the radius wide from a corner half a cell below the light vertices, in blocks of
-  3×3×3 whose 27 cells take 27 consecutive buckets, the blocks hashed into `2^k` slots, about two
-  buckets a vertex (`mergeBucketMask`), so the table follows the vertex count and never the box.
+  3×3×3 whose 27 cells take 27 consecutive buckets, the blocks hashed into ⌈2n/27⌉ slots, two
+  buckets a vertex (`mergeSlotCount`; the mix's high half scaled to the count, so it need not be a
+  power of two -- rounding one up had given a 129 M-photon map 3.5 buckets a photon, 1.8 GB of
+  table), so the table follows the vertex count and never the box.
   The dense lattice before it took `(L/r)³` cells, capped at 64 M by widening them (every merge
   then weighing more candidates) and on the device by the memory left; a few thousand vertices in
   a large box at a fine radius held the whole 256 MB table, cleared and prefix-summed every pass.
@@ -10517,17 +10519,27 @@ as the one at fault.
   around any site all differ, so a site never reads one bucket twice and counts each vertex once
   however the blocks collide; it touches at most eight blocks, two cache lines of table each, as
   the dense lattice kept neighbours together, and the host's walk (`mergeForEachBucket`) hashes
-  each of them once (`mergeSlot`, 32-bit: the GPU multiplies 64-bit integers in software). One
+  each of them once (`mergeMix`, 32-bit: the GPU multiplies 64-bit integers in software). A
+  bucket also holds the strays -- one cell of every other block hashed to its slot, about 13 a
+  site at two buckets a point -- which outnumber a sparse site's own points: in modes `U` and `J`
+  every point carries its block's **tag** (the mix's low byte, the slot being its high bits scaled;
+  one byte a point, in bucket order), so a query reads a stray's byte and, but for one in 256, goes
+  no further (`mergeForEachEntry`), and the counts those merges are gated and paced by (mode `U`'s
+  site population, mode `J`'s device work) count the tagged entries, as the dense lattice's
+  counted its cells'. The photon map keeps none: its gathers weigh hundreds of photons, and
+  tagging its 10^8-photon builds cost a third random scatter, 0.65 s a build at 129 M photons. One
   set of pieces serves the three maps: the corner rule (`mergeLatticeOver`, half a cell below the
   points), the host's counting sort (`mergeBin`) and walk, the device's key kernel (`kMergeKey`)
   and bin sequence (`mergeBinDevice`: key, stable sort by bucket, each bucket's start). Within a bucket the vertices keep their binning
   order, so a site meets its cells' vertices in the order the dense lattice gave, and the CPU's
-  merges are bit-identical to it. `FTRACE_MERGE_TABLE=<k>` holds the slots to at most `k` (a
-  power of two; 1: one block of 27 buckets that every block shares), which
-  `tools/check_merge_table.py` uses to hold the renders to the default table's. Host and device
-  compute a cell alike (`mergeCellCoord`, in double, held to ±2^30), the site's in `DGridCell`,
+  merges are bit-identical to it. The cell and key helpers are forced inline on the host: MSVC
+  otherwise left the key out of line in the count loop, and a 129 M-photon map's two counts took
+  1.33 s and 0.98 s for 0.72 s and 0.69 s. `FTRACE_MERGE_TABLE=<k>` holds the slots to at most `k` (1: one
+  block of 27 buckets that every block shares), which `tools/check_merge_table.py` uses to hold
+  the renders to the default table's. Host and device compute a cell alike (`mergeCellCoord`, in
+  double, by the width's reciprocal, held to ±2^30), the site's in `DGridCell`,
   and every device map carries its lattice as the points were binned in it (`MergeLattice`: the
-  corner and width in double, the mask; `DPhotonMap`, `DSurfMap`, `DVcmGrid`) -- a site placed in
+  corner and width in double, the table's slots; `DPhotonMap`, `DSurfMap`, `DVcmGrid`) -- a site placed in
   another rounding of it takes the cell beside its own near a plane and misses the points two
   cells off (until 0.450.22 the photon and surface maps held theirs in float: GPU-MERGE-FLOAT-
   LATTICE). The device probe (`FTRACE_DEVICE_PROBE`, after every build) holds the device's cell
@@ -13124,6 +13136,12 @@ multiply-adds) while the CPU stays bit-identical; a change meant to alter some r
 them as differing cases, each with its mean change. build.bat replaces ftrace.exe, so the old
 binary is copied aside first (it runs from anywhere: no DLLs beside it). `render <label>` and
 `compare <a> <b>` are the halves. Output in png/check_bitid/<label>/.
+
+**Timing a change to the merges** (`tools/time_merge.py --old <exe>`): modes U, J, M and S on both
+devices, each merge at its own radius on a dense scene (mode M at 20 M photons on the GPU, where
+building the map is most of the time) and U and J at a fine radius over check_vcm_grid_cap's sparse
+box, the two builds interleaved round by round, each case's medians and their ratio. On an idle
+machine only: a check sweep's load moves the times more than most changes it is meant to measure.
 
 **The draws a render takes are in an order the source fixes (0.450.11, RNG-ARG-ORDER).** C++ leaves
 the order in which a call evaluates its arguments to the compiler, so `f(rng.uniform(),

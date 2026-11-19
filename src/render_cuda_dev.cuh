@@ -1078,12 +1078,12 @@ namespace {
 struct DGridCell {
     int ix, iy, iz;
     __device__ DGridCell(const DVec3& p, const MergeLattice& L)
-        : ix(mergeCellCoord((double)p.x, L.lo[0], L.cell)), iy(mergeCellCoord((double)p.y, L.lo[1], L.cell)),
-          iz(mergeCellCoord((double)p.z, L.lo[2], L.cell)) {}
-    // The bucket of neighbour `n` (n in 0..26, dz outermost and dx innermost, as the walk visits
-    // them) in a table of mask `mask`; the 27 are distinct (mergeBucket).
-    __device__ unsigned int neighbour(int n, unsigned int mask) const {
-        return mergeBucket(ix + n % 3 - 1, iy + (n / 3) % 3 - 1, iz + n / 9 - 1, mask);
+        : ix(mergeCellCoord((double)p.x, L.lo[0], L.invCell)), iy(mergeCellCoord((double)p.y, L.lo[1], L.invCell)),
+          iz(mergeCellCoord((double)p.z, L.lo[2], L.invCell)) {}
+    // The key of neighbour `n` (n in 0..26, dz outermost and dx innermost, as the walk visits them)
+    // in a table of `slots` slots: its bucket, the 27 distinct, and its block's tag (mergeCellKey).
+    __device__ MergeKey neighbour(int n, unsigned int slots) const {
+        return mergeCellKey(ix + n % 3 - 1, iy + (n / 3) % 3 - 1, iz + n / 9 - 1, slots);
     }
 };
 }  // namespace
@@ -8764,7 +8764,7 @@ struct DMergeFootprint {
 // (No nEmitted here: the normalization is folded into each record's pX/pY/pZ.)
 struct DPhotonMap {
     const DGatherPhoton* photons; // reordered into bucket-contiguous runs
-    const int*   cellStart;   // size mergeBucketCount(lat.mask)+1; bucket b is [cellStart[b], cellStart[b+1])
+    const int*   cellStart;   // size mergeBucketCount(lat.slots)+1; bucket b is [cellStart[b], cellStart[b+1])
     MergeLattice lat;         // the lattice, its cells the gather radius wide (merge_grid.h)
     Real   radius;            // gather radius (world units) — a MAXIMUM when kGather > 0
     Real   kGather;           // per-query adaptive target population; 0 = fixed radius
@@ -8782,13 +8782,11 @@ struct DPhotonMap {
 template <class F>
 __device__ static inline void dPmNeighborhood(const DPhotonMap& pm, const DVec3& p, F body) {
     const DGridCell g(p, pm.lat);
-    for (int dz = -1; dz <= 1; ++dz)
-      for (int dy = -1; dy <= 1; ++dy)
-        for (int dx = -1; dx <= 1; ++dx) {
-            const unsigned int c = mergeBucket(g.ix + dx, g.iy + dy, g.iz + dz, pm.lat.mask);
-            const int e = pm.cellStart[c + 1];
-            for (int k = pm.cellStart[c]; k < e; ++k) body(k);
-        }
+    for (int n = 0; n < 27; ++n) {
+        const unsigned int c = g.neighbour(n, pm.lat.slots).bucket;   // the photon map keeps no tags
+        const int e = pm.cellStart[c + 1];
+        for (int k = pm.cellStart[c]; k < e; ++k) body(k);
+    }
 }
 
 // Per-query adaptive gather radius — device twin of PhotonMap::adaptiveRadius (photonmap.h),
@@ -10201,8 +10199,9 @@ struct DSurfMis {                             // the light-side half of the merg
 struct DSurfMap {
     const DSurfPhoton* pts;
     const DSurfMis*    mis;
-    const int*         cellStart;             // size mergeBucketCount(lat.mask) + 1
+    const int*         cellStart;             // size mergeBucketCount(lat.slots) + 1
     const int*         order;                 // photon indices, bucket-contiguous
+    const unsigned char* tag;                 // order[k]'s block's tag (MergeKey)
     MergeLattice lat;                         // the lattice, its cells the radius wide (merge_grid.h)
     Real   radius;
     double kappaS;                            // n_m * pi r_s^2 -- this technique's constant
@@ -21330,8 +21329,8 @@ struct DSurfSite {
           fp(dVertexMergeFootprint(sc, vk, sm.radius)) {
         r2 = (double)sm.radius * (double)sm.radius;
     }
-    // The bucket of the site's `n`-th neighbour cell.
-    __device__ unsigned int cell(const DSurfMap& sm, int n) const { return g.neighbour(n, sm.lat.mask); }
+    // The key of the site's `n`-th neighbour cell.
+    __device__ MergeKey cell(const DSurfMap& sm, int n) const { return g.neighbour(n, sm.lat.slots); }
 };
 }  // namespace
 // The merge of photon `sm.order[q]` at the site: its XYZ added to gX, gY, gZ. `lobe` is the site's
@@ -21449,35 +21448,35 @@ __device__ static inline void dWarpSiteAdd(const DScene& sc, const DMergeFootpri
 // A merge site's entries -- its 27 cells' photons or light vertices -- as one list, the cells in walk
 // order (dz outermost, dx innermost), of which this caller takes entries lane, lane + lanes, ...:
 // (0, 1) one thread's whole list, (lane, 32) a warp's share, so a warp spends ceil(entries / 32)
-// rounds on the site, not a round or more a cell. `cell(n, b, e)` sets neighbour cell n's bucket's
-// entries [b, e) (its cell's points and the strays sharing it); `body(k)` takes entry k. Every caller walks all 27 cells, so each
-// returns the list's length, whichever entries it took. Modes J (kWfSurfGather, dSurfMergeAt) and U
-// (dVcmMergeSum).
+// rounds on the site, not a round or more a cell. `cell(n, b, e, t)` sets neighbour cell n's bucket's
+// entries [b, e) and its block's tag t (the bucket holds other blocks' points too, MergeKey);
+// `body(k, t)` takes entry k, which is the cell's own where its tag is t. Modes J (kWfSurfGather,
+// dSurfMergeAt) and U (dVcmMergeSum).
 template <class Cell, class Body>
-__device__ static inline int dSiteListWalk(const Cell& cell, int lane, int lanes, const Body& body) {
-    // A caller keeps its place in the list as a cell (`next`, the walk's next) and an entry k in
-    // [k, kEnd), and passes `skip` entries over to reach its next one.
-    int next = 0, k = 0, kEnd = 0, skip = lane, total = 0;
+__device__ static inline void dSiteListWalk(const Cell& cell, int lane, int lanes, const Body& body) {
+    // A caller keeps its place in the list as a cell (`next`, the walk's next, its tag t) and an entry
+    // k in [k, kEnd), and passes `skip` entries over to reach its next one.
+    int next = 0, k = 0, kEnd = 0, skip = lane;
+    unsigned char t = 0;
     for (;;) {
         while (kEnd - k <= skip && next < 27) {
             skip -= kEnd - k;
-            cell(next++, k, kEnd);
-            total += kEnd - k;
+            cell(next++, k, kEnd, t);
         }
         if (kEnd - k <= skip) break;   // the list ends before this caller's next entry
         k += skip;
-        body(k++);
+        body(k++, t);
         skip = lanes - 1;
     }
-    return total;
 }
-// The photons of surface-map cell `n` of `site` (dSiteListWalk's `cell`).
-__device__ static inline void dSurfSiteCell(const DSurfMap& sm, const DSurfSite& site, int n, int& b, int& e) {
-    const unsigned int c = site.cell(sm, n);
-    b = sm.cellStart[c]; e = sm.cellStart[c + 1];
+// The photons of surface-map cell `n` of `site` (dSiteListWalk's `cell`) and the cell's tag.
+__device__ static inline void dSurfSiteCell(const DSurfMap& sm, const DSurfSite& site, int n, int& b, int& e,
+                                            unsigned char& t) {
+    const MergeKey c = site.cell(sm, n);
+    b = sm.cellStart[c.bucket]; e = sm.cellStart[c.bucket + 1]; t = c.tag;
 }
 // One camera vertex's gather, by the thread that reached it (the inline path; kWfSurfGather is the
-// wavefront's, a warp a site). Returns the photons it weighed (g_dWork's count).
+// wavefront's, a warp a site). Returns the photons it weighed, its cells' own (g_dWork's count).
 __device__ static int dSurfMergeAt(const DScene& sc, const DSurfMap& sm, const DVertex& vk,
                                    const DVec3& woCam, const DSurfMergeW& sw,
                                    double& gX, double& gY, double& gZ,
@@ -21485,8 +21484,14 @@ __device__ static int dSurfMergeAt(const DScene& sc, const DSurfMap& sm, const D
     const DSurfSite site(sc, sm, vk);
     DVertexLobe lobe(sc, vk, woCam, false);
     Real coatTh = (Real)0;   // dSurfMergePhoton's, with the lobe
-    return dSiteListWalk([&](int n, int& b, int& e) { dSurfSiteCell(sm, site, n, b, e); }, 0, 1,
-                         [&](int q) { dSurfMergePhoton(sc, sm, site, lobe, coatTh, sw, q, gX, gY, gZ, js); });
+    int weighed = 0;
+    dSiteListWalk([&](int n, int& b, int& e, unsigned char& t) { dSurfSiteCell(sm, site, n, b, e, t); }, 0, 1,
+                  [&](int q, unsigned char t) {
+                      if (sm.tag[q] != t) return;   // another block's
+                      ++weighed;
+                      dSurfMergePhoton(sc, sm, site, lobe, coatTh, sw, q, gX, gY, gZ, js);
+                  });
+    return weighed;
 }
 
 // The first `n` queued sites (DSurfQueue), a warp each: the lanes take the site's photons in turn,
@@ -21516,11 +21521,17 @@ __global__ void kWfSurfGather(DScene sc, DSurfMap sm, DSurfQueue sq, int n, doub
         double gX = 0.0, gY = 0.0, gZ = 0.0;
         DVertexLobe lobe(sc, rq.vk, rq.woCam, false);
         Real coatTh = (Real)0;   // dSurfMergePhoton's, with the lobe
-        // The site's photons as one list, its cells in walk order, the lanes taking them in turn.
-        const int total = dSiteListWalk([&](int c, int& b, int& e) { dSurfSiteCell(sm, site, c, b, e); }, lane, 32,
-                                        [&](int q) { dSurfMergePhoton(sc, sm, site, lobe, coatTh, sw, q,
-                                                                      gX, gY, gZ, js); });
-        if (lane == 0) dAddWork((unsigned long long)total);
+        // The site's photons as one list, its cells in walk order, the lanes taking them in turn; the
+        // work counted is the photons of its own cells the lanes weighed, summed across the warp.
+        int weighed = 0;
+        dSiteListWalk([&](int c, int& b, int& e, unsigned char& t) { dSurfSiteCell(sm, site, c, b, e, t); }, lane, 32,
+                      [&](int q, unsigned char t) {
+                          if (sm.tag[q] != t) return;   // another block's
+                          ++weighed;
+                          dSurfMergePhoton(sc, sm, site, lobe, coatTh, sw, q, gX, gY, gZ, js);
+                      });
+        for (int o = 16; o > 0; o >>= 1) weighed += __shfl_xor_sync(0xffffffffu, weighed, o);
+        if (lane == 0) dAddWork((unsigned long long)weighed);
         dWarpSiteAdd(sc, site.fp, rq.gaSeed, lane, gX, gY, gZ, rq.f, camFilm, rq.pix);
     }
 }

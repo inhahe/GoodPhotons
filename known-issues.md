@@ -201,6 +201,76 @@ to 0.25 renders as a 150 nm one within 2e-3, 1.0e-3 measured (its body's escape 
 on 0.450.1 it rendered as the unmapped 600 nm, 1.9 off), the `thinfilm` control byte for byte, and
 the three misspellings stop the load (on 0.450.1 they loaded).
 
+## DONE (2026-11-19, 0.450.24): MERGE-HASH-TIMING — the hashed merge lattice timed against the dense one, and what the timing found
+
+Paired on an idle machine (`tools/time_merge.py`, new, five rounds a case, the medians): the dense
+lattice of 0.450.18 (4697faa's build) against 0.450.24, each merge at its own radius on
+`_merge_glossy_bowl` (U) and `_caustic_box` (J, M, S), and at a fine radius over
+check_vcm_grid_cap's 10 m box:
+
+| case | dense | 0.450.24 | ratio |
+|---|---|---|---|
+| U, CPU, bowl, 32 threads | 5.36 s | 5.18 s | 0.967 |
+| U, CPU, bowl, 1 thread | 6.38 s | 6.39 s | 1.002 |
+| U, GPU, bowl | 16.29 s | 16.50 s | 1.013 |
+| J, CPU / GPU, caustic box | 2.59 / 5.10 s | 2.59 / 5.12 s | 0.998 / 1.003 |
+| M, CPU, 4 M photons | 2.57 s | 2.57 s | 0.999 |
+| M, GPU, 20 M photons (129 M stored) | 14.55 s | 14.28 s | 0.981 |
+| S, GPU | 11.47 s | 11.43 s | 0.997 |
+| U, CPU / GPU, the sparse box | 1.55 / 0.80 s | 0.28 / 0.80 s | 0.183 / 0.997 |
+| J, CPU / GPU, the sparse box | 0.28 / 0.80 s | 0.28 / 0.81 s | 0.992 / 1.006 |
+
+The batch's own builds between them were slower: mode M's map at 20 M photons on the CPU took
+10.4-10.8 s on the dense lattice, 11.3-11.4 s on 0.450.21 and 0.450.22 and 12.7-14.4 s on 0.450.23,
+and GPU mode M there took 5-9 % longer than the dense build until the key was forced inline
+(below). What the timing found, **fixed in 0.450.24:**
+
+* **The strays** (REVIEW-0450J): modes U and J keep each point's block's tag, one byte, and their
+  queries, mode U's site population and mode J's paced work take only the tagged entries
+  (`mergeForEachEntry`). GPU mode U on the bowl: 16.75 s on 0.450.23, 16.50 s with them.
+* **The table's slots exact**: ⌈2n/27⌉ slots, the mix's high half scaled to their count
+  (`mergeSlotOf`), where 0.450.23 rounded them up to a power of two -- up to 3.5 buckets a point,
+  1.8 GB of table at 129 M photons, which every binning cleared and prefix-summed and the radius
+  probe walked twice. `FTRACE_MERGE_TABLE` no longer needs a power of two.
+* **The photon map keeps no tags**: a gather weighs hundreds of photons beside a percent or two of
+  strays, and the tags' scatter cost 0.65 s a binning at 129 M photons.
+* **`mergeBin` writes each point in place** (a callback, so the photon map scatters its records
+  once instead of building an index order and gathering through it), its scratch four bytes a
+  point (five with tags), unfilled, each point's key computed once.
+* **A cell by the width's reciprocal** (`MergeLattice::invCell`): a multiply where every bin and
+  query divided.
+* **The key forced inline** (`MG_HD`): MSVC kept `mergeCellKey` out of line in `mergeBin`'s count
+  loop, a call a point. A 129 M-photon map's two counts: 1.33 s and 0.98 s -> 0.72 s and 0.69 s
+  (timed in a scratch build of the real headers on synthetic photons over a box's walls, beside
+  4697faa's own buildGrid, which counts in 0.86 s and 0.43 s).
+* **The radius probe counts in a register** (`PhotonMap::countR`): `medianNeighborCount` counted
+  through `queryR`'s callback, a store to one word a match, each waiting on the last. Its 4096
+  queries of 25 k photons each: 0.73 s -> 0.48 s, most of that now its two walks of the table
+  (4697faa's took 0.93 s).
+* **`queryR` and `adaptiveRadius` scan from the lambda's own locals**: a callback's stores made the
+  compiler reload every capture after each match, 5 % of a gather-like walk (the same scratch
+  bench, a kernel-weighted sum a match).
+
+So mode M's map at 20 M photons on the CPU is back to 10.5 s, the dense build's 10.4 s. Left as
+measured: GPU mode U on the bowl, 1.3 % over the dense lattice, the hashed walk's cost (eight block
+mixes a site, a tag byte an entry) where the sparse box gains 5.5x on the CPU. Most of a large
+photon map's build is still on one thread: PM-BUILD-PARALLEL (TODO).
+
+**Verified:** `-checkpmgrid` has a test of the tags: the points binned with them and walked as
+modes U and J walk them, every point of a query's 27 cells must be among its entries, and at most
+one in 64 of the strays in its buckets (the tags let one in 256 through). Over 400 probes every
+point is found, and 17 of the 7526 strays let through at the default table, 186 929 of 47.7 M at
+one slot; with the tag test taken out of `mergeForEachEntry` it reads BAD at both, every stray
+through. check_merge_table (modes U, J, M and S on both devices at 27 buckets against the default
+table: the CPU byte-identical, the GPU within 9e-7 of a pixel; `-checkpmgrid` at 27 buckets),
+`-checkcellwalk`, the device probe and check_vcm_grid_cap pass. check_bitid against 0.450.23 is
+identical but for four rows, each placed: smooth J on the GPU (-1.0 % in the mean) is identical to
+0.450.23 under `FTRACE_JDEVLIGHT=1` and to the dense lattice's build at the defaults -- its redraws
+are paced by the work it counts, which counts no strays now, so the pacing is the dense lattice's
+again and 0.450.19's +1.0 % is undone; mode M on flat (CPU and GPU) and mapped (GPU), under 0.02 %
+in the mean, is the radius probe's sample moved with the table's slot count (flat on the CPU 0.05517
+-> 0.05527) and identical at a pinned radius (the GPU to its atomics' floor, 7e-10).
+
 ## DONE (2026-11-19, 0.450.23): REVIEW-0450J — what the Opus (max) and Fable (xhigh) reviews of 0.450.19-0.450.21 found
 
 `/code-review max` (Opus, 14 findings) and `/code-review xhigh` (Fable, 12) of 4697faa..d05c0f0
@@ -240,12 +310,12 @@ mode M (frames within 0.015 % in the mean, its radius sampled from re-hashed buc
 S's floor; fur and CPU fire byte-identical; GPU fire R within 2e-5 in the mean, its light sample
 now drawn from the box its pdf is walked in.
 
-**Not changed (yet): the strays** (both) -- a bucket's points from other blocks sharing its slot,
-about 13 a site at two buckets a point, which the distance test rejects but which mode U's device
-counts into a site's population, so a site with no light vertex in reach rarely reads 0 and runs
-the merge path, and a site near the queue's threshold is queued; mode J's device counts them into
-the work its redraws are paced by. Exact alternatives (a slot's block key, a block map) cost memory
-or build work; the choice waits on the idle-machine timing of MERGE-HASH-TIMING.
+**The strays, fixed in 0.450.24** (both; MERGE-HASH-TIMING) -- a bucket's points from other blocks
+sharing its slot, about 13 a site at two buckets a point, which the distance test rejects but which
+mode U's device counted into a site's population, so a site with no light vertex in reach rarely
+read 0 and ran the merge path, and a site near the queue's threshold was queued; mode J's device
+counted them into the work its redraws are paced by. Modes U and J now keep each point's block's
+tag, and those counts take only the tagged entries.
 
 ## DONE (2026-11-19, 0.450.20): REVIEW-0450I — what the Opus (max) and Fable (xhigh) reviews of SLAB-DDA-COPIES found
 

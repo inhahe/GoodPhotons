@@ -1952,7 +1952,7 @@ machine varied 18.5 s / 25.8 s / 27.2 s.
 - **`FTRACE_MERGE_TABLE=<k>` (diagnostic, modes `U`, `J`, `M`, `S`).** The merge maps -- mode
   `U`'s light vertices, mode `J`'s surface photons, the photon map of modes `M` and `S` -- bin their
   points in a hashed lattice whose table holds about two buckets a point; this holds its slots to
-  at most `k` (a power of two; `1` leaves one block of 27 buckets that every block shares). A merge
+  at most `k` (`1` leaves one block of 27 buckets that every block shares). A merge
   never reads a bucket twice, so the merges are the same at any table size: the CPU's renders are
   byte-identical, the GPU's equal to rounding, and `tools/check_merge_table.py` requires both. Mode
   `M`'s own radius choice samples the map bucket by bucket and so moves with the table (pin it with
