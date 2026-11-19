@@ -195,7 +195,7 @@ def offenders(raw):
                 item = fr.pos
             i = draws[i]
             continue
-        seq = SEQ.match(s, i) if s[i] in "&|?:" else None   # the only characters it starts on
+        seq = SEQ.match(s, i)
         if seq:
             stack[-1].add("s", i)
             i = seq.end()

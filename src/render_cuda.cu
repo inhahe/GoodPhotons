@@ -2320,13 +2320,23 @@ static int forwardHeroC(int heroC, bool media, bool grin) {
 static bool forwardRunsWavefront(bool wavefront, int effHeroC, bool beams, bool stableSeed) {
     return wavefront && effHeroC == 1 && !beams && !stableSeed;
 }
-// The device memory the wavefront's SoA photon pool takes for an N-photon trace: a slot's arrays,
-// one term each, as wavefrontTrace allocates them below.
+// The wavefront's SoA photon pool, an entry an array: its WFState member, its element type and the
+// elements a slot holds. wavefrontTrace allocates and frees the pool by this list and
+// wavefrontPoolBytes sizes it by it, so the preflight's count cannot leave an array out.
+#define FT_WF_POOL(X)                                                                           \
+    X(ro, DVec3, 1) X(rd, DVec3, 1) X(beta, Real, 1) X(lambda, Real, 1) X(rng, DRng, 1)         \
+    X(bounce, int, 1) X(alive, int, 1) X(stkMat, int, DMediumStack::CAP)                        \
+    X(stkPri, int, DMediumStack::CAP) X(stkN, int, 1) X(hit, DHit, 1)                           \
+    X(gmMed, int, 1) X(gmArc, Real, 1)        /* GRIN pre-pass results, extend -> shade */      \
+    X(pathC, DPathCaustic, 1)                 /* caustic path state */                          \
+    X(curveTmin, Real, 1)                     /* fiber exit, shade -> extend */                 \
+    X(timeX, float, 1)                        /* the photon's time, all stages */
+// The device memory the wavefront's photon pool takes for an N-photon trace.
 static size_t wavefrontPoolBytes(long long N) {
     using namespace gpu;
-    const size_t slot = 2 * sizeof(DVec3) + 2 * sizeof(Real) + sizeof(DRng) + 2 * sizeof(int) +
-                        2 * DMediumStack::CAP * sizeof(int) + sizeof(int) + sizeof(DHit) + sizeof(int) +
-                        sizeof(Real) + sizeof(DPathCaustic) + sizeof(Real) + sizeof(float);
+#define FT_WF_SLOT_BYTES(m, T, n) + sizeof(T) * (size_t)(n)
+    const size_t slot = 0 FT_WF_POOL(FT_WF_SLOT_BYTES);
+#undef FT_WF_SLOT_BYTES
     return (size_t)wavefrontSlots(N) * slot;
 }
 
@@ -2341,22 +2351,9 @@ static void wavefrontTrace(DUpload& up, const gpu::DCamSet& cs, double* d_energy
     const int W = wavefrontSlots(N);   // persistent slot count
 
     WFState st;
-    CUDA_CHECK(cudaMalloc(&st.ro,     (size_t)W * sizeof(DVec3)));
-    CUDA_CHECK(cudaMalloc(&st.rd,     (size_t)W * sizeof(DVec3)));
-    CUDA_CHECK(cudaMalloc(&st.beta,   (size_t)W * sizeof(Real)));
-    CUDA_CHECK(cudaMalloc(&st.lambda, (size_t)W * sizeof(Real)));
-    CUDA_CHECK(cudaMalloc(&st.rng,    (size_t)W * sizeof(DRng)));
-    CUDA_CHECK(cudaMalloc(&st.bounce, (size_t)W * sizeof(int)));
-    CUDA_CHECK(cudaMalloc(&st.alive,  (size_t)W * sizeof(int)));
-    CUDA_CHECK(cudaMalloc(&st.stkMat, (size_t)W * DMediumStack::CAP * sizeof(int)));
-    CUDA_CHECK(cudaMalloc(&st.stkPri, (size_t)W * DMediumStack::CAP * sizeof(int)));
-    CUDA_CHECK(cudaMalloc(&st.stkN,   (size_t)W * sizeof(int)));
-    CUDA_CHECK(cudaMalloc(&st.hit,    (size_t)W * sizeof(DHit)));
-    CUDA_CHECK(cudaMalloc(&st.gmMed,  (size_t)W * sizeof(int)));    // GRIN pre-pass results,
-    CUDA_CHECK(cudaMalloc(&st.gmArc,  (size_t)W * sizeof(Real)));   // extend -> shade
-    CUDA_CHECK(cudaMalloc(&st.pathC, (size_t)W * sizeof(DPathCaustic)));  // caustic path state
-    CUDA_CHECK(cudaMalloc(&st.curveTmin, (size_t)W * sizeof(Real)));     // fiber exit, shade -> extend
-    CUDA_CHECK(cudaMalloc(&st.timeX, (size_t)W * sizeof(float)));         // the photon's time, all stages
+#define FT_WF_ALLOC(m, T, n) CUDA_CHECK(cudaMalloc(&st.m, (size_t)W * (size_t)(n) * sizeof(T)));
+    FT_WF_POOL(FT_WF_ALLOC)
+#undef FT_WF_ALLOC
     CUDA_CHECK(cudaMemset(st.alive, 0, (size_t)W * sizeof(int)));
 
     unsigned long long* d_dispatched = nullptr;
@@ -2388,10 +2385,9 @@ static void wavefrontTrace(DUpload& up, const gpu::DCamSet& cs, double* d_energy
         if (live <= 0) break;
     }
 
-    cudaFree(st.ro); cudaFree(st.rd); cudaFree(st.beta); cudaFree(st.lambda);
-    cudaFree(st.rng); cudaFree(st.bounce); cudaFree(st.alive);
-    cudaFree(st.stkMat); cudaFree(st.stkPri); cudaFree(st.stkN); cudaFree(st.hit);
-    cudaFree(st.gmMed); cudaFree(st.gmArc); cudaFree(st.pathC); cudaFree(st.curveTmin); cudaFree(st.timeX);
+#define FT_WF_FREE(m, T, n) cudaFree(st.m);
+    FT_WF_POOL(FT_WF_FREE)
+#undef FT_WF_FREE
     cudaFree(d_dispatched); cudaFree(d_live);
 }
 
@@ -3709,8 +3705,9 @@ static void uploadBeamMapCuda(const Scene& scene, const BeamMap* bmap, DUpload& 
 // the deep stack past BDPT_MAXDEPTH. The launcher picks by it, and the VRAM preflight weighs by it
 // (cudaBdptRoute).
 struct BdptPick { bool hero, deep; };
+static bool bdptDeep(int maxDepth) { return maxDepth > BDPT_MAXDEPTH; }
 static BdptPick bdptPick(int heroC, bool media, bool grin, bool lens, int maxDepth) {
-    return BdptPick{heroC > 1 && !media && !grin && !lens, maxDepth > BDPT_MAXDEPTH};
+    return BdptPick{heroC > 1 && !media && !grin && !lens, bdptDeep(maxDepth)};
 }
 // The kBdptT instantiation a pick runs: renderBdptCuda launches through it and cudaBdptRoute weighs
 // it, so the two name one kernel. `merge`: mode J's merges are on (the scalar merge instantiation);
@@ -3772,7 +3769,7 @@ Film renderBdptCuda(const Scene& scene, const Camera& cam, int resX, int resY,
     // Two kernel variants: the default shallow stack, and a deep one for scenes that need
     // it. Anything past BDPT_DEEPDEPTH still clamps — going deeper would need another
     // instantiation, and the local-memory footprint is already ~13 KB/thread there.
-    const bool deep = (maxDepth > BDPT_MAXDEPTH);
+    const bool deep = bdptDeep(maxDepth);   // pick.deep, below, by the same rule
     if (maxDepth > BDPT_DEEPDEPTH) maxDepth = BDPT_DEEPDEPTH;   // device array bound
 
     DUpload up;
@@ -4297,9 +4294,8 @@ Film renderBdptCuda(const Scene& scene, const Camera& cam, int resX, int resY,
         pos = subEnd;
 
         long long totalSamples = (long long)npix * c;
-        // Mode J only ever instantiates the scalar (NS == 0) kernel: `pick.hero` is already
-        // false for any scene with a participating medium, and a mode-J scene without one
-        // has nothing to merge.
+        // Mode J's merges take the scalar (NS == 0) instantiation; where its maps come out empty
+        // it renders as mode D, through the plain instantiation below, the hero bundle and all.
         // EITHER merge kind needs the MERGE=true instantiation, not just the beams: SEGN --
         // the size of the camera-side MIS sum arrays -- is `MERGE ? MAXV : 1`, so launching the
         // MERGE=false kernel for a media-free `-jsurf` render left those sums structurally
@@ -4625,10 +4621,12 @@ GpuRoute cudaBdptRoute(const Scene& scene, bool lens, int maxDepth, int heroC, b
     // renderBdptCuda then renders as mode D.
     GpuRoute r{{(const void*)bdptKernelFor(p, false, false)}};
     if (!merging) return r;
-    // Mode J's merges: the merge instantiation, in the beam queue's stratified order where that is on
-    // and with the queue's two kernels where the beams queue; -jsurf's light pass where the device
-    // runs it, and its surface gather where it queues.
-    r.kernels.push_back((const void*)bdptKernelFor(p, true, beamQueue && wfStratOn()));
+    // Mode J's merges: the merge instantiation -- and its stratified variant too where the beam queue
+    // may take that order (the launcher falls back to the first wherever the queue is not built) --
+    // with the queue's two kernels where the beams queue; -jsurf's light pass where the device runs
+    // it, and its surface gather where it queues.
+    r.kernels.push_back((const void*)bdptKernelFor(p, true, false));
+    if (beamQueue && wfStratOn()) r.kernels.push_back((const void*)bdptKernelFor(p, true, true));
     if (beamQueue) {
         r.kernels.push_back((const void*)kWfBeamHits);
         r.kernels.push_back((const void*)kWfBeamEval);
@@ -4685,8 +4683,8 @@ size_t cudaForwardPosedCameraBytes(const Scene& scene, bool wavefront, int heroC
 }
 
 size_t cudaForwardWavefrontBytes(const Scene& scene, bool wavefront, int heroC, long long N, bool beamGather,
-                                 int nCam) {
-    return cudaForwardRunsWavefront(scene, wavefront, heroC, beamGather, nCam) ? wavefrontPoolBytes(N) : 0;
+                                 int nCam, bool stableSeed) {
+    return cudaForwardRunsWavefront(scene, wavefront, heroC, beamGather, nCam, stableSeed) ? wavefrontPoolBytes(N) : 0;
 }
 
 size_t cudaSharedFlightPosedBytes(const Scene& scene, int nCam, bool wavefront, int heroC, bool beamGather) {

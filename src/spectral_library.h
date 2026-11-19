@@ -252,35 +252,30 @@ inline bool resolveSpectrumTokens(const std::vector<std::string>& w, Spectrum& o
         if (!ok) throw std::runtime_error(msg);
     };
     // "unknown <kind> reference '<token>'" and why: its category's directory missing
-    // (missingLibraryNote), or no file or alias in it.
+    // (missingLibraryNote), or no file or alias in it. Built only on a miss: it stats the library.
     auto unknown = [](const char* cat, const std::string& token) {
         const std::string note = missingLibraryNote({cat});
         return "unknown " + std::string(cat) + " reference '" + token + "'" +
                (note.empty() ? " — no matching file/alias in data/" + std::string(cat) + "/" : note);
     };
     if (h.rfind("glass:", 0) == 0) {
-        require(loadGlass(h.substr(6), out),
-                unknown("glass", h));
+        if (!loadGlass(h.substr(6), out)) throw std::runtime_error(unknown("glass", h));
         return true;
     }
     if (h.rfind("metal:", 0) == 0) {
-        require(loadCurve("metal", h.substr(6), out),
-                unknown("metal", h));
+        if (!loadCurve("metal", h.substr(6), out)) throw std::runtime_error(unknown("metal", h));
         return true;
     }
     if (h.rfind("reflectance:", 0) == 0) {
-        require(loadCurve("reflectance", h.substr(12), out),
-                unknown("reflectance", h));
+        if (!loadCurve("reflectance", h.substr(12), out)) throw std::runtime_error(unknown("reflectance", h));
         return true;
     }
     if (h.rfind("illuminant:", 0) == 0) {
-        require(loadCurve("illuminant", h.substr(11), out),
-                unknown("illuminant", h));
+        if (!loadCurve("illuminant", h.substr(11), out)) throw std::runtime_error(unknown("illuminant", h));
         return true;
     }
     if (h.rfind("filter:", 0) == 0) {
-        require(loadCurve("filter", h.substr(7), out),
-                unknown("filter", h));
+        if (!loadCurve("filter", h.substr(7), out)) throw std::runtime_error(unknown("filter", h));
         return true;
     }
     if (h.rfind("file:", 0) == 0) {

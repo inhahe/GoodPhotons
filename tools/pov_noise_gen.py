@@ -149,29 +149,35 @@ TEMPLATE = r'''// pov_noise.h - EXACT host+device port of POV-Ray's Perlin noise
 
 #include <math.h>
 
-#ifdef __CUDA_ARCH__
-  #define POVN_MEM __device__ const
-#else
-  #define POVN_MEM static const
-#endif
-
 // ---- baked tables -----------------------------------------------------------
-POVN_MEM unsigned short g_povHash[8192] = {
-{hash}
-};
-
-POVN_MEM double g_povRTable[534] = {
-{rtable}
-};
-
-// Perlin (gen 3) gradient lattice: NoisePermutation[2*(2048+1)] and
-// NoiseGradients[2*(2048+1)][3], flattened.
-POVN_MEM int g_povPerm[4098] = {
-{perm}
-};
-POVN_MEM double g_povGrad[12294] = {
-{grad}
-};
+// The values once, in an init macro each; the host's tables, one entity across its units
+// (inline), and under nvcc the device's own copies (static), both defined in every pass -- under
+// separate compilation a definition with external linkage must not depend on __CUDA_ARCH__ -- and a
+// reader names one by POVN_T, the pass choosing (ggx.h's layout). The Perlin (gen 3) gradient lattice
+// is NoisePermutation[2*(2048+1)] and NoiseGradients[2*(2048+1)][3], flattened.
+#define G_POVHASH_INIT { \
+{hash_m} }
+#define G_POVRTABLE_INIT { \
+{rtable_m} }
+#define G_POVPERM_INIT { \
+{perm_m} }
+#define G_POVGRAD_INIT { \
+{grad_m} }
+inline const unsigned short g_povHashH[8192] = G_POVHASH_INIT;
+inline const double g_povRTableH[534] = G_POVRTABLE_INIT;
+inline const int g_povPermH[4098] = G_POVPERM_INIT;
+inline const double g_povGradH[12294] = G_POVGRAD_INIT;
+#if defined(__CUDACC__)
+static __device__ const unsigned short g_povHashD[8192] = G_POVHASH_INIT;
+static __device__ const double g_povRTableD[534] = G_POVRTABLE_INIT;
+static __device__ const int g_povPermD[4098] = G_POVPERM_INIT;
+static __device__ const double g_povGradD[12294] = G_POVGRAD_INIT;
+#endif
+#ifdef __CUDA_ARCH__
+  #define POVN_T(name) name##D
+#else
+  #define POVN_T(name) name##H
+#endif
 
 // ---- SolidNoise (Perlin, gen 3) ---------------------------------------------
 POV_HD FT_UNIT_INLINE double povSCurve(double t) { return t * t * (3.0 - 2.0 * t); }
@@ -191,14 +197,14 @@ POV_HD FT_UNIT_INLINE double povSolidNoise(double px, double py, double pz) {
         r0[i] = t - it;
         r1[i] = r0[i] - 1.0;
     }
-    int ii = g_povPerm[b0[0]];
-    int jj = g_povPerm[b1[0]];
-    int b00 = g_povPerm[ii + b0[1]];
-    int b10 = g_povPerm[jj + b0[1]];
-    int b01 = g_povPerm[ii + b1[1]];
-    int b11 = g_povPerm[jj + b1[1]];
+    int ii = POVN_T(g_povPerm)[b0[0]];
+    int jj = POVN_T(g_povPerm)[b1[0]];
+    int b00 = POVN_T(g_povPerm)[ii + b0[1]];
+    int b10 = POVN_T(g_povPerm)[jj + b0[1]];
+    int b01 = POVN_T(g_povPerm)[ii + b1[1]];
+    int b11 = POVN_T(g_povPerm)[jj + b1[1]];
     double sx = povSCurve(r0[0]), sy = povSCurve(r0[1]), sz = povSCurve(r0[2]);
-#define POVG(idx,gx,gy,gz) (g_povGrad[((idx))*3+0]*(gx)+g_povGrad[((idx))*3+1]*(gy)+g_povGrad[((idx))*3+2]*(gz))
+#define POVG(idx,gx,gy,gz) (POVN_T(g_povGrad)[((idx))*3+0]*(gx)+POVN_T(g_povGrad)[((idx))*3+1]*(gy)+POVN_T(g_povGrad)[((idx))*3+2]*(gz))
     double u, v, a, b, c, d;
     u = POVG(b00 + b0[2], r0[0], r0[1], r0[2]);
     v = POVG(b10 + b0[2], r1[0], r0[1], r0[2]);
@@ -242,8 +248,8 @@ POV_HD FT_UNIT_INLINE double povNoise(double x, double y, double z, int gen) {
     double sx = povSCurve(x_ix), sy = povSCurve(y_iy), sz = povSCurve(z_iz);
     double tx = 1 - sx, ty = 1 - sy, tz = 1 - sz;
     double txty = tx * ty, sxty = sx * ty, txsy = tx * sy, sxsy = sx * sy;
-#define POVH2(a,b) (g_povHash[(int)(g_povHash[(int)(a)] ^ (b))])
-#define POVH1I(a,b) ((g_povHash[(int)(a) ^ (b)] & 0xFF) * 2)
+#define POVH2(a,b) (POVN_T(g_povHash)[(int)(POVN_T(g_povHash)[(int)(a)] ^ (b))])
+#define POVH1I(a,b) ((POVN_T(g_povHash)[(int)(a) ^ (b)] & 0xFF) * 2)
     int ixiy = POVH2(ix,     iy);
     int jxiy = POVH2(ix + 1, iy);
     int ixjy = POVH2(ix,     iy + 1);
@@ -251,14 +257,14 @@ POV_HD FT_UNIT_INLINE double povNoise(double x, double y, double z, int gen) {
 #define POVINCR(mp,s,px,py,pz) ((s)*((mp)[1] + (mp)[2]*(px) + (mp)[4]*(py) + (mp)[6]*(pz)))
     const double* mp;
     double sum = 0.0;
-    mp = &g_povRTable[POVH1I(ixiy, iz)];     sum  = POVINCR(mp, (txty*tz), x_ix, y_iy, z_iz);
-    mp = &g_povRTable[POVH1I(jxiy, iz)];     sum += POVINCR(mp, (sxty*tz), x_jx, y_iy, z_iz);
-    mp = &g_povRTable[POVH1I(ixjy, iz)];     sum += POVINCR(mp, (txsy*tz), x_ix, y_jy, z_iz);
-    mp = &g_povRTable[POVH1I(jxjy, iz)];     sum += POVINCR(mp, (sxsy*tz), x_jx, y_jy, z_iz);
-    mp = &g_povRTable[POVH1I(ixiy, iz + 1)]; sum += POVINCR(mp, (txty*sz), x_ix, y_iy, z_jz);
-    mp = &g_povRTable[POVH1I(jxiy, iz + 1)]; sum += POVINCR(mp, (sxty*sz), x_jx, y_iy, z_jz);
-    mp = &g_povRTable[POVH1I(ixjy, iz + 1)]; sum += POVINCR(mp, (txsy*sz), x_ix, y_jy, z_jz);
-    mp = &g_povRTable[POVH1I(jxjy, iz + 1)]; sum += POVINCR(mp, (sxsy*sz), x_jx, y_jy, z_jz);
+    mp = &POVN_T(g_povRTable)[POVH1I(ixiy, iz)];     sum  = POVINCR(mp, (txty*tz), x_ix, y_iy, z_iz);
+    mp = &POVN_T(g_povRTable)[POVH1I(jxiy, iz)];     sum += POVINCR(mp, (sxty*tz), x_jx, y_iy, z_iz);
+    mp = &POVN_T(g_povRTable)[POVH1I(ixjy, iz)];     sum += POVINCR(mp, (txsy*tz), x_ix, y_jy, z_iz);
+    mp = &POVN_T(g_povRTable)[POVH1I(jxjy, iz)];     sum += POVINCR(mp, (sxsy*tz), x_jx, y_jy, z_iz);
+    mp = &POVN_T(g_povRTable)[POVH1I(ixiy, iz + 1)]; sum += POVINCR(mp, (txty*sz), x_ix, y_iy, z_jz);
+    mp = &POVN_T(g_povRTable)[POVH1I(jxiy, iz + 1)]; sum += POVINCR(mp, (sxty*sz), x_jx, y_iy, z_jz);
+    mp = &POVN_T(g_povRTable)[POVH1I(ixjy, iz + 1)]; sum += POVINCR(mp, (txsy*sz), x_ix, y_jy, z_jz);
+    mp = &POVN_T(g_povRTable)[POVH1I(jxjy, iz + 1)]; sum += POVINCR(mp, (sxsy*sz), x_jx, y_jy, z_jz);
 #undef POVH2
 #undef POVH1I
 #undef POVINCR
@@ -300,8 +306,8 @@ POV_HD FT_UNIT_INLINE void povDNoise(double x, double y, double z, double out[3]
     double sx = povSCurve(x_ix), sy = povSCurve(y_iy), sz = povSCurve(z_iz);
     double tx = 1 - sx, ty = 1 - sy, tz = 1 - sz;
     double txty = tx * ty, sxty = sx * ty, txsy = tx * sy, sxsy = sx * sy;
-#define POVH2(a,b) (g_povHash[(int)(g_povHash[(int)(a)] ^ (b))])
-#define POVH1I(a,b) ((g_povHash[(int)(a) ^ (b)] & 0xFF) * 2)
+#define POVH2(a,b) (POVN_T(g_povHash)[(int)(POVN_T(g_povHash)[(int)(a)] ^ (b))])
+#define POVH1I(a,b) ((POVN_T(g_povHash)[(int)(a) ^ (b)] & 0xFF) * 2)
     int ixiy = POVH2(ix,     iy);
     int jxiy = POVH2(ix + 1, iy);
     int ixjy = POVH2(ix,     iy + 1);
@@ -309,35 +315,35 @@ POV_HD FT_UNIT_INLINE void povDNoise(double x, double y, double z, double out[3]
 #define POVINCR(mp,s,px,py,pz) ((s)*((mp)[1] + (mp)[2]*(px) + (mp)[4]*(py) + (mp)[6]*(pz)))
     const double* mp;
     double s;
-    mp = &g_povRTable[POVH1I(ixiy, iz)];     s = txty * tz;
+    mp = &POVN_T(g_povRTable)[POVH1I(ixiy, iz)];     s = txty * tz;
     out[0]  = POVINCR(mp,      s, x_ix, y_iy, z_iz);
     out[1]  = POVINCR(mp + 8,  s, x_ix, y_iy, z_iz);
     out[2]  = POVINCR(mp + 16, s, x_ix, y_iy, z_iz);
-    mp = &g_povRTable[POVH1I(jxiy, iz)];     s = sxty * tz;
+    mp = &POVN_T(g_povRTable)[POVH1I(jxiy, iz)];     s = sxty * tz;
     out[0] += POVINCR(mp,      s, x_jx, y_iy, z_iz);
     out[1] += POVINCR(mp + 8,  s, x_jx, y_iy, z_iz);
     out[2] += POVINCR(mp + 16, s, x_jx, y_iy, z_iz);
-    mp = &g_povRTable[POVH1I(ixjy, iz)];     s = txsy * tz;
+    mp = &POVN_T(g_povRTable)[POVH1I(ixjy, iz)];     s = txsy * tz;
     out[0] += POVINCR(mp,      s, x_ix, y_jy, z_iz);
     out[1] += POVINCR(mp + 8,  s, x_ix, y_jy, z_iz);
     out[2] += POVINCR(mp + 16, s, x_ix, y_jy, z_iz);
-    mp = &g_povRTable[POVH1I(jxjy, iz)];     s = sxsy * tz;
+    mp = &POVN_T(g_povRTable)[POVH1I(jxjy, iz)];     s = sxsy * tz;
     out[0] += POVINCR(mp,      s, x_jx, y_jy, z_iz);
     out[1] += POVINCR(mp + 8,  s, x_jx, y_jy, z_iz);
     out[2] += POVINCR(mp + 16, s, x_jx, y_jy, z_iz);
-    mp = &g_povRTable[POVH1I(ixiy, iz + 1)]; s = txty * sz;
+    mp = &POVN_T(g_povRTable)[POVH1I(ixiy, iz + 1)]; s = txty * sz;
     out[0] += POVINCR(mp,      s, x_ix, y_iy, z_jz);
     out[1] += POVINCR(mp + 8,  s, x_ix, y_iy, z_jz);
     out[2] += POVINCR(mp + 16, s, x_ix, y_iy, z_jz);
-    mp = &g_povRTable[POVH1I(jxiy, iz + 1)]; s = sxty * sz;
+    mp = &POVN_T(g_povRTable)[POVH1I(jxiy, iz + 1)]; s = sxty * sz;
     out[0] += POVINCR(mp,      s, x_jx, y_iy, z_jz);
     out[1] += POVINCR(mp + 8,  s, x_jx, y_iy, z_jz);
     out[2] += POVINCR(mp + 16, s, x_jx, y_iy, z_jz);
-    mp = &g_povRTable[POVH1I(ixjy, iz + 1)]; s = txsy * sz;
+    mp = &POVN_T(g_povRTable)[POVH1I(ixjy, iz + 1)]; s = txsy * sz;
     out[0] += POVINCR(mp,      s, x_ix, y_jy, z_jz);
     out[1] += POVINCR(mp + 8,  s, x_ix, y_jy, z_jz);
     out[2] += POVINCR(mp + 16, s, x_ix, y_jy, z_jz);
-    mp = &g_povRTable[POVH1I(jxjy, iz + 1)]; s = sxsy * sz;
+    mp = &POVN_T(g_povRTable)[POVH1I(jxjy, iz + 1)]; s = sxsy * sz;
     out[0] += POVINCR(mp,      s, x_jx, y_jy, z_jz);
     out[1] += POVINCR(mp + 8,  s, x_jx, y_jy, z_jz);
     out[2] += POVINCR(mp + 16, s, x_jx, y_jy, z_jz);
@@ -372,14 +378,14 @@ POV_HD FT_UNIT_INLINE void povDTurbulence(double x, double y, double z,
     }
 }
 
-#undef POVN_MEM
+#undef POVN_T
 '''
 
 hdr = (TEMPLATE
-       .replace("{hash}", hash_txt)
-       .replace("{rtable}", rt_txt)
-       .replace("{perm}", perm_txt)
-       .replace("{grad}", grad_txt))
+       .replace("{hash_m}", hash_txt.replace(chr(10), " " + chr(92) + chr(10)))
+       .replace("{rtable_m}", rt_txt.replace(chr(10), " " + chr(92) + chr(10)))
+       .replace("{perm_m}", perm_txt.replace(chr(10), " " + chr(92) + chr(10)))
+       .replace("{grad_m}", grad_txt.replace(chr(10), " " + chr(92) + chr(10))))
 
 os.makedirs(os.path.dirname(OUT), exist_ok=True)
 with open(OUT, "w", encoding="utf-8") as f:

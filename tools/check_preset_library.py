@@ -43,8 +43,9 @@ def main():
     # The scratch directory is emptied before and deleted after, so only one this check made -- marked
     # as its own -- is ever deleted; any other existing directory is refused, not emptied.
     mark = os.path.join(d, ".check_preset_library")
-    if os.path.isdir(d) and os.listdir(d) and not os.path.exists(mark):
-        print("--out %s exists and is not this check's scratch directory: name a new one" % d)
+    if os.path.isdir(d) and not os.path.exists(mark):
+        print("--out %s exists and holds no mark of this check's (.check_preset_library): delete it if it is"
+              " a scratch directory left behind, or name another with --out" % d)
         return 1
     shutil.rmtree(d, ignore_errors=True)
     os.makedirs(d)
@@ -85,6 +86,29 @@ def main():
         check("data/ holding %s: %s" % (" and ".join(have) or "nothing",
                                          "names the missing" if want else "a plain unknown preset"),
               ok, "rc %d: %s" % (rc, line.strip()[:110] or "no 'unknown preset' line"))
+    # A material preset reads data/material, data/metal and data/glass, and names the ones missing.
+    shutil.rmtree(data, ignore_errors=True)
+    os.makedirs(os.path.join(data, "light"))
+    os.makedirs(os.path.join(data, "illuminant"))
+    scene = os.path.join(d, "s_preset_gold.ftsl")
+    with open(scene, "w", encoding="utf-8", newline="") as f:
+        f.write((SCENE % ("", "bb6500")).replace('material "w" { type diffuse reflect 0.7 }',
+                                                 'material "w" { preset gold }'))
+    p = subprocess.run([copy, "-in", scene, "-mode", "R", "-device", "cpu", "-spp", "1", "-no-meter",
+                        "-window-min", "-o", os.path.join(d, "out.png")], cwd=d, capture_output=True, text=True,
+                       encoding="utf-8", errors="replace")
+    line = next((l for l in (p.stdout + p.stderr).splitlines() if "unknown material preset 'gold'" in l), "")
+    check("data/ without material, metal, glass: a material preset names all three",
+          p.returncode != 0 and "data/material" in line and "data/metal" in line and "data/glass" in line,
+          "rc %d: %s" % (p.returncode, line.strip()[:110]))
+    # A library bundle's own reference -- a light whose spd names illuminant:F11 -- names its directory.
+    shutil.rmtree(os.path.join(data, "illuminant"), ignore_errors=True)
+    with open(os.path.join(data, "light", "mylamp.light"), "w", encoding="utf-8", newline="") as f:
+        f.write("spd illuminant:F11" + NL)
+    rc, log = run(copy, d, "mylamp")
+    line = next((l for l in log.splitlines() if "illuminant:F11" in l), "")
+    check("a bundle's reference to a missing library names it",
+          rc != 0 and "data/illuminant is in neither" in line, "rc %d: %s" % (rc, line.strip()[:110]))
     # A library name other than a preset's -- a glass -- says so the same way (speclib::missingLibraryNote).
     shutil.rmtree(data, ignore_errors=True)
     os.makedirs(os.path.join(data, "light"))

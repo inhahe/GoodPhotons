@@ -2788,10 +2788,12 @@ choice of kernel is a decision function the launcher itself runs -- the forward 
 `rRunsRgb`, `pBackwardOnGpu`) -- and a route (`GpuRoute`, render_cuda.h: `cudaForwardRoute`,
 `cudaBackwardRoute`, `cudaBdptRoute`, `cudaPhotonMapRoute`, `cudaSppmRoute`, `cudaVcmRoute`) lists
 the kernels that decision launches, which `cudaRouteLocalBytes` weighs: what is weighed and what
-launches cannot part. Mode `J` is asked before its beam map exists: it merges where its beams
-(through a medium) or `-jsurf` (on by default) will, which is the merge instantiation, with the
-beam queue's variant and kernels and `-jsurf`'s light pass and gather; where neither, it is mode
-`D` exactly, hero bundle and all.
+launches cannot part; renderBdptCuda itself launches through `bdptKernelFor`, the pointer its route
+weighs. Mode `J` is asked before its maps exist, so its route holds the plain instantiation, which
+renders it where they come out empty (mode `D` exactly, hero bundle and all), and where its beams
+(through a medium) or `-jsurf` (on by default) merge, the merge instantiation too -- its stratified
+variant as well under `FTRACE_WFSTRAT`, the beam queue's two kernels where the beams queue, and
+`-jsurf`'s light pass and gather where the device runs and queues them.
 
 **The reservation is per RESIDENT thread, and the context keeps it (0.389.5).** The driver backs a
 kernel's local memory for every thread the card holds at once (SMs × max threads per SM: 196608
@@ -2823,8 +2825,10 @@ camera's film and hit map, held the whole flight, and under a blur of a moving c
 camera's posed copies, `cudaSharedFlightPosedBytes`) and the exposure meter's frames ask too, the
 forward modes weigh their walk on the backend it runs (kTrace, or the wavefront's three kernels
 where `-wavefront` is asked and nothing keeps the megakernel), mode P that and, where its
-camera-side layers run on the device, kBackward, and a mode-S frame is charged its session's own state a pixel
-(`cudaSppmPixelBytes`, ~200 B) rather than a film pair. A
+camera-side layers run on the device, kBackward; a forward render or flight on the wavefront is
+charged its photon pool too (`cudaForwardWavefrontBytes`, a slot a photon of the batch up to 1 M,
+sized by the one list its allocation reads, `FT_WF_POOL`), and a mode-S frame its session's own
+state a pixel (`cudaSppmPixelBytes`, ~200 B) rather than a film pair. A
 meter frame asks after its own support tests, so one bound for the CPU anyway prints no verdict,
 and for the instantiation it launches (`meterAffords`, once a kernel set and frame size): a D or J
 frame meters on the device with kBdptT at `kMeterBdptDepth` (8) and `kMeterBdptHeroC` (scalar)
@@ -13302,15 +13306,17 @@ runs its own cases first (exit 2 where the scanner itself is wrong), and runs af
   Three changes: (1) `--split-compile=0` partitioned that TU's device code across all cores
   (ptxas 52.6 → 21.1 s, cicc 64.3 → 43.2 s, the TU 2:49 → 1:50) -- dropped in 0.450.17: its
   partitioning made the device code depend on the run, so no two builds could be compared, and
-  without it the code is the same every time and modes R, D and U render 12-24 % faster (J 16 %
-  slower, J-NOSPLIT; CMakeLists.txt has the numbers); (2) `/MP` for the host TUs, which only matters on a full rebuild; (3) the
+  without it the code is the same every time (render_cuda_bdpt.cu compiled twice with it gave two
+  functions different register counts; twice without, alike), and, same source, idle card, cornell,
+  without it: mode R 6.43 -> 5.34 s, D 16.3 -> 12.4, U 4.43 -> 3.89, M 4.87 -> 4.11, S 8.76 -> 7.14,
+  B 560 -> 523, and J 19.2 -> 22.3 (J-NOSPLIT); (2) `/MP` for the host TUs, which only matters on a full rebuild; (3) the
   version string moved into `src/version.cpp`, the only TU with `FTRACE_VERSION` defined —
   it used to be target-wide, so every `VERSION` bump rebuilt *everything*, which is what
   made the "15-minute builds" of 2026-09-06: bumps plus foreign CPU load, not the compiler.
   What is left is serial by nature: `cudafe++` (14 s), preprocessing (12 s), the host pass
   of the .cu (17 s) and the links; splitting `render_cuda.cu` into per-mode TUs would
   parallelise those too, at the cost of duplicating the shared device helpers per TU.
-  One constraint `--split-compile` adds: a `__device__` function with EXTERNAL linkage (a
+  One constraint `--split-compile` added, while it was on: a `__device__` function with EXTERNAL linkage (a
   plain `inline` template in a header, as `dPatternEval` was) can be partitioned away from
   a `__launch_bounds__`-capped caller, and `nvlink` then rejects the link when the callee's
   own register allocation exceeds the cap (169 vs 168 for `kBdptT`). Device helpers must be

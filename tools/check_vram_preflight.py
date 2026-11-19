@@ -179,6 +179,22 @@ def main():
           rc == 0 and rgb and rw is not None and r_ is not None and float(rw.group(1)) < r_,
           "rc %d, %s, R -rgb %s GB, R %s GB" % (rc, "the previewer" if rgb else "not the previewer",
                                                rw.group(1) if rw else "?", r_))
+    # The wavefront's photon pool, which each batch allocates beside the films: B on the wavefront
+    # (-wavefront, the hero bundle off) is charged it on top of B's own buffers -- a few hundred bytes
+    # a slot, a slot a photon of the batch up to 1 M.
+    bufs = re.compile(r"\+ ([\d.]+) GB film/scene/queues/context")
+    _, plain, _ = run("B pool", "B", ["-camera", "a", "-n", "1000000", "-heroc", "1"], "auto", None)
+    _, wf, _ = run("B wavefront", "B", ["-camera", "a", "-n", "1000000", "-heroc", "1", "-wavefront"], "auto", None)
+    bp, bw = bufs.search(plain), bufs.search(wf)
+    check("B on the wavefront is charged its photon pool",
+          bp is not None and bw is not None and float(bw.group(1)) - float(bp.group(1)) >= 0.1,
+          "buffers %s GB plain, %s GB on the wavefront" % (bp.group(1) if bp else "?", bw.group(1) if bw else "?"))
+    # ...by the batch it traces, which under a time budget with -n 0 is 2 M photons, not -n's 0.
+    _, wt, _ = run("B wavefront timed", "B", ["-camera", "a", "-n", "0", "-time", "2", "-heroc", "1", "-wavefront"], "auto", None)
+    bt = bufs.search(wt)
+    check("...and under a time budget, by the batch it traces",
+          bp is not None and bt is not None and float(bt.group(1)) - float(bp.group(1)) >= 0.1,
+          "buffers %s GB plain, %s GB timed on the wavefront" % (bp.group(1) if bp else "?", bt.group(1) if bt else "?"))
     # The exposure meter's frames: a locked path of two frames, its exposure automatic (no light's
     # `power`), metered in mode D before its first frame renders. The meter must ask before it meters:
     # its [vram] line ahead of the meter's own (both on stdout, whose order the log keeps); and with the

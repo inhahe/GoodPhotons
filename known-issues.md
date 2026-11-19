@@ -201,6 +201,31 @@ to 0.25 renders as a 150 nm one within 2e-3, 1.0e-3 measured (its body's escape 
 on 0.450.1 it rendered as the unmapped 600 nm, 1.9 off), the `thinfilm` control byte for byte, and
 the three misspellings stop the load (on 0.450.1 they loaded).
 
+## DONE (2026-11-19, 0.450.18): REVIEW-0450H — what the Opus (max) and Fable (xhigh) reviews of 0.450.17 found
+
+`/code-review max` (Opus, 14 findings, none high) and `/code-review xhigh` (Fable, 15) of
+2816cd6..1714ae9, one after the other; ten found by both. Each checked against the code.
+**Fixed:** the forward preflight sized the pool and posed cameras by the raw `-n`, where a budgeted
+run traces 2 M-photon batches (an under-count with `-n 0`); the pool term takes the stable seed as
+the posed term does; mode J's route keeps the plain merge kernel beside the STRAT one (the launcher
+falls back to it wherever the queue is not built); a material preset names data/metal and data/glass
+too; the library note is built only on a miss; check_preset_library refuses any directory it did not
+make; the OOM advice reads in either direction. The wavefront pool is one list (`FT_WF_POOL`) its
+allocation, its frees and its size all read. The noise tables take ggx.h's layout -- the values once
+in an init macro, the host's tables `inline` in every pass, the device's own `static` copies, readers
+choosing by `POVN_T` -- one host table and no definition that depends on `__CUDA_ARCH__`. Checks:
+check_preset_library's material-preset and bundle-reference cases, check_vram_preflight's wavefront
+pool, the latter under a time budget with `-n 0`, where 0.450.17 charged 0.25 GB against 0.52.
+Stale words: cudaBdptRoute's and cudaForwardPosedCameraBytes' comments and the headroom constant's
+(both), mode J's "only the scalar kernel" (Fable), design.md's J route, its charged buffers. Also
+(Fable): renderBdptCuda's `deep` and the pick's one rule (`bdptDeep`); the scanner's guard, which
+bought nothing, gone; check_preset_library's refusal says what to do; CMakeLists' comment keeps the
+constraint, design.md the numbers.
+**Not changed:** the flight's pool counted at the largest batch (both; conservative, at most
+~0.3 GB). J-NOSPLIT left open rather than fixed (Fable): localized to kWfBeamHits, one cause ruled
+out, and the next task.
+The bundling of 0.450.17's two changes in one commit (Opus): history now; these are separate.
+
 ## DONE (2026-11-19, 0.450.17): REVIEW-0450G — what the Opus (max) and Fable (xhigh) reviews of 0.450.15-0.450.16 found
 
 `/code-review max` (Opus, 15 findings) and `/code-review xhigh` (Fable, 15) of f8d518b..2816cd6, one
@@ -209,8 +234,7 @@ after the other in a worktree; nine found by both. Each checked against the code
 * **`FT_UNIT_INLINE` and the host noise tables chose their linkage by `__CUDA_ARCH__`** (Fable), which
   NVIDIA's rules for separate compilation forbid: a definition with external linkage must not be
   present in one pass and absent in the other. Keyed by the unit again (`FT_FAMILY_TU`, the same in
-  both passes), the tables `static const` -- their host ODR nit (REVIEW-0450F) stays, being the
-  lesser; and `curvature.h`'s and `rng.h`'s device helpers, which the sweep missed, take it too.
+  both passes), the tables `static const` (0.450.18 gives them ggx.h's layout, REVIEW-0450H); and `curvature.h`'s and `rng.h`'s device helpers, which the sweep missed, take it too.
 
 * **Mode J's route dropped the plain kernel** its launcher falls back to where the maps come out empty
   (an under-count, the dangerous direction): the route holds it beside the merge instantiation.
@@ -1935,6 +1959,9 @@ path for a write past `depCap` first, then rerun the command alone with the buff
 Read since: `depositPhoton` counts every photon and writes only those under `depCap`, and the host
 regrows by checked allocations, so the deposit's own bounds hold; the fault is elsewhere in the
 walk, and the next step is a reproduction, alone and beside a GPU load, under memcheck.
+Rerun on 0.450.17 (the exact command): three times alone (40 s each) and three beside another
+process's GPU mode-D render (2:00 each), all clean. So four in some hundred GPU check runs, always
+beside another GPU process, never on demand.
 
 ## OPEN (2026-11-04, 0.433.6): CURVE-CAUSTIC — modes M and S light a `type diffuse` strand only by NEE and its diffuse continuation, so a caustic from a point or spot light misses it
 
@@ -6202,6 +6229,16 @@ deterministic now, so this can be chased: compare the merge instantiations' regi
 (`cuobjdump -res-usage`, kBdptT<0,8,true,false> and the jsurf kernels) between the two builds, and
 see which of mode J's kernels lost time (its passes' own timings), then pin that kernel's inlining
 or its unit's cap. The other modes are not to be given back for it.
+
+**Localized (Nsight Systems, _fog_cornell, 32 spp):** the whole loss is `kWfBeamHits`, the beam queue's
+hit search, 1.66 -> 2.65 s of GPU time; every other mode-J kernel got a little faster (the merge
+kBdptT 1.32 -> 1.23 s, the surface gather 0.30 -> 0.29, the light pass 0.24 -> 0.21). Its SASS is
+the same 528 instructions in both builds, register-renamed (74 -> 54 registers), with six
+out-of-line calls; its stacks are equal (256 B). So the time goes in what it calls -- `boxHit`
+(`__device__ static`, no inline hint) and DStopPoll's poll are the candidates on its node loop.
+Not `boxHit`: a force-inlined copy in that kernel alone left mode J at 22.4 s (paired, against 22.5).
+**Next:** read the six call targets (`cuobjdump -sass` of the linked binary, the callees' own code in
+both builds) and time `kWfBeamHits` alone under Nsight Compute in each.
 
 ## DONE (2026-11-19, 0.450.17; opened 2026-10-14, tech debt): GPU-STACK-DRIFT — every kernel's stack reservation moves when unrelated device code changes
 

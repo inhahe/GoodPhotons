@@ -91,7 +91,7 @@ inline std::string memAdvice(double failedBytes) {
         ours ? ""
              : "       This render is only a small part of what the machine has committed, so\n"
                "       the MACHINE ran out rather than this render — other programs are using\n"
-               "       it. Close something and re-run; shrinking the flags below only makes\n"
+               "       it. Close something and re-run; changing the flag below only makes\n"
                "       this render smaller than a limit that was never really about it.\n");
     return std::string(buf);
 }

@@ -5964,11 +5964,11 @@ static int checkVNoise() {
                 double dx = bx ? fx - 1.0 : fx;
                 double dy = by ? fy - 1.0 : fy;
                 double dz = bz ? fz - 1.0 : fz;
-                int h2 = g_povHash[(int)(g_povHash[(int)(ix + bx)] ^ (iy + by))];
-                int base = (g_povHash[(int)h2 ^ (iz + bz)] & 0xFF) * 2;
+                int h2 = g_povHashH[(int)(g_povHashH[(int)(ix + bx)] ^ (iy + by))];
+                int base = (g_povHashH[(int)h2 ^ (iz + bz)] & 0xFF) * 2;
                 double w = wx * wy * wz;
                 for (int c = 0; c < 3; ++c) {
-                    const double* mp = &g_povRTable[base + 8 * c];
+                    const double* mp = &g_povRTableH[base + 8 * c];
                     ref[c] += w * (mp[1] + mp[2] * dx + mp[4] * dy + mp[6] * dz);
                 }
             }
@@ -20708,12 +20708,15 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
         // copy of it, one a thread, and the wavefront's photon pool where the walk runs there --
         // mode P's layers trace with a stable seed, which keeps them on the megakernel; mode S's
         // session keeps its own state a pixel instead.
+        // Both forward terms by the batch the trace loop runs: -n, or 2 M photons where a time or
+        // noise budget leaves -n unset (runRender's forward loop).
+        const long long batchN = (N > 0) ? N : 2'000'000;
         const size_t film   = (m == 'S') ? (size_t)res * resY * cudaSppmPixelBytes()
                             : (size_t)res * resY * 3 * sizeof(double) * 2 +
                               ((gpuForwardMode && cam.seesMotion(scene) && cam.moves())
-                                   ? cudaForwardPosedCameraBytes(scene, wavefront, g_heroC, N, m == 'P') : 0) +
-                              ((gpuForwardMode && m != 'P')
-                                   ? cudaForwardWavefrontBytes(scene, wavefront, g_heroC, N) : 0);
+                                   ? cudaForwardPosedCameraBytes(scene, wavefront, g_heroC, batchN, m == 'P') : 0) +
+                              (gpuForwardMode
+                                   ? cudaForwardWavefrontBytes(scene, wavefront, g_heroC, batchN, false, 1, m == 'P') : 0);
         // Mode J's beams, through a medium, and its beam queue, allocated beside the kernel once the
         // render starts.
         const bool jBeams = m == 'J' && jBeamsChoice().rule != JBeams::Off && !scene.media.empty();

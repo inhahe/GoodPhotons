@@ -52,7 +52,7 @@ struct GpuRoute {
 // 0 for "unknown" (no device, or an empty route), which callers treat as no opinion, not as free.
 size_t cudaRouteLocalBytes(const GpuRoute& r);
 // The headroom the preflight keeps beside a render's kernels and buffers for the scene upload and the
-// driver's own context, and a session sizing a buffer from the free memory keeps too.
+// driver's own context, which the blurred flight's session keeps too when it sizes its posed cameras.
 constexpr size_t kVramHeadroomBytes = (size_t)256 * 1024 * 1024;
 // The forward photon walk (modes A, B, C, V, mode P's forward layer, a shared flight of `nCam`
 // cameras gathering photon beams by `beamGather`): the megakernel, or the wavefront's three kernels
@@ -66,10 +66,12 @@ bool cudaForwardRunsWavefront(const Scene& scene, bool wavefront, int heroC, boo
 // The backward walk (modes R and W, mode P's camera-side layers): the RGB previewer's kernel where
 // `rgb` (-rgb, in its scope on the device), the spectral one otherwise.
 GpuRoute cudaBackwardRoute(bool rgb);
-// BDPT (modes D and J, the meter's D and J frames): renderBdptCuda's instantiation for `maxDepth`
-// and `heroC` (the bundle off through a medium, GRIN or a camera `lens`: bdptPick) or, where mode J
-// merges (`merging`), the merge instantiation -- with the beam queue's variant and kernels where the
-// beams queue (`beamQueue`), and -jsurf's light pass and surface gather (`surfMerge`).
+// BDPT (modes D and J, the meter's D and J frames): renderBdptCuda's plain instantiation for
+// `maxDepth` and `heroC` (the bundle off through a medium, GRIN or a camera `lens`: bdptPick), which
+// mode J renders where its maps come out empty; and where mode J merges (`merging`) the merge
+// instantiation too -- in the beam queue's stratified order as well under FTRACE_WFSTRAT, with the
+// queue's two kernels where the beams queue (`beamQueue`), and -jsurf's light pass where the device
+// runs it and its surface gather where it queues (`surfMerge`).
 GpuRoute cudaBdptRoute(const Scene& scene, bool lens, int maxDepth, int heroC, bool merging = false,
                        bool beamQueue = false, bool surfMerge = false);
 // Mode M: the photon walk and the gather. Mode S: the walk, the visible points and the gather.
@@ -483,17 +485,17 @@ bool cudaBackwardSupported(const Scene& scene, const Camera& cam);
 // forward flight (kSharedFlightBlurWhy), a moving scene's shared or saved mode-M map -- main.cpp
 // says so itself.
 const char* cudaBlurUnsupported(const Scene& scene, const Camera& cam, char mode);
-// Device memory a blurred single-camera forward render (modes A, B and C) of a camera that moves
-// takes for its per-thread posed copies of the camera (DCamSet::cam), on the backend
-// renderForwardCuda will run (`wavefront` asked, `heroC` the hero bundle asked): one a thread of
-// the megakernel's grid, or one a slot of the wavefront's pool for an N-photon trace -- for the
-// VRAM preflight.
+// Device memory a blurred single-camera forward render (modes A, B, C, V, P's forward layer) of a
+// camera that moves takes for its per-thread posed copies of the camera (DCamSet::cam), on the
+// backend its walk runs (cudaForwardRunsWavefront's arguments: `wavefront` asked, `heroC` the hero
+// bundle asked, `stableSeed` mode P's): one a thread of the megakernel's grid, or one a slot of the
+// wavefront's pool for an N-photon trace -- for the VRAM preflight.
 size_t cudaForwardPosedCameraBytes(const Scene& scene, bool wavefront, int heroC, long long N,
                                    bool stableSeed = false);
 // Device memory the wavefront backend's photon pool takes for an N-photon trace, where the forward
 // walk runs there (cudaForwardRunsWavefront's arguments), else 0 -- for the VRAM preflight.
 size_t cudaForwardWavefrontBytes(const Scene& scene, bool wavefront, int heroC, long long N,
-                                 bool beamGather = false, int nCam = 1);
+                                 bool beamGather = false, int nCam = 1, bool stableSeed = false);
 // The same for a blurred shared forward flight of `nCam` cameras (sharedForwardGpuBegin's arguments)
 // whose set moves: every camera a thread, sized once for the session's largest batch.
 size_t cudaSharedFlightPosedBytes(const Scene& scene, int nCam, bool wavefront, int heroC, bool beamGather);

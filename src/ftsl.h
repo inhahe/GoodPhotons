@@ -5068,7 +5068,7 @@ private:
                 return m;
             }
             PresetNotes notes;
-            if (!resolveMaterialPreset(pname, m, &notes)) { fail("unknown material preset '" + pname + "'" + speclib::missingLibraryNote({"material"})); return m; }
+            if (!resolveMaterialPreset(pname, m, &notes)) { fail("unknown material preset '" + pname + "'" + speclib::missingLibraryNote({"material", "metal", "glass"})); return m; }
             if (find(b, "roughness")) {
                 if (!bindScalarPattern(b, "roughness", m.roughnessPat) &&
                     !bindScalarTexture(b, "roughness", m.roughnessTex))
