@@ -15676,13 +15676,30 @@ struct DMergeLobe {
     ggx::Pair p;            // a glossy lobe's pair (wo, wi)
     double g = 0.0;         // ...its value over the reflectance, ggx::fAll
     Real cH = (Real)1;      // ...and its half-vector cosine, which an iridescent lobe's R reads
-    __device__ DMergeLobe(const DScene& sc_, const DVertex& vt_, const DVec3& wo_)
-        : sc(sc_), vt(vt_), m(sc_.mats[vt_.matId]), h(dVertHit(vt_)), wo(wo_) {
+    // A translucent lobe's two albedos (dDiffuseTransmitAlbedos) at rhoLam, which every light
+    // direction shares: read again only at another wavelength.
+    mutable Real rhoLam = (Real)-1;
+    mutable double rhoR = 0.0, rhoT = 0.0;
+    bool ready = false;     // prepare() has run
+    // `now` false leaves the hit and the roughness to prepare(), for a caller that may weigh no light
+    // direction at all (mode J's gathers, at a site's first photon past the cheap tests).
+    __device__ DMergeLobe(const DScene& sc_, const DVertex& vt_, const DVec3& wo_, bool now = true)
+        : sc(sc_), vt(vt_), m(sc_.mats[vt_.matId]), wo(wo_) {
+        if (now) prepare();
+    }
+    __device__ void prepare() {
+        h = dVertHit(vt);
         if (m.type == D_GLOSSY) {
             alpha = ggx::alpha((double)dMatRoughness(sc, m, h));
             ms = dGlossyMs(m);
         }
         cosWo = ddot(wo, vt.ns);
+        ready = true;
+    }
+    __device__ void albedos(Real lambda) const {
+        if (lambda == rhoLam) return;
+        dDiffuseTransmitAlbedos(sc, m, h, lambda, rhoR, rhoT);
+        rhoLam = lambda;
     }
     __device__ void at(const DVec3& wi_) {
         wi = wi_;
@@ -15704,7 +15721,7 @@ struct DMergeLobe {
             if (m.iridescence) r *= (double)dIridescenceR(sc, m, &h, lambda, cH);
             return r * g;
         } else if (m.type == D_DIFFUSETRANSMIT) {
-            double rhoR, rhoT; dDiffuseTransmitAlbedos(sc, m, h, lambda, rhoR, rhoT);
+            albedos(lambda);
             const int lobe = dTranslucentLobe(vt.ns, dVertexGeoN(vt), wo, wi);
             return (lobe > 0 ? rhoR : (lobe < 0 ? rhoT : 0.0)) / DPI;
         } else if (m.type == D_HAIR) {
@@ -15721,7 +15738,7 @@ struct DMergeLobe {
         } else if (m.type == D_GLOSSY) {
             return ggx::pdfAll(rev ? dPairSwapped(p) : p, ms);
         } else if (m.type == D_DIFFUSETRANSMIT) {
-            double rhoR, rhoT; dDiffuseTransmitAlbedos(sc, m, h, lambda, rhoR, rhoT);
+            albedos(lambda);
             const double tot = rhoR + rhoT;
             if (tot <= 0.0) return 0.0;
             const int lobe = rev ? dTranslucentLobe(vt.ns, dVertexGeoN(vt), wi, wo)
@@ -21393,7 +21410,7 @@ struct DSurfSite {
 // camera vertex's toward the camera side (DMergeLobe), `coatTh` its coat's film there
 // (dCoatThicknessAt).
 __device__ static inline void dSurfMergePhoton(const DScene& sc, const DSurfMap& sm, const DSurfSite& site,
-                                               DMergeLobe& lobe, Real coatTh, const DSurfMergeW& sw, int q,
+                                               DMergeLobe& lobe, Real& coatTh, const DSurfMergeW& sw, int q,
                                                double& gX, double& gY, double& gZ,
                                                const DJSpec* js) {
     const DVertex& vk = lobe.vt;
@@ -21405,6 +21422,7 @@ __device__ static inline void dSurfMergePhoton(const DScene& sc, const DSurfMap&
     if (!site.fp.keeps(ph.p, DVec3(ph.nx, ph.ny, ph.nz), (Real)ddot(dd, dd))) return;   // this surface's
     const DSurfMis& lm = sm.mis[ph.misIdx];
     const Real lam = (Real)ph.lambda;
+    if (!lobe.ready) { lobe.prepare(); coatTh = dCoatThicknessAt(sc, lobe.m, lobe.h); }
     // ...times a coated body's coat on the photon's way in: it was stored before its own pick.
     lobe.at(ph.wo);
     double fCam = lobe.f(lam) * dCoatEvalAt(sc, lobe.m, vk.ns, coatTh, lobe.wo, ph.wo).at(lam);
@@ -21538,8 +21556,8 @@ __device__ static int dSurfMergeAt(const DScene& sc, const DSurfMap& sm, const D
                                    double& gX, double& gY, double& gZ,
                                    const DJSpec* js = nullptr) {
     const DSurfSite site(sc, sm, vk);
-    DMergeLobe lobe(sc, vk, woCam);
-    const Real coatTh = dCoatThicknessAt(sc, lobe.m, lobe.h);
+    DMergeLobe lobe(sc, vk, woCam, false);
+    Real coatTh = (Real)0;   // dSurfMergePhoton's, with the lobe
     return dSiteListWalk([&](int n, int& b, int& e) { dSurfSiteCell(sm, site, n, b, e); }, 0, 1,
                          [&](int q) { dSurfMergePhoton(sc, sm, site, lobe, coatTh, sw, q, gX, gY, gZ, js); });
 }
@@ -21569,8 +21587,8 @@ __global__ void kWfSurfGather(DScene sc, DSurfMap sm, DSurfQueue sq, int n, doub
         const DJSpec* js = (rq.flags & 1) ? &sq.spec[r] : nullptr;
         const DSurfSite site(sc, sm, rq.vk);
         double gX = 0.0, gY = 0.0, gZ = 0.0;
-        DMergeLobe lobe(sc, rq.vk, rq.woCam);
-        const Real coatTh = dCoatThicknessAt(sc, lobe.m, lobe.h);
+        DMergeLobe lobe(sc, rq.vk, rq.woCam, false);
+        Real coatTh = (Real)0;   // dSurfMergePhoton's, with the lobe
         // The site's photons as one list, its cells in walk order, the lanes taking them in turn.
         const int total = dSiteListWalk([&](int c, int& b, int& e) { dSurfSiteCell(sm, site, c, b, e); }, lane, 32,
                                         [&](int q) { dSurfMergePhoton(sc, sm, site, lobe, coatTh, sw, q,
