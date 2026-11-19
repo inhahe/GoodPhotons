@@ -281,11 +281,13 @@ def scene(obj_lines, cam):
     ] + obj_lines) + NL
 REF = ["-mode", "R", "-device", "gpu", "-spp", "512"]
 CASES = [("M_gpu", ["-mode", "M", "-device", "gpu", "-n", "8000000", "-spp", "16", "-pmradius", "0.1"]),
-         ("M_cpu", ["-mode", "M", "-device", "cpu", "-n", "2000000", "-spp", "4", "-pmradius", "0.1"]),
+         # 16 samples, as the GPU case takes: the floor by a mirror box's base is its direct light and
+         # the mirror's caustic, both drawn per camera sample, and at 4 one seed read it 0.92-1.06.
+         ("M_cpu", ["-mode", "M", "-device", "cpu", "-n", "2000000", "-spp", "16", "-pmradius", "0.1"]),
          ("S_gpu", ["-mode", "S", "-device", "gpu", "-spp", "32", "-pmradius", "0.1"]),
          ("S_cpu", ["-mode", "S", "-device", "cpu", "-spp", "8", "-pmradius", "0.1"]),
          # the geometric footprint in place of the probe (host only): the same crossing rule
-         ("M_cpu_gageom", ["-mode", "M", "-device", "cpu", "-n", "2000000", "-spp", "4", "-pmradius", "0.1",
+         ("M_cpu_gageom", ["-mode", "M", "-device", "cpu", "-n", "2000000", "-spp", "16", "-pmradius", "0.1",
                            "-gageom", "1"]),
          ("S_cpu_gageom", ["-mode", "S", "-device", "cpu", "-spp", "8", "-pmradius", "0.1", "-gageom", "1"])]
 TOL = 0.07
