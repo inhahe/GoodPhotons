@@ -2453,6 +2453,9 @@ struct Scene {
         int gres[3] = {0, 0, 0};
         std::vector<double> cellW, cellCdf;
         double cellSum = 0.0;
+        // The cells' size along each axis, its reciprocal (gres over the box), and the point
+        // density's scale, cellW[c] * pointNorm in cell c: what firePointPdf walks the grid with.
+        double cellSize[3] = {0, 0, 0}, invCell[3] = {0, 0, 0}, pointNorm = 0.0;
 
         // A point drawn in proportion to the cell powers (a cell by cellCdf from u0, uniform inside
         // it from u1..u3), and the volume density of that draw at `x` (0 outside the box).
@@ -2900,6 +2903,11 @@ struct Scene {
             ev.cellCdf.assign(1, 1.0);
             ev.cellSum = 1.0;
         }
+        for (int a = 0; a < 3; ++a) {
+            ev.cellSize[a] = (&ext.x)[a] / ev.gres[a];
+            ev.invCell[a] = ev.gres[a] / (&ext.x)[a];
+        }
+        ev.pointNorm = 1.0 / (ev.cellSum * (ev.cellSize[0] * ev.cellSize[1] * ev.cellSize[2]));
     }
 
     // build() after finalizeEmitters(). Cheap Monte-Carlo over the emitting box × band.

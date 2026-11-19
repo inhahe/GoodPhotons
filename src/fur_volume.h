@@ -49,6 +49,7 @@
 #include "rng.h"
 #include "hair.h"
 #include "fur_grid.h"
+#include "cell_walk.h"   // rayBoxClip, CellWalk: entryDist, sampleFlight
 #include "vdbgrid.h"   // halfBitsToFloat / floatToHalfBits (the fp16 helpers, not the grid)
 
 namespace furvol {
@@ -614,7 +615,7 @@ struct FurVolume {
     // the two is at most the coat's own depth, far below the octave-wide transition band.
     double entryDist(const Vec3& o, const Vec3& d) const {
         double ta, tb;
-        return valid() && clipRayBox(grid->lo, grid->hi, o, d, 0.0, 1e300, ta, tb) ? ta : -1.0;
+        return valid() && rayBoxClip(&grid->lo.x, &grid->hi.x, &o.x, &d.x, 0.0, 1e300, ta, tb) ? ta : -1.0;
     }
 
     // What a free-flight draw found.
@@ -631,11 +632,9 @@ struct FurVolume {
     // cell segment's optical depth from the target and stop inside the cell that exhausts it.
     Flight sampleFlight(const Vec3& o, const Vec3& d, double maxDist, double u) const {
         Flight f;
-        double t0, t1;
-        if (!valid() || !(maxDist > 0.0) || !clipRayBox(grid->lo, grid->hi, o, d, 0.0, maxDist, t0, t1))
-            return f;
+        CellWalk w;
+        if (!valid() || !(maxDist > 0.0) || !grid->walk(o, d, maxDist, w)) return f;
         const double want = -std::log(std::max(1e-300, 1.0 - u));
-        CellWalk w = grid->walk(o, d, t0, t1);
         double acc = 0.0;
         size_t ci; double a, b;
         while (cellWalkNext(w, ci, a, b)) {

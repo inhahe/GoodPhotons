@@ -1962,6 +1962,11 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
             d.cellCdf = ev.cellCdf.empty() ? nullptr : (const double*)keep(uploadVec(ev.cellCdf));
             d.nCells  = (int)ev.cellCdf.size();
             d.cellSum = ev.cellSum;
+            for (int a = 0; a < 3; ++a) {
+                d.boxLo[a] = (&ev.bmin.x)[a]; d.boxHi[a] = (&ev.bmax.x)[a];
+                d.cellSize[a] = ev.cellSize[a]; d.invCell[a] = ev.invCell[a];
+            }
+            d.pointNorm = ev.pointNorm;
             d.kelvin  = scene.media[(size_t)ev.mediumIndex].emitKelvin;
             d.gW      = (camFires && ev.lamSampler.integral > 0.0)
                             ? ev.power / ev.lamSampler.integral : 0.0;

@@ -7114,7 +7114,7 @@ alone can't restore, so they are not disk-resumable.
 | `-stereo-keep-eyes` | Keep the intermediate per-eye PNGs (`<out>_<cam>__eyeL/​R.png`) that `-stereo` writes before compositing. By default they're deleted once the composite is done. |
 
 **Diagnostics / self-tests:** `-checkbvh`, `-bvhstats`, `-checkimplicit`,
-`-checkcurve`, `-checkfur`, `-checkfurgrid`, `-checkfurvol`, `-checkpmgrid`, `-checkcontainer`, `-checklens`, `-checkfluoro`, `-checkfog`,
+`-checkcurve`, `-checkfur`, `-checkfurgrid`, `-checkfurvol`, `-checkcellwalk`, `-checkpmgrid`, `-checkcontainer`, `-checklens`, `-checkfluoro`, `-checkfog`,
 `-checkthinfilm`,
 `-checkmultilayer`, `-thinfilmswatch`, `-checkgrating`, `-checkupsample`,
 `-checkgrid`, `-checkscatter`, `-checkvnoise`, `-checkworley`, `-checkgabor`,
@@ -7195,6 +7195,12 @@ in seven sections: roots on the surface, area-uniform root distribution, determi
 across seeds, growth never pointing into the skin, clumping that collapses tips without
 moving roots, a well-formed segment chain, and a regression on the loader-ordering trap
 that once made a whole groom generate zero strands silently — see **Grooms** above.
+`-checkcellwalk` guards the **lattice walk** every grid march shares (a medium's majorant grid,
+the fur coat's, a fire's emission grid; `cell_walk.h`), in four sections: on random lattices and
+rays (axis-aligned and a hair off an axis among them) the stretches tile the ray's clip to the box
+in order, each in the cell it names; a ray leaving a cell plane a hair off its axis, whose crossing
+rounds to behind the walk, never steps back; a zero or NaN direction and a NaN end each end the walk
+at once; and the fire's t² integral matches a fine midpoint sum.
 `-checkfurgrid` guards the **fiber-density grid** behind `-dual-grid`, in five sections, and
 is unusual in that it validates a mean-field model against the *shipping* curve intersector
 rather than against another closed form: mass conservation (`Σ rℓ` deposited equals `Σ rℓ`

@@ -150,6 +150,7 @@
 #include "version.h"          // ftraceVersion(): the repo-root VERSION string, baked into one tiny TU
 
 #include "scene.h"
+#include "cell_walk.h"         // checkCellWalk
 #include "parallel.h"           // ft::setStopProbe — lets load-time loops see the stop flag
 #include "isomesh.h"            // -export-mesh: isosurface -> watertight OBJ (marching tetrahedra)
 #include "watertight.h"         // -check-watertight: report non-airtight meshes/isosurfaces
@@ -1476,6 +1477,223 @@ static int checkFur(long long strands) {
     }
 
     std::printf("[checkfur] %s\n", fails == 0 ? "ALL PASS" : "FAILURES PRESENT");
+    return fails;
+}
+
+// ---------------------------------------------------------------------------
+// LATTICE WALK self-test  (-checkcellwalk; cell_walk.h)
+// ---------------------------------------------------------------------------
+// Every lattice the renderer marches (a medium's majorant grid, the fur coat's, a fire's
+// emission grid) runs cell_walk.h's one walk on both devices, so a fault in it is a fault in all
+// of them, and the renders that exercise it would only show it as a slightly wrong brightness.
+// Checked directly:
+//   1. random lattices and rays -- origins inside and out, directions random, axis-aligned and
+//      a hair off an axis -- clipped (cellWalkClip) and walked: the stretches tile [ta, tb]
+//      exactly, in order, none empty, each one's middle in the cell it names, and their lengths
+//      sum to tb - ta;
+//   2. an origin a rounding below a cell plane but binned above it, moving down a hair off the
+//      plane (its crossing then rounds to behind the walk): no stretch starts before ta or before
+//      the last one's end;
+//   3. a zero direction hands back one stretch, to a finite end or an infinite one, and a NaN
+//      direction at most one -- each walk capped, so a fault is a failure here, not a hang;
+//   4. cellWalkT2Integral against a fine midpoint sum of the weight times t^2 along the ray;
+//   5. a NaN end hands back none. Last, because a walk that does not stop at one never returns
+//      from cellWalkNext: the self-test then hangs here, after the others have reported.
+static int checkCellWalk() {
+    int fails = 0;
+    Pcg32 rng; rng.seed(0xCE11A1C5u, 0x7A1Cu);
+    // A walk's stretches, at most `cap` of them; false when the walk outlived the cap.
+    struct Span { size_t ci; double a, b; };
+    auto walkAll = [](CellWalk w, int cap, std::vector<Span>& out) {
+        out.clear();
+        size_t ci; double a, b;
+        while ((int)out.size() < cap && cellWalkNext(w, ci, a, b)) out.push_back({ci, a, b});
+        return (int)out.size() < cap;
+    };
+    // 1. tiling and cell membership.
+    {
+        int rays = 0, bad = 0, walked = 0;
+        double worstSum = 0.0;
+        std::vector<Span> sp;
+        for (int trial = 0; trial < 20000; ++trial) {
+            double lo[3], cs[3], ic[3], hi[3], o[3], d[3];
+            int n[3];
+            for (int k = 0; k < 3; ++k) {
+                lo[k] = (rng.uniform() - 0.5) * 20.0;
+                n[k] = 1 + (int)(rng.uniform() * 24.0);
+                cs[k] = 0.01 + rng.uniform() * 0.5;
+                ic[k] = 1.0 / cs[k];
+                hi[k] = lo[k] + n[k] * cs[k];
+                const double u = rng.uniform();
+                o[k] = lo[k] + (u * 1.6 - 0.3) * (hi[k] - lo[k]);
+            }
+            const int kind = trial % 4;   // 0, 1: random; 2: an axis exactly; 3: a hair off one
+            double len = 0.0;
+            for (int k = 0; k < 3; ++k) { d[k] = rng.uniform() * 2.0 - 1.0; len += d[k] * d[k]; }
+            len = std::sqrt(len);
+            for (int k = 0; k < 3; ++k) d[k] /= len;
+            if (kind >= 2) {
+                const int ax = trial / 4 % 3;
+                for (int k = 0; k < 3; ++k) {
+                    const double u = rng.uniform();
+                    d[k] = (k == ax) ? (u < 0.5 ? -1.0 : 1.0) : (kind == 3 ? (u - 0.5) * 1e-9 : 0.0);
+                }
+            }
+            ++rays;
+            CellWalk w;
+            if (!cellWalkClip(w, lo, hi, cs, ic, n, o, d, 0.0, 1e300)) continue;
+            ++walked;
+            const double ta = w.t, tb = w.tEnd;
+            bool ok = walkAll(w, 4 * (n[0] + n[1] + n[2]) + 8, sp) && !sp.empty();
+            double sum = 0.0;
+            const double scale = std::max(1.0, std::fabs(tb));
+            for (size_t k = 0; ok && k < sp.size(); ++k) {
+                const Span& z = sp[k];
+                if (!(z.b > z.a) || z.a < ta || z.b > tb) ok = false;
+                if (k == 0 && z.a != ta) ok = false;
+                if (k > 0 && z.a != sp[k - 1].b) ok = false;
+                sum += z.b - z.a;
+                // The middle of a stretch well clear of its ends lies in its cell.
+                if (z.b - z.a > 1e-9 * scale) {
+                    const double tm = 0.5 * (z.a + z.b);
+                    int c[3];
+                    for (int a2 = 0; a2 < 3; ++a2) {
+                        const int i = (int)std::floor((o[a2] + d[a2] * tm - lo[a2]) * ic[a2]);
+                        c[a2] = std::min(std::max(i, 0), n[a2] - 1);
+                    }
+                    if (z.ci != ((size_t)c[2] * n[1] + c[1]) * n[0] + c[0]) ok = false;
+                }
+            }
+            if (ok && std::fabs(sp.back().b - tb) > 1e-9 * scale) ok = false;
+            if (ok) {
+                const double e = std::fabs(sum - (tb - ta)) / std::max(1e-12, tb - ta);
+                worstSum = std::max(worstSum, e);
+                if (e > 1e-9) ok = false;
+            }
+            if (!ok) ++bad;
+        }
+        const bool pass = bad == 0 && walked > rays / 4;
+        if (!pass) ++fails;
+        std::printf("[checkcellwalk] 1. %d of %d random rays walked: %d whose stretches do not tile "
+                    "[ta, tb] in order in the cells they name; worst |sum - (tb - ta)| %.2e -> %s\n",
+                    walked, rays, bad, worstSum, pass ? "PASS" : "FAIL");
+    }
+    // 2. a crossing that rounds to behind the walk.
+    {
+        const double lo[3] = {0, 0, 0}, cs[3] = {0.1, 0.1, 0.1}, ic[3] = {10, 10, 10}, hi[3] = {1, 1, 1};
+        const int n[3] = {10, 10, 10};
+        int bad = 0, tried = 0;
+        std::vector<Span> sp;
+        for (int j = 1; j < 10; ++j) {
+            // The largest origin below plane j (lo + j cs) that (o - lo) * ic still bins at j: the
+            // walk starts in cell j while the ray lies below it, so moving down, the crossing of
+            // the plane, (lo + j cs - o) / d, is ahead in exact arithmetic but rounds against it.
+            const double plane = lo[0] + j * cs[0];
+            double ox = std::nextafter(plane, 0.0);
+            while ((int)std::floor((ox - lo[0]) * ic[0]) < j && ox < plane) ox = std::nextafter(ox, 1.0);
+            if (!(ox < plane) || (int)std::floor((ox - lo[0]) * ic[0]) != j) continue;
+            for (double dx : {-1e-9, -1e-11}) {
+                const double o[3] = {ox, 0.05, 0.55};
+                const double d[3] = {dx, std::sqrt(1.0 - dx * dx), 0.0};
+                CellWalk w;
+                if (!cellWalkClip(w, lo, hi, cs, ic, n, o, d, 0.0, 1e300)) continue;
+                ++tried;
+                const double ta = w.t;
+                if (!walkAll(w, 100, sp) || sp.empty() || sp[0].a < ta) { ++bad; continue; }
+                for (size_t k = 1; k < sp.size(); ++k)
+                    if (sp[k].a < sp[k - 1].b) { ++bad; break; }
+            }
+        }
+        const bool pass = bad == 0 && tried > 0;
+        if (!pass) ++fails;
+        std::printf("[checkcellwalk] 2. %d rays leaving a cell plane a hair off its axis: %d with a "
+                    "stretch before ta or before the last one's end -> %s\n", tried, bad, pass ? "PASS" : "FAIL");
+    }
+    // 3. degenerate directions and ends.
+    {
+        const double lo[3] = {0, 0, 0}, cs[3] = {0.25, 0.25, 0.25}, ic[3] = {4, 4, 4};
+        const int n[3] = {4, 4, 4};
+        const double o[3] = {0.3, 0.6, 0.9}, zero[3] = {0, 0, 0};
+        const double nan = std::numeric_limits<double>::quiet_NaN(), nd[3] = {nan, 0.0, 1.0};
+        std::vector<Span> sp;
+        CellWalk w;
+        bool ok = true;
+        cellWalkInit(w, lo, cs, ic, n, o, zero, 0.0, 1.0);
+        ok = ok && walkAll(w, 10, sp) && sp.size() == 1 && sp[0].a == 0.0 && sp[0].b == 1.0;
+        cellWalkInit(w, lo, cs, ic, n, o, zero, 0.0, HUGE_VAL);
+        ok = ok && walkAll(w, 10, sp) && sp.size() == 1 && sp[0].b == HUGE_VAL;
+        cellWalkInit(w, lo, cs, ic, n, o, nd, 0.0, 1.0);
+        ok = ok && walkAll(w, 10, sp) && sp.size() <= 1;
+        if (!ok) ++fails;
+        std::printf("[checkcellwalk] 3. a zero direction one stretch (finite and infinite end), a NaN "
+                    "direction at most one -> %s\n", ok ? "PASS" : "FAIL");
+    }
+    // 4. the t^2 integral.
+    {
+        double worst = 0.0;
+        int checked = 0;
+        for (int trial = 0; trial < 40; ++trial) {
+            double lo[3], cs[3], ic[3], hi[3], o[3], d[3];
+            int n[3];
+            for (int k = 0; k < 3; ++k) {
+                lo[k] = rng.uniform() - 0.5;
+                n[k] = 2 + (int)(rng.uniform() * 6.0);
+                cs[k] = 0.1 + 0.2 * rng.uniform();
+                ic[k] = 1.0 / cs[k];
+                hi[k] = lo[k] + n[k] * cs[k];
+            }
+            std::vector<double> wgt((size_t)n[0] * n[1] * n[2]);
+            for (double& x : wgt) {
+                const double u = rng.uniform();
+                x = u < 0.3 ? 0.0 : rng.uniform();
+            }
+            double len = 0.0;
+            for (int k = 0; k < 3; ++k) {
+                o[k] = lo[k] - 1.0 + rng.uniform() * 0.5;   // outside the box, below its corner
+                const double u = rng.uniform();
+                d[k] = (lo[k] + (0.3 + 0.4 * u) * (hi[k] - lo[k])) - o[k];
+                len += d[k] * d[k];
+            }
+            len = std::sqrt(len);
+            for (int k = 0; k < 3; ++k) d[k] /= len;
+            const double got = cellWalkT2Integral(lo, hi, cs, ic, n, wgt.data(), 1.0, o, d);
+            const int NS = 400000;
+            const double tMax = 12.0, h = tMax / NS;
+            double ref = 0.0;
+            for (int k = 0; k < NS; ++k) {
+                const double t = (k + 0.5) * h;
+                int c[3];
+                bool in = true;
+                for (int a2 = 0; a2 < 3; ++a2) {
+                    const double x = o[a2] + d[a2] * t;
+                    if (x < lo[a2] || x >= hi[a2]) { in = false; break; }
+                    c[a2] = std::min((int)((x - lo[a2]) * ic[a2]), n[a2] - 1);
+                }
+                if (in) ref += wgt[((size_t)c[2] * n[1] + c[1]) * n[0] + c[0]] * t * t * h;
+            }
+            if (ref <= 0.0) continue;
+            ++checked;
+            worst = std::max(worst, std::fabs(got - ref) / ref);
+        }
+        const bool pass = checked >= 20 && worst < 2e-3;
+        if (!pass) ++fails;
+        std::printf("[checkcellwalk] 4. the t^2 integral over %d rays: worst |walk - midpoint sum| / sum "
+                    "%.2e -> %s\n", checked, worst, pass ? "PASS" : "FAIL");
+    }
+    // 5. a NaN end.
+    {
+        const double lo[3] = {0, 0, 0}, cs[3] = {0.25, 0.25, 0.25}, ic[3] = {4, 4, 4};
+        const int n[3] = {4, 4, 4};
+        const double o[3] = {0.3, 0.6, 0.9}, d[3] = {0.6, 0.0, 0.8};
+        std::fflush(stdout);
+        std::vector<Span> sp;
+        CellWalk w;
+        cellWalkInit(w, lo, cs, ic, n, o, d, 0.0, std::numeric_limits<double>::quiet_NaN());
+        const bool ok = walkAll(w, 10, sp) && sp.empty();
+        if (!ok) ++fails;
+        std::printf("[checkcellwalk] 5. a NaN end none -> %s\n", ok ? "PASS" : "FAIL");
+    }
+    std::printf("[checkcellwalk] %s\n", fails == 0 ? "ALL PASS" : "FAILURES PRESENT");
     return fails;
 }
 
@@ -23913,6 +24131,7 @@ static int run(int argc, char** argv) {
     bool checkLayeredOnly = false;
     bool checkGgxOnly = false;
     bool checkFurGridOnly = false;
+    bool checkCellWalkOnly = false;
     bool checkPmGridOnly = false;
     bool checkFurVolOnly = false;
     bool checkContainerOnly = false;
@@ -24751,6 +24970,7 @@ static int run(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "-checklayered")) checkLayeredOnly = true;
         else if (!std::strcmp(argv[i], "-checkggx")) checkGgxOnly = true;
         else if (!std::strcmp(argv[i], "-checkfurgrid")) checkFurGridOnly = true;
+        else if (!std::strcmp(argv[i], "-checkcellwalk")) checkCellWalkOnly = true;
         else if (!std::strcmp(argv[i], "-checkpmgrid")) checkPmGridOnly = true;
         else if (!std::strcmp(argv[i], "-checkfurvol")) checkFurVolOnly = true;
         else if (!std::strcmp(argv[i], "-checkcontainer")) checkContainerOnly = true;
@@ -25372,6 +25592,7 @@ static int run(int argc, char** argv) {
     if (checkLayeredOnly)  return layered::check::run() == 0 ? 0 : 1;  // pure math, no scene needed
     if (checkGgxOnly)      return ggx::check::run() == 0 ? 0 : 1;      // pure math, no scene needed
     if (checkFurGridOnly)  return checkFurGrid() == 0 ? 0 : 1;        // deterministic, no scene needed
+    if (checkCellWalkOnly) return checkCellWalk() == 0 ? 0 : 1;       // deterministic, no scene needed
     if (checkPmGridOnly)   return checkPmGrid();   // deterministic, no scene needed
     if (checkFurVolOnly)   return checkFurVol() == 0 ? 0 : 1;         // deterministic, no scene needed
     if (checkContainerOnly) return checkContainer(200'000); // deterministic, no scene needed

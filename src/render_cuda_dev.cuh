@@ -1061,6 +1061,15 @@ __device__ static CellWalk dMajWalk(const DMajorant& g, const DVec3& o, const DV
     return w;
 }
 
+// The ray o + t d, t in [t0, t1], clipped to the box [lo, hi]: false when the overlap is empty or a
+// point (host twin: clipRayBox).
+__device__ static bool dClipRayBox(const DVec3& lo, const DVec3& hi, const DVec3& o, const DVec3& d,
+                                   double t0, double t1, double& ta, double& tb) {
+    const double l[3] = {lo.x, lo.y, lo.z}, h[3] = {hi.x, hi.y, hi.z};
+    const double ox[3] = {o.x, o.y, o.z}, dx[3] = {d.x, d.y, d.z};
+    return rayBoxClip(l, h, ox, dx, t0, t1, ta, tb);
+}
+
 struct DMedium {
     int    enabled;
     int    route;              // Medium::route: -1 untagged, 0 = mode D, 1 = mode J (0.386.0)
@@ -1418,6 +1427,9 @@ struct DEmissiveVolume {
     const double* cellCdf;
     int           nCells;
     double        cellSum;
+    // The grid as the host walks it (EmissiveVolume::cellSize, invCell, pointNorm), its box in
+    // double: dFirePointPdf's lattice is the host's own.
+    double        boxLo[3], boxHi[3], cellSize[3], invCell[3], pointNorm;
     // Its term in the camera's illuminant (host twin Scene::fireG): gW * Planck(kelvin, lambda),
     // gW the fire's power over its Planck curve's integral.
     double        kelvin;
@@ -3252,11 +3264,7 @@ __device__ static bool dMedClip(const DMedium& m, const DVec3& o, const DVec3& d
         if (lo > hi) return false;
         ta = lo; tb = hi; return tb > ta;
     }
-    const double oo[3] = { (double)o.x, (double)o.y, (double)o.z };
-    const double dd[3] = { (double)dir.x, (double)dir.y, (double)dir.z };
-    const double mn[3] = { (double)m.bmin.x, (double)m.bmin.y, (double)m.bmin.z };
-    const double mx[3] = { (double)m.bmax.x, (double)m.bmax.y, (double)m.bmax.z };
-    return rayBoxClip(mn, mx, oo, dd, t0, t1, ta, tb);
+    return dClipRayBox(m.bmin, m.bmax, o, dir, t0, t1, ta, tb);
 }
 
 // ============================ GRIN (gradient-index) marching ==================
@@ -9995,19 +10003,8 @@ __device__ static void dVolCacheMarch(const DScene& sc, const DBeamMap& bm,
         const DVolCache& c = bm.vc[mi];
         if (!c.ready) continue;
         // ray/grid span (the host's VolCache::raySpan)
-        double t0 = 0.0, t1 = (double)tMax;
-        const double oa[3] = {oc.x, oc.y, oc.z}, da[3] = {dc.x, dc.y, dc.z};
-        const double la[3] = {c.lo.x, c.lo.y, c.lo.z}, ha[3] = {c.hi.x, c.hi.y, c.hi.z};
-        bool miss = false;
-        for (int a = 0; a < 3 && !miss; ++a) {
-            if (fabs(da[a]) < 1e-12) { if (oa[a] < la[a] || oa[a] > ha[a]) miss = true; continue; }
-            double ta = (la[a] - oa[a]) / da[a], tb = (ha[a] - oa[a]) / da[a];
-            if (ta > tb) { const double tmp = ta; ta = tb; tb = tmp; }
-            if (ta > t0) t0 = ta;
-            if (tb < t1) t1 = tb;
-            if (t0 >= t1) miss = true;
-        }
-        if (miss || !(t1 > t0)) continue;
+        double t0, t1;
+        if (!dClipRayBox(c.lo, c.hi, oc, dc, 0.0, (double)tMax, t0, t1)) continue;
         const DMedium& md = sc.media[mi];
         const double ss550 = fmax((double)0, (double)specLookup(md.sigma_s, (Real)550));
         if (!(ss550 > 0.0)) continue;
@@ -13264,7 +13261,7 @@ __device__ static bool genPhoton(const DScene& sc, const DCamSet& cs,
         int vi = 0;
         for (; vi + 1 < sc.emissiveVolN; ++vi) { r -= sc.emissiveVolumes[vi].power; if (r <= 0.0) break; }
         if (fireOut) *fireOut = vi;
-        const DEmissiveVolume ev = sc.emissiveVolumes[vi];
+        const DEmissiveVolume& ev = sc.emissiveVolumes[vi];
         const DMedium& fm = sc.media[ev.mediumIndex];
         // Uniform position in the grid AABB; lambda importance-sampled from the volume's
         // Planck-at-emitKelvin CDF. beta = grandTotal*ke/(meanKe*dLam*p(lambda)) so the
@@ -16068,15 +16065,6 @@ struct DGlossyMis {
 // collects (dFireSegment), weighted there as an emitter hit is (dFireSegmentWeight). The reasoning
 // is the host's; these are its device copies, in double where the host is.
 
-// The ray o + t d, t in [t0, t1], clipped to the box [lo, hi]: false when the overlap is empty or a
-// point (host twin: clipRayBox).
-__device__ static bool dClipRayBox(const DVec3& lo, const DVec3& hi, const DVec3& o, const DVec3& d,
-                                   double t0, double t1, double& ta, double& tb) {
-    const double l[3] = {lo.x, lo.y, lo.z}, h[3] = {hi.x, hi.y, hi.z};
-    const double ox[3] = {o.x, o.y, o.z}, dx[3] = {d.x, d.y, d.z};
-    return rayBoxClip(l, h, ox, dx, t0, t1, ta, tb);
-}
-
 // The fire `u` picks in proportion to power (host twin: Scene::pickFire).
 __device__ static int dPickFire(const DScene& sc, double u) {
     int f = 0;
@@ -16147,24 +16135,9 @@ __device__ static DVec3 dFireConeSample(const DEmissiveVolume& v, const DVec3& x
 // The point half: the direction's solid-angle density, the line integral of the point density
 // times t^2 through the grid's cells (host twin: firePointPdf, Amanatides-Woo).
 __device__ static double dFirePointPdf(const DEmissiveVolume& v, const DVec3& x, const DVec3& d) {
-    double t0, t1;
-    if (v.nCells == 0 || !dClipRayBox(v.bmin, v.bmax, x, d, 0.0, 1e300, t0, t1)) return 0.0;
-    const double lo[3] = {v.bmin.x, v.bmin.y, v.bmin.z};
-    const double ext[3] = {(double)v.bmax.x - v.bmin.x, (double)v.bmax.y - v.bmin.y,
-                           (double)v.bmax.z - v.bmin.z};
-    double cs[3], ic[3];
-    for (int a = 0; a < 3; ++a) { cs[a] = ext[a] / v.gres[a]; ic[a] = v.gres[a] / ext[a]; }
-    const double norm = 1.0 / (v.cellSum * (cs[0] * cs[1] * cs[2]));   // point density = cellW * norm
+    if (v.nCells == 0) return 0.0;
     const double xo[3] = {x.x, x.y, x.z}, dd[3] = {d.x, d.y, d.z};
-    CellWalk w;
-    cellWalkInit(w, lo, cs, ic, v.gres, xo, dd, t0, t1);
-    double pdf = 0.0;
-    size_t ci; double a, b;
-    while (cellWalkNext(w, ci, a, b)) {
-        const double cw = v.cellW[ci];
-        if (cw > 0.0) pdf += cw * norm * (b * b * b - a * a * a) / 3.0;
-    }
-    return pdf;
+    return cellWalkT2Integral(v.boxLo, v.boxHi, v.cellSize, v.invCell, v.gres, v.cellW, v.pointNorm, xo, dd);
 }
 
 // The light-sampling direction's density: a quarter cone (it bounds the estimate for a vertex

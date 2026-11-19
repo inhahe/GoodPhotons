@@ -4039,14 +4039,21 @@ was lit differently by every mode (known-issues GLOW-LIGHT-MODES). Now:
   with matching auto-exposure. Scenes authored against the old darkening need their albedo
   re-tuned — `gallery_rain`'s ground went 5 % → 1 % in the same commit.
 - **`cell_walk.h`** — the ray-box slab clip (`rayBoxClip`) and the Amanatides-Woo walk through
-  a regular lattice of cells (`CellWalk`: `cellWalkInit`, then `cellWalkNext` hands back each cell
-  and the stretch of the ray inside it), host-and-device (`FT_UNIT_INLINE`). Every box clip
-  (`clipRayBox`, `dClipRayBox`, `dMedClip`'s box) and every lattice march takes these: the media's
-  majorant grid (`Renderer::majorantWalk`, `dMajWalk`), the fur coat's grid (`FurGrid::march`,
-  `FurVolume::sampleFlight`/`entryDist`) and a fire's emission grid (`firePointPdf` and its device
-  twin), so host and device cut a ray into the same spans. A parallel axis (`|d| < 1e-12`, the
-  clip's test) is never stepped and its next crossing is at infinity, so a degenerate direction
-  ends after one span.
+  a regular lattice of cells (`CellWalk`: `cellWalkClip` clips the ray to the lattice's box and
+  starts it, or `cellWalkInit` over a segment the caller clipped to a region the box bounds; then
+  `cellWalkNext` hands back each cell and the stretch of the ray inside it), host-and-device
+  (`FT_UNIT_INLINE`). Every box clip takes it (`clipRayBox` and `dClipRayBox`: the media's bounds,
+  `dMedClip`, the fires, the fur coat, the volume caches' `raySpan` and `dVolCacheMarch`), and
+  every lattice march: the media's majorant grid (`Renderer::majorantWalk`, `dMajWalk`, their
+  tracking loops iterating it alike), the fur coat's grid (`FurGrid::walk`: its march,
+  `FurVolume::sampleFlight`) and a fire's emission grid (`cellWalkT2Integral`, the line integral
+  of the cell weights times t², which is `firePointPdf` and `dFirePointPdf` at the fire's
+  `pointNorm`; `EmissiveVolume` keeps its cell size, reciprocal and norm, and the device gets the
+  grid in double). A parallel axis (`|d| < 1e-12`, the clip's test) is never stepped and its next
+  crossing is at infinity, so a degenerate direction ends after one stretch; a NaN end ends the
+  walk at once; and a crossing that a nearly parallel axis's rounding puts behind the walk is
+  passed over rather than stepped back to, so the stretches tile the segment in order.
+  `-checkcellwalk` holds all of that.
 - **`geometry.h` / `bvh.h`** — primitives + SAH BVH (split plane by SAH, always
   recurse to LEAF_SIZE, median fallback; front-to-back traversal, ray-slab test
   unrolled; `tEnter` pruning). Triangles use the **Woop watertight** test (JCGT 2013):

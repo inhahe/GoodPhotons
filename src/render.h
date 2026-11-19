@@ -32,6 +32,7 @@
 #include "hair_shade.h" // fiber BCSDF bridge (MatType::Hair, TODO §P3)
 #include "interference.h" // thin-film / multilayer reflectance, clamp01
 #include "ggx.h"      // the glossy lobe (GGX), its sampler and its density
+#include "cell_walk.h" // CellWalk: majorantWalk
 
 struct EnergyReport {
     double emitted = 0, absorbed = 0, sensor = 0, escaped = 0, residual = 0;
@@ -1012,22 +1013,17 @@ struct Renderer {
     // and to the single global majorant sigma_max = sigmaT(lambda) * densityMax when it
     // does not (an unbounded density field).
     //
-    // WALKING THE MAJORANT GRID. The estimators below step the ray cell by cell (cell_walk.h,
-    // the stepping the device's tracking loops take too) and run their per-cell tracking loop
-    // over [tEnter, tExit] with THAT cell's coefficients. They share `majorantWalk`, which calls
-    // `body(cellIndex, t0, t1)` for each cell the segment crosses and stops early when the body
-    // returns false. The walk is in the grid's own AABB, which is the medium bound's AABB, so
-    // `clipToBounds` has already trimmed the segment to it -- but a ray can still start on or
-    // outside a face by an epsilon, which the walk's clamped entry cell absorbs.
-    template <class Body>
-    static void majorantWalk(const MajorantGrid& g, const Vec3& o, const Vec3& dir,
-                             double ta, double tb, Body&& body) {
+    // WALKING THE MAJORANT GRID. The estimators below step the ray cell by cell (cell_walk.h, the
+    // stepping their device twins take, dMajWalk) and run their per-cell tracking loop over
+    // [tEnter, tExit] with THAT cell's coefficients. The walk is in the grid's own AABB, which is
+    // the medium bound's AABB, so `clipToBounds` has already trimmed the segment to it -- but a ray
+    // can still start on or outside a face by an epsilon, which the walk's clamped entry cell
+    // absorbs. This is that walk of o + t dir over [ta, tb].
+    static CellWalk majorantWalk(const MajorantGrid& g, const Vec3& o, const Vec3& dir, double ta, double tb) {
         const int n[3] = {g.nx, g.ny, g.nz};
         CellWalk w;
         cellWalkInit(w, &g.wmin.x, &g.cell.x, &g.invCell.x, n, &o.x, &dir.x, ta, tb);
-        size_t ci; double a, b;
-        while (cellWalkNext(w, ci, a, b))
-            if (!body(ci, a, b)) return;
+        return w;
     }
 
     // Sample the next real collision along (o,dir) within [0,dMax]. Returns true and
@@ -1055,19 +1051,20 @@ struct Renderer {
         }
         if (med.majorant && med.majorant->valid()) {
             const MajorantGrid& g = *med.majorant;
-            bool hit = false;
-            majorantWalk(g, o, dir, ta, tb, [&](size_t ci, double t0, double t1) {
+            CellWalk w = majorantWalk(g, o, dir, ta, tb);
+            size_t ci; double t0, t1;
+            while (cellWalkNext(w, ci, t0, t1)) {
                 double sigMax = stBase * ((double)g.ctrl[ci] + (double)g.res[ci]);
-                if (sigMax <= 0.0) return true;           // vacuum cell: skip, no RNG draw
+                if (sigMax <= 0.0) continue;              // vacuum cell: skip, no RNG draw
                 double t = t0;
                 for (;;) {
                     t += -std::log(1.0 - rng.uniformOpen()) / sigMax;
-                    if (t >= t1) return true;
+                    if (t >= t1) break;
                     double sigT = stBase * med.densityAt(o + dir * t, tabs);
-                    if (rng.uniform() * sigMax < sigT) { tHit = t; hit = true; return false; }
+                    if (rng.uniform() * sigMax < sigT) { tHit = t; return true; }
                 }
-            });
-            return hit;
+            }
+            return false;
         }
         double sigMax = stBase * med.densityMax;
         if (sigMax <= 0.0) return false;
@@ -1109,20 +1106,22 @@ struct Renderer {
         if (med.majorant && med.majorant->valid()) {
             const MajorantGrid& g = *med.majorant;
             double Tr = 1.0;
-            majorantWalk(g, o, dir, ta, tb, [&](size_t ci, double t0, double t1) {
+            CellWalk w = majorantWalk(g, o, dir, ta, tb);
+            size_t ci; double t0, t1;
+            while (cellWalkNext(w, ci, t0, t1)) {
                 const double sigC = stBase * (double)g.ctrl[ci];
                 const double sigR = stBase * (double)g.res[ci];
                 if (sigC > 0.0) Tr *= std::exp(-sigC * (t1 - t0));       // control, analytic
-                if (sigR <= 0.0) return Tr > 0.0;                        // uniform cell: exact
+                if (sigR <= 0.0) { if (Tr > 0.0) continue; break; }      // uniform cell: exact
                 double t = t0;
                 for (;;) {
                     t += -std::log(1.0 - rng.uniformOpen()) / sigR;
-                    if (t >= t1) return true;
+                    if (t >= t1) break;
                     double sigT = stBase * med.densityAt(o + dir * t, tabs);
                     Tr *= 1.0 - (sigT - sigC) / sigR;
-                    if (Tr == 0.0) return false;
+                    if (Tr == 0.0) return 0.0;
                 }
-            });
+            }
             return Tr > 0.0 ? Tr : 0.0;
         }
         double sigMax = stBase * med.densityMax;
@@ -1208,16 +1207,18 @@ struct Renderer {
         // get a negative weight update and a biased (indeed, possibly negative) estimate.
         if (med.majorant && med.majorant->valid()) {
             const MajorantGrid& g = *med.majorant;
-            majorantWalk(g, o, dir, ta, tb, [&](size_t ci, double t0, double t1) {
+            CellWalk w = majorantWalk(g, o, dir, ta, tb);
+            size_t ci; double t0, t1;
+            while (cellWalkNext(w, ci, t0, t1)) {
                 const double cC = (double)g.ctrl[ci], cR = (double)g.res[ci];
                 for (int i = 0; i < K; ++i)                          // control part: analytic
                     if (stB[i] * cC > 0.0) Tr[i] *= std::exp(-stB[i] * cC * (t1 - t0));
                 const double sigR = stMax * cR;                      // residual: bounds all lambdas
-                if (sigR <= 0.0) return true;
+                if (sigR <= 0.0) continue;
                 double t = t0;
                 for (;;) {
                     t += -std::log(1.0 - rng.uniformOpen()) / sigR;
-                    if (t >= t1) return true;
+                    if (t >= t1) break;
                     const double dens = med.densityAt(o + dir * t, tabs);
                     for (int i = 0; i < K; ++i) {
                         const double sigT = stB[i] * dens, sigC = stB[i] * cC;
@@ -1225,7 +1226,7 @@ struct Renderer {
                         if (Tr[i] < 0.0) Tr[i] = 0.0;
                     }
                 }
-            });
+            }
             return;
         }
         const double sigMax = stMax * med.densityMax;                // global majorant over all lambdas

@@ -201,6 +201,55 @@ to 0.25 renders as a 150 nm one within 2e-3, 1.0e-3 measured (its body's escape 
 on 0.450.1 it rendered as the unmapped 600 nm, 1.9 off), the `thinfilm` control byte for byte, and
 the three misspellings stop the load (on 0.450.1 they loaded).
 
+## DONE (2026-11-19, 0.450.20): REVIEW-0450I — what the Opus (max) and Fable (xhigh) reviews of SLAB-DDA-COPIES found
+
+`/code-review max` (Opus, 8 findings) and `/code-review xhigh` (Fable, 13) of 026f410..4697faa
+(`cell_walk.h`), one after the other in the review worktree; six found by both. Neither found a
+correctness regression in the clip or the walk. Each checked against the code. **Fixed in
+0.450.20:**
+
+* **Two slab clips left out** (both): `VolCache::raySpan` and its device twin in `dVolCacheMarch`,
+  dividing where the rest multiply by the reciprocal. Both take the shared clip now
+  (`rayBoxClip`, `dClipRayBox`), and the closed entry's count (it said five and listed six) is
+  eight.
+* **A NaN end never ends the walk** (both): `w.t >= w.tEnd` is never true for one, and leaving
+  the lattice set `w.t` to it again, so `cellWalkNext` spun -- on the device a hung kernel. No
+  caller reached it (every clip refuses a NaN end), but the fur's step guard had covered it. The
+  exit is `!(w.t < w.tEnd)`.
+* **A stretch could start behind the last** (Fable): an axis a hair off parallel puts its next
+  crossing, computed from the cell the start point bins into, a rounding behind the walk (about
+  ulp / |d|, 1e-4 near |d| = 1e-12), and the walk stepped back to it -- a free flight could land
+  before the segment and a sliver counted twice. Inherited from the old majorant and fur walks.
+  The walk passes such a crossing over instead.
+* **No direct test of the walk** (Fable): `-checkcellwalk` (new) -- random lattices and rays tile
+  their clip in order in the cells they name, a ray leaving a cell plane a hair off its axis never
+  steps back, degenerate directions and a NaN end end the walk, and the fire's t^2 integral
+  matches a midpoint sum. Its section 2 fails on 8 of 8 rays with the step-back put back, and
+  section 5 hangs with the old exit test.
+* **The walk's precondition held by hand** (both): `cellWalkClip` clips the ray to the lattice's
+  box and starts the walk in one call; the fur (`FurGrid::walk`) and the fire take it, so their
+  segment is the clip by construction. The majorant walk keeps `cellWalkInit`, its segment being
+  the medium bound's clip, which the lattice's box bounds.
+* **The fire pdf's integral written twice** (both): `cellWalkT2Integral` holds it for
+  `firePointPdf` and `dFirePointPdf`, and `EmissiveVolume` keeps the cell size, its reciprocal and
+  the norm (seven double divisions a GPU evaluation fewer), the device getting the grid and its
+  box in double, so its lattice is the host's.
+* **`majorantWalk`'s callback** (both): the host's three tracking loops iterate the walk directly,
+  as their device twins do; `majorantWalk` returns it, as `dMajWalk` does.
+* **`dMedClip` repeated `dClipRayBox`** (both): it calls it.
+* **"The same spans"** (both): under FTRACE_GPU_FP32 the device's lattices and rays are float, so
+  host and device share the stepping, not the spans; the comments say so.
+* **Indirect includes** (Opus): fur_grid.h, fur_volume.h, render.h, backward.h, volcache.h and
+  main.cpp include cell_walk.h themselves. **Two needless macros** (Fable): `CW_FABS`/`CW_FLOOR`
+  go (plain `fabs`/`floor` resolve in both passes, as curvature.h's `sqrt` does).
+* **VERSION** (Fable): the edge inputs above changed with 4697faa, unbumped; 0.450.20 is bumped.
+
+**Not changed:** the fur's clip now taking a ray that only touches the coat's box as a miss
+(both) -- `entryDist` -1 and no march where it had returned the touch distance. That is the clip's
+meaning everywhere else, the ray crosses no fiber there, and its measure is zero. A debug assert of
+the precondition in `cellWalkInit` (Fable) -- `cellWalkClip` makes it hold by construction where
+the lattice is the box, and the majorant walk's segment is clipped to the region the box bounds.
+
 ## DONE (2026-11-19, 0.450.18): REVIEW-0450H — what the Opus (max) and Fable (xhigh) reviews of 0.450.17 found
 
 `/code-review max` (Opus, 14 findings, none high) and `/code-review xhigh` (Fable, 15) of
@@ -7037,10 +7086,12 @@ measured how much of a fire scene's render time this is.
 
 ## DONE (2026-11-19, no render change): SLAB-DDA-COPIES — the box clip and the grid walk were written out several times
 
-The ray-box slab clip existed five times -- `clipRayBox` (`geometry.h`), its device twin
-`dClipRayBox`, `dMedClip`'s box branch, and the fur code's `FurVolume::entryDist`,
+The ray-box slab clip existed eight times -- `clipRayBox` (`geometry.h`), its device twin
+`dClipRayBox`, `dMedClip`'s box branch, the fur code's `FurVolume::entryDist`,
 `FurVolume::sampleFlight` and `FurGrid::march` (those three at a 1e-15 parallel-axis epsilon where
-the others had 1e-12) -- and the Amanatides-Woo cell walk six times: `Renderer::majorantWalk` and
+the others had 1e-12), and the volume caches' `VolCache::raySpan` and its device twin in
+`dVolCacheMarch` (dividing where the others multiply by the reciprocal; folded in 0.450.20, as
+both reviews found them, REVIEW-0450I) -- and the Amanatides-Woo cell walk six times: `Renderer::majorantWalk` and
 the device's `DMajWalk`, `firePointPdf` and its device twin, `sampleFlight` and the march (the fur
 two with a 1e-9 entry nudge and a step guard, the fire two computing each plane crossing from the
 entry point rather than the origin). **Fixed:** one host-and-device header, `cell_walk.h`:

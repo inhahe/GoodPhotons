@@ -654,8 +654,10 @@ Then the rest of 4.2-4.6 in their order, 4.7's bookkeeping alongside whatever to
   between two builds of one source); dropped: repeatable builds, R/D/U 12-24 % faster.
 - [ ] **J-NOSPLIT** — mode J renders 16 % slower without `--split-compile`: find the kernel that lost
   it (now measurable) and pin its inlining or cap; known-issues.
+- [x] **REVIEW-0450I** (0.450.20) — the Opus (max) and Fable (xhigh) reviews of SLAB-DDA-COPIES: the
+  volume caches' clips, a NaN-safe and monotone walk, `-checkcellwalk`, one fire pdf integral; known-issues.
 - [x] **SLAB-DDA-COPIES** — the box clip and the grid walk were written out several times: one
-  `cell_walk.h` for host and device (five clips, six walks), renders byte-identical.
+  `cell_walk.h` for host and device (eight clips, six walks), renders byte-identical.
 - [x] **GMIS-NULL-BY-HAND** (0.450.15) — one pass-through restore a walk: the scalar walks' interaction
   functions, one `passedThrough` per hero loop (the device's three sites folded), each mode-M walk's
   coverage test; the clear-on-real-vertex inversion declined (known-issues).

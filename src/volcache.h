@@ -73,6 +73,7 @@
 #include <cstdlib>
 #include <cstdio>
 #include "linalg.h"
+#include "cell_walk.h"    // rayBoxClip: raySpan
 #include "photonbeams.h"
 
 // COMMAND-LINE CONFIGURATION (0.315.0). `-volcache [res]` sets `res` and `split`, `-volcache-sh`
@@ -320,22 +321,7 @@ struct VolCache {
     // which is strictly better sampling for the same cost.
     bool raySpan(const Vec3& o, const Vec3& d, double tLo, double tHi,
                  double& t0, double& t1) const {
-        if (!ready) return false;
-        t0 = tLo; t1 = tHi;
-        const double oa[3] = {o.x, o.y, o.z}, da[3] = {d.x, d.y, d.z};
-        const double la[3] = {lo.x, lo.y, lo.z}, ha[3] = {hi.x, hi.y, hi.z};
-        for (int a = 0; a < 3; ++a) {
-            if (std::fabs(da[a]) < 1e-12) {
-                if (oa[a] < la[a] || oa[a] > ha[a]) return false;
-                continue;
-            }
-            double ta = (la[a] - oa[a]) / da[a], tb = (ha[a] - oa[a]) / da[a];
-            if (ta > tb) { const double tmp = ta; ta = tb; tb = tmp; }
-            if (ta > t0) t0 = ta;
-            if (tb < t1) t1 = tb;
-            if (t0 >= t1) return false;
-        }
-        return t1 > t0;
+        return ready && rayBoxClip(&lo.x, &hi.x, &o.x, &d.x, tLo, tHi, t0, t1);
     }
 
     // In-scattered radiance toward `wOut`, WITHOUT sigma_s (the caller applies it with the

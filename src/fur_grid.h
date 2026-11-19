@@ -67,6 +67,7 @@
 
 #include "linalg.h"
 #include "curve.h"
+#include "cell_walk.h"   // CellWalk: walk, march
 
 // ---------------------------------------------------------------------------------------
 // Octahedral direction + coherence in one word: 12 bits per octahedral coordinate (about
@@ -325,13 +326,12 @@ struct FurGrid {
         return fc ? sigmaT(*fc, d) : 0.0;
     }
 
-    // The walk of `o + t*d`, t in [t0, t1] -- the ray's clip to the box [lo, hi] -- through the
-    // cells (cell_walk.h): what the march and FurVolume::sampleFlight step through.
-    CellWalk walk(const Vec3& o, const Vec3& d, double t0, double t1) const {
+    // The walk of `o + t*d`, t in [0, maxDist], through the cells (cell_walk.h, cellWalkClip):
+    // false when the ray misses the box [lo, hi]. What the march and FurVolume::sampleFlight step
+    // through.
+    bool walk(const Vec3& o, const Vec3& d, double maxDist, CellWalk& w) const {
         const int n[3] = {nx, ny, nz};
-        CellWalk w;
-        cellWalkInit(w, &lo.x, &cell.x, &invCell.x, n, &o.x, &d.x, t0, t1);
-        return w;
+        return cellWalkClip(w, &lo.x, &hi.x, &cell.x, &invCell.x, n, &o.x, &d.x, 0.0, maxDist);
     }
 
     // -----------------------------------------------------------------------------------
@@ -347,10 +347,9 @@ struct FurGrid {
     // sampling noise.  That identity is what lets this replace `Scene::walkFibers`.
     FurMarch march(const Vec3& o, const Vec3& dir, double maxDist) const {
         FurMarch m;
-        double t0, t1;
-        if (!valid || !(maxDist > 0.0) || !clipRayBox(lo, hi, o, dir, 0.0, maxDist, t0, t1)) return m;
+        CellWalk w;
+        if (!valid || !(maxDist > 0.0) || !walk(o, dir, maxDist, w)) return m;
         m.hit = true;
-        CellWalk w = walk(o, dir, t0, t1);
         double bestMat = 0.0;   // depth of the leading material, as a winner-take-all margin
         double s2Acc = 0.0;
         size_t ci; double a, b;

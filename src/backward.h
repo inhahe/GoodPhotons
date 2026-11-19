@@ -51,6 +51,7 @@
 #include "grin.h"     // shared gradient-index (GRIN) Eikonal marcher
 #include "hero.h"     // hero-wavelength spectral sampling (kHeroC)
 #include "fur_volume.h"   // -fur-volume: the aggregate far-tier fur medium
+#include "cell_walk.h"    // cellWalkT2Integral: firePointPdf
 #include "radcache.h" // -radcache: biased early termination into a world-space irradiance cache
 #include "bsdf_eval.h" // bdpt::bsdfF / bsdfPdf — the evaluable BSDF, for glossy NEE
 #include "parallel.h"  // ft::stopRequested, for abandonOnStop
@@ -2134,21 +2135,8 @@ struct BackwardRenderer {
     // exactly by stepping through the grid's cells (Amanatides-Woo).
     static double firePointPdf(const Scene::EmissiveVolume& v, const Vec3& x, const Vec3& d) {
         if (v.cellCdf.empty()) throw std::logic_error("firePointPdf before buildFireCells");
-        double t0, t1;
-        if (!clipRayBox(v.bmin, v.bmax, x, d, 0.0, 1e300, t0, t1)) return 0.0;
-        const Vec3 ext = v.bmax - v.bmin;
-        double cs[3], ic[3];
-        for (int a = 0; a < 3; ++a) { cs[a] = (&ext.x)[a] / v.gres[a]; ic[a] = v.gres[a] / (&ext.x)[a]; }
-        const double norm = 1.0 / (v.cellSum * (cs[0] * cs[1] * cs[2]));   // point density = cellW * norm
-        CellWalk w;
-        cellWalkInit(w, &v.bmin.x, cs, ic, v.gres, &x.x, &d.x, t0, t1);
-        double pdf = 0.0;
-        size_t ci; double a, b;
-        while (cellWalkNext(w, ci, a, b)) {
-            const double cw = v.cellW[ci];
-            if (cw > 0.0) pdf += cw * norm * (b * b * b - a * a * a) / 3.0;
-        }
-        return pdf;
+        return cellWalkT2Integral(&v.bmin.x, &v.bmax.x, v.cellSize, v.invCell, v.gres, v.cellW.data(),
+                                  v.pointNorm, &x.x, &d.x);
     }
     // The density of fireNee's direction for fire `v` from `x`: the defensive mixture of the cone
     // (kFireCone of the draws; it bounds the estimate for a vertex inside the fire, where point
