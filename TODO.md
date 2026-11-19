@@ -625,8 +625,9 @@ Then the rest of 4.2-4.6 in their order, 4.7's bookkeeping alongside whatever to
 - [ ] **GMIS-NULL-BY-HAND** — every caller keeps the glossy MIS record across a pass-through by hand.
 - [ ] **GROOM-SILENT-OOM** — the groom tool can exit without a word when memory is short.
 - [ ] **GROOM-DRAG-UNTESTED** — the groom tool's drags have no automated test.
-- [ ] **"mode `U` (VCM) still uses a dense cell grid with the same `(int)(nCells + 1)` overflow"** —
-  check what 0.381.7's cell cap left of it.
+- [x] **"mode `U` (VCM) still uses a dense cell grid with the same `(int)(nCells + 1)` overflow"**
+  (0.450.12) — the device capped since 0.381.7; the host's VcmGrid takes the same cap now (a fine
+  radius over a large box had CPU mode U exit 1 silently); tools/check_vcm_grid_cap.py.
 - [ ] **"The 12 render modes are 5 estimators wearing 12 letters"** — thin aliases over five entry
   points, and close the U/J gap that costs image quality.
 - [ ] **"Checked-in scenes cite ~22 derivation scripts that live in gitignored `scraps/`"** — a fresh

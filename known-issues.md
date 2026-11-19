@@ -22363,7 +22363,18 @@ photons and all derived structures are rebuilt.
 **Still open:** removing the floor is necessary but not sufficient — see the caustic-map entry
 above.
 
-### TECH DEBT: mode `U` (VCM) still uses a dense cell grid with the same `(int)(nCells + 1)` overflow
+### DONE (2026-11-18, 0.450.12): mode `U` (VCM) still used a dense cell grid with the same `(int)(nCells + 1)` overflow
+
+> **Checked against the code.** The device's grid was capped by 0.381.7 (`kVcmMaxCells`, 64 M cells:
+> past it the cells grow, a merge testing distance against the radius) and indexes its cells in
+> `long long` (DGridCell) -- no wrap left there. The HOST's twin (`vcm.h` `VcmGrid::build`) had
+> neither: at a fine radius over a large box its cell count overflowed even `long long` (10 m at a
+> micrometre is 10^21 cells), and CPU mode U exited 1 without a word. It takes the device's rule
+> now (the same cap, the cells grown past it, each dimension clamped before its int).
+> `tools/check_vcm_grid_cap.py`: mode U at `-pmradius 1e-6` over a 10 m box finishes, finite, its
+> mean within 5 % of the scene's own radius's, on both devices; on 0.450.11 the CPU case fails. The
+> hashed grid this entry proposed is not needed: the cap keeps the dense lattice within 256 MB.
+
 
 `DVcmGrid` / `kVcmCellKey` in `src/render_cuda.cu` compute `(long long)gnx*gny*gnz` and then cast
 `(int)(nCells + 1)`, which is exactly the wrap that the SPPM path had before 0.199.6, and the same
