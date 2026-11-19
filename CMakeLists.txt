@@ -68,10 +68,9 @@ add_executable(ftrace
     src/third_party/imnodes/imnodes.cpp
 )
 target_include_directories(ftrace PRIVATE src src/gpda src/third_party/imgui src/third_party/implot src/third_party/imnodes)
-# The version string lives in ONE tiny translation unit. It used to be a target-wide
-# definition, which made every VERSION bump -- and this project bumps on every observable
-# change -- dirty all twenty-odd TUs including the 18k-line render_cuda.cu: a full rebuild
-# for a one-line change. Now a bump recompiles version.cpp and relinks.
+# The version string lives in ONE tiny translation unit, so a VERSION bump -- this project
+# bumps on every observable change -- recompiles version.cpp and relinks, where a target-wide
+# definition would dirty every TU, the CUDA ones included.
 target_sources(ftrace PRIVATE src/version.cpp)
 # The process code page is UTF-8 (src/ftrace.manifest), so any path can be named on the command
 # line and in a scene. MSVC's linker merges a .manifest source into the embedded manifest.
@@ -187,8 +186,8 @@ if(CMAKE_CUDA_COMPILER)
     # difference between "an OOB happened somewhere" and "OOB at render_cuda.cu:1234".
     target_compile_options(ftrace PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo>)
     # nvcc's optimiser (cicc) and assembler (ptxas) are single-threaded per translation unit,
-    # and render_cuda.cu is one 18k-line TU. --split-compile partitions its device code so
-    # those phases use every core. Measured 2026-09-06 (i7-8700K, ~3 cores of other load):
+    # and render_cuda.cu holds most of the device code's kernels in one. --split-compile
+    # partitions its device code so those phases use every core. Measured 2026-09-06 (i7-8700K, ~3 cores of other load):
     # ptxas 52.6 s -> 21.1 s, cicc 64.3 s -> 43.2 s, the whole TU 2:49 -> 1:50. NVIDIA
     # documents "minimal (if any)" effect on the generated code; checked here by an A/B of
     # render speed on the same scenes (design.md, Build & release).
