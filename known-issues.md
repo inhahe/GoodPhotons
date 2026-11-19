@@ -201,6 +201,53 @@ to 0.25 renders as a 150 nm one within 2e-3, 1.0e-3 measured (its body's escape 
 on 0.450.1 it rendered as the unmapped 600 nm, 1.9 off), the `thinfilm` control byte for byte, and
 the three misspellings stop the load (on 0.450.1 they loaded).
 
+## DONE (2026-11-19, 0.450.25): REVIEW-0450K — what the Opus (max) and Fable (xhigh) reviews of 0.450.22-0.450.24 found
+
+`/code-review max` (Opus, 12 findings) and `/code-review xhigh` (Fable, 11) of d05c0f0..ef166cf,
+one after the other in the review worktree; eight found by both. Neither found a high-severity
+regression. Each finding was checked against the code. **Fixed in 0.450.25:**
+
+* **Mode U's session overran its budget** (both): the store's per-subpath share (`perPath`, the
+  budget's divisor and the printed store size) counted a cell key and an order index a vertex,
+  not the bucket table (two ints a vertex, allocated beside them since 0.450.23) nor the tags
+  (0.450.24) -- about 3 % over. It counts all the loop allocates now, per subpath too.
+* **SurfMap's accounting left the tags out** (both): `heapBytes`, `usedBytes`, `shrinkToFit` and
+  `radiusOnly` take `tag` too, so mode J's epoch cache budgets it and frees it.
+* **The device site count read every tag** (both): mode U's camera kernel asks only whether a site
+  holds any light vertex and whether more than the queue's inline bound; `DVcmSite::count` stops
+  there.
+* **`mergeBin` copied its table to scatter through it** (both): a second table-sized vector, 1 GB
+  at 129 M photons, twice a `buildAuto`, outside ftalloc. The table is its own cursor now (bucket b
+  counted at b + 2, so the scatter leaves every start in place), and the key scratch is named to an
+  out-of-memory report.
+* **The host walk's callback** (Fable): `mergeNeighbourKeys` puts a query's 27 keys in the caller's
+  array, and `queryR`, `countR` and `adaptiveRadius` scan them in plain loops over their own
+  locals, without a lambda's captures to copy. `mergeForEachBucket`, `mergeBucket` and
+  PhotonMap's `cellIndex` and `cellCoord` are gone (-checkpmgrid used the last three alone).
+* **`tools/time_merge.py`** (both): the builds' order alternates by round, so a second run's gain
+  or loss falls on both; its skip message names the right fix.
+* **Stale text** (both): the device builds named as `kSppmCellKey` / `kVcmCellKey` (design.md,
+  photonmap.h, render_cuda_dev2.cuh), the J surface map said to be uploaded as it stands where the
+  device bins its own, JSurfDev's "six" buffers, REFERENCE.md's loaded-machine sparse-box figure,
+  and MERGE-HASH-TIMING's "eight block mixes a site", which the host's walk takes and the device's
+  does not (below).
+
+**Not changed:** the device's tag filter in each caller's body rather than in `dSiteListWalk`
+(Opus): moved there, with every sum the same to the byte, GPU mode U on `_merge_glossy_bowl` took
+19.8 s for 16.5 s -- nvcc compiles `dVcmMergeSum` far worse with the test in the walk (its own
+registers 129 -> 130, the merge kernel's stack 8 B more; the time measured three ways, the count's
+change and the walk's taken back one at a time); the walk's comment now says the test is the
+body's own and why. The device's walk mixing a cell at a time (both): a lane advances through the
+cells by a runtime index, so a table of eight mixes would live in local memory, and a mix is ten
+integer operations beside a merge's lobe; the text now says what each device does. `kMergeTag`
+recomputing a key after the sort (Opus): one launch and a read a point, under 0.1 % of a mode-U
+pass. C4141 for `inline __forceinline` (Opus, unconfirmed there): the build shows none. A
+host-binned map uploaded with float positions (Fable): a point lost that way must lie within a
+float rounding of a cell plane and of the radius from the site, a share near 1e-7 of a disc's rim,
+below the float gather's own error. Mode M's radius probe hanging on the table (Opus): logged as
+PM-PROBE-GEOMETRY. PM-BUILD-PARALLEL and MIRROR-BASE-GPU left open (Fable): MIRROR-BASE-GPU was
+the check's (8851601); PM-BUILD-PARALLEL and PM-PROBE-GEOMETRY are done next.
+
 ## DONE (2026-11-19, 0.450.24): MERGE-HASH-TIMING — the hashed merge lattice timed against the dense one, and what the timing found
 
 Paired on an idle machine (`tools/time_merge.py`, new, five rounds a case, the medians): the dense
@@ -252,8 +299,8 @@ and GPU mode M there took 5-9 % longer than the dense build until the key was fo
   bench, a kernel-weighted sum a match).
 
 So mode M's map at 20 M photons on the CPU is back to 10.5 s, the dense build's 10.4 s. Left as
-measured: GPU mode U on the bowl, 1.3 % over the dense lattice, the hashed walk's cost (eight block
-mixes a site, a tag byte an entry) where the sparse box gains 5.5x on the CPU. Most of a large
+measured: GPU mode U on the bowl, 1.3 % over the dense lattice, the hashed walk's cost (a mix a
+cell on the device, a tag byte an entry) where the sparse box gains 5.5x on the CPU. Most of a large
 photon map's build is still on one thread: PM-BUILD-PARALLEL (TODO).
 
 **Verified:** `-checkpmgrid` has a test of the tags: the points binned with them and walked as
@@ -286,8 +333,11 @@ GPU-MERGE-FLOAT-LATTICE). **Fixed in 0.450.23:**
   out-of-memory report -- VcmGrid's and SurfMap's had lost ftalloc's naming, Fable) and 27-bucket
   walk (`mergeForEachBucket`); the device's three key kernels are one template (`kMergeKey`) and its
   three bin sequences one function (`mergeBinDevice`).
-* **27 hash mixes a site** (both): the walk hashes each of the at most eight blocks a site's cells
-  lie in once, and the mix (`mergeSlot`) is 32-bit -- a GPU multiplies 64-bit integers in software.
+* **27 hash mixes a site** (both): the host's walk (`mergeForEachBucket`) hashes each of the at
+  most eight blocks a site's cells lie in once; the device's (`DGridCell`) still mixes a cell at a
+  time -- a lane advances through the cells by a runtime index, which an eight-entry table of mixes
+  would put in local memory -- and the mix (`mergeSlot`) is 32-bit on both, as a GPU multiplies
+  64-bit integers in software.
 * **Mode U's bucket table could stop a render mid-session** (both): it grew per pass through the
   fatal `ensureDevCap`, outside the session's budget; it is allocated at session start beside the
   cell keys, at the most a pass can need, so a shortage there halves the light subpaths instead.

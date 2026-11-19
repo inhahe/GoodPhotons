@@ -28,7 +28,7 @@
 #include <thread>
 #include "linalg.h"
 #include "gatherplane.h"   // onGatherSurfaceSided: which photons a gather keeps
-#include "merge_grid.h"    // mergeBucket: the hashed lattice
+#include "merge_grid.h"    // mergeLatticeKey: the hashed lattice
 #include "color.h"
 #include "allocreport.h"   // OOM that names the buffer, its size and the flag that sizes it
 #include "workcount.h"    // tlWork: a query's candidates, for the CPU refresh (MODEM-CPU-NONDET)
@@ -97,9 +97,9 @@ struct PhotonBank {
     }
 };
 
-// The photon map's lattice is the merge maps' hashed one (merge_grid.h, mergeBucket), shared with
-// the device's gathers (dPmNeighborhood, kSppmCellKey), which must find each photon in the bucket
-// the host's counting sort put it in.
+// The photon map's lattice is the merge maps' hashed one (merge_grid.h, mergeLatticeKey), shared with
+// the device's gathers (dPmNeighborhood) and its SPPM build (mergeBinDevice), which must find each
+// photon in the bucket the host's counting sort put it in.
 //
 // WHY THE GRID IS HASHED AND NOT DENSE. A dense grid indexes cells as (iz*ny+iy)*nx+ix and
 // therefore has to ALLOCATE nx*ny*nz ints, which grows as (L/r)^3 in the scene size L over the
@@ -166,21 +166,6 @@ struct PhotonMap {
     std::vector<int> cellStart;
 
     long long bucketCount() const { return (long long)mergeBucketCount(lat.slots); }
-
-    // Bucket for an integer cell coordinate.
-    unsigned int cellIndex(int ix, int iy, int iz) const {
-        return mergeBucket(ix, iy, iz, lat.slots);
-    }
-    // Integer cell coordinate of a world point. NOT clamped to the bbox: with a hashed
-    // lattice there is no "outside the array" to defend against, and clamping was actively
-    // slightly wrong — a query point just beyond the bbox got folded onto the edge cell, so
-    // its 3x3x3 neighbourhood lost the far row. Unclamped, the neighbourhood straddles the
-    // boundary correctly and the extra cells are simply empty.
-    void cellCoord(const Vec3& p, int& ix, int& iy, int& iz) const {
-        ix = mergeCellCoord(p.x, lat.lo[0], lat.invCell);
-        iy = mergeCellCoord(p.y, lat.lo[1], lat.invCell);
-        iz = mergeCellCoord(p.z, lat.lo[2], lat.invCell);
-    }
 
     // Bin the deposited photons into a uniform grid of cell size `r` (== gather radius,
     // so a radius-r query touches only the 3x3x3 neighbourhood) via a counting sort,
@@ -390,7 +375,7 @@ struct PhotonMap {
         // guard was the binding constraint on every large scene — on gallery_rain it inflated
         // a requested 0.031 m to 0.094 m, three times too coarse to resolve a caustic — and it
         // bound hardest exactly where a fine radius was most wanted. The hashed lattice
-        // (mergeBucket) sizes the table from the PHOTON COUNT instead, so r is now free to be
+        // (merge_grid.h) sizes the table from the PHOTON COUNT instead, so r is now free to be
         // whatever the measured density asks for and the only limit left is the deliberate
         // two-octave clamp above.
         if (std::abs(r1 / r0 - 1.0) > 0.05) buildGrid(r1);   // else keep the probe binning
@@ -420,51 +405,51 @@ struct PhotonMap {
         // rejects it on distance, below).
         // The reject scan reads ONLY pos[] (see the layout note on PhotonMap): ~85% of the
         // candidates in this 3x3x3 box fail the test, and for those the fat payload record is
-        // never touched at all. What the scan reads is copied into the body's own locals, and a
-        // bucket's candidates counted at once: the callback stores into its captures each match (a
-        // gather's sums), and a store the compiler cannot place would have it reload every value
-        // read through this lambda's captures (5 % of a gather's walk).
+        // never touched at all. The scan reads locals alone (the query point copied in, not read
+        // through `p`): the callback stores into its captures each match (a gather's sums), and a
+        // store the compiler cannot place would have it reload anything read through a reference
+        // (5 % of a gather's walk).
+        const Vec3 q = p;
         const Vec3* __restrict pp = pos.data();
         const Photon* ph = photons.data();
         const int* cs = cellStart.data();
-        mergeForEachBucket(lat, p.x, p.y, p.z, [&](unsigned int c, unsigned char) {
-            const Vec3 q = p;
-            const double rr = r2;
-            const Vec3* __restrict P = pp;
-            const Photon* H = ph;
-            const int b = cs[c], e = cs[c + 1];
+        MergeKey keys[27];
+        mergeNeighbourKeys(lat, q.x, q.y, q.z, keys);
+        for (const MergeKey& c : keys) {
+            const int b = cs[c.bucket], e = cs[c.bucket + 1];
             cand += e - b;
             for (int k = b; k < e; ++k) {
-                const Vec3 d = q - P[k];
+                const Vec3 d = q - pp[k];
                 const double d2 = dot(d, d);
-                if (d2 <= rr) fn(H[k], d2, k);
+                if (d2 <= r2) fn(ph[k], d2, k);
             }
-        });
+        }
         bdpt::tlCandidates() += cand;
     }
 
     // The number of photons within `r` of p -- what a queryR counting in its callback finds, and
-    // the candidates it adds to the CPU refresh's tally -- the count kept in a local a bucket. A
-    // count through a callback's capture is a store to one memory word a match, each waiting on the
-    // last: on a dense probe (medianNeighborCount, tens of thousands of matches a query) that chain
-    // took four times the walk's own cost.
+    // the candidates it adds to the CPU refresh's tally -- counted in a local. A count through a
+    // callback's capture is a store to one memory word a match, each waiting on the last: on a dense
+    // probe (medianNeighborCount, tens of thousands of matches a query) that chain took four times
+    // the walk's own cost.
     int countR(const Vec3& p, double r) const {
         if (photons.empty()) return 0;
         const double r2 = r * r;
-        long long cand = 0;
-        int n = 0;
+        const Vec3 q = p;
         const Vec3* __restrict pp = pos.data();
         const int* cs = cellStart.data();
-        mergeForEachBucket(lat, p.x, p.y, p.z, [&](unsigned int c, unsigned char) {
-            const int b = cs[c], e = cs[c + 1];
-            int got = 0;
-            for (int k = b; k < e; ++k) {
-                const Vec3 d = p - pp[k];
-                if (dot(d, d) <= r2) ++got;
-            }
+        MergeKey keys[27];
+        mergeNeighbourKeys(lat, q.x, q.y, q.z, keys);
+        long long cand = 0;
+        int n = 0;
+        for (const MergeKey& c : keys) {
+            const int b = cs[c.bucket], e = cs[c.bucket + 1];
             cand += e - b;
-            n += got;
-        });
+            for (int k = b; k < e; ++k) {
+                const Vec3 d = q - pp[k];
+                if (dot(d, d) <= r2) ++n;
+            }
+        }
         bdpt::tlCandidates() += cand;
         return n;
     }
@@ -517,35 +502,32 @@ struct PhotonMap {
         const double r2 = radius * radius;
         const double invR2 = 1.0 / r2;
         long long cand = 0;   // the candidates tested, as queryR counts them
+        // The scan reads locals alone, as queryR's does: each match stores into hist.
+        const Vec3 q = p, nq = n;
         const Vec3* __restrict pp = pos.data();
         const Photon* ph = photons.data();
         const int* cs = cellStart.data();
-        mergeForEachBucket(lat, p.x, p.y, p.z, [&](unsigned int c, unsigned char) {
-            // The scan's reads in the body's own locals, as queryR keeps them: each match stores
-            // into hist.
-            const Vec3 q = p, nq = n;
-            const double rr = r2, inv = invR2, sl = slack;
-            const bool two = twoSided;
-            const Vec3* __restrict P = pp;
-            const Photon* H = ph;
-            const int b = cs[c], e = cs[c + 1];
+        MergeKey keys[27];
+        mergeNeighbourKeys(lat, q.x, q.y, q.z, keys);
+        for (const MergeKey& c : keys) {
+            const int b = cs[c.bucket], e = cs[c.bucket + 1];
             cand += e - b;
             for (int k = b; k < e; ++k) {
-                Vec3 d = q - P[k];
+                Vec3 d = q - pp[k];
                 const double d2 = dot(d, d);
-                if (d2 > rr) continue;
+                if (d2 > r2) continue;
                 bool farSide;
-                if (!onGatherSurfaceSided(q, nq, P[k], H[k].n, d2, sl, two, farSide)) continue;
+                if (!onGatherSurfaceSided(q, nq, pp[k], ph[k].n, d2, slack, twoSided, farSide)) continue;
                 // Shell index: t in (2^-(i+1), 2^-i] -> i. ilogb(t) is the exponent e
                 // with t = m*2^e, m in [1,2), so i = -e-1. d2 == 0 lands in the
                 // innermost shell (ilogb(0) is FP_ILOGB0, clamped below).
-                const double t = d2 * inv;
+                const double t = d2 * invR2;
                 int i = (t > 0.0) ? -std::ilogb(t) - 1 : (kAdaptBins - 1);
                 if (i < 0) i = 0;
                 if (i >= kAdaptBins) i = kAdaptBins - 1;
                 ++hist[i];
             }
-        });
+        }
         bdpt::tlCandidates() += cand;
         // Largest i (smallest shell) whose cumulative population still reaches k.
         long long C = 0;

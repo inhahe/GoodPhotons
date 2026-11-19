@@ -5315,22 +5315,29 @@ static int checkPmGrid() {
                  [&](size_t i, size_t k) { ord[k] = (int)i; }, cs, &tg, "the check's bins", "-");
         std::vector<unsigned char> seen(posRef.size(), 0);
         std::vector<int> hit;
+        // A point's cell, as the lattice places it (mergeCellCoord).
+        auto cellOf = [&](const Vec3& v, int c[3]) {
+            c[0] = mergeCellCoord(v.x, pm.lat.lo[0], pm.lat.invCell);
+            c[1] = mergeCellCoord(v.y, pm.lat.lo[1], pm.lat.invCell);
+            c[2] = mergeCellCoord(v.z, pm.lat.lo[2], pm.lat.invCell);
+        };
         Pcg32 qr; qr.seed(0x5EEDu, 0x77u);
         long long own = 0, inBuckets = 0, let = 0, missed = 0;
         for (int q = 0; q < 400; ++q) {
             const Vec3 p = posRef[(size_t)(qr.uniform() * (N - 1))];
-            mergeForEachBucket(pm.lat, p.x, p.y, p.z,
-                               [&](unsigned int c, unsigned char) { inBuckets += cs[c + 1] - cs[c]; });
+            MergeKey keys[27];
+            mergeNeighbourKeys(pm.lat, p.x, p.y, p.z, keys);
+            for (const MergeKey& c : keys) inBuckets += cs[c.bucket + 1] - cs[c.bucket];
             hit.clear();
             mergeForEachEntry(pm.lat, cs.data(), tg.data(), p.x, p.y, p.z, [&](int k) {
                 hit.push_back(ord[k]);
                 seen[(size_t)ord[k]] = 1;
             });
-            int ix, iy, iz; pm.cellCoord(p, ix, iy, iz);
+            int ic[3]; cellOf(p, ic);
             long long mine = 0;
             for (size_t i = 0; i < posRef.size(); ++i) {
-                int cx, cy, cz; pm.cellCoord(posRef[i], cx, cy, cz);
-                if (std::abs(cx - ix) <= 1 && std::abs(cy - iy) <= 1 && std::abs(cz - iz) <= 1) {
+                int cc[3]; cellOf(posRef[i], cc);
+                if (std::abs(cc[0] - ic[0]) <= 1 && std::abs(cc[1] - ic[1]) <= 1 && std::abs(cc[2] - ic[2]) <= 1) {
                     ++mine;
                     if (!seen[i]) ++missed;
                 }
@@ -5356,8 +5363,7 @@ static int checkPmGrid() {
             if (pm.cellStart[b] < pm.cellStart[b - 1]) ok = false;
         // and every photon is findable in the bucket its own coordinate hashes to
         for (int i = 0; i < N && ok; ++i) {
-            int ix, iy, iz; pm.cellCoord(pm.pos[i], ix, iy, iz);
-            const unsigned c = pm.cellIndex(ix, iy, iz);
+            const unsigned c = mergeLatticeKey(pm.lat, pm.pos[i].x, pm.pos[i].y, pm.pos[i].z).bucket;
             if (i < pm.cellStart[c] || i >= pm.cellStart[c + 1]) ok = false;
         }
         chk("bucket runs tile [0,N) and every photon sits in its own bucket", ok);

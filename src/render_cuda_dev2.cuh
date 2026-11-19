@@ -2447,13 +2447,16 @@ struct DVcmSite {
         const MergeKey c = g.neighbour(n, grid.lat.slots);
         b = grid.cellStart[c.bucket]; e = grid.cellStart[c.bucket + 1]; t = c.tag;
     }
-    // The light vertices of its 27 cells, theirs alone (their tags): what a merge there weighs.
-    __device__ int count(const DVcmGrid& grid) const {
+    // The light vertices of its 27 cells, theirs alone (their tags) -- what a merge there weighs --
+    // counted no further than `upTo`: the camera kernel asks only whether there are any, and whether
+    // more than the queue's inline bound (DVcmMergeQueue::inlineMax).
+    __device__ int count(const DVcmGrid& grid, int upTo) const {
         int n = 0;
         for (int c = 0; c < 27; ++c) {
             int b, e; unsigned char t;
             cell(grid, c, b, e, t);
-            for (int k = b; k < e; ++k) n += grid.tag[k] == t;
+            for (int k = b; k < e; ++k)
+                if (grid.tag[k] == t && ++n >= upTo) return n;
         }
         return n;
     }
@@ -3099,7 +3102,8 @@ __global__ void kVcmCameraT(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx
                     unsigned long long gaSeed = 0;
                     if (sc.gatherArea) gaSeed = rng.next64();
                     const DVcmSite site(grid, vt.p);
-                    const int pop = site.count(grid);   // the light vertices it weighs
+                    // The light vertices it weighs, as far as the choice below needs them counted.
+                    const int pop = site.count(grid, mq.reqs ? mq.inlineMax + 1 : 1);
                     if (pop > 0) {
                         DJSpec js;
                         if (jOn) jrun.snap(js);
@@ -3210,9 +3214,9 @@ __global__ void kVcmCameraT(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx
 // the device. Each piece is an EXACT-arithmetic mirror of the host build it replaces
 // (vcm.h VcmGrid::build twin in vcmSessionPass / photonmap.h PhotonMap::build), so the
 // consuming kernels see bit-identical inputs in the identical order: min/max reductions
-// are order-independent and exact; the cell-key kernels repeat the host's float/double
-// mixed expressions type-for-type; and a STABLE sort by cell id equals a counting sort's
-// output order (both keep original index order within a cell).
+// are order-independent and exact; the key kernel (kMergeKey, render_cuda.cu's mergeBinDevice)
+// computes a point's bucket with the host's merge_grid.h functions; and a STABLE sort by bucket
+// equals a counting sort's output order (both keep original index order within a bucket).
 
 // Double-precision CIE twins (exact color.h mirror; the float `cieX` above serves the Real
 // transport path). Used by kSppmGatherConvert: the host build computed cie{X,Y,Z}(lambda)

@@ -1222,8 +1222,8 @@ that converges to the same physical image.
   every merge keeps cells the radius wide. Before, the grid was a dense lattice over the light
   vertices' box: past 64 M cells (or, on the GPU, past the memory left) it widened its cells,
   every merge then weighing more candidates (`[mode U] the merges' grid coarsened ...`), and a
-  sparse frame spent most of a pass clearing it (`-pmradius 1e-4` over a 10 m box: 1.80 s to
-  0.30 s on the CPU).
+  sparse frame spent most of a pass clearing it (`-pmradius 1e-4` over a 10 m box: 1.55 s to
+  0.28 s on the CPU, timed on an idle machine).
 
 - **`J` — UPBP (mode `D` and mode `M`'s beams, under one weight).** Unifying Points,
   Beams and Paths (Křivánek et al. 2014) is to *volumes* what `U` is to surfaces. Mode `D`

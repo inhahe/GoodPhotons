@@ -23,6 +23,7 @@
 #include <cstddef>
 #include <cstdlib>
 #include <memory>
+#include <new>
 #include <vector>
 #include "allocreport.h"    // ftalloc::resize: a table too large names itself
 
@@ -93,11 +94,6 @@ MG_HD MergeKey mergeCellKey(int ix, int iy, int iz, unsigned int slots) {
                     (unsigned char)h};
 }
 
-// The bucket of cell (ix, iy, iz).
-MG_HD unsigned int mergeBucket(int ix, int iy, int iz, unsigned int slots) {
-    return mergeCellKey(ix, iy, iz, slots).bucket;
-}
-
 // A lattice as the device's maps carry it (DPhotonMap, DSurfMap, DVcmGrid): its corner and cell
 // width in double, as its points were binned -- a gather that places a site in another rounding of
 // them takes the cell beside its own near a cell plane, and misses the points two cells away -- and
@@ -161,32 +157,45 @@ inline void mergeBin(const MergeLattice& L, size_t n, PosOf&& posOf, Place&& pla
                      std::vector<unsigned char>* tag, const char* what, const char* flags) {
     const size_t nBuckets = mergeBucketCount(L.slots);
     cellStart.clear();
-    ftalloc::resize(cellStart, nBuckets + 1, what, flags);   // zeroed
-    // Four bytes a point (five with tags), left unfilled -- a map of a hundred million photons bins
-    // twice in buildAuto -- and each point's key computed once.
-    std::unique_ptr<unsigned int[]> bucketOf(new unsigned int[n]);
-    std::unique_ptr<unsigned char[]> tagOf(tag ? new unsigned char[n] : nullptr);
+    // One entry over, dropped at the end: the table is its own cursor (below).
+    ftalloc::resize(cellStart, nBuckets + 2, what, flags);   // zeroed
+    // Each point's key, computed once, in scratch of four bytes a point (five with tags) left unfilled:
+    // a map of a hundred million photons bins twice in buildAuto.
+    std::unique_ptr<unsigned int[]> bucketOf;
+    std::unique_ptr<unsigned char[]> tagOf;
+    try {
+        bucketOf.reset(new unsigned int[n]);
+        if (tag) tagOf.reset(new unsigned char[n]);
+    } catch (const std::bad_alloc&) {
+        ftalloc::reportOom("a binning's key of each point", n, tag ? 5 : 4, flags);
+    }
+    int* const cs = cellStart.data();
+    // Bucket b's points counted at cs[b + 2], so that after the prefix sum cs[b + 1] is where bucket b
+    // begins: the scatter takes it as b's next position, which leaves it where bucket b + 1 begins --
+    // every start in its place, with no copy of the table to scatter through.
     for (size_t i = 0; i < n; ++i) {
         const auto& p = posOf(i);
         const MergeKey key = mergeLatticeKey(L, p.x, p.y, p.z);
         bucketOf[i] = key.bucket;
         if (tag) tagOf[i] = key.tag;
-        ++cellStart[(size_t)key.bucket + 1];
+        ++cs[(size_t)key.bucket + 2];
     }
-    for (size_t b = 0; b < nBuckets; ++b) cellStart[b + 1] += cellStart[b];
-    if (tag) tag->resize(n);
-    std::vector<int> cursor(cellStart.begin(), cellStart.end() - 1);
+    for (size_t b = 2; b < nBuckets + 2; ++b) cs[b] += cs[b - 1];
+    if (tag) ftalloc::resize(*tag, n, "a binning's tags", flags);
     for (size_t i = 0; i < n; ++i) {
-        const size_t k = (size_t)cursor[bucketOf[i]]++;
+        const size_t k = (size_t)cs[(size_t)bucketOf[i] + 1]++;
         if (tag) (*tag)[k] = tagOf[i];
         place(i, k);
     }
+    cellStart.pop_back();
 }
 
-// fn(bucket, tag) for each of the 27 cells around the cell holding (x, y, z) in lattice `L`, in walk
-// order (dz outermost, dx innermost), the at most eight blocks they lie in hashed once each.
-template <class F>
-inline void mergeForEachBucket(const MergeLattice& L, double x, double y, double z, F&& fn) {
+// The keys of the 27 cells around the cell holding (x, y, z) in lattice `L`, into `keys` in walk order
+// (dz outermost, dx innermost), the at most eight blocks they lie in hashed once each: the buckets a
+// host query reads, which it then scans in a loop of its own, from its own locals. (The device's walk,
+// DGridCell, takes a cell at a time: a lane there advances by a runtime index, which would put an
+// array like this one in local memory.)
+inline void mergeNeighbourKeys(const MergeLattice& L, double x, double y, double z, MergeKey keys[27]) {
     const int c[3] = {mergeCellCoord(x, L.lo[0], L.invCell), mergeCellCoord(y, L.lo[1], L.invCell),
                       mergeCellCoord(z, L.lo[2], L.invCell)};
     // Per axis and offset -1, 0, 1: which of the axis's (at most two) blocks the cell is in, and its
@@ -205,12 +214,14 @@ inline void mergeForEachBucket(const MergeLattice& L, double x, double y, double
     for (int i = 0; i < 2; ++i)
         for (int j = 0; j < 2; ++j)
             for (int k = 0; k < 2; ++k) mix[i][j][k] = mergeMix(blk[0][k], blk[1][j], blk[2][i]);
+    int n = 0;
     for (int dz = 0; dz < 3; ++dz)
         for (int dy = 0; dy < 3; ++dy)
             for (int dx = 0; dx < 3; ++dx) {
                 const unsigned int h = mix[sel[2][dz]][sel[1][dy]][sel[0][dx]];
-                fn(27u * mergeSlotOf(h, L.slots) + (unsigned int)(place[0][dx] + 3 * place[1][dy] + 9 * place[2][dz]),
-                   (unsigned char)h);
+                keys[n++] = MergeKey{27u * mergeSlotOf(h, L.slots) +
+                                         (unsigned int)(place[0][dx] + 3 * place[1][dy] + 9 * place[2][dz]),
+                                     (unsigned char)h};
             }
 }
 
@@ -220,9 +231,11 @@ inline void mergeForEachBucket(const MergeLattice& L, double x, double y, double
 template <class F>
 inline void mergeForEachEntry(const MergeLattice& L, const int* cellStart, const unsigned char* tag,
                               double x, double y, double z, F&& fn) {
-    mergeForEachBucket(L, x, y, z, [&](unsigned int c, unsigned char want) {
-        const int e = cellStart[c + 1];
-        for (int k = cellStart[c]; k < e; ++k)
-            if (tag[k] == want) fn(k);
-    });
+    MergeKey keys[27];
+    mergeNeighbourKeys(L, x, y, z, keys);
+    for (const MergeKey& c : keys) {
+        const int e = cellStart[c.bucket + 1];
+        for (int k = cellStart[c.bucket]; k < e; ++k)
+            if (tag[k] == c.tag) fn(k);
+    }
 }

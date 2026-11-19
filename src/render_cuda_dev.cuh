@@ -119,7 +119,7 @@
 #include "pattern_device.cuh"   // DPattern / DPatEnvT / dPatternEval — shared with raster_cuda.cu
 #include "stochtile.h"    // O7: the host/device-shared histogram-preserving tiling operator
 #include "cell_walk.h"   // rayBoxClip / CellWalk: the box clip and lattice walk the host takes too
-#include "merge_grid.h"   // mergeBucket: the hashed lattice of the merge maps, the host's too
+#include "merge_grid.h"   // mergeCellKey: the hashed lattice of the merge maps, the host's too
 #include "grin.h"         // grin::sceneHasGrin (host gate mirrored into DScene::hasGrin)
 #include "surfmerge.h"   // SurfMap/SurfPhoton/SurfMis: mode J's point x point merges
 #include "photonmap.h"    // host PhotonMap::build reused for the mode-M grid (GPU gather)
@@ -10168,11 +10168,12 @@ __device__ static void dGatherPhotonBeams(const DScene& sc, const DBeamMap& bm,
 // atomics, and a per-hit RNG stream for the stochastic transmittance of heterogeneous media),
 // so it is validated statistically: parity against the inline path (FTRACE_NOWAVEFRONT=1).
 // ---- mode J's SECOND merge kind on the device: point x point surface merges (`-jsurf`) ------
-// Device twin of surfmerge.h. The host map's hashed lattice (merge_grid.h: `cellStart` + `order`,
-// cell == gather radius) is uploaded as it stands, its lattice in double (MergeLattice), rather
-// than rebuilt on the device: the gather has to look where the light pass binned, and a second
-// binning is a second chance to disagree -- a disagreement that does not crash, it silently gathers
-// nothing (cf. dPmNeighborhood's note).
+// Device twin of surfmerge.h. A map the host's light pass traced is uploaded as it was binned
+// (merge_grid.h: `cellStart`, `order`, `tag`, cell == gather radius), its lattice in double
+// (MergeLattice), rather than binned again on the device: the gather has to look where the light
+// pass binned, and a second binning is a second chance to disagree -- a disagreement that does not
+// crash, it silently gathers nothing (cf. dPmNeighborhood's note). A map the device traces itself
+// (buildJSurfMapDevice) is binned there, by the host's functions (mergeBinDevice).
 // Device twin of bdpt.h's FTRACE_J_HALF (0 = both halves, 1 = connections only, 2 = merges
 // only). Both halves keep the SAME MIS weights they have in a full render, so the two sum to
 // it -- which is what makes a CPU-vs-GPU comparison of ONE half a clean measurement.
@@ -21450,8 +21451,10 @@ __device__ static inline void dWarpSiteAdd(const DScene& sc, const DMergeFootpri
 // (0, 1) one thread's whole list, (lane, 32) a warp's share, so a warp spends ceil(entries / 32)
 // rounds on the site, not a round or more a cell. `cell(n, b, e, t)` sets neighbour cell n's bucket's
 // entries [b, e) and its block's tag t (the bucket holds other blocks' points too, MergeKey);
-// `body(k, t)` takes entry k, which is the cell's own where its tag is t. Modes J (kWfSurfGather,
-// dSurfMergeAt) and U (dVcmMergeSum).
+// `body(k, t)` takes each of this caller's entries, strays and all, and must weigh entry k only if
+// its tag (the map's `tag[k]`, bucket order) is t, as the host's mergeForEachEntry weighs them. The
+// test is the body's own: made here instead, nvcc compiles mode U's merge (dVcmMergeSum) to run its
+// renders a fifth slower. Modes J (kWfSurfGather, dSurfMergeAt) and U (dVcmMergeSum).
 template <class Cell, class Body>
 __device__ static inline void dSiteListWalk(const Cell& cell, int lane, int lanes, const Body& body) {
     // A caller keeps its place in the list as a cell (`next`, the walk's next, its tag t) and an entry

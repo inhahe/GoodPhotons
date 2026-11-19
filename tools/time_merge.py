@@ -8,8 +8,10 @@ building the 129 M-photon map is most of the time), and modes U and J at a fine 
 10 m box (png/check_vcm_grid_cap/box.ftsl, which tools/check_vcm_grid_cap.py writes; those cases are
 skipped without it). Mode J takes -beamfreeze, so its light side does not pace by the work it counts.
 
-Each round runs every case once with each build, old first; prints each case's median per build and
-the ratio new / old, with every run's time. Run it on an idle machine: a check sweep's load moves the
+A case runs its rounds before the next case begins, each round once with each build, the order
+alternating (old first in the even rounds, new first in the odd), so whatever the second of two
+runs gains or loses (the first's teardown still in flight, clocks ramping) falls on both builds
+alike; prints each case's median per build and the ratio new / old, with every run's time. Run it on an idle machine: a check sweep's load moves the
 times by more than most changes it is meant to measure (known-issues MERGE-HASH-TIMING).
 """
 import argparse
@@ -57,11 +59,12 @@ def main():
         if a.only not in tag:
             continue
         if not os.path.exists(scene):
-            print("%-16s skipped: no %s (run tools/check_vcm_grid_cap.py once)" % (tag, os.path.relpath(scene, ROOT)))
+            print("%-16s skipped: no %s%s" % (tag, os.path.relpath(scene, ROOT),
+                                              " (tools/check_vcm_grid_cap.py writes it)" if scene == BOX else ""))
             continue
         t = {"old": [], "new": []}
-        for _ in range(a.rounds):
-            for lab in ("old", "new"):
+        for rnd in range(a.rounds):
+            for lab in (("old", "new") if rnd % 2 == 0 else ("new", "old")):
                 png = os.path.join(a.out, "%s_%s.png" % (tag, lab))
                 cmd = [exe[lab], "-in", scene, "-no-meter", "-seed", "7", "-window-min", "-o", png] + args
                 t0 = time.perf_counter()

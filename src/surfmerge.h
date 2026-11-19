@@ -169,16 +169,17 @@ struct SurfMap {
     // Bytes held by the containers above (their capacity), for a cache that budgets maps by size.
     size_t heapBytes() const {
         return pts.capacity() * sizeof(SurfPhoton) + mis.capacity() * sizeof(SurfMis) +
-               cellStart.capacity() * sizeof(int) + order.capacity() * sizeof(int);
+               cellStart.capacity() * sizeof(int) + order.capacity() * sizeof(int) + tag.capacity();
     }
     // Bytes the containers above actually use (their size).
     size_t usedBytes() const {
         return pts.size() * sizeof(SurfPhoton) + mis.size() * sizeof(SurfMis) +
-               cellStart.size() * sizeof(int) + order.size() * sizeof(int);
+               cellStart.size() * sizeof(int) + order.size() * sizeof(int) + tag.size();
     }
     // Release the containers' spare capacity (see BeamMap::shrinkToFit).
     void shrinkToFit() {
         pts.shrink_to_fit(); mis.shrink_to_fit(); cellStart.shrink_to_fit(); order.shrink_to_fit();
+        tag.shrink_to_fit();
     }
 
     bool empty() const { return pts.empty(); }
@@ -201,6 +202,7 @@ struct SurfMap {
         lat = mergeLatticeAt(0, 0, 0, radius, 1);
         cellStart.clear(); cellStart.shrink_to_fit();
         order.clear(); order.shrink_to_fit();
+        tag.clear(); tag.shrink_to_fit();
     }
     // `r` is the gather radius; the cell is sized to it so a query touches 3x3x3 cells.
     void build(double r) {

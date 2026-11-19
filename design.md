@@ -6619,9 +6619,9 @@ as the one at fault.
   share one, whose photons then counted twice -- PM-BUCKET-TWICE). The mix is SplitMix64's
   finaliser over three odd-constant products rather than the classic XOR-of-three-primes,
   because the XOR form leaves *neighbouring* blocks correlated in the low bits. Host and device
-  share the one function (`mergeBucket`), and the device's three traversals (mode-M gather, its final-gather
+  share the one function (`mergeCellKey`), and the device's three traversals (mode-M gather, its final-gather
   sub-ray, SPPM) now go through one `dPmNeighborhood` helper instead of three hand-copied
-  transcriptions of the host binning. `cellCoord` no longer clamps to the bbox: with no array
+  transcriptions of the host binning. A cell's coordinate (`mergeCellCoord`) does not clamp to the bbox: with no array
   to run off, clamping was actively slightly wrong (a query just outside got folded onto the
   edge cell and lost the far row of its neighbourhood). `-checkpmgrid` validates the query
   against brute force on exactly the configuration the dense lattice could not represent.
@@ -10420,7 +10420,7 @@ as the one at fault.
   direct term via the specular walk), reuses the mode-M forward deposit (`launchForward`,
   fresh seed = cumulative emitted), builds the grid **on-device** at the largest current
   per-pixel radius (0.39.1: deposits stay resident in a grow-only device buffer; rMax via
-  `transform_reduce`, `kSppmCellKey` + stable sort + `lower_bound` cell ranges,
+  `transform_reduce`, `mergeBinDevice` -- `kMergeKey` + stable sort + `lower_bound` bucket ranges --,
   `kSppmGatherConvert` bakes the photon records with double-precision cie tables — per-pass
   PCIe traffic drops from the full photon slab to a few bytes; ~13× faster passes), then
   `kSppmGather` (query + Hachisuka shared-statistics radius/flux update) and
@@ -10456,7 +10456,8 @@ as the one at fault.
   count crosses PCIe per pass, vs the former ~69 MB slab download) into contiguous per-path
   ranges so the same-λ vertex CONNECTION reads its PAIRED light subpath exactly
   (single-wavelength spectral BDPT); (3) sort-builds the uniform hash grid on-device
-  (`kVcmCellKey` + `thrust::sequence` + stable sort + `lower_bound` — order-identical to the
+  (`mergeBinDevice`: `kMergeKey` + `thrust::sequence` + stable sort + `lower_bound`, then
+  `kMergeTag` for the blocks' tags — order-identical to the
   former host counting sort; cell = merge radius, reusing the M3 device-grid query layout;
   ~4× faster passes, byte-identical output); (4) `kVcmCamera` traces one camera
   subpath per pixel doing emission (s=0) / NEE (s=1) / paired-path vertex connection (c) / grid merge
@@ -10515,11 +10516,13 @@ as the one at fault.
   The dense lattice before it took `(L/r)³` cells, capped at 64 M by widening them (every merge
   then weighing more candidates) and on the device by the memory left; a few thousand vertices in
   a large box at a fine radius held the whole 256 MB table, cleared and prefix-summed every pass.
-  A bucket's low part is its cell's place in its block (`mergeBucket`), in which the 27 cells
+  A bucket's low part is its cell's place in its block (`mergeCellKey`), in which the 27 cells
   around any site all differ, so a site never reads one bucket twice and counts each vertex once
   however the blocks collide; it touches at most eight blocks, two cache lines of table each, as
-  the dense lattice kept neighbours together, and the host's walk (`mergeForEachBucket`) hashes
-  each of them once (`mergeMix`, 32-bit: the GPU multiplies 64-bit integers in software). A
+  the dense lattice kept neighbours together, and the host's walk (`mergeNeighbourKeys`, the 27
+  keys into the caller's array, which its query scans from its own locals) hashes each of them
+  once (`mergeMix`, 32-bit: the GPU multiplies 64-bit integers in software); the device's
+  (`DGridCell`) mixes a cell at a time, a lane there advancing by a runtime index. A
   bucket also holds the strays -- one cell of every other block hashed to its slot, about 13 a
   site at two buckets a point -- which outnumber a sparse site's own points: in modes `U` and `J`
   every point carries its block's **tag** (the mix's low byte, the slot being its high bits scaled;

@@ -432,6 +432,13 @@ Then the rest of 4.2-4.6 in their order, 4.7's bookkeeping alongside whatever to
 - [x] **MIRROR-BASE-GPU** — not the renderer: the check's mirror ring held the pixels straddling the
   box top's edge (the lamp in the mirror, 14x the floor), whose 16-sample noise 8 seeds did not
   average away; the box rings leave them out (`box_floor`), and the devices agree to 0.1 %.
+- [ ] **PM-PROBE-GEOMETRY** — mode M's automatic radius samples the map by occupied BUCKET
+  (`medianNeighborCount`), so every change to the table's size or hash moves it and every unpinned
+  mode M render with it (0.450.23 and 0.450.24 did; `FTRACE_MERGE_TABLE` does, so
+  check_merge_table pins the radius). Sample by CELL instead, with a set the geometry alone
+  decides -- the cells whose coordinates hash lowest (a bottom-k sample), each represented by its
+  lexicographically smallest photon -- which keeps the order-independence `-loadmap` needs and
+  drops the table from the radius (the review of 0.450.22-0.450.24).
 - [x] **GPU-MERGE-FLOAT-LATTICE** (0.450.22) — the device's merge maps carry their lattice in double
   (`MergeLattice`), as their points were binned; the device probe holds it.
 - [x] **REVIEW-0450F** (0.450.15) — the Opus (max) and Fable (xhigh) reviews of 0.450.12-0.450.14, and
@@ -669,6 +676,10 @@ Then the rest of 4.2-4.6 in their order, 4.7's bookkeeping alongside whatever to
   between two builds of one source); dropped: repeatable builds, R/D/U 12-24 % faster.
 - [ ] **J-NOSPLIT** — mode J renders 16 % slower without `--split-compile`: find the kernel that lost
   it (now measurable) and pin its inlining or cap; known-issues.
+- [x] **REVIEW-0450K** (0.450.25) — the Opus (max) and Fable (xhigh) reviews of 0.450.22-0.450.24: mode
+  U's budget counting its table and tags, SurfMap's accounting, the capped site count, a bin with no
+  copy of its table, the host's 27 keys in the caller's array (a shared device tag filter measured
+  and declined: GPU U 20 % slower); known-issues.
 - [x] **REVIEW-0450I** (0.450.20) — the Opus (max) and Fable (xhigh) reviews of SLAB-DDA-COPIES: the
   volume caches' clips, a NaN-safe and monotone walk, `-checkcellwalk`, one fire pdf integral; known-issues.
 - [x] **SLAB-DDA-COPIES** — the box clip and the grid walk were written out several times: one

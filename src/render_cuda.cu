@@ -3186,7 +3186,7 @@ static void buildBeamLbvhDevice(JBeamDev& d, const gpu::DBeamRec* beams, int n,
 // count stops being budget-bound. `FTRACE_JDEVLIGHT=1` selects this path.
 //
 // Grow-only scratch, exactly as the VCM/SPPM sessions do it: a per-chunk rebuild (step 3) must
-// not cudaMalloc/cudaFree six buffers every 0.15 s.
+// not cudaMalloc/cudaFree seven buffers every 0.15 s.
 struct JSurfDev {
     gpu::DSurfPhoton* pts = nullptr;   size_t ptsCap = 0;
     gpu::DSurfMis*    mis = nullptr;   size_t misCap = 0;
@@ -3206,7 +3206,7 @@ struct JSurfDev {
         ptsCap = misCap = cellKeyCap = orderCap = cellStartCap = tagCap = 0;
         arena.release();
     }
-    // A local of renderBdptCuda, so the destructor is the release: six device buffers, one of
+    // A local of renderBdptCuda, so the destructor is the release: seven device buffers, one of
     // them the photon slab, must not survive the call that made them.
     ~JSurfDev() { release(); }
     JSurfDev() = default;
@@ -6741,8 +6741,8 @@ VcmSession* vcmSessionBegin(const Scene& scene, const Camera& cam, int resX, int
     s->secStride = C - 1;
     // A light subpath stores at most one vertex per edge up to maxDepth - 1 (kVcmLightT's
     // lastEdge), and a pass holds every stored vertex twice -- the per-path slab and its compact
-    // copy -- with the secondary-λ rows beside each, plus a cell key and an order index for the
-    // grid. One light subpath per pixel can ask for gigabytes (6.6 GB at 1100x733 and
+    // copy -- with the secondary-λ rows beside each, plus a cell key, an order index, a tag and two
+    // buckets of the grid's table. One light subpath per pixel can ask for gigabytes (6.6 GB at 1100x733 and
     // -max-bounce 64), so the store gets a budget: an eighth of the card, at least 768 MB, and
     // never more than half the memory free once the scene is up and the kernels' stacks are set
     // aside (reserved at their first launch, after this, unless an earlier launch holds them). A pass that would not fit traces FEWER light
@@ -6787,9 +6787,13 @@ VcmSession* vcmSessionBegin(const Scene& scene, const Camera& cam, int resX, int
             if (std::atoll(e) > 0) budget = std::min(budget, (size_t)std::atoll(e) << 20);
     }
     const bool keepHs = !scene.motionSets.empty() || !scene.vertexKeys.empty() || scene.needsCavity;
+    // A subpath's share of everything the loop below allocates: per vertex, the slab and its compact
+    // copy, their hit states, the cell key, the order index, the tag and two buckets of the table
+    // (mergeSlotCount); per subpath, its vertex count, wavelengths and span.
     const size_t perPath = (size_t)s->vcmCap *
-        (2 * sizeof(gpu::DVcmLV) + 2 * (size_t)s->secStride * sizeof(gpu::DVcmSec) + 2 * sizeof(int) +
-         (keepHs ? 2 * sizeof(gpu::DVertHitState) : 0));
+        (2 * sizeof(gpu::DVcmLV) + 2 * (size_t)s->secStride * sizeof(gpu::DVcmSec) + 4 * sizeof(int) + 1 +
+         (keepHs ? 2 * sizeof(gpu::DVertHitState) : 0)) +
+        3 * sizeof(int) + (size_t)C * (sizeof(gpu::Real) + sizeof(double));
     size_t nl = std::max<size_t>(1, std::min(np, budget / perPath));
     // Allocation failures cost light subpaths (variance), not the run: the budget is an estimate.
     auto tryAlloc = [](auto** p, size_t bytes) {
