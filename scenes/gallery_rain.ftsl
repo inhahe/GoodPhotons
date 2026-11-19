@@ -975,7 +975,7 @@ quad { origin -18 0 -19   u 0 0 45   v 46 0 0   material gridground }
 #
 # THE EXTRA THICKNESS IS ADDED DOWNWARD, i.e. every cap's TOP FACE y is unchanged. That is
 # not cosmetic bookkeeping: the hero pieces were dropped onto these caps by
-# `scraps/settle_scene.py` and their rest poses are recorded as literal coordinates, so
+# `tools/settle_scene.py` and their rest poses are recorded as literal coordinates, so
 # moving a top face by even a centimetre would leave a piece floating or sunk. Only the
 # bottom face moved, and the bottom face touches nothing. (One consequence to know: on the
 # gyroid plinth, whose middle cage tier is only 0.28 m tall, a 0.24 m cap now covers all but

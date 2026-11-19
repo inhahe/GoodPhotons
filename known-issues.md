@@ -32957,6 +32957,13 @@ the fix is to make the letters thin aliases over five estimator entry points, an
 
 ### Checked-in scenes cite ~22 derivation scripts that live in gitignored `scraps/` — 2026-09-01
 
+> **Audited 2026-11-18:** tracked scenes cite 34 files under `scraps/`, all but four from
+> `gallery_rain.ftsl` (`gallery.ftsl` and `gallery_settled.ftsl` cite `newklein_stand.py`,
+> `pattern_tex.ftsl` `gen_graychecker.py`, `_grin_scatfog.ftsl` `_cmp_pfm.py`, `_deltalight_mix.ftsl`
+> `imgdiff.py`). All 34 still exist locally (the output cleaner keeps a cited file), none in a fresh
+> clone. One had moved: gallery_rain cited `scraps/settle_scene.py`, which is `tools/settle_scene.py`,
+> and now says so. The fix below stands for the rest, scene by scene.
+
 `scenes/*.ftsl` comments name the script that solved each authored constant, which is the
 right instinct and is most of what makes `gallery_rain.ftsl` auditable rather than a wall of
 magic numbers. But 22 of those scripts are under `/scraps/` (`.gitignore:105`), so **every one
