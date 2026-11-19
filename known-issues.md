@@ -301,7 +301,7 @@ GPU-MERGE-FLOAT-LATTICE). **Fixed in 0.450.23:**
   sparse box's figure, and `FTRACE_MERGE_TABLE` documented there.
 * **Two bugs logged, not fixed** (both): GPU-MERGE-FLOAT-LATTICE was fixed in 0.450.22;
   GATHER-BASE-MIRROR-M turned out to be the check's noise (fixed in the check), and on the way
-  showed MIRROR-BASE-GPU, open below until its cause is placed.
+  showed MIRROR-BASE-GPU, the check's own edge pixels (below).
 
 **Verified:** check_merge_table (all four modes, both devices, and -checkpmgrid at 27 buckets),
 -checkpmgrid, -checkcellwalk, the device probe, check_vcm_grid_cap and the fire checks
@@ -526,34 +526,43 @@ SurfMap's doubling rule (Fable): a different map with its own padding and no dev
 with. The vertex-count-blind cap's clearing of a 64 M-cell table each CPU pass where it binds
 (Fable): VCM-SPARSE-LATTICE.
 
-## OPEN (2026-11-19, bug): MIRROR-BASE-GPU — GPU modes M and S read the floor at a mirror box's base 2.5 % over the CPU's
+## DONE (2026-11-19, the check): MIRROR-BASE-GPU — GPU modes M and S read the floor at a mirror box's base 2.5 % over the CPU's: the check's edge pixels, not the renderer
 
 check_gather_base's mirror box (3 cm, on a lit floor, `-pmradius 0.1`), the ring of floor 0-2 cm
-from its base: GPU mode M 1.0226 of mode R over 8 seeds (seed to seed 0.988-1.049, the mean's
-error 0.7 %), CPU mode M 0.996 (16 samples, 8 seeds, 0.5 %) and 0.9886 at the GPU's own 8 M
-photons (4 seeds); GPU mode S 1.021 against CPU mode S 0.996 in the check's own run. The 2-5 cm ring
-agrees (GPU 0.963-0.965, CPU 0.964-0.967), as does the diffuse box's 0-2 cm ring (1.003 against
-1.002), so it is the mirror's base alone, on the device alone, in both photon modes. That ring is
-direct light and the mirror's reflection of the lamp, not the photon maps -- CPU mode M reads it
-the same to four digits at 2 M and 8 M photons -- so the suspect is what the two modes share
-there: the gather footprint's probe (which passes faces holding no photons, a mirror's among them,
-but must count an opaque one as a crossing), or the device's direct light beside a mirror.
-Placed so far: **not the footprint** -- with `-gatherarea 0` the gap stays (GPU 0.972, CPU 0.939, 4
-seeds each, the 2-5 cm ring 0.749 on both); **not the photons** -- the GPU's ring is the same to
-three digits at 2 M photons and 8 M, as the CPU's is; **not the reference** -- CPU mode R reads it
-1.0018 of GPU mode R. So it is the GPU's camera-side estimate in modes M and S at a floor point beside
-a mirror: its direct light, or a path from it off the mirror to the lamp, about 2.5 % over the
-CPU's. **Next:** split that estimate by its terms on both devices (direct light alone; the
-specular continuation alone) to find which one the GPU over-counts.
+from its base: GPU mode M 1.0226 of mode R over 8 seeds, CPU mode M 0.996; GPU mode S 1.021 against
+CPU mode S 0.996 in the check's own run. The 2-5 cm ring and the diffuse box agreed.
+
+**Not the renderer.** Each seed's map traced on one device and gathered on the other (`-savemap`,
+`-loadmap`) put the gap with the gathering device (CPU trace on the GPU 1.0215, GPU trace on the CPU
+0.9886), and seed to seed the values followed the camera's samples, whatever map: so not the
+photons. Taking the gather's parts away one by one (`-nopmadaptive`, `-gatherarea 0`,
+`-nocaustics`) left the same GPU / CPU ratio, 1.033, every time -- the four seeds' camera samples
+again. Split finely, the ring's floor agreed to 0.5 % (GPU / CPU 0.995-0.999 from 8 mm out); the
+whole gap sat in the pixels 0-6 mm out, which straddle the box top's edge: from 0.9 m above the
+3 cm top hides the floor 5 mm out from the base, so those pixels are mostly top, and a mirror's top
+shows the lamp there, 14 times the floor's radiance. At 16 samples their coverage of the edge swings
+2.3 % seed to seed in the ring's mean, which 8 seeds do not average away: over 32 seeds GPU mode M
+reads 1.0119 +- 0.0040 of mode R and CPU mode M 1.0051 +- 0.0040, 1.2 sigma apart, and at 256 samples
+the four (mode, device) pairs draw the edge pixels alike (GPU M over GPU R +0.25 % on the four
+sides' mean).
+
+**Fixed in the check:** a box's rings leave out the pixels whose footprint reaches the top as the
+camera sees it (`box_floor`). Without them the 32 seeds read GPU M 1.0082 +- 0.0028 and CPU M
+1.0072 +- 0.0018, the CPU's spread seed to seed 0.010 where it was 0.023; the check's box objects
+pass, the mirror's 0-2 cm ring at 1.005 (GPU M), 1.008 (CPU M), 0.998 (GPU S) and 1.011 (CPU S).
+(The entry's first reading -- the ring as direct light and the mirror's reflection of the lamp --
+was half right: mode M without `-pmfg` takes the floor's light from the photon maps alone; the lamp
+in it was the box top's.)
 
 ## DONE (2026-11-19, the check): GATHER-BASE-MIRROR-M — check_gather_base's mirror ring under CPU mode M was noise, not a regression
 
 `tools/check_gather_base.py` failed one row: the mirror box, CPU mode M, the floor 0-2 cm from the
 base, 0.929 of mode R (tolerance 7 %), the same digits on 0.450.17, 0.450.20 and 0.450.21. Over 8
 seeds at the check's own 4 samples one seed reads anywhere from 0.917 to 1.056 (the check takes two,
-an error of 3.5 %), their mean 0.967: the ring is direct light and the mirror's reflection of the
-lamp, both drawn per camera sample, so 8 M photons for 2 M leave every seed's value unchanged to
-four digits, and 16 samples bring one seed's spread to 1.5 % and the mean to 0.996. A bisect from
+an error of 3.5 %), their mean 0.967: the swing is the camera's samples -- in the pixels straddling
+the box top's edge, which show the lamp in the mirror (MIRROR-BASE-GPU, which took them out of the
+ring) -- so 8 M photons for 2 M leave every seed's value unchanged to four digits, and 16 samples
+bring one seed's spread to 1.5 % and the mean to 0.996. A bisect from
 0.434.14 (1.0525) found only the noise redrawn: 0.434.24 (mode M's golden-ratio wavelengths) took
 the two-seed value to 0.9759, the 2-5 cm ring unmoved (0.9668 -> 0.9650). **Fixed:** the check's
 two CPU mode M cases take 16 samples, as its GPU case does; the mirror's ring reads 0.978. The

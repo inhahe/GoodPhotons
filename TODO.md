@@ -429,8 +429,9 @@ Then the rest of 4.2-4.6 in their order, 4.7's bookkeeping alongside whatever to
 - [x] **PM-BUCKET-TWICE** (0.450.21) — mode M's and SPPM's gathers could read a bucket twice when two
   of their cells shared it: the photon map takes merge_grid.h's bucket, host and device.
 - [x] **GATHER-BASE-MIRROR-M** — the check's CPU mode M ring was noise at 4 samples: they take 16.
-- [ ] **MIRROR-BASE-GPU** — GPU modes M and S read the floor at a mirror box's base 2.5 % over the CPU's
-  (8 seeds, 3 sigma): place it in the footprint probe or out of it; known-issues.
+- [x] **MIRROR-BASE-GPU** — not the renderer: the check's mirror ring held the pixels straddling the
+  box top's edge (the lamp in the mirror, 14x the floor), whose 16-sample noise 8 seeds did not
+  average away; the box rings leave them out (`box_floor`), and the devices agree to 0.1 %.
 - [x] **GPU-MERGE-FLOAT-LATTICE** (0.450.22) — the device's merge maps carry their lattice in double
   (`MergeLattice`), as their points were binned; the device probe holds it.
 - [x] **REVIEW-0450F** (0.450.15) — the Opus (max) and Fable (xhigh) reviews of 0.450.12-0.450.14, and

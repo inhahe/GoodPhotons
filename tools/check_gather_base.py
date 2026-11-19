@@ -50,7 +50,8 @@ them is the whole disc's coverage too (held as the balls' ring is); so is a diff
 there (`tablesheet`), which holds photons and is crossed once, its low leg open.
 
 The floor 0-2 cm and 2-5 cm out from a box's base must each read within 7 % of mode R (two seeds
-apiece). The floor 4-12 cm from a ball's contact must read within 3 % of the same render with the
+apiece), the pixels that reach the box's top as the camera sees it left out (box_floor: a 3 cm top
+hides the floor 5 mm out, and its edge pixels are top). The floor 4-12 cm from a ball's contact must read within 3 % of the same render with the
 footprint correction off (-gatherarea 0), whose coverage there is the whole disc: the kernel's blur
 from the lit floor beyond makes mode R no reference there. The tower's rings must read within 3 % of
 that render divided by each pixel's share of the disc outside the tower, a circular segment's
@@ -120,8 +121,9 @@ def write_ball_obj(path, r, n=48):
 # ball is seen from low beside it, looking under its overhang, where a low light from the side
 # reaches, and its floor is measured out from the point it rests on. That floor is what the probe
 # begins inside the ball over: from above, the ball hides it.
-TOP_CAM = 'camera "c" { eye 0 0.9 0.0001  look_at 0 0 0  up 0 0 1  fov_y %g  film { res %d %d } }' % (
-    2 * np.degrees(np.arctan(HALF / 0.9)), W, H)
+TOP_EYE = 0.9       # the view from above: its eye's height over the box's middle
+TOP_CAM = 'camera "c" { eye 0 %g 0.0001  look_at 0 0 0  up 0 0 1  fov_y %g  film { res %d %d } }' % (
+    TOP_EYE, 2 * np.degrees(np.arctan(HALF / TOP_EYE)), W, H)
 SW, SH, SFOV = 160, 100, 30.0
 SEYE, SLOOK = np.array([0.0, 0.06, 0.55]), np.array([0.0, 0.03, 0.0])
 SIDE_CAM = 'camera "c" { eye %g %g %g  look_at %g %g %g  up 0 1 0  fov_y %g  film { res %d %d } }' % (
@@ -175,14 +177,26 @@ def side_dist(occluded=True, radius=BOX):
 # over mode R, and mode S 15-25 %, however the coverage is taken. So that ring holds each estimate to
 # the same render with the footprint correction off (`-gatherarea 0`): the same photons, so the
 # ratio is the coverage alone, which is the whole disc there since the floor is all present.
+def box_floor(X, Z, height):
+    """The floor's distance out from the base of a box `height` tall under each pixel of the view from
+    above (top_dist), or NaN where the pixel's footprint reaches the box's top as the camera sees it.
+    Seen from TOP_EYE the top covers the floor out to BOX * height / (TOP_EYE - height) from the
+    base (5 mm for 3 cm), so the pixel holding that edge is part top -- and a mirror's top shows the
+    lamp there, 14 times the floor's radiance: at 16 samples its coverage noise outweighed the
+    floor's whole 0-2 cm ring and read the ring 1.0 +- 0.023 of mode R seed to seed."""
+    d = np.maximum(np.abs(X), np.abs(Z)) - BOX
+    half = HALF / W                                         # half a pixel, on the floor
+    near = np.maximum(np.abs(X) - half, np.abs(Z) - half) - BOX
+    return np.where((d >= 0) & (near < BOX * height / (TOP_EYE - height)), np.nan, d)
+
+
 def _box(mat, height=0.03, bottom=True):
     faces = box(-BOX, 0.0, -BOX, BOX, height, BOX, "obj")
     if not bottom:
         faces = [f for f in faces if "origin %g 0 %g  u %g 0 0" % (-BOX, -BOX, 2 * BOX) not in f]
         assert len(faces) == 5
-    return ([mat] + faces, TOP_CAM,
-            lambda: top_dist(lambda X, Z: np.maximum(np.abs(X), np.abs(Z)) - BOX), RINGS, "the base",
-            "R")
+    return ([mat] + faces, TOP_CAM, lambda: top_dist(lambda X, Z: box_floor(X, Z, height)), RINGS,
+            "the base", "R")
 
 
 def _ball(mat, mesh=False, radius=BOX, rings=((0.04, 0.12),)):
@@ -281,8 +295,8 @@ def scene(obj_lines, cam):
     ] + obj_lines) + NL
 REF = ["-mode", "R", "-device", "gpu", "-spp", "512"]
 CASES = [("M_gpu", ["-mode", "M", "-device", "gpu", "-n", "8000000", "-spp", "16", "-pmradius", "0.1"]),
-         # 16 samples, as the GPU case takes: the floor by a mirror box's base is its direct light and
-         # the mirror's caustic, both drawn per camera sample, and at 4 one seed read it 0.92-1.06.
+         # 16 samples, as the GPU case takes: at 4 one seed read the mirror box's 0-2 cm ring 0.92-1.06,
+         # most of that the pixels straddling the box top's edge, which box_floor now leaves out.
          ("M_cpu", ["-mode", "M", "-device", "cpu", "-n", "2000000", "-spp", "16", "-pmradius", "0.1"]),
          ("S_gpu", ["-mode", "S", "-device", "gpu", "-spp", "32", "-pmradius", "0.1"]),
          ("S_cpu", ["-mode", "S", "-device", "cpu", "-spp", "8", "-pmradius", "0.1"]),
