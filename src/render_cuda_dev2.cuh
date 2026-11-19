@@ -3471,19 +3471,16 @@ __global__ void kJSurfCellKey(const DSurfPhoton* pts, int n, DVec3 gLo, double c
 }
 #endif
 
-// BUCKET id per deposited photon (PhotonMap::cellCoord + cellIndex twin). The host converted
-// DPhoton's float position to a double Vec3 BEFORE the all-double cell math, so promote first.
-// Unclamped and hashed since 0.199.6, matching the host exactly — see pmCellHash.
+// BUCKET id per deposited photon (PhotonMap::cellCoord + cellIndex twin; merge_grid.h). The host
+// converted DPhoton's float position to a double Vec3 BEFORE the all-double cell math, so promote first.
 #ifndef FT_FAMILY_TU
 __global__ void kSppmCellKey(const DPhoton* ph, long long n, double lox, double loy, double loz,
                              double cellSize, unsigned int tableMask, int* key) {
     long long stride = (long long)gridDim.x * blockDim.x;
-    for (long long i = blockIdx.x * (long long)blockDim.x + threadIdx.x; i < n; i += stride) {
-        int ix = (int)floor(((double)ph[i].pos.x - lox) / cellSize);
-        int iy = (int)floor(((double)ph[i].pos.y - loy) / cellSize);
-        int iz = (int)floor(((double)ph[i].pos.z - loz) / cellSize);
-        key[i] = (int)pmCellHash(ix, iy, iz, tableMask);
-    }
+    for (long long i = blockIdx.x * (long long)blockDim.x + threadIdx.x; i < n; i += stride)
+        key[i] = (int)mergeBucket(mergeCellCoord((double)ph[i].pos.x, lox, cellSize),
+                                  mergeCellCoord((double)ph[i].pos.y, loy, cellSize),
+                                  mergeCellCoord((double)ph[i].pos.z, loz, cellSize), tableMask);
 }
 #endif
 

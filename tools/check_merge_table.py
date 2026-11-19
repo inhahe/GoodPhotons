@@ -1,20 +1,25 @@
 """Regression check: a merge map's query is exact at any size of its hashed table.
 
-    python -u tools/check_merge_table.py [--exe ftrace.exe] [--out png/check_merge_table] [--modes UJ]
+    python -u tools/check_merge_table.py [--exe ftrace.exe] [--out png/check_merge_table] [--modes UJMS]
 
-The merge maps -- mode U's light vertices, mode J's surface photons -- bin their points in a
-hashed lattice (merge_grid.h): cells the merge radius wide in hashed blocks of 3x3x3, buckets about
-two a point. A bucket holds a cell of every block that hashes to its slot, and a query reads the 27
-cells around it, so it must never read one bucket twice, or the points of two of its cells sharing
-it would count twice; a bucket's low part is its cell's place in its block, which the 27 never
-share. FTRACE_MERGE_TABLE=1 holds the table to one slot, 27 buckets that every block shares, so
-every bucket holds thousands of cells and a query's blocks all collide: an exact query still
-accepts each point once, in the order it was binned, so the render is the default table's. A glass ball's caustic on a diffuse floor in a
-room, each mode rendered with the default table and with the 27 buckets:
+The merge maps -- mode U's light vertices, mode J's surface photons, the photon map of modes M and
+S -- bin their points in a hashed lattice (merge_grid.h): cells the merge radius wide in hashed
+blocks of 3x3x3, buckets about two a point. A bucket holds a cell of every block that hashes to its
+slot, and a query reads the 27 cells around it, so it must never read one bucket twice, or the
+points of two of its cells sharing it would count twice; a bucket's low part is its cell's place in
+its block, which the 27 never share. FTRACE_MERGE_TABLE=1 holds the table to one slot, 27 buckets
+that every block shares, so every bucket holds thousands of cells and a query's blocks all collide:
+an exact query still accepts each point once, in the order it was binned, so the render is the
+default table's. A glass ball's caustic on a diffuse floor in a room, each mode rendered with the
+default table and with the 27 buckets:
 
   - on the CPU, byte for byte the same HDR output;
-  - on the GPU, the same to 1e-5 of each pixel (a warp's share of a merge list moves with the
-    strays among it, which regroups the sums; nothing more).
+  - on the GPU, the same to 1e-5 of each pixel in modes U and J (a warp's share of a merge list
+    moves with the strays among it, which regroups the sums; nothing more), and to 3e-4 in modes M
+    and S, whose photons are deposited by atomics and so differ that much from run to run.
+
+And `-checkpmgrid`'s photon map, its radius queries compared with brute force as exact photon
+sets, at the 27 buckets too.
 
 Exits 1 on any failure.
 """
@@ -44,8 +49,13 @@ light area { origin -0.2 1.98 -0.2  u 0.4 0 0  v 0 0 0.4  normal 0 -1 0  power 3
 camera "c" { eye 0 1 3.2  look_at 0 0.7 0  up 0 1 0  fov_y 45  film { res 64 48 } }
 """
 # Mode J redraws its light side at epochs paced by the work it counts, the gather's candidates among
-# it, which a smaller table's strays raise: -beamfreeze holds it to one realization.
-MODES = {"U": ["-mode", "U", "-spp", "4"], "J": ["-mode", "J", "-spp", "4", "-beamfreeze"]}
+# it, which a smaller table's strays raise: -beamfreeze holds it to one realization. Mode M chooses
+# its radius from a median over a sample of the map's buckets, which the table's size reorders:
+# -pmradius pins it.
+MODES = {"U": ["-mode", "U", "-spp", "4"], "J": ["-mode", "J", "-spp", "4", "-beamfreeze"],
+         "M": ["-mode", "M", "-n", "400000", "-spp", "2", "-beamfreeze", "-pmradius", "0.05"],
+         "S": ["-mode", "S", "-spp", "4"]}
+GPU_TOL = {"U": 1e-5, "J": 1e-5, "M": 3e-4, "S": 3e-4}
 GPU_TOKENS = ("-> GPU", "[gpu]", "VCM/UPS on ", "SPPM on ")
 
 
@@ -102,11 +112,21 @@ def main():
             else:
                 rel = np.abs(i1 - i0) / np.maximum(np.abs(i0), 1e-6 * max(m0, 1e-30))
                 worst = float(rel.max())
-                ok = worst <= 1e-5
+                ok = worst <= GPU_TOL[tag]
                 detail = "worst pixel %.2e of itself, mean x%.8f" % (worst, float(i1.mean()) / max(m0, 1e-30))
             if not ok:
                 fails.append(name)
             print("%-4s %s: %s" % ("ok" if ok else "FAIL", name, detail), flush=True)
+    env = dict(os.environ)
+    env["FTRACE_MERGE_TABLE"] = "1"
+    p = subprocess.run([exe, "-checkpmgrid"], cwd=ROOT, env=env, capture_output=True, text=True,
+                       encoding="utf-8", errors="replace")
+    line = next((l for l in p.stdout.splitlines() if "brute force" in l and "probes" in l), "")
+    ok = p.returncode == 0 and "(ok)" in line
+    if not ok:
+        fails.append("-checkpmgrid at 27 buckets")
+    print("%-4s -checkpmgrid at 27 buckets: %s" % ("ok" if ok else "FAIL", line.strip() or (p.stdout + p.stderr)[-400:]),
+          flush=True)
     print("PASS" if not fails else "FAILED: " + "; ".join(fails))
     return 1 if fails else 0
 

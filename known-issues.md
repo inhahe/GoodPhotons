@@ -410,20 +410,53 @@ SurfMap's doubling rule (Fable): a different map with its own padding and no dev
 with. The vertex-count-blind cap's clearing of a 64 M-cell table each CPU pass where it binds
 (Fable): VCM-SPARSE-LATTICE.
 
-## OPEN (2026-11-19, bug): PM-BUCKET-TWICE — mode M's and SPPM's gathers read a bucket twice when two of their cells share it
+## OPEN (2026-11-19, bug): GATHER-BASE-MIRROR-M — CPU mode M reads the floor beside a mirror box's base 7 % dark
 
-The photon map's lattice is hashed (`pmCellHash`, photonmap.h, 0.199.6): a bucket holds every cell
-that hashes to it, and a gather reads the 27 cells around it, bucket by bucket -- the host's
-`PhotonMap::queryR` and the adaptive radius's walk, the device's `dPmNeighborhood` (mode M's
-gather, its final gather, SPPM) and SPPM's device grid (`kSppmCellKey`). Nothing stops two of the
-27 cells hashing to one bucket; the bucket is then read twice and every photon in it within the
-radius counts twice. The chance a gather meets it is about 351 / T for T buckets (T about twice
-the photon count): 1.7e-4 of the gathers at a million photons, each over-counting the photons of
-two of its 27 cells -- a bias of order 1e-5, smaller with more photons, but not zero, and largest
-on a small map. **Proper fix:** the merge maps' bucket (`merge_grid.h`, `mergeBucket`), whose low
-part is the cell's place in its hashed 3x3x3 block, so a gather's 27 cells always fall in 27
-buckets; the CPU's gather is then the same at any table size (`FTRACE_MERGE_TABLE`,
-check_merge_table.py).
+`tools/check_gather_base.py` fails one row: the mirror box, CPU mode M, the ring of floor 0-2 cm
+from the base, 0.929 of mode R (tolerance 7 %); `M_cpu_gageom` the same. Every other row passes,
+GPU mode M reads that ring 1.031 and CPU mode S 0.996, so it is CPU mode M's alone. The same
+digits on 0.450.17, 0.450.20 and 0.450.21, so it predates this week's work; the check was last
+edited in 0.434.14, when it passed. **Next:** bisect between 0.434.14 and 0.450.17 (CPU mode M
+only, so a host-only build serves), then find what the mirror's base ring loses.
+
+## OPEN (2026-11-19, bug): GPU-MERGE-FLOAT-LATTICE — the device's merge gathers place a site in a float-rounded lattice
+
+The device's photon map (`DPhotonMap`) and mode J's surface map (`DSurfMap`) carry their lattice's
+corner as a `DVec3` and its cell width as `Real`, which under FTRACE_GPU_FP32 are float; the gather
+computes a site's cell from those (`dPmNeighborhood`, `DGridCell` in `DSurfSite`), while the points
+were binned in double -- by the host (PhotonMap::buildGrid, SurfMap::build, then uploaded) or by
+the device's own key kernels (`kSppmCellKey` with the double corner, `kJSurfCellKey` with the double
+width). A site within the two lattices' disagreement of a cell plane then takes the cell beside its
+own, and its 3x3x3 neighbourhood misses the photons within the radius two cells away on the far
+side. The disagreement is the float rounding of the corner plus that of the width times the cell
+index -- about 1e-7 of a cell a cell away from the corner, so it grows with the scene's extent in
+cells and with its distance from the origin (a scene 1e4 units out has a float corner rounded by
+1e-3). Mode U's grid is consistent (`kVcmCellKey` and `DVcmSite` read the same float corner and
+double width). **Proper fix:** carry the corner and width in double in both structs, as
+`DVcmGrid::cell` is, so the gather's lattice is the binning's; a check that moves a scene far from
+the origin and holds GPU M, S and J to their CPU renders.
+
+## DONE (2026-11-19, 0.450.21): PM-BUCKET-TWICE — mode M's and SPPM's gathers could read a bucket twice when two of their cells shared it
+
+The photon map's lattice was hashed per cell (`pmCellHash`, photonmap.h, 0.199.6): a bucket held
+every cell that hashed to it, and a gather read the 27 cells around it bucket by bucket -- the
+host's `PhotonMap::queryR` and the adaptive radius's walk, the device's `dPmNeighborhood` (mode
+M's gather, its final gather, SPPM) and SPPM's device grid (`kSppmCellKey`). Nothing stopped two
+of the 27 hashing to one bucket; it was then read twice and every photon in it within the radius
+counted twice -- about 351 / T of the gathers for T buckets (T about twice the photon count).
+**Fixed:** the photon map takes the merge maps' bucket (`merge_grid.h`, `mergeBucket`, 0.450.19):
+the cells in hashed 3x3x3 blocks, a cell's place in its block the bucket's low part, so a gather's
+27 cells always take 27 buckets. `pmCellHash` and `pmTableSize` are gone.
+
+**Verified:** `tools/check_merge_table.py` now covers modes M (at a pinned radius) and S and runs
+`-checkpmgrid` at one slot of 27 buckets: all byte-identical to the default table on the CPU, the
+GPU within 7e-7 of a pixel, `-checkpmgrid`'s queries exact photon sets against brute force. With
+each cell hashed alone put back (the old scheme) at 27 buckets the same check reads mode U x1.15,
+J x1.17, M x1.69 and `-checkpmgrid` BAD. Against 0.450.20 at a pinned radius, CPU mode M on
+check_bitid's flat scene moves one pixel of 6912, 0.8 % darker (a double count gone). At the
+automatic radius mode M's frames move by under 0.02 % in the mean: `medianNeighborCount` samples
+the map bucket by bucket, so the new layout draws another sample and the radius moves (0.05508 ->
+0.05537 there); mode S is identical but for its atomics' floor.
 
 ## DONE (2026-11-19, 0.450.19): VCM-SPARSE-LATTICE — mode U's lattice was sized by the radius alone
 

@@ -8748,12 +8748,12 @@ struct DMergeFootprint {
 // (No nEmitted here: the normalization is folded into each record's pX/pY/pZ.)
 struct DPhotonMap {
     const DGatherPhoton* photons; // reordered into bucket-contiguous runs
-    const int*   cellStart;   // size tableMask+2; bucket b is [cellStart[b], cellStart[b+1])
+    const int*   cellStart;   // size mergeBucketCount(tableMask)+1; bucket b is [cellStart[b], cellStart[b+1])
     DVec3  lo;                // lattice origin (world)
     Real   cellSize;          // == gather radius
     Real   radius;            // gather radius (world units) — a MAXIMUM when kGather > 0
     Real   kGather;           // per-query adaptive target population; 0 = fixed radius
-    unsigned int tableMask;   // bucket count - 1; see pmCellHash (photonmap.h)
+    unsigned int tableMask;   // the table's mask (merge_grid.h, mergeBucket)
 };
 
 // The 3x3x3 bucket walk, shared by all three device gathers (mode-M gather, its final-gather
@@ -8767,13 +8767,13 @@ struct DPhotonMap {
 // rejection and lifting it here would cost a second subtract-and-dot per candidate.
 template <class F>
 __device__ static inline void dPmNeighborhood(const DPhotonMap& pm, const DVec3& p, F body) {
-    const int ix = (int)floor(((double)p.x - (double)pm.lo.x) / (double)pm.cellSize);
-    const int iy = (int)floor(((double)p.y - (double)pm.lo.y) / (double)pm.cellSize);
-    const int iz = (int)floor(((double)p.z - (double)pm.lo.z) / (double)pm.cellSize);
+    const int ix = mergeCellCoord((double)p.x, (double)pm.lo.x, (double)pm.cellSize);
+    const int iy = mergeCellCoord((double)p.y, (double)pm.lo.y, (double)pm.cellSize);
+    const int iz = mergeCellCoord((double)p.z, (double)pm.lo.z, (double)pm.cellSize);
     for (int dz = -1; dz <= 1; ++dz)
       for (int dy = -1; dy <= 1; ++dy)
         for (int dx = -1; dx <= 1; ++dx) {
-            const unsigned int c = pmCellHash(ix + dx, iy + dy, iz + dz, pm.tableMask);
+            const unsigned int c = mergeBucket(ix + dx, iy + dy, iz + dz, pm.tableMask);
             const int e = pm.cellStart[c + 1];
             for (int k = pm.cellStart[c]; k < e; ++k) body(k);
         }

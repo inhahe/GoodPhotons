@@ -6598,7 +6598,8 @@ as the one at fault.
   noise `M^-1/6` and bias `M^-2/3` — both error terms → 0, with a mild cost curve.
   `build` is split into `buildGrid` + `fillCie` for this, since the probe needs a second
   counting sort but only one (expensive, threaded) CIE pass.
-  **The lattice is HASHED, not dense** (`pmCellHash`, 0.199.6). A dense grid indexes cells as
+  **The lattice is HASHED, not dense** (0.199.6; since 0.450.21 the merge maps' `merge_grid.h`,
+  modes `U` and `J`'s too). A dense grid indexes cells as
   `(iz·ny+iy)·nx+ix` and must therefore *allocate* `nx·ny·nz` ints — a count that grows as
   `(L/r)³` in scene size over gather radius, while the photons themselves live on surfaces and
   only occupy `(L/r)²` of it. So on any large scene the *empty* cells set the memory bill, and
@@ -6607,15 +6608,18 @@ as the one at fault.
   exactly where a fine radius was most wanted: on `gallery_rain` (scene radius 32.7 m) a
   requested 0.031 m was inflated to 0.094 m, three times too coarse to resolve a caustic —
   which is what smeared the scene's caustics into a colourless grey veil. Hashing sizes the
-  bucket table from the **photon count** (`pmTableSize`, 2× rounded up to a power of two, i.e.
+  bucket table from the **photon count** (`mergeBucketMask`, about 2 buckets a photon, i.e.
   a flat ~8 B/photon against the map's 56), so the volume term disappears and `r` is free to
   follow the measured density; the only limit left is the deliberate two-octave clamp. Cells
-  that collide into one bucket are not a correctness problem — the query already distance-tests
+  that share a bucket are not a correctness problem — the query already distance-tests
   every candidate — and at 2× occupancy that costs ~13 extra tests across a 27-bucket
-  neighbourhood. The mix is SplitMix64's finaliser over three odd-constant products rather than
-  the classic XOR-of-three-primes, because the XOR form leaves *neighbouring* cells correlated
-  in the low bits and a gather visits 27 neighbouring cells at once. Host and device share the
-  one function (`PM_HD`), and the device's three traversals (mode-M gather, its final-gather
+  neighbourhood; but a gather must never read one bucket twice, so the cells go in hashed 3×3×3
+  blocks with a cell's place in its block as the bucket's low part, and a gather's 27 cells
+  always take 27 different buckets (`pmCellHash`, hashing each cell alone, let two of them
+  share one, whose photons then counted twice -- PM-BUCKET-TWICE). The mix is SplitMix64's
+  finaliser over three odd-constant products rather than the classic XOR-of-three-primes,
+  because the XOR form leaves *neighbouring* blocks correlated in the low bits. Host and device
+  share the one function (`mergeBucket`), and the device's three traversals (mode-M gather, its final-gather
   sub-ray, SPPM) now go through one `dPmNeighborhood` helper instead of three hand-copied
   transcriptions of the host binning. `cellCoord` no longer clamps to the bbox: with no array
   to run off, clamping was actively slightly wrong (a query just outside got folded onto the
@@ -10503,7 +10507,7 @@ as the one at fault.
   kernels' most, `cudaVcmRoute`'s, which main.cpp's preflight reads too, through
   `vramAffords` before the session starts) and the sort's scratch.
   **The merge grid is hashed** (`merge_grid.h`, since 0.450.19; mode `J`'s surface map takes the
-  same): cells the radius wide from a corner half a cell below the light vertices, in blocks of
+  same, and since 0.450.21 the photon map of modes `M` and `S`): cells the radius wide from a corner half a cell below the light vertices, in blocks of
   3×3×3 whose 27 cells take 27 consecutive buckets, the blocks hashed into `2^k` slots, about two
   buckets a vertex (`mergeBucketMask`), so the table follows the vertex count and never the box.
   The dense lattice before it took `(L/r)³` cells, capped at 64 M by widening them (every merge

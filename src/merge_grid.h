@@ -1,10 +1,11 @@
-// merge_grid.h -- the hashed lattice the merge maps bin their points into, on the host and the device:
-// mode U's light vertices (VcmGrid, DVcmGrid) and mode J's surface photons (SurfMap, DSurfMap). Cells
-// are as wide as the merge radius, so a query reads the 3x3x3 cells around it, and the table of
-// buckets is sized from the POINT COUNT, never from the box the points span: a dense lattice takes
-// (L / r)^3 cells over a box L wide, where points on surfaces fill only (L / r)^2 of them, so a fine
-// radius over a large scene asked for gigabytes or coarsened its cells (and every merge with them);
-// here a point costs about two ints of table however fine the cells are.
+// merge_grid.h -- the hashed lattice the merge maps bin their points into, on the host and the
+// device: mode U's light vertices (VcmGrid, DVcmGrid), mode J's surface photons (SurfMap, DSurfMap)
+// and the photon map of modes M and S (PhotonMap, DPhotonMap, SPPM's device grid). Cells are as
+// wide as the merge radius, so a query reads the 3x3x3 cells around it, and the table of buckets is
+// sized from the POINT COUNT, never from the box the points span: a dense lattice takes (L / r)^3
+// cells over a box L wide, where points on surfaces fill only (L / r)^2 of them, so a fine radius
+// over a large scene asked for gigabytes or coarsened its cells (and every merge with them); here a
+// point costs about two ints of table however fine the cells are.
 //
 // The cells go in blocks of 3x3x3, a block's 27 cells in 27 consecutive buckets -- the block hashed,
 // the cell's place in it (its coordinates mod 3) the low part -- so a query's 27 cells span at most

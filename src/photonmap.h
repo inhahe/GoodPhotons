@@ -29,6 +29,7 @@
 #include <thread>
 #include "linalg.h"
 #include "gatherplane.h"   // onGatherSurfaceSided: which photons a gather keeps
+#include "merge_grid.h"    // mergeBucket: the hashed lattice
 #include "color.h"
 #include "allocreport.h"   // OOM that names the buffer, its size and the flag that sizes it
 #include "workcount.h"    // tlWork: a query's candidates, for the CPU refresh (MODEM-CPU-NONDET)
@@ -87,16 +88,9 @@ struct Photon {
 // A per-thread deposit bank: the split (position, payload) pair that a photon pass appends
 // to, mirroring PhotonMap's own split layout so the concatenation into the map is a plain
 // append of both arrays. The two vectors are always the same length.
-// Host/device annotation for the one function the CPU grid and the CUDA gather kernels MUST
-// agree on bit for bit — the cell hash. If the two ever disagreed, a GPU gather would look in
-// a different bucket than the host counting sort filled and silently return black.
-#ifdef __CUDACC__
-  #define PM_HD __host__ __device__
-#else
-  #define PM_HD
-#endif
-
-// Bucket index for an integer cell coordinate, in a table of (mask+1) buckets.
+// The photon map's lattice is the merge maps' hashed one (merge_grid.h, mergeBucket), shared with
+// the device's gathers (dPmNeighborhood, kSppmCellKey), which must find each photon in the bucket
+// the host's counting sort put it in.
 //
 // WHY THE GRID IS HASHED AND NOT DENSE. A dense grid indexes cells as (iz*ny+iy)*nx+ix and
 // therefore has to ALLOCATE nx*ny*nz ints, which grows as (L/r)^3 in the scene size L over the
@@ -110,33 +104,12 @@ struct Photon {
 //
 // Hashing removes the volume term completely: the table is sized from the PHOTON COUNT, so the
 // cost per photon is a constant ~8 B no matter how fine the cells are, and r is free to follow
-// the measured density wherever it leads. Cells that collide into one bucket are not a
-// correctness problem — the query already distance-tests every candidate it visits, so an
-// aliased photon is simply rejected. With the table at 2x the photon count the expected number
-// of aliased candidates is ~0.5 per bucket, i.e. ~13 extra distance tests across the whole
-// 3x3x3 neighbourhood, against the hundreds of genuine candidates a tuned gather visits.
-//
-// The mix is a 64-bit multiply-xorshift (SplitMix64's finaliser over three odd-constant
-// products), not the classic XOR-of-three-primes: the XOR form leaves neighbouring cells
-// correlated in the low bits, and a gather visits 27 NEIGHBOURING cells at once — precisely the
-// pattern that clusters them into the same few buckets.
-PM_HD FT_UNIT_INLINE unsigned int pmCellHash(int ix, int iy, int iz, unsigned int mask) {
-    unsigned long long h = (unsigned long long)(unsigned int)ix * 0x9E3779B97F4A7C15ull;
-    h ^= (unsigned long long)(unsigned int)iy * 0xC2B2AE3D27D4EB4Full;
-    h ^= (unsigned long long)(unsigned int)iz * 0x165667B19E3779F9ull;
-    h ^= h >> 30; h *= 0xBF58476D1CE4E5B9ull;
-    h ^= h >> 27; h *= 0x94D049BB133111EBull;
-    h ^= h >> 31;
-    return (unsigned int)h & mask;
-}
+// the measured density wherever it leads. A bucket holds a cell of every block that hashes to its
+// slot; the query distance-tests every candidate, so a stray is simply rejected, and with about two
+// buckets a photon that is ~13 extra distance tests across a 3x3x3 neighbourhood, against the
+// hundreds of genuine candidates a tuned gather visits. A gather's 27 cells always fall in 27
+// different buckets, so none is read twice -- two sharing one would count its photons twice.
 
-// Smallest power of two >= n, at least 1024 (a floor so a tiny map still has slack).
-inline unsigned int pmTableSize(size_t n) {
-    unsigned long long want = 2ull * (unsigned long long)n;
-    unsigned int t = 1024;
-    while ((unsigned long long)t < want && t < (1u << 31)) t <<= 1;
-    return t;
-}
 
 struct PhotonBank {
     std::vector<Vec3>   pos;
@@ -192,15 +165,15 @@ struct PhotonMap {
     // buildAuto still reads them as the measured bbox EXTENT in cells, and the mode-M log
     // prints them so "how fine is the lattice" stays visible.
     int    nx = 1, ny = 1, nz = 1;
-    // Bucket runs: bucket b occupies [cellStart[b], cellStart[b+1]). Size tableMask+2.
+    // Bucket runs: bucket b occupies [cellStart[b], cellStart[b+1]). Size bucketCount() + 1.
     std::vector<int> cellStart;
-    unsigned int tableMask = 0;    // tableSize - 1; tableSize is a power of two
+    unsigned int tableMask = 0;    // mergeBucketMask of the photon count
 
-    long long bucketCount() const { return (long long)tableMask + 1; }
+    long long bucketCount() const { return (long long)mergeBucketCount(tableMask); }
 
     // Bucket for an integer cell coordinate.
     unsigned int cellIndex(int ix, int iy, int iz) const {
-        return pmCellHash(ix, iy, iz, tableMask);
+        return mergeBucket(ix, iy, iz, tableMask);
     }
     // Integer cell coordinate of a world point. NOT clamped to the bbox: with a hashed
     // lattice there is no "outside the array" to defend against, and clamping was actively
@@ -208,9 +181,9 @@ struct PhotonMap {
     // its 3x3x3 neighbourhood lost the far row. Unclamped, the neighbourhood straddles the
     // boundary correctly and the extra cells are simply empty.
     void cellCoord(const Vec3& p, int& ix, int& iy, int& iz) const {
-        ix = (int)std::floor((p.x - lo.x) / cellSize);
-        iy = (int)std::floor((p.y - lo.y) / cellSize);
-        iz = (int)std::floor((p.z - lo.z) / cellSize);
+        ix = mergeCellCoord(p.x, lo.x, cellSize);
+        iy = mergeCellCoord(p.y, lo.y, cellSize);
+        iz = mergeCellCoord(p.z, lo.z, cellSize);
     }
 
     // Bin the deposited photons into a uniform grid of cell size `r` (== gather radius,
@@ -226,7 +199,7 @@ struct PhotonMap {
         radius = r;
         cellSize = (r > 0.0) ? r : 1e-6;
         if (photons.empty()) {
-            nx = ny = nz = 1; tableMask = 0; cellStart.assign(2, 0);
+            nx = ny = nz = 1; tableMask = 0; cellStart.assign(mergeBucketCount(0) + 1, 0);
             cie.clear(); pos.clear(); return;
         }
 
@@ -250,10 +223,10 @@ struct PhotonMap {
         nx = dim(ext.x, cellSize); ny = dim(ext.y, cellSize); nz = dim(ext.z, cellSize);
 
         // Pass 1: count photons per BUCKET.
-        const unsigned int tableSize = pmTableSize(photons.size());
-        tableMask = tableSize - 1;
+        tableMask = mergeBucketMask(photons.size());
+        const size_t tableSize = mergeBucketCount(tableMask);
         std::vector<int> cellOf(photons.size());
-        ftalloc::resize(cellStart, (size_t)tableSize + 1, "the photon grid bucket table", "-n");
+        ftalloc::resize(cellStart, tableSize + 1, "the photon grid bucket table", "-n");
         std::fill(cellStart.begin(), cellStart.end(), 0);
         for (size_t i = 0; i < photons.size(); ++i) {
             int ix, iy, iz; cellCoord(pos[i], ix, iy, iz);
@@ -441,7 +414,7 @@ struct PhotonMap {
         // guard was the binding constraint on every large scene — on gallery_rain it inflated
         // a requested 0.031 m to 0.094 m, three times too coarse to resolve a caustic — and it
         // bound hardest exactly where a fine radius was most wanted. The hashed lattice
-        // (pmCellHash) sizes the table from the PHOTON COUNT instead, so r is now free to be
+        // (mergeBucket) sizes the table from the PHOTON COUNT instead, so r is now free to be
         // whatever the measured density asks for and the only limit left is the deliberate
         // two-octave clamp above.
         if (std::abs(r1 / r0 - 1.0) > 0.05) buildGrid(r1);   // else keep the probe binning

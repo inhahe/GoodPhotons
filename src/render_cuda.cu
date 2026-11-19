@@ -5910,8 +5910,8 @@ std::vector<Film> renderPhotonMapSharedCuda(const Scene& scene, const std::vecto
             }
             D.photons = (const DGatherPhoton*)up.keep(d_sorted);
         }
-        // cellStart always has >= 2 entries after build() (even for an empty map, where every
-        // [begin,end) slice is empty so the gather loop simply never runs) — always upload it.
+        // cellStart always has its buckets after build() (an empty map the 27 residue buckets, every
+        // [begin,end) slice empty, so the gather loop simply never runs) — always upload it.
         D.cellStart = (const int*)up.keep(uploadVec(M.cellStart));
     };
     DPhotonMap dpm{}, dpmC{};
@@ -6496,12 +6496,9 @@ void sppmSessionPass(SppmSession* s, long long photonsPerPass, double alpha) {
         lox = (double)bb.mnx - cellSize * 0.5;
         loy = (double)bb.mny - cellSize * 0.5;
         loz = (double)bb.mnz - cellSize * 0.5;
-        // Bucket table sized from the PHOTON COUNT, exactly as the host does (pmTableSize).
-        // The former dense variant sized it from gnx*gny*gnz — a cell count that on a fine
-        // SPPM radius over a large scene overflows the `(int)(nCells + 1)` this lower_bound
-        // passed to counting_iterator, i.e. it did not merely cost memory, it wrapped.
-        const unsigned int tableSize = pmTableSize(n);
-        tableMask = tableSize - 1;
+        // Bucket table sized from the PHOTON COUNT, exactly as the host does (mergeBucketMask).
+        tableMask = mergeBucketMask(n);
+        const size_t tableSize = mergeBucketCount(tableMask);
         ensureDevCap(s->d_cellKey, s->cellKeyCap, n);
         ensureDevCap(s->d_order,   s->orderCap,   n);
         kSppmCellKey<<<2048, 128>>>(s->d_photons, (long long)n, lox, loy, loz, cellSize,
@@ -6510,7 +6507,7 @@ void sppmSessionPass(SppmSession* s, long long photonsPerPass, double alpha) {
         thrust::device_ptr<int> tKey(s->d_cellKey), tOrd(s->d_order);
         thrust::sequence(pol, tOrd, tOrd + n);
         thrust::stable_sort_by_key(pol, tKey, tKey + n, tOrd);
-        ensureDevCap(s->d_cellStart, s->cellStartCap, (size_t)tableSize + 1);
+        ensureDevCap(s->d_cellStart, s->cellStartCap, tableSize + 1);
         thrust::lower_bound(pol, tKey, tKey + n,
                             thrust::counting_iterator<int>(0),
                             thrust::counting_iterator<int>((int)tableSize + 1),
@@ -6519,9 +6516,9 @@ void sppmSessionPass(SppmSession* s, long long photonsPerPass, double alpha) {
         kSppmGatherConvert<<<2048, 128>>>(s->d_photons, s->d_order, (long long)n, s->d_gather);
         cudaCheckKernel("sppm-gather-convert");
         dpm.photons = s->d_gather;
-    } else {
-        ensureDevCap(s->d_cellStart, s->cellStartCap, 2);
-        CUDA_CHECK(cudaMemset(s->d_cellStart, 0, 2 * sizeof(int)));
+    } else {   // the residue buckets alone, empty: a gather reads 27 of them
+        ensureDevCap(s->d_cellStart, s->cellStartCap, mergeBucketCount(0) + 1);
+        CUDA_CHECK(cudaMemset(s->d_cellStart, 0, (mergeBucketCount(0) + 1) * sizeof(int)));
     }
     dpm.lo = DVec3(lox, loy, loz);
     dpm.cellSize = (Real)cellSize; dpm.radius = (Real)rMax;
