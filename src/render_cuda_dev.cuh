@@ -21383,28 +21383,40 @@ __device__ static inline DMergeFootprint dVertexMergeFootprint(const DScene& sc,
                            v.fiberR, v.pscale, sc.gatherArea, dTwoSidedType(sc.mats[v.matId].type));
 }
 
+// A merge site's cell in a dense grid of cells `cell` wide from `lo`, nx x ny x nz of them (mode J's
+// surface map, DSurfSite; mode U's grid, DVcmSite): the cell holding p, its coordinates clamped into
+// the grid in double, before the conversion, so that a point far outside is clamped rather than
+// overflowed; and the dense index of its 27 neighbours in the merges' walk order.
+struct DGridCell {
+    int ix, iy, iz;
+    __device__ DGridCell(const DVec3& p, double lx, double ly, double lz, double cell, int nx, int ny, int nz) {
+        ix = (int)fmin(fmax(floor(((double)p.x - lx) / cell), 0.0), (double)(nx - 1));
+        iy = (int)fmin(fmax(floor(((double)p.y - ly) / cell), 0.0), (double)(ny - 1));
+        iz = (int)fmin(fmax(floor(((double)p.z - lz) / cell), 0.0), (double)(nz - 1));
+    }
+    // The dense index of neighbour `n` (n in 0..26, dz outermost and dx innermost, as the walk visits
+    // them), or -1 off the grid.
+    __device__ long long neighbour(int n, int nx, int ny, int nz) const {
+        const int cz = iz + n / 9 - 1, cy = iy + (n / 3) % 3 - 1, cx = ix + n % 3 - 1;
+        if (cz < 0 || cz >= nz || cy < 0 || cy >= ny || cx < 0 || cx >= nx) return -1;
+        return ((long long)cz * ny + cy) * nx + cx;
+    }
+};
 // One gather site's fixed part: its cell, the vertex's oriented geometric normal and sidedness,
 // and the radius squared. Mirrors SurfMap::query's 3x3x3 walk EXACTLY -- same clamped cell
 // coordinate, same dense index, same `<= r^2` test -- because the map was binned by that rule on
 // the host and a second transcription of it is a second chance to disagree.
 struct DSurfSite {
-    int ix, iy, iz;
+    DGridCell g;
     double r2;
     DMergeFootprint fp;   // its normal and sidedness (dMergeFromBehind's too), band and probes
     __device__ DSurfSite(const DScene& sc, const DSurfMap& sm, const DVertex& vk)
-        : fp(dVertexMergeFootprint(sc, vk, sm.radius)) {
+        : g(vk.p, (double)sm.lo.x, (double)sm.lo.y, (double)sm.lo.z, (double)sm.cell, sm.nx, sm.ny, sm.nz),
+          fp(dVertexMergeFootprint(sc, vk, sm.radius)) {
         r2 = (double)sm.radius * (double)sm.radius;
-        ix = (int)fmin(fmax(floor(((double)vk.p.x - (double)sm.lo.x) / (double)sm.cell), 0.0), (double)(sm.nx - 1));
-        iy = (int)fmin(fmax(floor(((double)vk.p.y - (double)sm.lo.y) / (double)sm.cell), 0.0), (double)(sm.ny - 1));
-        iz = (int)fmin(fmax(floor(((double)vk.p.z - (double)sm.lo.z) / (double)sm.cell), 0.0), (double)(sm.nz - 1));
     }
-    // The dense index of the site's `n`-th neighbour cell (n in 0..26, dz outermost and dx
-    // innermost, as the walk visits them), or -1 off the grid.
-    __device__ long long cell(const DSurfMap& sm, int n) const {
-        const int cz = iz + n / 9 - 1, cy = iy + (n / 3) % 3 - 1, cx = ix + n % 3 - 1;
-        if (cz < 0 || cz >= sm.nz || cy < 0 || cy >= sm.ny || cx < 0 || cx >= sm.nx) return -1;
-        return ((long long)cz * sm.ny + cy) * sm.nx + cx;
-    }
+    // The dense index of the site's `n`-th neighbour cell, or -1 off the grid.
+    __device__ long long cell(const DSurfMap& sm, int n) const { return g.neighbour(n, sm.nx, sm.ny, sm.nz); }
 };
 // The merge of photon `sm.order[q]` at the site: its XYZ added to gX, gY, gZ. `lobe` is the site's
 // camera vertex's toward the camera side (DMergeLobe), `coatTh` its coat's film there
