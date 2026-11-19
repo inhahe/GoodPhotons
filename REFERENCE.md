@@ -1217,6 +1217,13 @@ that converges to the same physical image.
   connections pair a camera path with its **own** light path so they share one wavelength
   and are exact; merges gather photons from other paths, so like modes `M`/`S` they use
   the standard spectral-photon-mapping XYZ estimate.)
+  **The merge grid is hashed and sized from the light-vertex count (0.450.19)**, on the CPU and
+  the GPU, so a fine `-pmradius` over a large scene costs no more memory than a coarse one and
+  every merge keeps cells the radius wide. Before, the grid was a dense lattice over the light
+  vertices' box: past 64 M cells (or, on the GPU, past the memory left) it widened its cells,
+  every merge then weighing more candidates (`[mode U] the merges' grid coarsened ...`), and a
+  sparse frame spent most of a pass clearing it (a micrometre radius over a 10 m box: 1.81 s to
+  0.29 s on the CPU).
 
 - **`J` — UPBP (mode `D` and mode `M`'s beams, under one weight).** Unifying Points,
   Beams and Paths (Křivánek et al. 2014) is to *volumes* what `U` is to surfaces. Mode `D`
@@ -1427,6 +1434,10 @@ that converges to the same physical image.
   > own constant and both denominators mention both. The two halves are independent in both
   > directions: a media-free scene gets surface merges and no beams, a pure-fog scene beams and no
   > surface photons.
+  >
+  > The surface map is binned in the same hashed grid mode `U` uses (0.450.19), sized from its
+  > photon count, so a fine `-jsurf-radius` over a large scene neither takes gigabytes nor widens
+  > the cells (before, `gallery_rain`'s 29 k surface photons took a 50 M-cell lattice).
   >
   > `-jsurf-radius <r>` is the **starting** gather disc in world units; left off it defaults to the
   > same `-pmradius` / `-pmradiusfrac` modes `M`/`S`/`U` use, deliberately, so that comparing

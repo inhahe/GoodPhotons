@@ -61,7 +61,7 @@
 #include <cstdint>
 #include <algorithm>
 #include "linalg.h"
-#include "allocreport.h"
+#include "merge_grid.h"   // the hashed lattice, one with the device's grid
 
 namespace bdpt {
 
@@ -145,13 +145,10 @@ struct SurfBank {
     void clear() { pts.clear(); mis.clear(); }
 };
 
-// Uniform hash grid over the stored photons, counting-sort layout (photonmap.h's).
-//
-// `cellCount()` and every cell index are `long long`, NOT int. A 512^3 grid is 134 M cells
-// and `(int)(nCells + 1)` overflows — which is exactly the bug still open against vcm.h's
-// grid in known-issues.md ("mode U still uses a dense cell grid with the same overflow").
-// This one is written the right way round from the start, and the resolution is additionally
-// capped so a scene with one distant stray photon cannot ask for a petabyte of cells.
+// The stored photons and the hashed lattice over them (merge_grid.h, photonmap.h's counting-sort
+// layout): cells the gather radius wide, so a query reads the 3x3x3 neighbourhood, and buckets
+// about two a photon, whatever box the photons span. The device's map (buildJSurfMapDevice,
+// DSurfMap) is the same lattice.
 struct SurfMap {
     std::vector<SurfPhoton> pts;
     std::vector<SurfMis>    mis;
@@ -167,9 +164,9 @@ struct SurfMap {
 
     Vec3 lo{0, 0, 0};
     double cell = 1.0;
-    long long nx = 1, ny = 1, nz = 1;
-    std::vector<int> cellStart;   // size nCells+1
-    std::vector<int> order;       // photon indices, cell-contiguous
+    unsigned int mask = 0;        // mergeBucketMask of the photon count
+    std::vector<int> cellStart;   // bucket b's photons are order[cellStart[b] .. cellStart[b + 1])
+    std::vector<int> order;       // photon indices, bucket-contiguous
     // Bytes held by the containers above (their capacity), for a cache that budgets maps by size.
     size_t heapBytes() const {
         return pts.capacity() * sizeof(SurfPhoton) + mis.capacity() * sizeof(SurfMis) +
@@ -198,93 +195,64 @@ struct SurfMap {
         const size_t j = (size_t)pts[i].misIdx;
         return j < mis.size() ? &mis[j] : nullptr;
     }
-    long long cellCount() const { return nx * ny * nz; }
-    long long cellIndex(long long ix, long long iy, long long iz) const {
-        return (iz * ny + iy) * nx + ix;
-    }
-    void cellCoord(const Vec3& p, long long& ix, long long& iy, long long& iz) const {
-        ix = (long long)std::floor((p.x - lo.x) / cell);
-        iy = (long long)std::floor((p.y - lo.y) / cell);
-        iz = (long long)std::floor((p.z - lo.z) / cell);
-        ix = std::min(std::max(ix, 0LL), nx - 1);
-        iy = std::min(std::max(iy, 0LL), ny - 1);
-        iz = std::min(std::max(iz, 0LL), nz - 1);
+    void cellCoord(const Vec3& p, int& ix, int& iy, int& iz) const {
+        ix = mergeCellCoord(p.x, lo.x, cell);
+        iy = mergeCellCoord(p.y, lo.y, cell);
+        iz = mergeCellCoord(p.z, lo.z, cell);
     }
 
     // The radius alone, without the grid: for a map the device grids itself (render_cuda.h
-    // cudaJSurfOnDevice), which reads only its photon count, emission count and radius. The grid
-    // runs to hundreds of MB (gallery_rain: 50 M cells for 29 k photons), held for nothing.
+    // cudaJSurfOnDevice), which reads only its photon count, emission count and radius.
     void radiusOnly(double r) {
         radius = (r > 0.0) ? r : 1e-6;
         cell = radius;
-        nx = ny = nz = 0;
+        mask = 0;
         cellStart.clear(); cellStart.shrink_to_fit();
         order.clear(); order.shrink_to_fit();
     }
     // `r` is the gather radius; the cell is sized to it so a query touches 3x3x3 cells.
-    // A grid that would exceed `maxCells` is coarsened instead of refused — a coarser cell
-    // only makes the query visit more photons, which costs time and changes no result.
-    void build(double r, long long maxCells = 64LL << 20) {
+    void build(double r) {
         radius = (r > 0.0) ? r : 1e-6;
         cell = radius;
         const size_t n = pts.size();
-        if (n == 0) { nx = ny = nz = 1; cellStart.assign(2, 0); order.clear(); return; }
-        Vec3 mn = pts[0].p, mx = pts[0].p;
+        if (n == 0) { mask = 0; cellStart.assign(mergeBucketCount(0) + 1, 0); order.clear(); return; }
+        Vec3 mn = pts[0].p;
         for (const SurfPhoton& q : pts) {
             mn.x = std::min(mn.x, q.p.x); mn.y = std::min(mn.y, q.p.y); mn.z = std::min(mn.z, q.p.z);
-            mx.x = std::max(mx.x, q.p.x); mx.y = std::max(mx.y, q.p.y); mx.z = std::max(mx.z, q.p.z);
         }
-        // Grow the cell until the grid fits the budget. Doubling terminates fast (the count
-        // falls 8x a step) and keeps `cell >= radius`, which the 3x3x3 query relies on.
-        Vec3 ext0 = (mx - mn) + Vec3{cell, cell, cell} * 2.0;
-        for (int guard = 0; guard < 64; ++guard) {
-            long long ax = std::max(1LL, (long long)std::ceil(ext0.x / cell));
-            long long ay = std::max(1LL, (long long)std::ceil(ext0.y / cell));
-            long long az = std::max(1LL, (long long)std::ceil(ext0.z / cell));
-            if (ax <= maxCells && ay <= maxCells && az <= maxCells &&
-                (double)ax * (double)ay * (double)az <= (double)maxCells) {
-                nx = ax; ny = ay; nz = az; break;
-            }
-            cell *= 2.0;
-            ext0 = (mx - mn) + Vec3{cell, cell, cell} * 2.0;
-            nx = ny = nz = 1;
-        }
+        // The corner a cell below the photons, as the device's.
         lo = mn - Vec3{cell, cell, cell};
-        const long long nCells = cellCount();
-        std::vector<long long> cellOf(n);
-        // The one allocation here sized by a flag rather than by the scene: `-jsurf-radius`
-        // (through `maxCells`) decides how many cells there are. Name it, so an OOM says
-        // which knob to turn instead of "bad allocation" between two progress lines.
-        cellStart.clear();
-        ftalloc::resize(cellStart, (size_t)nCells + 1, "the surface-merge grid", "-jsurf-radius", "Raise");   // zeroed
+        mask = mergeBucketMask(n);
+        const size_t nBuckets = mergeBucketCount(mask);
+        std::vector<unsigned int> bucketOf(n);
+        cellStart.assign(nBuckets + 1, 0);
         for (size_t i = 0; i < n; ++i) {
-            long long ix, iy, iz; cellCoord(pts[i].p, ix, iy, iz);
-            const long long c = cellIndex(ix, iy, iz);
-            cellOf[i] = c; ++cellStart[(size_t)c + 1];
+            int ix, iy, iz; cellCoord(pts[i].p, ix, iy, iz);
+            const unsigned int c = mergeBucket(ix, iy, iz, mask);
+            bucketOf[i] = c; ++cellStart[(size_t)c + 1];
         }
-        for (long long c = 0; c < nCells; ++c)
-            cellStart[(size_t)c + 1] += cellStart[(size_t)c];
+        for (size_t c = 0; c < nBuckets; ++c) cellStart[c + 1] += cellStart[c];
         order.assign(n, 0);
         std::vector<int> cursor(cellStart.begin(), cellStart.end() - 1);
-        for (size_t i = 0; i < n; ++i) order[(size_t)cursor[(size_t)cellOf[i]]++] = (int)i;
+        for (size_t i = 0; i < n; ++i) order[(size_t)cursor[bucketOf[i]]++] = (int)i;
     }
 
     // fn(photonIndex) for every photon within `radius` of p.
     template <class F>
     void query(const Vec3& p, F&& fn) const {
         if (order.empty()) return;
-        long long ix, iy, iz; cellCoord(p, ix, iy, iz);
+        int ix, iy, iz; cellCoord(p, ix, iy, iz);
         const double r2 = radius * radius;
-        for (long long dz = -1; dz <= 1; ++dz) { const long long cz = iz + dz; if (cz < 0 || cz >= nz) continue;
-        for (long long dy = -1; dy <= 1; ++dy) { const long long cy = iy + dy; if (cy < 0 || cy >= ny) continue;
-        for (long long dx = -1; dx <= 1; ++dx) { const long long cx = ix + dx; if (cx < 0 || cx >= nx) continue;
-            const long long c = cellIndex(cx, cy, cz);
-            for (int k = cellStart[(size_t)c]; k < cellStart[(size_t)c + 1]; ++k) {
+        for (int dz = -1; dz <= 1; ++dz)
+        for (int dy = -1; dy <= 1; ++dy)
+        for (int dx = -1; dx <= 1; ++dx) {
+            const unsigned int c = mergeBucket(ix + dx, iy + dy, iz + dz, mask);
+            for (int k = cellStart[c]; k < cellStart[(size_t)c + 1]; ++k) {
                 const int idx = order[(size_t)k];
                 const Vec3 d = p - pts[(size_t)idx].p;
                 if (dot(d, d) <= r2) fn(idx);
             }
-        }}}
+        }
     }
 };
 

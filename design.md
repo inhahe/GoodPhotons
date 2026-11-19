@@ -6489,10 +6489,11 @@ as the one at fault.
     vertex", and a point merge's site *is* an existing vertex rather than a new one, so C1
     splits after `y_{j-1}` and every light-side accumulator is read at **j-1** — one index
     earlier than a beam merge, which inserts a vertex and reads at **j**.
-  * **`SurfMap`** — flat SoA arrays plus a counting-sort uniform grid with `long long` cell
-    arithmetic that **coarsens** rather than refusing on a huge scene (mode `U`'s own dense grid
-    still has the `(int)(nCells+1)` overflow this avoids). `query(p, fn)` scans the 3×3×3 cell
-    box and keeps the inscribed sphere. `misOf(i)` returns **null** when the map carries no
+  * **`SurfMap`** — flat SoA arrays plus a counting sort into the merge maps' hashed lattice
+    (`merge_grid.h`, below under mode `U`): cells the radius wide, buckets about two a photon
+    whatever box the photons span (the dense grid it replaced took 50 M cells for `gallery_rain`'s
+    29 k photons, and coarsened past 64 M). `query(p, fn)` scans the 3×3×3 cells' buckets and
+    keeps the inscribed sphere. `misOf(i)` returns **null** when the map carries no
     weight for a photon, and the gather then **skips the merge entirely** rather than weighting
     it 1 — unlike a beam map, whose weight-1 fallback degrades to mode `M`'s estimator (too
     bright, still a picture), an unweighted point merge would be added *on top of* a complete
@@ -10493,12 +10494,23 @@ as the one at fault.
   smallest wave may ask for where it is more (a site at each of its paths' vertices), within an
   eighth of the memory left beside the light-vertex store, the kernels' stacks (the session's
   kernels' most, `cudaVcmRoute`'s, which main.cpp's preflight reads too, through
-  `vramAffords` before the session starts) and the sort's scratch; the grid's cell table takes
-  coarser cells where the device refuses it (`tryDevCap`), its merges then weighing more
-  candidates. The lattice itself -- cells the radius wide over the light vertices' box, at most 2e6
-  an axis and `kVcmMaxCells` (64 M, int-indexed) in all, its cells widening until it holds them --
-  is one rule for the host's `VcmGrid` and the device's grid (`vcm_lattice.h`, its corner stored in
-  the caller's scalar so a float grid rounds as it did). A site's warp ends in `dWarpSiteAdd`,
+  `vramAffords` before the session starts) and the sort's scratch.
+  **The merge grid is hashed** (`merge_grid.h`, since 0.450.19; mode `J`'s surface map takes the
+  same): cells the radius wide from a corner half a cell below the light vertices, in blocks of
+  3×3×3 whose 27 cells take 27 consecutive buckets, the blocks hashed into `2^k` slots, about two
+  buckets a vertex (`mergeBucketMask`), so the table follows the vertex count and never the box.
+  The dense lattice before it took `(L/r)³` cells, capped at 64 M by widening them (every merge
+  then weighing more candidates) and on the device by the memory left; a few thousand vertices in
+  a large box at a fine radius held the whole 256 MB table, cleared and prefix-summed every pass.
+  A bucket's low part is its cell's place in its block (`mergeBucket`), in which the 27 cells
+  around any site all differ, so a site never reads one bucket twice and counts each vertex once
+  however the blocks collide; it touches at most eight blocks, two cache lines of table each, as
+  the dense lattice kept neighbours together. Within a bucket the vertices keep their binning
+  order, so a site meets its cells' vertices in the order the dense lattice gave, and the CPU's
+  merges are bit-identical to it. `FTRACE_MERGE_TABLE=<k>` holds the slots to at most `k` (a
+  power of two; 1: one block of 27 buckets that every block shares), which
+  `tools/check_merge_table.py` uses to hold the renders to the default table's. Host and device
+  compute a cell alike (`mergeCellCoord`, in double, held to ±2^30), the site's in `DGridCell`. A site's warp ends in `dWarpSiteAdd`,
   mode J's queue's end too. A merge site builds its own lobe, prepared at once, never a caller's by
   reference: a lobe whose address leaves its kernel for a call ptxas keeps out of line lives in
   local memory there (the camera kernel's `camLobe` so handed to the inline merge made mode U 10 %
@@ -13349,7 +13361,7 @@ runs its own cases first (exit 2 where the scanner itself is wrong), and runs af
   uncapped copy, or the other capped unit's, held to its cap -- so the link could again refuse
   after an edit there (the shared headers' host-and-device helpers -- `ggx.h`, `bluenoise.h`,
   `pov_noise.h`, `pov_functions.h`, `pattern.h`, `stochtile.h`, `worley.h`, `gabor.h`,
-  `lighttree.h`, `gatherplane.h`, `photonmap.h`, `lens.h`, `curvature.h`, `cell_walk.h`, `rng.h` -- are
+  `lighttree.h`, `gatherplane.h`, `photonmap.h`, `lens.h`, `curvature.h`, `cell_walk.h`, `merge_grid.h`, `rng.h` -- are
   `FT_UNIT_INLINE`, `unit_linkage.h`: `static` in a capped unit, plain `inline` in every other, so
   that a host TU's external inline caller means one function everywhere -- `static` for all, as
   0.450.10 had it, broke the host's ODR -- and keyed by the unit, the same in its host and device

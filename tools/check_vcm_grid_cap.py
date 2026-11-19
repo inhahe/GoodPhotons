@@ -1,15 +1,16 @@
-"""Regression check: mode U renders at a merge radius whose dense cell lattice would not fit.
+"""Regression check: modes U and J render at a merge radius whose dense cell lattice would not fit.
 
     python -u tools/check_vcm_grid_cap.py [--out png/check_vcm_grid_cap] [--exe ftrace.exe]
 
-Mode U bins its light vertices in a dense lattice of radius-wide cells over their box (vcm.h
-VcmGrid, the device's DVcmGrid). At a fine radius over a large box that lattice asks for more cells
-than memory holds -- 10 m at a micrometre is 10^21 -- and the host's cellStart.assign threw, so the
-render failed. Both grids cap the cells (64 M) and grow them past it instead: a merge tests distance
-against the radius, so a bigger cell only adds candidates. A box of 10 m (two walls 10 m apart,
-lit), rendered in mode U at `-pmradius 1e-6`, must finish with a finite image on the CPU and the
-GPU, its mean within 5 % of the same frame at the scene's own radius (the merges at a micrometre
-add almost nothing, and the rest is the same estimator's).
+Mode U bins its light vertices, and mode J its surface photons, in a lattice of radius-wide cells.
+Dense over the points' box, at a fine radius over a large box that lattice asks for more cells than
+memory holds -- 10 m at a micrometre is 10^21 -- and the host's cellStart.assign threw, so the
+render failed; later both capped the cells (64 M) and grew them past it, every merge then weighing
+more candidates. The lattice is hashed now (merge_grid.h), its table sized from the point count. A
+box of 10 m (two walls 10 m apart, lit), rendered in mode U at `-pmradius 1e-6` and in mode J at
+`-jsurf-radius 1e-6`, must finish with a finite image on the CPU and the GPU, its mean within 5 %
+of the same frame at the scene's own radius (the merges at a micrometre add almost nothing, and
+the rest is the same estimator's).
 
 Exits 1 on any failure.
 """
@@ -48,13 +49,13 @@ def main():
         f.write(SCENE)
     ok = True
 
-    def render(tag, device, extra):
+    def render(tag, device, mode, extra):
         png = os.path.join(d, tag + ".png")
         pfm = png[:-4] + ".pfm"
         for f in (png, pfm):
             if os.path.exists(f):
                 os.remove(f)
-        p = subprocess.run([exe, "-in", path, "-mode", "U", "-device", device, "-spp", "8", "-seed", "1", "-hdr",
+        p = subprocess.run([exe, "-in", path, "-mode", mode, "-device", device, "-spp", "8", "-seed", "1", "-hdr",
                             "-no-meter", "-window-min", "-o", png] + extra, cwd=ROOT, capture_output=True,
                            text=True, encoding="utf-8", errors="replace")
         log = p.stdout + p.stderr
@@ -62,21 +63,25 @@ def main():
         img = read_pfm(pfm, top_down=True) if p.returncode == 0 and os.path.exists(pfm) else None
         return p.returncode, img, on_gpu, log
 
-    for device in ("cpu", "gpu"):
-        rc0, ref, g0, _ = render("own_" + device, device, [])
-        rc1, fine, g1, log = render("fine_" + device, device, ["-pmradius", "1e-6"])
-        ran = rc1 == 0 and fine is not None and (device == "cpu" or g1)
-        finite = ran and bool(np.isfinite(fine).all())
-        m0 = float(ref.mean()) if ref is not None else float("nan")
-        m1 = float(fine.mean()) if finite else float("nan")
-        good = finite and rc0 == 0 and ref is not None and m0 > 0 and abs(m1 / m0 - 1.0) <= 0.05
-        ok &= good
-        print("%-4s mode U on the %s at -pmradius 1e-6 over a 10 m box: %s, mean %.4g of the own radius's"
-              % ("ok" if good else "FAIL", device.upper(),
-                 ("exit %d" % rc1) if not ran else ("finite" if finite else "not finite"),
-                 (m1 / m0) if (finite and m0 > 0) else float("nan")), flush=True)
-        if not ran:
-            print(log[-800:])
+    # mode J's light side held to one realization: its refresh epochs are paced by the work it counts,
+    # which a finer radius changes
+    for mode, flag in (("U", "-pmradius"), ("J", "-jsurf-radius")):
+        for device in ("cpu", "gpu"):
+            freeze = ["-beamfreeze"] if mode == "J" else []
+            rc0, ref, g0, _ = render("own_%s_%s" % (mode, device), device, mode, freeze)
+            rc1, fine, g1, log = render("fine_%s_%s" % (mode, device), device, mode, [flag, "1e-6"] + freeze)
+            ran = rc1 == 0 and fine is not None and (device == "cpu" or g1)
+            finite = ran and bool(np.isfinite(fine).all())
+            m0 = float(ref.mean()) if ref is not None else float("nan")
+            m1 = float(fine.mean()) if finite else float("nan")
+            good = finite and rc0 == 0 and ref is not None and m0 > 0 and abs(m1 / m0 - 1.0) <= 0.05
+            ok &= good
+            print("%-4s mode %s on the %s at %s 1e-6 over a 10 m box: %s, mean %.4g of the own radius's"
+                  % ("ok" if good else "FAIL", mode, device.upper(), flag,
+                     ("exit %d" % rc1) if not ran else ("finite" if finite else "not finite"),
+                     (m1 / m0) if (finite and m0 > 0) else float("nan")), flush=True)
+            if not ran:
+                print(log[-800:])
     print("PASS" if ok else "FAILED")
     return 0 if ok else 1
 

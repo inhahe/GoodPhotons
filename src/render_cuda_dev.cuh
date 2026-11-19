@@ -119,6 +119,7 @@
 #include "pattern_device.cuh"   // DPattern / DPatEnvT / dPatternEval — shared with raster_cuda.cu
 #include "stochtile.h"    // O7: the host/device-shared histogram-preserving tiling operator
 #include "cell_walk.h"   // rayBoxClip / CellWalk: the box clip and lattice walk the host takes too
+#include "merge_grid.h"   // mergeBucket: the hashed lattice of the merge maps, the host's too
 #include "grin.h"         // grin::sceneHasGrin (host gate mirrored into DScene::hasGrin)
 #include "surfmerge.h"   // SurfMap/SurfPhoton/SurfMis: mode J's point x point merges
 #include "photonmap.h"    // host PhotonMap::build reused for the mode-M grid (GPU gather)
@@ -10191,11 +10192,11 @@ struct DSurfMis {                             // the light-side half of the merg
 struct DSurfMap {
     const DSurfPhoton* pts;
     const DSurfMis*    mis;
-    const int*         cellStart;             // size nx*ny*nz + 1
-    const int*         order;                 // photon indices, cell-contiguous
+    const int*         cellStart;             // size mergeBucketCount(mask) + 1
+    const int*         order;                 // photon indices, bucket-contiguous
     DVec3  lo;
     Real   cell;                              // == radius
-    int    nx, ny, nz;
+    unsigned int mask;                        // the table's (merge_grid.h)
     Real   radius;
     double kappaS;                            // n_m * pi r_s^2 -- this technique's constant
     long long nPts;
@@ -21333,43 +21334,38 @@ __device__ static inline DMergeFootprint dVertexMergeFootprint(const DScene& sc,
                            v.fiberR, v.pscale, sc.gatherArea, dTwoSidedType(sc.mats[v.matId].type));
 }
 
-// A merge site's cell in a dense grid of cells `cell` wide from `lo`, nx x ny x nz of them (mode J's
-// surface map, DSurfSite; mode U's grid, DVcmSite): the cell holding p, its coordinates clamped into
-// the grid in double, before the conversion, so that a point far outside is clamped rather than
-// overflowed; and the dense index of its 27 neighbours in the merges' walk order.
+// A merge site's cell in a hashed lattice of cells `cell` wide from `lo` (merge_grid.h; mode J's
+// surface map, DSurfSite; mode U's grid, DVcmSite): the cell holding p, in the host's arithmetic
+// (mergeCellCoord, in double), and the buckets of its 27 neighbours in the merges' walk order.
 namespace {
 struct DGridCell {
     int ix, iy, iz;
-    __device__ DGridCell(const DVec3& p, double lx, double ly, double lz, double cell, int nx, int ny, int nz) {
-        ix = (int)fmin(fmax(floor(((double)p.x - lx) / cell), 0.0), (double)(nx - 1));
-        iy = (int)fmin(fmax(floor(((double)p.y - ly) / cell), 0.0), (double)(ny - 1));
-        iz = (int)fmin(fmax(floor(((double)p.z - lz) / cell), 0.0), (double)(nz - 1));
-    }
-    // The dense index of neighbour `n` (n in 0..26, dz outermost and dx innermost, as the walk visits
-    // them), or -1 off the grid.
-    __device__ long long neighbour(int n, int nx, int ny, int nz) const {
-        const int cz = iz + n / 9 - 1, cy = iy + (n / 3) % 3 - 1, cx = ix + n % 3 - 1;
-        if (cz < 0 || cz >= nz || cy < 0 || cy >= ny || cx < 0 || cx >= nx) return -1;
-        return ((long long)cz * ny + cy) * nx + cx;
+    __device__ DGridCell(const DVec3& p, double lx, double ly, double lz, double cell)
+        : ix(mergeCellCoord((double)p.x, lx, cell)), iy(mergeCellCoord((double)p.y, ly, cell)),
+          iz(mergeCellCoord((double)p.z, lz, cell)) {}
+    // The bucket of neighbour `n` (n in 0..26, dz outermost and dx innermost, as the walk visits
+    // them) in a table of mask `mask`; the 27 are distinct (mergeBucket).
+    __device__ unsigned int neighbour(int n, unsigned int mask) const {
+        return mergeBucket(ix + n % 3 - 1, iy + (n / 3) % 3 - 1, iz + n / 9 - 1, mask);
     }
 };
 }  // namespace
 // One gather site's fixed part: its cell, the vertex's oriented geometric normal and sidedness,
-// and the radius squared. Mirrors SurfMap::query's 3x3x3 walk EXACTLY -- same clamped cell
-// coordinate, same dense index, same `<= r^2` test -- because the map was binned by that rule on
-// the host and a second transcription of it is a second chance to disagree.
+// and the radius squared. Mirrors SurfMap::query's 3x3x3 walk EXACTLY -- the same cell coordinate,
+// the same buckets, the same `<= r^2` test -- because the map was binned by that rule on the host
+// and a second transcription of it is a second chance to disagree.
 namespace {
 struct DSurfSite {
     DGridCell g;
     double r2;
     DMergeFootprint fp;   // its normal and sidedness (dMergeFromBehind's too), band and probes
     __device__ DSurfSite(const DScene& sc, const DSurfMap& sm, const DVertex& vk)
-        : g(vk.p, (double)sm.lo.x, (double)sm.lo.y, (double)sm.lo.z, (double)sm.cell, sm.nx, sm.ny, sm.nz),
+        : g(vk.p, (double)sm.lo.x, (double)sm.lo.y, (double)sm.lo.z, (double)sm.cell),
           fp(dVertexMergeFootprint(sc, vk, sm.radius)) {
         r2 = (double)sm.radius * (double)sm.radius;
     }
-    // The dense index of the site's `n`-th neighbour cell, or -1 off the grid.
-    __device__ long long cell(const DSurfMap& sm, int n) const { return g.neighbour(n, sm.nx, sm.ny, sm.nz); }
+    // The bucket of the site's `n`-th neighbour cell.
+    __device__ unsigned int cell(const DSurfMap& sm, int n) const { return g.neighbour(n, sm.mask); }
 };
 }  // namespace
 // The merge of photon `sm.order[q]` at the site: its XYZ added to gX, gY, gZ. `lobe` is the site's
@@ -21511,9 +21507,8 @@ __device__ static inline int dSiteListWalk(const Cell& cell, int lane, int lanes
 }
 // The photons of surface-map cell `n` of `site` (dSiteListWalk's `cell`).
 __device__ static inline void dSurfSiteCell(const DSurfMap& sm, const DSurfSite& site, int n, int& b, int& e) {
-    const long long c = site.cell(sm, n);
-    b = e = 0;
-    if (c >= 0) { b = sm.cellStart[c]; e = sm.cellStart[c + 1]; }
+    const unsigned int c = site.cell(sm, n);
+    b = sm.cellStart[c]; e = sm.cellStart[c + 1];
 }
 // One camera vertex's gather, by the thread that reached it (the inline path; kWfSurfGather is the
 // wavefront's, a warp a site). Returns the photons it weighed (g_dWork's count).

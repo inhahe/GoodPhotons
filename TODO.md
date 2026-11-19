@@ -423,8 +423,11 @@ Then the rest of 4.2-4.6 in their order, 4.7's bookkeeping alongside whatever to
 - [x] **PREFLIGHT-ROUTE-PLAN** (0.450.16) — the preflight weighs routes, each the kernels its launcher
   will run from the launcher's own decision (render_cuda.h `GpuRoute`); mode P's camera-side layers
   and `-rgb` weighed as they run; known-issues.
-- [ ] **VCM-SPARSE-LATTICE** — size mode U's merge lattice by the vertex density too, on both devices
-  (vcm_lattice.h), measured on a dense and a sparse scene; known-issues.
+- [x] **VCM-SPARSE-LATTICE** (0.450.19) — modes U and J bin their merges in a hashed lattice sized
+  from the point count (merge_grid.h), on both devices; the CPU's merges bit-identical to the dense
+  lattice's; tools/check_merge_table.py.
+- [ ] **PM-BUCKET-TWICE** — mode M's and SPPM's gathers read a bucket twice when two of their cells
+  share it: give the photon map merge_grid.h's bucket; known-issues.
 - [x] **REVIEW-0450F** (0.450.15) — the Opus (max) and Fable (xhigh) reviews of 0.450.12-0.450.14, and
   0.450.14's mode-U slowdown (+18 %) found by timing and bisected: one albedo slot, the merge's own
   lobe; the scanner's levels and headers, the gates in CMake, FT_UNIT_INLINE per device pass in
@@ -472,6 +475,10 @@ Then the rest of 4.2-4.6 in their order, 4.7's bookkeeping alongside whatever to
   the occupancy pays.
 - [ ] **MERGE-LAZY-TIMING** — time fab8da8's lazy lobe against 0.450.9 paired, on the case 0.450.5
   measured its cost on (mode J, _fog_cornell: 5.48 -> 5.71 s median), on an idle GPU.
+- [ ] **MERGE-HASH-TIMING** — time 0.450.19's hashed merge lattice against the dense one (0.450.18)
+  paired on an idle machine: modes U and J, CPU and GPU, on a dense scene at its own radius
+  (_merge_glossy_bowl, _caustic_box; scraps/_mergegrid_time.py). Measured only under a check
+  sweep's load: CPU U single-threaded within the noise (-8 % to +3 %), the sparse box 6x faster.
 - [x] **RNG-ARG-ORDER** (0.450.11) — every call that took two or more RNG draws as arguments (89,
   the renderers' camera, lens and hair draws, the layered body's, the caustic aim's twins, the
   self-tests') draws them first into a declaration list or a braced initializer, which C++

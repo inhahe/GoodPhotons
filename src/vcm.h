@@ -83,8 +83,7 @@
 #include "render.h"
 #include "bdpt.h"        // bsdfF, bsdfPdf, isConnectibleMat, isTwoSidedMat, offsetOrigin
 #include "gathercoverage.h"   // MergeFootprint: the merges' footprint
-#include "vcm_lattice.h"      // the lattice's sizing, one rule with the device's grid
-#include "allocreport.h"      // ftalloc::resize: the grid's table named, should it not fit
+#include "merge_grid.h"       // the hashed lattice, one with the device's grid
 #include "color.h"
 
 namespace vcm {
@@ -191,57 +190,46 @@ struct LightVertexSec {
     int    nUp = 1;                          // wavelengths still live at this vertex
 };
 
-// Uniform hash grid over the stored light vertices (indices into a flat array), mirroring
-// photonmap.h's counting-sort layout. Cell size == merge radius, so a radius query only
-// touches the 3x3x3 neighbourhood.
+// The hashed lattice over the stored light vertices (merge_grid.h; indices into a flat array, in
+// photonmap.h's counting-sort layout): cells the merge radius wide, so a radius query reads only
+// the 3x3x3 neighbourhood, and buckets about two a vertex, whatever box the vertices span. The
+// device's grid (vcmSessionPass, DVcmGrid) is the same lattice.
 struct VcmGrid {
     Vec3 lo{0, 0, 0};
     double cell = 1e-4;
-    int nx = 1, ny = 1, nz = 1;
-    std::vector<int> cellStart;   // size nCells+1
-    std::vector<int> order;       // vertex indices in cell-contiguous order
+    unsigned int mask = 0;        // mergeBucketMask of the vertex count
+    std::vector<int> cellStart;   // bucket b's vertices are order[cellStart[b] .. cellStart[b + 1])
+    std::vector<int> order;       // vertex indices in bucket-contiguous order
 
-    long long cellCount() const { return (long long)nx * ny * nz; }
-    int cellIndex(int ix, int iy, int iz) const { return (iz * ny + iy) * nx + ix; }
     void cellCoord(const Vec3& p, int& ix, int& iy, int& iz) const {
-        ix = (int)std::floor((p.x - lo.x) / cell);
-        iy = (int)std::floor((p.y - lo.y) / cell);
-        iz = (int)std::floor((p.z - lo.z) / cell);
-        ix = std::min(std::max(ix, 0), nx - 1);
-        iy = std::min(std::max(iy, 0), ny - 1);
-        iz = std::min(std::max(iz, 0), nz - 1);
+        ix = mergeCellCoord(p.x, lo.x, cell);
+        iy = mergeCellCoord(p.y, lo.y, cell);
+        iz = mergeCellCoord(p.z, lo.z, cell);
     }
 
     void build(const std::vector<LightVertex>& v, double radius) {
         cell = radius > 0.0 ? radius : 1e-6;
         const size_t n = v.size();
-        if (n == 0) { nx = ny = nz = 1; cellStart.assign(2, 0); order.clear(); return; }
-        Vec3 mn = v[0].p, mx = v[0].p;
+        if (n == 0) { mask = 0; cellStart.assign(mergeBucketCount(0) + 1, 0); order.clear(); return; }
+        Vec3 mn = v[0].p;
         for (const auto& lv : v) {
             mn.x = std::min(mn.x, lv.p.x); mn.y = std::min(mn.y, lv.p.y); mn.z = std::min(mn.z, lv.p.z);
-            mx.x = std::max(mx.x, lv.p.x); mx.y = std::max(mx.y, lv.p.y); mx.z = std::max(mx.z, lv.p.z);
         }
-        // The lattice over the vertices' box, within kVcmMaxCells (vcmLattice): query() tests
-        // distance against the radius, not the cell.
-        const double bLo[3] = {mn.x, mn.y, mn.z}, bHi[3] = {mx.x, mx.y, mx.z};
-        const VcmLattice<double> lat = vcmLattice<double>(bLo, bHi, cell);
-        lo = Vec3{lat.lo[0], lat.lo[1], lat.lo[2]};
-        cell = lat.cell;
-        nx = lat.n[0]; ny = lat.n[1]; nz = lat.n[2];
-        const long long nCells = cellCount();
-        std::vector<int> cellOf(n);
-        // Sized by the merge radius (-pmradius), not by the scene: named, so an OOM says which knob.
-        cellStart.clear();
-        ftalloc::resize(cellStart, (size_t)nCells + 1, "the vertex-merge grid", "-pmradius", "Raise");   // zeroed
+        // The corner half a cell below the vertices, as the device's.
+        lo = mn - Vec3{cell, cell, cell} * 0.5;
+        mask = mergeBucketMask(n);
+        const size_t nBuckets = mergeBucketCount(mask);
+        std::vector<unsigned int> bucketOf(n);
+        cellStart.assign(nBuckets + 1, 0);
         for (size_t i = 0; i < n; ++i) {
             int ix, iy, iz; cellCoord(v[i].p, ix, iy, iz);
-            int c = cellIndex(ix, iy, iz);
-            cellOf[i] = c; ++cellStart[c + 1];
+            const unsigned int c = mergeBucket(ix, iy, iz, mask);
+            bucketOf[i] = c; ++cellStart[(size_t)c + 1];
         }
-        for (long long c = 0; c < nCells; ++c) cellStart[c + 1] += cellStart[c];
+        for (size_t c = 0; c < nBuckets; ++c) cellStart[c + 1] += cellStart[c];
         order.assign(n, 0);
         std::vector<int> cursor(cellStart.begin(), cellStart.end() - 1);
-        for (size_t i = 0; i < n; ++i) order[cursor[cellOf[i]]++] = (int)i;
+        for (size_t i = 0; i < n; ++i) order[(size_t)cursor[bucketOf[i]]++] = (int)i;
     }
 
     // Invoke fn(vertexIndex) for every stored vertex within radius r of p (r <= cell).
@@ -250,16 +238,16 @@ struct VcmGrid {
         if (order.empty()) return;
         int ix, iy, iz; cellCoord(p, ix, iy, iz);
         const double r2 = r * r;
-        for (int dz = -1; dz <= 1; ++dz) { int cz = iz + dz; if (cz < 0 || cz >= nz) continue;
-        for (int dy = -1; dy <= 1; ++dy) { int cy = iy + dy; if (cy < 0 || cy >= ny) continue;
-        for (int dx = -1; dx <= 1; ++dx) { int cx = ix + dx; if (cx < 0 || cx >= nx) continue;
-            int c = cellIndex(cx, cy, cz);
-            for (int k = cellStart[c]; k < cellStart[c + 1]; ++k) {
+        for (int dz = -1; dz <= 1; ++dz)
+        for (int dy = -1; dy <= 1; ++dy)
+        for (int dx = -1; dx <= 1; ++dx) {
+            const unsigned int c = mergeBucket(ix + dx, iy + dy, iz + dz, mask);
+            for (int k = cellStart[c]; k < cellStart[(size_t)c + 1]; ++k) {
                 int idx = order[k];
                 Vec3 d = p - v[idx].p;
                 if (dot(d, d) <= r2) fn(idx);
             }
-        }}}
+        }
     }
 };
 

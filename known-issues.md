@@ -361,15 +361,52 @@ SurfMap's doubling rule (Fable): a different map with its own padding and no dev
 with. The vertex-count-blind cap's clearing of a 64 M-cell table each CPU pass where it binds
 (Fable): VCM-SPARSE-LATTICE.
 
-## OPEN (2026-11-19, tech debt): VCM-SPARSE-LATTICE — mode U's lattice is sized by the radius alone
+## OPEN (2026-11-19, bug): PM-BUCKET-TWICE — mode M's and SPPM's gathers read a bucket twice when two of their cells share it
 
-A pass's merge lattice (vcm_lattice.h) has a cell the merge radius wide over the light vertices'
+The photon map's lattice is hashed (`pmCellHash`, photonmap.h, 0.199.6): a bucket holds every cell
+that hashes to it, and a gather reads the 27 cells around it, bucket by bucket -- the host's
+`PhotonMap::queryR` and the adaptive radius's walk, the device's `dPmNeighborhood` (mode M's
+gather, its final gather, SPPM) and SPPM's device grid (`kSppmCellKey`). Nothing stops two of the
+27 cells hashing to one bucket; the bucket is then read twice and every photon in it within the
+radius counts twice. The chance a gather meets it is about 351 / T for T buckets (T about twice
+the photon count): 1.7e-4 of the gathers at a million photons, each over-counting the photons of
+two of its 27 cells -- a bias of order 1e-5, smaller with more photons, but not zero, and largest
+on a small map. **Proper fix:** the merge maps' bucket (`merge_grid.h`, `mergeBucket`), whose low
+part is the cell's place in its hashed 3x3x3 block, so a gather's 27 cells always fall in 27
+buckets; the CPU's gather is then the same at any table size (`FTRACE_MERGE_TABLE`,
+check_merge_table.py).
+
+## DONE (2026-11-19, 0.450.19): VCM-SPARSE-LATTICE — mode U's lattice was sized by the radius alone
+
+A pass's merge lattice (vcm_lattice.h) had a cell the merge radius wide over the light vertices'
 box, up to 64 M cells, whatever the vertex count: a few thousand vertices in a large box at a fine
-radius take the whole 256 MB table, which the CPU clears, prefix-sums and copies every pass (and
-the device holds). **Proper fix:** size the cells by the vertex density too -- no finer than the
-box's volume over a small multiple of the vertex count -- on both devices at once (the rule is
-shared), measured against today's on a dense scene and a sparse one: a cell coarser than the
-radius only adds candidates.
+radius took the whole 256 MB table, which the CPU cleared, prefix-summed and copied every pass, and
+past the cap (or, on the device, the memory left) the cells widened, every merge weighing more
+candidates. Mode J's surface map had the same dense lattice (50 M cells for `gallery_rain`'s 29 k
+photons) with its own cap. The fix proposed here -- coarser cells where the vertices are sparse --
+would have kept the widening; the photon map had already shown the better one (0.199.6): **a
+hashed lattice** sized from the point count. **Fixed:** `merge_grid.h`, host and device, for modes
+U and J (VcmGrid, DVcmGrid, SurfMap, DSurfMap, one `DGridCell`): cells the radius wide in blocks of
+3x3x3, the blocks hashed into slots, a block's 27 cells in 27 consecutive buckets, about two
+buckets a point. A bucket's low part is the cell's place in its block, so a site's 27 cells fall
+in 27 different buckets and none is read twice (the photon map's hash can read one twice:
+PM-BUCKET-TWICE); a site touches at most eight blocks, as a dense lattice kept neighbours together;
+within a bucket the points keep their binning order, so a site meets its cells' points in the
+dense lattice's order. vcm_lattice.h, the device's memory-forced coarsening and its message, and
+`ftalloc::resize`'s `verb` (the two grids' "Raise the radius") are gone.
+
+**Verified:** `tools/check_merge_table.py` (new): with the table held to one slot of 27 buckets
+(`FTRACE_MERGE_TABLE=1`), every bucket shared by thousands of cells, modes U and J render
+byte-identically to the default table on the CPU and the GPU (J with `-beamfreeze`: its light
+side's epochs are paced by the work it counts, which a small table's strays raise).
+`check_bitid` against 0.450.18: identical but GPU M and S (their floor) and GPU J on its smooth
+scene (+1.0 % mean), which is identical under `FTRACE_JDEVLIGHT=1` -- the device redraws J's
+surface photons in blocks of samples paced by the counted camera work, the gather's candidates,
+strays included, among it, so the blocks fall elsewhere. `check_vcm_grid_cap.py` (now modes U and
+J, at `-pmradius` / `-jsurf-radius` 1e-6 over a 10 m box) passes. Timed only under a check sweep's
+load: the sparse box (U at -pmradius 1e-4) 1.80 s -> 0.30 s on the CPU; the dense
+`_merge_glossy_bowl` single-threaded within the noise; an idle-machine pairing is TODO
+MERGE-HASH-TIMING.
 
 ## DONE (2026-11-18, 0.450.14): REVIEW-0450E — what the Opus (max) and Fable (xhigh) reviews of 0.450.10-0.450.11 found
 

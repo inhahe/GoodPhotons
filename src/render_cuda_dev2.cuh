@@ -1714,20 +1714,21 @@ struct DVcmSec {
     float  lam;
 };
 
-// Uniform hash grid over the compacted light vertices (device twin of vcm.h VcmGrid). `lv` is the
-// compact array in path order, which the connections read a path at a time; `byCell` holds the
-// same vertices in cell-contiguous order (cell c's are [cellStart[c], cellStart[c + 1])), which the
-// merges read a cell at a time, and `byCellSec` their secondary-λ rows (DVcmSec, secStride a
-// vertex; null without the hero bundle). The order within a cell is the compact array's.
+// The hashed lattice over the compacted light vertices (merge_grid.h; device twin of vcm.h VcmGrid).
+// `lv` is the compact array in path order, which the connections read a path at a time; `byCell`
+// holds the same vertices in bucket-contiguous order (bucket b's are [cellStart[b], cellStart[b + 1])),
+// which the merges read a bucket at a time, and `byCellSec` their secondary-λ rows (DVcmSec,
+// secStride a vertex; null without the hero bundle). The order within a bucket is the compact
+// array's.
 struct DVcmGrid {
     const DVcmLV* lv;       // compact light-vertex array (path order)
     int    nLV;
-    const int* cellStart;   // nCells+1
-    const DVcmLV* byCell;   // nLV vertices, cell-contiguous
+    const int* cellStart;   // mergeBucketCount(mask) + 1
+    const DVcmLV* byCell;   // nLV vertices, bucket-contiguous
     const DVcmSec* byCellSec;
     DVec3  lo;
     double cell;            // == merge radius
-    int    nx, ny, nz;
+    unsigned int mask;      // the table's (merge_grid.h)
 };
 
 // Per-pass constants (device twin of vcm.h PassCtx; media/diffraction handled elsewhere).
@@ -2434,18 +2435,17 @@ struct DVcmMergeQueue {
 // The pixels a count of DVcmMergeQueue::profile covers.
 constexpr int kVcmProfBlock = 256;
 
-// A merge site's place in the pass's grid (DVcmGrid): the cell holding camera vertex `p`, clamped to the
-// grid as the build clamps a light vertex's.
+// A merge site's place in the pass's grid (DVcmGrid): the cell holding camera vertex `p`, as the build
+// bins a light vertex's.
 namespace {
 struct DVcmSite {
     DGridCell g;
     __device__ DVcmSite(const DVcmGrid& grid, const DVec3& p)
-        : g(p, (double)grid.lo.x, (double)grid.lo.y, (double)grid.lo.z, (double)grid.cell, grid.nx, grid.ny, grid.nz) {}
-    // The light vertices [b, e) of its neighbour cell n (dSiteListWalk's `cell`), empty off the grid.
+        : g(p, (double)grid.lo.x, (double)grid.lo.y, (double)grid.lo.z, (double)grid.cell) {}
+    // The light vertices [b, e) of its neighbour cell n's bucket (dSiteListWalk's `cell`).
     __device__ void cell(const DVcmGrid& grid, int n, int& b, int& e) const {
-        const long long c = g.neighbour(n, grid.nx, grid.ny, grid.nz);
-        b = e = 0;
-        if (c >= 0) { b = grid.cellStart[c]; e = grid.cellStart[c + 1]; }
+        const unsigned int c = g.neighbour(n, grid.mask);
+        b = grid.cellStart[c]; e = grid.cellStart[c + 1];
     }
     // The light vertices of its 27 cells: the list a merge there walks.
     __device__ int count(const DVcmGrid& grid) const {
@@ -3296,22 +3296,15 @@ __global__ void kVcmCompactScatter(const DVcmLV* slab, const DVcmSec* secSlab, i
 }
 #endif
 
-// Cell id per compacted light vertex. Mirrors the former host build EXPRESSION-FOR-
-// EXPRESSION: positions and gLo are Real (float), so the subtraction happens in float;
-// the divide promotes to double; floor/clamp in double/int. Identical bit results.
+// Bucket per compacted light vertex (merge_grid.h), its cell computed as a merge site's is
+// (DGridCell), in double -- that agreement decides whether a merge finds it.
 #ifndef FT_FAMILY_TU
-__global__ void kVcmCellKey(const DVcmLV* lv, int n, DVec3 gLo, double cell,
-                            int gnx, int gny, int gnz, int* key) {
+__global__ void kVcmCellKey(const DVcmLV* lv, int n, DVec3 gLo, double cell, unsigned int mask, int* key) {
     int stride = gridDim.x * blockDim.x;
-    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += stride) {
-        int ix = (int)floor((lv[i].p.x - gLo.x) / cell);
-        int iy = (int)floor((lv[i].p.y - gLo.y) / cell);
-        int iz = (int)floor((lv[i].p.z - gLo.z) / cell);
-        ix = min(max(ix, 0), gnx - 1);
-        iy = min(max(iy, 0), gny - 1);
-        iz = min(max(iz, 0), gnz - 1);
-        key[i] = (iz * gny + iy) * gnx + ix;
-    }
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += stride)
+        key[i] = (int)mergeBucket(mergeCellCoord((double)lv[i].p.x, (double)gLo.x, cell),
+                                  mergeCellCoord((double)lv[i].p.y, (double)gLo.y, cell),
+                                  mergeCellCoord((double)lv[i].p.z, (double)gLo.z, cell), mask);
 }
 #endif
 // The grid's cell-ordered copy (DVcmGrid::byCell): out[k] = lv[order[k]] for the n vertices, and
@@ -3464,22 +3457,17 @@ __global__ void kLbvhRefit(const int* parent, int n, int* visited, DNode* nodes)
 }
 #endif
 
-// Cell id per deposited SURFACE photon (mode J). Same shape as kVcmCellKey; the positions are
-// DSurfPhoton's, which the gather bins with the identical expression in dSurfMergeAt -- and it
-// is that agreement, not agreement with the host build, that decides whether a merge is found.
+// Bucket per deposited SURFACE photon (mode J; merge_grid.h). Same shape as kVcmCellKey; the
+// positions are DSurfPhoton's, which the gather bins with the identical expression (DGridCell) --
+// and it is that agreement, not agreement with the host build, that decides whether a merge is found.
 #ifndef FT_FAMILY_TU
-__global__ void kJSurfCellKey(const DSurfPhoton* pts, int n, DVec3 gLo, double cell,
-                              int gnx, int gny, int gnz, int* key) {
+__global__ void kJSurfCellKey(const DSurfPhoton* pts, int n, DVec3 gLo, double cell, unsigned int mask,
+                              int* key) {
     int stride = gridDim.x * blockDim.x;
-    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += stride) {
-        int ix = (int)floor(((double)pts[i].p.x - (double)gLo.x) / cell);
-        int iy = (int)floor(((double)pts[i].p.y - (double)gLo.y) / cell);
-        int iz = (int)floor(((double)pts[i].p.z - (double)gLo.z) / cell);
-        ix = min(max(ix, 0), gnx - 1);
-        iy = min(max(iy, 0), gny - 1);
-        iz = min(max(iz, 0), gnz - 1);
-        key[i] = (iz * gny + iy) * gnx + ix;
-    }
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += stride)
+        key[i] = (int)mergeBucket(mergeCellCoord((double)pts[i].p.x, (double)gLo.x, cell),
+                                  mergeCellCoord((double)pts[i].p.y, (double)gLo.y, cell),
+                                  mergeCellCoord((double)pts[i].p.z, (double)gLo.z, cell), mask);
 }
 #endif
 
