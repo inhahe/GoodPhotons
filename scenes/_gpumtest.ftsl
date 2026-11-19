@@ -1,6 +1,6 @@
 # Cornell-box validation scene for the GPU photon-map (mode M) port. TWO mode-M cameras
 # so the shared multi-camera path (runSharedPhotonMap / renderPhotonMapSharedCuda) fires.
-# Compare `-device cpu` vs `-device gpu` outputs with scraps/rmse to check the port.
+# Compare `-device cpu` vs `-device gpu` outputs (-hdr) with tools/pfmcmp.py to check the port.
 scene {
     units    meters
     spectral 360 830 1

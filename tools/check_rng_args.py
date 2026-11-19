@@ -1,6 +1,6 @@
 """Source check: no expression evaluates two RNG draws in an order the compiler chooses.
 
-    python tools/check_rng_args.py [--src src]
+    python tools/check_rng_args.py [--src src] [--warn-only]
 
 C++ leaves unsequenced the arguments of a call and the operands of most operators, so
 `f(rng.uniform(), rng.uniform())` or `rng.uniform() * rng.uniform()` makes an image depend on the
@@ -13,8 +13,10 @@ Flagged:
   - a call whose arguments hold draws in two of them, a draw counting for every bracket around it up
     to its statement: `f((k + rng.uniform()) / n, rng.uniform())`, `f(Vec3{rng.uniform()}, rnd())`;
   - one operand (a call's argument, a parenthesis, a braced clause, a statement's expression) holding
-    two draws, through parentheses, with no `&&`, `||`, `?` or `:` between them to sequence them:
-    `a * rng.uniform() + b * (rng.uniform() * 2)`.
+    two draws -- a bracket that draws being one draw there, its own frame judging what is inside it
+    -- with no `&&`, `||`, `?` or `:` OF ITS OWN LEVEL between them to sequence them:
+    `a * rng.uniform() + b * (rng.uniform() * 2)`, `rng.uniform() * (c ? 1 : 2) * rng.uniform()`,
+    `Vec3{rng.uniform(), 0, 0} * rng.uniform()`, `f(rng.uniform()) + rng.uniform()`.
 Sequenced, and passed: a declaration list (`const double u = rng.uniform(), v = rng.uniform();`), a
 braced initializer's clauses (`Vec3{rng.uniform(), rng.uniform()}`), the comma operator. A brace is
 a block, not an initializer, where it holds a statement (a `;`, or `if`, `return` and the like): a
@@ -23,7 +25,8 @@ function body after `const`, a lambda's after its return type. A helper that dra
 character literals and digit separators (`500'000`) are skipped.
 
 Lists each offender as file:line and exits 1 when there is one; exits 2 when the scanner fails its
-own cases (CASES), which it runs first.
+own cases (CASES), which it runs first; with --warn-only prints either as a warning and exits 0. The
+build runs it after every link (CMakeLists.txt, POST_BUILD).
 """
 import argparse
 import os
@@ -38,6 +41,7 @@ DRAW = re.compile(r"\b\w+(?:\.|->)(?:uniform|uniformOpen|next|nextFloat|uni|u01|
                   r"|\b(?:rng|prng|frand|uni|rnd|u01)\(\)")
 SEQ = re.compile(r"&&|\|\||\?|(?<!:):(?!:)")   # a conditional's `:` too, not a scope's `::`
 STMT_WORD = re.compile(r"\b(?:if|for|while|switch|return|do|case|break|continue)\b")
+HEADER = re.compile(r"\b(?:if|while|for|switch)\s*$")
 NOT_CALL = re.compile(r"\b(?:if|while|for|switch|return|sizeof|catch)\s*$")
 
 # (source, whether the scanner must flag it)
@@ -51,6 +55,17 @@ CASES = [
     ("x = rng.uniformOpen() * rng.uniform();", True),
     ("x = (*fn)(rng.uniform(), rnd());", True),
     ("x = table[i](rng.uniform(), rnd());", True),
+    ("x = rng.uniform() * (c ? 1.0 : 2.0) * rng.uniform();", True),
+    ("x = (c ? rng.uniform() : 0.0) + rng.uniform();", True),
+    ("x = Vec3{rng.uniform(), 0, 0} * rng.uniform();", True),
+    ("x = a() + (rng.uniform() < p && rng.uniform() < q);", False),
+    ("x = a(rng.uniform()) + (b && rng.uniform() < q);", True),
+    ("emit(rng.uniform(), [&](double w) { acc += w; }, rng.uniform());", True),
+    ("if (rng.uniform() < p) x = rng.uniform();", False),
+    ("while (rng.uniform() < q) n += rng.uniform();", False),
+    ("for (double t = rng.uniform(); t < 1; t += rng.uniform()) x = 1;", False),
+    ("T v{{rng.uniform(), rng.uniform()}, {0.0, 1.0}};", False),
+    ("if (a) { x = 1; } y = f(rng.uniform(), rng.uniform());", True),
     ("void g() const { x = rnd() * rnd(); }", True),
     ("auto l = [&]() -> Vec3 { return f(rng.uniform(), rng.uniform()); };", True),
     ("auto l = [&] { return rng.uniform() + rng.uniform(); };", True),
@@ -102,13 +117,22 @@ def strip(text):
 
 
 class Frame:
-    """A bracket, a block or a statement, and the draws in each of its comma-separated slots."""
+    """A bracket, a block or a statement, and what each of its comma-separated slots holds."""
 
     def __init__(self, kind, pos, call):
         self.kind, self.pos, self.call = kind, pos, call   # kind: "(", "[", "{" (an initializer),
         self.slot = 0                                      # "block" or "stmt"
-        self.draws = {}                 # slot -> [positions of its draws, through parentheses]
+        self.header = False             # an if/while/for/switch header's parenthesis
+        # slot -> its operands' draws and its own sequencing operators, in order: ("d", pos) a draw
+        # through parentheses, or a braced initializer holding draws as one, its clauses being
+        # sequenced among themselves; ("s", pos) a `&&`, `||`, `?` or `:` of this frame's level.
+        self.events = {}
         self.slots_with_draws = set()   # the slots a draw sits in, through any bracket
+
+    def add(self, kind, pos):
+        ev = self.events.setdefault(self.slot, [])
+        if not (ev and ev[-1] == (kind, pos)):
+            ev.append((kind, pos))
 
 
 def offenders(raw):
@@ -121,9 +145,15 @@ def offenders(raw):
     def close(fr):
         if fr.call and len(fr.slots_with_draws) >= 2:
             hits.add(fr.pos)
-        for ps in fr.draws.values():
-            if len(ps) >= 2 and not SEQ.search(s[ps[0]:ps[-1]]):
-                hits.add(ps[0])
+        for ev in fr.events.values():
+            last = None   # the slot's latest draw with no sequencing operator of its level since
+            for kind, pos in ev:
+                if kind == "s":
+                    last = None
+                elif last is not None:
+                    hits.add(last)
+                else:
+                    last = pos
 
     def holds_statement(at):
         """Whether the brace at `at` holds a statement -- a `;` or a statement keyword at its own
@@ -148,23 +178,26 @@ def offenders(raw):
             j -= 1
         return j
 
-    stack = [Frame("stmt", -1, False)]
+    stack = [Frame("block", -1, False), Frame("stmt", -1, False)]
     i = 0
     while i < n:
         if i in draws:
-            # The call rule counts the draw for every bracket up to its statement (a braced
-            # initializer's clauses, sequenced among themselves, still sit in one argument of an
-            # enclosing call); the one-operand rule counts it only through parentheses.
-            through_parens = True
+            # Counted for every bracket up to its statement: by the call rule as itself, by the
+            # one-operand rule as itself in the innermost bracket and, past it, as that bracket --
+            # one operand of whatever encloses it, its own frame judging the draws inside it.
+            item = i
             for fr in reversed(stack):
                 fr.slots_with_draws.add(fr.slot)
-                if through_parens:
-                    fr.draws.setdefault(fr.slot, []).append(i)
-                if fr.kind == "{":
-                    through_parens = False
+                fr.add("d", item)
                 if fr.kind == "stmt":
                     break
+                item = fr.pos
             i = draws[i]
+            continue
+        seq = SEQ.match(s, i)
+        if seq:
+            stack[-1].add("s", i)
+            i = seq.end()
             continue
         c = s[i]
         if c in "([":
@@ -173,27 +206,41 @@ def offenders(raw):
             # `(*fn)(...)`, `table[i](...)`; a lambda's parameters (`[&](...)`) hold no draws
             call = c == "(" and j >= 0 and (s[j].isalnum() or s[j] in "_>)]") and \
                 not NOT_CALL.search(s[max(0, j - 8):j + 1])
-            stack.append(Frame(c, i, call))
+            fr = Frame(c, i, call)
+            # a control statement's header: its body, after it, is a statement of its own
+            fr.header = c == "(" and HEADER.search(s[max(0, j - 8):j + 1]) is not None
+            stack.append(fr)
         elif c == "{":
             j = before(i)
             word = re.search(r"(\w+)\s*$", s[max(0, j - 10):j + 1])
-            if (j < 0 or s[j] in ");{}:]" or (word and word.group(1) in ("else", "do", "try"))
-                    or holds_statement(i)):
-                close(stack[-1])           # a block: the statement before it ends, and its own
-                stack.append(Frame("block", i, False))   # statements are frames of their own
+            if stack[-1].kind in ("(", "[", "{"):
+                # inside an expression: an initializer, or a lambda's body
+                block = holds_statement(i) or (j >= 0 and s[j] in ")]")
+            else:
+                block = (j < 0 or s[j] in ");{}:]" or (word and word.group(1) in ("else", "do", "try"))
+                         or holds_statement(i))
+            if block:
+                if stack[-1].kind == "stmt":
+                    close(stack.pop())     # the statement before it (a header, a declarator) ends
+                stack.append(Frame("block", i, False))   # its statements are frames of their own
                 stack.append(Frame("stmt", i, False))
             else:
                 stack.append(Frame("{", i, False))
         elif c in ")]":
-            if len(stack) > 1 and stack[-1].kind in "([":
-                close(stack.pop())
-        elif c == "}":
-            while len(stack) > 1 and stack[-1].kind not in ("{", "block"):
-                close(stack.pop())
-            if len(stack) > 1:
+            if stack[-1].kind in "([":
                 fr = stack.pop()
                 close(fr)
-                if fr.kind == "block":
+                if fr.header and stack[-1].kind == "stmt":
+                    close(stack.pop())
+                    stack.append(Frame("stmt", i, False))
+        elif c == "}":
+            while len(stack) > 2 and stack[-1].kind not in ("{", "block"):
+                close(stack.pop())
+            if len(stack) > 2:
+                fr = stack.pop()
+                close(fr)
+                # the enclosing block's next statement; a lambda's body returns to its expression
+                if fr.kind == "block" and stack[-1].kind == "block":
                     stack.append(Frame("stmt", i, False))
         elif c == ";":
             # a statement ends; a for header's `;` separates its parenthesis's slots
@@ -219,13 +266,15 @@ def selftest():
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split(NL)[0])
     ap.add_argument("--src", default=os.path.join(ROOT, "src"))
+    ap.add_argument("--warn-only", action="store_true", help="an offender is a warning: exit 0")
     a = ap.parse_args()
+    warn = "WARNING: " if a.warn_only else ""
     wrong = selftest()
     for src, want in wrong:
         print("scanner %s: %s" % ("misses" if want else "wrongly flags", src.replace(NL, " / ")))
     if wrong:
-        print("FAIL: the scanner gets %d of its %d cases wrong" % (len(wrong), len(CASES)))
-        return 2
+        print("%sFAIL: the scanner gets %d of its %d cases wrong" % (warn, len(wrong), len(CASES)))
+        return 0 if a.warn_only else 2
     total = 0
     for name in sorted(os.listdir(a.src)):
         if not name.endswith((".h", ".hpp", ".cpp", ".cu", ".cuh")):
@@ -235,9 +284,9 @@ def main():
         for ln, text in offenders(raw):
             print("%s:%d: %s" % (name, ln, text))
             total += 1
-    print("%d expression(s) evaluate two RNG draws in an order the compiler chooses" % total if total else
-          "ok: every expression's RNG draws are sequenced (and the scanner its %d cases)" % len(CASES))
-    return 1 if total else 0
+    print("%s%d expression(s) evaluate two RNG draws in an order the compiler chooses" % (warn, total) if total
+          else "ok: every expression's RNG draws are sequenced (and the scanner its %d cases)" % len(CASES))
+    return 1 if total and not a.warn_only else 0
 
 
 if __name__ == "__main__":

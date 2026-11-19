@@ -19,6 +19,7 @@
 // spectral-irradiance reconstruction (see the ROADMAP open question) and is exact for
 // a directly-viewed diffuse surface.
 #pragma once
+#include "unit_linkage.h"   // FT_UNIT_INLINE
 #include <vector>
 #include <cmath>
 #include <algorithm>
@@ -119,7 +120,7 @@ struct Photon {
 // products), not the classic XOR-of-three-primes: the XOR form leaves neighbouring cells
 // correlated in the low bits, and a gather visits 27 NEIGHBOURING cells at once — precisely the
 // pattern that clusters them into the same few buckets.
-PM_HD inline unsigned int pmCellHash(int ix, int iy, int iz, unsigned int mask) {
+PM_HD FT_UNIT_INLINE unsigned int pmCellHash(int ix, int iy, int iz, unsigned int mask) {
     unsigned long long h = (unsigned long long)(unsigned int)ix * 0x9E3779B97F4A7C15ull;
     h ^= (unsigned long long)(unsigned int)iy * 0xC2B2AE3D27D4EB4Full;
     h ^= (unsigned long long)(unsigned int)iz * 0x165667B19E3779F9ull;

@@ -306,7 +306,8 @@ static Spectrum resolveLight(const char* name) {
     if (resolveLightPreset(name, s)) return s;
     throw std::runtime_error("unknown -light preset '" + std::string(name) +
         "' — not a bb<K>/led<K>k parametric, a data/light or data/illuminant file/alias, "
-        "or a built-in lamp model (sodium/mercury/metal-halide/fluorescent/led-white)");
+        "or a built-in lamp model (sodium/mercury/metal-halide/fluorescent/led-white)" +
+        speclib::missingLibraryNote({"light", "illuminant"}));
 }
 
 static void addQuad(Scene& s, Vec3 a, Vec3 b, Vec3 c, Vec3 d, int mat, int sensorId = -1) {
@@ -20337,23 +20338,33 @@ static bool vramPreflight(char m, size_t buffers, size_t heldScene, bool forced,
     // the near-full test, which is about OTHER programs, adds all of it back.
     const bool tooTight = freeB + heldScene < needAll;
     const bool nearFull = totalB && (double)(freeB + ours) < 0.12 * (double)totalB;
+    // The render's own need past what the whole card holds: no other program is to blame, and
+    // forcing the card cannot make it fit.
+    const bool ownTooBig = totalB && needAll > totalB;
     if (tooTight || nearFull) {
         std::fprintf(stderr,
             "[device] NOT ENOUGH FREE VRAM for the GPU path (%s): the mode-%c "
             "megakernel reserves %.2f GB of per-thread local memory (%.2f GB of it "
             "already this process's, +%.2f GB film/scene/queues/context) but only %.2f GB of "
             "%.2f GB is free on %s.\n"
-            "[device] Some other process on this machine is holding the card. Running "
+            "[device] %s Running "
             "on the GPU anyway would spill that local memory to host RAM over PCIe and "
             "render 100-1000x slower at 100%% reported GPU load, with -interval, -time "
             "and -stop all inert. Using the CPU instead (-device gpu forces the GPU).\n",
             tooTight ? "over budget" : "card is >88% full",
             m, needLocal * toGB, reused * toGB,
             (needAll - (needLocal - reused)) * toGB,
-            freeB * toGB, totalB * toGB, cudaDeviceName());
+            freeB * toGB, totalB * toGB, cudaDeviceName(),
+            ownTooBig ? "This render alone needs more than the whole card holds (its films, a "
+                        "flight's cameras, the kernels' stacks): no other program is to blame."
+                      : "Some other process on this machine is holding the card.");
         if (!forced) return false;        // `auto`: fall back, which is the whole point
-        std::fprintf(stderr, "[device] -device gpu given explicitly; proceeding "
-                             "anyway. Expect the render to appear hung.\n");
+        std::fprintf(stderr, ownTooBig
+            ? "[device] -device gpu given explicitly; proceeding anyway, though the card cannot "
+              "hold it: a buffer it cannot allocate sends that part to the CPU, and the rest may "
+              "appear hung.\n"
+            : "[device] -device gpu given explicitly; proceeding anyway. Expect the render to "
+              "appear hung.\n");
     }
     return true;
 }
@@ -29534,21 +29545,26 @@ static int run(int argc, char** argv) {
     }
 #endif
     (void)mGpuOk;   // read only by the device routes (HAVE_CUDA): keep CPU-only builds warning-clean
+    // The instantiation a D or J meter frame launches: what meterAffords weighs and both its BDPT
+    // calls below (device and host) render, one name so that they cannot part.
+    constexpr int kMeterBdptDepth = 8, kMeterBdptHeroC = 1;
+    (void)kMeterBdptHeroC;   // read only by the device routes
 #ifdef HAVE_CUDA
     // Whether a W x H meter frame may run the kernels of mode `k` (cudaMegakernelLocalBytes's) on the
     // device: the card's room for them beside a frame's film pair (vramPreflight), at the instantiation
-    // the frame launches -- the render's, except that a D or J frame runs kBdptT scalar at depth 8
-    // (meterAnchor's renderBdptCuda call), so `k` is 'D' for both. Asked once a kernel set and frame
-    // size, and only by a frame its own tests have already sent to the device, so that one bound for
-    // the CPU anyway prints no verdict.
-    std::map<std::tuple<char, int, int>, bool> meterRoom;
-    const auto meterAffords = [&](char k, int W, int H) -> bool {
-        auto it = meterRoom.find({k, W, H});
+    // the frame launches -- the render's, except that a D or J frame runs kBdptT at kMeterBdptDepth
+    // with kMeterBdptHeroC (meterAnchor's renderBdptCuda call), so `k` is 'D' for both. `extra`:
+    // device bytes the frame takes beside its films (a blurred forward frame's posed cameras). Asked
+    // once a kernel set, frame size and extra, and only by a frame its own tests have already sent
+    // to the device, so that one bound for the CPU anyway prints no verdict.
+    std::map<std::tuple<char, int, int, size_t>, bool> meterRoom;
+    const auto meterAffords = [&](char k, int W, int H, size_t extra = 0) -> bool {
+        auto it = meterRoom.find({k, W, H, extra});
         if (it == meterRoom.end())
-            it = meterRoom.emplace(std::make_tuple(k, W, H),
-                                   vramPreflight(k, (size_t)W * H * 3 * sizeof(double) * 2, 0,
-                                                 !std::strcmp(device, "gpu"), k == 'D' ? 8 : 0,
-                                                 k == 'D' ? 1 : 0)).first;
+            it = meterRoom.emplace(std::make_tuple(k, W, H, extra),
+                                   vramPreflight(k, (size_t)W * H * 3 * sizeof(double) * 2 + extra, 0,
+                                                 !std::strcmp(device, "gpu"), k == 'D' ? kMeterBdptDepth : 0,
+                                                 k == 'D' ? kMeterBdptHeroC : 0)).first;
         return it->second;
     };
 #endif
@@ -29564,9 +29580,12 @@ static int run(int argc, char** argv) {
 #ifdef HAVE_CUDA
         const bool onDevice = meterGpu && (!mc.cam.seesMotion(scene) || !cudaBlurUnsupported(scene, mc.cam, mode));
         // The forward walk's device route, gated as renderForward gates it, with room for mode `k`'s
-        // kernels.
+        // kernels and, a blurred frame of a moving camera, its posed copies (one a thread of the
+        // megakernel, which the meter's trace runs on).
+        const size_t posed = (mc.cam.seesMotion(scene) && mc.cam.moves())
+                                 ? cudaForwardPosedCameraBytes(scene, false, g_heroC, meterN) : 0;
         const auto fwdOnDevice = [&](char k) {
-            return onDevice && cudaForwardSupported(scene) && meterAffords(k, W, H);
+            return onDevice && cudaForwardSupported(scene) && meterAffords(k, W, H, posed);
         };
 #else
         const auto fwdOnDevice = [&](char) { return meterGpu; };
@@ -29609,12 +29628,13 @@ static int run(int argc, char** argv) {
                 bool onGpu = false;
 #ifdef HAVE_CUDA
                 if (onDevice && cudaBdptSupported(scene) && meterAffords('D', W, H)) {
-                    mf = renderBdptCuda(scene, mc.cam, W, H, meterSpp, /*maxDepth*/8, diffraction);
+                    mf = renderBdptCuda(scene, mc.cam, W, H, meterSpp, kMeterBdptDepth, diffraction,
+                                        nullptr, kMeterBdptHeroC);
                     onGpu = true;
                 }
 #endif
                 if (!onGpu)
-                    mf = renderBdpt(scene, mc.cam, W, H, meterSpp, nThreads, /*maxDepth*/8, diffraction);
+                    mf = renderBdpt(scene, mc.cam, W, H, meterSpp, nThreads, kMeterBdptDepth, diffraction);
                 eAuto = autoExposureOf(filmToLinear(mf, (double)meterSpp));
                 break;
             }
@@ -29674,7 +29694,7 @@ static int run(int argc, char** argv) {
                 Film ref;
                 bool refGpu = false;
 #ifdef HAVE_CUDA
-                if (onDevice && backwardOnGpuOk(scene, mc.cam) && meterAffords('P', W, H)) {
+                if (onDevice && backwardOnGpuOk(scene, mc.cam) && meterAffords('P', W, H, posed)) {
                     ref = renderBackwardCuda(scene, mc.cam, W, H, meterSpp, diffraction, nullptr,
                                              g_maxBounceOverride, g_directOnly, g_heroC);
                     refGpu = true;

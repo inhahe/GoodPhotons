@@ -10476,7 +10476,14 @@ as the one at fault.
   kernels' most, `cudaMegakernelLocalBytes('U')`, which main.cpp's preflight reads too, through
   `vramAffords` before the session starts) and the sort's scratch; the grid's cell table takes
   coarser cells where the device refuses it (`tryDevCap`), its merges then weighing more
-  candidates. A site's warp ends in `dWarpSiteAdd`, mode J's queue's end too.
+  candidates. The lattice itself -- cells the radius wide over the light vertices' box, at most 2e6
+  an axis and `kVcmMaxCells` (64 M, int-indexed) in all, its cells widening until it holds them --
+  is one rule for the host's `VcmGrid` and the device's grid (`vcm_lattice.h`, its corner stored in
+  the caller's scalar so a float grid rounds as it did). A site's warp ends in `dWarpSiteAdd`,
+  mode J's queue's end too. A merge site builds its own lobe, prepared at once, never a caller's by
+  reference: a lobe whose address leaves its kernel for a call ptxas keeps out of line lives in
+  local memory there (the camera kernel's `camLobe` so handed to the inline merge made mode U 10 %
+  slower, 0.450.14).
   Measured on `_merge_glossy_bowl` at `-max-bounce 24`, wall time before -> queued (inline; the
   CPU): 64 passes at 96x72 at five times its radius 62.5 -> 7.4 s (21.2; 9.5), at its own radius
   7.1 -> 4.6 s (5.1; 2.9 -- 6 912 paths leave the device mostly idle); 16 passes at 320x240
@@ -13076,9 +13083,12 @@ b * rng.uniform()`), and a helper that draws (`unitDir()`) is called into a loca
 scene's emitter weights (`Emitter::selW`), the curve and Gabor self-tests and the BVH test's boxes
 were the last sites (0.450.14). `tools/check_rng_args.py` scans the source for any call whose
 arguments hold draws in two of them (`x.uniform()` and its kin, or `rng()`, `frand()`, `uni()`...),
-a draw counting for every bracket around it, and any operand holding two draws with no `&&`, `||`
-or conditional between them; a brace holding a statement is a block, not a braced initializer. It
-runs its own cases first (exit 2 where the scanner itself is wrong).
+a draw counting for every bracket around it, and any operand holding two draws -- a bracket that
+draws being one operand of its parent, its own frame judging what is inside -- with no `&&`, `||`
+or conditional OF THAT LEVEL between them; a brace holding a statement is a block, a control
+statement's header ends its statement, and a lambda's body inside a call returns to the call. It
+runs its own cases first (exit 2 where the scanner itself is wrong), and runs after every link
+(CMakeLists.txt, POST_BUILD, `--warn-only`: a warning in the build output).
 
 ## Scene-authoring tools (`tools/`)
 
@@ -13311,17 +13321,20 @@ runs its own cases first (exit 2 where the scanner itself is wrong).
   member, that a capped unit and another unit both keep out of line is a weak definition in each
   object, and nvlink binds every call to one of them -- render_cuda.cu's or raster_cuda.cu's
   uncapped copy, or the other capped unit's, held to its cap -- so the link could again refuse
-  after an edit there (the helpers of `pov_functions.h`, `pov_noise.h`, `bluenoise.h`, `ggx.h`,
-  `pattern.h` and `stochtile.h` are `FT_UNIT_INLINE`, `unit_linkage.h`: `static` in a capped unit,
-  plain `inline` elsewhere, so that a host TU's external inline caller means one function
-  everywhere -- `static` for all, as 0.450.10 had it, broke the ODR; a struct with member functions
-  goes in an unnamed namespace, as `DVertexLobe` did in 0.450.11 when its `pdf` bound kJSurfLightT
-  to render_cuda.cu's `dMatRoughness` at 252 registers, and twenty more did in 0.450.14 -- all but
-  those the units share, a kernel's parameter, a device global, a field of either, a type the host
-  uploads (`DVec3`, `DCamera`, `DCamSet`, `DBeamMap`...), whose members stay small enough that
+  after an edit there (the shared headers' host-and-device helpers -- `ggx.h`, `bluenoise.h`,
+  `pov_noise.h`, `pov_functions.h`, `pattern.h`, `stochtile.h`, `worley.h`, `gabor.h`,
+  `lighttree.h`, `gatherplane.h`, `photonmap.h`, `lens.h` -- are `FT_UNIT_INLINE`, `unit_linkage.h`: `static` in
+  every device pass, plain `inline` in every host pass, so that a host TU's external inline caller
+  means one function everywhere -- `static` for all, as 0.450.10 had it, broke the host's ODR; the
+  generators of the two POV headers emit it. A struct with member functions goes in an unnamed
+  namespace, as `DVertexLobe` did in 0.450.11 when its `pdf` bound kJSurfLightT to render_cuda.cu's
+  `dMatRoughness` at 252 registers -- all but those the units share, a kernel's parameter, a device
+  global, a field or member's return type of either, a type the host uploads (`DVec3`, `DCamera`,
+  `DCamSet`, `DBeamMap`, `DCoatEval` through `DCoatCtx`...), whose members stay small enough that
   ptxas inlines them. A shared function breaks the link through what it calls, whatever its own
-  count; `tools/check_device_linkage.py`, run by build.bat after every build and after a failed
-  one, lists any left, against every other GPU object); a kernel there is inside `#ifndef FT_FAMILY_TU` (render_cuda.cu compiles it, the family
+  count; `tools/check_device_linkage.py`, run after every link (CMakeLists.txt, POST_BUILD, on the
+  target's objects), lists any left, against every other GPU object, and names the function behind
+  a refused link when run by hand on the objects a failed build left); a kernel there is inside `#ifndef FT_FAMILY_TU` (render_cuda.cu compiles it, the family
   units do not); a device global goes through `FT_DEVGLOBAL`, defined in render_cuda.cu and
   `extern` in the family units, so the device holds one copy that `cudaMemcpyToSymbol` sets for
   all (the sphere connectors' tables, which were `static`, among them). Whole-program
@@ -13332,6 +13345,10 @@ runs its own cases first (exit 2 where the scanner itself is wrong).
   then CMake's default; the CUDA toolset named explicitly from `CUDA_PATH`, or the VS generator
   quietly configures CPU-only), copies `ftrace.exe` to the repo root, then runs
   `tools/check_device_probe.py` and warns loudly if the GPU half disagrees with the host half.
+  The build itself (CMakeLists.txt, POST_BUILD, whatever drives it) runs two gates after every
+  link, warning rather than failing: `tools/check_rng_args.py` and, with the CUDA backend,
+  `tools/check_device_linkage.py` on the target's objects (`$<TARGET_OBJECTS:ftrace>`); a link
+  that fails runs no post-build step, so build.bat's failure branch runs the linkage check itself.
   The "freshly-configured build dirs produce a GPU-silently-dead exe" problem (known-issues,
   2026-07-22 and 2026-08-16) was MSVC 14.5x's float `copysign` returning 0 in nvcc's device pass,
   fixed in `render_cuda.cu` in 0.385.0; the probe exists because that class of bug -- a host-header

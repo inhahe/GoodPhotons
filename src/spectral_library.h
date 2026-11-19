@@ -34,6 +34,7 @@
 #include <cctype>
 #include <cstdlib>
 #include <filesystem>
+#include <initializer_list>
 #include <stdexcept>
 #include "spectrum.h"
 #include "assetbytes.h"
@@ -62,6 +63,24 @@ inline std::filesystem::path categoryDir(const std::string& category) {
         if (fs::is_directory(alt, ec)) return alt;
     }
     return dir;   // report the cwd-relative name in whatever comes next
+}
+
+// What a failed lookup in the library's categories `cats` owes its message beside the name: the
+// directories of them in neither the working directory's data/ nor the executable's (categoryDir),
+// as ": the spectral library's data/light and data/illuminant are in neither ...", or "" when all
+// are there and the miss is the name's. A copy of ftrace.exe elsewhere, run from elsewhere, has no
+// library, which is no misspelling and must not read as one.
+inline std::string missingLibraryNote(std::initializer_list<const char*> cats) {
+    std::string missing;
+    int n = 0;
+    for (const char* cat : cats) {
+        std::error_code ec;
+        if (!std::filesystem::is_directory(categoryDir(cat), ec))
+            missing += std::string(n++ ? " and " : "") + "data/" + cat;
+    }
+    if (!n) return "";
+    return ": the spectral library's " + missing + (n > 1 ? " are" : " is") +
+           " in neither the working directory nor the executable's, so the names there cannot be read";
 }
 
 inline std::string lower(std::string s) {

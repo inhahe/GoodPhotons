@@ -1,4 +1,5 @@
 #pragma once
+#include "unit_linkage.h"   // FT_UNIT_INLINE
 // ---------------------------------------------------------------------------
 // Light BVH — Conty & Kulla, "Importance Sampling of Many Lights with Adaptive
 // Tree Splitting" (Solid Angle / Arnold; the same structure Cycles and PBRT-v4
@@ -43,9 +44,9 @@
 #include <cstdint>
 
 #if defined(__CUDACC__) || defined(__HIPCC__)
-  #define LT_FN __host__ __device__ inline
+  #define LT_FN __host__ __device__ FT_UNIT_INLINE
 #else
-  #define LT_FN inline
+  #define LT_FN FT_UNIT_INLINE
 #endif
 
 // Render-side knobs for the tree, set once by the CLI (-no-lighttree / -lighttree /

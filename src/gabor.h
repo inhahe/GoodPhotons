@@ -71,6 +71,7 @@
 // differs from the host's by up to 2 ulp, which would break the "a pattern evaluates
 // bit-for-bit identically on every backend" contract that patWorley/povDNoise keep.
 #pragma once
+#include "unit_linkage.h"   // FT_UNIT_INLINE
 
 #if defined(__CUDACC__)
   #ifndef GABOR_HD
@@ -99,7 +100,7 @@
 // murmur3 fmix32: full-avalanche 32-bit finalizer (same finalizer worley.h uses; the
 // SEEDS below are different, so the two noises are statistically independent even when
 // evaluated at identical coordinates).
-GABOR_HD inline unsigned int patGaborMix(unsigned int h) {
+GABOR_HD FT_UNIT_INLINE unsigned int patGaborMix(unsigned int h) {
     h ^= h >> 16; h *= 0x85ebca6bu;
     h ^= h >> 13; h *= 0xc2b2ae35u;
     h ^= h >> 16;
@@ -108,7 +109,7 @@ GABOR_HD inline unsigned int patGaborMix(unsigned int h) {
 
 // Cell -> base hash. Large odd constants, distinct from worley.h's, so permuted cells
 // don't collide and the two primitives don't correlate.
-GABOR_HD inline unsigned int patGaborCellHash(int cx, int cy, int cz) {
+GABOR_HD FT_UNIT_INLINE unsigned int patGaborCellHash(int cx, int cy, int cz) {
     unsigned int h = (unsigned int)cx * 2654435761u
                    ^ (unsigned int)cy * 1597334677u
                    ^ (unsigned int)cz * 3812015801u;
@@ -124,7 +125,7 @@ GABOR_HD inline unsigned int patGaborCellHash(int cx, int cy, int cz) {
 // (x^2/2 ~ 1.23 against a result near 0 at the interval end) costs ~3e-16 absolute.
 // That is orders of magnitude tighter than anything a noise field can care about, and
 // unlike libm it is the SAME sequence of IEEE operations on host and device.
-GABOR_HD inline double patGaborCosTurns(double t) {
+GABOR_HD FT_UNIT_INLINE double patGaborCosTurns(double t) {
     t = t - floor(t + 0.5);                       // [-0.5, 0.5)
     double a = t < 0.0 ? -t : t;                  // cos is even -> [0, 0.5]
     double sgn = 1.0;
@@ -150,7 +151,7 @@ GABOR_HD inline double patGaborCosTurns(double t) {
 // (already scaled) space, steered along (wx, wy, wz). Zero-mean, unit-ish variance is
 // NOT applied here — this is the unnormalised sum, exposed so the self-test can measure
 // the analytic variance directly. Use patGabor() for the [0,1] shading value.
-GABOR_HD inline double patGaborRaw(double x, double y, double z,
+GABOR_HD FT_UNIT_INLINE double patGaborRaw(double x, double y, double z,
                                    double f, double wx, double wy, double wz) {
     const double wl = wx * wx + wy * wy + wz * wz;
     const bool iso = !(wl > 1e-24);      // written so a NaN direction also falls back
@@ -216,7 +217,7 @@ GABOR_HD inline double patGaborRaw(double x, double y, double z,
 }
 
 // Shading value in [0, 1] with mean 0.5, matching the convention of `noise`.
-GABOR_HD inline double patGabor(double x, double y, double z,
+GABOR_HD FT_UNIT_INLINE double patGabor(double x, double y, double z,
                                 double f, double wx, double wy, double wz) {
     const double g = 0.5 + 0.5 * PAT_GABOR_INV3SIGMA *
                      patGaborRaw(x, y, z, f, wx, wy, wz);

@@ -83,6 +83,8 @@
 #include "render.h"
 #include "bdpt.h"        // bsdfF, bsdfPdf, isConnectibleMat, isTwoSidedMat, offsetOrigin
 #include "gathercoverage.h"   // MergeFootprint: the merges' footprint
+#include "vcm_lattice.h"      // the lattice's sizing, one rule with the device's grid
+#include "allocreport.h"      // ftalloc::resize: the grid's table named, should it not fit
 #include "color.h"
 
 namespace vcm {
@@ -199,8 +201,6 @@ struct VcmGrid {
     std::vector<int> cellStart;   // size nCells+1
     std::vector<int> order;       // vertex indices in cell-contiguous order
 
-    // The most cells the lattice takes (64 M, 256 MB of ints: the device grid's kVcmMaxCells).
-    static constexpr long long kMaxCells = 1LL << 26;
     long long cellCount() const { return (long long)nx * ny * nz; }
     int cellIndex(int ix, int iy, int iz) const { return (iz * ny + iy) * nx + ix; }
     void cellCoord(const Vec3& p, int& ix, int& iy, int& iz) const {
@@ -221,22 +221,19 @@ struct VcmGrid {
             mn.x = std::min(mn.x, lv.p.x); mn.y = std::min(mn.y, lv.p.y); mn.z = std::min(mn.z, lv.p.z);
             mx.x = std::max(mx.x, lv.p.x); mx.y = std::max(mx.y, lv.p.y); mx.z = std::max(mx.z, lv.p.z);
         }
-        // The lattice over the vertices' box. Past kMaxCells the cells grow instead of multiplying, as
-        // the device's grid does (vcmSessionPass, kVcmMaxCells): query() tests distance against the
-        // radius, not the cell, so a cell bigger than the radius only adds candidates, where a dense
-        // lattice at a fine radius would ask for gigabytes and wrap cellIndex's int.
-        for (int grow = 0;; ++grow) {
-            lo = mn - Vec3{cell, cell, cell} * 0.5;
-            const Vec3 ext = (mx - lo) + Vec3{cell, cell, cell} * 0.5;
-            nx = std::max(1, (int)std::ceil(std::min(ext.x / cell, 2e6)));
-            ny = std::max(1, (int)std::ceil(std::min(ext.y / cell, 2e6)));
-            nz = std::max(1, (int)std::ceil(std::min(ext.z / cell, 2e6)));
-            if (cellCount() <= kMaxCells || grow >= 8) break;
-            cell *= std::cbrt((double)cellCount() / (double)kMaxCells) * 1.01;
-        }
+        // The lattice over the vertices' box, within kVcmMaxCells (vcmLattice): query() tests
+        // distance against the radius, not the cell.
+        const double bLo[3] = {mn.x, mn.y, mn.z}, bHi[3] = {mx.x, mx.y, mx.z};
+        const VcmLattice<double> lat = vcmLattice<double>(bLo, bHi, cell);
+        lo = Vec3{lat.lo[0], lat.lo[1], lat.lo[2]};
+        cell = lat.cell;
+        nx = lat.n[0]; ny = lat.n[1]; nz = lat.n[2];
         const long long nCells = cellCount();
         std::vector<int> cellOf(n);
-        cellStart.assign((size_t)nCells + 1, 0);
+        // Sized by the merge radius (-pmradius), not by the scene: named, so an OOM says which knob.
+        cellStart.clear();
+        ftalloc::resize(cellStart, (size_t)nCells + 1, "the vertex-merge grid", "-pmradius");
+        std::fill(cellStart.begin(), cellStart.end(), 0);
         for (size_t i = 0; i < n; ++i) {
             int ix, iy, iz; cellCoord(v[i].p, ix, iy, iz);
             int c = cellIndex(ix, iy, iz);

@@ -69,7 +69,7 @@ def main():
         finite = ran and bool(np.isfinite(fine).all())
         m0 = float(ref.mean()) if ref is not None else float("nan")
         m1 = float(fine.mean()) if finite else float("nan")
-        good = finite and rc0 == 0 and ref is not None and abs(m1 / m0 - 1.0) <= 0.05
+        good = finite and rc0 == 0 and ref is not None and m0 > 0 and abs(m1 / m0 - 1.0) <= 0.05
         ok &= good
         print("%-4s mode U on the %s at -pmradius 1e-6 over a 10 m box: %s, mean %.4g of the own radius's"
               % ("ok" if good else "FAIL", device.upper(),

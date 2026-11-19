@@ -1,7 +1,8 @@
 """Build check: no function the register-capped GPU units compile out of line can be bound, at the
 device link, to another unit's copy of it.
 
-    python tools/check_device_linkage.py [--objdir build_cuda3/ftrace.dir/Release]
+    python tools/check_device_linkage.py [--objdir build_cuda3/ftrace.dir/Release | --objects OBJ...]
+                                         [--warn-only] [--cuobjdump PATH]
 
 render_cuda_bdpt.cu (kBdptT, -maxrregcount=168) and render_cuda_jsurf.cu (kJSurfLightT, 128) each
 compile their own copies of the device code they call, so that every function ptxas leaves out of
@@ -20,7 +21,10 @@ render_cuda.obj and raster_cuda.obj, uncapped, or the other capped unit, whose c
 cap -- with both register counts: every one a hazard, whatever its count, for what it calls. The
 fix is internal linkage: `static` (FT_UNIT_INLINE in a shared header, unit_linkage.h) for a
 function, an unnamed namespace for a struct's members. Exits 1 when there is one (or when an object
-or cuobjdump is missing); build.bat runs it after every build, failed ones included.
+or cuobjdump is missing), or with --warn-only prints the same as a warning and exits 0. The build
+runs it after every link (CMakeLists.txt, POST_BUILD, given the target's objects by --objects); a
+link that fails leaves no post-build step, so run it by hand then -- the objects are there -- to
+name the function behind an nvlink refusal.
 """
 import argparse
 import os
@@ -69,18 +73,29 @@ def external_functions(tool, obj):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split(chr(10))[0])
-    ap.add_argument("--objdir", default=os.path.join(ROOT, "build_cuda3", "ftrace.dir", "Release"))
+    ap.add_argument("--objdir", default=os.path.join(ROOT, "build_cuda3", "ftrace.dir", "Release"),
+                    help="the directory holding <unit>.obj (the Visual Studio generator's layout)")
+    ap.add_argument("--objects", nargs="*", default=None,
+                    help="the target's object files, any generator's names (<unit>.obj, <unit>.cu.obj...)")
+    ap.add_argument("--warn-only", action="store_true", help="a hit is a warning: exit 0")
+    ap.add_argument("--cuobjdump", default=None, help="the tool's path (default: PATH, then CUDA_PATH)")
     a = ap.parse_args()
-    tool = cuobjdump()
+    fail = 0 if a.warn_only else 1
+    tool = a.cuobjdump if a.cuobjdump and os.path.exists(a.cuobjdump) else cuobjdump()
     if not tool:
         print("cuobjdump not found (PATH, CUDA_PATH)")
-        return 1
+        return fail
     capped = [u[0] for u in UNITS]
-    objs = {n: os.path.join(a.objdir, n + ".obj") for n in UNCAPPED + capped}
-    missing = [o for o in objs.values() if not os.path.exists(o)]
+    units = UNCAPPED + capped
+    if a.objects is not None:
+        stem = lambda f: os.path.basename(f).split(".")[0]
+        objs = {stem(f): f for f in a.objects if stem(f) in units}
+    else:
+        objs = {n: os.path.join(a.objdir, n + ".obj") for n in units}
+    missing = [n for n in units if n not in objs or not os.path.exists(objs[n])]
     if missing:
         print("missing object: " + ", ".join(missing))
-        return 1
+        return fail
     fns = {n: external_functions(tool, o) for n, o in objs.items()}
     kernels = [u[2] for u in UNITS]
     bad = 0
@@ -98,9 +113,10 @@ def main():
                 print("%s: %s is out of line with external linkage here (%d registers) and in %s.cu (%d)"
                       % (unit, n, fns[unit][n], other, fns[other][n]))
     if bad:
-        print("%d function(s) the device link may bind to another unit's copy, held to another cap or none: "
-              "give them internal linkage (static; a struct's members, an unnamed namespace)" % bad)
-        return 1
+        print("%s%d function(s) the device link may bind to another unit's copy, held to another cap or none: "
+              "give them internal linkage (FT_UNIT_INLINE or static; a struct's members, an unnamed namespace)"
+              % ("WARNING: " if a.warn_only else "", bad))
+        return fail
     print("ok: every function the capped units keep out of line is their own")
     return 0
 

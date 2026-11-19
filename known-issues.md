@@ -201,6 +201,98 @@ to 0.25 renders as a 150 nm one within 2e-3, 1.0e-3 measured (its body's escape 
 on 0.450.1 it rendered as the unmapped 600 nm, 1.9 off), the `thinfilm` control byte for byte, and
 the three misspellings stop the load (on 0.450.1 they loaded).
 
+## OPEN (2026-11-19, tech debt): PREFLIGHT-ROUTE-PLAN — the VRAM preflight re-derives which kernels each launcher runs
+
+`cudaMegakernelLocalBytes` (render_cuda.cu) holds a second copy of every launcher's kernel choice --
+launchForward's backend (with its stable-seed exception), renderBackwardCuda's `-rgb` kernel,
+renderBdptCuda's hero gating (media, GRIN, lens), mode J's light pass, surface gather and beam
+kernels, mode P's camera-side layers (on the device only where `backwardOnGpuOk`). Each drift so far
+was caught by a review, not a test: mode V weighed at 0, mode P by a kernel it never launches, the
+meter by the render's instantiation (all fixed in 0.450.14), and today P weighs `kBackward` even
+where its camera-side layers stay on the CPU, `-rgb` mode R weighs `kBackward` not
+`kBackwardRGB`, D weighs the hero kernel where the bundle is gated off, and J only kBdptT. All
+over-charge, the direction that cannot hang a render. **Proper fix** (both reviews of
+0.450.12-0.450.14): one route-plan function per launcher returning the kernels it will launch,
+called by the launcher to choose them and by the preflight to weigh them.
+
+## DONE (2026-11-19, 0.450.15): REVIEW-0450F — what the Opus (max) and Fable (xhigh) reviews of 0.450.12-0.450.14 found, and what timing 0.450.14 found
+
+**0.450.14 had made mode U 18 % slower** -- found by timing it against 0.450.13 on an idle GPU
+(cornell, RTX 4090, three pairs a mode), bisected over seven builds (medians against 0.450.13):
+
+* **The translucent lobe's second albedo slot** (REVIEW-0450E): 36 bytes more a lobe, ~1 KB more
+  of every kBdptT's and mode-U kernel's stack, a lobe sitting in the frame of every site that
+  inlines one. One slot again; U +18 % -> +6 %.
+* **The merge handed a caller's lobe by reference** (REVIEW-0450E): the camera kernel's `camLobe`,
+  its address now leaving the kernel for dVcmMergeSum, lived in local memory -- the gather alone
+  1.53 -> 1.83 s. The merge builds its own lobe again; the light end's one eager lobe (REVIEW-0450E)
+  measured faster than the per-wavelength rebuilds it replaced (U 4.89 -> 5.06 s without it) and
+  stays.
+With those, U 4.54 -> 4.43 s against 0.450.13, and J unchanged (19.2 s). **Mode D's own numbers
+are build noise**, which the bisect found: the device build is not deterministic -- the same
+render_cuda_bdpt.cu, recompiled with no change, gave kBdptT a 56-byte larger stack and a different
+constant bank, and mode D 14.6 s where its first build ran 16.2 s (GPU-STACK-DRIFT). So D's
+14.4-16.2 s across this batch's builds says nothing about any one change, and two that seemed to
+cost it (lighttree.h unit-local, the unnamed namespaces below) were kept. Mode U's findings stand:
+its time held within 2 % across four builds of one source, and the gather's own GPU time moved as
+measured.
+
+`/code-review max` (Opus, 14 findings) and `/code-review xhigh` (Fable, 14) of 504fb37..f8d518b, one
+after the other in a worktree; five found by both. Each checked against the code. **Fixed:**
+
+* **check_rng_args.py's operand rule** (both): a `?` or `:` anywhere between two draws cleared
+  them, though nested in a parenthesis that sequences nothing outside it (`rng.uniform() * (c ? 1 :
+  2) * rng.uniform()`), and a braced temporary was never seen (`Vec3{rng.uniform()} *
+  rng.uniform()`). Sequencing operators count at their own level now, and a bracket that draws is
+  one operand of its parent. A braceless `if`/`while`/`for` whose header and body each drew was
+  flagged (Fable): a header ends its statement. A lambda body inside a call's arguments swallowed
+  the call's later arguments, and a nested initializer read as a block (Fable). 34 cases.
+* **The gates ran only from the untracked build.bat** (both): CMakeLists.txt runs both after every
+  link (POST_BUILD, `--warn-only`; the linkage check on `$<TARGET_OBJECTS:ftrace>`, with
+  `--cuobjdump` beside nvcc).
+* **`FT_UNIT_INLINE`** is `static` in every device pass and plain `inline` in every host pass (the
+  host ODR break REVIEW-0450E removed, now by `__CUDA_ARCH__`), and covers the helpers of six more
+  headers the GPU units reach (Opus): worley.h, gabor.h, lighttree.h, gatherplane.h, photonmap.h,
+  lens.h. The POV generators emit it (Opus), and `pov_functions_gen.py` the
+  four repairs the header had been given by hand: both regenerate their headers byte for byte. The
+  noise tables are `inline const` on the host (Fable), one copy, as their readers are one.
+* **Struct members with external linkage** (REVIEW-0450E's twenty unit-local structs, Opus): four
+  more structs held two of them as fields (DLensEntry, DSphChain, DSphereRefl, DSphBase2D), an ODR
+  break, and are unit-local too; DCoatEval, the return type of an external struct's member
+  (DCoatCtx::eval), is external again.
+* **A render too big for the whole card blamed another program** (both): it says the render alone
+  needs more than the card holds; the blurred flight's session sizes its posed cameras by the
+  preflight's rule, so the two no longer disagree (Fable); the meter counts a blurred frame's posed
+  cameras (Opus) and names its BDPT instantiation once, for its preflight and both its calls (Fable).
+* **The host and device merge lattices** (both): one rule, `vcm_lattice.h`, without the eight-step
+  growth cap -- a flat light-vertex box at a fine radius overshot the 64 M cells by up to 1.1x
+  (simulated: no catastrophe, but no cap either) -- and the host's table allocation named (Fable).
+* **An unknown library name read as a misspelling where the library was missing** (both): `glass:`,
+  `metal:`, `reflectance:`, `filter:`, `preset:` and `-light` all name the missing data/ directory
+  (`speclib::missingLibraryNote`); tools/check_preset_library.py.
+* **Dead branches in mode U's connections** (both): a light vertex reaching them is never a fiber.
+* **check_vcm_grid_cap divided by a black reference** (both); **the scraps audit's count** (Fable):
+  37 files, `newklein_stand.py` among gallery_rain's; `_gpumtest.ftsl` names `tools/pfmcmp.py`.
+
+**Not changed.** The preflight's second copy of every launcher's kernel choice (Opus), and mode P
+weighing `kBackward` where its camera-side layers stay on the CPU (both): PREFLIGHT-ROUTE-PLAN,
+above, the next task; every known case over-charges. The cell table withholding a reservation not
+yet held on pass 0 (Fable): the camera kernel, the session's largest (17.6 KB a thread against 15.9
+and 12.3), launches every pass, so only pass 0 pays -- the conservative rule's deliberate cost.
+SurfMap's doubling rule (Fable): a different map with its own padding and no device twin to agree
+with. The vertex-count-blind cap's clearing of a 64 M-cell table each CPU pass where it binds
+(Fable): VCM-SPARSE-LATTICE.
+
+## OPEN (2026-11-19, tech debt): VCM-SPARSE-LATTICE — mode U's lattice is sized by the radius alone
+
+A pass's merge lattice (vcm_lattice.h) has a cell the merge radius wide over the light vertices'
+box, up to 64 M cells, whatever the vertex count: a few thousand vertices in a large box at a fine
+radius take the whole 256 MB table, which the CPU clears, prefix-sums and copies every pass (and
+the device holds). **Proper fix:** size the cells by the vertex density too -- no finer than the
+box's volume over a small multiple of the vertex count -- on both devices at once (the rule is
+shared), measured against today's on a dense scene and a sparse one: a cell coarser than the
+radius only adds candidates.
+
 ## DONE (2026-11-18, 0.450.14): REVIEW-0450E — what the Opus (max) and Fable (xhigh) reviews of 0.450.10-0.450.11 found
 
 `/code-review max` (Opus, 11 findings) and `/code-review xhigh` (Fable, 15) of dbf75e8..504fb37, one
@@ -6062,6 +6154,19 @@ To settle it: build once without `--split-compile` and compare the table; if tha
 either drop the flag (slower builds) or pin the hot shared helpers' inlining (`__forceinline__`
 / `__noinline__`) so partitioning cannot move them.
 
+**It moves with no change at all (2026-11-19).** render_cuda_bdpt.cu recompiled from the same
+source, nothing else touched, gave `kBdptT<7,8,0,0>` 23 648 bytes of stack where the build before
+gave 23 592, and a different constant bank (21 848 against 21 768 bytes); mode D on cornell ran
+14.6 s on the one and 16.2 s on the other, every pair alike. So the device build is not
+deterministic, and the likeliest cause is still `--split-compile`'s threads, whose partitioning
+may then follow their timing. Two consequences until it is settled: **a timing compared across two
+builds measures the build as much as the change** -- mode D by up to 11 %; mode U held within 2 %
+over four builds -- so a device change's speed is judged from several builds of each side, or by
+what does not drift (a kernel's own GPU time where the change is confined to it). The images do
+not move with it: check_bitid finds GPU renders byte for byte alike across such builds, the drift
+being in where the stack lies and how the kernel runs, not in what it computes. **To settle it:** build the same
+source twice with and twice without `--split-compile`, and compare the objects byte for byte.
+
 ## DONE (2026-10-12, 0.375.3): REVIEW-0375 — what the Opus and Fable reviews of 0.375.0-0.375.1 found
 
 Each checked against the code before it was fixed; the checks that hold them are named.
@@ -6991,7 +7096,20 @@ points the other way), each corner keeping its UV, so every hit-side test agrees
 sampling. `tools/check_light_side.py` renders one lamp written both ways: 0.13x before, on the
 host and the device.
 
-## OPEN (2026-10-12, tech debt): GMIS-NULL-BY-HAND — every caller keeps the glossy MIS record across a pass-through by hand
+## DONE (2026-11-19, 0.450.15): GMIS-NULL-BY-HAND — every caller keeps the glossy MIS record across a pass-through by hand
+
+**Done, in this form.** The record is cleared at every vertex and put back by a pass-through, in
+one place a walk: the scalar walks' interaction functions (`interactMaterial`, `bkInteract`) take it
+and restore it themselves on a null event; each hero loop has one `passedThrough` (the record, the
+bounce refund, the first event, the softening's `nullHere`) -- the device's, which had written the
+four out at three sites, since 0.450.15 -- and each mode-M walk restores the record, its arrival
+flag and its softening together at its one coverage test. The inversion proposed below (clear only
+where a real vertex is made) was not taken: it makes forgetting fail the other way, a mirror or a
+dielectric left holding a glossy predecessor's density and halving the emission past it, at every
+real-vertex branch, where today forgetting is possible only at a null event, which the walks have
+one of each.
+
+**The entry as filed:**
 
 A coverage pass-through (see-through fur) is no vertex, so the glossy MIS record (`GlossyMis`,
 GLOSSY-NEE) of the last real vertex must survive it. Today every caller does that itself: save
@@ -33011,12 +33129,15 @@ the fix is to make the letters thin aliases over five estimator entry points, an
 
 ### Checked-in scenes cite ~22 derivation scripts that live in gitignored `scraps/` — 2026-09-01
 
-> **Audited 2026-11-18:** tracked scenes cite 34 files under `scraps/`, all but four from
-> `gallery_rain.ftsl` (`gallery.ftsl` and `gallery_settled.ftsl` cite `newklein_stand.py`,
-> `pattern_tex.ftsl` `gen_graychecker.py`, `_grin_scatfog.ftsl` `_cmp_pfm.py`, `_deltalight_mix.ftsl`
-> `imgdiff.py`). All 34 still exist locally (the output cleaner keeps a cited file), none in a fresh
-> clone. One had moved: gallery_rain cited `scraps/settle_scene.py`, which is `tools/settle_scene.py`,
-> and now says so. The fix below stands for the rest, scene by scene.
+> **Audited 2026-11-18, recounted 2026-11-19:** tracked scenes cite 37 files under `scraps/`, some
+> in subdirectories (`scraps/meshes/rest_pose.py`), which the first count's pattern missed. 34 are
+> `gallery_rain.ftsl`'s, `newklein_stand.py` among them, which `gallery.ftsl` and
+> `gallery_settled.ftsl` cite too; the other three are `gen_graychecker.py` (`pattern_tex.ftsl`),
+> `_cmp_pfm.py` (`_grin_scatfog.ftsl`) and `imgdiff.py` (`_deltalight_mix.ftsl`). `_gpumtest.ftsl`'s
+> `scraps/rmse` now names `tools/pfmcmp.py`. All still exist locally (the output cleaner keeps a
+> cited file), none in a fresh clone. One had moved: gallery_rain cited `scraps/settle_scene.py`,
+> which is `tools/settle_scene.py`, and now says so. The fix below stands for the rest, scene by
+> scene.
 
 `scenes/*.ftsl` comments name the script that solved each authored constant, which is the
 right instinct and is most of what makes `gallery_rain.ftsl` auditable rather than a wall of

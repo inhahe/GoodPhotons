@@ -28,6 +28,7 @@
 // the image). The camera maps this lens-local frame to world via (u,v,w) with the
 // front vertex plane pinned at the camera eye.
 #pragma once
+#include "unit_linkage.h"   // FT_UNIT_INLINE
 #include <vector>
 #include <string>
 #include <cmath>
@@ -577,9 +578,9 @@ inline constexpr double kLensDefensive = 0.02;
 inline constexpr double kLensDefensiveReject = 1.0 / 512.0;
 
 #if defined(__CUDACC__) || defined(__HIPCC__)
-  #define LENS_HD __host__ __device__ inline
+  #define LENS_HD __host__ __device__ FT_UNIT_INLINE
 #else
-  #define LENS_HD inline
+  #define LENS_HD FT_UNIT_INLINE
 #endif
 // The mixture's pick for a sample in a table bin, from its first coordinate u1: LENS_PICK_UNAIMED
 // (the unaimed sampler draws it), LENS_PICK_AIMED, or LENS_PICK_NONE (a rejecting bin's sample

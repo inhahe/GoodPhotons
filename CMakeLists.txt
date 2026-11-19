@@ -239,3 +239,30 @@ if(CMAKE_CUDA_COMPILER)
 else()
     message(STATUS "CUDA not found; building CPU-only (-device gpu unavailable)")
 endif()
+
+# --- Gates after every link ---------------------------------------------------
+# tools/check_rng_args.py (no expression takes two RNG draws in an order the compiler chooses, which
+# makes an image depend on the compiler that built it) and, with the CUDA backend,
+# tools/check_device_linkage.py (no register-capped GPU unit shares an out-of-line function with
+# another, which could make a later link refuse its kernel). They warn rather than fail: the
+# binary that linked is sound, and the warning names what to fix. A link that fails runs no
+# post-build step: run check_device_linkage.py by hand then, on the objects it left, to name the
+# function behind an nvlink refusal. Without Python 3 they are skipped, and the configure says so.
+find_package(Python3 COMPONENTS Interpreter QUIET)
+if(Python3_Interpreter_FOUND)
+    add_custom_command(TARGET ftrace POST_BUILD
+        COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tools/check_rng_args.py" --warn-only
+        COMMENT "RNG draw order (tools/check_rng_args.py)" VERBATIM)
+    if(CMAKE_CUDA_COMPILER)
+        get_filename_component(FTRACE_CUDA_BIN "${CMAKE_CUDA_COMPILER}" DIRECTORY)
+        add_custom_command(TARGET ftrace POST_BUILD
+            COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tools/check_device_linkage.py"
+                    --warn-only --cuobjdump "${FTRACE_CUDA_BIN}/cuobjdump${CMAKE_EXECUTABLE_SUFFIX}"
+                    --objects "$<TARGET_OBJECTS:ftrace>"
+            COMMAND_EXPAND_LISTS VERBATIM
+            COMMENT "Device linkage of the register-capped GPU units (tools/check_device_linkage.py)")
+    endif()
+else()
+    message(STATUS "Python 3 not found: the post-build gates (tools/check_rng_args.py, "
+                   "tools/check_device_linkage.py) are skipped")
+endif()

@@ -2973,25 +2973,28 @@ private:
             std::string g = h.substr(6);
             Spectrum ior;
             if (resolveGlassIor(g, ior)) return ior;
-            fail("unknown glass '" + g + "'"); return defaultGlass("BK7");
+            fail("unknown glass '" + g + "'" + speclib::missingLibraryNote({"glass"})); return defaultGlass("BK7");
         }
         if (h.rfind("metal:", 0) == 0) {
             std::string mname = h.substr(6);
             Spectrum r;
             if (resolveMetalReflectance(mname, r)) return r;
-            fail("unknown metal '" + mname + "'"); return constantSpectrum(0.9);
+            fail("unknown metal '" + mname + "'" + speclib::missingLibraryNote({"metal"}));
+            return constantSpectrum(0.9);
         }
         if (h.rfind("reflectance:", 0) == 0) {
             std::string rname = h.substr(12);
             Spectrum r;
             if (resolveNaturalReflectance(rname, r)) return r;
-            fail("unknown reflectance '" + rname + "'"); return constantSpectrum(0.5);
+            fail("unknown reflectance '" + rname + "'" + speclib::missingLibraryNote({"reflectance"}));
+            return constantSpectrum(0.5);
         }
         if (h.rfind("filter:", 0) == 0) {
             std::string fname = h.substr(7);
             Spectrum t;
             if (resolveFilterTransmittance(fname, t)) return t;
-            fail("unknown filter '" + fname + "'"); return constantSpectrum(0.5);
+            fail("unknown filter '" + fname + "'" + speclib::missingLibraryNote({"filter"}));
+            return constantSpectrum(0.5);
         }
         if (h.rfind("preset:", 0) == 0)  return resolvePreset(h.substr(7));
         if (h.rfind("file:", 0) == 0)    return loadSpdFile(h.substr(5), curveCubic);
@@ -3084,15 +3087,8 @@ private:
     Spectrum resolvePreset(const std::string& nm) {
         Spectrum s;
         if (resolveLightPreset(nm, s)) return s;
-        // The tabulated presets are engine data, found in data/ under the working directory or
-        // beside the executable (speclib::categoryDir): a copy of ftrace.exe elsewhere, run from
-        // elsewhere, has none, which is no misspelling and must not read as one.
-        std::error_code ec;
-        if (!std::filesystem::is_directory(speclib::categoryDir("illuminant"), ec))
-            fail("unknown preset '" + nm + "': the spectral library (data/illuminant) is in neither the "
-                 "working directory nor the executable's, so its presets cannot be read");
-        else
-            fail("unknown preset '" + nm + "'");
+        // The named presets are engine data, data/light's bundles and data/illuminant's tables.
+        fail("unknown preset '" + nm + "'" + speclib::missingLibraryNote({"light", "illuminant"}));
         return blackbody(6500.0);
     }
 

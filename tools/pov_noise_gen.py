@@ -135,6 +135,7 @@ TEMPLATE = r'''// pov_noise.h - EXACT host+device port of POV-Ray's Perlin noise
 // limit.  On the host (and nvcc host pass) they are plain static const.  The
 // single povNoise() body reads whichever is in scope for the current pass.
 #pragma once
+#include "unit_linkage.h"   // FT_UNIT_INLINE
 
 #if defined(__CUDACC__)
   #ifndef POV_HD
@@ -151,7 +152,7 @@ TEMPLATE = r'''// pov_noise.h - EXACT host+device port of POV-Ray's Perlin noise
 #ifdef __CUDA_ARCH__
   #define POVN_MEM __device__ const
 #else
-  #define POVN_MEM static const
+  #define POVN_MEM inline const   // one table across the host's units, as its readers are one
 #endif
 
 // ---- baked tables -----------------------------------------------------------
@@ -173,10 +174,10 @@ POVN_MEM double g_povGrad[12294] = {
 };
 
 // ---- SolidNoise (Perlin, gen 3) ---------------------------------------------
-POV_HD inline double povSCurve(double t) { return t * t * (3.0 - 2.0 * t); }
-POV_HD inline double povLerp(double t, double a, double b) { return a + t * (b - a); }
+POV_HD FT_UNIT_INLINE double povSCurve(double t) { return t * t * (3.0 - 2.0 * t); }
+POV_HD FT_UNIT_INLINE double povLerp(double t, double a, double b) { return a + t * (b - a); }
 
-POV_HD inline double povSolidNoise(double px, double py, double pz) {
+POV_HD FT_UNIT_INLINE double povSolidNoise(double px, double py, double pz) {
     const int NE = 2048;
     const double ROLLOVER = 10000000.023157213;
     double P[3] = { px, py, pz };
@@ -219,7 +220,7 @@ POV_HD inline double povSolidNoise(double px, double py, double pz) {
 
 // ---- PortableNoise (gens 1 & 2) + generator dispatch ------------------------
 // povNoise: POV's Noise(EPoint, noise_generator).  Returns a value in ~[0,1].
-POV_HD inline double povNoise(double x, double y, double z, int gen) {
+POV_HD FT_UNIT_INLINE double povNoise(double x, double y, double z, int gen) {
     const double POV_EPS = 1.0e-10;
     if (gen == 3) { // kNoiseGen_Perlin
         double sum = 0.5 * (1.59 * povSolidNoise(x, y, z) + 0.985);
@@ -283,7 +284,7 @@ POV_HD inline double povNoise(double x, double y, double z, int gen) {
 // with the record's 0.5-bias term, exactly as POV returns it (turbulence warps
 // consume it raw). This is the primitive behind domain warping:
 //   noise(x + k*dnoisex(x,y,z), y + k*dnoisey(...), z + k*dnoisez(...)).
-POV_HD inline void povDNoise(double x, double y, double z, double out[3]) {
+POV_HD FT_UNIT_INLINE void povDNoise(double x, double y, double z, double out[3]) {
     const double POV_EPS = 1.0e-10;
     int tmp;
     tmp = (x >= 0) ? (int)x : (int)(x - (1 - POV_EPS));
@@ -353,7 +354,7 @@ POV_HD inline void povDNoise(double x, double y, double z, double out[3]) {
 // vector (`warp { turbulence <k> }` displaces by k * DTurbulence(p)) — exposed
 // because the pattern VM has no loops, so the octave sum cannot be authored
 // from dnoise* alone.
-POV_HD inline void povDTurbulence(double x, double y, double z,
+POV_HD FT_UNIT_INLINE void povDTurbulence(double x, double y, double z,
                                   double octaves, double lambda, double omega,
                                   double out[3]) {
     int oct = (int)octaves;

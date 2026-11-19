@@ -11,10 +11,11 @@
 //     member) that two units keep out of line is a weak definition in each, and nvlink binds
 //     every call to one of them -- render_cuda.cu's, uncapped, or the other capped unit's, held
 //     to its cap. A struct with member functions sits in an unnamed namespace, unless the units
-//     share it -- a kernel's parameter, a device global, a field of either, a type the host
-//     uploads (DVec3, DCamera, DCamSet, DBeamMap...) -- when its members must stay small enough
-//     that ptxas inlines them; the shared headers' helpers are FT_UNIT_INLINE (unit_linkage.h).
-//     tools/check_device_linkage.py, run by build.bat, lists any function this misses;
+//     share it -- a kernel's parameter, a device global, a field or member's return type of
+//     either, a type the host uploads (DVec3, DCamera, DCamSet, DBeamMap, DCoatEval through
+//     DCoatCtx...) -- when its members must stay small enough that ptxas inlines them; the
+//     shared headers' helpers are FT_UNIT_INLINE (unit_linkage.h). tools/check_device_linkage.py,
+//     run after every link (CMakeLists.txt), lists any function this misses;
 //   * a kernel here inside #ifndef FT_FAMILY_TU: render_cuda.cu compiles it, the family units
 //     do not;
 //   * a device global through FT_DEVGLOBAL: one copy, defined in render_cuda.cu.
@@ -2882,6 +2883,7 @@ __device__ static int dLensPupilClassify(const DLensSystem& L, const D3& p, doub
 // Where light from scene point p enters the lens (host twin Camera::lensEntry, which explains
 // both samplers and the rebased start): Y on the front element's clear cap, the leg p -> Y,
 // and that leg in lens-local mm started just in front of the glass. Independent of wavelength.
+namespace {
 struct DLensEntry {
     DVec3 Y, wdir;     // world entry point; unit direction p -> Y
     double dist;       // |Y - p| (world)
@@ -2890,6 +2892,7 @@ struct DLensEntry {
     double omega;      // the solid angle (sr) one sample stands for: the inverse of its sampler's
                        // density from p -- the mixture's in a table bin
 };
+}  // namespace
 // The leg from lens-local point pl to a point uniform on the front element's clear cap, started
 // just in front of the glass, if that point is the first of the element the leg meets (host twin
 // LensSystem::frontLeg).
@@ -6842,7 +6845,6 @@ __device__ static inline bool dCoatLambertBody(const DMaterial& m) {
 __device__ static inline bool dCoatAny(const DMaterial& m) { return m.coatStack >= 0 || m.coatParent >= 0; }
 // Host twin render.h CoatEval: the coat's factor for one pair with everything but the wavelength read
 // once (the film's thickness, the pair's cosines), for a caller that takes it at several wavelengths.
-namespace {
 struct DCoatEval {
     int kind = 0;                    // 0 one, 1 Lambertian body, 2 directional body, 3 coat lobe, 4 zero
     const DMaterial* st = nullptr;
@@ -6868,7 +6870,6 @@ struct DCoatEval {
         }
     }
 };
-}  // namespace
 __device__ static inline double dCoatCos(const DVec3& a, const DVec3& b) {
     const double c = fabs((double)dot(a, b));
     return c > 1.0 ? 1.0 : c;
@@ -10813,7 +10814,9 @@ __device__ static inline double dFresnelSplit(double cosI, double cosT, double n
 }
 
 // Host twin Renderer::SphBase2D / sphBase2D.
+namespace {
 struct DSphBase2D { DSphV2 P, dir0; double R, cd, sd; bool totalOut; };
+}  // namespace
 __device__ static bool dSphBase2D(const DSphV2& eye2, double r, double n, bool outside, double c1, double s1,
                                   DSphBase2D& b) {
     const DSphV2 N{c1, s1}, T{-s1, c1};
@@ -10856,7 +10859,9 @@ __device__ static inline double dSphChainStep(bool outside, int c, const DSphBas
 }
 // Host twin Renderer::SphChain / sphChainFrom: the chain taking `refl` reflections inside (-1: off the
 // surface), in space, coordinates centred on S.
+namespace {
 struct DSphChain { D3 first, last, dir; double F, inner; };
+}  // namespace
 __device__ static bool dSphChainFrom(const D3& o, D3 d, double r, double n, bool outside, int refl,
                                      DSphChain& out) {
     const double b0 = d3dot(o, d), c0 = d3dot(o, o) - r * r, disc = b0 * b0 - c0;
@@ -11388,7 +11393,9 @@ __device__ static inline bool dMirrorConnectsMat(const DMaterial& m) {
 // Reflect a ray off sphere S at its first intersection ahead of `o`. Works from either
 // side (a convex mirror ball seen from outside, a mirrored room seen from within), since
 // the reflecting normal is taken against the ray. Twin of Renderer::reflectOffSphere.
+namespace {
 struct DSphereRefl { D3 P1, exitDir; };
+}  // namespace
 __device__ static bool dReflectOffSphere(const D3& o, const D3& d, const DSphere& S,
                                          DSphereRefl& out) {
     D3 O(S.c); double r = S.r;
@@ -15658,12 +15665,12 @@ struct DVertexLobe {
     ggx::Pair p;            // a glossy lobe's pair (wo, wi)
     double g = 0.0;         // ...its value over the reflectance, ggx::fAll
     Real cH = (Real)1;      // ...and its half-vector cosine, which an iridescent lobe's R reads
-    // A translucent lobe's two albedos (dDiffuseTransmitAlbedos), which every direction shares, at the
-    // wavelength albedos() last asked for (rhoR, rhoT). Two are kept: the first wavelength asked -- a
-    // connection's hero, whose pdfs ask again after its bundle's other wavelengths -- and the latest
-    // other, so a bundle reads each wavelength's once.
-    Real rhoLam0 = (Real)-1, rhoLam1 = (Real)-1;
-    double rhoR0 = 0.0, rhoT0 = 0.0, rhoR1 = 0.0, rhoT1 = 0.0;
+    // A translucent lobe's two albedos (dDiffuseTransmitAlbedos) at rhoLam, which every direction
+    // shares: read again only at another wavelength. One slot, and no field the lobe can do
+    // without: a lobe sits in the stack frame of every site that inlines one, so each byte here is
+    // some thirty in kBdptT's and the mode-U kernels' stacks (36 more, a second slot, were ~1 KB a
+    // thread there, and mode U some 12 % slower).
+    Real rhoLam = (Real)-1;
     double rhoR = 0.0, rhoT = 0.0;
     __device__ DVertexLobe(const DScene& sc_, const DVertex& vt_, const DVec3& wo_, bool now = false)
         : sc(sc_), vt(vt_), m(sc_.mats[vt_.matId]), wo(wo_), cosWo(ddot(wo_, vt_.ns)) {
@@ -15689,11 +15696,9 @@ struct DVertexLobe {
     }
     __device__ void albedos(Real lambda) {
         if (!ready) prepare();
-        if (lambda == rhoLam0) { rhoR = rhoR0; rhoT = rhoT0; return; }
-        if (lambda == rhoLam1) { rhoR = rhoR1; rhoT = rhoT1; return; }
+        if (lambda == rhoLam) return;
         dDiffuseTransmitAlbedos(sc, m, h, lambda, rhoR, rhoT);
-        if (rhoLam0 < (Real)0) { rhoLam0 = lambda; rhoR0 = rhoR; rhoT0 = rhoT; }
-        else                   { rhoLam1 = lambda; rhoR1 = rhoR; rhoT1 = rhoT; }
+        rhoLam = lambda;
     }
     // f(wo -> wi) at `lambda` (double, for a connection's radiance).
     __device__ double f(Real lambda) {
@@ -18533,6 +18538,15 @@ __device__ static void bkRadianceHeroLoop(const DScene& sc, int diffraction,
         const DGlossyMis gmisIn = gmis;
         gmis.clear();
         bool nullHereH = false;   // a coverage pass-through is no vertex: it lends nothing new
+        // A coverage pass-through keeps the last real vertex's MIS record, is refunded its bounce
+        // (capped: 256 is far above anything real fur hands back), and is not the path's first
+        // event: every one of them through here (host twin passedThrough).
+        const auto passedThrough = [&]() {
+            gmis = gmisIn;
+            nullHereH = true;
+            if (nullStepsH < 256) { --b; ++nullStepsH; }
+            dUnnoteFirst(firstHere);
+        };
         // A coated body's lobe takes the coat on its light samples and gathers, and a coated vertex
         // its continuation after the switch (host twin radianceHeroLoop).
         const DVec3 rdInH = rd;   // the arrival, for the coat (dCoatF)
@@ -18694,11 +18708,7 @@ __device__ static void bkRadianceHeroLoop(const DScene& sc, int diffraction,
                                                  specR, specTech, specW, contBsdfPdf,
                                                  specularArrival, curveTmin, rng);
                     if (r == 0) return;
-                    if (r == 2) {               // a coverage pass-through is no vertex
-                        gmis = gmisIn; nullHereH = true;
-                        if (nullStepsH < 256) { --b; ++nullStepsH; }
-                        dUnnoteFirst(firstHere);  // ...and not the first event
-                    }
+                    if (r == 2) passedThrough();   // a coverage pass-through is no vertex
                     break;
                 }
                 [[fallthrough]];
@@ -18783,9 +18793,7 @@ __device__ static void bkRadianceHeroLoop(const DScene& sc, int diffraction,
                                            lam[0], invPdf[0], thr[0], L[0], specularArrival,
                                            contBsdfPdf, stk, rng, gi, nullptr, &heroNull, &curveTmin))
                         return;
-                    if (heroNull) { gmis = gmisIn; nullHereH = true; }
-                    if (heroNull && nullStepsH < 256) { --b; ++nullStepsH; }
-                    if (heroNull) dUnnoteFirst(firstHere);
+                    if (heroNull) passedThrough();
                     break;
                 }
                 }
@@ -18809,9 +18817,7 @@ __device__ static void bkRadianceHeroLoop(const DScene& sc, int diffraction,
                                        invPdf[0], thr[0], L[0], specularArrival, contBsdfPdf, stk,
                                        rng, gi, nullptr, &heroNull2, &curveTmin))
                     return;
-                if (heroNull2) { gmis = gmisIn; nullHereH = true; }
-                if (heroNull2 && nullStepsH < 256) { --b; ++nullStepsH; }
-                if (heroNull2) dUnnoteFirst(firstHere);
+                if (heroNull2) passedThrough();
                 break;
             }
             case D_DIFFUSE:

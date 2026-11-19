@@ -32,7 +32,7 @@
 #ifdef __CUDA_ARCH__
   #define POVN_MEM __device__ const
 #else
-  #define POVN_MEM static const
+  #define POVN_MEM inline const   // one table across the host's units, as its readers are one
 #endif
 
 // ---- baked tables -----------------------------------------------------------

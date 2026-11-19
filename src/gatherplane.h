@@ -1,4 +1,5 @@
 #pragma once
+#include "unit_linkage.h"   // FT_UNIT_INLINE
 // Which stored photons a density estimate keeps (MERGE-PROXIMITY), and the scalar rules of the
 // footprint that divides it: the gathers of modes M and S (photonmap.h's adaptive radius,
 // photonmap_render.h, sppm_render.h), the merges of modes J and U (MergeFootprint: bdpt.h, vcm.h),
@@ -20,10 +21,10 @@
 #define FT_GP_HD
 #endif
 
-FT_GP_HD inline float  gpSqrt(float x)  { return sqrtf(x); }
-FT_GP_HD inline double gpSqrt(double x) { return ::sqrt(x); }
-FT_GP_HD inline float  gpEps(float)  { return FLT_EPSILON; }
-FT_GP_HD inline double gpEps(double) { return DBL_EPSILON; }
+FT_GP_HD FT_UNIT_INLINE float  gpSqrt(float x)  { return sqrtf(x); }
+FT_GP_HD FT_UNIT_INLINE double gpSqrt(double x) { return ::sqrt(x); }
+FT_GP_HD FT_UNIT_INLINE float  gpEps(float)  { return FLT_EPSILON; }
+FT_GP_HD FT_UNIT_INLINE double gpEps(double) { return DBL_EPSILON; }
 
 // MERGE-PROXIMITY: which stored photons lie on the surface a gather point is on. A gather takes the
 // photons within a ball, and a second surface inside it -- the floor under a table top, once the
@@ -43,7 +44,7 @@ constexpr double kGatherFacingCos = 0.5;
 // over the surface's own relief.
 constexpr double kLowLegFrac = 0.01;
 
-template <class T> FT_GP_HD inline bool withinGatherBand(T off, T d2, T c, T slack) {
+template <class T> FT_GP_HD FT_UNIT_INLINE bool withinGatherBand(T off, T d2, T c, T slack) {
     if (off <= slack) return true;
     T q = T(1) - c * c;
     if (q < T(0)) q = T(0);
@@ -71,7 +72,7 @@ constexpr double kGatherRoundUlps = 8.0;
 // fluorescent strand gathers at all: modes M and S walk on past a `type diffuse` one
 // (CURVE-GATHER). A curve as thick as the radius is a surface at that scale, and takes the band as
 // one. The facing test stays. One value per gather point, so its count, sum and footprint agree.
-template <class T> FT_GP_HD inline T gatherBandSlack(T radius, T fiberR, T pscale = T(0)) {
+template <class T> FT_GP_HD FT_UNIT_INLINE T gatherBandSlack(T radius, T fiberR, T pscale = T(0)) {
     if (fiberR > T(0) && fiberR < radius) return T(HUGE_VAL);
     return radius * T(1e-3) + T(kGatherRoundUlps) * gpEps(T(0)) * pscale;
 }
@@ -90,7 +91,7 @@ template <class T> FT_GP_HD inline T gatherBandSlack(T radius, T fiberR, T pscal
 // translucent solid, parallel to it a thickness away, is another surface whose photons are the
 // light arriving at that face, not the light this one transmits. One-sided (`twoSided` false), the
 // near side's alone.
-template <class T> FT_GP_HD inline bool gatherFacing(T c, bool twoSided, bool& farSide) {
+template <class T> FT_GP_HD FT_UNIT_INLINE bool gatherFacing(T c, bool twoSided, bool& farSide) {
     farSide = false;
     if (c >= T(kGatherFacingCos)) return true;
     if (twoSided && c <= -T(kGatherFacingCos)) { farSide = true; return true; }

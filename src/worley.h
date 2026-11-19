@@ -29,6 +29,7 @@
 // Manhattan diameter of the 3x3x3 block, and 8-1 > 6) — it only guards NaN
 // inputs, whose comparisons are all false, from looping forever.
 #pragma once
+#include "unit_linkage.h"   // FT_UNIT_INLINE
 
 #if defined(__CUDACC__)
   #ifndef WORLEY_HD
@@ -43,7 +44,7 @@
 #include <math.h>
 
 // murmur3 fmix32: full-avalanche 32-bit finalizer.
-WORLEY_HD inline unsigned int patWorleyMix(unsigned int h) {
+WORLEY_HD FT_UNIT_INLINE unsigned int patWorleyMix(unsigned int h) {
     h ^= h >> 16; h *= 0x85ebca6bu;
     h ^= h >> 13; h *= 0xc2b2ae35u;
     h ^= h >> 16;
@@ -52,7 +53,7 @@ WORLEY_HD inline unsigned int patWorleyMix(unsigned int h) {
 
 // Cell -> base hash. The three coordinates are combined with large odd
 // constants before the finalizer so permuted cells don't collide.
-WORLEY_HD inline unsigned int patWorleyCellHash(int cx, int cy, int cz) {
+WORLEY_HD FT_UNIT_INLINE unsigned int patWorleyCellHash(int cx, int cy, int cz) {
     unsigned int h = (unsigned int)cx * 374761393u
                    ^ (unsigned int)cy * 668265263u
                    ^ (unsigned int)cz * 2246822519u;
@@ -61,7 +62,7 @@ WORLEY_HD inline unsigned int patWorleyCellHash(int cx, int cy, int cz) {
 
 // Worley query at (x, y, z) under `metric` (0 Euclid / 1 Manhattan / 2 Chebyshev).
 // out[0] = F1, out[1] = F2, out[2] = id of the F1 cell in [0,1).
-WORLEY_HD inline void patWorley(double x, double y, double z, int metric,
+WORLEY_HD FT_UNIT_INLINE void patWorley(double x, double y, double z, int metric,
                                 double out[3]) {
     const double fx = floor(x), fy = floor(y), fz = floor(z);
     const int bx = (int)fx, by = (int)fy, bz = (int)fz;

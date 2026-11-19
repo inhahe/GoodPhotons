@@ -16,6 +16,7 @@ kBdptT(DScene sc, const __grid_constant__ DCamera cam, double* camFilm, double* 
 }  // namespace gpu
 
 #include "render_cuda_dev2.cuh"
+#include "vcm_lattice.h"   // mode U's merge lattice: one sizing rule with the host's VcmGrid
 
 namespace gpu {
 // Defined in render_cuda_jsurf.cu, under its own register cap.
@@ -2590,21 +2591,23 @@ SharedGpuSession* sharedForwardGpuBegin(const Scene& scene,
     s->cs.beamOrderMax = pbeams::gOrderMax;   // -beams-order (host twin: Renderer::beamOrderMax)
     // A moving camera set, under a blur: every thread poses its own copy of every camera at its
     // photon's time, a buffer of threads x cameras that a big flight can make larger than the card
-    // has free. Made once for the session, here, where the flight can still fly on the CPU.
-    // The walk's stacks, reserved at its first launch, after this, are set aside first.
+    // has free. Made once for the session, here, where the flight can still fly on the CPU, by the
+    // preflight's own rule (vramPreflight, which counted it: cudaSharedFlightPosedBytes): the walk's
+    // stacks, reserved at its first launch, after this, set aside, and 256 MB of headroom kept.
     if (s->cs.camMoves) {
         const size_t needB = cudaSharedFlightPosedBytes(scene, nc, wavefront, heroC, beamGather);
         size_t freeB = 0, totalB = 0;
         cudaMemGetInfo(&freeB, &totalB);
         const size_t pending = pendingLocalBytes(cudaMegakernelLocalBytes(
             camMode, maxBounce, heroC, cudaForwardRunsWavefront(scene, wavefront, heroC, beamGather, nc)));
-        const size_t room = (freeB > pending) ? freeB - pending : 0;
-        if (needB > room / 2 || cudaMalloc(&s->d_posed, needB) != cudaSuccess) {
+        const size_t headroom = (size_t)256 * 1024 * 1024;
+        const size_t room = (freeB > pending + headroom) ? freeB - pending - headroom : 0;
+        if (needB > room || cudaMalloc(&s->d_posed, needB) != cudaSuccess) {
             cudaGetLastError();
             s->d_posed = nullptr;
             std::fprintf(stderr, "[device] a blurred shared flight poses its %d cameras at each photon's time in "
-                                 "%.2f GB of device memory, more than half the %.2f GB free beside the walk's "
-                                 "stacks; using CPU\n",
+                                 "%.2f GB of device memory, more than the %.2f GB free beside the walk's "
+                                 "stacks and the headroom; using CPU\n",
                          nc, (double)needB / 1e9, (double)room / 1e9);
             sharedForwardGpuEnd(s);
             return nullptr;
@@ -6623,8 +6626,6 @@ static constexpr long long kVcmReqCap = 1LL << 20;
 // The most light vertices a merge site holds and is still merged where it was found
 // (DVcmMergeQueue::inlineMax).
 static constexpr int kVcmInlineMax = 32;
-// The most cells a pass's grid has (vcmSessionPass); past it the cells grow instead.
-static constexpr long long kVcmMaxCells = 1LL << 26;
 
 bool cudaVcmSupported(const Scene& scene) {
     // VCM reuses the BDPT device scope (per-hit BSDFs, area/sphere/spot/sun lights, no
@@ -6909,10 +6910,8 @@ void vcmSessionPass(VcmSession* s, double radius) {
             LvToBboxF{}, BboxF{FLT_MAX, FLT_MAX, FLT_MAX, -FLT_MAX, -FLT_MAX, -FLT_MAX},
             BboxMergeF{});
         // The dense cell table grows as (extent / radius)^3 while the radius shrinks pass by
-        // pass. Past kVcmMaxCells (256 MB of ints, and int-indexed) the cells grow instead: the
-        // camera's 3x3x3 lookup tests distance against the radius, not the cell, so a cell
-        // bigger than the radius only adds candidates.
-        // So do they where the device will not hold the table (the merges' queue takes its share of
+        // pass: the lattice takes no more than kVcmMaxCells (vcmLattice, the host grid's rule).
+        // Its cells grow too where the device will not hold the table (the merges' queue takes its share of
         // the memory first): the pass renders, its merges weighing more candidates. The table takes
         // no more than the memory free past what the passes must leave -- VcmSession::sortWorst,
         // past what the arena holds already, and the kernels' stacks until a launch has reserved
@@ -6940,17 +6939,13 @@ void vcmSessionPass(VcmSession* s, double radius) {
         };
         bool roomCoarsened = false;
         long long nCells = 0;
-        for (int grow = 0;; ++grow) {
-            gLo = DVec3(bb.mnx - cell * 0.5, bb.mny - cell * 0.5, bb.mnz - cell * 0.5);
-            DVec3 ext(bb.mxx - gLo.x + cell * 0.5, bb.mxy - gLo.y + cell * 0.5, bb.mxz - gLo.z + cell * 0.5);
-            gnx = std::max(1, (int)std::ceil(std::min((double)ext.x / cell, 2e6)));
-            gny = std::max(1, (int)std::ceil(std::min((double)ext.y / cell, 2e6)));
-            gnz = std::max(1, (int)std::ceil(std::min((double)ext.z / cell, 2e6)));
-            nCells = (long long)gnx * gny * gnz;
-            if (nCells > kVcmMaxCells && grow < 8) {
-                cell *= std::cbrt((double)nCells / (double)kVcmMaxCells) * 1.01;
-                continue;
-            }
+        const double bbLo[3] = {bb.mnx, bb.mny, bb.mnz}, bbHi[3] = {bb.mxx, bb.mxy, bb.mxz};
+        for (;;) {
+            const VcmLattice<Real> lat = vcmLattice<Real>(bbLo, bbHi, cell);
+            cell = lat.cell;
+            gLo = DVec3(lat.lo[0], lat.lo[1], lat.lo[2]);
+            gnx = lat.n[0]; gny = lat.n[1]; gnz = lat.n[2];
+            nCells = lat.cells();
             if ((size_t)nCells + 1 <= s->cellStartCap ||
                 ((size_t)nCells + 1 <= cellRoom() &&
                  tryDevCap(s->d_cellStart, s->cellStartCap, (size_t)nCells + 1, cellRoom()))) break;

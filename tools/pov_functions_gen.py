@@ -196,6 +196,7 @@ TEMPLATE = r'''// pov_functions.h - EXACT ports of POV-Ray's internal isosurface
 // EXCLUDED (need POV's Perlin-noise / pattern / pigment / spline engine, not yet
 // ported): {excluded_list}.
 #pragma once
+#include "unit_linkage.h"   // FT_UNIT_INLINE
 
 #if defined(__CUDACC__)
   #ifndef POV_HD
@@ -225,6 +226,11 @@ TEMPLATE = r'''// pov_functions.h - EXACT ports of POV-Ray's internal isosurface
 
 // POV's ROT2D "surface of revolution" switch, verbatim (operates on the mutable
 // PARAM_X/PARAM_Y locals and recomputes x2,y2).  p>0 enables the revolve.
+// A verbatim port: some functions declare `y2` for ROT2D, which assigns it, and never read it
+// (nvcc #550, set but never used). Suppressed for this header alone.
+#if defined(__CUDACC__)
+#pragma nv_diag_suppress 550
+#endif
 #define ROT2D(p,d,ang) if (p>0) {x2=sqrt(x2+PARAM_Z*PARAM_Z)- d; th=(ang)*M_PI_180; \\
     if (th!=0){{ PARAM_X= x2*cos(th)-PARAM_Y*sin(th); PARAM_Y= x2*sin(th)+PARAM_Y*cos(th);}} else PARAM_X=x2; \\
     x2=PARAM_X*PARAM_X; y2=PARAM_Y*PARAM_Y;}}
@@ -235,7 +241,7 @@ TEMPLATE = r'''// pov_functions.h - EXACT ports of POV-Ray's internal isosurface
 // Evaluate POV internal function `id` with args _pp[] (_pp[0..2]=x,y,z,
 // _pp[3..]=P0..).  The param is named `_pp` (not `p`) to avoid colliding with POV
 // bodies that declare a local `p` (e.g. f_superellipsoid).
-POV_HD inline double povFnEval(int id, const double* _pp) {{
+POV_HD FT_UNIT_INLINE double povFnEval(int id, const double* _pp) {{
     double X = _pp[0], Y = _pp[1], Z = _pp[2];
 #define PARAM_X X
 #define PARAM_Y Y
@@ -256,7 +262,7 @@ POV_HD inline double povFnEval(int id, const double* _pp) {{
 
 // Total argument count (including x,y,z) for POV internal function `id`, or 0 if
 // unsupported.  Device-safe so the VM can pop the right number of stack slots.
-POV_HD inline int povFnArity(int id) {
+POV_HD FT_UNIT_INLINE int povFnArity(int id) {
     switch (id) {
 {arity_switch}
     default: return 0;
@@ -284,12 +290,34 @@ inline bool povFnLookup(const char* name, int& id, int& arity) {{
         if (strcmp(name, T[i].name) == 0) {{ id = T[i].id; arity = T[i].arity; return true; }}
     return false;
 }}
+#if defined(__CUDACC__)
+#pragma nv_diag_default 550
+#endif
 '''
 
 hdr = TEMPLATE
 # The template was authored with doubled braces / backslashes (f-string legacy);
 # collapse them to single for real C, then splice the generated sections.
 hdr = hdr.replace("{{", "{").replace("}}", "}").replace("\\\\", "\\")
+# The ports' own repairs to POV's bodies, each exactly where it applies:
+#  - f_folium_surface_2d declares a z2 it never reads (an unused-variable warning);
+#  - f_hex_x / f_hex_y's fmod(..., 3): an int second argument picks MSVC's host-only
+#    fmod<double, int>, which the device pass cannot call.
+REPAIRS = [
+    ("    double r, x2=PARAM_X*PARAM_X, y2=PARAM_Y*PARAM_Y, z2=PARAM_Z*PARAM_Z, th;\n"
+     "    ROT2D(PARAM(3),PARAM(4),PARAM(5))\n"
+     "    r = -( y2  * (1 + (PARAM(2) - 4*PARAM(1))*PARAM_X) + x2*(1 + PARAM(2)));",
+     "    double r, x2=PARAM_X*PARAM_X, y2=PARAM_Y*PARAM_Y, th;\n"
+     "    ROT2D(PARAM(3),PARAM(4),PARAM(5))\n"
+     "    r = -( y2  * (1 + (PARAM(2) - 4*PARAM(1))*PARAM_X) + x2*(1 + PARAM(2)));", 1),
+    ("    y1=fabs(fmod(fabs(PARAM_Y), 3)-1.5);\n",
+     "    y1=fabs(fmod(fabs(PARAM_Y), 3.0)-1.5);   // 3.0: an int picks MSVC's host-only fmod<double, int>\n", 2),
+]
+for old, new, count in REPAIRS:
+    found = switch.count(old)
+    if found != count:
+        raise SystemExit("repair expected %d time(s), found %d: %r" % (count, found, old[:60]))
+    switch = switch.replace(old, new)
 hdr = hdr.replace("{switch}", switch)
 hdr = hdr.replace("{arity_switch}", arity_switch)
 hdr = hdr.replace("{table}", table)

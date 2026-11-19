@@ -412,6 +412,16 @@ Then the rest of 4.2-4.6 in their order, 4.7's bookkeeping alongside whatever to
   wavelength; byte for byte 0.450.4's images. 640x480 bowl: gather 43.4 -> 15.7 s; Nsight 10.5 -> 1.5
   G local requests, 26.6 -> 15.6 G FP64. Its four pattern readers forced inline, which made mode D
   1.75x faster too (0.450.4 had dGlossyF out of line at 168 registers).
+- [ ] **PREFLIGHT-ROUTE-PLAN** — one route-plan function per GPU launcher, read by the launcher and by
+  the VRAM preflight, in place of the preflight's second copy of every kernel choice (mode P's
+  camera-side layers, `-rgb`, D's gated hero bundle, J's other kernels); known-issues.
+- [ ] **VCM-SPARSE-LATTICE** — size mode U's merge lattice by the vertex density too, on both devices
+  (vcm_lattice.h), measured on a dense and a sparse scene; known-issues.
+- [x] **REVIEW-0450F** (0.450.15) — the Opus (max) and Fable (xhigh) reviews of 0.450.12-0.450.14, and
+  0.450.14's mode-U slowdown (+18 %) found by timing and bisected: one albedo slot, the merge's own
+  lobe; the scanner's levels and headers, the gates in CMake, FT_UNIT_INLINE per device pass in
+  twelve headers and the POV generators, four more unit-local structs, the lattice shared, the
+  library hint everywhere; known-issues REVIEW-0450F.
 - [x] **REVIEW-0450E** (0.450.14) — the Opus (max) and Fable (xhigh) reviews of 0.450.10-0.450.11: the
   last unsequenced draws (selW's among them) and a scanner that sees them, modes V and P and the
   meter weighed by the kernels they launch, a flight's posed cameras, one reservation rule, the
@@ -625,9 +635,13 @@ Then the rest of 4.2-4.6 in their order, 4.7's bookkeeping alongside whatever to
 - [x] **REMAP0-IMPOSSIBLE** (0.439.7) — the MIS sums read a zero density as a delta's, whatever
   made it zero (only the sun's was special-cased).
 
-- [ ] **GPU-STACK-DRIFT** — every kernel's stack reservation moves when unrelated device code changes.
+- [ ] **GPU-STACK-DRIFT** — every kernel's stack reservation moves when unrelated device code changes,
+  and with none (2026-11-19: the device build is not deterministic; mode D's speed moved 11 % between
+  two builds of one source): settle `--split-compile`'s part, builds compared byte for byte.
 - [ ] **SLAB-DDA-COPIES** — the box clip and the grid walk are written out several times.
-- [ ] **GMIS-NULL-BY-HAND** — every caller keeps the glossy MIS record across a pass-through by hand.
+- [x] **GMIS-NULL-BY-HAND** (0.450.15) — one pass-through restore a walk: the scalar walks' interaction
+  functions, one `passedThrough` per hero loop (the device's three sites folded), each mode-M walk's
+  coverage test; the clear-on-real-vertex inversion declined (known-issues).
 - [ ] **GROOM-SILENT-OOM** — the groom tool can exit without a word when memory is short.
 - [ ] **GROOM-DRAG-UNTESTED** — the groom tool's drags have no automated test.
 - [x] **"mode `U` (VCM) still uses a dense cell grid with the same `(int)(nCells + 1)` overflow"**
