@@ -430,8 +430,8 @@ Then the rest of 4.2-4.6 in their order, 4.7's bookkeeping alongside whatever to
   of their cells shared it: the photon map takes merge_grid.h's bucket, host and device.
 - [ ] **GATHER-BASE-MIRROR-M** — check_gather_base's mirror box: CPU mode M reads the floor 0-2 cm from
   its base 0.929 of mode R (GPU M 1.031), since before 0.450.17: bisect; known-issues.
-- [ ] **GPU-MERGE-FLOAT-LATTICE** — the device's photon and surface maps place a gather site in a
-  float-rounded lattice where the photons were binned in double: carry the corner and width in double.
+- [x] **GPU-MERGE-FLOAT-LATTICE** (0.450.22) — the device's merge maps carry their lattice in double
+  (`MergeLattice`), as their points were binned; the device probe holds it.
 - [x] **REVIEW-0450F** (0.450.15) — the Opus (max) and Fable (xhigh) reviews of 0.450.12-0.450.14, and
   0.450.14's mode-U slowdown (+18 %) found by timing and bisected: one albedo slot, the merge's own
   lobe; the scanner's levels and headers, the gates in CMake, FT_UNIT_INLINE per device pass in

@@ -10521,7 +10521,13 @@ as the one at fault.
   merges are bit-identical to it. `FTRACE_MERGE_TABLE=<k>` holds the slots to at most `k` (a
   power of two; 1: one block of 27 buckets that every block shares), which
   `tools/check_merge_table.py` uses to hold the renders to the default table's. Host and device
-  compute a cell alike (`mergeCellCoord`, in double, held to ±2^30), the site's in `DGridCell`. A site's warp ends in `dWarpSiteAdd`,
+  compute a cell alike (`mergeCellCoord`, in double, held to ±2^30), the site's in `DGridCell`,
+  and every device map carries its lattice as the points were binned in it (`MergeLattice`: the
+  corner and width in double, the mask; `DPhotonMap`, `DSurfMap`, `DVcmGrid`) -- a site placed in
+  another rounding of it takes the cell beside its own near a plane and misses the points two
+  cells off (until 0.450.22 the photon and surface maps held theirs in float: GPU-MERGE-FLOAT-
+  LATTICE). The device probe (`FTRACE_DEVICE_PROBE`, after every build) holds the device's cell
+  to the host's binning for points either side of cell planes in lattices far from the origin. A site's warp ends in `dWarpSiteAdd`,
   mode J's queue's end too. A merge site builds its own lobe, prepared at once, never a caller's by
   reference: a lobe whose address leaves its kernel for a call ptxas keeps out of line lives in
   local memory there (the camera kernel's `camLobe` so handed to the inline merge made mode U 10 %

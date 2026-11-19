@@ -1726,9 +1726,7 @@ struct DVcmGrid {
     const int* cellStart;   // mergeBucketCount(mask) + 1
     const DVcmLV* byCell;   // nLV vertices, bucket-contiguous
     const DVcmSec* byCellSec;
-    DVec3  lo;
-    double cell;            // == merge radius
-    unsigned int mask;      // the table's (merge_grid.h)
+    MergeLattice lat;       // the lattice, its cells the merge radius wide (merge_grid.h)
 };
 
 // Per-pass constants (device twin of vcm.h PassCtx; media/diffraction handled elsewhere).
@@ -2441,10 +2439,10 @@ namespace {
 struct DVcmSite {
     DGridCell g;
     __device__ DVcmSite(const DVcmGrid& grid, const DVec3& p)
-        : g(p, (double)grid.lo.x, (double)grid.lo.y, (double)grid.lo.z, (double)grid.cell) {}
+        : g(p, grid.lat) {}
     // The light vertices [b, e) of its neighbour cell n's bucket (dSiteListWalk's `cell`).
     __device__ void cell(const DVcmGrid& grid, int n, int& b, int& e) const {
-        const unsigned int c = g.neighbour(n, grid.mask);
+        const unsigned int c = g.neighbour(n, grid.lat.mask);
         b = grid.cellStart[c]; e = grid.cellStart[c + 1];
     }
     // The light vertices of its 27 cells: the list a merge there walks.
@@ -3299,12 +3297,10 @@ __global__ void kVcmCompactScatter(const DVcmLV* slab, const DVcmSec* secSlab, i
 // Bucket per compacted light vertex (merge_grid.h), its cell computed as a merge site's is
 // (DGridCell), in double -- that agreement decides whether a merge finds it.
 #ifndef FT_FAMILY_TU
-__global__ void kVcmCellKey(const DVcmLV* lv, int n, DVec3 gLo, double cell, unsigned int mask, int* key) {
+__global__ void kVcmCellKey(const DVcmLV* lv, int n, MergeLattice lat, int* key) {
     int stride = gridDim.x * blockDim.x;
     for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += stride)
-        key[i] = (int)mergeBucket(mergeCellCoord((double)lv[i].p.x, (double)gLo.x, cell),
-                                  mergeCellCoord((double)lv[i].p.y, (double)gLo.y, cell),
-                                  mergeCellCoord((double)lv[i].p.z, (double)gLo.z, cell), mask);
+        key[i] = (int)mergeLatticeBucket(lat, lv[i].p.x, lv[i].p.y, lv[i].p.z);
 }
 #endif
 // The grid's cell-ordered copy (DVcmGrid::byCell): out[k] = lv[order[k]] for the n vertices, and
@@ -3461,26 +3457,20 @@ __global__ void kLbvhRefit(const int* parent, int n, int* visited, DNode* nodes)
 // positions are DSurfPhoton's, which the gather bins with the identical expression (DGridCell) --
 // and it is that agreement, not agreement with the host build, that decides whether a merge is found.
 #ifndef FT_FAMILY_TU
-__global__ void kJSurfCellKey(const DSurfPhoton* pts, int n, DVec3 gLo, double cell, unsigned int mask,
-                              int* key) {
+__global__ void kJSurfCellKey(const DSurfPhoton* pts, int n, MergeLattice lat, int* key) {
     int stride = gridDim.x * blockDim.x;
     for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += stride)
-        key[i] = (int)mergeBucket(mergeCellCoord((double)pts[i].p.x, (double)gLo.x, cell),
-                                  mergeCellCoord((double)pts[i].p.y, (double)gLo.y, cell),
-                                  mergeCellCoord((double)pts[i].p.z, (double)gLo.z, cell), mask);
+        key[i] = (int)mergeLatticeBucket(lat, pts[i].p.x, pts[i].p.y, pts[i].p.z);
 }
 #endif
 
 // BUCKET id per deposited photon (PhotonMap::cellCoord + cellIndex twin; merge_grid.h). The host
 // converted DPhoton's float position to a double Vec3 BEFORE the all-double cell math, so promote first.
 #ifndef FT_FAMILY_TU
-__global__ void kSppmCellKey(const DPhoton* ph, long long n, double lox, double loy, double loz,
-                             double cellSize, unsigned int tableMask, int* key) {
+__global__ void kSppmCellKey(const DPhoton* ph, long long n, MergeLattice lat, int* key) {
     long long stride = (long long)gridDim.x * blockDim.x;
     for (long long i = blockIdx.x * (long long)blockDim.x + threadIdx.x; i < n; i += stride)
-        key[i] = (int)mergeBucket(mergeCellCoord((double)ph[i].pos.x, lox, cellSize),
-                                  mergeCellCoord((double)ph[i].pos.y, loy, cellSize),
-                                  mergeCellCoord((double)ph[i].pos.z, loz, cellSize), tableMask);
+        key[i] = (int)mergeLatticeBucket(lat, ph[i].pos.x, ph[i].pos.y, ph[i].pos.z);
 }
 #endif
 

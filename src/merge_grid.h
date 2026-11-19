@@ -56,6 +56,22 @@ MG_HD unsigned int mergeBucket(int ix, int iy, int iz, unsigned int mask) {
     return 27u * ((unsigned int)h & mask) + (unsigned int)((ix - 3 * bx) + 3 * (iy - 3 * by) + 9 * (iz - 3 * bz));
 }
 
+// A lattice as the device's maps carry it (DPhotonMap, DSurfMap, DVcmGrid): its corner and cell
+// width in double, as its points were binned -- a gather that places a site in another rounding of
+// them takes the cell beside its own near a cell plane, and misses the points two cells away -- and
+// its table's mask.
+struct MergeLattice {
+    double lo[3];
+    double cell;
+    unsigned int mask;
+};
+
+// The bucket of the cell holding (x, y, z) in lattice `L`: how a map bins a point.
+MG_HD unsigned int mergeLatticeBucket(const MergeLattice& L, double x, double y, double z) {
+    return mergeBucket(mergeCellCoord(x, L.lo[0], L.cell), mergeCellCoord(y, L.lo[1], L.cell),
+                       mergeCellCoord(z, L.lo[2], L.cell), L.mask);
+}
+
 // The buckets of a table: 27 * (mask + 1).
 inline size_t mergeBucketCount(unsigned int mask) { return 27 * ((size_t)mask + 1); }
 

@@ -419,22 +419,26 @@ digits on 0.450.17, 0.450.20 and 0.450.21, so it predates this week's work; the 
 edited in 0.434.14, when it passed. **Next:** bisect between 0.434.14 and 0.450.17 (CPU mode M
 only, so a host-only build serves), then find what the mirror's base ring loses.
 
-## OPEN (2026-11-19, bug): GPU-MERGE-FLOAT-LATTICE — the device's merge gathers place a site in a float-rounded lattice
+## DONE (2026-11-19, 0.450.22): GPU-MERGE-FLOAT-LATTICE — the device's merge gathers placed a site in a float-rounded lattice
 
-The device's photon map (`DPhotonMap`) and mode J's surface map (`DSurfMap`) carry their lattice's
-corner as a `DVec3` and its cell width as `Real`, which under FTRACE_GPU_FP32 are float; the gather
-computes a site's cell from those (`dPmNeighborhood`, `DGridCell` in `DSurfSite`), while the points
-were binned in double -- by the host (PhotonMap::buildGrid, SurfMap::build, then uploaded) or by
-the device's own key kernels (`kSppmCellKey` with the double corner, `kJSurfCellKey` with the double
-width). A site within the two lattices' disagreement of a cell plane then takes the cell beside its
-own, and its 3x3x3 neighbourhood misses the photons within the radius two cells away on the far
-side. The disagreement is the float rounding of the corner plus that of the width times the cell
-index -- about 1e-7 of a cell a cell away from the corner, so it grows with the scene's extent in
-cells and with its distance from the origin (a scene 1e4 units out has a float corner rounded by
-1e-3). Mode U's grid is consistent (`kVcmCellKey` and `DVcmSite` read the same float corner and
-double width). **Proper fix:** carry the corner and width in double in both structs, as
-`DVcmGrid::cell` is, so the gather's lattice is the binning's; a check that moves a scene far from
-the origin and holds GPU M, S and J to their CPU renders.
+The device's photon map (`DPhotonMap`) and mode J's surface map (`DSurfMap`) carried their
+lattice's corner as a `DVec3` and its cell width as `Real`, float under FTRACE_GPU_FP32, and the
+gathers computed a site's cell from those (`dPmNeighborhood`, `DGridCell`), while the points were
+binned in double -- by the host (PhotonMap::buildGrid, SurfMap::build, then uploaded) or by the
+device's key kernels (`kSppmCellKey` with the double corner, `kJSurfCellKey` with the double
+width). A site within the two lattices' disagreement of a cell plane took the cell beside its own,
+and its 3x3x3 neighbourhood missed the sliver of its disc two cells away -- a darkening second
+order in the disagreement (the float rounding of the corner, plus the width's times the cell
+index), small near the origin and growing with the scene's distance from it. **Fixed:**
+`MergeLattice` (merge_grid.h: corner and width in double, the mask), carried by all three device
+maps (`DVcmGrid` too, whose float corner had at least agreed with its key kernel's) and read by
+`DGridCell`, `dPmNeighborhood` and the three key kernels (`mergeLatticeBucket`), so a gather
+queries the lattice its points were binned in.
+
+**Verified:** the device probe (`FTRACE_DEVICE_PROBE`, run after every build) now places points a
+rounding or two either side of cell planes, in two lattices far from the origin, on the device and
+holds each to the bucket the host bins it in: 168 points agree; with the float lattice put back in
+`DGridCell`, 8 do not and the build says the probe failed.
 
 ## DONE (2026-11-19, 0.450.21): PM-BUCKET-TWICE — mode M's and SPPM's gathers could read a bucket twice when two of their cells shared it
 

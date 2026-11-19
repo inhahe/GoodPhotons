@@ -47,7 +47,7 @@ kJSurfLightT(DScene sc, DCamera cam, int diffraction, int maxDepth,
     X(DCamSet) X(DGatherPhoton) X(DPhotonMap) X(DTrRay) X(DBeamRec) X(DBeamMis) \
     X(DVolCache) X(DBeamMap) X(DBeamMergeW) X(DSurfPhoton) X(DSurfMis) X(DSurfMap) \
     X(DWfSeg) X(DWfHit) X(DWfQueue) X(DVertex) X(DEscape) X(DHeroBundle) \
-    X(DPLight) X(DPreviewLight) X(DPTex) X(DPathSeg) X(DSurfMergeW) X(DSppmState)
+    X(DPLight) X(DPreviewLight) X(DPTex) X(DPathSeg) X(DSurfMergeW) X(DSppmState) X(MergeLattice)
 enum { FT_MATH_N = 25 };
 template <class T> HD inline void ftMathRow(T x, T y, double* o) {
     o[0] = sqrt(x);  o[1] = fabs(x);  o[2] = cos(x);   o[3] = exp(x);   o[4] = sin(x);  o[5] = floor(x);
@@ -67,6 +67,13 @@ __global__ void kDeviceProbe(unsigned long long* sizes, double* math, const doub
         ftMathRow<float>((float)xs[r], (float)ys[r], math + (2 * r) * FT_MATH_N);
         ftMathRow<double>(xs[r], ys[r], math + (2 * r + 1) * FT_MATH_N);
     }
+}
+// The merge-lattice half of the probe: the bucket a merge site at each of the n points (xyz, float,
+// as a device site's position is) takes in `lat` -- its own cell's, DGridCell's centre neighbour.
+__global__ void kMergeCellProbe(MergeLattice lat, const float* pts, int n, unsigned int* out) {
+    for (int i = 0; i < n; ++i)
+        out[i] = DGridCell(DVec3((Real)pts[3 * i], (Real)pts[3 * i + 1], (Real)pts[3 * i + 2]), lat)
+                     .neighbour(13, lat.mask);
 }
 
 } // namespace gpu
@@ -194,8 +201,48 @@ static int deviceProbe() {
                         dbl ? "double" : "float", xs[r], ys[r], a, b);
         }
     }
-    std::printf("[probe] %d disagreement(s) between the host and device compilers (%d structs, %d math values)\n",
-                bad, NT, (int)hm.size());
+    // Merge lattices far from the origin and points a rounding or two either side of their cell
+    // planes, as floats: the device must place each in the bucket the host bins it in (merge_grid.h,
+    // mergeLatticeBucket). A lattice the device holds in another rounding than the binning's takes
+    // the cell beside near a plane, and its gather misses what lies two cells off.
+    int nMerge = 0;
+    {
+        const MergeLattice lats[2] = {{{1.0e4 + 0.123, -2.5e3 + 0.7, 750.0137}, 0.0037, 63},
+                                      {{-31.4, 2.71, 1.0e3 + 0.5}, 0.0213, 4095}};
+        for (const MergeLattice& lat : lats) {
+            std::vector<float> pts;
+            for (int a = 0; a < 3; ++a)
+                for (long long k : {1LL, 977LL, 23456LL, 270000LL}) {
+                    const float plane = (float)(lat.lo[a] + (double)k * lat.cell);
+                    float x = plane;
+                    for (int j = 0; j < 3; ++j) x = std::nextafter(x, -INFINITY);
+                    for (int j = 0; j < 7; ++j, x = std::nextafter(x, INFINITY)) {
+                        float q[3];
+                        for (int b = 0; b < 3; ++b) q[b] = (float)(lat.lo[b] + 0.5 * lat.cell);
+                        q[a] = x;
+                        pts.insert(pts.end(), q, q + 3);
+                    }
+                }
+            const int n = (int)pts.size() / 3;
+            float* dP = nullptr; unsigned int* dO = nullptr;
+            cudaMalloc(&dP, pts.size() * sizeof(float)); cudaMalloc(&dO, n * sizeof(unsigned int));
+            cudaMemcpy(dP, pts.data(), pts.size() * sizeof(float), cudaMemcpyHostToDevice);
+            kMergeCellProbe<<<1, 1>>>(lat, dP, n, dO);
+            std::vector<unsigned int> dev(n);
+            cudaMemcpy(dev.data(), dO, n * sizeof(unsigned int), cudaMemcpyDeviceToHost);
+            cudaFree(dP); cudaFree(dO);
+            int apart = 0;
+            for (int i = 0; i < n; ++i)
+                if (dev[i] != mergeLatticeBucket(lat, pts[3 * i], pts[3 * i + 1], pts[3 * i + 2])) ++apart;
+            if (apart) std::printf("[probe] MERGE lattice at (%g, %g, %g), cell %g: %d of %d points in another "
+                                   "bucket on the device than the host bins them in\n",
+                                   lat.lo[0], lat.lo[1], lat.lo[2], lat.cell, apart, n);
+            nMerge += n;
+            bad += apart;
+        }
+    }
+    std::printf("[probe] %d disagreement(s) between the host and device compilers (%d structs, %d math values, "
+                "%d merge cells)\n", bad, NT, (int)hm.size(), nMerge);
     return bad;
 }
 
@@ -3253,16 +3300,15 @@ static void buildJSurfMapDevice(JSurfDev& d, const gpu::DScene& sc, const gpu::D
         gpu::BboxMergeF{});
     // The corner a cell below the photons (SurfMap::build's), the buckets from the photon count.
     const double cell = radius;
-    const gpu::DVec3 gLo((gpu::Real)((double)bb.mnx - cell), (gpu::Real)((double)bb.mny - cell),
-                         (gpu::Real)((double)bb.mnz - cell));
-    const unsigned int mask = mergeBucketMask((size_t)n);
-    const size_t nBuckets = mergeBucketCount(mask);
+    const MergeLattice lat{{(double)bb.mnx - cell, (double)bb.mny - cell, (double)bb.mnz - cell}, cell,
+                           mergeBucketMask((size_t)n)};
+    const size_t nBuckets = mergeBucketCount(lat.mask);
     ensureDevCap(d.cellKey, d.cellKeyCap, (size_t)n);
     ensureDevCap(d.order,   d.orderCap,   (size_t)n);
     int ckBlocks = (n + 127) / 128;
     if (ckBlocks < 1)    ckBlocks = 1;
     if (ckBlocks > 2048) ckBlocks = 2048;
-    gpu::kJSurfCellKey<<<ckBlocks, 128>>>(d.pts, n, gLo, cell, mask, d.cellKey);
+    gpu::kJSurfCellKey<<<ckBlocks, 128>>>(d.pts, n, lat, d.cellKey);
     cudaCheckKernel("jsurf-cellkey");
     thrust::device_ptr<int> tKey(d.cellKey), tOrd(d.order);
     thrust::sequence(pol, tOrd, tOrd + n);
@@ -3277,8 +3323,7 @@ static void buildJSurfMapDevice(JSurfDev& d, const gpu::DScene& sc, const gpu::D
 
     dsm.pts = d.pts; dsm.mis = d.mis;
     dsm.cellStart = d.cellStart; dsm.order = d.order;
-    dsm.lo = gLo; dsm.cell = (gpu::Real)cell;
-    dsm.mask = mask;
+    dsm.lat = lat;
     dsm.radius = (gpu::Real)radius;
     // n_m counts subpaths ASKED FOR, not photons stored -- the host pass counts the same way
     // (it increments before its `pdfLam <= 0` continue), and getting it wrong scales every
@@ -3460,9 +3505,7 @@ static void uploadSurfMapCuda(const bdpt::SurfMap* smap, DUpload& up, gpu::DSurf
     dsm.mis       = (const gpu::DSurfMis*)up.keep(uploadVec(mis));
     dsm.cellStart = (const int*)up.keep(uploadVec(smap->cellStart));
     dsm.order     = (const int*)up.keep(uploadVec(smap->order));
-    dsm.lo     = gpu::DVec3{(gpu::Real)smap->lo.x, (gpu::Real)smap->lo.y, (gpu::Real)smap->lo.z};
-    dsm.cell   = (gpu::Real)smap->cell;
-    dsm.mask   = smap->mask;
+    dsm.lat    = MergeLattice{{smap->lo.x, smap->lo.y, smap->lo.z}, smap->cell, smap->mask};
     dsm.radius = (gpu::Real)smap->radius;
     // n_m * pi r_s^2, the constant the estimator divides by and the weight scales its own
     // technique with -- the exact twin of the beam map's mergeKappa = n_m * 2 r_b.
@@ -5860,10 +5903,9 @@ std::vector<Film> renderPhotonMapSharedCuda(const Scene& scene, const std::vecto
     // chunk and the first gathered pixel.
     auto uploadPhotonMap = [&](const PhotonMap& M, DPhotonMap& D, const char* what) {
         D = DPhotonMap{};
-        D.lo = DVec3(M.lo.x, M.lo.y, M.lo.z);
-        D.cellSize = (Real)M.cellSize; D.radius = (Real)M.radius;
+        D.lat = MergeLattice{{M.lo.x, M.lo.y, M.lo.z}, M.cellSize, M.tableMask};
+        D.radius = (Real)M.radius;
         D.kGather = (Real)M.kGather;   // > 0 only on the caustic map (see -pmadaptive)
-        D.tableMask = M.tableMask;
         D.photons = nullptr;
         if (!M.photons.empty()) {
             // Upload the sorted map host->device in chunks (no full mirror), folding each
@@ -6480,8 +6522,7 @@ void sppmSessionPass(SppmSession* s, long long photonsPerPass, double alpha) {
     // folds cie(lambda)*power/pi into each record (NO area/nEmitted fold; those depend on
     // the current per-pixel radius, applied at resolve). Then gather + progressive update.
     const double cellSize = (rMax > 0.0) ? rMax : 1e-6;
-    double lox = 0.0, loy = 0.0, loz = 0.0;
-    unsigned int tableMask = 0;
+    MergeLattice lat{{0.0, 0.0, 0.0}, cellSize, 0};
     DPhotonMap dpm{};
     dpm.photons = nullptr;
     if (nDep > 0) {
@@ -6493,16 +6534,15 @@ void sppmSessionPass(SppmSession* s, long long photonsPerPass, double alpha) {
             BboxMergeF{});
         // The host build promoted float positions to double BEFORE the bbox/pad math;
         // min/max commute with that promotion, so these are the same doubles.
-        lox = (double)bb.mnx - cellSize * 0.5;
-        loy = (double)bb.mny - cellSize * 0.5;
-        loz = (double)bb.mnz - cellSize * 0.5;
+        lat.lo[0] = (double)bb.mnx - cellSize * 0.5;
+        lat.lo[1] = (double)bb.mny - cellSize * 0.5;
+        lat.lo[2] = (double)bb.mnz - cellSize * 0.5;
         // Bucket table sized from the PHOTON COUNT, exactly as the host does (mergeBucketMask).
-        tableMask = mergeBucketMask(n);
-        const size_t tableSize = mergeBucketCount(tableMask);
+        lat.mask = mergeBucketMask(n);
+        const size_t tableSize = mergeBucketCount(lat.mask);
         ensureDevCap(s->d_cellKey, s->cellKeyCap, n);
         ensureDevCap(s->d_order,   s->orderCap,   n);
-        kSppmCellKey<<<2048, 128>>>(s->d_photons, (long long)n, lox, loy, loz, cellSize,
-                                    tableMask, s->d_cellKey);
+        kSppmCellKey<<<2048, 128>>>(s->d_photons, (long long)n, lat, s->d_cellKey);
         cudaCheckKernel("sppm-cellkey");
         thrust::device_ptr<int> tKey(s->d_cellKey), tOrd(s->d_order);
         thrust::sequence(pol, tOrd, tOrd + n);
@@ -6520,9 +6560,8 @@ void sppmSessionPass(SppmSession* s, long long photonsPerPass, double alpha) {
         ensureDevCap(s->d_cellStart, s->cellStartCap, mergeBucketCount(0) + 1);
         CUDA_CHECK(cudaMemset(s->d_cellStart, 0, (mergeBucketCount(0) + 1) * sizeof(int)));
     }
-    dpm.lo = DVec3(lox, loy, loz);
-    dpm.cellSize = (Real)cellSize; dpm.radius = (Real)rMax;
-    dpm.tableMask = tableMask;
+    dpm.lat = lat;
+    dpm.radius = (Real)rMax;
     dpm.cellStart = s->d_cellStart;
 
     // (3) Gather + progressive update.
@@ -6919,8 +6958,8 @@ void vcmSessionPass(VcmSession* s, double radius) {
     // twin of vcm.h VcmGrid::build): the corner half a cell below the vertices, buckets from the
     // vertex count, and the STABLE sort by bucket equals the counting sort's output order, so the
     // merges meet each cell's vertices in the compact array's order.
-    double cell = radius;
-    DVec3 gLo(0, 0, 0); unsigned int mask = 0;
+    const double cell = radius;
+    MergeLattice lat{{0.0, 0.0, 0.0}, cell, 0};
     if (nLV == 0) {   // the residue buckets alone, empty: a site reads 27 of them
         ensureDevCap(s->d_cellStart, s->cellStartCap, mergeBucketCount(0) + 1);
         CUDA_CHECK(cudaMemset(s->d_cellStart, 0, (mergeBucketCount(0) + 1) * sizeof(int)));
@@ -6930,14 +6969,15 @@ void vcmSessionPass(VcmSession* s, double radius) {
             thrust::device_pointer_cast(s->d_lvCompact + nLV),
             LvToBboxF{}, BboxF{FLT_MAX, FLT_MAX, FLT_MAX, -FLT_MAX, -FLT_MAX, -FLT_MAX},
             BboxMergeF{});
-        gLo = DVec3((Real)((double)bb.mnx - cell * 0.5), (Real)((double)bb.mny - cell * 0.5),
-                    (Real)((double)bb.mnz - cell * 0.5));
-        mask = mergeBucketMask(nLV);
-        const size_t nBuckets = mergeBucketCount(mask);
+        lat.lo[0] = (double)bb.mnx - cell * 0.5;
+        lat.lo[1] = (double)bb.mny - cell * 0.5;
+        lat.lo[2] = (double)bb.mnz - cell * 0.5;
+        lat.mask = mergeBucketMask(nLV);
+        const size_t nBuckets = mergeBucketCount(lat.mask);
         ensureDevCap(s->d_cellStart, s->cellStartCap, nBuckets + 1);
         ensureDevCap(s->d_cellKey, s->cellKeyCap, nLV);
         ensureDevCap(s->d_order,   s->orderCap,   nLV);
-        kVcmCellKey<<<2048, 128>>>(s->d_lvCompact, (int)nLV, gLo, cell, mask, s->d_cellKey);
+        kVcmCellKey<<<2048, 128>>>(s->d_lvCompact, (int)nLV, lat, s->d_cellKey);
         cudaCheckKernel("vcm-cellkey");
         thrust::device_ptr<int> tKey(s->d_cellKey), tOrd(s->d_order);
         thrust::sequence(pol, tOrd, tOrd + nLV);
@@ -6966,7 +7006,7 @@ void vcmSessionPass(VcmSession* s, double radius) {
     grid.cellStart = s->d_cellStart;
     grid.byCell = (nLV > 0) ? s->d_lvSlab : nullptr;
     grid.byCellSec = (nLV > 0 && s->secStride > 0) ? s->d_lvSecSlab : nullptr;
-    grid.lo = gLo; grid.cell = cell; grid.mask = mask;
+    grid.lat = lat;
 
     // (5) Camera pass — one camera subpath per pixel, each paired with light subpath
     // (pixel % nLight); adds this pass's radiance into accum.

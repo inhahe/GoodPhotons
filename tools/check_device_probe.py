@@ -11,7 +11,10 @@ modes D and R read 0.58x and 0.72x of the truth, while the deterministic mode W 
 
 `FTRACE_DEVICE_PROBE=1` makes ftrace print, before any render, the sizeof() of every struct the
 host uploads as each half sees it, and the value of every math function the device code calls
-(float and double, edge inputs included) as each half computes it. This runs it on a tiny mode-W
+(float and double, edge inputs included) as each half computes it -- and, for merge lattices far
+from the origin, the bucket the device places points a rounding either side of a cell plane in,
+against the bucket the host bins them in (merge_grid.h: a device lattice in another rounding than
+the binning's takes the cell beside, and its gathers miss photons). This runs it on a tiny mode-W
 render and fails on any disagreement. Run it after every change to the host compiler or the CUDA
 toolkit -- it is a few seconds, and it is the only thing that catches this class of bug.
 Exits 0 when the two halves agree, 1 otherwise (or when no GPU is available).

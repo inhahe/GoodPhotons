@@ -1070,6 +1070,24 @@ __device__ static bool dClipRayBox(const DVec3& lo, const DVec3& hi, const DVec3
     return rayBoxClip(l, h, ox, dx, t0, t1, ta, tb);
 }
 
+// A merge site's cell in a device map's hashed lattice (merge_grid.h; the photon map's gathers,
+// dPmNeighborhood; mode J's surface map, DSurfSite; mode U's grid, DVcmSite): the cell holding p in
+// the lattice its points were binned in (mergeCellCoord, in double), and the buckets of its 27
+// neighbours in the merges' walk order.
+namespace {
+struct DGridCell {
+    int ix, iy, iz;
+    __device__ DGridCell(const DVec3& p, const MergeLattice& L)
+        : ix(mergeCellCoord((double)p.x, L.lo[0], L.cell)), iy(mergeCellCoord((double)p.y, L.lo[1], L.cell)),
+          iz(mergeCellCoord((double)p.z, L.lo[2], L.cell)) {}
+    // The bucket of neighbour `n` (n in 0..26, dz outermost and dx innermost, as the walk visits
+    // them) in a table of mask `mask`; the 27 are distinct (mergeBucket).
+    __device__ unsigned int neighbour(int n, unsigned int mask) const {
+        return mergeBucket(ix + n % 3 - 1, iy + (n / 3) % 3 - 1, iz + n / 9 - 1, mask);
+    }
+};
+}  // namespace
+
 struct DMedium {
     int    enabled;
     int    route;              // Medium::route: -1 untagged, 0 = mode D, 1 = mode J (0.386.0)
@@ -8748,12 +8766,10 @@ struct DMergeFootprint {
 // (No nEmitted here: the normalization is folded into each record's pX/pY/pZ.)
 struct DPhotonMap {
     const DGatherPhoton* photons; // reordered into bucket-contiguous runs
-    const int*   cellStart;   // size mergeBucketCount(tableMask)+1; bucket b is [cellStart[b], cellStart[b+1])
-    DVec3  lo;                // lattice origin (world)
-    Real   cellSize;          // == gather radius
+    const int*   cellStart;   // size mergeBucketCount(lat.mask)+1; bucket b is [cellStart[b], cellStart[b+1])
+    MergeLattice lat;         // the lattice, its cells the gather radius wide (merge_grid.h)
     Real   radius;            // gather radius (world units) — a MAXIMUM when kGather > 0
     Real   kGather;           // per-query adaptive target population; 0 = fixed radius
-    unsigned int tableMask;   // the table's mask (merge_grid.h, mergeBucket)
 };
 
 // The 3x3x3 bucket walk, shared by all three device gathers (mode-M gather, its final-gather
@@ -8767,13 +8783,11 @@ struct DPhotonMap {
 // rejection and lifting it here would cost a second subtract-and-dot per candidate.
 template <class F>
 __device__ static inline void dPmNeighborhood(const DPhotonMap& pm, const DVec3& p, F body) {
-    const int ix = mergeCellCoord((double)p.x, (double)pm.lo.x, (double)pm.cellSize);
-    const int iy = mergeCellCoord((double)p.y, (double)pm.lo.y, (double)pm.cellSize);
-    const int iz = mergeCellCoord((double)p.z, (double)pm.lo.z, (double)pm.cellSize);
+    const DGridCell g(p, pm.lat);
     for (int dz = -1; dz <= 1; ++dz)
       for (int dy = -1; dy <= 1; ++dy)
         for (int dx = -1; dx <= 1; ++dx) {
-            const unsigned int c = mergeBucket(ix + dx, iy + dy, iz + dz, pm.tableMask);
+            const unsigned int c = mergeBucket(g.ix + dx, g.iy + dy, g.iz + dz, pm.lat.mask);
             const int e = pm.cellStart[c + 1];
             for (int k = pm.cellStart[c]; k < e; ++k) body(k);
         }
@@ -10189,11 +10203,9 @@ struct DSurfMis {                             // the light-side half of the merg
 struct DSurfMap {
     const DSurfPhoton* pts;
     const DSurfMis*    mis;
-    const int*         cellStart;             // size mergeBucketCount(mask) + 1
+    const int*         cellStart;             // size mergeBucketCount(lat.mask) + 1
     const int*         order;                 // photon indices, bucket-contiguous
-    DVec3  lo;
-    Real   cell;                              // == radius
-    unsigned int mask;                        // the table's (merge_grid.h)
+    MergeLattice lat;                         // the lattice, its cells the radius wide (merge_grid.h)
     Real   radius;
     double kappaS;                            // n_m * pi r_s^2 -- this technique's constant
     long long nPts;
@@ -21307,22 +21319,6 @@ __device__ static inline DMergeFootprint dVertexMergeFootprint(const DScene& sc,
                            v.fiberR, v.pscale, sc.gatherArea, dTwoSidedType(sc.mats[v.matId].type));
 }
 
-// A merge site's cell in a hashed lattice of cells `cell` wide from `lo` (merge_grid.h; mode J's
-// surface map, DSurfSite; mode U's grid, DVcmSite): the cell holding p, in the host's arithmetic
-// (mergeCellCoord, in double), and the buckets of its 27 neighbours in the merges' walk order.
-namespace {
-struct DGridCell {
-    int ix, iy, iz;
-    __device__ DGridCell(const DVec3& p, double lx, double ly, double lz, double cell)
-        : ix(mergeCellCoord((double)p.x, lx, cell)), iy(mergeCellCoord((double)p.y, ly, cell)),
-          iz(mergeCellCoord((double)p.z, lz, cell)) {}
-    // The bucket of neighbour `n` (n in 0..26, dz outermost and dx innermost, as the walk visits
-    // them) in a table of mask `mask`; the 27 are distinct (mergeBucket).
-    __device__ unsigned int neighbour(int n, unsigned int mask) const {
-        return mergeBucket(ix + n % 3 - 1, iy + (n / 3) % 3 - 1, iz + n / 9 - 1, mask);
-    }
-};
-}  // namespace
 // One gather site's fixed part: its cell, the vertex's oriented geometric normal and sidedness,
 // and the radius squared. Mirrors SurfMap::query's 3x3x3 walk EXACTLY -- the same cell coordinate,
 // the same buckets, the same `<= r^2` test -- because the map was binned by that rule on the host
@@ -21333,12 +21329,12 @@ struct DSurfSite {
     double r2;
     DMergeFootprint fp;   // its normal and sidedness (dMergeFromBehind's too), band and probes
     __device__ DSurfSite(const DScene& sc, const DSurfMap& sm, const DVertex& vk)
-        : g(vk.p, (double)sm.lo.x, (double)sm.lo.y, (double)sm.lo.z, (double)sm.cell),
+        : g(vk.p, sm.lat),
           fp(dVertexMergeFootprint(sc, vk, sm.radius)) {
         r2 = (double)sm.radius * (double)sm.radius;
     }
     // The bucket of the site's `n`-th neighbour cell.
-    __device__ unsigned int cell(const DSurfMap& sm, int n) const { return g.neighbour(n, sm.mask); }
+    __device__ unsigned int cell(const DSurfMap& sm, int n) const { return g.neighbour(n, sm.lat.mask); }
 };
 }  // namespace
 // The merge of photon `sm.order[q]` at the site: its XYZ added to gX, gY, gZ. `lobe` is the site's
