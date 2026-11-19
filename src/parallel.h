@@ -84,10 +84,11 @@ inline void setStopMirror(volatile int* m) {
 }
 
 // --- The threads the program may use (`-t`) ---------------------------------------
-// main.cpp sets the cap from `-t` once the command line is read; 0 (the default) leaves
-// it at the machine's. Every pass here takes at most workerCount() threads, the caller's
-// among them, so a run asked for one thread stays on one and a sweep of small -t
-// processes is not oversubscribed by their map builds and loads.
+// main.cpp sets the cap from `-t` before the scene loads; 0 (the default) leaves it at the
+// machine's. Every pass here takes at most workerCount() threads, the caller's among them,
+// and so do the program's other threaded builds (the BVH, isosurfaces, the elastic bake,
+// reaction-diffusion, the denoiser, the photon maps), so a run asked for one thread stays
+// on one and a sweep of small -t processes is not oversubscribed by their loads and builds.
 inline std::atomic<unsigned>& threadCapSlot() {
     static std::atomic<unsigned> c{0};
     return c;
@@ -106,9 +107,10 @@ inline unsigned workerCount() {
 // than 2*grain items runs inline. fn must be safe to call concurrently for distinct i.
 // Returns true if every i ran; false if a stop was requested and the remaining range
 // was abandoned (see above — the output is then partial and must be thrown away).
-// An exception from fn -- or from starting a thread -- stops the claiming of further
-// chunks, waits for every worker, and is rethrown on the caller's thread (the first, if
-// several threw): never a std::terminate from a thread left running or a throw escaping one.
+// An exception from fn stops the claiming of further chunks, waits for every worker, and is
+// rethrown on the caller's thread (the first, if several threw): never a std::terminate from
+// a thread left running or a throw escaping one. A thread that will not start leaves the
+// pass to the threads that did, the caller's among them.
 namespace detail {
 // The loop on the caller's thread alone, still chunked to poll the stop flag (`stoppable`).
 template <class Fn>
@@ -155,13 +157,17 @@ inline bool threadedFor(size_t n, size_t grain, Fn& fn, bool stoppable) {
         }
     };
     std::vector<std::thread> pool;
-    // Joined on every way out, a failed thread start's included.
+    // Joined on every way out.
     struct JoinAll {
         std::vector<std::thread>& p;
         ~JoinAll() { for (auto& t : p) if (t.joinable()) t.join(); }
     } joinAll{pool};
-    pool.reserve(nt - 1);
-    for (unsigned t = 0; t + 1 < nt; ++t) pool.emplace_back(worker);
+    try {
+        pool.reserve(nt - 1);
+        for (unsigned t = 0; t + 1 < nt; ++t) pool.emplace_back(worker);
+    } catch (...) {
+        // A thread that would not start: the pass goes on with those that did, the caller among them.
+    }
     worker();                                       // the caller is a worker too
     for (auto& t : pool) t.join();
     if (err) std::rethrow_exception(err);
@@ -202,8 +208,10 @@ public:
                     seen = gen_;
                     const std::function<void(int)>* j = job_;
                     lk.unlock();
-                    (*j)(i);
+                    std::exception_ptr e;
+                    try { (*j)(i); } catch (...) { e = std::current_exception(); }
                     lk.lock();
+                    if (e && !err_) err_ = e;   // run() rethrows it, once every worker is done
                     if (--pending_ == 0) cvDone_.notify_one();
                 }
             });
@@ -216,15 +224,22 @@ public:
     BandPool(const BandPool&) = delete;
     BandPool& operator=(const BandPool&) = delete;
     int size() const { return nW_; }
-    // Run body(workerIndex) on every worker and wait for all of them.
+    // Run body(workerIndex) on every worker and wait for all of them. An exception a worker's body
+    // threw (the first, if several did) is rethrown here, after every worker has finished.
     void run(const std::function<void(int)>& body) {
         std::unique_lock<std::mutex> lk(m_);
         job_ = &body;
         pending_ = nW_;
+        err_ = nullptr;
         ++gen_;
         cvJob_.notify_all();
         cvDone_.wait(lk, [&] { return pending_ == 0; });
         job_ = nullptr;
+        if (err_) {
+            std::exception_ptr e = err_;
+            err_ = nullptr;
+            std::rethrow_exception(e);
+        }
     }
 
 private:
@@ -232,6 +247,7 @@ private:
     std::mutex                     m_;
     std::condition_variable        cvJob_, cvDone_;
     const std::function<void(int)>* job_ = nullptr;
+    std::exception_ptr             err_;   // the first exception this run's workers threw
     uint64_t                       gen_ = 0;
     int                            pending_ = 0;
     int                            nW_ = 1;
@@ -247,7 +263,14 @@ template <class Fn>
     if (n < 2 * grain || pool.size() < 2) return detail::serialFor(n, grain, fn);
     std::atomic<size_t> cursor{0};
     std::atomic<bool> cancelled{false};
-    const std::function<void(int)> body = [&](int) { detail::cursorWorker(n, grain, fn, cursor, cancelled); };
+    const std::function<void(int)> body = [&](int) {
+        try {
+            detail::cursorWorker(n, grain, fn, cursor, cancelled);
+        } catch (...) {
+            cursor.store(n, std::memory_order_relaxed);   // no worker claims another chunk
+            throw;                                        // run() rethrows it on the caller
+        }
+    };
     pool.run(body);
     return !cancelled.load(std::memory_order_relaxed);
 }

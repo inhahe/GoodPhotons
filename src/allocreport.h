@@ -26,9 +26,12 @@
 // installed by main.cpp: it needs <windows.h>, and this header is included by four other
 // translation units — including a .cu — that have no business pulling that in.
 #pragma once
+#include <condition_variable>
 #include <cstddef>
 #include <cstdio>
+#include <deque>
 #include <memory>
+#include <mutex>
 #include <new>
 #include <stdexcept>
 #include <string>
@@ -152,20 +155,70 @@ struct NoInit : std::allocator<T> {
 // resizes into before reading one.
 template <class T> using BulkVec = std::vector<T, NoInit<T>>;
 
-// Frees `v`'s storage (leaving it empty) on a thread of its own when it is large: the system releases
+// The program's one releaser of large buffers (releaseInBackground): a thread, started on first use,
+// that frees what it is handed, in order. Its static destructor lets it finish what is queued and
+// joins it, so no free is still running when the process tears down -- a thread killed by the exit
+// mid-free could hold the heap's lock that the remaining teardown needs.
+class Releaser {
+public:
+    struct Held { virtual ~Held() = default; };
+    template <class V> struct Of : Held {
+        V v;
+        explicit Of(V&& x) : v(std::move(x)) {}
+    };
+    // Queues `h` for freeing; false (and `h` untouched) when the thread cannot be started.
+    bool push(std::unique_ptr<Held>& h) {
+        std::lock_guard<std::mutex> g(m_);
+        if (!th_.joinable()) {
+            try { th_ = std::thread([this] { run(); }); } catch (...) { return false; }
+        }
+        q_.push_back(std::move(h));
+        cv_.notify_one();
+        return true;
+    }
+    ~Releaser() {
+        { std::lock_guard<std::mutex> g(m_); quit_ = true; }
+        cv_.notify_one();
+        if (th_.joinable()) th_.join();
+    }
+private:
+    void run() {
+        std::unique_lock<std::mutex> lk(m_);
+        for (;;) {
+            cv_.wait(lk, [&] { return quit_ || !q_.empty(); });
+            if (q_.empty()) return;   // quit, and nothing left to free
+            std::unique_ptr<Held> h = std::move(q_.front());
+            q_.pop_front();
+            lk.unlock();
+            h.reset();                // the free itself, outside the lock
+            lk.lock();
+        }
+    }
+    std::mutex m_;
+    std::condition_variable cv_;
+    std::deque<std::unique_ptr<Held>> q_;
+    std::thread th_;
+    bool quit_ = false;
+};
+inline Releaser& releaser() {
+    static Releaser r;
+    return r;
+}
+
+// Frees `v`'s storage (leaving it empty) on the releaser's thread when it is large: the system releases
 // a large allocation's pages on the freeing thread, 0.6-0.9 s for the 7 GB a 129 M-photon map bins
-// through, which a caller done with it need not wait for. Small ones are freed here, and so is one
-// whose thread cannot start (the lambda holding it dies with the failed start).
+// through, which a caller done with it need not wait for. Small ones are freed here, and so is one the
+// releaser cannot take.
 template <class V>
 inline void releaseInBackground(V& v) noexcept {
-    if (v.capacity() * sizeof(typename V::value_type) < ((size_t)256 << 20)) {
-        V().swap(v);
-        return;
+    if (v.capacity() * sizeof(typename V::value_type) >= ((size_t)256 << 20)) {
+        try {
+            std::unique_ptr<Releaser::Held> h(new Releaser::Of<V>(std::move(v)));
+            if (releaser().push(h)) return;
+        } catch (...) {
+        }
     }
-    try {
-        std::thread([buf = V(std::move(v))]() mutable { V().swap(buf); }).detach();
-    } catch (...) {
-    }
+    V().swap(v);
 }
 
 }  // namespace ftalloc

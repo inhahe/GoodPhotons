@@ -5358,15 +5358,24 @@ static int checkPmGrid() {
     // splits the work by bucket range and by point range, and must still leave each bucket's points
     // in index order, which the gathers sum in. 1.5 M points (the map's, each repeated at three
     // offsets, so the buckets hold runs to keep in order), binned with tags, against an independent
-    // stable sort by key: the table, the order and the tags exactly.
+    // stable sort by key: the table, the order and the tags exactly. The table is a BulkVec, as the
+    // photon map's, that another binning filled first, so an entry the threads left unwritten would
+    // keep that one's value: every entry is held to the starts the keys give, the empty buckets' too.
     {
         std::vector<Vec3> big;
         big.reserve(posRef.size() * 13);
         for (int rep = 0; big.size() < 1500000; ++rep)
             for (const Vec3& p : posRef) big.push_back(p + Vec3{0.001 * (rep % 3), 0.0, 0.002 * (rep % 5)});
         const MergeLattice bl = mergeLatticeOver(-31.0, -1.0, -31.0, r, big.size());
-        std::vector<int> cs, ord(big.size());
+        ftalloc::BulkVec<int> cs;
+        std::vector<int> ord(big.size());
         std::vector<unsigned char> tg;
+        {   // the other binning: the same points half a cell over, so its buckets' starts differ
+            std::vector<Vec3> off(big.size());
+            for (size_t i = 0; i < big.size(); ++i) off[i] = big[i] + Vec3{0.5 * r, 0.0, 0.5 * r};
+            mergeBin(bl, off.size(), [&](size_t i) -> const Vec3& { return off[i]; },
+                     [&](size_t i, size_t k) { ord[k] = (int)i; }, cs, nullptr, "the check's bins", "-");
+        }
         mergeBin(bl, big.size(), [&](size_t i) -> const Vec3& { return big[i]; },
                  [&](size_t i, size_t k) { ord[k] = (int)i; }, cs, &tg, "the check's bins", "-");
         std::vector<MergeKey> key(big.size());
@@ -5380,6 +5389,14 @@ static int checkPmGrid() {
             const MergeKey& c = key[(size_t)want[k]];
             if (tg[k] != c.tag || (int)k < cs[c.bucket] || (int)k >= cs[c.bucket + 1]) ok = false;
         }
+        if (ok) {   // every bucket's start, from its keys' counts
+            std::vector<int> start(mergeBucketCount(bl.slots) + 1, 0);
+            for (const MergeKey& c : key) ++start[(size_t)c.bucket + 1];
+            for (size_t b = 1; b < start.size(); ++b) start[b] += start[b - 1];
+            for (size_t b = 0; b < start.size() && ok; ++b) if (cs[b] != start[b]) ok = false;
+        }
+        if (mergeThreadsFor(big.size()) < 2)
+            std::printf("[checkpmgrid] (one thread allowed: the threaded binning below was not exercised)\n");
         chk("a binning on every core (1.5 M points) is the one-thread sort: table, order and tags", ok);
     }
 
@@ -5435,21 +5452,7 @@ static int checkPmGrid() {
         chk("buildAuto delivers the density-chosen radius (no memory guard)", ok);
     }
 
-    // 4. DETERMINISM. Same photons in, same lattice out — mode M's -savemap/-loadmap contract
-    // depends on a rebuild reproducing the original run, and the median probe is only
-    // order-independent if the binning is.
-    {
-        PhotonMap a, b;
-        a.pos.assign(posRef.begin(), posRef.end()); a.photons = pm.photons;
-        b.pos.assign(posRef.begin(), posRef.end()); b.photons = pm.photons;
-        std::reverse(b.pos.begin(), b.pos.end());       // feed the SAME set in a different order
-        std::reverse(b.photons.begin(), b.photons.end());
-        a.build(r); b.build(r);
-        chk("median neighbour count is independent of input order",
-            a.medianNeighborCount() == b.medianNeighborCount());
-    }
-
-    // 5. THE RADIUS PROBE'S SAMPLE IS THE GEOMETRY'S. The map above is too sparse to show it (its
+    // 4. THE RADIUS PROBE'S SAMPLE IS THE GEOMETRY'S. The map above is too sparse to show it (its
     // probe counts 0 wherever it looks). medianNeighborCount takes the 4096 occupied cells whose
     // coordinates hash lowest, each by its lexicographically smallest photon, whatever the array's
     // order, the table or the threads. Two dense maps of photons on a floor, ~1 cm cells, many more
@@ -5475,7 +5478,7 @@ static int checkPmGrid() {
                 if (order == 0) m.pos.assign(P.begin(), P.end());
                 else            m.pos.assign(P.rbegin(), P.rend());
                 m.photons.assign(np, Photon{Vec3{0, 1, 0}, 1.0f, 550.0f});
-                m.buildGrid(rr);
+                m.build(rr);
                 got[order] = m.medianNeighborCount();
                 sample[order] = m.probeSample();
                 if (order != 0) continue;
@@ -5520,6 +5523,8 @@ static int checkPmGrid() {
                         sample[0].size(), sameCells ? "are" : "are NOT");
             ok = ok && nCells > 4096 && want > 0 && got[0] == want && got[1] == want && sameCells;
         }
+        if (mergeThreadsFor(1300000) < 2)
+            std::printf("[checkpmgrid] (one thread allowed: the threaded probe below was not exercised)\n");
         chk("the radius probe samples the geometry's cells, whatever the order or the threads", ok);
     }
 
@@ -24522,6 +24527,12 @@ static int run(int argc, char** argv) {
             else if (v == "strip"    || v == "ignore") g_onUnsupported = OnUnsupported::Strip;
             else                                     g_onUnsupported = OnUnsupported::Error;
         }
+        // -t holds for the scene load's threads too (parallel.h's workerCount), so it is
+        // taken before the load; the main loop below reads it again for the renderers.
+        else if (!std::strcmp(argv[i], "-t")) {
+            const int t = std::atoi(argv[i + 1]);
+            ft::setThreadCap((unsigned)std::max(1, t));
+        }
     }
     // The fur-LOD flags, and the raster/viewer flags that veto deleting the strands, for the
     // same reason: the decision has to be made inside the loader, before it builds a BVH over
@@ -25571,7 +25582,8 @@ static int run(int argc, char** argv) {
         }   // end segment 3
     }
     if (nThreads < 1) nThreads = 1;
-    // The load's and the map builds' threads (parallel.h) hold to -t as the renderers do.
+    // The map builds' threads (parallel.h) hold to -t as the renderers do; the cap was set before
+    // the scene load too (above), this covers the default, the machine's count.
     ft::setThreadCap((unsigned)nThreads);
     // -oidn's device follows -device unless -oidn-device names one: a render sent to the CPU
     // (often to keep off a GPU something else is saturating) must not denoise on that GPU,

@@ -163,7 +163,7 @@ struct SurfMap {
     long long devCap = 0;
 
     MergeLattice lat = mergeLatticeAt(0, 0, 0, 1.0, 1);   // cells the gather radius wide
-    std::vector<int> cellStart;   // bucket b's photons are order[cellStart[b] .. cellStart[b + 1])
+    ftalloc::BulkVec<int> cellStart;   // bucket b's photons are order[cellStart[b] .. cellStart[b + 1]) (mergeBin)
     std::vector<int> order;       // photon indices, bucket-contiguous
     std::vector<unsigned char> tag;   // order[k]'s block's tag (MergeKey)
     // Bytes held by the containers above (their capacity), for a cache that budgets maps by size.

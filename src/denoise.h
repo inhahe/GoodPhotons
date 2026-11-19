@@ -52,6 +52,7 @@
 #include <algorithm>
 #include <thread>
 #include "linalg.h"
+#include "parallel.h"   // ft::workerCount: -t's cap
 
 namespace denoise {
 
@@ -333,7 +334,7 @@ inline void apply(std::vector<Vec3>& img, int W, int H, const Params& p) {
         // every live-window refresh. Bands are read-only on the inputs and disjoint on
         // the outputs, so no synchronisation is needed inside a pass.
         auto parallel = [&](auto&& body) {
-            unsigned nt = std::max(1u, std::thread::hardware_concurrency());
+            unsigned nt = ft::workerCount();   // -t's cap (parallel.h)
             nt = std::min<unsigned>(nt, (unsigned)std::max(1, H / 8));
             if (nt <= 1) { body(0, H); return; }
             std::vector<std::thread> ts; ts.reserve(nt);

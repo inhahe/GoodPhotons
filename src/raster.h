@@ -1423,7 +1423,7 @@ inline PreviewGeom tessellate(const Scene& sc, int isoRes,
             for (int i = 0; i < nImp; ++i) est[i] = cellEstimate(sc.implicits[i]);
             std::stable_sort(order.begin(), order.end(),
                              [&](int a, int b) { return est[a] > est[b]; });
-            unsigned hw = std::thread::hardware_concurrency(); if (hw == 0) hw = 4;
+            const unsigned hw = ft::workerCount();   // -t's cap (parallel.h)
             int T = (int)std::min<size_t>((size_t)nImp, (size_t)hw);
             std::atomic<int> next{0}, done{0};
             std::mutex progMx;

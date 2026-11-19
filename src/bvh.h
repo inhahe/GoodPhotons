@@ -170,7 +170,7 @@ struct Bvh {
         for (int i = 0; i < n; ++i) { bp[i].box = boxes[i]; bp[i].centroid = boxes[i].center(); bp[i].idx = i; }
         nodes.reserve(2 * n);
         // One less than the hardware count: this thread is already one of the workers.
-        unsigned hw = std::thread::hardware_concurrency();
+        unsigned hw = ft::workerCount();   // -t's cap (parallel.h)
         int threads = (hw < 2) ? 1 : (int)hw;
         if (maxThreads > 0) threads = maxThreads;
         else if (bvhThreadOverride() > 0) threads = bvhThreadOverride();
@@ -252,7 +252,7 @@ struct Bvh {
     // reason about but balances badly: subtree sizes differ by orders of magnitude, so depth 4
     // hands one thread a tenth of the tree and eleven threads nothing. Spawning depth-first
     // while a counter allows it lets the split follow the tree's real shape, and the counter
-    // caps total threads at hardware_concurrency no matter how lopsided it gets.
+    // caps total threads at the build's thread count no matter how lopsided it gets.
     // Deliberately NOT members. A std::atomic member deletes Bvh's implicit copy-assignment,
     // and scene.h:2508 assigns one Bvh to another -- so the build state lives in build()'s frame
     // and travels down the recursion by pointer instead. Caught at compile time, which is the

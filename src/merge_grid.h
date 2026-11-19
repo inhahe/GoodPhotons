@@ -155,6 +155,12 @@ inline MergeLattice mergeLatticeOver(double mnx, double mny, double mnz, double 
 // light vertices each.
 constexpr size_t kMergeBinThreadsFrom = (size_t)1 << 20;
 
+// The threads a pass over `n` points takes (mergeBin, the photon map's radius probe): from
+// kMergeBinThreadsFrom points ft::workerCount()'s, at most 64; below it one.
+inline unsigned mergeThreadsFor(size_t n) {
+    return n >= kMergeBinThreadsFrom ? std::min(ft::workerCount(), 64u) : 1u;
+}
+
 // The counting sort of `n` points into lattice `L`: `cellStart` (a vector of int, mergeBucketCount(L.slots)
 // + 1 entries, bucket b holding positions cellStart[b] .. cellStart[b + 1]), `place(i, k)` for each point,
 // to put point i at position k (bucket-contiguous, each bucket's points in index order), and, where `tag`
@@ -166,13 +172,18 @@ template <class PosOf, class Place, class CellStart>
 inline void mergeBin(const MergeLattice& L, size_t n, PosOf&& posOf, Place&& place, CellStart& cellStart,
                      std::vector<unsigned char>* tag, const char* what, const char* flags) {
     const size_t nBuckets = mergeBucketCount(L.slots);
-    const unsigned T = (n >= kMergeBinThreadsFrom) ? std::min(ft::workerCount(), 64u) : 1u;
-    cellStart.clear();
-    // On one thread one entry over, dropped at the end: the table is its own cursor (below), its counts
-    // zeroed first. On several every entry is written (4), so a table that leaves a resize's elements
-    // unwritten (ftalloc::BulkVec, the photon map's) is not zero-filled for nothing.
-    ftalloc::resize(cellStart, nBuckets + (T > 1 ? 1 : 2), what, flags);
-    if (T == 1) std::fill(cellStart.begin(), cellStart.end(), 0);
+    const unsigned T = mergeThreadsFor(n);
+    // On one thread one entry over, dropped at the end -- the table is its own cursor (below) -- and its
+    // counts zeroed, once, by the assign. On several every entry is written (4), so a table that leaves
+    // a resize's elements unwritten (ftalloc::BulkVec, the merge maps') is not zero-filled for nothing.
+    if (T == 1) {
+        try { cellStart.assign(nBuckets + 2, 0); }
+        catch (const std::bad_alloc&) { ftalloc::reportOom(what, nBuckets + 2, sizeof(int), flags); }
+        catch (const std::length_error&) { ftalloc::reportOom(what, nBuckets + 2, sizeof(int), flags); }
+    } else {
+        cellStart.clear();
+        ftalloc::resize(cellStart, nBuckets + 1, what, flags);
+    }
     // Each point's key, computed once, in scratch of four bytes a point (five with tags) left unfilled:
     // a map of a hundred million photons bins twice in buildAuto.
     std::unique_ptr<unsigned int[]> bucketOf;

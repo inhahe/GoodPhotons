@@ -196,7 +196,7 @@ struct LightVertexSec {
 // device's grid (vcmSessionPass, DVcmGrid) is the same lattice.
 struct VcmGrid {
     MergeLattice lat = mergeLatticeAt(0, 0, 0, 1e-4, 1);   // cells the merge radius wide
-    std::vector<int> cellStart;   // bucket b's vertices are order[cellStart[b] .. cellStart[b + 1])
+    ftalloc::BulkVec<int> cellStart;   // bucket b's vertices are order[cellStart[b] .. cellStart[b + 1]) (mergeBin)
     std::vector<int> order;       // vertex indices in bucket-contiguous order
     std::vector<unsigned char> tag;   // order[k]'s block's tag (MergeKey)
 

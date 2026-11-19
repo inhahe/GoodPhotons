@@ -224,8 +224,7 @@ inline bool rdRun(const RDParams& p, std::vector<float>& u, std::vector<float>& 
     const double F = p.feed, K = p.kill, DU = p.du, DV = p.dv, DT = p.dt;
     const double WO = RD_W_ORTHO, WD = RD_W_DIAG;
 
-    unsigned hw = std::thread::hardware_concurrency();
-    if (hw == 0) hw = 4;
+    const unsigned hw = ft::workerCount();   // -t's cap (parallel.h)
     unsigned nt = (unsigned)(N / 16); if (nt < 1) nt = 1;
     if (nt > hw) nt = hw;
 

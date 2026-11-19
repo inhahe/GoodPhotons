@@ -23,6 +23,7 @@
 //    keeps them where curvature/detail is high, preserving the manifold.
 #pragma once
 #include "implicit.h"   // Implicit::eval / gradient / bounds, plus Vec3 (via linalg.h)
+#include "parallel.h"   // ft::workerCount: -t's cap
 #include <cstdint>
 #include <cstdio>
 #include <cmath>
@@ -136,7 +137,7 @@ inline Mesh marchImplicit(const Implicit& im, const Options& opt,
     // output is bit-identical to the serial loop. `par` gates threading so small
     // lattices stay serial (they already run concurrently across implicits).
     auto parallelFor = [](size_t n, bool par, auto&& fn) {
-        unsigned hw = std::thread::hardware_concurrency(); if (hw == 0) hw = 4;
+        const unsigned hw = ft::workerCount();   // -t's cap (parallel.h)
         size_t T = par ? std::min<size_t>(hw, n) : 1;
         if (T <= 1) { for (size_t x = 0; x < n; ++x) fn(x); return; }
         std::atomic<size_t> next{0};

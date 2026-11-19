@@ -201,6 +201,47 @@ to 0.25 renders as a 150 nm one within 2e-3, 1.0e-3 measured (its body's escape 
 on 0.450.1 it rendered as the unmapped 600 nm, 1.9 off), the `thinfilm` control byte for byte, and
 the three misspellings stop the load (on 0.450.1 they loaded).
 
+## DONE (2026-11-19, 0.450.30): REVIEW-0450M — what the Opus (max) and Fable (xhigh) reviews of 0.450.29 found
+
+0.450.29 grew new mechanisms of its own (parallel.h's exception path and thread cap, the background
+release), so it was reviewed: `/code-review max` (Opus, 11 findings) and `/code-review xhigh`
+(Fable, 13) of 3f51557..24ce16d, one after the other in the review worktree; nine found by both.
+**Fixed in 0.450.30:**
+
+* **`-t` did not hold for the scene load** (both): the cap was set after `ftsl::load`. `-t` is
+  read in the prescan before the load now, and the other threaded builds the load runs (the BVH,
+  isosurfaces, the elastic bake's BandPool, reaction-diffusion, the denoiser) take
+  `ft::workerCount()` instead of the machine's count.
+* **The background release raised the peak** (both): the scratch's 7 GB was still committed
+  while `fillCie` committed the CIE table. The scratch's positions array, the CIE table's type and
+  size, is swapped into `cie` now, so `fillCie` allocates nothing.
+* **A detached thread at exit** (Fable): a free still running when the process tears down could be
+  killed holding the heap's lock. One long-lived releaser thread takes the buffers; a static
+  destructor lets it finish and joins it.
+* **A failed thread start threw away the pass** (both): the threads that started finished it, then
+  the error discarded it. The pass goes on with those threads, the caller among them.
+* **BandPool passes could still `std::terminate`** (both): a worker's exception is caught, the
+  pass stops handing out chunks, and `run()` rethrows the first once every worker is done.
+* **No test of an unwritten table entry** (Opus): -checkpmgrid's threaded binning goes into a
+  `BulkVec` another binning filled first, and every entry, empty buckets' included, is held to the
+  starts its keys give; with one start in 1024 left unwritten it reads BAD.
+* **Threaded tests that pass on one thread** (Fable): under `-t 1` the threaded legs say they were
+  not exercised.
+* **Modes U and J's tables zeroed twice** (both): VcmGrid's and SurfMap's tables are `BulkVec`s, and
+  the one-thread path zeroes any table once (an `assign`).
+* **Smaller** (both): the thread rule in one helper (`mergeThreadsFor`); the probe's redundant
+  `onCaller` branch; its doc comment back on `medianNeighborCount`, "on every core" corrected;
+  `build` no longer re-implements a one-argument `buildGrid`, which is gone; -checkpmgrid's test
+  of two medians of 0 is gone; design.md's threading section and the BulkVec list current; a
+  comment narrating the removed memory guard reduced to the constraint.
+
+**Not changed:** nothing; every finding was taken.
+
+**Verified:** -checkpmgrid (default table and one slot; under `-t 1` its threaded legs say they
+were not exercised), check_merge_table, check_vcm_store, check_surf_wavefront and a `-savemap` /
+`-loadmap` round trip pass; check_bitid against 0.450.29 identical. The 20 M-photon CPU map phase
+6.20-6.32 s (0.450.29: 6.54-6.66 s); paired, GPU and CPU mode M unchanged within 1.2 %.
+
 ## DONE (2026-11-19, 0.450.29): REVIEW-0450L — what the Opus (max) and Fable (xhigh) reviews of 8851601..0.450.28 found
 
 `/code-review max` (Opus, 8 findings) and `/code-review xhigh` (Fable, 11) of ef166cf..3f51557, one

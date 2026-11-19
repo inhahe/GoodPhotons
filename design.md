@@ -10554,7 +10554,10 @@ as the one at fault.
   constructs nothing (`NoInit`; `Vec3` would zero itself), so the passes that write every element
   -- the deposit's concatenation, `-loadmap`'s read, the device's download (trimmed to what it
   wrote), the binning, `fillCie` -- are not preceded by a one-thread zero fill of what they
-  overwrite. `FTRACE_MERGE_TABLE=<k>` holds the slots to at most `k` (1: one
+  overwrite. The three merge maps' bucket tables (`cellStart`) are `BulkVec`s too: `mergeBin`
+  zeroes a table only on one thread, where it counts into it; on several every entry is
+  written. The binning's positions array then becomes the CIE table's storage (the same type
+  and size), and the rest is freed on the releaser's thread. `FTRACE_MERGE_TABLE=<k>` holds the slots to at most `k` (1: one
   block of 27 buckets that every block shares), which `tools/check_merge_table.py` uses to hold
   the renders to the default table's. Host and device compute a cell alike (`mergeCellCoord`, in
   double, by the width's reciprocal, held to ±2^30), the site's in `DGridCell`,
@@ -12747,8 +12750,9 @@ scene-scaled standoff never had a justification. 6.5 mm in `gallery_rain` agains
 
 ## Threading model (CPU)
 
-Band/chunk parallelism via `std::thread` pools sized by `hardware_concurrency`;
-work units pull atomically from a shared counter in chunks. Determinism comes from
+Band/chunk parallelism via `std::thread` pools sized by `-t` (the renderers' thread count;
+`ft::workerCount()`, below, for the builds and the load); work units pull atomically from a
+shared counter in chunks. Determinism comes from
 per-unit RNG seeding (above) plus order-independent accumulation per band/tile;
 film merges are structured so paired runs differ only by summation-order ulps at
 worst (mode R) or are bit-identical (fixed splits).
@@ -12767,6 +12771,16 @@ reduction serial (envmap's mean radiance) or must justify the changed summation 
 `parallelFor(pool, n, grain, fn)` runs the same cursor on a persistent `ft::BandPool` instead,
 for a loop run so often (an iterative solver's every step) that making its threads each time
 would cost more than its work.
+
+**Thread count and failure (0.450.30).** `ft::workerCount()` is the machine's thread count
+capped by `-t` (`ft::setThreadCap`, set before the scene loads); every pass here takes at most
+that many threads, and so do the program's other threaded builds (the BVH, isosurfaces, the
+elastic bake, reaction-diffusion, the denoiser, the photon maps' binning and probe). An
+exception a worker throws stops the claiming of further chunks, every worker is joined, and it
+is rethrown on the caller; a `BandPool` run rethrows its workers' first the same way. A thread
+that will not start leaves the pass to those that did. A large buffer a build is done with is
+freed on one long-lived releaser thread (`ftalloc::releaseInBackground`), which a static
+destructor drains and joins at exit.
 
 That same cursor is the program's **load-time cancellation seam** (0.138.2) — see
 "Stopping a render" below.

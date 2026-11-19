@@ -181,7 +181,11 @@ struct PhotonMap {
     // the probe radius, once at the chosen one) but only ever needs the CIE pass once —
     // and on a large map that pass is several exp() per photon, i.e. the expensive half.
     void build(double r) {
-        { BinScratch s; buildGrid(r, s); }   // the scratch freed before the CIE table is made
+        {
+            BinScratch s;
+            buildGrid(r, s);
+            cie.swap(s.pos);   // the CIE table's storage (BinScratch)
+        }
         fillCie();
     }
 
@@ -189,7 +193,8 @@ struct PhotonMap {
     // photons[] and pos[], so a second binning given the same scratch (buildAuto bins twice) finds it
     // allocated -- at 129 M photons 7 GB it would otherwise fault in again. Every element is written by
     // the binning (BulkVec: a resize leaves them as they were). A local of build and buildAuto, so it
-    // goes on every way out.
+    // goes on every way out. Once the binnings are done its positions array, the CIE table's type and
+    // size, is swapped into `cie`, so fillCie allocates nothing while the rest is still being freed.
     struct BinScratch {
         ftalloc::BulkVec<Photon> ph;
         ftalloc::BulkVec<Vec3>   pos;
@@ -198,7 +203,6 @@ struct PhotonMap {
         ~BinScratch() { ftalloc::releaseInBackground(ph); ftalloc::releaseInBackground(pos); }
     };
 
-    void buildGrid(double r) { BinScratch s; buildGrid(r, s); }
     void buildGrid(double r, BinScratch& s) {
         radius = r;
         const double cellSize = (r > 0.0) ? r : 1e-6;
@@ -248,39 +252,6 @@ struct PhotonMap {
         });
     }
 
-    // MEDIAN number of OTHER photons inside the current gather radius of a deposited
-    // photon — i.e. how many photons a typical gather actually sums. Requires a built grid.
-    //
-    // MEDIAN rather than mean: a caustic can hold orders of magnitude more photons per unit
-    // area than the walls around it, and a mean would be dragged up by that tail and shrink
-    // the radius until the dim parts of the image went to noise. Median asks "how dense is it
-    // where photons typically are", which is the quantity the estimator is tuned on.
-    //
-    // THE SAMPLE IS A FUNCTION OF THE PHOTONS' POSITIONS ALONE: not of their order in the array,
-    // nor of the table they are binned in. Not of the order, because the counting sort is stable,
-    // so photons within a cell keep their arrival order, and a map that has been saved (already
-    // sorted at one radius) and reloaded re-sorts to a different within-cell order than the
-    // original deposit did: a sample that strided over photons[] would differ, and `-loadmap`
-    // would no longer reproduce the `-savemap` run that wrote the file. Not of the table, because then
-    // every change to the table's size or hash would move the chosen radius, and every render
-    // that leaves it automatic with it.
-    //
-    // So it samples CELLS: the `sampleTarget` occupied cells whose coordinates hash lowest (a
-    // bottom-k sample of the cells mergeCellCoord places the photons in, under a 64-bit mix), each
-    // represented by its lexicographically smallest photon. Both are set functions of the
-    // positions (coincident positions would tie, but then the neighbour count is identical
-    // anyway). Querying an actual photon rather than the cell centre matters: a cell the surface
-    // merely clips at a corner has its centre off the surface and would report a spuriously empty
-    // neighbourhood.
-    //
-    // Cell sampling also makes the statistic area-weighted rather than photon-weighted, which
-    // is if anything the better match: camera gathers land on visible surface points, spread
-    // over area, not in proportion to local photon density.
-    //
-    // On every core: each thread keeps the bottom k of the cells its share of the photons lies in
-    // -- a cell of the whole bottom k is in the bottom k of every share it appears in, so the
-    // shares' union holds it, its representative the least of theirs -- and the k queries are
-    // split among the threads, their candidates added to this thread's tally as one walk adds them.
     // The radius probe's cell of a point (medianNeighborCount): its coordinates in the lattice and their
     // 64-bit mix, which orders the probe's sample (probeBefore).
     struct ProbeCell { int c[3]; unsigned long long h; };
@@ -321,7 +292,7 @@ struct PhotonMap {
         };
         using Reps = std::unordered_map<ProbeCell, Vec3, CellHash, CellEq>;
         const size_t K = (size_t)sampleTarget;
-        const unsigned T = (n >= kMergeBinThreadsFrom) ? std::min(ft::workerCount(), 64u) : 1u;
+        const unsigned T = mergeThreadsFor(n);
         std::vector<Reps> kept(T);
         ft::parallelForAll(T, 1, [&](size_t t) {
             Reps& reps = kept[t];
@@ -362,24 +333,57 @@ struct PhotonMap {
         cells.resize(m);
         return cells;
     }
+    // MEDIAN number of OTHER photons inside the current gather radius of a deposited
+    // photon — i.e. how many photons a typical gather actually sums. Requires a built grid.
+    //
+    // MEDIAN rather than mean: a caustic can hold orders of magnitude more photons per unit
+    // area than the walls around it, and a mean would be dragged up by that tail and shrink
+    // the radius until the dim parts of the image went to noise. Median asks "how dense is it
+    // where photons typically are", which is the quantity the estimator is tuned on.
+    //
+    // THE SAMPLE IS A FUNCTION OF THE PHOTONS' POSITIONS ALONE: not of their order in the array,
+    // nor of the table they are binned in. Not of the order, because the counting sort is stable,
+    // so photons within a cell keep their arrival order, and a map that has been saved (already
+    // sorted at one radius) and reloaded re-sorts to a different within-cell order than the
+    // original deposit did: a sample that strided over photons[] would differ, and `-loadmap`
+    // would no longer reproduce the `-savemap` run that wrote the file. Not of the table, because then
+    // every change to the table's size or hash would move the chosen radius, and every render
+    // that leaves it automatic with it.
+    //
+    // So it samples CELLS: the `sampleTarget` occupied cells whose coordinates hash lowest (a
+    // bottom-k sample of the cells mergeCellCoord places the photons in, under a 64-bit mix), each
+    // represented by its lexicographically smallest photon. Both are set functions of the
+    // positions (coincident positions would tie, but then the neighbour count is identical
+    // anyway). Querying an actual photon rather than the cell centre matters: a cell the surface
+    // merely clips at a corner has its centre off the surface and would report a spuriously empty
+    // neighbourhood.
+    //
+    // Cell sampling also makes the statistic area-weighted rather than photon-weighted, which
+    // is if anything the better match: camera gathers land on visible surface points, spread
+    // over area, not in proportion to local photon density.
+    //
+    // On mergeThreadsFor's threads: each thread keeps the bottom k of the cells its share of the
+    // photons lies in -- a cell of the whole bottom k is in the bottom k of every share it appears in,
+    // so the shares' union holds it, its representative the least of theirs -- and the k queries are
+    // split among the threads, their candidates added to this thread's tally as one walk adds them.
     double medianNeighborCount(int sampleTarget = 4096) const {
         const std::vector<std::pair<ProbeCell, Vec3>> cells = probeSample(sampleTarget);
         const size_t m = cells.size();
         if (m == 0) return 0.0;
-        const unsigned T = (photons.size() >= kMergeBinThreadsFrom) ? std::min(ft::workerCount(), 64u) : 1u;
+        const unsigned T = mergeThreadsFor(photons.size());
         std::vector<int> counts(m);
         const unsigned Tq = (m >= 64) ? T : 1u;
+        // Each part's candidates taken out of whichever thread's tally ran it and put in the caller's,
+        // as one walk on the caller's thread would have left them.
         std::vector<long long> cand(Tq, 0);
-        const bool onCaller = Tq == 1;
         ft::parallelForAll(Tq, 1, [&](size_t t) {
             const long long before = bdpt::tlCandidates();
             for (size_t j = m * t / Tq, e = m * (t + 1) / Tq; j < e; ++j)
                 counts[j] = countR(cells[j].second, radius) - 1;   // not the representative itself
             cand[t] = bdpt::tlCandidates() - before;
-            if (!onCaller) bdpt::tlCandidates() = before;   // the caller's tally takes them all, below
+            bdpt::tlCandidates() = before;
         });
-        if (!onCaller)
-            for (unsigned t = 0; t < Tq; ++t) bdpt::tlCandidates() += cand[t];
+        for (unsigned t = 0; t < Tq; ++t) bdpt::tlCandidates() += cand[t];
         const size_t mid = counts.size() / 2;
         std::nth_element(counts.begin(), counts.begin() + (ptrdiff_t)mid, counts.end());
         return (double)counts[mid];
@@ -435,7 +439,7 @@ struct PhotonMap {
         if (photons.empty()) { build(r0 > 0.0 && rMax > 0.0 ? std::min(r0, rMax) : r0);
                                return radius; }
         {
-            BinScratch s;   // both binnings', freed before the CIE table is made
+            BinScratch s;   // both binnings'; its positions array becomes the CIE table's storage
             buildGrid(r0, s);
             const double n0 = medianNeighborCount();
             const double k  = kAt1M * std::cbrt((double)photons.size() / 1.0e6);
@@ -448,17 +452,12 @@ struct PhotonMap {
                 // a single lit texel) shouldn't be allowed to pick an absurd grid.
                 r1 = std::min(std::max(r1, r0 / 64.0), r0 * 4.0);
                 if (rMax > 0.0 && r1 > rMax) r1 = rMax;   // see the rMax note above
-                // NO MEMORY GUARD ANY MORE (removed 0.199.6). While the lattice was dense, cellStart
-                // held one int per CELL, so a fine radius over a large scene asked for an array that
-                // grew as (L/r)^3 and had to be defended by growing r1 back until the grid fit. That
-                // guard was the binding constraint on every large scene — on gallery_rain it inflated
-                // a requested 0.031 m to 0.094 m, three times too coarse to resolve a caustic — and it
-                // bound hardest exactly where a fine radius was most wanted. The hashed lattice
-                // (merge_grid.h) sizes the table from the PHOTON COUNT instead, so r is now free to be
-                // whatever the measured density asks for and the only limit left is the deliberate
-                // two-octave clamp above.
+                // No memory bound on r1: the table is sized by the PHOTON COUNT (merge_grid.h), not
+                // by the lattice's volume, so a fine radius over a large scene costs no more table
+                // than a coarse one, and the only limit is the two-octave clamp above.
                 if (std::abs(r1 / r0 - 1.0) > 0.05) buildGrid(r1, s);   // else keep the probe binning
             }
+            cie.swap(s.pos);
         }
         fillCie();
         return radius;

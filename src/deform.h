@@ -378,7 +378,7 @@ private:
         };
         if (nb < 2) return ft::parallelFor(nb, 1, block);
         if (!pool_) {
-            const unsigned hw = std::thread::hardware_concurrency();
+            const unsigned hw = ft::workerCount();   // -t's cap (parallel.h)
             pool_ = std::make_unique<ft::BandPool>((int)std::min<size_t>(hw ? hw : 4, nb));
         }
         return ft::parallelFor(*pool_, nb, 1, block);
