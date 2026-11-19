@@ -2410,7 +2410,7 @@ __global__ void kVcmLightT(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx,
 // The camera kernel merges where it is a site with few light vertices (inlineMax), and one the full
 // queue turns away, which it counts (`overflow`); a site with none it skips.
 struct DVcmMergeReq {
-    DVertex vt;            // the camera vertex merged at (dVertFromHit), its lobe's (DMergeLobe)
+    DVertex vt;            // the camera vertex merged at (dVertFromHit), its lobe's (DVertexLobe)
     DVec3   wo;            // toward the camera walk's previous vertex
     double  dVCM, dVM;     // the camera walk's MIS partials on arrival there
     double  f;             // the site's scale: its throughput (the VCM-SPEC carrier's) * vmNorm
@@ -2472,7 +2472,7 @@ __device__ static void dVcmMergeSum(const DScene& sc, const DVcmCtx& ctx, const 
     const DMaterial& m = sc.mats[vt.matId];
     const DVec3 ngoCam = fp.n;
     const double r2 = ctx.radius * ctx.radius;
-    DMergeLobe lobe(sc, vt, wo);
+    DVertexLobe lobe(sc, vt, wo);
     dSiteListWalk([&](int n, int& b, int& e) { site.cell(grid, n, b, e); }, lane, lanes, [&](int k) {
         const DVcmLV& lv = grid.byCell[k];
         const DVcmSec* row = ((NS > 0) && grid.byCellSec) ? (grid.byCellSec + (size_t)k * secStride) : nullptr;
@@ -2789,6 +2789,8 @@ __global__ void kVcmCameraT(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx
 
             if (dConnectibleType(mp->type)) {
                 DVertex vt = dVertFromHit(sc, h, matId);
+                // vt's BSDF toward the walk's side, for NEE's direction and every connection's (at()).
+                DVertexLobe camLobe(sc, vt, wo);
                 DVec3 ngoCam = dShadedNg(h);
                 bool twoSidedCam = dTwoSidedType(mp->type);
                 // Its coat's film (dCoatThicknessAt) at the walk's hit: read once, for NEE, every
@@ -2922,10 +2924,10 @@ __global__ void kVcmCameraT(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx
                                                 nst.curveTmin)) {
                                     // ...times a coated vertex's coat toward the light (dCoatF).
                                     const DCoatEval ce = dCoatEvalAt(sc, *mp, h.n, camCoatTh(), wo, wiL);
-                                    f = dBsdfF(sc, vt, wo, wiL, lambda) * stG * ce.at(lambda);
+                                    camLobe.at(wiL);
+                                    f = camLobe.f(lambda) * stG * ce.at(lambda);
                                     for (int k = 0; k + 1 < nUp; ++k)
-                                        fSec[k] = dBsdfF(sc, vt, wo, wiL, lamAll[k + 1]) * stG *
-                                                  ce.at(lamAll[k + 1]);
+                                        fSec[k] = camLobe.f(lamAll[k + 1]) * stG * ce.at(lamAll[k + 1]);
                                 }
                                 // Fuse BSDF x Le per-λ before the max test: either factor may
                                 // vanish at the hero while the product is alive at a secondary.
@@ -2939,8 +2941,9 @@ __global__ void kVcmCameraT(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx
                                     double pdfChoice = em.power / sc.totalPower;
                                     double directPdfW = neeDirectPdfW;
                                     double emissionPdfW = neeEmissionPdfW;
-                                    double bsdfDirPdfW = dBsdfPdf(sc, vt, wo, wiL, lambda);
-                                    double bsdfRevPdfW = dBsdfPdf(sc, vt, wiL, wo, lambda);
+                                    // camLobe is at wiL: the shadow test passed, or f would be 0.
+                                    double bsdfDirPdfW = camLobe.pdf(false, lambda);
+                                    double bsdfRevPdfW = camLobe.pdf(true, lambda);
                                     // A delta light can never be found by BSDF sampling, so
                                     // that strategy is DROPPED from the balance heuristic
                                     // (weight 0) rather than given a density it does not have.
@@ -2997,8 +3000,8 @@ __global__ void kVcmCameraT(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx
                     bool litSide = (cosLit != 0.0) && (twoSidedLit || ddot(ngoLit, w * (Real)-1) > 0.0);
                     if (!camSide || !litSide) continue;
                     // Occlusion FIRST: the shadow ray kills most connections in a
-                    // typical scene, and it is far cheaper than the 2x dBsdfF +
-                    // 4x dBsdfPdf + MIS block below. No RNG is consumed in this
+                    // typical scene, and it is far cheaper than the BSDF and MIS block
+                    // below. No RNG is consumed in this
                     // loop and occluded() has no side effects, so hoisting the
                     // test is bit-identical — it only skips work for connections
                     // that contributed nothing anyway.
@@ -3025,7 +3028,8 @@ __global__ void kVcmCameraT(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx
                     const DCoatEval ceLit = (lvt.matId >= 0) ? dCoatEval(sc, sc.mats[lvt.matId], dVertHit(lvt),
                                                                          lv.wo, w * (Real)-1)
                                                              : DCoatEval{};
-                    double fCam = dBsdfF(sc, vt, wo, w, lambda) * ceCam.at(lambda);
+                    camLobe.at(w);
+                    double fCam = camLobe.f(lambda) * ceCam.at(lambda);
                     double fLit = dBsdfFAdjoint(sc, lvt, lv.wo, w * (Real)-1, lambda) * ceLit.at(lambda);
                     fLit *= adjLit;
                     // The camera path and the stored light path share this pass's bundle (same
@@ -3036,7 +3040,7 @@ __global__ void kVcmCameraT(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx
                     double fProdSec[SECN], mxProd = fCam * fLit;
                     const DVcmSec* lsRow = ((NS > 0) && lvSec) ? (lvSec + (size_t)j * secStride) : nullptr;
                     for (int k = 0; k + 1 < nUpConn; ++k) {
-                        double fc = dBsdfF(sc, vt, wo, w, lamAll[k + 1]) * ceCam.at(lamAll[k + 1]);
+                        double fc = camLobe.f(lamAll[k + 1]) * ceCam.at(lamAll[k + 1]);
                         double fl = dBsdfFAdjoint(sc, lvt, lv.wo, w * (Real)-1,
                                                   lamAll[k + 1]) * adjLit * ceLit.at(lamAll[k + 1]);
                         fProdSec[k] = fc * fl;
@@ -3045,10 +3049,12 @@ __global__ void kVcmCameraT(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx
                     // At nUpConn == 1 this is exactly the old `fCam <= 0 || fLit <= 0` bail
                     // (both factors are non-negative, so the product is 0 iff either is).
                     if (mxProd <= 0.0) continue;
-                    double camDirPdfW = dBsdfPdf(sc, vt, wo, w, lambda);
-                    double camRevPdfW = dBsdfPdf(sc, vt, w, wo, lambda);
-                    double litDirPdfW = dBsdfPdf(sc, lvt, lv.wo, w * (Real)-1, lambda);
-                    double litRevPdfW = dBsdfPdf(sc, lvt, w * (Real)-1, lv.wo, lambda);
+                    double camDirPdfW = camLobe.pdf(false, lambda);
+                    double camRevPdfW = camLobe.pdf(true, lambda);
+                    DVertexLobe litLobe(sc, lvt, lv.wo);   // the light vertex's, from its walk's side
+                    litLobe.at(w * (Real)-1);
+                    double litDirPdfW = litLobe.pdf(false, lambda);
+                    double litRevPdfW = litLobe.pdf(true, lambda);
                     double camDirPdfA = camDirPdfW * fabs(cosLit) / dist2;
                     double litDirPdfA = litDirPdfW * fabs(cosCam) / dist2;
                     // No merge AT a curve, at either end.

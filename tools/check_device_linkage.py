@@ -9,13 +9,15 @@ line there fits their kernels' launch bounds (render_cuda_dev.cuh). That holds f
 internal linkage. One with EXTERNAL linkage -- a non-static inline function, a template, a class's
 member function -- that is out of line in a capped unit AND in render_cuda.cu becomes a weak
 definition in both objects, and nvlink keeps one of them for every caller: render_cuda.cu's,
-compiled without the cap, may be the one, and then the link refuses kBdptT once that copy needs
-more registers than the bounds allow -- after an edit anywhere in render_cuda.cu.
+compiled without the cap, may be the one, and then the link refuses kBdptT once that copy -- or a
+function it calls, render_cuda.cu's own (DVertexLobe::pdf, at 76 registers, bound kJSurfLightT to
+render_cuda.cu's dMatRoughness at 252) -- needs more registers than the bounds allow: after an edit
+anywhere in render_cuda.cu.
 
 So it lists, from `cuobjdump -res-usage` of the three objects, every externally linked function
 other than the unit's own kernels that a capped unit keeps out of line and render_cuda.obj does
-too, with both register counts. The fix is to give it internal linkage (`static`), or to keep it
-inline. Exits 1 when there is one (or when an object or cuobjdump is missing); build.bat runs it
+too, with both register counts -- every one a hazard, whatever its count, for what it calls. The fix
+is internal linkage: `static` for a function, an unnamed namespace for a struct's members. Exits 1 when there is one (or when an object or cuobjdump is missing); build.bat runs it
 after every build.
 """
 import argparse
@@ -85,7 +87,8 @@ def main():
             print("%s: %s is out of line with external linkage here (%d registers) and in render_cuda.cu (%d%s)"
                   % (unit, n, fns[n], main_fns[n], ", over the cap %d" % cap if main_fns[n] > cap else ""))
     if bad:
-        print("%d function(s) the device link may bind to render_cuda.cu's uncapped copy: make them static" % bad)
+        print("%d function(s) the device link may bind to render_cuda.cu's uncapped copy: give them internal "
+              "linkage (static; a struct's members, an unnamed namespace)" % bad)
         return 1
     print("ok: every function the capped units keep out of line is their own")
     return 0

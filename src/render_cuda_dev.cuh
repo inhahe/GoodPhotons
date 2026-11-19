@@ -6753,13 +6753,21 @@ __device__ static inline DGlossyDraw dWhittedGlossyDraw(const DScene& sc, const 
 // dRecordRoughness), for speed: out of line, a capped unit (render_cuda_bdpt.cu, render_cuda_jsurf.cu)
 // holds each to its kernels' bounds and the calls spill, and inline, mode D runs 1.75 times faster.
 // Left to nvcc, whether they are inlined depends on every call the unit makes.
+// A glossy lobe's reflectance at `lambda`: its reflect slot, times an iridescent glossy's interference
+// reflectance at the pair's half-vector cosine `cH`. Times ggx::fAll of the pair, the lobe's value
+// (dGlossyF; DVertexLobe::f, which keeps fAll from wavelength to wavelength).
+__device__ __forceinline__ static double dGlossyR(const DScene& sc, const DMaterial& m, const DHit& h,
+                                                  Real cH, Real lambda) {
+    double r = clamp01(dReflectSlot(sc, m, h, lambda, nullptr));
+    if (m.iridescence) r *= (double)dIridescenceR(sc, m, &h, lambda, cH);
+    return r;
+}
 __device__ __forceinline__ static double dGlossyF(const DScene& sc, const DMaterial& m, const DHit& h,
                                   const DVec3& ns, const DVec3& wo, const DVec3& wi, Real lambda) {
     const ggx::Pair p = ggx::pair(ns, wo, wi, ggx::alpha((double)dMatRoughness(sc, m, h)));
     if (!p.ok) return 0.0;
-    double r = clamp01(dReflectSlot(sc, m, h, lambda, nullptr));
-    if (m.iridescence) r *= (double)dIridescenceR(sc, m, &h, lambda, dHalfVectorCos(wo, wi));
-    return r * ggx::fAll(p, dGlossyMs(m));
+    const Real cH = m.iridescence ? dHalfVectorCos(wo, wi) : (Real)1;
+    return dGlossyR(sc, m, h, cH, lambda) * ggx::fAll(p, dGlossyMs(m));
 }
 // Twin of glossyPdf: the density with which dDrawGlossy draws `wi` for the arrival `wo`.
 __device__ static double dGlossyPdf(const DScene& sc, const DMaterial& m, const DHit& h,
@@ -15579,75 +15587,6 @@ __device__ static inline Real dGatherAlbedo(const DScene& sc, const DMaterial& m
 // camera side lies on, and a light walk that arrives below ns stops there.
 __device__ __host__ static inline bool dLambertLit(double cosWi) { return cosWi > 0.0; }
 
-// BSDF value f(wo->wi) at a surface vertex (double, for the connection radiance L).
-// Takes the full DVertex so textured/patterned/record-driven albedo & roughness are
-// evaluated per-hit (M9) — the reconstructed DHit feeds dDiffuseRho / dReflectSlot /
-// dMatRoughness exactly as the sampler used them, so MIS densities stay consistent.
-__device__ static double dBsdfF(const DScene& sc, const DVertex& vt,
-                                const DVec3& wo, const DVec3& wi, Real lambda) {
-    const DMaterial& m = sc.mats[vt.matId];
-    const DVec3& ns = vt.ns;
-    double cosWi = ddot(wi, ns), cosWo = ddot(wo, ns);
-    if (m.type == D_DIFFUSE || m.type == D_FLUORESCENT) {
-        if (!dLambertLit(cosWi)) return 0.0;          // from either side of ns (dLambertLit)
-        DHit h = dVertHit(vt);
-        double rho = clamp01(dDiffuseRho(sc, m, h, lambda));
-        return rho / DPI;
-    } else if (m.type == D_GLOSSY) {
-        // r times the GGX lobe; r carries an iridescent lobe's interference reflectance (dGlossyF).
-        DHit h = dVertHit(vt);
-        return dGlossyF(sc, m, h, ns, wo, wi, lambda);
-    } else if (m.type == D_DIFFUSETRANSMIT) {
-        // Two-sided Lambertian, mode R's integrand (host twin bsdfF, dTranslucentLobe).
-        DHit h = dVertHit(vt);
-        double rhoR, rhoT; dDiffuseTransmitAlbedos(sc, m, h, lambda, rhoR, rhoT);
-        const int lobe = dTranslucentLobe(ns, dVertexGeoN(vt), wo, wi);
-        return (lobe > 0 ? rhoR : (lobe < 0 ? rhoT : 0.0)) / DPI;
-    } else if (m.type == D_HAIR) {
-        // Fiber BCSDF (bsdf_eval.h bsdfF twin). The frame comes from the strand tangent the
-        // vertex carries; f is pre-divided by |cos(ns,wi)| (see dHairCosGuard).
-        DHit h = dVertHit(vt);
-        const DHairShade hs = dHairShadeAt(sc, m, h, lambda, wo);
-        return (double)dHairFCos(hs, wi) / dHairCosGuard(fabs(cosWi));
-    }
-    return 0.0;
-}
-// Directional pdf (solid angle) of sampling wi at a surface vertex (double, for MIS).
-// Per-hit roughness (glossy) is read from the vertex's texcoords so the density matches
-// the sampling that used the same textured/patterned roughness (M9).
-__device__ static double dBsdfPdf(const DScene& sc, const DVertex& vt,
-                                  const DVec3& wo, const DVec3& wi, Real lambda) {
-    const DMaterial& m = sc.mats[vt.matId];
-    const DVec3& ns = vt.ns;
-    const double cosWi = ddot(wi, ns);
-    if (m.type == D_DIFFUSE || m.type == D_FLUORESCENT) {
-        if (!dLambertLit(cosWi)) return 0.0;          // from either side of ns (dLambertLit)
-        return cosWi / DPI;
-    } else if (m.type == D_GLOSSY) {
-        DHit h = dVertHit(vt);
-        return dGlossyPdf(sc, m, h, ns, wo, wi);      // the visible normals' (ggx::pdfAll)
-    } else if (m.type == D_DIFFUSETRANSMIT) {
-        // The lobe-selected cosine sampling at a vertex reached from `wo`, about the shading
-        // normal turned to wo's geometric side, a draw on the wrong side of the true surface
-        // absorbed: the density of the lobe dTranslucentLobe puts wi in, none in the wedges
-        // (host twin bsdfPdf).
-        DHit h = dVertHit(vt);
-        double rhoR, rhoT; dDiffuseTransmitAlbedos(sc, m, h, lambda, rhoR, rhoT);
-        double tot = rhoR + rhoT;
-        if (tot <= 0.0) return 0.0;
-        const int lobe = dTranslucentLobe(ns, dVertexGeoN(vt), wo, wi);
-        if (lobe == 0) return 0.0;
-        return (lobe > 0 ? rhoR : rhoT) / tot * fabs(cosWi) / DPI;
-    } else if (m.type == D_HAIR) {
-        // The BCSDF's own sampling density in solid angle -- exactly what dhair::sample draws
-        // from, so MIS is consistent by construction (bsdf_eval.h bsdfPdf twin).
-        DHit h = dVertHit(vt);
-        const DHairShade hs = dHairShadeAt(sc, m, h, lambda, wo);
-        return dhair::pdf(hs.b, hs.woLocal, dhair::toLocal(hs.fr, wi));
-    }
-    return 0.0;
-}
-
 // The GGX pair (b, a) from the pair (a, b): the same half vector and distribution, its two ends'
 // cosines and A terms swapped -- what ggx::pair computes for the swapped arguments, bit for bit.
 __device__ static inline ggx::Pair dPairSwapped(const ggx::Pair& p) {
@@ -15657,37 +15596,40 @@ __device__ static inline ggx::Pair dPairSwapped(const ggx::Pair& p) {
     return r;
 }
 
-// A MERGE SITE'S LOBE (modes U and J): camera vertex `vt`'s BSDF toward `wo` and its two
-// directional pdfs, for the many light directions a merge weighs -- dBsdfF's and dBsdfPdf's
-// arithmetic step for step, so a merge reads what they would -- but the vertex's hit rebuilt and its
-// roughness read once a site, and a light direction's geometry (at(): a glossy lobe's GGX pair, whose
-// reverse is the same pair with its ends swapped) once for every wavelength the light vertex
-// carries, where each call to them rebuilds both. A change to either must be made here too: nothing
-// but the merges' images checks that the two agree. A hair fiber's lobe calls them.
-struct DMergeLobe {
+// A SURFACE VERTEX'S BSDF LOBE: vertex `vt`'s BSDF toward `wo` (the walk's side) and its two
+// directional pdfs, for any number of directions wi (at()) and wavelengths -- the device's one
+// implementation of a connectible BSDF. dBsdfF and dBsdfPdf are a lobe for a single direction; a
+// merge (modes U and J) keeps one for its site, so its hit is rebuilt and its roughness read once,
+// and a light direction's geometry (a glossy lobe's GGX pair, whose reverse is the same pair with its
+// ends swapped) once for every wavelength the light vertex carries. Takes the full DVertex so
+// textured, patterned and record-driven albedo and roughness are read per hit (M9), as the sampler
+// read them, which keeps the MIS densities consistent. What a query needs of the hit is read at its
+// first need (prepare): a Lambertian lobe's pdf, or its value from below, needs none; `now` reads it
+// at once. In an unnamed namespace, so its member functions have internal linkage, one copy a unit
+// (render_cuda_dev.cuh's first constraint).
+namespace {
+struct DVertexLobe {
     const DScene& sc;
     const DVertex& vt;
     const DMaterial& m;
-    DHit h;                 // vt's hit (dVertHit)
-    DVec3 wo;               // toward the camera side's previous vertex
+    DHit h;                 // vt's hit (dVertHit), once prepared
+    DVec3 wo;
+    double cosWo;           // wo's cosine to vt's shading normal
     double alpha = 0.0;     // a glossy lobe's: ggx::alpha of its roughness at h
     bool ms = false;        // ...and whether it adds its multiple scattering (dGlossyMs)
-    double cosWo = 0.0;     // wo's cosine to vt's shading normal
-    // The light direction at() prepared:
+    bool ready = false;     // prepare() has run
+    // The direction at() set:
     DVec3 wi;
     double cosWi = 0.0;
     ggx::Pair p;            // a glossy lobe's pair (wo, wi)
     double g = 0.0;         // ...its value over the reflectance, ggx::fAll
     Real cH = (Real)1;      // ...and its half-vector cosine, which an iridescent lobe's R reads
-    // A translucent lobe's two albedos (dDiffuseTransmitAlbedos) at rhoLam, which every light
-    // direction shares: read again only at another wavelength.
-    mutable Real rhoLam = (Real)-1;
-    mutable double rhoR = 0.0, rhoT = 0.0;
-    bool ready = false;     // prepare() has run
-    // `now` false leaves the hit and the roughness to prepare(), for a caller that may weigh no light
-    // direction at all (mode J's gathers, at a site's first photon past the cheap tests).
-    __device__ DMergeLobe(const DScene& sc_, const DVertex& vt_, const DVec3& wo_, bool now = true)
-        : sc(sc_), vt(vt_), m(sc_.mats[vt_.matId]), wo(wo_) {
+    // A translucent lobe's two albedos (dDiffuseTransmitAlbedos) at rhoLam, which every direction
+    // shares: read again only at another wavelength.
+    Real rhoLam = (Real)-1;
+    double rhoR = 0.0, rhoT = 0.0;
+    __device__ DVertexLobe(const DScene& sc_, const DVertex& vt_, const DVec3& wo_, bool now = false)
+        : sc(sc_), vt(vt_), m(sc_.mats[vt_.matId]), wo(wo_), cosWo(ddot(wo_, vt_.ns)) {
         if (now) prepare();
     }
     __device__ void prepare() {
@@ -15696,51 +15638,61 @@ struct DMergeLobe {
             alpha = ggx::alpha((double)dMatRoughness(sc, m, h));
             ms = dGlossyMs(m);
         }
-        cosWo = ddot(wo, vt.ns);
         ready = true;
-    }
-    __device__ void albedos(Real lambda) const {
-        if (lambda == rhoLam) return;
-        dDiffuseTransmitAlbedos(sc, m, h, lambda, rhoR, rhoT);
-        rhoLam = lambda;
     }
     __device__ void at(const DVec3& wi_) {
         wi = wi_;
         cosWi = ddot(wi, vt.ns);
         if (m.type == D_GLOSSY) {
+            if (!ready) prepare();
             p = ggx::pair(vt.ns, wo, wi, alpha);
             g = p.ok ? ggx::fAll(p, ms) : 0.0;
             if (m.iridescence) cH = dHalfVectorCos(wo, wi);
         }
     }
-    // dBsdfF(sc, vt, wo, wi, lambda).
-    __device__ double f(Real lambda) const {
+    __device__ void albedos(Real lambda) {
+        if (!ready) prepare();
+        if (lambda == rhoLam) return;
+        dDiffuseTransmitAlbedos(sc, m, h, lambda, rhoR, rhoT);
+        rhoLam = lambda;
+    }
+    // f(wo -> wi) at `lambda` (double, for a connection's radiance).
+    __device__ double f(Real lambda) {
         if (m.type == D_DIFFUSE || m.type == D_FLUORESCENT) {
-            if (!dLambertLit(cosWi)) return 0.0;
+            if (!dLambertLit(cosWi)) return 0.0;          // from either side of ns (dLambertLit)
+            if (!ready) prepare();
             return clamp01(dDiffuseRho(sc, m, h, lambda)) / DPI;
         } else if (m.type == D_GLOSSY) {
+            // r times the GGX lobe; r carries an iridescent lobe's interference reflectance.
             if (!p.ok) return 0.0;
-            double r = clamp01(dReflectSlot(sc, m, h, lambda, nullptr));
-            if (m.iridescence) r *= (double)dIridescenceR(sc, m, &h, lambda, cH);
-            return r * g;
+            return dGlossyR(sc, m, h, cH, lambda) * g;
         } else if (m.type == D_DIFFUSETRANSMIT) {
+            // Two-sided Lambertian, mode R's integrand (host twin bsdfF, dTranslucentLobe).
             albedos(lambda);
             const int lobe = dTranslucentLobe(vt.ns, dVertexGeoN(vt), wo, wi);
             return (lobe > 0 ? rhoR : (lobe < 0 ? rhoT : 0.0)) / DPI;
         } else if (m.type == D_HAIR) {
-            return dBsdfF(sc, vt, wo, wi, lambda);
+            // Fiber BCSDF (bsdf_eval.h bsdfF twin). The frame comes from the strand tangent the
+            // vertex carries; f is pre-divided by |cos(ns,wi)| (see dHairCosGuard).
+            if (!ready) prepare();
+            const DHairShade hs = dHairShadeAt(sc, m, h, lambda, wo);
+            return (double)dHairFCos(hs, wi) / dHairCosGuard(fabs(cosWi));
         }
         return 0.0;
     }
-    // dBsdfPdf(sc, vt, wo, wi, lambda), or with `rev` dBsdfPdf(sc, vt, wi, wo, lambda).
-    __device__ double pdf(bool rev, Real lambda) const {
+    // The density (solid angle) of sampling wi from wo, or with `rev` of wo from wi.
+    __device__ double pdf(bool rev, Real lambda) {
         const double cosB = rev ? cosWo : cosWi;
         if (m.type == D_DIFFUSE || m.type == D_FLUORESCENT) {
-            if (!dLambertLit(cosB)) return 0.0;
+            if (!dLambertLit(cosB)) return 0.0;          // from either side of ns (dLambertLit)
             return cosB / DPI;
         } else if (m.type == D_GLOSSY) {
-            return ggx::pdfAll(rev ? dPairSwapped(p) : p, ms);
+            return ggx::pdfAll(rev ? dPairSwapped(p) : p, ms);   // the visible normals'
         } else if (m.type == D_DIFFUSETRANSMIT) {
+            // The lobe-selected cosine sampling at a vertex reached from the near end, about the
+            // shading normal turned to its geometric side, a draw on the wrong side of the true
+            // surface absorbed: the density of the lobe dTranslucentLobe puts the far end in, none in
+            // the wedges (host twin bsdfPdf).
             albedos(lambda);
             const double tot = rhoR + rhoT;
             if (tot <= 0.0) return 0.0;
@@ -15749,11 +15701,33 @@ struct DMergeLobe {
             if (lobe == 0) return 0.0;
             return (lobe > 0 ? rhoR : rhoT) / tot * fabs(cosB) / DPI;
         } else if (m.type == D_HAIR) {
-            return rev ? dBsdfPdf(sc, vt, wi, wo, lambda) : dBsdfPdf(sc, vt, wo, wi, lambda);
+            // The BCSDF's own sampling density -- exactly what dhair::sample draws from, so MIS is
+            // consistent by construction (bsdf_eval.h bsdfPdf twin).
+            if (!ready) prepare();
+            const DHairShade hs = dHairShadeAt(sc, m, h, lambda, rev ? wi : wo);
+            return dhair::pdf(hs.b, hs.woLocal, dhair::toLocal(hs.fr, rev ? wo : wi));
         }
         return 0.0;
     }
 };
+}  // namespace
+
+// BSDF value f(wo->wi) at a surface vertex (double, for the connection radiance L): its lobe's, for
+// the one direction.
+__device__ static double dBsdfF(const DScene& sc, const DVertex& vt,
+                                const DVec3& wo, const DVec3& wi, Real lambda) {
+    DVertexLobe lobe(sc, vt, wo);
+    lobe.at(wi);
+    return lobe.f(lambda);
+}
+// Directional pdf (solid angle) of sampling wi from wo at a surface vertex (double, for MIS): its
+// lobe's, for the one direction.
+__device__ static double dBsdfPdf(const DScene& sc, const DVertex& vt,
+                                  const DVec3& wo, const DVec3& wi, Real lambda) {
+    DVertexLobe lobe(sc, vt, wo);
+    lobe.at(wi);
+    return lobe.pdf(false, lambda);
+}
 
 // Camera importance (PBRT imagePlaneArea convention — see bdpt.h cameraWe/PdfDir).
 __device__ static double dCameraPdfDir(const DCamera& cam, double cosCam) {
@@ -21422,10 +21396,10 @@ struct DSurfSite {
     __device__ long long cell(const DSurfMap& sm, int n) const { return g.neighbour(n, sm.nx, sm.ny, sm.nz); }
 };
 // The merge of photon `sm.order[q]` at the site: its XYZ added to gX, gY, gZ. `lobe` is the site's
-// camera vertex's toward the camera side (DMergeLobe), `coatTh` its coat's film there
+// camera vertex's toward the camera side (DVertexLobe), `coatTh` its coat's film there
 // (dCoatThicknessAt).
 __device__ static inline void dSurfMergePhoton(const DScene& sc, const DSurfMap& sm, const DSurfSite& site,
-                                               DMergeLobe& lobe, Real& coatTh, const DSurfMergeW& sw, int q,
+                                               DVertexLobe& lobe, Real& coatTh, const DSurfMergeW& sw, int q,
                                                double& gX, double& gY, double& gZ,
                                                const DJSpec* js) {
     const DVertex& vk = lobe.vt;
@@ -21571,7 +21545,7 @@ __device__ static int dSurfMergeAt(const DScene& sc, const DSurfMap& sm, const D
                                    double& gX, double& gY, double& gZ,
                                    const DJSpec* js = nullptr) {
     const DSurfSite site(sc, sm, vk);
-    DMergeLobe lobe(sc, vk, woCam, false);
+    DVertexLobe lobe(sc, vk, woCam, false);
     Real coatTh = (Real)0;   // dSurfMergePhoton's, with the lobe
     return dSiteListWalk([&](int n, int& b, int& e) { dSurfSiteCell(sm, site, n, b, e); }, 0, 1,
                          [&](int q) { dSurfMergePhoton(sc, sm, site, lobe, coatTh, sw, q, gX, gY, gZ, js); });
@@ -21602,7 +21576,7 @@ __global__ void kWfSurfGather(DScene sc, DSurfMap sm, DSurfQueue sq, int n, doub
         const DJSpec* js = (rq.flags & 1) ? &sq.spec[r] : nullptr;
         const DSurfSite site(sc, sm, rq.vk);
         double gX = 0.0, gY = 0.0, gZ = 0.0;
-        DMergeLobe lobe(sc, rq.vk, rq.woCam, false);
+        DVertexLobe lobe(sc, rq.vk, rq.woCam, false);
         Real coatTh = (Real)0;   // dSurfMergePhoton's, with the lobe
         // The site's photons as one list, its cells in walk order, the lanes taking them in turn.
         const int total = dSiteListWalk([&](int c, int& b, int& e) { dSurfSiteCell(sm, site, c, b, e); }, lane, 32,

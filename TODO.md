@@ -437,11 +437,10 @@ Then the rest of 4.2-4.6 in their order, 4.7's bookkeeping alongside whatever to
   could put one out at 238; now every function in a capped unit fits it (cuobjdump: none over 168).
   Whole-program compilation also linked, but in 77 minutes of ptxas, and no faster. Next: land the
   declined edits (known-issues REVIEW-0450B) and the two below.
-- [ ] **MERGE-LOBE-SHARED** — DMergeLobe repeats dBsdfF's and dBsdfPdf's arithmetic step for step,
-  kept equal by hand (the Opus review of 0.450.5): make the two thin wrappers over a prepared lobe,
-  so the merges and the connections are one implementation, and kVcmCameraT's connection loop (six
-  rebuilds of the hit and the pair a light vertex, as the merges had) takes the lobe too; with it a
-  translucent lobe's two albedos read once at the hero wavelength rather than at f and at each pdf.
+- [x] **MERGE-LOBE-SHARED** (0.450.11) — DVertexLobe is the one connectible-BSDF implementation:
+  dBsdfF and dBsdfPdf a lobe for one direction, the hair case in it, the glossy reflectance shared
+  with dGlossyF (dGlossyR), the hit read at its first need; mode U's camera kernel keeps a camera
+  lobe for NEE and every connection, and one a light vertex for its two pdfs (design.md).
 - [ ] **DVERTHITSTATE-8B** — DVertHitState is 16 B in every DVertex of modes D and J (352 B of local
   memory a thread in kBdptT, 2.1 KB in the deep variant), half of it the deform barycentrics the
   vertex keeps as vb0q/vb1q (both reviews of 0.450.1-0.450.4). Declined then for the link

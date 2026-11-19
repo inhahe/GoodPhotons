@@ -3105,7 +3105,8 @@ midpoints per medium, as `dTrDetMedium`), shared by every bin. The rule that kee
 is the same everywhere: a factor whose reader is heavy is evaluated in a loop with ONE call site
 (`DJSpecRun::mul`, the fiber's loop shared with the hero bundle's secondaries, the lens trace's
 loop shared with the main trace). Since 0.450.5 four of those readers are `__forceinline__`
-(`dGlossyF`, `dPatIn`, `dPatternScalarAt`, `dRecordRoughness`): the merges' lobe (`DMergeLobe`)
+(`dGlossyF`, `dPatIn`, `dPatternScalarAt`, `dRecordRoughness`): the merges' lobe (`DMergeLobe`, now
+`DVertexLobe`)
 calls the slot readers itself, which put them out of line at 236-252 registers, kJSurfLightT
 included, which the change never touched. Forcing them converged at those four, and it paid
 besides: 0.450.4's binary already held `dGlossyF` out of line, squeezed to `kBdptT`'s 168
@@ -10495,6 +10496,17 @@ as the one at fault.
   resident) and 13.7 of 32 lanes active, the lanes' candidates refused at different tests
   (VCM-GATHER-DIVERGENCE, TODO).
 
+  **One lobe for every connectible BSDF (0.450.11, MERGE-LOBE-SHARED).** The merges' lobe was a
+  second copy of `dBsdfF`'s and `dBsdfPdf`'s arithmetic, kept equal by hand. It is now the only one,
+  `DVertexLobe`: `dBsdfF` and `dBsdfPdf` are a lobe for a single direction, the hair fiber's case
+  is in it rather than called from it, and the glossy reflectance (`dGlossyR`) is the one `dGlossyF`
+  reads on a hit. What a query needs of the hit it reads at its first need (`prepare`), so a
+  Lambertian pdf, or a Lambertian value from below, rebuilds none, as `dBsdfF` never did. Mode U's
+  camera kernel keeps one for its camera vertex, for NEE's direction and every connection's, and
+  one a light vertex for its two pdfs; the light vertex's value stays `dBsdfFAdjoint`, which reads
+  the lobe from the other end (a Lambertian lobe's lit test and a translucent one's lobe choice are
+  not symmetric).
+
   Since 0.34.0 (M9) the **GPU BDPT** kernel (mode `D`) threads the **per-hit
   surface point** through its connection BSDF: each `DVertex` stores the interpolated texcoords
   (`u,v`) and `dVertHit` reconstructs a minimal `DHit` (since 0.450.4 with the walk's hit's pattern
@@ -13274,8 +13286,11 @@ binary is copied aside first (it runs from anywhere: no DLLs beside it). `render
   member, that a capped unit and render_cuda.cu both keep out of line is a weak definition in each
   object, and nvlink binds every call to one of them, render_cuda.cu's uncapped copy maybe, so the
   link could again refuse after an edit there (0.450.10 made the pattern helpers of
-  `pov_functions.h`, `pov_noise.h` and `bluenoise.h`, and `ggx.h`'s, `static`;
-  `tools/check_device_linkage.py`, run by build.bat, lists any left); a kernel there is inside `#ifndef FT_FAMILY_TU` (render_cuda.cu compiles it, the family
+  `pov_functions.h`, `pov_noise.h` and `bluenoise.h`, and `ggx.h`'s, `static`; a struct whose
+  members are out of line goes in an unnamed namespace, as `DVertexLobe` did in 0.450.11 when its
+  `pdf` bound kJSurfLightT to render_cuda.cu's `dMatRoughness` at 252 registers -- a shared function
+  breaks the link through what it calls, whatever its own count; `tools/check_device_linkage.py`,
+  run by build.bat after every build and after a failed one, lists any left); a kernel there is inside `#ifndef FT_FAMILY_TU` (render_cuda.cu compiles it, the family
   units do not); a device global goes through `FT_DEVGLOBAL`, defined in render_cuda.cu and
   `extern` in the family units, so the device holds one copy that `cudaMemcpyToSymbol` sets for
   all (the sphere connectors' tables, which were `static`, among them). Whole-program
