@@ -195,59 +195,34 @@ struct LightVertexSec {
 // the 3x3x3 neighbourhood, and buckets about two a vertex, whatever box the vertices span. The
 // device's grid (vcmSessionPass, DVcmGrid) is the same lattice.
 struct VcmGrid {
-    Vec3 lo{0, 0, 0};
-    double cell = 1e-4;
-    unsigned int mask = 0;        // mergeBucketMask of the vertex count
+    MergeLattice lat{{0, 0, 0}, 1e-4, 0};   // cells the merge radius wide
     std::vector<int> cellStart;   // bucket b's vertices are order[cellStart[b] .. cellStart[b + 1])
     std::vector<int> order;       // vertex indices in bucket-contiguous order
 
-    void cellCoord(const Vec3& p, int& ix, int& iy, int& iz) const {
-        ix = mergeCellCoord(p.x, lo.x, cell);
-        iy = mergeCellCoord(p.y, lo.y, cell);
-        iz = mergeCellCoord(p.z, lo.z, cell);
-    }
-
     void build(const std::vector<LightVertex>& v, double radius) {
-        cell = radius > 0.0 ? radius : 1e-6;
+        const double cell = radius > 0.0 ? radius : 1e-6;
         const size_t n = v.size();
-        if (n == 0) { mask = 0; cellStart.assign(mergeBucketCount(0) + 1, 0); order.clear(); return; }
-        Vec3 mn = v[0].p;
+        Vec3 mn = n ? v[0].p : Vec3{0, 0, 0};
         for (const auto& lv : v) {
             mn.x = std::min(mn.x, lv.p.x); mn.y = std::min(mn.y, lv.p.y); mn.z = std::min(mn.z, lv.p.z);
         }
-        // The corner half a cell below the vertices, as the device's.
-        lo = mn - Vec3{cell, cell, cell} * 0.5;
-        mask = mergeBucketMask(n);
-        const size_t nBuckets = mergeBucketCount(mask);
-        std::vector<unsigned int> bucketOf(n);
-        cellStart.assign(nBuckets + 1, 0);
-        for (size_t i = 0; i < n; ++i) {
-            int ix, iy, iz; cellCoord(v[i].p, ix, iy, iz);
-            const unsigned int c = mergeBucket(ix, iy, iz, mask);
-            bucketOf[i] = c; ++cellStart[(size_t)c + 1];
-        }
-        for (size_t c = 0; c < nBuckets; ++c) cellStart[c + 1] += cellStart[c];
-        order.assign(n, 0);
-        std::vector<int> cursor(cellStart.begin(), cellStart.end() - 1);
-        for (size_t i = 0; i < n; ++i) order[(size_t)cursor[bucketOf[i]]++] = (int)i;
+        lat = mergeLatticeOver(mn.x, mn.y, mn.z, cell, n);
+        mergeBin(lat, n, [&](size_t i) -> const Vec3& { return v[i].p; }, cellStart, order,
+                 "the vertex-merge grid", "-max-bounce");
     }
 
-    // Invoke fn(vertexIndex) for every stored vertex within radius r of p (r <= cell).
+    // Invoke fn(vertexIndex) for every stored vertex within radius r of p (r <= the cell).
     template <class F>
     void query(const std::vector<LightVertex>& v, const Vec3& p, double r, F&& fn) const {
         if (order.empty()) return;
-        int ix, iy, iz; cellCoord(p, ix, iy, iz);
         const double r2 = r * r;
-        for (int dz = -1; dz <= 1; ++dz)
-        for (int dy = -1; dy <= 1; ++dy)
-        for (int dx = -1; dx <= 1; ++dx) {
-            const unsigned int c = mergeBucket(ix + dx, iy + dy, iz + dz, mask);
+        mergeForEachBucket(lat, p.x, p.y, p.z, [&](unsigned int c) {
             for (int k = cellStart[c]; k < cellStart[(size_t)c + 1]; ++k) {
                 int idx = order[k];
                 Vec3 d = p - v[idx].p;
                 if (dot(d, d) <= r2) fn(idx);
             }
-        }
+        });
     }
 };
 

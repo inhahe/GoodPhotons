@@ -428,8 +428,9 @@ Then the rest of 4.2-4.6 in their order, 4.7's bookkeeping alongside whatever to
   lattice's; tools/check_merge_table.py.
 - [x] **PM-BUCKET-TWICE** (0.450.21) — mode M's and SPPM's gathers could read a bucket twice when two
   of their cells shared it: the photon map takes merge_grid.h's bucket, host and device.
-- [ ] **GATHER-BASE-MIRROR-M** — check_gather_base's mirror box: CPU mode M reads the floor 0-2 cm from
-  its base 0.929 of mode R (GPU M 1.031), since before 0.450.17: bisect; known-issues.
+- [x] **GATHER-BASE-MIRROR-M** — the check's CPU mode M ring was noise at 4 samples: they take 16.
+- [ ] **MIRROR-BASE-GPU** — GPU modes M and S read the floor at a mirror box's base 2.5 % over the CPU's
+  (8 seeds, 3 sigma): place it in the footprint probe or out of it; known-issues.
 - [x] **GPU-MERGE-FLOAT-LATTICE** (0.450.22) — the device's merge maps carry their lattice in double
   (`MergeLattice`), as their points were binned; the device probe holds it.
 - [x] **REVIEW-0450F** (0.450.15) — the Opus (max) and Fable (xhigh) reviews of 0.450.12-0.450.14, and

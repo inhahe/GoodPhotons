@@ -1222,8 +1222,8 @@ that converges to the same physical image.
   every merge keeps cells the radius wide. Before, the grid was a dense lattice over the light
   vertices' box: past 64 M cells (or, on the GPU, past the memory left) it widened its cells,
   every merge then weighing more candidates (`[mode U] the merges' grid coarsened ...`), and a
-  sparse frame spent most of a pass clearing it (a micrometre radius over a 10 m box: 1.81 s to
-  0.29 s on the CPU).
+  sparse frame spent most of a pass clearing it (`-pmradius 1e-4` over a 10 m box: 1.80 s to
+  0.30 s on the CPU).
 
 - **`J` — UPBP (mode `D` and mode `M`'s beams, under one weight).** Unifying Points,
   Beams and Paths (Křivánek et al. 2014) is to *volumes* what `U` is to surfaces. Mode `D`
@@ -1949,6 +1949,15 @@ machine varied 18.5 s / 25.8 s / 27.2 s.
   and below what it would hold) and lets a wave go down to 256 paths, so a small frame takes several
   waves, or with a tiny `n` turns sites away to the inline merge; `tools/check_vcm_wavefront.py`
   uses both, and requires the same image every way and waves that hold their sites.
+- **`FTRACE_MERGE_TABLE=<k>` (diagnostic, modes `U`, `J`, `M`, `S`).** The merge maps -- mode
+  `U`'s light vertices, mode `J`'s surface photons, the photon map of modes `M` and `S` -- bin their
+  points in a hashed lattice whose table holds about two buckets a point; this holds its slots to
+  at most `k` (a power of two; `1` leaves one block of 27 buckets that every block shares). A merge
+  never reads a bucket twice, so the merges are the same at any table size: the CPU's renders are
+  byte-identical, the GPU's equal to rounding, and `tools/check_merge_table.py` requires both. Mode
+  `M`'s own radius choice samples the map bucket by bucket and so moves with the table (pin it with
+  `-pmradius`), and mode `J` paces its light-side redraws by the work it counts, which a small
+  table's strays raise (hold it with `-beamfreeze`).
 - **`FTRACE_JEPOCHKEEP=<k>` (diagnostic, mode `J` flights).** Keeps at most `k` of a batch's
   `-beamepochs` realizations, so its later frames re-trace the rest as a batch too large to keep
   them would; `tools/check_jbeams.py` uses it to show such an epoch is traced as epoch 0 was.
@@ -7196,11 +7205,12 @@ across seeds, growth never pointing into the skin, clumping that collapses tips 
 moving roots, a well-formed segment chain, and a regression on the loader-ordering trap
 that once made a whole groom generate zero strands silently — see **Grooms** above.
 `-checkcellwalk` guards the **lattice walk** every grid march shares (a medium's majorant grid,
-the fur coat's, a fire's emission grid; `cell_walk.h`), in four sections: on random lattices and
+the fur coat's, a fire's emission grid; `cell_walk.h`), in five sections: on random lattices and
 rays (axis-aligned and a hair off an axis among them) the stretches tile the ray's clip to the box
 in order, each in the cell it names; a ray leaving a cell plane a hair off its axis, whose crossing
-rounds to behind the walk, never steps back; a zero or NaN direction and a NaN end each end the walk
-at once; and the fire's t² integral matches a fine midpoint sum.
+rounds to behind the walk, never steps back; a zero direction hands back one stretch and a NaN
+direction at most one; the fire's t² integral matches a fine midpoint sum; and a NaN end hands back
+none (last, as a walk that missed it would hang there).
 `-checkfurgrid` guards the **fiber-density grid** behind `-dual-grid`, in five sections, and
 is unusual in that it validates a mean-field model against the *shipping* curve intersector
 rather than against another closed form: mass conservation (`Σ rℓ` deposited equals `Σ rℓ`

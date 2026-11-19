@@ -68,6 +68,20 @@ __global__ void kDeviceProbe(unsigned long long* sizes, double* math, const doub
         ftMathRow<double>(xs[r], ys[r], math + (2 * r + 1) * FT_MATH_N);
     }
 }
+// A device map's point's position, for kMergeKey: a light vertex's, a surface photon's, a photon's.
+__device__ inline const DVec3& mergePosOf(const DVcmLV& v) { return v.p; }
+__device__ inline const DVec3& mergePosOf(const DSurfPhoton& v) { return v.p; }
+__device__ inline const DVec3& mergePosOf(const DPhoton& v) { return v.pos; }
+// The bucket in `lat` of each of the n points (merge_grid.h, mergeLatticeBucket: the host's binning
+// of a point, which a merge site's DGridCell agrees with).
+template <class P>
+__global__ void kMergeKey(const P* pts, long long n, MergeLattice lat, int* key) {
+    const long long stride = (long long)gridDim.x * blockDim.x;
+    for (long long i = blockIdx.x * (long long)blockDim.x + threadIdx.x; i < n; i += stride) {
+        const DVec3& p = mergePosOf(pts[i]);
+        key[i] = (int)mergeLatticeBucket(lat, p.x, p.y, p.z);
+    }
+}
 // The merge-lattice half of the probe: the bucket a merge site at each of the n points (xyz, float,
 // as a device site's position is) takes in `lat` -- its own cell's, DGridCell's centre neighbour.
 __global__ void kMergeCellProbe(MergeLattice lat, const float* pts, int n, unsigned int* out) {
@@ -1994,8 +2008,7 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
             const Scene::EmissiveVolume& ev = scene.emissiveVolumes[v];
             DEmissiveVolume& d = devs[v];
             d.mediumIndex = ev.mediumIndex;
-            d.bmin = {ev.bmin.x, ev.bmin.y, ev.bmin.z};
-            d.bmax = {ev.bmax.x, ev.bmax.y, ev.bmax.z};
+            for (int a = 0; a < 3; ++a) { d.bmin[a] = (&ev.bmin.x)[a]; d.bmax[a] = (&ev.bmax.x)[a]; }
             d.meanKe = ev.meanKe;
             d.power  = ev.power;
             d.lamCdf  = (const double*)keep(uploadVec(ev.lamSampler.cdf));
@@ -2008,11 +2021,7 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
             d.cellW   = ev.cellW.empty() ? nullptr : (const double*)keep(uploadVec(ev.cellW));
             d.cellCdf = ev.cellCdf.empty() ? nullptr : (const double*)keep(uploadVec(ev.cellCdf));
             d.nCells  = (int)ev.cellCdf.size();
-            d.cellSum = ev.cellSum;
-            for (int a = 0; a < 3; ++a) {
-                d.boxLo[a] = (&ev.bmin.x)[a]; d.boxHi[a] = (&ev.bmax.x)[a];
-                d.cellSize[a] = ev.cellSize[a]; d.invCell[a] = ev.invCell[a];
-            }
+            for (int a = 0; a < 3; ++a) { d.cellSize[a] = ev.cellSize[a]; d.invCell[a] = ev.invCell[a]; }
             d.pointNorm = ev.pointNorm;
             d.kelvin  = scene.media[(size_t)ev.mediumIndex].emitKelvin;
             d.gW      = (camFires && ev.lamSampler.integral > 0.0)
@@ -3035,34 +3044,49 @@ struct ThrustArenaAlloc {
 };
 
 // Grow-only device buffer of `cap` elements: reallocated only when `need` passes it, to 1.5x the old
-// capacity (no more than `most`, and no less than `need`), so per-pass session buffers stop
-// churning cudaMalloc/cudaFree; `need` alone where the device refuses the growth. False, the buffer
-// released (p null, cap 0), where the device refuses `need` too; then `*why` (where given) is the
-// refusal's error, which need not be a shortage (a context a driver reset left broken).
+// capacity (no less than `need`), so per-pass session buffers stop churning cudaMalloc/cudaFree;
+// `need` alone where the device refuses the growth. A refusal of `need` too ends the run, saying
+// why -- which need not be a shortage (a context a driver reset left broken).
 template <class T>
-static bool tryDevCap(T*& p, size_t& cap, size_t need, size_t most = SIZE_MAX, cudaError_t* why = nullptr) {
-    if (need <= cap) return true;
-    const size_t grown = std::max(need, std::min(cap + cap / 2, most));
+static void ensureDevCap(T*& p, size_t& cap, size_t need) {
+    if (need <= cap) return;
+    const size_t grown = std::max(need, cap + cap / 2);
     if (p) { cudaFree(p); p = nullptr; }
     cap = 0;
+    cudaError_t why = cudaSuccess;
     for (size_t want : {grown, need}) {
-        const cudaError_t e = cudaMalloc(&p, want * sizeof(T));
-        if (e == cudaSuccess) { cap = want; return true; }
-        if (why) *why = e;
+        why = cudaMalloc(&p, want * sizeof(T));
+        if (why == cudaSuccess) { cap = want; return; }
         (void)cudaGetLastError();
         p = nullptr;
     }
-    return false;
-}
-// tryDevCap where the render cannot go on without the buffer: a refusal ends the run, saying why.
-template <class T>
-static void ensureDevCap(T*& p, size_t& cap, size_t need) {
-    cudaError_t why = cudaSuccess;
-    if (tryDevCap(p, cap, need, SIZE_MAX, &why)) return;
     std::fprintf(stderr, "[cuda] a device buffer of %zu x %zu B could not be allocated: %s\n",
                  need, sizeof(T), cudaGetErrorString(why));
     std::fflush(stderr);
     std::exit(EXIT_FAILURE);
+}
+
+// The device's counting sort of `n` points into lattice `lat` (merge_grid.h; the host's mergeBin):
+// each point's bucket in `key`, `order` the point indices sorted by it STABLY -- as the host's
+// counting sort is, so a gather meets a cell's points in index order and sums them as the host does
+// -- and each bucket's start in `cellStart` (mergeBucketCount(lat.mask) + 1 entries). `blocks`: the
+// key kernel's grid. The buffers grow as their capacities need (ensureDevCap).
+template <class Policy, class P>
+static void mergeBinDevice(Policy& pol, const P* pts, size_t n, const MergeLattice& lat, int blocks,
+                           int*& key, size_t& keyCap, int*& order, size_t& orderCap,
+                           int*& cellStart, size_t& cellStartCap) {
+    const size_t nBuckets = mergeBucketCount(lat.mask);
+    ensureDevCap(key, keyCap, n);
+    ensureDevCap(order, orderCap, n);
+    ensureDevCap(cellStart, cellStartCap, nBuckets + 1);
+    gpu::kMergeKey<<<blocks, 128>>>(pts, (long long)n, lat, key);
+    cudaCheckKernel("merge-key");
+    thrust::device_ptr<int> tKey(key), tOrd(order);
+    thrust::sequence(pol, tOrd, tOrd + n);
+    thrust::stable_sort_by_key(pol, tKey, tKey + n, tOrd);
+    thrust::lower_bound(pol, tKey, tKey + n, thrust::counting_iterator<int>(0),
+                        thrust::counting_iterator<int>((int)(nBuckets + 1)),
+                        thrust::device_pointer_cast(cellStart));
 }
 
 // ---- a device LBVH over the beam map's sub-beams (FTRACE_JLBVH=1) --------------------
@@ -3298,28 +3322,13 @@ static void buildJSurfMapDevice(JSurfDev& d, const gpu::DScene& sc, const gpu::D
         pol, thrust::device_pointer_cast(d.pts), thrust::device_pointer_cast(d.pts + n),
         gpu::JSurfToBboxF{}, gpu::BboxF{FLT_MAX, FLT_MAX, FLT_MAX, -FLT_MAX, -FLT_MAX, -FLT_MAX},
         gpu::BboxMergeF{});
-    // The corner a cell below the photons (SurfMap::build's), the buckets from the photon count.
-    const double cell = radius;
-    const MergeLattice lat{{(double)bb.mnx - cell, (double)bb.mny - cell, (double)bb.mnz - cell}, cell,
-                           mergeBucketMask((size_t)n)};
-    const size_t nBuckets = mergeBucketCount(lat.mask);
-    ensureDevCap(d.cellKey, d.cellKeyCap, (size_t)n);
-    ensureDevCap(d.order,   d.orderCap,   (size_t)n);
+    // The lattice over the photons as SurfMap::build's (mergeLatticeOver).
+    const MergeLattice lat = mergeLatticeOver(bb.mnx, bb.mny, bb.mnz, radius, (size_t)n);
     int ckBlocks = (n + 127) / 128;
     if (ckBlocks < 1)    ckBlocks = 1;
     if (ckBlocks > 2048) ckBlocks = 2048;
-    gpu::kJSurfCellKey<<<ckBlocks, 128>>>(d.pts, n, lat, d.cellKey);
-    cudaCheckKernel("jsurf-cellkey");
-    thrust::device_ptr<int> tKey(d.cellKey), tOrd(d.order);
-    thrust::sequence(pol, tOrd, tOrd + n);
-    // STABLE, because the host's counting sort is stable and the gather sums in visit order:
-    // an unstable sort would reorder a cell's photons and change the last bits of every merge.
-    thrust::stable_sort_by_key(pol, tKey, tKey + n, tOrd);
-    ensureDevCap(d.cellStart, d.cellStartCap, nBuckets + 1);
-    thrust::lower_bound(pol, tKey, tKey + n,
-                        thrust::counting_iterator<int>(0),
-                        thrust::counting_iterator<int>((int)(nBuckets + 1)),
-                        thrust::device_pointer_cast(d.cellStart));
+    mergeBinDevice(pol, d.pts, (size_t)n, lat, ckBlocks, d.cellKey, d.cellKeyCap, d.order, d.orderCap,
+                   d.cellStart, d.cellStartCap);
 
     dsm.pts = d.pts; dsm.mis = d.mis;
     dsm.cellStart = d.cellStart; dsm.order = d.order;
@@ -3505,7 +3514,7 @@ static void uploadSurfMapCuda(const bdpt::SurfMap* smap, DUpload& up, gpu::DSurf
     dsm.mis       = (const gpu::DSurfMis*)up.keep(uploadVec(mis));
     dsm.cellStart = (const int*)up.keep(uploadVec(smap->cellStart));
     dsm.order     = (const int*)up.keep(uploadVec(smap->order));
-    dsm.lat    = MergeLattice{{smap->lo.x, smap->lo.y, smap->lo.z}, smap->cell, smap->mask};
+    dsm.lat    = smap->lat;
     dsm.radius = (gpu::Real)smap->radius;
     // n_m * pi r_s^2, the constant the estimator divides by and the weight scales its own
     // technique with -- the exact twin of the beam map's mergeKappa = n_m * 2 r_b.
@@ -5903,7 +5912,7 @@ std::vector<Film> renderPhotonMapSharedCuda(const Scene& scene, const std::vecto
     // chunk and the first gathered pixel.
     auto uploadPhotonMap = [&](const PhotonMap& M, DPhotonMap& D, const char* what) {
         D = DPhotonMap{};
-        D.lat = MergeLattice{{M.lo.x, M.lo.y, M.lo.z}, M.cellSize, M.tableMask};
+        D.lat = M.lat;
         D.radius = (Real)M.radius;
         D.kGather = (Real)M.kGather;   // > 0 only on the caustic map (see -pmadaptive)
         D.photons = nullptr;
@@ -6532,26 +6541,12 @@ void sppmSessionPass(SppmSession* s, long long photonsPerPass, double alpha) {
             thrust::device_pointer_cast(s->d_photons + n),
             PhToBboxF{}, BboxF{FLT_MAX, FLT_MAX, FLT_MAX, -FLT_MAX, -FLT_MAX, -FLT_MAX},
             BboxMergeF{});
-        // The host build promoted float positions to double BEFORE the bbox/pad math;
-        // min/max commute with that promotion, so these are the same doubles.
-        lat.lo[0] = (double)bb.mnx - cellSize * 0.5;
-        lat.lo[1] = (double)bb.mny - cellSize * 0.5;
-        lat.lo[2] = (double)bb.mnz - cellSize * 0.5;
-        // Bucket table sized from the PHOTON COUNT, exactly as the host does (mergeBucketMask).
-        lat.mask = mergeBucketMask(n);
-        const size_t tableSize = mergeBucketCount(lat.mask);
-        ensureDevCap(s->d_cellKey, s->cellKeyCap, n);
-        ensureDevCap(s->d_order,   s->orderCap,   n);
-        kSppmCellKey<<<2048, 128>>>(s->d_photons, (long long)n, lat, s->d_cellKey);
-        cudaCheckKernel("sppm-cellkey");
-        thrust::device_ptr<int> tKey(s->d_cellKey), tOrd(s->d_order);
-        thrust::sequence(pol, tOrd, tOrd + n);
-        thrust::stable_sort_by_key(pol, tKey, tKey + n, tOrd);
-        ensureDevCap(s->d_cellStart, s->cellStartCap, tableSize + 1);
-        thrust::lower_bound(pol, tKey, tKey + n,
-                            thrust::counting_iterator<int>(0),
-                            thrust::counting_iterator<int>((int)tableSize + 1),
-                            thrust::device_pointer_cast(s->d_cellStart));
+        // The host build promoted float positions to double BEFORE the bbox/pad math; min/max
+        // commute with that promotion, so these are the same doubles (mergeLatticeOver, as the
+        // host's PhotonMap::buildGrid).
+        lat = mergeLatticeOver(bb.mnx, bb.mny, bb.mnz, cellSize, n);
+        mergeBinDevice(pol, s->d_photons, n, lat, 2048, s->d_cellKey, s->cellKeyCap, s->d_order, s->orderCap,
+                       s->d_cellStart, s->cellStartCap);
         ensureDevCap(s->d_gather, s->gatherCap, n);
         kSppmGatherConvert<<<2048, 128>>>(s->d_photons, s->d_order, (long long)n, s->d_gather);
         cudaCheckKernel("sppm-gather-convert");
@@ -6650,9 +6645,9 @@ struct VcmSession {
     double* d_invLam  = nullptr;       // nLight*heroC (invPdfLambda; [i*C]<=0 marks "no wavelength")
     int*    d_pathBegin = nullptr;     // nLight (device-scanned per-pass)
     int*    d_pathEnd   = nullptr;     // nLight
-    // Device scratch for the on-device compaction + grid build. The vertex-sized ones are allocated
-    // in Begin at the most a pass can need (nLight * vcmCap), so ensureDevCap never grows them;
-    // the cell table and the thrust arena grow with the grid:
+    // Device scratch for the on-device compaction + grid build. The vertex-sized ones and the bucket
+    // table are allocated in Begin at the most a pass can need (nLight * vcmCap vertices), so
+    // ensureDevCap never grows them; the thrust arena grows with the sort:
     gpu::DVcmLV* d_lvCompact = nullptr; size_t lvCompactCap = 0;
     gpu::DVcmSec* d_lvSecCompact = nullptr; size_t lvSecCompactCap = 0;
     // The stored vertices' hit states (gpu::DVertHitState), slab and compact copy, nLight * vcmCap
@@ -6796,29 +6791,32 @@ VcmSession* vcmSessionBegin(const Scene& scene, const Camera& cam, int resX, int
             tryAlloc(&s->d_invLam, nl * (size_t)C * sizeof(double)) &&
             tryAlloc(&s->d_pathBegin, nl * sizeof(int)) &&
             tryAlloc(&s->d_pathEnd, nl * sizeof(int)) &&
-            // ...and the pass's compact copy and grid keys at the most a pass can need (every
-            // subpath storing every vertex), so no pass allocates them and none can fail to.
+            // ...and the pass's compact copy, grid keys and bucket table at the most a pass can need
+            // (every subpath storing every vertex), so no pass allocates them and none can fail to.
             tryAlloc(&s->d_lvCompact, lv * sizeof(gpu::DVcmLV)) &&
             (s->secStride == 0 ||
              tryAlloc(&s->d_lvSecCompact, lv * (size_t)s->secStride * sizeof(gpu::DVcmSec))) &&
             tryAlloc(&s->d_cellKey, lv * sizeof(int)) &&
             tryAlloc(&s->d_order, lv * sizeof(int)) &&
+            tryAlloc(&s->d_cellStart, (mergeBucketCount(mergeBucketMask(lv)) + 1) * sizeof(int)) &&
             (!keepHs || (tryAlloc(&s->d_lvHsSlab, lv * sizeof(gpu::DVertHitState)) &&
                          tryAlloc(&s->d_lvHsCompact, lv * sizeof(gpu::DVertHitState))))) {
             s->lvCompactCap = lv;
             s->lvSecCompactCap = lv * (size_t)s->secStride;
             s->cellKeyCap = s->orderCap = lv;
+            s->cellStartCap = mergeBucketCount(mergeBucketMask(lv)) + 1;
             break;
         }
         for (void* q : {(void*)s->d_lvSlab, (void*)s->d_lvSecSlab, (void*)s->d_lvCount,
                         (void*)s->d_lamBuf, (void*)s->d_invLam, (void*)s->d_pathBegin,
                         (void*)s->d_pathEnd, (void*)s->d_lvCompact, (void*)s->d_lvSecCompact,
-                        (void*)s->d_cellKey, (void*)s->d_order, (void*)s->d_lvHsSlab, (void*)s->d_lvHsCompact})
+                        (void*)s->d_cellKey, (void*)s->d_order, (void*)s->d_cellStart, (void*)s->d_lvHsSlab,
+                        (void*)s->d_lvHsCompact})
             cudaFree(q);
         s->d_lvSlab = nullptr; s->d_lvSecSlab = nullptr; s->d_lvCount = nullptr;
         s->d_lamBuf = nullptr; s->d_invLam = nullptr; s->d_pathBegin = nullptr; s->d_pathEnd = nullptr;
         s->d_lvCompact = nullptr; s->d_lvSecCompact = nullptr; s->d_cellKey = nullptr;
-        s->d_order = nullptr; s->d_lvHsSlab = nullptr; s->d_lvHsCompact = nullptr;
+        s->d_order = nullptr; s->d_cellStart = nullptr; s->d_lvHsSlab = nullptr; s->d_lvHsCompact = nullptr;
         if (nl == 1) {
             std::fprintf(stderr, "[mode U] no room on the GPU for the light-vertex store\n");
             vcmSessionEnd(s);
@@ -6839,8 +6837,8 @@ VcmSession* vcmSessionBegin(const Scene& scene, const Camera& cam, int resX, int
     if (!(std::getenv("FTRACE_NOVCMWF") && std::atoi(std::getenv("FTRACE_NOVCMWF")) != 0)) {
         const void* camFn = (C > 1) ? (const void*)gpu::kVcmCameraT<BDPT_NSEC> : (const void*)gpu::kVcmCameraT<0>;
         // The stacks are reserved at the kernels' first launch, after this, unless an earlier
-        // launch's reservation already holds them; the sort's worst stays free too. (The grid's cell
-        // table coarsens where the memory is short: vcmSessionPass.)
+        // launch's reservation already holds them; the sort's worst stays free too. (The grid's bucket
+        // table was allocated above, at the most a pass can need.)
         const size_t pending = pendingLocalBytes(s->localNeed);
         size_t freeB = 0, totalB = 0;
         if (cudaMemGetInfo(&freeB, &totalB) != cudaSuccess) { cudaGetLastError(); freeB = 0; }
@@ -6969,23 +6967,9 @@ void vcmSessionPass(VcmSession* s, double radius) {
             thrust::device_pointer_cast(s->d_lvCompact + nLV),
             LvToBboxF{}, BboxF{FLT_MAX, FLT_MAX, FLT_MAX, -FLT_MAX, -FLT_MAX, -FLT_MAX},
             BboxMergeF{});
-        lat.lo[0] = (double)bb.mnx - cell * 0.5;
-        lat.lo[1] = (double)bb.mny - cell * 0.5;
-        lat.lo[2] = (double)bb.mnz - cell * 0.5;
-        lat.mask = mergeBucketMask(nLV);
-        const size_t nBuckets = mergeBucketCount(lat.mask);
-        ensureDevCap(s->d_cellStart, s->cellStartCap, nBuckets + 1);
-        ensureDevCap(s->d_cellKey, s->cellKeyCap, nLV);
-        ensureDevCap(s->d_order,   s->orderCap,   nLV);
-        kVcmCellKey<<<2048, 128>>>(s->d_lvCompact, (int)nLV, lat, s->d_cellKey);
-        cudaCheckKernel("vcm-cellkey");
-        thrust::device_ptr<int> tKey(s->d_cellKey), tOrd(s->d_order);
-        thrust::sequence(pol, tOrd, tOrd + nLV);
-        thrust::stable_sort_by_key(pol, tKey, tKey + nLV, tOrd);
-        thrust::lower_bound(pol, tKey, tKey + nLV,
-                            thrust::counting_iterator<int>(0),
-                            thrust::counting_iterator<int>((int)(nBuckets + 1)),
-                            thrust::device_pointer_cast(s->d_cellStart));
+        lat = mergeLatticeOver(bb.mnx, bb.mny, bb.mnz, cell, nLV);
+        mergeBinDevice(pol, s->d_lvCompact, nLV, lat, 2048, s->d_cellKey, s->cellKeyCap, s->d_order, s->orderCap,
+                       s->d_cellStart, s->cellStartCap);
         // The merges read a cell's vertices one after another (DVcmGrid::byCell), so they get them
         // in cell order, contiguous, where a lookup through `order` would scatter a site's
         // vertices over the whole store. The copy goes into the light slab, which holds at least

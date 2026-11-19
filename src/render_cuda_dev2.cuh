@@ -2472,8 +2472,8 @@ __device__ static void dVcmMergeSum(const DScene& sc, const DVcmCtx& ctx, const 
     const DMaterial& m = sc.mats[vt.matId];
     const DVec3 ngoCam = fp.n;
     const double r2 = ctx.radius * ctx.radius;
-    // Its own lobe, prepared now: a site here holds vertices (the camera kernel counts them first),
-    // and a warp's lanes then read the hit once, together, rather than each at its own first
+    // Its own lobe, prepared now: a site here holds candidates (the camera kernel counts its buckets'
+    // entries first, strays among them), and a warp's lanes then read the hit once, together, rather than each at its own first
     // candidate. Never a caller's lobe by reference: a lobe whose address leaves its kernel for a
     // call ptxas keeps out of line lives in local memory there, every query of it a load.
     DVertexLobe lobe(sc, vt, wo, true);
@@ -3294,15 +3294,6 @@ __global__ void kVcmCompactScatter(const DVcmLV* slab, const DVcmSec* secSlab, i
 }
 #endif
 
-// Bucket per compacted light vertex (merge_grid.h), its cell computed as a merge site's is
-// (DGridCell), in double -- that agreement decides whether a merge finds it.
-#ifndef FT_FAMILY_TU
-__global__ void kVcmCellKey(const DVcmLV* lv, int n, MergeLattice lat, int* key) {
-    int stride = gridDim.x * blockDim.x;
-    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += stride)
-        key[i] = (int)mergeLatticeBucket(lat, lv[i].p.x, lv[i].p.y, lv[i].p.z);
-}
-#endif
 // The grid's cell-ordered copy (DVcmGrid::byCell): out[k] = lv[order[k]] for the n vertices, and
 // each one's `stride` secondary-λ rows beside it (sec null: none).
 #ifndef FT_FAMILY_TU
@@ -3450,27 +3441,6 @@ __global__ void kLbvhRefit(const int* parent, int n, int* visited, DNode* nodes)
             node = parent[node];
         }
     }
-}
-#endif
-
-// Bucket per deposited SURFACE photon (mode J; merge_grid.h). Same shape as kVcmCellKey; the
-// positions are DSurfPhoton's, which the gather bins with the identical expression (DGridCell) --
-// and it is that agreement, not agreement with the host build, that decides whether a merge is found.
-#ifndef FT_FAMILY_TU
-__global__ void kJSurfCellKey(const DSurfPhoton* pts, int n, MergeLattice lat, int* key) {
-    int stride = gridDim.x * blockDim.x;
-    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += stride)
-        key[i] = (int)mergeLatticeBucket(lat, pts[i].p.x, pts[i].p.y, pts[i].p.z);
-}
-#endif
-
-// BUCKET id per deposited photon (PhotonMap::cellCoord + cellIndex twin; merge_grid.h). The host
-// converted DPhoton's float position to a double Vec3 BEFORE the all-double cell math, so promote first.
-#ifndef FT_FAMILY_TU
-__global__ void kSppmCellKey(const DPhoton* ph, long long n, MergeLattice lat, int* key) {
-    long long stride = (long long)gridDim.x * blockDim.x;
-    for (long long i = blockIdx.x * (long long)blockDim.x + threadIdx.x; i < n; i += stride)
-        key[i] = (int)mergeLatticeBucket(lat, ph[i].pos.x, ph[i].pos.y, ph[i].pos.z);
 }
 #endif
 

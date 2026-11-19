@@ -6471,7 +6471,7 @@ as the one at fault.
   **On by default on the CPU since 0.260.0** — all three UPBP-VM gates green (gate 3: switching the
   third technique in on `_fog_cornell` moved the image by X −0.86 % / Y −0.27 % / Z +0.12 % mean,
   medians within 0.1 %). **On the GPU too since 0.263.1** — the device carries the same three-technique
-  estimator: `DSurfMap` (the host's dense lattice uploaded as it stands, so both sides bin by
+  estimator: `DSurfMap` (the host's hashed lattice uploaded as it stands, so both sides bin by
   one rule), `dSurfMergeAt` gathering per camera *vertex*, and a device weight that finally
   carries BOTH merge kinds. That last part is the reason the port could not be partial: with a
   single kappa the camera-side `segSumM` could be left unscaled and multiplied once in the
@@ -10516,7 +10516,11 @@ as the one at fault.
   A bucket's low part is its cell's place in its block (`mergeBucket`), in which the 27 cells
   around any site all differ, so a site never reads one bucket twice and counts each vertex once
   however the blocks collide; it touches at most eight blocks, two cache lines of table each, as
-  the dense lattice kept neighbours together. Within a bucket the vertices keep their binning
+  the dense lattice kept neighbours together, and the host's walk (`mergeForEachBucket`) hashes
+  each of them once (`mergeSlot`, 32-bit: the GPU multiplies 64-bit integers in software). One
+  set of pieces serves the three maps: the corner rule (`mergeLatticeOver`, half a cell below the
+  points), the host's counting sort (`mergeBin`) and walk, the device's key kernel (`kMergeKey`)
+  and bin sequence (`mergeBinDevice`: key, stable sort by bucket, each bucket's start). Within a bucket the vertices keep their binning
   order, so a site meets its cells' vertices in the order the dense lattice gave, and the CPU's
   merges are bit-identical to it. `FTRACE_MERGE_TABLE=<k>` holds the slots to at most `k` (a
   power of two; 1: one block of 27 buckets that every block shares), which
@@ -13378,7 +13382,7 @@ runs its own cases first (exit 2 where the scanner itself is wrong), and runs af
   uncapped copy, or the other capped unit's, held to its cap -- so the link could again refuse
   after an edit there (the shared headers' host-and-device helpers -- `ggx.h`, `bluenoise.h`,
   `pov_noise.h`, `pov_functions.h`, `pattern.h`, `stochtile.h`, `worley.h`, `gabor.h`,
-  `lighttree.h`, `gatherplane.h`, `photonmap.h`, `lens.h`, `curvature.h`, `cell_walk.h`, `merge_grid.h`, `rng.h` -- are
+  `lighttree.h`, `gatherplane.h`, `lens.h`, `curvature.h`, `cell_walk.h`, `merge_grid.h`, `rng.h` -- are
   `FT_UNIT_INLINE`, `unit_linkage.h`: `static` in a capped unit, plain `inline` in every other, so
   that a host TU's external inline caller means one function everywhere -- `static` for all, as
   0.450.10 had it, broke the host's ODR -- and keyed by the unit, the same in its host and device

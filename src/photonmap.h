@@ -19,7 +19,6 @@
 // spectral-irradiance reconstruction (see the ROADMAP open question) and is exact for
 // a directly-viewed diffuse surface.
 #pragma once
-#include "unit_linkage.h"   // FT_UNIT_INLINE
 #include <vector>
 #include <cmath>
 #include <algorithm>
@@ -88,6 +87,16 @@ struct Photon {
 // A per-thread deposit bank: the split (position, payload) pair that a photon pass appends
 // to, mirroring PhotonMap's own split layout so the concatenation into the map is a plain
 // append of both arrays. The two vectors are always the same length.
+struct PhotonBank {
+    std::vector<Vec3>   pos;
+    std::vector<Photon> payload;
+    size_t size() const { return payload.size(); }
+    void push(const Vec3& p, const Vec3& n, float power, float lambda) {
+        pos.push_back(p);
+        payload.push_back(Photon{n, power, lambda});
+    }
+};
+
 // The photon map's lattice is the merge maps' hashed one (merge_grid.h, mergeBucket), shared with
 // the device's gathers (dPmNeighborhood, kSppmCellKey), which must find each photon in the bucket
 // the host's counting sort put it in.
@@ -109,20 +118,9 @@ struct Photon {
 // buckets a photon that is ~13 extra distance tests across a 3x3x3 neighbourhood, against the
 // hundreds of genuine candidates a tuned gather visits. A gather's 27 cells always fall in 27
 // different buckets, so none is read twice -- two sharing one would count its photons twice.
-
-
-struct PhotonBank {
-    std::vector<Vec3>   pos;
-    std::vector<Photon> payload;
-    size_t size() const { return payload.size(); }
-    void push(const Vec3& p, const Vec3& n, float power, float lambda) {
-        pos.push_back(p);
-        payload.push_back(Photon{n, power, lambda});
-    }
-};
-
-// Uniform hash grid over deposited photons. After build(), the three per-photon arrays
-// are reordered together into cell-contiguous runs and `cellStart` gives each cell's
+//
+// The hash grid over deposited photons. After build(), the three per-photon arrays
+// are reordered together into bucket-contiguous runs and `cellStart` gives each bucket's
 // [begin,end) slice — a flat, pointer-free layout (counting sort) that ports directly to
 // the GPU. Index k addresses the same photon in `pos[k]` / `photons[k]` / `cie[k]`.
 //
@@ -156,9 +154,8 @@ struct PhotonMap {
     // radius for; only the CAUSTIC map turns it on (see main.cpp -pmadaptive).
     double    kGather  = 0.0;
 
-    // grid geometry
-    Vec3   lo{0, 0, 0};            // cell-lattice origin (padded bbox min)
-    double cellSize = 0.02;
+    // grid geometry: cells the gather radius wide (merge_grid.h)
+    MergeLattice lat{{0, 0, 0}, 0.02, 0};
     // Padded bbox cell dims. PURELY DIAGNOSTIC since 0.199.6 — the lattice is hashed, so
     // nothing indexes through these and their product is never formed (it overflows a long
     // long on a fine grid over a large scene, which is the whole reason the dense grid went).
@@ -167,13 +164,12 @@ struct PhotonMap {
     int    nx = 1, ny = 1, nz = 1;
     // Bucket runs: bucket b occupies [cellStart[b], cellStart[b+1]). Size bucketCount() + 1.
     std::vector<int> cellStart;
-    unsigned int tableMask = 0;    // mergeBucketMask of the photon count
 
-    long long bucketCount() const { return (long long)mergeBucketCount(tableMask); }
+    long long bucketCount() const { return (long long)mergeBucketCount(lat.mask); }
 
     // Bucket for an integer cell coordinate.
     unsigned int cellIndex(int ix, int iy, int iz) const {
-        return mergeBucket(ix, iy, iz, tableMask);
+        return mergeBucket(ix, iy, iz, lat.mask);
     }
     // Integer cell coordinate of a world point. NOT clamped to the bbox: with a hashed
     // lattice there is no "outside the array" to defend against, and clamping was actively
@@ -181,9 +177,9 @@ struct PhotonMap {
     // its 3x3x3 neighbourhood lost the far row. Unclamped, the neighbourhood straddles the
     // boundary correctly and the extra cells are simply empty.
     void cellCoord(const Vec3& p, int& ix, int& iy, int& iz) const {
-        ix = mergeCellCoord(p.x, lo.x, cellSize);
-        iy = mergeCellCoord(p.y, lo.y, cellSize);
-        iz = mergeCellCoord(p.z, lo.z, cellSize);
+        ix = mergeCellCoord(p.x, lat.lo[0], lat.cell);
+        iy = mergeCellCoord(p.y, lat.lo[1], lat.cell);
+        iz = mergeCellCoord(p.z, lat.lo[2], lat.cell);
     }
 
     // Bin the deposited photons into a uniform grid of cell size `r` (== gather radius,
@@ -197,9 +193,10 @@ struct PhotonMap {
 
     void buildGrid(double r) {
         radius = r;
-        cellSize = (r > 0.0) ? r : 1e-6;
+        const double cellSize = (r > 0.0) ? r : 1e-6;
         if (photons.empty()) {
-            nx = ny = nz = 1; tableMask = 0; cellStart.assign(mergeBucketCount(0) + 1, 0);
+            nx = ny = nz = 1; lat = MergeLattice{{0, 0, 0}, cellSize, 0};
+            cellStart.assign(mergeBucketCount(0) + 1, 0);
             cie.clear(); pos.clear(); return;
         }
 
@@ -208,44 +205,28 @@ struct PhotonMap {
             mn.x = std::min(mn.x, p.x); mn.y = std::min(mn.y, p.y); mn.z = std::min(mn.z, p.z);
             mx.x = std::max(mx.x, p.x); mx.y = std::max(mx.y, p.y); mx.z = std::max(mx.z, p.z);
         }
-        // Pad by half a cell so the lattice origin sits strictly below every photon (the
-        // integer coords stay non-negative, which is not required by the hash but keeps the
-        // diagnostic dims below meaningful).
-        lo = mn - Vec3{cellSize, cellSize, cellSize} * 0.5;
-        Vec3 ext = (mx - lo) + Vec3{cellSize, cellSize, cellSize} * 0.5;
+        lat = mergeLatticeOver(mn.x, mn.y, mn.z, cellSize, photons.size());
         // Diagnostic only, and clamped into int: a fine lattice over a large scene can want
         // billions of cells per axis, which is exactly the situation the hash exists to make
-        // affordable — it must not overflow the number we merely PRINT.
+        // affordable — it must not overflow the number we merely PRINT. The box half a cell
+        // past the photons each side.
+        const Vec3 ext = (mx - mn) + Vec3{cellSize, cellSize, cellSize};
         auto dim = [](double e, double c) {
             const double d = std::ceil(e / c);
             return (int)std::min(std::max(d, 1.0), 2.0e9);
         };
         nx = dim(ext.x, cellSize); ny = dim(ext.y, cellSize); nz = dim(ext.z, cellSize);
 
-        // Pass 1: count photons per BUCKET.
-        tableMask = mergeBucketMask(photons.size());
-        const size_t tableSize = mergeBucketCount(tableMask);
-        std::vector<int> cellOf(photons.size());
-        ftalloc::resize(cellStart, tableSize + 1, "the photon grid bucket table", "-n");
-        std::fill(cellStart.begin(), cellStart.end(), 0);
-        for (size_t i = 0; i < photons.size(); ++i) {
-            int ix, iy, iz; cellCoord(pos[i], ix, iy, iz);
-            int c = (int)cellIndex(ix, iy, iz);
-            cellOf[i] = c;
-            ++cellStart[c + 1];
-        }
-        // Prefix sum -> cellStart[b] = begin offset of bucket b.
-        for (unsigned int c = 0; c < tableSize; ++c) cellStart[c + 1] += cellStart[c];
-
-        // Pass 2: scatter into cell-contiguous order. pos[] and photons[] are permuted by
-        // the SAME cursor walk, so index k keeps addressing one photon across both.
+        // Bin, then permute pos[] and photons[] by the SAME order, so index k keeps
+        // addressing one photon across both.
+        std::vector<int> order;
+        mergeBin(lat, photons.size(), [&](size_t i) -> const Vec3& { return pos[i]; }, cellStart, order,
+                 "the photon grid bucket table", "-n");
         std::vector<Photon> sorted(photons.size());
         std::vector<Vec3>   sortedPos(pos.size());
-        std::vector<int> cursor(cellStart.begin(), cellStart.end() - 1);
-        for (size_t i = 0; i < photons.size(); ++i) {
-            const int d = cursor[cellOf[i]]++;
-            sorted[d]    = photons[i];
-            sortedPos[d] = pos[i];
+        for (size_t k = 0; k < order.size(); ++k) {
+            sorted[k]    = photons[(size_t)order[k]];
+            sortedPos[k] = pos[(size_t)order[k]];
         }
         photons.swap(sorted);
         pos.swap(sortedPos);
@@ -431,38 +412,29 @@ struct PhotonMap {
     double gatherSlack(double fiberR) const { return gatherBandSlack(radius, fiberR); }
 
     // Same, but with an explicit query radius `r`. The 3x3x3 cell neighbourhood only
-    // covers radii up to the grid cell size, so the CALLER MUST ensure r <= cellSize
+    // covers radii up to the grid cell size, so the CALLER MUST ensure r <= lat.cell
     // (true for PPM/SPPM, where the grid is built at the largest current per-pixel
     // radius and every pixel's radius only shrinks from there).
     template <class F>
     void queryR(const Vec3& p, double r, F&& fn) const {
         if (photons.empty()) return;
-        int ix, iy, iz; cellCoord(p, ix, iy, iz);
         const double r2 = r * r;
         long long cand = 0;   // the candidates tested: a gather's cost, for the CPU refresh
         // No per-axis bounds tests: the lattice is hashed, so an out-of-bbox cell coordinate is
-        // a legal bucket lookup that simply finds no photon within r (or finds an aliased one
-        // and rejects it on distance, below).
-        for (int dz = -1; dz <= 1; ++dz) {
-            int cz = iz + dz;
-            for (int dy = -1; dy <= 1; ++dy) {
-                int cy = iy + dy;
-                for (int dx = -1; dx <= 1; ++dx) {
-                    int cx = ix + dx;
-                    int c = (int)cellIndex(cx, cy, cz);
-                    // The reject scan reads ONLY pos[] (see the layout note on PhotonMap):
-                    // ~85% of the candidates in this 3x3x3 box fail the test, and for those
-                    // the fat payload record is never touched at all.
-                    const Vec3* __restrict pp = pos.data();
-                    cand += cellStart[c + 1] - cellStart[c];
-                    for (int k = cellStart[c]; k < cellStart[c + 1]; ++k) {
-                        Vec3 d = p - pp[k];
-                        double d2 = dot(d, d);
-                        if (d2 <= r2) fn(photons[k], d2, k);
-                    }
-                }
+        // a legal bucket lookup that simply finds no photon within r (or finds a stray and
+        // rejects it on distance, below).
+        mergeForEachBucket(lat, p.x, p.y, p.z, [&](unsigned int c) {
+            // The reject scan reads ONLY pos[] (see the layout note on PhotonMap): ~85% of the
+            // candidates in this 3x3x3 box fail the test, and for those the fat payload record
+            // is never touched at all.
+            const Vec3* __restrict pp = pos.data();
+            cand += cellStart[c + 1] - cellStart[c];
+            for (int k = cellStart[c]; k < cellStart[c + 1]; ++k) {
+                Vec3 d = p - pp[k];
+                double d2 = dot(d, d);
+                if (d2 <= r2) fn(photons[k], d2, k);
             }
-        }
+        });
         bdpt::tlCandidates() += cand;
     }
 
@@ -513,35 +485,27 @@ struct PhotonMap {
         int hist[kAdaptBins] = {0};
         const double r2 = radius * radius;
         const double invR2 = 1.0 / r2;
-        int ix, iy, iz; cellCoord(p, ix, iy, iz);
         long long cand = 0;   // the candidates tested, as queryR counts them
-        for (int dz = -1; dz <= 1; ++dz) {
-            const int cz = iz + dz;
-            for (int dy = -1; dy <= 1; ++dy) {
-                const int cy = iy + dy;
-                for (int dx = -1; dx <= 1; ++dx) {
-                    const int c = (int)cellIndex(ix + dx, cy, cz);
-                    const Vec3* __restrict pp = pos.data();
-                    cand += cellStart[c + 1] - cellStart[c];
-                    for (int k = cellStart[c]; k < cellStart[c + 1]; ++k) {
-                        Vec3 d = p - pp[k];
-                        const double d2 = dot(d, d);
-                        if (d2 > r2) continue;
-                        bool farSide;
-                        if (!onGatherSurfaceSided(p, n, pp[k], photons[k].n, d2, slack, twoSided,
-                                                  farSide)) continue;
-                        // Shell index: t in (2^-(i+1), 2^-i] -> i. ilogb(t) is the exponent e
-                        // with t = m*2^e, m in [1,2), so i = -e-1. d2 == 0 lands in the
-                        // innermost shell (ilogb(0) is FP_ILOGB0, clamped below).
-                        const double t = d2 * invR2;
-                        int i = (t > 0.0) ? -std::ilogb(t) - 1 : (kAdaptBins - 1);
-                        if (i < 0) i = 0;
-                        if (i >= kAdaptBins) i = kAdaptBins - 1;
-                        ++hist[i];
-                    }
-                }
+        mergeForEachBucket(lat, p.x, p.y, p.z, [&](unsigned int c) {
+            const Vec3* __restrict pp = pos.data();
+            cand += cellStart[c + 1] - cellStart[c];
+            for (int k = cellStart[c]; k < cellStart[c + 1]; ++k) {
+                Vec3 d = p - pp[k];
+                const double d2 = dot(d, d);
+                if (d2 > r2) continue;
+                bool farSide;
+                if (!onGatherSurfaceSided(p, n, pp[k], photons[k].n, d2, slack, twoSided,
+                                          farSide)) continue;
+                // Shell index: t in (2^-(i+1), 2^-i] -> i. ilogb(t) is the exponent e
+                // with t = m*2^e, m in [1,2), so i = -e-1. d2 == 0 lands in the
+                // innermost shell (ilogb(0) is FP_ILOGB0, clamped below).
+                const double t = d2 * invR2;
+                int i = (t > 0.0) ? -std::ilogb(t) - 1 : (kAdaptBins - 1);
+                if (i < 0) i = 0;
+                if (i >= kAdaptBins) i = kAdaptBins - 1;
+                ++hist[i];
             }
-        }
+        });
         bdpt::tlCandidates() += cand;
         // Largest i (smallest shell) whose cumulative population still reaches k.
         long long C = 0;

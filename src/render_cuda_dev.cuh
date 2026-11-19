@@ -1046,9 +1046,9 @@ struct DMajorant {
 };
 
 // The walk of o + t d, t in [ta, tb], through a DMajorant's cells (cell_walk.h, the stepping
-// Renderer::majorantWalk takes on the host, so CPU and GPU renders of the same heterogeneous
-// medium cut its rays into the same spans): cellWalkNext hands back one cell and its span at a
-// time. Doubles throughout, as the tracking loops are.
+// Renderer::majorantWalk takes on the host; the spans agree to the precision of the lattice and ray
+// the device holds, float under FTRACE_GPU_FP32): cellWalkNext hands back one cell and its span at
+// a time. Doubles throughout, as the tracking loops are.
 __device__ static CellWalk dMajWalk(const DMajorant& g, const DVec3& o, const DVec3& d,
                                     double ta, double tb) {
     const double lo[3] = {g.wmin.x, g.wmin.y, g.wmin.z};
@@ -1427,7 +1427,7 @@ struct DRecScalarStop { double pos; int exprOff; int exprN; };
 // binMass/step). meanKe/power are MC-estimated on the host (finalizeEmissiveVolumes).
 struct DEmissiveVolume {
     int    mediumIndex;
-    DVec3  bmin, bmax;
+    double bmin[3], bmax[3];   // the box, in double: the host's, which its grid is walked in
     double meanKe;
     double power;
     const double* lamCdf;   // lamN+1 normalised CDF over [LAMBDA_MIN,LAMBDA_MAX]
@@ -1444,10 +1444,8 @@ struct DEmissiveVolume {
     const double* cellW;
     const double* cellCdf;
     int           nCells;
-    double        cellSum;
-    // The grid as the host walks it (EmissiveVolume::cellSize, invCell, pointNorm), its box in
-    // double: dFirePointPdf's lattice is the host's own.
-    double        boxLo[3], boxHi[3], cellSize[3], invCell[3], pointNorm;
+    // The grid as the host walks it (EmissiveVolume::cellSize, invCell, pointNorm).
+    double        cellSize[3], invCell[3], pointNorm;
     // Its term in the camera's illuminant (host twin Scene::fireG): gW * Planck(kelvin, lambda),
     // gW the fire's power over its Planck curve's integral.
     double        kelvin;
@@ -10172,11 +10170,11 @@ __device__ static void dGatherPhotonBeams(const DScene& sc, const DBeamMap& bm,
 // atomics, and a per-hit RNG stream for the stochastic transmittance of heterogeneous media),
 // so it is validated statistically: parity against the inline path (FTRACE_NOWAVEFRONT=1).
 // ---- mode J's SECOND merge kind on the device: point x point surface merges (`-jsurf`) ------
-// Device twin of surfmerge.h. The host map is already a DENSE uniform lattice (`cellStart` +
-// `order`, cell == gather radius), so it is uploaded as it stands rather than rebuilt as the
-// hashed lattice mode M's photon map uses: the gather has to bin EXACTLY the way the light pass
-// stored, and two transcriptions of one binning rule is two chances to disagree -- a
-// disagreement that does not crash, it silently gathers nothing (cf. dPmNeighborhood's note).
+// Device twin of surfmerge.h. The host map's hashed lattice (merge_grid.h: `cellStart` + `order`,
+// cell == gather radius) is uploaded as it stands, its lattice in double (MergeLattice), rather
+// than rebuilt on the device: the gather has to look where the light pass binned, and a second
+// binning is a second chance to disagree -- a disagreement that does not crash, it silently gathers
+// nothing (cf. dPmNeighborhood's note).
 // Device twin of bdpt.h's FTRACE_J_HALF (0 = both halves, 1 = connections only, 2 = merges
 // only). Both halves keep the SAME MIS weights they have in a full render, so the two sum to
 // it -- which is what makes a CPU-vs-GPU comparison of ONE half a clean measurement.
@@ -13279,9 +13277,9 @@ __device__ static bool genPhoton(const DScene& sc, const DCamSet& cs,
         // Planck-at-emitKelvin CDF. beta = grandTotal*ke/(meanKe*dLam*p(lambda)) so the
         // isotropic 1/(4pi)/(dist^2*Omega) splat reproduces the emission line-integral
         // (host twin: render.h tracePhoton volume-birth branch).
-        DVec3 origin = DVec3{ (Real)(ev.bmin.x + (ev.bmax.x - ev.bmin.x) * (double)rng.uniform()),
-                              (Real)(ev.bmin.y + (ev.bmax.y - ev.bmin.y) * (double)rng.uniform()),
-                              (Real)(ev.bmin.z + (ev.bmax.z - ev.bmin.z) * (double)rng.uniform()) };
+        DVec3 origin = DVec3{ (Real)(ev.bmin[0] + (ev.bmax[0] - ev.bmin[0]) * (double)rng.uniform()),
+                              (Real)(ev.bmin[1] + (ev.bmax[1] - ev.bmin[1]) * (double)rng.uniform()),
+                              (Real)(ev.bmin[2] + (ev.bmax[2] - ev.bmin[2]) * (double)rng.uniform()) };
         double pdfLam = 0.0;
         double lam = dEmissionSampleLambda(ev, (double)rng.uniform(), pdfLam);
         lambda = (Real)lam;
@@ -16093,11 +16091,10 @@ __device__ static DVec3 dFireCellPoint(const DEmissiveVolume& v, double u0, doub
     const int i = lo % v.gres[0];
     const int j = (lo / v.gres[0]) % v.gres[1];
     const int k = lo / (v.gres[0] * v.gres[1]);
-    const double ex = (double)v.bmax.x - v.bmin.x, ey = (double)v.bmax.y - v.bmin.y,
-                 ez = (double)v.bmax.z - v.bmin.z;
-    return DVec3((Real)(v.bmin.x + ex * (i + u1) / v.gres[0]),
-                 (Real)(v.bmin.y + ey * (j + u2) / v.gres[1]),
-                 (Real)(v.bmin.z + ez * (k + u3) / v.gres[2]));
+    const double ex = v.bmax[0] - v.bmin[0], ey = v.bmax[1] - v.bmin[1], ez = v.bmax[2] - v.bmin[2];
+    return DVec3((Real)(v.bmin[0] + ex * (i + u1) / v.gres[0]),
+                 (Real)(v.bmin[1] + ey * (j + u2) / v.gres[1]),
+                 (Real)(v.bmin[2] + ez * (k + u3) / v.gres[2]));
 }
 
 // The cone half of the light-sampling mixture: its solid-angle density for direction `d` from `x`,
@@ -16108,11 +16105,10 @@ __device__ static DVec3 dFireCellPoint(const DEmissiveVolume& v, double u0, doub
 struct DFireCone { double cx, cy, cz, d2, cosMax, oneMinusCos; bool inside; };
 __device__ static DFireCone dFireCone(const DEmissiveVolume& v, const DVec3& x) {
     DFireCone c;
-    c.cx = 0.5 * ((double)v.bmin.x + v.bmax.x) - x.x;
-    c.cy = 0.5 * ((double)v.bmin.y + v.bmax.y) - x.y;
-    c.cz = 0.5 * ((double)v.bmin.z + v.bmax.z) - x.z;
-    const double ex = (double)v.bmax.x - v.bmin.x, ey = (double)v.bmax.y - v.bmin.y,
-                 ez = (double)v.bmax.z - v.bmin.z;
+    c.cx = 0.5 * (v.bmin[0] + v.bmax[0]) - x.x;
+    c.cy = 0.5 * (v.bmin[1] + v.bmax[1]) - x.y;
+    c.cz = 0.5 * (v.bmin[2] + v.bmax[2]) - x.z;
+    const double ex = v.bmax[0] - v.bmin[0], ey = v.bmax[1] - v.bmin[1], ez = v.bmax[2] - v.bmin[2];
     const double R2 = (ex * ex + ey * ey + ez * ez) * 0.25;
     c.d2 = c.cx * c.cx + c.cy * c.cy + c.cz * c.cz;
     c.inside = c.d2 <= R2;
@@ -16149,7 +16145,7 @@ __device__ static DVec3 dFireConeSample(const DEmissiveVolume& v, const DVec3& x
 __device__ static double dFirePointPdf(const DEmissiveVolume& v, const DVec3& x, const DVec3& d) {
     if (v.nCells == 0) return 0.0;
     const double xo[3] = {x.x, x.y, x.z}, dd[3] = {d.x, d.y, d.z};
-    return cellWalkT2Integral(v.boxLo, v.boxHi, v.cellSize, v.invCell, v.gres, v.cellW, v.pointNorm, xo, dd);
+    return cellWalkT2Integral(v.bmin, v.bmax, v.cellSize, v.invCell, v.gres, v.cellW, v.pointNorm, xo, dd);
 }
 
 // The light-sampling direction's density: a quarter cone (it bounds the estimate for a vertex
@@ -16175,7 +16171,8 @@ __device__ static void dFireSegment(const DScene& sc, const DVec3& o, const DVec
         if (only >= 0 && vi != only) continue;
         const DEmissiveVolume& v = sc.emissiveVolumes[vi];
         double ta, tb;
-        if (!dClipRayBox(v.bmin, v.bmax, o, d, 0.0, len, ta, tb)) continue;
+        const double ox[3] = {o.x, o.y, o.z}, dx[3] = {d.x, d.y, d.z};
+        if (!rayBoxClip(v.bmin, v.bmax, ox, dx, 0.0, len, ta, tb)) continue;
         const double wv = w(vi);
         if (!(wv > 0.0)) continue;
         const DMedium& med = sc.media[v.mediumIndex];
@@ -21452,8 +21449,8 @@ __device__ static inline void dWarpSiteAdd(const DScene& sc, const DMergeFootpri
 // A merge site's entries -- its 27 cells' photons or light vertices -- as one list, the cells in walk
 // order (dz outermost, dx innermost), of which this caller takes entries lane, lane + lanes, ...:
 // (0, 1) one thread's whole list, (lane, 32) a warp's share, so a warp spends ceil(entries / 32)
-// rounds on the site, not a round or more a cell. `cell(n, b, e)` sets neighbour cell n's entries
-// [b, e), empty off the grid; `body(k)` takes entry k. Every caller walks all 27 cells, so each
+// rounds on the site, not a round or more a cell. `cell(n, b, e)` sets neighbour cell n's bucket's
+// entries [b, e) (its cell's points and the strays sharing it); `body(k)` takes entry k. Every caller walks all 27 cells, so each
 // returns the list's length, whichever entries it took. Modes J (kWfSurfGather, dSurfMergeAt) and U
 // (dVcmMergeSum).
 template <class Cell, class Body>

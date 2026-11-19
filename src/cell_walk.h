@@ -57,8 +57,10 @@ CW_HD void cellWalkInit(CellWalk& w, const double lo[3], const double cs[3], con
                         const int n[3], const double o[3], const double d[3], double ta, double tb) {
     for (int k = 0; k < 3; ++k) {
         w.n[k] = n[k];
-        const int i = (int)floor((o[k] + d[k] * ta - lo[k]) * ic[k]);
-        w.c[k] = i < 0 ? 0 : (i >= n[k] ? n[k] - 1 : i);
+        // Clamped in double before the conversion, so that a start far off the lattice or a NaN
+        // (which takes the low cell) converts defined.
+        const double f = floor((o[k] + d[k] * ta - lo[k]) * ic[k]);
+        w.c[k] = f >= 0.0 ? (f < (double)n[k] ? (int)f : n[k] - 1) : 0;
         if (d[k] >= 1e-12) {
             w.step[k] = 1;
             w.tNext[k] = (lo[k] + (w.c[k] + 1) * cs[k] - o[k]) / d[k];

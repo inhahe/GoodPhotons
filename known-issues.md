@@ -201,6 +201,52 @@ to 0.25 renders as a 150 nm one within 2e-3, 1.0e-3 measured (its body's escape 
 on 0.450.1 it rendered as the unmapped 600 nm, 1.9 off), the `thinfilm` control byte for byte, and
 the three misspellings stop the load (on 0.450.1 they loaded).
 
+## DONE (2026-11-19, 0.450.23): REVIEW-0450J — what the Opus (max) and Fable (xhigh) reviews of 0.450.19-0.450.21 found
+
+`/code-review max` (Opus, 14 findings) and `/code-review xhigh` (Fable, 12) of 4697faa..d05c0f0
+(the hashed merge lattice for modes U, J, M and S, the cell walk's follow-ups), one after the
+other in the review worktree; eight found by both. Neither found a high-severity regression; each
+finding was checked against the code. **Fixed in 0.450.22**, between the review and this entry:
+the device's photon and surface maps placing a site in a float-rounded lattice (both;
+GPU-MERGE-FLOAT-LATTICE). **Fixed in 0.450.23:**
+
+* **One lattice, written once** (both): the three host maps (VcmGrid, SurfMap, PhotonMap) hold a
+  `MergeLattice` and share merge_grid.h's corner rule (`mergeLatticeOver`: half a cell below the
+  points, where SurfMap had taken a whole one), counting sort (`mergeBin`, its table named to an
+  out-of-memory report -- VcmGrid's and SurfMap's had lost ftalloc's naming, Fable) and 27-bucket
+  walk (`mergeForEachBucket`); the device's three key kernels are one template (`kMergeKey`) and its
+  three bin sequences one function (`mergeBinDevice`).
+* **27 hash mixes a site** (both): the walk hashes each of the at most eight blocks a site's cells
+  lie in once, and the mix (`mergeSlot`) is 32-bit -- a GPU multiplies 64-bit integers in software.
+* **Mode U's bucket table could stop a render mid-session** (both): it grew per pass through the
+  fatal `ensureDevCap`, outside the session's budget; it is allocated at session start beside the
+  cell keys, at the most a pass can need, so a shortage there halves the light subpaths instead.
+* **`(int)floor(NaN)` in `cellWalkInit`** (both): clamped in double first, a NaN taking the low cell.
+* **The device fire's box twice** (both): `DEmissiveVolume` keeps one box, in double (every reader:
+  the cell point, the cone, the segment clip, the point pdf), and no `cellSum`, which nothing read.
+* **Dead code and stale text** (both): `tryDevCap`'s `most`, which nothing passed (folded into
+  `ensureDevCap`); photonmap.h's `unit_linkage.h` and its place in the shared-helper lists; the
+  lattice rationale moved out of `PhotonBank`'s comment; comments that still described the dense
+  lattice, its coarsening or "the same spans"; REFERENCE.md's `-checkcellwalk` sections and the
+  sparse box's figure, and `FTRACE_MERGE_TABLE` documented there.
+* **Two bugs logged, not fixed** (both): GPU-MERGE-FLOAT-LATTICE was fixed in 0.450.22;
+  GATHER-BASE-MIRROR-M turned out to be the check's noise (fixed in the check), and on the way
+  showed MIRROR-BASE-GPU, open below until its cause is placed.
+
+**Verified:** check_merge_table (all four modes, both devices, and -checkpmgrid at 27 buckets),
+-checkpmgrid, -checkcellwalk, the device probe, check_vcm_grid_cap and the fire checks
+(check_fire_r on the GPU, check_fire_modes) pass. Against 0.450.22, check_bitid is identical but
+mode M (frames within 0.015 % in the mean, its radius sampled from re-hashed buckets) and GPU M and
+S's floor; fur and CPU fire byte-identical; GPU fire R within 2e-5 in the mean, its light sample
+now drawn from the box its pdf is walked in.
+
+**Not changed (yet): the strays** (both) -- a bucket's points from other blocks sharing its slot,
+about 13 a site at two buckets a point, which the distance test rejects but which mode U's device
+counts into a site's population, so a site with no light vertex in reach rarely reads 0 and runs
+the merge path, and a site near the queue's threshold is queued; mode J's device counts them into
+the work its redraws are paced by. Exact alternatives (a slot's block key, a block map) cost memory
+or build work; the choice waits on the idle-machine timing of MERGE-HASH-TIMING.
+
 ## DONE (2026-11-19, 0.450.20): REVIEW-0450I — what the Opus (max) and Fable (xhigh) reviews of SLAB-DDA-COPIES found
 
 `/code-review max` (Opus, 8 findings) and `/code-review xhigh` (Fable, 13) of 026f410..4697faa
@@ -410,14 +456,38 @@ SurfMap's doubling rule (Fable): a different map with its own padding and no dev
 with. The vertex-count-blind cap's clearing of a 64 M-cell table each CPU pass where it binds
 (Fable): VCM-SPARSE-LATTICE.
 
-## OPEN (2026-11-19, bug): GATHER-BASE-MIRROR-M — CPU mode M reads the floor beside a mirror box's base 7 % dark
+## OPEN (2026-11-19, bug): MIRROR-BASE-GPU — GPU modes M and S read the floor at a mirror box's base 2.5 % over the CPU's
 
-`tools/check_gather_base.py` fails one row: the mirror box, CPU mode M, the ring of floor 0-2 cm
-from the base, 0.929 of mode R (tolerance 7 %); `M_cpu_gageom` the same. Every other row passes,
-GPU mode M reads that ring 1.031 and CPU mode S 0.996, so it is CPU mode M's alone. The same
-digits on 0.450.17, 0.450.20 and 0.450.21, so it predates this week's work; the check was last
-edited in 0.434.14, when it passed. **Next:** bisect between 0.434.14 and 0.450.17 (CPU mode M
-only, so a host-only build serves), then find what the mirror's base ring loses.
+check_gather_base's mirror box (3 cm, on a lit floor, `-pmradius 0.1`), the ring of floor 0-2 cm
+from its base: GPU mode M 1.0226 of mode R over 8 seeds (seed to seed 0.988-1.049, the mean's
+error 0.7 %), CPU mode M 0.996 (16 samples, 8 seeds, 0.5 %) and 0.9886 at the GPU's own 8 M
+photons (4 seeds); GPU mode S 1.021 against CPU mode S 0.996 in the check's own run. The 2-5 cm ring
+agrees (GPU 0.963-0.965, CPU 0.964-0.967), as does the diffuse box's 0-2 cm ring (1.003 against
+1.002), so it is the mirror's base alone, on the device alone, in both photon modes. That ring is
+direct light and the mirror's reflection of the lamp, not the photon maps -- CPU mode M reads it
+the same to four digits at 2 M and 8 M photons -- so the suspect is what the two modes share
+there: the gather footprint's probe (which passes faces holding no photons, a mirror's among them,
+but must count an opaque one as a crossing), or the device's direct light beside a mirror.
+Placed so far: **not the footprint** -- with `-gatherarea 0` the gap stays (GPU 0.972, CPU 0.939, 4
+seeds each, the 2-5 cm ring 0.749 on both); **not the photons** -- the GPU's ring is the same to
+three digits at 2 M photons and 8 M, as the CPU's is; **not the reference** -- CPU mode R reads it
+1.0018 of GPU mode R. So it is the GPU's camera-side estimate in modes M and S at a floor point beside
+a mirror: its direct light, or a path from it off the mirror to the lamp, about 2.5 % over the
+CPU's. **Next:** split that estimate by its terms on both devices (direct light alone; the
+specular continuation alone) to find which one the GPU over-counts.
+
+## DONE (2026-11-19, the check): GATHER-BASE-MIRROR-M — check_gather_base's mirror ring under CPU mode M was noise, not a regression
+
+`tools/check_gather_base.py` failed one row: the mirror box, CPU mode M, the floor 0-2 cm from the
+base, 0.929 of mode R (tolerance 7 %), the same digits on 0.450.17, 0.450.20 and 0.450.21. Over 8
+seeds at the check's own 4 samples one seed reads anywhere from 0.917 to 1.056 (the check takes two,
+an error of 3.5 %), their mean 0.967: the ring is direct light and the mirror's reflection of the
+lamp, both drawn per camera sample, so 8 M photons for 2 M leave every seed's value unchanged to
+four digits, and 16 samples bring one seed's spread to 1.5 % and the mean to 0.996. A bisect from
+0.434.14 (1.0525) found only the noise redrawn: 0.434.24 (mode M's golden-ratio wavelengths) took
+the two-seed value to 0.9759, the 2-5 cm ring unmoved (0.9668 -> 0.9650). **Fixed:** the check's
+two CPU mode M cases take 16 samples, as its GPU case does; the mirror's ring reads 0.978. The
+measurements also showed MIRROR-BASE-GPU.
 
 ## DONE (2026-11-19, 0.450.22): GPU-MERGE-FLOAT-LATTICE — the device's merge gathers placed a site in a float-rounded lattice
 

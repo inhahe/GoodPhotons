@@ -162,9 +162,7 @@ struct SurfMap {
     long long devPaths = 0;
     long long devCap = 0;
 
-    Vec3 lo{0, 0, 0};
-    double cell = 1.0;
-    unsigned int mask = 0;        // mergeBucketMask of the photon count
+    MergeLattice lat{{0, 0, 0}, 1.0, 0};   // cells the gather radius wide
     std::vector<int> cellStart;   // bucket b's photons are order[cellStart[b] .. cellStart[b + 1])
     std::vector<int> order;       // photon indices, bucket-contiguous
     // Bytes held by the containers above (their capacity), for a cache that budgets maps by size.
@@ -195,64 +193,39 @@ struct SurfMap {
         const size_t j = (size_t)pts[i].misIdx;
         return j < mis.size() ? &mis[j] : nullptr;
     }
-    void cellCoord(const Vec3& p, int& ix, int& iy, int& iz) const {
-        ix = mergeCellCoord(p.x, lo.x, cell);
-        iy = mergeCellCoord(p.y, lo.y, cell);
-        iz = mergeCellCoord(p.z, lo.z, cell);
-    }
-
     // The radius alone, without the grid: for a map the device grids itself (render_cuda.h
     // cudaJSurfOnDevice), which reads only its photon count, emission count and radius.
     void radiusOnly(double r) {
         radius = (r > 0.0) ? r : 1e-6;
-        cell = radius;
-        mask = 0;
+        lat = MergeLattice{{0, 0, 0}, radius, 0};
         cellStart.clear(); cellStart.shrink_to_fit();
         order.clear(); order.shrink_to_fit();
     }
     // `r` is the gather radius; the cell is sized to it so a query touches 3x3x3 cells.
     void build(double r) {
         radius = (r > 0.0) ? r : 1e-6;
-        cell = radius;
         const size_t n = pts.size();
-        if (n == 0) { mask = 0; cellStart.assign(mergeBucketCount(0) + 1, 0); order.clear(); return; }
-        Vec3 mn = pts[0].p;
+        Vec3 mn = n ? pts[0].p : Vec3{0, 0, 0};
         for (const SurfPhoton& q : pts) {
             mn.x = std::min(mn.x, q.p.x); mn.y = std::min(mn.y, q.p.y); mn.z = std::min(mn.z, q.p.z);
         }
-        // The corner a cell below the photons, as the device's.
-        lo = mn - Vec3{cell, cell, cell};
-        mask = mergeBucketMask(n);
-        const size_t nBuckets = mergeBucketCount(mask);
-        std::vector<unsigned int> bucketOf(n);
-        cellStart.assign(nBuckets + 1, 0);
-        for (size_t i = 0; i < n; ++i) {
-            int ix, iy, iz; cellCoord(pts[i].p, ix, iy, iz);
-            const unsigned int c = mergeBucket(ix, iy, iz, mask);
-            bucketOf[i] = c; ++cellStart[(size_t)c + 1];
-        }
-        for (size_t c = 0; c < nBuckets; ++c) cellStart[c + 1] += cellStart[c];
-        order.assign(n, 0);
-        std::vector<int> cursor(cellStart.begin(), cellStart.end() - 1);
-        for (size_t i = 0; i < n; ++i) order[(size_t)cursor[bucketOf[i]]++] = (int)i;
+        lat = mergeLatticeOver(mn.x, mn.y, mn.z, radius, n);
+        mergeBin(lat, n, [&](size_t i) -> const Vec3& { return pts[i].p; }, cellStart, order,
+                 "the surface-merge grid", "-jsurf-count");
     }
 
     // fn(photonIndex) for every photon within `radius` of p.
     template <class F>
     void query(const Vec3& p, F&& fn) const {
         if (order.empty()) return;
-        int ix, iy, iz; cellCoord(p, ix, iy, iz);
         const double r2 = radius * radius;
-        for (int dz = -1; dz <= 1; ++dz)
-        for (int dy = -1; dy <= 1; ++dy)
-        for (int dx = -1; dx <= 1; ++dx) {
-            const unsigned int c = mergeBucket(ix + dx, iy + dy, iz + dz, mask);
+        mergeForEachBucket(lat, p.x, p.y, p.z, [&](unsigned int c) {
             for (int k = cellStart[c]; k < cellStart[(size_t)c + 1]; ++k) {
                 const int idx = order[(size_t)k];
                 const Vec3 d = p - pts[(size_t)idx].p;
                 if (dot(d, d) <= r2) fn(idx);
             }
-        }
+        });
     }
 };
 
