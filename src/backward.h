@@ -1354,12 +1354,12 @@ struct BackwardRenderer {
     //
     // The MIS weight against the lobe-sampling strategy is a ratio of DENSITIES, which are
     // geometric, so it is computed once at `lambdaCam` and shared -- exactly as neeLightHero does
-    // for its bundle. `dLam` is the quadrature bin width: the estimator stops being one MC sample
-    // over lambda and becomes a K-bin sum of the same integral, which is where the colour noise
-    // goes. Glossy vertices only (`nb` is required): a fiber's BCSDF needs its own per-wavelength
-    // rebuild and is not handled here.
+    // for its bundle. `dLam[k]` is wavelength k's quadrature weight, its cell's width: the estimator
+    // stops being one MC sample over lambda and becomes a K-cell sum of the same integral, which is
+    // where the colour noise goes. Glossy vertices only (`nb` is required): a fiber's BCSDF needs its
+    // own per-wavelength rebuild and is not handled here.
     void neeLightSpecGlossy(const Scene& scene, const Hit& h, const NeeBsdf& nb,
-                            const double* lam, const double* thrRatio, int K, double dLam,
+                            const double* lam, const double* thrRatio, int K, const double* dLam,
                             double lambdaCam, double thrScalar, Pcg32& rng,
                             double* xyz) const {
         const Vec3 ngo = orientedGeoN(h);
@@ -1398,15 +1398,15 @@ struct BackwardRenderer {
                                                  lam, KK, Tr, rng);
             if (h.extMat >= 0)   // the leg inside the vertex's solid (legAbsorption)
                 for (int k = 0; k < KK; ++k) Tr[k] *= legAbsorption(scene, h.extMat, dist, lam[k]);
-            const double gWeight = w * selW * wMis * thrScalar * dLam;
-            if (!(gWeight > 0.0)) continue;
+            const double gBase = w * selW * wMis * thrScalar;
+            if (!(gBase > 0.0)) continue;
             // the coat on a coated vertex's lobe (render.h coatF: a body's way in, a coat's
             // reflection; 1 for a bare one): `nb` is the vertex's own material and arrival
             const CoatEval ce = coatEval(scene, *nb.m, h, nb.wo, wiConn);
             for (int k = 0; k < KK; ++k) {
                 const double f = bdpt::bsdfF(*nb.m, h.n, nb.wo, wiConn, lam[k], scene, &h) * ce.at(lam[k]);
                 if (!(f > 0.0)) continue;
-                const double v = gWeight * thrRatio[k] * f * em.spdFn(lam[k]) * Tr[k];
+                const double v = gBase * dLam[k] * thrRatio[k] * f * em.spdFn(lam[k]) * Tr[k];
                 if (!(v > 0.0)) continue;
                 xyz[0] += cieX(lam[k]) * v;
                 xyz[1] += cieY(lam[k]) * v;
@@ -1428,7 +1428,7 @@ struct BackwardRenderer {
     // `sigBins` (optional) is the fiber's absorption already tabulated at `lam` -- the caller owns
     // that cache because the grid type lives above this header. Null means invert per bin.
     bool neeLightSpecHair(const Scene& scene, const Hit& h, const Material& m, const HairShade& hs,
-                          const double* lam, const double* thrRatio, int K, double dLam,
+                          const double* lam, const double* thrRatio, int K, const double* dLam,
                           double lambdaCam, double thrScalar, const double* sigBins,
                           Pcg32& rng, double* xyz) const {
         if (hs.b.kappa > 0.0) return false;
@@ -1462,14 +1462,14 @@ struct BackwardRenderer {
                                                  lam, KK, Tr, rng);
             if (h.extMat >= 0)   // the leg inside the vertex's solid (legAbsorption)
                 for (int k = 0; k < KK; ++k) Tr[k] *= legAbsorption(scene, h.extMat, dist, lam[k]);
-            const double gWeight = w * selW * thrScalar * dLam / PI;   // rho/PI with rho == 1
-            if (!(gWeight > 0.0)) continue;
+            const double gBase = w * selW * thrScalar;
+            if (!(gBase > 0.0)) continue;
             for (int k = 0; k < KK; ++k) {
                 const double sig = sigBins ? sigBins[k] : hairSigmaAAt(scene, m, h, lam[k]);
                 const double resp = hair::fFromLobes(la, sig, hairSpecularFrom(m, lam[k], hs.specPat))
                                     / fCam;                     // the angular half cancels
                 if (!(resp > 0.0)) continue;
-                const double v = gWeight * thrRatio[k] * resp * em.spdFn(lam[k]) * Tr[k];
+                const double v = gBase * dLam[k] / PI * thrRatio[k] * resp * em.spdFn(lam[k]) * Tr[k];   // rho/PI, rho 1
                 if (!(v > 0.0)) continue;
                 xyz[0] += cieX(lam[k]) * v;
                 xyz[1] += cieY(lam[k]) * v;

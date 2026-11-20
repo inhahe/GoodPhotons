@@ -9165,8 +9165,10 @@ private:
         if (sa || ss) {
             Spectrum a = sa ? evalSpectrum(sa->val) : constantSpectrum(0.0);
             Spectrum s = ss ? evalSpectrum(ss->val) : constantSpectrum(0.0);
-            med.sigma_a = [a, invL](double w) { return a(w) * invL; };
-            med.sigma_s = [s, invL](double w) { return s(w) * invL; };
+            // A scaled spectrum rather than a closure, so a table keeps its knots for whoever reads
+            // them (the device's exact tables, the spectral carrier's cuts); the same product.
+            med.sigma_a = scaledSpectrum(a, invL);
+            med.sigma_s = scaledSpectrum(s, invL);
         } else {
             double sigmaT = dblOf(b, "sigma_t", 0.0) * invL;
             double albedo = dblOf(b, "albedo", 0.9);

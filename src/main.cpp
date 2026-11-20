@@ -22905,9 +22905,9 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
     // the camera visible points (stochastic PPM), traces N photons, gathers, and updates the
     // radius/flux. -n = photons PER PASS, -spp = number of passes (or a -time/-noise budget).
     if (mode == 'S') {
+        reportSpecCells(scene);
         // A scene's cameras were judged before the run (resolveCameraModes), but a built-in
         // scene, or one with no camera block, comes straight here.
-        reportSpecCells(scene);
         if (const char* unsupported = modeFeatureUnsupported(scene, 'S', cam.projection)) {
             std::fprintf(stderr, "[mode S] this scene uses %s, which SPPM (mode S) does not "
                                  "render; render it in mode R, B, or M with -beams instead.\n",

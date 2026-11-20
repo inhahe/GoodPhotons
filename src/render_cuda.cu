@@ -952,11 +952,8 @@ static void setSceneScale(const Scene& scene) {
     const double lenScale = scene.lenScale;
     CUDA_CHECK(cudaMemcpyToSymbol(gpu::c_lenScale, &lenScale, sizeof lenScale));
 }
-// ...and with it gpu::c_specCells, the spectral carrier's cells of the same scene (null where it splits
-// no bin): both from the uploaded DScene, at the same points.
 static void dSetLenScale(const gpu::DScene& sc) {
     CUDA_CHECK(cudaMemcpyToSymbol(gpu::c_lenScale, &sc.lenScale, sizeof sc.lenScale));
-    CUDA_CHECK(cudaMemcpyToSymbol(gpu::c_specCells, &sc.specCells, sizeof sc.specCells));
 }
 
 static void buildUploadScene(const Scene& scene, DUpload& up) {
@@ -2091,8 +2088,11 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
     if (scene.specCells.split()) {
         const SpecCells& c = scene.specCells;
         DSpecCells hc{};
+        if (c.n > kSpecCellsMax) throw std::logic_error("buildUploadScene: more spectral cells than the carrier holds");
         hc.n = c.n;
-        for (int i = 0; i < c.n; ++i) { hc.lo[i] = c.lo[i]; hc.hi[i] = c.hi[i]; hc.lam[i] = c.lam[i]; }
+        for (int i = 0; i < c.n; ++i) {
+            hc.hi[i] = c.hi[i]; hc.lam[i] = c.lam[i]; hc.width[i] = c.width[i]; hc.mass[i] = c.mass[i];
+        }
         for (int k = 0; k < kBandProbeBins; ++k) { hc.first[k] = c.first[k]; hc.count[k] = c.count[k]; }
         DSpecCells* d = nullptr;
         CUDA_CHECK(cudaMalloc(&d, sizeof hc));
@@ -2100,7 +2100,6 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
         keep(d);
         sc.specCells = d;
     }
-    dSetLenScale(sc);
     sc.jBeamDomR2  = scene.jBeamDomainR2;
     // `cavity` probe settings (O3 stage 2). The host loader has already resolved the
     // radius (explicit `cavity_radius`, else 2% of the scene AABB diagonal) and the
@@ -2341,7 +2340,7 @@ static void sceneOrHeld(const Scene& scene, const CudaSceneHold* held, DUpload& 
         throw std::logic_error(std::string(who) + ": the held device scene is not the scene being rendered");
     up.sc = held->up.sc;
     up.sceneId = held->up.sceneId; up.sceneGen = held->up.sceneGen; up.sceneBuild = held->up.sceneBuild;
-    dSetLenScale(up.sc);
+    setSceneScale(scene);
 }
 static double g_lastBdptOverheadSec = 0.0;
 double cudaLastBdptOverheadSec() { return g_lastBdptOverheadSec; }

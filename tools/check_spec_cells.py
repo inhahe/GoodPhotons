@@ -14,8 +14,11 @@ sRGB's channels cancel behind a gel, where XYZ's do not):
 
   - a gel opaque below 546.5 nm, clear above it (a step just past bin 9's centre);
   - the same step a quarter into the bin (541 nm);
-  - a gel ramping from 0 at 555 nm to 0.9 at 585 nm (a support edge inside bin 9);
+  - a gel ramping from 0 at 555 nm to 0.9 at 585 nm (a support edge inside bin 9, a bend inside bin 11);
+  - the first gel before a glossy wall (the spectral light sampling at the glossy vertex);
   - a half mirror whose reflectance steps from 0.05 to 0.9 at 546.5 nm;
+  - a half mirror reflecting a 3 nm Gaussian band at 550 nm, and one with a 1 nm shortpass edge at
+    546.5 nm (analytic spectra, sampled rather than read from knots);
   - check_coat_modes' tank, its thin-film ball's substrate absorbing above 546.5 nm only: a coin whose
     branch is impossible on one side of the step.
 
@@ -26,66 +29,33 @@ import os
 import re
 import sys
 
-import numpy as np
-
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 NL = chr(10)
 sys.path.insert(0, os.path.join(ROOT, "tools"))
-from check_glossy_nee_media import tile_stats, tile_verdict  # noqa: E402
-from check_radiance_eta2 import TANK  # noqa: E402
+from check_glossy_nee_media import SRGB_TO_XYZ as M, tile_stats, tile_verdict  # noqa: E402
+from check_coat_modes import filter_scene, half_mirror, partial_tank  # noqa: E402
 import check_glossy_nee_media as gnm  # noqa: E402
 
 SPLIT = re.compile(r"\[specgather\] the spectral carrier's 24 bins split at")
 TOL = 0.03
 TANK_TOL = 0.05   # check_coat_modes' for the same tank: its upper tiles are dark
-# linear sRGB (D65) to XYZ
-M = np.array([[0.4124, 0.3576, 0.1805], [0.2126, 0.7152, 0.0722], [0.0193, 0.1192, 0.9505]])
-
-
-def gel(table):
-    return [
-        'camera "c" { eye 0 0.6 -2.5  look_at 0 0.6 0  up 0 1 0  fov_y 30  film { res 64 48 } }',
-        'material "white" { type diffuse  reflect 0.7 }',
-        'material "gel" { type filter  transmit table { %s } }' % table,
-        'quad { origin -3 0 -3   u 0 0 6   v 6 0 0   material white }',
-        'quad { origin -3 0 1.5  u 6 0 0   v 0 3 0   material white }',
-        'quad { origin -0.6 0.05 -0.5  u 1.2 0 0  v 0 1.2 0  material gel }',
-        'light area { origin -0.5 2.4 0.3  u 1 0 0  v 0 0 1  normal 0 -1 0  power 150  spd preset:d65 }',
-    ]
-
-
-MIRROR = [
-    'camera "c" { eye 0 0.6 -2.5  look_at 0 0.6 0  up 0 1 0  fov_y 30  film { res 64 48 } }',
-    'material "white" { type diffuse  reflect 0.7 }',
-    'material "hm" { type halfmirror  reflect table { 380:0.05 546.5:0.05 546.52:0.9 780:0.9 } }',
-    'quad { origin -3 0 -3   u 0 0 6   v 6 0 0   material white }',
-    'quad { origin 1.5 0 -3  u 0 3 0   v 0 0 6   material white }',
-    'quad { origin -0.6 0.05 -0.6  u 1.2 0 1.2  v 0 1.2 0  material hm }',
-    'light area { origin -0.5 2.4 -0.5  u 1 0 0  v 0 0 1  normal 0 -1 0  power 150  spd preset:d65 }',
-]
-
-
-def tank():
-    """check_coat_modes' partial tank with the substrate's step at 546.5 nm, inside bin 9."""
-    out = []
-    for ln in TANK:
-        if ln.startswith('camera'):
-            out.append('camera "c" { eye 0 0.45 -1.5  look_at 0 0.4 0  up 0 1 0  fov_y 26  film { res 64 48 } }')
-        elif ln.startswith('material "water"'):
-            out += ['material "water" { type dielectric  ior 1.333  priority 1 }',
-                    'material "redcoat" { type thinfilm  ior 1.5  film_ior 1.38  film_thickness 300'
-                    '  substrate_k table { 380:0 546.5:0 546.52:2 780:2 }  priority 1 }']
-        else:
-            out.append(ln.replace("radius 0.25  material white", "radius 0.25  material redcoat"))
-    return out
+# (case, device) pairs a bug elsewhere leaves wrong, reported KNOWN instead of failing: the host's forward
+# photon pass reads a half mirror with an analytic reflectance about half bright (known-issues
+# HOST-HALFMIRROR-ANALYTIC; 0.450.44 alike). Remove an entry when its bug is fixed.
+KNOWN = {("mir_short", "cpu")}
 
 
 CASES = [
-    ("gel_centre", gel("380:0 546.5:0 546.52:0.9 780:0.9")),
-    ("gel_quarter", gel("380:0 541.0:0 541.02:0.9 780:0.9")),
-    ("gel_ramp", gel("380:0 555:0 585:0.9 780:0.9")),
-    ("mirror", MIRROR),
-    ("tank", tank()),
+    ("gel_centre", filter_scene("table { 380:0 546.5:0 546.52:0.9 780:0.9 }")),
+    ("gel_quarter", filter_scene("table { 380:0 541.0:0 541.02:0.9 780:0.9 }")),
+    ("gel_ramp", filter_scene("table { 380:0 555:0 585:0.9 780:0.9 }")),
+    ("gel_glossy", filter_scene("table { 380:0 546.5:0 546.52:0.9 780:0.9 }",
+                                "type glossy  reflect 0.7  roughness 0.3")),
+    ("mirror", half_mirror("table { 380:0.05 546.5:0.05 546.52:0.9 780:0.9 }")),
+    ("mir_gauss", half_mirror("gaussian center=550 sigma=3 amp=0.9")),
+    ("mir_short", half_mirror("shortpass edge=546.5 slope=1 amp=0.9")),
+    # check_coat_modes' tank, its substrate stepping inside bin 9: a coin impossible on one side.
+    ("tank", partial_tank("table { 380:0 546.5:0 546.52:2 780:2 }")),
 ]
 
 
@@ -97,6 +67,10 @@ def main():
     ap.add_argument("--no-gpu", action="store_true")
     ap.add_argument("--cases", default=",".join(n for n, _ in CASES), help="the cases to run, comma-separated")
     a = ap.parse_args()
+    known = [n for n, _ in CASES]
+    asked = [c for c in a.cases.split(",") if c]
+    if not asked or any(c not in known for c in asked):
+        ap.error("--cases: one or more of " + ", ".join(known))
     exe, d = os.path.abspath(a.exe), os.path.abspath(a.out)
     os.makedirs(d, exist_ok=True)
     devs = ["cpu"] if a.no_gpu else ["cpu", "gpu"]
@@ -109,7 +83,7 @@ def main():
         return p
     gnm.subprocess.run = run_logged
     ok = True
-    for name, lines in [c for c in CASES if c[0] in a.cases.split(",")]:
+    for name, lines in [c for c in CASES if c[0] in asked]:
         with open(os.path.join(d, name + ".ftsl"), "w", encoding="utf-8", newline="") as f:
             f.write(NL.join(lines) + NL)
         # The tank's upper tiles are dark and lit through water and the ball's coat: mode R wants 8192
@@ -117,7 +91,7 @@ def main():
         if name != "tank":
             ref = (["-mode", "R"], "cpu", 4 * a.spp)
         else:
-            ref = (["-mode", "R"], "cpu", 1024) if a.no_gpu else (["-mode", "R"], "gpu", 8192)
+            ref = (["-mode", "R"], "cpu" if a.no_gpu else "gpu", 8192)
         rr = gnm.render_seeds(exe, d, name + ".ftsl", name + "_R", ref[0], ref[1], ref[2], rgb=True)
         rx = [x @ M.T for x in rr]
         for mode, args in (("M", ["-mode", "M", "-n", "20000000"]), ("S", ["-mode", "S", "-n", "2000000"])):
@@ -137,8 +111,9 @@ def main():
                     ratio, z, bad = tile_verdict(x1, x0, TANK_TOL if name == "tank" else TOL)
                     good &= not bad.any()
                     parts.append("%s worst x%.3f (%.1f sigma)" % (cname, ratio.flat[int(z.argmax())], z.max()))
-                ok &= good
-                print("%s: %s, mode %s%s / mode R: %s%s" % ("ok" if good else "FAIL", name, mode,
+                known = (name, dev) in KNOWN
+                ok &= good or (known and said)
+                print("%s: %s, mode %s%s / mode R: %s%s" % ("ok" if good else ("KNOWN" if known else "FAIL"), name, mode,
                       " (device)" if dev == "gpu" else "", ", ".join(parts), "" if said else "; NO split line"),
                       flush=True)
     print("PASS" if ok else "FAILED")

@@ -1181,10 +1181,12 @@ that converges to the same physical image.
   **Colour along the camera walk.** The camera walk runs at one wavelength and the map holds
   photons of every wavelength, so the walk carries the spectral factors it met (glass, gels,
   coloured mirrors, coats, media) over a grid of wavelengths and each photon reads the cell its
-  own wavelength falls in. The grid is 24 bins of 19.6 nm, and since 0.451.0 they are split where
-  one of the scene's `table { … }` spectra steps sharply inside a bin, bends sharply, or leaves zero
-  (up to 16 cuts), so a gel, filter or mirror whose spectrum steps inside a bin reads correctly on
-  both sides of the step. Before then such a step was read at the bin's centre, up to 28 % off in a channel
+  own wavelength falls in. The grid is 24 bins of 19.6 nm, and since 0.451.0 they are split where a
+  spectrum the walk folds is far from linear across a bin (up to 16 cuts) -- a step, a sharp bend, a
+  narrow band, a soft edge, a point where it leaves zero, whether it is a `table { … }`, a `gaussian`,
+  a `shortpass` or any other curve -- so a gel, filter or mirror whose spectrum steps inside a bin
+  reads correctly on both sides of the step. A scene that wants more cuts says so
+  (`[specgather] warning: …`). Before then such a step was read at the bin's centre, up to 28 % off in a channel
   (a gel opaque below 546.5 nm read mode R's green 0.72). Where a render's bins were split it
   says so: `[specgather] the spectral carrier's 24 bins split at … nm`. Mode `S` carries the same
   grid.

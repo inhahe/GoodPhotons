@@ -322,6 +322,102 @@ act (Sysinternals `handle.exe` on the locked path, which build.bat could run whe
 exclude the build directory from the scanner if that is it, or have build.bat retry the failed step
 once; and have it say plainly, last, that ftrace.exe was NOT updated.
 
+## OPEN (2026-11-20): HOST-HALFMIRROR-ANALYTIC — on the CPU a half mirror whose reflectance is an analytic curve renders about half as bright in modes M, S and B
+
+Found by check_spec_cells' `mir_short` case (0.451.1), and in 0.450.44 alike, so older than the spectral
+carrier's cells. A half mirror with `reflect shortpass edge=546.5 slope=1 amp=0.9` over check_coat_modes'
+half-mirror room, the middle of the frame in XYZ against mode R (host and GPU mode R agree to 1 %):
+CPU mode M 0.54 / 0.52 / 0.49, CPU mode S alike, CPU mode B 0.89 / 0.94 / 1.00; GPU mode M 0.99-1.00.
+With `amp=0.2`, CPU mode M 0.69 / 0.63 / 0.54. The same edge on a gel (`transmit shortpass ...`) reads
+1.00, and a half mirror stepping at 546.5 nm as a `table` reads 1.00 in either direction, with a floor of
+0.05 or of 0. So it is the host's forward photon pass at a half mirror whose reflectance is not a table:
+the host's camera walks agree with the device's, and the forward interaction (interactPhotonSpecular's
+HalfMirror case, and the hero bundle's de-hero before it) reads the same for both kinds of curve, so the
+difference is somewhere the photon pass treats the curve, not yet found. Reproduce:
+`scraps/_short_probe.py ftrace.exe mir_short.ftsl` after check_spec_cells has written its scenes.
+check_spec_cells reports the CPU pair KNOWN until it is fixed.
+
+## OPEN (2026-11-20): SPECGATHER-CELL-CENTROID — modes M and S read a carrier cell at its middle, not where the light's wavelengths in it lie
+
+Found by the Opus review of 0.451.0 (REVIEW-0451). A cell of the spectral carrier (SpecCells) is read
+at its midpoint -- an unsplit bin at its centre -- whatever the emission does inside it. Under a light
+whose power in the cell sits away from that point (a line, `rgbline` at 589 nm), every photon reads a
+factor that slopes across the cell where the light is not: the reviewer's sodium-like light behind a gel
+ramping over 570-600 nm reads about 20 % dark in modes M and S, mode R exact. **Proper fix:** read each
+cell at the emission's centroid inside it (the mean wavelength under the walk's density, computed as
+SpecCells::setMass computes the mass), exact for a line and the midpoint for a flat light. It moves
+every chromatic mode M and S image slightly (the centre and the centroid differ under any real
+illuminant), so it is its own change, measured on check_coat_modes, check_spec_cells and a line-lit
+case of its own; and the device then takes the cells always, not only where a bin is split.
+
+## OPEN (2026-11-20): JSPEC-BIN-RESOLUTION — the beam gather's carrier and mode J's still read a step inside a 24-nm bin at its centre
+
+Found by the Opus review of 0.451.0 (REVIEW-0451). Mode M's camera walk reads its own carrier in the
+scene's cells since 0.451.0 (SPECGATHER-BIN-RESOLUTION), but hands the beam gather (`-beams`) a `JSpec`
+on the 24 uniform bins (`toJSpec`: each bin's centre's cell), and mode J's and mode U's carrier is that
+`JSpec` throughout. So fog seen through a gel stepping inside a bin reads the old misreading: behind
+check_spec_cells' 546.5 nm gel, bin 9 takes the gel's 0 and `JSpec::at` interpolates 0 to 0.9 between
+546 and 566 nm (about 0.2 at 550 nm where the gel passes 0.9). **Proper fix:** put `JSpec` on the
+scene's cells too (its `r[]` sized `kSpecCellsMax`, read by cell rather than interpolated across a cut,
+its support's `hole` mask per cell) -- which grows the per-segment and per-vertex carrier
+JSPEC-CARRIER-SIZE measures (120 B to about 190 B), so it goes with that entry's half-precision bins.
+
+## DONE (2026-11-20, 0.451.1): REVIEW-0451 — what the Opus (max) and Fable (xhigh) reviews of 0.451.0 found
+
+Opus (max) and Fable (xhigh) reviewed 365b2fe..79be75f. Each finding was checked against the code.
+
+**Fixed:**
+* **The cuts came from tables alone, and from every material** (both): an analytic spectrum
+  (`gaussian`, `shortpass`, `rgbbox`, a lambda) and a medium's table -- the loader wrapped it in a
+  closure (Fable) -- never cut a bin; a table still sloped at its first or last knot bent there unseen
+  (Fable); a diffuse colour the gather reads per photon took cuts that bought nothing; an absorption
+  leaving zero counted as a support edge and outranked real steps; cuts past the budget were dropped
+  without a word. The cuts are chosen by the error a cell leaves (`chooseSpecCuts`): every folded
+  spectrum sampled 80 times a bin, a cell judged by the larger of its spectra's distance from linear
+  across it (the RMS residual of a least-squares line) and their mean's distance from the centre read,
+  plus, for factors, the support share; the worst cell cut where it lowers the worse half most, to 1 %
+  of each spectrum's range; diffuse and translucent colours and emission left out; a cut snapped to a
+  table's knot; a warning past 16 cuts. (The centre read's bias alone was tried first: a step centred in
+  its cell reads the mean exactly there, and the selector spent its cuts on slivers that moved cells'
+  middles onto a soft edge.) A medium's spectra are `scaledSpectrum`s now, so the device reads their
+  tables exactly too. `tableKnots` / `tableCuts` are gone; `spectrumKnots` gives a monotone table's own
+  knots on request (`kMonoSub` 1).
+* **The spectral NEE read the carrier on the uniform bins** (both): at a glossy vertex behind a gel
+  stepping inside a bin, the direct light took bin 9's centre for the whole bin. The NEE's quadrature
+  runs over the cells, each weighted by its width (host and device; `DSPECNEE_MAXK` holds 40).
+* **A fiber's absorption table was on the uniform bins on the CPU** (both), its cells on the GPU:
+  `hairSigmaCells` tabulates it per cell for modes M and S and their NEE. (A table colour counts as
+  constant: the old comment's premise was wrong.)
+* **The device found the cells through a process-wide pointer into memory each upload frees** (both):
+  `DSpecThr::init(sc)` takes them from `DScene::specCells`, the cell count clamped to the arrays; the
+  global is gone, and `setSceneScale` / `dSetLenScale` are as they were. The host's masses and widths go
+  up with the cells, so both backends divide by the same numbers.
+* **Mode S's per-pixel stride and the carrier's cells agree by construction only** (both): the host
+  throws where they differ, the device bounds its loop by both. Its gather hoists the pixel's ratio row
+  out of the photon loop, and a ratio is read by its cell (`ratioAt`) rather than a cell's wavelength
+  looked up again (Fable).
+* `--cases` naming no case passed with nothing rendered (both): unknown names are refused. `--no-gpu`
+  gave the tank the 1024-sample reference its dark tiles defeat (Fable): 8192 on the CPU too. The scene
+  builders and the sRGB to XYZ matrix the two checks each kept are check_coat_modes' and
+  check_glossy_nee_media's (both). Comments that narrated the measurements state the constraint, and
+  design.md's 24-bin descriptions, the NEE's comment, the `[specgather]` line's reason, kBandProbeBins'
+  and binMass's readers and hairSigmaBins' were stale (both).
+* check_spec_cells adds a glossy wall behind the gel's step (the NEE), a half mirror's 3 nm Gaussian
+  band and its 1 nm shortpass edge (the analytic spectra).
+
+**Logged, not fixed here:** reading a cell at the emission's centroid rather than its middle (Opus):
+SPECGATHER-CELL-CENTROID, its own change since it moves every chromatic image. The beam gather's and mode
+J's carrier on the uniform bins (Opus): JSPEC-BIN-RESOLUTION.
+
+**Dismissed:** templating the device carrier on its cell count (Opus) for the 0.8 % its 40-cell arrays
+cost mode M: a second instantiation of mode M's and mode S's kernels for that. Unused materials'
+spectra still count for cuts (Opus, part of the selection finding): with the cuts chosen by error, an
+unused smooth material costs nothing, and a budget overrun is said. That check_coat_modes' green gel
+lost its linear-sRGB check (Fable): sRGB is a fixed linear map of XYZ, so X, Y and Z each within 5 %
+bound each sRGB channel's error absolutely (red's by 0.05 (3.24 X + 1.54 Y + 0.50 Z)); behind a green
+gel red is a small difference of those terms, which makes the same absolute error a large relative one,
+in 0.450.44 as now -- there its errors happened to cancel.
+
 ## DONE (2026-11-20, 0.450.45): REVIEW-0450R — what the Opus (max) and Fable (xhigh) reviews of 0.450.43-0.450.44 found
 
 Both read a354380..69feeb2 (the scan's lists cut to index events, the queued glass-sphere connections);
@@ -6782,7 +6878,8 @@ S run eight (`SEEDS`).
 ## DONE (2026-11-20, 0.451.0): SPECGATHER-BIN-RESOLUTION — mode M's 24-bin carrier misreads a spectral edge or kink inside one of its bins
 
 **Fixed: the carrier's bins are split where the scene's tables step, bend or leave zero** (`SpecCells`,
-design.md SPECGATHER, "The cells"). Both of the carrier's readings were at fault, not only the support's
+design.md SPECGATHER, "The cells"; since 0.451.1 wherever any spectrum the walk folds is far from linear
+across a bin, tables and analytic curves alike: REVIEW-0451). Both of the carrier's readings were at fault, not only the support's
 sum this entry first blamed. A photon read its bin's centre whatever side of a step its own wavelength
 was on -- the numerator, local but large where the bin holds much of a colour-matching weight (bin 9,
 536-556 nm, green's peak) -- and the support's sum counted the bin's whole walk density on one side,

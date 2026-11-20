@@ -548,9 +548,10 @@ struct SpecThr {
     // multiplied by `thr` leaves the walk's spectral factors evaluated at lamP and everything
     // else untouched; past a partial coin, times pscale (see `p`). A dead path (cam == 0)
     // contributes nothing either way.
-    double ratio(double lamP) const {
+    double ratio(double lamP) const { return ratioAt(binOf(lamP)); }
+    double ratioAt(int k) const {                                  // cell k's
         if (!any) return 1.0;
-        return (cam > 1e-300) ? v[binOf(lamP)] / cam * pscale : 0.0;
+        return (cam > 1e-300) ? v[k] / cam * pscale : 0.0;
     }
     // The largest ratio over the bins (1 when nothing chromatic was folded). Where coloured glass
     // absorbs at the walk's own wavelength and passes others, `cam` and with it the scalar
@@ -604,8 +605,8 @@ inline void reportSpecCells(const Scene& scene) {
             std::snprintf(buf, sizeof buf, " %.2f", c.lo[j]);
             at += buf;
         }
-    std::printf("[specgather] the spectral carrier's %d bins split at%s nm (%d cells), where the scene's "
-                "tables step or leave zero\n", kBandProbeBins, at.c_str(), c.n);
+    std::printf("[specgather] the spectral carrier's %d bins split at%s nm (%d cells), where a spectrum "
+                "the camera walk folds is not near linear across a bin\n", kBandProbeBins, at.c_str(), c.n);
 }
 
 // SPECGATHER: a layered coat's coat-or-body coin at every bin, as modes J and U fold it, for mode M's
@@ -1358,16 +1359,15 @@ inline Vec3 photonGather(const Scene& scene, const PhotonMap& pm, Ray ray, doubl
                 if (gneeOn) {
                     const BackwardRenderer::NeeBsdf nb{&m, ray.d * -1.0};
                     if (specNeeOn()) {
-                        // SPECTRAL (0.341.0): one shadow ray, evaluated over the SpecThr grid,
+                        // SPECTRAL (0.341.0): one shadow ray, evaluated over the carrier's cells,
                         // so a gold lobe under a warm light stops painting each sample one
                         // colour. The walk's own spectral throughput rides in through `ratio`.
-                        double lamG[kBandProbeBins], ratG[kBandProbeBins], xyz[3] = {0, 0, 0};
-                        for (int k = 0; k < kBandProbeBins; ++k) {
-                            lamG[k] = bandBinLambda(k);
+                        double lamG[SpecThr::K], ratG[SpecThr::K], xyz[3] = {0, 0, 0};
+                        for (int k = 0; k < sthr.n; ++k) {
+                            lamG[k] = sthr.lamOf(k);
                             ratG[k] = sthr.ratio(lamG[k]);
                         }
-                        const double dLam = (LAMBDA_MAX - LAMBDA_MIN) / (double)kBandProbeBins;
-                        bwNee.neeLightSpecGlossy(scene, h, nb, lamG, ratG, kBandProbeBins, dLam,
+                        bwNee.neeLightSpecGlossy(scene, h, nb, lamG, ratG, sthr.n, sthr.cells->width,
                                                  lambda, thr, rng, xyz);
                         L += Vec3(xyz[0], xyz[1], xyz[2]);
                     } else {
@@ -1459,17 +1459,16 @@ inline Vec3 photonGather(const Scene& scene, const PhotonMap& pm, Ray ray, doubl
                 if (hairNeeOn()) {
                     bool didSpec = false;
                     if (specNeeHairOn()) {
-                        // SPECTRAL (0.343.0): one shadow ray over the SpecThr grid, so a blonde
+                        // SPECTRAL (0.343.0): one shadow ray over the carrier's cells, so a blonde
                         // fiber under a warm light stops painting each sample one colour.
-                        double lamG[kBandProbeBins], ratG[kBandProbeBins], xyz[3] = {0, 0, 0};
-                        for (int k = 0; k < kBandProbeBins; ++k) {
-                            lamG[k] = bandBinLambda(k);
+                        double lamG[SpecThr::K], ratG[SpecThr::K], xyz[3] = {0, 0, 0};
+                        for (int k = 0; k < sthr.n; ++k) {
+                            lamG[k] = sthr.lamOf(k);
                             ratG[k] = sthr.ratio(lamG[k]);
                         }
-                        const double dLam = (LAMBDA_MAX - LAMBDA_MIN) / (double)kBandProbeBins;
-                        const double* sigB = hairSigmaBins<kBandProbeBins, &bandBinLambda>(scene, m, h);
-                        didSpec = bwNee.neeLightSpecHair(scene, h, m, hs, lamG, ratG, kBandProbeBins,
-                                                         dLam, lambda, thr, sigB, rng, xyz);
+                        const double* sigB = hairSigmaCells(scene, m, h);
+                        didSpec = bwNee.neeLightSpecHair(scene, h, m, hs, lamG, ratG, sthr.n,
+                                                         sthr.cells->width, lambda, thr, sigB, rng, xyz);
                         if (didSpec) L += Vec3(xyz[0], xyz[1], xyz[2]);
                     }
                     if (!didSpec)
@@ -1519,14 +1518,14 @@ inline Vec3 photonGather(const Scene& scene, const PhotonMap& pm, Ray ray, doubl
                     // wavelength is exactly that (hair.h lobeAngular / fFromLobes). A bin whose own
                     // medulla is live (or a hero whose was) keeps the full rebuild: whether the
                     // medulla is live depends on the wavelength.
-                    // the absorption per bin: a per-material table when the colour is constant
-                    // (hairSigmaBins), else inverted at each wavelength
-                    const double* bins = hairSigmaBins<kBandProbeBins, &bandBinLambda>(scene, m, h);
+                    // the absorption per cell: a per-material table when the colour is constant
+                    // (hairSigmaCells), else inverted at each wavelength
+                    const double* bins = hairSigmaCells(scene, m, h);
                     sthr.mul([&](double lamK) {
                         // this wavelength's shade, folded from the sample's angular half where
                         // both fibers are solid and evaluated in full where not (hairFoldFCos)
                         const HairShade hk = hairShadeRetint(scene, m, h, lamK, hs,
-                                                             bins ? bins[bandBinOf(lamK)] : -1.0);
+                                                             bins ? bins[sthr.binOf(lamK)] : -1.0);
                         return clamp01(hairFoldFCos(la, hk, wl, cosLong, nullptr) / pdfH);
                     }, wCam);
                 }

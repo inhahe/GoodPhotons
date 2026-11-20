@@ -1258,8 +1258,9 @@ wavelength and then multiplied a photon sum spanning every wavelength. Exact for
 wrong in either direction for a coloured one (measured up to 14 %).
 
 `SpecThr` (`photonmap_render.h`) and `DSpecThr` / `dSpecFold` (`render_cuda.cu`) carry the same
-product over a 24-bin grid beside the scalar; the estimate reweights each photon by
-`v[bin(ph.lambda)] / cam`. The denominator `cam` is accumulated from **the very scalars that went
+product over a grid of cells beside the scalar (the scene's `SpecCells`: the 24 uniform bins, split
+where a folded factor is not near linear across one -- "The cells", below); the estimate reweights
+each photon by `v[cell(ph.lambda)] / cam`. The denominator `cam` is accumulated from **the very scalars that went
 into `thr`**, not re-sampled from the grid — that is what makes `thr * ratio` collapse exactly to
 (everything else) x v[lambda_p]. A factor is evaluated at every bin (since 0.381.7: a three-point
 flatness probe used to stand in for that, and folded a band-pass gel, zero at all three, as a flat
@@ -1291,11 +1292,11 @@ the walk's own wavelength; a walk cannot sample a branch its wavelength forbids.
 cannot take the walk's branches (`partial`: a coat opaque at some wavelengths, total internal
 reflection at some), `ratio()` divides instead by the branches' probability averaged over the
 density the walk's wavelength was drawn from (the emission sampler: sum_k Q_k p[k], Q_k its mass in
-bin k): every walk wavelength shares that denominator, so the walks that can take the branches
+cell k): every walk wavelength shares that denominator, so the walks that can take the branches
 stand in for those that cannot. Whether a walk is partial depends on its branches alone, never on
 its wavelength, so the exact importance ratio (where the support is whole) and the averaged one
-(where it is not) combine without bias; the average is taken at bin centres, the carrier's own
-resolution. A plain weight (a filter's transmission, a mirror's or glossy lobe's reflectance)
+(where it is not) combine without bias; the average is taken at the cells' wavelengths, the
+carrier's own resolution. A plain weight (a filter's transmission, a mirror's or glossy lobe's reflectance)
 that is zero in some bins is the same problem without a coin -- a walk drawn there carries nothing
 at any wavelength -- so `mul` folds its support (zero or not, per bin) into `p` too (0.381.4), as
 the device does for a fiber's per-bin weight through `mulVec`. Not the media term: a ratio-tracking
@@ -1314,30 +1315,43 @@ stack: the pixel keeps its ratio per cell (`SPPMState::vpRatio`, the device's `D
 4 B a cell a pixel -- 96 B where the scene splits no bin -- only read where `vpSpec` says some factor
 was not flat), and the gather multiplies each photon by its cell's. `tools/check_coat_modes.py` holds mode S to mode R per colour channel.
 
-**The cells (0.451.0, SPECGATHER-BIN-RESOLUTION).** The grid is the scene's `SpecCells`
+**The cells (0.451.0-0.451.1, SPECGATHER-BIN-RESOLUTION).** The grid is the scene's `SpecCells`
 (`spectrum.h`, built by `Scene::buildSpecCells` beside the emission sampler, whose mass in each cell it
-holds): the 24 uniform bins, each split where one of the scene's tables (any material's or medium's;
-`tableCuts`) steps inside it -- a segment narrower than a quarter bin across which it changes by a
-fifth of its range or more, cut at both ends -- bends (a knot whose change of slope puts a centre read
-2 % of the range off a quarter bin away), or becomes or stops being zero: the support edges first, then
-the steepest steps, then the sharpest bends, 16 cuts at most. A split cell is read at its midpoint, an unsplit bin
-at its centre with the uniform grid's own expressions, so a scene without such a table carries exactly
-what it did. Read at one wavelength, a bin with a step inside gave one side's value to the other
-side's photons, and in the support's sum its whole walk density to one side: behind a gel opaque
-below 546.5 nm (just past bin 9's centre) mode M read mode R's green 0.72 and red 1.05, a quarter into
-the bin green 1.12 and red 0.96, off a half mirror stepping there green 0.75 -- host and device alike.
-A gel ramping from 0 at 555 nm to 0.9 at 585 read Y 1.04, from the bend at 585 inside bin 11, whose
-centre read the plateau. With the cells every factor is linear or smooth across every cell, and a step
-reads exactly on both sides. The
-carriers' arrays hold `kSpecCellsMax` (40); `camMediaTrSpec` / `dCamMediaTrSpec` lay the media
-vector over the cells, mode S's `vpRatio` holds a ratio per cell, and the device reads the cells
-through `c_specCells` (`DScene::specCells`, null where nothing is split, set with `c_lenScale`). What
-stays on the uniform bins: the spectral NEE's quadrature (it reads the carrier through `ratio()` at
-the bins' centres), a fiber's absorption table (`hairSigmaBins`, from a constant colour's smooth
-uplift), and the beam gather's `JSpec` (`toJSpec` reads each bin's centre's cell). Mode J's carrier
-(`JSpec`) is its own and keeps its 24 bins. `[specgather] ...` says where a render's bins were
-split; `tools/check_spec_cells.py` holds modes M and S, both devices, to mode R across steps inside a
-bin.
+holds): the 24 uniform bins, split where a spectrum the camera walk folds is not near linear across a
+cell. `chooseSpecCuts` samples each such spectrum 80 times a bin and, from the uniform bins, cuts the
+cell worst for any of them at the point that best lowers the worse half, until every cell is within
+1 % of each spectrum's largest magnitude or 16 cuts are taken (then a warning says so). A cell's error:
+the larger of how far the spectrum is from linear across it (the RMS residual of its own least-squares
+line -- linear, a centre read is right to first order for every photon's weight) and its mean from the
+centre read, and for a factor (not a coefficient) the share of the cell on the other side of a zero
+from that wavelength, a hole in the walk's support. (The centre read's bias alone was tried first: a
+step centred in its cell reads the mean exactly there, and the cuts went into slivers that moved cells'
+middles onto an edge.) Measured on the selector: one cut for a table's step, two for the 555-585 nm
+ramp (with or without its plateau knots), four for the green band-pass gel, 5-7 for a logistic edge a
+nanometre or five wide, eleven for a 3 nm Gaussian band, none for a straight line, a 40 nm Gaussian or
+an rgb colour's 25 nm sigmoid. A cut snaps to a table's knot within a sample of it, so a table's step reads exactly. The
+spectra folded: a specular material's or a fiber's reflectance and transmittance (factors), and the
+coefficients -- absorption, index, a film's, a substrate's, a coat's, a fiber's absorptions, a
+medium's. Not a diffuse or translucent colour, which the gather reads at each photon's own wavelength,
+nor emission, which places the photons and is read where they fall. Analytic spectra (`gaussian`,
+`shortpass`) are sampled like tables. A split cell is read at its midpoint, an unsplit bin at its
+centre with the uniform grid's own expressions for its ends, centre and width, so a scene whose folded
+spectra are near linear across every bin carries exactly what it did. Read at one wavelength, a bin with
+a step inside gave one side's value to the other side's photons, and in the support's sum its whole walk
+density to one side: behind a gel opaque below 546.5 nm (just past bin 9's centre) mode M read mode R's
+green 0.72 and red 1.05, a quarter into the bin green 1.12 and red 0.96, off a half mirror stepping there
+green 0.75 -- host and device alike; a gel ramping from 0 at 555 nm to 0.9 at 585 read Y 1.04, from the
+bend at 585 inside bin 11, whose centre read the plateau. The carriers' arrays hold `kSpecCellsMax`
+(40). Over the cells: `camMediaTrSpec` / `dCamMediaTrSpec`'s media vector, mode S's per-pixel ratios
+(`SPPMState::vpRatio`, `DSppmState::vpRatio`, `vpCells` a pixel), a fiber's absorption table
+(`hairSigmaCells`) and the spectral NEE's quadrature (`neeLightSpecGlossy` / `neeLightSpecHair` /
+`bkNeeLightSpecGlossy`, each cell weighted by its width). The device takes the cells from
+`DScene::specCells` (`DSpecThr::init(sc)`; null where nothing is split, and the bins then read as they
+always did), with the host's masses and widths. Left on the uniform bins: the beam gather's `JSpec`
+(`toJSpec` reads each bin's centre's cell) and mode J's carrier, which is its own (known-issues
+JSPEC-BIN-RESOLUTION). `[specgather] ...` says where a render's bins were split;
+`tools/check_spec_cells.py` holds modes M and S, both devices, to mode R across steps inside a bin, a
+bend, a glossy wall behind a step, analytic bands and edges, and a coin's support edge.
 
 **The ratio's range (0.433.1, MODEM-COMPOTE-NAN).** Where coloured glass absorbs at the walk's own
 wavelength and passes others, `cam`, and with it the scalar throughput, falls as far as the ratio

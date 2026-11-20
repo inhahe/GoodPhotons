@@ -78,6 +78,8 @@ SCENES = {
 # the forward modes), `[gpu]` lines (mode M), and the device modes U and S name (`VCM/UPS on`,
 # `SPPM on`). One list, so every check asks the same question.
 GPU_TOKENS = ("-> GPU", "[gpu]", "VCM/UPS on ", "SPPM on ")
+# Linear sRGB (D65) to XYZ, for checks that judge a colour where sRGB's channels cancel (`x @ SRGB_TO_XYZ.T`).
+SRGB_TO_XYZ = np.array([[0.4124, 0.3576, 0.1805], [0.2126, 0.7152, 0.0722], [0.0193, 0.1192, 0.9505]])
 
 
 def read_pfm(path):

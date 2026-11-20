@@ -1664,7 +1664,7 @@ struct DScene {
     double           lenScale; // the scene's length scale (host Scene::lenScale), which c_lenScale
                                // carries to the kernels: dSetLenScale before every launch on it
     const DSpecCells* specCells; // the spectral carrier's cells where the scene splits its bins, else
-                               // null (host Scene::specCells), which c_specCells carries the same way
+                               // null (host Scene::specCells; DSpecThr::init)
     DVec3  sensorOrigin, sensorUAxis, sensorVAxis;   // model A contact sensor plane
     DVec3  sceneCenter;              // env (shape==3): bounding-sphere center
     double sceneRadius;              // env (shape==3): bounding-sphere radius
@@ -16944,7 +16944,7 @@ __device__ static double bkNeeLight(const DScene& sc, const DHit& h, Real rho,
     return total;
 }
 
-#define DSPECNEE_MAXK 32   // the spectral NEE's per-thread scratch bound; it runs on the 24 uniform bins
+#define DSPECNEE_MAXK kSpecCellsMax   // the spectral NEE's per-thread scratch: one entry a carrier cell
 
 // SPECTRAL glossy NEE for mode M's gather (0.342.0; host twin backward.h neeLightSpecGlossy).
 // Same emitter loop and the same ONE shadow ray per sample as bkNeeLight -- a connection's
@@ -16953,12 +16953,12 @@ __device__ static double bkNeeLight(const DScene& sc, const DHit& h, Real rho,
 // emitter's spectrum, the shadow leg's media transmittance (one shared walk) and the walk's own
 // throughput (`thrRatio`, DSpecThr's ratio per bin). Accumulates straight into XYZ.
 //
-// `dLam` is the quadrature bin width: the term stops being one MC sample over lambda and becomes
-// a K-bin sum of the same integral, which is where the colour noise goes. The MIS weight is a
-// ratio of DENSITIES, which are geometric, so it is taken once at `lambdaCam` and shared.
+// `dLam[i]` is wavelength i's quadrature weight, its cell's width: the term stops being one MC sample
+// over lambda and becomes a K-cell sum of the same integral, which is where the colour noise goes. The
+// MIS weight is a ratio of DENSITIES, which are geometric, so it is taken once at `lambdaCam` and shared.
 __device__ static void bkNeeLightSpecGlossy(const DScene& sc, const DHit& h, const DNeeBsdf& nb,
                                             const Real* lam, const double* thrRatio, int K,
-                                            double dLam, Real lambdaCam, double thrScalar,
+                                            const double* dLam, Real lambdaCam, double thrScalar,
                                             DRng& rng, double* xyz) {
     DVec3 ngo0 = dShadedNg(h);
     DEmitterDraw draw; dPickEmitters(sc, h.p, &h.n, rng, draw);
@@ -16988,8 +16988,8 @@ __device__ static void bkNeeLightSpecGlossy(const DScene& sc, const DHit& h, con
             : g.spot
             ? (double)g.fall * (double)g.cosSurf / (double)g.dist2 * (double)g.stG
             : (double)g.G * (double)em.area * (double)g.stG;
-        const double gWeight = geom * selW * wMisG * thrScalar * dLam;
-        if (!(gWeight > 0.0)) continue;
+        const double gBase = geom * selW * wMisG * thrScalar;
+        if (!(gBase > 0.0)) continue;
         double Tr[DSPECNEE_MAXK];
         const int KK = (K < DSPECNEE_MAXK) ? K : DSPECNEE_MAXK;
         for (int i = 0; i < KK; ++i) Tr[i] = 1.0;
@@ -17002,7 +17002,7 @@ __device__ static void bkNeeLightSpecGlossy(const DScene& sc, const DHit& h, con
         for (int i = 0; i < KK; ++i) {
             const double f = dGlossyFHit(sc, *nb.m, h, nb.wo, g.wi, lam[i]) * ce.at(lam[i]);
             if (!(f > 0.0)) continue;
-            const double v = gWeight * thrRatio[i] * f
+            const double v = gBase * dLam[i] * thrRatio[i] * f
                            * (double)specLookup(em.emitSpd, lam[i]) * Tr[i];
             if (!(v > 0.0)) continue;
             xyz[0] += (double)cieX(lam[i]) * v;

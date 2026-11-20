@@ -359,10 +359,10 @@ inline void sppmVisiblePoint(const Scene& scene, Ray ray, Pcg32& rng, bool diffr
                 }
                 if (!passedThru) {
                     pastDiffuse = true;   // a fibre's scattering: no glow is seen past it
-                    const double* bins = hairSigmaBins<kBandProbeBins, &bandBinLambda>(scene, m, h);
+                    const double* bins = hairSigmaCells(scene, m, h);
                     sthr.mul([&](double lamK) {
                         const HairShade hk = hairShadeRetint(scene, m, h, lamK, hs,
-                                                             bins ? bins[bandBinOf(lamK)] : -1.0);
+                                                             bins ? bins[sthr.binOf(lamK)] : -1.0);
                         return clamp01(hairFoldFCos(la, hk, wl, cosLong, nullptr) / pdfH);
                     }, wCam);
                 }
@@ -433,8 +433,10 @@ inline void sppmPass(const Scene& scene, const Camera& cam, SPPMState& st,
                     P.vpSpec = P.vpValid && sthr.any;
                     if (P.vpSpec) {   // in float over its peak, the peak in vpThr (SpecThr::peak)
                         const double pk = sthr.peak();
+                        if (st.cells != sthr.n)   // init() was handed another scene's cells
+                            throw std::logic_error("sppm: the pixels' ratio stride is not the carrier's cells");
                         float* vr = st.ratios((size_t)y * W + x);
-                        for (int k = 0; k < sthr.n; ++k) vr[k] = (float)(sthr.ratio(sthr.lamOf(k)) / pk);
+                        for (int k = 0; k < sthr.n; ++k) vr[k] = (float)(sthr.ratioAt(k) / pk);
                         P.vpThr *= pk;
                     }
                     P.directSum += directL;
@@ -471,6 +473,7 @@ inline void sppmPass(const Scene& scene, const Camera& cam, SPPMState& st,
                 const Hit& h = P.vpHit;
                 const Material& m = scene.mats[h.matId];
                 const Vec3 gn = orientedGeoN(h);   // the true normal, as the photons carry it
+                const float* vr = P.vpSpec ? st.ratios((size_t)y * W + x) : nullptr;
                 double M = 0.0;          // photons found this pass
                 Vec3   phi{0, 0, 0};     // local flux sum (XYZ, per-photon wavelength)
                 const double slack = gatherBandSlack(P.radius, h.fiberRadius);
@@ -481,7 +484,7 @@ inline void sppmPass(const Scene& scene, const Camera& cam, SPPMState& st,
                     double rho = gatherAlbedo(scene, m, h, ph.lambda, farSide);   // a translucent's far side: rho_T
                     double f = rho * (1.0 / PI);
                     // the camera prefix's factors at this photon's wavelength (SPPM-SPECTRAL)
-                    if (P.vpSpec) f *= (double)st.ratios((size_t)y * W + x)[scene.specCells.cellOf(ph.lambda)];
+                    if (vr) f *= (double)vr[scene.specCells.cellOf(ph.lambda)];
                     phi += pm.cie[k] * (f * (double)ph.power);        // == cie(lambda_p), precomputed
                     M += 1.0;
                 });

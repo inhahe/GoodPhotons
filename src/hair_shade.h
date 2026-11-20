@@ -71,9 +71,9 @@ inline double hairSigmaAAt(const Scene& scene, const Material& m, const Hit& hit
     return std::max(0.0, m.hairSigmaA(lambda));
 }
 
-// The absorption at the K wavelengths of the mode-M spectral carrier, per material, when the
-// fiber's colour is a CONSTANT spectrum (no texture, pattern, record or vertex colour on the
-// reflect slot): computed once per thread per material, never per bounce. Null otherwise.
+// The absorption at the K wavelengths LamOf(k) of a spectral carrier's uniform bins (mode J's), per
+// material, when the fiber's colour is a CONSTANT spectrum (no texture, pattern, record or vertex colour
+// on the reflect slot): computed once per thread per material, never per bounce. Null otherwise.
 template <int K, double (*LamOf)(int)>
 inline const double* hairSigmaBins(const Scene& scene, const Material& m, const Hit& hit) {
     if (m.reflectTex >= 0 || m.reflectPat >= 0 || hit.hasVcol) return nullptr;
@@ -86,6 +86,24 @@ inline const double* hairSigmaBins(const Scene& scene, const Material& m, const 
         it = cache.emplace(&m, bins).first;
     }
     return it->second.data();
+}
+
+// The same at the wavelengths of the scene's spectral carrier cells (Scene::specCells, mode M's and mode
+// S's walk): a cell's entry at its own wavelength, so a split cell reads the absorption on its side of
+// the split. Null where hairSigmaBins' would be.
+inline const double* hairSigmaCells(const Scene& scene, const Material& m, const Hit& hit) {
+    const SpecCells& cells = scene.specCells;
+    if (m.reflectTex >= 0 || m.reflectPat >= 0 || hit.hasVcol) return nullptr;
+    { double rv; if (recordReflectBound(scene, m, hit, cells.lam[0], rv)) return nullptr; }
+    struct Entry { const SpecCells* cells; std::array<double, kSpecCellsMax> v; };
+    thread_local std::unordered_map<const Material*, Entry> cache;
+    auto it = cache.find(&m);
+    if (it == cache.end() || it->second.cells != &cells) {
+        Entry e{&cells, {}};
+        for (int k = 0; k < cells.n; ++k) e.v[(size_t)k] = hairSigmaAAt(scene, m, hit, cells.lam[k]);
+        it = cache.insert_or_assign(&m, e).first;
+    }
+    return it->second.v.data();
 }
 
 // The coverage (`opacity`) at a hit, clamped to [0,1]: the same at every wavelength.

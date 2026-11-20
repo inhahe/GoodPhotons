@@ -53,16 +53,12 @@ import argparse
 import os
 import sys
 
-import numpy as np
-
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "tools"))
-from check_glossy_nee_media import render_seeds, tile_stats, tile_stats_k, tile_verdict  # noqa: E402
+from check_glossy_nee_media import SRGB_TO_XYZ, render_seeds, tile_stats, tile_stats_k, tile_verdict  # noqa: E402
 from check_radiance_eta2 import TANK  # noqa: E402
 
 NL = chr(10)
-# linear sRGB (D65) to XYZ, for the pairs judged in XYZ
-SRGB_TO_XYZ = np.array([[0.4124, 0.3576, 0.1805], [0.2126, 0.7152, 0.0722], [0.0193, 0.1192, 0.9505]])
 SCENE = [
     'camera "c" { eye 0 0.45 -2.2  look_at 0 0.35 0  up 0 1 0  fov_y 34  film { res 64 48 } }',
     'material "floor" { type diffuse  reflect 0.6 }',
@@ -96,11 +92,11 @@ def opaque_tank(priority):
     return out
 
 
-def partial_tank():
+def partial_tank(substrate="table { 380:0 594.99:0 595.01:2 780:2 }"):
     """The water tank framed close on its ball, a thin-film body ranked as the water is, on a
-    substrate that absorbs above 595 nm only: where it is clear the priority rule suppresses the
-    surface (inside the water it is no boundary at all), and where it absorbs the coat is opaque,
-    reflecting its interference colour."""
+    substrate whose absorption is `substrate` (by default only above 595 nm): where it is clear the
+    priority rule suppresses the surface (inside the water it is no boundary at all), and where it
+    absorbs the coat is opaque, reflecting its interference colour."""
     out = []
     for ln in TANK:
         if ln.startswith('camera'):
@@ -109,41 +105,44 @@ def partial_tank():
         elif ln.startswith('material "water"'):
             out += ['material "water" { type dielectric  ior 1.333  priority 1 }',
                     'material "redcoat" { type thinfilm  ior 1.5  film_ior 1.38  film_thickness 300'
-                    '  substrate_k table { 380:0 594.99:0 595.01:2 780:2 }  priority 1 }']
+                    '  substrate_k %s  priority 1 }' % substrate]
         else:
             out.append(ln.replace("radius 0.25  material white", "radius 0.25  material redcoat"))
     return out
 
 
-FILTER = [
-    'camera "c" { eye 0 0.6 -2.5  look_at 0 0.6 0  up 0 1 0  fov_y 30  film { res 64 48 } }',
-    'material "white" { type diffuse  reflect 0.7 }',
-    'material "redgel" { type filter  transmit table { 380:0 594.99:0 595.01:0.9 780:0.9 } }',
-    'quad { origin -3 0 -3   u 0 0 6   v 6 0 0   material white }',
-    'quad { origin -3 0 1.5  u 6 0 0   v 0 3 0   material white }',
-    'quad { origin -0.6 0.05 -0.5  u 1.2 0 0  v 0 1.2 0  material redgel }',
-    'light area { origin -0.5 2.4 0.3  u 1 0 0  v 0 0 1  normal 0 -1 0  power 150  '
-    'spd preset:d65 }',
-]
+def filter_scene(transmit, wall="type diffuse  reflect 0.7"):
+    """A gel transmitting `transmit` between the camera and a lit wall of material `wall`."""
+    return [
+        'camera "c" { eye 0 0.6 -2.5  look_at 0 0.6 0  up 0 1 0  fov_y 30  film { res 64 48 } }',
+        'material "white" { type diffuse  reflect 0.7 }',
+        'material "wall" { %s }' % wall,
+        'material "redgel" { type filter  transmit %s }' % transmit,
+        'quad { origin -3 0 -3   u 0 0 6   v 6 0 0   material white }',
+        'quad { origin -3 0 1.5  u 6 0 0   v 0 3 0   material wall }',
+        'quad { origin -0.6 0.05 -0.5  u 1.2 0 0  v 0 1.2 0  material redgel }',
+        'light area { origin -0.5 2.4 0.3  u 1 0 0  v 0 0 1  normal 0 -1 0  power 150  '
+        'spd preset:d65 }',
+    ]
 
 
-GREEN_GEL = [ln.replace('material "redgel" { type filter  transmit table { 380:0 594.99:0 595.01:0.9 780:0.9 } }',
-                        'material "redgel" { type filter  transmit table { 380:0 440:0 500:0.9 '
-                        '560:0.9 600:0 780:0 } }') for ln in FILTER]
-assert GREEN_GEL != FILTER
+def half_mirror(reflect):
+    """A half mirror reflecting `reflect` (transmitting the rest) between a lit floor and a wall."""
+    return [
+        'camera "c" { eye 0 0.6 -2.5  look_at 0 0.6 0  up 0 1 0  fov_y 30  film { res 64 48 } }',
+        'material "white" { type diffuse  reflect 0.7 }',
+        'material "redmirror" { type halfmirror  reflect %s }' % reflect,
+        'quad { origin -3 0 -3   u 0 0 6   v 6 0 0   material white }',
+        'quad { origin 1.5 0 -3  u 0 3 0   v 0 0 6   material white }',
+        'quad { origin -0.6 0.05 -0.6  u 1.2 0 1.2  v 0 1.2 0  material redmirror }',
+        'light area { origin -0.5 2.4 -0.5  u 1 0 0  v 0 0 1  normal 0 -1 0  power 150  '
+        'spd preset:d65 }',
+    ]
 
 
-HALF_MIRROR = [
-    'camera "c" { eye 0 0.6 -2.5  look_at 0 0.6 0  up 0 1 0  fov_y 30  film { res 64 48 } }',
-    'material "white" { type diffuse  reflect 0.7 }',
-    'material "redmirror" { type halfmirror  reflect table { 380:0.05 594.99:0.05 595.01:0.9 '
-    '780:0.9 } }',
-    'quad { origin -3 0 -3   u 0 0 6   v 6 0 0   material white }',
-    'quad { origin 1.5 0 -3  u 0 3 0   v 0 0 6   material white }',
-    'quad { origin -0.6 0.05 -0.6  u 1.2 0 1.2  v 0 1.2 0  material redmirror }',
-    'light area { origin -0.5 2.4 -0.5  u 1 0 0  v 0 0 1  normal 0 -1 0  power 150  '
-    'spd preset:d65 }',
-]
+FILTER = filter_scene("table { 380:0 594.99:0 595.01:0.9 780:0.9 }")
+GREEN_GEL = filter_scene("table { 380:0 440:0 500:0.9 560:0.9 600:0 780:0 }")
+HALF_MIRROR = half_mirror("table { 380:0.05 594.99:0.05 595.01:0.9 780:0.9 }")
 
 
 def main():
@@ -191,11 +190,9 @@ def main():
         pairs.append(("opaque coat in water, mode %s%s: ranked below / above the water" % (
             mode, " (device)" if dev == "gpu" else ""), lo, hi))
     # The green gel is judged in XYZ: behind it linear sRGB's red and blue are small differences of
-    # large terms, which make a percent in X read several in red. Its ramps' bends and support edges
-    # split the carrier's bins (SpecCells); what is left is each cell's linear piece read at its
-    # centre where a colour-matching curve changes fast across it, 1-3 % (known-issues
-    # SPECGATHER-BIN-RESOLUTION); without the split it read X 1.03, Z 1.045, and without its every
-    # bin folded (REVIEW-0381B) x0.27 / x5.
+    # large terms, which make a percent in X read several in red. Its ramps split the carrier's bins
+    # (SpecCells); what is left is each cell's linear piece read at its centre where a
+    # colour-matching curve changes fast across it, 1-3 % (known-issues SPECGATHER-BIN-RESOLUTION).
     for name, what, ref, tol in (
             ("partial", "coat opaque in the red only, in water",
              (["-mode", "R"], "cpu", 1024) if a.no_gpu else (["-mode", "R"], "gpu", 8192), 0.05),

@@ -3737,30 +3737,32 @@ struct Scene {
         buildLightTree();
     }
 
-    // The spectral carrier's cells (SpecCells): cut where any material's or medium's table steps or
-    // leaves zero (tableCuts), the support edges first, then the steepest steps, kSpecCutsMax at most.
-    // Emission spectra are not among them: they shape the photons' wavelengths, which every cell reads
-    // where they fall, not a factor the camera walk folds.
+    // The spectral carrier's cells (SpecCells): cut where a spectrum the camera walk folds is not near
+    // linear across a bin (chooseSpecCuts, to 1 % of its range), kSpecCutsMax at most, the rest said. Folded: a specular material's (or a fiber's) reflectance and transmittance, whose zeros are
+    // holes in the walk's support, and the coefficients -- an absorption, an index, a coat's, a film's
+    // and a substrate's, a fiber's, a medium's. Not a diffuse or translucent surface's colour, which
+    // the gather reads at each photon's own wavelength, nor emission, which shapes the photons'
+    // wavelengths and is read where they fall.
     void buildSpecCells() {
-        std::vector<std::pair<double, double>> found;
-        std::vector<double> x, y;
-        auto scan = [&](const Spectrum& sp) {
-            if (sp && tableKnots(sp, x, y)) tableCuts(x, y, found);
-        };
-        for (const Material& m : mats)
-            for (const Spectrum* sp : {&m.reflect, &m.ior, &m.absorb, &m.transmit, &m.filmIor, &m.substrateK,
-                                       &m.coatAbsorb, &m.hairSpecular, &m.hairSigmaA, &m.hairMedullaSigmaS,
-                                       &m.hairMedullaSigmaA})
-                scan(*sp);
-        for (const Medium& md : media) { scan(md.sigma_a); scan(md.sigma_s); }
-        std::stable_sort(found.begin(), found.end(),
-                         [](const std::pair<double, double>& u, const std::pair<double, double>& v) {
-                             return u.first > v.first;
-                         });
-        std::vector<double> cuts;
-        for (const auto& f : found) cuts.push_back(f.second);
-        specCells.build(std::move(cuts));
+        std::vector<SpecCutCurve> folded;
+        for (const Material& m : mats) {
+            if (isSpecularType(m.type) || m.type == MatType::Hair) {
+                folded.push_back({&m.reflect, true});
+                folded.push_back({&m.transmit, true});
+            }
+            if (m.type == MatType::Hair) folded.push_back({&m.hairSpecular, true});
+            for (const Spectrum* sp : {&m.ior, &m.absorb, &m.filmIor, &m.substrateK, &m.coatAbsorb,
+                                       &m.hairSigmaA, &m.hairMedullaSigmaS, &m.hairMedullaSigmaA})
+                folded.push_back({sp, false});
+        }
+        for (const Medium& md : media) { folded.push_back({&md.sigma_a, false}); folded.push_back({&md.sigma_s, false}); }
+        double left = 0.0;
+        specCells.build(chooseSpecCuts(folded, 0.01, left));
         specCells.setMass(emitSampler);
+        if (left > 0.0)
+            std::fprintf(stderr, "[specgather] warning: the scene's spectra want more than %d cuts of the "
+                                 "spectral carrier's bins; the worst left reads %.1f %% of its range off "
+                                 "(modes M and S)\n", kSpecCutsMax, 100.0 * left);
     }
 
     // The wavelength densities of a BACKWARD camera path (backward.h renderRows) and the
