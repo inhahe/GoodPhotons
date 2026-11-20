@@ -38,10 +38,11 @@ bool cudaMemInfo(size_t* freeB, size_t* totalB);
 // walk's backend, BDPT's instantiation, mode U's bundle), so that what is weighed and what launches
 // cannot part. Mode P's is its two layers' joined.
 using GpuRoute = std::vector<const void*>;
-// Gives the route's kernels their shared-memory carveout before their first launch (render_cuda.cu's
-// preferL1): main.cpp's vramPreflight, which every GPU render and meter frame passes before it
-// launches anything, makes the call.
-void cudaRoutePrepare(const GpuRoute& r);
+// Route `a` with route `b`'s kernels after it: mode P's two layers.
+inline GpuRoute cudaRouteJoin(GpuRoute a, const GpuRoute& b) {
+    a.insert(a.end(), b.begin(), b.end());
+    return a;
+}
 // The device memory a route's kernels reserve for per-thread LOCAL storage alone: the most of their
 // local sizes times the threads the card holds resident. This is real VRAM and it is often
 // gigabytes, and the context keeps it after the kernel returns, for the next launch to reuse. If the

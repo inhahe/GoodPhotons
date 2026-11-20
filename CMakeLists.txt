@@ -40,24 +40,23 @@ if(MSVC)
     # is the next one that would hit the wall.
     # Fast math is NOT enabled: physical correctness matters more than speed for now.
     # A printf whose format string its arguments do not match -- too few (C4473), too many (C4474),
-    # the wrong type (C4477) -- reads what was never passed: an error, not a warning. (`-h` printed
-    # "within 15 0f the best map" for a "15 % of" in its text until 0.450.38.) The CUDA units' host
-    # pass takes them through -Xcompiler, below.
+    # the wrong type (C4477) -- reads what was never passed: an error, not a warning. So is a name that
+    # hides another -- a local hiding a local (C4456), a parameter (C4457), a class member (C4458) or a
+    # global (C4459) -- which an edit moving a use across a brace gets silently wrong. A header included
+    # in angle brackets (the CRT, the Windows SDK, the CUDA toolkit) is external, its warnings off, so
+    # neither the code the project does not own nor a toolkit upgrade can fail the build. The CUDA
+    # units' host pass takes the same flags through -Xcompiler, below.
     add_compile_options($<$<COMPILE_LANGUAGE:CXX>:/we4473>
                         $<$<COMPILE_LANGUAGE:CXX>:/we4474>
-                        $<$<COMPILE_LANGUAGE:CXX>:/we4477>)
-    # So is a name that hides another -- a local hiding a local (C4456), a parameter (C4457), a class
-    # member (C4458) or a global (C4459) -- which an edit moving a use across a brace gets silently
-    # wrong, and a local read before every path has set it (C4701). Cleared in 0.450.39
-    # (SHADOW-WARNINGS).
-    add_compile_options($<$<COMPILE_LANGUAGE:CXX>:/we4456>
+                        $<$<COMPILE_LANGUAGE:CXX>:/we4477>
+                        $<$<COMPILE_LANGUAGE:CXX>:/we4456>
                         $<$<COMPILE_LANGUAGE:CXX>:/we4457>
                         $<$<COMPILE_LANGUAGE:CXX>:/we4458>
                         $<$<COMPILE_LANGUAGE:CXX>:/we4459>
-                        $<$<COMPILE_LANGUAGE:CXX>:/we4701>)
-    # Two that only bury the rest: the CRT's "use the _s variant" for getenv / fopen / sscanf (C4996,
-    # 120 of them a build), and a struct padded to the alignment it asks for (C4324, which is the
-    # point of the alignas). So a build prints only what is worth reading.
+                        $<$<COMPILE_LANGUAGE:CXX>:/external:anglebrackets>
+                        $<$<COMPILE_LANGUAGE:CXX>:/external:W0>)
+    # Two that only bury the rest: the CRT's "use the _s variant" for getenv / fopen / sscanf (C4996),
+    # and a struct padded to the alignment it asks for (C4324, which is the point of the alignas).
     add_compile_definitions(_CRT_SECURE_NO_WARNINGS)
     add_compile_options($<$<COMPILE_LANGUAGE:CXX>:/wd4324>)
 endif()
@@ -215,7 +214,9 @@ if(CMAKE_CUDA_COMPILER)
     # (render_cuda_bdpt.cu, render_cuda_jsurf.cu, above).
     # CCCL 3.x (the thrust/cub shipped with CUDA 13) requires MSVC's standard-conforming
     # preprocessor; without it the thrust headers #error out. Scoped to the CUDA host
-    # pass-through so plain C++ TUs keep their default flags.
+    # pass-through so plain C++ TUs keep their default flags. The warning rules are the C++
+    # units' (above), but for C4193: CCCL pushes MSVC's warning state in one header and pops it in
+    # another, which the external-header boundary splits, so a pop finds no push.
     if(MSVC)
         target_compile_options(ftrace PRIVATE
             $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/Zc:preprocessor>
@@ -226,8 +227,10 @@ if(CMAKE_CUDA_COMPILER)
             $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/we4457>
             $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/we4458>
             $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/we4459>
-            $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/we4701>
-            $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/wd4324>)
+            $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/external:anglebrackets>
+            $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/external:W0>
+            $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/wd4324>
+            $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/wd4193>)
     endif()
     if(FTRACE_GPU_FP32)
         target_compile_definitions(ftrace PRIVATE FTRACE_GPU_FP32=1)

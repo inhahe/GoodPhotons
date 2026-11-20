@@ -278,6 +278,30 @@ SHADOW-WARNINGS.
 (CMakeLists.txt). No other call had one. Proven: the same flags refuse a scratch file's
 `printf("within 15 % of ...")` with error C4473.
 
+## DONE (2026-11-19, 0.450.41): REVIEW-0450P — what the Opus (xhigh) review of 0.450.38-0.450.40 found
+
+The batch was the help's printf, the warning sweep and REVIEW-0450O's follow-ups, mostly renames the
+compiler and check_bitid already verify: one Opus review at xhigh. No correctness bug.
+
+**Fixed:** the viewer's path-trace preview (`-viewer` / `-explore`, PV_PT) launched kBackwardRGB
+without the MaxL1 carveout -- no preflight weighs it, and since 0.450.40 the sessions' own weighings
+no longer set it either. Every launcher of a route kernel now gives the kernels it may launch their
+L1 at its top (`preferL1`), so no path depends on a preflight having run; `cudaRoutePrepare` is gone.
+design.md named the deleted `dSurfMergePhoton`. The CMake comments told the warnings' history; they
+state the rules. preferL1's comment promised a retry "at the next weighing", which no longer called
+it. The `/we` flags reached the CRT, the Windows SDK and the CUDA toolkit's headers, so a toolchain
+upgrade could fail the build over code the project does not own: angle-bracket headers are external
+at level 0 (`/external:anglebrackets /external:W0`; the CUDA host pass silences C4193, CCCL's
+warning push and pop the external boundary splits), and C4701, whose verdict moves with the optimizer,
+is a warning again. check_surf_wavefront's wide case could not tell whether its sites' queues ever
+held more than a warp: both gathers count the sites whose queue carried past a warp
+(`dSiteListWarp`'s verdict), their summary lines print it, and the wide J case and mode U's bowl case
+require it nonzero. (`_caustic_box` counts 0 at its own radius and 48 637 at five times it, so the
+requirement fails where the path does not run; the bowl's count is 123 910.) Mode P's two route joins are one helper, `cudaRouteJoin`.
+
+**Not changed:** 0.450.39 and 0.450.40 bumped VERSION with no observable change (true); their numbers
+already name those commits in known-issues, TODO and design.md, so they stand.
+
 ## DONE (2026-11-19, no change): MERGE-LAZY-TIMING — does mode J's lazy merge lobe cost or pay?
 
 fab8da8 made mode J's surface merges prepare a site's lobe (its hit rebuilt, the roughness and the

@@ -902,6 +902,7 @@ static constexpr int       kWfSegCap   = 1 << 20;    // beam segments (gpu::DWfS
 static constexpr int       kWfHitCap   = 1 << 25;    // beam hits (gpu::DWfHit)
 static constexpr long long kSurfReqCap = 1LL << 20;  // point-merge sites (gpu::DSurfReq)
 static size_t residentThreads();   // the device-memory preflight's, below
+static void preferL1(const std::vector<const void*>& ks);   // each launcher's, before it launches
 // The blocks of kSiteWarpBlock threads a warp gather (kVcmMergeGather, kWfSurfGather) is launched in for
 // `sites` queued sites, a warp each: as many as cover them, to 4096, the kernels striding over the rest.
 static int siteWarpGrid(long long sites) {
@@ -2429,6 +2430,7 @@ static void wavefrontTrace(DUpload& up, const gpu::DCamSet& cs, double* d_energy
     using namespace gpu;
     if (N <= 0) return;
     const int W = wavefrontSlots(N);   // persistent slot count
+    preferL1({(const void*)kWfInit, (const void*)kWfExtend, (const void*)kWfShade});
 
     WFState st;
 #define FT_WF_ALLOC(m, T, n) CUDA_CHECK(cudaMalloc(&st.m, (size_t)W * (size_t)(n) * sizeof(T)));
@@ -2490,6 +2492,7 @@ static void launchForward(DUpload& up, const gpu::DCamSet& cs, double* d_energy,
                           bool stableSeed = false,
                           gpu::DCamera** posedKeep = nullptr, size_t* posedCapKeep = nullptr) {
     using namespace gpu;
+    preferL1({(const void*)kTrace});
     // seedBase==0 keeps the original single-shot seed exactly; each accumulation chunk
     // passes a distinct cumulative-photon offset for an independent stream -- or, seeding
     // stably, its photons' absolute indices start there under the single-shot seed.
@@ -3322,6 +3325,7 @@ static void buildJSurfMapDevice(JSurfDev& d, const gpu::DScene& sc, const gpu::D
     int blocks = (int)((nPaths + 127) / 128);
     if (blocks < 1)    blocks = 1;
     if (blocks > 2048) blocks = 2048;      // still saturate the card on a large -n
+    preferL1({(const void*)gpu::kJSurfLightT<BDPT_DEEPDEPTH>, (const void*)gpu::kJSurfLightT<BDPT_MAXDEPTH>});
     if (deep)
         gpu::kJSurfLightT<BDPT_DEEPDEPTH><<<blocks, 128>>>(sc, cam, diffraction, maxDepth,
                                                            nPaths, salt, out);
@@ -3855,6 +3859,10 @@ Film renderBdptCuda(const Scene& scene, const Camera& cam, int resX, int resY,
     if (C > hero::kHeroMax) C = hero::kHeroMax;
     if (C < 1) C = 1;
     const BdptPick pick = bdptPick(C, up.sc.mediaN != 0, up.sc.hasGrin != 0, cam.hasLens(), maxDepth);
+    // Every kernel the launches below may take (preferL1).
+    preferL1({(const void*)bdptKernelFor(pick, false, false), (const void*)bdptKernelFor(pick, true, false),
+              (const void*)bdptKernelFor(pick, true, true), (const void*)kWfBeamHits, (const void*)kWfBeamEval,
+              (const void*)kWfSurfGather});
 
     const size_t npix = (size_t)resX * resY;
     double* d_cam   = nullptr; CUDA_CHECK(cudaMalloc(&d_cam,   npix * 3 * sizeof(double)));
@@ -4181,9 +4189,9 @@ Film renderBdptCuda(const Scene& scene, const Camera& cam, int resX, int resY,
             if (g_jSpecHost) CUDA_CHECK(cudaMalloc(&sq.spec, (size_t)cap * sizeof(DJSpec)));
             if (g_jTrSpecHost && g_jChromaHost)
                 CUDA_CHECK(cudaMalloc(&sq.chroma, (size_t)cap * 2 * DJSPEC_K * sizeof(double)));
-            CUDA_CHECK(cudaMalloc(&d_sqCounters, 2 * sizeof(int)));
-            CUDA_CHECK(cudaMemset(d_sqCounters, 0, 2 * sizeof(int)));
-            sq.nReqs = d_sqCounters; sq.overflow = d_sqCounters + 1;
+            CUDA_CHECK(cudaMalloc(&d_sqCounters, 3 * sizeof(int)));
+            CUDA_CHECK(cudaMemset(d_sqCounters, 0, 3 * sizeof(int)));
+            sq.nReqs = d_sqCounters; sq.overflow = d_sqCounters + 1; sq.carried = d_sqCounters + 2;
             for (auto& e : sqEv) CUDA_CHECK(cudaEventCreate(&e));
         } else {
             static bool said = false;
@@ -4560,13 +4568,14 @@ Film renderBdptCuda(const Scene& scene, const Camera& cam, int resX, int resY,
         if (wq.chroma) cudaFree(wq.chroma);
     }
     if (sq.reqs) {
-        int inl = 0;
+        int inl = 0, carried = 0;
         (void)cudaMemcpy(&inl, sq.overflow, sizeof(int), cudaMemcpyDeviceToHost);
+        (void)cudaMemcpy(&carried, sq.carried, sizeof(int), cudaMemcpyDeviceToHost);
         if (!g_gpuQuietRebuild && sqPaths > 0)
             std::fprintf(stderr, "[gpu] mode J point merges: %lld sites gathered a warp each "
                                  "(%.2f a path) in %.1f s of GPU time, %d inline with the queue "
-                                 "full (FTRACE_NOSURFWF=1 gathers every one inline)\n",
-                         sqSites, (double)sqSites / (double)sqPaths, sqMsGather / 1e3, inl);
+                                 "full, %d past a warp (FTRACE_NOSURFWF=1 gathers every one inline)\n",
+                         sqSites, (double)sqSites / (double)sqPaths, sqMsGather / 1e3, inl, carried);
         for (auto& e : sqEv) cudaEventDestroy(e);
         cudaFree(sq.reqs); cudaFree(d_sqCounters);
         if (sq.spec) cudaFree(sq.spec);
@@ -4662,8 +4671,9 @@ static size_t mostLocalOf(const std::vector<const void*>& ks) {
 // its registers allow, the beam queue's hit search four of nine -- and the blocks are not worth it: a
 // carveout sized to keep them (shared memory for the registers' blocks, the rest L1) put mode J back where
 // the driver's own split had it, its hit search 15 times slower (design.md, "Threading model (GPU)").
-// Set once a kernel, before its first launch; one the runtime refused is tried again at the next
-// weighing, and the first refusal said.
+// Every launcher of a route kernel calls it, at its top, with the kernels it may launch, so no launch path
+// misses it -- the viewer's preview, which no preflight weighs, among them. Set once a kernel; one the
+// runtime refused is tried again at the next call, and the first refusal said.
 static void preferL1(const std::vector<const void*>& ks) {
     if (!cudaAvailable()) return;
     static std::mutex m;
@@ -4684,8 +4694,6 @@ static void preferL1(const std::vector<const void*>& ks) {
         }
     }
 }
-
-void cudaRoutePrepare(const GpuRoute& r) { preferL1(r); }
 
 size_t cudaRouteLocalBytes(const GpuRoute& r) { return mostLocalOf(r); }
 
@@ -4842,6 +4850,7 @@ Film renderBackwardCuda(const Scene& scene, const Camera& cam, int resX, int res
                         Film* specOut, const CudaSceneHold* held) {
     using namespace gpu;
     Film out; out.resX = resX; out.resY = resY; out.alloc();
+    preferL1({(const void*)kBackward});
     // The split's second film, allocated before any early return, so a caller always gets both
     // films at the render's size (empty of light when nothing rendered).
     if (specOut) { *specOut = Film{}; specOut->resX = resX; specOut->resY = resY; specOut->alloc(); }
@@ -4977,6 +4986,7 @@ Film renderBackwardRGBCuda(const Scene& scene, const Camera& cam, int resX, int 
                            int maxBounce, bool directOnly) {
     using namespace gpu;
     Film out; out.resX = resX; out.resY = resY; out.alloc();
+    preferL1({(const void*)kBackwardRGB});
     if (!cudaAvailable() || !cudaBackwardRGBSupported(scene, cam)) return out;
 
     DUpload up;
@@ -5068,6 +5078,7 @@ void backwardRGBSessionSetCamera(BackwardRGBSession* s, const Camera& cam) {
 
 long long backwardRGBSessionAccumulate(BackwardRGBSession* s, long long spp, bool diffraction) {
     using namespace gpu;
+    preferL1({(const void*)kBackwardRGB});   // the viewer's preview, which no preflight weighs
     if (!s || !s->haveCam || spp <= 0) return s ? s->accum : 0;
     dSetLenScale(s->up.sc);
     const long long base = s->accum;
@@ -5329,6 +5340,7 @@ std::vector<Film> renderPhotonMapSharedCuda(const Scene& scene, const std::vecto
                                             const CudaSceneHold* held) {
     using namespace gpu;
     const auto tCall = std::chrono::steady_clock::now();
+    preferL1({(const void*)kGather});
     int nc = (int)cams.size();
     std::vector<Film> out(nc);
     for (int c = 0; c < nc; ++c) { out[c].resX = resX[c]; out[c].resY = resY[c]; out[c].alloc(); }
@@ -6493,6 +6505,7 @@ SppmSession* sppmSessionBegin(const Scene& scene, const Camera& cam, int resX, i
 // emitted, so every pass is an independent photon set) into a bounded map.
 void sppmSessionPass(SppmSession* s, long long photonsPerPass, double alpha) {
     using namespace gpu;
+    preferL1({(const void*)kSppmVisiblePoint, (const void*)kSppmGather});
     dSetLenScale(s->up.sc);
     const long long passIdx = s->passes;                 // 0-based index of THIS pass
 
@@ -6929,10 +6942,13 @@ VcmSession* vcmSessionBegin(const Scene& scene, const Camera& cam, int resX, int
         if (cap > 0 &&
             tryAlloc(&s->mq.reqs, (size_t)cap * sizeof(gpu::DVcmMergeReq)) &&
             (!g_jSpecHost || tryAlloc(&s->mq.spec, (size_t)cap * sizeof(gpu::DJSpec))) &&
-            tryAlloc(&s->mq.nReqs, 2 * sizeof(int)) &&
+            tryAlloc(&s->mq.nReqs, 3 * sizeof(int)) &&
             tryAlloc(&s->mq.profile, nProf * sizeof(int))) {
             s->mq.cap = (int)cap;
             s->mq.overflow = s->mq.nReqs + 1;
+            // ...and the sites past a warp, for the session: the waves reset only the first two.
+            s->mq.carried = s->mq.nReqs + 2;
+            CUDA_CHECK(cudaMemset(s->mq.nReqs, 0, 3 * sizeof(int)));
             s->mq.inlineMax = kVcmInlineMax;
             for (auto& e : s->mqEv) CUDA_CHECK(cudaEventCreate(&e));
             s->mqLeast = shrunk ? 256 : least;
@@ -6952,6 +6968,8 @@ VcmSession* vcmSessionBegin(const Scene& scene, const Camera& cam, int resX, int
 // Run one VCM pass at the given merge `radius`.
 void vcmSessionPass(VcmSession* s, double radius) {
     using namespace gpu;
+    preferL1({(const void*)kVcmLightT<BDPT_NSEC>, (const void*)kVcmLightT<0>, (const void*)kVcmCameraT<BDPT_NSEC>,
+              (const void*)kVcmCameraT<0>, (const void*)kVcmMergeGather<BDPT_NSEC>, (const void*)kVcmMergeGather<0>});
     dSetLenScale(s->up.sc);
     const long long passIdx = s->passes;                 // 0-based index of THIS pass
     // Motion blur (host twin vcmPass): the whole pass -- both subpaths, their connections and
@@ -7197,11 +7215,14 @@ long long vcmSessionPasses(const VcmSession* s) { return s ? s->passes : 0; }
 
 void vcmSessionEnd(VcmSession* s) {
     if (!s) return;
-    if (s->mqWaves > 0)
+    if (s->mqWaves > 0) {
+        int carried = 0;
+        (void)cudaMemcpy(&carried, s->mq.carried, sizeof(int), cudaMemcpyDeviceToHost);
         std::printf("mode U merges: %lld sites gathered a warp each (%.2f a path) in %.2f s of GPU "
-                    "time, %lld inline\n", s->mqSites,
+                    "time, %lld inline, %d past a warp\n", s->mqSites,
                     s->mqPaths > 0 ? (double)(s->mqSites + s->mqInline) / (double)s->mqPaths : 0.0,
-                    s->mqMsGather / 1000.0, s->mqInline);
+                    s->mqMsGather / 1000.0, s->mqInline, carried);
+    }
     if (s->mq.reqs) cudaFree(s->mq.reqs);
     if (s->mq.spec) cudaFree(s->mq.spec);
     if (s->mq.nReqs) cudaFree(s->mq.nReqs);

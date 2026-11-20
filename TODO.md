@@ -521,6 +521,7 @@ Then the rest of 4.2-4.6 in their order, 4.7's bookkeeping alongside whatever to
 - [x] **J-SURF-GATHER-DIVERGENCE** (0.450.37) — mode J's queued surface gather tests a photon a lane and weighs
   32 at a time (dSiteListWarp): at five times the radius its gather 33 % faster, at its own unchanged
   (its sites hold a warp's worth of photons or fewer); known-issues.
+- [x] **REVIEW-0450P** (0.450.41) — the Opus (xhigh) review of 0.450.38-0.450.40; known-issues REVIEW-0450P.
 - [x] **REVIEW-0450O** (0.450.40) — the Opus (max) and Fable (xhigh) reviews of 0.450.34-0.450.37;
   known-issues REVIEW-0450O.
 - [x] **SHADOW-WARNINGS** (0.450.39) — 34 hidden names renamed or removed, 3 dead parameters, the narrowings

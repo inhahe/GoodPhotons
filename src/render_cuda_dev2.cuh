@@ -2424,6 +2424,7 @@ struct DVcmMergeQueue {
     DVcmMergeReq* reqs; int* nReqs; int cap;   // null reqs: merge inline
     DJSpec* spec;          // per slot when the carrier is on (c_jSpecOn), else null
     int*    overflow;      // sites turned away and merged inline: the queue full, or no `spec` for a carrier
+    int*    carried;       // sites whose light vertices passing filled more than a warp (dSiteListWarp)
     // The sites that asked for the queue, a count per kVcmProfBlock pixels over the pass, by which
     // vcmSessionPass sizes the next pass's waves.
     int*    profile;
@@ -2473,9 +2474,10 @@ struct DVcmSite {
 // its 64 ints of shared memory `warpBuf`) take it together (dSiteListWarp), each weighing the
 // vertices the warp's cheap tests passed; WARP a template parameter, so each caller's copy holds its
 // own walk alone. Forced inline, into the gather (whose copy ran 14 % faster inlined) and into the camera
-// kernel's out-of-line dVcmMergeSumInline.
+// kernel's out-of-line dVcmMergeSumInline. Returns the warp walk's verdict (dSiteListWarp): whether the
+// site's passing vertices filled more than a warp; false for the inline merge.
 template <int NS, bool WARP>
-__device__ __forceinline__ static void dVcmMergeSum(const DScene& sc, const DVcmCtx& ctx, const DVcmGrid& grid,
+__device__ __forceinline__ static bool dVcmMergeSum(const DScene& sc, const DVcmCtx& ctx, const DVcmGrid& grid,
                                     const DVcmSite& site, int secStride, const DVertex& vt, Real coatTh,
                                     const DMergeFootprint& fp, const DVec3& wo, double dVCM, double dVM,
                                     int edges, const DJSpec* js, int lane, int* warpBuf,
@@ -2567,8 +2569,12 @@ __device__ __forceinline__ static void dVcmMergeSum(const DScene& sc, const DVcm
         mx += ax * mw; my += ay * mw; mz += az * mw;
     };
     const auto cell = [&](int n, int& b, int& e, unsigned char& t) { site.cell(grid, n, b, e, t); };
-    if constexpr (WARP) dSiteListWarp(cell, lane, warpBuf, pass, weigh);
-    else dSiteListWalk(cell, [&](int k, unsigned char t) { if (pass(k, t) >= 0) weigh(k); });
+    if constexpr (WARP) {
+        return dSiteListWarp(cell, lane, warpBuf, pass, weigh);
+    } else {
+        dSiteListWalk(cell, [&](int k, unsigned char t) { if (pass(k, t) >= 0) weigh(k); });
+        return false;
+    }
 }
 // The camera kernel's inline merge (dVcmMergeSum, its own thread's walk), kept out of line: inlined into
 // the camera kernel, which sits at the register cap, the merge ran mode U's renders a fifth slower.
@@ -2598,8 +2604,10 @@ __global__ void kVcmMergeGather(DScene sc, DVcmCtx ctx, DVcmGrid grid, int secSt
         const DJSpec* js = (rq.flags & 1) ? &mq.spec[r] : nullptr;
         const DMergeFootprint fp = dVertexMergeFootprint(sc, rq.vt, (Real)ctx.radius);
         double mx = 0.0, my = 0.0, mz = 0.0;
-        dVcmMergeSum<NS, true>(sc, ctx, grid, DVcmSite(grid, rq.vt.p), secStride, rq.vt, rq.coatTh, fp, rq.wo,
-                               rq.dVCM, rq.dVM, rq.edges, js, lane, buf, mx, my, mz);
+        const bool carried = dVcmMergeSum<NS, true>(sc, ctx, grid, DVcmSite(grid, rq.vt.p), secStride, rq.vt,
+                                                    rq.coatTh, fp, rq.wo, rq.dVCM, rq.dVM, rq.edges, js, lane, buf,
+                                                    mx, my, mz);
+        if (carried && lane == 0) atomicAdd(mq.carried, 1);
         dWarpSiteAdd(sc, fp, rq.gaSeed, lane, mx, my, mz, rq.f, accum, rq.pix);
     }
 }

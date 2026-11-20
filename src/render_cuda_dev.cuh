@@ -21323,6 +21323,7 @@ struct DSurfQueue {
     DJSpec*   spec;          // per slot when JSPEC is on, else null
     double*   chroma;        // per slot 2*DJSPEC_K (segSumM, etaKm1 bins) when chromatic, else null
     int*      overflow;      // sites gathered inline, the queue full
+    int*      carried;       // sites whose photons passing filled more than a warp (dSiteListWarp)
 };
 
 // The merge footprint (DMergeFootprint) at camera vertex `v` for merge radius `r`, modes J and U:
@@ -21526,13 +21527,16 @@ __device__ __forceinline__ static int* dSiteWarpBuf() {
 // -- k itself, or what k stands for -- or -1), the warp queues the passes' values in `buf`
 // (dSiteWarpBuf), and whenever 32 are queued each lane weighs one (`weigh(v)`), the rest once the list
 // is done. So the costly part runs with every lane busy rather than those whose entry happened to
-// pass. Every lane of the warp calls it, for the same site.
+// pass. Every lane of the warp calls it, for the same site. Returns, alike in every lane, whether the
+// queue ever held more than a warp's worth and carried the rest (which the gathers count, so their
+// checks can tell the path ran).
 template <class Cell, class Pass, class Weigh>
-__device__ static inline void dSiteListWarp(const Cell& cell, int lane, int* buf, const Pass& pass,
+__device__ static inline bool dSiteListWarp(const Cell& cell, int lane, int* buf, const Pass& pass,
                                             const Weigh& weigh) {
     DSiteCursor cur(lane);
     const unsigned below = (1u << lane) - 1u;   // the lanes before this one
     int queued = 0;                             // the warp's, alike in every lane
+    bool carried = false;                       // ...as is this
     for (;;) {
         int k = 0; unsigned char t = 0;
         const bool has = cur.step(cell, 32, k, t);
@@ -21554,11 +21558,13 @@ __device__ static inline void dSiteListWarp(const Cell& cell, int lane, int* buf
             const int mine = lane < take ? buf[lane] : 0;
             if (carries) buf[lane] = buf[32 + lane];
             __syncwarp();
+            carried = carried || queued > 32;
             queued -= take;
             if (lane < take) weigh(mine);
         }
         if (!more && queued == 0) break;
     }
+    return carried;
 }
 // The photons of surface-map cell `n` of `site` (dSiteListWalk's `cell`) and the cell's tag.
 __device__ static inline void dSurfSiteCell(const DSurfMap& sm, const DSurfSite& site, int n, int& b, int& e,
@@ -21618,15 +21624,21 @@ __global__ void kWfSurfGather(DScene sc, DSurfMap sm, DSurfQueue sq, int n, doub
         // The site's photons as one list, its cells in walk order; the work counted is the photons of
         // its own cells the lanes tested, summed across the warp.
         int weighed = 0;
-        dSiteListWarp([&](int c, int& b, int& e, unsigned char& t) { dSurfSiteCell(sm, site, c, b, e, t); }, lane, buf,
-                      [&](int q, unsigned char t) {
-                          if (sm.tag[q] != t) return -1;   // another block's
-                          ++weighed;
-                          return dSurfMergePasses(sm, site, rq.vk, q);   // the photon, queued
-                      },
-                      [&](int idx) { dSurfMergeWeigh(sc, sm, lobe, coatTh, site, sw, idx, gX, gY, gZ, js); });
+        const auto cell = [&](int c, int& b, int& e, unsigned char& t) { dSurfSiteCell(sm, site, c, b, e, t); };
+        const bool carried = dSiteListWarp(cell, lane, buf,
+                                           [&](int q, unsigned char t) {
+                                               if (sm.tag[q] != t) return -1;   // another block's
+                                               ++weighed;
+                                               return dSurfMergePasses(sm, site, rq.vk, q);   // the photon, queued
+                                           },
+                                           [&](int idx) {
+                                               dSurfMergeWeigh(sc, sm, lobe, coatTh, site, sw, idx, gX, gY, gZ, js);
+                                           });
         for (int o = 16; o > 0; o >>= 1) weighed += __shfl_xor_sync(0xffffffffu, weighed, o);
-        if (lane == 0) dAddWork((unsigned long long)weighed);
+        if (lane == 0) {
+            dAddWork((unsigned long long)weighed);
+            if (carried) atomicAdd(sq.carried, 1);
+        }
         dWarpSiteAdd(sc, site.fp, rq.gaSeed, lane, gX, gY, gZ, rq.f, camFilm, rq.pix);
     }
 }

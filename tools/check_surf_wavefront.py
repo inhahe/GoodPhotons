@@ -20,8 +20,8 @@ the film's atomic sums differs, which moves a float32 pixel by a rounding at mos
     and the inline gather's image;
   - in scenes/_caustic_box.ftsl at five times its surface radius (`-jsurf-radius 0.087`), where a
     site holds hundreds of photons and the warp's queue (dSiteListWarp) runs full rounds and carries
-    remainders, which the scenes' own radii seldom reach: every site through the queue and the
-    inline gather's image.
+    remainders, which the scenes' own radii seldom reach: every site through the queue, some whose
+    queue carried past a warp (the point-merge line's count), and the inline gather's image.
 
 These render one light-side epoch (`-beamepochs 1`): the point-merge line reports the frame's
 first. And the waves' sizes (renderBdptCuda's surfWave): with the queue shrunk to 2048 requests
@@ -46,6 +46,7 @@ from check_jchroma import SCENE as CHROMA_SCENE  # noqa: E402
 
 LINE = re.compile(r"mode J point merges: (\d+) sites gathered a warp each \(([\d.]+) a path\) "
                   r"in [\d.]+ s of GPU time, (\d+) inline")
+CARRIED = re.compile(r"mode J point merges: .*?, (\d+) past a warp")   # sites whose queue carried
 WAVE = re.compile(r"\[wave\] c=\d+ paths (\d+)\.\.(\d+) \(\d+\), (\d+) point-merge sites "
                   r"\((\d+) turned away\)")
 
@@ -83,11 +84,16 @@ def main():
         pfm = png[:-4] + ".pfm"
         return p.returncode, log, (read_pfm(pfm, top_down=False) if os.path.exists(pfm) else None)
 
-    def pair(name, args):
-        """The inline gather's image and the queue's; checks both ran as asked. Returns them."""
+    def pair(name, args, carries=False):
+        """The inline gather's image and the queue's; checks both ran as asked, and with `carries` that
+        some site's queue held more than a warp's photons and carried the rest. Returns the inline image."""
         rc0, log0, inline = run(name + "_inline", args, {"FTRACE_NOSURFWF": "1"})
         rc1, log1, queued = run(name + "_queued", args, {})
         m = LINE.search(log1)
+        if carries:
+            c = CARRIED.search(log1)
+            check(name + ": some site's queue carries past a warp", c is not None and int(c.group(1)) > 0,
+                  ("%s sites" % c.group(1)) if c else "no count in the point-merge line")
         check(name + ": the inline gather renders, bypassing the queue",
               rc0 == 0 and inline is not None and LINE.search(log0) is None,
               "rc %d%s" % (rc0, ", a point-merge line" if LINE.search(log0) else ""))
@@ -127,7 +133,7 @@ def main():
           % (away, len(later), sum(w[3] for w in waves[:len(waves) - len(later)])))
 
     pair("chroma", CHROMA)
-    pair("wide", WIDE)
+    pair("wide", WIDE, carries=True)
     return check.verdict(NL.join(logs[-3:]))
 
 

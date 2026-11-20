@@ -11,7 +11,8 @@ at most (ORDER_TOL). So it requires, against the inline merge's image of the sam
 
   - in scenes/_merge_glossy_bowl.ftsl at five times its merge radius (`-pmradius 0.05`, a wide
     merge, each site gathering many light vertices): every site through the queue (the
-    run's merge line, none inline) and the inline merge's image; the inline run itself printing no
+    run's merge line, none inline), some whose queue carried past a warp (its count there), and the
+    inline merge's image; the inline run itself printing no
     merge line, i.e. bypassing the queue;
   - the same image with the queue shrunk to 32 requests (FTRACE_VCMWFCAP), which turns sites away
     to the inline merge every wave;
@@ -43,6 +44,7 @@ from pfm import ORDER_TOL, image_diff, read_pfm  # noqa: E402
 
 LINE = re.compile(r"mode U merges: (\d+) sites gathered a warp each \(([\d.]+) a path\) "
                   r"in [\d.]+ s of GPU time, (\d+) inline")
+CARRIED = re.compile(r"mode U merges: .*?, (\d+) past a warp")   # sites whose queue carried
 WAVE = re.compile(r"\[wave\] U pass (\d+) paths (\d+)\.\.(\d+) \(\d+\), (\d+) merge sites "
                   r"\((\d+) turned away\)")
 
@@ -94,11 +96,16 @@ def main():
         pfm = png[:-4] + ".pfm"
         return p.returncode, log, (read_pfm(pfm, top_down=False) if os.path.exists(pfm) else None)
 
-    def pair(name, args):
-        """The inline merge's image and the queue's; checks both ran as asked. Returns the first."""
+    def pair(name, args, carries=False):
+        """The inline merge's image and the queue's; checks both ran as asked, and with `carries` that
+        some site's queue held more than a warp's vertices and carried the rest. Returns the first."""
         rc0, log0, inline = run(name + "_inline", args, {"FTRACE_NOVCMWF": "1"})
         rc1, log1, queued = run(name + "_queued", args, {})
         m = LINE.search(log1)
+        if carries:
+            c = CARRIED.search(log1)
+            check(name + ": some site's queue carries past a warp", c is not None and int(c.group(1)) > 0,
+                  ("%s sites" % c.group(1)) if c else "no count in the merge line")
         check(name + ": the inline merge renders, bypassing the queue",
               rc0 == 0 and inline is not None and LINE.search(log0) is None,
               "rc %d%s" % (rc0, ", a merge line" if LINE.search(log0) else ""))
@@ -112,7 +119,7 @@ def main():
                   "largest change %.2g of the pixel, %d values differ" % (r, n))
         return inline
 
-    inline = pair("bowl", BOWL)
+    inline = pair("bowl", BOWL, carries=True)
     rc2, log2, tiny = run("bowl_tiny", BOWL, {"FTRACE_VCMWFCAP": "32"})
     m2 = LINE.search(log2)
     check("bowl: a 32-request queue turns sites away inline",

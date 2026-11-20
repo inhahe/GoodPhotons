@@ -10594,7 +10594,7 @@ as the one at fault.
   half vector and the distribution are symmetric, so it is what `ggx::pair` computes for the
   swapped arguments, bit for bit). Each wavelength then reads the reflectance alone. Its
   arithmetic is `dBsdfF`'s and `dBsdfPdf`'s step for step, so the images are those of 0.450.4,
-  byte for byte (check_bitid); mode J's surface merges take it too (`dSurfMergePhoton`, its coat by
+  byte for byte (check_bitid); mode J's surface merges take it too (`dSurfMergeWeigh`, its coat by
   `dCoatEvalAt` at a film read once a site). The secondaries' loops run to the hero width, a
   constant, so their values stay in registers. Measured at 640x480 on `_merge_glossy_bowl`
   (`-max-bounce 24`, 8 passes): the gather 43.4 -> 15.7 s, the render 49.3 -> 20.6 s; Nsight on one
@@ -12837,7 +12837,8 @@ weighs (`cudaRouteLocalBytes`) for every GPU render and meter frame before anyth
 sessions weigh theirs again at their start. **Every route kernel prefers the largest L1** its shared
 memory leaves room for (`preferL1`: `cudaFuncAttributePreferredSharedMemoryCarveout` = MaxL1, once a
 kernel; a kernel the runtime refuses is tried again at the next call and the first refusal printed),
-set by `cudaRoutePrepare`, which the preflight calls on the route before weighing it. The megakernels live in local memory -- their stacks and spilled state,
+set by every launcher of a route kernel at its top, for the kernels it may launch (so the viewer's
+path-trace preview, which no preflight weighs, has it too). The megakernels live in local memory -- their stacks and spilled state,
 which L1 caches -- and use a kilobyte or a few of shared memory a block, so the driver's own split
 left them L1 they could use: on `_fog_cornell` at a fixed sample count mode J ran in 4.23 s for 6.65
 and mode R in 2.96 for 3.57, and modes B, D, M, P, S, U, W and J without a medium within a percent
