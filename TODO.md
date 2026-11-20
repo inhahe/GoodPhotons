@@ -530,9 +530,20 @@ Then the rest of 4.2-4.6 in their order, 4.7's bookkeeping alongside whatever to
   held file (twice at most) and ends every failure on `[build] NOT UPDATED`; known-issues BUILD-LOCK.
 - [x] **REVIEW-0451** (0.451.1) — the Opus (max) and Fable (xhigh) reviews of 0.451.0; known-issues REVIEW-0451.
 - [x] **MODEB-PASSTHROUGH**, the direct legs (0.451.3) — modes A and B's camera legs cross gels and half
-  mirrors (camLegPass / dCamLegThrough); check_passthrough.
-- [ ] **MODEB-PASSTHROUGH, what is left** — the specular connections' legs (glass sphere, mirrors) through a gel
-  or half mirror, and the step half mirror's Z 0.96 in mode B; known-issues.
+  mirrors (camLegThrough / dCamLegThrough); check_passthrough.
+- [x] **REVIEW-0452** (0.451.4) — the Opus (max) and Fable (xhigh) reviews of 0.451.2-0.451.3: mode P's split,
+  the device's fiber legs, crossings charged to -max-bounce, the cumulative kCoinRare, `tile_verdict` live where
+  either image is lit; known-issues REVIEW-0452.
+- [ ] **MODEB-PASSTHROUGH, the sky** — the sky, sun and glows modes A and B see directly, through a gel or half
+  mirror (prepareSky, addBlurredSkyRows); known-issues.
+- [ ] **MODEB-PASSTHROUGH, compounds** — a `mix` / `layered` surface whose child is a gel or half mirror, on the
+  camera legs; known-issues.
+- [ ] **MODEB-PASSTHROUGH, the specular connections** — their legs (glass sphere, mirrors) through a gel or half
+  mirror; known-issues.
+- [ ] **SKY-THROUGH-FOG** — the sky seen through an absorbing fog: mode R 0.316, mode M 0.900, mode B 0.342,
+  Beer-Lambert 0.3415; and the clear sky differs by 2 % between them; known-issues.
+- [ ] **THINLENS-VIGNETTING** (needs the user's decision) — through a thin lens mode A records irradiance with
+  natural vignetting, the other modes radiance: one camera equation for all, or none; known-issues.
 - [x] **HOST-HALFMIRROR-ANALYTIC** (0.451.2) — a coin far rarer at some cell than at its peak turns mode M's
   and S's walk partial (`kCoinRare`): a half mirror falling to 1e-123 read half bright on the CPU; known-issues.
 - [ ] **SPECGATHER-CELL-CENTROID** — read each carrier cell at the emission's centroid in it, not its middle

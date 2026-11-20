@@ -1470,7 +1470,7 @@ struct Renderer {
         int px = 0, py = 0;
         double cosSurf = 0, corr = 0, denom = 0, dist = 0;
         Vec3 wdir;
-        CamLegPass leg;   // the gels and half mirrors the camera leg crosses (camLegPass)
+        double legT[hero::kHeroMax];   // what the gels and half mirrors on the camera leg pass (camLegThrough)
     };
     // A FIBER vertex connects differently, in three ways that all live down here rather
     // than in the caller (see hair_shade.h for why the projection factor changes):
@@ -1565,9 +1565,17 @@ struct Renderer {
     // The camera connections below, and the camSplat* that route them, take a surface point p with
     // its shading and true normals (n, ng) and `pe`, its self-intersection distance: its hit's
     // (Scene::hitEps), the leg's offset off p, its tmin and its shortening; the scene's (Scene::eps)
-    // at a light's own surface point.
+    // at a light's own surface point. `room`: the gels and half mirrors their camera leg may cross
+    // (legRoom); the routers take the vertex's depth and work it out.
+    //
+    // A camera leg's gel or half mirror is a vertex of the path, as it is where a camera ray crosses
+    // one in mode R, so a leg from a vertex `depth` scatterings into its photon path (SpecVtx::depth)
+    // may cross the -max-bounce vertices left; none in mode P's blurred split (specularSideSplats).
+    int legRoom(int depth) const { return specularSideSplats ? maxBounce - depth : 0; }
+    // `lam[0..nLam)`: the wavelengths g.legT is taken at.
     bool connectGeom(const Scene& scene, const Camera& cam, const Vec3& p, const Vec3& n,
-                     const Vec3& ng, double pe, const Vec3& wi, ConnGeom& g,
+                     const Vec3& ng, double pe, const Vec3& wi, ConnGeom& g, int room,
+                     const double* lam, int nLam,
                      const HairShade* hs = nullptr, bool glossy = false) const {
         Vec3 toCam = cam.eye - p;
         g.dist = length(toCam);
@@ -1578,8 +1586,8 @@ struct Renderer {
             if (!cam.project(p, g.px, g.py, cosCamH, dist2H)) return false;
             const double off = hairExitOffset(*hs, n, g.wdir, pe);
             if (off >= g.dist) return false;
-            g.leg = camLegPass(scene, p + g.wdir * pe, g.wdir, g.dist - off - pe, pe, off);
-            if (g.leg.blocked) return false;
+            if (!camLegThrough(scene, p + g.wdir * pe, g.wdir, g.dist - off - pe, pe, off, room,
+                               lam, nLam, g.legT)) return false;
             g.denom = dist2H * cam.pixelSolidAngle(cosCamH);
             return true;
         }
@@ -1587,8 +1595,8 @@ struct Renderer {
         if (!camSideOk(n, ng, g.wdir, glossy, g.cosSurf)) return false;
         double cosCam, dist2;
         if (!cam.project(p, g.px, g.py, cosCam, dist2)) return false;
-        g.leg = camLegPass(scene, p + ng * pe, g.wdir, g.dist - 2 * pe, pe);
-        if (g.leg.blocked) return false;
+        if (!camLegThrough(scene, p + ng * pe, g.wdir, g.dist - 2 * pe, pe, 0.0, room,
+                           lam, nLam, g.legT)) return false;
         double omega = cam.pixelSolidAngle(cosCam);
         // Veach shading-normal adjoint correction for this particle connection
         // (wi = toward the previous/light-side vertex, wo = wdir toward the camera).
@@ -1606,13 +1614,13 @@ struct Renderer {
     // rectilinear alike): for a rectilinear lens Omega_pix = A_pix*cosCam^3, which
     // reproduces the classic G * We = cosSurf*cosCam/dist^2 * 1/(A_pix cosCam^4).
     // `gs` (optional): a glossy vertex, whose f replaces rho/pi toward the camera (GlossySplat).
-    void connect(const Scene& scene, const Camera& cam, Film& film,
+    void connect(const Scene& scene, const Camera& cam, Film& film, int room,
                  const Vec3& p, const Vec3& n, const Vec3& ng, double pe, const Vec3& wi,
                  double lambda, double beta, double rho, Pcg32& rng,
                  const HairShade* hs = nullptr, const GlossySplat* gs = nullptr,
                  const CoatSplat* coat = nullptr) const {
         ConnGeom g;
-        if (!connectGeom(scene, cam, p, n, ng, pe, wi, g, hs, gs != nullptr)) return;
+        if (!connectGeom(scene, cam, p, n, ng, pe, wi, g, room, &lambda, 1, hs, gs != nullptr)) return;
         // For a fiber, `hairFCos` IS f*projection (hair_shade.h); cosSurf is 1 so the
         // arithmetic below stays one shared expression instead of two near-copies.
         double f = hs ? hairFCos(*hs, g.wdir) : gs ? gs->f(g.wdir, lambda) : rho / PI;
@@ -1620,25 +1628,25 @@ struct Renderer {
         double contrib = beta * f * g.cosSurf * g.corr / g.denom;
         // Attenuation of the shadow ray through the fog (Beer-Lambert; ratio tracking
         // for a heterogeneous medium, exact exp for a homogeneous one; product over media).
-        contrib *= legTransmittance(scene, cam.medium(), p, g.wdir, g.dist, lambda, rng) * g.leg.at(lambda);
+        contrib *= legTransmittance(scene, cam.medium(), p, g.wdir, g.dist, lambda, rng) * g.legT[0];
         film.add(g.px, g.py, Vec3(cieX(lambda), cieY(lambda), cieZ(lambda)) * contrib);
     }
 
     // Hero-wavelength mode-B connection: one shared connectGeom, then splat each of the
     // `nUp` live wavelengths with its own throughput beta[i] and reflectance rho[i]. The
     // per-λ contribution uses the SAME float ordering as connect() above.
-    void connectHero(const Scene& scene, const Camera& cam, Film& film,
+    void connectHero(const Scene& scene, const Camera& cam, Film& film, int room,
                      const Vec3& p, const Vec3& n, const Vec3& ng, double pe, const Vec3& wi,
                      const double* lam, const double* beta, const double* rho, int nUp,
                      Pcg32& rng, const GlossySplat* gs = nullptr,
                      const CoatSplat* coat = nullptr) const {   // see connect
         ConnGeom g;
-        if (!connectGeom(scene, cam, p, n, ng, pe, wi, g, nullptr, gs != nullptr)) return;
+        if (!connectGeom(scene, cam, p, n, ng, pe, wi, g, room, lam, nUp, nullptr, gs != nullptr)) return;
         for (int i = 0; i < nUp; ++i) {
             double f = gs ? gs->f(g.wdir, lam[i]) : rho[i] / PI;
             f *= coatSplatF(coat, g.wdir, lam[i]);
             double contrib = beta[i] * f * g.cosSurf * g.corr / g.denom;
-            contrib *= legTransmittance(scene, cam.medium(), p, g.wdir, g.dist, lam[i], rng) * g.leg.at(lam[i]);
+            contrib *= legTransmittance(scene, cam.medium(), p, g.wdir, g.dist, lam[i], rng) * g.legT[i];
             film.add(g.px, g.py, Vec3(cieX(lam[i]), cieY(lam[i]), cieZ(lam[i])) * contrib);
         }
     }
@@ -1648,7 +1656,7 @@ struct Renderer {
     // single-scattering albedo; there is no surface normal. wIn is the photon's
     // propagation direction into the collision.
     //   contrib = beta * albedo * p_HG(cos) / (dist^2 * Omega_pix) * T_fog
-    void connectVolume(const Scene& scene, const Medium& med, const Camera& cam, Film& film,
+    void connectVolume(const Scene& scene, const Medium& med, const Camera& cam, Film& film, int room,
                        const Vec3& p, const Vec3& wIn, double lambda, double beta,
                        Pcg32& rng) const {
         Vec3 toCam = cam.eye - p;
@@ -1656,14 +1664,14 @@ struct Renderer {
         Vec3 wdir = toCam / dist;
         int px, py; double cosCam, dist2;
         if (!cam.project(p, px, py, cosCam, dist2)) return;
-        const CamLegPass leg = camLegPass(scene, p + wdir * scene.eps, wdir, dist - 2 * scene.eps, scene.eps);
-        if (leg.blocked) return;
+        double legT[hero::kHeroMax];
+        if (!camLegThrough(scene, p + wdir * scene.eps, wdir, dist - 2 * scene.eps, scene.eps, 0.0, room, &lambda, 1, legT)) return;
 
         double ph = med.phaseValue(dot(wIn, wdir), lambda); // scattering medium's phase (HG or rainbow)
         double Lambda = med.albedo(lambda);
         double omega = cam.pixelSolidAngle(cosCam);         // projection-general pixel solid angle
         double contrib = beta * Lambda * ph / (dist2 * omega);
-        contrib *= legTransmittance(scene, cam.medium(), p, wdir, dist, lambda, rng) * leg.at(lambda);
+        contrib *= legTransmittance(scene, cam.medium(), p, wdir, dist, lambda, rng) * legT[0];
         film.add(px, py, Vec3(cieX(lambda), cieY(lambda), cieZ(lambda)) * contrib);
     }
 
@@ -1678,7 +1686,7 @@ struct Renderer {
     //
     // Surface (or fiber) vertex: beta * f * cosSurf * w, f the BRDF (rho/pi for this
     // Lambertian splat; the fiber's hairFCos carries its own projection).
-    void connectLensPhysical(const Scene& scene, const Camera& cam, Film& film,
+    void connectLensPhysical(const Scene& scene, const Camera& cam, Film& film, int room,
                              const Vec3& p, const Vec3& n, const Vec3& ng, double pe, const Vec3& wi,
                              double lambda, double beta, double rho, Pcg32& rng,
                              const HairShade* hs, const Vec3* plane,
@@ -1696,14 +1704,14 @@ struct Renderer {
         if (off >= le.dist) return;
         int px, py; double wgt;
         if (!cam.lensEntryImage(le, lambda, px, py, wgt)) return;
-        const CamLegPass leg = camLegPass(scene, p + (hs ? wdir : ng) * (hs ? pe : off), wdir, le.dist - off - pe, pe,
-                                          hs ? off : 0.0);
-        if (leg.blocked) return;
+        double legT[hero::kHeroMax];
+        if (!camLegThrough(scene, p + (hs ? wdir : ng) * (hs ? pe : off), wdir, le.dist - off - pe, pe,
+                           hs ? off : 0.0, room, &lambda, 1, legT)) return;
         const double corr = hs ? 1.0 : shadingAdjointCorr(wi, wdir, n, ng);
         const double fcos = (hs ? hairFCos(*hs, wdir)
                                 : (gs ? gs->f(wdir, lambda) : rho / PI) * cosSurf) * coatSplatF(coat, wdir, lambda);
         double contrib = beta * fcos * corr * wgt;
-        contrib *= legTransmittance(scene, cam.medium(), p, wdir, le.dist, lambda, rng) * leg.at(lambda);
+        contrib *= legTransmittance(scene, cam.medium(), p, wdir, le.dist, lambda, rng) * legT[0];
         film.add(px, py, Vec3(cieX(lambda), cieY(lambda), cieZ(lambda)) * contrib);
     }
 
@@ -1711,7 +1719,7 @@ struct Renderer {
     // draw, so the RNG stream does not depend on C), the entry and the scene leg from p to it;
     // the glass disperses, so each is traced through it on its own and lands in its own cell,
     // or is clipped on its own.
-    void connectLensHeroPhysical(const Scene& scene, const Camera& cam, Film& film,
+    void connectLensHeroPhysical(const Scene& scene, const Camera& cam, Film& film, int room,
                                  const Vec3& p, const Vec3& n, const Vec3& ng, double pe, const Vec3& wi,
                                  const double* lam, const double* beta, const double* rho,
                                  int nUp, Pcg32& rng, const Vec3* plane,
@@ -1732,32 +1740,32 @@ struct Renderer {
             any = any || ok[i];
         }
         if (!any) return;
-        const CamLegPass leg = camLegPass(scene, p + ng * pe, wdir, le.dist - 2 * pe, pe);
-        if (leg.blocked) return;
+        double legT[hero::kHeroMax];
+        if (!camLegThrough(scene, p + ng * pe, wdir, le.dist - 2 * pe, pe, 0.0, room, lam, nUp, legT)) return;
         const double corr = shadingAdjointCorr(wi, wdir, n, ng);
         for (int i = 0; i < nUp; ++i) {
             if (!ok[i]) continue;
             double contrib = beta[i] * (gs ? gs->f(wdir, lam[i]) : rho[i] / PI) * cosSurf * corr *
                              wgt[i] * coatSplatF(coat, wdir, lam[i]);
-            contrib *= legTransmittance(scene, cam.medium(), p, wdir, le.dist, lam[i], rng) * leg.at(lam[i]);
+            contrib *= legTransmittance(scene, cam.medium(), p, wdir, le.dist, lam[i], rng) * legT[i];
             film.add(px[i], py[i], Vec3(cieX(lam[i]), cieY(lam[i]), cieZ(lam[i])) * contrib);
         }
     }
 
     // A volume vertex through a physical lens: `phaseW` is what replaces f * cosSurf, the
     // in-scatter albedo * phase for a fog vertex or the isotropic 1/(4 pi) for a fire.
-    void connectVolumeLensPhysical(const Scene& scene, const Camera& cam, Film& film,
+    void connectVolumeLensPhysical(const Scene& scene, const Camera& cam, Film& film, int room,
                                    const Vec3& p, double lambda, double beta, double phaseW,
                                    const Vec3* wIn, const Medium* med, Pcg32& rng) const {
         const double u1 = rng.uniform(), u2 = rng.uniform();
         Vec3 Y, wdir; double dist, wgt; int px, py;
         if (!cam.lensConnect(p, lambda, u1, u2, Y, wdir, dist, px, py, wgt)) return;
-        const CamLegPass leg = camLegPass(scene, p + wdir * scene.eps, wdir, dist - 2 * scene.eps, scene.eps);
-        if (leg.blocked) return;
+        double legT[hero::kHeroMax];
+        if (!camLegThrough(scene, p + wdir * scene.eps, wdir, dist - 2 * scene.eps, scene.eps, 0.0, room, &lambda, 1, legT)) return;
         double f = phaseW;
         if (med && wIn) f = med->albedo(lambda) * med->phaseValue(dot(*wIn, wdir), lambda);
         double contrib = beta * f * wgt;
-        contrib *= legTransmittance(scene, cam.medium(), p, wdir, dist, lambda, rng) * leg.at(lambda);
+        contrib *= legTransmittance(scene, cam.medium(), p, wdir, dist, lambda, rng) * legT[0];
         film.add(px, py, Vec3(cieX(lambda), cieY(lambda), cieZ(lambda)) * contrib);
     }
 
@@ -1780,14 +1788,14 @@ struct Renderer {
     // `plane` (optional): an aimed quad's face (Emitter::nGeom); a pupil point behind it gets
     // nothing, whatever `n` (the aim) says. Tested at the sampled point, not the eye: a pupil
     // can straddle the plane.
-    void connectLens(const Scene& scene, const Camera& cam, Film& film,
+    void connectLens(const Scene& scene, const Camera& cam, Film& film, int room,
                      const Vec3& p, const Vec3& n, const Vec3& ng, double pe, const Vec3& wi,
                      double lambda, double beta, double rho, Pcg32& rng,
                      const HairShade* hs = nullptr, const Vec3* plane = nullptr,
                      const GlossySplat* gs = nullptr,
                      const CoatSplat* coat = nullptr) const {                // see connect
         if (cam.hasLens()) {
-            connectLensPhysical(scene, cam, film, p, n, ng, pe, wi, lambda, beta, rho, rng, hs, plane,
+            connectLensPhysical(scene, cam, film, room, p, n, ng, pe, wi, lambda, beta, rho, rng, hs, plane,
                                 gs, coat);
             return;
         }
@@ -1811,9 +1819,9 @@ struct Renderer {
         if (!cam.lensImage(A, wdir, px, py)) return;
         const double off = hs ? hairExitOffset(*hs, n, wdir, pe) : pe;
         if (off >= dist) return;
-        const CamLegPass leg = camLegPass(scene, p + (hs ? wdir : ng) * (hs ? pe : off), wdir, dist - off - pe, pe,
-                                          hs ? off : 0.0);
-        if (leg.blocked) return;
+        double legT[hero::kHeroMax];
+        if (!camLegThrough(scene, p + (hs ? wdir : ng) * (hs ? pe : off), wdir, dist - off - pe, pe,
+                           hs ? off : 0.0, room, &lambda, 1, legT)) return;
 
         // beta * (rho/pi BRDF) * cosSurf * cosLens / dist^2 * (pi R^2 = 1/pdf_A).
         // cosSurf carries the Veach shading-normal adjoint correction (see connect()).
@@ -1836,7 +1844,7 @@ struct Renderer {
         // out) and A stays consistent with C; only ABSOLUTE-EV A/C are corrected to
         // land mid-tone at ABS_EXPOSURE_GAIN, matching B.
         contrib *= 1.0 / (cam.pixelPlaneArea() * cam.filmDist * cam.filmDist);
-        contrib *= legTransmittance(scene, cam.medium(), p, wdir, dist, lambda, rng) * leg.at(lambda);
+        contrib *= legTransmittance(scene, cam.medium(), p, wdir, dist, lambda, rng) * legT[0];
         film.add(px, py, Vec3(cieX(lambda), cieY(lambda), cieZ(lambda)) * contrib);
     }
 
@@ -1846,14 +1854,14 @@ struct Renderer {
     // pupil is achromatic (thin-lens geometry, no per-λ dispersion), so C wavelengths
     // legitimately share the connection — same as mode B. Per-λ ordering matches
     // connectLens() above.
-    void connectLensHero(const Scene& scene, const Camera& cam, Film& film,
+    void connectLensHero(const Scene& scene, const Camera& cam, Film& film, int room,
                          const Vec3& p, const Vec3& n, const Vec3& ng, double pe, const Vec3& wi,
                          const double* lam, const double* beta, const double* rho, int nUp,
                          Pcg32& rng, const Vec3* plane = nullptr,
                          const GlossySplat* gs = nullptr,
                          const CoatSplat* coat = nullptr) const {   // see connectLens / connect
         if (cam.hasLens()) {
-            connectLensHeroPhysical(scene, cam, film, p, n, ng, pe, wi, lam, beta, rho, nUp, rng, plane,
+            connectLensHeroPhysical(scene, cam, film, room, p, n, ng, pe, wi, lam, beta, rho, nUp, rng, plane,
                                     gs, coat);
             return;
         }
@@ -1872,15 +1880,15 @@ struct Renderer {
         if (cosLens <= 1e-6) return;                     // not heading toward the film
         int px, py;
         if (!cam.lensImage(A, wdir, px, py)) return;
-        const CamLegPass leg = camLegPass(scene, p + ng * pe, wdir, dist - 2 * pe, pe);
-        if (leg.blocked) return;
+        double legT[hero::kHeroMax];
+        if (!camLegThrough(scene, p + ng * pe, wdir, dist - 2 * pe, pe, 0.0, room, lam, nUp, legT)) return;
         double corr = shadingAdjointCorr(wi, wdir, n, ng);
         double cellNorm = 1.0 / (cam.pixelPlaneArea() * cam.filmDist * cam.filmDist);
         for (int i = 0; i < nUp; ++i) {
             double contrib = beta[i] * (gs ? PI * gs->f(wdir, lam[i]) : rho[i]) * cosSurf * corr *
                              cosLens * (R * R) / (dist * dist) * coatSplatF(coat, wdir, lam[i]);
             contrib *= cellNorm;
-            contrib *= legTransmittance(scene, cam.medium(), p, wdir, dist, lam[i], rng) * leg.at(lam[i]);
+            contrib *= legTransmittance(scene, cam.medium(), p, wdir, dist, lam[i], rng) * legT[i];
             film.add(px, py, Vec3(cieX(lam[i]), cieY(lam[i]), cieZ(lam[i])) * contrib);
         }
     }
@@ -1888,11 +1896,11 @@ struct Renderer {
     // Model A lens splat for a VOLUME scattering vertex (fog). As connectLens but the
     // surface BRDF*cosSurf is replaced by albedo*phase; the phase function carries no
     // 1/pi, so the pupil pdf's pi R^2 stays. wIn is the photon's incoming direction.
-    void connectLensVolume(const Scene& scene, const Medium& med, const Camera& cam, Film& film,
+    void connectLensVolume(const Scene& scene, const Medium& med, const Camera& cam, Film& film, int room,
                            const Vec3& p, const Vec3& wIn, double lambda, double beta,
                            Pcg32& rng) const {
         if (cam.hasLens()) {
-            connectVolumeLensPhysical(scene, cam, film, p, lambda, beta, 0.0, &wIn, &med, rng);
+            connectVolumeLensPhysical(scene, cam, film, room, p, lambda, beta, 0.0, &wIn, &med, rng);
             return;
         }
         double R = cam.apertureR;
@@ -1907,8 +1915,8 @@ struct Renderer {
         if (cosLens <= 1e-6) return;
         int px, py;
         if (!cam.lensImage(A, wdir, px, py)) return;
-        const CamLegPass leg = camLegPass(scene, p + wdir * scene.eps, wdir, dist - 2 * scene.eps, scene.eps);
-        if (leg.blocked) return;
+        double legT[hero::kHeroMax];
+        if (!camLegThrough(scene, p + wdir * scene.eps, wdir, dist - 2 * scene.eps, scene.eps, 0.0, room, &lambda, 1, legT)) return;
 
         double ph = med.phaseValue(dot(wIn, wdir), lambda); // scattering medium's phase (HG or rainbow)
         double Lambda = med.albedo(lambda);
@@ -1918,7 +1926,7 @@ struct Renderer {
         // matches B's absolute scale in absolute-EV modes (per-camera constant; auto-
         // exposed scenes unaffected).
         contrib *= 1.0 / (cam.pixelPlaneArea() * cam.filmDist * cam.filmDist);
-        contrib *= legTransmittance(scene, cam.medium(), p, wdir, dist, lambda, rng) * leg.at(lambda);
+        contrib *= legTransmittance(scene, cam.medium(), p, wdir, dist, lambda, rng) * legT[0];
         film.add(px, py, Vec3(cieX(lambda), cieY(lambda), cieZ(lambda)) * contrib);
     }
 
@@ -1929,28 +1937,28 @@ struct Renderer {
     // strength (grandTotal·κ_e(x,λ)/meanKe); the /(dist²·Ω) converts the volume-birth
     // integral into the emission line-integral seen by the pixel. Fog transmittance
     // still applies (the flame's own soot self-absorbs its glow).
-    void connectEmissionVolume(const Scene& scene, const Camera& cam, Film& film,
+    void connectEmissionVolume(const Scene& scene, const Camera& cam, Film& film, int room,
                                const Vec3& p, double lambda, double beta, Pcg32& rng) const {
         Vec3 toCam = cam.eye - p;
         double dist = length(toCam);
         Vec3 wdir = toCam / dist;
         int px, py; double cosCam, dist2;
         if (!cam.project(p, px, py, cosCam, dist2)) return;
-        const CamLegPass leg = camLegPass(scene, p + wdir * scene.eps, wdir, dist - 2 * scene.eps, scene.eps);
-        if (leg.blocked) return;
+        double legT[hero::kHeroMax];
+        if (!camLegThrough(scene, p + wdir * scene.eps, wdir, dist - 2 * scene.eps, scene.eps, 0.0, room, &lambda, 1, legT)) return;
         double omega = cam.pixelSolidAngle(cosCam);
         double contrib = beta * (1.0 / (4.0 * PI)) / (dist2 * omega);
-        contrib *= legTransmittance(scene, cam.medium(), p, wdir, dist, lambda, rng) * leg.at(lambda);
+        contrib *= legTransmittance(scene, cam.medium(), p, wdir, dist, lambda, rng) * legT[0];
         film.add(px, py, Vec3(cieX(lambda), cieY(lambda), cieZ(lambda)) * contrib);
     }
 
     // Model A (finite-lens) camera splat for a volume emission vertex. As
     // connectLensVolume, with the albedo*phase in-scatter term replaced by the isotropic
     // 1/(4π) emission term.
-    void connectEmissionLensVolume(const Scene& scene, const Camera& cam, Film& film,
+    void connectEmissionLensVolume(const Scene& scene, const Camera& cam, Film& film, int room,
                                    const Vec3& p, double lambda, double beta, Pcg32& rng) const {
         if (cam.hasLens()) {
-            connectVolumeLensPhysical(scene, cam, film, p, lambda, beta, 1.0 / (4.0 * PI),
+            connectVolumeLensPhysical(scene, cam, film, room, p, lambda, beta, 1.0 / (4.0 * PI),
                                       nullptr, nullptr, rng);
             return;
         }
@@ -1966,21 +1974,22 @@ struct Renderer {
         if (cosLens <= 1e-6) return;
         int px, py;
         if (!cam.lensImage(A, wdir, px, py)) return;
-        const CamLegPass leg = camLegPass(scene, p + wdir * scene.eps, wdir, dist - 2 * scene.eps, scene.eps);
-        if (leg.blocked) return;
+        double legT[hero::kHeroMax];
+        if (!camLegThrough(scene, p + wdir * scene.eps, wdir, dist - 2 * scene.eps, scene.eps, 0.0, room, &lambda, 1, legT)) return;
         double contrib = beta * (1.0 / (4.0 * PI)) * cosLens * (PI * R * R) / (dist * dist);
         contrib *= 1.0 / (cam.pixelPlaneArea() * cam.filmDist * cam.filmDist);
-        contrib *= legTransmittance(scene, cam.medium(), p, wdir, dist, lambda, rng) * leg.at(lambda);
+        contrib *= legTransmittance(scene, cam.medium(), p, wdir, dist, lambda, rng) * legT[0];
         film.add(px, py, Vec3(cieX(lambda), cieY(lambda), cieZ(lambda)) * contrib);
     }
 
     // Splat a volume-emission vertex to every camera (pinhole B or finite lens A).
-    void camSplatEmissionAll(const Scene& scene, const CamTarget* cams, int nCam,
+    void camSplatEmissionAll(const Scene& scene, const CamTarget* cams, int nCam, int depth,
                              const Vec3& p, double lambda, double beta, Pcg32& rng) const {
+        const int room = legRoom(depth);
         for (int c = 0; c < nCam; ++c)
             if (cams[c].cam && cams[c].film) {
-                if (lensCam(*cams[c].cam)) connectEmissionLensVolume(scene, *cams[c].cam, *cams[c].film, p, lambda, beta, rng);
-                else          connectEmissionVolume(scene, *cams[c].cam, *cams[c].film, p, lambda, beta, rng);
+                if (lensCam(*cams[c].cam)) connectEmissionLensVolume(scene, *cams[c].cam, *cams[c].film, room, p, lambda, beta, rng);
+                else          connectEmissionVolume(scene, *cams[c].cam, *cams[c].film, room, p, lambda, beta, rng);
             }
     }
 
@@ -1988,27 +1997,28 @@ struct Renderer {
     // `plane` (optional): an aimed quad's face (Emitter::nGeom); a camera point behind it gets
     // nothing -- the eye for the pinhole, the sampled pupil point for the lens.
     // `gs` (optional): a glossy vertex (GlossySplat), whose lobe replaces the Lambertian rho/pi.
-    void camSplat(const Scene& scene, const Camera& cam, Film& film, const Vec3& p,
+    void camSplat(const Scene& scene, const Camera& cam, Film& film, int room, const Vec3& p,
                   const Vec3& n, const Vec3& ng, double pe, const Vec3& wi, double lambda, double beta,
                   double rho, Pcg32& rng, const Vec3* plane = nullptr,
                   const GlossySplat* gs = nullptr, const CoatSplat* coat = nullptr) const {
-        if (lensCam(cam)) connectLens(scene, cam, film, p, n, ng, pe, wi, lambda, beta, rho, rng, nullptr,
+        if (lensCam(cam)) connectLens(scene, cam, film, room, p, n, ng, pe, wi, lambda, beta, rho, rng, nullptr,
                                   plane, gs, coat);
         else if (!(plane && dot(*plane, cam.eye - p) <= 0.0))
-            connect(scene, cam, film, p, n, ng, pe, wi, lambda, beta, rho, rng, nullptr, gs, coat);
+            connect(scene, cam, film, room, p, n, ng, pe, wi, lambda, beta, rho, rng, nullptr, gs, coat);
     }
 
     // Splat a surface vertex to every camera target. In model B (the shared-pass case)
     // camSplat -> connect draws no RNG, so the loop is RNG-neutral; with nCam==1 this is
     // exactly the old single-camera call (model A draws its aperture sample once here).
     // `plane` (optional): an aimed quad's face, passed to camSplat.
-    void camSplatAll(const Scene& scene, const CamTarget* cams, int nCam, const Vec3& p,
+    void camSplatAll(const Scene& scene, const CamTarget* cams, int nCam, int depth, const Vec3& p,
                      const Vec3& n, const Vec3& ng, double pe, const Vec3& wi, double lambda, double beta,
                      double rho, Pcg32& rng, const Vec3* plane = nullptr,
                      const GlossySplat* gs = nullptr, const CoatSplat* coat = nullptr) const {
+        const int room = legRoom(depth);
         for (int c = 0; c < nCam; ++c)
             if (cams[c].cam && cams[c].film)
-                camSplat(scene, *cams[c].cam, *cams[c].film, p, n, ng, pe, wi, lambda, beta, rho, rng,
+                camSplat(scene, *cams[c].cam, *cams[c].film, room, p, n, ng, pe, wi, lambda, beta, rho, rng,
                          plane, gs, coat);
     }
 
@@ -2017,43 +2027,45 @@ struct Renderer {
     // the ignored Lambertian slot. `wi` is likewise unused — the fiber does not take the
     // Veach shading-normal correction — but it is kept in the signature so the call sites
     // read the same as the surface ones.
-    void camSplatHair(const Scene& scene, const Camera& cam, Film& film, const Vec3& p,
+    void camSplatHair(const Scene& scene, const Camera& cam, Film& film, int room, const Vec3& p,
                       const Vec3& n, const Vec3& ng, double pe, const Vec3& wi, double lambda,
                       double beta, const HairShade& hs, Pcg32& rng) const {
-        if (lensCam(cam)) connectLens(scene, cam, film, p, n, ng, pe, wi, lambda, beta, 0.0, rng, &hs);
-        else          connect(scene, cam, film, p, n, ng, pe, wi, lambda, beta, 0.0, rng, &hs);
+        if (lensCam(cam)) connectLens(scene, cam, film, room, p, n, ng, pe, wi, lambda, beta, 0.0, rng, &hs);
+        else          connect(scene, cam, film, room, p, n, ng, pe, wi, lambda, beta, 0.0, rng, &hs);
     }
-    void camSplatAllHair(const Scene& scene, const CamTarget* cams, int nCam, const Vec3& p,
+    void camSplatAllHair(const Scene& scene, const CamTarget* cams, int nCam, int depth, const Vec3& p,
                          const Vec3& n, const Vec3& ng, double pe, const Vec3& wi, double lambda,
                          double beta, const HairShade& hs, Pcg32& rng) const {
+        const int room = legRoom(depth);
         for (int c = 0; c < nCam; ++c)
             if (cams[c].cam && cams[c].film)
-                camSplatHair(scene, *cams[c].cam, *cams[c].film, p, n, ng, pe, wi, lambda, beta, hs, rng);
+                camSplatHair(scene, *cams[c].cam, *cams[c].film, room, p, n, ng, pe, wi, lambda, beta, hs, rng);
     }
 
     // Hero-wavelength routing (mode A finite lens or mode B pinhole), splatting all `nUp`
     // live wavelengths through one shared connection. Mode B draws no RNG (RNG-neutral
     // over the camera loop); mode A draws its single aperture sample once per camera.
-    void camSplatHero(const Scene& scene, const Camera& cam, Film& film, const Vec3& p,
+    void camSplatHero(const Scene& scene, const Camera& cam, Film& film, int room, const Vec3& p,
                       const Vec3& n, const Vec3& ng, double pe, const Vec3& wi, const double* lam,
                       const double* beta, const double* rho, int nUp, Pcg32& rng,
                       const Vec3* plane = nullptr,
                       const GlossySplat* gs = nullptr,
                       const CoatSplat* coat = nullptr) const {       // see camSplat
         if (lensCam(cam))
-            connectLensHero(scene, cam, film, p, n, ng, pe, wi, lam, beta, rho, nUp, rng, plane, gs, coat);
+            connectLensHero(scene, cam, film, room, p, n, ng, pe, wi, lam, beta, rho, nUp, rng, plane, gs, coat);
         else if (!(plane && dot(*plane, cam.eye - p) <= 0.0))
-            connectHero(scene, cam, film, p, n, ng, pe, wi, lam, beta, rho, nUp, rng, gs, coat);
+            connectHero(scene, cam, film, room, p, n, ng, pe, wi, lam, beta, rho, nUp, rng, gs, coat);
     }
-    void camSplatAllHero(const Scene& scene, const CamTarget* cams, int nCam, const Vec3& p,
+    void camSplatAllHero(const Scene& scene, const CamTarget* cams, int nCam, int depth, const Vec3& p,
                          const Vec3& n, const Vec3& ng, double pe, const Vec3& wi, const double* lam,
                          const double* beta, const double* rho, int nUp, Pcg32& rng,
                          const Vec3* plane = nullptr,
                          const GlossySplat* gs = nullptr,
                          const CoatSplat* coat = nullptr) const {    // see camSplatAll
+        const int room = legRoom(depth);
         for (int c = 0; c < nCam; ++c)
             if (cams[c].cam && cams[c].film)
-                camSplatHero(scene, *cams[c].cam, *cams[c].film, p, n, ng, pe, wi, lam, beta, rho, nUp,
+                camSplatHero(scene, *cams[c].cam, *cams[c].film, room, p, n, ng, pe, wi, lam, beta, rho, nUp,
                              rng, plane, gs, coat);
     }
 
@@ -3183,12 +3195,13 @@ struct Renderer {
     // photon here (its phase/albedo drive the in-scatter term); transmittance still
     // accounts for all media (product) inside the volume connect functions.
     void camSplatVolumeAll(const Scene& scene, const Medium& med, const CamTarget* cams,
-                           int nCam, const Vec3& p, const Vec3& wIn, double lambda,
+                           int nCam, int depth, const Vec3& p, const Vec3& wIn, double lambda,
                            double beta, Pcg32& rng) const {
+        const int room = legRoom(depth);
         for (int c = 0; c < nCam; ++c)
             if (cams[c].cam && cams[c].film) {
-                if (lensCam(*cams[c].cam)) connectLensVolume(scene, med, *cams[c].cam, *cams[c].film, p, wIn, lambda, beta, rng);
-                else          connectVolume(scene, med, *cams[c].cam, *cams[c].film, p, wIn, lambda, beta, rng);
+                if (lensCam(*cams[c].cam)) connectLensVolume(scene, med, *cams[c].cam, *cams[c].film, room, p, wIn, lambda, beta, rng);
+                else          connectVolume(scene, med, *cams[c].cam, *cams[c].film, room, p, wIn, lambda, beta, rng);
             }
     }
 
@@ -3225,23 +3238,25 @@ struct Renderer {
     // take the coat's way out, at the wavelength they leave with.
     // `scattered` (may be null): set where a glossy draw took its multiple scattering's branch, a
     // scattering for the caustic split (GlossyDraw::ms).
-    bool interactPhotonSpecular(const Scene& scene, const CamTarget* cams, int nCam,
+    // `depth`: the vertex's scatterings on its photon path, itself among them (SpecVtx::depth).
+    bool interactPhotonSpecular(const Scene& scene, const CamTarget* cams, int nCam, int depth,
                                 const Material& m, const Hit& h, Ray& ray, double& beta,
                                 double& lambda, MediumStack& stk, Pcg32& rng,
-                                EnergyReport& e, bool firstHit = false, bool* scattered = nullptr) const {
+                                EnergyReport& e, bool* scattered = nullptr) const {
         const Vec3 wa = ray.d * -1.0;   // the arrival
         const CoatSplat cs{&scene, &h, CoatCtx(m, wa)};
-        if (!interactPhotonSpecularLobe(scene, cams, nCam, m, h, ray, beta, lambda, stk, rng, e, firstHit,
+        if (!interactPhotonSpecularLobe(scene, cams, nCam, depth, m, h, ray, beta, lambda, stk, rng, e,
                                         cs.c ? &cs : nullptr, scattered))
             return false;
         coatContinue(scene, m, h, wa, ray.d, lambda, beta, e);
         return true;
     }
-    bool interactPhotonSpecularLobe(const Scene& scene, const CamTarget* cams, int nCam,
+    bool interactPhotonSpecularLobe(const Scene& scene, const CamTarget* cams, int nCam, int depth,
                                     const Material& m, const Hit& h, Ray& ray, double& beta,
                                     double& lambda, MediumStack& stk, Pcg32& rng,
-                                    EnergyReport& e, bool firstHit, const CoatSplat* coat,
+                                    EnergyReport& e, const CoatSplat* coat,
                                     bool* scattered = nullptr) const {
+        const bool firstHit = depth == 1;   // the photon's first scattering (lambertArrival)
         switch (m.type) {
             case MatType::Dielectric:
             case MatType::ThinFilm:
@@ -3338,11 +3353,11 @@ struct Renderer {
                 // lambda' ~ M and splats the glow (albedo aEff*Q) with the
                 // camera-response evaluated at lambda' (Stokes-shifted colour).
                 if (nCam > 0 && !forwardCatch) {
-                    camSplatAll(scene, cams, nCam, h.p, h.n, ngo, scene.hitEps(h), wi, lambda, beta, rho, rng, nullptr,
+                    camSplatAll(scene, cams, nCam, depth, h.p, h.n, ngo, scene.hitEps(h), wi, lambda, beta, rho, rng, nullptr,
                                 nullptr, coat);
                     if (aEff > 0.0 && m.fluoYield > 0.0 && m.fluoEmitSampler.integral > 0.0) {
                         double pf; double lp = m.fluoEmitSampler.sample(rng, pf);   // drawn once, camera-independent
-                        camSplatAll(scene, cams, nCam, h.p, h.n, ngo, scene.hitEps(h), wi, lp, beta, aEff * m.fluoYield, rng,
+                        camSplatAll(scene, cams, nCam, depth, h.p, h.n, ngo, scene.hitEps(h), wi, lp, beta, aEff * m.fluoYield, rng,
                                     nullptr, nullptr, coat);
                     }
                 }
@@ -3369,7 +3384,7 @@ struct Renderer {
                 const Vec3 wPrev{-ray.d.x, -ray.d.y, -ray.d.z};   // toward the light-side vertex
                 const HairShade hs = hairShadeAt(scene, m, h, lambda, wPrev);
                 if (nCam > 0 && !forwardCatch)
-                    camSplatAllHair(scene, cams, nCam, h.p, h.n, orientedGeoN(h), scene.hitEps(h), wPrev,
+                    camSplatAllHair(scene, cams, nCam, depth, h.p, h.n, orientedGeoN(h), scene.hitEps(h), wPrev,
                                     lambda, beta, hs, rng);
 
                 double pdf = 0.0, fv = 0.0;
@@ -3534,7 +3549,7 @@ struct Renderer {
             }
             // Direct-visibility emission splat (the flame seen directly by the camera).
             if (nCam > 0 && !forwardCatch)
-                camSplatEmissionAll(scene, cams, nCam, origin, lambda, beta, rng);
+                camSplatEmissionAll(scene, cams, nCam, 0, origin, lambda, beta, rng);
             // Fall through to the shared transport loop so the emitted light also
             // illuminates the rest of the scene (self-scatter in the soot, walls, etc.).
         } else {
@@ -3743,7 +3758,7 @@ struct Renderer {
             const double rhoE = em.normalTilted ? PI / em.aimNorm : 1.0;
             const Vec3 face = em.normalTilted ? scene.aimFaceNow(em) : Vec3{0, 0, 0};
             const Vec3* plane = em.normalTilted ? &face : nullptr;
-            camSplatAll(scene, cams, nCam, origin, emitN, emitN, scene.eps, emitN, lambda, beta, rhoE, rng, plane);
+            camSplatAll(scene, cams, nCam, 0, origin, emitN, emitN, scene.eps, emitN, lambda, beta, rhoE, rng, plane);
             camSpecularSplatAll(scene, cams, nCam, 0, origin, emitN, emitN, scene.eps, nullptr, lambda, beta, rhoE, rng, plane);
         }
         }   // end emitter-birth branch
@@ -4086,8 +4101,8 @@ struct Renderer {
                         Vec3 xc = ray.o + ray.d * tC;
                         double betaC = (aC > 0.0) ? betaPre * std::exp(-aC * tC) : betaPre;
                         const Medium& smc = scene.media[whichC];
-                        if (lensCam(*cams[c].cam)) connectLensVolume(scene, smc, *cams[c].cam, *cams[c].film, xc, ray.d, lambda, betaC, crng);
-                        else          connectVolume(scene, smc, *cams[c].cam, *cams[c].film, xc, ray.d, lambda, betaC, crng);
+                        if (lensCam(*cams[c].cam)) connectLensVolume(scene, smc, *cams[c].cam, *cams[c].film, legRoom(bounce + 1), xc, ray.d, lambda, betaC, crng);
+                        else          connectVolume(scene, smc, *cams[c].cam, *cams[c].film, legRoom(bounce + 1), xc, ray.d, lambda, betaC, crng);
                         camSpecularSplatVolumeAll(scene, smc, &cams[c], 1, bounce + 1, xc, ray.d, lambda, betaC, crng);
                     }
                 }
@@ -4206,7 +4221,7 @@ struct Renderer {
                 // where a non-GRIN medium can never reach this block at all.
                 const bool coveredByBeam = beamMS && !marchHit && !sm.grin();
                 if (nCam > 0 && !forwardCatch && !coveredByBeam) {
-                    camSplatVolumeAll(scene, sm, cams, nCam, mp, ray.d, lambda, beta, rng);
+                    camSplatVolumeAll(scene, sm, cams, nCam, bounce + 1, mp, ray.d, lambda, beta, rng);
                     camSpecularSplatVolumeAll(scene, sm, cams, nCam, bounce + 1, mp, ray.d, lambda, beta, rng);
                 }
                 if (coveredByBeam) ++beamScatters;   // this photon just bought one more order
@@ -4274,7 +4289,7 @@ struct Renderer {
                     const GlossySplat gsp{&scene, &scene.mats[(size_t)cm.coatChild], &h, h.n, wl, &cm};
                     // ...softened on the first bounce, as any glossy lobe's (glossyArrival).
                     double bS = beta * glossyArrival(h, wl, bounce == 0);
-                    camSplatAll(scene, cams, nCam, h.p, h.n, orientedGeoN(h), scene.hitEps(h), wl, lambda, bS,
+                    camSplatAll(scene, cams, nCam, bounce + 1, h.p, h.n, orientedGeoN(h), scene.hitEps(h), wl, lambda, bS,
                                 0.0, rng, nullptr, &gsp);
                     camSpecularSplatAllGlossy(scene, cams, nCam, bounce + 1, h.p, h.n, orientedGeoN(h), scene.hitEps(h), wl, &lambda, &bS, 1, gsp, rng);
                 }
@@ -4383,13 +4398,12 @@ struct Renderer {
                         const GlossySplat gsp{&scene, &m, &h, h.n, wl};
                         const CoatSplat cs{&scene, &h, CoatCtx(m, wl)};   // a coated body's way out
                         const CoatSplat* cp = cs.c ? &cs : nullptr;
-                        camSplatAll(scene, cams, nCam, h.p, h.n, orientedGeoN(h), scene.hitEps(h), wl, lambda, beta,
+                        camSplatAll(scene, cams, nCam, bounce + 1, h.p, h.n, orientedGeoN(h), scene.hitEps(h), wl, lambda, beta,
                                     0.0, rng, nullptr, &gsp, cp);
                         camSpecularSplatAllGlossy(scene, cams, nCam, bounce + 1, h.p, h.n, orientedGeoN(h), scene.hitEps(h), wl, &lambda, &beta, 1, gsp, rng, cp);
                     }
                     bool msBranch = false;   // a draw into the multiple scattering: a scattering
-                    if (!interactPhotonSpecular(scene, cams, nCam, m, h, ray, beta, lambda, stk, rng, e,
-                                                bounce == 0, &msBranch))
+                    if (!interactPhotonSpecular(scene, cams, nCam, bounce + 1, m, h, ray, beta, lambda, stk, rng, e, &msBranch))
                         return;
                     if (msBranch) sawScatter = true;
                     if (gFold) {
@@ -4433,8 +4447,7 @@ struct Renderer {
                     // is the textbook wavelength-DIVERGENT vertex, the one case no per-member
                     // weight could ever rescue.
                     retireSpectral(FK_Specular);
-                    if (!interactPhotonSpecular(scene, cams, nCam, m, h, ray, beta, lambda, stk, rng, e,
-                                                bounce == 0))
+                    if (!interactPhotonSpecular(scene, cams, nCam, bounce + 1, m, h, ray, beta, lambda, stk, rng, e))
                         return;
                     continue;
                 }
@@ -4508,8 +4521,8 @@ struct Renderer {
                     if (nCam > 0 && !forwardCatch) {
                         const CoatSplat cs{&scene, &h, CoatCtx(m, wi)};   // a coated body's way out
                         const CoatSplat* cp = cs.c ? &cs : nullptr;
-                        camSplatAll(scene, cams, nCam, h.p,  h.n,  ngo, scene.hitEps(h), wi, lambda, beta, rhoR, rng, nullptr, nullptr, cp);
-                        camSplatAll(scene, cams, nCam, h.p, -h.n, -ngo, scene.hitEps(h), wi, lambda, beta, rhoT, rng, nullptr, nullptr, cp);
+                        camSplatAll(scene, cams, nCam, bounce + 1, h.p,  h.n,  ngo, scene.hitEps(h), wi, lambda, beta, rhoR, rng, nullptr, nullptr, cp);
+                        camSplatAll(scene, cams, nCam, bounce + 1, h.p, -h.n, -ngo, scene.hitEps(h), wi, lambda, beta, rhoT, rng, nullptr, nullptr, cp);
                         camSpecularSplatAll(scene, cams, nCam, bounce + 1, h.p,  h.n,  ngo, scene.hitEps(h), &wi, lambda, beta, rhoR, rng, nullptr, cp);
                         camSpecularSplatAll(scene, cams, nCam, bounce + 1, h.p, -h.n, -ngo, scene.hitEps(h), &wi, lambda, beta, rhoT, rng, nullptr, cp);
                     }
@@ -4592,7 +4605,7 @@ struct Renderer {
                     if (nCam > 0 && !forwardCatch) {
                         const CoatSplat cs{&scene, &h, CoatCtx(m, wi)};   // a coated body's way out
                         const CoatSplat* cp = cs.c ? &cs : nullptr;
-                        camSplatAll(scene, cams, nCam, h.p, h.n, ngo, scene.hitEps(h), wi, lambda, beta, rho, rng, nullptr, nullptr, cp);
+                        camSplatAll(scene, cams, nCam, bounce + 1, h.p, h.n, ngo, scene.hitEps(h), wi, lambda, beta, rho, rng, nullptr, nullptr, cp);
                         camSpecularSplatAll(scene, cams, nCam, bounce + 1, h.p, h.n, ngo, scene.hitEps(h), &wi, lambda, beta, rho, rng, nullptr, cp);
                     }
                     // Russian roulette: absorb with prob (1-rho), else scatter
@@ -4732,7 +4745,7 @@ struct Renderer {
             const Vec3 face = em.normalTilted ? scene.aimFaceNow(em) : Vec3{0, 0, 0};
             const Vec3* plane = em.normalTilted ? &face : nullptr;
             double rhoOne[hero::kHeroMax]; for (int i = 0; i < C; ++i) rhoOne[i] = rhoE;
-            camSplatAllHero(scene, cams, nCam, origin, emitN, emitN, scene.eps, emitN, lam, beta, rhoOne, C, rng,
+            camSplatAllHero(scene, cams, nCam, 0, origin, emitN, emitN, scene.eps, emitN, lam, beta, rhoOne, C, rng,
                             plane);
             camSpecularSplatAllHero(scene, cams, nCam, 0, origin, emitN, emitN, scene.eps, nullptr, lam, beta, rhoOne, C, rng, plane);
         }
@@ -4918,7 +4931,7 @@ struct Renderer {
                     const double sC = glossyArrival(h, wl, bounce == 0);
                     double bS[hero::kHeroMax];
                     for (int i = 0; i < nUp; ++i) bS[i] = beta[i] * sC;
-                    camSplatAllHero(scene, cams, nCam, h.p, h.n, orientedGeoN(h), scene.hitEps(h), wl, lam, bS,
+                    camSplatAllHero(scene, cams, nCam, bounce + 1, h.p, h.n, orientedGeoN(h), scene.hitEps(h), wl, lam, bS,
                                     unused, nUp, rng, nullptr, &gsp);
                     camSpecularSplatAllGlossy(scene, cams, nCam, bounce + 1, h.p, h.n, orientedGeoN(h), scene.hitEps(h), wl, lam, bS, nUp, gsp, rng);
                 }
@@ -4995,8 +5008,8 @@ struct Renderer {
                     if (nCam > 0 && !forwardCatch) {
                         const CoatSplat cs{&scene, &h, CoatCtx(m, wi)};   // a coated body's way out
                         const CoatSplat* cp = cs.c ? &cs : nullptr;
-                        camSplatAllHero(scene, cams, nCam, h.p,  h.n,  ngo, scene.hitEps(h), wi, lam, beta, rhoR, nUp, rng, nullptr, nullptr, cp);
-                        camSplatAllHero(scene, cams, nCam, h.p, -h.n, -ngo, scene.hitEps(h), wi, lam, beta, rhoT, nUp, rng, nullptr, nullptr, cp);
+                        camSplatAllHero(scene, cams, nCam, bounce + 1, h.p,  h.n,  ngo, scene.hitEps(h), wi, lam, beta, rhoR, nUp, rng, nullptr, nullptr, cp);
+                        camSplatAllHero(scene, cams, nCam, bounce + 1, h.p, -h.n, -ngo, scene.hitEps(h), wi, lam, beta, rhoT, nUp, rng, nullptr, nullptr, cp);
                         camSpecularSplatAllHero(scene, cams, nCam, bounce + 1, h.p,  h.n,  ngo, scene.hitEps(h), &wi, lam, beta, rhoR, nUp, rng, nullptr, cp);
                         camSpecularSplatAllHero(scene, cams, nCam, bounce + 1, h.p, -h.n, -ngo, scene.hitEps(h), &wi, lam, beta, rhoT, nUp, rng, nullptr, cp);
                     }
@@ -5067,7 +5080,7 @@ struct Renderer {
                         double unused[hero::kHeroMax] = {};
                         const CoatSplat cs{&scene, &h, CoatCtx(m, wl)};   // a coated body's way out
                         const CoatSplat* cp = cs.c ? &cs : nullptr;
-                        camSplatAllHero(scene, cams, nCam, h.p, h.n, orientedGeoN(h), scene.hitEps(h), wl, lam, beta,
+                        camSplatAllHero(scene, cams, nCam, bounce + 1, h.p, h.n, orientedGeoN(h), scene.hitEps(h), wl, lam, beta,
                                         unused, nUp, rng, nullptr, &gsp, cp);
                         camSpecularSplatAllGlossy(scene, cams, nCam, bounce + 1, h.p, h.n, orientedGeoN(h), scene.hitEps(h), wl, lam, beta, nUp, gsp, rng, cp);
                     }
@@ -5147,24 +5160,23 @@ struct Renderer {
                             cl[0] = lam[i]; cb[0] = beta[i];
                             MediumStack cstk = stk;         // sub-paths diverge from here on
                             Ray cray = ray;
-                            if (interactPhotonSpecular(scene, cams, nCam, m, h, cray, cb[0],
-                                                       cl[0], cstk, rng, e, bounce == 0))
+                            if (interactPhotonSpecular(scene, cams, nCam, bounce + 1, m, h, cray, cb[0],
+                                                       cl[0], cstk, rng, e))
                                 tracePhotonHeroLoop(scene, cams, nCam, sensorFilm, cray, cstk,
                                                     cl, cb, /*secAlive=*/false, bounce + 1,
                                                     rng, e, sawFocus, sawScatter);
                             beta[i] = 0.0;                  // its energy is now that sub-path's
                         }
                         secAlive = false;                   // hero carries on alone, UNBOOSTED
-                        if (!interactPhotonSpecular(scene, cams, nCam, m, h, ray, beta[0],
-                                                    lam[0], stk, rng, e, bounce == 0))
+                        if (!interactPhotonSpecular(scene, cams, nCam, bounce + 1, m, h, ray, beta[0],
+                                                    lam[0], stk, rng, e))
                             return;
                         continue;
                     }
                     // Default policy: terminate secondaries, then run the shared scalar
                     // interaction on the (boosted) hero channel.
                     deHero();
-                    if (!interactPhotonSpecular(scene, cams, nCam, m, h, ray, beta[0], lam[0], stk, rng, e,
-                                                bounce == 0))
+                    if (!interactPhotonSpecular(scene, cams, nCam, bounce + 1, m, h, ray, beta[0], lam[0], stk, rng, e))
                         return;
                     continue;
                 }
@@ -5195,7 +5207,7 @@ struct Renderer {
                     if (nCam > 0 && !forwardCatch) {
                         const CoatSplat cs{&scene, &h, CoatCtx(m, wi)};   // a coated body's way out
                         const CoatSplat* cp = cs.c ? &cs : nullptr;
-                        camSplatAllHero(scene, cams, nCam, h.p, h.n, ngo, scene.hitEps(h), wi, lam, beta, rho, nUp, rng, nullptr, nullptr, cp);
+                        camSplatAllHero(scene, cams, nCam, bounce + 1, h.p, h.n, ngo, scene.hitEps(h), wi, lam, beta, rho, nUp, rng, nullptr, nullptr, cp);
                         camSpecularSplatAllHero(scene, cams, nCam, bounce + 1, h.p, h.n, ngo, scene.hitEps(h), &wi, lam, beta, rho, nUp, rng, nullptr, cp);
                     }
                     // Continuation RR over the WHOLE bundle: the survival probability is

@@ -989,8 +989,10 @@ that converges to the same physical image.
   `P`, `D`, or `R` for those. A `filter` gel and a `halfmirror` pass what they pass unbent, so
   since 0.451.3 a splat sees through them, taking the gel's transmittance or the mirror's
   1 − reflectance at each wavelength (before, the wall behind a gel rendered black, and what a
-  half mirror lets through was missing); through one in front of a glass sphere or another mirror
-  the analytic connections still stop. Best default
+  half mirror lets through was missing). Each one crossed is a vertex of the path, so it counts
+  against `-max-bounce` as it does in mode R. Still stopped by them: the analytic connections
+  through a glass sphere or off another mirror, the directly seen sky, sun and glows (black behind
+  a gel), and a `mix` or `layered` surface whose child is a gel or half mirror. Best default
   for diffuse and caustic-heavy scenes. In an *absolute-EV* scene an authored
   `fstop`/`lens` still sets exposure here — the pinhole has no depth of field, but it
   applies the camera-equation light-gathering term `(π/4)/N²`, so f/2 is exactly four

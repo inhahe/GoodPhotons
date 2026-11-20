@@ -326,17 +326,29 @@ once; and have it say plainly, last, that ftrace.exe was NOT updated.
 
 **Fixed (0.451.3) for the direct camera legs:** the forward connections -- mode B's surface, volume and
 emission splats and mode A's lens connections, single-wavelength and hero bundles, host and device -- take
-a blocked leg through `camLegPass` / `dCamLegThrough`, which walks it only when the plain any-hit test
+a blocked leg through `camLegThrough` / `dCamLegThrough`, which walks it only when the plain any-hit test
 says blocked and the scene holds a gel or a half mirror (`Scene::passThroughAny`), and multiplies the
 splat by what each such surface passes at each wavelength. Measured, XYZ against mode R, both devices:
 behind the gel 0.000 -> 0.999-1.002; the soft-edged half mirror 0.89 / 0.94 / 1.00 -> 1.00 / 1.00 / 1.01;
 the step half mirror 0.99 / 0.98 / 0.57 -> 1.00 / 1.01 / 0.96. `tools/check_passthrough.py` holds mode B
-to mode R on all three (0.451.1 fails it: the gel 0.000 at 300 sigma). Mode A was not measured: these
+to mode R on all three, fog behind the gel, two gels and -max-bounce 1, and mode P's blurred split
+(0.451.1 fails it: the gel 0.000 at 300 sigma). Mode A was not measured: these
 scenes' pinhole camera gives mode A, the finite-lens camera, nothing to render; its lens connections take
-the same change. **Left:** the analytic specular connections' legs -- vertex to a glass sphere or a
-mirror, and the mirror's own check that it is what the eye sees (`mirrorSeenAt`) -- still stop at a gel
-or half mirror (the device's sphere legs skip the sphere, which its closest-hit walk cannot), and the
-step half mirror's Z reads 0.96 on both devices, not yet understood.
+the same change. (The step half mirror's Z 0.96 was noise: four seeds at four times the samples read
+0.997 over the frame, every tile within 2 sigma.) Since 0.451.4 each surface a leg crosses counts
+against -max-bounce, as mode R counts it (REVIEW-0452). **Left:**
+* the analytic specular connections' legs -- vertex to a glass sphere or a mirror, and the mirror's own
+  check that it is what the eye sees (`mirrorSeenAt`) -- still stop at a gel or half mirror (the
+  device's sphere legs skip the sphere, which its closest-hit walk cannot);
+* the sky, sun and glows modes A and B see directly (`prepareSky`, `addBlurredSkyRows`, the device's
+  sky rows) stop at the first surface, so they are black behind a gel while the wall beside them shows
+  through it. **Fix:** a sample whose first hit passes light walks on, at a wavelength of its own (a
+  pinhole's sky is exact in XYZ per direction only where nothing filters it), times what each surface
+  passes, its count growing with the render as a lens's does;
+* a `mix` or `layered` surface whose child is a gel or half mirror blocks the leg. **Fix:** the leg
+  takes the child weights' expectation at the hit -- a mix's `sum w_c pass_c(lam)` (its weight map
+  read where it has one), a stack's coat first (the walk's coat coin and coatContinue) -- and
+  `passThroughAny` and occludedGeometry's skip count such compounds.
 
 The report:
 
@@ -354,6 +366,45 @@ passes is missing. **Proper fix:** a camera leg (camSplatAll, the lens connectio
 legs of the specular connections) crosses a filter or a half mirror with its transmittance at each
 wavelength of the bundle -- deterministic, as a translucent fiber's coverage is in shadowTransmittance --
 on the host and the device, and a regression check of modes A and B behind a gel and through half mirrors.
+
+## OPEN (2026-11-20): SKY-THROUGH-FOG — the sky seen directly through an absorbing fog reads differently in modes R, M and B
+
+Found probing how the forward sky pass meets a medium (for MODEB-PASSTHROUGH's sky). A uniform sky
+(`light env { spd 1.0 }`) over a floor, seen through a fog box (`sigma_t 0.5  albedo 0`, 2 m deep), the
+top quarter of the frame (sky only), its fog render over its clear one, on the CPU: mode R **0.3157**
+(the GPU 0.3162, `-heroc 1` 0.3155), mode M **0.9004**, mode B 0.3421; Beer-Lambert along each pixel's
+pinhole ray, worked out per pixel, **0.3415**. So mode R's sky is 7.6 % too dark behind the fog and mode
+M's barely dimmed -- unless the analytic figure misses something mode B happens to match. And mode B's
+match is itself unexplained: its sky pass (`prepareSky`) takes `envXYZForDir` along the camera ray with
+no medium on it, so something else dims it. The clear sky alone disagrees too: mode B 2.1 % above mode
+R (2.2185 against 2.1721, the channels' sum), mode M 1.2 % below (2.1468) -- far outside the noise of
+about a thousand wavelengths a pixel over 768 pixels. Reproduce: `python scraps/_sky_fog_probe.py`.
+**To do:** find which is right (the analytic transmittance with the camera's own rays; mode R's
+free-flight through a pure absorber; mode M's camera walk through a medium to a miss; what dims mode B's
+sky), fix the others, and a regression check of the three modes' sky, clear and through fog.
+
+## OPEN (2026-11-20, needs a decision): THINLENS-VIGNETTING — through a thin lens, mode A's image has natural vignetting and an irradiance scale that the other modes' do not
+
+Found writing check_passthrough's thin-lens case (REVIEW-0452). Through a physical `lens { }`, mode A
+and mode R record the same thing -- the lens image's irradiance, its falloff included (`genLensRay`'s
+weight) -- and agree tile for tile. Through a **thin** lens (`aperture`, or `lens <mm>` with `fstop`)
+mode A records irradiance too: its splat carries `cosLens * R^2 / dist^2` over the cell's area
+(`connectLens`, the `F = 1/A_cell` re-seat), so the corners fall off as the lens's natural vignetting
+does. Mode R's thin lens, like mode B's pinhole, records radiance: flat to the corners, and on a scale the
+camera equation `(pi/4)/N^2` apart from mode A's. Measured on check_passthrough's gel scene through
+`lens 35  fstop 4  focus 4.0`, the linear output (`-hdr`): mode A / mode R about 0.038 over the frame,
+from 0.86 to 1.14 of that between the corners and the middle. With `aperture 0.02` and no `fstop`, 0.001.
+Auto-exposure divides the scale out, so the visible difference is mode A's darker corners; the earlier
+July entry ("A/B/C now agree in absolute brightness") names the end state, "one camera-equation absolute
+model (add cos^4 natural vignetting too)", and stops short of it. **Decision needed**, either:
+* every mode's thin lens takes the camera equation with its natural vignetting, as the physical lens
+  already does in mode R (the backward camera's weight `cos^4 * A / Z^2` per sample on a thin lens,
+  mode B's pinhole the same falloff) -- physically right, and it darkens the corners of every existing
+  thin-lens render outside mode A; or
+* mode A's thin lens drops its `cos` falloff and its aperture scale and records radiance as the rest do
+  -- every existing mode-A thin-lens render brightens toward the corners.
+Until then check_passthrough divides mode A's thin-lens image by its fitted ratio to mode R on a scene
+without the gel.
 
 ## DONE (2026-11-20, 0.451.2): HOST-HALFMIRROR-ANALYTIC — on the CPU a half mirror whose reflectance is an analytic curve renders about half as bright in modes M, S and B
 
@@ -409,6 +460,51 @@ check_spec_cells' 546.5 nm gel, bin 9 takes the gel's 0 and `JSpec::at` interpol
 scene's cells too (its `r[]` sized `kSpecCellsMax`, read by cell rather than interpolated across a cut,
 its support's `hole` mask per cell) -- which grows the per-segment and per-vertex carrier
 JSPEC-CARRIER-SIZE measures (120 B to about 190 B), so it goes with that entry's half-precision bins.
+
+## DONE (2026-11-20, 0.451.4): REVIEW-0452 — what the Opus (max) and Fable (xhigh) reviews of 0.451.2-0.451.3 found
+
+Opus (max) and Fable (xhigh) reviewed e21dbfc..7bf37b4 (HOST-HALFMIRROR-ANALYTIC, MODEB-PASSTHROUGH).
+Each finding was checked against the code.
+
+**Fixed:**
+* **Mode P's blurred split counted light seen through a gel twice** (both): its camera side files every
+  sample whose first surface is specular-type, a gel's included, and its forward side now splatted
+  through the gel too. A leg in the split crosses none (`legRoom` 0 where `specularSideSplats` is off;
+  the device's `DCamSet::pSplit`). check_passthrough's `blur_P` case fails without it (X 1.42).
+* **The device's fiber legs still stopped at a gel** (both): `dHairCamLegBlocked` goes through
+  `dCamLegThrough`, as the host's hair branches do.
+* **A crossing cost no bounce** (Fable): a gel or half mirror on the leg is a vertex of the path, which
+  mode R counts against -max-bounce; the connections take `room` = -max-bounce less the vertex's depth
+  (`Renderer::legRoom`, `dLegRoom`; the routers and `interactPhotonSpecular` take the depth, whose
+  `firstHit` is depth 1). check_passthrough's `bounce1` case.
+* **The device re-originated each crossing at the raw hit** (both), within `dEpsAt` of it however far
+  the primitive reaches: it starts past `dHitEps(h)`, as every device continuation does.
+* **The device allowed 7 crossings, the host 8** (both), and **restated host constants as literals**
+  (both): `kCamLegThroughMax` and `kCoinRare` (now in spectrum.h) are shared.
+* **kCoinRare was tested coin by coin** (both): on the accumulated per-cell probability instead, so
+  coins each inside the threshold but compounding past it turn the walk partial.
+* **A leg passing nothing still splatted** (Fable), adding an empty hit the noise estimate counts: a leg
+  whose product is 0 at every wavelength is blocked.
+* **NaN passed the clamp** (Fable): `v > 0 ? min(v, 1) : 0`.
+* **CamLegPass held eight Hit records** (both), about 2.3 KB built and copied per connection: the factors
+  are taken at the caller's wavelengths (`camLegThrough(..., lam, n, T)`), nothing stored.
+* **A leg blocked by a wall paid a closest-hit walk** (Opus) in any scene with a gel: an any-hit test that
+  skips gels and half mirrors (`occludedGeometry`'s `skipPassThrough`) settles it first.
+* A bound pattern evaluated once a wavelength (Opus), hoisted; comments glued to the wrong line (Opus); the
+  never-varied `camLeg` parameter (both), removed; narration in comments (Fable), rewritten.
+* **Coverage** (both): check_passthrough gains fog behind the gel, two gels, -max-bounce 1 and mode P's
+  blur, and holds them to 3 % (from 5 %); `tile_verdict` (check_glossy_nee_media) counts a tile live
+  where either image is lit, so light where the reference has none fails -- every check built on it
+  re-run. The step half mirror's Z 0.96 the 5 % hid was noise (MODEB-PASSTHROUGH).
+
+**Left, in MODEB-PASSTHROUGH** (Fable): the sky, sun and glows modes A and B see directly, and `mix` /
+`layered` surfaces whose child is a gel or half mirror, still stop the leg.
+
+**Dismissed:** one any-hit traversal multiplying the factors as `shadowTransmittance` does for fibers
+(Fable). With the opaque test first, only a leg that a gel or half mirror alone blocks walks its hits, a
+walk of as many closest-hit queries as it crosses surfaces; the factors need a full Hit (a pattern, a
+half mirror's angle) that an any-hit callback does not build, and instanced meshes would need a
+material-aware any-hit.
 
 ## DONE (2026-11-20, 0.451.1): REVIEW-0451 — what the Opus (max) and Fable (xhigh) reviews of 0.451.0 found
 

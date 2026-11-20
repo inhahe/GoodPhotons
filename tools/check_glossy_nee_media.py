@@ -155,13 +155,14 @@ def tile_stats_k(imgs, n=4):
 
 def tile_verdict(x1, x0, rel, z_max=5.0):
     """Compare two tile_stats (mean, standard error) pairs: the ratio x1 / x0 per tile, the
-    z-scores (0 on a tile under 2 % of x0's brightest, too dark to carry information), and the
-    failing tiles -- those that differ by more than `z_max` standard errors AND by more than
-    `rel` of x0."""
+    z-scores (0 on a tile under 2 % of x0's brightest in both images, too dark to carry
+    information), and the failing tiles -- those that differ by more than `z_max` standard errors
+    AND by more than `rel` of x0. A tile x0 leaves dark that x1 lights is live: light where the
+    reference has none is a failure too."""
     (m1, e1), (m0, e0) = x1, x0
     z = np.abs(m1 - m0) / np.maximum(np.hypot(e1, e0), 1e-30)
     ratio = m1 / np.maximum(m0, 1e-30)
-    live = m0 > 0.02 * m0.max()
+    live = np.maximum(m0, m1) > 0.02 * m0.max()
     return ratio, np.where(live, z, 0.0), live & (z > z_max) & (np.abs(ratio - 1.0) > rel)
 
 

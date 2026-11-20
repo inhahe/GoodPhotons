@@ -5868,8 +5868,9 @@ struct Scene {
     }
     // occluded() less the GRIN rule: geometry alone, for the probes that ask what is THERE (the
     // cavity pattern, the gather footprint, the sky's entry past haze) rather than what light reaches.
+    // `skipPassThrough`: gels and half mirrors do not block (camLegThrough asks whether anything else does).
     bool occludedGeometry(const Vec3& o, const Vec3& dir, double maxDist, double tmin = kTminEps,
-                          bool camLeg = false, double curveTmin = 0.0) const {
+                          bool camLeg = false, double curveTmin = 0.0, bool skipPassThrough = false) const {
         tmin = tminOr(tmin);
         ++raystats::tls;
         Ray r{o, dir, curveTmin};
@@ -5882,8 +5883,12 @@ struct Scene {
         const CurveRay cray = nC ? makeCurveRay(r.d) : CurveRay{};   // see closestHit
         const PatTables tabs = patTables();      // see closestHit
         const bool camHide = camLeg && camHiddenAny;      // see closestHit's `camHide`
+        const bool skipPT = skipPassThrough && passThroughAny;
         const auto hidden = [&](int matId) {
-            return camHide && matId >= 0 && matId < (int)mats.size() && mats[matId].hideCamera;
+            if (!(matId >= 0 && matId < (int)mats.size())) return false;
+            const Material& m = mats[(size_t)matId];
+            return (camHide && m.hideCamera) ||
+                   (skipPT && (m.type == MatType::Filter || m.type == MatType::HalfMirror));
         };
         return traverseWorldAny(r, tmin, seg, [&](int prim) {
             Hit h; h.t = seg;
@@ -6652,53 +6657,49 @@ inline double transmitSlot(const Scene& scene, const Material& m,
     return m.transmitPat < 0 ? v : v * slotPatMul(scene, m.transmitPat, h);
 }
 
-// A camera leg through the surfaces that pass light straight on (MODEB-PASSTHROUGH): a `filter` gel,
-// which passes T(lam), and a `halfmirror`, which passes 1 - R(lam) -- a light path the leg is, where any
-// other surface on it stops it (Scene::occluded's rule, camera-hidden surfaces skipped). `blocked`, or
-// the surfaces crossed, whose product at a wavelength is at(lam): 1 where it crosses none. The forward
-// splat modes connect each photon vertex to the camera along such a leg; one that meets nothing costs
-// the occluded() test it always did.
-struct CamLegPass {
-    static constexpr int kMax = 8;   // the most such surfaces a leg crosses; past them it is blocked
-    bool blocked = false;
-    int n = 0;
-    const Scene* scene = nullptr;
-    Hit hits[kMax];
-    double at(double lambda) const {
-        double t = 1.0;
-        for (int i = 0; i < n; ++i) {
-            const Material& m = scene->mats[(size_t)hits[i].matId];
-            const double v = m.type == MatType::Filter ? transmitSlot(*scene, m, hits[i], lambda)
-                                                       : 1.0 - reflectSlot(*scene, m, hits[i], lambda);
-            t *= v < 0.0 ? 0.0 : (v > 1.0 ? 1.0 : v);
-        }
-        return t;
-    }
-};
-// The leg o + t dir, t in [tmin, maxDist] (Scene::occluded's arguments); `camLeg`: it ends at the camera,
-// so camera-hidden surfaces are skipped (a specular connection's leg from the photon vertex is not one).
-inline CamLegPass camLegPass(const Scene& scene, const Vec3& o, const Vec3& dir, double maxDist,
-                             double tmin = Scene::kTminEps, double curveTmin = 0.0, bool camLeg = true) {
-    CamLegPass r;
-    r.scene = &scene;
-    if (!scene.occluded(o, dir, maxDist, tmin, camLeg, curveTmin)) return r;
-    if (!scene.passThroughAny || scene.crossesGrin(o, dir, maxDist)) { r.blocked = true; return r; }
+// A camera leg through the surfaces that pass light straight on (MODEB-PASSTHROUGH): a `filter` gel, which
+// passes T(lam), and a `halfmirror`, which passes 1 - R(lam) -- a light path the leg is, where any other
+// surface on it stops it (Scene::occluded's rule for a camera leg, camera-hidden surfaces skipped). The
+// leg o + t dir, t in [tmin, maxDist] (occluded()'s arguments); false where it is blocked, else true and
+// T[i] what those surfaces pass at lam[i], i < n (1 where it crosses none). `room`: the most of them it
+// may cross (Renderer::legRoom: each is a vertex of the path, which -max-bounce counts; none in mode P's
+// blurred split, whose camera side draws whatever is seen through them), past which it is blocked.
+// A clear leg costs the occluded() test it always did; a blocked one, in a scene with such a surface, a
+// second any-hit test that skips them, and only where nothing else blocks it a walk of its closest hits.
+// A leg that passes nothing at every wavelength is blocked, so it adds no empty hit to the pixel's count
+// (the forward modes' noise estimate reads it).
+constexpr int kCamLegThroughMax = 8;   // the most such surfaces a leg crosses; past them it is blocked
+inline bool camLegThrough(const Scene& scene, const Vec3& o, const Vec3& dir, double maxDist, double tmin,
+                          double curveTmin, int room, const double* lam, int n, double* T) {
+    for (int i = 0; i < n; ++i) T[i] = 1.0;
+    if (!scene.occluded(o, dir, maxDist, tmin, /*camLeg=*/true, curveTmin)) return true;
+    room = std::min(room, kCamLegThroughMax);
+    if (room <= 0 || !scene.passThroughAny) return false;
+    if (scene.occludedGeometry(o, dir, maxDist, tmin, /*camLeg=*/true, curveTmin, /*skipPassThrough=*/true) ||
+        scene.crossesGrin(o, dir, maxDist))
+        return false;
     Vec3 q = o;
     double left = maxDist, tq = tmin, cq = curveTmin;
-    for (;;) {
-        const Hit h = scene.closestHit(Ray{q, dir, cq}, tq, nullptr, false, /*skipCamHidden=*/camLeg, left);
-        if (!h.valid || !(h.t < left)) return r;          // the rest of the leg is clear
-        const MatType t = scene.mats[(size_t)h.matId].type;
-        if ((t != MatType::Filter && t != MatType::HalfMirror) || r.n == CamLegPass::kMax) {
-            r.blocked = true;
-            return r;
+    for (int k = 0; k <= room; ++k) {
+        const Hit h = scene.closestHit(Ray{q, dir, cq}, tq, nullptr, false, /*skipCamHidden=*/true, left);
+        if (!h.valid || !(h.t < left)) return true;          // the rest of the leg is clear
+        const Material& m = scene.mats[(size_t)h.matId];
+        const bool gel = m.type == MatType::Filter;
+        if ((!gel && m.type != MatType::HalfMirror) || k == room) return false;
+        const double pat = (gel && m.transmitPat >= 0) ? slotPatMul(scene, m.transmitPat, h) : 1.0;   // once
+        bool any = false;
+        for (int i = 0; i < n; ++i) {
+            const double v = gel ? m.transmit(lam[i]) * pat : 1.0 - reflectSlot(scene, m, h, lam[i]);
+            T[i] *= v > 0.0 ? (v < 1.0 ? v : 1.0) : 0.0;   // NaN passes nothing
+            any = any || T[i] > 0.0;
         }
-        r.hits[r.n++] = h;
+        if (!any) return false;
         q = h.p;
         left -= h.t;
         tq = scene.hitEps(h);
         cq = 0.0;
     }
+    return false;
 }
 
 // The wavelength-free factor on the radiance an emissive surface sends toward `wo` from a

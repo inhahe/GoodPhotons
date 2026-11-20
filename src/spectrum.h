@@ -392,6 +392,13 @@ struct EmissionSampler {
 // not near linear across it (chooseSpecCuts). A scene with no such factor has exactly the uniform bins,
 // each read at its centre.
 constexpr int kSpecCutsMax = 16;
+// A walk whose branches' probability, at some cell, is under this share of its likeliest cell's is partial
+// (SpecThr::p, the device's DSpecThr): the exact ratio p(lamP) / p(lamC) is unbiased only where walks drawn
+// at lamC do take the branches, and a branch a thousandth as likely is, for a finite render, one they never
+// take -- its light would come only from the walks drawn elsewhere, weighed as if they were all. The
+// averaged probability is unbiased whatever the spread. Taken on the walk's accumulated product, so three
+// coins each under the ratio but compounding past it count as one would.
+constexpr double kCoinRare = 1e-3;
 constexpr int kSpecCellsMax = kBandProbeBins + kSpecCutsMax;
 struct SpecCells {
     int n = kBandProbeBins;

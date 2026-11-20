@@ -11624,17 +11624,31 @@ the mirror-free patch, not 1.0, is the number the mirror box has to match.
 
 A forward splat connects a photon vertex to the camera along a straight leg. A `filter` gel and a
 `halfmirror` pass what they pass unbent, so a leg through one is a light path carrying the gel's T(lam)
-or the mirror's 1 - R(lam). The connections (`connect`, `connectGeom`'s users, the volume, emission and
-lens connections and their hero variants; on the device `connect*`) take their leg through
-`camLegPass` (`scene.h`) / `dCamLegThrough`: the any-hit occlusion test first, as before, so a clear
-leg costs nothing more; where it is blocked and the scene holds such a material
-(`Scene::passThroughAny`, `DScene::passThroughAny`), a walk of the leg's closest hits -- camera-hidden
-surfaces skipped, a GRIN region a block -- that keeps the gels and half mirrors it crosses (8 at most)
-and stops at anything else. The host keeps the hits and evaluates their product at any wavelength
-(`CamLegPass::at`); the device, whose forward kernels' stacks cannot hold eight hit records, evaluates
-at the wavelengths its site needs. Without it the wall behind a gel rendered black in mode B
-(MODEB-PASSTHROUGH); `tools/check_passthrough.py` is the check. The analytic specular connections' legs
-(through a glass sphere, off a mirror) still stop at one.
+or the mirror's 1 - R(lam). The connections (`connect`, `connectGeom`'s users, the volume, emission,
+fiber and lens connections and their hero variants; on the device `connect*`) take their leg through
+`camLegThrough` (`scene.h`) / `dCamLegThrough`, at the wavelengths the site splats:
+
+* the any-hit occlusion test first, as before, so a clear leg costs nothing more;
+* where it is blocked and the scene holds such a material (`Scene::passThroughAny`,
+  `DScene::passThroughAny`), a second any-hit test that skips them (`occludedGeometry`'s
+  `skipPassThrough`): a leg a wall blocks stops there;
+* only then a walk of the leg's closest hits -- camera-hidden surfaces skipped, a GRIN region a
+  block -- multiplying in what each gel or half mirror passes, a bound pattern read once a crossing.
+
+A leg that passes nothing at every wavelength is blocked, so it adds no empty hit to the noise estimate.
+
+**Each crossing is a vertex of the path**, as it is where mode R's camera ray crosses one, so it counts
+against -max-bounce: a connection takes `room`, the crossings left to it (`Renderer::legRoom` /
+`dLegRoom`: -max-bounce less the vertex's depth, `SpecVtx::depth`'s count; `kCamLegThroughMax`, 8, at
+most). The routers (`camSplatAll` and kin, `splatSurfaceAll` and kin) and `interactPhotonSpecular` take
+the vertex's depth to work it out. Mode P's blurred split gives every leg a room of 0: its camera side
+files each sample whose first surface is specular-type, a gel's included, and draws what is seen through
+it (`specularSideSplats` off, `DCamSet::pSplit`).
+
+Without it the wall behind a gel rendered black in mode B (MODEB-PASSTHROUGH); `tools/check_passthrough.py`
+is the check. Still stopped at one: the analytic specular connections' legs (through a glass sphere, off a
+mirror), the sky, sun and glows a forward camera sees directly (`prepareSky`, `addBlurredSkyRows`), and a
+`mix` or `layered` surface whose child passes light.
 
 ## Glossy camera splats, and the rough interference reflector (0.401.0)
 
