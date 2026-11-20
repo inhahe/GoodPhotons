@@ -307,7 +307,7 @@ Then the rest of 4.2-4.6 in their order, 4.7's bookkeeping alongside whatever to
   events (reflections outside and inside, to 16; 128 since 0.448.1), its rim and its folds
   (known-issues).
 - [ ] **GPU-SPHERE-CONNECT-SLOW** — GPU mode B through a glass sphere: since 0.450.42 the connection closes on
-  its roots and splats its images in loops after its scan (17.5 -> 9.7 s, ahead of the CPU's 11.7);
+  its roots and splats its images in loops after its scan (17.5 -> 9.2 s, ahead of the CPU's 11.7);
   left, queue the connections into a kernel of their own, so a warp's lanes run them together, and an
   fp32 scan (known-issues).
 - [x] **MODEB-SPHERE-ROOM** (0.448.1) — the check's depth cap, which mode R counts the ball's events
@@ -523,6 +523,9 @@ Then the rest of 4.2-4.6 in their order, 4.7's bookkeeping alongside whatever to
 - [x] **J-SURF-GATHER-DIVERGENCE** (0.450.37) — mode J's queued surface gather tests a photon a lane and weighs
   32 at a time (dSiteListWarp): at five times the radius its gather 33 % faster, at its own unchanged
   (its sites hold a warp's worth of photons or fewer); known-issues.
+- [ ] **BUILD-LOCK** — build.bat now and then fails on a locked output (LNK1104 / C1083) and passes on the
+  retry: catch the holder (handle.exe), then exclude or retry; known-issues.
+- [x] **REVIEW-0450Q** (0.450.43) — the Opus (max) and Fable (xhigh) reviews of 0.450.42; known-issues REVIEW-0450Q.
 - [x] **REVIEW-0450P** (0.450.41) — the Opus (xhigh) review of 0.450.38-0.450.40; known-issues REVIEW-0450P.
 - [x] **REVIEW-0450O** (0.450.40) — the Opus (max) and Fable (xhigh) reviews of 0.450.34-0.450.37;
   known-issues REVIEW-0450O.

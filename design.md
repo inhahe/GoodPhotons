@@ -11435,24 +11435,29 @@ turns fast with its direction (22 % at a tenth of a pixel from the rim). Mode B 
 runs faster than before 0.448.0 for all the chains it adds (330 s on the GPU for 1e8 photons of
 check_ball_images' outside view, where 0.447.2 took 413; 69 s on the CPU for 4e7).
 
-**On the device the scan closes on its candidates after it (0.450.42).** A photon thread that reaches a
-diffuse vertex runs the connection, and a warp's lanes reach theirs at different times and find their
-roots at different samples, so inline each root's refinement and each image's chain traces, Jacobian and
-shadow rays ran one lane at a time: Nsight had mode B's photon kernel at 2.4 active lanes an
+**On the device the scan closes on its candidates after it (0.450.42-0.450.43).** A photon thread that
+reaches a diffuse vertex runs the connection, and a warp's lanes reach theirs at different times and
+find their roots at different samples, so inline each root's refinement and each image's chain traces,
+Jacobian and shadow rays ran one lane at a time: Nsight had mode B's photon kernel at 2.4 active lanes an
 instruction and its FP64 pipe 76 % busy on check_ball_images' outside view. `dSphScanChains` records each
-chain's candidates (`DSphEvent`: a sign change, or a dip the roulette kept) and closes on them in a loop
-after the scan, in the scan's order, each chain capped at four found when it is closed as it was when it
-was met; `dConnectSpecularSphere`'s `image` keeps the cheap test that decides a found image (the leg
-through the vertex, the chief chain's side) and holds the splat -- the chain traced again, its
-differentials, its legs' shadow rays, its light -- for a loop after that (`pend`). Every root is closed
-and every image splatted in the order it was inline, so every draw the media take is the one it took;
-each list flushes in order when full (16). The splats' loop alone left the images bit for bit those of
-0.450.41; closing the roots after the scan inlines their arithmetic elsewhere, which ptxas contracts
-otherwise, and a borderline root or dip closes the other way now and then: check_bitid's glass spheres
-(`flat`, GPU mode B) moved 262 of 6912 pixels, the mean by under 0.001 %. The outside
-view at 5e6 photons, 17.5 -> 13.5 s with the splats deferred and 9.7 s with the roots too (the CPU's
-32 threads, 11.7 s); the kernel's FP64 instructions 29 -> 17 G. Still 3.8 lanes: only the lanes at a
-vertex together run a connection together (GPU-SPHERE-CONNECT-SLOW).
+chain's candidates (`DSphEvent`: a sign change, or a dip the roulette kept, its two samples by their
+place in the scan) and closes on them in a loop apart from the samples; both connectors' `image` decides
+whether the chain found an image there (the leg through the vertex, the chief chain or reflection toward
+it), runs the cheap tests that leave it nothing to add (the frame, the vertex's side, a faint chain's
+roulette) and holds the rest -- the differentials, the shadow rays, the light -- for a loop after the
+scan, with the chain it traced (`Pend`). Both lists are a `DSphBatch` (16 events, 4 images), which takes
+its items in the order they come and hands them on when it fills and when asked: every root is closed
+and every image splatted in the scan's order (the host twin's), each chain capped at four found when it
+is closed, so the media draw the same numbers: built without contraction (`--fmad=false`), this and
+0.450.41's inline connection render check_bitid's glass spheres alike to the bit, and so do lists of one
+item, which flush at every push. Built as ever, the deferred arithmetic contracts otherwise than inline,
+and a borderline root or dip now and then closes the other way (`flat`, GPU mode B: 262 of 6912 pixels
+moved, the mean by under 0.001 %). A list that fills mid-scan flushes in the lanes it fills in alone,
+which costs: 8 events ran the outside view 8 % slower than 16, and 32 gained nothing for 750 B more of
+the stack, which the driver reserves for every resident thread (the lists hold some 1.7 KB of kTrace's
+22.9 KB). The outside view at 5e6
+photons, 17.5 -> 9.2 s (the CPU's 32 threads, 11.7 s); the kernel's FP64 instructions 29 -> 17 G. Still
+3.8 lanes: only the lanes at a vertex together run a connection together (GPU-SPHERE-CONNECT-SLOW).
 
 Before 0.448.0 only the refraction was drawn, so mode B read a glass ball's body some 10 % under mode R
 and its rim as little as a fifth, and an eye in a glass ball in `scenes/_camera_in_water.ftsl`'s room

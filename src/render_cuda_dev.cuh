@@ -10727,10 +10727,29 @@ static constexpr int kDSphDeepMax = 128;
 static constexpr double kDSphDeepRho = 0.97;
 static constexpr double kDSphChainFloor = 1e-4;
 static constexpr double kDSphChainSure = 0.02;
-// The images a glass-sphere connection holds for its splat loop before it splats them (dConnectSpecularSphere).
-static constexpr int kDSphPendMax = 16;
-// The candidates a sphere connector's scan holds before it closes on them (dSphScanChains).
+// The images a glass-sphere connection holds for its splat loop before it splats them (dConnectSpecularSphere),
+// and the candidates a sphere connector's scan holds before it closes on them (dSphScanChains): each a few
+// dozen bytes of every forward kernel's stack.
+static constexpr int kDSphPendMax = 4;
 static constexpr int kDSphEventMax = 16;
+// A short list that takes its items in the order they come and hands each on (`drain`) when it fills and
+// when asked: so a step the sphere connectors run for several items runs in one loop, which a warp's
+// lanes take together, and the items in the order they came.
+namespace {
+template <class T, int N>
+struct DSphBatch {
+    T items[N];
+    int n = 0;
+    template <class F> __device__ void push(const T& t, const F& drain) {
+        if (n == N) flush(drain);
+        items[n++] = t;
+    }
+    template <class F> __device__ void flush(const F& drain) {
+        for (int k = 0; k < n; ++k) drain(items[k]);
+        n = 0;
+    }
+};
+}  // namespace
 
 // A 2-vector, for the chains' scan in their plane.
 namespace {
@@ -11082,16 +11101,16 @@ __device__ static bool dSphDip(const Miss& miss, const DSphV2& ua, const DSphV2&
     return v;
 }
 
-// A candidate a chain's scan meets (dSphScanChains): a sign change of its miss between ua and ub, or a dip
-// toward zero between them that the roulette kept with probability q.
+// A candidate a chain's scan meets (dSphScanChains): a sign change of its miss between its samples a and b
+// (by their place in the scan: a fixed sample's index, or -1 - an end ladder's), or a dip toward zero
+// between them that the roulette kept with probability q.
 namespace {
-struct DSphEvent { DSphV2 ua, ub; double fa, fb, q; int c; bool dip; };
+struct DSphEvent { double fa, fb, q; int a, b, c; bool dip; };
 }  // namespace
-// The scan of a sphere connector over nC chains (host twin Renderer::sphScanChains, where the why is). The
-// scan records each chain's candidates and closes on them -- roots refined, dips searched, `root` asked
-// whether each makes an image -- in a loop after it, in the scan's order, each chain capped at 4 found as it
-// was inline: so the scan's samples, alike in every lane, run together, and so do a warp's refinements,
-// rather than one lane at a time as each met a candidate mid-scan.
+// The scan of a sphere connector over nC chains (host twin Renderer::sphScanChains, where the why is). It
+// closes on each chain's candidates -- roots refined, dips searched, `root` asked whether each makes an
+// image -- in loops apart from the scan's samples (DSphBatch), so a warp's lanes run each together, in the
+// scan's order (the host twin's), each chain capped at 4 found.
 template <class Eval, class Miss, class Root, class U01>
 __device__ static void dSphScanChains(int nC, const DSphScanEnds& ends, const Eval& eval, const Miss& missOf,
                                       const Root& root, const U01& u01) {
@@ -11103,64 +11122,63 @@ __device__ static void dSphScanChains(int nC, const DSphScanEnds& ends, const Ev
         prevValid[c] = prev2Valid[c] = valid[c] = false;
         found[c] = 0;
     }
-    DSphEvent events[kDSphEventMax];
-    int nEvents = 0;
+    auto at = [&](int id) {   // a sample's (cos, sin) by its place in the scan
+        return id >= 0 ? DSphV2{g_sphScanC[id], g_sphScanS[id]} : DSphV2{ends.c[-1 - id], ends.s[-1 - id]};
+    };
     auto close = [&](const DSphEvent& e) {
         const int c = e.c;
         if (found[c] >= 4) return;
         auto missC = [&](double cc1, double ss1, bool& vm) { return missOf(c, cc1, ss1, vm); };
+        const DSphV2 ua = at(e.a), ub = at(e.b);
         if (!e.dip) {
-            if (root(c, dSphRoot(missC, e.ua, e.fa, e.ub, e.fb), 1.0)) ++found[c];
+            if (root(c, dSphRoot(missC, ua, e.fa, ub, e.fb), 1.0)) ++found[c];
             return;
         }
         DSphV2 ue; double fe;
-        if (dSphDip(missC, e.ua, e.ub, e.fb < 0.0 ? -1.0 : 1.0, ue, fe) && (fe < 0.0) != (e.fb < 0.0)) {
-            if (root(c, dSphRoot(missC, e.ua, e.fa, ue, fe), 1.0 / e.q)) ++found[c];
-            if (found[c] < 4 && root(c, dSphRoot(missC, ue, fe, e.ub, e.fb), 1.0 / e.q)) ++found[c];
+        if (dSphDip(missC, ua, ub, e.fb < 0.0 ? -1.0 : 1.0, ue, fe) && (fe < 0.0) != (e.fb < 0.0)) {
+            if (root(c, dSphRoot(missC, ua, e.fa, ue, fe), 1.0 / e.q)) ++found[c];
+            if (found[c] < 4 && root(c, dSphRoot(missC, ue, fe, ub, e.fb), 1.0 / e.q)) ++found[c];
         }
     };
-    auto flush = [&]() {
-        for (int k = 0; k < nEvents; ++k) close(events[k]);
-        nEvents = 0;
-    };
-    auto record = [&](const DSphEvent& e) {
-        if (nEvents == kDSphEventMax) flush();
-        events[nEvents++] = e;
-    };
-    DSphV2 prevU{1.0, 0.0}, prev2U{1.0, 0.0};
+    DSphBatch<DSphEvent, kDSphEventMax> events;
+    int prevId = 0, prev2Id = 0;
+    DSphV2 prevU{1.0, 0.0};
     double prevT = 0.0, prev2T = 0.0;
-    auto visit = [&](double c1, double s1, double t) {
+    auto visit = [&](double c1, double s1, double t, int id) {
         eval(c1, s1, miss, valid, F);
-        const DSphV2 u{c1, s1};
         for (int c = 0; c < nC; ++c) {
-            if (valid[c] && prevValid[c]) {
+            // (found[] only grows, so a chain at its cap records no more: close() would drop them.)
+            if (valid[c] && prevValid[c] && found[c] < 4) {
                 if ((miss[c] < 0.0) != (prevMiss[c] < 0.0)) {
-                    record(DSphEvent{prevU, u, prevMiss[c], miss[c], 1.0, c, false});
+                    events.push(DSphEvent{prevMiss[c], miss[c], 1.0, prevId, id, c, false}, close);
                 } else if (prev2Valid[c] && (prev2Miss[c] < 0.0) == (miss[c] < 0.0) &&
                            fabs(prevMiss[c]) < fabs(prev2Miss[c]) && fabs(prevMiss[c]) < fabs(miss[c]) &&
                            dSphDipNears(prev2T, prevT, t, prev2Miss[c], prevMiss[c], miss[c])) {
                     const double q = F[c] >= kDSphChainSure ? 1.0 : F[c] / kDSphChainSure;
                     if (q >= 1.0 || u01(c, prevU) < q)
-                        record(DSphEvent{prev2U, u, prev2Miss[c], miss[c], q, c, true});
+                        events.push(DSphEvent{prev2Miss[c], miss[c], q, prev2Id, id, c, true}, close);
                 }
             }
             prev2Miss[c] = prevMiss[c]; prev2Valid[c] = prevValid[c];
             prevMiss[c] = miss[c]; prevValid[c] = valid[c];
         }
-        prev2U = prevU; prev2T = prevT;
-        prevU = u; prevT = t;
+        prev2Id = prevId; prev2T = prevT;
+        prevId = id; prevU = DSphV2{c1, s1}; prevT = t;
     };
     int next = 0;
     for (int i = 0; i <= SPH_SCAN_N; ++i) {
         const double phi = -DPI + (2.0 * DPI) * i / SPH_SCAN_N;
-        while (next < ends.n && ends.phi[next] <= phi) { visit(ends.c[next], ends.s[next], ends.t[next]); ++next; }
+        while (next < ends.n && ends.phi[next] <= phi) { visit(ends.c[next], ends.s[next], ends.t[next], -1 - next); ++next; }
         if (ends.skips(fabs(phi))) continue;
-        visit(g_sphScanC[i], g_sphScanS[i], phi);
+        visit(g_sphScanC[i], g_sphScanS[i], phi, i);
     }
-    while (next < ends.n) { visit(ends.c[next], ends.s[next], ends.t[next]); ++next; }
-    flush();
+    while (next < ends.n) { visit(ends.c[next], ends.s[next], ends.t[next], -1 - next); ++next; }
+    events.flush(close);
 }
 
+// The number of internal reflections chain c takes, as dSphChainFrom counts them (-1: off the surface; host
+// twin Renderer::sphChainRefl).
+__device__ static inline int dSphChainRefl(bool outside, int c) { return outside ? c - 1 : c; }
 // Connect vertex p to a pinhole through every drawn chain of smooth dielectric sphere S, at the nL
 // wavelengths lam[] that see S alike (`ix`): one geometry for them all. Port of
 // Renderer::connectSpecularSphere.
@@ -11250,36 +11268,20 @@ __device__ static void dConnectSpecularSphere(const DScene& sc, const DCamera& c
         return dir.x * q.y - dir.y * q.x;
     };
 
-    // Chain c's image at u in space: its chief ray from the eye through P1chief, the chain it takes (`ch`),
-    // and whether that chain reaches p's side -- the test that decides, with image()'s, whether the chain
-    // found an image there.
-    auto chief = [&](int c, const DSphV2& u, D3& P1chief, D3& d0, DSphChain& ch) -> bool {
-        P1chief = O + ex * (r * u.x) + ey * (r * u.y);
-        d0 = d3norm(P1chief - eye);
-        if (!dSphChainFrom(eye - O, d0, r, n, outside, outside ? c - 1 : c, ch) || ch.F <= 0.0) return false;
-        return d3dot(ap - ch.last, ch.dir) > 0.0;
-    };
-    // An image's splat: its chain traced in space again (chief: the same inputs, the same chain) and its
-    // Jacobian, its legs' shadow rays, its light added to the film.
-    auto splat = [&](int c, const DSphV2& u, double w0, double wPick) {
-        const int refl = outside ? c - 1 : c;
-        D3 P1chief, d0;
-        DSphChain ch;
-        if (!chief(c, u, P1chief, d0, ch)) return;
+    // An image that passed image()'s tests, held for the splat with what they found: its chief ray's
+    // direction from the eye (d0) and the chain it takes (ch), where on the frame (px, py, its solid
+    // angle), the roulette's keep.
+    struct Pend { DSphChain ch; D3 d0; double w0, wPick, omega, keep; int c, px, py; };
+    // An image's splat: its chain's differentials, its legs' shadow rays, its light added to the film.
+    auto splat = [&](const Pend& e) {
+        const DSphChain& ch = e.ch;
+        const D3& d0 = e.d0;
+        const double w0 = e.w0, wPick = e.wPick, omega = e.omega, keep = e.keep;
+        const int px = e.px, py = e.py;
+        const int refl = dSphChainRefl(outside, e.c);
         const D3 last = O + ch.last, first = O + ch.first;
         D3 wP = last - p; const double dP = d3len(wP);
-        if (dP < 1e-9) return;
         wP = wP * (1.0 / dP);
-        if (vt.shape(wP) < 0.0) return;          // the cheap tests first (host twin)
-        int px, py; Real cosCam, dist2e;
-        if (!cam.project(P1chief.toR(), px, py, cosCam, dist2e)) return;
-        const double omega = cam.pixelSolidAngle(cosCam);
-        if (omega <= 0.0) return;
-        double keep = 1.0;
-        if (ch.F < kDSphChainSure && w0 == 1.0) {      // (not one a roulette found: host twin)
-            keep = ch.F / kDSphChainSure;
-            if (dSphRouletteU(p, c, u.x, u.y) >= keep) return;
-        }
         D3 a1, a2; d3onb(d0, a1, a2);
         const double eps = 1e-6;
         DSphChain rA, rB;
@@ -11331,30 +11333,39 @@ __device__ static void dConnectSpecularSphere(const DScene& sc, const DCamera& c
             }
             filmAdd(film, hits, cam.resX, px, py, lam[j], (Real)contrib);
         }
-        return;
     };
-    // An image the scan closed on: its cheap test decides whether the chain found it (dSphScanChains counts
-    // it), and its splat waits in `pend` for the loop after the scan, which a warp's lanes run together
-    // rather than one lane at a time as each meets a root mid-scan -- in the scan's order, so every draw
-    // its media take is the one it took inline.
-    struct Pend { DSphV2 u; double w0, wPick; int c; };
-    Pend pend[kDSphPendMax];
-    int nPend = 0;
-    auto flush = [&]() {
-        for (int k = 0; k < nPend; ++k) splat(pend[k].c, pend[k].u, pend[k].w0, pend[k].wPick);
-        nPend = 0;
-    };
+    // An image the scan closed on: whether the chain found it there (dSphScanChains counts it) -- the leg
+    // through the vertex, the chief chain toward it -- and, before its splat waits in `pend` for the loop
+    // after the scan, the cheap tests that leave it nothing to add: the vertex's side, the frame, a faint
+    // chain's roulette. In the scan's order (the host twin's), so the media draw the same numbers.
+    DSphBatch<Pend, kDSphPendMax> pend;
     auto image = [&](int c, const DSphV2& u, double w0, double wPick) -> bool {
         DSphV2 Q2, dir2;                              // behind p, or no root closed on: no image
         if (!legOf(c, u.x, u.y, Q2, dir2)) return false;
         const DSphV2 q2 = p2 - Q2;
         if (vdot(q2, dir2) <= 0.0) return false;
         if (fabs(dir2.x * q2.y - dir2.y * q2.x) > 1e-6 * (r + sqrt(vdot(q2, q2)))) return false;
-        D3 P1chief, d0;
+        // Its chief ray from the eye through P1chief, the chain it takes in space, and whether that carries
+        // light and leaves toward p.
+        const D3 P1chief = O + ex * (r * u.x) + ey * (r * u.y);
+        const D3 d0 = d3norm(P1chief - eye);
         DSphChain ch;
-        if (!chief(c, u, P1chief, d0, ch)) return false;
-        if (nPend == kDSphPendMax) flush();
-        pend[nPend++] = Pend{u, w0, wPick, c};
+        if (!dSphChainFrom(eye - O, d0, r, n, outside, dSphChainRefl(outside, c), ch) || ch.F <= 0.0) return false;
+        if (d3dot(ap - ch.last, ch.dir) <= 0.0) return false;
+        D3 wP = (O + ch.last) - p; const double dP = d3len(wP);
+        if (dP < 1e-9) return true;
+        wP = wP * (1.0 / dP);
+        if (vt.shape(wP) < 0.0) return true;          // the cheap tests first (host twin)
+        int px, py; Real cosCam, dist2e;
+        if (!cam.project(P1chief.toR(), px, py, cosCam, dist2e)) return true;
+        const double omega = cam.pixelSolidAngle(cosCam);
+        if (omega <= 0.0) return true;
+        double keep = 1.0;
+        if (ch.F < kDSphChainSure && w0 == 1.0) {      // (not one a roulette found: host twin)
+            keep = ch.F / kDSphChainSure;
+            if (dSphRouletteU(p, c, u.x, u.y) >= keep) return true;
+        }
+        pend.push(Pend{ch, d0, w0, wPick, omega, keep, c, px, py}, splat);
         return true;
     };
     dSphScanChains(deep.w > 0.0 ? nC + 1 : nC, dSphScanEnds(r, dEyeO, n, outside), eval,
@@ -11363,7 +11374,7 @@ __device__ static void dConnectSpecularSphere(const DScene& sc, const DCamera& c
                        return c == nC ? image(deep.c, u, w0, deep.w) : image(c, u, w0, 1.0);
                    },
                    [&](int c, const DSphV2& u) { return dSphRouletteU(p, chainOf(c) + 1000, u.x, u.y); });
-    flush();
+    pend.flush(splat);
 }
 
 // ================== analytic specular connection by REFLECTION ==================
@@ -11677,36 +11688,27 @@ __device__ static void dConnectSpecularSphereMirror(const DScene& sc, const DCam
     #undef D_TRACE2D_MIRROR
 
     // One image, at the surface point u (host twin connectSpecularSphereMirror): false where it is none.
-    auto image = [&](int, const DSphV2& u, double) -> bool {
-        bool v; const double m = missAt(u.x, u.y, v);
-        if (!v) return false;
-        const D3 P1chief = O + ex * (r * u.x) + ey * (r * u.y);
-        const D3 d0 = d3norm(P1chief - eye);
-        DSphereRefl ch;
-        if (!dReflectOffSphere(eye, d0, S, ch)) return false;
-        if (d3dot(p - ch.P1, ch.exitDir) <= 0.0) return false;   // p must be on the forward side
-        if (fabs(m) > 1e-6 * (r + d3len(p - ch.P1))) return false;
-        int px, py; Real cosCam, dist2e;
-        if (!cam.project(P1chief.toR(), px, py, cosCam, dist2e)) return true;
-        const double omega = cam.pixelSolidAngle(cosCam);
-        if (omega <= 0.0) return true;
-
+    // An image that passed image()'s tests, held for the splat with what they found: its chief ray's
+    // direction (d0) and reflection (ch), where on the frame, the vertex's shape factor toward it.
+    struct Pend { DSphereRefl ch; D3 d0; double omega, shape; int px, py; };
+    // An image's splat: its reflection's differentials, its leg's shadow ray, the mirror's own reflectance
+    // there, its light added to the film.
+    auto splat = [&](const Pend& e) {
+        const DSphereRefl& ch = e.ch;
+        const D3& d0 = e.d0;
+        const double omega = e.omega, shape = e.shape;
+        const int px = e.px, py = e.py;
         D3 wP = ch.P1 - p; const double dP = d3len(wP);
-        if (dP < 1e-9) return true;
         wP = wP * (1.0 / dP);
-        const double shape = vt.shape(wP);
-        if (shape < 0.0) return true;
-
         D3 toEye = eye - ch.P1; const double dE = d3len(toEye);
-        if (dE < 1e-9) return true;
         const D3 wRE = toEye * (1.0 / dE);
 
         // Ray-differential geometry factor G = dOmega_eye / dA_perp at p (eps small: host twin).
         D3 a1, a2; d3onb(d0, a1, a2);
         const double eps = 1e-6;
         DSphereRefl rA, rB;
-        if (!dReflectOffSphere(eye, d3norm(d0 + a1 * eps), S, rA)) return true;
-        if (!dReflectOffSphere(eye, d3norm(d0 + a2 * eps), S, rB)) return true;
+        if (!dReflectOffSphere(eye, d3norm(d0 + a1 * eps), S, rA)) return;
+        if (!dReflectOffSphere(eye, d3norm(d0 + a2 * eps), S, rB)) return;
         D3 e1, e2; d3onb(ch.exitDir, e1, e2);
         double ax, ay, bx, by;
         {   double den = d3dot(rA.exitDir, ch.exitDir);
@@ -11720,7 +11722,7 @@ __device__ static void dConnectSpecularSphereMirror(const DScene& sc, const DCam
             D3 off = (rB.P1 + rB.exitDir * s) - p;
             bx = d3dot(off, e1); by = d3dot(off, e2); }
         const double jac = fabs(ax * by - ay * bx);
-        if (jac < 2.5e-17 * eps * eps) return true;   // caustic singularity guard (G over 4e16)
+        if (jac < 2.5e-17 * eps * eps) return;   // caustic singularity guard (G over 4e16)
         // The same G the flat mirror gets in closed form as 1/D^2; expressed here as an
         // equivalent unfolded distance so both connectors share one splat.
         const double G = (eps * eps) / jac;
@@ -11729,12 +11731,37 @@ __device__ static void dConnectSpecularSphereMirror(const DScene& sc, const DCam
         // The shadow ray skips the mirror (the glass connector's reason; p is on its side of it, out or in).
         if (occludedTo(sc, dOffsetAlong(p.toR(), vt.legNormal(), wP.toR(), vt.reach), ch.P1.toR(), 2e-6, RAY_TMIN, false, (Real)0,
                        sphIdx))
-            return true;
+            return;
         DHit hm;
-        if (!dMirrorSeenAt(sc, eye, D3(0,0,0) - wRE, dE, hm)) return true;
+        if (!dMirrorSeenAt(sc, eye, D3(0,0,0) - wRE, dE, hm)) return;
 
         dSplatMirrorLegs(sc, cam, film, hits, sc.mats[hm.matId], hm, px, py, omega,
                          p, wP, dP, ch.P1, wRE, dE, D, shape, lam, beta, w, nUp, rng, vt.glossy, vt.coat);
+    };
+    // An image the scan closed on: whether the chain found it there -- the leg through the vertex, its
+    // forward side -- and the cheap tests that leave it nothing to add, before its splat waits in `pend` for
+    // the loop after the scan; in the scan's order (the host twin's), so the splats draw the same numbers.
+    DSphBatch<Pend, kDSphPendMax> pend;
+    auto image = [&](int, const DSphV2& u, double) -> bool {
+        bool v; const double m = missAt(u.x, u.y, v);
+        if (!v) return false;
+        const D3 P1chief = O + ex * (r * u.x) + ey * (r * u.y);
+        const D3 d0 = d3norm(P1chief - eye);
+        DSphereRefl ch;
+        if (!dReflectOffSphere(eye, d0, S, ch)) return false;
+        if (d3dot(p - ch.P1, ch.exitDir) <= 0.0) return false;   // p must be on the forward side
+        if (fabs(m) > 1e-6 * (r + d3len(p - ch.P1))) return false;
+        int px, py; Real cosCam, dist2e;
+        if (!cam.project(P1chief.toR(), px, py, cosCam, dist2e)) return true;
+        const double omega = cam.pixelSolidAngle(cosCam);
+        if (omega <= 0.0) return true;
+        D3 wP = ch.P1 - p; const double dP = d3len(wP);
+        if (dP < 1e-9) return true;
+        wP = wP * (1.0 / dP);
+        const double shape = vt.shape(wP);
+        if (shape < 0.0) return true;
+        if (d3len(eye - ch.P1) < 1e-9) return true;
+        pend.push(Pend{ch, d0, omega, shape, px, py}, splat);
         return true;
     };
     // One chain, scanned as the glass sphere's are (host twin).
@@ -11745,6 +11772,7 @@ __device__ static void dConnectSpecularSphereMirror(const DScene& sc, const DCam
                    },
                    [&](int, double c1, double s1, bool& v) { return missAt(c1, s1, v); }, image,
                    [](int, const DSphV2&) { return 0.0; });
+    pend.flush(splat);
 }
 
 // Splat vertex p to every camera through every smooth dielectric sphere (the refracted

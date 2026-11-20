@@ -278,6 +278,51 @@ SHADOW-WARNINGS.
 (CMakeLists.txt). No other call had one. Proven: the same flags refuse a scratch file's
 `printf("within 15 % of ...")` with error C4473.
 
+## OPEN (2026-11-20): BUILD-LOCK — a build now and then fails on a locked output, and passes on the retry
+
+The header's third harness trap (C1083 on a fresh `.obj`, 2026-11-17) came back three times on
+2026-11-19/20, and in a second form: twice `LNK1104: cannot open file 'build_cuda3/bin/ftrace.exe'` (the
+file then absent), once `C1083: Cannot open compiler generated file: 'build_cuda3/ftrace.dir/Release/
+render_cuda.obj': Permission denied`. No ftrace was running (`-stop` listed none) and no other build
+was; each time the same build started again passed. Each followed, within the hour, a build or an
+Nsight Compute run on the files it then replaced -- when an on-access scanner holds a fresh file. **The
+cost is not the retry:** a failed build leaves the old exe in the repo root, so whatever runs next
+measures the old one (once here a check of the wrong build read as a regression), and a script that
+greps the log for errors can miss LNK1104's `fatal error` spelling. **To do:** catch the holder in the
+act (Sysinternals `handle.exe` on the locked path, which build.bat could run when a step fails), then
+exclude the build directory from the scanner if that is it, or have build.bat retry the failed step
+once; and have it say plainly, last, that ftrace.exe was NOT updated.
+
+## DONE (2026-11-20, 0.450.43): REVIEW-0450Q — what the Opus (max) and Fable (xhigh) reviews of 0.450.42 found
+
+Both traced the deferred scan against the inline code and the host twin and found the roots' order,
+the per-chain cap and the draws' order equivalent; neither ran anything.
+
+**Proven (Fable asked):** built without contraction (`--fmad=false`), 0.450.43 and 0.450.41's inline
+connection render check_bitid's scenes identically, `flat`'s glass spheres in GPU mode B among them,
+and so do 0.450.43's lists cut to one item each, which flush at every push: the deferral is order-exact,
+and a normal build's moved pixels are ptxas contracting the moved arithmetic otherwise.
+
+**Fixed:** the splat traced the chief chain again in its own inlined copy, which at a threshold could
+answer otherwise than image()'s and drop an image the chain had counted (both): image() traces it once,
+inline, and its entry carries the chain and direction to the splat. (A `__noinline__` chief, one copy
+for both, grew the stack 408 B and ran 2.8 % slower: a call at the register cap spills around it.) The
+cheap tests that leave an image nothing -- the vertex's side, the frame, a faint chain's roulette -- ran
+after the queue and the second trace (both): image() runs them. A capped chain still recorded its later
+candidates (both): it records none, found[] only growing. The mirror connector's splats ran inline, half
+the change (Fable): its image() decides and tests, its splat waits too. Two hand-written flush-when-full
+lists (both): one `DSphBatch`. The reflection count written twice (Opus): `dSphChainRefl`. The extracted
+side test made a NaN count as not found (Fable): the original `<= 0 -> false` form. Comments narrating
+the inline code (both): they state the order constraint. The entry's heading and its `-device cpu`
+advice contradicted its newest paragraph, and its "three chains" was four (both, Fable).
+
+**The stack (both):** the lists cost kTrace's stack -- 21 256 B in 0.450.40, 22 488 in 0.450.42 -- which
+the driver reserves for every resident thread. Events now name their two samples by their place in the
+scan (64 -> 40 B); the lists' sizes were measured against it on the outside view at 5e6 photons: 8 events
+and 4 images 9.98 s, 16 and 4 9.18 s (0.450.42: 9.68), 32 and 4 9.25 s for 750 B more. Kept at 16 and 4:
+22 952 B, some 330 MB more reserved on a 4090 than 0.450.40 held, for a mode B 47 % faster through glass
+spheres.
+
 ## DONE (2026-11-19, 0.450.41): REVIEW-0450P — what the Opus (xhigh) review of 0.450.38-0.450.40 found
 
 The batch was the help's printf, the warning sweep and REVIEW-0450O's follow-ups, mostly renames the
@@ -1397,17 +1442,18 @@ the light slab (`DVcmGrid::byCell`). check_vcm_wavefront passes (its images bit-
 or inline); check_bitid against 0.450.0: every case identical but GPU modes M and S (within their floor)
 and coated_U_gpu, 3 pixels off by 1.0e-7 (the merges' sums in another order).
 
-## OPEN (2026-11-16): GPU-SPHERE-CONNECT-SLOW — GPU mode B through a glass sphere is slower than the CPU
+## OPEN (2026-11-16): GPU-SPHERE-CONNECT-SLOW — GPU mode B through a glass sphere runs at a few lanes a warp
 
 Mode B's glass-sphere connection runs in each photon thread, in double precision, a scan of 99 samples
-a vertex and a root's refinement and three chains in space for each image: on this machine's GPU
+a vertex and a root's refinement and three chains in space for each image (the chief and two
+differentials): on this machine's GPU
 (fp64 at a small fraction of fp32) a ball's furnace ran some 306 thousand photons a second where 16
 CPU threads ran 417 thousand. 0.448.0 made it some 1.6 times as fast as before (the refinement no
 longer takes a cosine and a sine a step) while drawing every chain, but the device still loses to the
 host. The proper fix is the wavefront shape the camera side already has: queue each vertex's sphere
 connections and run them in a kernel of their own, coherent (one thread a vertex and chain), its scan
-in fp32 where the miss's precision allows and fp64 only to refine. Until then mode B with large glass
-spheres in view renders faster with `-device cpu`.
+in fp32 where the miss's precision allows and fp64 only to refine. (Until 0.450.42 mode B with large glass
+spheres in view rendered faster with `-device cpu`; since then the GPU is ahead, below.)
 
 **0.450.42, the connection's own divergence:** Nsight had the photon kernel at 2.38 active lanes an
 instruction, its FP64 pipe 76 % busy, on check_ball_images' outside view; a scratch build timing the
@@ -1416,8 +1462,8 @@ the roots' refinement 28 %, each run one lane at a time as the lanes met them mi
 closes on its candidates in a loop after it and the splats wait for a loop after that, in the same order
 (design.md; check_bitid's GPU mode B on its glass spheres moves 262 of 6912 pixels, a borderline root
 closing otherwise under ptxas's other contraction, the mean by under 0.001 %; check_ball_images passes
-all 47 cases against mode R): 17.5 -> 9.7 s at 5e6 photons, the CPU's 32 threads 11.7 s -- the GPU ahead
-now, but still at 3.8 lanes, the FP64 pipe 78 % busy. **Left:** the queue above, which would bring a
+all 47 cases against mode R): 17.5 -> 9.7 s at 5e6 photons (9.2 since 0.450.43), the CPU's 32 threads
+11.7 s -- the GPU ahead now, but still at 3.8 lanes, the FP64 pipe 78 % busy. **Left:** the queue above, which would bring a
 warp's lanes to a connection together, and the fp32 scan.
 
 ## DONE (2026-11-16, 0.448.5): REVIEW-0448C — what the Opus (xhigh) review of 0.448.4 found
