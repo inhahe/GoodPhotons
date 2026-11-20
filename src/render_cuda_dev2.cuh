@@ -2472,10 +2472,9 @@ struct DVcmSite {
 // inline merge (WARP false) takes all of it on its own thread (dSiteListWalk), a warp's lanes (`lane`,
 // its 64 ints of shared memory `warpBuf`) take it together (dSiteListWarp), each weighing the
 // vertices the warp's cheap tests passed; WARP a template parameter, so each caller's copy holds its
-// own walk alone. Kept out of line: inlined into the camera kernel, which sits at the register cap,
-// the merge ran mode U's renders a fifth slower.
+// own walk alone. The camera kernel calls it through dVcmMergeSumInline.
 template <int NS, bool WARP>
-__device__ __noinline__ static void dVcmMergeSum(const DScene& sc, const DVcmCtx& ctx, const DVcmGrid& grid,
+__device__ static void dVcmMergeSum(const DScene& sc, const DVcmCtx& ctx, const DVcmGrid& grid,
                                     const DVcmSite& site, int secStride, const DVertex& vt, Real coatTh,
                                     const DMergeFootprint& fp, const DVec3& wo, double dVCM, double dVM,
                                     int edges, const DJSpec* js, int lane, int* warpBuf,
@@ -2570,17 +2569,29 @@ __device__ __noinline__ static void dVcmMergeSum(const DScene& sc, const DVcmCtx
     if constexpr (WARP) dSiteListWarp(cell, lane, warpBuf, pass, weigh);
     else dSiteListWalk(cell, 0, 1, [&](int k, unsigned char t) { if (pass(k, t)) weigh(k); });
 }
+// The camera kernel's inline merge (dVcmMergeSum, its own thread's walk), kept out of line: inlined into
+// the camera kernel, which sits at the register cap, the merge ran mode U's renders a fifth slower.
+template <int NS>
+__device__ __noinline__ static void dVcmMergeSumInline(const DScene& sc, const DVcmCtx& ctx, const DVcmGrid& grid,
+                                                       const DVcmSite& site, int secStride, const DVertex& vt,
+                                                       Real coatTh, const DMergeFootprint& fp, const DVec3& wo,
+                                                       double dVCM, double dVM, int edges, const DJSpec* js,
+                                                       double& mx, double& my, double& mz) {
+    dVcmMergeSum<NS, false>(sc, ctx, grid, site, secStride, vt, coatTh, fp, wo, dVCM, dVM, edges, js, 0, nullptr,
+                            mx, my, mz);
+}
 
 // The first `n` queued merge sites (DVcmMergeQueue), a warp each: the lanes take the site's light
 // vertices together (dVcmMergeSum), the footprint's probes are the warp's, and lane 0 adds the
 // site's sum to the accumulator. Launched in blocks of kVcmGatherBlock threads, which size its warps'
-// candidate buffers (dSiteListWarp).
+// candidate buffers (dSiteListWarp): another block traps.
 constexpr int kVcmGatherBlock = 128;
+static_assert(kVcmGatherBlock % 32 == 0, "kVcmMergeGather's warps must be whole: its walk syncs all 32 lanes");
 #ifndef FT_FAMILY_TU
 template <int NS>
-__global__ void __launch_bounds__(kVcmGatherBlock) kVcmMergeGather(DScene sc, DVcmCtx ctx, DVcmGrid grid,
-                                                                    int secStride, DVcmMergeQueue mq, int n,
-                                                                    double* accum) {
+__global__ void kVcmMergeGather(DScene sc, DVcmCtx ctx, DVcmGrid grid, int secStride,
+                                DVcmMergeQueue mq, int n, double* accum) {
+    if (blockDim.x != (unsigned)kVcmGatherBlock) __trap();
     D_MOTION_CLEAR();   // this thread's time: the launch's (passU), as the camera walk's
     __shared__ int candidates[kVcmGatherBlock / 32][64];
     const int lane = threadIdx.x & 31;
@@ -3147,8 +3158,8 @@ __global__ void kVcmCameraT(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx
                         if (!queued) {
                             const DMergeFootprint fp = dVertexMergeFootprint(sc, vt, (Real)ctx.radius);
                             double mx = 0.0, my = 0.0, mz = 0.0;
-                            dVcmMergeSum<NS, false>(sc, ctx, grid, site, secStride, vt, coatTh, fp, wo, dVCM, dVM,
-                                                    edges, jsp, 0, nullptr, mx, my, mz);
+                            dVcmMergeSumInline<NS>(sc, ctx, grid, site, secStride, vt, coatTh, fp, wo, dVCM, dVM,
+                                                   edges, jsp, mx, my, mz);
                             if (mx != 0.0 || my != 0.0 || mz != 0.0) {
                                 const double fa = f * (sc.gatherArea ? dSurfFootprint(sc, fp, gaSeed) : 1.0);
                                 rx += mx * fa; ry += my * fa; rz += mz * fa;

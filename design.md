@@ -10604,9 +10604,14 @@ as the one at fault.
   footprint -- for every entry, and the lobe, coat and MIS weights only for those that pass. The
   warp queues its passes in 64 ints of its own shared memory (`dSiteListWarp`: a ballot, each
   passing lane writing at its prefix), and whenever 32 are queued each lane weighs one; the rest
-  once the list is done. The inline merge keeps the one-thread walk (`dSiteListWalk`); the walk is a
-  template parameter, and `dVcmMergeSum` stays out of line (`__noinline__`): inlined into the
-  camera kernel, which sits at the register cap, the merge ran mode U's renders a fifth slower.
+  once the list is done, from the same one call (so the weighing is inlined once), and the walk ends
+  with the first round some lane found empty (`__all_sync`: the lanes take consecutive entries). The
+  inline merge keeps the one-thread walk (`dSiteListWalk`); both walk the list by one cursor
+  (`DSiteCursor`), and which a caller takes is a template parameter. The gather's copy is inlined into
+  `kVcmMergeGather`; the camera kernel's is kept out of line (`dVcmMergeSumInline`, `__noinline__`):
+  inlined into the camera kernel, which sits at the register cap, the merge ran mode U's renders a
+  fifth slower. 0.450.35's one call site and inlined gather (from the reviews) took the 640x480
+  bowl's gather another 14 % (7.15 -> 6.14 s).
   Measured on `_merge_glossy_bowl` at 640x480 (`-max-bounce 24`, 8 passes): the gather 11.55 ->
   8.49 s, the render 14.24 -> 11.21 s; Nsight on one launch, 584 -> 427 ms, 16.8 -> 28.5 active
   lanes an instruction, 71.8 -> 44.7 G warp instructions (6 % more threads' instructions: the
@@ -12817,17 +12822,28 @@ That same cursor is the program's **load-time cancellation seam** (0.138.2) — 
 ## Threading model (GPU)
 
 The device kernels each mode launches are listed in its route (`GpuRoute`: `cudaBdptRoute`,
-`cudaBackwardRoute`, `cudaPhotonMapRoute`, ...), which the VRAM preflight and each session's start
-weigh (`cudaRouteLocalBytes`) before the first launch. **Every route kernel prefers the largest
-L1** (`preferL1`: `cudaFuncAttributePreferredSharedMemoryCarveout` = MaxL1, once a kernel). The
-megakernels live in local memory -- their stacks and spilled state, which L1 caches -- and use about
-a kilobyte of shared memory a block, so the driver's own split left them L1 they could use: on
-`_fog_cornell` at a fixed sample count mode J ran in 4.23 s for 6.65 and mode R in 2.96 for 3.57,
-and modes B, M, P, S, U, W and J without a medium within a percent (0.450.31). Mode D gained nothing
-(0.4 % slower at 512 samples), so its route asks none (`GpuRoute::l1`). The device-wide
-`cudaFuncCachePreferL1` got a sixth of mode J's. (Found chasing J-NOSPLIT: the beam queue's hit search,
-set to prefer L1 in a test, took the camera kernel's time with it -- the SMs keep a configuration
-until a kernel asks for another.)
+`cudaBackwardRoute`, `cudaPhotonMapRoute`, ...), which the VRAM preflight (`vramPreflight`, main.cpp)
+weighs (`cudaRouteLocalBytes`) for every GPU render and meter frame before anything launches; some
+sessions weigh theirs again at their start. **Every route kernel prefers the largest L1** its shared
+memory leaves room for (`preferL1`: `cudaFuncAttributePreferredSharedMemoryCarveout` = MaxL1, set where
+the route is weighed, once a kernel; a kernel the runtime refuses is tried again at the next weighing
+and the first refusal printed). The megakernels live in local memory -- their stacks and spilled state,
+which L1 caches -- and use a kilobyte or a few of shared memory a block, so the driver's own split
+left them L1 they could use: on `_fog_cornell` at a fixed sample count mode J ran in 4.23 s for 6.65
+and mode R in 2.96 for 3.57, and modes B, D, M, P, S, U, W and J without a medium within a percent
+(0.450.31).
+
+MaxL1 costs some kernels blocks: on the 4090 it leaves them the 8 KB shared configuration, where mode
+R's camera kernel (3.3 KB of shared memory a block) keeps one of the two blocks its registers allow and
+the beam queue's hit search (`kWfBeamHits`, 54 registers) four of nine. They are better without them:
+these kernels are bound by how much of their working set L1 holds, and a carveout sized to keep the
+registers' blocks (0.450.35's trial, from both reviews of 0.450.31) took the hit search to the 64 KB
+configuration and nine blocks, 65 % of the warps resident against 24 %, and 15 times slower; mode J
+went back to 6.64 s and mode R's camera kernel lost 8 % a launch. Mode D's route, which 0.450.31
+excepted (0.4 % slower at 512 samples, within the noise), asks the same: the SMs keep a configuration
+until a kernel asks for another, and mode J's route holds the same kernel, so the exception could not
+hold anyway. (Found chasing J-NOSPLIT: the beam queue's hit search, set to prefer L1 in a test, took
+the camera kernel's time with it.)
 
 ## Stopping a render (`g_stopRequested`, `-stop`)
 

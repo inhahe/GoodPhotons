@@ -21459,54 +21459,44 @@ __device__ static inline void dWarpSiteAdd(const DScene& sc, const DMergeFootpri
         atomicAdd(&film[pix + 2], gZ * fa);
     }
 }
-// A merge site's entries -- its 27 cells' photons or light vertices -- as one list, the cells in walk
-// order (dz outermost, dx innermost), of which this caller takes entries lane, lane + lanes, ...:
-// (0, 1) one thread's whole list, (lane, 32) a warp's share, so a warp spends ceil(entries / 32)
-// rounds on the site, not a round or more a cell. `cell(n, b, e, t)` sets neighbour cell n's bucket's
-// entries [b, e) and its block's tag t (the bucket holds other blocks' points too, MergeKey);
-// `body(k, t)` takes each of this caller's entries, strays and all, and must weigh entry k only if
-// its tag (the map's `tag[k]`, bucket order) is t, as the host's mergeForEachEntry weighs them. The
-// test is the body's own: made here instead, nvcc compiles mode U's merge (dVcmMergeSum) to run its
-// renders a fifth slower. Modes J (kWfSurfGather, dSurfMergeAt) and U's inline merge (dVcmMergeSum;
-// its warp's is dSiteListWarp).
-template <class Cell, class Body>
-__device__ static inline void dSiteListWalk(const Cell& cell, int lane, int lanes, const Body& body) {
-    // A caller keeps its place in the list as a cell (`next`, the walk's next, its tag t) and an entry
-    // k in [k, kEnd), and passes `skip` entries over to reach its next one.
-    int next = 0, k = 0, kEnd = 0, skip = lane;
-    unsigned char t = 0;
-    for (;;) {
-        while (kEnd - k <= skip && next < 27) {
-            skip -= kEnd - k;
-            cell(next++, k, kEnd, t);
-        }
-        if (kEnd - k <= skip) break;   // the list ends before this caller's next entry
-        k += skip;
-        body(k++, t);
-        skip = lanes - 1;
-    }
-}
-// One caller's place in a merge site's list -- dSiteListWalk's walk a step at a time, for a walk whose
-// lanes must take the same number of steps whether they have an entry left or not (dSiteListWarp).
+// One caller's place in a merge site's list -- its 27 cells' photons or light vertices as one list,
+// the cells in walk order (dz outermost, dx innermost), of which the caller takes entries lane,
+// lane + lanes, ...: (0, 1) one thread's whole list, (lane, 32) a warp's share, so a warp spends
+// ceil(entries / 32) rounds on the site, not a round or more a cell. It keeps its place as a cell
+// (`next`, the walk's next, its tag t) and an entry k in [k, kEnd), and passes `skip` entries over to
+// reach its next one.
 struct DSiteCursor {
     int next = 0, k = 0, kEnd = 0, skip;
     unsigned char t = 0;
     __device__ explicit DSiteCursor(int lane) : skip(lane) {}
-    // This caller's next entry (`out`) and its cell's tag (`tOut`), as dSiteListWalk's `cell` and
-    // `lanes` give them; false past the list's end, and at every step after it.
+    // This caller's next entry (`out`) and its cell's tag (`tOut`); false past the list's end, and at
+    // every step after it. `cell(n, b, e, t)` sets neighbour cell n's bucket's entries [b, e) and its
+    // block's tag t (the bucket holds other blocks' points too, MergeKey).
     template <class Cell>
     __device__ bool step(const Cell& cell, int lanes, int& out, unsigned char& tOut) {
         while (kEnd - k <= skip && next < 27) {
             skip -= kEnd - k;
             cell(next++, k, kEnd, t);
         }
-        if (kEnd - k <= skip) return false;
+        if (kEnd - k <= skip) return false;   // the list ends before this caller's next entry
         k += skip;
         out = k++; tOut = t;
         skip = lanes - 1;
         return true;
     }
 };
+// A merge site's entries, this caller's of them (DSiteCursor's lane and lanes) one at a time:
+// `body(k, t)` takes each, strays and all, and must weigh entry k only if its tag (the map's `tag[k]`,
+// bucket order) is t, as the host's mergeForEachEntry weighs them. The test is the body's own: made
+// here instead, nvcc compiles mode U's merge (dVcmMergeSum) to run its renders a fifth slower. Modes J
+// (kWfSurfGather, dSurfMergeAt) and U's inline merge (dVcmMergeSum; its warp's is dSiteListWarp).
+template <class Cell, class Body>
+__device__ static inline void dSiteListWalk(const Cell& cell, int lane, int lanes, const Body& body) {
+    DSiteCursor cur(lane);
+    int k = 0;
+    unsigned char t = 0;
+    while (cur.step(cell, lanes, k, t)) body(k, t);
+}
 // A merge site's entries taken by a whole warp, as dSiteListWalk's (lane, 32) takes them, but weighed
 // a warp at a time: each round its lanes take the list's next 32 entries and test them (`pass(k, t)`:
 // the cheap refusals, another block's or out of the radius among them), the warp queues those that
@@ -21526,20 +21516,24 @@ __device__ static inline void dSiteListWarp(const Cell& cell, int lane, int* buf
         const unsigned m = __ballot_sync(0xffffffffu, ok);
         if (ok) buf[queued + __popc(m & below)] = k;
         queued += __popc(m);
+        // Entries may be left past this round only if it had one for every lane: the lanes take consecutive ones.
+        const bool more = __all_sync(0xffffffffu, has);
         __syncwarp();
-        if (queued >= 32) {
-            const bool carries = lane < queued - 32;   // the 33rd and later, moved to the front
-            const int mine = buf[lane], carry = carries ? buf[32 + lane] : 0;
+        // A full warp's worth, or at the list's end what is left: the first 32 queued, a lane each, the
+        // rest moved to the front. A lane reads and writes only its own slot and the one 32 past it,
+        // which none writes, so the one barrier after the move orders it before the next round's queueing.
+        // `weigh` called from this one place: it is the gather's costliest code, inlined once.
+        if (queued >= 32 || (!more && queued > 0)) {
+            const int take = queued < 32 ? queued : 32;
+            const bool carries = lane < queued - 32;
+            const int mine = lane < take ? buf[lane] : 0;
+            if (carries) buf[lane] = buf[32 + lane];
             __syncwarp();
-            if (carries) buf[lane] = carry;
-            __syncwarp();
-            queued -= 32;
-            weigh(mine);
+            queued -= take;
+            if (lane < take) weigh(mine);
         }
-        if (!__any_sync(0xffffffffu, has)) break;
+        if (!more && queued == 0) break;
     }
-    if (lane < queued) weigh(buf[lane]);
-    __syncwarp();   // every lane's read of the buffer done before the warp's next site writes it
 }
 // The photons of surface-map cell `n` of `site` (dSiteListWalk's `cell`) and the cell's tag.
 __device__ static inline void dSurfSiteCell(const DSurfMap& sm, const DSurfSite& site, int n, int& b, int& e,

@@ -201,6 +201,15 @@ to 0.25 renders as a 150 nm one within 2e-3, 1.0e-3 measured (its body's escape 
 on 0.450.1 it rendered as the unmapped 600 nm, 1.9 off), the `thinfilm` control byte for byte, and
 the three misspellings stop the load (on 0.450.1 they loaded).
 
+## OPEN (2026-11-19): SHADOW-WARNINGS — 31 MSVC C4456 warnings: a local declaration hides another
+
+Found when both reviews of 0.450.31-0.450.33 caught one in render_cuda.cu (an inner `B`, the gather's
+block, hiding the profile's `B` of 256 pixels; renamed in 0.450.35). A full /W4 compile still prints
+31 more, in main.cpp (`wantGpu`, `wantAuto`, `res`, `N` three times, `secs`, `spp`, ...), lens.h:763
+(`s`) and mesh.h:924 (`k`): each an inner name that silently means something else across a brace,
+which an edit moving a use across it gets wrong without a word. Fix: rename each inner one, then make
+C4456 an error in CMakeLists.txt so no new one lands.
+
 ## DONE (2026-11-19, 0.450.34): VCM-LOBE-FP32 — the merges' GGX pair ran in double, holding the FP64 pipe
 
 After VCM-GATHER-DIVERGENCE, Nsight had mode U's gather's FP64 pipe 68.6 % busy for its whole launch

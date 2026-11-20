@@ -516,6 +516,11 @@ Then the rest of 4.2-4.6 in their order, 4.7's bookkeeping alongside whatever to
 - [x] **VCM-GATHER-DIVERGENCE** (0.450.33) — the queued gather's lanes test their entries, and the warp
   weighs the ones that pass 32 at a time (dSiteListWarp): 16.8 -> 28.5 active lanes, the 640x480
   bowl's gather 11.55 -> 8.49 s, its render 21 % faster; known-issues.
+- [ ] **J-SURF-GATHER-DIVERGENCE** — mode J's queued surface gather (kWfSurfGather) walks a site's photons a
+  lane each, as mode U's did before 0.450.33: split dSurfMergePhoton into pass (tag, radius, from behind,
+  footprint) and weigh, and take dSiteListWarp (both reviews of 0.450.31-0.450.33).
+- [ ] **SHADOW-WARNINGS** — 31 MSVC C4456 shadowing warnings (main.cpp, lens.h, mesh.h): rename each inner
+  declaration, then make C4456 an error; known-issues.
 - [x] **VCM-LOBE-FP32** (0.450.34) — the merges' lobe takes its GGX pair in the device's precision
   (DMergeLobe), connections keep double: the gather's FP64 pipe 69 -> 24 % busy, the 640x480 bowl's
   render 12 % faster, its images double's to 4e-5 a pixel; known-issues.
