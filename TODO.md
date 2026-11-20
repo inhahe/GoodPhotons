@@ -491,8 +491,8 @@ Then the rest of 4.2-4.6 in their order, 4.7's bookkeeping alongside whatever to
 - [x] **DVERTHITSTATE-8B** (0.450.32) — the deform barycentrics restored from the vertex's own `vb0q/vb1q`:
   DVertHitState 8 B, DVertex 152 B; no speed moved (register-bound), 35-211 MB of reserved local
   memory freed; known-issues.
-- [ ] **MERGE-LAZY-TIMING** — time fab8da8's lazy lobe against 0.450.9 paired, on the case 0.450.5
-  measured its cost on (mode J, _fog_cornell: 5.48 -> 5.71 s median), on an idle GPU.
+- [x] **MERGE-LAZY-TIMING** (no change) — eager against lazy at HEAD, paired: 0.998-1.004 on every mode J
+  case; the lazy lobe stays; known-issues.
 - [x] **MERGE-HASH-TIMING** (0.450.24) — the hashed merge lattice paired against the dense one on an
   idle machine: no dense case slower by more than GPU U's 1.3 %, the sparse box 5.5x faster on the
   CPU; on the way, modes U and J tag each point's block (the strays out of the counts), exact

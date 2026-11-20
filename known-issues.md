@@ -278,6 +278,22 @@ SHADOW-WARNINGS.
 (CMakeLists.txt). No other call had one. Proven: the same flags refuse a scratch file's
 `printf("within 15 % of ...")` with error C4473.
 
+## DONE (2026-11-19, no change): MERGE-LAZY-TIMING — does mode J's lazy merge lobe cost or pay?
+
+fab8da8 made mode J's surface merges prepare a site's lobe (its hit rebuilt, the roughness and the
+coat's film read) at the site's first photon past the cheap tests rather than at the site, so a site
+whose photons all fail pays none of it; the TODO asked to time that against 0.450.9 on `_fog_cornell`,
+where 0.450.5 had measured mode J's merges at 5.48 -> 5.71 s. Since then the warp gather weighs a
+site's passes together (0.450.37), so its lanes prepare together at the first flush, and the
+question worth timing is the one at HEAD: an eager variant of 0.450.40 (both gathers preparing at the
+site) against the lazy one, paired over four rounds.
+
+**Measured:** `_fog_cornell` mode J 4.16 -> 4.17 s (with beams) and 2.59 -> 2.59 s (`-jbeams off`),
+`_caustic_box` mode J 5.11 -> 5.10 s and, at five times its surface radius, 2.07 -> 2.07 s (eager over
+lazy, 0.998-1.004; the gathers' own time unchanged). Neither costs: the lazy lobe stays, since a
+pattern-mapped roughness or coat film is where a site with no passing photon saves the most, and none
+of these scenes has one.
+
 ## DONE (2026-11-19, 0.450.40): REVIEW-0450O — what the Opus (max) and Fable (xhigh) reviews of 0.450.34-0.450.37 found
 
 Both read 77baad4..0749352 (VCM-LOBE-FP32, REVIEW-0450N's follow-ups, J-SURF-GATHER-DIVERGENCE)
