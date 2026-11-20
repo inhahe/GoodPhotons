@@ -21459,7 +21459,8 @@ __device__ static inline void dWarpSiteAdd(const DScene& sc, const DMergeFootpri
 // `body(k, t)` takes each of this caller's entries, strays and all, and must weigh entry k only if
 // its tag (the map's `tag[k]`, bucket order) is t, as the host's mergeForEachEntry weighs them. The
 // test is the body's own: made here instead, nvcc compiles mode U's merge (dVcmMergeSum) to run its
-// renders a fifth slower. Modes J (kWfSurfGather, dSurfMergeAt) and U (dVcmMergeSum).
+// renders a fifth slower. Modes J (kWfSurfGather, dSurfMergeAt) and U's inline merge (dVcmMergeSum;
+// its warp's is dSiteListWarp).
 template <class Cell, class Body>
 __device__ static inline void dSiteListWalk(const Cell& cell, int lane, int lanes, const Body& body) {
     // A caller keeps its place in the list as a cell (`next`, the walk's next, its tag t) and an entry
@@ -21476,6 +21477,61 @@ __device__ static inline void dSiteListWalk(const Cell& cell, int lane, int lane
         body(k++, t);
         skip = lanes - 1;
     }
+}
+// One caller's place in a merge site's list -- dSiteListWalk's walk a step at a time, for a walk whose
+// lanes must take the same number of steps whether they have an entry left or not (dSiteListWarp).
+struct DSiteCursor {
+    int next = 0, k = 0, kEnd = 0, skip;
+    unsigned char t = 0;
+    __device__ explicit DSiteCursor(int lane) : skip(lane) {}
+    // This caller's next entry (`out`) and its cell's tag (`tOut`), as dSiteListWalk's `cell` and
+    // `lanes` give them; false past the list's end, and at every step after it.
+    template <class Cell>
+    __device__ bool step(const Cell& cell, int lanes, int& out, unsigned char& tOut) {
+        while (kEnd - k <= skip && next < 27) {
+            skip -= kEnd - k;
+            cell(next++, k, kEnd, t);
+        }
+        if (kEnd - k <= skip) return false;
+        k += skip;
+        out = k++; tOut = t;
+        skip = lanes - 1;
+        return true;
+    }
+};
+// A merge site's entries taken by a whole warp, as dSiteListWalk's (lane, 32) takes them, but weighed
+// a warp at a time: each round its lanes take the list's next 32 entries and test them (`pass(k, t)`:
+// the cheap refusals, another block's or out of the radius among them), the warp queues those that
+// pass in `buf` (64 ints of the warp's own shared memory), and whenever 32 are queued each lane weighs
+// one (`weigh(k)`), the rest once the list is done. So the costly part runs with every lane busy
+// rather than those whose entry happened to pass. Every lane of the warp calls it, for the same site.
+template <class Cell, class Pass, class Weigh>
+__device__ static inline void dSiteListWarp(const Cell& cell, int lane, int* buf, const Pass& pass,
+                                            const Weigh& weigh) {
+    DSiteCursor cur(lane);
+    const unsigned below = (1u << lane) - 1u;   // the lanes before this one
+    int queued = 0;                             // the warp's, alike in every lane
+    for (;;) {
+        int k = 0; unsigned char t = 0;
+        const bool has = cur.step(cell, 32, k, t);
+        const bool ok = has && pass(k, t);
+        const unsigned m = __ballot_sync(0xffffffffu, ok);
+        if (ok) buf[queued + __popc(m & below)] = k;
+        queued += __popc(m);
+        __syncwarp();
+        if (queued >= 32) {
+            const bool carries = lane < queued - 32;   // the 33rd and later, moved to the front
+            const int mine = buf[lane], carry = carries ? buf[32 + lane] : 0;
+            __syncwarp();
+            if (carries) buf[lane] = carry;
+            __syncwarp();
+            queued -= 32;
+            weigh(mine);
+        }
+        if (!__any_sync(0xffffffffu, has)) break;
+    }
+    if (lane < queued) weigh(buf[lane]);
+    __syncwarp();   // every lane's read of the buffer done before the warp's next site writes it
 }
 // The photons of surface-map cell `n` of `site` (dSiteListWalk's `cell`) and the cell's tag.
 __device__ static inline void dSurfSiteCell(const DSurfMap& sm, const DSurfSite& site, int n, int& b, int& e,

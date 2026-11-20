@@ -10594,9 +10594,26 @@ as the one at fault.
   constant, so their values stay in registers. Measured at 640x480 on `_merge_glossy_bowl`
   (`-max-bounce 24`, 8 passes): the gather 43.4 -> 15.7 s, the render 49.3 -> 20.6 s; Nsight on one
   launch, 8.71 -> 1.31 s, local-memory requests 10.5 -> 1.5 G, FP64 instructions 26.6 -> 15.6 G,
-  the SMs' compute 53 -> 84 % busy, DRAM 56 -> 15 %. Still 244 registers (a sixth of the warps
-  resident) and 13.7 of 32 lanes active, the lanes' candidates refused at different tests
-  (VCM-GATHER-DIVERGENCE, TODO).
+  the SMs' compute 53 -> 84 % busy, DRAM 56 -> 15 %. That left the lanes' candidates refused at
+  different tests, a lane idle while the others weighed theirs.
+
+  **A warp's candidates weighed together (0.450.33, VCM-GATHER-DIVERGENCE).** The queued gather
+  (`kVcmMergeGather`) walks its site's list as before, the lanes taking 32 entries a round, but
+  splits each entry's work in two (`dVcmMergeSum`'s `pass` and `weigh`): the cheap refusals --
+  another block's, on a strand, out of the radius, over the depth, from behind, outside the
+  footprint -- for every entry, and the lobe, coat and MIS weights only for those that pass. The
+  warp queues its passes in 64 ints of its own shared memory (`dSiteListWarp`: a ballot, each
+  passing lane writing at its prefix), and whenever 32 are queued each lane weighs one; the rest
+  once the list is done. The inline merge keeps the one-thread walk (`dSiteListWalk`); the walk is a
+  template parameter, and `dVcmMergeSum` stays out of line (`__noinline__`): inlined into the
+  camera kernel, which sits at the register cap, the merge ran mode U's renders a fifth slower.
+  Measured on `_merge_glossy_bowl` at 640x480 (`-max-bounce 24`, 8 passes): the gather 11.55 ->
+  8.49 s, the render 14.24 -> 11.21 s; Nsight on one launch, 584 -> 427 ms, 16.8 -> 28.5 active
+  lanes an instruction, 71.8 -> 44.7 G warp instructions (6 % more threads' instructions: the
+  ballots, and a passed vertex read twice). At the scene's own 96x72, where sites hold few vertices
+  and merge inline, the render is unchanged; at five times its radius, the gather 0.79 -> 0.60 s.
+  Only the order of a site's sums moved, below a float32 pixel's rounding (check_vcm_wavefront:
+  the queue's image is the inline merge's to the byte).
 
   **One lobe for every connectible BSDF (0.450.11, MERGE-LOBE-SHARED).** The merges' lobe was a
   second copy of `dBsdfF`'s and `dBsdfPdf`'s arithmetic, kept equal by hand. It is now the only one,

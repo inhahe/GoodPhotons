@@ -201,6 +201,32 @@ to 0.25 renders as a 150 nm one within 2e-3, 1.0e-3 measured (its body's escape 
 on 0.450.1 it rendered as the unmapped 600 nm, 1.9 off), the `thinfilm` control byte for byte, and
 the three misspellings stop the load (on 0.450.1 they loaded).
 
+## DONE (2026-11-19, 0.450.33): VCM-GATHER-DIVERGENCE — mode U's queued gather ran with half its lanes idle
+
+After 0.450.5's merge lobe, Nsight had `kVcmMergeGather` at 13.7 of 32 lanes active: each lane took
+its own entries of the site's list, and one whose entry a cheap test refused (another block's, out
+of the radius, from behind, outside the footprint) idled while the others evaluated the lobe, coat
+and MIS weights of theirs.
+
+**Fixed:** the warp tests 32 entries a round and queues those that pass in 64 ints of its shared
+memory (`dSiteListWarp`: a ballot and each passing lane's prefix); whenever 32 are queued each lane
+weighs one, the remainder once the list is done (`dVcmMergeSum`'s `pass` and `weigh`, design.md).
+The inline merge keeps its one-thread walk.
+
+**On the way:** the first build ran mode U's renders 17-24 % slower wherever sites merge inline
+(`_merge_glossy_bowl` 8.66 -> 10.70 s) with the gather's own time unchanged. `dVcmMergeSum` had been
+an out-of-line function (129 and 178 registers) and was now inlined into the camera kernel, which
+sits at 255 (its SASS 49 408 -> 61 632 lines); separating the two walks by a template parameter
+alone did not undo it. It is `__noinline__` now, the camera kernels' stacks are 0.450.32's to the
+byte, and those renders are back within 0.3 %.
+
+**Measured** (0.450.32 against 0.450.33, paired): the bowl at 640x480 (`-max-bounce 24`, 8 passes),
+gather 11.55 -> 8.49 s, render 14.24 -> 11.21 s; Nsight on one launch 584 -> 427 ms, 16.8 -> 28.5
+active lanes an instruction, warp instructions 71.8 -> 44.7 G. At the scene's own 96x72 (sites
+merge inline) and `_caustic_box`, unchanged; at five times the radius the gather 0.79 -> 0.60 s.
+check_vcm_wavefront passes, the queue's image the inline merge's to the byte. Left: whether the
+lobe's pair can run in single precision (VCM-LOBE-FP32, TODO).
+
 ## DONE (2026-11-19, 0.450.32): DVERTHITSTATE-8B — a GPU path vertex kept a deforming triangle's barycentrics twice
 
 `DVertHitState`, the hit's pattern state in every `DVertex` of modes D and J (and beside each stored

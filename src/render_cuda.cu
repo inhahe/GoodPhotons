@@ -7138,14 +7138,15 @@ void vcmSessionPass(VcmSession* s, double radius) {
             const long long demand = (cnt[0] < 0) ? (1LL << 31) : (long long)cnt[0];
             const long long gathered = std::min<long long>(demand, s->mq.cap);
             if (gathered > 0) {
-                const int gBlocks = (int)std::min(4096LL, (gathered * 32 + 127) / 128);   // a warp a site
+                constexpr int B = gpu::kVcmGatherBlock;
+                const int gBlocks = (int)std::min(4096LL, (gathered * 32 + B - 1) / B);   // a warp a site
                 CUDA_CHECK(cudaEventRecord(s->mqEv[0]));
                 if (s->secStride > 0)
-                    kVcmMergeGather<BDPT_NSEC><<<gBlocks, 128>>>(s->up.sc, ctx, grid, s->secStride,
-                                                                 s->mq, (int)gathered, s->d_accum);
+                    kVcmMergeGather<BDPT_NSEC><<<gBlocks, B>>>(s->up.sc, ctx, grid, s->secStride,
+                                                               s->mq, (int)gathered, s->d_accum);
                 else
-                    kVcmMergeGather<0><<<gBlocks, 128>>>(s->up.sc, ctx, grid, 0,
-                                                         s->mq, (int)gathered, s->d_accum);
+                    kVcmMergeGather<0><<<gBlocks, B>>>(s->up.sc, ctx, grid, 0,
+                                                       s->mq, (int)gathered, s->d_accum);
                 CUDA_CHECK(cudaEventRecord(s->mqEv[1]));
                 cudaCheckKernel("vcm-merge-gather");
                 float ms = 0.f;

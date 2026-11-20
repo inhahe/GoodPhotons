@@ -2468,14 +2468,17 @@ struct DVcmSite {
 // mz -- before the site's scale and its footprint's (fp, dVertexMergeFootprint's at the pass's
 // radius). `wo` points back along the camera walk, which reached `vt` over `edges` edges with MIS
 // partials dVCM and dVM; `coatTh` is its coat's film there (dCoatThicknessAt at the walk's hit);
-// `js` is the VCM-SPEC carrier arriving there, null when off. The site's vertices are one list
-// (dSiteListWalk), of which this caller takes entries lane, lane + lanes, ...: (0, 1) is the inline
-// merge, (lane, 32) a warp's.
-template <int NS>
-__device__ static void dVcmMergeSum(const DScene& sc, const DVcmCtx& ctx, const DVcmGrid& grid,
+// `js` is the VCM-SPEC carrier arriving there, null when off. The site's vertices are one list: the
+// inline merge (WARP false) takes all of it on its own thread (dSiteListWalk), a warp's lanes (`lane`,
+// its 64 ints of shared memory `warpBuf`) take it together (dSiteListWarp), each weighing the
+// vertices the warp's cheap tests passed; WARP a template parameter, so each caller's copy holds its
+// own walk alone. Kept out of line: inlined into the camera kernel, which sits at the register cap,
+// the merge ran mode U's renders a fifth slower.
+template <int NS, bool WARP>
+__device__ __noinline__ static void dVcmMergeSum(const DScene& sc, const DVcmCtx& ctx, const DVcmGrid& grid,
                                     const DVcmSite& site, int secStride, const DVertex& vt, Real coatTh,
                                     const DMergeFootprint& fp, const DVec3& wo, double dVCM, double dVM,
-                                    int edges, const DJSpec* js, int lane, int lanes,
+                                    int edges, const DJSpec* js, int lane, int* warpBuf,
                                     double& mx, double& my, double& mz) {
     constexpr int SECN = (NS > 0) ? NS : 1;
     const DMaterial& m = sc.mats[vt.matId];
@@ -2486,22 +2489,27 @@ __device__ static void dVcmMergeSum(const DScene& sc, const DVcmCtx& ctx, const 
     // candidate. Never a caller's lobe by reference: a lobe whose address leaves its kernel for a
     // call ptxas keeps out of line lives in local memory there, every query of it a load.
     DVertexLobe lobe(sc, vt, wo, true);
-    dSiteListWalk([&](int n, int& b, int& e, unsigned char& t) { site.cell(grid, n, b, e, t); }, lane, lanes,
-                  [&](int k, unsigned char t) {
-        if (grid.tag[k] != t) return;   // another block's
+    // Entry k's refusals before its lobe: another block's (its cell's tag t), or one the merge does not
+    // weigh (host twin vcm.h).
+    const auto pass = [&](int k, unsigned char t) -> bool {
+        if (grid.tag[k] != t) return false;   // another block's
         const DVcmLV& lv = grid.byCell[k];
-        const DVcmSec* row = ((NS > 0) && grid.byCellSec) ? (grid.byCellSec + (size_t)k * secStride) : nullptr;
         // Never merge with a vertex stored ON a strand (vcm.h, 0.362.0): the merge evaluates the
         // CAMERA BSDF against a photon and never looks at where the photon sits, so a strand lying
         // on the skin would bleed into it.
-        if (lv.fiberR > (Real)0) return;
+        if (lv.fiberR > (Real)0) return false;
         const DVec3 d = vt.p - lv.p;
-        if (ddot(d, d) > r2) return;
-        if (edges + lv.edges > ctx.maxDepth) return;
-        const DVec3 wMerge = lv.wo;
-        if (dMergeFromBehind(fp.twoSided, wMerge, ngoCam)) return;   // host twin mergeFromBehind
+        if (ddot(d, d) > r2) return false;
+        if (edges + lv.edges > ctx.maxDepth) return false;
+        if (dMergeFromBehind(fp.twoSided, lv.wo, ngoCam)) return false;   // host twin mergeFromBehind
         // its surface's true normal on its light's side (the hit's, host twin)
-        if (!fp.keeps(lv.p, lv.back ? lv.ng * (Real)-1 : lv.ng, (Real)ddot(d, d))) return;
+        return fp.keeps(lv.p, lv.back ? lv.ng * (Real)-1 : lv.ng, (Real)ddot(d, d));
+    };
+    // Entry k, passed, weighed into mx, my, mz.
+    const auto weigh = [&](int k) {
+        const DVcmLV& lv = grid.byCell[k];
+        const DVcmSec* row = ((NS > 0) && grid.byCellSec) ? (grid.byCellSec + (size_t)k * secStride) : nullptr;
+        const DVec3 wMerge = lv.wo;
         const Real lam = (Real)lv.lambda;
         // A MERGE crosses paths, so the two ends carry DIFFERENT bundles and there is no shared λ
         // set. The estimate therefore stays keyed on the LIGHT vertex's own wavelengths (the
@@ -2557,26 +2565,34 @@ __device__ static void dVcmMergeSum(const DScene& sc, const DVcmCtx& ctx, const 
         if (lvUp > 1) { const double inv = 1.0 / lvUp; ax *= inv; ay *= inv; az *= inv; }
         const double mw = (double)lv.mergeW;   // a compound's (COMPOUND-MERGE-PICK)
         mx += ax * mw; my += ay * mw; mz += az * mw;
-    });
+    };
+    const auto cell = [&](int n, int& b, int& e, unsigned char& t) { site.cell(grid, n, b, e, t); };
+    if constexpr (WARP) dSiteListWarp(cell, lane, warpBuf, pass, weigh);
+    else dSiteListWalk(cell, 0, 1, [&](int k, unsigned char t) { if (pass(k, t)) weigh(k); });
 }
 
 // The first `n` queued merge sites (DVcmMergeQueue), a warp each: the lanes take the site's light
-// vertices in turn (dVcmMergeSum), the footprint's probes are the warp's, and lane 0 adds the
-// site's sum to the accumulator.
+// vertices together (dVcmMergeSum), the footprint's probes are the warp's, and lane 0 adds the
+// site's sum to the accumulator. Launched in blocks of kVcmGatherBlock threads, which size its warps'
+// candidate buffers (dSiteListWarp).
+constexpr int kVcmGatherBlock = 128;
 #ifndef FT_FAMILY_TU
 template <int NS>
-__global__ void kVcmMergeGather(DScene sc, DVcmCtx ctx, DVcmGrid grid, int secStride,
-                                DVcmMergeQueue mq, int n, double* accum) {
+__global__ void __launch_bounds__(kVcmGatherBlock) kVcmMergeGather(DScene sc, DVcmCtx ctx, DVcmGrid grid,
+                                                                    int secStride, DVcmMergeQueue mq, int n,
+                                                                    double* accum) {
     D_MOTION_CLEAR();   // this thread's time: the launch's (passU), as the camera walk's
+    __shared__ int candidates[kVcmGatherBlock / 32][64];
     const int lane = threadIdx.x & 31;
+    int* const buf = candidates[threadIdx.x >> 5];
     const int warps = (int)((gridDim.x * blockDim.x) >> 5);
     for (int r = (int)((blockIdx.x * blockDim.x + threadIdx.x) >> 5); r < n; r += warps) {
         const DVcmMergeReq& rq = mq.reqs[r];
         const DJSpec* js = (rq.flags & 1) ? &mq.spec[r] : nullptr;
         const DMergeFootprint fp = dVertexMergeFootprint(sc, rq.vt, (Real)ctx.radius);
         double mx = 0.0, my = 0.0, mz = 0.0;
-        dVcmMergeSum<NS>(sc, ctx, grid, DVcmSite(grid, rq.vt.p), secStride, rq.vt, rq.coatTh, fp, rq.wo,
-                         rq.dVCM, rq.dVM, rq.edges, js, lane, 32, mx, my, mz);
+        dVcmMergeSum<NS, true>(sc, ctx, grid, DVcmSite(grid, rq.vt.p), secStride, rq.vt, rq.coatTh, fp, rq.wo,
+                               rq.dVCM, rq.dVM, rq.edges, js, lane, buf, mx, my, mz);
         dWarpSiteAdd(sc, fp, rq.gaSeed, lane, mx, my, mz, rq.f, accum, rq.pix);
     }
 }
@@ -3131,8 +3147,8 @@ __global__ void kVcmCameraT(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx
                         if (!queued) {
                             const DMergeFootprint fp = dVertexMergeFootprint(sc, vt, (Real)ctx.radius);
                             double mx = 0.0, my = 0.0, mz = 0.0;
-                            dVcmMergeSum<NS>(sc, ctx, grid, site, secStride, vt, coatTh, fp, wo, dVCM, dVM, edges,
-                                             jsp, 0, 1, mx, my, mz);
+                            dVcmMergeSum<NS, false>(sc, ctx, grid, site, secStride, vt, coatTh, fp, wo, dVCM, dVM,
+                                                    edges, jsp, 0, nullptr, mx, my, mz);
                             if (mx != 0.0 || my != 0.0 || mz != 0.0) {
                                 const double fa = f * (sc.gatherArea ? dSurfFootprint(sc, fp, gaSeed) : 1.0);
                                 rx += mx * fa; ry += my * fa; rz += mz * fa;

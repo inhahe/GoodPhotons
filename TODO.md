@@ -513,11 +513,13 @@ Then the rest of 4.2-4.6 in their order, 4.7's bookkeeping alongside whatever to
   self-tests') draws them first into a declaration list or a braced initializer, which C++
   sequences; hair::sampleWith draws a fiber's four (design.md, "The draws a render takes"). Every
   render's noise realization moved once.
-- [ ] **VCM-GATHER-DIVERGENCE** — the gather keeps 13.7 of 32 lanes active (a lane's candidate refused
-  at the distance, sidedness or band test idles while the others evaluate) at 244 registers, a
-  sixth of the warps resident: gather the candidates that pass the cheap tests into a warp-wide
-  list (ballot and prefix), and evaluate the lobe for full warps from it; then see whether the
-  pair can run in single precision where its double buys nothing (a decision: the images move).
+- [x] **VCM-GATHER-DIVERGENCE** (0.450.33) — the queued gather's lanes test their entries, and the warp
+  weighs the ones that pass 32 at a time (dSiteListWarp): 16.8 -> 28.5 active lanes, the 640x480
+  bowl's gather 11.55 -> 8.49 s, its render 21 % faster; known-issues.
+- [ ] **VCM-LOBE-FP32** — whether the merge lobe's GGX pair (`DVertexLobe::at`) can run in single
+  precision where its double buys nothing (the gather ran 15.6 G FP64 instructions a launch at
+  0.450.5): time it on the 640x480 bowl, and judge the images against mode R at grazing angles,
+  where the MIS ratios that motivated double are touchiest.
 - [x] **REVIEW-0450-FABLE** (0.450.3) — the Fable (xhigh) review of 0.450.0: the queue sized to its
   smallest wave, mode U in the local-memory preflight, one warp-gather tail, the seed's draws
   sequenced, check_bitid's floor for GPU J and U; known-issues REVIEW-0450-FABLE.
