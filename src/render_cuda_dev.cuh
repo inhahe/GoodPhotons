@@ -10727,6 +10727,10 @@ static constexpr int kDSphDeepMax = 128;
 static constexpr double kDSphDeepRho = 0.97;
 static constexpr double kDSphChainFloor = 1e-4;
 static constexpr double kDSphChainSure = 0.02;
+// The images a glass-sphere connection holds for its splat loop before it splats them (dConnectSpecularSphere).
+static constexpr int kDSphPendMax = 16;
+// The candidates a sphere connector's scan holds before it closes on them (dSphScanChains).
+static constexpr int kDSphEventMax = 16;
 
 // A 2-vector, for the chains' scan in their plane.
 namespace {
@@ -11078,7 +11082,16 @@ __device__ static bool dSphDip(const Miss& miss, const DSphV2& ua, const DSphV2&
     return v;
 }
 
-// The scan of a sphere connector over nC chains (host twin Renderer::sphScanChains, where the why is).
+// A candidate a chain's scan meets (dSphScanChains): a sign change of its miss between ua and ub, or a dip
+// toward zero between them that the roulette kept with probability q.
+namespace {
+struct DSphEvent { DSphV2 ua, ub; double fa, fb, q; int c; bool dip; };
+}  // namespace
+// The scan of a sphere connector over nC chains (host twin Renderer::sphScanChains, where the why is). The
+// scan records each chain's candidates and closes on them -- roots refined, dips searched, `root` asked
+// whether each makes an image -- in a loop after it, in the scan's order, each chain capped at 4 found as it
+// was inline: so the scan's samples, alike in every lane, run together, and so do a warp's refinements,
+// rather than one lane at a time as each met a candidate mid-scan.
 template <class Eval, class Miss, class Root, class U01>
 __device__ static void dSphScanChains(int nC, const DSphScanEnds& ends, const Eval& eval, const Miss& missOf,
                                       const Root& root, const U01& u01) {
@@ -11090,26 +11103,45 @@ __device__ static void dSphScanChains(int nC, const DSphScanEnds& ends, const Ev
         prevValid[c] = prev2Valid[c] = valid[c] = false;
         found[c] = 0;
     }
+    DSphEvent events[kDSphEventMax];
+    int nEvents = 0;
+    auto close = [&](const DSphEvent& e) {
+        const int c = e.c;
+        if (found[c] >= 4) return;
+        auto missC = [&](double cc1, double ss1, bool& vm) { return missOf(c, cc1, ss1, vm); };
+        if (!e.dip) {
+            if (root(c, dSphRoot(missC, e.ua, e.fa, e.ub, e.fb), 1.0)) ++found[c];
+            return;
+        }
+        DSphV2 ue; double fe;
+        if (dSphDip(missC, e.ua, e.ub, e.fb < 0.0 ? -1.0 : 1.0, ue, fe) && (fe < 0.0) != (e.fb < 0.0)) {
+            if (root(c, dSphRoot(missC, e.ua, e.fa, ue, fe), 1.0 / e.q)) ++found[c];
+            if (found[c] < 4 && root(c, dSphRoot(missC, ue, fe, e.ub, e.fb), 1.0 / e.q)) ++found[c];
+        }
+    };
+    auto flush = [&]() {
+        for (int k = 0; k < nEvents; ++k) close(events[k]);
+        nEvents = 0;
+    };
+    auto record = [&](const DSphEvent& e) {
+        if (nEvents == kDSphEventMax) flush();
+        events[nEvents++] = e;
+    };
     DSphV2 prevU{1.0, 0.0}, prev2U{1.0, 0.0};
     double prevT = 0.0, prev2T = 0.0;
     auto visit = [&](double c1, double s1, double t) {
         eval(c1, s1, miss, valid, F);
         const DSphV2 u{c1, s1};
         for (int c = 0; c < nC; ++c) {
-            auto missC = [&](double cc1, double ss1, bool& vm) { return missOf(c, cc1, ss1, vm); };
-            if (valid[c] && prevValid[c] && found[c] < 4) {
+            if (valid[c] && prevValid[c]) {
                 if ((miss[c] < 0.0) != (prevMiss[c] < 0.0)) {
-                    if (root(c, dSphRoot(missC, prevU, prevMiss[c], u, miss[c]), 1.0)) ++found[c];
+                    record(DSphEvent{prevU, u, prevMiss[c], miss[c], 1.0, c, false});
                 } else if (prev2Valid[c] && (prev2Miss[c] < 0.0) == (miss[c] < 0.0) &&
                            fabs(prevMiss[c]) < fabs(prev2Miss[c]) && fabs(prevMiss[c]) < fabs(miss[c]) &&
                            dSphDipNears(prev2T, prevT, t, prev2Miss[c], prevMiss[c], miss[c])) {
                     const double q = F[c] >= kDSphChainSure ? 1.0 : F[c] / kDSphChainSure;
-                    DSphV2 ue; double fe;
-                    if ((q >= 1.0 || u01(c, prevU) < q) &&
-                        dSphDip(missC, prev2U, u, miss[c] < 0.0 ? -1.0 : 1.0, ue, fe) && (fe < 0.0) != (miss[c] < 0.0)) {
-                        if (root(c, dSphRoot(missC, prev2U, prev2Miss[c], ue, fe), 1.0 / q)) ++found[c];
-                        if (found[c] < 4 && root(c, dSphRoot(missC, ue, fe, u, miss[c]), 1.0 / q)) ++found[c];
-                    }
+                    if (q >= 1.0 || u01(c, prevU) < q)
+                        record(DSphEvent{prev2U, u, prev2Miss[c], miss[c], q, c, true});
                 }
             }
             prev2Miss[c] = prevMiss[c]; prev2Valid[c] = prevValid[c];
@@ -11126,6 +11158,7 @@ __device__ static void dSphScanChains(int nC, const DSphScanEnds& ends, const Ev
         visit(g_sphScanC[i], g_sphScanS[i], phi);
     }
     while (next < ends.n) { visit(ends.c[next], ends.s[next], ends.t[next]); ++next; }
+    flush();
 }
 
 // Connect vertex p to a pinhole through every drawn chain of smooth dielectric sphere S, at the nL
@@ -11217,37 +11250,41 @@ __device__ static void dConnectSpecularSphere(const DScene& sc, const DCamera& c
         return dir.x * q.y - dir.y * q.x;
     };
 
-    auto image = [&](int c, const DSphV2& u, double w0, double wPick) -> bool {
-        DSphV2 Q2, dir2;                              // behind p, or no root closed on: no image
-        if (!legOf(c, u.x, u.y, Q2, dir2)) return false;
-        const DSphV2 q2 = p2 - Q2;
-        if (vdot(q2, dir2) <= 0.0) return false;
-        if (fabs(dir2.x * q2.y - dir2.y * q2.x) > 1e-6 * (r + sqrt(vdot(q2, q2)))) return false;
+    // Chain c's image at u in space: its chief ray from the eye through P1chief, the chain it takes (`ch`),
+    // and whether that chain reaches p's side -- the test that decides, with image()'s, whether the chain
+    // found an image there.
+    auto chief = [&](int c, const DSphV2& u, D3& P1chief, D3& d0, DSphChain& ch) -> bool {
+        P1chief = O + ex * (r * u.x) + ey * (r * u.y);
+        d0 = d3norm(P1chief - eye);
+        if (!dSphChainFrom(eye - O, d0, r, n, outside, outside ? c - 1 : c, ch) || ch.F <= 0.0) return false;
+        return d3dot(ap - ch.last, ch.dir) > 0.0;
+    };
+    // An image's splat: its chain traced in space again (chief: the same inputs, the same chain) and its
+    // Jacobian, its legs' shadow rays, its light added to the film.
+    auto splat = [&](int c, const DSphV2& u, double w0, double wPick) {
         const int refl = outside ? c - 1 : c;
-        const D3 P1chief = O + ex * (r * u.x) + ey * (r * u.y);
-        const D3 d0 = d3norm(P1chief - eye);
+        D3 P1chief, d0;
         DSphChain ch;
-        if (!dSphChainFrom(eye - O, d0, r, n, outside, refl, ch) || ch.F <= 0.0) return false;
-        if (d3dot(ap - ch.last, ch.dir) <= 0.0) return false;
+        if (!chief(c, u, P1chief, d0, ch)) return;
         const D3 last = O + ch.last, first = O + ch.first;
         D3 wP = last - p; const double dP = d3len(wP);
-        if (dP < 1e-9) return true;
+        if (dP < 1e-9) return;
         wP = wP * (1.0 / dP);
-        if (vt.shape(wP) < 0.0) return true;          // the cheap tests first (host twin)
+        if (vt.shape(wP) < 0.0) return;          // the cheap tests first (host twin)
         int px, py; Real cosCam, dist2e;
-        if (!cam.project(P1chief.toR(), px, py, cosCam, dist2e)) return true;
+        if (!cam.project(P1chief.toR(), px, py, cosCam, dist2e)) return;
         const double omega = cam.pixelSolidAngle(cosCam);
-        if (omega <= 0.0) return true;
+        if (omega <= 0.0) return;
         double keep = 1.0;
         if (ch.F < kDSphChainSure && w0 == 1.0) {      // (not one a roulette found: host twin)
             keep = ch.F / kDSphChainSure;
-            if (dSphRouletteU(p, c, u.x, u.y) >= keep) return true;
+            if (dSphRouletteU(p, c, u.x, u.y) >= keep) return;
         }
         D3 a1, a2; d3onb(d0, a1, a2);
         const double eps = 1e-6;
         DSphChain rA, rB;
-        if (!dSphChainFrom(eye - O, d3norm(d0 + a1 * eps), r, n, outside, refl, rA)) return true;
-        if (!dSphChainFrom(eye - O, d3norm(d0 + a2 * eps), r, n, outside, refl, rB)) return true;
+        if (!dSphChainFrom(eye - O, d3norm(d0 + a1 * eps), r, n, outside, refl, rA)) return;
+        if (!dSphChainFrom(eye - O, d3norm(d0 + a2 * eps), r, n, outside, refl, rB)) return;
         D3 e1, e2; d3onb(ch.dir, e1, e2);
         double ax, ay, bx, by;
         {   double denom = d3dot(rA.dir, ch.dir);
@@ -11261,7 +11298,7 @@ __device__ static void dConnectSpecularSphere(const DScene& sc, const DCamera& c
             const D3 off = (rB.last + rB.dir * s) - ap;
             bx = d3dot(off, e1); by = d3dot(off, e2); }
         const double jac = fabs(ax * by - ay * bx);
-        if (jac < 2.5e-17 * eps * eps) return true;
+        if (jac < 2.5e-17 * eps * eps) return;
         const double G = (eps * eps) / jac;
         const double geom = G * ch.F * w0 * wPick / keep / omega * (outside ? 1.0 : n * n);   // n^2: host twin
 
@@ -11269,14 +11306,14 @@ __device__ static void dConnectSpecularSphere(const DScene& sc, const DCamera& c
         // often as out (and which the legs, outside it, cannot otherwise meet).
         const DVec3 wPR = wP.toR();
         if (occludedTo(sc, dOffsetAlong(p.toR(), vt.legNormal(), wPR, vt.reach), last.toR(), 2e-6, RAY_TMIN, false, (Real)0, sphIdx))
-            return true;
+            return;
         DVec3 wER((Real)0, (Real)0, (Real)0);
         double dE = 0.0;
         if (outside) {
             D3 wE = eye - first; dE = d3len(wE); wE = wE * (1.0 / dE);
             wER = wE.toR();
             // camera leg: hide_camera applies (Scene::occluded / DMaterial::hideCamera)
-            if (occludedTo(sc, first.toR(), eye.toR(), 2e-6, RAY_TMIN, /*camLeg=*/true, (Real)0, sphIdx)) return true;
+            if (occludedTo(sc, first.toR(), eye.toR(), 2e-6, RAY_TMIN, /*camLeg=*/true, (Real)0, sphIdx)) return;
         }
         for (int j = 0; j < nL; ++j) {
             DSpecVtx vj = vt; vj.weight = (double)w[j]; vj.lambda = lam[j];
@@ -11294,6 +11331,30 @@ __device__ static void dConnectSpecularSphere(const DScene& sc, const DCamera& c
             }
             filmAdd(film, hits, cam.resX, px, py, lam[j], (Real)contrib);
         }
+        return;
+    };
+    // An image the scan closed on: its cheap test decides whether the chain found it (dSphScanChains counts
+    // it), and its splat waits in `pend` for the loop after the scan, which a warp's lanes run together
+    // rather than one lane at a time as each meets a root mid-scan -- in the scan's order, so every draw
+    // its media take is the one it took inline.
+    struct Pend { DSphV2 u; double w0, wPick; int c; };
+    Pend pend[kDSphPendMax];
+    int nPend = 0;
+    auto flush = [&]() {
+        for (int k = 0; k < nPend; ++k) splat(pend[k].c, pend[k].u, pend[k].w0, pend[k].wPick);
+        nPend = 0;
+    };
+    auto image = [&](int c, const DSphV2& u, double w0, double wPick) -> bool {
+        DSphV2 Q2, dir2;                              // behind p, or no root closed on: no image
+        if (!legOf(c, u.x, u.y, Q2, dir2)) return false;
+        const DSphV2 q2 = p2 - Q2;
+        if (vdot(q2, dir2) <= 0.0) return false;
+        if (fabs(dir2.x * q2.y - dir2.y * q2.x) > 1e-6 * (r + sqrt(vdot(q2, q2)))) return false;
+        D3 P1chief, d0;
+        DSphChain ch;
+        if (!chief(c, u, P1chief, d0, ch)) return false;
+        if (nPend == kDSphPendMax) flush();
+        pend[nPend++] = Pend{u, w0, wPick, c};
         return true;
     };
     dSphScanChains(deep.w > 0.0 ? nC + 1 : nC, dSphScanEnds(r, dEyeO, n, outside), eval,
@@ -11302,6 +11363,7 @@ __device__ static void dConnectSpecularSphere(const DScene& sc, const DCamera& c
                        return c == nC ? image(deep.c, u, w0, deep.w) : image(c, u, w0, 1.0);
                    },
                    [&](int c, const DSphV2& u) { return dSphRouletteU(p, chainOf(c) + 1000, u.x, u.y); });
+    flush();
 }
 
 // ================== analytic specular connection by REFLECTION ==================

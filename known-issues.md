@@ -1409,6 +1409,17 @@ connections and run them in a kernel of their own, coherent (one thread a vertex
 in fp32 where the miss's precision allows and fp64 only to refine. Until then mode B with large glass
 spheres in view renders faster with `-device cpu`.
 
+**0.450.42, the connection's own divergence:** Nsight had the photon kernel at 2.38 active lanes an
+instruction, its FP64 pipe 76 % busy, on check_ball_images' outside view; a scratch build timing the
+connection's stages had the images' splats (three chain traces, two shadow rays) 53 % of the render and
+the roots' refinement 28 %, each run one lane at a time as the lanes met them mid-scan. The scan now
+closes on its candidates in a loop after it and the splats wait for a loop after that, in the same order
+(design.md; check_bitid's GPU mode B on its glass spheres moves 262 of 6912 pixels, a borderline root
+closing otherwise under ptxas's other contraction, the mean by under 0.001 %; check_ball_images passes
+all 47 cases against mode R): 17.5 -> 9.7 s at 5e6 photons, the CPU's 32 threads 11.7 s -- the GPU ahead
+now, but still at 3.8 lanes, the FP64 pipe 78 % busy. **Left:** the queue above, which would bring a
+warp's lanes to a connection together, and the fp32 scan.
+
 ## DONE (2026-11-16, 0.448.5): REVIEW-0448C — what the Opus (xhigh) review of 0.448.4 found
 
 `/code-review xhigh` (Opus, 9 findings) of 0ee7cd2..a91ca7c, in a worktree; each checked against the

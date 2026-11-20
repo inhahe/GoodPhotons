@@ -306,8 +306,10 @@ Then the rest of 4.2-4.6 in their order, 4.7's bookkeeping alongside whatever to
 - [x] **BALL-EYE-HALO** (0.448.0) — mode B's glass-sphere connection draws every chain of surface
   events (reflections outside and inside, to 16; 128 since 0.448.1), its rim and its folds
   (known-issues).
-- [ ] **GPU-SPHERE-CONNECT-SLOW** — GPU mode B through a glass sphere is slower than the CPU: queue
-  the sphere connections into a kernel of their own (known-issues).
+- [ ] **GPU-SPHERE-CONNECT-SLOW** — GPU mode B through a glass sphere: since 0.450.42 the connection closes on
+  its roots and splats its images in loops after its scan (17.5 -> 9.7 s, ahead of the CPU's 11.7);
+  left, queue the connections into a kernel of their own, so a warp's lanes run them together, and an
+  fp32 scan (known-issues).
 - [x] **MODEB-SPHERE-ROOM** (0.448.1) — the check's depth cap, which mode R counts the ball's events
   against and mode B's connection did not (known-issues).
 - [x] **MODEM-BALL-LAMP** (no change) — the lamp's edge pixels' coverage noise at 64 spp, the same
