@@ -15589,8 +15589,8 @@ __device__ __host__ static inline bool dLambertLit(double cosWi) { return cosWi 
 
 // The GGX pair (b, a) from the pair (a, b): the same half vector and distribution, its two ends'
 // cosines and A terms swapped -- what ggx::pair computes for the swapped arguments, bit for bit.
-__device__ static inline ggx::Pair dPairSwapped(const ggx::Pair& p) {
-    ggx::Pair r = p;
+template <class T> __device__ static inline ggx::PairT<T> dPairSwapped(const ggx::PairT<T>& p) {
+    ggx::PairT<T> r = p;
     r.ca = p.cb; r.cb = p.ca;
     r.Aa = p.Ab; r.Ab = p.Aa;
     return r;
@@ -15605,10 +15605,12 @@ __device__ static inline ggx::Pair dPairSwapped(const ggx::Pair& p) {
 // textured, patterned and record-driven albedo and roughness are read per hit (M9), as the sampler
 // read them, which keeps the MIS densities consistent. What a query needs of the hit is read at its
 // first need (prepare): a Lambertian lobe's pdf, or its value from below, needs none; `now` reads it
-// at once. In an unnamed namespace, so its member functions have internal linkage, one copy a unit
-// (render_cuda_dev.cuh's first constraint).
+// at once. `P` is the precision of a glossy lobe's GGX pair: double for a connection's (DVertexLobe),
+// the device's own for a merge's (DMergeLobe). In an unnamed namespace, so its member functions have
+// internal linkage, one copy a unit (render_cuda_dev.cuh's first constraint).
 namespace {
-struct DVertexLobe {
+template <class P>
+struct DVertexLobeT {
     const DScene& sc;
     const DVertex& vt;
     const DMaterial& m;
@@ -15621,8 +15623,8 @@ struct DVertexLobe {
     // The direction at() set:
     DVec3 wi;
     double cosWi = 0.0;
-    ggx::Pair p;            // a glossy lobe's pair (wo, wi)
-    double g = 0.0;         // ...its value over the reflectance, ggx::fAll
+    ggx::PairT<P> p;        // a glossy lobe's pair (wo, wi)
+    P g = (P)0;             // ...its value over the reflectance, ggx::fAll
     Real cH = (Real)1;      // ...and its half-vector cosine, which an iridescent lobe's R reads
     // A translucent lobe's two albedos (dDiffuseTransmitAlbedos) at rhoLam, which every direction
     // shares: read again only at another wavelength. One slot, and no field the lobe can do
@@ -15630,7 +15632,7 @@ struct DVertexLobe {
     // some thirty in kBdptT's and the mode-U kernels' stacks.
     Real rhoLam = (Real)-1;
     double rhoR = 0.0, rhoT = 0.0;
-    __device__ DVertexLobe(const DScene& sc_, const DVertex& vt_, const DVec3& wo_, bool now = false)
+    __device__ DVertexLobeT(const DScene& sc_, const DVertex& vt_, const DVec3& wo_, bool now = false)
         : sc(sc_), vt(vt_), m(sc_.mats[vt_.matId]), wo(wo_), cosWo(ddot(wo_, vt_.ns)) {
         if (now) prepare();
     }
@@ -15647,8 +15649,8 @@ struct DVertexLobe {
         cosWi = ddot(wi, vt.ns);
         if (m.type == D_GLOSSY) {
             if (!ready) prepare();
-            p = ggx::pair(vt.ns, wo, wi, alpha);
-            g = p.ok ? ggx::fAll(p, ms) : 0.0;
+            p = ggx::pairT<P>(vt.ns, wo, wi, (P)alpha);
+            g = p.ok ? ggx::fAll(p, ms) : (P)0;
             if (m.iridescence) cH = dHalfVectorCos(wo, wi);
         }
     }
@@ -15667,7 +15669,7 @@ struct DVertexLobe {
         } else if (m.type == D_GLOSSY) {
             // r times the GGX lobe; r carries an iridescent lobe's interference reflectance.
             if (!p.ok) return 0.0;
-            return dGlossyR(sc, m, h, cH, lambda) * g;
+            return dGlossyR(sc, m, h, cH, lambda) * (double)g;
         } else if (m.type == D_DIFFUSETRANSMIT) {
             // Two-sided Lambertian, mode R's integrand (host twin bsdfF, dTranslucentLobe).
             albedos(lambda);
@@ -15689,7 +15691,7 @@ struct DVertexLobe {
             if (!dLambertLit(cosB)) return 0.0;          // from either side of ns (dLambertLit)
             return cosB / DPI;
         } else if (m.type == D_GLOSSY) {
-            return ggx::pdfAll(rev ? dPairSwapped(p) : p, ms);   // the visible normals'
+            return (double)ggx::pdfAll(rev ? dPairSwapped(p) : p, ms);   // the visible normals'
         } else if (m.type == D_DIFFUSETRANSMIT) {
             // The lobe-selected cosine sampling at a vertex reached from the near end, about the
             // shading normal turned to its geometric side, a draw on the wrong side of the true
@@ -15713,6 +15715,12 @@ struct DVertexLobe {
     }
 };
 }  // namespace
+// A connection's lobe: its pair in double, as every MIS weight beside it.
+using DVertexLobe = DVertexLobeT<double>;
+// A merge's (modes U and J): its pair in the device's own precision. In double it kept the FP64 pipe
+// of mode U's gather 69 % busy; in float no image tells it from double's, near-mirror lobes at
+// grazing angles included (VCM-LOBE-FP32, design.md).
+using DMergeLobe = DVertexLobeT<Real>;
 
 // BSDF value f(wo->wi) at a surface vertex (double, for the connection radiance L): its lobe's, for
 // the one direction.
@@ -21340,10 +21348,10 @@ struct DSurfSite {
 };
 }  // namespace
 // The merge of photon `sm.order[q]` at the site: its XYZ added to gX, gY, gZ. `lobe` is the site's
-// camera vertex's toward the camera side (DVertexLobe), `coatTh` its coat's film there
+// camera vertex's toward the camera side (DMergeLobe), `coatTh` its coat's film there
 // (dCoatThicknessAt).
 __device__ static inline void dSurfMergePhoton(const DScene& sc, const DSurfMap& sm, const DSurfSite& site,
-                                               DVertexLobe& lobe, Real& coatTh, const DSurfMergeW& sw, int q,
+                                               DMergeLobe& lobe, Real& coatTh, const DSurfMergeW& sw, int q,
                                                double& gX, double& gY, double& gZ,
                                                const DJSpec* js) {
     const DVertex& vk = lobe.vt;
@@ -21546,7 +21554,7 @@ __device__ static int dSurfMergeAt(const DScene& sc, const DSurfMap& sm, const D
                                    double& gX, double& gY, double& gZ,
                                    const DJSpec* js = nullptr) {
     const DSurfSite site(sc, sm, vk);
-    DVertexLobe lobe(sc, vk, woCam, false);
+    DMergeLobe lobe(sc, vk, woCam, false);
     Real coatTh = (Real)0;   // dSurfMergePhoton's, with the lobe
     int weighed = 0;
     dSiteListWalk([&](int n, int& b, int& e, unsigned char& t) { dSurfSiteCell(sm, site, n, b, e, t); }, 0, 1,
@@ -21583,7 +21591,7 @@ __global__ void kWfSurfGather(DScene sc, DSurfMap sm, DSurfQueue sq, int n, doub
         const DJSpec* js = (rq.flags & 1) ? &sq.spec[r] : nullptr;
         const DSurfSite site(sc, sm, rq.vk);
         double gX = 0.0, gY = 0.0, gZ = 0.0;
-        DVertexLobe lobe(sc, rq.vk, rq.woCam, false);
+        DMergeLobe lobe(sc, rq.vk, rq.woCam, false);
         Real coatTh = (Real)0;   // dSurfMergePhoton's, with the lobe
         // The site's photons as one list, its cells in walk order, the lanes taking them in turn; the
         // work counted is the photons of its own cells the lanes weighed, summed across the warp.

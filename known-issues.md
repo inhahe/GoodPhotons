@@ -201,6 +201,28 @@ to 0.25 renders as a 150 nm one within 2e-3, 1.0e-3 measured (its body's escape 
 on 0.450.1 it rendered as the unmapped 600 nm, 1.9 off), the `thinfilm` control byte for byte, and
 the three misspellings stop the load (on 0.450.1 they loaded).
 
+## DONE (2026-11-19, 0.450.34): VCM-LOBE-FP32 — the merges' GGX pair ran in double, holding the FP64 pipe
+
+After VCM-GATHER-DIVERGENCE, Nsight had mode U's gather's FP64 pipe 68.6 % busy for its whole launch
+and its FP32 FMA pipe 1.4 %: the merge lobe's GGX pair (`ggx::pair`: a half vector normalised, two
+Smith A terms, D, and the value's and pdfs' divisions) in double, on a card whose double runs at
+1/64 of float.
+
+**Fixed:** the lobe is templated on the pair's precision (`DVertexLobeT<P>`; `ggx::pairT<T>` and the
+lobe's terms already were); a merge's (`DMergeLobe`: mode U's both walks, mode J's surface merges)
+takes `Real`, a connection's (`DVertexLobe`) keeps double. The merge's value and pdfs come out as
+double for the weights around them.
+
+**Measured** (0.450.33 against 0.450.34, paired): the 640x480 bowl (`-max-bounce 24`, 8 passes),
+gather 8.49 -> 7.14 s, render 11.18 -> 9.85 s; Nsight on one launch 426 -> 365 ms, FP64 instructions
+5.77 -> 1.76 G, the FP64 pipe 68.6 -> 24.4 % busy. The bowl at 96x72 (inline merges) 8.69 -> 8.15 s;
+`_caustic_box` modes U and J unchanged. **The images:** `scraps/_grazing_gloss.ftsl` -- glossy strips
+at roughness 0.003, 0.03 and 0.3 seen at a grazing angle, lit from low at the far end -- in GPU modes
+U and J at 1024 samples and three seeds, paired against 0.450.33 at the same seeds: every strip's
+mean within 1e-5, no pixel moved more than 4e-5; mode U 0.997-1.002 and mode J 1.000-1.003 of mode R
+in both builds. check_glossy_adjoint (device J and U, the three grazing scenes) 0.998-1.000 of mode R; check_bitid's
+GPU J and U at most 1.6e-5 of a pixel from 0.450.33; check_vcm_wavefront passes.
+
 ## DONE (2026-11-19, 0.450.33): VCM-GATHER-DIVERGENCE — mode U's queued gather ran with half its lanes idle
 
 After 0.450.5's merge lobe, Nsight had `kVcmMergeGather` at 13.7 of 32 lanes active: each lane took

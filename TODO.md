@@ -516,10 +516,9 @@ Then the rest of 4.2-4.6 in their order, 4.7's bookkeeping alongside whatever to
 - [x] **VCM-GATHER-DIVERGENCE** (0.450.33) — the queued gather's lanes test their entries, and the warp
   weighs the ones that pass 32 at a time (dSiteListWarp): 16.8 -> 28.5 active lanes, the 640x480
   bowl's gather 11.55 -> 8.49 s, its render 21 % faster; known-issues.
-- [ ] **VCM-LOBE-FP32** — whether the merge lobe's GGX pair (`DVertexLobe::at`) can run in single
-  precision where its double buys nothing (the gather ran 15.6 G FP64 instructions a launch at
-  0.450.5): time it on the 640x480 bowl, and judge the images against mode R at grazing angles,
-  where the MIS ratios that motivated double are touchiest.
+- [x] **VCM-LOBE-FP32** (0.450.34) — the merges' lobe takes its GGX pair in the device's precision
+  (DMergeLobe), connections keep double: the gather's FP64 pipe 69 -> 24 % busy, the 640x480 bowl's
+  render 12 % faster, its images double's to 4e-5 a pixel; known-issues.
 - [x] **REVIEW-0450-FABLE** (0.450.3) — the Fable (xhigh) review of 0.450.0: the queue sized to its
   smallest wave, mode U in the local-memory preflight, one warp-gather tail, the seed's draws
   sequenced, check_bitid's floor for GPU J and U; known-issues REVIEW-0450-FABLE.

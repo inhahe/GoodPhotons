@@ -10615,6 +10615,18 @@ as the one at fault.
   Only the order of a site's sums moved, below a float32 pixel's rounding (check_vcm_wavefront:
   the queue's image is the inline merge's to the byte).
 
+  **The merges' lobe in single precision (0.450.34, VCM-LOBE-FP32).** `DVertexLobe` is
+  `DVertexLobeT<P>`, `P` the precision of a glossy lobe's GGX pair (`ggx::pairT<P>`, whose D reads
+  its squared sine by a cross product so a small alpha keeps its precision in float): double for a
+  connection's (`DVertexLobe`, beside the MIS weights it feeds), the device's own `Real` for a
+  merge's (`DMergeLobe`: mode U's `dVcmMergeSum`, mode J's surface merges). In double the pair's
+  square roots and divisions kept the gather's FP64 pipe 69 % busy, its FP32 2 %. Now 24 %, the
+  640x480 bowl's gather 8.49 -> 7.14 s and its render 11.18 -> 9.85 s; the bowl at its own size,
+  whose merges run inline, 6 % faster. The images: the same seeds' renders of three glossy strips
+  seen at a grazing angle (roughness 0.003, 0.03, 0.3, lit from low at the far end) agree with
+  double's to 1e-5 a strip and 4e-5 a pixel in modes U and J, and with mode R to 0.3 %;
+  check_glossy_adjoint's device J and U hold mode R to 0.2 %.
+
   **One lobe for every connectible BSDF (0.450.11, MERGE-LOBE-SHARED).** The merges' lobe was a
   second copy of `dBsdfF`'s and `dBsdfPdf`'s arithmetic, kept equal by hand. It is now the only one,
   `DVertexLobe`: `dBsdfF` and `dBsdfPdf` are a lobe for a single direction, the hair fiber's case

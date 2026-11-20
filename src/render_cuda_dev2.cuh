@@ -2410,7 +2410,7 @@ __global__ void kVcmLightT(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx,
 // The camera kernel merges where it is a site with few light vertices (inlineMax), and one the full
 // queue turns away, which it counts (`overflow`); a site with none it skips.
 struct DVcmMergeReq {
-    DVertex vt;            // the camera vertex merged at (dVertFromHit), its lobe's (DVertexLobe)
+    DVertex vt;            // the camera vertex merged at (dVertFromHit), its lobe's (DMergeLobe)
     DVec3   wo;            // toward the camera walk's previous vertex
     double  dVCM, dVM;     // the camera walk's MIS partials on arrival there
     double  f;             // the site's scale: its throughput (the VCM-SPEC carrier's) * vmNorm
@@ -2488,7 +2488,7 @@ __device__ __noinline__ static void dVcmMergeSum(const DScene& sc, const DVcmCtx
     // first), and a warp's lanes then read the hit once, together, rather than each at its own first
     // candidate. Never a caller's lobe by reference: a lobe whose address leaves its kernel for a
     // call ptxas keeps out of line lives in local memory there, every query of it a load.
-    DVertexLobe lobe(sc, vt, wo, true);
+    DMergeLobe lobe(sc, vt, wo, true);
     // Entry k's refusals before its lobe: another block's (its cell's tag t), or one the merge does not
     // weigh (host twin vcm.h).
     const auto pass = [&](int k, unsigned char t) -> bool {
