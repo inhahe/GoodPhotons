@@ -11459,6 +11459,22 @@ the stack, which the driver reserves for every resident thread (the lists hold s
 photons, 17.5 -> 9.2 s (the CPU's 32 threads, 11.7 s); the kernel's FP64 instructions 29 -> 17 G. Still
 3.8 lanes: only the lanes at a vertex together run a connection together (GPU-SPHERE-CONNECT-SLOW).
 
+**Queued, a kernel of their own (0.450.44).** So the connections themselves run a warp's lanes together,
+the photon kernel queues each one (`dSphEnqueue`: a `DSphReq` holds the sphere at the path's time, the
+index the camera sees it with, the vertex and its splat records with the hit they read, the wavelengths
+that see it alike, the room the depth cap leaves, the camera, the path's time, and a stream of its own
+from the walk's state, the walk drawing nothing for it) and `kSphConnect` runs them, a thread each, after
+each wave of photons (`launchForward`): each wave sized so its requests fill the queue (2^19, or an
+eighth of the free memory) at the last wave's rate a photon (a call's first, the call before's: a
+render's batches are calls of their own, and its first waves spilled 3 % inline, a fifth of the time), a
+request past it connected inline, a
+moving camera's (each thread's own posed copy) inline. Under per-photon seeding with no medium -- whose
+transmittance is the one draw a connection takes, now from its own stream -- the queue's images are the
+inline ones' to the bit (`tools/check_sphere_queue.py`: outside and inside a glass ball, over a glossy
+and a coated floor, and a queue shrunk to many waves and spilling inline); under per-thread seeding each
+wave past a call's first takes a seed of its own. The outside view at 5e6 photons, 9.2 -> 2.9 s, the
+CPU's 32 threads 11.7: from 17.5 s before 0.450.42. `FTRACE_NOSPHQ=1` connects inline (REFERENCE.md).
+
 Before 0.448.0 only the refraction was drawn, so mode B read a glass ball's body some 10 % under mode R
 and its rim as little as a fifth, and an eye in a glass ball in `scenes/_camera_in_water.ftsl`'s room
 missed the halo the inner surface shows round the lamp (for an eye at the centre a rear-view mirror:

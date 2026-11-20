@@ -1442,7 +1442,7 @@ the light slab (`DVcmGrid::byCell`). check_vcm_wavefront passes (its images bit-
 or inline); check_bitid against 0.450.0: every case identical but GPU modes M and S (within their floor)
 and coated_U_gpu, 3 pixels off by 1.0e-7 (the merges' sums in another order).
 
-## OPEN (2026-11-16): GPU-SPHERE-CONNECT-SLOW — GPU mode B through a glass sphere runs at a few lanes a warp
+## DONE (2026-11-20, 0.450.42-0.450.44): GPU-SPHERE-CONNECT-SLOW — GPU mode B through a glass sphere runs at a few lanes a warp
 
 Mode B's glass-sphere connection runs in each photon thread, in double precision, a scan of 99 samples
 a vertex and a root's refinement and three chains in space for each image (the chief and two
@@ -1465,6 +1465,12 @@ closing otherwise under ptxas's other contraction, the mean by under 0.001 %; ch
 all 47 cases against mode R): 17.5 -> 9.7 s at 5e6 photons (9.2 since 0.450.43), the CPU's 32 threads
 11.7 s -- the GPU ahead now, but still at 3.8 lanes, the FP64 pipe 78 % busy. **Left:** the queue above, which would bring a
 warp's lanes to a connection together, and the fp32 scan.
+
+**0.450.44, queued:** each connection goes to a queue and `kSphConnect` runs them, a warp's lanes
+together, after each wave of photons (design.md). 9.2 -> 2.9 s at 5e6 photons -- 17.5 s before 0.450.42,
+the CPU's 32 threads 11.7 s. Under per-photon seeding with no medium the images are the inline ones' to
+the bit (tools/check_sphere_queue.py: five cases, a shrunk queue's 144 waves among them). The scan in
+fp32, refined in fp64, is left as an optimization (TODO SPH-SCAN-FP32): the GPU no longer loses.
 
 ## DONE (2026-11-16, 0.448.5): REVIEW-0448C — what the Opus (xhigh) review of 0.448.4 found
 

@@ -1949,6 +1949,18 @@ machine varied 18.5 s / 25.8 s / 27.2 s.
   and below what it would hold) and lets a wave go down to 256 paths, so a small frame takes several
   waves, or with a tiny `n` turns sites away to the inline merge; `tools/check_vcm_wavefront.py`
   uses both, and requires the same image every way and waves that hold their sites.
+- **`FTRACE_NOSPHQ=1` (diagnostic, mode `B` on the GPU).** Since 0.450.44 mode `B`'s connections
+  through a glass sphere are queued: each photon vertex's connection goes to a kernel of its own that
+  runs a warp's connections together, after each wave of photons, instead of the photon's thread making
+  it while the warp's other photons waited (a camera that moves under a blur keeps the inline ones).
+  The image gets the same terms, summed in another order -- under per-photon seeding
+  (`FTRACE_GPU_PHOTONSEED=1`) and with no medium the same image, to rounding; a medium's transmittance
+  draws from the connection's own stream, not the photon's. Measured on check_ball_images' glass ball
+  seen from outside, 5e6 photons: 9.2 -> 2.9 s (the CPU's 32 threads 11.7 s). Setting this forces the
+  inline connection (the A/B control). `FTRACE_WAVE_DEBUG=1` prints a `[wave] B sphere connections`
+  line a wave: its photons, its queued requests and those the full queue turned away to the inline
+  connection; `FTRACE_SPHQCAP=<n>` shrinks the queue to `n` requests, so a render takes many waves and
+  turns some away. `tools/check_sphere_queue.py` uses all three.
 - **`FTRACE_MERGE_TABLE=<k>` (diagnostic, modes `U`, `J`, `M`, `S`).** The merge maps -- mode
   `U`'s light vertices, mode `J`'s surface photons, the photon map of modes `M` and `S` -- bin their
   points in a hashed lattice whose table holds about two buckets a point; this holds its slots to

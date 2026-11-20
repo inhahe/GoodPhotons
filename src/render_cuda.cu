@@ -2387,6 +2387,16 @@ static int wavefrontSlots(long long N) {
 }
 // The forward megakernel's grid (launchForward's kTrace): ~262k threads.
 static constexpr int kFwdBlockSize = 128, kFwdNumBlocks = 2048;
+// Mode B's glass-sphere connection queue (launchForward): the requests it holds at most, and whether it is
+// used (FTRACE_NOSPHQ=1 connects every one inline, for comparing the two).
+static constexpr long long kSphQueueCap = 1LL << 19;
+static bool sphQueueOn() {
+    static const bool on = [] {
+        const char* e = std::getenv("FTRACE_NOSPHQ");
+        return !(e && *e && std::atoi(e) != 0);
+    }();
+    return on;
+}
 // The hero bundle a forward trace carries for `heroC` asked: none (1) through participating media
 // or GRIN bending, where the geometry is not the same for every wavelength between dispersive
 // events.
@@ -2492,7 +2502,7 @@ static void launchForward(DUpload& up, const gpu::DCamSet& cs, double* d_energy,
                           bool stableSeed = false,
                           gpu::DCamera** posedKeep = nullptr, size_t* posedCapKeep = nullptr) {
     using namespace gpu;
-    preferL1({(const void*)kTrace});
+    preferL1({(const void*)kTrace, (const void*)kSphConnect});
     // seedBase==0 keeps the original single-shot seed exactly; each accumulation chunk
     // passes a distinct cumulative-photon offset for an independent stream -- or, seeding
     // stably, its photons' absolute indices start there under the single-shot seed.
@@ -2538,12 +2548,74 @@ static void launchForward(DUpload& up, const gpu::DCamSet& cs, double* d_energy,
             const char* e = std::getenv("FTRACE_GPU_PHOTONSEED");
             return (e && *e) ? std::atoi(e) : 0;
         }();
-        kTrace<<<kFwdNumBlocks, kFwdBlockSize>>>(up.sc, csRun, d_energy, N, diffraction ? 1 : 0,
-                                           kseed, maxBounce, camModeInt, effHeroC,
-                                           stableSeed ? 1 : perPhotonSeed,
-                                           stableSeed ? (long long)seedBase : 0LL);
+        // Mode B's glass-sphere connections queued (DSphReq) and run by kSphConnect after each wave of the
+        // photons, a warp's lanes together (GPU-SPHERE-CONNECT-SLOW): where the scene has a glass sphere
+        // and no camera moves (a moving camera's are each thread's own). Each wave is sized so its requests
+        // fill the queue at the last wave's rate; a request past it connects inline. A wave is its own
+        // launch, so under per-thread seeding each takes its own seed; per-photon seeding takes the
+        // photons' absolute indices, as one launch would.
+        const bool sphQueue = camModeInt == CAM_B && up.sc.nDielSph > 0 && csRun.nCam > 0 && !csRun.camStride &&
+                              !csRun.pSplit && sphQueueOn();
+        int* d_sphCount = nullptr;
+        if (sphQueue) {
+            size_t freeB = 0, totalB = 0;
+            cudaMemGetInfo(&freeB, &totalB);
+            // FTRACE_SPHQCAP=<n> shrinks it, for the checks: many waves, and requests past it inline.
+            static const long long capEnv = [] {
+                const char* e = std::getenv("FTRACE_SPHQCAP");
+                return (e && *e) ? std::atoll(e) : 0LL;
+            }();
+            const size_t want = capEnv > 0 ? (size_t)capEnv
+                                           : std::min<size_t>(kSphQueueCap, freeB / 8 / sizeof(gpu::DSphReq));
+            if (want >= (capEnv > 0 ? 1u : 4096u) &&
+                cudaMalloc(&csRun.sphReqs, want * sizeof(gpu::DSphReq)) == cudaSuccess &&
+                cudaMalloc(&d_sphCount, sizeof(int)) == cudaSuccess) {
+                csRun.sphCap = (int)want;
+                csRun.sphCount = d_sphCount;
+            } else {
+                cudaGetLastError();
+                if (csRun.sphReqs) cudaFree(csRun.sphReqs);
+                csRun.sphReqs = nullptr;
+            }
+        }
+        const bool perPhoton = stableSeed || perPhotonSeed;
+        // Requests a photon at the last wave (of this call or the one before: a render's batches are calls
+        // of their own), so even a call's first wave fills the queue without spilling; 4 before any.
+        static double sphRate = 4.0;
+        long long wave = csRun.sphReqs ? std::min<long long>(N, (long long)(0.9 * csRun.sphCap / sphRate)) : N;
+        for (long long done = 0, w = 0; done < N; ++w) {
+            const long long n = std::min(wave, N - done);
+            const unsigned long long seedW = (perPhoton || w == 0) ? kseed
+                                           : kseed ^ ((unsigned long long)w * 0xD1B54A32D192ED03ULL);
+            if (d_sphCount) CUDA_CHECK(cudaMemset(d_sphCount, 0, sizeof(int)));
+            kTrace<<<kFwdNumBlocks, kFwdBlockSize>>>(up.sc, csRun, d_energy, n, diffraction ? 1 : 0,
+                                               seedW, maxBounce, camModeInt, effHeroC,
+                                               stableSeed ? 1 : perPhotonSeed,
+                                               (stableSeed ? (long long)seedBase : 0LL) + done);
+            cudaCheckKernel("forward");
+            if (d_sphCount) {
+                int asked = 0;
+                CUDA_CHECK(cudaMemcpy(&asked, d_sphCount, sizeof(int), cudaMemcpyDeviceToHost));
+                const long long want = asked < 0 ? (1LL << 31) : (long long)asked;   // past 2^31: wrapped
+                const int run = (int)std::min<long long>(want, csRun.sphCap);
+                if (run > 0) {
+                    kSphConnect<<<std::min(4096, (run + 127) / 128), 128>>>(up.sc, csRun, run);
+                    cudaCheckKernel("sphere-connect");
+                }
+                static const bool waveDebug = std::getenv("FTRACE_WAVE_DEBUG") != nullptr;   // a line a wave
+                if (waveDebug)
+                    std::printf("[wave] B sphere connections: wave %lld, %lld photons, %lld queued, %lld inline\n",
+                                w, n, (long long)run, want - run);
+                // The next wave: the queue filled to 90 % at this one's requests a photon.
+                const double rate = (double)want / (double)n;
+                if (rate > 0.0) sphRate = rate;
+                wave = rate > 0.0 ? std::max<long long>(1LL << 14, (long long)(0.9 * csRun.sphCap / rate)) : N;
+            }
+            done += n;
+        }
+        if (csRun.sphReqs) cudaFree(csRun.sphReqs);
+        if (d_sphCount) cudaFree(d_sphCount);
     }
-    cudaCheckKernel("forward");
     if (d_posed) cudaFree(d_posed);
 }
 
@@ -4709,6 +4781,8 @@ GpuRoute cudaForwardRoute(const Scene& scene, bool wavefront, int heroC, bool be
     using namespace gpu;
     if (cudaForwardRunsWavefront(scene, wavefront, heroC, beamGather, nCam, stableSeed))
         return GpuRoute{(const void*)kWfInit, (const void*)kWfExtend, (const void*)kWfShade};
+    // ...and with a glass sphere in the scene, mode B's queued connections (launchForward).
+    if (!scene.dielSphereIdx.empty()) return GpuRoute{(const void*)kTrace, (const void*)kSphConnect};
     return GpuRoute{(const void*)kTrace};
 }
 
