@@ -8300,7 +8300,7 @@ struct DCamSet {
     // Mode B's glass-sphere connections queued for kSphConnect (DSphReq, typed where it is defined), or
     // null: each connected inline. sphCount counts the turned-away requests too, which connect inline.
     void* sphReqs = nullptr;
-    int*  sphCount = nullptr;
+    unsigned long long* sphCount = nullptr;
     int   sphCap = 0;
     // -max-bounce, which mode B's analytic connections count their own vertices against (host twin
     // Renderer::maxBounce); launchForward sets it.
@@ -10743,14 +10743,23 @@ static constexpr int kDSphEventMax = 16;
 namespace {
 template <class T, int N>
 struct DSphBatch {
-    T items[N];
+    // Slots that construct nothing: an item's default constructor (D3's zeroes its members) would
+    // otherwise store into every slot of this dynamically indexed array at each connection, writes the
+    // compiler cannot drop. A slot is written before it is read (push, flush).
+    union Slot {
+        T v;
+        __device__ Slot() {}
+    };
+    static_assert(std::is_trivially_copyable<T>::value && std::is_trivially_destructible<T>::value,
+                  "a slot neither constructs nor destroys its item");
+    Slot items[N];
     int n = 0;
     template <class F> __device__ void push(const T& t, const F& drain) {
         if (n == N) flush(drain);
-        items[n++] = t;
+        items[n++].v = t;
     }
     template <class F> __device__ void flush(const F& drain) {
-        for (int k = 0; k < n; ++k) drain(items[k]);
+        for (int k = 0; k < n; ++k) drain(items[k].v);
         n = 0;
     }
 };
@@ -11692,7 +11701,6 @@ __device__ static void dConnectSpecularSphereMirror(const DScene& sc, const DCam
     const auto missAt = [&](double sc1, double ss1, bool& v) { double mss; D_TRACE2D_MIRROR(sc1, ss1, mss, v); return mss; };
     #undef D_TRACE2D_MIRROR
 
-    // One image, at the surface point u (host twin connectSpecularSphereMirror): false where it is none.
     // An image that passed image()'s tests, held for the splat with what they found: its chief ray's
     // direction (d0) and reflection (ch), where on the frame, the vertex's shape factor toward it.
     struct Pend { DSphereRefl ch; D3 d0; double omega, shape; int px, py; };
@@ -11783,8 +11791,12 @@ __device__ static void dConnectSpecularSphereMirror(const DScene& sc, const DCam
 // A glass-sphere connection queued for kSphConnect (DCamSet::sphReqs): what dConnectSpecularSphere reads
 // of the vertex's thread -- the sphere at the path's time, the index the camera sees it with, the vertex
 // and its splat records (their hit copied in `hit`, their pointers set again by the kernel), the
-// wavelengths that see it alike, the room the depth cap leaves, the camera, the path's time, and the
-// connection's own random stream.
+// wavelengths that see it alike, the room the depth cap leaves, the camera with its film and hit counts,
+// the path's time, and the connection's own random stream (dSphStream).
+// The camera is held by address, not by its index in a set: the set the vertex splats to may be a slice of
+// the launch's (the beam gather's one camera a slice), whose indices are not the launch's. A camera posed
+// for its thread's photon would be reposed for the next one before kSphConnect runs, so no request is made
+// for a set whose cameras move (launchForward).
 namespace {
 struct DSphReq {
     DSphere S;
@@ -11795,38 +11807,46 @@ struct DSphReq {
     DGlossySplat gs;
     DCoatSplat cs;
     Real lam[hero::kHeroMax], beta[hero::kHeroMax], w[hero::kHeroMax];
-    unsigned long long rngState, rngInc;
+    const DCamera* cam;
+    double* film;
+    double* hits;
+    DRng rng;
     float motionU;
-    int nL, room, sphIdx, cam;
-    bool hasGs, hasCs;
+    int nL, room, sphIdx;
 };
 }  // namespace
-// Queues vertex p's connection through S for camera c (dConnectSpecularSphere's arguments) for kSphConnect;
-// false where there is no queue, the queue is full, or the vertex's splat records read two hits, and the
-// caller connects inline. The request's stream is the walk's state mixed with the sphere, the camera and
-// the group's first wavelength, the walk drawing nothing for it: a walk through no medium, whose
-// connections draw nothing, runs as it does inline.
+// A glass-sphere connection's own random stream: from the walk's state at its vertex, salted with the
+// walk's increment, the sphere, the camera and the group's first wavelength. Queued or connected inline,
+// a connection draws from this and never from the walk, so the walk runs the same whichever it was and
+// two cameras' connections at one vertex draw apart.
+__device__ static DRng dSphStream(const DRng& walk, int sphIdx, int c, Real lam0) {
+    DRng r;
+    r.seedUnit(walk.state, walk.inc ^ dMix64(((unsigned long long)(unsigned)(sphIdx + 1) << 40) ^
+                                             ((unsigned long long)(unsigned)(c + 1) << 24) ^
+                                             (unsigned long long)__float_as_uint((float)lam0)));
+    return r;
+}
+// Queues vertex p's connection through S for camera c of `cs` (dConnectSpecularSphere's arguments, its
+// stream dSphStream's) for kSphConnect; false where there is no queue, the queue is full, or the vertex's
+// splat records read two hits, and the caller connects inline.
 __device__ static bool dSphEnqueue(const DCamSet& cs, int c, const DSphere& S, const DSphIndex& ix, const D3& p,
                                    const DSpecVtx& vt, const Real* lam, const Real* beta, const Real* w, int nL,
                                    int room, int sphIdx, const DRng& rng) {
     if (!cs.sphReqs) return false;
     const DHit* h = vt.glossy ? vt.glossy->h : (vt.coat ? vt.coat->h : nullptr);
     if (vt.glossy && vt.coat && vt.coat->h != h) return false;
-    const int slot = atomicAdd(cs.sphCount, 1);
-    if (slot < 0 || slot >= cs.sphCap) return false;
+    const unsigned long long slot = atomicAdd(cs.sphCount, 1ull);   // 64 bits: a count never wraps
+    if (slot >= (unsigned long long)cs.sphCap) return false;
     DSphReq& q = ((DSphReq*)cs.sphReqs)[slot];
-    q.S = S; q.ix = ix; q.p = p; q.vt = vt;
+    q.S = S; q.ix = ix; q.p = p; q.vt = vt;   // vt's record pointers: kept as flags, re-aimed by the kernel
     if (h) q.hit = *h;
-    q.hasGs = vt.glossy != nullptr;
     if (vt.glossy) q.gs = *vt.glossy;
-    q.hasCs = vt.coat != nullptr;
     if (vt.coat) q.cs = *vt.coat;
     for (int i = 0; i < nL; ++i) { q.lam[i] = lam[i]; q.beta[i] = beta[i]; q.w[i] = w[i]; }
-    q.rngState = rng.state ^ ((unsigned long long)(unsigned)(sphIdx + 1) * 0x9E3779B97F4A7C15ULL) ^
-                 ((unsigned long long)(unsigned)__float_as_uint((float)lam[0]) << 21);
-    q.rngInc = rng.inc ^ ((unsigned long long)(unsigned)(c + 1) << 33);
+    q.cam = &cs.cam(c); q.film = cs.films[c]; q.hits = cs.hits[c];
+    q.rng = rng;
     q.motionU = dMotionU();
-    q.nL = nL; q.room = room; q.sphIdx = sphIdx; q.cam = c;
+    q.nL = nL; q.room = room; q.sphIdx = sphIdx;
     return true;
 }
 // The queued glass-sphere connections (DSphReq), a thread each, so a warp's lanes run connections together
@@ -11837,14 +11857,12 @@ __global__ void kSphConnect(DScene sc, DCamSet cs, int n) {
     const DSphReq* reqs = (const DSphReq*)cs.sphReqs;
     const int stride = gridDim.x * blockDim.x;
     for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += stride) {
-        DSphReq q = reqs[i];   // the splat records' pointers aimed at this copy
-        q.vt.glossy = nullptr; q.vt.coat = nullptr;
-        if (q.hasGs) { q.gs.sc = &sc; q.gs.h = &q.hit; q.vt.glossy = &q.gs; }
-        if (q.hasCs) { q.cs.sc = &sc; q.cs.h = &q.hit; q.vt.coat = &q.cs; }
+        DSphReq q = reqs[i];   // the splat records' pointers, set where there is one, aimed at this copy
+        if (q.vt.glossy) { q.gs.sc = &sc; q.gs.h = &q.hit; q.vt.glossy = &q.gs; }
+        if (q.vt.coat) { q.cs.sc = &sc; q.cs.h = &q.hit; q.vt.coat = &q.cs; }
         dSetMotionU(q.motionU);
-        DRng rng; rng.state = q.rngState; rng.inc = q.rngInc | 1ull;
-        dConnectSpecularSphere(sc, cs.cams[q.cam], cs.films[q.cam], cs.hits[q.cam], q.S, q.ix, q.p, q.vt,
-                               q.lam, q.beta, q.w, q.nL, q.room, q.sphIdx, rng);
+        dConnectSpecularSphere(sc, *q.cam, q.film, q.hits, q.S, q.ix, q.p, q.vt, q.lam, q.beta, q.w, q.nL,
+                               q.room, q.sphIdx, q.rng);
     }
 }
 #endif
@@ -11887,9 +11905,10 @@ __device__ static void camSpecularSplatAllVtxN(const DScene& sc, const DCamSet& 
                             gl[m] = lam[j]; gb[m] = beta[j]; gw[m] = w[j]; ++m;
                             done[j] = true;
                         }
-                    if (!dSphEnqueue(cs, c, S, ix[i], pd, vt, gl, gb, gw, m, room, sc.dielSph[k], rng))
+                    DRng own = dSphStream(rng, sc.dielSph[k], c, gl[0]);
+                    if (!dSphEnqueue(cs, c, S, ix[i], pd, vt, gl, gb, gw, m, room, sc.dielSph[k], own))
                         dConnectSpecularSphere(sc, cs.cam(c), cs.films[c], cs.hits[c], S, ix[i], pd, vt, gl, gb, gw,
-                                               m, room, sc.dielSph[k], rng);
+                                               m, room, sc.dielSph[k], own);
                 }
             }
         }

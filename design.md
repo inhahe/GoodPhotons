@@ -11462,18 +11462,33 @@ photons, 17.5 -> 9.2 s (the CPU's 32 threads, 11.7 s); the kernel's FP64 instruc
 **Queued, a kernel of their own (0.450.44).** So the connections themselves run a warp's lanes together,
 the photon kernel queues each one (`dSphEnqueue`: a `DSphReq` holds the sphere at the path's time, the
 index the camera sees it with, the vertex and its splat records with the hit they read, the wavelengths
-that see it alike, the room the depth cap leaves, the camera, the path's time, and a stream of its own
-from the walk's state, the walk drawing nothing for it) and `kSphConnect` runs them, a thread each, after
-each wave of photons (`launchForward`): each wave sized so its requests fill the queue (2^19, or an
-eighth of the free memory) at the last wave's rate a photon (a call's first, the call before's: a
-render's batches are calls of their own, and its first waves spilled 3 % inline, a fifth of the time), a
-request past it connected inline, a
-moving camera's (each thread's own posed copy) inline. Under per-photon seeding with no medium -- whose
-transmittance is the one draw a connection takes, now from its own stream -- the queue's images are the
-inline ones' to the bit (`tools/check_sphere_queue.py`: outside and inside a glass ball, over a glossy
-and a coated floor, and a queue shrunk to many waves and spilling inline); under per-thread seeding each
-wave past a call's first takes a seed of its own. The outside view at 5e6 photons, 9.2 -> 2.9 s, the
-CPU's 32 threads 11.7: from 17.5 s before 0.450.42. `FTRACE_NOSPHQ=1` connects inline (REFERENCE.md).
+that see it alike, the room the depth cap leaves, the camera with its film and hit counts by address, the
+path's time, and its stream) and `kSphConnect` runs them, a thread each, after each wave of photons
+(`launchForward`). The camera is held by address because the set a vertex splats to can be a slice of the
+launch's -- the beam gather's one-camera slice, where every camera is index 0. A moving camera's
+connections stay inline: its posed copy is its thread's, reposed for the thread's next photon. **Every
+glass-sphere connection draws from a stream of its own** (`dSphStream`: `seedUnit` from the walk's state,
+salted with its increment, the sphere, the camera and the group's first wavelength), queued or inline, and
+never from the walk: so a walk runs the same whether its request won a slot or was turned away to the
+inline connection, which the slots' `atomicAdd` order decides, and two cameras' connections at a vertex
+draw apart. **A call that queues seeds per photon** (kTrace's `perPhotonSeed`, from the photons' absolute
+indices), so its image depends on its seed and photon count alone, never on how the waves split them.
+The queue (`SphQueue`, `makeSphQueue`) is sized as the merge queues are (`mergeQueueCap`): the larger of
+2^19 requests and a least wave's (4 a photon a sphere, a camera and a hero group), or an eighth of the
+memory left beside kTrace's and kSphConnect's stacks before their first launch reserves them
+(`pendingLocalBytes`), none below 65 536; its count is 64-bit, so it never wraps into live slots. A shared
+flight's session keeps one across its launches (8 ms to make and free on the 4090), a single render makes
+its own. Each wave (`sphWave`) is as many photons as fill the queue to 90 % at the last wave's requests a
+photon, never fewer than kTrace's resident threads, and the waves of one call one size; the rate carries
+across the calls of one scene and camera count on a host thread (a render's batches; the scene as
+`CudaSceneHold` tells scenes apart, `DUpload::sceneId`), and a call without it starts with a wave of the
+least size, which measures it. A request past the queue connects inline -- most of them for a flight of
+dozens of cameras, more than the queue can hold. Under per-photon seeding the queue's images are the
+inline ones' to the bit, through any medium (`tools/check_sphere_queue.py`: outside and inside a glass
+ball, over a glossy and a coated floor, a queue shrunk to many waves and spilling inline, two cameras
+through fog with `-beams`, a ball sliding across the shutter, a dispersive ball under `-heroc 4`, a fog
+whose density varies). The outside view at 5e6 photons, 9.2 -> 2.9 s, the CPU's 32 threads 11.7: from
+17.5 s before 0.450.42. `FTRACE_NOSPHQ=1` connects inline (REFERENCE.md).
 
 Before 0.448.0 only the refraction was drawn, so mode B read a glass ball's body some 10 % under mode R
 and its rim as little as a fifth, and an eye in a glass ball in `scenes/_camera_in_water.ftsl`'s room

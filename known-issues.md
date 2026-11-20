@@ -322,6 +322,66 @@ act (Sysinternals `handle.exe` on the locked path, which build.bat could run whe
 exclude the build directory from the scanner if that is it, or have build.bat retry the failed step
 once; and have it say plainly, last, that ftrace.exe was NOT updated.
 
+## DONE (2026-11-20, 0.450.45): REVIEW-0450R — what the Opus (max) and Fable (xhigh) reviews of 0.450.43-0.450.44 found
+
+Both read a354380..69feeb2 (the scan's lists cut to index events, the queued glass-sphere connections);
+neither ran anything. Each finding below was checked against the code, the first three by a failing case.
+
+**Fixed:**
+* **The beam gather's one-camera slice routed every camera's queued connection to camera 0** (both). A
+  request named its camera by its index in the set it was made with, and kSphConnect read that index in
+  the launch's set; the slice (`cs1`, the beam gather's per-camera resample) is every camera's index 0.
+  A request now holds its camera, film and hit counts by address. `check_sphere_queue`'s new `beams` case
+  (two cameras through fog, `-beams`): 0.450.44 differs from the inline connection in 6 240 of camera c's
+  values and 16 365 of camera d's, by up to twice a pixel; 0.450.45 in none.
+* **A connection turned away by the full queue drew from the walk itself** (Fable), a queued one from a
+  stream of its own: in a medium whose transmittance draws, a photon's later path depended on whether its
+  request won a slot, which `atomicAdd` order decides. And a request's stream mixed the camera only into
+  PCG's increment, so every camera's first draw at a vertex was the same (Opus). Every connection now
+  draws from `dSphStream` (`seedUnit` from the walk's state, salted with its increment, the sphere, the
+  camera and the first wavelength), queued or not. The new `hetero` case (a fog whose density varies):
+  the first round's build differed in 17 656 values; 0.450.45 in none.
+* **The wave split decided the image** (Fable): under the default per-thread seeding each wave took a
+  seed of its own, and the split followed the queue's size, the free memory and a rate carried
+  process-wide from whatever rendered last. A call that queues seeds per photon, from the photons'
+  indices: its image depends on its seed and photon count alone. The rate is kept per host thread and per
+  scene and camera count (both: the scene as `CudaSceneHold` tells scenes apart, `DUpload::sceneId`), and a
+  call without one starts with a wave of kTrace's resident threads, which measures it.
+* **The queue's memory** (both): sized from the free memory before kTrace's first launch reserves its
+  stacks, the rule every other queue keeps (`pendingLocalBytes`). It is sized by `mergeQueueCap` now, as
+  the merge queues are: beside `{kTrace, kSphConnect}`'s stacks, none below 65 536 requests,
+  `FTRACE_SPHQCAP` only shrinking it (both: it was honoured above the cap, and REFERENCE.md said it
+  shrinks), and grown, where memory allows, to what a least wave asks: 4 requests a photon a sphere, a
+  camera and a hero group (Fable, as mode U's queue grows to its resident wave).
+* **The waves** (both): a floor of 16 384 photons, half the 32 768 kTrace keeps resident here; a first
+  wave with none (0 photons at `FTRACE_SPHQCAP` <= 4, its rate then 0/0); a leftover last wave; the
+  formula written twice. One helper, `sphWave`: equal waves, none below kTrace's resident threads (a
+  shrunk queue's 16 384). A flight of dozens of cameras still connects most of its requests inline: no
+  queue holds what it asks.
+* **The count wrapped** (Fable): past 2^32 requests in a wave an `int` count came back into the queue's
+  slots and overwrote live ones. It is 64-bit.
+* **The queue made and freed at every call** (both): 8.3 ms on the 4090, measured (`cudaMemGetInfo`, the
+  allocations, a free). A shared flight's session and a held scene (mode P's batches) keep theirs; a render
+  without a hold uploads its whole scene at every call, beside which it is small.
+* **DSphBatch default-constructed every slot** (Opus): `Pend`'s `D3` members zero themselves, so each
+  connection stored 48 doubles into the dynamically indexed list (the mirror's 36) before its scan. Its
+  slots construct nothing now.
+* `hasGs` / `hasCs` repeated what the copied splat-record pointers say (Fable): the kernel tests those.
+  The mirror connector's old `image` comment had been left above `Pend` (Fable).
+* **The check** (both) had one camera, no medium, no motion and no hero bundle: it adds `beams`,
+  `motion` (a ball sliding across the shutter), `hero` (SF10 under `-heroc 4`) and `hetero`, and the
+  `waves` case requires its image.
+
+**Dismissed:** that `vramPreflight` does not count the queue (Fable). The queue takes at most an eighth of
+what is free beside the stacks when it is made, so it cannot push them out, and a card the preflight
+passes keeps the rest.
+
+**Measured:** check_sphere_queue's eleven cases bit-identical, check_ball_images' 47 pass; check_bitid
+against 0.450.44 moves only `flat_B_gpu`, which has glass spheres and now seeds per photon (a new
+realization, mean +0.057 %), and GPU modes M and S in the last bits (at most 1.6e-5 of a pixel, the
+recompiled kernels). Paired, four rounds each: the glass ball seen from outside 2.83 -> 2.83 s, the
+caustic box in mode B 13.75 -> 13.50 s.
+
 ## DONE (2026-11-20, 0.450.43): REVIEW-0450Q — what the Opus (max) and Fable (xhigh) reviews of 0.450.42 found
 
 Both traced the deferred scan against the inline code and the host twin and found the roots' order,

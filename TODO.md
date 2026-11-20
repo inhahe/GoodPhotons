@@ -528,6 +528,8 @@ Then the rest of 4.2-4.6 in their order, 4.7's bookkeeping alongside whatever to
 - [x] **BUILD-LOCK** — build.bat now and then failed on a locked output (LNK1104 / C1083): the holder is
   LithicBackup's continuous backup copying the tree's fresh files; the local build.bat builds again on a
   held file (twice at most) and ends every failure on `[build] NOT UPDATED`; known-issues BUILD-LOCK.
+- [x] **REVIEW-0450R** (0.450.45) — the Opus (max) and Fable (xhigh) reviews of 0.450.43-0.450.44;
+  known-issues REVIEW-0450R.
 - [x] **REVIEW-0450Q** (0.450.43) — the Opus (max) and Fable (xhigh) reviews of 0.450.42; known-issues REVIEW-0450Q.
 - [x] **REVIEW-0450P** (0.450.41) — the Opus (xhigh) review of 0.450.38-0.450.40; known-issues REVIEW-0450P.
 - [x] **REVIEW-0450O** (0.450.40) — the Opus (max) and Fable (xhigh) reviews of 0.450.34-0.450.37;

@@ -712,6 +712,10 @@ static T* uploadVec(const std::vector<T, A>& v) {   // any allocator's (ftalloc:
 struct DUpload {
     gpu::DScene  sc{};
     gpu::DCamera dc{};
+    // The scene uploaded, as CudaSceneHold tells scenes apart (buildUploadScene; sceneOrHeld copies a
+    // held one's): what a launch keys state it carries from one call to the next on (launchForward).
+    const void* sceneId = nullptr;
+    uint64_t sceneGen = 0, sceneBuild = 0;
     std::vector<void*> frees;
     // Knot arrays already uploaded, by (table, scale) (bakeSpec): a table that many materials or
     // emitters share goes up once.
@@ -956,6 +960,7 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
     using namespace gpu;
     auto keep = [&](void* p) { if (p) up.frees.push_back(p); return p; };
     setSceneScale(scene);
+    up.sceneId = &scene; up.sceneGen = scene.generation; up.sceneBuild = scene.buildCount;
 
     // NOTE: no cudaLimitStackSize fiddling here, deliberately. The kernels' call
     // graphs are kept statically acyclic (see the dhair Bessel comment) so nvlink can
@@ -2279,12 +2284,29 @@ static void buildUpload(const Scene& scene, const Camera& cam, int resX, int res
 // render_cuda.h. `up` holds only the scene half (up.dc is unused) and owns its allocations,
 // which a renderBdptCuda call against the hold never frees: the call copies `up.sc` (a POD of
 // device pointers) and keeps its own per-call allocations in a DUpload of its own.
+// The queue itself: its requests, the device count of those a wave asked for (the turned-away ones too),
+// and the requests it holds (made by makeSphQueue). What launches many times keeps one across its launches,
+// where it is made once: a shared flight's session, and a held scene for the calls that render it (mode
+// P's batches); launchForward otherwise makes and frees its own.
+struct SphQueue {
+    void* reqs = nullptr;
+    unsigned long long* count = nullptr;
+    int   cap = 0;
+    bool  tried = false;   // made, or found not to fit: a kept queue is sized once
+    bool  shrunk = false;  // FTRACE_SPHQCAP sized it
+};
+static void freeSphQueue(SphQueue& q) {
+    if (q.reqs) cudaFree(q.reqs);
+    if (q.count) cudaFree(q.count);
+    q = SphQueue{};
+}
 struct CudaSceneHold {
     const Scene* scene = nullptr;
     uint64_t generation = 0;   // with the address: a scene loaded where the old one was is new
     uint64_t buildCount = 0;   // and a scene rebuilt in place (Scene::build) is new too
     size_t   bytes = 0;        // the device memory it holds (cudaSceneHoldBytes)
     DUpload up;
+    mutable SphQueue sphQ;     // mode B's glass-sphere queue for the calls that render it (renderForwardCuda)
 };
 size_t cudaSceneHoldBytes(const CudaSceneHold* held) { return held ? held->bytes : 0; }
 bool cudaSceneHoldFits(const CudaSceneHold* held, const Scene& scene) {
@@ -2300,6 +2322,7 @@ static void sceneOrHeld(const Scene& scene, const CudaSceneHold* held, DUpload& 
     if (!cudaSceneHoldFits(held, scene))
         throw std::logic_error(std::string(who) + ": the held device scene is not the scene being rendered");
     up.sc = held->up.sc;
+    up.sceneId = held->up.sceneId; up.sceneGen = held->up.sceneGen; up.sceneBuild = held->up.sceneBuild;
     setSceneScale(scene);
 }
 static double g_lastBdptOverheadSec = 0.0;
@@ -2331,6 +2354,7 @@ CudaSceneHold* cudaHoldScene(const Scene& scene) {
 }
 void cudaReleaseScene(CudaSceneHold* held) {
     if (!held) return;
+    freeSphQueue(held->sphQ);
     freeUpload(held->up);
     delete held;
 }
@@ -2396,6 +2420,56 @@ static bool sphQueueOn() {
         return !(e && *e && std::atoi(e) != 0);
     }();
     return on;
+}
+// Makes `q` where it is not made yet, as the merge queues are sized (mergeQueueCap): the larger of
+// kSphQueueCap and `wants` requests (what a launch's least wave asks), or what an eighth of the memory left
+// beside kTrace's and kSphConnect's stacks holds (the stacks the first launch reserves,
+// pendingLocalBytes), none below 65 536; FTRACE_SPHQCAP=<n> (diagnostic, n >= 16) shrinks it, and sets
+// q.shrunk, which lets the waves go down to 16 384 photons. False where there is no queue: every request
+// then connects inline.
+static bool makeSphQueue(SphQueue& q, long long wants) {
+    using namespace gpu;
+    if (!q.tried) {
+        q.tried = true;
+        size_t freeB = 0, totalB = 0;
+        (void)cudaMemGetInfo(&freeB, &totalB);
+        const size_t pending = pendingLocalBytes(cudaRouteLocalBytes(
+            GpuRoute{(const void*)kTrace, (const void*)kSphConnect}));
+        const size_t room = (freeB > pending) ? freeB - pending : 0;
+        bool shrunk = false;
+        const long long hardCap = std::min<long long>(std::max(kSphQueueCap, wants), (1LL << 31) - 1);   // an int slot
+        const long long cap = mergeQueueCap(room, sizeof(DSphReq), hardCap, "FTRACE_SPHQCAP", shrunk);
+        if (cap > 0 && cudaMalloc(&q.reqs, (size_t)cap * sizeof(DSphReq)) == cudaSuccess &&
+            cudaMalloc((void**)&q.count, sizeof(unsigned long long)) == cudaSuccess) {
+            q.cap = (int)cap;
+            q.shrunk = shrunk;
+        } else {
+            (void)cudaGetLastError();
+            freeSphQueue(q);
+            q.tried = true;
+        }
+    }
+    return q.reqs != nullptr;
+}
+// Which scene and camera count a carried request rate (launchForward) was measured on: the scene as
+// CudaSceneHold tells scenes apart (its address, generation and build count: DUpload::sceneId and on).
+struct SphRateKey {
+    const void* scene = nullptr;
+    uint64_t gen = 0, build = 0;
+    int nCam = 0;
+    bool operator==(const SphRateKey& o) const {
+        return scene == o.scene && gen == o.gen && build == o.build && nCam == o.nCam;
+    }
+};
+// The photons of the next wave, of the `left` a call has still to trace, for a queue of `cap` requests
+// and `rate` (> 0) requests a photon measured, < 0 for none yet: as many as fill the queue to 90 %, no
+// fewer than `least`, and the waves the rest takes of one size; a call with no rate yet starts with `least`.
+static long long sphWave(long long left, double rate, int cap, long long least) {
+    if (rate < 0.0) return std::min(left, least);
+    const long long per = std::max(least, (long long)(0.9 * (double)cap / rate));
+    if (per >= left) return left;
+    const long long waves = (left + per - 1) / per;
+    return (left + waves - 1) / waves;
 }
 // The hero bundle a forward trace carries for `heroC` asked: none (1) through participating media
 // or GRIN bending, where the geometry is not the same for every wavelength between dispersive
@@ -2492,7 +2566,8 @@ static void wavefrontTrace(DUpload& up, const gpu::DCamSet& cs, double* d_energy
 // one backend that seeds per photon.
 // `posedKeep` / `posedCapKeep`: a buffer the caller keeps across launches for a moving camera set's
 // posed copies (a session's), grown here as a launch needs, in DCameras; null, a launch allocates
-// and frees its own.
+// and frees its own. `sphKeep`: mode B's glass-sphere connection queue kept the same way, made at
+// the first launch that queues; null, a launch makes and frees its own.
 // `maxBounce`: the most surface interactions a photon makes -- `-max-bounce` for modes A, B and C
 // (main.cpp effMaxBounce, as the CPU's renderForward takes it), photonMaxBounce() (photonmap.h,
 // `-photon-bounce`) for mode M's and mode S's deposits.
@@ -2500,7 +2575,8 @@ static void launchForward(DUpload& up, const gpu::DCamSet& cs, double* d_energy,
                           long long N, bool diffraction, unsigned long long seedBase,
                           bool wavefront, int camModeInt, int heroC, int maxBounce,
                           bool stableSeed = false,
-                          gpu::DCamera** posedKeep = nullptr, size_t* posedCapKeep = nullptr) {
+                          gpu::DCamera** posedKeep = nullptr, size_t* posedCapKeep = nullptr,
+                          SphQueue* sphKeep = nullptr) {
     using namespace gpu;
     preferL1({(const void*)kTrace, (const void*)kSphConnect});
     // seedBase==0 keeps the original single-shot seed exactly; each accumulation chunk
@@ -2550,54 +2626,45 @@ static void launchForward(DUpload& up, const gpu::DCamSet& cs, double* d_energy,
         }();
         // Mode B's glass-sphere connections queued (DSphReq) and run by kSphConnect after each wave of the
         // photons, a warp's lanes together (GPU-SPHERE-CONNECT-SLOW): where the scene has a glass sphere
-        // and no camera moves (a moving camera's are each thread's own). Each wave is sized so its requests
-        // fill the queue at the last wave's rate; a request past it connects inline. A wave is its own
-        // launch, so under per-thread seeding each takes its own seed; per-photon seeding takes the
-        // photons' absolute indices, as one launch would.
+        // and no camera moves (a request holds its camera by address, and a posed camera is its thread's
+        // until the next photon). A request past the queue connects inline.
         const bool sphQueue = camModeInt == CAM_B && up.sc.nDielSph > 0 && csRun.nCam > 0 && !csRun.camStride &&
                               !csRun.pSplit && sphQueueOn();
-        int* d_sphCount = nullptr;
-        if (sphQueue) {
-            size_t freeB = 0, totalB = 0;
-            cudaMemGetInfo(&freeB, &totalB);
-            // FTRACE_SPHQCAP=<n> shrinks it, for the checks: many waves, and requests past it inline.
-            static const long long capEnv = [] {
-                const char* e = std::getenv("FTRACE_SPHQCAP");
-                return (e && *e) ? std::atoll(e) : 0LL;
-            }();
-            const size_t want = capEnv > 0 ? (size_t)capEnv
-                                           : std::min<size_t>(kSphQueueCap, freeB / 8 / sizeof(gpu::DSphReq));
-            if (want >= (capEnv > 0 ? 1u : 4096u) &&
-                cudaMalloc(&csRun.sphReqs, want * sizeof(gpu::DSphReq)) == cudaSuccess &&
-                cudaMalloc(&d_sphCount, sizeof(int)) == cudaSuccess) {
-                csRun.sphCap = (int)want;
-                csRun.sphCount = d_sphCount;
-            } else {
-                cudaGetLastError();
-                if (csRun.sphReqs) cudaFree(csRun.sphReqs);
-                csRun.sphReqs = nullptr;
-            }
+        // Waves no smaller than the photons kTrace keeps resident, which a smaller wave leaves idle (a
+        // shrunk queue's, 16 384), and of one size within a call (sphWave); the queue sized, where memory
+        // allows, for a wave of that least size at 4 requests a photon a sphere, a camera and a group of the
+        // hero bundle's wavelengths (each group that sees a dispersive sphere with its own index asks its own).
+        static const long long kTraceResident = residentThreadsOf((const void*)kTrace);
+        SphQueue ownQ;
+        SphQueue& q = sphKeep ? *sphKeep : ownQ;
+        if (sphQueue &&
+            makeSphQueue(q, std::max<long long>(1LL << 14, kTraceResident) * 4 * csRun.nCam * up.sc.nDielSph *
+                            effHeroC)) {
+            csRun.sphReqs = q.reqs; csRun.sphCount = q.count; csRun.sphCap = q.cap;
         }
-        const bool perPhoton = stableSeed || perPhotonSeed;
-        // Requests a photon at the last wave (of this call or the one before: a render's batches are calls
-        // of their own), so even a call's first wave fills the queue without spilling; 4 before any.
-        static double sphRate = 4.0;
-        long long wave = csRun.sphReqs ? std::min<long long>(N, (long long)(0.9 * csRun.sphCap / sphRate)) : N;
+        const long long least = q.shrunk ? (1LL << 14) : std::max<long long>(1LL << 14, kTraceResident);
+        // A call that queues seeds per photon, from the photons' absolute indices: its image then depends
+        // on its seed and photon count alone, not on how its waves split them (the queue's size, the free
+        // memory, the rate carried in), as per-thread seeding's would.
+        const int seedPerPhoton = (stableSeed || csRun.sphReqs) ? 1 : perPhotonSeed;
+        // The requests a photon, carried from one call to the next of one scene and camera count on this
+        // host thread (a render's batches, a session's launches); a call that has none starts with a wave
+        // of the least size, which measures it. A rate that misleads costs a spill or a wave, not an image.
+        thread_local SphRateKey rateKey{};
+        thread_local double sphRate = -1.0;
+        const SphRateKey key{up.sceneId, up.sceneGen, up.sceneBuild, csRun.nCam};
+        if (!(key == rateKey)) { rateKey = key; sphRate = -1.0; }
         for (long long done = 0, w = 0; done < N; ++w) {
-            const long long n = std::min(wave, N - done);
-            const unsigned long long seedW = (perPhoton || w == 0) ? kseed
-                                           : kseed ^ ((unsigned long long)w * 0xD1B54A32D192ED03ULL);
-            if (d_sphCount) CUDA_CHECK(cudaMemset(d_sphCount, 0, sizeof(int)));
+            const long long n = csRun.sphReqs ? sphWave(N - done, sphRate, csRun.sphCap, least) : N - done;
+            if (csRun.sphReqs) CUDA_CHECK(cudaMemset(csRun.sphCount, 0, sizeof(unsigned long long)));
             kTrace<<<kFwdNumBlocks, kFwdBlockSize>>>(up.sc, csRun, d_energy, n, diffraction ? 1 : 0,
-                                               seedW, maxBounce, camModeInt, effHeroC,
-                                               stableSeed ? 1 : perPhotonSeed,
+                                               kseed, maxBounce, camModeInt, effHeroC, seedPerPhoton,
                                                (stableSeed ? (long long)seedBase : 0LL) + done);
             cudaCheckKernel("forward");
-            if (d_sphCount) {
-                int asked = 0;
-                CUDA_CHECK(cudaMemcpy(&asked, d_sphCount, sizeof(int), cudaMemcpyDeviceToHost));
-                const long long want = asked < 0 ? (1LL << 31) : (long long)asked;   // past 2^31: wrapped
-                const int run = (int)std::min<long long>(want, csRun.sphCap);
+            if (csRun.sphReqs) {
+                unsigned long long asked = 0;
+                CUDA_CHECK(cudaMemcpy(&asked, csRun.sphCount, sizeof asked, cudaMemcpyDeviceToHost));
+                const int run = (int)std::min<unsigned long long>(asked, (unsigned long long)csRun.sphCap);
                 if (run > 0) {
                     kSphConnect<<<std::min(4096, (run + 127) / 128), 128>>>(up.sc, csRun, run);
                     cudaCheckKernel("sphere-connect");
@@ -2605,16 +2672,12 @@ static void launchForward(DUpload& up, const gpu::DCamSet& cs, double* d_energy,
                 static const bool waveDebug = std::getenv("FTRACE_WAVE_DEBUG") != nullptr;   // a line a wave
                 if (waveDebug)
                     std::printf("[wave] B sphere connections: wave %lld, %lld photons, %lld queued, %lld inline\n",
-                                w, n, (long long)run, want - run);
-                // The next wave: the queue filled to 90 % at this one's requests a photon.
-                const double rate = (double)want / (double)n;
-                if (rate > 0.0) sphRate = rate;
-                wave = rate > 0.0 ? std::max<long long>(1LL << 14, (long long)(0.9 * csRun.sphCap / rate)) : N;
+                                w, n, (long long)run, (long long)(asked - (unsigned long long)run));
+                sphRate = (double)std::max<unsigned long long>(asked, 1) / (double)n;   // never 0: rare, not none
             }
             done += n;
         }
-        if (csRun.sphReqs) cudaFree(csRun.sphReqs);
-        if (d_sphCount) cudaFree(d_sphCount);
+        if (!sphKeep) freeSphQueue(ownQ);
     }
     if (d_posed) cudaFree(d_posed);
 }
@@ -2648,7 +2711,7 @@ Film renderForwardCuda(const Scene& scene, const Camera& cam, int resX, int resY
     DCamSet cs = makeCamSet(up, hc, fp, hp);
     cs.pSplit = pSplit ? 1 : 0;
     launchForward(up, cs, d_energy, N, diffraction, seedBase, wavefront, camModeInt, heroC,
-                  maxBounce >= 1 ? maxBounce : 32, stableSeed);
+                  maxBounce >= 1 ? maxBounce : 32, stableSeed, nullptr, nullptr, held ? &held->sphQ : nullptr);
 
     // --- download ---
     std::vector<double> film(npix * 3);
@@ -2682,6 +2745,7 @@ struct SharedGpuSession {
     double* d_energy = nullptr;             // resident 5-counter energy tally
     gpu::DCamera* d_posed = nullptr;        // a moving camera set's posed copies (launchForward)
     size_t posedCap = 0;                    // ...in DCameras
+    SphQueue sphQ;                          // mode B's glass-sphere connection queue (launchForward)
     gpu::DCamSet cs{};
     int  camModeInt = 0;
     bool wavefront = false;
@@ -2788,7 +2852,7 @@ void sharedForwardGpuBatch(SharedGpuSession* s, long long N,
     dSetLenScale(s->up.sc);
     launchForward(s->up, s->cs, s->d_energy, N, diffraction, seedBase,
                   s->wavefront, s->camModeInt, s->heroC, s->maxBounce, false, &s->d_posed,
-                  &s->posedCap);
+                  &s->posedCap, &s->sphQ);
 }
 
 void sharedForwardGpuHits0(SharedGpuSession* s, std::vector<double>& hits) {
@@ -2821,6 +2885,7 @@ void sharedForwardGpuEnd(SharedGpuSession* s) {
     for (int c = 0; c < s->nc; ++c) { cudaFree(s->d_films[c]); cudaFree(s->d_hits[c]); }
     cudaFree(s->d_energy);
     if (s->d_posed) cudaFree(s->d_posed);
+    freeSphQueue(s->sphQ);
     delete s;
 }
 

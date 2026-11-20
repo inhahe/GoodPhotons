@@ -1954,13 +1954,18 @@ machine varied 18.5 s / 25.8 s / 27.2 s.
   runs a warp's connections together, after each wave of photons, instead of the photon's thread making
   it while the warp's other photons waited (a camera that moves under a blur keeps the inline ones).
   The image gets the same terms, summed in another order -- under per-photon seeding
-  (`FTRACE_GPU_PHOTONSEED=1`) and with no medium the same image, to rounding; a medium's transmittance
-  draws from the connection's own stream, not the photon's. Measured on check_ball_images' glass ball
-  seen from outside, 5e6 photons: 9.2 -> 2.9 s (the CPU's 32 threads 11.7 s). Setting this forces the
-  inline connection (the A/B control). `FTRACE_WAVE_DEBUG=1` prints a `[wave] B sphere connections`
-  line a wave: its photons, its queued requests and those the full queue turned away to the inline
-  connection; `FTRACE_SPHQCAP=<n>` shrinks the queue to `n` requests, so a render takes many waves and
-  turns some away. `tools/check_sphere_queue.py` uses all three.
+  (`FTRACE_GPU_PHOTONSEED=1`) the same image, to rounding: a connection draws (a medium's
+  transmittance) from a stream of its own, queued or not. A render that queues seeds each photon from
+  its index, as `FTRACE_GPU_PHOTONSEED=1` does, so its image does not depend on how its photons were
+  split into waves.
+  Measured on check_ball_images' glass ball seen from outside, 5e6 photons: 9.2 -> 2.9 s (the CPU's 32
+  threads 11.7 s). The queue holds up to 2^19 connections (an eighth of the memory free beside the
+  photon kernel's stacks, if less), so a shared flight of dozens of cameras, which asks far more a
+  photon, connects most of them inline. Setting this forces the inline connection (the A/B control).
+  `FTRACE_WAVE_DEBUG=1` prints a `[wave] B sphere connections` line a wave: its photons, its queued
+  requests and those the full queue turned away to the inline connection; `FTRACE_SPHQCAP=<n>` (at
+  least 16, below the queue's own size; otherwise ignored) shrinks the queue to `n` requests, so a
+  render takes many waves and turns some away. `tools/check_sphere_queue.py` uses all three.
 - **`FTRACE_MERGE_TABLE=<k>` (diagnostic, modes `U`, `J`, `M`, `S`).** The merge maps -- mode
   `U`'s light vertices, mode `J`'s surface photons, the photon map of modes `M` and `S` -- bin their
   points in a hashed lattice whose table holds about two buckets a point; this holds its slots to
