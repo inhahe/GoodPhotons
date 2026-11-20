@@ -367,21 +367,20 @@ legs of the specular connections) crosses a filter or a half mirror with its tra
 wavelength of the bundle -- deterministic, as a translucent fiber's coverage is in shadowTransmittance --
 on the host and the device, and a regression check of modes A and B behind a gel and through half mirrors.
 
-## OPEN (2026-11-20): SKY-THROUGH-FOG — the sky seen directly through an absorbing fog reads differently in modes R, M and B
+## OPEN (2026-11-20): SKY-THROUGH-FOG — modes A, B and M show the sky through a fog undimmed
 
 Found probing how the forward sky pass meets a medium (for MODEB-PASSTHROUGH's sky). A uniform sky
 (`light env { spd 1.0 }`) over a floor, seen through a fog box (`sigma_t 0.5  albedo 0`, 2 m deep), the
-top quarter of the frame (sky only), its fog render over its clear one, on the CPU: mode R **0.3157**
-(the GPU 0.3162, `-heroc 1` 0.3155), mode M **0.9004**, mode B 0.3421; Beer-Lambert along each pixel's
-pinhole ray, worked out per pixel, **0.3415**. So mode R's sky is 7.6 % too dark behind the fog and mode
-M's barely dimmed -- unless the analytic figure misses something mode B happens to match. And mode B's
-match is itself unexplained: its sky pass (`prepareSky`) takes `envXYZForDir` along the camera ray with
-no medium on it, so something else dims it. The clear sky alone disagrees too: mode B 2.1 % above mode
-R (2.2185 against 2.1721, the channels' sum), mode M 1.2 % below (2.1468) -- far outside the noise of
-about a thousand wavelengths a pixel over 768 pixels. Reproduce: `python scraps/_sky_fog_probe.py`.
-**To do:** find which is right (the analytic transmittance with the camera's own rays; mode R's
-free-flight through a pure absorber; mode M's camera walk through a medium to a miss; what dims mode B's
-sky), fix the others, and a regression check of the three modes' sky, clear and through fog.
+top quarter of the frame (sky only), its fog render over its clear one, on the CPU: mode R **0.3414**,
+Beer-Lambert along each pixel's pinhole ray worked out per pixel **0.3415** -- and modes M and B
+**1.0000**. The clear sky agrees in all three (3.056, the channels' sum). Modes A and B draw the sky a
+camera sees directly in a pass of their own (`prepareSky`, `addBlurredSkyRows`), which reads
+`envXYZForDir` / `envRadianceSeen` and the sun along the camera ray and no medium on it, though the
+glows the same pass draws take one (`glowSeenXYZ`); mode M's sky alike (exactly 1, so a pass of the same
+kind, not yet traced). Reproduce: `python scraps/_sky_fog_probe.py`. **Fix:** the sky pass takes the
+media along the ray to the sky (`Renderer::mediaTransmittance` to infinity, at a wavelength of the
+sample's own: a pinhole's exact XYZ holds only where no medium is on the ray), mode M's the same, and a
+regression check of modes R, M, A and B, clear and through fog, on both devices.
 
 ## OPEN (2026-11-20, needs a decision): THINLENS-VIGNETTING — through a thin lens, mode A's image has natural vignetting and an irradiance scale that the other modes' do not
 

@@ -540,8 +540,8 @@ Then the rest of 4.2-4.6 in their order, 4.7's bookkeeping alongside whatever to
   camera legs; known-issues.
 - [ ] **MODEB-PASSTHROUGH, the specular connections** — their legs (glass sphere, mirrors) through a gel or half
   mirror; known-issues.
-- [ ] **SKY-THROUGH-FOG** — the sky seen through an absorbing fog: mode R 0.316, mode M 0.900, mode B 0.342,
-  Beer-Lambert 0.3415; and the clear sky differs by 2 % between them; known-issues.
+- [ ] **SKY-THROUGH-FOG** — modes A, B and M show the sky through a fog undimmed (1.000 where mode R and
+  Beer-Lambert read 0.341); known-issues.
 - [ ] **THINLENS-VIGNETTING** (needs the user's decision) — through a thin lens mode A records irradiance with
   natural vignetting, the other modes radiance: one camera equation for all, or none; known-issues.
 - [x] **HOST-HALFMIRROR-ANALYTIC** (0.451.2) — a coin far rarer at some cell than at its peak turns mode M's
