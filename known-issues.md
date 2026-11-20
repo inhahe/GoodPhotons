@@ -278,7 +278,36 @@ SHADOW-WARNINGS.
 (CMakeLists.txt). No other call had one. Proven: the same flags refuse a scratch file's
 `printf("within 15 % of ...")` with error C4473.
 
-## OPEN (2026-11-20): BUILD-LOCK — a build now and then fails on a locked output, and passes on the retry
+## DONE (2026-11-20): BUILD-LOCK — a build now and then fails on a locked output, and passes on the retry
+
+**The holder: LithicBackup's continuous backup** (the maintainer's own backup Worker service). Both of
+its sets, `backup to i:` and `backup to j:`, select this tree with new subdirectories included, so
+each file the build writes is copied to two drives a few seconds after it last changes (0.5 s under
+1 MB, 3 s under 100 MB, 10 s under 1 GB). Its log on 2026-11-20 shows copies of exactly 30 909 952 B,
+ftrace.exe's size, twice per drive (`build_cuda3/bin/` and the repo root) within seconds of each
+build; on the `i:` drive alone the set holds 1 743 versions of `build_cuda3/*` (27.5 GiB) and 113 of
+the root's ftrace.exe (3.4 GiB). An unelevated `handle64` sees no other process's handles, so the
+holder was found from the Worker's log and its set database, then reproduced. **The link opens its
+output exclusively:** a read handle on the old `build_cuda3/bin/ftrace.exe` (`scraps/_hold_like_lithic.py`,
+held while a one-file change relinks) fails the link with the same `LNK1104`, both shared the way the
+Worker opens its sources (read + write) and with delete sharing as well -- the second deletes the old
+file and leaves its name taken until the handle closes: the incidents' "the file then absent". So no
+sharing mode a reader picks lets the build through; only not holding the file does.
+
+**Fixed (build.bat, local and untracked):** a build that fails on a held file (LNK1104 / LNK1168 /
+C1083 "Permission denied" / MSB3021 / MSB3026, read from MSBuild's file log `build_cuda3/build_last.log`)
+builds again, twice at most, 10 s apart, each lock appended to `scraps/_build_locks.txt`; every failure
+ends on `[build] NOT UPDATED: ftrace.exe in the repo root is still the previous build, if any.`, every
+success on `[build] done: ...`. Tested with the holder: released at the retry, the build fails once and
+then passes; never released, it fails three times and says so; a real compile error is not retried.
+(The original, run under the same hold, failed with LNK1104 and no retry.)
+
+**The maintainer's decision, outside this repo:** excluding `build_cuda3/` (all of it is rebuilt by
+`build.bat`) from both LithicBackup sets would end the collisions and the 27.5 GiB a drive of copied
+build output. And LithicBackup itself could stay out of a writer's way the way the Windows search
+indexer does: read a file under an oplock and drop the copy when another process opens it.
+
+The original report:
 
 The header's third harness trap (C1083 on a fresh `.obj`, 2026-11-17) came back three times on
 2026-11-19/20, and in a second form: twice `LNK1104: cannot open file 'build_cuda3/bin/ftrace.exe'` (the

@@ -525,8 +525,9 @@ Then the rest of 4.2-4.6 in their order, 4.7's bookkeeping alongside whatever to
 - [x] **J-SURF-GATHER-DIVERGENCE** (0.450.37) — mode J's queued surface gather tests a photon a lane and weighs
   32 at a time (dSiteListWarp): at five times the radius its gather 33 % faster, at its own unchanged
   (its sites hold a warp's worth of photons or fewer); known-issues.
-- [ ] **BUILD-LOCK** — build.bat now and then fails on a locked output (LNK1104 / C1083) and passes on the
-  retry: catch the holder (handle.exe), then exclude or retry; known-issues.
+- [x] **BUILD-LOCK** — build.bat now and then failed on a locked output (LNK1104 / C1083): the holder is
+  LithicBackup's continuous backup copying the tree's fresh files; the local build.bat builds again on a
+  held file (twice at most) and ends every failure on `[build] NOT UPDATED`; known-issues BUILD-LOCK.
 - [x] **REVIEW-0450Q** (0.450.43) — the Opus (max) and Fable (xhigh) reviews of 0.450.42; known-issues REVIEW-0450Q.
 - [x] **REVIEW-0450P** (0.450.41) — the Opus (xhigh) review of 0.450.38-0.450.40; known-issues REVIEW-0450P.
 - [x] **REVIEW-0450O** (0.450.40) — the Opus (max) and Fable (xhigh) reviews of 0.450.34-0.450.37;

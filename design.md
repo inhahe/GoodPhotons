@@ -13575,6 +13575,11 @@ runs its own cases first (exit 2 where the scanner itself is wrong), and runs af
   `tools/check_device_linkage.py` on the target's objects (`$<TARGET_OBJECTS:ftrace>`); a link
   that fails runs no post-build step, so run the linkage check by hand then, on the objects it
   left, to name the function behind the refusal (this machine's local build.bat does).
+  The local build.bat also builds again, twice at most and 10 s apart, when a build fails on a
+  file another program holds open (LNK1104 / LNK1168 / C1083 "Permission denied" / MSB3021 /
+  MSB3026 in the MSBuild file log `build_cuda3/build_last.log`; each recorded in
+  `scraps/_build_locks.txt`), and ends every failure on `[build] NOT UPDATED: ...`, every success on
+  `[build] done: ...` (known-issues BUILD-LOCK).
   The "freshly-configured build dirs produce a GPU-silently-dead exe" problem (known-issues,
   2026-07-22 and 2026-08-16) was MSVC 14.5x's float `copysign` returning 0 in nvcc's device pass,
   fixed in `render_cuda.cu` in 0.385.0; the probe exists because that class of bug -- a host-header
