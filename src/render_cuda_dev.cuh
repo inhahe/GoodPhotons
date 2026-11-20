@@ -3827,7 +3827,10 @@ struct DHit {
     // three floats the host writes) and dDiffuseRho, which DOES hold the scene, does the
     // lookup. Same answer, paid for only where it is used.
     // Defaulted to "no colour": every intersector writes it, but a hit nobody filled must never
-    // index the colour table with whatever the stack held.
+    // index the colour table with whatever the stack held. The barycentrics are also where a
+    // deforming triangle's point sat at the instant (deformTri, dPatIn), so every triangle
+    // intersector writes them (dTriFill), coloured or not, and so do the vertex records that keep
+    // them (DVertex / DVcmLV::vb0q, vb1q).
     int  vcol = -1; Real vb0, vb1;
     // O3 stage 2 cavity, filled LAZILY by dCavityOf() and cached, exactly like the
     // host's Hit::cavity: it needs whole-scene traversal so no intersector fills it,
@@ -15620,7 +15623,7 @@ struct DVertexLobeT {
     bool ready = false;     // prepare() has run
     // The direction at() set:
     DVec3 wi;
-    double cosWi = 0.0;
+    double cosWi = 0.0;     // ...its cosine to vt's shading normal: a glossy lobe's pair has its own
     ggx::PairT<P> p;        // a glossy lobe's pair (wo, wi)
     P g = (P)0;             // ...its value over the reflectance, ggx::fAll
     Real cH = (Real)1;      // ...and its half-vector cosine, which an iridescent lobe's R reads
@@ -15642,6 +15645,9 @@ struct DVertexLobeT {
         }
         ready = true;
     }
+    // cosWi for every direction, a glossy lobe's (which reads its pair's own) included, and alpha kept
+    // double: computed only where read, alpha in the pair's precision, mode U's gather ran 2.6 %
+    // slower on the 640x480 bowl at boost clocks (0.450.40's trial, REVIEW-0450O).
     __device__ void at(const DVec3& wi_) {
         wi = wi_;
         cosWi = ddot(wi, vt.ns);
@@ -19945,7 +19951,7 @@ __device__ static void dRandomWalk(const DScene& sc, const DCamera& cam, int dif
         v.areaScale = (v.lightIdx >= 0) ? dLightAreaScaleAt(sc, sc.emitters[v.lightIdx], h.ng, h.deformTri) : 1.0;
         v.mediumId = -1;
         v.u = h.u; v.v = h.v; v.curv = h.curv;   // per-hit texcoords + curvature for textured/patterned/record BSDF eval (M9, O3)
-        v.vcol = h.vcol; v.vb0q = dPackBary(h.vb0); v.vb1q = dPackBary(h.vb1);   // and its vertex colour
+        v.vcol = h.vcol; v.vb0q = dPackBary(h.vb0); v.vb1q = dPackBary(h.vb1);   // its colour and deform point
         v.extMat = h.extMat;
         // The strand frame and radius: dBsdfF / dBsdfPdf read them at a D_HAIR vertex (the fiber
         // BCSDF's frame), the connections' far-side clearance reads them, and fiberR > 0 is how
@@ -21345,23 +21351,25 @@ struct DSurfSite {
     __device__ MergeKey cell(const DSurfMap& sm, int n) const { return g.neighbour(n, sm.lat.slots); }
 };
 }  // namespace
-// Whether photon `sm.order[q]` passes a merge's refusals at the site, camera vertex `vk`'s, before its
-// lobe: within the radius, not from behind, on this surface.
-__device__ static inline bool dSurfMergePasses(const DSurfMap& sm, const DSurfSite& site, const DVertex& vk, int q) {
-    const DSurfPhoton& ph = sm.pts[sm.order[q]];
+// The photon of bucket entry `q` (sm.pts' index, sm.order[q]) if it passes a merge's refusals at the
+// site, camera vertex `vk`'s, before its lobe -- within the radius, not from behind, on this surface --
+// else -1.
+__device__ static inline int dSurfMergePasses(const DSurfMap& sm, const DSurfSite& site, const DVertex& vk, int q) {
+    const int idx = sm.order[q];
+    const DSurfPhoton& ph = sm.pts[idx];
     const DVec3 dd{vk.p.x - ph.p.x, vk.p.y - ph.p.y, vk.p.z - ph.p.z};
-    if (ddot(dd, dd) > site.r2) return false;
-    if (dMergeFromBehind(site.fp.twoSided, ph.wo, site.fp.n)) return false;   // host twin mergeFromBehind
-    return site.fp.keeps(ph.p, DVec3(ph.nx, ph.ny, ph.nz), (Real)ddot(dd, dd));   // this surface's
+    if (ddot(dd, dd) > site.r2) return -1;
+    if (dMergeFromBehind(site.fp.twoSided, ph.wo, site.fp.n)) return -1;   // host twin mergeFromBehind
+    return site.fp.keeps(ph.p, DVec3(ph.nx, ph.ny, ph.nz), (Real)ddot(dd, dd)) ? idx : -1;   // this surface's
 }
-// The merge of photon `sm.order[q]` at the site, which passed (dSurfMergePasses): its XYZ added to gX,
-// gY, gZ. `lobe` is the site's camera vertex's toward the camera side (DMergeLobe), `coatTh` its coat's
-// film there (dCoatThicknessAt), both read at the first photon weighed.
+// The merge of photon `idx` (sm.pts') at the site, which passed (dSurfMergePasses): its XYZ added to
+// gX, gY, gZ. `lobe` is the site's camera vertex's toward the camera side (DMergeLobe), `coatTh` its
+// coat's film there (dCoatThicknessAt), both read at the first photon weighed.
 __device__ static inline void dSurfMergeWeigh(const DScene& sc, const DSurfMap& sm, DMergeLobe& lobe, Real& coatTh,
-                                              const DSurfSite& site, const DSurfMergeW& sw, int q,
+                                              const DSurfSite& site, const DSurfMergeW& sw, int idx,
                                               double& gX, double& gY, double& gZ, const DJSpec* js) {
     const DVertex& vk = lobe.vt;
-    const DSurfPhoton& ph = sm.pts[sm.order[q]];
+    const DSurfPhoton& ph = sm.pts[idx];
     const DSurfMis& lm = sm.mis[ph.misIdx];
     const Real lam = (Real)ph.lambda;
     if (!lobe.ready) { lobe.prepare(); coatTh = dCoatThicknessAt(sc, lobe.m, lobe.h); }
@@ -21384,12 +21392,6 @@ __device__ static inline void dSurfMergeWeigh(const DScene& sc, const DSurfMap& 
     }
     const double cf = w * fCam * (double)ph.beta * (js ? js->at((double)lam) : 1.0);   // JSPEC
     gX += (double)ph.cx * cf; gY += (double)ph.cy * cf; gZ += (double)ph.cz * cf;
-}
-// Both: photon `sm.order[q]`'s merge at the site, if it passes.
-__device__ static inline void dSurfMergePhoton(const DScene& sc, const DSurfMap& sm, const DSurfSite& site,
-                                               DMergeLobe& lobe, Real& coatTh, const DSurfMergeW& sw, int q,
-                                               double& gX, double& gY, double& gZ, const DJSpec* js) {
-    if (dSurfMergePasses(sm, site, lobe.vt, q)) dSurfMergeWeigh(sc, sm, lobe, coatTh, site, sw, q, gX, gY, gZ, js);
 }
 // The merge footprint of modes J and U draws probe `i` at a site off a stream of its own, seeded from
 // `seed`, which the walk drew from its stream at the site: so the queued gather can run a site's
@@ -21468,10 +21470,12 @@ __device__ static inline void dWarpSiteAdd(const DScene& sc, const DMergeFootpri
 }
 // One caller's place in a merge site's list -- its 27 cells' photons or light vertices as one list,
 // the cells in walk order (dz outermost, dx innermost), of which the caller takes entries lane,
-// lane + lanes, ...: (0, 1) one thread's whole list, (lane, 32) a warp's share, so a warp spends
-// ceil(entries / 32) rounds on the site, not a round or more a cell. It keeps its place as a cell
-// (`next`, the walk's next, its tag t) and an entry k in [k, kEnd), and passes `skip` entries over to
-// reach its next one.
+// lane + lanes, ...: (0, 1) one thread's whole list (dSiteListWalk), (lane, 32) a warp's share
+// (dSiteListWarp), so a warp spends ceil(entries / 32) rounds on the site, not a round or more a cell.
+// It keeps its place as a cell (`next`, the walk's next, its tag t) and an entry k in [k, kEnd), and
+// passes `skip` entries over to reach its next one. In an unnamed namespace (render_cuda_dev.cuh's first
+// constraint).
+namespace {
 struct DSiteCursor {
     int next = 0, k = 0, kEnd = 0, skip;
     unsigned char t = 0;
@@ -21492,24 +21496,37 @@ struct DSiteCursor {
         return true;
     }
 };
-// A merge site's entries, this caller's of them (DSiteCursor's lane and lanes) one at a time:
-// `body(k, t)` takes each, strays and all, and must weigh entry k only if its tag (the map's `tag[k]`,
-// bucket order) is t, as the host's mergeForEachEntry weighs them. The test is the body's own: made
-// here instead, nvcc compiles mode U's merge (dVcmMergeSum) to run its renders a fifth slower. The
-// inline merges of modes J (dSurfMergeAt) and U (dVcmMergeSum); their warps' is dSiteListWarp.
+}  // namespace
+// A merge site's whole list on one thread: `body(k, t)` takes each entry, strays and all, and must
+// weigh entry k only if its tag (the map's `tag[k]`, bucket order) is t, as the host's
+// mergeForEachEntry weighs them. The test is the body's own: made here instead, nvcc compiles mode U's
+// merge (dVcmMergeSum) to run its renders a fifth slower. The inline merges of modes J (dSurfMergeAt)
+// and U (dVcmMergeSum); their queued gathers' is dSiteListWarp.
 template <class Cell, class Body>
-__device__ static inline void dSiteListWalk(const Cell& cell, int lane, int lanes, const Body& body) {
-    DSiteCursor cur(lane);
+__device__ static inline void dSiteListWalk(const Cell& cell, const Body& body) {
+    DSiteCursor cur(0);
     int k = 0;
     unsigned char t = 0;
-    while (cur.step(cell, lanes, k, t)) body(k, t);
+    while (cur.step(cell, 1, k, t)) body(k, t);
 }
-// A merge site's entries taken by a whole warp, as dSiteListWalk's (lane, 32) takes them, but weighed
-// a warp at a time: each round its lanes take the list's next 32 entries and test them (`pass(k, t)`:
-// the cheap refusals, another block's or out of the radius among them), the warp queues those that
-// pass in `buf` (64 ints of the warp's own shared memory), and whenever 32 are queued each lane weighs
-// one (`weigh(k)`), the rest once the list is done. So the costly part runs with every lane busy
-// rather than those whose entry happened to pass. Every lane of the warp calls it, for the same site.
+// The block a warp gather (kVcmMergeGather, kWfSurfGather) is launched in, and the ints of shared
+// memory each of its warps hands dSiteListWarp: up to 31 queued before a round, 32 more in it.
+constexpr int kSiteWarpBlock = 128;
+constexpr int kSiteWarpBufInts = 64;
+static_assert(kSiteWarpBlock % 32 == 0, "a warp gather's warps must be whole: dSiteListWarp syncs all 32 lanes");
+// This warp's dSiteListWarp buffer, in its block's shared memory; a launch in any other block traps.
+__device__ __forceinline__ static int* dSiteWarpBuf() {
+    __shared__ int bufs[kSiteWarpBlock / 32][kSiteWarpBufInts];
+    if (blockDim.x != (unsigned)kSiteWarpBlock) __trap();
+    return bufs[threadIdx.x >> 5];
+}
+// A merge site's entries taken by a whole warp, its lanes taking consecutive ones, but weighed a warp
+// at a time: each round its lanes take the list's next 32 entries and test them (`pass(k, t)`: the cheap
+// refusals, another block's or out of the radius among them, returning what weighing the entry needs
+// -- k itself, or what k stands for -- or -1), the warp queues the passes' values in `buf`
+// (dSiteWarpBuf), and whenever 32 are queued each lane weighs one (`weigh(v)`), the rest once the list
+// is done. So the costly part runs with every lane busy rather than those whose entry happened to
+// pass. Every lane of the warp calls it, for the same site.
 template <class Cell, class Pass, class Weigh>
 __device__ static inline void dSiteListWarp(const Cell& cell, int lane, int* buf, const Pass& pass,
                                             const Weigh& weigh) {
@@ -21519,9 +21536,10 @@ __device__ static inline void dSiteListWarp(const Cell& cell, int lane, int* buf
     for (;;) {
         int k = 0; unsigned char t = 0;
         const bool has = cur.step(cell, 32, k, t);
-        const bool ok = has && pass(k, t);
+        const int v = has ? pass(k, t) : -1;
+        const bool ok = v >= 0;
         const unsigned m = __ballot_sync(0xffffffffu, ok);
-        if (ok) buf[queued + __popc(m & below)] = k;
+        if (ok) buf[queued + __popc(m & below)] = v;
         queued += __popc(m);
         // Entries may be left past this round only if it had one for every lane: the lanes take consecutive ones.
         const bool more = __all_sync(0xffffffffu, has);
@@ -21556,13 +21574,14 @@ __device__ static int dSurfMergeAt(const DScene& sc, const DSurfMap& sm, const D
                                    const DJSpec* js = nullptr) {
     const DSurfSite site(sc, sm, vk);
     DMergeLobe lobe(sc, vk, woCam, false);
-    Real coatTh = (Real)0;   // dSurfMergePhoton's, with the lobe
+    Real coatTh = (Real)0;   // dSurfMergeWeigh's, with the lobe
     int weighed = 0;
-    dSiteListWalk([&](int n, int& b, int& e, unsigned char& t) { dSurfSiteCell(sm, site, n, b, e, t); }, 0, 1,
+    dSiteListWalk([&](int n, int& b, int& e, unsigned char& t) { dSurfSiteCell(sm, site, n, b, e, t); },
                   [&](int q, unsigned char t) {
                       if (sm.tag[q] != t) return;   // another block's
                       ++weighed;
-                      dSurfMergePhoton(sc, sm, site, lobe, coatTh, sw, q, gX, gY, gZ, js);
+                      const int idx = dSurfMergePasses(sm, site, vk, q);
+                      if (idx >= 0) dSurfMergeWeigh(sc, sm, lobe, coatTh, site, sw, idx, gX, gY, gZ, js);
                   });
     return weighed;
 }
@@ -21570,16 +21589,11 @@ __device__ static int dSurfMergeAt(const DScene& sc, const DSurfMap& sm, const D
 // The first `n` queued sites (DSurfQueue), a warp each: the lanes take the site's photons together
 // (dSiteListWarp: each lane tests its own, and the warp weighs those that pass 32 at a time), and lane 0
 // adds the warp's sum to the film. A stop ends it early; its chunk is dropped (DeviceStopScope).
-// Launched in blocks of kWfSurfGatherBlock threads, which size its warps' candidate buffers: another
-// block traps.
-constexpr int kWfSurfGatherBlock = 128;
-static_assert(kWfSurfGatherBlock % 32 == 0, "kWfSurfGather's warps must be whole: its walk syncs all 32 lanes");
+// Launched in blocks of kSiteWarpBlock threads (dSiteWarpBuf).
 #ifndef FT_FAMILY_TU
 __global__ void kWfSurfGather(DScene sc, DSurfMap sm, DSurfQueue sq, int n, double* camFilm) {
-    if (blockDim.x != (unsigned)kWfSurfGatherBlock) __trap();
+    int* const buf = dSiteWarpBuf();
     D_MOTION_CLEAR();   // this thread's time: the launch's (passU)
-    __shared__ int candidates[kWfSurfGatherBlock / 32][64];
-    int* const buf = candidates[threadIdx.x >> 5];
     const int lane = threadIdx.x & 31;
     const int warps = (int)((gridDim.x * blockDim.x) >> 5);
     long long stopNext = 0;   // the stop flag is a bus round trip: read it once ~1 ms (kBdptT's rule)
@@ -21606,11 +21620,11 @@ __global__ void kWfSurfGather(DScene sc, DSurfMap sm, DSurfQueue sq, int n, doub
         int weighed = 0;
         dSiteListWarp([&](int c, int& b, int& e, unsigned char& t) { dSurfSiteCell(sm, site, c, b, e, t); }, lane, buf,
                       [&](int q, unsigned char t) {
-                          if (sm.tag[q] != t) return false;   // another block's
+                          if (sm.tag[q] != t) return -1;   // another block's
                           ++weighed;
-                          return dSurfMergePasses(sm, site, rq.vk, q);
+                          return dSurfMergePasses(sm, site, rq.vk, q);   // the photon, queued
                       },
-                      [&](int q) { dSurfMergeWeigh(sc, sm, lobe, coatTh, site, sw, q, gX, gY, gZ, js); });
+                      [&](int idx) { dSurfMergeWeigh(sc, sm, lobe, coatTh, site, sw, idx, gX, gY, gZ, js); });
         for (int o = 16; o > 0; o >>= 1) weighed += __shfl_xor_sync(0xffffffffu, weighed, o);
         if (lane == 0) dAddWork((unsigned long long)weighed);
         dWarpSiteAdd(sc, site.fp, rq.gaSeed, lane, gX, gY, gZ, rq.f, camFilm, rq.pix);

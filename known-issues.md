@@ -278,6 +278,38 @@ SHADOW-WARNINGS.
 (CMakeLists.txt). No other call had one. Proven: the same flags refuse a scratch file's
 `printf("within 15 % of ...")` with error C4473.
 
+## DONE (2026-11-19, 0.450.40): REVIEW-0450O — what the Opus (max) and Fable (xhigh) reviews of 0.450.34-0.450.37 found
+
+Both read 77baad4..0749352 (VCM-LOBE-FP32, REVIEW-0450N's follow-ups, J-SURF-GATHER-DIVERGENCE)
+and found no correctness bug: the warp queue, the barycentrics' swap and the float pair's range
+held on tracing.
+
+**Fixed (0.450.39-0.450.40):** SHADOW-WARNINGS, logged rather than fixed (both): fixed in 0.450.39.
+design.md's two stale passages, the merges' lobe and the queued gathers' walk (both). DHit's
+`vb0`/`vb1` and the vertex packer said "vertex colour" alone; they say the deform point reads them
+too, and that every triangle intersector writes them (Opus). check_surf_wavefront compares the
+queue with the inline gather at five times `_caustic_box`'s radius too, where sites hold hundreds
+of photons and the warp's queue carries remainders (both). The two warp gathers' scaffolding is one
+set: `kSiteWarpBlock`, `kSiteWarpBufInts`, `dSiteWarpBuf` (the warp's buffer, the block-size trap)
+and the host's `siteWarpGrid` (both). `dSiteListWalk(cell, body)`, its dead lane arguments gone
+(both); `DSiteCursor` in an unnamed namespace, per the header's first constraint (Fable). A warp
+gather's test returns what to queue, so mode J queues the photon's index and its weighing no longer
+reads `sm.order` again; the one-line `dSurfMergePhoton` is gone (Fable). `dVcmMergeSum` is
+`__forceinline__`, stating the inlining the gather's 14 % rests on (Fable). The carveout is a named
+step, `cudaRoutePrepare`, which vramPreflight calls, not a side effect of the size query (Fable).
+`GpuRoute` is `std::vector<const void*>`, its one-member struct and `+=` gone (Fable).
+
+**Measured and dismissed:** the merge lobe's `cosWi` only where read and `alpha` in the pair's
+precision (Fable). Fewer FP64 instructions, yet mode U's gather on the 640x480 bowl ran 2.6 %
+slower at boost clocks (8.66 -> 8.91 s, eight paired rounds; 0.5 % under Nsight's locked clocks), and
+reverting it alone brought it back (0.998): kept as it was, with a comment saying so. The gathers'
+3 KB of shared memory a block capping them at two blocks under MaxL1 (Opus): at 254 registers two
+is their limit anyway (Nsight's register and shared-memory limits for kVcmMergeGather both 2).
+
+**Verified:** check_vcm_wavefront and check_surf_wavefront (the wide case included) pass, the queue's
+image the inline gather's to the byte; check_bitid identical in D, J and U; racecheck and synccheck
+clean on both gathers; mode U and J timings within 0.5 % of 0.450.39.
+
 ## DONE (2026-11-19, 0.450.39): SHADOW-WARNINGS — a full build printed some 250 MSVC warnings, a name hiding another among them
 
 Found when both reviews of 0.450.31-0.450.33 caught one in render_cuda.cu (an inner `B`, the gather's

@@ -20682,6 +20682,7 @@ static bool cameraRunsOnJ(const Scene& scene, char mode, int projection, const c
 // kernels it will launch: runRender for its own modes (vramAffords), its mode S and U dispatches,
 // run()'s mode-M routes (mGpuOk), the shared forward flight and the meter (meterAffords).
 static bool vramPreflight(char m, const GpuRoute& route, size_t buffers, size_t heldScene, bool forced) {
+    cudaRoutePrepare(route);
     const size_t needLocal = cudaRouteLocalBytes(route);
     // Memory this process already holds, which `freeB` below is short of and which must not
     // be blamed on another program: the local reservation its context keeps from whatever
@@ -21111,7 +21112,10 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
             case 'U': route = cudaVcmRoute(g_heroC); break;
             case 'P':
                 route = cudaForwardRoute(scene, wavefront, g_heroC, false, 1, /*stableSeed*/true);
-                if (pBackwardOnGpu(scene, cam)) route += cudaBackwardRoute(false);
+                if (pBackwardOnGpu(scene, cam)) {
+                    const GpuRoute back = cudaBackwardRoute(false);
+                    route.insert(route.end(), back.begin(), back.end());
+                }
                 break;
             default: route = cudaForwardRoute(scene, wavefront, g_heroC); break;   // A, B, C, V
         }
@@ -29982,7 +29986,10 @@ static int run(int argc, char** argv) {
             GpuRoute route = (k == 'D') ? cudaBdptRoute(scene, false, kMeterBdptDepth, kMeterBdptHeroC)
                            : (k == 'R') ? cudaBackwardRoute(false)
                            :              cudaForwardRoute(scene, false, g_heroC);
-            if (k == 'P') route += cudaBackwardRoute(false);
+            if (k == 'P') {
+                const GpuRoute back = cudaBackwardRoute(false);
+                route.insert(route.end(), back.begin(), back.end());
+            }
             it = meterRoom.emplace(std::make_tuple(k, W, H, extra),
                                    vramPreflight(k, route, (size_t)W * H * 3 * sizeof(double) * 2 + extra, 0,
                                                  !std::strcmp(device, "gpu"))).first;

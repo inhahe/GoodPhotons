@@ -902,6 +902,11 @@ static constexpr int       kWfSegCap   = 1 << 20;    // beam segments (gpu::DWfS
 static constexpr int       kWfHitCap   = 1 << 25;    // beam hits (gpu::DWfHit)
 static constexpr long long kSurfReqCap = 1LL << 20;  // point-merge sites (gpu::DSurfReq)
 static size_t residentThreads();   // the device-memory preflight's, below
+// The blocks of kSiteWarpBlock threads a warp gather (kVcmMergeGather, kWfSurfGather) is launched in for
+// `sites` queued sites, a warp each: as many as cover them, to 4096, the kernels striding over the rest.
+static int siteWarpGrid(long long sites) {
+    return (int)std::min(4096LL, (sites * 32 + gpu::kSiteWarpBlock - 1) / gpu::kSiteWarpBlock);
+}
 // One point-merge request's bytes: the request, and the JSPEC carrier and chromatic weights'
 // bins where those are on.
 static size_t surfReqBytes() {
@@ -4284,10 +4289,8 @@ Film renderBdptCuda(const Scene& scene, const Camera& cam, int resX, int resY,
         demand = (nq < 0) ? (1LL << 31) : (long long)nq;
         gathered = std::min<long long>(demand, sq.cap);
         if (gathered > 0) {
-            // A warp a site.
-            const int gBlocks = (int)std::min(4096LL, (gathered * 32 + kWfSurfGatherBlock - 1) / kWfSurfGatherBlock);
             CUDA_CHECK(cudaEventRecord(sqEv[0]));
-            kWfSurfGather<<<gBlocks, kWfSurfGatherBlock>>>(up.sc, dsm, sq, (int)gathered, d_cam);
+            kWfSurfGather<<<siteWarpGrid(gathered), kSiteWarpBlock>>>(up.sc, dsm, sq, (int)gathered, d_cam);
             CUDA_CHECK(cudaEventRecord(sqEv[1]));
             cudaCheckKernel("wf-surf-gather");
             float ms = 0.f;
@@ -4682,13 +4685,9 @@ static void preferL1(const std::vector<const void*>& ks) {
     }
 }
 
-// The route's kernels weighed, and so given their L1 (preferL1). main.cpp's device-memory preflight
-// (vramPreflight) weighs the route of every GPU render and meter frame before it launches anything; the
-// sessions' own weighings, where they make one, come after it.
-size_t cudaRouteLocalBytes(const GpuRoute& r) {
-    preferL1(r.kernels);
-    return mostLocalOf(r.kernels);
-}
+void cudaRoutePrepare(const GpuRoute& r) { preferL1(r); }
+
+size_t cudaRouteLocalBytes(const GpuRoute& r) { return mostLocalOf(r); }
 
 bool cudaForwardRunsWavefront(const Scene& scene, bool wavefront, int heroC, bool beamGather, int nCam,
                               bool stableSeed) {
@@ -4701,13 +4700,13 @@ GpuRoute cudaForwardRoute(const Scene& scene, bool wavefront, int heroC, bool be
                           bool stableSeed) {
     using namespace gpu;
     if (cudaForwardRunsWavefront(scene, wavefront, heroC, beamGather, nCam, stableSeed))
-        return GpuRoute{{(const void*)kWfInit, (const void*)kWfExtend, (const void*)kWfShade}};
-    return GpuRoute{{(const void*)kTrace}};
+        return GpuRoute{(const void*)kWfInit, (const void*)kWfExtend, (const void*)kWfShade};
+    return GpuRoute{(const void*)kTrace};
 }
 
 GpuRoute cudaBackwardRoute(bool rgb) {
     using namespace gpu;
-    return GpuRoute{{rgb ? (const void*)kBackwardRGB : (const void*)kBackward}};
+    return GpuRoute{rgb ? (const void*)kBackwardRGB : (const void*)kBackward};
 }
 
 GpuRoute cudaBdptRoute(const Scene& scene, bool lens, int maxDepth, int heroC, bool merging, bool beamQueue,
@@ -4716,32 +4715,32 @@ GpuRoute cudaBdptRoute(const Scene& scene, bool lens, int maxDepth, int heroC, b
     const BdptPick p = bdptPick(heroC, !scene.media.empty(), grin::sceneHasGrin(scene), lens, maxDepth);
     // The plain instantiation: mode D's, and mode J's where its maps come out empty, which
     // renderBdptCuda then renders as mode D.
-    GpuRoute r{{(const void*)bdptKernelFor(p, false, false)}};
+    GpuRoute r{(const void*)bdptKernelFor(p, false, false)};
     if (!merging) return r;
     // Mode J's merges: the merge instantiation -- and its stratified variant too where the beam queue
     // may take that order (the launcher falls back to the first wherever the queue is not built) --
     // with the queue's two kernels where the beams queue; -jsurf's light pass where the device runs
     // it, and its surface gather where it queues.
-    r.kernels.push_back((const void*)bdptKernelFor(p, true, false));
-    if (beamQueue && wfStratOn()) r.kernels.push_back((const void*)bdptKernelFor(p, true, true));
+    r.push_back((const void*)bdptKernelFor(p, true, false));
+    if (beamQueue && wfStratOn()) r.push_back((const void*)bdptKernelFor(p, true, true));
     if (beamQueue) {
-        r.kernels.push_back((const void*)kWfBeamHits);
-        r.kernels.push_back((const void*)kWfBeamEval);
+        r.push_back((const void*)kWfBeamHits);
+        r.push_back((const void*)kWfBeamEval);
     }
     if (surfMerge && cudaJSurfOnDevice())
-        r.kernels.push_back(p.deep ? (const void*)kJSurfLightT<BDPT_DEEPDEPTH> : (const void*)kJSurfLightT<BDPT_MAXDEPTH>);
-    if (surfMerge && surfGatherQueued()) r.kernels.push_back((const void*)kWfSurfGather);
+        r.push_back(p.deep ? (const void*)kJSurfLightT<BDPT_DEEPDEPTH> : (const void*)kJSurfLightT<BDPT_MAXDEPTH>);
+    if (surfMerge && surfGatherQueued()) r.push_back((const void*)kWfSurfGather);
     return r;
 }
 
 GpuRoute cudaPhotonMapRoute() {
     using namespace gpu;
-    return GpuRoute{{(const void*)kTrace, (const void*)kGather}};
+    return GpuRoute{(const void*)kTrace, (const void*)kGather};
 }
 
 GpuRoute cudaSppmRoute() {
     using namespace gpu;
-    return GpuRoute{{(const void*)kTrace, (const void*)kSppmVisiblePoint, (const void*)kSppmGather}};
+    return GpuRoute{(const void*)kTrace, (const void*)kSppmVisiblePoint, (const void*)kSppmGather};
 }
 
 // The hero bundle mode U's session carries for `heroC` asked: 1 to BDPT_NSEC + 1 wavelengths (its
@@ -4754,9 +4753,9 @@ static int vcmSessionHeroC(int heroC) {
 GpuRoute cudaVcmRoute(int heroC) {
     using namespace gpu;
     const bool hero = vcmSessionHeroC(heroC) > 1;
-    return GpuRoute{{hero ? (const void*)kVcmLightT<BDPT_NSEC> : (const void*)kVcmLightT<0>,
-                     hero ? (const void*)kVcmCameraT<BDPT_NSEC> : (const void*)kVcmCameraT<0>,
-                     hero ? (const void*)kVcmMergeGather<BDPT_NSEC> : (const void*)kVcmMergeGather<0>}};
+    return GpuRoute{hero ? (const void*)kVcmLightT<BDPT_NSEC> : (const void*)kVcmLightT<0>,
+                    hero ? (const void*)kVcmCameraT<BDPT_NSEC> : (const void*)kVcmCameraT<0>,
+                    hero ? (const void*)kVcmMergeGather<BDPT_NSEC> : (const void*)kVcmMergeGather<0>};
 }
 
 size_t cudaModeJBeamQueueBytes() {
@@ -7150,8 +7149,8 @@ void vcmSessionPass(VcmSession* s, double radius) {
             const long long demand = (cnt[0] < 0) ? (1LL << 31) : (long long)cnt[0];
             const long long gathered = std::min<long long>(demand, s->mq.cap);
             if (gathered > 0) {
-                constexpr int gB = gpu::kVcmGatherBlock;
-                const int gBlocks = (int)std::min(4096LL, (gathered * 32 + gB - 1) / gB);   // a warp a site
+                const int gBlocks = siteWarpGrid(gathered);
+                constexpr int gB = gpu::kSiteWarpBlock;
                 CUDA_CHECK(cudaEventRecord(s->mqEv[0]));
                 if (s->secStride > 0)
                     kVcmMergeGather<BDPT_NSEC><<<gBlocks, gB>>>(s->up.sc, ctx, grid, s->secStride,

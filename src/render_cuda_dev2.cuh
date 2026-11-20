@@ -2472,9 +2472,10 @@ struct DVcmSite {
 // inline merge (WARP false) takes all of it on its own thread (dSiteListWalk), a warp's lanes (`lane`,
 // its 64 ints of shared memory `warpBuf`) take it together (dSiteListWarp), each weighing the
 // vertices the warp's cheap tests passed; WARP a template parameter, so each caller's copy holds its
-// own walk alone. The camera kernel calls it through dVcmMergeSumInline.
+// own walk alone. Forced inline, into the gather (whose copy ran 14 % faster inlined) and into the camera
+// kernel's out-of-line dVcmMergeSumInline.
 template <int NS, bool WARP>
-__device__ static void dVcmMergeSum(const DScene& sc, const DVcmCtx& ctx, const DVcmGrid& grid,
+__device__ __forceinline__ static void dVcmMergeSum(const DScene& sc, const DVcmCtx& ctx, const DVcmGrid& grid,
                                     const DVcmSite& site, int secStride, const DVertex& vt, Real coatTh,
                                     const DMergeFootprint& fp, const DVec3& wo, double dVCM, double dVM,
                                     int edges, const DJSpec* js, int lane, int* warpBuf,
@@ -2489,20 +2490,20 @@ __device__ static void dVcmMergeSum(const DScene& sc, const DVcmCtx& ctx, const 
     // call ptxas keeps out of line lives in local memory there, every query of it a load.
     DMergeLobe lobe(sc, vt, wo, true);
     // Entry k's refusals before its lobe: another block's (its cell's tag t), or one the merge does not
-    // weigh (host twin vcm.h).
-    const auto pass = [&](int k, unsigned char t) -> bool {
-        if (grid.tag[k] != t) return false;   // another block's
+    // weigh (host twin vcm.h); k if it passes, else -1.
+    const auto pass = [&](int k, unsigned char t) -> int {
+        if (grid.tag[k] != t) return -1;   // another block's
         const DVcmLV& lv = grid.byCell[k];
         // Never merge with a vertex stored ON a strand (vcm.h, 0.362.0): the merge evaluates the
         // CAMERA BSDF against a photon and never looks at where the photon sits, so a strand lying
         // on the skin would bleed into it.
-        if (lv.fiberR > (Real)0) return false;
+        if (lv.fiberR > (Real)0) return -1;
         const DVec3 d = vt.p - lv.p;
-        if (ddot(d, d) > r2) return false;
-        if (edges + lv.edges > ctx.maxDepth) return false;
-        if (dMergeFromBehind(fp.twoSided, lv.wo, ngoCam)) return false;   // host twin mergeFromBehind
+        if (ddot(d, d) > r2) return -1;
+        if (edges + lv.edges > ctx.maxDepth) return -1;
+        if (dMergeFromBehind(fp.twoSided, lv.wo, ngoCam)) return -1;   // host twin mergeFromBehind
         // its surface's true normal on its light's side (the hit's, host twin)
-        return fp.keeps(lv.p, lv.back ? lv.ng * (Real)-1 : lv.ng, (Real)ddot(d, d));
+        return fp.keeps(lv.p, lv.back ? lv.ng * (Real)-1 : lv.ng, (Real)ddot(d, d)) ? k : -1;
     };
     // Entry k, passed, weighed into mx, my, mz.
     const auto weigh = [&](int k) {
@@ -2567,7 +2568,7 @@ __device__ static void dVcmMergeSum(const DScene& sc, const DVcmCtx& ctx, const 
     };
     const auto cell = [&](int n, int& b, int& e, unsigned char& t) { site.cell(grid, n, b, e, t); };
     if constexpr (WARP) dSiteListWarp(cell, lane, warpBuf, pass, weigh);
-    else dSiteListWalk(cell, 0, 1, [&](int k, unsigned char t) { if (pass(k, t)) weigh(k); });
+    else dSiteListWalk(cell, [&](int k, unsigned char t) { if (pass(k, t) >= 0) weigh(k); });
 }
 // The camera kernel's inline merge (dVcmMergeSum, its own thread's walk), kept out of line: inlined into
 // the camera kernel, which sits at the register cap, the merge ran mode U's renders a fifth slower.
@@ -2583,19 +2584,14 @@ __device__ __noinline__ static void dVcmMergeSumInline(const DScene& sc, const D
 
 // The first `n` queued merge sites (DVcmMergeQueue), a warp each: the lanes take the site's light
 // vertices together (dVcmMergeSum), the footprint's probes are the warp's, and lane 0 adds the
-// site's sum to the accumulator. Launched in blocks of kVcmGatherBlock threads, which size its warps'
-// candidate buffers (dSiteListWarp): another block traps.
-constexpr int kVcmGatherBlock = 128;
-static_assert(kVcmGatherBlock % 32 == 0, "kVcmMergeGather's warps must be whole: its walk syncs all 32 lanes");
+// site's sum to the accumulator. Launched in blocks of kSiteWarpBlock threads (dSiteWarpBuf).
 #ifndef FT_FAMILY_TU
 template <int NS>
 __global__ void kVcmMergeGather(DScene sc, DVcmCtx ctx, DVcmGrid grid, int secStride,
                                 DVcmMergeQueue mq, int n, double* accum) {
-    if (blockDim.x != (unsigned)kVcmGatherBlock) __trap();
+    int* const buf = dSiteWarpBuf();
     D_MOTION_CLEAR();   // this thread's time: the launch's (passU), as the camera walk's
-    __shared__ int candidates[kVcmGatherBlock / 32][64];
     const int lane = threadIdx.x & 31;
-    int* const buf = candidates[threadIdx.x >> 5];
     const int warps = (int)((gridDim.x * blockDim.x) >> 5);
     for (int r = (int)((blockIdx.x * blockDim.x + threadIdx.x) >> 5); r < n; r += warps) {
         const DVcmMergeReq& rq = mq.reqs[r];

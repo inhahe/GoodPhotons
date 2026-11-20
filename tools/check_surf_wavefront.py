@@ -17,7 +17,11 @@ the film's atomic sums differs, which moves a float32 pixel by a rounding at mos
   - in tools/check_jchroma.py's box of chromatic fog (beams and point merges, 8 spp at 64x64),
     where a site carries a JSPEC carrier and chromatic weights' bins in the queue's side tables:
     every site through the queue -- a site whose table the queue lacked would be counted inline --
-    and the inline gather's image.
+    and the inline gather's image;
+  - in scenes/_caustic_box.ftsl at five times its surface radius (`-jsurf-radius 0.087`), where a
+    site holds hundreds of photons and the warp's queue (dSiteListWarp) runs full rounds and carries
+    remainders, which the scenes' own radii seldom reach: every site through the queue and the
+    inline gather's image.
 
 These render one light-side epoch (`-beamepochs 1`): the point-merge line reports the frame's
 first. And the waves' sizes (renderBdptCuda's surfWave): with the queue shrunk to 2048 requests
@@ -59,6 +63,8 @@ def main():
         f.write(CHROMA_SCENE)
     FOG = [fog, "-r", "160", "120", "-spp", "4", "-jbeams", "off"]
     CHROMA = [chroma, "-r", "64", "64", "-spp", "8", "-max-bounce", "8", "-jsurf"]
+    WIDE = [os.path.join(ROOT, "scenes", "_caustic_box.ftsl"), "-r", "64", "64", "-spp", "4",
+            "-jsurf-radius", "0.087"]
     check = fogbox.Checks(62)
     logs = []
 
@@ -121,6 +127,7 @@ def main():
           % (away, len(later), sum(w[3] for w in waves[:len(waves) - len(later)])))
 
     pair("chroma", CHROMA)
+    pair("wide", WIDE)
     return check.verdict(NL.join(logs[-3:]))
 
 

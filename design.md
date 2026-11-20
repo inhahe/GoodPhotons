@@ -735,9 +735,10 @@ Four consequences worth knowing:
     JSPEC carrier and the chromatic bins in side tables; the film offset) to a `DSurfQueue`, and
     after the wave `kWfSurfGather` gathers each with a whole warp -- the lanes take the site's
     photons together, its 27 cells as one list (a lane a cell's photon would idle most lanes on
-    sparse cells), each lane testing its own (`dSurfMergePasses`: radius, from behind, footprint)
-    and the warp weighing those that pass 32 at a time (`dSiteListWarp`, as mode U's gather; since
-    0.450.37), the weighing `dSurfMergeWeigh`, which the inline `dSurfMergeAt` shares -- and lane 0
+    sparse cells), each lane testing its own (`dSurfMergePasses`: radius, from behind, footprint,
+    which hands on the photon's index, so the weighing lane need not read the bucket again) and the
+    warp weighing those that pass 32 at a time (`dSiteListWarp`, as mode U's gather; since 0.450.37),
+    the weighing `dSurfMergeWeigh`, which the inline `dSurfMergeAt` shares -- and lane 0
     adds the warp's sum to the film by atomics, as the inline gather
     and the beam queue's evaluations do: the same terms in another order. (0.437.0 summed each
     pixel's sites in a fixed order through per-path slot tables and a fold kernel; the rest of the
@@ -3124,8 +3125,8 @@ midpoints per medium, as `dTrDetMedium`), shared by every bin. The rule that kee
 is the same everywhere: a factor whose reader is heavy is evaluated in a loop with ONE call site
 (`DJSpecRun::mul`, the fiber's loop shared with the hero bundle's secondaries, the lens trace's
 loop shared with the main trace). Since 0.450.5 four of those readers are `__forceinline__`
-(`dGlossyF`, `dPatIn`, `dPatternScalarAt`, `dRecordRoughness`): the merges' lobe (`DMergeLobe`, now
-`DVertexLobe`)
+(`dGlossyF`, `dPatIn`, `dPatternScalarAt`, `dRecordRoughness`): the merges' lobe (`DMergeLobe`, since
+0.450.11 one instantiation of the connections' `DVertexLobeT`, in the device's precision since 0.450.34)
 calls the slot readers itself, which put them out of line at 236-252 registers, kJSurfLightT
 included, which the change never touched. Forcing them converged at those four, and it paid
 besides: 0.450.4's binary already held `dGlossyF` out of line, squeezed to `kBdptT`'s 168
@@ -10486,9 +10487,11 @@ as the one at fault.
   camera vertex as `dVertFromHit` makes it, the direction back, its MIS partials and edge count, its
   scale, the footprint probe's seed, its coat's film thickness, the accumulator offset; a VCM-SPEC
   carrier in a side table) to a `DVcmMergeQueue`, and after the camera wave `kVcmMergeGather`
-  gathers each with a whole warp: the lanes take the site's light vertices in turn, its 27 cells as
-  one list (`dSiteListWalk`, mode J's walk too), and lane 0 adds the sum to `accum` by atomics. The
-  per-vertex work is `dVcmMergeSum`, which the inline merge calls with one lane: a site the full
+  gathers each with a whole warp: the lanes take the site's light vertices together, its 27 cells as
+  one list, each lane testing its own and the warp weighing those that pass 32 at a time
+  (`dSiteListWarp`, since 0.450.33; mode J's queued gather's walk too), and lane 0 adds the sum to
+  `accum` by atomics. The per-vertex work is `dVcmMergeSum`, whose inline merge takes the list on its
+  own thread (`dSiteListWalk`, mode J's inline gather's walk too): a site the full
   queue turns away, a site whose 27 cells hold at most 32 light vertices (`kVcmInlineMax`: a warp
   would idle on it, and its request costs more than its merge), or every site under
   `FTRACE_NOVCMWF=1`; a site whose cells hold none is skipped. Both take the coat's film thickness
@@ -12832,9 +12835,9 @@ The device kernels each mode launches are listed in its route (`GpuRoute`: `cuda
 `cudaBackwardRoute`, `cudaPhotonMapRoute`, ...), which the VRAM preflight (`vramPreflight`, main.cpp)
 weighs (`cudaRouteLocalBytes`) for every GPU render and meter frame before anything launches; some
 sessions weigh theirs again at their start. **Every route kernel prefers the largest L1** its shared
-memory leaves room for (`preferL1`: `cudaFuncAttributePreferredSharedMemoryCarveout` = MaxL1, set where
-the route is weighed, once a kernel; a kernel the runtime refuses is tried again at the next weighing
-and the first refusal printed). The megakernels live in local memory -- their stacks and spilled state,
+memory leaves room for (`preferL1`: `cudaFuncAttributePreferredSharedMemoryCarveout` = MaxL1, once a
+kernel; a kernel the runtime refuses is tried again at the next call and the first refusal printed),
+set by `cudaRoutePrepare`, which the preflight calls on the route before weighing it. The megakernels live in local memory -- their stacks and spilled state,
 which L1 caches -- and use a kilobyte or a few of shared memory a block, so the driver's own split
 left them L1 they could use: on `_fog_cornell` at a fixed sample count mode J ran in 4.23 s for 6.65
 and mode R in 2.96 for 3.57, and modes B, D, M, P, S, U, W and J without a medium within a percent
