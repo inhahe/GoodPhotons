@@ -6694,7 +6694,7 @@ in the first draws off a fresh generator, at the resolution of a 2000-cell table
 self-test's kernel seeds the same way, so `check_rainbow_sampler.py` guards it: a build whose
 `seedUnit` seeds from the raw index fails at 501.25 and 650 nm (chi^2/dof 1.270, 1.327).
 
-## OPEN (2026-11-19): J-NOSPLIT — mode J renders 16 % slower built without `--split-compile`
+## DONE (2026-11-19, 0.450.31): J-NOSPLIT — mode J renders 16 % slower built without `--split-compile`
 
 Dropping `--split-compile` (GPU-STACK-DRIFT, 0.450.17) made modes R, D and U 12-24 % faster and mode
 J 16 % slower (cornell / _fog_cornell, idle card, three pairs: J 19.2 -> 22.3 s). The builds are
@@ -6712,6 +6712,20 @@ out-of-line calls; its stacks are equal (256 B). So the time goes in what it cal
 Not `boxHit`: a force-inlined copy in that kernel alone left mode J at 22.4 s (paired, against 22.5).
 **Next:** read the six call targets (`cuobjdump -sass` of the linked binary, the callees' own code in
 both builds) and time `kWfBeamHits` alone under Nsight Compute in each.
+
+**Found (Nsight Compute, 0.450.30):** `kWfBeamHits` spends 98.6 % of its time stalled on L1TEX
+loads -- the BVH node fetches of its walk, L1 hitting 58 %, L2 99 % -- at 0.6 % compute and 4 % of
+bandwidth: latency, not work, and the build without `--split-compile` holds more of it resident (54
+registers to 74, nine blocks an SM to six), each block's walk competing for the same L1. Giving the
+kernel the largest L1 its shared memory leaves room for (`cudaFuncAttributePreferredSharedMemoryCarveout`)
+took the whole mode J render from 6.7 s to 4.1 s, far past what the hit search alone costs: the SMs
+keep the configuration, and mode J's camera kernel, which lives in local memory, ran in it.
+**Fixed (0.450.31):** every route kernel prefers the largest L1 (`preferL1`, set where a route is
+weighed), mode D's route excepted (`GpuRoute::l1`: 0.4 % slower with it at 512 samples). On
+`_fog_cornell`: mode J 6.65 s -> 4.23 s, mode R 3.57 s -> 2.96 s; modes D, B, M, P, S, U, W and J
+without a medium unchanged within 1 %; check_bitid identical. The device-wide `cudaFuncCachePreferL1` recovered a
+sixth of it. The `--split-compile` build is not re-measured: it was dropped for being nondeterministic,
+and the loss it would have saved is a fraction of what this wins.
 
 ## DONE (2026-11-19, 0.450.17; opened 2026-10-14, tech debt): GPU-STACK-DRIFT — every kernel's stack reservation moves when unrelated device code changes
 

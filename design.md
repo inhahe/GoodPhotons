@@ -12785,6 +12785,21 @@ destructor drains and joins at exit.
 That same cursor is the program's **load-time cancellation seam** (0.138.2) — see
 "Stopping a render" below.
 
+## Threading model (GPU)
+
+The device kernels each mode launches are listed in its route (`GpuRoute`: `cudaBdptRoute`,
+`cudaBackwardRoute`, `cudaPhotonMapRoute`, ...), which the VRAM preflight and each session's start
+weigh (`cudaRouteLocalBytes`) before the first launch. **Every route kernel prefers the largest
+L1** (`preferL1`: `cudaFuncAttributePreferredSharedMemoryCarveout` = MaxL1, once a kernel). The
+megakernels live in local memory -- their stacks and spilled state, which L1 caches -- and use about
+a kilobyte of shared memory a block, so the driver's own split left them L1 they could use: on
+`_fog_cornell` at a fixed sample count mode J ran in 4.23 s for 6.65 and mode R in 2.96 for 3.57,
+and modes B, M, P, S, U, W and J without a medium within a percent (0.450.31). Mode D gained nothing
+(0.4 % slower at 512 samples), so its route asks none (`GpuRoute::l1`). The device-wide
+`cudaFuncCachePreferL1` got a sixth of mode J's. (Found chasing J-NOSPLIT: the beam queue's hit search,
+set to prefer L1 in a test, took the camera kernel's time with it -- the SMs keep a configuration
+until a kernel asks for another.)
+
 ## Stopping a render (`g_stopRequested`, `-stop`)
 
 One flag drives every clean stop: `g_stopRequested` (`main.cpp`). It is raised by the

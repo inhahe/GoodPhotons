@@ -684,8 +684,8 @@ Then the rest of 4.2-4.6 in their order, 4.7's bookkeeping alongside whatever to
 
 - [x] **GPU-STACK-DRIFT** (0.450.17) — `--split-compile` made the device build nondeterministic (mode D 11 %
   between two builds of one source); dropped: repeatable builds, R/D/U 12-24 % faster.
-- [ ] **J-NOSPLIT** — mode J renders 16 % slower without `--split-compile`: find the kernel that lost
-  it (now measurable) and pin its inlining or cap; known-issues.
+- [x] **J-NOSPLIT** (0.450.31) — not inlining: the L1. Every route kernel but mode D's prefers the
+  largest L1 (`preferL1`): mode J through a medium 36 % faster, mode R 17 %, the rest unchanged; known-issues.
 - [x] **REVIEW-0450M** (0.450.30) — the Opus (max) and Fable (xhigh) reviews of 0.450.29: `-t` read
   before the load and held by every threaded build, the CIE table in the scratch's storage, one
   joined releaser thread, BandPool exceptions rethrown, a test of every table entry; known-issues.

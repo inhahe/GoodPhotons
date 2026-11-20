@@ -4649,7 +4649,29 @@ static size_t mostLocalOf(const std::vector<const void*>& ks) {
     return most * residentThreads();
 }
 
+// Each kernel `ks` lists prefers the largest L1 its shared memory leaves room for, set once a kernel. The
+// route kernels live in local memory -- their stacks and spilled state, read through L1 -- and use a
+// kilobyte or so of shared memory a block, so the driver's own split left them L1 they could use: on
+// _fog_cornell mode J ran 36 % faster for it, R 17 %, the rest within the noise, mode D's route
+// asking none (GpuRoute::l1; design.md, "Threading model (GPU)"). A device-wide cudaFuncCachePreferL1
+// did not do it; the per-kernel carveout does.
+static void preferL1(const std::vector<const void*>& ks) {
+    if (!cudaAvailable()) return;
+    static std::mutex m;
+    static std::vector<const void*> done;
+    std::lock_guard<std::mutex> g(m);
+    for (const void* k : ks) {
+        if (!k || std::find(done.begin(), done.end(), k) != done.end()) continue;
+        done.push_back(k);
+        cudaFuncSetAttribute(k, cudaFuncAttributePreferredSharedMemoryCarveout, (int)cudaSharedmemCarveoutMaxL1);
+        cudaGetLastError();
+    }
+}
+
+// The route's kernels weighed -- the preflight, and each session's start, which every launch of them
+// follows -- and so where they are given their L1 too (preferL1).
 size_t cudaRouteLocalBytes(const GpuRoute& r) {
+    if (r.l1) preferL1(r.kernels);
     return mostLocalOf(r.kernels);
 }
 
@@ -4680,7 +4702,10 @@ GpuRoute cudaBdptRoute(const Scene& scene, bool lens, int maxDepth, int heroC, b
     // The plain instantiation: mode D's, and mode J's where its maps come out empty, which
     // renderBdptCuda then renders as mode D.
     GpuRoute r{{(const void*)bdptKernelFor(p, false, false)}};
-    if (!merging) return r;
+    if (!merging) {
+        r.l1 = false;   // mode D: the largest L1 bought it nothing (preferL1)
+        return r;
+    }
     // Mode J's merges: the merge instantiation -- and its stratified variant too where the beam queue
     // may take that order (the launcher falls back to the first wherever the queue is not built) --
     // with the queue's two kernels where the beams queue; -jsurf's light pass where the device runs

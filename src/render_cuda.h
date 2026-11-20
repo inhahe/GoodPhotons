@@ -39,8 +39,12 @@ bool cudaMemInfo(size_t* freeB, size_t* totalB);
 // cannot part. Routes add (mode P's two layers).
 struct GpuRoute {
     std::vector<const void*> kernels;
+    // Whether its kernels prefer the largest L1 their shared memory leaves room for (render_cuda.cu's
+    // preferL1, set where the route is weighed): every route's but mode D's, which gained nothing.
+    bool l1 = true;
     GpuRoute& operator+=(const GpuRoute& o) {
         kernels.insert(kernels.end(), o.kernels.begin(), o.kernels.end());
+        l1 = l1 && o.l1;
         return *this;
     }
 };
