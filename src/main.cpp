@@ -23747,7 +23747,7 @@ static void printHelp(const char* prog) {
 "                        pass. auto: sized by the -beamk knee up to -beamcount, radii widened by\n"
 "                        the floor (the rule before 0.435.0; -beamk, -beamcount or -n picks it).\n"
 "                        off: no beams, as -nobeams. A scene may say render { jbeams auto }.\n"
-"                        Measured on fog scenes: 1000 beams is within 15 % of the best map at\n"
+"                        Measured on fog scenes: 1000 beams is within 15 %% of the best map at\n"
 "                        depth 8 (no beams beats both there) and the best arm at -max-bounce 32;\n"
 "                        auto trails it 1.5-3.5x, but wins in dense bounded media such as\n"
 "                        gallery_rain's rain (known-issues J-FIELD-SLOW)\n"

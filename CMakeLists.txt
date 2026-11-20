@@ -39,6 +39,13 @@ if(MSVC)
     # C++ TUs rather than just main.cpp because viewer_gui.cpp pulls in the same headers and
     # is the next one that would hit the wall.
     # Fast math is NOT enabled: physical correctness matters more than speed for now.
+    # A printf whose format string its arguments do not match -- too few (C4473), too many (C4474),
+    # the wrong type (C4477) -- reads what was never passed: an error, not a warning. (`-h` printed
+    # "within 15 0f the best map" for a "15 % of" in its text until 0.450.38.) The CUDA units' host
+    # pass takes them through -Xcompiler, below.
+    add_compile_options($<$<COMPILE_LANGUAGE:CXX>:/we4473>
+                        $<$<COMPILE_LANGUAGE:CXX>:/we4474>
+                        $<$<COMPILE_LANGUAGE:CXX>:/we4477>)
 endif()
 
 add_executable(ftrace
@@ -197,7 +204,10 @@ if(CMAKE_CUDA_COMPILER)
     # pass-through so plain C++ TUs keep their default flags.
     if(MSVC)
         target_compile_options(ftrace PRIVATE
-            $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/Zc:preprocessor>)
+            $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/Zc:preprocessor>
+            $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/we4473>
+            $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/we4474>
+            $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/we4477>)
     endif()
     if(FTRACE_GPU_FP32)
         target_compile_definitions(ftrace PRIVATE FTRACE_GPU_FP32=1)

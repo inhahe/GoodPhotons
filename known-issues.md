@@ -265,6 +265,19 @@ trade-off, 1.5 mm on a 100 m edge).
 **Taken as a TODO item:** mode J's kWfSurfGather walks a site a lane each, as mode U's did
 (J-SURF-GATHER-DIVERGENCE).
 
+## DONE (2026-11-19, 0.450.38): HELP-PERCENT — `-h` printed "within 15 0f the best map"
+
+The help's text runs through printf, and a "15 % of" in the `-jbeams` entry was read as a conversion
+(`% o`, an octal with a space flag), which printed whatever sat in its missing argument's place and
+swallowed the "o" of "of": undefined behaviour in the one call every new user makes first. MSVC had
+said so (C4473) in every build, among 200-odd other warnings. Found listing them for
+SHADOW-WARNINGS.
+
+**Fixed:** `15 %% of`; and a printf whose arguments do not match its format string -- too few
+(C4473), too many (C4474), the wrong type (C4477) -- is an error in every C++ and CUDA host compile
+(CMakeLists.txt). No other call had one. Proven: the same flags refuse a scratch file's
+`printf("within 15 % of ...")` with error C4473.
+
 ## OPEN (2026-11-19): SHADOW-WARNINGS — 31 MSVC C4456 warnings: a local declaration hides another
 
 Found when both reviews of 0.450.31-0.450.33 caught one in render_cuda.cu (an inner `B`, the gather's
