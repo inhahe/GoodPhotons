@@ -505,6 +505,13 @@ struct SpecThr {
     // mul's three-point probe: a factor flat there is folded as the constant it is (it cancels).
     // `exhaustive` evaluates every bin, where a branch impossible in a narrow band could slip past
     // the probe (a coated surface, a half mirror).
+    // A coin whose branch is, at some cell, under this share of its likeliest cell's probability turns
+    // the walk partial, as an impossible one does. The exact ratio p(lamP) / p(lamC) is unbiased only
+    // where walks drawn at lamC do take the branch, and a branch a thousandth as likely is, for a
+    // finite render, one they never take: its light came only from walks drawn elsewhere, weighed as
+    // if they were all of them (a half mirror whose reflectance falls to 1e-123 in the red read half
+    // bright). The averaged probability is unbiased whatever the spread, so a coin can always take it.
+    static constexpr double kCoinRare = 1e-3;
     template <class F> void mulCoin(const F& f, double factorAtCam, double probAtCam,
                                     bool exhaustive) {
         double pr;
@@ -523,16 +530,17 @@ struct SpecThr {
         // bin) does not cancel.
         cam *= factorAtCam;
         pcam *= probAtCam;
-        double a = 0.0;
+        double a = 0.0, prLo = 0.0, prHi = 0.0;
         bool flat = true;
         for (int k = 0; k < n; ++k) {
             const double fk = f(lamOf(k), pr);
-            if (k == 0) a = fk;
+            if (k == 0) { a = fk; prLo = prHi = pr; }
             else if (std::fabs(fk - a) > 1e-12 * (1.0 + std::fabs(a))) flat = false;
             v[k] *= fk;
             p[k] *= pr;
-            if (!(pr > 0.0)) partial = true;
+            prLo = std::min(prLo, pr); prHi = std::max(prHi, pr);
         }
+        if (!(prLo > kCoinRare * prHi)) partial = true;   // impossible, or as good as, somewhere
         if (!flat || std::fabs(factorAtCam - a) > 1e-12 * (1.0 + std::fabs(a))) any = true;
         if (partial) rescale();
     }

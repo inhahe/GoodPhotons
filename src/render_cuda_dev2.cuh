@@ -490,16 +490,18 @@ struct DSpecThr {
         // Every cell, once; a coin flat over them and at the walk's wavelength leaves `any` alone.
         cam *= factorAtCam;
         pcam *= probAtCam;
-        double a = 0.0;
+        double a = 0.0, prLo = 0.0, prHi = 0.0;
         bool flat = true;
         for (int k = 0; k < n; ++k) {
             const double fk = f(lamOf(k), pr);
-            if (k == 0) a = fk;
+            if (k == 0) { a = fk; prLo = prHi = pr; }
             else if (fabs(fk - a) > 1e-12 * (1.0 + fabs(a))) flat = false;
             v[k] *= fk;
             p[k] *= (float)pr;
-            if (!(pr > 0.0)) partial = 1;
+            prLo = fmin(prLo, pr); prHi = fmax(prHi, pr);
         }
+        // Impossible, or as good as, somewhere (host twin SpecThr::kCoinRare, where the why is).
+        if (!(prLo > 1e-3 * prHi)) partial = 1;
         if (!flat || fabs(factorAtCam - a) > 1e-12 * (1.0 + fabs(a))) any = 1;
         if (partial) rescale(sc);
     }

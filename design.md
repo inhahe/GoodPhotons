@@ -1290,8 +1290,12 @@ probability alone into a second per-bin product `p` (and `pcam` at the walk's wa
 p_L / p_walk re-expresses the walk at L only where L allows every branch the walk took and so does
 the walk's own wavelength; a walk cannot sample a branch its wavelength forbids. Where some bin
 cannot take the walk's branches (`partial`: a coat opaque at some wavelengths, total internal
-reflection at some), `ratio()` divides instead by the branches' probability averaged over the
-density the walk's wavelength was drawn from (the emission sampler: sum_k Q_k p[k], Q_k its mass in
+reflection at some) -- or takes them under a thousandth as often as at its likeliest cell
+(`SpecThr::kCoinRare`, 0.451.2: a branch walks drawn there never take in a finite render, so the exact
+ratio's light would come only from the walks drawn elsewhere, weighed as if they were all; a half mirror
+whose reflectance fell to 1e-123 in the red read half bright on the CPU, where the device's float
+probabilities had made it an exact zero) -- `ratio()` divides instead by the branches' probability
+averaged over the density the walk's wavelength was drawn from (the emission sampler: sum_k Q_k p[k], Q_k its mass in
 cell k): every walk wavelength shares that denominator, so the walks that can take the branches
 stand in for those that cannot. Whether a walk is partial depends on its branches alone, never on
 its wavelength, so the exact importance ratio (where the support is whole) and the averaged one

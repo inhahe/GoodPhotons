@@ -18,7 +18,8 @@ sRGB's channels cancel behind a gel, where XYZ's do not):
   - the first gel before a glossy wall (the spectral light sampling at the glossy vertex);
   - a half mirror whose reflectance steps from 0.05 to 0.9 at 546.5 nm;
   - a half mirror reflecting a 3 nm Gaussian band at 550 nm, and one with a 1 nm shortpass edge at
-    546.5 nm (analytic spectra, sampled rather than read from knots);
+    546.5 nm (analytic spectra, sampled rather than read from knots; the edge's reflectance falls to
+    1e-123 in the red, a coin as good as impossible there: known-issues HOST-HALFMIRROR-ANALYTIC);
   - check_coat_modes' tank, its thin-film ball's substrate absorbing above 546.5 nm only: a coin whose
     branch is impossible on one side of the step.
 
@@ -39,10 +40,6 @@ import check_glossy_nee_media as gnm  # noqa: E402
 SPLIT = re.compile(r"\[specgather\] the spectral carrier's 24 bins split at")
 TOL = 0.03
 TANK_TOL = 0.05   # check_coat_modes' for the same tank: its upper tiles are dark
-# (case, device) pairs a bug elsewhere leaves wrong, reported KNOWN instead of failing: the host's forward
-# photon pass reads a half mirror with an analytic reflectance about half bright (known-issues
-# HOST-HALFMIRROR-ANALYTIC; 0.450.44 alike). Remove an entry when its bug is fixed.
-KNOWN = {("mir_short", "cpu")}
 
 
 CASES = [
@@ -111,9 +108,8 @@ def main():
                     ratio, z, bad = tile_verdict(x1, x0, TANK_TOL if name == "tank" else TOL)
                     good &= not bad.any()
                     parts.append("%s worst x%.3f (%.1f sigma)" % (cname, ratio.flat[int(z.argmax())], z.max()))
-                known = (name, dev) in KNOWN
-                ok &= good or (known and said)
-                print("%s: %s, mode %s%s / mode R: %s%s" % ("ok" if good else ("KNOWN" if known else "FAIL"), name, mode,
+                ok &= good
+                print("%s: %s, mode %s%s / mode R: %s%s" % ("ok" if good else "FAIL", name, mode,
                       " (device)" if dev == "gpu" else "", ", ".join(parts), "" if said else "; NO split line"),
                       flush=True)
     print("PASS" if ok else "FAILED")

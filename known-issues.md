@@ -322,7 +322,39 @@ act (Sysinternals `handle.exe` on the locked path, which build.bat could run whe
 exclude the build directory from the scanner if that is it, or have build.bat retry the failed step
 once; and have it say plainly, last, that ftrace.exe was NOT updated.
 
-## OPEN (2026-11-20): HOST-HALFMIRROR-ANALYTIC — on the CPU a half mirror whose reflectance is an analytic curve renders about half as bright in modes M, S and B
+## OPEN (2026-11-20): MODEB-PASSTHROUGH — modes A and B see nothing through a gel, and only part of what a half mirror passes
+
+Seen while finding HOST-HALFMIRROR-ANALYTIC. The forward splat modes connect each photon vertex to the
+camera along a straight leg, and the leg's visibility (Scene::occluded / shadowTransmittance, the
+device's occludedTo) counts every surface on it a blocker but a translucent fiber. A `filter` gel and a
+`halfmirror` do not bend what they pass, so a leg through one is a light path, carrying the gel's T(lam)
+or the mirror's 1 - R(lam) -- but it is cut. Measured, the frame's middle in XYZ against mode R:
+check_spec_cells' gel (`filter_scene`, the wall seen through a gel): modes A and B **0.000** on the CPU,
+mode D 1.000. check_coat_modes' half-mirror room with the reflectance stepping from 0.05 to 0.9 at
+546.5 nm: mode B 0.99 / 0.98 / 0.57 on both devices (the blue it passes is short); with a shortpass edge
+reflecting below 546.5 nm, 0.89 / 0.94 / 1.00 (the red it passes). Modes R, M, S and D agree with each
+other; a half mirror's reflection reaches modes A and B through connectSpecularPlane, so only what it
+passes is missing. **Proper fix:** a camera leg (camSplatAll, the lens connection of mode A, and the
+legs of the specular connections) crosses a filter or a half mirror with its transmittance at each
+wavelength of the bundle -- deterministic, as a translucent fiber's coverage is in shadowTransmittance --
+on the host and the device, and a regression check of modes A and B behind a gel and through half mirrors.
+
+## DONE (2026-11-20, 0.451.2): HOST-HALFMIRROR-ANALYTIC — on the CPU a half mirror whose reflectance is an analytic curve renders about half as bright in modes M, S and B
+
+**Cause: a coin as good as impossible for some walks, read by the exact importance ratio.** Mode M's and
+mode S's carrier re-expresses a coin the walk tossed at each photon's wavelength by p(lamP) / p(lamC),
+which is unbiased only where walks drawn at lamC do take the branch. The soft edge's reflectance falls to
+1e-123 in the red, never exactly 0, so the walk kept that ratio -- and a walk drawn in the red never
+reflects, so the reflected light came only from the walks drawn where it is large, about half of them,
+weighed as if they were all. An exact zero (a step table to 0) turns the walk `partial`, which divides
+by the probability averaged over the walk density instead; and the device stores the coin's
+probabilities in float, where 1e-123 is 0, so it took that rule already and read right. Mode B's 0.89
+was not this -- the device's mode B reads the same -- but its own: MODEB-PASSTHROUGH. **Fixed:** a coin whose branch is anywhere under a thousandth of its likeliest cell's
+probability turns the walk partial (`SpecThr::kCoinRare`, host and device alike); the averaged estimator
+is unbiased whatever the spread. CPU mode M 0.54 / 0.52 / 0.49 -> 0.996 / 1.001 / 1.002 of mode R,
+`amp=0.2` 0.69 -> 0.98; check_spec_cells' `mir_short` holds it on both devices.
+
+The report:
 
 Found by check_spec_cells' `mir_short` case (0.451.1), and in 0.450.44 alike, so older than the spectral
 carrier's cells. A half mirror with `reflect shortpass edge=546.5 slope=1 amp=0.9` over check_coat_modes'
