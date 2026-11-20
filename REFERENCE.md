@@ -986,7 +986,11 @@ that converges to the same physical image.
   (below) — is no delta, so it is splatted like a diffuse vertex, through its own lobe
   (since 0.401.0; before that it was black here too). Everything else specular — a glass
   *mesh*, frosted glass, a mirror seen inside another mirror — still renders black; use
-  `P`, `D`, or `R` for those. Best default
+  `P`, `D`, or `R` for those. A `filter` gel and a `halfmirror` pass what they pass unbent, so
+  since 0.451.3 a splat sees through them, taking the gel's transmittance or the mirror's
+  1 − reflectance at each wavelength (before, the wall behind a gel rendered black, and what a
+  half mirror lets through was missing); through one in front of a glass sphere or another mirror
+  the analytic connections still stop. Best default
   for diffuse and caustic-heavy scenes. In an *absolute-EV* scene an authored
   `fstop`/`lens` still sets exposure here — the pinhole has no depth of field, but it
   applies the camera-equation light-gathering term `(π/4)/N²`, so f/2 is exactly four

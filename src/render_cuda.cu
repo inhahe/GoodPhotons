@@ -2083,6 +2083,7 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
     sc.sceneCenter = {scene.sceneCenter.x, scene.sceneCenter.y, scene.sceneCenter.z};
     sc.sceneRadius = scene.sceneRadius;
     sc.lenScale = scene.lenScale;
+    sc.passThroughAny = scene.passThroughAny ? 1 : 0;
     // The spectral carrier's cells, where the scene's tables split its bins (Scene::specCells).
     sc.specCells = nullptr;
     if (scene.specCells.split()) {

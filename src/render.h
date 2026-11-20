@@ -1470,6 +1470,7 @@ struct Renderer {
         int px = 0, py = 0;
         double cosSurf = 0, corr = 0, denom = 0, dist = 0;
         Vec3 wdir;
+        CamLegPass leg;   // the gels and half mirrors the camera leg crosses (camLegPass)
     };
     // A FIBER vertex connects differently, in three ways that all live down here rather
     // than in the caller (see hair_shade.h for why the projection factor changes):
@@ -1577,8 +1578,8 @@ struct Renderer {
             if (!cam.project(p, g.px, g.py, cosCamH, dist2H)) return false;
             const double off = hairExitOffset(*hs, n, g.wdir, pe);
             if (off >= g.dist) return false;
-            if (scene.occluded(p + g.wdir * pe, g.wdir, g.dist - off - pe, pe,
-                               /*camLeg=*/true, off)) return false;
+            g.leg = camLegPass(scene, p + g.wdir * pe, g.wdir, g.dist - off - pe, pe, off);
+            if (g.leg.blocked) return false;
             g.denom = dist2H * cam.pixelSolidAngle(cosCamH);
             return true;
         }
@@ -1586,7 +1587,8 @@ struct Renderer {
         if (!camSideOk(n, ng, g.wdir, glossy, g.cosSurf)) return false;
         double cosCam, dist2;
         if (!cam.project(p, g.px, g.py, cosCam, dist2)) return false;
-        if (scene.occluded(p + ng * pe, g.wdir, g.dist - 2 * pe, pe, /*camLeg=*/true)) return false;
+        g.leg = camLegPass(scene, p + ng * pe, g.wdir, g.dist - 2 * pe, pe);
+        if (g.leg.blocked) return false;
         double omega = cam.pixelSolidAngle(cosCam);
         // Veach shading-normal adjoint correction for this particle connection
         // (wi = toward the previous/light-side vertex, wo = wdir toward the camera).
@@ -1618,7 +1620,7 @@ struct Renderer {
         double contrib = beta * f * g.cosSurf * g.corr / g.denom;
         // Attenuation of the shadow ray through the fog (Beer-Lambert; ratio tracking
         // for a heterogeneous medium, exact exp for a homogeneous one; product over media).
-        contrib *= legTransmittance(scene, cam.medium(), p, g.wdir, g.dist, lambda, rng);
+        contrib *= legTransmittance(scene, cam.medium(), p, g.wdir, g.dist, lambda, rng) * g.leg.at(lambda);
         film.add(g.px, g.py, Vec3(cieX(lambda), cieY(lambda), cieZ(lambda)) * contrib);
     }
 
@@ -1636,7 +1638,7 @@ struct Renderer {
             double f = gs ? gs->f(g.wdir, lam[i]) : rho[i] / PI;
             f *= coatSplatF(coat, g.wdir, lam[i]);
             double contrib = beta[i] * f * g.cosSurf * g.corr / g.denom;
-            contrib *= legTransmittance(scene, cam.medium(), p, g.wdir, g.dist, lam[i], rng);
+            contrib *= legTransmittance(scene, cam.medium(), p, g.wdir, g.dist, lam[i], rng) * g.leg.at(lam[i]);
             film.add(g.px, g.py, Vec3(cieX(lam[i]), cieY(lam[i]), cieZ(lam[i])) * contrib);
         }
     }
@@ -1654,13 +1656,14 @@ struct Renderer {
         Vec3 wdir = toCam / dist;
         int px, py; double cosCam, dist2;
         if (!cam.project(p, px, py, cosCam, dist2)) return;
-        if (scene.occluded(p + wdir * scene.eps, wdir, dist - 2 * scene.eps, scene.eps, /*camLeg=*/true)) return;
+        const CamLegPass leg = camLegPass(scene, p + wdir * scene.eps, wdir, dist - 2 * scene.eps, scene.eps);
+        if (leg.blocked) return;
 
         double ph = med.phaseValue(dot(wIn, wdir), lambda); // scattering medium's phase (HG or rainbow)
         double Lambda = med.albedo(lambda);
         double omega = cam.pixelSolidAngle(cosCam);         // projection-general pixel solid angle
         double contrib = beta * Lambda * ph / (dist2 * omega);
-        contrib *= legTransmittance(scene, cam.medium(), p, wdir, dist, lambda, rng);
+        contrib *= legTransmittance(scene, cam.medium(), p, wdir, dist, lambda, rng) * leg.at(lambda);
         film.add(px, py, Vec3(cieX(lambda), cieY(lambda), cieZ(lambda)) * contrib);
     }
 
@@ -1693,13 +1696,14 @@ struct Renderer {
         if (off >= le.dist) return;
         int px, py; double wgt;
         if (!cam.lensEntryImage(le, lambda, px, py, wgt)) return;
-        if (scene.occluded(p + (hs ? wdir : ng) * (hs ? pe : off), wdir, le.dist - off - pe, pe,
-                           /*camLeg=*/true, hs ? off : 0.0)) return;
+        const CamLegPass leg = camLegPass(scene, p + (hs ? wdir : ng) * (hs ? pe : off), wdir, le.dist - off - pe, pe,
+                                          hs ? off : 0.0);
+        if (leg.blocked) return;
         const double corr = hs ? 1.0 : shadingAdjointCorr(wi, wdir, n, ng);
         const double fcos = (hs ? hairFCos(*hs, wdir)
                                 : (gs ? gs->f(wdir, lambda) : rho / PI) * cosSurf) * coatSplatF(coat, wdir, lambda);
         double contrib = beta * fcos * corr * wgt;
-        contrib *= legTransmittance(scene, cam.medium(), p, wdir, le.dist, lambda, rng);
+        contrib *= legTransmittance(scene, cam.medium(), p, wdir, le.dist, lambda, rng) * leg.at(lambda);
         film.add(px, py, Vec3(cieX(lambda), cieY(lambda), cieZ(lambda)) * contrib);
     }
 
@@ -1728,13 +1732,14 @@ struct Renderer {
             any = any || ok[i];
         }
         if (!any) return;
-        if (scene.occluded(p + ng * pe, wdir, le.dist - 2 * pe, pe, /*camLeg=*/true)) return;
+        const CamLegPass leg = camLegPass(scene, p + ng * pe, wdir, le.dist - 2 * pe, pe);
+        if (leg.blocked) return;
         const double corr = shadingAdjointCorr(wi, wdir, n, ng);
         for (int i = 0; i < nUp; ++i) {
             if (!ok[i]) continue;
             double contrib = beta[i] * (gs ? gs->f(wdir, lam[i]) : rho[i] / PI) * cosSurf * corr *
                              wgt[i] * coatSplatF(coat, wdir, lam[i]);
-            contrib *= legTransmittance(scene, cam.medium(), p, wdir, le.dist, lam[i], rng);
+            contrib *= legTransmittance(scene, cam.medium(), p, wdir, le.dist, lam[i], rng) * leg.at(lam[i]);
             film.add(px[i], py[i], Vec3(cieX(lam[i]), cieY(lam[i]), cieZ(lam[i])) * contrib);
         }
     }
@@ -1747,11 +1752,12 @@ struct Renderer {
         const double u1 = rng.uniform(), u2 = rng.uniform();
         Vec3 Y, wdir; double dist, wgt; int px, py;
         if (!cam.lensConnect(p, lambda, u1, u2, Y, wdir, dist, px, py, wgt)) return;
-        if (scene.occluded(p + wdir * scene.eps, wdir, dist - 2 * scene.eps, scene.eps, /*camLeg=*/true)) return;
+        const CamLegPass leg = camLegPass(scene, p + wdir * scene.eps, wdir, dist - 2 * scene.eps, scene.eps);
+        if (leg.blocked) return;
         double f = phaseW;
         if (med && wIn) f = med->albedo(lambda) * med->phaseValue(dot(*wIn, wdir), lambda);
         double contrib = beta * f * wgt;
-        contrib *= legTransmittance(scene, cam.medium(), p, wdir, dist, lambda, rng);
+        contrib *= legTransmittance(scene, cam.medium(), p, wdir, dist, lambda, rng) * leg.at(lambda);
         film.add(px, py, Vec3(cieX(lambda), cieY(lambda), cieZ(lambda)) * contrib);
     }
 
@@ -1805,8 +1811,9 @@ struct Renderer {
         if (!cam.lensImage(A, wdir, px, py)) return;
         const double off = hs ? hairExitOffset(*hs, n, wdir, pe) : pe;
         if (off >= dist) return;
-        if (scene.occluded(p + (hs ? wdir : ng) * (hs ? pe : off), wdir, dist - off - pe, pe,
-                           /*camLeg=*/true, hs ? off : 0.0)) return;
+        const CamLegPass leg = camLegPass(scene, p + (hs ? wdir : ng) * (hs ? pe : off), wdir, dist - off - pe, pe,
+                                          hs ? off : 0.0);
+        if (leg.blocked) return;
 
         // beta * (rho/pi BRDF) * cosSurf * cosLens / dist^2 * (pi R^2 = 1/pdf_A).
         // cosSurf carries the Veach shading-normal adjoint correction (see connect()).
@@ -1829,7 +1836,7 @@ struct Renderer {
         // out) and A stays consistent with C; only ABSOLUTE-EV A/C are corrected to
         // land mid-tone at ABS_EXPOSURE_GAIN, matching B.
         contrib *= 1.0 / (cam.pixelPlaneArea() * cam.filmDist * cam.filmDist);
-        contrib *= legTransmittance(scene, cam.medium(), p, wdir, dist, lambda, rng);
+        contrib *= legTransmittance(scene, cam.medium(), p, wdir, dist, lambda, rng) * leg.at(lambda);
         film.add(px, py, Vec3(cieX(lambda), cieY(lambda), cieZ(lambda)) * contrib);
     }
 
@@ -1865,14 +1872,15 @@ struct Renderer {
         if (cosLens <= 1e-6) return;                     // not heading toward the film
         int px, py;
         if (!cam.lensImage(A, wdir, px, py)) return;
-        if (scene.occluded(p + ng * pe, wdir, dist - 2 * pe, pe, /*camLeg=*/true)) return;
+        const CamLegPass leg = camLegPass(scene, p + ng * pe, wdir, dist - 2 * pe, pe);
+        if (leg.blocked) return;
         double corr = shadingAdjointCorr(wi, wdir, n, ng);
         double cellNorm = 1.0 / (cam.pixelPlaneArea() * cam.filmDist * cam.filmDist);
         for (int i = 0; i < nUp; ++i) {
             double contrib = beta[i] * (gs ? PI * gs->f(wdir, lam[i]) : rho[i]) * cosSurf * corr *
                              cosLens * (R * R) / (dist * dist) * coatSplatF(coat, wdir, lam[i]);
             contrib *= cellNorm;
-            contrib *= legTransmittance(scene, cam.medium(), p, wdir, dist, lam[i], rng);
+            contrib *= legTransmittance(scene, cam.medium(), p, wdir, dist, lam[i], rng) * leg.at(lam[i]);
             film.add(px, py, Vec3(cieX(lam[i]), cieY(lam[i]), cieZ(lam[i])) * contrib);
         }
     }
@@ -1899,7 +1907,8 @@ struct Renderer {
         if (cosLens <= 1e-6) return;
         int px, py;
         if (!cam.lensImage(A, wdir, px, py)) return;
-        if (scene.occluded(p + wdir * scene.eps, wdir, dist - 2 * scene.eps, scene.eps, /*camLeg=*/true)) return;
+        const CamLegPass leg = camLegPass(scene, p + wdir * scene.eps, wdir, dist - 2 * scene.eps, scene.eps);
+        if (leg.blocked) return;
 
         double ph = med.phaseValue(dot(wIn, wdir), lambda); // scattering medium's phase (HG or rainbow)
         double Lambda = med.albedo(lambda);
@@ -1909,7 +1918,7 @@ struct Renderer {
         // matches B's absolute scale in absolute-EV modes (per-camera constant; auto-
         // exposed scenes unaffected).
         contrib *= 1.0 / (cam.pixelPlaneArea() * cam.filmDist * cam.filmDist);
-        contrib *= legTransmittance(scene, cam.medium(), p, wdir, dist, lambda, rng);
+        contrib *= legTransmittance(scene, cam.medium(), p, wdir, dist, lambda, rng) * leg.at(lambda);
         film.add(px, py, Vec3(cieX(lambda), cieY(lambda), cieZ(lambda)) * contrib);
     }
 
@@ -1927,10 +1936,11 @@ struct Renderer {
         Vec3 wdir = toCam / dist;
         int px, py; double cosCam, dist2;
         if (!cam.project(p, px, py, cosCam, dist2)) return;
-        if (scene.occluded(p + wdir * scene.eps, wdir, dist - 2 * scene.eps, scene.eps, /*camLeg=*/true)) return;
+        const CamLegPass leg = camLegPass(scene, p + wdir * scene.eps, wdir, dist - 2 * scene.eps, scene.eps);
+        if (leg.blocked) return;
         double omega = cam.pixelSolidAngle(cosCam);
         double contrib = beta * (1.0 / (4.0 * PI)) / (dist2 * omega);
-        contrib *= legTransmittance(scene, cam.medium(), p, wdir, dist, lambda, rng);
+        contrib *= legTransmittance(scene, cam.medium(), p, wdir, dist, lambda, rng) * leg.at(lambda);
         film.add(px, py, Vec3(cieX(lambda), cieY(lambda), cieZ(lambda)) * contrib);
     }
 
@@ -1956,10 +1966,11 @@ struct Renderer {
         if (cosLens <= 1e-6) return;
         int px, py;
         if (!cam.lensImage(A, wdir, px, py)) return;
-        if (scene.occluded(p + wdir * scene.eps, wdir, dist - 2 * scene.eps, scene.eps, /*camLeg=*/true)) return;
+        const CamLegPass leg = camLegPass(scene, p + wdir * scene.eps, wdir, dist - 2 * scene.eps, scene.eps);
+        if (leg.blocked) return;
         double contrib = beta * (1.0 / (4.0 * PI)) * cosLens * (PI * R * R) / (dist * dist);
         contrib *= 1.0 / (cam.pixelPlaneArea() * cam.filmDist * cam.filmDist);
-        contrib *= legTransmittance(scene, cam.medium(), p, wdir, dist, lambda, rng);
+        contrib *= legTransmittance(scene, cam.medium(), p, wdir, dist, lambda, rng) * leg.at(lambda);
         film.add(px, py, Vec3(cieX(lambda), cieY(lambda), cieZ(lambda)) * contrib);
     }
 

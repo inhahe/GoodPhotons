@@ -1663,6 +1663,8 @@ struct DScene {
                                // transport visibility queries' GRIN rule (dCrossesGrin).
     double           lenScale; // the scene's length scale (host Scene::lenScale), which c_lenScale
                                // carries to the kernels: dSetLenScale before every launch on it
+    int passThroughAny;        // a `filter` or `halfmirror` material (host Scene::passThroughAny): a
+                               // blocked camera leg may pass through one (dCamLegThrough)
     const DSpecCells* specCells; // the spectral carrier's cells where the scene splits its bins, else
                                // null (host Scene::specCells; DSpecThr::init)
     DVec3  sensorOrigin, sensorUAxis, sensorVAxis;   // model A contact sensor plane
@@ -7040,6 +7042,11 @@ __device__ static inline bool dCamSideOk(const DVec3& n, const DVec3& ng, const 
                                          bool glossy, Real& cosSurf) {
     return dCamSideOkT(n, ng, wdir, glossy, cosSurf);
 }
+// Device twin of camLegPass (scene.h), defined below dTransmitSlot: false where the leg from `o` to
+// `target` (occludedTo's arguments) is blocked; else true, T[i] what the gels and half mirrors on it pass
+// at lam[i] (1 with none). A clear leg costs occludedTo's one any-hit walk.
+__device__ static bool dCamLegThrough(const DScene& sc, const DVec3& o, const DVec3& target, double absEps,
+                                      Real tmin, bool camLeg, const Real* lam, int n, Real* T);
 __device__ static void connect(const DScene& sc, const DCamera& cam, double* film, double* hits,
                                const DVec3& p, const DVec3& n, const DVec3& ng, Real reach, const DVec3& wi,
                                Real lambda, Real beta, Real rho, DRng& rng,
@@ -7051,7 +7058,9 @@ __device__ static void connect(const DScene& sc, const DCamera& cam, double* fil
     if (!dCamSideOk(n, ng, wdir, gs != nullptr, cosSurf)) return;   // the camera side
     int px, py; Real cosCam, dist2;
     if (!cam.project(p, px, py, cosCam, dist2)) return;
-    if (occludedTo(sc, dOffsetAlong(p, ng, wdir, reach), p + wdir * dist, 2e-6, RAY_TMIN, /*camLeg=*/true)) return;  // camera leg: hide_camera applies (Scene::occluded / DMaterial::hideCamera)
+    Real legT;
+    if (!dCamLegThrough(sc, dOffsetAlong(p, ng, wdir, reach), p + wdir * dist, 2e-6, RAY_TMIN, true, &lambda, 1, &legT)) return;
+    beta *= legT;   // the gels and half mirrors the camera leg crosses  // camera leg: hide_camera applies (Scene::occluded / DMaterial::hideCamera)
     Real f = gs ? gs->f(wdir, lambda) : rho / (Real)DPI;
     if (coat) f *= (Real)dCoatS(coat, wdir, lambda);   // a coated body's way out (DCoatSplat)
     // Projection-general splat: contrib = beta*f*cosSurf*corr / (dist^2 * pixelSolidAngle).
@@ -7075,7 +7084,9 @@ __device__ static void connectVolume(const DScene& sc, const DMedium& med, const
     DVec3 wdir = toCam / dist;
     int px, py; Real cosCam, dist2;
     if (!cam.project(p, px, py, cosCam, dist2)) return;
-    if (occludedTo(sc, p + wdir * dEpsAt(p), p + wdir * dist, 2e-6, RAY_TMIN, /*camLeg=*/true)) return;  // camera leg: hide_camera applies (Scene::occluded / DMaterial::hideCamera)
+    Real legT;
+    if (!dCamLegThrough(sc, p + wdir * dEpsAt(p), p + wdir * dist, 2e-6, RAY_TMIN, true, &lambda, 1, &legT)) return;
+    beta *= legT;   // the gels and half mirrors the camera leg crosses  // camera leg: hide_camera applies (Scene::occluded / DMaterial::hideCamera)
     Real ph = dMedPhase(med, dot(wIn, wdir), lambda);
     Real Lambda = medAlbedo(med, lambda);
     // Projection-general splat (no cosSurf for a volume vertex): the phase carries the
@@ -7114,7 +7125,9 @@ __device__ static void connectLensPhysical(const DScene& sc, const DCamera& cam,
     if (!dCamSideOk(n, ng, wdir, gs != nullptr, cosSurf)) return;   // the camera side
     int px, py; double wgt;
     if (!dLensEntryImage(cam, le, lambda, px, py, wgt)) return;
-    if (occludedTo(sc, dOffsetAlong(p, ng, wdir, reach), le.Y, 2e-6, RAY_TMIN, /*camLeg=*/true)) return;
+    Real legT;
+    if (!dCamLegThrough(sc, dOffsetAlong(p, ng, wdir, reach), le.Y, 2e-6, RAY_TMIN, true, &lambda, 1, &legT)) return;
+    beta *= legT;   // the gels and half mirrors the camera leg crosses
     const Real corr = dShadingAdjointCorr(wi, wdir, n, ng);
     Real contrib = (Real)((double)beta * (gs ? (double)gs->f(wdir, lambda) : (double)rho / DPI) *
                           (double)cosSurf * (double)corr * wgt * dCoatS(coat, wdir, lambda));
@@ -7130,7 +7143,9 @@ __device__ static void connectVolumeLensPhysical(const DScene& sc, const DCamera
     const double u1 = rng.uniform(), u2 = rng.uniform();
     DVec3 Y, wdir; double dist, wgt; int px, py;
     if (!dLensConnect(cam, p, lambda, u1, u2, Y, wdir, dist, px, py, wgt)) return;
-    if (occludedTo(sc, p + wdir * dEpsAt(p), Y, 2e-6, RAY_TMIN, /*camLeg=*/true)) return;
+    Real legT;
+    if (!dCamLegThrough(sc, p + wdir * dEpsAt(p), Y, 2e-6, RAY_TMIN, true, &lambda, 1, &legT)) return;
+    beta *= legT;   // the gels and half mirrors the camera leg crosses
     Real f = phaseW;
     if (med && wIn) f = medAlbedo(*med, lambda) * dMedPhase(*med, dot(*wIn, wdir), lambda);
     Real contrib = (Real)((double)beta * (double)f * wgt);
@@ -7162,11 +7177,12 @@ __device__ static void connectLensHeroPhysical(const DScene& sc, const DCamera& 
         any = any || ok[i];
     }
     if (!any) return;
-    if (occludedTo(sc, dOffsetAlong(p, ng, wdir, reach), le.Y, 2e-6, RAY_TMIN, /*camLeg=*/true)) return;
+    Real legT[hero::kHeroMax];
+    if (!dCamLegThrough(sc, dOffsetAlong(p, ng, wdir, reach), le.Y, 2e-6, RAY_TMIN, true, lam, nUp, legT)) return;
     const Real corr = dShadingAdjointCorr(wi, wdir, n, ng);
     for (int i = 0; i < nUp; ++i) {
         if (!ok[i]) continue;
-        Real contrib = (Real)((double)beta[i] *
+        Real contrib = (Real)((double)(beta[i] * legT[i]) *
                               (gs ? (double)gs->f(wdir, lam[i]) : (double)rho[i] / DPI) *
                               (double)cosSurf * (double)corr * wg[i] * dCoatS(coat, wdir, lam[i]));
         contrib *= dLegTransmittance(sc, cam.enclosure.topMat(), p, wdir, (double)(Real)dist, lam[i], rng);
@@ -7195,7 +7211,9 @@ __device__ static void connectLens(const DScene& sc, const DCamera& cam, double*
     if (cosLens <= (Real)1e-6) return;               // not heading toward the film
     int px, py;
     if (!cam.lensImage(A, wdir, px, py)) return;
-    if (occludedTo(sc, dOffsetAlong(p, ng, wdir, reach), p + wdir * dist, 2e-6, RAY_TMIN, /*camLeg=*/true)) return;  // camera leg: hide_camera applies (Scene::occluded / DMaterial::hideCamera)
+    Real legT;
+    if (!dCamLegThrough(sc, dOffsetAlong(p, ng, wdir, reach), p + wdir * dist, 2e-6, RAY_TMIN, true, &lambda, 1, &legT)) return;
+    beta *= legT;   // the gels and half mirrors the camera leg crosses  // camera leg: hide_camera applies (Scene::occluded / DMaterial::hideCamera)
     Real corr = dShadingAdjointCorr(wi, wdir, n, ng);   // Veach adjoint (1 when ns==ng)
     Real contrib = beta * (gs ? (Real)DPI * gs->f(wdir, lambda) : rho) * cosSurf * corr * cosLens *
                    (R * R) / (dist * dist);
@@ -7230,7 +7248,9 @@ __device__ static void connectLensVolume(const DScene& sc, const DMedium& med, c
     if (cosLens <= (Real)1e-6) return;
     int px, py;
     if (!cam.lensImage(A, wdir, px, py)) return;
-    if (occludedTo(sc, p + wdir * dEpsAt(p), p + wdir * dist, 2e-6, RAY_TMIN, /*camLeg=*/true)) return;  // camera leg: hide_camera applies (Scene::occluded / DMaterial::hideCamera)
+    Real legT;
+    if (!dCamLegThrough(sc, p + wdir * dEpsAt(p), p + wdir * dist, 2e-6, RAY_TMIN, true, &lambda, 1, &legT)) return;
+    beta *= legT;   // the gels and half mirrors the camera leg crosses  // camera leg: hide_camera applies (Scene::occluded / DMaterial::hideCamera)
     Real ph = dMedPhase(med, dot(wIn, wdir), lambda);
     Real Lambda = medAlbedo(med, lambda);
     Real contrib = beta * Lambda * ph * cosLens * (Real)DPI * (R * R) / (dist * dist);
@@ -10600,7 +10620,9 @@ __device__ static void connectEmissionVolume(const DScene& sc, const DCamera& ca
     DVec3 wdir = toCam / dist;
     int px, py; Real cosCam, dist2;
     if (!cam.project(p, px, py, cosCam, dist2)) return;
-    if (occludedTo(sc, p + wdir * dEpsAt(p), p + wdir * dist, 2e-6, RAY_TMIN, /*camLeg=*/true)) return;  // camera leg: hide_camera applies (Scene::occluded / DMaterial::hideCamera)
+    Real legT;
+    if (!dCamLegThrough(sc, p + wdir * dEpsAt(p), p + wdir * dist, 2e-6, RAY_TMIN, true, &lambda, 1, &legT)) return;
+    beta *= legT;   // the gels and half mirrors the camera leg crosses  // camera leg: hide_camera applies (Scene::occluded / DMaterial::hideCamera)
     double solidAngle = cam.pixelSolidAngle(cosCam);
     Real contrib = beta * (Real)(1.0 / (4.0 * DPI)) / (Real)((double)dist2 * solidAngle);
     contrib *= dLegTransmittance(sc, cam.enclosure.topMat(), p, wdir, (double)dist, lambda, rng);
@@ -10628,7 +10650,9 @@ __device__ static void connectEmissionLensVolume(const DScene& sc, const DCamera
     if (cosLens <= (Real)1e-6) return;
     int px, py;
     if (!cam.lensImage(A, wdir, px, py)) return;
-    if (occludedTo(sc, p + wdir * dEpsAt(p), p + wdir * dist, 2e-6, RAY_TMIN, /*camLeg=*/true)) return;  // camera leg: hide_camera applies (Scene::occluded / DMaterial::hideCamera)
+    Real legT;
+    if (!dCamLegThrough(sc, p + wdir * dEpsAt(p), p + wdir * dist, 2e-6, RAY_TMIN, true, &lambda, 1, &legT)) return;
+    beta *= legT;   // the gels and half mirrors the camera leg crosses  // camera leg: hide_camera applies (Scene::occluded / DMaterial::hideCamera)
     Real contrib = beta * (Real)(1.0 / (4.0 * DPI)) * cosLens * (Real)DPI * (R * R) / (dist * dist);
     contrib *= (Real)1 / (Real)(cam.pixelPlaneArea() * cam.filmDist * cam.filmDist);
     contrib *= dLegTransmittance(sc, cam.enclosure.topMat(), p, wdir, (double)dist, lambda, rng);
@@ -12863,6 +12887,35 @@ __device__ static Real dTransmitSlot(const DScene& sc, const DMaterial& m, const
     if (tpOut) *tpOut = tp;                                                  // JSPEC shape
     return v * tp;
 }
+__device__ static bool dCamLegThrough(const DScene& sc, const DVec3& o, const DVec3& target, double absEps,
+                                      Real tmin, bool camLeg, const Real* lam, int n, Real* T) {
+    for (int i = 0; i < n; ++i) T[i] = (Real)1;
+    if (!occludedTo(sc, o, target, absEps, tmin, camLeg)) return true;
+    if (!sc.passThroughAny) return false;
+    const DVec3 tv = target - o;
+    const Real td = length(tv);
+    if (!(td > (Real)0)) return true;
+    const DVec3 dir = tv / td;
+    Real left = connMaxT((double)td, absEps, dMaxAbs(target));
+    if (dCrossesGrin(sc, o, dir, left)) return false;
+    DVec3 q = o;
+    Real tq = tmin;
+    for (int k = 0; k < 8; ++k) {   // CamLegPass::kMax surfaces at most
+        const DHit h = closestHit(sc, q, dir, tq, left, camLeg);
+        if (!h.valid || !(h.t < left)) return true;   // the rest of the leg is clear
+        const DMaterial& m = sc.mats[h.matId];
+        if (m.type != D_FILTER && m.type != D_HALFMIRROR) return false;
+        for (int i = 0; i < n; ++i) {
+            const Real v = m.type == D_FILTER ? dTransmitSlot(sc, m, h, lam[i])
+                                              : (Real)1 - dReflectSlot(sc, m, h, lam[i], nullptr);
+            T[i] *= v < (Real)0 ? (Real)0 : (v > (Real)1 ? (Real)1 : v);
+        }
+        q = h.p;
+        left -= h.t;
+        tq = dEpsAt(h.p);
+    }
+    return false;
+}
 
 // ---- emission slot: the two halves of `emit pattern:` on the device -----------------
 // Emission is read from BOTH sides of transport — at a hit ON an emissive surface (the
@@ -14406,12 +14459,13 @@ __device__ static void connectHero(const DScene& sc, const DCamera& cam, double*
     if (!dCamSideOk(n, ng, wdir, gs != nullptr, cosSurf)) return;   // the camera side
     int px, py; Real cosCam, dist2;
     if (!cam.project(p, px, py, cosCam, dist2)) return;
-    if (occludedTo(sc, dOffsetAlong(p, ng, wdir, reach), p + wdir * dist, 2e-6, RAY_TMIN, /*camLeg=*/true)) return;  // camera leg: hide_camera applies (Scene::occluded / DMaterial::hideCamera)
+    Real legT[hero::kHeroMax];
+    if (!dCamLegThrough(sc, dOffsetAlong(p, ng, wdir, reach), p + wdir * dist, 2e-6, RAY_TMIN, true, lam, nUp, legT)) return;  // camera leg: hide_camera applies (Scene::occluded / DMaterial::hideCamera)
     Real corr = dShadingAdjointCorr(wi, wdir, n, ng);
     double solidAngle = cam.pixelSolidAngle(cosCam);
     Real geo = cosSurf * corr / (Real)((double)dist2 * solidAngle);
     for (int i = 0; i < nUp; ++i) {
-        Real contrib = beta[i] * (gs ? gs->f(wdir, lam[i]) : rho[i] / (Real)DPI) * geo;
+        Real contrib = beta[i] * legT[i] * (gs ? gs->f(wdir, lam[i]) : rho[i] / (Real)DPI) * geo;
         if (coat) contrib *= (Real)dCoatS(coat, wdir, lam[i]);   // a coated body's way out
         contrib *= dLegTransmittance(sc, cam.enclosure.topMat(), p, wdir, (double)dist, lam[i], rng);
         filmAdd(film, hits, cam.resX, px, py, lam[i], contrib);
@@ -14446,12 +14500,13 @@ __device__ static void connectLensHero(const DScene& sc, const DCamera& cam, dou
     if (cosLens <= (Real)1e-6) return;
     int px, py;
     if (!cam.lensImage(A, wdir, px, py)) return;
-    if (occludedTo(sc, dOffsetAlong(p, ng, wdir, reach), p + wdir * dist, 2e-6, RAY_TMIN, /*camLeg=*/true)) return;  // camera leg: hide_camera applies (Scene::occluded / DMaterial::hideCamera)
+    Real legT[hero::kHeroMax];
+    if (!dCamLegThrough(sc, dOffsetAlong(p, ng, wdir, reach), p + wdir * dist, 2e-6, RAY_TMIN, true, lam, nUp, legT)) return;  // camera leg: hide_camera applies (Scene::occluded / DMaterial::hideCamera)
     Real corr = dShadingAdjointCorr(wi, wdir, n, ng);
     Real cellNorm = (Real)1 / (Real)(cam.pixelPlaneArea() * cam.filmDist * cam.filmDist);
     Real geo = cosSurf * corr * cosLens * (R * R) / (dist * dist) * cellNorm;
     for (int i = 0; i < nUp; ++i) {
-        Real contrib = beta[i] * (gs ? (Real)DPI * gs->f(wdir, lam[i]) : rho[i]) * geo;
+        Real contrib = beta[i] * legT[i] * (gs ? (Real)DPI * gs->f(wdir, lam[i]) : rho[i]) * geo;
         if (coat) contrib *= (Real)dCoatS(coat, wdir, lam[i]);   // a coated body's way out
         contrib *= dLegTransmittance(sc, cam.enclosure.topMat(), p, wdir, (double)dist, lam[i], rng);
         filmAdd(film, hits, cam.resX, px, py, lam[i], contrib);

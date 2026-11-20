@@ -322,7 +322,23 @@ act (Sysinternals `handle.exe` on the locked path, which build.bat could run whe
 exclude the build directory from the scanner if that is it, or have build.bat retry the failed step
 once; and have it say plainly, last, that ftrace.exe was NOT updated.
 
-## OPEN (2026-11-20): MODEB-PASSTHROUGH — modes A and B see nothing through a gel, and only part of what a half mirror passes
+## OPEN (2026-11-20, mostly fixed 0.451.3): MODEB-PASSTHROUGH — modes A and B see nothing through a gel, and only part of what a half mirror passes
+
+**Fixed (0.451.3) for the direct camera legs:** the forward connections -- mode B's surface, volume and
+emission splats and mode A's lens connections, single-wavelength and hero bundles, host and device -- take
+a blocked leg through `camLegPass` / `dCamLegThrough`, which walks it only when the plain any-hit test
+says blocked and the scene holds a gel or a half mirror (`Scene::passThroughAny`), and multiplies the
+splat by what each such surface passes at each wavelength. Measured, XYZ against mode R, both devices:
+behind the gel 0.000 -> 0.999-1.002; the soft-edged half mirror 0.89 / 0.94 / 1.00 -> 1.00 / 1.00 / 1.01;
+the step half mirror 0.99 / 0.98 / 0.57 -> 1.00 / 1.01 / 0.96. `tools/check_passthrough.py` holds mode B
+to mode R on all three (0.451.1 fails it: the gel 0.000 at 300 sigma). Mode A was not measured: these
+scenes' pinhole camera gives mode A, the finite-lens camera, nothing to render; its lens connections take
+the same change. **Left:** the analytic specular connections' legs -- vertex to a glass sphere or a
+mirror, and the mirror's own check that it is what the eye sees (`mirrorSeenAt`) -- still stop at a gel
+or half mirror (the device's sphere legs skip the sphere, which its closest-hit walk cannot), and the
+step half mirror's Z reads 0.96 on both devices, not yet understood.
+
+The report:
 
 Seen while finding HOST-HALFMIRROR-ANALYTIC. The forward splat modes connect each photon vertex to the
 camera along a straight leg, and the leg's visibility (Scene::occluded / shadowTransmittance, the

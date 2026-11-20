@@ -11620,6 +11620,22 @@ regressed connector shows up as black rather than as a subtle level shift. Meter
 of the same frame — mode `B` and mode `R` carry a systematic ~0.6–1 % offset everywhere, so
 the mirror-free patch, not 1.0, is the number the mirror box has to match.
 
+## Camera legs through gels and half mirrors (forward modes `A` and `B`, 0.451.3)
+
+A forward splat connects a photon vertex to the camera along a straight leg. A `filter` gel and a
+`halfmirror` pass what they pass unbent, so a leg through one is a light path carrying the gel's T(lam)
+or the mirror's 1 - R(lam). The connections (`connect`, `connectGeom`'s users, the volume, emission and
+lens connections and their hero variants; on the device `connect*`) take their leg through
+`camLegPass` (`scene.h`) / `dCamLegThrough`: the any-hit occlusion test first, as before, so a clear
+leg costs nothing more; where it is blocked and the scene holds such a material
+(`Scene::passThroughAny`, `DScene::passThroughAny`), a walk of the leg's closest hits -- camera-hidden
+surfaces skipped, a GRIN region a block -- that keeps the gels and half mirrors it crosses (8 at most)
+and stops at anything else. The host keeps the hits and evaluates their product at any wavelength
+(`CamLegPass::at`); the device, whose forward kernels' stacks cannot hold eight hit records, evaluates
+at the wavelengths its site needs. Without it the wall behind a gel rendered black in mode B
+(MODEB-PASSTHROUGH); `tools/check_passthrough.py` is the check. The analytic specular connections' legs
+(through a glass sphere, off a mirror) still stop at one.
+
 ## Glossy camera splats, and the rough interference reflector (0.401.0)
 
 **Glossy splats.** Until 0.401.0 the forward splat (`connect` and its lens / hero variants,

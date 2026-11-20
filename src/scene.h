@@ -3142,6 +3142,10 @@ struct Scene {
     // common scene — no hidden material anywhere — pays one bool test per camera ray
     // instead of a per-primitive material lookup inside the BVH leaf.
     bool camHiddenAny = false;
+    // Whether a material passes light straight through it, unbent, with a factor (a `filter` gel, a
+    // `halfmirror`): a camera leg that meets one is not blocked (camLegPass). Counted with
+    // camHiddenAny, so a scene without one pays one bool test per blocked leg.
+    bool passThroughAny = false;
     // The materials that glow with no emitter to sample them (isLight, and matHasEmitter finds
     // none): by material, the XYZ of the emission, sum over the 1 nm grid of CIE x emit -- the
     // directly viewed colour, as envXYZ is the sky's -- and {0, 0, 0} for every other material.
@@ -3599,6 +3603,9 @@ struct Scene {
         // rebuilds materials/emitters leaves the fast-path gate consistent with `mats`.
         camHiddenAny = false;
         for (const auto& m : mats) if (m.hideCamera) { camHiddenAny = true; break; }
+        passThroughAny = false;
+        for (const auto& m : mats)
+            if (m.type == MatType::Filter || m.type == MatType::HalfMirror) { passThroughAny = true; break; }
         glowXYZ.clear();
         glowAny = false;
         for (size_t i = 0; i < mats.size(); ++i) {
@@ -6643,6 +6650,55 @@ inline double transmitSlot(const Scene& scene, const Material& m,
                            const Hit& h, double lambda) {
     double v = m.transmit(lambda);
     return m.transmitPat < 0 ? v : v * slotPatMul(scene, m.transmitPat, h);
+}
+
+// A camera leg through the surfaces that pass light straight on (MODEB-PASSTHROUGH): a `filter` gel,
+// which passes T(lam), and a `halfmirror`, which passes 1 - R(lam) -- a light path the leg is, where any
+// other surface on it stops it (Scene::occluded's rule, camera-hidden surfaces skipped). `blocked`, or
+// the surfaces crossed, whose product at a wavelength is at(lam): 1 where it crosses none. The forward
+// splat modes connect each photon vertex to the camera along such a leg; one that meets nothing costs
+// the occluded() test it always did.
+struct CamLegPass {
+    static constexpr int kMax = 8;   // the most such surfaces a leg crosses; past them it is blocked
+    bool blocked = false;
+    int n = 0;
+    const Scene* scene = nullptr;
+    Hit hits[kMax];
+    double at(double lambda) const {
+        double t = 1.0;
+        for (int i = 0; i < n; ++i) {
+            const Material& m = scene->mats[(size_t)hits[i].matId];
+            const double v = m.type == MatType::Filter ? transmitSlot(*scene, m, hits[i], lambda)
+                                                       : 1.0 - reflectSlot(*scene, m, hits[i], lambda);
+            t *= v < 0.0 ? 0.0 : (v > 1.0 ? 1.0 : v);
+        }
+        return t;
+    }
+};
+// The leg o + t dir, t in [tmin, maxDist] (Scene::occluded's arguments); `camLeg`: it ends at the camera,
+// so camera-hidden surfaces are skipped (a specular connection's leg from the photon vertex is not one).
+inline CamLegPass camLegPass(const Scene& scene, const Vec3& o, const Vec3& dir, double maxDist,
+                             double tmin = Scene::kTminEps, double curveTmin = 0.0, bool camLeg = true) {
+    CamLegPass r;
+    r.scene = &scene;
+    if (!scene.occluded(o, dir, maxDist, tmin, camLeg, curveTmin)) return r;
+    if (!scene.passThroughAny || scene.crossesGrin(o, dir, maxDist)) { r.blocked = true; return r; }
+    Vec3 q = o;
+    double left = maxDist, tq = tmin, cq = curveTmin;
+    for (;;) {
+        const Hit h = scene.closestHit(Ray{q, dir, cq}, tq, nullptr, false, /*skipCamHidden=*/camLeg, left);
+        if (!h.valid || !(h.t < left)) return r;          // the rest of the leg is clear
+        const MatType t = scene.mats[(size_t)h.matId].type;
+        if ((t != MatType::Filter && t != MatType::HalfMirror) || r.n == CamLegPass::kMax) {
+            r.blocked = true;
+            return r;
+        }
+        r.hits[r.n++] = h;
+        q = h.p;
+        left -= h.t;
+        tq = scene.hitEps(h);
+        cq = 0.0;
+    }
 }
 
 // The wavelength-free factor on the radiance an emissive surface sends toward `wo` from a

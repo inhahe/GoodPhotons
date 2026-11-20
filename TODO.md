@@ -529,8 +529,10 @@ Then the rest of 4.2-4.6 in their order, 4.7's bookkeeping alongside whatever to
   LithicBackup's continuous backup copying the tree's fresh files; the local build.bat builds again on a
   held file (twice at most) and ends every failure on `[build] NOT UPDATED`; known-issues BUILD-LOCK.
 - [x] **REVIEW-0451** (0.451.1) — the Opus (max) and Fable (xhigh) reviews of 0.451.0; known-issues REVIEW-0451.
-- [ ] **MODEB-PASSTHROUGH** — modes A and B's camera legs stop at a gel (0.000 behind one) and at a half
-  mirror (what it passes is missing): cross them with T / 1 - R per wavelength, host and device; known-issues.
+- [x] **MODEB-PASSTHROUGH**, the direct legs (0.451.3) — modes A and B's camera legs cross gels and half
+  mirrors (camLegPass / dCamLegThrough); check_passthrough.
+- [ ] **MODEB-PASSTHROUGH, what is left** — the specular connections' legs (glass sphere, mirrors) through a gel
+  or half mirror, and the step half mirror's Z 0.96 in mode B; known-issues.
 - [x] **HOST-HALFMIRROR-ANALYTIC** (0.451.2) — a coin far rarer at some cell than at its peak turns mode M's
   and S's walk partial (`kCoinRare`): a half mirror falling to 1e-123 read half bright on the CPU; known-issues.
 - [ ] **SPECGATHER-CELL-CENTROID** — read each carrier cell at the emission's centroid in it, not its middle
