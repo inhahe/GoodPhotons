@@ -921,7 +921,7 @@ inline void readBody(R& rd, const std::vector<Elem>& elems, const Affine& xf, bo
                     // float colour as an 8-bit one.
                     const bool byteScale = (e.props[icr].type == PT::U8 ||
                                             e.props[icr].type == PT::I8);
-                    const double k = byteScale ? (1.0 / 255.0) : 1.0;
+                    const double colourScale = byteScale ? (1.0 / 255.0) : 1.0;
                     // sRGB -> LINEAR: vertex colours are authored/scanned in display
                     // space, and every other colour in ftrace is linear by the time it
                     // reaches a material. Skipping this is what makes an imported scan
@@ -931,8 +931,8 @@ inline void readBody(R& rd, const std::vector<Elem>& elems, const Affine& xf, bo
                         return (c <= 0.04045) ? c / 12.92
                                               : std::pow((c + 0.055) / 1.055, 2.4);
                     };
-                    colors.push_back(Vec3{lin(vals[icr] * k), lin(vals[icg] * k),
-                                          lin(vals[icb] * k)});
+                    colors.push_back(Vec3{lin(vals[icr] * colourScale), lin(vals[icg] * colourScale),
+                                          lin(vals[icb] * colourScale)});
                 }
             } else if (wantFace) {
                 for (size_t j = 1; j + 1 < poly.size(); ++j)

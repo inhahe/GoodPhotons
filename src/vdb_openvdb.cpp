@@ -19,8 +19,6 @@
 // (io/Archive.cc, io/Compression.h/.cc, io/GridDescriptor.cc, tree/{Root,Internal,
 // Leaf}Node.h, math/{Transform,Maps}); see the C4 notes in TODO.md.
 
-#define _CRT_SECURE_NO_WARNINGS
-
 #include "vdbgrid.h"
 #include "assetbytes.h"
 

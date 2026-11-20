@@ -1229,7 +1229,7 @@ static BOOL CALLBACK setFontProc(HWND c, LPARAM f) {
 // readable, is re-made at the new DPI: font, row heights, cell widths, then laid out again.
 void LiveWindow::Impl::onDpiChanged(HWND h, int newDpi, const RECT* sug) {
     RECT cr; GetClientRect(h, &cr);
-    const int cw = cr.right - cr.left, imgH = (cr.bottom - cr.top) - panelH;
+    const int cw = cr.right - cr.left, clientImgH = (cr.bottom - cr.top) - panelH;
     dpiNow.store(newDpi);
     if (hasPanel.load()) {
         HFONT old = ownFont;
@@ -1240,8 +1240,8 @@ void LiveWindow::Impl::onDpiChanged(HWND h, int newDpi, const RECT* sug) {
         panelBaseH = px(kPanelH) + (hasBindRow.load() ? px(kRowH) : 0);
         panelH     = panelBaseH + ndStripH(cw);
     }
-    if (!IsIconic(h) && sug && imgH > 0) {
-        RECT r{0, 0, cw, imgH + panelH};
+    if (!IsIconic(h) && sug && clientImgH > 0) {
+        RECT r{0, 0, cw, clientImgH + panelH};
         AdjustWindowRectExForDpi(&r, WS_OVERLAPPEDWINDOW, FALSE, 0, (UINT)newDpi);
         SetWindowPos(h, nullptr, sug->left, sug->top, r.right - r.left, r.bottom - r.top,
                      SWP_NOZORDER | SWP_NOACTIVATE);

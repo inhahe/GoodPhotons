@@ -533,8 +533,8 @@ struct Camera {
             if (pick == LENS_PICK_NONE) return false;
             Vec3 d0;
             if (pick == LENS_PICK_UNAIMED) {
-                double w;
-                if (!L.rearDir(pFilm, v1, u2, d0, w)) return false;
+                double rearW;
+                if (!L.rearDir(pFilm, v1, u2, d0, rearW)) return false;
             } else {
                 d0 = P->exit.sample(ce, cphi, sphi, v1, u2) - pFilm;
                 const double r = length(d0);
@@ -553,10 +553,10 @@ struct Camera {
             // when curved, since a disc in the plane would miss the rays crossing the cap outside
             // its shadow; its disk when planar, with PBRT's cos^4 A / Z^2 importance.
             Vec3 d0;
-            double w = 0.0;
-            if (!L.rearDir(pFilm, u1, u2, d0, w)) return false;
+            double rearW = 0.0;
+            if (!L.rearDir(pFilm, u1, u2, d0, rearW)) return false;
             if (!L.trace(pFilm, d0, lambda, /*sensorToScene=*/true, outLocal)) return false;
-            weight = w;
+            weight = rearW;
         }
         // Lens-local (mm) -> world. The front-surface vertex plane is pinned at `eye`;
         // transverse offsets and the axial (z-T) offset convert mm -> scene metres.

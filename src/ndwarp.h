@@ -1198,7 +1198,7 @@ inline Stats apply(const Model& m, const Config& cfg, Scene& s, Cache* cache = n
 
 // A one-line "you cannot see this yet" note for the dimensions in Stats::edgeOn, or an
 // empty string when everything filled is visible.
-inline std::string edgeOnNote(const Stats& st, int n) {
+inline std::string edgeOnNote(const Stats& st) {
     if (st.edgeOn.empty()) return "";
     std::string names;
     for (size_t i = 0; i < st.edgeOn.size(); ++i) {

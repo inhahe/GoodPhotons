@@ -3953,7 +3953,7 @@ struct Renderer {
             // Model A perspective catch: if the photon flies through the aperture
             // (nearer than the surface AND any fog collision), it lands on the film.
             if (forwardCatch && nCam > 0 && cams[0].cam && cams[0].film) {
-                int px, py;
+                int px = 0, py = 0;   // set by every catch that reports one (lensImage, lensFilmToPixel)
                 const Camera& cc = *cams[0].cam;
                 // A physical lens catches what enters its front element and comes out on the
                 // sensor, and absorbs what enters and is clipped inside (lensCatch); a thin

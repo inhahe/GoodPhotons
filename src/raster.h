@@ -1719,7 +1719,7 @@ inline EdgeFn makeEdge(double Px, double Py, double Qx, double Qy, double s) {
 // Only geometry/albedo is stored here — shading is deferred to a single later pass so
 // each covered pixel is shaded exactly once regardless of overdraw. Attributes are
 // interpolated perspective-correctly via invd.
-inline void fillTriangleG(const STri& t, int W, int H, int y0, int y1, GBuffer& g,
+inline void fillTriangleG(const STri& t, int W, int y0, int y1, GBuffer& g,
                           const PTri* srcTris = nullptr) {
     const VtxScreen& A = t.v0; const VtxScreen& B = t.v1; const VtxScreen& C = t.v2;
     double minx = std::floor(std::min({A.sx, B.sx, C.sx}));
@@ -2393,7 +2393,7 @@ inline std::vector<uint8_t> renderFrame(const PreviewGeom& geom, const Camera& c
     std::vector<STri>& stris = S.stris;
     stris.clear();                               // keeps capacity across frames
     {
-        int pT = std::min<int>(nThreads, std::max<size_t>(1, tris.size()));
+        int pT = (int)std::min<size_t>((size_t)std::max(nThreads, 0), std::max<size_t>(1, tris.size()));
         if (pT <= 1 || !pool) {
             stris.reserve(tris.size());
             projectRange(0, tris.size(), stris);
@@ -2479,7 +2479,7 @@ inline std::vector<uint8_t> renderFrame(const PreviewGeom& geom, const Camera& c
         for (const STri& s : stris) {
             if (s.iy1 < y0 || s.iy0 >= y1) continue;   // triangle can't touch this band
             if (seeThrough && s.clear) continue;       // clear surfaces handled in Pass 2b
-            fillTriangleG(s, W, H, y0, y1, g, tris.data());
+            fillTriangleG(s, W, y0, y1, g, tris.data());
         }
     });
 

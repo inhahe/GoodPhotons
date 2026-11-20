@@ -287,15 +287,15 @@ struct Bvh {
     // hot path. Each parallel task therefore polls on its own schedule, which changes only how
     // fast a `-stop` lands, never the tree: when nothing stops, the flag is never read true.
     int buildRange(std::vector<BuildPrim>& bp, int start, int end,
-                   std::vector<BvhNode>& nodes, unsigned& m_pollTick, BuildCtx& ctx) {
-        int nodeIdx = (int)nodes.size();
-        nodes.push_back(BvhNode{});
+                   std::vector<BvhNode>& outNodes, unsigned& m_pollTick, BuildCtx& ctx) {
+        int nodeIdx = (int)outNodes.size();
+        outNodes.push_back(BvhNode{});
         Aabb bounds, cbounds;
         for (int i = start; i < end; ++i) { bounds.expand(bp[i].box); cbounds.expand(bp[i].centroid); }
         int count = end - start;
 
         auto makeLeaf = [&]() {
-            BvhNode& node = nodes[nodeIdx];
+            BvhNode& node = outNodes[nodeIdx];
             node.box = bounds; node.first = start; node.count = count; node.left = node.right = -1;
         };
         if (count <= LEAF_SIZE) { makeLeaf(); return nodeIdx; }
@@ -413,16 +413,16 @@ struct Bvh {
             buildRange(bp, midIdx, end, rbuf, rt, ctx);
             th.join();
             ctx.budget.fetch_add(1, std::memory_order_relaxed);
-            // `nodes` still holds exactly this parent as its last element, so the two bases
+            // `outNodes` still holds exactly this parent as its last element, so the two bases
             // below are the same positions the sequential build would have used.
-            l = (int)nodes.size(); appendRemap(nodes, lbuf);
-            r = (int)nodes.size(); appendRemap(nodes, rbuf);
+            l = (int)outNodes.size(); appendRemap(outNodes, lbuf);
+            r = (int)outNodes.size(); appendRemap(outNodes, rbuf);
         } else {
-            l = buildRange(bp, start, midIdx, nodes, m_pollTick, ctx);
-            r = buildRange(bp, midIdx, end, nodes, m_pollTick, ctx);
+            l = buildRange(bp, start, midIdx, outNodes, m_pollTick, ctx);
+            r = buildRange(bp, midIdx, end, outNodes, m_pollTick, ctx);
         }
-        // nodes may have reallocated during recursion; index by nodeIdx.
-        BvhNode& node = nodes[nodeIdx];
+        // outNodes may have reallocated during recursion; index by nodeIdx.
+        BvhNode& node = outNodes[nodeIdx];
         node.box = bounds; node.left = l; node.right = r; node.count = 0;
         return nodeIdx;
     }

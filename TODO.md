@@ -521,8 +521,9 @@ Then the rest of 4.2-4.6 in their order, 4.7's bookkeeping alongside whatever to
 - [x] **J-SURF-GATHER-DIVERGENCE** (0.450.37) — mode J's queued surface gather tests a photon a lane and weighs
   32 at a time (dSiteListWarp): at five times the radius its gather 33 % faster, at its own unchanged
   (its sites hold a warp's worth of photons or fewer); known-issues.
-- [ ] **SHADOW-WARNINGS** — 31 MSVC C4456 shadowing warnings (main.cpp, lens.h, mesh.h): rename each inner
-  declaration, then make C4456 an error; known-issues.
+- [x] **SHADOW-WARNINGS** (0.450.39) — 34 hidden names renamed or removed, 3 dead parameters, the narrowings
+  explicit; hiding (C4456-C4459) and C4701 are errors; a full build prints only nvcc's stub's four
+  warnings; known-issues.
 - [x] **VCM-LOBE-FP32** (0.450.34) — the merges' lobe takes its GGX pair in the device's precision
   (DMergeLobe), connections keep double: the gather's FP64 pipe 69 -> 24 % busy, the 640x480 bowl's
   render 12 % faster, its images double's to 4e-5 a pixel; known-issues.

@@ -3069,15 +3069,15 @@ static bool checkLensPhysicalOne(const char* preset, LensSystem L, LensShareTall
                 s[which] += v; s2[which] += v * v; ++hit[which];
             }
         }
-        double m[2], se[2];
+        double m[2], sem[2];
         for (int i = 0; i < 2; ++i) {
             m[i] = s[i] / n;
-            se[i] = std::sqrt(std::max(0.0, s2[i] / n - m[i] * m[i]) / n);
+            sem[i] = std::sqrt(std::max(0.0, s2[i] / n - m[i] * m[i]) / n);
         }
-        const double z6 = std::fabs(m[0] - m[1]) / std::max(std::sqrt(se[0] * se[0] + se[1] * se[1]), 1e-300);
+        const double z6 = std::fabs(m[0] - m[1]) / std::max(std::sqrt(sem[0] * sem[0] + sem[1] * sem[1]), 1e-300);
         std::printf("[checklens] %s: point at %g m (%.2f, %.2f): solid angle aimed %.4e +- %.1e, front "
                     "%.4e +- %.1e (%.1f sigma); hit rate aimed %.1f%%, front %.1f%%\n",
-                    preset, range, pt[1], pt[2], m[0], se[0], m[1], se[1], z6,
+                    preset, range, pt[1], pt[2], m[0], sem[0], m[1], sem[1], z6,
                     100.0 * hit[0] / n, 100.0 * hit[1] / n);
         pass = pass && (hit[0] + hit[1] == 0 || z6 < 4.0);
     }
@@ -3165,15 +3165,15 @@ static bool checkLensPhysicalOne(const char* preset, LensSystem L, LensShareTall
                 s[which] += wgt; s2[which] += wgt * wgt; ++hit[which];
             }
         }
-        double m[2], se[2];
+        double m[2], sem[2];
         for (int i = 0; i < 2; ++i) {
             m[i] = s[i] / n;
-            se[i] = std::sqrt(std::max(0.0, s2[i] / n - m[i] * m[i]) / n);
+            sem[i] = std::sqrt(std::max(0.0, s2[i] / n - m[i] * m[i]) / n);
         }
-        const double z9 = std::fabs(m[0] - m[1]) / std::max(std::sqrt(se[0] * se[0] + se[1] * se[1]), 1e-300);
+        const double z9 = std::fabs(m[0] - m[1]) / std::max(std::sqrt(sem[0] * sem[0] + sem[1] * sem[1]), 1e-300);
         std::printf("[checklens] %s: film pixel (%d, %d): importance aimed %.5e +- %.1e, unaimed %.5e "
                     "+- %.1e (%.1f sigma); rays out aimed %.1f%%, unaimed %.1f%%\n",
-                    preset, px, py, m[0], se[0], m[1], se[1], z9, 100.0 * hit[0] / n, 100.0 * hit[1] / n);
+                    preset, px, py, m[0], sem[0], m[1], sem[1], z9, 100.0 * hit[0] / n, 100.0 * hit[1] / n);
         pass = pass && (hit[0] + hit[1] == 0 || z9 < 4.0);
     }
     // (9b) What the defensive share (lens.h kLensDefensive) is for: a table that misses. The
@@ -3695,8 +3695,8 @@ static bool checkPatternNudge() {
             "camera \"c\" { eye 0 2 3  look_at 0 0 0  up 0 1 0  fov_y 40  film { res 8 8 } }\n",
             "<checkpatops>", L, e);
         bool lightOk = false;
-        for (const Emitter& em : L.scene.emitters)
-            if (em.shape == EmitterShape::Sphere) lightOk = em.radius == 0.1;
+        for (const Emitter& lightEm : L.scene.emitters)
+            if (lightEm.shape == EmitterShape::Sphere) lightOk = lightEm.radius == 0.1;
         bool sphereOk = false;
         for (const Sphere& s : L.scene.spheres) sphereOk = sphereOk || s.r == 0.5;
         if (!loaded || !lightOk || !sphereOk) negBad = 1;
@@ -3716,11 +3716,11 @@ static bool checkPatternNudge() {
         sl.addMeshLight(0, 2, constantSpectrum(1.0), 1.0, -1);
         if (sl.emitters.size() != 1) patchBad = 1;
         else {
-            Emitter& em = sl.emitters[0];
-            em.emitPat = 0;
+            Emitter& meshEm = sl.emitters[0];
+            meshEm.emitPat = 0;
             for (int k = 0; k < 16; ++k) {                      // u1 < 0.5 draws the near triangle
                 Vec3 y, nOut;
-                const double pm = emitterSamplePoint(sl, em, 0.03 * (k + 0.5), (k % 4 + 0.5) / 4.0, y, nOut);
+                const double pm = emitterSamplePoint(sl, meshEm, 0.03 * (k + 0.5), (k % 4 + 0.5) / 4.0, y, nOut);
                 Hit h;
                 if (!intersectTri(Ray{y + Vec3(0, 1, 0), Vec3(0, -1, 0)}, sl.tris[0], 1e-9, h)) { ++patchBad; continue; }
                 ++patchN;
@@ -5737,12 +5737,12 @@ static int checkUpsample() {
         //     cannot pass by coincidence.
         {
             Spectrum s;
-            const double R = 0.2, G = 0.5, B = 0.9;
+            const double kR = 0.2, kG = 0.5, kB = 0.9;
             if (probeReflect("upsample \"m\" { expr \"r*1 + g*10 + b*100 + w*0.001\" }\n"
                              "material \"probe\" { type diffuse  reflect rgb:m 0.2 0.5 0.9 }", s)) {
                 bool okc = true;
                 for (double w : lams)
-                    okc = okc && std::fabs(s(w) - (R + G * 10 + B * 100 + w * 0.001)) < 1e-9;
+                    okc = okc && std::fabs(s(w) - (kR + kG * 10 + kB * 100 + w * 0.001)) < 1e-9;
                 uchk("r,g,b,w each reach their own slot", okc);
             } else passH = false;
         }
@@ -5791,7 +5791,7 @@ static int checkUpsample() {
         //     valid across several resolved indices (it is append-only for exactly this).
         {
             Spectrum s;
-            const double R = 0.3, G = 0.6, B = 0.1;
+            const double kR = 0.3, kG = 0.6, kB = 0.1;
             if (probeReflect("spectrum \"sr\" = gaussian center=620 sigma=40 amp=1\n"
                              "spectrum \"sg\" = gaussian center=540 sigma=40 amp=1\n"
                              "spectrum \"sb\" = gaussian center=460 sigma=40 amp=1\n"
@@ -5800,7 +5800,7 @@ static int checkUpsample() {
                 bool okc = true;
                 for (double w : lams) {
                     auto gau = [&](double c0) { double t = (w - c0) / 40.0; return std::exp(-0.5 * t * t); };
-                    okc = okc && std::fabs(s(w) - (R * gau(620) + G * gau(540) + B * gau(460))) < 1e-9;
+                    okc = okc && std::fabs(s(w) - (kR * gau(620) + kG * gau(540) + kB * gau(460))) < 1e-9;
                 }
                 uchk("three-spectrum measured basis matches by hand", okc);
             } else passH = false;
@@ -8017,7 +8017,7 @@ static int checkStochTile() {
     // 48^3 linear gives mean |dR| 1.0e-2 / worst 2.4e-2 on the lichen asset, vs 1.4e-4 /
     // 4.3e-3 warped), so half the samples below are pushed hard toward zero.
     {
-        const float* lut = upsample::coeffLut().data();
+        const float* coeffLut = upsample::coeffLut().data();
         const upsample::Basis& B = upsample::basis();
         auto xyzErr = [&](const double* c, double r, double g, double b) {
             double tX, tY, tZ; upsample::linSrgbToXyz(r, g, b, tX, tY, tZ);
@@ -8042,7 +8042,7 @@ static int checkStochTile() {
             auto pick = [&]() { const double x = frand(); return dark ? x * x * x : x; };
             const double r = pick(), g = pick(), b = pick();
             double c[3];
-            stochJhCoeff(lut, r, g, b, c);
+            stochJhCoeff(coeffLut, r, g, b, c);
             const double eL = xyzErr(c, r, g, b), eF = fitErr(r, g, b);
             if (eL > wL) { wL = eL; wr = r; wg = g; wb = b; }
             wF = std::max(wF, eF); sL += eL; sF += eF; ++n8;
@@ -8067,7 +8067,7 @@ static int checkStochTile() {
                     const double gb = (double)k / (STOCH_JH_N - 1);
                     const double r = gr * gr, g = gg * gg, b = gb * gb;
                     double c[3];
-                    stochJhCoeff(lut, r, g, b, c);
+                    stochJhCoeff(coeffLut, r, g, b, c);
                     nodeGap = std::max(nodeGap, xyzErr(c, r, g, b) - fitErr(r, g, b));
                 }
         std::printf("[checkstochtile] S8 grid-node error above the fitter = %.3g\n", nodeGap);
@@ -8329,15 +8329,15 @@ static int checkHair() {
 
         double worstQ = 0.0;
         for (double s : {0.05, 0.3}) {
-            const int N = 200000;
+            const int nQ = 200000;
             const double q = 0.4;                     // an arbitrary interior point
             int below = 0;
-            for (int i = 0; i < N; ++i)
+            for (int i = 0; i < nQ; ++i)
                 if (hair::sampleTrimmedLogistic(frand(), s, -hair::kPi, hair::kPi) < q) ++below;
             const double wantF = (hair::logisticCdf(q, s) - hair::logisticCdf(-hair::kPi, s)) /
                                  (hair::logisticCdf(hair::kPi, s) -
                                   hair::logisticCdf(-hair::kPi, s));
-            worstQ = std::max(worstQ, std::fabs((double)below / N - wantF));
+            worstQ = std::max(worstQ, std::fabs((double)below / nQ - wantF));
         }
         std::printf("[checkhair] S4 trimmed-logistic sampler CDF error = %.4f\n", worstQ);
         ok &= want("S4 the trimmed-logistic sampler does not match its CDF", worstQ < 0.01);
@@ -10912,7 +10912,7 @@ static int checkMeshFormats() {
         double d = 0.5; unsigned char b8[8]; std::memcpy(b8,&d,8);
         for (int i=0;i<8;++i) plyNoisy.push_back((char)b8[i]);          // opacity (f64)
         putF32(plyNoisy,(float)c[0],false);                             // x
-        plyNoisy.push_back((char)200);                                  // red (u8)
+        plyNoisy.push_back('\xC8');                                     // red (u8): 200
         putF32(plyNoisy,(float)c[1],false);                             // y
         plyNoisy.push_back((char)1); plyNoisy.push_back((char)0);       // junk (i16)
         putF32(plyNoisy,(float)c[2],false);                             // z
@@ -17967,7 +17967,6 @@ static int runStopCommand(const char* who) {
 
     while (!pending.empty() && std::chrono::steady_clock::now() < deadline) {
         std::this_thread::sleep_for(std::chrono::milliseconds(250));
-        std::error_code ec;
         std::vector<long> still;
         for (long pid : pending) {
             if (stopTargetGone(pid, dir)) continue;
@@ -22922,8 +22921,6 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
         // the largest current radius, and gathers on the device. Pinhole cameras only (dGenRay)
         // and the photon-map-supported scene scope; anything else falls through to the CPU.
         {
-            const bool wantGpu  = !std::strcmp(device, "gpu");
-            const bool wantAuto = !std::strcmp(device, "auto");
             if ((wantGpu || wantAuto) && !cam.hasLens() &&
                 (!cam.seesMotion(scene) || !cudaBlurUnsupported(scene, cam, 'S')) &&
                 cudaAvailable() && cudaSppmSupported(scene) && vramAffords('S')) {
@@ -23022,8 +23019,6 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
         // emission/NEE/connection/merge. Pinhole cameras only and
         // the BDPT-supported, media-free scene scope; anything else falls through to the CPU.
         {
-            const bool wantGpu  = !std::strcmp(device, "gpu");
-            const bool wantAuto = !std::strcmp(device, "auto");
             if ((wantGpu || wantAuto) && !cam.hasLens() &&
                 (!cam.seesMotion(scene) || !cudaBlurUnsupported(scene, cam, 'U')) &&
                 cudaAvailable() && cudaVcmSupported(scene) && vramAffords('U')) {
@@ -25289,10 +25284,10 @@ static int run(int argc, char** argv) {
         // 48) WITH the deposit split; `-volcache off` = off. `-volcache-sh auto|on|off` picks the
         // reconstruction. These set vccfg::* and win over the FTRACE_VOLCACHE* environment.
         else if (!std::strcmp(argv[i], "-volcache")) {
-            int res = 48;
-            if (i + 1 < argc && (!std::strcmp(argv[i + 1], "off") || !std::strcmp(argv[i + 1], "0"))) { res = 0; ++i; }
-            else if (i + 1 < argc && std::atoi(argv[i + 1]) > 0) { res = std::atoi(argv[++i]); }
-            vccfg::res = res; vccfg::split = res > 0 ? 1 : 0;
+            int vcRes = 48;
+            if (i + 1 < argc && (!std::strcmp(argv[i + 1], "off") || !std::strcmp(argv[i + 1], "0"))) { vcRes = 0; ++i; }
+            else if (i + 1 < argc && std::atoi(argv[i + 1]) > 0) { vcRes = std::atoi(argv[++i]); }
+            vccfg::res = vcRes; vccfg::split = vcRes > 0 ? 1 : 0;
         }
         else if (!std::strcmp(argv[i], "-volcache-sh") && i + 1 < argc) {
             const char* v = argv[++i];
@@ -25978,7 +25973,7 @@ static int run(int argc, char** argv) {
         // an extrusion in that state loses every side wall to the degenerate cull — which
         // reads as "extrude did nothing" unless it is said plainly.
         {
-            const std::string eo = ndwarp::edgeOnNote(st, ndCfg.n);
+            const std::string eo = ndwarp::edgeOnNote(st);
             if (!eo.empty()) std::printf("[nd] %s\n", eo.c_str());
         }
         if (st.linear) {
@@ -26292,7 +26287,8 @@ static int run(int argc, char** argv) {
             const Implicit& im = scene.implicits[k];
             std::string name = im.name.empty() ? ("isosurface_" + std::to_string(k)) : im.name;
             const PatTables tabs = scene.patTables();
-            airtight::Report r = airtight::check(im, airtightRays, 0x9E3779B97F4A7C15ull + k, &tabs);
+            // The seed is 32-bit: the golden-ratio constant's low half, a different one for each surface.
+            airtight::Report r = airtight::check(im, airtightRays, (unsigned)(0x9E3779B97F4A7C15ull + k), &tabs);
             bool glass = dielectric(im.matId);
             if (r.degenerate) {
                 std::printf("  [SKIP] \"%s\"  degenerate/unbounded container — no valid chords\n",
@@ -26784,9 +26780,9 @@ static int run(int argc, char** argv) {
             // is the separate issue #1). No effect outside absolute EV (auto-exposure's
             // p99 anchor cancels any uniform aperture scale anyway).
             if (scene.absolute && cmode == 'B' && c.lensF > 0.0 && c.apertureR > 0.0 && !c.hasLens()) {
-                double N = c.lensF / (2.0 * c.apertureR);           // f-number = focal / (2·apertureR)
-                if (N > 0.0) {
-                    double camEq = (PI / 4.0) / (N * N);            // (π/4)/N² image-side irradiance factor
+                double fNum = c.lensF / (2.0 * c.apertureR);           // f-number = focal / (2·apertureR)
+                if (fNum > 0.0) {
+                    double camEq = (PI / 4.0) / (fNum * fNum);            // (π/4)/fNum² image-side irradiance factor
                     // A lens its keys rack (CameraPose::lensKeyed) over an open shutter: the factor's
                     // mean over the shutter, as the exposure averages it (64 stratified times).
                     if (c.timed() && c.moves() && c.motion->keys[0].lensKeyed) {
@@ -27480,9 +27476,9 @@ static int run(int argc, char** argv) {
         for (const auto& [g, cams] : meterPlan) {
             if (cams.empty()) continue;
             const bool adaptive = meterAdaptive.count(g) != 0;
-            const int  N   = (int)cams.size();
-            const int  kmx = adaptive ? std::min(N, kMeterMax) : N;
-            const int  kmn = adaptive ? std::min(N, kMeterMin) : N;
+            const int  nCams   = (int)cams.size();
+            const int  kmx = adaptive ? std::min(nCams, kMeterMax) : nCams;
+            const int  kmn = adaptive ? std::min(nCams, kMeterMin) : nCams;
             MeterConverge conv(kmn, kmx, kMeterTolStops);
             for (const auto& mc : cams) {
                 if (g_liveWin && g_liveWin->closed()) { raiseStop(); break; }
@@ -27515,7 +27511,7 @@ static int run(int argc, char** argv) {
                 expAnchors[g] = conv.anchor();
                 if (adaptive)
                     std::printf("[raster] exposure lock: group %d meters the average of %d/%d "
-                                "frames (anchor %.4g)\n", g, conv.used(), N, expAnchors[g]);
+                                "frames (anchor %.4g)\n", g, conv.used(), nCams, expAnchors[g]);
                 else
                     std::printf("[raster] exposure lock: group %d meters '%s' (anchor %.4g)\n",
                                 g, cams.front().name.c_str(), expAnchors[g]);
@@ -28985,7 +28981,7 @@ static int run(int argc, char** argv) {
                 }
                 // The edge-on note matters most HERE: in the viewer the user has just
                 // dragged a slider and is looking for the change it made.
-                const std::string eo = ndwarp::edgeOnNote(ndLastStats, ndCfg.n);
+                const std::string eo = ndwarp::edgeOnNote(ndLastStats);
                 if (!eo.empty()) line += "  |  " + eo;
                 return line;
             };
@@ -29621,7 +29617,7 @@ static int run(int argc, char** argv) {
                         renderBackward(scene, c, VW, VH, 1, nThreads, /*diffraction*/false,
                                        /*sampleBase*/(unsigned long long)wPass,
                                        /*forceWhitted*/true, &wFilm, y0, y1);
-                        double secs = std::chrono::duration<double>(clock::now() - t0).count();
+                        double bandSecs = std::chrono::duration<double>(clock::now() - t0).count();
                         // Tone-map JUST this band, with the pose's locked anchor, and splice it
                         // into the shown image over the coarse pixels it replaces. N is the pass
                         // count these rows have received, not the frame's -- rows further down are
@@ -29642,8 +29638,8 @@ static int run(int argc, char** argv) {
                         // Retune for the next band. Clamped below at 1 row (a heavy scene must
                         // still make progress) and above at 1/4 of the frame (so an easy scene
                         // does not swallow the whole image in one unresponsive gulp).
-                        if (secs > 1e-4) {
-                            double scale = kWBandSec / secs;
+                        if (bandSecs > 1e-4) {
+                            double scale = kWBandSec / bandSecs;
                             wBandRows = (int)std::clamp((double)wBandRows * scale, 1.0,
                                                         std::max(1.0, VH / 4.0));
                         }
@@ -29714,17 +29710,17 @@ static int run(int argc, char** argv) {
                             traceDirty = false;
                         }
                         if (backwardRGBSessionSamples(traceSess) < kTraceCapSpp) {
-                            long long spp = backwardRGBSessionAccumulate(traceSess, kTraceBatchSpp, /*diffraction*/false);
+                            long long traceSpp = backwardRGBSessionAccumulate(traceSess, kTraceBatchSpp, /*diffraction*/false);
                             backwardRGBSessionDownload(traceSess, traceFilm);
-                            std::vector<uint8_t> img = filmToRgb8(traceFilm, (double)spp, ev,
+                            std::vector<uint8_t> img = filmToRgb8(traceFilm, (double)traceSpp, ev,
                                                                   scene.absolute, &traceAnchor);
                             drawOverlay(c, VW, VH, img);
                             g_liveWin->update(VW, VH, img);
                             g_windowBackend = gpuBackend;   // the PV_PT session is a CUDA one
                             g_windowMode    = exploreMode ? "explore (path-trace)" : "raster preview (path-trace)";
                             setLiveTitle("path-trace " +
-                                                std::to_string(spp) + " spp  eye(" + fmt3(eye) + ")");
-                            tracingNow = (spp < kTraceCapSpp);   // more to refine -> keep spinning
+                                                std::to_string(traceSpp) + " spp  eye(" + fmt3(eye) + ")");
+                            tracingNow = (traceSpp < kTraceCapSpp);   // more to refine -> keep spinning
                         }
                     }
                 }
@@ -30154,9 +30150,9 @@ static int run(int argc, char** argv) {
     for (const auto& [g, cams] : meterPlan) {
         if (cams.empty() || g_stopRequested) continue;
         const bool adaptive = meterAdaptive.count(g) != 0;
-        const int  N   = (int)cams.size();
-        const int  kmx = adaptive ? std::min(N, kMeterMax) : N;
-        const int  kmn = adaptive ? std::min(N, kMeterMin) : N;
+        const int  nCams   = (int)cams.size();
+        const int  kmx = adaptive ? std::min(nCams, kMeterMax) : nCams;
+        const int  kmn = adaptive ? std::min(nCams, kMeterMin) : nCams;
         MeterConverge conv(kmn, kmx, kMeterTolStops);
         bool metered = false;
 #ifdef HAVE_CUDA
@@ -30262,7 +30258,7 @@ static int run(int argc, char** argv) {
             expAnchors[g] = conv.anchor();
             if (adaptive)
                 std::printf("[meter] exposure lock: group %d meters the average of %d/%d frame(s) "
-                            "(anchor %.4g)\n", g, conv.used(), N, expAnchors[g]);
+                            "(anchor %.4g)\n", g, conv.used(), nCams, expAnchors[g]);
             else
                 std::printf("[meter] exposure lock: group %d meters '%s' (anchor %.4g)\n",
                             g, cams.front().name.c_str(), expAnchors[g]);
@@ -32032,8 +32028,8 @@ static int runDenoiseShot(int argc, char** argv, int at) {
         // The denoised frame must not land on the render it is made from.
         const auto same = [](const std::string& a, const std::string& b) {
             std::error_code ec;
-            std::wstring x = std::filesystem::absolute(std::filesystem::u8path(a), ec).lexically_normal().wstring();
-            std::wstring y = std::filesystem::absolute(std::filesystem::u8path(b), ec).lexically_normal().wstring();
+            std::wstring x = std::filesystem::absolute(assetbytes::toPath(a), ec).lexically_normal().wstring();
+            std::wstring y = std::filesystem::absolute(assetbytes::toPath(b), ec).lexically_normal().wstring();
 #ifdef _WIN32
             for (std::wstring* z : {&x, &y})
                 for (wchar_t& c : *z) c = (wchar_t)::towlower((wint_t)c);
@@ -32047,7 +32043,7 @@ static int runDenoiseShot(int argc, char** argv, int at) {
         }
         {
             std::error_code ec;
-            const std::filesystem::path dir = std::filesystem::u8path(out).parent_path();
+            const std::filesystem::path dir = assetbytes::toPath(out).parent_path();
             if (!dir.empty()) std::filesystem::create_directories(dir, ec);
         }
         const std::string stem = pfmPathFor(in).substr(0, pfmPathFor(in).size() - 4);
@@ -32100,7 +32096,7 @@ static int runDenoiseShot(int argc, char** argv, int at) {
                 // Guides traced through a physical lens carry its pupil's noise (writeGuideFiles'
                 // marker says so), and OIDN must not take them for clean.
                 std::error_code ec;
-                const bool clean = !std::filesystem::exists(std::filesystem::u8path(stem + ".guides-noisy.txt"), ec);
+                const bool clean = !std::filesystem::exists(assetbytes::toPath(stem + ".guides-noisy.txt"), ec);
                 ok = oidnrt::denoise(col.data(), alb.data(), nrm.data(), w, h, clean, /*auxKey*/0, g_oidnOpts, err);
             }
 #ifdef HAVE_OPTIX

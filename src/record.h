@@ -119,7 +119,7 @@ inline int recLocate(const RecChannel& ch, double d, double& t) {
 // Fritsch-Carlson monotone cubic Hermite tangent for interior/endpoint node k given
 // per-interval secant slopes. `sec[j]` is the slope of interval [j, j+1] (length
 // n-1). Guarantees no overshoot / monotonicity-preservation.
-inline double recFCTangent(const double* pos, const double* val, const double* sec,
+inline double recFCTangent(const double* pos, const double* sec,
                            int n, int k) {
     if (k == 0)     return sec[0];
     if (k == n - 1) return sec[n - 2];
@@ -164,8 +164,8 @@ inline double recSampleScalar(const Record& rec, const RecChannel& ch,
         sec[k] = (h > 1e-12) ? (vs[k + 1] - vs[k]) / h : 0.0;
     }
     if (i > m - 2) i = m - 2;
-    double mk  = recFCTangent(ps, vs, sec, m, i);
-    double mk1 = recFCTangent(ps, vs, sec, m, i + 1);
+    double mk  = recFCTangent(ps, sec, m, i);
+    double mk1 = recFCTangent(ps, sec, m, i + 1);
     double h   = ps[i + 1] - ps[i];
     double t2 = t * t, t3 = t2 * t;
     double h00 =  2 * t3 - 3 * t2 + 1;

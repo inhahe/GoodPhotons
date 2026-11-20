@@ -1,6 +1,5 @@
 // FBX mesh loader implementation — confines the vendored ufbx library to this one
 // translation unit (see src/fbx.h for the rationale and the public signature).
-#define _CRT_SECURE_NO_WARNINGS   // assetbytes.h reads files with plain C stdio
 #include "fbx.h"
 #include "scene.h"
 #include "geometry.h"

@@ -13,8 +13,6 @@
 // four points and inverting, so any affine map (including rotation/shear) is
 // handled and the CPU/GPU trilinear samplers stay NanoVDB-agnostic.
 
-#define _CRT_SECURE_NO_WARNINGS   // std::fopen etc. (single-TU loader, plain C stdio)
-
 // NanoVDB is a large third-party template header; silence its warnings locally so
 // the renderer's /W4 stays clean without polluting the vendored file.
 #if defined(_MSC_VER)

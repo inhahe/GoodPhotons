@@ -3263,7 +3263,9 @@ void cudaSetSunAim(const double* wxyz, const double* r, int n, double sumR2, dou
         throw std::logic_error("cudaSetSunAim: " + std::to_string(n) + " targets exceed the "
                                "device's " + std::to_string(SUNAIM_MAX));
     }
-    g_sunAimWHost.assign(wxyz, wxyz + 3 * (size_t)(n > 0 ? n : 0));
+    // The directions in the device's precision (gpu::Real), the radii in double.
+    g_sunAimWHost.resize(3 * (size_t)(n > 0 ? n : 0));
+    for (size_t i = 0; i < g_sunAimWHost.size(); ++i) g_sunAimWHost[i] = (gpu::Real)wxyz[i];
     g_sunAimRHost.assign(r, r + (size_t)(n > 0 ? n : 0));
     g_sunAimSumR2Host = (n > 0) ? sumR2 : 0.0;
     g_sunAimFHost = (n > 0) ? f : 0.0;
@@ -5731,14 +5733,14 @@ std::vector<Film> renderPhotonMapSharedCuda(const Scene& scene, const std::vecto
         ftalloc::resize(pmC.photons, (size_t)nCau, "the caustic map payloads", "-n");
         ftalloc::resize(pmC.pos, (size_t)nCau, "the caustic map positions", "-n");
         size_t wg = 0, wc = 0;                  // independent write cursors
-        std::vector<DPhoton> stage;
+        std::vector<DPhoton> hostChunk;
         for (size_t off = 0; off < (size_t)nDep; off += PM_CHUNK) {
             size_t cnt = std::min(PM_CHUNK, (size_t)nDep - off);
-            stage.resize(cnt);
-            CUDA_CHECK(cudaMemcpy(stage.data(), d_photons + off, cnt * sizeof(DPhoton),
+            hostChunk.resize(cnt);
+            CUDA_CHECK(cudaMemcpy(hostChunk.data(), d_photons + off, cnt * sizeof(DPhoton),
                                   cudaMemcpyDeviceToHost));
             for (size_t i = 0; i < cnt; ++i) {
-                const DPhoton& d = stage[i];
+                const DPhoton& d = hostChunk[i];
                 const bool caus = (nCau > 0) && d.caustic;
                 PhotonMap& M = caus ? pmC : pm;
                 size_t&    w = caus ? wc  : wg;

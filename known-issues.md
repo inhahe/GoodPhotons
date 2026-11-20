@@ -278,14 +278,28 @@ SHADOW-WARNINGS.
 (CMakeLists.txt). No other call had one. Proven: the same flags refuse a scratch file's
 `printf("within 15 % of ...")` with error C4473.
 
-## OPEN (2026-11-19): SHADOW-WARNINGS — 31 MSVC C4456 warnings: a local declaration hides another
+## DONE (2026-11-19, 0.450.39): SHADOW-WARNINGS — a full build printed some 250 MSVC warnings, a name hiding another among them
 
 Found when both reviews of 0.450.31-0.450.33 caught one in render_cuda.cu (an inner `B`, the gather's
-block, hiding the profile's `B` of 256 pixels; renamed in 0.450.35). A full /W4 compile still prints
-31 more, in main.cpp (`wantGpu`, `wantAuto`, `res`, `N` three times, `secs`, `spp`, ...), lens.h:763
-(`s`) and mesh.h:924 (`k`): each an inner name that silently means something else across a brace,
-which an edit moving a use across it gets wrong without a word. Fix: rename each inner one, then make
-C4456 an error in CMakeLists.txt so no new one lands.
+block, hiding the profile's `B` of 256 pixels; renamed in 0.450.35). Logged at "31" from a partial
+log; a full compile counted 23 distinct locals hiding locals (C4456), 7 hiding class members (C4458),
+1 a parameter (C4457), 3 a global (C4459) -- each an inner name that silently means something else
+across a brace, which an edit moving a use across it gets wrong without a word -- besides the printf
+that garbled `-h` (HELP-PERCENT, 0.450.38), and 3 dead parameters, 5 narrowing conversions, a
+possibly-uninitialised local and a truncating cast, under 120 CRT deprecation notices.
+
+**Fixed:** every inner name renamed for what it holds (`sem`, `lightEm`, `meshEm`, `kR/kG/kB`,
+`coeffLut`, `nQ`, `vcRes`, `fNum`, `nCams`, `bandSecs`, `traceSpp`, `ball`, `along`, `colourScale`,
+`group`, `outNodes`, `rearW`, `arrErr`, `cacheErr`, `drift`, `probeEps`, `clientImgH`, `hostChunk`),
+or deleted where it repeated the outer one's value (`ec`, two `wantGpu`/`wantAuto` pairs, three local
+`PI`s for geometry.h's); the dead parameters removed (`edgeOnNote`'s `n`, `fillTriangleG`'s `H`,
+`recFCTangent`'s `val`); the narrowings explicit (airtight's 32-bit seed, the raster's thread count,
+the sun aim's device-precision directions); two maps used only as sets made sets (isomesh's `seen`,
+`nbrI`; `nb`, which is iterated, keeps its map and order); `px, py` initialised; a byte written as
+`'\xC8'`. C4456-C4459 and C4701 are errors in every C++ and CUDA host compile; `_CRT_SECURE_NO_WARNINGS`
+and `/wd4324` (a struct padded to the `alignas` it asks for) keep the notices from burying the rest.
+A full build now prints four warnings, all in nvcc's generated device-link stub. check_bitid identical
+on both devices.
 
 ## DONE (2026-11-19, 0.450.34): VCM-LOBE-FP32 — the merges' GGX pair ran in double, holding the FP64 pipe
 

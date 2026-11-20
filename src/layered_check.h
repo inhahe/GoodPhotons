@@ -88,7 +88,6 @@ inline double albedo(const Params& P, const Body& body, const Vec3& wi, int n, u
 template <class Body>
 inline double integrateF(const Params& P, const Body& body, const Vec3& wi, int n, unsigned seed) {
     Rng rng(seed);
-    const double PI = 3.14159265358979323846;
     double acc = 0.0;
     for (int i = 0; i < n; ++i) {
         const double u1 = rng(), u2 = rng();
@@ -103,7 +102,6 @@ inline double integrateF(const Params& P, const Body& body, const Vec3& wi, int 
 
 inline int run() {
     int fails = 0;
-    const double PI = 3.14159265358979323846;
     auto report = [&](const char* name, bool ok, const char* fmt, double a, double b) {
         std::printf("  %-22s %s  ", name, ok ? "PASS" : "FAIL");
         std::printf(fmt, a, b);

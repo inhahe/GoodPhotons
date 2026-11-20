@@ -46,6 +46,20 @@ if(MSVC)
     add_compile_options($<$<COMPILE_LANGUAGE:CXX>:/we4473>
                         $<$<COMPILE_LANGUAGE:CXX>:/we4474>
                         $<$<COMPILE_LANGUAGE:CXX>:/we4477>)
+    # So is a name that hides another -- a local hiding a local (C4456), a parameter (C4457), a class
+    # member (C4458) or a global (C4459) -- which an edit moving a use across a brace gets silently
+    # wrong, and a local read before every path has set it (C4701). Cleared in 0.450.39
+    # (SHADOW-WARNINGS).
+    add_compile_options($<$<COMPILE_LANGUAGE:CXX>:/we4456>
+                        $<$<COMPILE_LANGUAGE:CXX>:/we4457>
+                        $<$<COMPILE_LANGUAGE:CXX>:/we4458>
+                        $<$<COMPILE_LANGUAGE:CXX>:/we4459>
+                        $<$<COMPILE_LANGUAGE:CXX>:/we4701>)
+    # Two that only bury the rest: the CRT's "use the _s variant" for getenv / fopen / sscanf (C4996,
+    # 120 of them a build), and a struct padded to the alignment it asks for (C4324, which is the
+    # point of the alignas). So a build prints only what is worth reading.
+    add_compile_definitions(_CRT_SECURE_NO_WARNINGS)
+    add_compile_options($<$<COMPILE_LANGUAGE:CXX>:/wd4324>)
 endif()
 
 add_executable(ftrace
@@ -207,7 +221,13 @@ if(CMAKE_CUDA_COMPILER)
             $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/Zc:preprocessor>
             $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/we4473>
             $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/we4474>
-            $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/we4477>)
+            $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/we4477>
+            $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/we4456>
+            $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/we4457>
+            $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/we4458>
+            $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/we4459>
+            $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/we4701>
+            $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/wd4324>)
     endif()
     if(FTRACE_GPU_FP32)
         target_compile_definitions(ftrace PRIVATE FTRACE_GPU_FP32=1)

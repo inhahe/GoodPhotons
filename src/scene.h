@@ -4886,13 +4886,13 @@ struct Scene {
         struct Seen { int solid; int pri; double t; bool inside; int net; };
         Seen seen[3][kEnclosureMax];
         int nSeen[3] = {0, 0, 0};
-        const double eps = 1e-7 * (1.0 + std::max(std::fabs(p.x), std::max(std::fabs(p.y), std::fabs(p.z))));
+        const double probeEps = 1e-7 * (1.0 + std::max(std::fabs(p.x), std::max(std::fabs(p.y), std::fabs(p.z))));
         for (int k = 0; k < 3; ++k) {
             Ray r{p, kDirs[k]};
             double tAcc = 0.0;
             bool left = false;   // the ray left the scene: the counts are complete
             for (int surfaces = 0; surfaces < 64; ++surfaces) {
-                const Hit h = closestHit(r, eps, nullptr, false, false, DBL_MAX, /*skipCurves=*/true);
+                const Hit h = closestHit(r, probeEps, nullptr, false, false, DBL_MAX, /*skipCurves=*/true);
                 if (!h.valid) { left = true; break; }
                 tAcc += h.t;
                 // The face's own material's solid, else the one its closed piece bounds (a pool's wall).

@@ -4001,9 +4001,9 @@ private:
                 }
             }
             std::vector<BrItem> items;
-            std::string err;
-            if (!parseArrayText(text, i, items, err)) {
-                fail(who + ": " + err + " in the array literal composed into the sample call "
+            std::string arrErr;
+            if (!parseArrayText(text, i, items, arrErr)) {
+                fail(who + ": " + arrErr + " in the array literal composed into the sample call "
                      "at `" + text.substr(at) + "`");
                 return false;
             }
@@ -6166,14 +6166,14 @@ private:
             FurSpec::BaldZone z;
             if (!w.empty() && !isNumber(w[0])) {
                 if (movingRefused(w[0], "fur `bald`")) return false;
-                auto bs = sphereByName_.find(w[0]);
-                if (bs == sphereByName_.end()) {
+                auto ball = sphereByName_.find(w[0]);
+                if (ball == sphereByName_.end()) {
                     fail("fur '" + sp.name + "' bald \"" + w[0] + "\" names no sphere in the scene "
                          "(use `bald <x> <y> <z> <r>` for a zone that is not one)");
                     return false;
                 }
-                z.center = bs->second.center;             // already in internal units
-                z.radius = bs->second.radius + (w.size() > 1 ? Len(num(w[1])) : 0.0);
+                z.center = ball->second.center;             // already in internal units
+                z.radius = ball->second.radius + (w.size() > 1 ? Len(num(w[1])) : 0.0);
             } else if (w.size() >= 4) {
                 z.center = P(Vec3{num(w[0]), num(w[1]), num(w[2])});
                 z.radius = Len(num(w[3]));
@@ -6248,7 +6248,7 @@ private:
         for (int k = 0; k < K && K > 1; ++k) times[(size_t)k] = S.motionA + (S.motionB - S.motionA) * k / (K - 1);
         const uint64_t key = elastic::keyOf(rest, tris, held, P);
         const uint64_t pathKey = elastic::pathKeyOf(held, targets, moving);
-        std::string path, err;
+        std::string path, cacheErr;
         elastic::framePath(cache, frame, path);
         elastic::Record rec;
         if (elastic::g_baking) {
@@ -6256,15 +6256,15 @@ private:
             elastic::framePath(cache, frame - 1, prevPath);
             elastic::Record prev;
             const elastic::Record* pp = nullptr;
-            if (elastic::read(prevPath, prev, err)) {
+            if (elastic::read(prevPath, prev, cacheErr)) {
                 if (prev.key != key) {
                     fail("deform elastic: " + prevPath + " was baked for another mesh, handles or settings -- "
                          "delete it, or bake the shot from its first frame");
                     return false;
                 }
                 pp = &prev;
-            } else if (!err.empty()) {
-                fail("deform elastic: " + err);
+            } else if (!cacheErr.empty()) {
+                fail("deform elastic: " + cacheErr);
                 return false;
             } else {
                 std::printf("[elastic] frame %lld: no record for frame %lld -- starting at rest\n", frame, frame - 1);
@@ -6275,22 +6275,22 @@ private:
                 rec.pos.size() == (size_t)K && rec.vel.size() == rest.size()) {
                 std::printf("[elastic] frame %lld is up to date (%s)\n", frame, path.c_str());
             } else {
-                if (!elastic::bakeFrame(rest, tris, held, targets, times, frame, P, pp, rec, err, moving)) {
-                    if (!stopped()) fail("deform elastic: " + err);
+                if (!elastic::bakeFrame(rest, tris, held, targets, times, frame, P, pp, rec, cacheErr, moving)) {
+                    if (!stopped()) fail("deform elastic: " + cacheErr);
                     return false;
                 }
                 rec.key = key;
                 rec.pathKey = pathKey;
                 rec.chainKey = chain;
-                if (!elastic::write(path, rec, err)) { fail("deform elastic: " + err); return false; }
+                if (!elastic::write(path, rec, cacheErr)) { fail("deform elastic: " + cacheErr); return false; }
                 std::printf("[elastic] baked frame %lld (%zu vertices, %d keys) -> %s\n", frame, rest.size(), K,
                             path.c_str());
             }
         } else {
-            if (!elastic::read(path, rec, err)) {
-                fail(err.empty() ? "deform elastic: no cache record " + path + " -- bake the shot first "
+            if (!elastic::read(path, rec, cacheErr)) {
+                fail(cacheErr.empty() ? "deform elastic: no cache record " + path + " -- bake the shot first "
                                    "(ftrace -bake-elastic <scene%04d.ftsl> <first> <last>)"
-                                 : "deform elastic: " + err);
+                                 : "deform elastic: " + cacheErr);
                 return false;
             }
             bool same = rec.key == key && rec.frame == frame && rec.times.size() == (size_t)K;
@@ -7686,7 +7686,7 @@ private:
             probe[c] = Vec3{(c & 1) ? box.hi.x : box.lo.x, (c & 2) ? box.hi.y : box.lo.y,
                             (c & 4) ? box.hi.z : box.lo.z};
         const double tol = kMotionTol * std::max(length(box.hi - box.lo), 1e-9);
-        const auto err = [&](const Affine& exact, const Affine& blend) {
+        const auto drift = [&](const Affine& exact, const Affine& blend) {
             double e = 0.0;
             for (const Vec3& p : probe) e = std::max(e, length(exact.apply(p) - blend.apply(p)));
             return e;
@@ -7724,7 +7724,7 @@ private:
                 if (!open[i]) continue;
                 const double m = 0.5 * (kt[i] + kt[i + 1]);
                 const Affine wm = D(m);
-                const double e = err(wm, kw[i].lerp(kw[i + 1], 0.5));
+                const double e = drift(wm, kw[i].lerp(kw[i + 1], 0.5));
                 if (e > tol) cuts.push_back({i, e, m, wm});
                 else open[i] = 0;
             }
@@ -11133,7 +11133,7 @@ private:
                 }
             };
             if (lookSmooth > 1e-6 && N >= 3) {
-                const double PI = 3.141592653589793, TWO_PI = 6.283185307179586;
+                const double TWO_PI = 2.0 * PI;   // geometry.h's PI, doubled exactly
                 int r = std::max(1, (int)std::lround(3.0 * lookSmooth));
                 std::vector<double> w((size_t)(2 * r + 1));
                 for (int k = -r; k <= r; ++k)

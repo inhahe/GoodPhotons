@@ -760,9 +760,9 @@ inline bool fitRegion(Pcg32& rng, U&& uniformRay, A&& aimRay, double scale, Lens
             if (R.kind == LensPupil::AIMBOX) {
                 // The rectangle's rim scaled by q, uniform along it: a top or bottom side (length
                 // 2a each) or a left or right one (2b each).
-                const double s = 2.0 * v - 1.0, side = (w < 0.5) ? -1.0 : 1.0;
-                if (rng.uniform() * (R.a + R.b) < R.a) { ex = R.cx + q * R.a * s;    ey = q * R.b * side; }
-                else                                   { ex = R.cx + q * R.a * side; ey = q * R.b * s; }
+                const double along = 2.0 * v - 1.0, side = (w < 0.5) ? -1.0 : 1.0;
+                if (rng.uniform() * (R.a + R.b) < R.a) { ex = R.cx + q * R.a * along;    ey = q * R.b * side; }
+                else                                   { ex = R.cx + q * R.a * side; ey = q * R.b * along; }
             } else {
                 const double an = 2.0 * PI * v;
                 ex = R.cx + q * R.a * std::cos(an);

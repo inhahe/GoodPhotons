@@ -512,11 +512,11 @@ inline bool run(Scene& sc, const Params& p, std::string& report) {
     // ---- 3. colliders ----------------------------------------------------------------------
     std::vector<Tri> ctris;
     for (const std::string& nm : p.collide) {
-        const MeshGroup* g = nullptr;
-        for (const MeshGroup& mg : sc.meshGroups) if (mg.name == nm) { g = &mg; break; }
-        if (!g) { report += "collide \"" + nm + "\": no such mesh group; ignored. "; continue; }
-        if (g->blasId >= 0) { report += "collide \"" + nm + "\": instanced (BLAS) geometry is not yet a collider; ignored. "; continue; }
-        for (size_t t = 0; t < g->triCount; ++t) ctris.push_back(sc.tris[g->triStart + t]);
+        const MeshGroup* group = nullptr;
+        for (const MeshGroup& mg : sc.meshGroups) if (mg.name == nm) { group = &mg; break; }
+        if (!group) { report += "collide \"" + nm + "\": no such mesh group; ignored. "; continue; }
+        if (group->blasId >= 0) { report += "collide \"" + nm + "\": instanced (BLAS) geometry is not yet a collider; ignored. "; continue; }
+        for (size_t t = 0; t < group->triCount; ++t) ctris.push_back(sc.tris[group->triStart + t]);
     }
     detail::Grid cg;
     std::vector<Vec3> ccent;

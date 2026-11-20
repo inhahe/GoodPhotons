@@ -31,6 +31,7 @@
 #include <string>
 #include <queue>
 #include <unordered_map>
+#include <unordered_set>
 #include <functional>
 #include <algorithm>
 #include <thread>
@@ -396,13 +397,13 @@ inline void decimateAdaptive(Mesh& m, double ratio, const Implicit& im) {
     };
 
     { // seed unique edges
-        std::unordered_map<uint64_t,char> seen;
+        std::unordered_set<uint64_t> seen;
         seen.reserve(nt0*3);
         for (int t=0;t<nt0;++t)
             for (int e=0;e<3;++e){
                 int a=F[t].v[e], b=F[t].v[(e+1)%3];
                 uint64_t k=edgeKey(a,b);
-                if (seen.emplace(k,1).second) pushEdge(a,b);
+                if (seen.insert(k).second) pushEdge(a,b);
             }
     }
 
@@ -424,11 +425,11 @@ inline void decimateAdaptive(Mesh& m, double ratio, const Implicit& im) {
         // vertices opposite the faces on edge (i,j). Any other common neighbour would
         // fuse two distinct edges into one -> a non-manifold (>2 faces) edge.
         {
-            std::unordered_map<int,char> nbrI;      // edge-neighbours of i
+            std::unordered_set<int> nbrI;           // edge-neighbours of i
             std::vector<int> opp;                   // 3rd vertex of each shared face
             for (int t : fi) {
                 int a=F[t].v[0],b=F[t].v[1],c=F[t].v[2];
-                for (int w : {a,b,c}) if (w!=i) nbrI.emplace(w,1);
+                for (int w : {a,b,c}) if (w!=i) nbrI.insert(w);
                 if (a==j||b==j||c==j) for (int w : {a,b,c}) if (w!=i && w!=j) opp.push_back(w);
             }
             for (int t : fj) {
@@ -479,7 +480,7 @@ inline void decimateAdaptive(Mesh& m, double ratio, const Implicit& im) {
         // Re-push edges from i to its (still-live) neighbours.
         std::unordered_map<int,char> nb;
         for (int t : vf[i]) if (!F[t].dead)
-            for (int e=0;e<3;++e){ int w=F[t].v[e]; if (w!=i && alive[w]) nb.emplace(w,1); }
+            for (int e=0;e<3;++e){ int w=F[t].v[e]; if (w!=i && alive[w]) nb.emplace(w,(char)1); }
         for (auto& kv : nb) pushEdge(i, kv.first);
     }
 
