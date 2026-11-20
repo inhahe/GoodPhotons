@@ -21345,20 +21345,23 @@ struct DSurfSite {
     __device__ MergeKey cell(const DSurfMap& sm, int n) const { return g.neighbour(n, sm.lat.slots); }
 };
 }  // namespace
-// The merge of photon `sm.order[q]` at the site: its XYZ added to gX, gY, gZ. `lobe` is the site's
-// camera vertex's toward the camera side (DMergeLobe), `coatTh` its coat's film there
-// (dCoatThicknessAt).
-__device__ static inline void dSurfMergePhoton(const DScene& sc, const DSurfMap& sm, const DSurfSite& site,
-                                               DMergeLobe& lobe, Real& coatTh, const DSurfMergeW& sw, int q,
-                                               double& gX, double& gY, double& gZ,
-                                               const DJSpec* js) {
-    const DVertex& vk = lobe.vt;
-    const int idx = sm.order[q];
-    const DSurfPhoton& ph = sm.pts[idx];
+// Whether photon `sm.order[q]` passes a merge's refusals at the site, camera vertex `vk`'s, before its
+// lobe: within the radius, not from behind, on this surface.
+__device__ static inline bool dSurfMergePasses(const DSurfMap& sm, const DSurfSite& site, const DVertex& vk, int q) {
+    const DSurfPhoton& ph = sm.pts[sm.order[q]];
     const DVec3 dd{vk.p.x - ph.p.x, vk.p.y - ph.p.y, vk.p.z - ph.p.z};
-    if (ddot(dd, dd) > site.r2) return;
-    if (dMergeFromBehind(site.fp.twoSided, ph.wo, site.fp.n)) return;   // host twin mergeFromBehind
-    if (!site.fp.keeps(ph.p, DVec3(ph.nx, ph.ny, ph.nz), (Real)ddot(dd, dd))) return;   // this surface's
+    if (ddot(dd, dd) > site.r2) return false;
+    if (dMergeFromBehind(site.fp.twoSided, ph.wo, site.fp.n)) return false;   // host twin mergeFromBehind
+    return site.fp.keeps(ph.p, DVec3(ph.nx, ph.ny, ph.nz), (Real)ddot(dd, dd));   // this surface's
+}
+// The merge of photon `sm.order[q]` at the site, which passed (dSurfMergePasses): its XYZ added to gX,
+// gY, gZ. `lobe` is the site's camera vertex's toward the camera side (DMergeLobe), `coatTh` its coat's
+// film there (dCoatThicknessAt), both read at the first photon weighed.
+__device__ static inline void dSurfMergeWeigh(const DScene& sc, const DSurfMap& sm, DMergeLobe& lobe, Real& coatTh,
+                                              const DSurfSite& site, const DSurfMergeW& sw, int q,
+                                              double& gX, double& gY, double& gZ, const DJSpec* js) {
+    const DVertex& vk = lobe.vt;
+    const DSurfPhoton& ph = sm.pts[sm.order[q]];
     const DSurfMis& lm = sm.mis[ph.misIdx];
     const Real lam = (Real)ph.lambda;
     if (!lobe.ready) { lobe.prepare(); coatTh = dCoatThicknessAt(sc, lobe.m, lobe.h); }
@@ -21381,6 +21384,12 @@ __device__ static inline void dSurfMergePhoton(const DScene& sc, const DSurfMap&
     }
     const double cf = w * fCam * (double)ph.beta * (js ? js->at((double)lam) : 1.0);   // JSPEC
     gX += (double)ph.cx * cf; gY += (double)ph.cy * cf; gZ += (double)ph.cz * cf;
+}
+// Both: photon `sm.order[q]`'s merge at the site, if it passes.
+__device__ static inline void dSurfMergePhoton(const DScene& sc, const DSurfMap& sm, const DSurfSite& site,
+                                               DMergeLobe& lobe, Real& coatTh, const DSurfMergeW& sw, int q,
+                                               double& gX, double& gY, double& gZ, const DJSpec* js) {
+    if (dSurfMergePasses(sm, site, lobe.vt, q)) dSurfMergeWeigh(sc, sm, lobe, coatTh, site, sw, q, gX, gY, gZ, js);
 }
 // The merge footprint of modes J and U draws probe `i` at a site off a stream of its own, seeded from
 // `seed`, which the walk drew from its stream at the site: so the queued gather can run a site's
@@ -21486,8 +21495,8 @@ struct DSiteCursor {
 // A merge site's entries, this caller's of them (DSiteCursor's lane and lanes) one at a time:
 // `body(k, t)` takes each, strays and all, and must weigh entry k only if its tag (the map's `tag[k]`,
 // bucket order) is t, as the host's mergeForEachEntry weighs them. The test is the body's own: made
-// here instead, nvcc compiles mode U's merge (dVcmMergeSum) to run its renders a fifth slower. Modes J
-// (kWfSurfGather, dSurfMergeAt) and U's inline merge (dVcmMergeSum; its warp's is dSiteListWarp).
+// here instead, nvcc compiles mode U's merge (dVcmMergeSum) to run its renders a fifth slower. The
+// inline merges of modes J (dSurfMergeAt) and U (dVcmMergeSum); their warps' is dSiteListWarp.
 template <class Cell, class Body>
 __device__ static inline void dSiteListWalk(const Cell& cell, int lane, int lanes, const Body& body) {
     DSiteCursor cur(lane);
@@ -21558,12 +21567,19 @@ __device__ static int dSurfMergeAt(const DScene& sc, const DSurfMap& sm, const D
     return weighed;
 }
 
-// The first `n` queued sites (DSurfQueue), a warp each: the lanes take the site's photons in turn,
-// across its cells as one list, and lane 0 adds the warp's sum to the film. A stop ends it early;
-// its chunk is dropped (DeviceStopScope).
+// The first `n` queued sites (DSurfQueue), a warp each: the lanes take the site's photons together
+// (dSiteListWarp: each lane tests its own, and the warp weighs those that pass 32 at a time), and lane 0
+// adds the warp's sum to the film. A stop ends it early; its chunk is dropped (DeviceStopScope).
+// Launched in blocks of kWfSurfGatherBlock threads, which size its warps' candidate buffers: another
+// block traps.
+constexpr int kWfSurfGatherBlock = 128;
+static_assert(kWfSurfGatherBlock % 32 == 0, "kWfSurfGather's warps must be whole: its walk syncs all 32 lanes");
 #ifndef FT_FAMILY_TU
 __global__ void kWfSurfGather(DScene sc, DSurfMap sm, DSurfQueue sq, int n, double* camFilm) {
+    if (blockDim.x != (unsigned)kWfSurfGatherBlock) __trap();
     D_MOTION_CLEAR();   // this thread's time: the launch's (passU)
+    __shared__ int candidates[kWfSurfGatherBlock / 32][64];
+    int* const buf = candidates[threadIdx.x >> 5];
     const int lane = threadIdx.x & 31;
     const int warps = (int)((gridDim.x * blockDim.x) >> 5);
     long long stopNext = 0;   // the stop flag is a bus round trip: read it once ~1 ms (kBdptT's rule)
@@ -21584,16 +21600,17 @@ __global__ void kWfSurfGather(DScene sc, DSurfMap sm, DSurfQueue sq, int n, doub
         const DSurfSite site(sc, sm, rq.vk);
         double gX = 0.0, gY = 0.0, gZ = 0.0;
         DMergeLobe lobe(sc, rq.vk, rq.woCam, false);
-        Real coatTh = (Real)0;   // dSurfMergePhoton's, with the lobe
-        // The site's photons as one list, its cells in walk order, the lanes taking them in turn; the
-        // work counted is the photons of its own cells the lanes weighed, summed across the warp.
+        Real coatTh = (Real)0;   // dSurfMergeWeigh's, with the lobe
+        // The site's photons as one list, its cells in walk order; the work counted is the photons of
+        // its own cells the lanes tested, summed across the warp.
         int weighed = 0;
-        dSiteListWalk([&](int c, int& b, int& e, unsigned char& t) { dSurfSiteCell(sm, site, c, b, e, t); }, lane, 32,
+        dSiteListWarp([&](int c, int& b, int& e, unsigned char& t) { dSurfSiteCell(sm, site, c, b, e, t); }, lane, buf,
                       [&](int q, unsigned char t) {
-                          if (sm.tag[q] != t) return;   // another block's
+                          if (sm.tag[q] != t) return false;   // another block's
                           ++weighed;
-                          dSurfMergePhoton(sc, sm, site, lobe, coatTh, sw, q, gX, gY, gZ, js);
-                      });
+                          return dSurfMergePasses(sm, site, rq.vk, q);
+                      },
+                      [&](int q) { dSurfMergeWeigh(sc, sm, lobe, coatTh, site, sw, q, gX, gY, gZ, js); });
         for (int o = 16; o > 0; o >>= 1) weighed += __shfl_xor_sync(0xffffffffu, weighed, o);
         if (lane == 0) dAddWork((unsigned long long)weighed);
         dWarpSiteAdd(sc, site.fp, rq.gaSeed, lane, gX, gY, gZ, rq.f, camFilm, rq.pix);

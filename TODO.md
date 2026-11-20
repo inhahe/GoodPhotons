@@ -518,9 +518,9 @@ Then the rest of 4.2-4.6 in their order, 4.7's bookkeeping alongside whatever to
   bowl's gather 11.55 -> 8.49 s, its render 21 % faster; known-issues.
 - [x] **REVIEW-0450N** (0.450.35-0.450.36) — the Opus (max) and Fable (xhigh) reviews of 0.450.31-0.450.33;
   known-issues REVIEW-0450N.
-- [ ] **J-SURF-GATHER-DIVERGENCE** — mode J's queued surface gather (kWfSurfGather) walks a site's photons a
-  lane each, as mode U's did before 0.450.33: split dSurfMergePhoton into pass (tag, radius, from behind,
-  footprint) and weigh, and take dSiteListWarp (both reviews of 0.450.31-0.450.33).
+- [x] **J-SURF-GATHER-DIVERGENCE** (0.450.37) — mode J's queued surface gather tests a photon a lane and weighs
+  32 at a time (dSiteListWarp): at five times the radius its gather 33 % faster, at its own unchanged
+  (its sites hold a warp's worth of photons or fewer); known-issues.
 - [ ] **SHADOW-WARNINGS** — 31 MSVC C4456 shadowing warnings (main.cpp, lens.h, mesh.h): rename each inner
   declaration, then make C4456 an error; known-issues.
 - [x] **VCM-LOBE-FP32** (0.450.34) — the merges' lobe takes its GGX pair in the device's precision

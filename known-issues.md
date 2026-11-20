@@ -201,6 +201,25 @@ to 0.25 renders as a 150 nm one within 2e-3, 1.0e-3 measured (its body's escape 
 on 0.450.1 it rendered as the unmapped 600 nm, 1.9 off), the `thinfilm` control byte for byte, and
 the three misspellings stop the load (on 0.450.1 they loaded).
 
+## DONE (2026-11-19, 0.450.37): J-SURF-GATHER-DIVERGENCE — mode J's queued surface gather walked a site a lane each
+
+Both reviews of 0.450.31-0.450.33 pointed out that mode J's kWfSurfGather kept the walk mode U's
+gather had before VCM-GATHER-DIVERGENCE: a lane whose photon a cheap test refused idled while the
+others weighed theirs.
+
+**Fixed:** dSurfMergePhoton is its test (`dSurfMergePasses`: radius, from behind, footprint) and its
+weighing (`dSurfMergeWeigh`); kWfSurfGather takes them through dSiteListWarp, with 64 ints of shared
+memory a warp, a trap on any block but kWfSurfGatherBlock and a static_assert of whole warps. The
+inline gather keeps both in one call.
+
+**Measured** (0.450.36 against 0.450.37, paired): `_caustic_box` mode J at five times its surface
+radius (`-jsurf-radius 0.087`), the gather 1.2 -> 0.8 s, the render 2.31 -> 2.07 s; Nsight on one
+launch 19.3 -> 13.6 ms, 13.0 -> 20.6 active lanes an instruction. At its own radius a site holds a
+few dozen photons, a warp's worth or less, and its lanes idle for that, not for the refusals: 12.2
+-> 12.9 lanes, 10 % fewer instructions, the launch 0.8 % faster, the render unchanged, as are
+`_fog_cornell`'s with and without beams. check_surf_wavefront passes: the queue's image the inline
+gather's to the byte, in the fog and in the chromatic box.
+
 ## DONE (2026-11-19, 0.450.35-0.450.36): REVIEW-0450N — what the Opus (max) and Fable (xhigh) reviews of 0.450.31-0.450.33 found
 
 Both read fa508c9..77baad4 (J-NOSPLIT's carveout, DVERTHITSTATE-8B, VCM-GATHER-DIVERGENCE) and

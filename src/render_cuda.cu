@@ -4282,9 +4282,10 @@ Film renderBdptCuda(const Scene& scene, const Camera& cam, int resX, int resY,
         demand = (nq < 0) ? (1LL << 31) : (long long)nq;
         gathered = std::min<long long>(demand, sq.cap);
         if (gathered > 0) {
-            const int gBlocks = (int)std::min(4096LL, (gathered * 32 + 127) / 128);   // a warp a site
+            // A warp a site.
+            const int gBlocks = (int)std::min(4096LL, (gathered * 32 + kWfSurfGatherBlock - 1) / kWfSurfGatherBlock);
             CUDA_CHECK(cudaEventRecord(sqEv[0]));
-            kWfSurfGather<<<gBlocks, 128>>>(up.sc, dsm, sq, (int)gathered, d_cam);
+            kWfSurfGather<<<gBlocks, kWfSurfGatherBlock>>>(up.sc, dsm, sq, (int)gathered, d_cam);
             CUDA_CHECK(cudaEventRecord(sqEv[1]));
             cudaCheckKernel("wf-surf-gather");
             float ms = 0.f;

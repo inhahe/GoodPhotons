@@ -734,9 +734,11 @@ Four consequences worth knowing:
     (`DSurfReq`: the vertex, the weight's camera half `DSurfMergeW`, the direction, the scale; the
     JSPEC carrier and the chromatic bins in side tables; the film offset) to a `DSurfQueue`, and
     after the wave `kWfSurfGather` gathers each with a whole warp -- the lanes take the site's
-    photons in turn, its 27 cells as one list (a lane a cell's photon would idle most lanes on
-    sparse cells), the per-photon work is `dSurfMergePhoton`, shared with the inline
-    `dSurfMergeAt` -- and lane 0 adds the warp's sum to the film by atomics, as the inline gather
+    photons together, its 27 cells as one list (a lane a cell's photon would idle most lanes on
+    sparse cells), each lane testing its own (`dSurfMergePasses`: radius, from behind, footprint)
+    and the warp weighing those that pass 32 at a time (`dSiteListWarp`, as mode U's gather; since
+    0.450.37), the weighing `dSurfMergeWeigh`, which the inline `dSurfMergeAt` shares -- and lane 0
+    adds the warp's sum to the film by atomics, as the inline gather
     and the beam queue's evaluations do: the same terms in another order. (0.437.0 summed each
     pixel's sites in a fixed order through per-path slot tables and a fold kernel; the rest of the
     film is summed by atomics anyway, so 0.437.1 dropped them, and with them the tables' memory and
