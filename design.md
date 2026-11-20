@@ -10646,8 +10646,11 @@ as the one at fault.
   Since 0.34.0 (M9) the **GPU BDPT** kernel (mode `D`) threads the **per-hit
   surface point** through its connection BSDF: each `DVertex` stores the interpolated texcoords
   (`u,v`) and `dVertHit` reconstructs a minimal `DHit` (since 0.450.4 with the walk's hit's pattern
-  state, `DVertHitState`: its cavity, probed once, and where a moving or deforming primitive's point
-  sat at the instant, so a connection reads a pattern on a mover where the walk read it; mode U's
+  state, `DVertHitState`: its cavity, probed once, and which primitive moved -- a motion set, or a
+  deforming triangle, whose point at the instant the vertex's own 16-bit barycentrics place (`vb0q`,
+  `vb1q`, kept for its vertex colour; 8 bytes since 0.450.32) -- so a connection reads a pattern on a
+  mover where the walk read it, a deforming triangle's to 1.5e-5 of its edges, which a high-frequency
+  pattern on a very large deforming face could show at its edges; mode U's
   stored light vertices keep it in a side slab where the scene moves or reads `cavity`), so
   `dBsdfF`/`dBsdfPdf` and the random
   walk evaluate per-hit-driven throughput slots consistently in BOTH the sampler and the
@@ -11964,8 +11967,10 @@ sees the instant, exactly as a static scene with those transforms would show it.
   (`dFinalizeTri`, `Tri::finalize`'s twin) only on a nearer crossing; a sphere is moved; an
   isosurface, a curve or an instance is met by the ray carried to the instant and its hit
   carried out (`dHitToMoved`). A query keeps one set's motion and inverse (`DMotionNow`).
-  `DHit` carries `motionSet` / `deformTri` / `deformB1/B2`, and `dPatIn` reads a mover's
-  patterns where it sat at the instant, as `patCtxFromHit` does. Shadow rays to the sun and the
+  `DHit` carries `motionSet` / `deformTri` (a deforming triangle's point at the instant placed by
+  the hit's own barycentrics, `vb0` / `vb1`, which the host keeps a second copy of as
+  `deformB1/B2`), and `dPatIn` reads a mover's patterns where it sat at the instant, as
+  `patCtxFromHit` does. Shadow rays to the sun and the
   sky run to the swept sphere (`dExitDistance`).
 - **Mode R/W**: `kBackward` / `kBackwardRGB` draw each sample's time as `renderRows` does
   (`dSetCameraTime`: the base-79 shutter lattice rotated by the pixel's phase, 0.5 in mode W)

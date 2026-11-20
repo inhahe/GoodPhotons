@@ -3858,17 +3858,16 @@ struct DHit {
     // triangle, sphere and curve intersectors and the instance mapping; 0 (the point's own
     // distance stands in) elsewhere.
     Real pscale = (Real)0;
-    // Where a hit with a time reads its patterns (host twins Hit::motionSet / deformTri /
-    // deformB1/B2): the moving primitive's motion set, or the deforming triangle and the
-    // intersector's barycentrics of its v1 and v2 -- dPatIn carries the point back to the
-    // instant through them. -1 for a still primitive, or a hit without a time; written only by
-    // the timed intersectors, so they default.
+    // Where a hit with a time reads its patterns (host twins Hit::motionSet / deformTri): the
+    // moving primitive's motion set, or the deforming triangle, whose point at the instant the
+    // hit's own barycentrics (vb0, vb1; the host keeps a copy, deformB1/B2) place -- dPatIn carries
+    // the point back there through them. -1 for a still primitive, or a hit without a time;
+    // written only by the timed intersectors, so they default.
     int motionSet = -1, deformTri = -1;
-    Real deformB1 = (Real)0, deformB2 = (Real)0;
 };
 #if FTRACE_GPU_FP32
 // Held in every kernel's registers or local memory and in the wavefront state arrays.
-static_assert(sizeof(DHit) == 132, "DHit changed size");   // every kernel's registers and local memory
+static_assert(sizeof(DHit) == 124, "DHit changed size");   // every kernel's registers and local memory
 static_assert(sizeof(DSphere) == 32, "DSphere changed size: one 32-byte sector a leaf test");
 static_assert(sizeof(DTri) == 168, "DTri changed size: one per triangle, the largest geometry upload");
 #endif
@@ -5378,8 +5377,7 @@ __device__ static bool dIntersectTriNow(const DScene& sc, const DTriShear& sh, c
     dFinalizeTri(tt);
     dTriFill(rd, tt, t, b0, b1, b2, h);
     h.motionSet = deforms ? -1 : set;
-    h.deformTri = deforms ? i : -1;
-    h.deformB1 = b1; h.deformB2 = b2;
+    h.deformTri = deforms ? i : -1;   // its point at the instant: dTriFill's barycentrics
     return true;
 }
 // A hit met where a mover sits at the instant, carried out by its motion D (Di its inverse)
@@ -12237,7 +12235,7 @@ __device__ __forceinline__ static DPatIn dPatIn(const DScene& sc, const DHit& h)
         dDeformedCorners(sc, h.deformTri, (double)dMotionU(), c, nullptr, nullptr);
         const DVec3 e1 = c[1] - c[0], e2 = c[2] - c[0], E1 = t.v1 - t.v0, E2 = t.v2 - t.v0;
         const DVec3 fNow = cross(e1, e2), fThen = cross(E1, E2);
-        const DVec3 pThen = t.v0 + E1 * h.deformB1 + E2 * h.deformB2;
+        const DVec3 pThen = t.v0 + E1 * h.vb1 + E2 * ((Real)1 - h.vb0 - h.vb1);
         const double aNow = (double)length(fNow), aThen = (double)length(fThen);
         // A face of no area at the instant has no normal there: nudged along the hit's own.
         const DVec3 ngThen = !(aThen > 0.0) ? h.ng : dot(h.ng, fNow) < (Real)0 ? -t.gn : t.gn;
@@ -15165,7 +15163,8 @@ enum { BV_CAMERA = 0, BV_LIGHT = 1, BV_SURFACE = 2, BV_MEDIUM = 3 };
 // the hit's cavity, and where a moving or deforming primitive's point sat at the instant (dPatIn). A
 // deforming triangle's point there is its barycentrics', which the vertex keeps for its colour
 // (DVertex / DVcmLV::vb0q, vb1q), so this keeps only which primitive moved: 8 bytes in each of a
-// thread's 2 * BDPT_MAXV vertices.
+// thread's 2 * BDPT_MAXV vertices in the FP32 build (16 in the double one, which reads that point
+// through the same 16-bit barycentrics, 1.5e-5 of an edge from the walk's).
 struct DVertHitState {
     Real cavity = (Real)-1;     // its cavity probe's, run where its material reads one (dCavityOf); < 0 none
     int  motionRef = -1;        // its motion set (>= 0), or -2 - its deforming triangle; -1 neither
@@ -15177,12 +15176,11 @@ __device__ static inline DVertHitState dHitStateOf(const DScene& sc, const DHit&
     s.motionRef = (h.deformTri >= 0) ? -2 - h.deformTri : h.motionSet;
     return s;
 }
-// ...and back onto a hit rebuilt with the walk's barycentrics (h.vb0, h.vb1: the intersector's b0 and b1,
-// unpacked to within dPackBary's quantum), which place a deforming triangle's point at the instant.
+// ...and back onto a rebuilt hit, whose barycentrics (dVertHit's, within dPackBary's quantum of the
+// walk's) place a deforming triangle's point at the instant.
 __device__ static inline void dRestoreHitState(DHit& h, const DVertHitState& s) {
     h.motionSet = (s.motionRef >= 0) ? s.motionRef : -1;
     h.deformTri = (s.motionRef <= -2) ? -2 - s.motionRef : -1;
-    h.deformB1 = h.vb1; h.deformB2 = (Real)1 - h.vb0 - h.vb1;
     if (s.cavity >= (Real)0) { h.cavity = s.cavity; h.cavityDone = true; }
 }
 

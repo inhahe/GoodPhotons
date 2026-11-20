@@ -516,6 +516,8 @@ Then the rest of 4.2-4.6 in their order, 4.7's bookkeeping alongside whatever to
 - [x] **VCM-GATHER-DIVERGENCE** (0.450.33) — the queued gather's lanes test their entries, and the warp
   weighs the ones that pass 32 at a time (dSiteListWarp): 16.8 -> 28.5 active lanes, the 640x480
   bowl's gather 11.55 -> 8.49 s, its render 21 % faster; known-issues.
+- [x] **REVIEW-0450N** (0.450.35-0.450.36) — the Opus (max) and Fable (xhigh) reviews of 0.450.31-0.450.33;
+  known-issues REVIEW-0450N.
 - [ ] **J-SURF-GATHER-DIVERGENCE** — mode J's queued surface gather (kWfSurfGather) walks a site's photons a
   lane each, as mode U's did before 0.450.33: split dSurfMergePhoton into pass (tag, radius, from behind,
   footprint) and weigh, and take dSiteListWarp (both reviews of 0.450.31-0.450.33).

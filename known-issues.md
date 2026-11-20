@@ -201,6 +201,51 @@ to 0.25 renders as a 150 nm one within 2e-3, 1.0e-3 measured (its body's escape 
 on 0.450.1 it rendered as the unmapped 600 nm, 1.9 off), the `thinfilm` control byte for byte, and
 the three misspellings stop the load (on 0.450.1 they loaded).
 
+## DONE (2026-11-19, 0.450.35-0.450.36): REVIEW-0450N — what the Opus (max) and Fable (xhigh) reviews of 0.450.31-0.450.33 found
+
+Both read fa508c9..77baad4 (J-NOSPLIT's carveout, DVERTHITSTATE-8B, VCM-GATHER-DIVERGENCE) and
+found no correctness bug: the warp queue's indices, barriers and once-each weighing, and the
+barycentric restore, held on tracing.
+
+**Measured and dismissed: an occupancy-sized carveout** (both). MaxL1 does cost blocks -- on the
+4090 it leaves the 8 KB shared configuration, where kBackward keeps 1 of the 2 blocks its registers
+allow and kWfBeamHits 4 of 9 -- but giving each kernel the shared memory for its registers' blocks
+(0.450.35's trial) was slower: kWfBeamHits went to the 64 KB configuration, 65 % of its warps resident
+against 24 %, and ran 15 times slower; mode J on `_fog_cornell` went 4.10 -> 6.64 s; kBackward lost
+8 % a launch. These kernels are bound by how much of their working set L1 holds (design.md,
+"Threading model (GPU)").
+
+**Fixed in 0.450.35:** preferL1 marks a kernel done only once set, retries a refusal at the next
+weighing and prints the first (it had marked first and discarded the error); its comment names the
+weighing every launch follows, main.cpp's vramPreflight, rather than the session starts, which weigh
+only sometimes (Fable). GpuRoute::l1 is gone: mode D's exception could not hold (mode J's route holds
+the same kernel, and the SMs keep a configuration), and mode D under MaxL1 measures 1.001.
+dSiteListWarp weighs from one call site, without a barrier that ordered nothing, and ends on
+`__all_sync` (one empty round a site fewer, Fable). Only the camera kernel's copy of dVcmMergeSum
+stays out of line (dVcmMergeSumInline); the gather's is inlined -- with the one call site, the
+640x480 bowl's gather 7.15 -> 6.14 s, its render 9.93 -> 8.91 s. dSiteListWalk is DSiteCursor in a
+loop, one copy of the walk (mode J's surface gather and U's inline merge unchanged). The gather's
+`B` no longer shadows the profile's `B` (C4456; the 31 others: SHADOW-WARNINGS). kVcmMergeGather
+traps a block of any other size and static_asserts whole warps (Fable) instead of a
+`__launch_bounds__` in the unit of the kernels without them.
+
+**Fixed in 0.450.36:** `DHit` no longer keeps the deform barycentrics beside its own `vb0`/`vb1`
+(the same crossing's): dPatIn places a deforming triangle's point from those, so dRestoreHitState
+lost its unstated precondition (its caller restoring the barycentrics first) and `DHit` 8 bytes,
+132 -> 124. The walk's own hits read b2 as 1 - b0 - b1, a float rounding from the intersector's.
+Every kernel holds a DHit, and the ones at the register cap gained (0.450.35 against 0.450.36,
+paired): `_fog_cornell` mode R 3.09 -> 2.85 s, mode M 2.08 -> 1.84 s, `_caustic_box` mode M 4.15 ->
+3.61 s and mode S 11.45 -> 10.78 s, mode D 1.7 % faster; J, U, P and W within 1.4 %. check_bitid
+identical in D, J and U (M and S move as the old build does against itself); check_vertex_hit_state
+passes.
+The DVertHitState comment is scoped to the FP32 build (16 B in the double one, which now reads a
+deforming point through the same 16-bit barycentrics). design.md describes the 8-byte state, and
+the quantum's cost on a very large deforming face with a sharp pattern (Fable: an accepted
+trade-off, 1.5 mm on a 100 m edge).
+
+**Taken as a TODO item:** mode J's kWfSurfGather walks a site a lane each, as mode U's did
+(J-SURF-GATHER-DIVERGENCE).
+
 ## OPEN (2026-11-19): SHADOW-WARNINGS — 31 MSVC C4456 warnings: a local declaration hides another
 
 Found when both reviews of 0.450.31-0.450.33 caught one in render_cuda.cu (an inner `B`, the gather's
