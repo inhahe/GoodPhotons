@@ -21089,7 +21089,7 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
         // Both forward terms by the batch the trace loop runs: -n, or 2 M photons where a time or
         // noise budget leaves -n unset (runRender's forward loop).
         const long long batchN = (N > 0) ? N : 2'000'000;
-        const size_t film   = (m == 'S') ? (size_t)res * resY * cudaSppmPixelBytes()
+        const size_t film   = (m == 'S') ? (size_t)res * resY * cudaSppmPixelBytes(scene.specCells.n)
                             : (size_t)res * resY * 3 * sizeof(double) * 2 +
                               ((gpuForwardMode && cam.seesMotion(scene) && cam.moves())
                                    ? cudaForwardPosedCameraBytes(scene, wavefront, g_heroC, batchN, m == 'P') : 0) +
@@ -22560,6 +22560,7 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
     if (mode == 'M') {
         double radius = (g_pmRadiusAbs > 0.0) ? g_pmRadiusAbs
                                               : scene.sceneRadius * g_pmRadiusFactor;
+        reportSpecCells(scene);
         std::printf("mode M: photon map — tracing %lld photons on %d CPU threads "
                     "(light=%s), gather radius %.4g ...\n",
                     N, nThreads, lightLabel, radius);
@@ -22906,6 +22907,7 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
     if (mode == 'S') {
         // A scene's cameras were judged before the run (resolveCameraModes), but a built-in
         // scene, or one with no camera block, comes straight here.
+        reportSpecCells(scene);
         if (const char* unsupported = modeFeatureUnsupported(scene, 'S', cam.projection)) {
             std::fprintf(stderr, "[mode S] this scene uses %s, which SPPM (mode S) does not "
                                  "render; render it in mode R, B, or M with -beams instead.\n",
@@ -22964,7 +22966,7 @@ static int runRender(const Scene& scene, const Camera& cam, char mode,
         std::printf("mode S: SPPM — %lld photons/pass, R0=%.4g, alpha=%.2f at %dx%d on "
                     "%d CPU threads (light=%s) ...\n",
                     N, R0, g_sppmAlpha, res, resY, nThreads, lightLabel);
-        SPPMState st; st.init(res, resY, R0);
+        SPPMState st; st.init(res, resY, R0, scene.specCells.n);
         // renderChunked runs the pass loop, reporting L*passes so the progress driver's
         // divide-by-sppDone recovers the resolved radiance L. Persistent state means we
         // ignore the chunk's sppTarget granularity and just step one pass per iteration.
@@ -29892,6 +29894,9 @@ static int run(int argc, char** argv) {
                                          : (std::to_string(cams.size()) + " cameras").c_str(),
                         cams.size() == 1 ? "s" : "", in.c_str());
     }
+
+    for (const RenderCam& rc : toRender)
+        if (rc.mode == 'M' || rc.mode == 'S') { reportSpecCells(scene); break; }
 
     // The footprint probes of modes M and S, and of J's and U's merges, read which side of a closed
     // solid a face is met from (Hit::solid): marked once for the whole batch, before the meter below

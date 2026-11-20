@@ -1485,6 +1485,8 @@ __device__ static inline bool dBowEval(const DBowTab& bt, int em, int med, doubl
     return true;
 }
 
+struct DSpecCells;   // render_cuda_dev2.cuh: mode M's and mode S's carrier cells
+
 struct DScene {
     // Per-vertex colours (Scene::vertColors), three linear-RGB floats per entry, indexed
     // by DTri::vcol; and the shared Jakob-Hanika RGB -> coefficient table that turns an
@@ -1661,6 +1663,8 @@ struct DScene {
                                // transport visibility queries' GRIN rule (dCrossesGrin).
     double           lenScale; // the scene's length scale (host Scene::lenScale), which c_lenScale
                                // carries to the kernels: dSetLenScale before every launch on it
+    const DSpecCells* specCells; // the spectral carrier's cells where the scene splits its bins, else
+                               // null (host Scene::specCells), which c_specCells carries the same way
     DVec3  sensorOrigin, sensorUAxis, sensorVAxis;   // model A contact sensor plane
     DVec3  sceneCenter;              // env (shape==3): bounding-sphere center
     double sceneRadius;              // env (shape==3): bounding-sphere radius
@@ -3388,9 +3392,9 @@ __device__ static bool dMedSampleCollision(const DMedium& m, const DVec3& o, con
 // split is what makes an optically thick volume converge (~1100x variance reduction at
 // tau = 8) and why merely TIGHTENING the majorant would have done nothing.
 // Cap on the wavelength count dMedTransmittanceSpec accepts (a per-thread stack array, so it is
-// fixed): DSpecThr::K + 1 -- the grid plus the camera's own wavelength, which rides along so the
-// scalar throughput and the carrier's denominator cannot disagree.
-#define DSPEC_TRMAX 32
+// fixed): DSpecThr::K + 1 -- the carrier's cells at most plus the camera's own wavelength, which rides
+// along so the scalar throughput and the carrier's denominator cannot disagree.
+#define DSPEC_TRMAX (kSpecCellsMax + 1)
 __device__ static Real dMedTransmittance(const DMedium& m, const DVec3& o, const DVec3& dir,
                                          Real dist, Real lambda, DRng& rng,
                                          const DPatEnv& env) {
@@ -16940,7 +16944,7 @@ __device__ static double bkNeeLight(const DScene& sc, const DHit& h, Real rho,
     return total;
 }
 
-#define DSPECNEE_MAXK 32   // the spectral NEE's per-thread scratch bound; DSpecThr::K is 24
+#define DSPECNEE_MAXK 32   // the spectral NEE's per-thread scratch bound; it runs on the 24 uniform bins
 
 // SPECTRAL glossy NEE for mode M's gather (0.342.0; host twin backward.h neeLightSpecGlossy).
 // Same emitter loop and the same ONE shadow ray per sample as bkNeeLight -- a connection's

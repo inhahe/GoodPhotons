@@ -1091,9 +1091,10 @@ struct Renderer {
     // variance reduction (~1100x at tau = 8). Note the factors may exceed 1 (the residual
     // is signed); that is correct and is what keeps the estimator unbiased.
     // Upper bound on the wavelength count mediumTransmittanceSpec accepts (a stack array in a
-    // hot path, so it is fixed rather than allocated). SpecThr::K + 1 -- the grid plus the
-    // camera's own wavelength, which rides along so the scalar and the vector cannot disagree.
-    static constexpr int kSpecTrMax = 32;
+    // hot path, so it is fixed rather than allocated). SpecThr::K + 1 -- the carrier's cells at
+    // most, plus the camera's own wavelength, which rides along so the scalar and the vector cannot
+    // disagree.
+    static constexpr int kSpecTrMax = kSpecCellsMax + 1;
     static double mediumTransmittance(const Medium& med, const Vec3& o, const Vec3& dir,
                                       double dist, double lambda, Pcg32& rng,
                                       const PatTables* tabs) {

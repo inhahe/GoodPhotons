@@ -43,21 +43,28 @@ struct SPPMPixel {
     Hit    vpHit;             // diffuse hit record (pos/normal/uv/matId for BSDF eval)
     double vpThr = 0.0;       // specular throughput camera -> visible point (0 = none)
     bool   vpValid = false;
-    // SPPM-SPECTRAL: the walk's spectral factors as the gather needs them, one ratio per SpecThr
-    // bin (SpecThr::ratio at the bin, over its peak, which vpThr carries: a ratio can pass a
-    // float), so a photon of wavelength L is weighted by the camera prefix's factors at L rather
-    // than at the walk's own wavelength. Read only when vpSpec.
+    // SPPM-SPECTRAL: whether the walk folded a factor that is not flat, and the gather then reads
+    // the pixel's ratios (SPPMState::vpRatio).
     bool   vpSpec = false;
-    float  vpRatio[SpecThr::K];
 };
 
 struct SPPMState {
     int resX = 0, resY = 0;
     std::vector<SPPMPixel> px;
+    // SPPM-SPECTRAL: the walk's spectral factors as the gather needs them, `cells` ratios a pixel, one
+    // per cell of the scene's carrier (SpecThr::ratio at the cell, over its peak, which vpThr carries:
+    // a ratio can pass a float), so a photon of wavelength L is weighted by the camera prefix's
+    // factors at L rather than at the walk's own wavelength. A pixel's are read only where vpSpec.
+    int cells = kBandProbeBins;
+    std::vector<float> vpRatio;
+    float* ratios(size_t pix) { return vpRatio.data() + pix * (size_t)cells; }
     long long emittedTotal = 0;   // photons emitted across ALL passes (normalization)
     long long passes = 0;
-    void init(int w, int h, double R0) {
+    // `nCells`: the scene's carrier cells (Scene::specCells.n).
+    void init(int w, int h, double R0, int nCells) {
         resX = w; resY = h;
+        cells = nCells;
+        vpRatio.assign((size_t)w * h * (size_t)nCells, 0.0f);
         px.assign((size_t)w * h, {});
         for (auto& p : px) p.radius = R0;
         emittedTotal = 0; passes = 0;
@@ -352,10 +359,10 @@ inline void sppmVisiblePoint(const Scene& scene, Ray ray, Pcg32& rng, bool diffr
                 }
                 if (!passedThru) {
                     pastDiffuse = true;   // a fibre's scattering: no glow is seen past it
-                    const double* bins = hairSigmaBins<SpecThr::K, &SpecThr::lamOf>(scene, m, h);
+                    const double* bins = hairSigmaBins<kBandProbeBins, &bandBinLambda>(scene, m, h);
                     sthr.mul([&](double lamK) {
                         const HairShade hk = hairShadeRetint(scene, m, h, lamK, hs,
-                                                             bins ? bins[SpecThr::binOf(lamK)] : -1.0);
+                                                             bins ? bins[bandBinOf(lamK)] : -1.0);
                         return clamp01(hairFoldFCos(la, hk, wl, cosLong, nullptr) / pdfH);
                     }, wCam);
                 }
@@ -420,14 +427,14 @@ inline void sppmPass(const Scene& scene, const Camera& cam, SPPMState& st,
                     const double pjx = rng.uniform(), pjy = rng.uniform();   // in order
                     Ray ray = c.genRay(x, y, pjx, pjy);
                     Vec3 directL;
-                    SpecThr sthr(scene.emitSampler);
+                    SpecThr sthr(scene.specCells);
                     sppmVisiblePoint(scene, ray, rng, diffraction, maxBounce,
                                      P.vpHit, P.vpThr, P.vpValid, directL, sthr, c.enclosure);
                     P.vpSpec = P.vpValid && sthr.any;
                     if (P.vpSpec) {   // in float over its peak, the peak in vpThr (SpecThr::peak)
                         const double pk = sthr.peak();
-                        for (int k = 0; k < SpecThr::K; ++k)
-                            P.vpRatio[k] = (float)(sthr.ratio(SpecThr::lamOf(k)) / pk);
+                        float* vr = st.ratios((size_t)y * W + x);
+                        for (int k = 0; k < sthr.n; ++k) vr[k] = (float)(sthr.ratio(sthr.lamOf(k)) / pk);
                         P.vpThr *= pk;
                     }
                     P.directSum += directL;
@@ -474,7 +481,7 @@ inline void sppmPass(const Scene& scene, const Camera& cam, SPPMState& st,
                     double rho = gatherAlbedo(scene, m, h, ph.lambda, farSide);   // a translucent's far side: rho_T
                     double f = rho * (1.0 / PI);
                     // the camera prefix's factors at this photon's wavelength (SPPM-SPECTRAL)
-                    if (P.vpSpec) f *= (double)P.vpRatio[SpecThr::binOf(ph.lambda)];
+                    if (P.vpSpec) f *= (double)st.ratios((size_t)y * W + x)[scene.specCells.cellOf(ph.lambda)];
                     phi += pm.cie[k] * (f * (double)ph.power);        // == cie(lambda_p), precomputed
                     M += 1.0;
                 });

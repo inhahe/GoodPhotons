@@ -388,8 +388,18 @@ __device__ static double dEmitCdfAt(const DScene& sc, double lam) {
     return sc.emitSamplerCdf[b] + (t - b) * (sc.emitSamplerCdf[b + 1] - sc.emitSamplerCdf[b]);
 }
 
+// The scene's carrier cells (host twin SpecCells: its cells' ends and wavelengths, and each uniform bin's
+// first cell and count), uploaded where the scene splits a bin; null where it splits none, and the cells
+// are then the uniform bins, read as they always were (c_specCells, set with every upload).
+struct DSpecCells {
+    int n;
+    double lo[kSpecCellsMax], hi[kSpecCellsMax], lam[kSpecCellsMax];
+    unsigned char first[kBandProbeBins], count[kBandProbeBins];
+};
+FT_DEVGLOBAL(__constant__ const DSpecCells* c_specCells, = nullptr);
+
 struct DSpecThr {
-    static const int K = kBandProbeBins;   // SpecThr::K, the host twin's grid
+    static const int K = kSpecCellsMax;   // room for the most cells (SpecThr::K)
     double v[K];
     // The same product at the camera's wavelength, accumulated from the very scalars that went into
     // `thr` -- NOT re-sampled from the grid. `thr` already contains this factor, so `thr * ratio`
@@ -408,15 +418,27 @@ struct DSpecThr {
     int    partial;
     double pscale;
     __device__ void init() {
-        for (int k = 0; k < K; ++k) { v[k] = 1.0; p[k] = 1.0f; }
+        const int n = nCells();
+        for (int k = 0; k < n; ++k) { v[k] = 1.0; p[k] = 1.0f; }
         cam = 1.0; any = 0; pcam = 1.0; partial = 0; pscale = 1.0;
     }
+    // The scene's cells (c_specCells): how many, cell k's wavelength, the cell `lam` falls in.
+    __device__ static int nCells() {
+        const DSpecCells* c = c_specCells;
+        return c ? c->n : kBandProbeBins;
+    }
     __device__ static Real lamOf(int k) {
-        return (Real)(DLMIN + (k + 0.5) * (DLMAX - DLMIN) / (double)K);
+        const DSpecCells* c = c_specCells;
+        return c ? (Real)c->lam[k] : (Real)(DLMIN + (k + 0.5) * (DLMAX - DLMIN) / (double)kBandProbeBins);
     }
     __device__ static int binOf(Real lam) {
-        int b = (int)(((double)lam - DLMIN) / (DLMAX - DLMIN) * K);
-        return b < 0 ? 0 : (b >= K ? K - 1 : b);
+        int b = (int)(((double)lam - DLMIN) / (DLMAX - DLMIN) * kBandProbeBins);
+        b = b < 0 ? 0 : (b >= kBandProbeBins ? kBandProbeBins - 1 : b);
+        const DSpecCells* c = c_specCells;
+        if (!c) return b;
+        int i = c->first[b];
+        for (int e = i + c->count[b] - 1; i < e && (double)lam >= c->hi[i]; ++i) {}
+        return i;
     }
     // Fold in a factor already evaluated ON the grid plus its value at the camera's wavelength --
     // the media term, whose per-wavelength values come from one shared walk rather than from a
@@ -427,7 +449,8 @@ struct DSpecThr {
     __device__ void mulVec(const DScene& sc, const double* vk, double atCam, bool support) {
         cam *= atCam;
         bool zero = false;
-        for (int k = 0; k < K; ++k) {
+        const int n = nCells();
+        for (int k = 0; k < n; ++k) {
             if (!any && fabs(vk[k] - vk[0]) > 1e-12 * (1.0 + fabs(vk[0]))) any = 1;
             v[k] *= vk[k];
             if (support && !(vk[k] > 0.0)) { p[k] = 0.0f; zero = true; }
@@ -441,7 +464,8 @@ struct DSpecThr {
         cam *= atCam;
         double a = 0.0;
         bool flat = true, zero = false;
-        for (int k = 0; k < K; ++k) {
+        const int n = nCells();
+        for (int k = 0; k < n; ++k) {
             const double fk = f(lamOf(k));
             if (k == 0) a = fk;
             else if (fabs(fk - a) > 1e-12 * (1.0 + fabs(a))) flat = false;
@@ -457,21 +481,22 @@ struct DSpecThr {
     template <class F> __device__ void mulCoin(const DScene& sc, const F& f, double factorAtCam,
                                                double probAtCam, bool exhaustive) {
         double pr;
+        const int n = nCells();
         if (!exhaustive) {
-            const double a = f(lamOf(0), pr), b = f(lamOf(K / 2), pr), c = f(lamOf(K - 1), pr);
+            const double a = f(lamOf(0), pr), b = f(lamOf(n / 2), pr), c = f(lamOf(n - 1), pr);
             const double tol = 1e-12 * (1.0 + fabs(a));
             if (fabs(a - b) <= tol && fabs(a - c) <= tol) {
                 cam *= factorAtCam;
-                for (int k = 0; k < K; ++k) v[k] *= a;
+                for (int k = 0; k < n; ++k) v[k] *= a;
                 return;
             }
         }
-        // Every bin, once; a coin flat over them and at the walk's wavelength leaves `any` alone.
+        // Every cell, once; a coin flat over them and at the walk's wavelength leaves `any` alone.
         cam *= factorAtCam;
         pcam *= probAtCam;
         double a = 0.0;
         bool flat = true;
-        for (int k = 0; k < K; ++k) {
+        for (int k = 0; k < n; ++k) {
             const double fk = f(lamOf(k), pr);
             if (k == 0) a = fk;
             else if (fabs(fk - a) > 1e-12 * (1.0 + fabs(a))) flat = false;
@@ -482,12 +507,14 @@ struct DSpecThr {
         if (!flat || fabs(factorAtCam - a) > 1e-12 * (1.0 + fabs(a))) any = 1;
         if (partial) rescale(sc);
     }
-    // pscale = pcam / sum_k Q_k p[k] (host twin SpecThr::rescale).
+    // pscale = pcam / sum_k Q_k p[k], Q_k the emission sampler's mass in cell k (host twin SpecThr::rescale).
     __device__ void rescale(const DScene& sc) {
         double D = 0.0;
-        for (int k = 0; k < K; ++k) {
-            const double lo = DLMIN + k * (DLMAX - DLMIN) / (double)K;
-            const double hi = DLMIN + (k + 1) * (DLMAX - DLMIN) / (double)K;
+        const DSpecCells* c = c_specCells;
+        const int n = nCells();
+        for (int k = 0; k < n; ++k) {
+            const double lo = c ? c->lo[k] : DLMIN + k * (DLMAX - DLMIN) / (double)kBandProbeBins;
+            const double hi = c ? c->hi[k] : DLMIN + (k + 1) * (DLMAX - DLMIN) / (double)kBandProbeBins;
             D += (dEmitCdfAt(sc, hi) - dEmitCdfAt(sc, lo)) * (double)p[k];
         }
         pscale = (D > 0.0) ? pcam / D : 1.0;
@@ -502,22 +529,27 @@ struct DSpecThr {
     __device__ double peak() const {
         if (!any || !(cam > 1e-300)) return 1.0;
         double m = 0.0;
-        for (int k = 0; k < K; ++k) m = fmax(m, v[k] / cam * pscale);
+        const int n = nCells();
+        for (int k = 0; k < n; ++k) m = fmax(m, v[k] / cam * pscale);
         return (m > 0.0) ? m : 1.0;
     }
-    // The carrier as the beam gather reads it (host twin SpecThr::toJSpec). False, and `js`
-    // untouched, while nothing chromatic was folded.
+    // The carrier as the beam gather reads it (host twin SpecThr::toJSpec): on its uniform bins, each
+    // the cell its centre falls in. False, and `js` untouched, while nothing chromatic was folded.
     __device__ bool toJSpec(DJSpec& js) const {
         if (!any) return false;
         const double pk = peak();
         const bool live = cam > 1e-300;
         js.any = 1; js.disp = 0; js.lamC = 0.0f; js.invPdfC = 0.0f;
         js.logS = log(pk);
-        for (int k = 0; k < K; ++k) js.r[k] = live ? (float)(v[k] / cam * pscale / pk) : 0.0f;
+        for (int k = 0; k < DJSPEC_K; ++k) {
+            const int c = c_specCells ? binOf((Real)(DLMIN + (k + 0.5) * (DLMAX - DLMIN) / (double)DJSPEC_K)) : k;
+            js.r[k] = live ? (float)(v[c] / cam * pscale / pk) : 0.0f;
+        }
         return true;
     }
 };
-static_assert(DSpecThr::K == DJSPEC_K, "mode M's carrier and the beam gather's share a grid");
+static_assert(kBandProbeBins == DJSPEC_K, "the beam gather's carrier is on the uniform bins");
+static_assert(DSPEC_TRMAX >= DSpecThr::K + 1, "a media vector holds every cell and the walk's own wavelength");
 
 // SPECGATHER: a layered coat's coin at every bin, for mode M's walk and mode S's (host twin
 // foldCoatCoin): `coatPick` and `coatR` as dResolveCompound returned them, `coatCos` and `coatTh` the
@@ -587,10 +619,11 @@ __device__ static void dSpecFold(DSpecThr& st, const DScene& sc, const DMaterial
 // carrier's denominator are the same number by construction rather than by coincidence.
 __device__ static void dCamMediaTrSpec(const DScene& sc, const DVec3& o, const DVec3& d, Real len,
                                        Real lambda, DRng& rng, double* Tv) {
+    const int K = DSpecThr::nCells();   // Tv[0..K): the cells; Tv[K]: the walk's own wavelength
     Real lams[DSpecThr::K + 1];
-    for (int k = 0; k < DSpecThr::K; ++k) lams[k] = DSpecThr::lamOf(k);
-    lams[DSpecThr::K] = lambda;
-    for (int k = 0; k <= DSpecThr::K; ++k) Tv[k] = 1.0;
+    for (int k = 0; k < K; ++k) lams[k] = DSpecThr::lamOf(k);
+    lams[K] = lambda;
+    for (int k = 0; k <= K; ++k) Tv[k] = 1.0;
     // The same sun-disc multi-sampling the scalar version does: a directly-viewed disc is ~10^4x
     // its surroundings, so one sample of the medium in front of it twinkles. Averaging whole
     // VECTORS keeps the wavelengths correlated within each sample.
@@ -599,18 +632,18 @@ __device__ static void dCamMediaTrSpec(const DScene& sc, const DVec3& o, const D
         for (int k = 0; k < sc.nEmitters; ++k)
             if (sc.emitters[k].shape == 6 && dInSunCone(sc.emitters[k], d)) { n = pbeams::kSunDiscTrSamples; break; }
     if (n == 1) {
-        dMediaTransmittanceSpec(sc, o, d, len, lams, DSpecThr::K + 1, Tv, rng);
+        dMediaTransmittanceSpec(sc, o, d, len, lams, K + 1, Tv, rng);
         return;
     }
     double acc[DSpecThr::K + 1];
-    for (int k = 0; k <= DSpecThr::K; ++k) acc[k] = 0.0;
+    for (int k = 0; k <= K; ++k) acc[k] = 0.0;
     for (int i = 0; i < n; ++i) {
         double one[DSpecThr::K + 1];
-        for (int k = 0; k <= DSpecThr::K; ++k) one[k] = 1.0;
-        dMediaTransmittanceSpec(sc, o, d, len, lams, DSpecThr::K + 1, one, rng);
-        for (int k = 0; k <= DSpecThr::K; ++k) acc[k] += one[k];
+        for (int k = 0; k <= K; ++k) one[k] = 1.0;
+        dMediaTransmittanceSpec(sc, o, d, len, lams, K + 1, one, rng);
+        for (int k = 0; k <= K; ++k) acc[k] += one[k];
     }
-    for (int k = 0; k <= DSpecThr::K; ++k) Tv[k] = acc[k] / (double)n;
+    for (int k = 0; k <= K; ++k) Tv[k] = acc[k] / (double)n;
 }
 
 // ----------------------- photon-map camera gather (mode M) -------------------
@@ -710,8 +743,8 @@ __device__ static void dPhotonGather(const DScene& sc, const DPhotonMap& pm,
                     {   // SPECGATHER: extinction is spectral too (badly so in a coloured medium)
                         double Tv[DSpecThr::K + 1];
                         dCamMediaTrSpec(sc, pro, rd, slen, lambda, rng, Tv);
-                        thr *= Tv[DSpecThr::K];
-                        sthr.mulVec(sc, Tv, Tv[DSpecThr::K], false);
+                        thr *= Tv[DSpecThr::nCells()];
+                        sthr.mulVec(sc, Tv, Tv[DSpecThr::nCells()], false);
                     }
                 }
                 // Coloured glass is spectral (SPECGATHER), whatever it absorbs at the walk's own
@@ -746,8 +779,8 @@ __device__ static void dPhotonGather(const DScene& sc, const DPhotonMap& pm,
             {   // SPECGATHER: extinction is spectral too (badly so in a coloured medium)
                 double Tv[DSpecThr::K + 1];
                 dCamMediaTrSpec(sc, ro, rd, dSeg, lambda, rng, Tv);
-                thr *= Tv[DSpecThr::K];
-                sthr.mulVec(sc, Tv, Tv[DSpecThr::K], false);
+                thr *= Tv[DSpecThr::nCells()];
+                sthr.mulVec(sc, Tv, Tv[DSpecThr::nCells()], false);
             }
             if (thr <= 0.0) return;
         }
@@ -986,14 +1019,14 @@ __device__ static void dPhotonGather(const DScene& sc, const DPhotonMap& pm,
                         // SPECTRAL (0.342.0, host twin photonmap_render.h): one shadow ray,
                         // evaluated over the DSpecThr grid, so a gold lobe under a warm light
                         // stops painting each sample one colour.
-                        Real   lamG[DSpecThr::K];
-                        double ratG[DSpecThr::K], xyz[3] = {0.0, 0.0, 0.0};
-                        for (int i = 0; i < DSpecThr::K; ++i) {
-                            lamG[i] = DSpecThr::lamOf(i);
+                        Real   lamG[kBandProbeBins];
+                        double ratG[kBandProbeBins], xyz[3] = {0.0, 0.0, 0.0};
+                        for (int i = 0; i < kBandProbeBins; ++i) {
+                            lamG[i] = (Real)(DLMIN + (i + 0.5) * (DLMAX - DLMIN) / (double)kBandProbeBins);
                             ratG[i] = sthr.ratio(lamG[i]);
                         }
-                        const double dLam = (DLMAX - DLMIN) / (double)DSpecThr::K;
-                        bkNeeLightSpecGlossy(sc, h, nb, lamG, ratG, DSpecThr::K, dLam,
+                        const double dLam = (DLMAX - DLMIN) / (double)kBandProbeBins;
+                        bkNeeLightSpecGlossy(sc, h, nb, lamG, ratG, kBandProbeBins, dLam,
                                              lambda, thr, rng, xyz);
                         oX += xyz[0]; oY += xyz[1]; oZ += xyz[2];
                     } else {
@@ -1104,7 +1137,7 @@ __device__ static void dPhotonGather(const DScene& sc, const DPhotonMap& pm,
                     const double den = m.hairSigmaAFromReflect ? dhair::sigmaADenominator(m.hairBetaN) : -1.0;   // hoisted: three pow() per bin otherwise
                     const double specPat = dHairSpecPatAt(sc, m, h);   // hoisted: the pattern is the same at every bin
                     double vk[DSpecThr::K];
-                    for (int k = 0; k < DSpecThr::K; ++k) {
+                    for (int k = 0, nk = DSpecThr::nCells(); k < nk; ++k) {
                         const DHairSpec spk = dHairSpecAt(sc, m, h, DSpecThr::lamOf(k), specPat,
                                                           hsv.b.kappa, den);
                         const double w = dHairFoldFCos(la, hsv, spk, wl, cosLong, nullptr) / pdfH;
@@ -1484,9 +1517,10 @@ struct DSppmState {
     DHit*   vpHit;     // npix    this pass's visible point (diffuse hit)
     double* vpThr;     // npix    specular throughput camera -> visible point
     unsigned char* vpValid; // npix
-    // SPPM-SPECTRAL (host twin SPPMPixel::vpRatio): the camera prefix's spectral ratio per
-    // DSpecThr bin, read where vpSpec is set.
-    float*  vpRatio;   // npix*K
+    // SPPM-SPECTRAL (host twin SPPMState::vpRatio): the camera prefix's spectral ratio per cell of the
+    // scene's carrier, vpCells a pixel (DSpecThr::nCells()), read where vpSpec is set.
+    float*  vpRatio;   // npix*vpCells
+    int     vpCells;
     unsigned char* vpSpec;  // npix
 };
 
@@ -1538,8 +1572,8 @@ __global__ void kSppmVisiblePoint(DScene sc, const __grid_constant__ DCamera cam
         st.vpSpec[pix] = spec ? 1 : 0;
         if (spec) {   // in float over its peak, the peak in vpThr (host twin)
             const double pk = sthr.peak();
-            for (int k = 0; k < DSpecThr::K; ++k)
-                st.vpRatio[(size_t)pix * DSpecThr::K + k] = (float)(sthr.ratio(DSpecThr::lamOf(k)) / pk);
+            for (int k = 0, nk = DSpecThr::nCells(); k < nk; ++k)
+                st.vpRatio[(size_t)pix * st.vpCells + k] = (float)(sthr.ratio(DSpecThr::lamOf(k)) / pk);
             st.vpThr[pix] = thr * pk;
         }
         st.directSum[pix * 3 + 0] += dX;
@@ -1570,7 +1604,7 @@ __global__ void kSppmGather(DScene sc, DPhotonMap pm, DSppmState st, int resX, i
         float gx = 0.f, gy = 0.f, gz = 0.f;
         double M = 0.0;
         // the camera prefix's factors at each photon's wavelength (SPPM-SPECTRAL)
-        const float* ratio = st.vpSpec[pix] ? st.vpRatio + (size_t)pix * DSpecThr::K : nullptr;
+        const float* ratio = st.vpSpec[pix] ? st.vpRatio + (size_t)pix * st.vpCells : nullptr;
         const Real slkS = gatherBandSlack<Real>((Real)R, h.fiberRadius, dRoundScale(h));
         dPmNeighborhood(pm, h.p, [&](int k) {
             const DGatherPhoton& ph = pm.photons[k];

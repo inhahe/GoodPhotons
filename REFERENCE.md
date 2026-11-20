@@ -1177,6 +1177,17 @@ that converges to the same physical image.
   therefore unavailable in exactly the configuration that most wants them: `-beams` forces mode
   `M` onto the CPU, so the render whose forward pass is most worth banking was the one that
   could not bank it — silently, writing no file and printing nothing.)
+
+  **Colour along the camera walk.** The camera walk runs at one wavelength and the map holds
+  photons of every wavelength, so the walk carries the spectral factors it met (glass, gels,
+  coloured mirrors, coats, media) over a grid of wavelengths and each photon reads the cell its
+  own wavelength falls in. The grid is 24 bins of 19.6 nm, and since 0.451.0 they are split where
+  one of the scene's `table { … }` spectra steps sharply inside a bin, bends sharply, or leaves zero
+  (up to 16 cuts), so a gel, filter or mirror whose spectrum steps inside a bin reads correctly on
+  both sides of the step. Before then such a step was read at the bin's centre, up to 28 % off in a channel
+  (a gel opaque below 546.5 nm read mode R's green 0.72). Where a render's bins were split it
+  says so: `[specgather] the spectral carrier's 24 bins split at … nm`. Mode `S` carries the same
+  grid.
 - **`S` — SPPM (progressive, caustic-strong).** Stochastic progressive photon mapping
   (Hachisuka 2008/2009): instead of one fixed-radius map, it runs **repeated bounded
   photon passes** and **shrinks each pixel's gather radius** over iterations, so the

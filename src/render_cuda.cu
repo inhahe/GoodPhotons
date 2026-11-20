@@ -952,8 +952,11 @@ static void setSceneScale(const Scene& scene) {
     const double lenScale = scene.lenScale;
     CUDA_CHECK(cudaMemcpyToSymbol(gpu::c_lenScale, &lenScale, sizeof lenScale));
 }
+// ...and with it gpu::c_specCells, the spectral carrier's cells of the same scene (null where it splits
+// no bin): both from the uploaded DScene, at the same points.
 static void dSetLenScale(const gpu::DScene& sc) {
     CUDA_CHECK(cudaMemcpyToSymbol(gpu::c_lenScale, &sc.lenScale, sizeof sc.lenScale));
+    CUDA_CHECK(cudaMemcpyToSymbol(gpu::c_specCells, &sc.specCells, sizeof sc.specCells));
 }
 
 static void buildUploadScene(const Scene& scene, DUpload& up) {
@@ -2083,6 +2086,21 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
     sc.sceneCenter = {scene.sceneCenter.x, scene.sceneCenter.y, scene.sceneCenter.z};
     sc.sceneRadius = scene.sceneRadius;
     sc.lenScale = scene.lenScale;
+    // The spectral carrier's cells, where the scene's tables split its bins (Scene::specCells).
+    sc.specCells = nullptr;
+    if (scene.specCells.split()) {
+        const SpecCells& c = scene.specCells;
+        DSpecCells hc{};
+        hc.n = c.n;
+        for (int i = 0; i < c.n; ++i) { hc.lo[i] = c.lo[i]; hc.hi[i] = c.hi[i]; hc.lam[i] = c.lam[i]; }
+        for (int k = 0; k < kBandProbeBins; ++k) { hc.first[k] = c.first[k]; hc.count[k] = c.count[k]; }
+        DSpecCells* d = nullptr;
+        CUDA_CHECK(cudaMalloc(&d, sizeof hc));
+        CUDA_CHECK(cudaMemcpy(d, &hc, sizeof hc, cudaMemcpyHostToDevice));
+        keep(d);
+        sc.specCells = d;
+    }
+    dSetLenScale(sc);
     sc.jBeamDomR2  = scene.jBeamDomainR2;
     // `cavity` probe settings (O3 stage 2). The host loader has already resolved the
     // radius (explicit `cavity_radius`, else 2% of the scene AABB diagonal) and the
@@ -2323,7 +2341,7 @@ static void sceneOrHeld(const Scene& scene, const CudaSceneHold* held, DUpload& 
         throw std::logic_error(std::string(who) + ": the held device scene is not the scene being rendered");
     up.sc = held->up.sc;
     up.sceneId = held->up.sceneId; up.sceneGen = held->up.sceneGen; up.sceneBuild = held->up.sceneBuild;
-    setSceneScale(scene);
+    dSetLenScale(up.sc);
 }
 static double g_lastBdptOverheadSec = 0.0;
 double cudaLastBdptOverheadSec() { return g_lastBdptOverheadSec; }
@@ -6601,11 +6619,11 @@ bool cudaSppmSupported(const Scene& scene) {
 }
 
 // The device memory a mode-S session keeps a pixel (sppmSessionBegin's state and film): what the VRAM
-// preflight charges a mode-S frame (main.cpp, vramAffords).
-size_t cudaSppmPixelBytes() {
+// preflight charges a mode-S frame (main.cpp, vramAffords). `cells`: the scene's carrier cells.
+size_t cudaSppmPixelBytes(int cells) {
     // tau, directSum and the film (3 doubles each); nAcc, vpThr and radius; vpValid and vpSpec;
-    // vpHit; vpRatio's spectral bins.
-    return 12 * sizeof(double) + 2 * sizeof(unsigned char) + sizeof(gpu::DHit) + gpu::DSpecThr::K * sizeof(float);
+    // vpHit; vpRatio's spectral cells.
+    return 12 * sizeof(double) + 2 * sizeof(unsigned char) + sizeof(gpu::DHit) + (size_t)cells * sizeof(float);
 }
 SppmSession* sppmSessionBegin(const Scene& scene, const Camera& cam, int resX, int resY,
                               double R0, bool diffraction, int maxBounce, int heroC) {
@@ -6624,7 +6642,8 @@ SppmSession* sppmSessionBegin(const Scene& scene, const Camera& cam, int resX, i
     CUDA_CHECK(cudaMalloc(&s->st.radius,    np * sizeof(double)));
     CUDA_CHECK(cudaMalloc(&s->st.vpValid,   np * sizeof(unsigned char)));
     CUDA_CHECK(cudaMalloc(&s->st.vpHit,     np * sizeof(gpu::DHit)));
-    CUDA_CHECK(cudaMalloc(&s->st.vpRatio,   np * gpu::DSpecThr::K * sizeof(float)));
+    s->st.vpCells = scene.specCells.n;
+    CUDA_CHECK(cudaMalloc(&s->st.vpRatio,   np * (size_t)s->st.vpCells * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&s->st.vpSpec,    np * sizeof(unsigned char)));
     CUDA_CHECK(cudaMemset(s->st.vpSpec,    0, np * sizeof(unsigned char)));
     CUDA_CHECK(cudaMemset(s->st.tau,       0, np * 3 * sizeof(double)));

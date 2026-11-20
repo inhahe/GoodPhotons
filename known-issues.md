@@ -6779,7 +6779,48 @@ S's real seed-to-seed scatter is 5 % a seed, so 1.063 was a 1.8-sigma deviation 
 sigma. **Fixed in the check:** `stats()` takes every seed it is given (bit-identical at two), and modes
 S run eight (`SEEDS`).
 
-## OPEN (2026-10-14): SPECGATHER-BIN-RESOLUTION — mode M's 24-bin carrier misreads a spectral edge or kink inside one of its bins
+## DONE (2026-11-20, 0.451.0): SPECGATHER-BIN-RESOLUTION — mode M's 24-bin carrier misreads a spectral edge or kink inside one of its bins
+
+**Fixed: the carrier's bins are split where the scene's tables step, bend or leave zero** (`SpecCells`,
+design.md SPECGATHER, "The cells"). Both of the carrier's readings were at fault, not only the support's
+sum this entry first blamed. A photon read its bin's centre whatever side of a step its own wavelength
+was on -- the numerator, local but large where the bin holds much of a colour-matching weight (bin 9,
+536-556 nm, green's peak) -- and the support's sum counted the bin's whole walk density on one side,
+which scaled every photon (the half mirror below has no support edge at all, and read worst). Measured
+with `scraps/_binres_study.py` (a gel or a half mirror over a lit wall, mode M against mode R, the gel's
+tiles, CPU / GPU alike), before -> after:
+
+| the table | linear sRGB | XYZ |
+|---|---|---|
+| a gel's step just past bin 9's centre (546.5 nm) | G 0.72, R 1.05 -> 0.998, 1.001 | 0.988 / 0.889 / 0.424 -> 1.001 / 1.000 / 0.997 |
+| the step a quarter into the bin (541 nm) | G 1.12, R 0.96 -> 0.999, 1.001 | |
+| a half mirror's step at 546.5 nm | G 0.75 -> 0.997 | |
+| a gel's ramp, 0 at 555 to 0.9 at 585 nm | G 1.12 (its X, Y 1.02, 1.04) -> X, Y 0.996, 1.005 | |
+
+**The ramp's green excess, explained:** not the support (its edge at 555 sits 1 nm from a bin's end) but
+the bend at 585 nm, inside bin 11: the bin's centre, 585.2, read the plateau's 0.9 where the bin's mean is
+0.83. Linear sRGB's green is a difference of large terms behind a red-pass gel, which made 4 % of
+luminance read 12 %. What is left there: its Z 1.26 of mode R's, on a Z 0.6 % of its X -- within a cell
+the ramp is linear, and z̄ falls several-fold across it, so the cell's centre leans high. A finer cut
+would shrink it; nothing seen needs one. `tools/check_spec_cells.py` holds modes M and S, both devices,
+to mode R in X, Y and Z across all four, and across check_coat_modes' tank with its substrate's step
+moved inside bin 9 (a coin whose branch is impossible on one side of the step); tiles under 2 % of a
+channel's brightest carry no verdict there, as everywhere. The tank's upper tiles are dark: against a
+1024-sample mode R they read 20-50 % high in both modes and on both devices, against check_coat_modes'
+8192 samples 0.99-1.01, so the check takes that reference, four seeds and check_coat_modes' 5 % there.
+Against 0.450.44 the check fails as it should (the gel's Y 0.887 at 53 sigma, the mirror's 0.861).
+
+check_coat_modes' green band-pass gel (its ramps' bends and support edges now split four bins) reads
+in XYZ X 1.015, Y 0.995, Z 1.025 of mode R, where 0.450.44 read 1.03, 1.01, 1.045 -- but its linear-sRGB
+red, a small difference of large terms behind a green gel, failed the 10 % it was allowed, the old
+errors having cancelled there and the new ones not. That pair is judged in XYZ at 5 % now. check_bitid
+against 0.450.44: every CPU case identical (a scene without tables carries what it did), GPU modes M
+and S within 1e-3, inside the old build's own run-to-run spread. Cost: GPU mode M 0.8 % slower (the
+fog Cornell box 2.07 -> 2.09 s, the caustic box 3.60 -> 3.63 s: the carrier's arrays hold 40 cells),
+mode S unchanged (10.71 -> 10.70 s); mode S's per-pixel ratios are sized by the scene's cells, 96 B a
+pixel where nothing is split.
+
+The original report:
 
 Mode M's camera walk re-expresses its spectral factors at each photon's wavelength through a 24-bin
 carrier (`SpecThr` / `DSpecThr`, 19.6 nm bins over 360-830 nm), and since 0.381.2, where a coin's

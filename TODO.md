@@ -394,8 +394,8 @@ Then the rest of 4.2-4.6 in their order, 4.7's bookkeeping alongside whatever to
   `stats()` takes every seed, and mode S runs eight.
 - [x] **POV-FMOD-INT** (0.445.2) — `f_hex_x` / `f_hex_y` were flat on the GPU (MSVC's host-only
   `fmod<double, int>` in device code); `3.0` takes the double overload on both.
-- [ ] **SPECGATHER-BIN-RESOLUTION** — mode M's 24-bin carrier misreads a spectral edge or kink inside
-  a bin; the 555-585 nm ramp's green excess is unexplained.
+- [x] **SPECGATHER-BIN-RESOLUTION** (0.451.0) — mode M's and mode S's carrier bins split where the scene's
+  tables step, bend or leave zero (SpecCells); the ramp's excess was its bend inside bin 11; known-issues.
 - [x] **SPPM-SPECTRAL** (0.432.0) — mode S's visible point carries its walk's spectral factors per
   bin (SpecThr), and each gathered photon is weighted at its own wavelength.
 - [x] **BIRTH-EMPTY-STACK** (0.445.5) — every light walk starts inside the solids enclosing its

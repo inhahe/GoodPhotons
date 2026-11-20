@@ -304,6 +304,11 @@ constexpr int kBandProbeBins = 24;
 inline double bandBinLambda(int k) {
     return LAMBDA_MIN + (k + 0.5) * (LAMBDA_MAX - LAMBDA_MIN) / (double)kBandProbeBins;
 }
+// The bin of that grid `lam` (nm) falls in, the end bins below and above the band.
+inline int bandBinOf(double lam) {
+    const int b = (int)((lam - LAMBDA_MIN) / (LAMBDA_MAX - LAMBDA_MIN) * kBandProbeBins);
+    return b < 0 ? 0 : (b >= kBandProbeBins ? kBandProbeBins - 1 : b);
+}
 
 // --- Emission importance sampling ------------------------------------------
 // Precomputes a CDF over [LAMBDA_MIN, LAMBDA_MAX] to sample lambda ~ SPD, and
@@ -378,3 +383,133 @@ struct EmissionSampler {
         return cdf[b] + (t - b) * (cdf[b + 1] - cdf[b]);
     }
 };
+
+// ---- The cells mode M's and mode S's spectral carrier is read in (SPECGATHER-BIN-RESOLUTION) ----
+// Their camera walk carries its spectral factors over a grid (SpecThr; the device's DSpecThr), and a
+// photon reads the cell its own wavelength falls in. Read at one wavelength, a cell gives its value to
+// every photon in it, and its whole walk density to whichever side of a support edge that wavelength
+// is on: across a step inside a 19.6 nm bin that is the other side's value for half its photons
+// (a gel opaque below 546.5 nm read mode R's green 0.72) and half a bin's density missing from the
+// support's sum (its red 1.05). So the grid is the kBandProbeBins uniform bins, each split where one of
+// the scene's tables steps inside it or leaves zero (`spectralCuts`): every factor is then smooth
+// across every cell. A scene with no such table has exactly the uniform bins, each read at its centre.
+constexpr int kSpecCutsMax = 16;
+constexpr int kSpecCellsMax = kBandProbeBins + kSpecCutsMax;
+struct SpecCells {
+    int n = kBandProbeBins;
+    double lo[kSpecCellsMax], hi[kSpecCellsMax];   // each cell's ends, ascending, the last's hi LAMBDA_MAX
+    double lam[kSpecCellsMax];                     // the wavelength it is read at
+    double mass[kSpecCellsMax];                    // the walk density's mass in it (setMass)
+    unsigned char first[kBandProbeBins];           // each uniform bin's first cell...
+    unsigned char count[kBandProbeBins];           // ...and how many it is split into
+    SpecCells() { build({}); }
+
+    // The grid with cuts at `cuts` (nm): one cell a bin and no cut but the bins' own ends where there
+    // are none. A cut outside the band, or within 0.05 nm of a bin's end or of a cut kept, is dropped
+    // (a step that narrow is one edge); past kSpecCutsMax the rest are (Scene::buildSpecCells orders
+    // them, the costliest first). An unsplit bin keeps the uniform grid's own expressions for its
+    // ends and centre, so a scene without cuts reads its carrier where it always did.
+    void build(std::vector<double> cuts) {
+        const double W = (LAMBDA_MAX - LAMBDA_MIN) / (double)kBandProbeBins;
+        std::vector<double> keep;
+        for (double c : cuts) {
+            if ((int)keep.size() == kSpecCutsMax) break;
+            if (!(c > LAMBDA_MIN && c < LAMBDA_MAX)) continue;
+            const double t = (c - LAMBDA_MIN) / W;
+            if (std::fabs(t - std::round(t)) * W < 0.05) continue;
+            bool twin = false;   // (not `near`: <windows.h> defines that away)
+            for (double k : keep) twin = twin || std::fabs(k - c) < 0.05;
+            if (!twin) keep.push_back(c);
+        }
+        std::sort(keep.begin(), keep.end());
+        n = 0;
+        size_t ci = 0;
+        for (int k = 0; k < kBandProbeBins; ++k) {
+            const double b0 = LAMBDA_MIN + k * (LAMBDA_MAX - LAMBDA_MIN) / (double)kBandProbeBins;
+            const double b1 = LAMBDA_MIN + (k + 1) * (LAMBDA_MAX - LAMBDA_MIN) / (double)kBandProbeBins;
+            first[k] = (unsigned char)n;
+            double a = b0;
+            while (ci < keep.size() && keep[ci] < b1) {
+                lo[n] = a; hi[n] = keep[ci]; lam[n] = 0.5 * (a + keep[ci]); ++n;
+                a = keep[ci++];
+            }
+            lo[n] = a; hi[n] = b1;
+            lam[n] = (a == b0) ? bandBinLambda(k) : 0.5 * (a + b1);
+            ++n;
+            count[k] = (unsigned char)(n - first[k]);
+        }
+        for (int i = 0; i < n; ++i) mass[i] = 0.0;
+    }
+    // The walk density's mass in each cell, as EmissionSampler::binMass has it in each bin.
+    void setMass(const EmissionSampler& walk) {
+        for (int i = 0; i < n; ++i) mass[i] = walk.cdfAt(hi[i]) - walk.cdfAt(lo[i]);
+    }
+    // The cell `w` (nm) falls in; the end cells below and above the band. A cut belongs to the cell
+    // above it.
+    int cellOf(double w) const {
+        const int b = bandBinOf(w);
+        int c = first[b];
+        for (int e = c + count[b] - 1; c < e && w >= hi[c]; ++c) {}
+        return c;
+    }
+    bool split() const { return n != kBandProbeBins; }
+};
+
+// A table's own knots: a linear table's pairs, a monotone-cubic one's knots (not spectrumKnots'
+// linear pieces of it), through shares and scales. False for anything that is not a table.
+inline bool tableKnots(const Spectrum& s, std::vector<double>& x, std::vector<double>& y) {
+    x.clear(); y.clear();
+    double k = 1.0;
+    const Spectrum* cur = &s;
+    for (int guard = 0; guard < 16 && cur && *cur; ++guard) {
+        if (const SharedSpectrum* t = cur->target<SharedSpectrum>()) { cur = t->fn.get(); continue; }
+        if (const ScaledSpectrum* t = cur->target<ScaledSpectrum>()) { k *= t->k; cur = t->fn.get(); continue; }
+        break;
+    }
+    if (!cur || !*cur) return false;
+    if (const TabulatedLinear* t = cur->target<TabulatedLinear>()) {
+        for (const auto& pr : t->pairs) { x.push_back(pr.first); y.push_back(pr.second * k); }
+        return x.size() >= 2;
+    }
+    if (const TabulatedMono* t = cur->target<TabulatedMono>()) {
+        for (size_t i = 0; i < t->x.size(); ++i) { x.push_back(t->x[i]); y.push_back(t->y[i] * k); }
+        return x.size() >= 2;
+    }
+    return false;
+}
+
+// Where a table steps, bends or leaves zero, for SpecCells: the knots `x` (ascending, nm) and values `y`
+// of a piecewise-linear curve, scored so the cells keep the costliest. A knot where the curve becomes
+// or stops being zero bounds a support (scored 2); a segment narrower than a quarter of a carrier bin
+// across which it changes by a fifth of its largest magnitude or more is a step, cut at both ends
+// (scored by that change over the magnitude, 0.2 to 1); a knot where its slope changes enough to put a
+// cell read at its centre 2 % of that magnitude off a quarter bin away is a bend (scored by that
+// error over the magnitude, its own cap below a step's floor). A cell read at its centre is exact for a
+// curve linear across it, and off to first order for one that steps or bends inside it: behind a gel
+// ramping from 0 at 555 nm to 0.9 at 585, which levels off inside bin 11, mode M read mode R's Y 1.04.
+// Each found goes to `out` as (score, wavelength).
+inline void tableCuts(const std::vector<double>& x, const std::vector<double>& y,
+                      std::vector<std::pair<double, double>>& out) {
+    const size_t n = std::min(x.size(), y.size());
+    if (n < 2) return;
+    double top = 0.0;
+    for (size_t i = 0; i < n; ++i) top = std::max(top, std::fabs(y[i]));
+    if (!(top > 0.0)) return;
+    const double quarter = 0.25 * (LAMBDA_MAX - LAMBDA_MIN) / (double)kBandProbeBins;
+    auto slope = [&](size_t i) {   // segment i's, i to i + 1; 0 for a zero-width one
+        const double w = x[i + 1] - x[i];
+        return w > 0.0 ? (y[i + 1] - y[i]) / w : 0.0;
+    };
+    for (size_t i = 0; i + 1 < n; ++i) {
+        const double w = x[i + 1] - x[i], dy = std::fabs(y[i + 1] - y[i]);
+        if (w < quarter && dy >= 0.2 * top) {
+            out.push_back({dy / top, x[i]});
+            out.push_back({dy / top, x[i + 1]});
+        }
+        if ((y[i] == 0.0) != (y[i + 1] == 0.0)) out.push_back({2.0, y[i] == 0.0 ? x[i] : x[i + 1]});
+        if (i > 0) {
+            const double off = std::fabs(slope(i) - slope(i - 1)) * quarter / top;
+            if (off >= 0.02) out.push_back({std::min(off, 0.19), x[i]});
+        }
+    }
+}

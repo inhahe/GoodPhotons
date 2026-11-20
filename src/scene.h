@@ -2374,6 +2374,9 @@ struct Scene {
     // per-lambda weight the backward reference needs (see backward.h).
     EmissionSampler emitSampler;
     double emitG = 0.0;
+    // The cells mode M's and mode S's spectral carrier is read in (SpecCells): the uniform bins, split
+    // at this scene's tables' steps and support edges; built with emitSampler, whose masses it holds.
+    SpecCells specCells;
     // g(lambda) at emitSampler's bin centres, tabulated once by finalizeEmitters, so the samplers
     // finalizeCameraSpectrum builds on the same bins read it rather than every emitter's spectrum.
     std::vector<double> emitGTab;
@@ -3725,12 +3728,39 @@ struct Scene {
         }
         emitSampler.build(binTable(emitGTab, stepNm), stepNm);
         emitG = emitSampler.integral;
+        buildSpecCells();
         finalizeCameraSpectrum();
         // Emitter powers are now final, so the light BVH can be built off them. Last,
         // and inside finalizeEmitters, so every path that rebuilds the emitter list
         // (-ignoreenv, applyIgnoreFlags, the built-in scenes) gets a matching tree
         // rather than a stale one pointing at emitters that no longer exist.
         buildLightTree();
+    }
+
+    // The spectral carrier's cells (SpecCells): cut where any material's or medium's table steps or
+    // leaves zero (tableCuts), the support edges first, then the steepest steps, kSpecCutsMax at most.
+    // Emission spectra are not among them: they shape the photons' wavelengths, which every cell reads
+    // where they fall, not a factor the camera walk folds.
+    void buildSpecCells() {
+        std::vector<std::pair<double, double>> found;
+        std::vector<double> x, y;
+        auto scan = [&](const Spectrum& sp) {
+            if (sp && tableKnots(sp, x, y)) tableCuts(x, y, found);
+        };
+        for (const Material& m : mats)
+            for (const Spectrum* sp : {&m.reflect, &m.ior, &m.absorb, &m.transmit, &m.filmIor, &m.substrateK,
+                                       &m.coatAbsorb, &m.hairSpecular, &m.hairSigmaA, &m.hairMedullaSigmaS,
+                                       &m.hairMedullaSigmaA})
+                scan(*sp);
+        for (const Medium& md : media) { scan(md.sigma_a); scan(md.sigma_s); }
+        std::stable_sort(found.begin(), found.end(),
+                         [](const std::pair<double, double>& u, const std::pair<double, double>& v) {
+                             return u.first > v.first;
+                         });
+        std::vector<double> cuts;
+        for (const auto& f : found) cuts.push_back(f.second);
+        specCells.build(std::move(cuts));
+        specCells.setMass(emitSampler);
     }
 
     // The wavelength densities of a BACKWARD camera path (backward.h renderRows) and the

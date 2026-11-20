@@ -40,19 +40,20 @@ walk at every photon's wavelength, which a walk can do only for branches its own
     between): zero at all three wavelengths mode M's carrier once probed for flatness, so until
     0.381.7 it folded as a flat zero and the wall behind it rendered black. Its edges are ramps over
     several carrier bins, which both backends' spectral tables hold exactly (the device's are 5 nm
-    apart and interpolated, so a step reaches it as a 5 nm ramp, wherever it falls); their kinks
-    sit inside carrier bins, which leaves about 8 % in blue (SPECGATHER-BIN-RESOLUTION), so this
-    pair allows 10 %.
+    apart and interpolated, so a step reaches it as a 5 nm ramp, wherever it falls); their bends and
+    support edges split the carrier's bins (SpecCells). This pair is judged in X, Y and Z: behind a
+    green gel linear sRGB's red and blue are small differences of large terms.
   The others put their spectral edges on a boundary of mode M's 24 carrier bins (595 nm: 360 +
-  12 x 470 / 24). The carrier takes each factor at its bin's centre for every photon in the bin
-  (known-issues SPECGATHER-BIN-RESOLUTION); an edge inside a bin is another error, and this check
-  is about the coins.
+  12 x 470 / 24), where they split nothing: this check is about the coins, tools/check_spec_cells.py
+  about steps inside a bin (known-issues SPECGATHER-BIN-RESOLUTION).
 A tile fails when the two differ by more than 5 standard errors (two seeds each) AND by more
-than 5 % (10 % for the green gel, above). Exits 1 on any failure.
+than 5 %. Exits 1 on any failure.
 """
 import argparse
 import os
 import sys
+
+import numpy as np
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "tools"))
@@ -60,6 +61,8 @@ from check_glossy_nee_media import render_seeds, tile_stats, tile_stats_k, tile_
 from check_radiance_eta2 import TANK  # noqa: E402
 
 NL = chr(10)
+# linear sRGB (D65) to XYZ, for the pairs judged in XYZ
+SRGB_TO_XYZ = np.array([[0.4124, 0.3576, 0.1805], [0.2126, 0.7152, 0.0722], [0.0193, 0.1192, 0.9505]])
 SCENE = [
     'camera "c" { eye 0 0.45 -2.2  look_at 0 0.35 0  up 0 1 0  fov_y 34  film { res 64 48 } }',
     'material "floor" { type diffuse  reflect 0.6 }',
@@ -187,15 +190,18 @@ def main():
                                ["-mode", mode], dev, a.spp) for pri in (1, 2)]
         pairs.append(("opaque coat in water, mode %s%s: ranked below / above the water" % (
             mode, " (device)" if dev == "gpu" else ""), lo, hi))
-    # The green gel's ramps put kinks inside carrier bins, which the 24-bin carrier resolves to
-    # about 8 % in blue (known-issues SPECGATHER-BIN-RESOLUTION); what the pair guards is the band
-    # being seen at all (x0.27 / x5 without it), so it allows 10 %.
+    # The green gel is judged in XYZ: behind it linear sRGB's red and blue are small differences of
+    # large terms, which make a percent in X read several in red. Its ramps' bends and support edges
+    # split the carrier's bins (SpecCells); what is left is each cell's linear piece read at its
+    # centre where a colour-matching curve changes fast across it, 1-3 % (known-issues
+    # SPECGATHER-BIN-RESOLUTION); without the split it read X 1.03, Z 1.045, and without its every
+    # bin folded (REVIEW-0381B) x0.27 / x5.
     for name, what, ref, tol in (
             ("partial", "coat opaque in the red only, in water",
              (["-mode", "R"], "cpu", 1024) if a.no_gpu else (["-mode", "R"], "gpu", 8192), 0.05),
             ("halfmirror", "half mirror reflecting red", (["-mode", "R"], "cpu", a.spp), 0.05),
             ("filter", "red gel filter", (["-mode", "R"], "cpu", a.spp), 0.05),
-            ("greengel", "green band-pass gel", (["-mode", "R"], "cpu", a.spp), 0.10)):
+            ("greengel", "green band-pass gel", (["-mode", "R"], "cpu", a.spp), 0.05)):
         rr = render_seeds(a.exe, d, name + ".ftsl", name + "_R", ref[0], ref[1], ref[2], rgb=True)
         # Mode S on four seeds: its noise in the tank is correlated across a tile, so two seeds'
         # error estimate (one degree of freedom) can fake a 5-sigma tile -- seeds 1 and 2 put one
@@ -205,9 +211,11 @@ def main():
                 mm = render_seeds(a.exe, d, name + ".ftsl",
                                   name + "_" + k + ("g" if dev == "gpu" else ""), args, dev, a.spp,
                                   seeds=(1, 2) if k == "M" else (1, 2, 3, 4), rgb=True)
-                pairs += [("%s, mode %s%s / mode R, channel %d" % (
-                    what, k, " (device)" if dev == "gpu" else "", c), [x[..., c] for x in mm],
-                    [x[..., c] for x in rr], tol) for c in range(3)]
+                xyz = name == "greengel"
+                mx, rx = ([x @ SRGB_TO_XYZ.T for x in mm], [x @ SRGB_TO_XYZ.T for x in rr]) if xyz else (mm, rr)
+                pairs += [("%s, mode %s%s / mode R, %s" % (
+                    what, k, " (device)" if dev == "gpu" else "", ("XYZ"[c] if xyz else "channel %d" % c)),
+                    [x[..., c] for x in mx], [x[..., c] for x in rx], tol) for c in range(3)]
         # Mode U's merges re-express its camera walk the same way (JSPEC's carrier), and a walk
         # drawn below 595 nm dies at the red gel: the merges past it must stand in for it. Red
         # only: behind a red-pass gel, green and blue in linear sRGB are near zero and negative.

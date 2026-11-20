@@ -1310,9 +1310,34 @@ keeps 1 - R(lambda). `tools/check_coat_modes.py` holds the half mirror and the g
 walk (coloured glass along each segment, mirror, glossy and its interference, the dielectric step's
 coin, the half mirror's coin, the gel, the fiber, the grating's approximate reflection). A pass
 traces the visible points before its photons, so the carrier cannot ride to the gather on the
-stack: the pixel keeps its ratio per bin (`SPPMPixel::vpRatio`, the device's `DSppmState::vpRatio`,
-96 B a pixel, only read where `vpSpec` says some factor was not flat), and the gather multiplies
-each photon by its bin's. `tools/check_coat_modes.py` holds mode S to mode R per colour channel.
+stack: the pixel keeps its ratio per cell (`SPPMState::vpRatio`, the device's `DSppmState::vpRatio`,
+4 B a cell a pixel -- 96 B where the scene splits no bin -- only read where `vpSpec` says some factor
+was not flat), and the gather multiplies each photon by its cell's. `tools/check_coat_modes.py` holds mode S to mode R per colour channel.
+
+**The cells (0.451.0, SPECGATHER-BIN-RESOLUTION).** The grid is the scene's `SpecCells`
+(`spectrum.h`, built by `Scene::buildSpecCells` beside the emission sampler, whose mass in each cell it
+holds): the 24 uniform bins, each split where one of the scene's tables (any material's or medium's;
+`tableCuts`) steps inside it -- a segment narrower than a quarter bin across which it changes by a
+fifth of its range or more, cut at both ends -- bends (a knot whose change of slope puts a centre read
+2 % of the range off a quarter bin away), or becomes or stops being zero: the support edges first, then
+the steepest steps, then the sharpest bends, 16 cuts at most. A split cell is read at its midpoint, an unsplit bin
+at its centre with the uniform grid's own expressions, so a scene without such a table carries exactly
+what it did. Read at one wavelength, a bin with a step inside gave one side's value to the other
+side's photons, and in the support's sum its whole walk density to one side: behind a gel opaque
+below 546.5 nm (just past bin 9's centre) mode M read mode R's green 0.72 and red 1.05, a quarter into
+the bin green 1.12 and red 0.96, off a half mirror stepping there green 0.75 -- host and device alike.
+A gel ramping from 0 at 555 nm to 0.9 at 585 read Y 1.04, from the bend at 585 inside bin 11, whose
+centre read the plateau. With the cells every factor is linear or smooth across every cell, and a step
+reads exactly on both sides. The
+carriers' arrays hold `kSpecCellsMax` (40); `camMediaTrSpec` / `dCamMediaTrSpec` lay the media
+vector over the cells, mode S's `vpRatio` holds a ratio per cell, and the device reads the cells
+through `c_specCells` (`DScene::specCells`, null where nothing is split, set with `c_lenScale`). What
+stays on the uniform bins: the spectral NEE's quadrature (it reads the carrier through `ratio()` at
+the bins' centres), a fiber's absorption table (`hairSigmaBins`, from a constant colour's smooth
+uplift), and the beam gather's `JSpec` (`toJSpec` reads each bin's centre's cell). Mode J's carrier
+(`JSpec`) is its own and keeps its 24 bins. `[specgather] ...` says where a render's bins were
+split; `tools/check_spec_cells.py` holds modes M and S, both devices, to mode R across steps inside a
+bin.
 
 **The ratio's range (0.433.1, MODEM-COMPOTE-NAN).** Where coloured glass absorbs at the walk's own
 wavelength and passes others, `cam`, and with it the scalar throughput, falls as far as the ratio

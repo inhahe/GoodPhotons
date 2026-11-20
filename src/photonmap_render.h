@@ -28,6 +28,8 @@
 #include "gathercoverage.h" // gatherCoverage: the footprint a gather divides by
 #include <vector>
 #include <thread>
+#include <mutex>
+#include <string>
 #include <cstdint>
 #include "render.h"
 #include "photonmap.h"
@@ -427,8 +429,10 @@ inline void tracePhotonPass(const Scene& scene, long long N, int nThreads,
 // BIT-IDENTICALLY, which is the regression test), and a factor is probed at three wavelengths first
 // so a flat one costs three evaluations rather than K.
 struct SpecThr {
-    static constexpr int K = kBandProbeBins;     // bins across [LAMBDA_MIN, LAMBDA_MAX]
-    double v[K];                                 // the product over the grid (the numerator)
+    static constexpr int K = kSpecCellsMax;      // room for the most cells a scene's grid has
+    const SpecCells* cells;                      // the scene's grid (Scene::specCells), never null
+    int n;                                       // its cells: the arrays' first n entries are live
+    double v[K];                                 // the product over the cells (the numerator)
     // The SAME product at the camera's wavelength, accumulated from the very scalars the walk
     // multiplied into `thr`. It is NOT recomputed from the grid, and that is the whole point:
     // `thr` already contains this factor, so `thr * ratio` collapses to (everything else) *
@@ -444,7 +448,7 @@ struct SpecThr {
     // cannot sample a branch its own wavelength forbids. Where some bin cannot take the walk's
     // branches (`partial`: a coat opaque at some wavelengths, total internal reflection at some),
     // ratio() divides instead by the probability of the branches averaged over the density the
-    // walk's wavelength is drawn from (`walkDensity`: sum_k Q_k p[k]), which every walk wavelength
+    // walk's wavelength is drawn from (sum_k Q_k p[k], Q_k its mass in cell k), which every walk wavelength
     // shares, so the walks that can take them stand in for the ones that cannot
     // (MODE-M-FOLD-SUPPORT). Whether a walk is partial depends only on its branches, never on its
     // wavelength, so the two rules combine without bias.
@@ -452,17 +456,13 @@ struct SpecThr {
     double pcam = 1.0;
     bool   partial = false;
     double pscale = 1.0;                         // pcam / sum_k Q_k p[k] once partial
-    const EmissionSampler* walkDensity;          // never null: the ratio needs it once partial
-    explicit SpecThr(const EmissionSampler& walk) : walkDensity(&walk) {
-        for (int k = 0; k < K; ++k) { v[k] = 1.0; p[k] = 1.0; }
+    // `c`: the scene's cells, whose masses are the walk's wavelength density's (the scene's
+    // emission sampler: SpecCells::setMass).
+    explicit SpecThr(const SpecCells& c) : cells(&c), n(c.n) {
+        for (int k = 0; k < n; ++k) { v[k] = 1.0; p[k] = 1.0; }
     }
-    static double lamOf(int k) {
-        return LAMBDA_MIN + (k + 0.5) * (LAMBDA_MAX - LAMBDA_MIN) / (double)K;
-    }
-    static int binOf(double lam) {
-        int b = (int)((lam - LAMBDA_MIN) / (LAMBDA_MAX - LAMBDA_MIN) * K);
-        return b < 0 ? 0 : (b >= K ? K - 1 : b);
-    }
+    double lamOf(int k) const { return cells->lam[k]; }      // cell k's wavelength
+    int binOf(double lam) const { return cells->cellOf(lam); }   // the cell `lam` falls in
     // Fold in one spectral factor, `f(lambda)`, at every bin: a band between any few probe
     // wavelengths -- a notch, a band-pass gel -- is as much the factor as its ends, and a zero in it
     // is a hole in the support. A factor equal at every bin folds as the constant it is and leaves
@@ -473,7 +473,7 @@ struct SpecThr {
         cam *= atCam;
         double a = 0.0;
         bool flat = true, zero = false;
-        for (int k = 0; k < K; ++k) {
+        for (int k = 0; k < n; ++k) {
             const double fk = f(lamOf(k));
             if (k == 0) a = fk;
             else if (std::fabs(fk - a) > 1e-12 * (1.0 + std::fabs(a))) flat = false;
@@ -494,7 +494,7 @@ struct SpecThr {
     // on the walk's wavelength (the majorant is taken over it), which `partial` must never.
     void mulVec(const double* vk, double atCam) {
         cam *= atCam;
-        for (int k = 0; k < K; ++k) {
+        for (int k = 0; k < n; ++k) {
             if (!any && std::fabs(vk[k] - vk[0]) > 1e-12 * (1.0 + std::fabs(vk[0]))) any = true;
             v[k] *= vk[k];
         }
@@ -509,11 +509,11 @@ struct SpecThr {
                                     bool exhaustive) {
         double pr;
         if (!exhaustive) {
-            const double a = f(lamOf(0), pr), b = f(lamOf(K / 2), pr), c = f(lamOf(K - 1), pr);
+            const double a = f(lamOf(0), pr), b = f(lamOf(n / 2), pr), c = f(lamOf(n - 1), pr);
             const double tol = 1e-12 * (1.0 + std::fabs(a));
             if (std::fabs(a - b) <= tol && std::fabs(a - c) <= tol) {
                 cam *= factorAtCam;
-                for (int k = 0; k < K; ++k) v[k] *= a;
+                for (int k = 0; k < n; ++k) v[k] *= a;
                 return;
             }
         }
@@ -525,7 +525,7 @@ struct SpecThr {
         pcam *= probAtCam;
         double a = 0.0;
         bool flat = true;
-        for (int k = 0; k < K; ++k) {
+        for (int k = 0; k < n; ++k) {
             const double fk = f(lamOf(k), pr);
             if (k == 0) a = fk;
             else if (std::fabs(fk - a) > 1e-12 * (1.0 + std::fabs(a))) flat = false;
@@ -536,12 +536,12 @@ struct SpecThr {
         if (!flat || std::fabs(factorAtCam - a) > 1e-12 * (1.0 + std::fabs(a))) any = true;
         if (partial) rescale();
     }
-    // pscale = pcam / sum_k Q_k p[k], Q_k the walk density's mass in bin k. The sum is zero only if
-    // no bin centre the walk could be drawn at takes these branches, which the walk itself just
-    // did: then the bins cannot resolve the support, and the walk's own probability serves.
+    // pscale = pcam / sum_k Q_k p[k], Q_k the walk density's mass in cell k. The sum is zero only if
+    // no cell's wavelength the walk could be drawn at takes these branches, which the walk itself
+    // just did: then the cells cannot resolve the support, and the walk's own probability serves.
     void rescale() {
         double D = 0.0;
-        for (int k = 0; k < K; ++k) D += walkDensity->binMass[k] * p[k];
+        for (int k = 0; k < n; ++k) D += cells->mass[k] * p[k];
         pscale = (D > 0.0) ? pcam / D : 1.0;
     }
     // The correction a photon of wavelength `lamP` needs. Denominator is `cam`, so this
@@ -560,24 +560,53 @@ struct SpecThr {
     double peak() const {
         if (!any || !(cam > 1e-300)) return 1.0;
         double m = 0.0;
-        for (int k = 0; k < K; ++k) m = std::max(m, v[k] / cam * pscale);
+        for (int k = 0; k < n; ++k) m = std::max(m, v[k] / cam * pscale);
         return (m > 0.0) ? m : 1.0;
     }
     // The carrier as the beam gather reads it (JSpec, beamgather.h: mode J's carrier, read between
-    // bin centres), the ratio over its peak and the peak in logS, so neither leaves a float. False,
-    // and `js` untouched, while nothing chromatic was folded: the gather then takes no carrier.
+    // bin centres), the ratio over its peak and the peak in logS, so neither leaves a float: on
+    // JSpec's uniform bins, each the cell its centre falls in (the bin itself where it is not split).
+    // False, and `js` untouched, while nothing chromatic was folded: the gather then takes no carrier.
     bool toJSpec(JSpec& js) const {
-        static_assert(JSpec::K == K, "mode M's carrier and the beam gather's share a grid");
+        static_assert(JSpec::K == kBandProbeBins, "the beam gather's carrier is on the uniform bins");
         if (!any) return false;
         const double pk = peak();
         const bool live = cam > 1e-300;
         js.any = true;
         js.disp = false; js.lamC = 0.0f; js.invPdfC = 0.0f;
         js.logS = std::log(pk);
-        for (int k = 0; k < K; ++k) js.r[k] = live ? (float)(v[k] / cam * pscale / pk) : 0.0f;
+        for (int k = 0; k < JSpec::K; ++k) {
+            const int c = cells->cellOf(bandBinLambda(k));
+            js.r[k] = live ? (float)(v[c] / cam * pscale / pk) : 0.0f;
+        }
         return true;
     }
 };
+
+// Says, where the scene's tables split the carrier's bins (SpecCells), where: a mode M or S render's
+// opening line beside its others, once a scene (as CudaSceneHold tells scenes apart), however many of
+// the routes that start one call it.
+inline void reportSpecCells(const Scene& scene) {
+    const SpecCells& c = scene.specCells;
+    if (!c.split()) return;
+    static std::mutex m;
+    static const Scene* said = nullptr;
+    static uint64_t saidGen = 0, saidBuild = 0;
+    {
+        std::lock_guard<std::mutex> lk(m);
+        if (said == &scene && saidGen == scene.generation && saidBuild == scene.buildCount) return;
+        said = &scene; saidGen = scene.generation; saidBuild = scene.buildCount;
+    }
+    std::string at;
+    char buf[32];
+    for (int k = 0; k < kBandProbeBins; ++k)
+        for (int j = c.first[k] + 1; j < c.first[k] + c.count[k]; ++j) {
+            std::snprintf(buf, sizeof buf, " %.2f", c.lo[j]);
+            at += buf;
+        }
+    std::printf("[specgather] the spectral carrier's %d bins split at%s nm (%d cells), where the scene's "
+                "tables step or leave zero\n", kBandProbeBins, at.c_str(), c.n);
+}
 
 // SPECGATHER: a layered coat's coat-or-body coin at every bin, as modes J and U fold it, for mode M's
 // walk and mode S's. A thin-film coat's reflectance swings across the band, and the body under it
@@ -594,33 +623,34 @@ inline void foldCoatCoin(SpecThr& sthr, const Scene& scene, const Material& lm, 
 
 // The media transmittance of one straight CAMERA segment -- one ratio-tracking sample, or
 // pbeams::kSunDiscTrSamples of them when the segment points into a sun's disc (see the constant's
-// note) -- at every SpecThr grid wavelength plus (in the last slot) the camera's own, all from one
-// shared walk (device twin: dCamMediaTrSpec). The camera's slot is what the
+// note) -- at each of the carrier `st`'s cells' wavelengths, Tv[0..st.n), plus (Tv[st.n]) the camera's
+// own, all from one shared walk (device twin: dCamMediaTrSpec). The camera's slot is what the
 // scalar `thr` takes, so the scalar and the carrier's denominator are the same number by
 // construction -- the lesson from SPECGATHER's first attempt, which recomputed it and detonated.
 inline void camMediaTrSpec(const Scene& scene, const Renderer& mats, const Vec3& o, const Vec3& d,
-                           double len, double lambda, Pcg32& rng, double* Tv) {
+                           double len, double lambda, Pcg32& rng, const SpecThr& st, double* Tv) {
+    const int K = st.n;
     double lams[SpecThr::K + 1];
-    for (int k = 0; k < SpecThr::K; ++k) lams[k] = SpecThr::lamOf(k);
-    lams[SpecThr::K] = lambda;
-    for (int k = 0; k <= SpecThr::K; ++k) Tv[k] = 1.0;
+    for (int k = 0; k < K; ++k) lams[k] = st.lamOf(k);
+    lams[K] = lambda;
+    for (int k = 0; k <= K; ++k) Tv[k] = 1.0;
     // Same sun-disc multi-sampling the scalar version does (see pbeams::kSunDiscTrSamples): a
     // directly-viewed disc is 10^4 times its surroundings, so one sample of the cloud in front of it
     // twinkles. Averaging whole VECTORS keeps the wavelengths correlated within each sample.
     const int n = (scene.sunCount > 0 && scene.sunRadiance(d, lambda) > 0.0)
                       ? pbeams::kSunDiscTrSamples : 1;
     if (n == 1) {
-        mats.mediaTransmittanceSpec(scene, o, d, len, lams, SpecThr::K + 1, Tv, rng);
+        mats.mediaTransmittanceSpec(scene, o, d, len, lams, K + 1, Tv, rng);
         return;
     }
     double acc[SpecThr::K + 1] = {0.0};
     for (int i = 0; i < n; ++i) {
         double one[SpecThr::K + 1];
-        for (int k = 0; k <= SpecThr::K; ++k) one[k] = 1.0;
-        mats.mediaTransmittanceSpec(scene, o, d, len, lams, SpecThr::K + 1, one, rng);
-        for (int k = 0; k <= SpecThr::K; ++k) acc[k] += one[k];
+        for (int k = 0; k <= K; ++k) one[k] = 1.0;
+        mats.mediaTransmittanceSpec(scene, o, d, len, lams, K + 1, one, rng);
+        for (int k = 0; k <= K; ++k) acc[k] += one[k];
     }
-    for (int k = 0; k <= SpecThr::K; ++k) Tv[k] = acc[k] / (double)n;
+    for (int k = 0; k <= K; ++k) Tv[k] = acc[k] / (double)n;
 }
 
 // The GiCtx a light sample takes at a vertex shading with `m` that the walk reached from `wa`
@@ -1011,7 +1041,7 @@ inline Vec3 photonGather(const Scene& scene, const PhotonMap& pm, Ray ray, doubl
 
     // SPECGATHER: the walk's spectral factors, beside the scalar `thr`; its wavelength came from
     // the emission sampler (above).
-    SpecThr sthr(scene.emitSampler);
+    SpecThr sthr(scene.specCells);
     const bool volOn = (bm != nullptr) && !bm->empty() && !scene.media.empty();
     // -sunnee: the sun's single scatter is marched, not gathered (beamgather.h sunNeeMarch).
     // Not gated on the map being non-empty: erasing the direct-sun chords may have emptied it.
@@ -1077,9 +1107,9 @@ inline Vec3 photonGather(const Scene& scene, const PhotonMap& pm, Ray ray, doubl
                           L += gatherBeams(so, sd, slen, aGlass, cmIdx); }
                         if (sunOn && !tail) L += sunNeeMarch(scene, mats, so, sd, slen, aGlass, lambda, invPdfL, rng) * thr;
                         {   double Tv[SpecThr::K + 1];
-                            camMediaTrSpec(scene, mats, so, sd, slen, lambda, rng, Tv);
-                            thr *= Tv[SpecThr::K];
-                            sthr.mulVec(Tv, Tv[SpecThr::K]);
+                            camMediaTrSpec(scene, mats, so, sd, slen, lambda, rng, sthr, Tv);
+                            thr *= Tv[sthr.n];
+                            sthr.mulVec(Tv, Tv[sthr.n]);
                         }
                     }
                     // Inside a dielectric whatever it absorbs at the walk's own wavelength: a
@@ -1121,9 +1151,9 @@ inline Vec3 photonGather(const Scene& scene, const PhotonMap& pm, Ray ray, doubl
             // Extinction along the camera segment: what is behind the fog gets dimmed.
             {   // SPECGATHER: extinction is spectral too, and with a coloured medium badly so.
                 double Tv[SpecThr::K + 1];
-                camMediaTrSpec(scene, mats, ray.o, ray.d, dSeg, lambda, rng, Tv);
-                thr *= Tv[SpecThr::K];
-                sthr.mulVec(Tv, Tv[SpecThr::K]);
+                camMediaTrSpec(scene, mats, ray.o, ray.d, dSeg, lambda, rng, sthr, Tv);
+                thr *= Tv[sthr.n];
+                sthr.mulVec(Tv, Tv[sthr.n]);
             }
             if (thr <= 0.0) return L;
         }
@@ -1331,13 +1361,13 @@ inline Vec3 photonGather(const Scene& scene, const PhotonMap& pm, Ray ray, doubl
                         // SPECTRAL (0.341.0): one shadow ray, evaluated over the SpecThr grid,
                         // so a gold lobe under a warm light stops painting each sample one
                         // colour. The walk's own spectral throughput rides in through `ratio`.
-                        double lamG[SpecThr::K], ratG[SpecThr::K], xyz[3] = {0, 0, 0};
-                        for (int k = 0; k < SpecThr::K; ++k) {
-                            lamG[k] = SpecThr::lamOf(k);
+                        double lamG[kBandProbeBins], ratG[kBandProbeBins], xyz[3] = {0, 0, 0};
+                        for (int k = 0; k < kBandProbeBins; ++k) {
+                            lamG[k] = bandBinLambda(k);
                             ratG[k] = sthr.ratio(lamG[k]);
                         }
-                        const double dLam = (LAMBDA_MAX - LAMBDA_MIN) / (double)SpecThr::K;
-                        bwNee.neeLightSpecGlossy(scene, h, nb, lamG, ratG, SpecThr::K, dLam,
+                        const double dLam = (LAMBDA_MAX - LAMBDA_MIN) / (double)kBandProbeBins;
+                        bwNee.neeLightSpecGlossy(scene, h, nb, lamG, ratG, kBandProbeBins, dLam,
                                                  lambda, thr, rng, xyz);
                         L += Vec3(xyz[0], xyz[1], xyz[2]);
                     } else {
@@ -1431,14 +1461,14 @@ inline Vec3 photonGather(const Scene& scene, const PhotonMap& pm, Ray ray, doubl
                     if (specNeeHairOn()) {
                         // SPECTRAL (0.343.0): one shadow ray over the SpecThr grid, so a blonde
                         // fiber under a warm light stops painting each sample one colour.
-                        double lamG[SpecThr::K], ratG[SpecThr::K], xyz[3] = {0, 0, 0};
-                        for (int k = 0; k < SpecThr::K; ++k) {
-                            lamG[k] = SpecThr::lamOf(k);
+                        double lamG[kBandProbeBins], ratG[kBandProbeBins], xyz[3] = {0, 0, 0};
+                        for (int k = 0; k < kBandProbeBins; ++k) {
+                            lamG[k] = bandBinLambda(k);
                             ratG[k] = sthr.ratio(lamG[k]);
                         }
-                        const double dLam = (LAMBDA_MAX - LAMBDA_MIN) / (double)SpecThr::K;
-                        const double* sigB = hairSigmaBins<SpecThr::K, &SpecThr::lamOf>(scene, m, h);
-                        didSpec = bwNee.neeLightSpecHair(scene, h, m, hs, lamG, ratG, SpecThr::K,
+                        const double dLam = (LAMBDA_MAX - LAMBDA_MIN) / (double)kBandProbeBins;
+                        const double* sigB = hairSigmaBins<kBandProbeBins, &bandBinLambda>(scene, m, h);
+                        didSpec = bwNee.neeLightSpecHair(scene, h, m, hs, lamG, ratG, kBandProbeBins,
                                                          dLam, lambda, thr, sigB, rng, xyz);
                         if (didSpec) L += Vec3(xyz[0], xyz[1], xyz[2]);
                     }
@@ -1491,12 +1521,12 @@ inline Vec3 photonGather(const Scene& scene, const PhotonMap& pm, Ray ray, doubl
                     // medulla is live depends on the wavelength.
                     // the absorption per bin: a per-material table when the colour is constant
                     // (hairSigmaBins), else inverted at each wavelength
-                    const double* bins = hairSigmaBins<SpecThr::K, &SpecThr::lamOf>(scene, m, h);
+                    const double* bins = hairSigmaBins<kBandProbeBins, &bandBinLambda>(scene, m, h);
                     sthr.mul([&](double lamK) {
                         // this wavelength's shade, folded from the sample's angular half where
                         // both fibers are solid and evaluated in full where not (hairFoldFCos)
                         const HairShade hk = hairShadeRetint(scene, m, h, lamK, hs,
-                                                             bins ? bins[SpecThr::binOf(lamK)] : -1.0);
+                                                             bins ? bins[bandBinOf(lamK)] : -1.0);
                         return clamp01(hairFoldFCos(la, hk, wl, cosLong, nullptr) / pdfH);
                     }, wCam);
                 }
