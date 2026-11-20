@@ -15162,25 +15162,27 @@ enum { BV_CAMERA = 0, BV_LIGHT = 1, BV_SURFACE = 2, BV_MEDIUM = 3 };
 // beta stay double for MIS stability; geometry (p/ns/ng) is Real.
 // What a path vertex keeps of its walk's hit for the patterns a connection reads there, which a hit
 // rebuilt from the vertex (dVertHit) would otherwise lack (the host's vertices keep the whole Hit):
-// the hit's cavity, and where a moving or deforming primitive's point sat at the instant (dPatIn).
+// the hit's cavity, and where a moving or deforming primitive's point sat at the instant (dPatIn). A
+// deforming triangle's point there is its barycentrics', which the vertex keeps for its colour
+// (DVertex / DVcmLV::vb0q, vb1q), so this keeps only which primitive moved: 8 bytes in each of a
+// thread's 2 * BDPT_MAXV vertices.
 struct DVertHitState {
     Real cavity = (Real)-1;     // its cavity probe's, run where its material reads one (dCavityOf); < 0 none
     int  motionRef = -1;        // its motion set (>= 0), or -2 - its deforming triangle; -1 neither
-    Real deformB1 = (Real)0, deformB2 = (Real)0;   // the intersector's barycentrics there (DHit's)
 };
 // The state of the walk's hit `h` (DVertHitState), its cavity probed now if its material reads one.
 __device__ static inline DVertHitState dHitStateOf(const DScene& sc, const DHit& h) {
     DVertHitState s;
     if (sc.needsCavity && h.matId >= 0 && sc.mats[h.matId].readsCavity) s.cavity = (Real)dCavityOf(sc, h);
     s.motionRef = (h.deformTri >= 0) ? -2 - h.deformTri : h.motionSet;
-    s.deformB1 = h.deformB1; s.deformB2 = h.deformB2;
     return s;
 }
-// ...and back onto a rebuilt hit.
+// ...and back onto a hit rebuilt with the walk's barycentrics (h.vb0, h.vb1: the intersector's b0 and b1,
+// unpacked to within dPackBary's quantum), which place a deforming triangle's point at the instant.
 __device__ static inline void dRestoreHitState(DHit& h, const DVertHitState& s) {
     h.motionSet = (s.motionRef >= 0) ? s.motionRef : -1;
     h.deformTri = (s.motionRef <= -2) ? -2 - s.motionRef : -1;
-    h.deformB1 = s.deformB1; h.deformB2 = s.deformB2;
+    h.deformB1 = h.vb1; h.deformB2 = (Real)1 - h.vb0 - h.vb1;
     if (s.cavity >= (Real)0) { h.cavity = s.cavity; h.cavityDone = true; }
 }
 
@@ -15222,17 +15224,20 @@ struct DVertex {
     int   extMat = -1;              // the hit's DHit::extMat, for a rough coating's incident medium
     // The hit's vertex colour (DHit::vcol, -1 if none) and its barycentrics in 16 bits each
     // (dPackBary), so a connection shades a vertex-coloured mesh as the walk did
-    // (VCOL-BDPT-GPU). The quantum, 1.5e-5 of a barycentric, is far below a colour's.
+    // (VCOL-BDPT-GPU), and reads a deforming triangle's patterns where its point sat at the
+    // instant (dRestoreHitState). The quantum, 1.5e-5 of a barycentric, is far below a colour's,
+    // and moves that point by 1.5e-5 of the triangle's edges.
     int   vcol = -1;
     unsigned short vb0q = 0, vb1q = 0;
     DVertHitState hs;           // where the walk's hit read its patterns (dHitStateOf)
 };
 #if FTRACE_GPU_FP32
-// BDPT holds 2 * BDPT_MAXV of these per thread in local memory: a field that grows it costs
-// occupancy. No padding is left (back filled the hole after lightIdx; nUp, patOwnSide and
-// extMat share 8 B, the vertex colour the next 8 B, the hit's pattern state 16 B), so a new
+// BDPT holds 2 * BDPT_MAXV of these per thread in local memory, which the driver reserves for
+// every thread the card holds resident: 8 B more is 35 MB of VRAM a default render, 211 MB a
+// deep one (on a 4090). No padding is left (back filled the hole after lightIdx; nUp, patOwnSide and
+// extMat share 8 B, the vertex colour the next 8 B, the hit's pattern state 8 B), so a new
 // field grows it by 8 B.
-static_assert(sizeof(DVertex) == 160, "DVertex changed size");
+static_assert(sizeof(DVertex) == 152, "DVertex changed size");
 #endif
 // dShadedNg of the hit a vertex was made at; a light or camera vertex (back 0) keeps its ng.
 __device__ static inline DVec3 dVertexGeoN(const DVertex& v) { return v.back ? v.ng * (Real)(-1) : v.ng; }

@@ -201,6 +201,29 @@ to 0.25 renders as a 150 nm one within 2e-3, 1.0e-3 measured (its body's escape 
 on 0.450.1 it rendered as the unmapped 600 nm, 1.9 off), the `thinfilm` control byte for byte, and
 the three misspellings stop the load (on 0.450.1 they loaded).
 
+## DONE (2026-11-19, 0.450.32): DVERTHITSTATE-8B — a GPU path vertex kept a deforming triangle's barycentrics twice
+
+`DVertHitState`, the hit's pattern state in every `DVertex` of modes D and J (and beside each stored
+light vertex of mode U), kept the intersector's deform barycentrics as two floats, beside the 16-bit
+copies (`vb0q`, `vb1q`) the vertex keeps of the same crossing for its vertex colour. Both reviews of
+0.450.1-0.450.4 found it; the 8-B form was declined then because the device link refused it
+(GPU-LINK-FRAGILITY, since fixed).
+
+**Fixed:** `dRestoreHitState` places a deforming triangle's point from the rebuilt hit's own
+barycentrics (`deformB1 = vb1`, `deformB2 = 1 - vb0 - vb1`), so `DVertHitState` is the cavity and the
+motion reference, 8 B, and `DVertex` 152 B. The quantum, 1.5e-5 of a barycentric, moves a connection's
+pattern point on a deforming mesh by that much of the triangle's edges (6e-7 m on
+check_vertex_hit_state's panel). It links.
+
+**Measured** (0.450.31 against 0.450.32, paired, four rounds): kBdptT's stack 19 896 -> 19 720 B a
+thread (the deep variant's 65 136 -> 64 064), registers 168 either way, so no occupancy changed and no
+speed did -- `_fog_cornell` modes D, J and their `-max-bounce 24` variants, `_caustic_box` mode J and
+`_merge_glossy_bowl` mode U within 1 % (0.990-1.003). What it buys is VRAM: the driver reserves the
+stack for every thread the card holds resident (196 608 on the 4090), so 35 MB a default BDPT render,
+211 MB a deep one, and 8 B of each of mode U's stored hit states. check_bitid identical in modes D, J
+and U (M and S move as the old build does against itself); check_vertex_hit_state passes (deform:
+worst block z 2.5 / 4.3 / 3.4 in D / J / U, none out).
+
 ## DONE (2026-11-19, 0.450.30): REVIEW-0450M — what the Opus (max) and Fable (xhigh) reviews of 0.450.29 found
 
 0.450.29 grew new mechanisms of its own (parallel.h's exception path and thread cap, the background
@@ -1049,7 +1072,7 @@ ptxas compiled `dMatRoughness` (252 registers) and `dReflectPatMul` (238) out of
 kBdptT's launch bounds allow 168, though the edits are in mode U's kernel, which kBdptT never
 calls; giving mode U's kernels launch bounds did not help. GPU-LINK-FRAGILITY (TODO).
 
-**Not changed: DVertHitState stays 16 B** (both found the deform barycentrics duplicate the hit's own,
+**Not changed then: DVertHitState stays 16 B** (shrunk in 0.450.32, DVERTHITSTATE-8B; both found the deform barycentrics duplicate the hit's own,
 which the vertex keeps for its vertex colour, so 8 B would do). The 8-B form, the barycentrics
 restored from `vb0q/vb1q`, left the device link refusing: ptxas compiled `dReflectPatMul` and
 `intersectImplicit` out of line uncapped (238, 252 registers) where kBdptT's launch bounds allow 168,
