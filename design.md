@@ -968,7 +968,9 @@ one ray was a single ratio-tracking sample per camera sample. `camMediaTrSpec` /
 (the extinction sites of `photonGather` / `dPhotonGather`, spectral since SPECGATHER; taken wherever
 `-beams` is asked for in a scene with a medium, `medOn`, whether or not a beam was stored -- a medium
 that scatters nothing stores none and still dims what is behind it, M-BEAMS-ABSORBER, so the device's
-gather is handed its map whenever one was built, `DBeamMap::on`) average
+gather is handed its map whenever one was built, `DBeamMap::on`; an escaping ray's out to infinity, as
+mode R's camera ray takes them, the global-majorant tracking an unbounded field runs ending by Russian
+roulette, `kTrRoulette`) average
 `pbeams::kSunDiscTrSamples` (64) samples for a camera segment whose direction lies inside a
 sun's disc, and one sample otherwise — unbiased either way, and paid only by the handful of
 pixels on the disc.
@@ -3786,11 +3788,19 @@ was lit differently by every mode (known-issues GLOW-LIGHT-MODES). Now:
   or on a compound is a draw a sample, and its count grows with the render. The pass sees on
   through what passes light straight on, as the camera legs do (0.451.5): a sample whose first
   hit is a gel or half mirror, or whose ray to the sky crosses a medium's bounds (`skySeenThrough`),
-  is drawn at a wavelength of its own (`skySeenThroughXYZ`), times what each surface passes
-  (`straightPass`, -max-bounce of them at most) and the media's transmittance, to the sky and sun or a
-  glow beyond; every other sample keeps its exact XYZ, and the count grows in any scene with such a
-  surface or a medium. Mode P's blurred split does not walk: its camera side files a sample by its
-  first surface, a gel's included. Mode C, which catches photons through
+  is drawn at a wavelength of its own (`skySeenThroughXYZ`, on `walkStraight` from the camera),
+  times what each surface passes (`straightPass`, -max-bounce of them at most) and the media's
+  transmittance, out to infinity where it escapes, as mode R's camera ray takes it (so an unbounded
+  haze hides the sky behind it, its glow all that shows; the tracking an unbounded density field runs
+  ends by Russian roulette, `kTrRoulette`) -- a sun's disc averaged over `pbeams::kSunDiscTrSamples`
+  draws, as mode M's camera
+  ray does -- to the sky and sun or a glow beyond. A pinhole's through-samples take a per-pixel rotated
+  van der Corput wavelength in base 5 (its point takes bases 2 and 3). Every other sample keeps its
+  exact XYZ, and only a pixel its first samples saw through something grows its count with the render
+  (`SkyView::grow`; `scaleAt` gives each pixel's sum its own count). Mode P's still composite takes the
+  sky seen through a medium from its forward layer (`classifyComposite` leaves such a pixel DIFF), and
+  the glows-only pass it runs draws the sky through a filter for it. Mode P's blurred split does not
+  walk: its camera side files a sample by its first surface, a gel's included. Mode C, which catches photons through
   its pupil, does not see one. The camera's wavelength density includes the glows' emission
   (`Scene::glowG`, a twentieth of its mass; device `DScene::glowG`), so a glow whose colour no
   light emits is still drawn.
@@ -11639,13 +11649,23 @@ fiber and lens connections and their hero variants; on the device `connect*`) ta
 `camLegThrough` (`scene.h`) / `dCamLegThrough`, at the wavelengths the site splats:
 
 * the any-hit occlusion test first, as before, so a clear leg costs nothing more;
-* where it is blocked and the scene holds such a material (`Scene::passThroughAny`,
-  `DScene::passThroughAny`), a second any-hit test that skips them (`occludedGeometry`'s
-  `skipPassThrough`): a leg a wall blocks stops there;
-* only then a walk of the leg's closest hits -- camera-hidden surfaces skipped, a GRIN region a
-  block -- multiplying in what each gel or half mirror passes, a bound pattern read once a crossing.
+* in a scene that holds such a material (`Scene::passThroughAny`, `DScene::passThroughAny`) that one
+  test notes them instead of stopping at them (`occludedGeometry`'s `skipPassThrough` and `metPT`),
+  and the instances that may hold one (`Scene::instancePassesStraight`, from `blasPassThrough` per
+  asset; `DInstance::passThrough`), movers included (`dTimedAny`'s `skipPT`): a leg a wall blocks
+  stops there, and one that met none is clear;
+* only then a walk of the leg's closest hits (`walkStraight`, which the sky pass shares; the device's
+  inline in `dCamLegThrough`) -- a GRIN region a block -- multiplying in what each gel or half mirror
+  passes, a bound pattern read once a crossing.
 
 A leg that passes nothing at every wavelength is blocked, so it adds no empty hit to the noise estimate.
+
+**`hide_camera` along a leg** follows mode R's rule: a hidden surface is skipped only on the stretch
+next to the camera, mode R's camera ray skipping it and the ray that has crossed a gel not. A leg runs
+toward the camera, so a hidden surface met on it counts wherever a crossing lies between it and the
+camera; `walkStraight` finds the last unhidden crossing first, in a scene with a hidden surface, and
+hides only what lies past it. The sky pass's walk starts at the camera and hides them until its first
+crossing.
 
 **Each crossing is a vertex of the path**, as it is where mode R's camera ray crosses one, so it counts
 against -max-bounce: a connection takes `room`, the crossings left to it (`Renderer::legRoom` /

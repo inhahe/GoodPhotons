@@ -1095,6 +1095,7 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
         d.handSign = in.handSign;
         d.reachMul = in.reachMul; d.reachAdd = in.reachAdd;
         d.blasId = in.blasId; d.matOverride = in.matOverride; d.route = in.route;
+        d.passThrough = scene.instancePassesStraight(in) ? 1 : 0;
         d.emitOff = (int)(instEmit.size() / 2); d.emitN = (int)in.emitOf.size();
         for (const auto& [m, e] : in.emitOf) { instEmit.push_back(m); instEmit.push_back(e); }
     }
@@ -6207,7 +6208,8 @@ std::vector<Film> renderPhotonMapSharedCuda(const Scene& scene, const std::vecto
 
     // ---- upload the built beam map ----
     // Mode M's volume gather: the same device layout mode J's merges use, minus the MIS
-    // partials (see uploadBeamMapCuda). nNodes == 0 is the "no volume gather" sentinel.
+    // partials (see uploadBeamMapCuda). `on` says a map was built (the gather takes the media's
+    // extinction then); nNodes == 0, that it holds no beam to gather.
     DBeamMap dbm{};
     uploadBeamMapCuda(scene, bmap, up, dbm, stage, /*withMis=*/false);
     if (pin) pin->lightSec = std::chrono::duration<double>(std::chrono::steady_clock::now() - tCall).count();

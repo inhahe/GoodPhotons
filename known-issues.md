@@ -494,6 +494,44 @@ scene's cells too (its `r[]` sized `kSpecCellsMax`, read by cell rather than int
 its support's `hole` mask per cell) -- which grows the per-segment and per-vertex carrier
 JSPEC-CARRIER-SIZE measures (120 B to about 190 B), so it goes with that entry's half-precision bins.
 
+## DONE (2026-11-21, 0.451.7): REVIEW-0453 — what the Opus (max) and Fable (xhigh) reviews of 0.451.4-0.451.6 found
+
+Opus (max) and Fable (xhigh) reviewed 7bf37b4..d721112 (REVIEW-0452's follow-up, the sky pass through
+gels and fog, M-BEAMS-ABSORBER). Each finding was checked against the code; all were fixed.
+
+* **A gel placed as a `mesh_instance` blocked every camera leg** (both), since 0.451.4: the any-hit test
+  that skips gels cannot look inside an instance. An instance that may hold one
+  (`Scene::instancePassesStraight`, per asset `blasPassThrough`; `DInstance::passThrough`, movers too)
+  is left to the walk. check_passthrough's `inst_gel` fails on 0.451.6 (behind the gel 0).
+* **`hide_camera` past a gel** (both): the legs and the sky walk skipped hidden surfaces along their whole
+  length, where mode R's ray stops skipping them once it crosses a surface. The walk (`walkStraight`,
+  shared by the legs and the sky pass now, and its device twin) hides one only on the camera's stretch;
+  check_passthrough's `hidden_panel` fails on 0.451.6 (x1.89).
+* **Mode P's still composite wrote the sky through a fog undimmed** (both): `classifyComposite` leaves
+  such a pixel to the forward layer, whose glows-only sky pass now draws the sky through a filter;
+  check_sky_fog's mode P cases fail on 0.451.6 (x2.86, x1.97).
+* **An unbounded density field hung the sky pass** (Fable): an escaping ray takes the media out to 1e30,
+  and the ratio tracking such a field runs against its global majorant never reached the end -- mode M's
+  camera walk alike since `medOn` (a scattering field took it before). It ends at an exact 0 and by
+  Russian roulette below `kTrRoulette` (1e-6), unbiased, host and device. Fable's cure, stopping the ray
+  at the scene's exit sphere, was measured and rejected: mode R's camera ray takes an unbounded medium
+  to infinity, so behind an unbounded haze the sky is gone and its glow is what shows (mode R 0.417 over
+  the sky's quarter, 0.451.7's mode B 0.41; capped, mode B would read about 2.1). check_sky_fog's
+  `field_absorb` holds that the walk ends, in modes B, A, M and P. (An unbounded medium that scatters
+  differs from mode R in the forward modes by design: they light it only near the scene, which
+  warnHazeOnlyNearScene says -- mode P 0.65, modes A and B about 0.8 over the sky's quarter.)
+* **A blocked leg took two any-hit traversals** (Fable), and **`hidden()` paid a bounds check per
+  primitive** (both): one traversal notes the gels and half mirrors instead of stopping at them
+  (`metPT`), and the hidden test is gated on its flag again.
+* **The pinhole sky through a filter was noisy** (both): its wavelengths are a per-pixel rotated van der
+  Corput sequence in base 5, a stopped render takes 16 of them, and a sun's disc averages
+  `kSunDiscTrSamples` transmittance draws. **Every pixel's count grew** in a scene with any gel or medium
+  (both): only a pixel its first samples saw through one grows (`SkyView::grow`, `scaleAt`).
+* The walk in three copies (both): one host walker; the device's predicate once (`dPassesStraight`,
+  `dPrimPassesStraight`) -- its leg walk stays inline, there being no device sky pass to share it.
+  The -loadmap warning (Fable) now says a volume without beam data still dims what is behind it.
+  Stale comments (both), the misplaced declaration (Fable), history in the checks' docstrings (both).
+
 ## DONE (2026-11-20, 0.451.4): REVIEW-0452 — what the Opus (max) and Fable (xhigh) reviews of 0.451.2-0.451.3 found
 
 Opus (max) and Fable (xhigh) reviewed e21dbfc..7bf37b4 (HOST-HALFMIRROR-ANALYTIC, MODEB-PASSTHROUGH).

@@ -1133,6 +1133,11 @@ struct Renderer {
             if (t >= tb) break;
             double sigT = stBase * med.densityAt(o + dir * t, tabs);
             Tr *= 1.0 - sigT / sigMax;
+            if (Tr == 0.0) return 0.0;
+            if (Tr > 0.0 && Tr < kTrRoulette) {   // an endless segment ends (kTrRoulette)
+                if (rng.uniform() * kTrRoulette >= Tr) return 0.0;
+                Tr = kTrRoulette;
+            }
         }
         return Tr;
     }
@@ -1232,16 +1237,27 @@ struct Renderer {
         }
         const double sigMax = stMax * med.densityMax;                // global majorant over all lambdas
         if (sigMax <= 0.0) return;
+        double f[kSpecTrMax];   // this medium's factors, multiplied into Tr at the end
+        for (int i = 0; i < K; ++i) f[i] = 1.0;
         double t = ta;
         for (;;) {
             t += -std::log(1.0 - rng.uniformOpen()) / sigMax;
             if (t >= tb) break;
             const double dens = med.densityAt(o + dir * t, tabs);
+            double fMax = 0.0;
             for (int i = 0; i < K; ++i) {
-                Tr[i] *= 1.0 - (stB[i] * dens) / sigMax;
-                if (Tr[i] < 0.0) Tr[i] = 0.0;
+                f[i] *= 1.0 - (stB[i] * dens) / sigMax;
+                if (f[i] < 0.0) f[i] = 0.0;
+                if (f[i] > fMax) fMax = f[i];
+            }
+            if (fMax == 0.0) break;
+            if (fMax < kTrRoulette) {   // an endless segment ends (kTrRoulette), all wavelengths together
+                if (rng.uniform() * kTrRoulette >= fMax) { for (int i = 0; i < K; ++i) f[i] = 0.0; break; }
+                const double s = kTrRoulette / fMax;
+                for (int i = 0; i < K; ++i) f[i] *= s;
             }
         }
+        for (int i = 0; i < K; ++i) Tr[i] *= f[i];
     }
 
 

@@ -938,6 +938,7 @@ struct DInstance {
     int    route;         // MeshInstance::route: -1, or the mode its hits' routed copies take
     // MeshInstance::emitOf: its (material, emitter) pairs, DScene::instEmit[2 * emitOff ..], emitN of them.
     int    emitOff, emitN;
+    int    passThrough;   // Scene::instancePassesStraight: it may hold a gel or half mirror
 };
 
 // Implicit surfaces (isosurface / CSG / metaballs) — device twins of implicit.h.
@@ -3435,6 +3436,11 @@ __device__ static Real dMedTransmittance(const DMedium& m, const DVec3& o, const
         DVec3 pp = o + dir * (Real)t;
         double sigT = stBase * dMedDensityAt(m, pp, env);
         Tr *= 1.0 - sigT / sigMax;
+        if (Tr == 0.0) return (Real)0;
+        if (Tr > 0.0 && Tr < kTrRoulette) {   // an endless segment ends (host twin)
+            if ((double)rng.uniform() * kTrRoulette >= Tr) return (Real)0;
+            Tr = kTrRoulette;
+        }
     }
     return (Real)Tr;
 }
@@ -3641,16 +3647,27 @@ __device__ static void dMedTransmittanceSpec(const DMedium& m, const DVec3& o, c
     }
     const double sigMax = stMax * m.densityMax;
     if (sigMax <= 0.0) return;
+    double f[DSPEC_TRMAX];   // this medium's factors, multiplied into Tr at the end (host twin)
+    for (int i = 0; i < K; ++i) f[i] = 1.0;
     double t = ta;
     for (;;) {
         t += -log(1.0 - (double)rng.uniformOpen()) / sigMax;
         if (t >= tb) break;
         const double dens = dMedDensityAt(m, o + dir * (Real)t, env);
+        double fMax = 0.0;
         for (int i = 0; i < K; ++i) {
-            Tr[i] *= 1.0 - (stB[i] * dens) / sigMax;
-            if (Tr[i] < 0.0) Tr[i] = 0.0;
+            f[i] *= 1.0 - (stB[i] * dens) / sigMax;
+            if (f[i] < 0.0) f[i] = 0.0;
+            if (f[i] > fMax) fMax = f[i];
+        }
+        if (fMax == 0.0) break;
+        if (fMax < kTrRoulette) {
+            if ((double)rng.uniform() * kTrRoulette >= fMax) { for (int i = 0; i < K; ++i) f[i] = 0.0; break; }
+            const double s = kTrRoulette / fMax;
+            for (int i = 0; i < K; ++i) f[i] *= s;
         }
     }
+    for (int i = 0; i < K; ++i) Tr[i] *= f[i];
 }
 
 __device__ static void dMediaTransmittanceSpec(const DScene& sc, const DVec3& o, const DVec3& dir,
@@ -5474,6 +5491,10 @@ __device__ static bool dIntersectOtherNow(const DScene& sc, const DVec3& ro, con
 }
 // A primitive's material by global number, or -1 for an instance (whose materials are per BLAS
 // triangle: the camera-hide test skips them, as the static walks do).
+// A surface that passes light straight on, unbent: a gel or a half mirror (host twin passesStraight).
+__device__ static inline bool dPassesStraight(const DMaterial& m) {
+    return m.type == D_FILTER || m.type == D_HALFMIRROR;
+}
 __device__ static inline int dPrimMat(const DScene& sc, int prim) {
     if (prim < sc.nTris) return sc.tris[prim].matId;
     prim -= sc.nTris;
@@ -5483,6 +5504,14 @@ __device__ static inline int dPrimMat(const DScene& sc, int prim) {
     prim -= sc.nImplicits;
     if (prim < sc.nCurveSegs) return sc.curveSegs[prim].matId;
     return -1;
+}
+// Whether primitive `prim` passes light straight on (dPassesStraight), or is an instance that may hold
+// such a surface (DInstance::passThrough).
+__device__ static inline bool dPrimPassesStraight(const DScene& sc, int prim) {
+    const int m = dPrimMat(sc, prim);
+    if (m >= 0) return dPassesStraight(sc.mats[m]);
+    const int ib = sc.nTris + sc.nSph + sc.nImplicits + sc.nCurveSegs;
+    return prim >= ib && sc.instances[prim - ib].passThrough != 0;
 }
 // The segment tree of the path's time: the movers boxed over its stretch of the interval.
 __device__ static inline int dMotionSegRoot(const DScene& sc) {
@@ -5539,12 +5568,12 @@ __device__ __noinline__ static bool dTimedClosest(const DScene& sc, const DVec3&
 }
 // Whether any mover blocks the segment before tMax. `soft`, when given, takes a fibre whose
 // opacity is below 1 (shadowTransmittance's rule) and returns whether it is one, its hit filled
-// in to attenuate by, instead of blocking. `camHideOn` skips camera-hidden movers and `skipPT`
-// gels and half mirrors, as occludedGeometry's `hidden()` skips the static ones.
+// in to attenuate by, instead of blocking. `camHideOn` skips camera-hidden movers; under `skipPT` a gel
+// or half mirror does not block and sets `*metPT` (where given), as in occludedGeometry.
 template <class Soft>
 __device__ __noinline__ static bool dTimedAny(const DScene& sc, const DVec3& o, const DVec3& dir, const DVec3& invD,
                                  const DTriShear& sh, Real tmin, Real curveTmin, Real tMax, bool camHideOn,
-                                 bool skipPT, Soft&& soft) {
+                                 bool skipPT, bool* metPT, Soft&& soft) {
     const int root = dMotionSegRoot(sc);
     if (root < 0) return false;
     const DNode* N = sc.mo.segNodes;
@@ -5557,19 +5586,19 @@ __device__ __noinline__ static bool dTimedAny(const DScene& sc, const DVec3& o, 
         if (n.count > 0) {
             for (int i = 0; i < n.count; ++i) {
                 const int prim = sc.mo.segPrim[n.first + i];
-                if (camHideOn || skipPT) {
+                if (camHideOn) {
                     const int matId = dPrimMat(sc, prim);
-                    if (matId >= 0 && ((camHideOn && sc.mats[matId].hideCamera != 0) ||
-                                       (skipPT && (sc.mats[matId].type == D_FILTER ||
-                                                   sc.mats[matId].type == D_HALFMIRROR)))) continue;
+                    if (matId >= 0 && sc.mats[matId].hideCamera != 0) continue;
                 }
+                const bool pt = skipPT && dPrimPassesStraight(sc, prim);
                 DHit h; h.t = tMax; h.valid = false;
-                if (prim < sc.nTris) {
-                    if (dIntersectTriNow(sc, sh, o, dir, prim, tmin, h, mc, true)) return true;
-                } else if (soft(prim, h, mc)) {
-                    continue;                                   // a soft fibre attenuated instead
-                } else if (dIntersectOtherNow(sc, o, dir, prim, tmin, curveTmin, h, mc, true)) {
-                    return true;
+                bool hit;
+                if (prim < sc.nTris) hit = dIntersectTriNow(sc, sh, o, dir, prim, tmin, h, mc, true);
+                else if (soft(prim, h, mc)) continue;           // a soft fibre attenuated instead
+                else hit = dIntersectOtherNow(sc, o, dir, prim, tmin, curveTmin, h, mc, true);
+                if (hit) {
+                    if (!pt) return true;
+                    if (metPT) *metPT = true;
                 }
             }
         } else {
@@ -5967,11 +5996,12 @@ __device__ static double dHairOpacityAt(const DScene& sc, const DMaterial& m, co
 
 // `skipSph`: a sphere (its index) the ray cannot meet but by rounding -- a sphere connector's leg to the
 // sphere's own surface (dConnectSpecularSphere, dConnectSpecularSphereMirror) -- or -1.
-// `skipPassThrough`: gels and half mirrors do not block (dCamLegThrough asks whether anything else does).
+// `skipPassThrough`: a gel or half mirror, or an instance that may hold one, does not block; one the
+// segment meets sets `*metPT` (where given), and dCamLegThrough then walks it (host twin).
 __device__ static bool occludedGeometry(const DScene& sc, const DVec3& o, const DVec3& dir,
                                          Real maxDist, Real tmin = RAY_TMIN, bool camLeg = false,
                                          Real curveTmin = (Real)0, int skipSph = -1,
-                                         bool skipPassThrough = false) {
+                                         bool skipPassThrough = false, bool* metPT = nullptr) {
     if (tmin < (Real)0) tmin = dEpsAt(o);
     if (sc.nNodes == 0) return false;
     // One uniform test, hoisted out of the leaf loop; `hidden()` is checked BEFORE the
@@ -5979,8 +6009,7 @@ __device__ static bool occludedGeometry(const DScene& sc, const DVec3& o, const 
     const bool camHideOn = camLeg && sc.camHiddenAny;
     const bool skipPT = skipPassThrough && sc.passThroughAny;
     auto hidden = [&](int matId) -> bool {
-        return (camHideOn && sc.mats[matId].hideCamera != 0) ||
-               (skipPT && (sc.mats[matId].type == D_FILTER || sc.mats[matId].type == D_HALFMIRROR));
+        return camHideOn && sc.mats[matId].hideCamera != 0;
     };
     DVec3 invD{(Real)1 / dir.x, (Real)1 / dir.y, (Real)1 / dir.z};
     const DTriShear sh = makeTriShear(dir);
@@ -6000,6 +6029,7 @@ __device__ static bool occludedGeometry(const DScene& sc, const DVec3& o, const 
                 int prim = sc.primIdx[n.first + i];
                 if (skip && skip[prim]) continue;
                 DHit h; h.t = tMax; h.valid = false;
+                const bool pt = skipPT && dPrimPassesStraight(sc, prim);   // noted, not a block
                 bool blocked;
                 if (prim < sc.nTris)                              { const DTri& t = sc.tris[prim];
                                                                     blocked = !hidden(t.matId) && intersectTri(sh, o, dir, t, tmin, h); }
@@ -6014,13 +6044,17 @@ __device__ static bool occludedGeometry(const DScene& sc, const DVec3& o, const 
                     // Instance leaf: any-hit inside the shared BLAS in local space. NOT covered by
                     // `hidden()`: instanced materials live per-BLAS-triangle, below this decode, and
                     // nothing that can carry hideCamera today (a `light area`'s two world tris) is
-                    // ever instanced. Same exclusion as closestHit and the host twin.
+                    // ever instanced. Same exclusion as closestHit and the host twin. One that may
+                    // pass light straight on is left to dCamLegThrough's walk under `skipPT` (`pt`).
                     const DInstance& inst = sc.instances[prim - sc.nTris - sc.nSph - sc.nImplicits - sc.nCurveSegs];
                     DVec3 lo = affPoint(inst.Lm, inst.Lt, o);
                     DVec3 ld = affDir(inst.Lm, dir);
                     blocked = blasOccluded(sc, inst, lo, ld, tmin, tMax);
                 }
-                if (blocked) return true;
+                if (blocked) {
+                    if (!pt) return true;
+                    if (metPT) *metPT = true;
+                }
             }
         } else {
             Real tc;
@@ -6029,7 +6063,7 @@ __device__ static bool occludedGeometry(const DScene& sc, const DVec3& o, const 
         }
     }
     // (A moving skipSph is the movers' to skip: claimed, it is tested no further.)
-    return timed && dTimedAny(sc, o, dir, invD, sh, tmin, curveTmin, tMax, camHideOn, skipPT,
+    return timed && dTimedAny(sc, o, dir, invD, sh, tmin, curveTmin, tMax, camHideOn, skipPT, metPT,
                               [&sc, skipSph](int prim, DHit&, DMotionNow&) {
                                   return skipSph >= 0 && prim == sc.nTris + skipSph;
                               });
@@ -6135,7 +6169,7 @@ __device__ static Real shadowTransmittance(const DScene& sc, const DVec3& o, con
                 T *= (1.0 - dHairOpacityAt(sc, cm, h));
             return true;
         };
-        if (dTimedAny(sc, o, dir, invD, sh, tmin, curveTmin, tMax, false, false, soft) || T <= 1e-4) return (Real)0;
+        if (dTimedAny(sc, o, dir, invD, sh, tmin, curveTmin, tMax, false, false, nullptr, soft) || T <= 1e-4) return (Real)0;
     }
     return (T > 0.0 && dCrossesGrin(sc, o, dir, maxDist)) ? (Real)0 : (Real)T;   // after the geometry
 }
@@ -7049,10 +7083,11 @@ __device__ static inline bool dCamSideOk(const DVec3& n, const DVec3& ng, const 
                                          bool glossy, Real& cosSurf) {
     return dCamSideOkT(n, ng, wdir, glossy, cosSurf);
 }
-// Device twin of camLegThrough (scene.h, where the why is), defined below dTransmitSlot: false where the
-// camera leg from `o` to `target` (occludedTo's arguments) is blocked; else true, T[i] what the gels and
-// half mirrors on it pass at lam[i] (1 with none), `room` the most of them it may cross (dLegRoom). A
-// clear leg costs occludedTo's one any-hit walk.
+// Device twin of camLegThrough (scene.h, where the why is, with walkStraight's), defined below
+// dTransmitSlot: false where the camera leg from `o` to `target` (occludedTo's arguments; the camera at
+// `target`) is blocked; else true, T[i] what the gels and half mirrors on it pass at lam[i] (1 with
+// none), `room` the most of them it may cross (dLegRoom). A leg costs one any-hit walk, and one that met
+// such a surface and nothing else a walk of its closest hits.
 __device__ static bool dCamLegThrough(const DScene& sc, const DVec3& o, const DVec3& target, double absEps,
                                       Real tmin, Real curveTmin, int room, const Real* lam, int n,
                                       Real* T);
@@ -12920,35 +12955,61 @@ __device__ static bool dCamLegThrough(const DScene& sc, const DVec3& o, const DV
                                       Real tmin, Real curveTmin, int room, const Real* lam, int n,
                                       Real* T) {
     for (int i = 0; i < n; ++i) T[i] = (Real)1;
-    if (!occludedTo(sc, o, target, absEps, tmin, /*camLeg=*/true, curveTmin)) return true;
     room = room < kCamLegThroughMax ? room : kCamLegThroughMax;
-    if (room <= 0 || !sc.passThroughAny) return false;
+    if (room <= 0 || !sc.passThroughAny) return !occludedTo(sc, o, target, absEps, tmin, /*camLeg=*/true, curveTmin);
     const DVec3 tv = target - o;
     const Real td = length(tv);
     if (!(td > (Real)0)) return true;
     const DVec3 dir = tv / td;
-    Real left = connMaxT((double)td, absEps, dMaxAbs(target));
-    if (occludedGeometry(sc, o, dir, left, tmin, /*camLeg=*/true, curveTmin, -1, /*skipPassThrough=*/true) ||
+    Real left = connMaxT((double)td, absEps, dMaxAbs(target));   // occludedTo's length
+    const Real lenReach = td - dReachEps((Real)0);
+    if (lenReach < left) left = lenReach;
+    bool metPT = false;
+    if (occludedGeometry(sc, o, dir, left, tmin, /*camLeg=*/true, curveTmin, -1, /*skipPassThrough=*/true, &metPT) ||
         dCrossesGrin(sc, o, dir, left))
         return false;   // something other than a gel or half mirror stops it
+    if (!metPT) return true;   // nothing on it
+    // A camera-hidden surface counts where a crossing lies between it and the camera (walkStraight's rule):
+    // with any in the scene, the distance of the last unhidden crossing, past which they are hidden.
+    constexpr int kStepsMax = 4 * kCamLegThroughMax;
+    const bool hideOn = sc.camHiddenAny != 0;
+    Real tLast = (Real)-1;
+    if (hideOn) {
+        DVec3 q = o;
+        Real tq = tmin, cq = curveTmin, lf = left, t = (Real)0;
+        for (int k = 0; k < kStepsMax; ++k) {
+            const DHit h = closestHit(sc, q, dir, tq, lf, /*camHide=*/false, cq);
+            if (!h.valid || !(h.t < lf)) break;
+            const DMaterial& m = sc.mats[h.matId];
+            if (!m.hideCamera) {
+                if (!dPassesStraight(m)) break;
+                tLast = t + h.t;
+            }
+            q = h.p; t += h.t; lf -= h.t; tq = dHitEps(h); cq = (Real)0;
+        }
+    }
     DVec3 q = o;
-    Real tq = tmin, cq = curveTmin;
-    for (int k = 0; k <= room; ++k) {
-        const DHit h = closestHit(sc, q, dir, tq, left, /*camHide=*/true, cq);
+    Real tq = tmin, cq = curveTmin, t = (Real)0;
+    for (int k = 0, steps = 0; steps < kStepsMax; ++steps) {
+        const DHit h = closestHit(sc, q, dir, tq, left, /*camHide=*/false, cq);
         if (!h.valid || !(h.t < left)) return true;   // the rest of the leg is clear
         const DMaterial& m = sc.mats[h.matId];
-        const bool gel = m.type == D_FILTER;
-        if ((!gel && m.type != D_HALFMIRROR) || k == room) return false;
-        const Real tp = (gel && m.transmitPat >= 0) ? (Real)clamp01(dPatternScalarAt(sc, m.transmitPat, h)) : (Real)1;
-        bool any = false;
-        for (int i = 0; i < n; ++i) {
-            const Real v = gel ? specLookup(m.transmit, lam[i]) * tp
-                               : (Real)1 - dReflectSlot(sc, m, h, lam[i], nullptr);
-            T[i] *= v > (Real)0 ? (v < (Real)1 ? v : (Real)1) : (Real)0;   // NaN passes nothing
-            any = any || T[i] > (Real)0;
+        if (!(hideOn && m.hideCamera && t + h.t > tLast)) {   // a hidden one on the camera's stretch: skipped
+            if (!dPassesStraight(m) || k == room) return false;
+            const Real tp = (m.type == D_FILTER && m.transmitPat >= 0)
+                          ? (Real)clamp01(dPatternScalarAt(sc, m.transmitPat, h)) : (Real)1;
+            bool any = false;
+            for (int i = 0; i < n; ++i) {
+                const Real v = m.type == D_FILTER ? specLookup(m.transmit, lam[i]) * tp
+                                                  : (Real)1 - dReflectSlot(sc, m, h, lam[i], nullptr);
+                T[i] *= v > (Real)0 ? (v < (Real)1 ? v : (Real)1) : (Real)0;   // NaN passes nothing
+                any = any || T[i] > (Real)0;
+            }
+            if (!any) return false;   // passes nothing: no empty hit for the noise estimate
+            ++k;
         }
-        if (!any) return false;   // passes nothing: no empty hit for the noise estimate
         q = h.p;
+        t += h.t;
         left -= h.t;
         tq = dHitEps(h);   // clear of its own primitive, whose error near the origin outgrows dEpsAt
         cq = (Real)0;
