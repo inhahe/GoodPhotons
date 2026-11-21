@@ -969,8 +969,10 @@ one ray was a single ratio-tracking sample per camera sample. `camMediaTrSpec` /
 `-beams` is asked for in a scene with a medium, `medOn`, whether or not a beam was stored -- a medium
 that scatters nothing stores none and still dims what is behind it, M-BEAMS-ABSORBER, so the device's
 gather is handed its map whenever one was built, `DBeamMap::on`; an escaping ray's out to infinity, as
-mode R's camera ray takes them, the global-majorant tracking an unbounded field runs ending by Russian
-roulette, `kTrRoulette`) average
+mode R's camera ray takes them -- an unbounded density field only inside its far sphere, mode J's beam
+domain, empty past it (`Medium::farClip`, `dMedFarClip`, UNBOUNDED-FIELD-FAR: tracking an arbitrary field
+toward infinity has no end), the global-majorant tracking it runs ending by Russian roulette below
+`kTrRoulette`) average
 `pbeams::kSunDiscTrSamples` (64) samples for a camera segment whose direction lies inside a
 sun's disc, and one sample otherwise — unbiased either way, and paid only by the handful of
 pixels on the disc.
@@ -3789,18 +3791,22 @@ was lit differently by every mode (known-issues GLOW-LIGHT-MODES). Now:
   through what passes light straight on, as the camera legs do (0.451.5): a sample whose first
   hit is a gel or half mirror, or whose ray to the sky crosses a medium's bounds (`skySeenThrough`),
   is drawn at a wavelength of its own (`skySeenThroughXYZ`, on `walkStraight` from the camera),
-  times what each surface passes (`straightPass`, -max-bounce of them at most) and the media's
+  times what each surface passes (`StraightCross`, -max-bounce of them at most) and the media's
   transmittance, out to infinity where it escapes, as mode R's camera ray takes it (so an unbounded
-  haze hides the sky behind it, its glow all that shows; the tracking an unbounded density field runs
-  ends by Russian roulette, `kTrRoulette`) -- a sun's disc averaged over `pbeams::kSunDiscTrSamples`
+  haze hides the sky behind it, its glow all that shows; an unbounded density field ends at its far
+  sphere, `Medium::farClip`) -- a sun's disc averaged over `pbeams::kSunDiscTrSamples`
   draws, as mode M's camera
   ray does -- to the sky and sun or a glow beyond. A pinhole's through-samples take a per-pixel rotated
   van der Corput wavelength in base 5 (its point takes bases 2 and 3). Every other sample keeps its
   exact XYZ, and only a pixel its first samples saw through something grows its count with the render
-  (`SkyView::grow`; `scaleAt` gives each pixel's sum its own count). Mode P's still composite takes the
-  sky seen through a medium from its forward layer (`classifyComposite` leaves such a pixel DIFF), and
-  the glows-only pass it runs draws the sky through a filter for it. Mode P's blurred split does not
-  walk: its camera side files a sample by its first surface, a gel's included. Mode C, which catches photons through
+  (`SkyView::grow`; `scaleAt` gives each pixel's sum its own count). The walk starts from the pass's own
+  first hit, and a surface it crosses adds what it shows of a glow of its own (a mix's `glow_only`
+  child). Mode P's still composite takes the sky seen through a bounded medium from its forward layer
+  (`classifyComposite` leaves such a pixel DIFF) and through an unbounded one from its backward layer
+  (SPEC: the forward one lights such a haze only near the scene), and the glows-only pass it runs draws
+  the sky through a filter for it, in the DIFF pixels alone (`prepareSky`'s `skip`). Mode P's blurred
+  split walks only from a first surface of no specular type -- a mix's or a stack's, whose samples its
+  camera side leaves to it -- and draws the sky and sun behind it (`splitSeesSkyThrough`). Mode C, which catches photons through
   its pupil, does not see one. The camera's wavelength density includes the glows' emission
   (`Scene::glowG`, a twentieth of its mass; device `DScene::glowG`), so a glow whose colour no
   light emits is still drawn.

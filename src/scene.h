@@ -1031,6 +1031,24 @@ struct Medium {
 
     // Clip a ray (o + t*d, t in [t0,t1]) to the bound, returning the sub-interval
     // [ta,tb] that lies inside the medium. Returns false if the ray misses the box.
+    // An unbounded density field's far end (UNBOUNDED-FIELD-FAR): tracked inside the sphere (farC, farR),
+    // mode J's beam domain (Scene::jBeamDomainR2), and taken as empty past it, where no tracking of an
+    // arbitrary field toward infinity ends (one thinning to nothing keeps its transmittance up, so no
+    // roulette ends it either). farR 0: none (a bounded medium, or a homogeneous one, whose infinite
+    // extent is analytic). Set by Scene::build.
+    Vec3 farC{0, 0, 0};
+    double farR = 0.0;
+    // Clip [ta, tb] of o + t d (d unit) to the far sphere, where there is one; false if nothing is left.
+    bool farClip(const Vec3& o, const Vec3& d, double& ta, double& tb) const {
+        if (!(farR > 0.0)) return tb > ta;
+        const Vec3 q = o - farC;
+        const double b = dot(q, d), disc = b * b - (dot(q, q) - farR * farR);
+        if (!(disc > 0.0)) return false;
+        const double sq = std::sqrt(disc);
+        if (-b - sq > ta) ta = -b - sq;
+        if (-b + sq < tb) tb = -b + sq;
+        return tb > ta;
+    }
     // Unbounded media pass the interval through unchanged.
     bool clipToBounds(const Vec3& o, const Vec3& d, double t0, double t1,
                       double& ta, double& tb) const {
@@ -5283,6 +5301,10 @@ struct Scene {
             double r = k * std::max(sceneRadius, 1e-3);
             if (sweptReach > sceneRadius) r = std::max(r, sweptReach);
             jBeamDomainR2 = r * r;
+            for (Medium& md : media) {   // an unbounded density field's far end (Medium::farClip)
+                md.farC = sceneCenter;
+                md.farR = (!md.bounded && md.heterogeneous()) ? r : 0.0;
+            }
         }
         // Distant suns are sized by the same bounding sphere: a photon is born on a
         // disc of radius R perpendicular to its (cone-sampled) travel direction, so the
@@ -5936,9 +5958,9 @@ struct Scene {
         const auto passes = [&](int matId) {
             return skipPT && matId >= 0 && matId < (int)mats.size() && passesStraight(mats[(size_t)matId]);
         };
-        const auto blocks = [&](bool hit, bool pt) {   // a hit on what passes light is noted, not a block
+        const auto blocks = [&](bool hit, int matId) {   // a hit on what passes light is noted, not a block
             if (!hit) return false;
-            if (!pt) return true;
+            if (!passes(matId)) return true;
             if (metPT) *metPT = true;
             return false;
         };
@@ -5946,23 +5968,26 @@ struct Scene {
             Hit h; h.t = seg;
             if (prim < (int)nT)             { const Tri& t = tris[prim];
                                               return !hidden(t.matId) &&
-                                                     blocks(intersectTriNow(sh, r, t, tmin, h), passes(t.matId)); }
+                                                     blocks(intersectTriNow(sh, r, t, tmin, h), t.matId); }
             if (prim < (int)(nT + nS))      { const Sphere& s = spheres[prim - nT];
                                               return !hidden(s.matId) &&
-                                                     blocks(intersectSphereNow(r, s, tmin, h), passes(s.matId)); }
+                                                     blocks(intersectSphereNow(r, s, tmin, h), s.matId); }
             if (prim < (int)(nT + nS + nI)) { const Implicit& im = implicits[prim - nT - nS];
                                               return !hidden(im.matId) &&
                                                      blocks(intersectImplicitNow(r, im, tmin, h, &tabs, /*anyHit=*/true),
-                                                            passes(im.matId)); }
+                                                            im.matId); }
             if (prim < (int)(nT + nS + nI + nC)) {
                 const CurveSeg& cs = curveSegs[prim - nT - nS - nI];
                 return !hidden(cs.matId) &&
-                       blocks(intersectCurveNow(cray, r, cs, curveMin(r, tmin), h, /*anyHit=*/true), passes(cs.matId));
+                       blocks(intersectCurveNow(cray, r, cs, curveMin(r, tmin), h, /*anyHit=*/true), cs.matId);
             }
             // An instance that may pass light straight on is left to camLegThrough's walk, whose hits
             // carry each triangle's material.
             const MeshInstance& inst = instances[prim - nT - nS - nI - nC];
-            return blocks(occludedInstanceNow(r, inst, tmin, seg, vcolData()), skipPT && instancePassesStraight(inst));
+            if (!occludedInstanceNow(r, inst, tmin, seg, vcolData())) return false;
+            if (!(skipPT && instancePassesStraight(inst))) return true;
+            if (metPT) *metPT = true;
+            return false;
         });
     }
 
@@ -6738,55 +6763,51 @@ struct StraightWalk {
     Hit met;              // what `Met` met, its t from `from`
 };
 // A walk along o + t dir, t in [tmin, maxDist) (`curveTmin` as closestHit's), across the surfaces that pass
-// light straight on (passesStraight; MODEB-PASSTHROUGH): `cross(from, h, m)` takes each in turn, nearest
-// first -- `from` the stretch's start, `h` the hit, `m` its material -- and returns false where the light
-// passes nothing more. `leg.room` of them at most (kCamLegThroughMax at most); under `leg.split` the
-// crossing nearest the camera may not be of a specular type (LegRule). The camera is at the walk's
-// start where `camAtStart`, else at its end, and a camera-hidden surface (Material::hideCamera) is
-// hidden only on the stretch next to it: mode R's camera ray skips one, a ray that has crossed a surface
-// does not. So with the camera at the end, a hidden surface counts where any crossing lies between it and
-// the camera -- found by a first pass over the hits, in a scene with such a surface.
-template <class Cross>
+// light straight on (passesStraight; MODEB-PASSTHROUGH): `cross(from, h, m, pending)` takes each in turn,
+// nearest first -- `from` the stretch's start, `h` the hit, `m` its material -- and returns false where the
+// light passes nothing more. `leg.room` of them at most (kCamLegThroughMax at most); under `leg.split` the
+// crossing nearest the camera may not be of a specular type (LegRule; a walk from the camera under it
+// starts from a first hit that is not). `first`, where given, is the walk's first hit, traced already.
+//
+// The camera is at the walk's start where `camAtStart`, else at its end, and a camera-hidden surface
+// (Material::hideCamera) is hidden only on the stretch next to it: mode R's camera ray skips one, a ray
+// that has crossed a surface does not. From the camera, the walk skips them until it crosses one. Toward
+// the camera, whether one met lies on that stretch is known only from what follows: an opaque one blocks
+// where an unhidden crossing follows it, and a hidden one that passes light is crossed `pending` --
+// `cross` sets its factor aside, `fold(true)` takes it in when an unhidden crossing follows and
+// `fold(false)` drops it where none does.
+template <class Cross, class Fold>
 inline StraightWalk walkStraight(const Scene& scene, const Vec3& o, const Vec3& dir, double maxDist,
-                                 double tmin, double curveTmin, LegRule leg, bool camAtStart, Cross&& cross) {
+                                 double tmin, double curveTmin, LegRule leg, bool camAtStart, Cross&& cross,
+                                 Fold&& fold, const Hit* first = nullptr) {
     constexpr int kStepsMax = 4 * kCamLegThroughMax;   // hidden surfaces skipped included
     const int room = std::min(leg.room, kCamLegThroughMax);
-    bool lastSpecular = false;   // the last crossing's own type is specular (the camera's nearest, camAtEnd)
     const bool hideOn = scene.camHiddenAny;
-    // Camera at the end: the distance of the last unhidden crossing; hidden surfaces past it are hidden.
-    double tLast = -1.0;
-    if (!camAtStart && hideOn) {
-        Vec3 q = o;
-        double left = maxDist, tq = tmin, cq = curveTmin, t = 0.0;
-        for (int k = 0; k < kStepsMax; ++k) {
-            const Hit h = scene.closestHit(Ray{q, dir, cq}, tq, nullptr, false, /*skipCamHidden=*/false, left);
-            if (!h.valid || !(h.t < left)) break;
-            const Material& m = scene.mats[(size_t)h.matId];
-            if (!m.hideCamera) {
-                if (!passesStraight(m)) break;
-                tLast = t + h.t;
-            }
-            q = h.p; t += h.t; left -= h.t; tq = scene.hitEps(h); cq = 0.0;
-        }
-    }
     StraightWalk w;
     w.from = o;
     double left = maxDist, tq = tmin, cq = curveTmin;
-    bool crossed = false;
+    bool crossed = false, lastSpecular = false;
+    bool hiddenBlocks = false;   // toward the camera: a hidden surface since the last crossing passes nothing
+    int hiddenCross = 0;         // ...and the hidden crossings set aside since it
     for (int k = 0, steps = 0; steps < kStepsMax; ++steps) {
-        const bool skipHidden = hideOn && camAtStart && !crossed;
-        const Hit h = scene.closestHit(Ray{w.from, dir, cq}, tq, nullptr, false, skipHidden, left);
+        const Hit h = (first && steps == 0)
+            ? *first
+            : scene.closestHit(Ray{w.from, dir, cq}, tq, nullptr, false, hideOn && camAtStart && !crossed, left);
         if (scene.crossesGrin(w.from, dir, h.valid && h.t < left ? h.t : left)) { w.end = StraightEnd::Stopped; return w; }
         if (!h.valid || !(h.t < left)) {
+            if (hiddenCross) fold(false);   // on the camera's stretch: hidden
             w.end = (leg.split && !camAtStart && lastSpecular) ? StraightEnd::Stopped : StraightEnd::Clear;
             return w;
         }
         const Material& m = scene.mats[(size_t)h.matId];
-        const bool hidden = hideOn && m.hideCamera && (camAtStart ? !crossed : w.dist + h.t > tLast);
-        if (!hidden) {
+        if (hideOn && !camAtStart && m.hideCamera) {
+            if (!passesStraight(m) || !cross(w.from, h, m, /*pending=*/true)) hiddenBlocks = true;
+            else ++hiddenCross;
+        } else {
             if (!passesStraight(m)) { w.end = StraightEnd::Met; w.met = h; return w; }
-            if (leg.split && camAtStart && !crossed && isSpecularType(m.type)) { w.end = StraightEnd::Stopped; return w; }
-            if (k == room || !cross(w.from, h, m)) { w.end = StraightEnd::Stopped; return w; }
+            if (hiddenBlocks || k + hiddenCross + 1 > room) { w.end = StraightEnd::Stopped; return w; }
+            if (hiddenCross) { fold(true); k += hiddenCross; hiddenCross = 0; }
+            if (!cross(w.from, h, m, /*pending=*/false)) { w.end = StraightEnd::Stopped; return w; }
             ++k;
             crossed = true;
             lastSpecular = isSpecularType(m.type);
@@ -7019,6 +7040,17 @@ inline double materialFilmThickness(const Scene& scene, const Material& m, const
     return m.filmThickness;
 }
 
+// A two-way mix's (or stack's) weight map at `h`: the probability of child 0, in [0, 1] -- a value that is
+// not a number picks child 1, as `u < t` does -- or -1 where it has none (its constant weights stand).
+// mixResolveChild, mixResolveDominant and StraightCross read it; device twin dMixWeightAt.
+inline double mixWeightAt(const Scene& scene, const Material& m, const Hit& h) {
+    if (!(m.mixChildren.size() == 2 && (m.mixWeightPat >= 0 || m.mixWeightTex >= 0))) return -1.0;
+    const double t = (m.mixWeightPat >= 0 && m.mixWeightPat < (int)scene.patterns.size())
+                   ? scene.patterns[m.mixWeightPat].eval(patCtxFromHit(scene, h))
+                   : scene.textures[m.mixWeightTex].scalarAt(h.u, h.v);
+    return t > 0.0 ? (t < 1.0 ? t : 1.0) : 0.0;
+}
+
 // Resolve a stochastic Mix to a child index, honouring an optional per-hit blend
 // mask. With a bound mixWeightPat or mixWeightTex (2 children), the value t at the
 // hit is the probability of child 0 (child 1 = 1-t, no absorption) — a spatial A/B
@@ -7027,16 +7059,8 @@ inline double materialFilmThickness(const Scene& scene, const Material& m, const
 // (1 - sum) slice absorbed. Mix weight is a stochastic (RR-style) selection that does
 // not enter the BSDF pdf, so a per-hit weight stays unbiased in every tracer.
 inline int mixResolveChild(const Scene& scene, const Material& m, const Hit& h, double u) {
-    if (m.mixChildren.size() == 2 &&
-        (m.mixWeightPat >= 0 || m.mixWeightTex >= 0)) {
-        double t;
-        if (m.mixWeightPat >= 0 && m.mixWeightPat < (int)scene.patterns.size())
-            t = scene.patterns[m.mixWeightPat].eval(patCtxFromHit(scene, h));
-        else
-            t = scene.textures[m.mixWeightTex].scalarAt(h.u, h.v);
-        if (t < 0.0) t = 0.0; else if (t > 1.0) t = 1.0;
-        return (u < t) ? m.mixChildren[0] : m.mixChildren[1];
-    }
+    const double t = mixWeightAt(scene, m, h);
+    if (t >= 0.0) return (u < t) ? m.mixChildren[0] : m.mixChildren[1];
     return mixPickChild(m, u);
 }
 
@@ -7083,15 +7107,7 @@ inline double compoundMergeStoreProb(const Scene& scene, const Material& m, doub
 // shows a crisp boundary where the render shows a smooth gradient. That is the honest
 // cost of one deterministic sample per pixel, and it stays put frame to frame.
 inline int mixResolveDominant(const Scene& scene, const Material& m, const Hit& h) {
-    if (m.mixChildren.size() == 2 &&
-        (m.mixWeightPat >= 0 || m.mixWeightTex >= 0)) {
-        double t;
-        if (m.mixWeightPat >= 0 && m.mixWeightPat < (int)scene.patterns.size())
-            t = scene.patterns[m.mixWeightPat].eval(patCtxFromHit(scene, h));
-        else
-            t = scene.textures[m.mixWeightTex].scalarAt(h.u, h.v);
-        if (t < 0.0) t = 0.0; else if (t > 1.0) t = 1.0;
-        return (t >= 0.5) ? m.mixChildren[0] : m.mixChildren[1];
-    }
+    const double t = mixWeightAt(scene, m, h);
+    if (t >= 0.0) return (t >= 0.5) ? m.mixChildren[0] : m.mixChildren[1];
     return mixDominantChild(m);
 }

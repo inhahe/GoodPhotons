@@ -35,6 +35,8 @@ both carries no verdict):
     leaves what is seen through the gel to its camera side);
   - a `mix` of the gel and the white (0.6 / 0.4) in the gel's place, and a `layered` coat over the gel:
     a leg takes the walks' pick on average (StraightCross);
+  - a `mix` of the gel and a `glow_only` emitter: the sky pass shows the emitter's half of the glow on it,
+    as it crosses the gel's half;
   - the mix sliding across the shutter in mode P, whose split files a sample by its first surface's own
     type -- a mix's is the forward side's, so its legs and its sky pass see through it;
   - the sky behind the mix, modes B and P under the shutter.
@@ -83,6 +85,10 @@ SKY_FOG = SKY + ['medium { sigma_t 0.5  albedo 0.0  g 0.0  bounds { min -3 0 -0.
 MIX = 'material "mixgel" { type mix  layer "redgel" 0.6  layer "white" 0.4 }'
 COAT = 'material "coatgel" { type layered  ior 1.5  coat { reflectance fresnel  ior 1.5 }  layer "redgel" 1.0 }'
 MIX_GEL = gel_as(FILTER, "mixgel", MIX)
+GLOW_MIX = 'material "glowgel" { type mix  layer "redgel" 0.5  layer "neon" 0.5 }'
+NEON = 'material "neon" { type diffuse  reflect 0.0  emit 0.05  glow_only on }'
+MIX_GLOW = ([ln for ln in FILTER if not (ln.startswith("quad") and "material redgel }" in ln)] +
+            [GLOW_MIX, NEON, 'quad { origin -0.6 0.05 -0.5  u 0 1.2 0  v 1.2 0 0  material glowgel }'])   # faces the camera
 COAT_GEL = gel_as(FILTER, "coatgel", COAT)
 GLOW = FILTER + ['material "glow" { type diffuse  reflect 0.3  emit 0.05  glow_only on }',
                  'quad { origin -0.3 0.3 0.5  u 0 0.6 0  v 0.6 0 0  material glow }']
@@ -117,6 +123,7 @@ CASES = [
     ("sky_blur", blurred(SKY), B_ARGS, [], None),
     ("sky_blur_P", blurred(SKY), ["-mode", "P"], [], None),
     ("mix_gel", MIX_GEL, B_ARGS, [], None),
+    ("mix_glow", MIX_GLOW, B_ARGS, [], None),
     ("coat_gel", COAT_GEL, B_ARGS, [], None),
     ("mix_blur_P", blurred(MIX_GEL, "mixgel"), ["-mode", "P"], [], None),
     ("mix_sky", gel_as(SKY, "mixgel", MIX), B_ARGS, [], None),

@@ -5459,7 +5459,10 @@ boundaries**: e.g. a smooth radial falloff `pow(saturate(1 - dist/R), 2)` render
 glowing sphere of haze whose edge fades gradually instead of a hard surface. Sampling is
 unbiased **delta (Woodcock) tracking** for scattering and **ratio tracking** for shadow
 transmittance — exact, no voxelization. A majorant `density_max` is auto-estimated over
-`bounds` (or set explicitly). Heterogeneous/bounded fog is honored by the **forward**
+`bounds` (or set explicitly). A `density` field with **no `bounds`** is tracked out to a sphere
+eight times the scene's radius about its centre and taken as empty past it, in every mode (since
+0.451.9: a field that thins to nothing along a ray escaping to the sky, a ground fog, had no end a
+tracker could reach, and hung the render); a homogeneous haze with no bounds stays infinite. Heterogeneous/bounded fog is honored by the **forward**
 modes (A/B/C) on **both the CPU and the GPU** (the device runs the identical density VM +
 delta/ratio tracking). **BDPT `D`** renders media of **every kind** — global haze,
 multiple superposed media, box/sphere/object-**bounded** fog, and **heterogeneous

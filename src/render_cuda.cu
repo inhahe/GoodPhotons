@@ -1935,6 +1935,8 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
             dm.tempPeak      = m.tempPeak;
             dm.emissionScale = m.emissionScale;
             dm.bounded  = m.bounded ? 1 : 0;
+            dm.farC = {m.farC.x, m.farC.y, m.farC.z};
+            dm.farR = m.farR;
             dm.boundShape = (m.boundShape == MediumBound::Sphere)   ? 1
                           : (m.boundShape == MediumBound::Implicit) ? 2
                           : (m.boundShape == MediumBound::Mesh)     ? 3 : 0;
@@ -2086,6 +2088,7 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
     sc.sceneRadius = scene.sceneRadius;
     sc.lenScale = scene.lenScale;
     sc.passThroughAny = scene.passThroughAny ? 1 : 0;
+    sc.compoundStraightAny = scene.compoundStraightAny ? 1 : 0;
     // The spectral carrier's cells, where the scene's tables split its bins (Scene::specCells).
     sc.specCells = nullptr;
     if (scene.specCells.split()) {

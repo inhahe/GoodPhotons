@@ -661,9 +661,9 @@ struct DMaterial {
     double grooveSpacing;
     DVec3  grooveDir;
     int    gratingMaxOrder;
+    int    straight;   // Material::straight: a gel, a half mirror, or a compound with such a child
     // Stochastic mix (D_MIX): pick child mixChild[k] with prob mixWeight[k];
     // leftover (1 - sum) absorbs. Resolved before the material switch.
-    int    straight;   // Material::straight: a gel, a half mirror, or a compound with such a child
     int    mixCount;
     int    mixChild[D_MIXMAX];
     double mixWeight[D_MIXMAX];
@@ -1123,6 +1123,8 @@ struct DMedium {
     double           emitKelvin;      // Kelvin of the hottest voxel
     double           tempPeak;        // raw temperature-grid peak (for peak-normalisation)
     double           emissionScale;   // brightness multiplier on the Planck term
+    DVec3            farC;            // an unbounded density field's far end (host Medium::farClip):
+    double           farR;            //   tracked inside it, empty past it; farR 0 none
     int              bounded;         // 1 => clip to the bound region
     int              boundShape;      // 0 => box [bmin,bmax], 1 => sphere, 2 => implicit field,
                                       // 3 => MESH containment (dMeshWeight)
@@ -1665,8 +1667,11 @@ struct DScene {
                                // transport visibility queries' GRIN rule (dCrossesGrin).
     double           lenScale; // the scene's length scale (host Scene::lenScale), which c_lenScale
                                // carries to the kernels: dSetLenScale before every launch on it
-    int passThroughAny;        // a `filter` or `halfmirror` material (host Scene::passThroughAny): a
-                               // blocked camera leg may pass through one (dCamLegThrough)
+    int passThroughAny;        // a material that passes light straight on, a gel, a half mirror or a
+                               // compound with such a child (host Scene::passThroughAny): a blocked
+                               // camera leg may pass through one (dCamLegThrough)
+    int compoundStraightAny;   // such a compound (host Scene::compoundStraightAny): LegRule's split
+                               // rule has a crossing to keep
     const DSpecCells* specCells; // the spectral carrier's cells where the scene splits its bins, else
                                // null (host Scene::specCells; DSpecThr::init)
     DVec3  sensorOrigin, sensorUAxis, sensorVAxis;   // model A contact sensor plane
@@ -3344,6 +3349,18 @@ __device__ static DVec3 dMedGradN(const DMedium& m, const DVec3& p, double h,
 // Sample the next real collision along (o,dir) within [0,dMax]. Device twin of
 // Renderer::sampleMediumCollision: exact analytic free-flight (one draw) for a
 // homogeneous medium (bit-identical to before), else delta (Woodcock) tracking.
+// Clip [ta, tb] of o + t d (d unit) to an unbounded density field's far sphere (host twin Medium::farClip),
+// where it has one; false if nothing is left.
+__device__ static inline bool dMedFarClip(const DMedium& m, const DVec3& o, const DVec3& d, double& ta, double& tb) {
+    if (!(m.farR > 0.0)) return tb > ta;
+    const DVec3 q = o - m.farC;
+    const double b = (double)dot(q, d), disc = b * b - ((double)dot(q, q) - m.farR * m.farR);
+    if (!(disc > 0.0)) return false;
+    const double sq = sqrt(disc);
+    if (-b - sq > ta) ta = -b - sq;
+    if (-b + sq < tb) tb = -b + sq;
+    return tb > ta;
+}
 __device__ static bool dMedSampleCollision(const DMedium& m, const DVec3& o, const DVec3& dir,
                                            Real dMax, Real lambda, DRng& rng, Real& tHit,
                                            const DPatEnv& env) {
@@ -3378,6 +3395,7 @@ __device__ static bool dMedSampleCollision(const DMedium& m, const DVec3& o, con
     }
     double sigMax = stBase * m.densityMax;
     if (sigMax <= 0.0) return false;
+    if (!dMedFarClip(m, o, dir, ta, tb)) return false;   // an unbounded field's far end
     double t = ta;
     for (;;) {
         t += -log(1.0 - (double)rng.uniformOpen()) / sigMax;
@@ -3430,6 +3448,7 @@ __device__ static Real dMedTransmittance(const DMedium& m, const DVec3& o, const
     }
     double sigMax = stBase * m.densityMax;
     if (sigMax <= 0.0) return (Real)1;
+    if (!dMedFarClip(m, o, dir, ta, tb)) return (Real)1;   // an unbounded field's far end
     double Tr = 1.0, t = ta;
     for (;;) {
         t += -log(1.0 - (double)rng.uniformOpen()) / sigMax;
@@ -3438,9 +3457,9 @@ __device__ static Real dMedTransmittance(const DMedium& m, const DVec3& o, const
         double sigT = stBase * dMedDensityAt(m, pp, env);
         Tr *= 1.0 - sigT / sigMax;
         if (Tr == 0.0) return (Real)0;
-        if (Tr > 0.0 && Tr < kTrRoulette) {   // an endless segment ends (host twin)
-            if ((double)rng.uniform() * kTrRoulette >= Tr) return (Real)0;
-            Tr = kTrRoulette;
+        if (fabs(Tr) < kTrRoulette) {   // a long segment ends (host twin; |Tr|, past density_max)
+            if ((double)rng.uniform() * kTrRoulette >= fabs(Tr)) return (Real)0;
+            Tr = Tr > 0.0 ? kTrRoulette : -kTrRoulette;
         }
     }
     return (Real)Tr;
@@ -3569,6 +3588,7 @@ __device__ static void dMedTransmittanceMulti(const DMedium& m, const DVec3& o, 
     }
     const double sigMax = stBase * m.densityMax;
     if (sigMax <= 0.0) return;
+    if (!dMedFarClip(m, o, dir, ta, tb)) { for (; k < n; ++k) q.mul(k, Tr); return; }   // far end
     double t = ta;
     while (k < n) {
         t += -log(1.0 - (double)rng.uniformOpen()) / sigMax;
@@ -3648,6 +3668,7 @@ __device__ static void dMedTransmittanceSpec(const DMedium& m, const DVec3& o, c
     }
     const double sigMax = stMax * m.densityMax;
     if (sigMax <= 0.0) return;
+    if (!dMedFarClip(m, o, dir, ta, tb)) return;   // an unbounded field's far end
     double f[DSPEC_TRMAX];   // this medium's factors, multiplied into Tr at the end (host twin)
     for (int i = 0; i < K; ++i) f[i] = 1.0;
     double t = ta;
@@ -5490,11 +5511,11 @@ __device__ static bool dIntersectOtherNow(const DScene& sc, const DVec3& ro, con
     if (!anyHit) dHitToMoved(mc.D, Di, set, h);
     return true;
 }
-// A primitive's material by global number, or -1 for an instance (whose materials are per BLAS
-// triangle: the camera-hide test skips them, as the static walks do).
 // A surface that passes light straight on, unbent: a gel, a half mirror, or a mix or stack with such a child
 // (host twin passesStraight, Material::straight).
 __device__ static inline bool dPassesStraight(const DMaterial& m) { return m.straight != 0; }
+// A primitive's material by global number, or -1 for an instance (whose materials are per BLAS
+// triangle: the camera-hide test skips them, as the static walks do).
 __device__ static inline int dPrimMat(const DScene& sc, int prim) {
     if (prim < sc.nTris) return sc.tris[prim].matId;
     prim -= sc.nTris;
@@ -5590,14 +5611,13 @@ __device__ __noinline__ static bool dTimedAny(const DScene& sc, const DVec3& o, 
                     const int matId = dPrimMat(sc, prim);
                     if (matId >= 0 && sc.mats[matId].hideCamera != 0) continue;
                 }
-                const bool pt = skipPT && dPrimPassesStraight(sc, prim);
                 DHit h; h.t = tMax; h.valid = false;
                 bool hit;
                 if (prim < sc.nTris) hit = dIntersectTriNow(sc, sh, o, dir, prim, tmin, h, mc, true);
                 else if (soft(prim, h, mc)) continue;           // a soft fibre attenuated instead
                 else hit = dIntersectOtherNow(sc, o, dir, prim, tmin, curveTmin, h, mc, true);
                 if (hit) {
-                    if (!pt) return true;
+                    if (!(skipPT && dPrimPassesStraight(sc, prim))) return true;
                     if (metPT) *metPT = true;
                 }
             }
@@ -6029,7 +6049,6 @@ __device__ static bool occludedGeometry(const DScene& sc, const DVec3& o, const 
                 int prim = sc.primIdx[n.first + i];
                 if (skip && skip[prim]) continue;
                 DHit h; h.t = tMax; h.valid = false;
-                const bool pt = skipPT && dPrimPassesStraight(sc, prim);   // noted, not a block
                 bool blocked;
                 if (prim < sc.nTris)                              { const DTri& t = sc.tris[prim];
                                                                     blocked = !hidden(t.matId) && intersectTri(sh, o, dir, t, tmin, h); }
@@ -6051,8 +6070,8 @@ __device__ static bool occludedGeometry(const DScene& sc, const DVec3& o, const 
                     DVec3 ld = affDir(inst.Lm, dir);
                     blocked = blasOccluded(sc, inst, lo, ld, tmin, tMax);
                 }
-                if (blocked) {
-                    if (!pt) return true;
+                if (blocked) {   // one that passes light straight on is noted, not a block
+                    if (!(skipPT && dPrimPassesStraight(sc, prim))) return true;
                     if (metPT) *metPT = true;
                 }
             }
@@ -12664,14 +12683,17 @@ __device__ static Real dMatFilmThickness(const DScene& sc, const DMaterial& m, c
 // Device twin of scene.h mixResolveChild: resolve a D_MIX to a child index, honouring
 // an optional per-hit blend mask (2-child mix: map value t = prob of child 0). Returns
 // -1 for the leftover absorption slice (constant-weight path only). u is one uniform.
+// A two-way mix's (or stack's) weight map at `h` (host twin mixWeightAt, where the why is): child 0's
+// probability in [0, 1], a value that is not a number reading 0, or -1 where it has none.
+__device__ static inline Real dMixWeightAt(const DScene& sc, const DMaterial& m, const DHit& h) {
+    if (!((m.mixWeightPat >= 0 || m.mixWeightTex >= 0) && m.mixCount == 2)) return (Real)-1;
+    const Real t = (m.mixWeightPat >= 0) ? (Real)dPatternScalarAt(sc, m.mixWeightPat, h)
+                                         : (Real)dTexScalarAt(sc.textures[m.mixWeightTex], h.u, h.v);
+    return t > (Real)0 ? (t < (Real)1 ? t : (Real)1) : (Real)0;
+}
 __device__ static int dMixResolveChild(const DScene& sc, const DMaterial& m, const DHit& h, Real u) {
-    if ((m.mixWeightPat >= 0 || m.mixWeightTex >= 0) && m.mixCount == 2) {
-        Real t = (m.mixWeightPat >= 0)
-               ? (Real)dPatternScalarAt(sc, m.mixWeightPat, h)
-               : (Real)dTexScalarAt(sc.textures[m.mixWeightTex], h.u, h.v);
-        if (t < 0) t = 0; else if (t > 1) t = 1;
-        return (u < t) ? m.mixChild[0] : m.mixChild[1];
-    }
+    const Real t = dMixWeightAt(sc, m, h);
+    if (t >= (Real)0) return (u < t) ? m.mixChild[0] : m.mixChild[1];
     Real acc = 0;
     for (int k = 0; k < m.mixCount; ++k) { acc += (Real)m.mixWeight[k]; if (u < acc) return m.mixChild[k]; }
     return -1;
@@ -12685,13 +12707,8 @@ __device__ static int dMixResolveChild(const DScene& sc, const DMaterial& m, con
 // A constant-weight mix picks the heaviest lobe, unless the leftover absorption slice
 // outweighs every single lobe (then -1, i.e. absorbed).
 __device__ static int dMixResolveDominant(const DScene& sc, const DMaterial& m, const DHit& h) {
-    if ((m.mixWeightPat >= 0 || m.mixWeightTex >= 0) && m.mixCount == 2) {
-        Real t = (m.mixWeightPat >= 0)
-               ? (Real)dPatternScalarAt(sc, m.mixWeightPat, h)
-               : (Real)dTexScalarAt(sc.textures[m.mixWeightTex], h.u, h.v);
-        if (t < 0) t = 0; else if (t > 1) t = 1;
-        return (t >= (Real)0.5) ? m.mixChild[0] : m.mixChild[1];
-    }
+    const Real t = dMixWeightAt(sc, m, h);
+    if (t >= (Real)0) return (t >= (Real)0.5) ? m.mixChild[0] : m.mixChild[1];
     int best = -1; double bestW = 0.0, sum = 0.0;
     for (int k = 0; k < m.mixCount; ++k) {
         if (m.mixWeight[k] > bestW) { bestW = m.mixWeight[k]; best = m.mixChild[k]; }
@@ -12954,45 +12971,52 @@ __device__ static Real dTransmitSlot(const DScene& sc, const DMaterial& m, const
     return v * tp;
 }
 // What a surface that passes light straight on passes, crossed at `h` along `d` (host twin StraightCross,
-// where the why is): dStraightCross reads the crossing's patterns and weight map once, dStraightPass each
-// wavelength. In [0, 1], NaN passing nothing.
+// where the why is): dStraightCrossAt reads the crossing's patterns, weight map and coat once, dStraightPass
+// each wavelength. In [0, 1], NaN passing nothing.
 struct DStraightCross {
-    Real pat;   // a plain gel's transmit pattern at the hit
-    Real t;     // a two-way weight map's value at the hit, or -1: the constant weights
+    Real   t;                 // dMixWeightAt's, or -1: the constant weights
+    Real   pat[D_MIXMAX];     // a gel's transmit pattern, by child (pat[0]: a plain gel's)
+    double cosI;              // a stack's coat: |cos| of the crossing at the shading normal
+    Real   th;                //   and its thickness (dCoatRAtJ's)
 };
-__device__ static DStraightCross dStraightCross(const DScene& sc, const DMaterial& m, const DHit& h) {
-    DStraightCross x{(Real)1, (Real)-1};
-    if (m.type == D_FILTER && m.transmitPat >= 0) x.pat = (Real)clamp01(dPatternScalarAt(sc, m.transmitPat, h));
-    if ((m.type == D_MIX || m.type == D_LAYERED) && m.mixCount == 2 &&
-        (m.mixWeightPat >= 0 || m.mixWeightTex >= 0)) {
-        Real t = (m.mixWeightPat >= 0) ? (Real)dPatternScalarAt(sc, m.mixWeightPat, h)
-                                       : (Real)dTexScalarAt(sc.textures[m.mixWeightTex], h.u, h.v);
-        x.t = t < (Real)0 ? (Real)0 : (t > (Real)1 ? (Real)1 : t);
+__device__ static void dStraightCrossAt(const DScene& sc, const DMaterial& m, const DHit& h, const DVec3& d,
+                                        DStraightCross& x) {
+    const auto patOf = [&](const DMaterial& k) -> Real {
+        return (k.type == D_FILTER && k.transmitPat >= 0) ? (Real)clamp01(dPatternScalarAt(sc, k.transmitPat, h))
+                                                          : (Real)1;
+    };
+    x.t = (Real)-1; x.cosI = 0.0; x.th = (Real)0;
+    if (!dIsCompound(m.type)) { x.pat[0] = patOf(m); return; }
+    x.t = dMixWeightAt(sc, m, h);
+    for (int k = 0; k < m.mixCount; ++k) x.pat[k] = m.mixChild[k] >= 0 ? patOf(sc.mats[m.mixChild[k]]) : (Real)1;
+    if (m.type == D_LAYERED && m.coatModel != 2) {
+        x.cosI = fabs((double)dot(h.n, d));
+        if (x.cosI > 1.0) x.cosI = 1.0;
+        x.th = dCoatThickness(sc, m, h);
     }
-    return x;
 }
-__device__ static Real dStraightLeaf(const DScene& sc, const DMaterial& k, const DHit& h, Real lambda) {
-    if (k.type == D_FILTER) {
-        const Real tp = k.transmitPat >= 0 ? (Real)clamp01(dPatternScalarAt(sc, k.transmitPat, h)) : (Real)1;
-        return specLookup(k.transmit, lambda) * tp;
-    }
+__device__ static Real dStraightLeaf(const DScene& sc, const DMaterial& k, const DHit& h, Real pat, Real lambda) {
+    if (k.type == D_FILTER) return specLookup(k.transmit, lambda) * pat;
     if (k.type == D_HALFMIRROR) return (Real)1 - dReflectSlot(sc, k, h, lambda, nullptr);
     return (Real)0;
 }
-__device__ static Real dStraightPass(const DScene& sc, const DMaterial& m, const DHit& h, const DVec3& d,
-                                     const DStraightCross& x, Real lambda) {
+__device__ static Real dStraightPass(const DScene& sc, const DMaterial& m, const DHit& h, const DStraightCross& x,
+                                     Real lambda) {
     Real v;
-    if (m.type == D_MIX || m.type == D_LAYERED) {
+    if (dIsCompound(m.type)) {
         v = (Real)0;
         for (int k = 0; k < m.mixCount; ++k) {
             const int c = m.mixChild[k];
             if (c < 0) continue;
             const Real w = x.t >= (Real)0 ? (k == 0 ? x.t : (Real)1 - x.t) : (Real)m.mixWeight[k];
-            if (w > (Real)0) v += w * dStraightLeaf(sc, sc.mats[c], h, lambda);
+            if (w > (Real)0) v += w * dStraightLeaf(sc, sc.mats[c], h, x.pat[k], lambda);
         }
-        if (m.type == D_LAYERED) v *= (Real)(1.0 - dLayeredCoatReflectance(sc, m, h, d, lambda));
+        if (m.type == D_LAYERED) {
+            const double R = m.coatModel == 2 ? (double)clamp01((Real)m.coatSpecular) : dCoatRAtJ(m, x.cosI, x.th, lambda);
+            v *= (Real)(1.0 - R);
+        }
     } else {
-        v = m.type == D_FILTER ? specLookup(m.transmit, lambda) * x.pat : dStraightLeaf(sc, m, h, lambda);
+        v = dStraightLeaf(sc, m, h, x.pat[0], lambda);
     }
     return v > (Real)0 ? (v < (Real)1 ? v : (Real)1) : (Real)0;
 }
@@ -13000,52 +13024,56 @@ __device__ static bool dCamLegThrough(const DScene& sc, const DVec3& o, const DV
                                       Real tmin, Real curveTmin, LegRule leg, const Real* lam, int n,
                                       Real* T) {
     for (int i = 0; i < n; ++i) T[i] = (Real)1;
-    const int room = leg.room < kCamLegThroughMax ? leg.room : kCamLegThroughMax;
+    int room = leg.room < kCamLegThroughMax ? leg.room : kCamLegThroughMax;
+    if (leg.split && !sc.compoundStraightAny) room = 0;   // every crossing a specular type's (host twin)
     if (room <= 0 || !sc.passThroughAny) return !occludedTo(sc, o, target, absEps, tmin, /*camLeg=*/true, curveTmin);
     const DVec3 tv = target - o;
     const Real td = length(tv);
     if (!(td > (Real)0)) return true;
     const DVec3 dir = tv / td;
     Real left = connMaxT((double)td, absEps, dMaxAbs(target));   // occludedTo's length
-    const Real lenReach = td - dReachEps((Real)0);
-    if (lenReach < left) left = lenReach;
     bool metPT = false;
     if (occludedGeometry(sc, o, dir, left, tmin, /*camLeg=*/true, curveTmin, -1, /*skipPassThrough=*/true, &metPT) ||
         dCrossesGrin(sc, o, dir, left))
-        return false;   // something other than a gel or half mirror stops it
+        return false;   // something other than what passes light straight on stops it
     if (!metPT) return true;   // nothing on it
-    // A camera-hidden surface counts where a crossing lies between it and the camera (walkStraight's rule):
-    // with any in the scene, the distance of the last unhidden crossing, past which they are hidden.
+    // walkStraight's one pass, toward the camera (host twin, where the why is): a camera-hidden surface is
+    // set aside until an unhidden crossing follows it -- an opaque one then blocks, one that passes light
+    // counts -- and dropped where none does.
     constexpr int kStepsMax = 4 * kCamLegThroughMax;
     const bool hideOn = sc.camHiddenAny != 0;
-    Real tLast = (Real)-1;
-    if (hideOn) {
-        DVec3 q = o;
-        Real tq = tmin, cq = curveTmin, lf = left, t = (Real)0;
-        for (int k = 0; k < kStepsMax; ++k) {
-            const DHit h = closestHit(sc, q, dir, tq, lf, /*camHide=*/false, cq);
-            if (!h.valid || !(h.t < lf)) break;
-            const DMaterial& m = sc.mats[h.matId];
-            if (!m.hideCamera) {
-                if (!dPassesStraight(m)) break;
-                tLast = t + h.t;
-            }
-            q = h.p; t += h.t; lf -= h.t; tq = dHitEps(h); cq = (Real)0;
-        }
-    }
+    Real Tp[hero::kHeroMax];
+    for (int i = 0; i < n; ++i) Tp[i] = (Real)1;
+    bool hiddenBlocks = false, lastSpecular = false;
+    int hiddenCross = 0;
     DVec3 q = o;
-    Real tq = tmin, cq = curveTmin, t = (Real)0;
-    bool lastSpecular = false;   // the camera's nearest crossing so far is of a specular type (LegRule)
+    Real tq = tmin, cq = curveTmin;
+    DStraightCross x;
     for (int k = 0, steps = 0; steps < kStepsMax; ++steps) {
         const DHit h = closestHit(sc, q, dir, tq, left, /*camHide=*/false, cq);
         if (!h.valid || !(h.t < left)) return !(leg.split && lastSpecular);   // the rest of the leg is clear
         const DMaterial& m = sc.mats[h.matId];
-        if (!(hideOn && m.hideCamera && t + h.t > tLast)) {   // a hidden one on the camera's stretch: skipped
-            if (!dPassesStraight(m) || k == room) return false;
-            const DStraightCross xc = dStraightCross(sc, m, h);
+        if (hideOn && m.hideCamera) {
+            bool any = false;
+            if (dPassesStraight(m)) {
+                dStraightCrossAt(sc, m, h, dir, x);
+                for (int i = 0; i < n; ++i) {
+                    Tp[i] *= dStraightPass(sc, m, h, x, lam[i]);
+                    any = any || Tp[i] > (Real)0;
+                }
+            }
+            if (any) ++hiddenCross; else hiddenBlocks = true;
+        } else {
+            if (!dPassesStraight(m) || hiddenBlocks || k + hiddenCross + 1 > room) return false;
+            if (hiddenCross) {
+                for (int i = 0; i < n; ++i) { T[i] *= Tp[i]; Tp[i] = (Real)1; }
+                k += hiddenCross;
+                hiddenCross = 0;
+            }
+            dStraightCrossAt(sc, m, h, dir, x);
             bool any = false;
             for (int i = 0; i < n; ++i) {
-                T[i] *= dStraightPass(sc, m, h, dir, xc, lam[i]);
+                T[i] *= dStraightPass(sc, m, h, x, lam[i]);
                 any = any || T[i] > (Real)0;
             }
             if (!any) return false;   // passes nothing: no empty hit for the noise estimate
@@ -13053,7 +13081,6 @@ __device__ static bool dCamLegThrough(const DScene& sc, const DVec3& o, const DV
             lastSpecular = dIsSpecularType(m.type);
         }
         q = h.p;
-        t += h.t;
         left -= h.t;
         tq = dHitEps(h);   // clear of its own primitive, whose error near the origin outgrows dEpsAt
         cq = (Real)0;

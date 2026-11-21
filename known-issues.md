@@ -498,6 +498,48 @@ scene's cells too (its `r[]` sized `kSpecCellsMax`, read by cell rather than int
 its support's `hole` mask per cell) -- which grows the per-segment and per-vertex carrier
 JSPEC-CARRIER-SIZE measures (120 B to about 190 B), so it goes with that entry's half-precision bins.
 
+## DONE (2026-11-21, 0.451.9): UNBOUNDED-FIELD-FAR — an unbounded density field that thins to nothing hung every tracker
+
+Found by the Opus review of 0.451.7-0.451.8 (REVIEW-0454). A `density` field with no `bounds` has no
+majorant grid, so its tracking runs against one global majorant out to the segment's end -- 1e30 for a
+ray escaping to the sky. Where the field has a floor its transmittance falls and 0.451.7's roulette ends
+it; where it thins to nothing (a ground fog, `saturate(1 - y/2)`), every step past the fog is a null
+collision with factor 1, nothing ends the loop, and past t ~ 1e17 a step no longer moves t at all: the
+render hung, `-stop` could not reach it, and on the GPU a kernel timed out. Mode R's delta tracking hung
+on such a field already; 0.451.5's sky pass, taking the media to the sky, made modes A, B and P hang too.
+**Fixed:** every tracker -- free flight and transmittance, scalar and spectral, host and device -- takes
+an unbounded density field only inside a far sphere (`Medium::farClip`, `dMedFarClip`): mode J's beam
+domain, eight times the scene's radius about its centre, past which the field is taken as empty. A
+homogeneous unbounded haze keeps its analytic infinite extent. A deliberate change to mode R's answer for
+such a field, from no answer at all: one with a floor reads as before (its transmittance is gone long
+before the sphere), one that thins out reads what lies within it. check_sky_fog's `ground`.
+
+## DONE (2026-11-21, 0.451.9): REVIEW-0454 — what the Opus (max) review of 0.451.7-0.451.8 found
+
+Opus (max) reviewed d721112..0d900e2 (0.451.7 REVIEW-0453's follow-up, 0.451.8 compounds); Fable's share
+of the week was spent (50 %), so no second review ran. Each finding was checked against the code; all
+were fixed.
+
+* **An unbounded density field thinning to nothing still hung** -- UNBOUNDED-FIELD-FAR. And a density
+  past `density_max` drove the scalar tracker negative, which the roulette missed: it takes |Tr|.
+* **A mix's `glow_only` child went undrawn** when its sibling is a gel: the sky walk crosses the mix and
+  never asked for its glow. A crossing now adds what it shows of a glow of its own (glowSeenXYZ, its own
+  pick); check_passthrough's `mix_glow` fails on 0.451.8.
+* **Mode P's still composite fitted its scale over the sky behind an unbounded haze**, which the forward
+  layer lights only near the scene: such a pixel is the backward layer's (SPEC); check_sky_fog's `haze`
+  (mode P).
+* **A weight map that is not a number** read the constant weights in the leg's expectation, where the
+  walks' pick takes child 1: one weight-map read, `mixWeightAt` / `dMixWeightAt`, for mixResolveChild,
+  mixResolveDominant and StraightCross on both devices.
+* **Wasted work**: mode P's composite sampled the sky in pixels it then discards (prepareSky's `skip`,
+  the DIFF pixels alone); in mode P's split every leg that met a gel walked though none could pass where
+  no compound does (room 0 then); `hide_camera` scenes walked each leg twice (one pass now, a hidden
+  crossing's factors set aside until a crossing follows); the any-hit test read the pass-through flag
+  for every primitive, misses included (on a hit only now); the sky walk retraced the pass's first hit
+  (handed in); StraightCross re-read patterns and the coat's thickness per wavelength (once a crossing).
+* Stale docs and comments (design.md's sky paragraph, camLegThrough's comment, three device comments);
+  `dCamLegThrough`'s dead reach shortening; walkStraight's unreachable split and hidden branches.
+
 ## DONE (2026-11-21, 0.451.7): REVIEW-0453 — what the Opus (max) and Fable (xhigh) reviews of 0.451.4-0.451.6 found
 
 Opus (max) and Fable (xhigh) reviewed 7bf37b4..d721112 (REVIEW-0452's follow-up, the sky pass through

@@ -293,60 +293,68 @@ inline double layeredCoatReflectance(const Scene& scene, const Material& m, cons
 }
 
 // What a surface that passes light straight on (passesStraight) passes, crossed at `h` along `d`: read once
-// a crossing (its patterns and its weight map at the hit) and asked at each wavelength (at), in [0, 1],
-// NaN passing nothing. A gel passes T(lambda), a half mirror 1 - R(lambda); a mix or a stack the walks'
-// pick on average -- a mix's children by their weights (a two-way weight map's t and 1 - t at the hit), a
-// stack's bodies so after its coat lets the light in (1 - its reflectance at `d`, the photon walk's and mode
-// R's coin), a child that passes nothing straight counting 0. Device twin dStraightPass.
+// a crossing -- its gels' patterns, its weight map (mixWeightAt), its coat's thickness -- and asked at each
+// wavelength (at), in [0, 1], NaN passing nothing. A gel passes T(lambda), a half mirror 1 - R(lambda); a
+// mix or a stack the walks' pick on average -- a mix's children by their weights (a two-way weight map's t
+// and 1 - t at the hit), a stack's bodies so after its coat lets the light in (1 - its reflectance at `d`,
+// the photon walk's and mode R's coin), a child that passes nothing straight counting 0. Device twin
+// dStraightPass.
 struct StraightCross {
+    static constexpr int kChildren = 8;   // the children whose gel pattern is read once (the device's D_MIXMAX)
     const Scene& scene;
     const Material& m;
     const Hit& h;
     Vec3 d;
-    double pat = 1.0;   // a plain gel's transmit pattern at the hit
-    double t = -1.0;    // a two-way weight map's value at the hit, or -1: the constant weights
+    bool compound = false;
+    double t = -1.0;              // mixWeightAt's, or -1: the constant weights
+    double pat[kChildren];        // a gel's transmit pattern at the hit, by child (pat[0]: a plain gel's)
+    double coatTh = 0.0;          // a stack's coat thickness at the hit (coatThickness)
     StraightCross(const Scene& s, const Material& mm, const Hit& hh, const Vec3& dd) : scene(s), m(mm), h(hh), d(dd) {
-        if (m.type == MatType::Filter && m.transmitPat >= 0) pat = slotPatMul(scene, m.transmitPat, h);
-        if ((m.type == MatType::Mix || m.type == MatType::Layered) && m.mixChildren.size() == 2 &&
-            (m.mixWeightPat >= 0 || m.mixWeightTex >= 0)) {
-            t = (m.mixWeightPat >= 0 && m.mixWeightPat < (int)scene.patterns.size())
-                ? scene.patterns[(size_t)m.mixWeightPat].eval(patCtxFromHit(scene, h))
-                : scene.textures[(size_t)m.mixWeightTex].scalarAt(h.u, h.v);
-            t = t < 0.0 ? 0.0 : (t > 1.0 ? 1.0 : t);
+        compound = m.type == MatType::Mix || m.type == MatType::Layered;
+        const auto patOf = [&](const Material& k) {
+            return (k.type == MatType::Filter && k.transmitPat >= 0) ? slotPatMul(scene, k.transmitPat, h) : 1.0;
+        };
+        if (!compound) { pat[0] = patOf(m); return; }
+        t = mixWeightAt(scene, m, h);
+        for (size_t k = 0; k < m.mixChildren.size() && k < (size_t)kChildren; ++k) {
+            const int c = m.mixChildren[k];
+            pat[k] = (c >= 0 && (size_t)c < scene.mats.size()) ? patOf(scene.mats[(size_t)c]) : 1.0;
         }
+        if (m.type == MatType::Layered) coatTh = coatThickness(scene, m, h);
     }
-    // A plain child's, its own patterns read at the hit.
-    double leaf(const Material& k, double lambda) const {
-        if (k.type == MatType::Filter) return transmitSlot(scene, k, h, lambda);
-        if (k.type == MatType::HalfMirror) return 1.0 - reflectSlot(scene, k, h, lambda);
+    // Child `k`'s (or the plain surface's, `k` 0), at `lambda`.
+    double leaf(const Material& km, size_t k, double lambda) const {
+        if (km.type == MatType::Filter)
+            return k < (size_t)kChildren ? km.transmit(lambda) * pat[k] : transmitSlot(scene, km, h, lambda);
+        if (km.type == MatType::HalfMirror) return 1.0 - reflectSlot(scene, km, h, lambda);
         return 0.0;
     }
     double at(double lambda) const {
         double v;
-        if (m.type == MatType::Mix || m.type == MatType::Layered) {
+        if (compound) {
             v = 0.0;
             for (size_t k = 0; k < m.mixChildren.size(); ++k) {
                 const int c = m.mixChildren[k];
                 if (c < 0 || (size_t)c >= scene.mats.size()) continue;
                 const double w = t >= 0.0 ? (k == 0 ? t : 1.0 - t) : m.mixWeights[k];
-                if (w > 0.0) v += w * leaf(scene.mats[(size_t)c], lambda);
+                if (w > 0.0) v += w * leaf(scene.mats[(size_t)c], k, lambda);
             }
-            if (m.type == MatType::Layered) v *= 1.0 - layeredCoatReflectance(scene, m, h, d, lambda);
+            if (m.type == MatType::Layered) v *= 1.0 - coatRDir(m, h, d, coatTh, lambda);
         } else {
-            v = m.type == MatType::Filter ? m.transmit(lambda) * pat : leaf(m, lambda);
+            v = leaf(m, 0, lambda);
         }
         return v > 0.0 ? (v < 1.0 ? v : 1.0) : 0.0;
     }
 };
 
-// A camera leg through the surfaces that pass light straight on (MODEB-PASSTHROUGH): a `filter` gel, which
-// passes T(lam), and a `halfmirror`, which passes 1 - R(lam) -- a light path the leg is, where any other
-// surface on it stops it (Scene::occluded's rule for a camera leg). The leg o + t dir, t in [tmin, maxDist]
-// (occluded()'s arguments), its far end the camera's; false where it is blocked, else true and T[i] what
-// those surfaces pass at lam[i], i < n (1 where it crosses none). `room`: the most of them it may cross
-// (Renderer::legRoom: each is a vertex of the path, which -max-bounce counts; none in mode P's blurred
-// split, whose camera side draws whatever is seen through them), past which it is blocked. A clear leg
-// costs the occluded() test it always did -- in a scene with such a surface, that one any-hit test notes
+// A camera leg through the surfaces that pass light straight on (MODEB-PASSTHROUGH; passesStraight): a gel,
+// a half mirror, a mix or stack with such a child -- a light path the leg is, where any other surface on it
+// stops it (Scene::occluded's rule for a camera leg). The leg o + t dir, t in [tmin, maxDist] (occluded()'s
+// arguments), the camera at its far end; false where it is blocked, else true and T[i] what those surfaces
+// pass at lam[i], i < n (StraightCross; 1 where it crosses none). `leg`: what it may cross (LegRule,
+// Renderer::legRoom -- each crossing is a vertex of the path, which -max-bounce counts; in mode P's
+// blurred split none of a specular type nearest the camera, and where no compound passes light, none at
+// all). A leg costs the one any-hit test it always did -- in a scene with such a surface, that test notes
 // them instead of stopping at them (occludedGeometry's `skipPassThrough`) -- and only a leg that met one
 // and nothing else adds a walk of its closest hits (walkStraight). A leg that passes nothing at every
 // wavelength is blocked, so it adds no empty hit to the pixel's count (the forward modes' noise estimate
@@ -354,6 +362,7 @@ struct StraightCross {
 inline bool camLegThrough(const Scene& scene, const Vec3& o, const Vec3& dir, double maxDist, double tmin,
                           double curveTmin, LegRule leg, const double* lam, int n, double* T) {
     for (int i = 0; i < n; ++i) T[i] = 1.0;
+    if (leg.split && !scene.compoundStraightAny) leg.room = 0;   // every crossing a specular type's
     if (std::min(leg.room, kCamLegThroughMax) <= 0 || !scene.passThroughAny)
         return !scene.occluded(o, dir, maxDist, tmin, /*camLeg=*/true, curveTmin);
     bool metPT = false;
@@ -362,15 +371,24 @@ inline bool camLegThrough(const Scene& scene, const Vec3& o, const Vec3& dir, do
         scene.crossesGrin(o, dir, maxDist))
         return false;
     if (!metPT) return true;
+    double Tp[hero::kHeroMax];   // a hidden crossing's factors, until the walk knows whether they count
+    for (int i = 0; i < n; ++i) Tp[i] = 1.0;
     const StraightWalk w = walkStraight(scene, o, dir, maxDist, tmin, curveTmin, leg, /*camAtStart=*/false,
-        [&](const Vec3&, const Hit& h, const Material& m) {
-            const StraightCross sc(scene, m, h, dir);
+        [&](const Vec3&, const Hit& h, const Material& m, bool pending) {
+            const StraightCross x(scene, m, h, dir);
+            double* to = pending ? Tp : T;
             bool any = false;
             for (int i = 0; i < n; ++i) {
-                T[i] *= sc.at(lam[i]);
-                any = any || T[i] > 0.0;
+                to[i] *= x.at(lam[i]);
+                any = any || to[i] > 0.0;
             }
             return any;
+        },
+        [&](bool keep) {
+            for (int i = 0; i < n; ++i) {
+                if (keep) T[i] *= Tp[i];
+                Tp[i] = 1.0;
+            }
         });
     return w.end == StraightEnd::Clear;
 }
@@ -1151,6 +1169,7 @@ struct Renderer {
         }
         double sigMax = stBase * med.densityMax;
         if (sigMax <= 0.0) return false;
+        if (!med.farClip(o, dir, ta, tb)) return false;   // an unbounded field's far end
         double t = ta;
         for (;;) {
             t += -std::log(1.0 - rng.uniformOpen()) / sigMax;
@@ -1210,6 +1229,7 @@ struct Renderer {
         }
         double sigMax = stBase * med.densityMax;
         if (sigMax <= 0.0) return 1.0;
+        if (!med.farClip(o, dir, ta, tb)) return 1.0;   // an unbounded field's far end
         double Tr = 1.0, t = ta;
         for (;;) {
             t += -std::log(1.0 - rng.uniformOpen()) / sigMax;
@@ -1217,9 +1237,11 @@ struct Renderer {
             double sigT = stBase * med.densityAt(o + dir * t, tabs);
             Tr *= 1.0 - sigT / sigMax;
             if (Tr == 0.0) return 0.0;
-            if (Tr > 0.0 && Tr < kTrRoulette) {   // an endless segment ends (kTrRoulette)
-                if (rng.uniform() * kTrRoulette >= Tr) return 0.0;
-                Tr = kTrRoulette;
+            // A long segment ends at no bias (kTrRoulette); |Tr|, as a density past density_max turns it
+            // negative.
+            if (std::fabs(Tr) < kTrRoulette) {
+                if (rng.uniform() * kTrRoulette >= std::fabs(Tr)) return 0.0;
+                Tr = Tr > 0.0 ? kTrRoulette : -kTrRoulette;
             }
         }
         return Tr;
@@ -1320,6 +1342,7 @@ struct Renderer {
         }
         const double sigMax = stMax * med.densityMax;                // global majorant over all lambdas
         if (sigMax <= 0.0) return;
+        if (!med.farClip(o, dir, ta, tb)) return;   // an unbounded field's far end
         double f[kSpecTrMax];   // this medium's factors, multiplied into Tr at the end
         for (int i = 0; i < K; ++i) f[i] = 1.0;
         double t = ta;

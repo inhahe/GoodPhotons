@@ -1,15 +1,17 @@
 """Regression check: the sky seen through a fog, in the forward modes and mode M, against mode R.
 
     python tools/check_sky_fog.py [--out png/check_sky_fog] [--exe ftrace.exe] [--no-gpu] [--spp 256]
-                                  [--fogs absorb,scatter,field_absorb]
+                                  [--fogs absorb,scatter,field_absorb,ground,haze]
 
 A uniform sky (`light env { spd 1.0 }`) over a 10 m floor (small, so the forward modes' env photons, spread
 over the scene's bounding sphere, cross the fog often), seen through a fog: a box 2 m deep absorbing only
-(`albedo 0`) and scattering (`albedo 0.5`), and an absorbing density field with no bounds, falling off
-with height, which an escaping ray takes out to infinity, as mode R's camera ray does: the sky behind it
-is gone, and the ratio tracking such a field runs ends by Russian roulette (kTrRoulette) -- the case
-holds that it ends. (An unbounded medium that scatters is no case here: the forward modes light one only
-near the scene, warnHazeOnlyNearScene, where mode R lights all of it.) The frame's top quarter is sky
+(`albedo 0`) and scattering (`albedo 0.5`); two absorbing density fields with no bounds, one with a floor
+(the sky behind it is gone: its tracking ends by Russian roulette, kTrRoulette) and a ground fog thinning
+to nothing above 2 m, which every mode tracks out to its far sphere (Medium::farClip) and no further --
+both cases hold that the walk ends; and, for mode P alone, a scattering haze with no bounds, whose sky
+pixels its still composite takes from the backward layer. (An unbounded medium that scatters is no case
+for the other modes: they light one only near the scene, warnHazeOnlyNearScene, where mode R lights all
+of it.) The frame's top quarter is sky
 alone, so it holds the sky's transmittance and the fog's in-scatter. Each mode on the CPU and the GPU against mode R on the CPU, that quarter in X, Y and Z over
 4 x 4 tiles:
 
@@ -48,6 +50,8 @@ FOGS = [   # (name, the medium, the modes that take it)
     ("absorb", BOX % "0.0", "BAMP"),
     ("scatter", BOX % "0.5", "BAMP"),
     ("field_absorb", FIELD % "0.0", "BAMP"),
+    ("ground", 'medium { sigma_t 0.1  albedo 0.0  density "saturate(1.0 - y/2.0)"  density_max 1 }', "BAMP"),
+    ("haze", "medium { sigma_t 0.04  albedo 0.5 }", "P"),
 ]
 MODES = [   # (tag, the camera's extra statement, the mode's arguments)
     ("B", "", ["-mode", "B", "-n", "4000000"]),
