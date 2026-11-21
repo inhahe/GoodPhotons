@@ -359,21 +359,27 @@ struct StraightCross {
 // and nothing else adds a walk of its closest hits (walkStraight). A leg that passes nothing at every
 // wavelength is blocked, so it adds no empty hit to the pixel's count (the forward modes' noise estimate
 // reads it).
-inline bool camLegThrough(const Scene& scene, const Vec3& o, const Vec3& dir, double maxDist, double tmin,
-                          double curveTmin, LegRule leg, const double* lam, int n, double* T) {
+//
+// legThrough is the same for any leg: `camLeg` puts the camera at its far end (the rule above, and
+// hide_camera's), false none on it -- a photon vertex's leg to a glass sphere or a mirror, whose hidden
+// surfaces are ordinary ones (Scene::occluded's camLeg). `crossed`, where given, gets the surfaces it
+// crossed, so a second leg can take what room the first left.
+inline bool legThrough(const Scene& scene, const Vec3& o, const Vec3& dir, double maxDist, double tmin,
+                       double curveTmin, LegRule leg, bool camLeg, const double* lam, int n, double* T,
+                       int* crossed = nullptr) {
     for (int i = 0; i < n; ++i) T[i] = 1.0;
+    if (crossed) *crossed = 0;
     if (leg.split && !scene.compoundStraightAny) leg.room = 0;   // every crossing a specular type's
     if (std::min(leg.room, kCamLegThroughMax) <= 0 || !scene.passThroughAny)
-        return !scene.occluded(o, dir, maxDist, tmin, /*camLeg=*/true, curveTmin);
+        return !scene.occluded(o, dir, maxDist, tmin, camLeg, curveTmin);
     bool metPT = false;
-    if (scene.occludedGeometry(o, dir, maxDist, tmin, /*camLeg=*/true, curveTmin, /*skipPassThrough=*/true,
-                               &metPT) ||
+    if (scene.occludedGeometry(o, dir, maxDist, tmin, camLeg, curveTmin, /*skipPassThrough=*/true, &metPT) ||
         scene.crossesGrin(o, dir, maxDist))
         return false;
     if (!metPT) return true;
     double Tp[hero::kHeroMax];   // a hidden crossing's factors, until the walk knows whether they count
     for (int i = 0; i < n; ++i) Tp[i] = 1.0;
-    const StraightWalk w = walkStraight(scene, o, dir, maxDist, tmin, curveTmin, leg, /*camAtStart=*/false,
+    const StraightWalk w = walkStraight(scene, o, dir, maxDist, tmin, curveTmin, leg, camLeg ? CamAt::End : CamAt::None,
         [&](const Vec3&, const Hit& h, const Material& m, bool pending) {
             const StraightCross x(scene, m, h, dir);
             double* to = pending ? Tp : T;
@@ -390,7 +396,12 @@ inline bool camLegThrough(const Scene& scene, const Vec3& o, const Vec3& dir, do
                 Tp[i] = 1.0;
             }
         });
+    if (crossed) *crossed = w.crossings;
     return w.end == StraightEnd::Clear;
+}
+inline bool camLegThrough(const Scene& scene, const Vec3& o, const Vec3& dir, double maxDist, double tmin,
+                          double curveTmin, LegRule leg, const double* lam, int n, double* T) {
+    return legThrough(scene, o, dir, maxDist, tmin, curveTmin, leg, /*camLeg=*/true, lam, n, T);
 }
 
 // T-bar (Material::coatTbar) of the layered material `st` at `lambda`, for a film of `thickness` (the
@@ -2876,17 +2887,26 @@ struct Renderer {
             const double geom = G * ch.F * w0 * wPick / keep / omega * (outside ? 1.0 : n * n);
 
             // Visibility: the leg from p, and from outside the eye's leg (an inside eye's is in the
-            // glass), each stopping just short of the sphere's own surface.
+            // glass), each stopping just short of the sphere's own surface -- through what passes light
+            // straight on (legThrough), in the room the chain's own c + 1 vertices leave the path.
             const double pe = vt.epsOr(scene.eps), se = scene.featureEps(std::fabs(r), length(O) + std::fabs(r));
-            if (scene.occluded(p + wP * pe, wP, dP - pe - se, pe)) return true;
+            const int legRoom = room - (c + 1);
+            double Tp[hero::kHeroMax], Te[hero::kHeroMax];
+            int kP = 0;
+            if (!legThrough(scene, p + wP * pe, wP, dP - pe - se, pe, 0.0, LegRule{legRoom, false}, /*camLeg=*/false,
+                            lam, nL, Tp, &kP))
+                return true;
+            for (int j = 0; j < nL; ++j) Te[j] = 1.0;
             Vec3 wE{0, 0, 0}; double dE = 0.0;
             if (outside) {
                 wE = eye - first; dE = length(wE); wE = wE * (1.0 / dE);
-                if (scene.occluded(first + wE * se, wE, dE - 2 * se, se, /*camLeg=*/true)) return true;
+                if (!legThrough(scene, first + wE * se, wE, dE - 2 * se, se, 0.0, LegRule{legRoom - kP, false},
+                                /*camLeg=*/true, lam, nL, Te))
+                    return true;
             }
             for (int j = 0; j < nL; ++j) {
                 SpecVtx vj = vt; vj.weight = w[j]; vj.lambda = lam[j];
-                double contrib = beta[j] * vj.term(wP) * geom;
+                double contrib = beta[j] * vj.term(wP) * geom * Tp[j] * Te[j];
                 if (!(contrib > 0.0)) continue;
                 contrib *= legAbsorption(scene, ix.insideMat, ch.inner, lam[j]);   // Beer-Lambert inside S
                 if (outside) {
@@ -2982,17 +3002,50 @@ struct Renderer {
         return mirrorConnectsMat(scene.mats[hm.matId]);
     }
 
+    // mirrorSeenAt through what passes light straight on: the walk from the eye along `wE` (walkStraight,
+    // the camera at its start) crosses them, `leg` what it may, to just short of the mirror the connection
+    // solved for at `dE` -- a half mirror passes light too, and the walk must not cross the very mirror it
+    // looks for -- and one closest hit from there confirms it, handed back in `hm`; T[i] what they pass at
+    // lam[i], i < n. False where anything else is in front, or the mirror is not what is met at dE.
+    // `crossed`: the surfaces it crossed.
+    static bool mirrorSeenThrough(const Scene& scene, const Vec3& eye, const Vec3& wE, double dE, Hit& hm,
+                                  LegRule leg, const double* lam, int n, double* T, int* crossed = nullptr) {
+        for (int i = 0; i < n; ++i) T[i] = 1.0;
+        if (crossed) *crossed = 0;
+        if (!scene.passThroughAny || std::min(leg.room, kCamLegThroughMax) <= 0)
+            return mirrorSeenAt(scene, eye, wE, dE, hm);
+        const double tol = 1e-4 * (1.0 + dE);
+        const StraightWalk w = walkStraight(scene, eye, wE, dE - tol, scene.eps, 0.0, leg,
+            CamAt::Start, [&](const Vec3&, const Hit& h, const Material& m, bool) {
+                const StraightCross x(scene, m, h, wE);
+                bool any = false;
+                for (int i = 0; i < n; ++i) {
+                    T[i] *= x.at(lam[i]);
+                    any = any || T[i] > 0.0;
+                }
+                return any;
+            }, [](bool) {});
+        if (crossed) *crossed = w.crossings;
+        if (w.end != StraightEnd::Clear) return false;   // something in front
+        hm = scene.closestHit(Ray{w.from, wE}, w.tmin, nullptr, /*skipHair=*/false,
+                              /*skipCamHidden=*/w.crossings == 0);
+        if (!hm.valid || std::fabs(w.dist + hm.t - dE) > tol) return false;
+        if (scene.crossesGrin(w.from, wE, hm.t)) return false;
+        if (hm.matId < 0 || hm.matId >= (int)scene.mats.size()) return false;
+        return mirrorConnectsMat(scene.mats[hm.matId]);
+    }
+
     // Splat the `nUp` live wavelengths of a photon vertex through one connection whose
     // geometry has already been solved: the vertex is at p, the light leaves it toward
     // wP over a distance dP to the mirror point R, the mirror hands it to the eye over
-    // dE, and the whole unfolded path is D long. Shared by the planar and spherical
-    // mirror connectors — everything below this point is wavelength-dependent only
+    // dE, and the whole unfolded path is D long, `legT[i]` what the two legs' crossings pass. Shared by
+    // the planar and spherical mirror connectors — everything below this point is wavelength-dependent only
     // through the mirror's reflectance and the fog.
     void splatMirrorLegs(const Scene& scene, Film& film, const Material& mm, const Hit& hm,
                          int px, int py, double omega, const Vec3& p, const Vec3& wP,
                          double dP, const Vec3& R, const Vec3& wRE, double dE, double D,
                          double shape, const double* lam, const double* beta,
-                         const double* w, int nUp, int camMedium, Pcg32& rng,
+                         const double* w, int nUp, const double* legT, int camMedium, Pcg32& rng,
                          const GlossySplat* gs = nullptr, const CoatSplat* coat = nullptr) const {
         const double invD2Omega = 1.0 / (D * D * omega);
         for (int i = 0; i < nUp; ++i) {
@@ -3001,7 +3054,7 @@ struct Renderer {
                                                         : clamp01(reflectSlot(scene, mm, hm, lam[i]));
             // A glossy vertex's lobe toward wP, at this wavelength (shape is cos/pi there).
             const double wi = (gs ? gs->f(wP, lam[i]) * PI : w[i]) * coatSplatF(coat, wP, lam[i]);
-            double contrib = beta[i] * (wi * shape) * refl * invD2Omega;
+            double contrib = beta[i] * (wi * shape) * refl * invD2Omega * legT[i];   // the legs' crossings
             if (contrib <= 0.0) continue;
             if (!scene.media.empty()) {
                 contrib *= mediaTransmittance(scene, p, wP,  dP, lam[i], rng);
@@ -3050,13 +3103,22 @@ struct Renderer {
         // any-hit occlusion walk is cheaper than the closest-hit that confirms the
         // mirror, so a shadowed connection never pays for the expensive query. Both
         // tests must pass and neither draws RNG, so the order is unobservable.
+        // Both through what passes light straight on, in the room the mirror's own vertex leaves the path.
         const double pe = vt.epsOr(scene.eps);
-        if (scene.occluded(p + wP * pe, wP, dP - pe - scene.eps, pe)) return;
+        const int legRoom = maxBounce - vt.depth - 1;
+        double legT[hero::kHeroMax], Te[hero::kHeroMax];
+        int kP = 0;
+        if (!legThrough(scene, p + wP * pe, wP, dP - pe - scene.eps, pe, 0.0, LegRule{legRoom, false}, /*camLeg=*/false,
+                        lam, nUp, legT, &kP))
+            return;
         Hit hm;
-        if (!mirrorSeenAt(scene, eye, -wRE, dE, hm) || !scene.mirrorClaims(mp, hm)) return;
+        if (!mirrorSeenThrough(scene, eye, -wRE, dE, hm, LegRule{legRoom - kP, false}, lam, nUp, Te) ||
+            !scene.mirrorClaims(mp, hm))
+            return;
+        for (int i = 0; i < nUp; ++i) legT[i] *= Te[i];
 
         splatMirrorLegs(scene, film, scene.mats[hm.matId], hm, px, py, omega,
-                        p, wP, dP, R, wRE, dE, D, shape, lam, beta, w, nUp, cam.medium(), rng, vt.glossy,
+                        p, wP, dP, R, wRE, dE, D, shape, lam, beta, w, nUp, legT, cam.medium(), rng, vt.glossy,
                         vt.coat);
     }
 
@@ -3162,12 +3224,18 @@ struct Renderer {
             const double D = 1.0 / std::sqrt(G);
 
             const double pe = vt.epsOr(scene.eps), se = scene.featureEps(std::fabs(r), length(O) + std::fabs(r));
-            if (scene.occluded(p + wP * pe, wP, dP - pe - se, pe)) return true;
+            const int legRoom = maxBounce - vt.depth - 1;   // the mirror's own vertex taken
+            double legT[hero::kHeroMax], Te[hero::kHeroMax];
+            int kP = 0;
+            if (!legThrough(scene, p + wP * pe, wP, dP - pe - se, pe, 0.0, LegRule{legRoom, false}, /*camLeg=*/false,
+                            lam, nUp, legT, &kP))
+                return true;
             Hit hm;
-            if (!mirrorSeenAt(scene, eye, -wRE, dE, hm)) return true;
+            if (!mirrorSeenThrough(scene, eye, -wRE, dE, hm, LegRule{legRoom - kP, false}, lam, nUp, Te)) return true;
+            for (int i = 0; i < nUp; ++i) legT[i] *= Te[i];
 
             splatMirrorLegs(scene, film, scene.mats[hm.matId], hm, px, py, omega,
-                            p, wP, dP, ch.P1, wRE, dE, D, shape, lam, beta, w, nUp, cam.medium(), rng,
+                            p, wP, dP, ch.P1, wRE, dE, D, shape, lam, beta, w, nUp, legT, cam.medium(), rng,
                             vt.glossy, vt.coat);
             return true;
         };

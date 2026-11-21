@@ -5544,7 +5544,7 @@ __device__ static inline int dMotionSegRoot(const DScene& sc) {
 // `boundsOut` (closestHit<true>'s): the nearest mover's DTri::bounds, a triangle's or a moving instance's.
 __device__ __noinline__ static bool dTimedClosest(const DScene& sc, const DVec3& ro, const DVec3& rd, const DVec3& invD,
                                      const DTriShear& sh, Real tmin, Real curveTmin, Real& tMax, DHit& h,
-                                     bool camHideOn, int* boundsOut = nullptr) {
+                                     bool camHideOn, int* boundsOut = nullptr, int skipSph = -1) {
     const int root = dMotionSegRoot(sc);
     if (root < 0) return false;
     const DNode* N = sc.mo.segNodes;
@@ -5561,6 +5561,7 @@ __device__ __noinline__ static bool dTimedClosest(const DScene& sc, const DVec3&
         if (n.count > 0) {
             for (int i = 0; i < n.count; ++i) {
                 const int prim = sc.mo.segPrim[n.first + i];
+                if (skipSph >= 0 && prim == sc.nTris + skipSph) continue;
                 if (camHideOn) {
                     const int matId = dPrimMat(sc, prim);
                     if (matId >= 0 && sc.mats[matId].hideCamera != 0) continue;
@@ -5651,10 +5652,13 @@ __device__ static inline void dApplyNormalMap(const DScene& sc, DHit& h);
 // `kTri` (dEnclosureAt only, so every other caller compiles as it always did): `*boundsOut` the solid the
 // hit triangle's closed piece bounds (DTri::bounds), an instance's too unless it overrides the material
 // (host twin: Hit::boundsSolid, instanceHitToWorld), a mover's too; -1 for any other primitive.
+// `skipSph`: a sphere it does not see (a specular connection's legs end on theirs, which in float a grazing
+// leg's end rounds inside as often as out), or -1.
 template <bool kTri = false>
 __device__ static DHit closestHit(const DScene& sc, const DVec3& ro, const DVec3& rd,
                                    Real tmin = RAY_TMIN, Real tCap = BIG,
-                                   bool camHide = false, Real curveTmin = (Real)0, int* boundsOut = nullptr) {
+                                   bool camHide = false, Real curveTmin = (Real)0, int* boundsOut = nullptr,
+                                   int skipSph = -1) {
     if (tmin < (Real)0) tmin = dEpsAt(ro);
     DHit h; h.t = tCap; h.valid = false; h.matId = 0; h.sensorId = -1; h.emitter = -1;
     if (sc.nNodes == 0) return h;
@@ -5698,7 +5702,8 @@ __device__ static DHit closestHit(const DScene& sc, const DVec3& ro, const DVec3
                                                         if constexpr (kTri) *boundsOut = t.bounds;
                                                     } }
                 else if (prim < sc.nTris + sc.nSph){ const DSphere& s = sc.sph[prim - sc.nTris];
-                                                    if (!hidden(s.matId) && intersectSphere(ro, rd, s, tmin, h, s.frame >= 0 ? sc.sphAxes + 3 * s.frame : nullptr)) {
+                                                    if (prim - sc.nTris != skipSph && !hidden(s.matId) &&
+                                                        intersectSphere(ro, rd, s, tmin, h, s.frame >= 0 ? sc.sphAxes + 3 * s.frame : nullptr)) {
                                                         tMax = h.t; hInst = -1;
                                                         if (sc.sphEmitter) h.emitter = sc.sphEmitter[prim - sc.nTris];
                                                         if constexpr (kTri) *boundsOut = -1;
@@ -5746,7 +5751,7 @@ __device__ static DHit closestHit(const DScene& sc, const DVec3& ro, const DVec3
     }
     int moverBounds = -1;
     if (timed && dTimedClosest(sc, ro, rd, invD, sh, tmin, curveTmin, tMax, h, camHideOn,
-                               kTri ? &moverBounds : nullptr)) {
+                               kTri ? &moverBounds : nullptr, skipSph)) {
         hInst = -1;                                // a mover's hit, in world space already
         if constexpr (kTri) *boundsOut = moverBounds;
     }
@@ -11309,6 +11314,13 @@ __device__ static inline int dSphChainRefl(bool outside, int c) { return outside
 // Connect vertex p to a pinhole through every drawn chain of smooth dielectric sphere S, at the nL
 // wavelengths lam[] that see S alike (`ix`): one geometry for them all. Port of
 // Renderer::connectSpecularSphere.
+// The specular connections' legs, through what passes light straight on: defined below, beside
+// dCamLegThrough (dLegThrough) and dMirrorSeenAt's twin through them (dMirrorSeenThrough).
+__device__ static bool dLegThrough(const DScene& sc, const DVec3& o, const DVec3& target, double absEps,
+                                   Real tmin, Real curveTmin, LegRule leg, bool camLeg, int skipSph,
+                                   const Real* lam, int n, Real* T, int* crossed = nullptr);
+__device__ static bool dMirrorSeenThrough(const DScene& sc, const D3& eye, const D3& wE, double dE, DHit& hm,
+                                          LegRule leg, const Real* lam, int n, Real* T);
 __device__ static void dConnectSpecularSphere(const DScene& sc, const DCamera& cam,
         double* film, double* hits, const DSphere& S, const DSphIndex& ix,
         const D3& p, const DSpecVtx& vt, const Real* lam, const Real* beta, const Real* w, int nL, int room,
@@ -11431,22 +11443,30 @@ __device__ static void dConnectSpecularSphere(const DScene& sc, const DCamera& c
         const double G = (eps * eps) / jac;
         const double geom = G * ch.F * w0 * wPick / keep / omega * (outside ? 1.0 : n * n);   // n^2: host twin
 
-        // The legs' shadow rays skip the sphere, which in float a grazing leg's end on it rounds inside as
-        // often as out (and which the legs, outside it, cannot otherwise meet).
+        // The legs skip the sphere, which in float a grazing leg's end on it rounds inside as often as out
+        // (and which the legs, outside it, cannot otherwise meet), and cross what passes light straight on,
+        // in the room the chain's own c + 1 vertices leave (host twin).
         const DVec3 wPR = wP.toR();
-        if (occludedTo(sc, dOffsetAlong(p.toR(), vt.legNormal(), wPR, vt.reach), last.toR(), 2e-6, RAY_TMIN, false, (Real)0, sphIdx))
+        const int legRoom = room - (e.c + 1);
+        Real Tp[hero::kHeroMax], Te[hero::kHeroMax];
+        int kP = 0;
+        if (!dLegThrough(sc, dOffsetAlong(p.toR(), vt.legNormal(), wPR, vt.reach), last.toR(), 2e-6, RAY_TMIN, (Real)0,
+                         LegRule{legRoom, false}, /*camLeg=*/false, sphIdx, lam, nL, Tp, &kP))
             return;
+        for (int j = 0; j < nL; ++j) Te[j] = (Real)1;
         DVec3 wER((Real)0, (Real)0, (Real)0);
         double dE = 0.0;
         if (outside) {
             D3 wE = eye - first; dE = d3len(wE); wE = wE * (1.0 / dE);
             wER = wE.toR();
             // camera leg: hide_camera applies (Scene::occluded / DMaterial::hideCamera)
-            if (occludedTo(sc, first.toR(), eye.toR(), 2e-6, RAY_TMIN, /*camLeg=*/true, (Real)0, sphIdx)) return;
+            if (!dLegThrough(sc, first.toR(), eye.toR(), 2e-6, RAY_TMIN, (Real)0, LegRule{legRoom - kP, false},
+                             /*camLeg=*/true, sphIdx, lam, nL, Te))
+                return;
         }
         for (int j = 0; j < nL; ++j) {
             DSpecVtx vj = vt; vj.weight = (double)w[j]; vj.lambda = lam[j];
-            double contrib = (double)beta[j] * vj.term(wP) * geom;
+            double contrib = (double)beta[j] * vj.term(wP) * geom * (double)Tp[j] * (double)Te[j];
             if (!(contrib > 0.0)) continue;
             contrib *= dLegAbsorption(sc, ix.insideMat, ch.inner, lam[j]);   // Beer-Lambert inside S
             if (outside) {
@@ -11692,7 +11712,7 @@ __device__ static void dSplatMirrorLegs(const DScene& sc, const DCamera& cam, do
         double* hits, const DMaterial& mm, const DHit& hm, int px, int py, double omega,
         const D3& p, const D3& wP, double dP, const D3& R, const D3& wRE, double dE,
         double D, double shape, const Real* lam, const Real* beta, const Real* w,
-        int nUp, DRng& rng, const DGlossySplat* gs = nullptr, const DCoatSplat* coat = nullptr) {
+        int nUp, const Real* legT, DRng& rng, const DGlossySplat* gs = nullptr, const DCoatSplat* coat = nullptr) {
     const double invD2Omega = 1.0 / (D * D * omega);
     const DVec3 wPR = wP.toR(), wRER = wRE.toR();
     const DVec3 pR = p.toR(), RR = R.toR();
@@ -11703,7 +11723,7 @@ __device__ static void dSplatMirrorLegs(const DScene& sc, const DCamera& cam, do
         // A glossy vertex's lobe toward wP, at this wavelength (shape is cos/pi there).
         double wi = gs ? (double)gs->f(wPR, lam[i]) * DPI : (double)w[i];
         if (coat) wi *= dCoatS(coat, wPR, lam[i]);   // a coated body's way out
-        double contrib = (double)beta[i] * (wi * shape) * refl * invD2Omega;
+        double contrib = (double)beta[i] * (wi * shape) * refl * invD2Omega * (double)legT[i];   // the legs' crossings
         if (contrib <= 0.0) continue;
         if (sc.mediaN > 0) {
             contrib *= (double)dMediaTransmittance(sc, pR, wPR,  (Real)dP, lam[i], rng);
@@ -11718,7 +11738,7 @@ __device__ static void dSplatMirrorLegs(const DScene& sc, const DCamera& cam, do
 // Twin of Renderer::connectSpecularPlane.
 __device__ static void dConnectSpecularPlane(const DScene& sc, const DCamera& cam,
         double* film, double* hits, const DMirrorPlane& mp, const D3& p, const DSpecVtx& vt,
-        const Real* lam, const Real* beta, const Real* w, int nUp, DRng& rng) {
+        const Real* lam, const Real* beta, const Real* w, int nUp, int room, DRng& rng) {
     const D3 eye(cam.eye);
     const D3 mn(mp.nx, mp.ny, mp.nz);
     const double se = d3dot(mn, eye) - mp.d;
@@ -11753,13 +11773,22 @@ __device__ static void dConnectSpecularPlane(const DScene& sc, const DCamera& ca
     // any-hit occlusion walk is cheaper than the closest-hit that confirms the mirror,
     // so a shadowed connection never pays for the expensive query. Both tests must
     // pass and neither draws RNG, so the order is unobservable.
-    if (occludedTo(sc, dOffsetAlong(p.toR(), vt.legNormal(), wP.toR(), vt.reach), p.toR() + wP.toR() * dP, 2e-6)) return;
+    // Both through what passes light straight on, in the room the mirror's own vertex leaves (host twin).
+    const int legRoom = room - 1;
+    Real legT[hero::kHeroMax], Te[hero::kHeroMax];
+    int kP = 0;
+    if (!dLegThrough(sc, dOffsetAlong(p.toR(), vt.legNormal(), wP.toR(), vt.reach), p.toR() + wP.toR() * dP, 2e-6,
+                     RAY_TMIN, (Real)0, LegRule{legRoom, false}, /*camLeg=*/false, -1, lam, nUp, legT, &kP))
+        return;
     DHit hm;
     // ...and the hit must be on this plane's own faces: a part's plane can coincide with another's.
-    if (!dMirrorSeenAt(sc, eye, D3(0,0,0) - wRE, dE, hm) || !dMirrorClaims(sc, mp, hm)) return;
+    if (!dMirrorSeenThrough(sc, eye, D3(0,0,0) - wRE, dE, hm, LegRule{legRoom - kP, false}, lam, nUp, Te) ||
+        !dMirrorClaims(sc, mp, hm))
+        return;
+    for (int i = 0; i < nUp; ++i) legT[i] *= Te[i];
 
     dSplatMirrorLegs(sc, cam, film, hits, sc.mats[hm.matId], hm, px, py, omega,
-                     p, wP, dP, R, wRE, dE, D, shape, lam, beta, w, nUp, rng, vt.glossy, vt.coat);
+                     p, wP, dP, R, wRE, dE, D, shape, lam, beta, w, nUp, legT, rng, vt.glossy, vt.coat);
 }
 
 // Connect vertex p to the pinhole `cam` by reflection in one SPHERICAL mirror. Same 1-D
@@ -11767,7 +11796,7 @@ __device__ static void dConnectSpecularPlane(const DScene& sc, const DCamera& ca
 // place of the two refractions. Twin of Renderer::connectSpecularSphereMirror.
 __device__ static void dConnectSpecularSphereMirror(const DScene& sc, const DCamera& cam,
         double* film, double* hits, const DSphere& S, const D3& p, const DSpecVtx& vt,
-        const Real* lam, const Real* beta, const Real* w, int nUp, int sphIdx, DRng& rng) {
+        const Real* lam, const Real* beta, const Real* w, int nUp, int room, int sphIdx, DRng& rng) {
     const D3 O(S.c); const double r = S.r; const D3 eye(cam.eye);
     const double dEyeO = d3len(eye - O);
     const double dPO   = d3len(p - O);
@@ -11855,14 +11884,18 @@ __device__ static void dConnectSpecularSphereMirror(const DScene& sc, const DCam
         const double D = 1.0 / sqrt(G);
 
         // The shadow ray skips the mirror (the glass connector's reason; p is on its side of it, out or in).
-        if (occludedTo(sc, dOffsetAlong(p.toR(), vt.legNormal(), wP.toR(), vt.reach), ch.P1.toR(), 2e-6, RAY_TMIN, false, (Real)0,
-                       sphIdx))
+        const int legRoom = room - 1;   // the mirror's own vertex taken (host twin)
+        Real legT[hero::kHeroMax], Te[hero::kHeroMax];
+        int kP = 0;
+        if (!dLegThrough(sc, dOffsetAlong(p.toR(), vt.legNormal(), wP.toR(), vt.reach), ch.P1.toR(), 2e-6, RAY_TMIN,
+                         (Real)0, LegRule{legRoom, false}, /*camLeg=*/false, sphIdx, lam, nUp, legT, &kP))
             return;
         DHit hm;
-        if (!dMirrorSeenAt(sc, eye, D3(0,0,0) - wRE, dE, hm)) return;
+        if (!dMirrorSeenThrough(sc, eye, D3(0,0,0) - wRE, dE, hm, LegRule{legRoom - kP, false}, lam, nUp, Te)) return;
+        for (int i = 0; i < nUp; ++i) legT[i] *= Te[i];
 
         dSplatMirrorLegs(sc, cam, film, hits, sc.mats[hm.matId], hm, px, py, omega,
-                         p, wP, dP, ch.P1, wRE, dE, D, shape, lam, beta, w, nUp, rng, vt.glossy, vt.coat);
+                         p, wP, dP, ch.P1, wRE, dE, D, shape, lam, beta, w, nUp, legT, rng, vt.glossy, vt.coat);
     };
     // An image the scan closed on: whether the chain found it there -- the leg through the vertex, its
     // forward side -- and the cheap tests that leave it nothing to add, before its splat waits in `pend` for
@@ -12033,7 +12066,7 @@ __device__ static void camSpecularSplatAllVtxN(const DScene& sc, const DCamSet& 
         for (int c = 0; c < cs.nCam; ++c)
             if (!cs.cam(c).hasLens)   // a physical lens has no pinhole to aim at
                 dConnectSpecularSphereMirror(sc, cs.cam(c), cs.films[c], cs.hits[c], S,
-                                             pd, vt, lam, beta, w, nUp, sc.mirrorSph[k], rng);
+                                             pd, vt, lam, beta, w, nUp, room, sc.mirrorSph[k], rng);
     }
     // The planes, at the path's time; one whose faces move differently or deform (mixed) by
     // its parts, each moving as one (host twin camSpecularSplatAllVtxN).
@@ -12047,7 +12080,7 @@ __device__ static void camSpecularSplatAllVtxN(const DScene& sc, const DCamSet& 
             for (int c = 0; c < cs.nCam; ++c)
                 if (!cs.cam(c).hasLens)   // a physical lens has no pinhole to aim at
                     dConnectSpecularPlane(sc, cs.cam(c), cs.films[c], cs.hits[c],
-                                          *mp, pd, vt, lam, beta, w, nUp, rng);
+                                          *mp, pd, vt, lam, beta, w, nUp, room, rng);
         }
     }
 }
@@ -13020,20 +13053,25 @@ __device__ static Real dStraightPass(const DScene& sc, const DMaterial& m, const
     }
     return v > (Real)0 ? (v < (Real)1 ? v : (Real)1) : (Real)0;
 }
-__device__ static bool dCamLegThrough(const DScene& sc, const DVec3& o, const DVec3& target, double absEps,
-                                      Real tmin, Real curveTmin, LegRule leg, const Real* lam, int n,
-                                      Real* T) {
+// dLegThrough is the same for any leg (host twin legThrough): `camLeg` false puts no camera on it, its hidden
+// surfaces ordinary ones; `skipSph` a sphere it does not see (occludedTo's); `crossed` the surfaces it
+// crossed, where given.
+__device__ static bool dLegThrough(const DScene& sc, const DVec3& o, const DVec3& target, double absEps,
+                                   Real tmin, Real curveTmin, LegRule leg, bool camLeg, int skipSph,
+                                   const Real* lam, int n, Real* T, int* crossed) {
     for (int i = 0; i < n; ++i) T[i] = (Real)1;
+    if (crossed) *crossed = 0;
     int room = leg.room < kCamLegThroughMax ? leg.room : kCamLegThroughMax;
     if (leg.split && !sc.compoundStraightAny) room = 0;   // every crossing a specular type's (host twin)
-    if (room <= 0 || !sc.passThroughAny) return !occludedTo(sc, o, target, absEps, tmin, /*camLeg=*/true, curveTmin);
+    if (room <= 0 || !sc.passThroughAny)
+        return !occludedTo(sc, o, target, absEps, tmin, camLeg, curveTmin, skipSph);
     const DVec3 tv = target - o;
     const Real td = length(tv);
     if (!(td > (Real)0)) return true;
     const DVec3 dir = tv / td;
     Real left = connMaxT((double)td, absEps, dMaxAbs(target));   // occludedTo's length
     bool metPT = false;
-    if (occludedGeometry(sc, o, dir, left, tmin, /*camLeg=*/true, curveTmin, -1, /*skipPassThrough=*/true, &metPT) ||
+    if (occludedGeometry(sc, o, dir, left, tmin, camLeg, curveTmin, skipSph, /*skipPassThrough=*/true, &metPT) ||
         dCrossesGrin(sc, o, dir, left))
         return false;   // something other than what passes light straight on stops it
     if (!metPT) return true;   // nothing on it
@@ -13041,7 +13079,7 @@ __device__ static bool dCamLegThrough(const DScene& sc, const DVec3& o, const DV
     // set aside until an unhidden crossing follows it -- an opaque one then blocks, one that passes light
     // counts -- and dropped where none does.
     constexpr int kStepsMax = 4 * kCamLegThroughMax;
-    const bool hideOn = sc.camHiddenAny != 0;
+    const bool hideOn = camLeg && sc.camHiddenAny != 0;
     Real Tp[hero::kHeroMax];
     for (int i = 0; i < n; ++i) Tp[i] = (Real)1;
     bool hiddenBlocks = false, lastSpecular = false;
@@ -13049,8 +13087,10 @@ __device__ static bool dCamLegThrough(const DScene& sc, const DVec3& o, const DV
     DVec3 q = o;
     Real tq = tmin, cq = curveTmin;
     DStraightCross x;
-    for (int k = 0, steps = 0; steps < kStepsMax; ++steps) {
-        const DHit h = closestHit(sc, q, dir, tq, left, /*camHide=*/false, cq);
+    int k = 0;
+    for (int steps = 0; steps < kStepsMax; ++steps) {
+        const DHit h = closestHit(sc, q, dir, tq, left, /*camHide=*/false, cq, nullptr, skipSph);
+        if (crossed) *crossed = k;
         if (!h.valid || !(h.t < left)) return !(leg.split && lastSpecular);   // the rest of the leg is clear
         const DMaterial& m = sc.mats[h.matId];
         if (hideOn && m.hideCamera) {
@@ -13084,6 +13124,53 @@ __device__ static bool dCamLegThrough(const DScene& sc, const DVec3& o, const DV
         left -= h.t;
         tq = dHitEps(h);   // clear of its own primitive, whose error near the origin outgrows dEpsAt
         cq = (Real)0;
+    }
+    return false;
+}
+
+__device__ static bool dCamLegThrough(const DScene& sc, const DVec3& o, const DVec3& target, double absEps,
+                                      Real tmin, Real curveTmin, LegRule leg, const Real* lam, int n, Real* T) {
+    return dLegThrough(sc, o, target, absEps, tmin, curveTmin, leg, /*camLeg=*/true, -1, lam, n, T);
+}
+
+// Twin of Renderer::mirrorSeenThrough (where the why is): the walk from the eye along `wE` crosses what
+// passes light straight on (hidden surfaces skipped until it crosses one), `leg` what it may, to just
+// short of the mirror at `dE`, and one closest hit from there confirms it, in `hm`; T[i] what they pass
+// at lam[i]. False where anything else is in front, or the mirror is not met at dE.
+__device__ static bool dMirrorSeenThrough(const DScene& sc, const D3& eye, const D3& wE, double dE, DHit& hm,
+                                          LegRule leg, const Real* lam, int n, Real* T) {
+    for (int i = 0; i < n; ++i) T[i] = (Real)1;
+    const int room = leg.room < kCamLegThroughMax ? leg.room : kCamLegThroughMax;
+    if (!sc.passThroughAny || room <= 0) return dMirrorSeenAt(sc, eye, wE, dE, hm);
+    constexpr int kStepsMax = 4 * kCamLegThroughMax;
+    const DVec3 dir = wE.toR();
+    DVec3 q = eye.toR();
+    Real tq = RAY_TMIN;
+    double dist = 0.0;
+    const double tol = 1e-4 * (1.0 + dE);
+    Real left = (Real)(dE - tol);
+    DStraightCross x;
+    for (int k = 0, steps = 0; steps < kStepsMax; ++steps) {
+        hm = closestHit(sc, q, dir, tq, left, /*camHide=*/k == 0, (Real)0);
+        if (!hm.valid || !(hm.t < left)) {   // clear to just short of the mirror: confirm it
+            hm = closestHit(sc, q, dir, tq, BIG, /*camHide=*/k == 0, (Real)0);
+            if (!hm.valid || fabs(dist + (double)hm.t - dE) > tol) return false;
+            if (dCrossesGrin(sc, q, dir, hm.t)) return false;
+            return dMirrorConnectsMat(sc.mats[hm.matId]);
+        }
+        if (dCrossesGrin(sc, q, dir, hm.t)) return false;
+        const DMaterial& m = sc.mats[hm.matId];
+        if (!dPassesStraight(m)) return false;   // something in front
+        if (k == room) return false;
+        dStraightCrossAt(sc, m, hm, dir, x);
+        bool any = false;
+        for (int i = 0; i < n; ++i) {
+            T[i] *= dStraightPass(sc, m, hm, x, lam[i]);
+            any = any || T[i] > (Real)0;
+        }
+        if (!any) return false;
+        ++k;
+        q = hm.p; dist += (double)hm.t; left -= hm.t; tq = dHitEps(hm);
     }
     return false;
 }

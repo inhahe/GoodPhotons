@@ -322,7 +322,7 @@ act (Sysinternals `handle.exe` on the locked path, which build.bat could run whe
 exclude the build directory from the scanner if that is it, or have build.bat retry the failed step
 once; and have it say plainly, last, that ftrace.exe was NOT updated.
 
-## OPEN (2026-11-20, mostly fixed 0.451.3): MODEB-PASSTHROUGH — modes A and B see nothing through a gel, and only part of what a half mirror passes
+## DONE (2026-11-21, 0.451.3-0.451.10): MODEB-PASSTHROUGH — modes A and B see nothing through a gel, and only part of what a half mirror passes
 
 **Fixed (0.451.3) for the direct camera legs:** the forward connections -- mode B's surface, volume and
 emission splats and mode A's lens connections, single-wavelength and hero bundles, host and device -- take
@@ -336,10 +336,13 @@ to mode R on all three, fog behind the gel, two gels and -max-bounce 1, and mode
 scenes' pinhole camera gives mode A, the finite-lens camera, nothing to render; its lens connections take
 the same change. (The step half mirror's Z 0.96 was noise: four seeds at four times the samples read
 0.997 over the frame, every tile within 2 sigma.) Since 0.451.4 each surface a leg crosses counts
-against -max-bounce, as mode R counts it (REVIEW-0452). **Left:**
-* the analytic specular connections' legs -- vertex to a glass sphere or a mirror, and the mirror's own
-  check that it is what the eye sees (`mirrorSeenAt`) -- still stop at a gel or half mirror (the
-  device's sphere legs skip the sphere, which its closest-hit walk cannot);
+against -max-bounce, as mode R counts it (REVIEW-0452). **Left, and since fixed:**
+* ~~the analytic specular connections' legs stop at a gel or half mirror~~ -- fixed 0.451.10: the leg
+  from a vertex to a glass sphere or a mirror (`legThrough`, no camera on it, so a hidden surface is an
+  ordinary one there) and the one on to the eye (the sphere's `legThrough`, the mirrors'
+  `mirrorSeenThrough`) cross them, in the room the chain's own vertices leave; the device's walk skips
+  the sphere it connects through (`closestHit`'s `skipSph`); check_passthrough's `gel_sphere`,
+  `sphere_gel`, `gel_ball`, `gel_mirror`;
 * ~~the sky, sun and glows modes A and B see directly stop at the first surface~~ -- fixed 0.451.5: a
   sky sample whose first hit is a gel or half mirror walks on at a wavelength of its own
   (`skySeenThroughXYZ`), and the sky pass's count grows as a lens's does; check_passthrough's `sky_gel`,

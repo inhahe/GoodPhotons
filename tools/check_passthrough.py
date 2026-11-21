@@ -33,6 +33,9 @@ both carries no verdict):
   - the sky behind the gel through a physical lens, mode A (the pass's lens samples);
   - the sky behind the gel sliding across the shutter, modes B and P (addBlurredSkyRows; mode P's split
     leaves what is seen through the gel to its camera side);
+  - a glass sphere behind the gel, and one with a gel between it and the wall, and a mirror ball and a
+    tilted mirror behind the gel: the analytic connections' legs (a vertex to the sphere or the mirror,
+    and on to the eye) cross what passes light too, in the room the chain leaves;
   - a `mix` of the gel and the white (0.6 / 0.4) in the gel's place, and a `layered` coat over the gel:
     a leg takes the walks' pick on average (StraightCross);
   - a `mix` of the gel and a `glow_only` emitter: the sky pass shows the emitter's half of the glow on it,
@@ -85,6 +88,14 @@ SKY_FOG = SKY + ['medium { sigma_t 0.5  albedo 0.0  g 0.0  bounds { min -3 0 -0.
 MIX = 'material "mixgel" { type mix  layer "redgel" 0.6  layer "white" 0.4 }'
 COAT = 'material "coatgel" { type layered  ior 1.5  coat { reflectance fresnel  ior 1.5 }  layer "redgel" 1.0 }'
 MIX_GEL = gel_as(FILTER, "mixgel", MIX)
+GLASS = 'material "glass" { type dielectric  ior 1.5 }'
+CHROME = 'material "chrome" { type mirror  reflect 0.9 }'
+GEL_SPHERE = FILTER + [GLASS, 'sphere { center 0 0.6 0.6  radius 0.3  material glass }']
+SPHERE_GEL = ([ln for ln in FILTER if not (ln.startswith("quad") and "material redgel }" in ln)] +
+              [GLASS, 'sphere { center 0 0.6 -0.2  radius 0.3  material glass }',
+               'quad { origin -0.6 0.05 0.6  u 1.2 0 0  v 0 1.2 0  material redgel }'])
+GEL_BALL = FILTER + [CHROME, 'sphere { center 0 0.6 0.6  radius 0.3  material chrome }']
+GEL_MIRROR = FILTER + [CHROME, 'quad { origin -0.35 0.85 0.3  u 0.7 0 0  v 0 -0.6 0.35  material chrome }']   # the lit floor
 GLOW_MIX = 'material "glowgel" { type mix  layer "redgel" 0.5  layer "neon" 0.5 }'
 NEON = 'material "neon" { type diffuse  reflect 0.0  emit 0.05  glow_only on }'
 MIX_GLOW = ([ln for ln in FILTER if not (ln.startswith("quad") and "material redgel }" in ln)] +
@@ -122,6 +133,10 @@ CASES = [
     ("sky_lens_A", with_camera(SKY, PHYS), A_ARGS, [], None),
     ("sky_blur", blurred(SKY), B_ARGS, [], None),
     ("sky_blur_P", blurred(SKY), ["-mode", "P"], [], None),
+    ("gel_sphere", GEL_SPHERE, B_ARGS, [], None),
+    ("sphere_gel", SPHERE_GEL, B_ARGS, [], None),
+    ("gel_ball", GEL_BALL, B_ARGS, [], None),
+    ("gel_mirror", GEL_MIRROR, B_ARGS, [], None),
     ("mix_gel", MIX_GEL, B_ARGS, [], None),
     ("mix_glow", MIX_GLOW, B_ARGS, [], None),
     ("coat_gel", COAT_GEL, B_ARGS, [], None),

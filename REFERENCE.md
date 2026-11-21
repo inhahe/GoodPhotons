@@ -993,8 +993,8 @@ that converges to the same physical image.
   against `-max-bounce` as it does in mode R. The sky, sun and glows seen directly behind one show
   through it too, and through a fog (since 0.451.5; before, black behind a gel and undimmed by a
   fog). A `mix` or `layered` surface with a gel or half-mirror child passes its share (since
-  0.451.8). Still stopped by them: the analytic connections through a glass sphere or off another
-  mirror. Best default
+  0.451.8), and the analytic connections through a glass sphere or off a mirror see through them
+  too (since 0.451.10). Best default
   for diffuse and caustic-heavy scenes. In an *absolute-EV* scene an authored
   `fstop`/`lens` still sets exposure here — the pinhole has no depth of field, but it
   applies the camera-equation light-gathering term `(π/4)/N²`, so f/2 is exactly four

@@ -544,8 +544,8 @@ Then the rest of 4.2-4.6 in their order, 4.7's bookkeeping alongside whatever to
   or half mirror (skySeenThroughXYZ); known-issues.
 - [x] **MODEB-PASSTHROUGH, compounds** (0.451.8) — a `mix` / `layered` surface whose child is a gel or half
   mirror, on the camera legs and in the sky pass (StraightCross); known-issues.
-- [ ] **MODEB-PASSTHROUGH, the specular connections** — their legs (glass sphere, mirrors) through a gel or half
-  mirror; known-issues.
+- [x] **MODEB-PASSTHROUGH, the specular connections** (0.451.10) — their legs (glass sphere, mirrors) through a
+  gel or half mirror (legThrough, mirrorSeenThrough); known-issues.
 - [x] **SKY-THROUGH-FOG** (0.451.5) — modes A and B showed the sky through a fog undimmed (1.000 where mode R
   and Beer-Lambert read 0.341); known-issues.
 - [x] **M-BEAMS-ABSORBER** (0.451.6) — mode M `-beams` dropped a camera ray's extinction through a medium that

@@ -16715,7 +16715,7 @@ static Vec3 skySeenThroughXYZ(const Scene& scene, const Ray& r, const Hit& first
     double T = 1.0, dist = 0.0;
     Vec3 acc{0, 0, 0};   // the glows of the surfaces crossed
     const StraightWalk sw = walkStraight(scene, r.o, r.d, 1e30, Scene::kTminEps, 0.0, LegRule{effMaxBounce(), split},
-        /*camAtStart=*/true, [&](const Vec3& from, const Hit& h, const Material& m, bool) {
+        CamAt::Start, [&](const Vec3& from, const Hit& h, const Material& m, bool) {
             if (glowAt)
                 acc += glowSeenXYZ(scene, h, Ray{from, r.d}, /*mono=*/true, lambda, u1, u2, rng,
                                    w * T * legAbsorption(scene, camMed, dist, lambda), /*perSample=*/false, camMed);

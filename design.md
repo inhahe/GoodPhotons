@@ -11694,8 +11694,12 @@ from `Scene::compoundStraightAny`, says so, as it runs for glows).
 
 Without it the wall behind a gel rendered black in mode B (MODEB-PASSTHROUGH); `tools/check_passthrough.py`
 is the check. The sky, sun and glows a forward camera sees directly walk through them the same way
-(`skySeenThroughXYZ`, under the sky pass in the glows' section). Still stopped at one: the analytic
-specular connections' legs (through a glass sphere, off a mirror).
+(`skySeenThroughXYZ`, under the sky pass in the glows' section), and so do the analytic specular
+connections' legs: the vertex's leg to a glass sphere or a mirror (`legThrough` with no camera on it,
+`CamAt::None`, its hidden surfaces ordinary ones; device `dLegThrough`, its walk skipping the sphere it
+connects through, `closestHit`'s `skipSph`) and the one on to the eye (the sphere's `legThrough`, the
+mirrors' `mirrorSeenThrough` / `dMirrorSeenThrough`, which confirm the mirror where the walk ends), the
+two sharing the room the chain's own vertices leave (`room - (c + 1)`, a mirror's `room - 1`).
 
 ## Glossy camera splats, and the rough interference reflector (0.401.0)
 

@@ -6756,10 +6756,15 @@ inline bool passesStraight(const Material& m) { return m.straight; }
 // first (StraightWalk::met); `Stopped`, the light passes nothing more -- `cross` said so, or more surfaces
 // than its room, or a region that bends rays (as nothing is seen straight through glass).
 enum class StraightEnd { Clear, Met, Stopped };
+// Where a walk's camera is (walkStraight's hide_camera rule): at its start, at its end, or nowhere on it
+// (a leg from a photon vertex to a glass sphere or a mirror, on which a hidden surface is an ordinary one).
+enum class CamAt { Start, End, None };
 struct StraightWalk {
     StraightEnd end = StraightEnd::Clear;
+    int crossings = 0;    // the surfaces it crossed (counted where a hidden one's turn to count came)
     Vec3 from;            // the last stretch's start: the walk's origin, or the last surface crossed
     double dist = 0.0;    // its distance from the origin
+    double tmin = 0.0;    // the tmin a ray leaving `from` along the walk takes (clear of what it crossed)
     Hit met;              // what `Met` met, its t from `from`
 };
 // A walk along o + t dir, t in [tmin, maxDist) (`curveTmin` as closestHit's), across the surfaces that pass
@@ -6769,27 +6774,30 @@ struct StraightWalk {
 // crossing nearest the camera may not be of a specular type (LegRule; a walk from the camera under it
 // starts from a first hit that is not). `first`, where given, is the walk's first hit, traced already.
 //
-// The camera is at the walk's start where `camAtStart`, else at its end, and a camera-hidden surface
-// (Material::hideCamera) is hidden only on the stretch next to it: mode R's camera ray skips one, a ray
-// that has crossed a surface does not. From the camera, the walk skips them until it crosses one. Toward
+// The camera is at the walk's start, at its end, or nowhere on it (`camAt`), and a camera-hidden surface
+// (Material::hideCamera) is hidden only on the stretch next to the camera: mode R's camera ray skips one, a
+// ray that has crossed a surface does not, and on a leg with no camera it is an ordinary surface. From the camera, the walk skips them until it crosses one. Toward
 // the camera, whether one met lies on that stretch is known only from what follows: an opaque one blocks
 // where an unhidden crossing follows it, and a hidden one that passes light is crossed `pending` --
 // `cross` sets its factor aside, `fold(true)` takes it in when an unhidden crossing follows and
 // `fold(false)` drops it where none does.
 template <class Cross, class Fold>
 inline StraightWalk walkStraight(const Scene& scene, const Vec3& o, const Vec3& dir, double maxDist,
-                                 double tmin, double curveTmin, LegRule leg, bool camAtStart, Cross&& cross,
+                                 double tmin, double curveTmin, LegRule leg, CamAt camAt, Cross&& cross,
                                  Fold&& fold, const Hit* first = nullptr) {
     constexpr int kStepsMax = 4 * kCamLegThroughMax;   // hidden surfaces skipped included
     const int room = std::min(leg.room, kCamLegThroughMax);
-    const bool hideOn = scene.camHiddenAny;
+    const bool hideOn = scene.camHiddenAny && camAt != CamAt::None;
+    const bool camAtStart = camAt == CamAt::Start;
     StraightWalk w;
     w.from = o;
+    w.tmin = tmin;
     double left = maxDist, tq = tmin, cq = curveTmin;
     bool crossed = false, lastSpecular = false;
     bool hiddenBlocks = false;   // toward the camera: a hidden surface since the last crossing passes nothing
     int hiddenCross = 0;         // ...and the hidden crossings set aside since it
-    for (int k = 0, steps = 0; steps < kStepsMax; ++steps) {
+    int& k = w.crossings;
+    for (int steps = 0; steps < kStepsMax; ++steps) {
         const Hit h = (first && steps == 0)
             ? *first
             : scene.closestHit(Ray{w.from, dir, cq}, tq, nullptr, false, hideOn && camAtStart && !crossed, left);
@@ -6813,6 +6821,7 @@ inline StraightWalk walkStraight(const Scene& scene, const Vec3& o, const Vec3& 
             lastSpecular = isSpecularType(m.type);
         }
         w.from = h.p; w.dist += h.t; left -= h.t; tq = scene.hitEps(h); cq = 0.0;
+        w.tmin = tq;
     }
     w.end = StraightEnd::Stopped;
     return w;
