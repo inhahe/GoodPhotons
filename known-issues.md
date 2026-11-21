@@ -344,10 +344,14 @@ against -max-bounce, as mode R counts it (REVIEW-0452). **Left:**
   sky sample whose first hit is a gel or half mirror walks on at a wavelength of its own
   (`skySeenThroughXYZ`), and the sky pass's count grows as a lens's does; check_passthrough's `sky_gel`,
   `glow_gel`, `sky_lens_A`, `sky_blur` and `sky_blur_P`;
-* a `mix` or `layered` surface whose child is a gel or half mirror blocks the leg. **Fix:** the leg
-  takes the child weights' expectation at the hit -- a mix's `sum w_c pass_c(lam)` (its weight map
-  read where it has one), a stack's coat first (the walk's coat coin and coatContinue) -- and
-  `passThroughAny` and occludedGeometry's skip count such compounds.
+* ~~a `mix` or `layered` surface whose child is a gel or half mirror blocks the leg~~ -- fixed
+  0.451.8: the leg and the sky pass take the walks' pick on average (`StraightCross`, `dStraightPass`:
+  a mix's children by their weights, its weight map read at the hit; a stack's bodies after its coat's
+  coin, `1 - R` at the crossing's direction, which is all the photon walk and mode R take of the coat
+  for a body passing straight through), and `Material::straight` counts such compounds. Mode P's split
+  files a sample by its first surface's own type, so a leg there is blocked only by a specular-type
+  crossing nearest the camera (`LegRule::split`), and its sky pass draws the sky behind a compound;
+  check_passthrough's `mix_gel`, `coat_gel`, `mix_blur_P`, `mix_sky`, `mix_sky_blur_P`.
 
 The report:
 

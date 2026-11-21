@@ -32,7 +32,12 @@ both carries no verdict):
   - a glow (`glow_only`) behind the gel, which the same pass draws;
   - the sky behind the gel through a physical lens, mode A (the pass's lens samples);
   - the sky behind the gel sliding across the shutter, modes B and P (addBlurredSkyRows; mode P's split
-    leaves what is seen through the gel to its camera side).
+    leaves what is seen through the gel to its camera side);
+  - a `mix` of the gel and the white (0.6 / 0.4) in the gel's place, and a `layered` coat over the gel:
+    a leg takes the walks' pick on average (StraightCross);
+  - the mix sliding across the shutter in mode P, whose split files a sample by its first surface's own
+    type -- a mix's is the forward side's, so its legs and its sky pass see through it;
+  - the sky behind the mix, modes B and P under the shutter.
 
 Exits 1 on any failure.
 """
@@ -56,12 +61,18 @@ def with_camera(lines, extra):
     return [ln.replace("film {", extra + "  film {") if ln.startswith("camera") else ln for ln in lines]
 
 
-def blurred(lines):
-    """`lines` with the gel sliding across a shutter."""
+def blurred(lines, mat="redgel"):
+    """`lines` with the gel (the quad of material `mat`) sliding across a shutter."""
     return (["scene { motion_interval -0.5 0.5 }"] +
             [ln.replace("film {", "shutter_open -0.5  shutter_close 0.5  film {") if ln.startswith("camera") else
              ("group { motion { key { translate -0.05 0 0 }  key { translate 0.05 0 0 } }  %s }" % ln
-              if "material redgel" in ln and ln.startswith("quad") else ln) for ln in lines])
+              if ("material %s }" % mat) in ln and ln.startswith("quad") else ln) for ln in lines])
+
+
+def gel_as(lines, mat, material):
+    """`lines` with the gel quad of material `mat` instead, `material` its statement."""
+    return [material] + [ln.replace("material redgel }", "material %s }" % mat)
+                         if ln.startswith("quad") and "material redgel }" in ln else ln for ln in lines]
 
 
 NO_GEL = [ln for ln in FILTER if "material redgel" not in ln]
@@ -69,6 +80,10 @@ FOG = FILTER + ['medium { sigma_t 0.3  albedo 0.9  g 0.0  bounds { min -3 0 -0.4
 BLUR = blurred(FILTER)
 SKY = [ln for ln in FILTER if not ln.startswith("quad { origin -3 0 1.5")] + ["light env { spd 1.0 }"]
 SKY_FOG = SKY + ['medium { sigma_t 0.5  albedo 0.0  g 0.0  bounds { min -3 0 -0.4  max 3 3 1.4 } }']
+MIX = 'material "mixgel" { type mix  layer "redgel" 0.6  layer "white" 0.4 }'
+COAT = 'material "coatgel" { type layered  ior 1.5  coat { reflectance fresnel  ior 1.5 }  layer "redgel" 1.0 }'
+MIX_GEL = gel_as(FILTER, "mixgel", MIX)
+COAT_GEL = gel_as(FILTER, "coatgel", COAT)
 GLOW = FILTER + ['material "glow" { type diffuse  reflect 0.3  emit 0.05  glow_only on }',
                  'quad { origin -0.3 0.3 0.5  u 0 0.6 0  v 0.6 0 0  material glow }']
 PHYS = "focus 4.0  lens { preset achromat  focal 50  fstop 2.8 }"
@@ -101,6 +116,11 @@ CASES = [
     ("sky_lens_A", with_camera(SKY, PHYS), A_ARGS, [], None),
     ("sky_blur", blurred(SKY), B_ARGS, [], None),
     ("sky_blur_P", blurred(SKY), ["-mode", "P"], [], None),
+    ("mix_gel", MIX_GEL, B_ARGS, [], None),
+    ("coat_gel", COAT_GEL, B_ARGS, [], None),
+    ("mix_blur_P", blurred(MIX_GEL, "mixgel"), ["-mode", "P"], [], None),
+    ("mix_sky", gel_as(SKY, "mixgel", MIX), B_ARGS, [], None),
+    ("mix_sky_blur_P", blurred(gel_as(SKY, "mixgel", MIX), "mixgel"), ["-mode", "P"], [], None),
 ]
 
 

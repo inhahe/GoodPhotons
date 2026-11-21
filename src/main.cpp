@@ -16703,15 +16703,17 @@ static bool skySeenThrough(const Scene& scene, const Ray& r, const Hit& h) {
 // ray taking the light its last ray reaches -- and the media on the way (drawn from `rng`), to the sky
 // and the sun where it escapes (`env`, `sun`: whether each is drawn), or a glow it then meets
 // (glowSeenXYZ, `u1` and `u2` its draws; `glow`: whether glows are). `camMed`: the solid the camera is
-// in (Camera::medium), or -1. A sun's disc takes its transmittance averaged over
+// in (Camera::medium), or -1. `split`: mode P's blurred split, which walks only from a first surface not of
+// a specular type (LegRule). A sun's disc takes its transmittance averaged over
 // pbeams::kSunDiscTrSamples draws, as mode M's camera ray does: it outshines the sky around it.
 static Vec3 skySeenThroughXYZ(const Scene& scene, const Ray& r, double lambda, double u1, double u2,
-                              Pcg32& rng, double w, int camMed, bool env, bool sun, bool glow) {
+                              Pcg32& rng, double w, int camMed, bool env, bool sun, bool glow,
+                              bool split = false) {
     const bool med = !scene.media.empty();
     double T = 1.0;
-    const StraightWalk sw = walkStraight(scene, r.o, r.d, 1e30, Scene::kTminEps, 0.0, effMaxBounce(),
+    const StraightWalk sw = walkStraight(scene, r.o, r.d, 1e30, Scene::kTminEps, 0.0, LegRule{effMaxBounce(), split},
         /*camAtStart=*/true, [&](const Vec3& from, const Hit& h, const Material& m) {
-            T *= straightPass(scene, m, h, straightPattern(scene, m, h), lambda);
+            T *= StraightCross(scene, m, h, r.d).at(lambda);
             if (med) T *= Renderer::mediaTransmittance(scene, from, r.d, h.t, lambda, rng);
             return T > 0.0;
         });
@@ -16971,13 +16973,20 @@ static void addEnvBackground(Film& film, const Scene& scene, const Camera& cam, 
 // own band into its own film. The glows the camera sees (glowSeenXYZ) are drawn the same way;
 // `glowsOnly` draws them alone, for mode P's blurred split, whose camera side has the sky and the
 // glows on specular-type surfaces.
+// Whether mode P's blurred split draws some sky on its forward side: the sky or sun seen through a mix or
+// stack that passes light (Scene::compoundStraightAny), whose samples its camera side leaves to it.
+static bool splitSeesSkyThrough(const Scene& scene) {
+    return scene.compoundStraightAny && (scene.envIndex >= 0 || scene.sunCount > 0);
+}
 static void addBlurredSkyRows(Film& film, const Scene& scene, const Camera& cam, long long N,
                               int nCamsSharing, uint64_t seedBase, int y0, int y1,
                               bool glowsOnly = false) {
     constexpr double kLo = 360.0, kHi = 830.0;
     const bool haveEnv = !glowsOnly && scene.envIndex >= 0, haveSun = !glowsOnly && scene.sunCount > 0;
     const bool haveGlow = scene.glowAny;
-    if ((!haveEnv && !haveSun && !haveGlow) || N <= 0 || y0 >= y1) return;
+    if ((!haveEnv && !haveSun && !haveGlow && !(glowsOnly && splitSeesSkyThrough(scene))) || N <= 0 ||
+        y0 >= y1)
+        return;
     const int rx = film.resX, ry = film.resY;
     const double perPixel = (double)N / ((double)rx * (double)ry * (double)std::max(1, nCamsSharing));
     const double want = perPixel / 16.0;
@@ -17015,13 +17024,15 @@ static void addBlurredSkyRows(Film& film, const Scene& scene, const Camera& cam,
                 const Hit h = scene.closestHit(r, Scene::kTminEps, nullptr, /*skipHair=*/false, /*skipCamHidden=*/true);
                 // Nothing is seen straight through a region that bends rays, as through glass (prepareSky).
                 if (scene.crossesGrin(r.o, r.d, h.valid ? h.t : 1e30)) continue;
-                // Through a filter (skySeenThrough), as prepareSky draws it; not in mode P's split, whose
-                // camera side files a sample by its first surface, a gel's or a half mirror's included.
-                if (!glowsOnly && throughDrawn && skySeenThrough(scene, r, h)) {
+                // Through a filter (skySeenThrough), as prepareSky draws it. Mode P's split files a sample
+                // by its first surface: a gel's or a half mirror's, and the sky through a medium, are its
+                // camera side's; a mix's or a stack's the forward side's, sky and sun included.
+                if (throughDrawn && skySeenThrough(scene, r, h) &&
+                    (!glowsOnly || (h.valid && !isSpecularType(scene.mats[(size_t)h.matId].type)))) {
                     const double lam = lensed ? lambda : kLo + (kHi - kLo) * rng.uniform();
                     const double g1 = rng.uniform(), g2 = rng.uniform();
-                    acc += skySeenThroughXYZ(scene, r, lam, g1, g2, rng, w, cp.medium(), haveEnv, haveSun,
-                                             haveGlow);
+                    acc += skySeenThroughXYZ(scene, r, lam, g1, g2, rng, w, cp.medium(),
+                                             scene.envIndex >= 0, scene.sunCount > 0, haveGlow, glowsOnly);
                     continue;
                 }
                 if (h.valid) {
@@ -17075,12 +17086,13 @@ static Film renderForward(const Scene& scene, const Camera* cam, int resX, int r
     // the sky the camera sees directly is drawn here meanwhile, as the CPU threads below draw it
     // (addBlurredSkyRows; mode C catches the sky's photons instead). Mode P's blurred split
     // (pSplit) skips the splats the camera side draws, and its sky, which the camera side has; its
-    // glows (Scene::glowAny) it draws, as the rest of what the camera's diffuse first hits show.
+    // glows (Scene::glowAny), and the sky seen through a mix or stack (splitSeesSkyThrough), it draws,
+    // as the rest of what the camera's non-specular first hits show.
     const char camModeG = lensMode ? 'A' : forwardCatch ? 'C' : 'B';
     const bool blurG = cam && cam->seesMotion(scene);
     if (useGpu && cam && (!blurG || !cudaBlurUnsupported(scene, *cam, pSplit ? 'P' : camModeG)) &&
         cudaAvailable() && cudaForwardSupported(scene)) {
-        if (!blurG || forwardCatch || (pSplit && !scene.glowAny))
+        if (!blurG || forwardCatch || (pSplit && !scene.glowAny && !splitSeesSkyThrough(scene)))
             return renderForwardCuda(scene, *cam, resX, resY, N, eOut, diffraction, camModeG, seedBase,
                                      wavefront, g_heroC, pSplit, stableSeed, held, effMaxBounce());
         Film sky; sky.resX = resX; sky.resY = resY; sky.alloc();

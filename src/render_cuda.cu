@@ -1313,6 +1313,7 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
         d.emitsBack = m.emitsBack ? 1 : 0;
         d.matReflectsNothing = m.reflectsNothing ? 1 : 0;
         d.hideCamera = m.hideCamera ? 1 : 0;
+        d.straight = m.straight ? 1 : 0;
         d.route = m.route;
         bakeSpec(m.emit, d.matEmit, up);
         { Vec3 le = m.emit ? rgbbake::emitToRgb(m.emit) : Vec3{0, 0, 0};

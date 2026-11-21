@@ -74,9 +74,12 @@ inline bool isSpecularType(MatType t) {
 }
 
 // A surface that passes light straight on, unbent: a `filter` gel and a `halfmirror` (camLegThrough,
-// straightPass). Declared ahead of Material, defined after it.
+// StraightCross), or a mix or layered material with such a child. Declared ahead of Material, defined
+// after it.
 struct Material;
 inline bool passesStraight(const Material& m);
+// A gel or a half mirror: a surface that passes light straight on by its own type.
+inline bool passesStraightLeaf(MatType t) { return t == MatType::Filter || t == MatType::HalfMirror; }
 
 // The authored `type` keyword for a material, for diagnostics. Mix/Layered resolve to
 // one of the others before they ever reach a BSDF switch, but can still be the type
@@ -196,6 +199,9 @@ struct Material {
     // it is intersected — every prim type carries `matId`, so the test is a load and a
     // compare, and a hidden surface costs strictly less than a visible one.
     bool hideCamera = false;
+    // Whether a surface of this material passes light straight on, unbent (passesStraight): a gel, a half
+    // mirror, or a mix or layered material with such a child. Set by Scene::build, from the children.
+    bool straight = false;
     // PER-OBJECT RENDER MODE (0.386.0): `mode D` / `mode J` on a material, or on an object or
     // group (the loader then gives the object its own copy of each material it uses, with this
     // set). -1 = untagged, i.e. the camera's mode. Read only by the bidirectional family: each
@@ -3158,6 +3164,9 @@ struct Scene {
     // `halfmirror`): a camera leg that meets one is not blocked (camLegThrough). Counted with
     // camHiddenAny, so a scene without one pays one bool test per blocked leg.
     bool passThroughAny = false;
+    // Whether a mix or layered material passes light straight on (Material::straight): mode P's blurred
+    // split then draws the sky seen through one on its forward side (main.cpp addBlurredSkyRows).
+    bool compoundStraightAny = false;
     // Per instanced mesh asset (blasList): whether a triangle of it passes light straight on, so a
     // placement of it may (instancePassesStraight). Rebuilt with passThroughAny.
     std::vector<char> blasPassThrough;
@@ -3624,8 +3633,16 @@ struct Scene {
         camHiddenAny = false;
         for (const auto& m : mats) if (m.hideCamera) { camHiddenAny = true; break; }
         passThroughAny = false;
-        for (const auto& m : mats)
-            if (passesStraight(m)) { passThroughAny = true; break; }
+        compoundStraightAny = false;
+        for (auto& m : mats) {
+            m.straight = passesStraightLeaf(m.type);
+            if (m.type == MatType::Mix || m.type == MatType::Layered)   // a child that passes light (no nesting)
+                for (int c : m.mixChildren)
+                    if (c >= 0 && (size_t)c < mats.size() && passesStraightLeaf(mats[(size_t)c].type)) m.straight = true;
+            passThroughAny = passThroughAny || m.straight;
+            if (m.type == MatType::Mix || m.type == MatType::Layered)
+                compoundStraightAny = compoundStraightAny || m.straight;
+        }
         blasPassThrough.assign(blasList.size(), 0);
         for (size_t b = 0; passThroughAny && b < blasList.size(); ++b)
             for (const Tri& t : blasList[b].tris)
@@ -6700,20 +6717,16 @@ inline double transmitSlot(const Scene& scene, const Material& m,
 }
 
 constexpr int kCamLegThroughMax = 8;   // the most such surfaces a leg crosses; past them it is blocked
-inline bool passesStraight(const Material& m) {
-    return m.type == MatType::Filter || m.type == MatType::HalfMirror;
-}
-// What a surface that passes light straight on (passesStraight) passes at `h` at `lambda`, in [0, 1], NaN
-// passing nothing: a gel's T(lambda) times `pat`, a half mirror's 1 - R(lambda). `pat`: straightPattern's.
-inline double straightPass(const Scene& scene, const Material& m, const Hit& h, double pat, double lambda) {
-    const double v = m.type == MatType::Filter ? m.transmit(lambda) * pat : 1.0 - reflectSlot(scene, m, h, lambda);
-    return v > 0.0 ? (v < 1.0 ? v : 1.0) : 0.0;
-}
-// A gel's bound transmit pattern at `h` (slotPatMul), 1 for anything else: read once a crossing, whatever
-// the wavelengths straightPass is then asked for.
-inline double straightPattern(const Scene& scene, const Material& m, const Hit& h) {
-    return (m.type == MatType::Filter && m.transmitPat >= 0) ? slotPatMul(scene, m.transmitPat, h) : 1.0;
-}
+// What a camera leg may cross (camLegThrough, the device's dCamLegThrough): `room` surfaces that pass light
+// straight on at most (the -max-bounce vertices its path has left, Renderer::legRoom / dLegRoom), and, in
+// mode P's blurred split (`split`), none of a specular type nearest the camera: the split's camera side
+// files a sample by its first surface's own type and draws what is seen through a gel or half mirror, a
+// mix's or a stack's being the forward side's.
+struct LegRule {
+    int room = 0;
+    bool split = false;
+};
+inline bool passesStraight(const Material& m) { return m.straight; }
 // How walkStraight's walk ended: `Clear`, nothing else met before its end; `Met`, another surface met
 // first (StraightWalk::met); `Stopped`, the light passes nothing more -- `cross` said so, or more surfaces
 // than its room, or a region that bends rays (as nothing is seen straight through glass).
@@ -6727,16 +6740,18 @@ struct StraightWalk {
 // A walk along o + t dir, t in [tmin, maxDist) (`curveTmin` as closestHit's), across the surfaces that pass
 // light straight on (passesStraight; MODEB-PASSTHROUGH): `cross(from, h, m)` takes each in turn, nearest
 // first -- `from` the stretch's start, `h` the hit, `m` its material -- and returns false where the light
-// passes nothing more. `room` of them at most (kCamLegThroughMax at most). The camera is at the walk's
+// passes nothing more. `leg.room` of them at most (kCamLegThroughMax at most); under `leg.split` the
+// crossing nearest the camera may not be of a specular type (LegRule). The camera is at the walk's
 // start where `camAtStart`, else at its end, and a camera-hidden surface (Material::hideCamera) is
 // hidden only on the stretch next to it: mode R's camera ray skips one, a ray that has crossed a surface
 // does not. So with the camera at the end, a hidden surface counts where any crossing lies between it and
 // the camera -- found by a first pass over the hits, in a scene with such a surface.
 template <class Cross>
 inline StraightWalk walkStraight(const Scene& scene, const Vec3& o, const Vec3& dir, double maxDist,
-                                 double tmin, double curveTmin, int room, bool camAtStart, Cross&& cross) {
+                                 double tmin, double curveTmin, LegRule leg, bool camAtStart, Cross&& cross) {
     constexpr int kStepsMax = 4 * kCamLegThroughMax;   // hidden surfaces skipped included
-    room = std::min(room, kCamLegThroughMax);
+    const int room = std::min(leg.room, kCamLegThroughMax);
+    bool lastSpecular = false;   // the last crossing's own type is specular (the camera's nearest, camAtEnd)
     const bool hideOn = scene.camHiddenAny;
     // Camera at the end: the distance of the last unhidden crossing; hidden surfaces past it are hidden.
     double tLast = -1.0;
@@ -6762,14 +6777,19 @@ inline StraightWalk walkStraight(const Scene& scene, const Vec3& o, const Vec3& 
         const bool skipHidden = hideOn && camAtStart && !crossed;
         const Hit h = scene.closestHit(Ray{w.from, dir, cq}, tq, nullptr, false, skipHidden, left);
         if (scene.crossesGrin(w.from, dir, h.valid && h.t < left ? h.t : left)) { w.end = StraightEnd::Stopped; return w; }
-        if (!h.valid || !(h.t < left)) { w.end = StraightEnd::Clear; return w; }
+        if (!h.valid || !(h.t < left)) {
+            w.end = (leg.split && !camAtStart && lastSpecular) ? StraightEnd::Stopped : StraightEnd::Clear;
+            return w;
+        }
         const Material& m = scene.mats[(size_t)h.matId];
         const bool hidden = hideOn && m.hideCamera && (camAtStart ? !crossed : w.dist + h.t > tLast);
         if (!hidden) {
             if (!passesStraight(m)) { w.end = StraightEnd::Met; w.met = h; return w; }
+            if (leg.split && camAtStart && !crossed && isSpecularType(m.type)) { w.end = StraightEnd::Stopped; return w; }
             if (k == room || !cross(w.from, h, m)) { w.end = StraightEnd::Stopped; return w; }
             ++k;
             crossed = true;
+            lastSpecular = isSpecularType(m.type);
         }
         w.from = h.p; w.dist += h.t; left -= h.t; tq = scene.hitEps(h); cq = 0.0;
     }
@@ -6777,41 +6797,6 @@ inline StraightWalk walkStraight(const Scene& scene, const Vec3& o, const Vec3& 
     return w;
 }
 
-// A camera leg through the surfaces that pass light straight on (MODEB-PASSTHROUGH): a `filter` gel, which
-// passes T(lam), and a `halfmirror`, which passes 1 - R(lam) -- a light path the leg is, where any other
-// surface on it stops it (Scene::occluded's rule for a camera leg). The leg o + t dir, t in [tmin, maxDist]
-// (occluded()'s arguments), its far end the camera's; false where it is blocked, else true and T[i] what
-// those surfaces pass at lam[i], i < n (1 where it crosses none). `room`: the most of them it may cross
-// (Renderer::legRoom: each is a vertex of the path, which -max-bounce counts; none in mode P's blurred
-// split, whose camera side draws whatever is seen through them), past which it is blocked. A clear leg
-// costs the occluded() test it always did -- in a scene with such a surface, that one any-hit test notes
-// them instead of stopping at them (occludedGeometry's `skipPassThrough`) -- and only a leg that met one
-// and nothing else adds a walk of its closest hits (walkStraight). A leg that passes nothing at every
-// wavelength is blocked, so it adds no empty hit to the pixel's count (the forward modes' noise estimate
-// reads it).
-inline bool camLegThrough(const Scene& scene, const Vec3& o, const Vec3& dir, double maxDist, double tmin,
-                          double curveTmin, int room, const double* lam, int n, double* T) {
-    for (int i = 0; i < n; ++i) T[i] = 1.0;
-    if (std::min(room, kCamLegThroughMax) <= 0 || !scene.passThroughAny)
-        return !scene.occluded(o, dir, maxDist, tmin, /*camLeg=*/true, curveTmin);
-    bool metPT = false;
-    if (scene.occludedGeometry(o, dir, maxDist, tmin, /*camLeg=*/true, curveTmin, /*skipPassThrough=*/true,
-                               &metPT) ||
-        scene.crossesGrin(o, dir, maxDist))
-        return false;
-    if (!metPT) return true;
-    const StraightWalk w = walkStraight(scene, o, dir, maxDist, tmin, curveTmin, room, /*camAtStart=*/false,
-        [&](const Vec3&, const Hit& h, const Material& m) {
-            const double pat = straightPattern(scene, m, h);
-            bool any = false;
-            for (int i = 0; i < n; ++i) {
-                T[i] *= straightPass(scene, m, h, pat, lam[i]);
-                any = any || T[i] > 0.0;
-            }
-            return any;
-        });
-    return w.end == StraightEnd::Clear;
-}
 
 // The wavelength-free factor on the radiance an emissive surface sends toward `wo` from a
 // hit `h` on it: a bound emission pattern at the hit, times an aimed quad's Le cos_a / cos_g

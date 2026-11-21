@@ -11655,8 +11655,15 @@ fiber and lens connections and their hero variants; on the device `connect*`) ta
   asset; `DInstance::passThrough`), movers included (`dTimedAny`'s `skipPT`): a leg a wall blocks
   stops there, and one that met none is clear;
 * only then a walk of the leg's closest hits (`walkStraight`, which the sky pass shares; the device's
-  inline in `dCamLegThrough`) -- a GRIN region a block -- multiplying in what each gel or half mirror
-  passes, a bound pattern read once a crossing.
+  inline in `dCamLegThrough`) -- a GRIN region a block -- multiplying in what each crossing passes
+  (`StraightCross`, device `dStraightPass`), its patterns read once a crossing.
+
+**A `mix` or `layered` surface with a gel or half-mirror child** passes light too (`Material::straight`,
+set from the children at build; `DMaterial::straight`): a leg takes the walks' pick on average -- a
+mix's children by their weights, a two-way weight map's at the hit; a stack's bodies after its coat's
+coin lets the light in, `1 - R` at the crossing's direction, which is all the photon walk and mode R
+take of the coat for a body passing straight through. A child that passes nothing straight counts 0, so
+a mix of a gel and a wall passes the gel's share.
 
 A leg that passes nothing at every wavelength is blocked, so it adds no empty hit to the noise estimate.
 
@@ -11671,15 +11678,18 @@ crossing.
 against -max-bounce: a connection takes `room`, the crossings left to it (`Renderer::legRoom` /
 `dLegRoom`: -max-bounce less the vertex's depth, `SpecVtx::depth`'s count; `kCamLegThroughMax`, 8, at
 most). The routers (`camSplatAll` and kin, `splatSurfaceAll` and kin) and `interactPhotonSpecular` take
-the vertex's depth to work it out. Mode P's blurred split gives every leg a room of 0: its camera side
-files each sample whose first surface is specular-type, a gel's included, and draws what is seen through
-it (`specularSideSplats` off, `DCamSet::pSplit`).
+the vertex's depth to work it out. A connection takes `LegRule` (`legRoom`, `dLegRoom`): that room, and
+in mode P's blurred split (`specularSideSplats` off, `DCamSet::pSplit`) its rule -- the split's camera
+side files each sample by its first surface's own type and draws what is seen through a specular-type
+one, a gel or half mirror, so a leg there is blocked where its crossing nearest the camera is of such a
+type; a mix or stack being no specular type, a leg sees through one, and the split's sky pass draws the
+sky behind one (`addBlurredSkyRows`, `skySeenThroughXYZ`'s `split`; it runs where `splitSeesSkyThrough`,
+from `Scene::compoundStraightAny`, says so, as it runs for glows).
 
 Without it the wall behind a gel rendered black in mode B (MODEB-PASSTHROUGH); `tools/check_passthrough.py`
 is the check. The sky, sun and glows a forward camera sees directly walk through them the same way
 (`skySeenThroughXYZ`, under the sky pass in the glows' section). Still stopped at one: the analytic
-specular connections' legs (through a glass sphere, off a mirror), and a `mix` or `layered` surface whose
-child passes light.
+specular connections' legs (through a glass sphere, off a mirror).
 
 ## Glossy camera splats, and the rough interference reflector (0.401.0)
 
