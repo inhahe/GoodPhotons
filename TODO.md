@@ -542,8 +542,8 @@ Then the rest of 4.2-4.6 in their order, 4.7's bookkeeping alongside whatever to
   mirror; known-issues.
 - [x] **SKY-THROUGH-FOG** (0.451.5) — modes A and B showed the sky through a fog undimmed (1.000 where mode R
   and Beer-Lambert read 0.341); known-issues.
-- [ ] **M-BEAMS-ABSORBER** — mode M `-beams` drops a camera ray's extinction through a medium that stores no
-  beams (a pure absorber); known-issues.
+- [x] **M-BEAMS-ABSORBER** (0.451.6) — mode M `-beams` dropped a camera ray's extinction through a medium that
+  stores no beams (a pure absorber); check_sky_fog; known-issues.
 - [ ] **THINLENS-VIGNETTING** (needs the user's decision) — through a thin lens mode A records irradiance with
   natural vignetting, the other modes radiance: one camera equation for all, or none; known-issues.
 - [x] **HOST-HALFMIRROR-ANALYTIC** (0.451.2) — a coin far rarer at some cell than at its peak turns mode M's

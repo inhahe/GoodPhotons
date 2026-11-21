@@ -3760,7 +3760,10 @@ static void uploadBeamMapCuda(const Scene& scene, const BeamMap* bmap, DUpload& 
     // `lbvh` means the host deliberately skipped its tree because a device one is coming, so an
     // empty `bvh.nodes` is expected rather than a malformed map. Without that distinction the
     // guard below would silently drop a perfectly good beam set and the volume would vanish.
-    if (!bmap || bmap->nEmitted <= 0) return;
+    if (!bmap) return;
+    dbm.on = 1;
+    dbm.sunNee = pbeams::gSunNee ? 1 : 0;   // after sunNeeSplit (buildBeamMap) has had its say
+    if (bmap->nEmitted <= 0) return;
     // A map that drew empty: no beams to upload, but the merge technique stays the render's
     // (kBdptT's mergeOn), with its constant.
     if (bmap->beams.empty()) {
@@ -3857,7 +3860,6 @@ static void uploadBeamMapCuda(const Scene& scene, const BeamMap* bmap, DUpload& 
     // g_volCachesForUpload right before the device render and clears it after; a null means
     // "no cache", and the march is then a no-op. See DVolCache.
     dbm.vc = nullptr; dbm.nVc = 0;
-    dbm.sunNee = pbeams::gSunNee ? 1 : 0;   // after sunNeeSplit (buildBeamMap) has had its say
     if (g_volCachesForUpload && !g_volCachesForUpload->empty()) {
         std::vector<gpu::DVolCache> dv(g_volCachesForUpload->size());
         size_t nReady = 0;

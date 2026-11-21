@@ -9527,6 +9527,9 @@ struct DVolCache {
 };
 
 struct DBeamMap {
+    // A map was built (-beams), whether or not it holds a beam: mode M's gather is handed it, and its
+    // camera ray then takes the media's extinction (host twin: photonGather's `bm` is non-null).
+    int              on  = 0;
     const DVolCache* vc  = nullptr;   // per medium (index = DScene medium id), or null
     int              nVc = 0;
     int              sunNee = 0;   // -sunnee: dPhotonGather marches the sun's single scatter

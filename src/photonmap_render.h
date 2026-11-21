@@ -1046,6 +1046,10 @@ inline Vec3 photonGather(const Scene& scene, const PhotonMap& pm, Ray ray, doubl
     // the emission sampler (above).
     SpecThr sthr(scene.specCells);
     const bool volOn = (bm != nullptr) && !bm->empty() && !scene.media.empty();
+    // Beams asked for, in a scene with a medium: the camera ray takes the media's extinction whether or
+    // not a beam was stored -- a medium that scatters nothing stores none, and still dims what is behind
+    // it. (Without -beams mode M is blind to media, and says so.)
+    const bool medOn = (bm != nullptr) && !scene.media.empty();
     // -sunnee: the sun's single scatter is marched, not gathered (beamgather.h sunNeeMarch).
     // Not gated on the map being non-empty: erasing the direct-sun chords may have emptied it.
     const bool sunOn = (bm != nullptr) && pbeams::gSunNee && scene.sunCount > 0 && !scene.media.empty();
@@ -1105,7 +1109,7 @@ inline Vec3 photonGather(const Scene& scene, const PhotonMap& pm, Ray ray, doubl
                     // This step's radiance factor before what the walk gathers along it (grin.h
                     // MarchInfo; device twin dPhotonGather).
                     if (mInfo.radScale != radIn) { thr *= mInfo.radScale / radIn; radIn = mInfo.radScale; }
-                    if (volOn || sunOn) {
+                    if (medOn) {
                         if (volOn && !tail) { MStatTimer _t(&mStats().beamNs, &mStats().beamN);
                           L += gatherBeams(so, sd, slen, aGlass, cmIdx); }
                         if (sunOn && !tail) L += sunNeeMarch(scene, mats, so, sd, slen, aGlass, lambda, invPdfL, rng) * thr;
@@ -1145,7 +1149,7 @@ inline Vec3 photonGather(const Scene& scene, const PhotonMap& pm, Ray ray, doubl
         // --- Participating media along this segment (mode M with -beams) ---------------
         // Done BEFORE `thr` takes the segment's attenuation, because each gathered beam
         // needs the transmittance to ITS OWN closest-approach point, not to the segment end.
-        if (volOn || sunOn) {
+        if (medOn) {
             const double dSeg = h.valid ? h.t : 1e30;
             if (volOn && !tail) { MStatTimer _t(&mStats().beamNs, &mStats().beamN);
               L += gatherBeams(ray.o, ray.d, dSeg, aGlass, cmIdx);

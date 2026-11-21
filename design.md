@@ -965,7 +965,10 @@ instead of nearest-cell, which is what painted a cell's realization noise as a f
 it at the same value — but mode M's estimate of it swung ±25 % between seeds at 32 spp: the
 disc is ~10⁴ times brighter than the cloud around it, and the cloud's transmittance along that
 one ray was a single ratio-tracking sample per camera sample. `camMediaTrSpec` / `dCamMediaTrSpec`
-(the extinction sites of `photonGather` / `dPhotonGather`, spectral since SPECGATHER) average
+(the extinction sites of `photonGather` / `dPhotonGather`, spectral since SPECGATHER; taken wherever
+`-beams` is asked for in a scene with a medium, `medOn`, whether or not a beam was stored -- a medium
+that scatters nothing stores none and still dims what is behind it, M-BEAMS-ABSORBER, so the device's
+gather is handed its map whenever one was built, `DBeamMap::on`) average
 `pbeams::kSunDiscTrSamples` (64) samples for a camera segment whose direction lies inside a
 sun's disc, and one sample otherwise — unbiased either way, and paid only by the handful of
 pixels on the disc.

@@ -687,6 +687,7 @@ __device__ static void dPhotonGather(const DScene& sc, const DPhotonMap& pm,
     const Real r2C = (Real)((double)pmC.radius * (double)pmC.radius);
     const int maxBounce = 32;
     const bool volOn = (bm != nullptr) && bm->nNodes > 0 && sc.mediaN > 0;
+    const bool medOn = (bm != nullptr) && sc.mediaN > 0;   // the media's extinction (host twin)
     // -sunnee: the sun's single scatter is marched, not gathered. Not gated on nNodes: erasing
     // the direct-sun chords may have emptied the map.
     const bool sunOn = (bm != nullptr) && bm->sunNee && sc.sunCount > 0 && sc.mediaN > 0;
@@ -734,7 +735,7 @@ __device__ static void dPhotonGather(const DScene& sc, const DPhotonMap& pm,
                 bent = bent || gm.bent;
                 if (!gm.stepped) break;            //   beam gather below
                 const Real slen = (Real)gm.arc;
-                if ((volOn || sunOn) && slen > 0) {
+                if (medOn && slen > 0) {
                     double bX = 0.0, bY = 0.0, bZ = 0.0;
                     if (volOn && !tail) dGatherBeamsM(sc, *bm, sthr, thr, pro, rd, slen, aGlass, cmIdx, rng, oX, oY, oZ);
                     if (sunOn && !tail) dSunNeeMarch(sc, pro, rd, slen, aGlass, lambda, invPdfL, rng, bX, bY, bZ);
@@ -769,7 +770,7 @@ __device__ static void dPhotonGather(const DScene& sc, const DPhotonMap& pm,
         // --- Participating media along this segment (mode M with -beams) ------------------
         // Done BEFORE `thr` takes the segment's attenuation, for the same reason: each
         // gathered beam carries the transmittance to ITS OWN closest approach.
-        if (volOn || sunOn) {
+        if (medOn) {
             const Real dSeg = h.valid ? h.t : (Real)1e30;
             double bX = 0.0, bY = 0.0, bZ = 0.0;
             if (volOn && !tail) dGatherBeamsM(sc, *bm, sthr, thr, ro, rd, dSeg, aGlass, cmIdx, rng, oX, oY, oZ);
@@ -1268,7 +1269,7 @@ __global__ void kGather(DScene sc, DPhotonMap pm, DPhotonMap pmC, DBeamMap bm, c
 
         double oX, oY, oZ;
         dPhotonGather(sc, pm, pmC, diffraction, ro, rd, lambda, invPdfL, rng, fgRays,
-                      bm.nNodes > 0 ? &bm : nullptr, oX, oY, oZ, camS.enclosure);
+                      bm.on ? &bm : nullptr, oX, oY, oZ, camS.enclosure);
         size_t o = ((size_t)py * resX + px) * 3;
         atomicAdd(&film[o + 0], oX);
         atomicAdd(&film[o + 1], oY);

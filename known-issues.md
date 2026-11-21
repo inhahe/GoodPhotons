@@ -375,7 +375,15 @@ walking them; on the device that test reached the static primitives' `hidden()` 
 any-hit (`dTimedAny`), so a moving gel blocked every leg through it. **Fixed:** `dTimedAny` takes the
 same skip (`skipPT`) beside `camHideOn`.
 
-## OPEN (2026-11-20): M-BEAMS-ABSORBER — mode M `-beams` leaves what is behind a purely absorbing medium undimmed
+## DONE (2026-11-21, 0.451.6): M-BEAMS-ABSORBER — mode M `-beams` left what is behind a purely absorbing medium undimmed
+
+**Fixed:** the camera walk takes the media's extinction wherever beams are asked for and the scene has a
+medium (`medOn`), host and device; the device's gather is handed the beam map whenever one was built
+(`DBeamMap::on`, stamped at upload with `sunNee`, both of which an empty map used to leave unset -- so
+an emptied map also lost the device's `-sunnee` march, which the host kept). `tools/check_sky_fog.py`'s
+absorbing case holds mode M to mode R; 0.451.5 fails it (x2.87).
+
+The report:
 
 Found with SKY-THROUGH-FOG. Mode M's camera walk takes a medium's extinction only where `volOn || sunOn`
 (photonmap_render.h `photonGather`), and `volOn` needs a non-empty beam map: a medium that absorbs and
