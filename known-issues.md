@@ -340,11 +340,10 @@ against -max-bounce, as mode R counts it (REVIEW-0452). **Left:**
 * the analytic specular connections' legs -- vertex to a glass sphere or a mirror, and the mirror's own
   check that it is what the eye sees (`mirrorSeenAt`) -- still stop at a gel or half mirror (the
   device's sphere legs skip the sphere, which its closest-hit walk cannot);
-* the sky, sun and glows modes A and B see directly (`prepareSky`, `addBlurredSkyRows`, the device's
-  sky rows) stop at the first surface, so they are black behind a gel while the wall beside them shows
-  through it. **Fix:** a sample whose first hit passes light walks on, at a wavelength of its own (a
-  pinhole's sky is exact in XYZ per direction only where nothing filters it), times what each surface
-  passes, its count growing with the render as a lens's does;
+* ~~the sky, sun and glows modes A and B see directly stop at the first surface~~ -- fixed 0.451.5: a
+  sky sample whose first hit is a gel or half mirror walks on at a wavelength of its own
+  (`skySeenThroughXYZ`), and the sky pass's count grows as a lens's does; check_passthrough's `sky_gel`,
+  `glow_gel`, `sky_lens_A`, `sky_blur` and `sky_blur_P`;
 * a `mix` or `layered` surface whose child is a gel or half mirror blocks the leg. **Fix:** the leg
   takes the child weights' expectation at the hit -- a mix's `sum w_c pass_c(lam)` (its weight map
   read where it has one), a stack's coat first (the walk's coat coin and coatContinue) -- and
@@ -367,7 +366,34 @@ legs of the specular connections) crosses a filter or a half mirror with its tra
 wavelength of the bundle -- deterministic, as a translucent fiber's coverage is in shadowTransmittance --
 on the host and the device, and a regression check of modes A and B behind a gel and through half mirrors.
 
-## OPEN (2026-11-20): SKY-THROUGH-FOG — modes A, B and M show the sky through a fog undimmed
+## DONE (2026-11-20, 0.451.5): DEV-MOVER-PASSTHROUGH — on the GPU, modes A and B saw nothing through a moving gel
+
+Found by check_passthrough's `sky_blur` (the red gel sliding across a shutter, mode B): the floor seen
+through the gel read 0 on the GPU, 0.64 on the CPU and in mode R. 0.451.4's camera legs settle a blocked
+leg with an any-hit test that skips gels and half mirrors (occludedGeometry's `skipPassThrough`) before
+walking them; on the device that test reached the static primitives' `hidden()` but not the movers'
+any-hit (`dTimedAny`), so a moving gel blocked every leg through it. **Fixed:** `dTimedAny` takes the
+same skip (`skipPT`) beside `camHideOn`.
+
+## OPEN (2026-11-20): M-BEAMS-ABSORBER — mode M `-beams` leaves what is behind a purely absorbing medium undimmed
+
+Found with SKY-THROUGH-FOG. Mode M's camera walk takes a medium's extinction only where `volOn || sunOn`
+(photonmap_render.h `photonGather`), and `volOn` needs a non-empty beam map: a medium that absorbs and
+scatters nothing (`albedo 0`) stores no beams (`[beams] warning: 0 beams stored`), so the camera ray
+crosses it at full strength -- the sky behind SKY-THROUGH-FOG's box read 1.000 under `-mode M -beams`
+where mode R reads 0.341. With `albedo 0.5` the beams exist and mode M reads 0.489 to mode R's 0.493.
+(Plain mode M, without `-beams`, is blind to media by design and says so.) **Fix:** take the extinction
+wherever beams are asked for and the scene has a medium, whether or not any were stored, host and device.
+
+## DONE (2026-11-20, 0.451.5): SKY-THROUGH-FOG — modes A and B showed the sky through a fog undimmed
+
+**Fixed:** the sky pass (`prepareSky`, `addBlurredSkyRows`) draws a sample whose ray to the sky crosses a
+medium's bounds at a wavelength of its own, times the media's transmittance (`skySeenThroughXYZ`, which
+also walks through gels and half mirrors, MODEB-PASSTHROUGH); the rest keep their exact XYZ.
+check_passthrough's `sky_fog` (an absorbing fog behind the red gel) fails on 0.451.4 (Z x2.6 at 216
+sigma). Mode M's own case is M-BEAMS-ABSORBER.
+
+The report (as corrected the same day; the first probe read the PFM's rows bottom-up, the floor's):
 
 Found probing how the forward sky pass meets a medium (for MODEB-PASSTHROUGH's sky). A uniform sky
 (`light env { spd 1.0 }`) over a floor, seen through a fog box (`sigma_t 0.5  albedo 0`, 2 m deep), the

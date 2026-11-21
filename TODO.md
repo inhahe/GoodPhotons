@@ -534,14 +534,16 @@ Then the rest of 4.2-4.6 in their order, 4.7's bookkeeping alongside whatever to
 - [x] **REVIEW-0452** (0.451.4) — the Opus (max) and Fable (xhigh) reviews of 0.451.2-0.451.3: mode P's split,
   the device's fiber legs, crossings charged to -max-bounce, the cumulative kCoinRare, `tile_verdict` live where
   either image is lit; known-issues REVIEW-0452.
-- [ ] **MODEB-PASSTHROUGH, the sky** — the sky, sun and glows modes A and B see directly, through a gel or half
-  mirror (prepareSky, addBlurredSkyRows); known-issues.
+- [x] **MODEB-PASSTHROUGH, the sky** (0.451.5) — the sky, sun and glows modes A and B see directly, through a gel
+  or half mirror (skySeenThroughXYZ); known-issues.
 - [ ] **MODEB-PASSTHROUGH, compounds** — a `mix` / `layered` surface whose child is a gel or half mirror, on the
   camera legs; known-issues.
 - [ ] **MODEB-PASSTHROUGH, the specular connections** — their legs (glass sphere, mirrors) through a gel or half
   mirror; known-issues.
-- [ ] **SKY-THROUGH-FOG** — modes A, B and M show the sky through a fog undimmed (1.000 where mode R and
-  Beer-Lambert read 0.341); known-issues.
+- [x] **SKY-THROUGH-FOG** (0.451.5) — modes A and B showed the sky through a fog undimmed (1.000 where mode R
+  and Beer-Lambert read 0.341); known-issues.
+- [ ] **M-BEAMS-ABSORBER** — mode M `-beams` drops a camera ray's extinction through a medium that stores no
+  beams (a pure absorber); known-issues.
 - [ ] **THINLENS-VIGNETTING** (needs the user's decision) — through a thin lens mode A records irradiance with
   natural vignetting, the other modes radiance: one camera equation for all, or none; known-issues.
 - [x] **HOST-HALFMIRROR-ANALYTIC** (0.451.2) — a coin far rarer at some cell than at its peak turns mode M's

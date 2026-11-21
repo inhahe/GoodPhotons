@@ -5539,11 +5539,12 @@ __device__ __noinline__ static bool dTimedClosest(const DScene& sc, const DVec3&
 }
 // Whether any mover blocks the segment before tMax. `soft`, when given, takes a fibre whose
 // opacity is below 1 (shadowTransmittance's rule) and returns whether it is one, its hit filled
-// in to attenuate by, instead of blocking.
+// in to attenuate by, instead of blocking. `camHideOn` skips camera-hidden movers and `skipPT`
+// gels and half mirrors, as occludedGeometry's `hidden()` skips the static ones.
 template <class Soft>
 __device__ __noinline__ static bool dTimedAny(const DScene& sc, const DVec3& o, const DVec3& dir, const DVec3& invD,
                                  const DTriShear& sh, Real tmin, Real curveTmin, Real tMax, bool camHideOn,
-                                 Soft&& soft) {
+                                 bool skipPT, Soft&& soft) {
     const int root = dMotionSegRoot(sc);
     if (root < 0) return false;
     const DNode* N = sc.mo.segNodes;
@@ -5556,9 +5557,11 @@ __device__ __noinline__ static bool dTimedAny(const DScene& sc, const DVec3& o, 
         if (n.count > 0) {
             for (int i = 0; i < n.count; ++i) {
                 const int prim = sc.mo.segPrim[n.first + i];
-                if (camHideOn) {
+                if (camHideOn || skipPT) {
                     const int matId = dPrimMat(sc, prim);
-                    if (matId >= 0 && sc.mats[matId].hideCamera != 0) continue;
+                    if (matId >= 0 && ((camHideOn && sc.mats[matId].hideCamera != 0) ||
+                                       (skipPT && (sc.mats[matId].type == D_FILTER ||
+                                                   sc.mats[matId].type == D_HALFMIRROR)))) continue;
                 }
                 DHit h; h.t = tMax; h.valid = false;
                 if (prim < sc.nTris) {
@@ -6026,7 +6029,7 @@ __device__ static bool occludedGeometry(const DScene& sc, const DVec3& o, const 
         }
     }
     // (A moving skipSph is the movers' to skip: claimed, it is tested no further.)
-    return timed && dTimedAny(sc, o, dir, invD, sh, tmin, curveTmin, tMax, camHideOn,
+    return timed && dTimedAny(sc, o, dir, invD, sh, tmin, curveTmin, tMax, camHideOn, skipPT,
                               [&sc, skipSph](int prim, DHit&, DMotionNow&) {
                                   return skipSph >= 0 && prim == sc.nTris + skipSph;
                               });
@@ -6132,7 +6135,7 @@ __device__ static Real shadowTransmittance(const DScene& sc, const DVec3& o, con
                 T *= (1.0 - dHairOpacityAt(sc, cm, h));
             return true;
         };
-        if (dTimedAny(sc, o, dir, invD, sh, tmin, curveTmin, tMax, false, soft) || T <= 1e-4) return (Real)0;
+        if (dTimedAny(sc, o, dir, invD, sh, tmin, curveTmin, tMax, false, false, soft) || T <= 1e-4) return (Real)0;
     }
     return (T > 0.0 && dCrossesGrin(sc, o, dir, maxDist)) ? (Real)0 : (Real)T;   // after the geometry
 }

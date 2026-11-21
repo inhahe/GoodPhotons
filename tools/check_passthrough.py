@@ -21,7 +21,15 @@ both carries no verdict):
     is radiance (THINLENS-VIGNETTING): mode A's image is divided, pixel by pixel, by its ratio to mode R
     on the scene without the gel, fitted by a polynomial in the distance from the frame's centre;
   - mode P with the gel sliding across the shutter: its blurred split draws what is seen through the gel
-    on its camera side, so its forward side must not see through it too (that counted it twice).
+    on its camera side, so its forward side must not see through it too (that counted it twice);
+  - the sky behind the gel, in place of the wall: modes A and B draw the sky a camera sees in a pass of
+    their own (main.cpp prepareSky, skySeenThroughXYZ), which walks through a gel or half mirror;
+  - the same with an absorbing fog between the gel and the sky (SKY-THROUGH-FOG: that pass took no
+    medium);
+  - a glow (`glow_only`) behind the gel, which the same pass draws;
+  - the sky behind the gel through a physical lens, mode A (the pass's lens samples);
+  - the sky behind the gel sliding across the shutter, modes B and P (addBlurredSkyRows; mode P's split
+    leaves what is seen through the gel to its camera side).
 
 Exits 1 on any failure.
 """
@@ -45,12 +53,21 @@ def with_camera(lines, extra):
     return [ln.replace("film {", extra + "  film {") if ln.startswith("camera") else ln for ln in lines]
 
 
+def blurred(lines):
+    """`lines` with the gel sliding across a shutter."""
+    return (["scene { motion_interval -0.5 0.5 }"] +
+            [ln.replace("film {", "shutter_open -0.5  shutter_close 0.5  film {") if ln.startswith("camera") else
+             ("group { motion { key { translate -0.05 0 0 }  key { translate 0.05 0 0 } }  %s }" % ln
+              if "material redgel" in ln and ln.startswith("quad") else ln) for ln in lines])
+
+
 NO_GEL = [ln for ln in FILTER if "material redgel" not in ln]
 FOG = FILTER + ['medium { sigma_t 0.3  albedo 0.9  g 0.0  bounds { min -3 0 -0.4  max 3 3 1.4 } }']
-BLUR = (["scene { motion_interval -0.5 0.5 }"] +
-        [ln.replace("film {", "shutter_open -0.5  shutter_close 0.5  film {") if ln.startswith("camera") else
-         ("group { motion { key { translate -0.05 0 0 }  key { translate 0.05 0 0 } }  %s }" % ln
-          if "material redgel" in ln and ln.startswith("quad") else ln) for ln in FILTER])
+BLUR = blurred(FILTER)
+SKY = [ln for ln in FILTER if not ln.startswith("quad { origin -3 0 1.5")] + ["light env { spd 1.0 }"]
+SKY_FOG = SKY + ['medium { sigma_t 0.5  albedo 0.0  g 0.0  bounds { min -3 0 -0.4  max 3 3 1.4 } }']
+GLOW = FILTER + ['material "glow" { type diffuse  reflect 0.3  emit 0.05  glow_only on }',
+                 'quad { origin -0.3 0.3 0.5  u 0 0.6 0  v 0.6 0 0  material glow }']
 PHYS = "focus 4.0  lens { preset achromat  focal 50  fstop 2.8 }"
 THIN = "lens 35  fstop 4  focus 4.0"
 B_ARGS = ["-mode", "B", "-n", "20000000"]
@@ -67,6 +84,12 @@ CASES = [
     ("lens_A", with_camera(FILTER, PHYS), A_ARGS, [], None),
     ("thin_A", with_camera(FILTER, THIN), A_ARGS, [], with_camera(NO_GEL, THIN)),
     ("blur_P", BLUR, ["-mode", "P"], [], None),
+    ("sky_gel", SKY, B_ARGS, [], None),
+    ("sky_fog", SKY_FOG, B_ARGS, [], None),
+    ("glow_gel", GLOW, B_ARGS, [], None),
+    ("sky_lens_A", with_camera(SKY, PHYS), A_ARGS, [], None),
+    ("sky_blur", blurred(SKY), B_ARGS, [], None),
+    ("sky_blur_P", blurred(SKY), ["-mode", "P"], [], None),
 ]
 
 

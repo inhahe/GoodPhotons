@@ -16677,6 +16677,57 @@ static Vec3 glowSeenXYZ(const Scene& scene, const Hit& h, const Ray& r, bool mon
     return (c.x + c.y + c.z > 0.0) ? c : Vec3{0, 0, 0};
 }
 
+// Whether a sky sample's camera ray `r`, whose first hit is `h` (invalid: none), sees anything through a
+// filter -- a gel or half mirror it meets first (passesStraight), or a medium on its way to the sky
+// (Medium::clipToBounds) -- and so takes skySeenThroughXYZ at a wavelength of its own, where a pinhole's
+// sky is otherwise exact in XYZ. A glow the ray meets first takes its medium in glowSeenXYZ.
+static bool skySeenThrough(const Scene& scene, const Ray& r, const Hit& h) {
+    if (h.valid) return scene.passThroughAny && passesStraight(scene.mats[(size_t)h.matId]);
+    double ta, tb;
+    for (const Medium& m : scene.media)
+        if (m.clipToBounds(r.o, r.d, 0.0, 1e30, ta, tb)) return true;
+    return false;
+}
+
+// What a sky sample's camera ray `r`, whose first hit is `h` (skySeenThrough said so), sees at the one
+// wavelength `lambda`, in XYZ, times `w` (a lens's weight, else 1) and the [360, 830] nm span `lambda` is
+// drawn uniformly over: on through the gels and half mirrors it meets first, times what each passes
+// (straightPass) -- the -max-bounce of them at most, mode R's camera ray taking the light its last ray
+// reaches -- and the media on the way (drawn from `rng`), to the sky and the sun where it escapes
+// (`env`, `sun`: whether each is drawn), or a glow it then meets (glowSeenXYZ, `u1` and `u2` its draws;
+// `glow`: whether glows are). `camMed`: the solid the camera is in (Camera::medium), or -1.
+static Vec3 skySeenThroughXYZ(const Scene& scene, Ray r, Hit h, double lambda, double u1, double u2,
+                              Pcg32& rng, double w, int camMed, bool env, bool sun, bool glow) {
+    constexpr double kLo = 360.0, kHi = 830.0;
+    const int room = std::min(effMaxBounce(), kCamLegThroughMax);
+    double T = 1.0, dist = 0.0;
+    for (int k = 0; h.valid && passesStraight(scene.mats[(size_t)h.matId]); ++k) {
+        if (k == room) return Vec3{0, 0, 0};
+        const Material& m = scene.mats[(size_t)h.matId];
+        T *= straightPass(scene, m, h, straightPattern(scene, m, h), lambda);
+        if (!scene.media.empty()) T *= Renderer::mediaTransmittance(scene, r.o, r.d, h.t, lambda, rng);
+        if (!(T > 0.0)) return Vec3{0, 0, 0};
+        dist += h.t;
+        const double eps = scene.hitEps(h);
+        r = Ray{h.p, r.d};
+        h = scene.closestHit(r, eps, nullptr, /*skipHair=*/false, /*skipCamHidden=*/true);
+        if (scene.crossesGrin(r.o, r.d, h.valid ? h.t : 1e30)) return Vec3{0, 0, 0};
+    }
+    if (h.valid) {
+        if (!glow) return Vec3{0, 0, 0};
+        // glowSeenXYZ takes the media and the camera's solid over its own last leg.
+        T *= legAbsorption(scene, camMed, dist, lambda);
+        return glowSeenXYZ(scene, h, r, /*mono=*/true, lambda, u1, u2, rng, w * T, /*perSample=*/false, camMed);
+    }
+    double L = 0.0;
+    if (env) L += scene.envRadianceSeen(r.d, lambda);
+    if (sun) L += scene.sunRadiance(r.d, lambda);
+    if (!(L > 0.0)) return Vec3{0, 0, 0};
+    if (!scene.media.empty()) T *= Renderer::mediaTransmittance(scene, r.o, r.d, 1e30, lambda, rng);
+    const Vec3 c = Vec3(cieX(lambda), cieY(lambda), cieZ(lambda)) * (L * T * w * (kHi - kLo));
+    return (c.x + c.y + c.z > 0.0) ? c : Vec3{0, 0, 0};
+}
+
 // The sky a forward (model-B) film shows directly, summed into `view` up to what `N` photons ask for
 // (addEnvBackground, which adds it to a film, has the why). Apart so that a caller timing its own
 // work -- a live window's repaint -- can do this first and leave it out of the repaint's cost.
@@ -16703,9 +16754,11 @@ static bool prepareSky(SkyView& view, const Scene& scene, const Camera& cam, int
     const bool lensed = cam.hasLens();
     const double perPixel = (double)N / ((double)rx * (double)ry);
     // A pinhole's 64 points resolve the sky and a plain glow exactly; a glow seen through a medium or
-    // on a compound is a draw a sample (glowXYZAt), so its count grows with the render as a lens's.
+    // on a compound, and anything seen through a gel, a half mirror or a medium (skySeenThrough), is a
+    // draw a sample (glowXYZAt, throughAt), so its count grows with the render as a lens's.
     const bool glowDrawn = haveGlow && (scene.glowCompound || !scene.media.empty() || cam.medium() >= 0);
-    const long long want = (lensed || glowDrawn)
+    const bool throughDrawn = scene.passThroughAny || !scene.media.empty();
+    const long long want = (lensed || glowDrawn || throughDrawn)
                          ? std::max(kFirst, std::min(4096LL, (long long)(perPixel / 4.0))) : kFirst;
     // What pinhole sample k of pixel `pix` sees of a glow at its hit (glowMatSeen): a plain glow's XYZ
     // exactly, its emission's (Scene::glowXYZ) times the pattern at the hit; a compound's through one
@@ -16717,6 +16770,15 @@ static bool prepareSky(SkyView& view, const Scene& scene, const Camera& cam, int
         const double u1 = g.uniform(), u2 = g.uniform();
         return glowSeenXYZ(scene, h, r, /*mono=*/false, lambda, u1, u2, g, 1.0, /*perSample=*/false,
                            cam.medium());
+    };
+    // What pinhole sample k of pixel `pix` sees through a filter (skySeenThrough), at a wavelength of its
+    // own, uniform over [kLo, kHi], drawn as glowXYZAt draws its.
+    const auto throughAt = [&](const Hit& h, const Ray& r, size_t pix, long long k) -> Vec3 {
+        Pcg32 g;
+        seedUnit(g, pix, 0x61C0FFEE5EE0ULL ^ ((uint64_t)k * 0x9E3779B97F4A7C15ULL));
+        const double lambda = kLo + (kHi - kLo) * g.uniform();
+        const double u1 = g.uniform(), u2 = g.uniform();
+        return skySeenThroughXYZ(scene, r, h, lambda, u1, u2, g, 1.0, cam.medium(), haveEnv, haveSun, haveGlow);
     };
     // A pinhole pixel's samples [k0, k1), points of its rotated Halton (2,3) lattice, added to `s`
     // in k order. Every one is traced: a feature thinner than the lattice's spacing (a strand, a
@@ -16735,7 +16797,9 @@ static bool prepareSky(SkyView& view, const Scene& scene, const Camera& cam, int
             // Nothing is seen straight through a region that bends rays, as through glass (B, A).
             if (scene.crossesGrin(r.o, r.d, h.valid ? h.t : 1e30)) continue;
             Vec3 c{0, 0, 0};
-            if (h.valid) {
+            if (throughDrawn && skySeenThrough(scene, r, h)) {
+                c = throughAt(h, r, pix, k);
+            } else if (h.valid) {
                 if (!haveGlow) continue;
                 c = glowXYZAt(h, r, pix, k);
             } else {
@@ -16763,7 +16827,12 @@ static bool prepareSky(SkyView& view, const Scene& scene, const Camera& cam, int
             // Nothing is seen straight through a region that bends rays, as through glass (B, A).
             if (scene.crossesGrin(r.o, r.d, h.valid ? h.t : 1e30)) continue;
             Vec3 c{0, 0, 0};
-            if (h.valid) {
+            if (throughDrawn && skySeenThrough(scene, r, h)) {
+                const double u1 = rng.uniform(), u2 = rng.uniform();
+                c = skySeenThroughXYZ(scene, r, h, lambda, u1, u2, rng, wLens, cam.medium(), haveEnv, haveSun,
+                                      haveGlow);
+                if (!(c.x + c.y + c.z > 0.0)) continue;
+            } else if (h.valid) {
                 if (!haveGlow) continue;
                 const double u1 = rng.uniform(), u2 = rng.uniform();
                 c = glowSeenXYZ(scene, h, r, /*mono=*/true, lambda, u1, u2, rng, wLens, /*perSample=*/false,
@@ -16883,6 +16952,7 @@ static void addBlurredSkyRows(Film& film, const Scene& scene, const Camera& cam,
     const double chance = std::min(1.0, want);    // a pixel's chance of its one sample, under one
     const double share = (double)N / ((double)K * chance);
     const bool lensed = cam.hasLens();
+    const bool throughDrawn = scene.passThroughAny || !scene.media.empty();
     PosedCamera posed(cam, true);       // a moving camera, at each sample's time
     for (int py = y0; py < y1; ++py)
         for (int px = 0; px < rx; ++px) {
@@ -16912,6 +16982,15 @@ static void addBlurredSkyRows(Film& film, const Scene& scene, const Camera& cam,
                 const Hit h = scene.closestHit(r, Scene::kTminEps, nullptr, /*skipHair=*/false, /*skipCamHidden=*/true);
                 // Nothing is seen straight through a region that bends rays, as through glass (prepareSky).
                 if (scene.crossesGrin(r.o, r.d, h.valid ? h.t : 1e30)) continue;
+                // Through a filter (skySeenThrough), as prepareSky draws it; not in mode P's split, whose
+                // camera side files a sample by its first surface, a gel's or a half mirror's included.
+                if (!glowsOnly && throughDrawn && skySeenThrough(scene, r, h)) {
+                    const double lam = lensed ? lambda : kLo + (kHi - kLo) * rng.uniform();
+                    const double g1 = rng.uniform(), g2 = rng.uniform();
+                    acc += skySeenThroughXYZ(scene, r, h, lam, g1, g2, rng, w, cp.medium(), haveEnv, haveSun,
+                                             haveGlow);
+                    continue;
+                }
                 if (h.valid) {
                     if (!haveGlow) continue;
                     // A glow it meets, as prepareSky adds it: a pinhole's draws a wavelength of its

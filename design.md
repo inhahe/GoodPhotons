@@ -3780,7 +3780,14 @@ was lit differently by every mode (known-issues GLOW-LIGHT-MODES). Now:
   (`forwardPixel`), without copying it. Under a blur P's split files each sample by its first
   surface, so its forward layer leaves a glow on a specular-type surface to the camera side, whose
   specular film has it (`glowSeenXYZ`, the one estimator the three sky passes share). A plain glow's colour is exact at a pinhole's 64 points; one seen through a medium
-  or on a compound is a draw a sample, and its count grows with the render. Mode C, which catches photons through
+  or on a compound is a draw a sample, and its count grows with the render. The pass sees on
+  through what passes light straight on, as the camera legs do (0.451.5): a sample whose first
+  hit is a gel or half mirror, or whose ray to the sky crosses a medium's bounds (`skySeenThrough`),
+  is drawn at a wavelength of its own (`skySeenThroughXYZ`), times what each surface passes
+  (`straightPass`, -max-bounce of them at most) and the media's transmittance, to the sky and sun or a
+  glow beyond; every other sample keeps its exact XYZ, and the count grows in any scene with such a
+  surface or a medium. Mode P's blurred split does not walk: its camera side files a sample by its
+  first surface, a gel's included. Mode C, which catches photons through
   its pupil, does not see one. The camera's wavelength density includes the glows' emission
   (`Scene::glowG`, a twentieth of its mass; device `DScene::glowG`), so a glow whose colour no
   light emits is still drawn.
@@ -11646,9 +11653,10 @@ files each sample whose first surface is specular-type, a gel's included, and dr
 it (`specularSideSplats` off, `DCamSet::pSplit`).
 
 Without it the wall behind a gel rendered black in mode B (MODEB-PASSTHROUGH); `tools/check_passthrough.py`
-is the check. Still stopped at one: the analytic specular connections' legs (through a glass sphere, off a
-mirror), the sky, sun and glows a forward camera sees directly (`prepareSky`, `addBlurredSkyRows`), and a
-`mix` or `layered` surface whose child passes light.
+is the check. The sky, sun and glows a forward camera sees directly walk through them the same way
+(`skySeenThroughXYZ`, under the sky pass in the glows' section). Still stopped at one: the analytic
+specular connections' legs (through a glass sphere, off a mirror), and a `mix` or `layered` surface whose
+child passes light.
 
 ## Glossy camera splats, and the rough interference reflector (0.401.0)
 

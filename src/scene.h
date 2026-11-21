@@ -66,6 +66,10 @@ enum class MatType { Diffuse, Dielectric, Mirror, HalfMirror, Glossy, Fluorescen
 // and that no Emitter covers): mode R counts its emission only on a camera or specular arrival, a
 // vertex of these types (backward.h specularArrival), and every other mode follows that rule
 // (bdpt.h glowSeenBy, vcm.h camGlow), as nothing can sample the glow from its own side.
+// A surface that passes light straight on, unbent: a `filter` gel and a `halfmirror` (camLegThrough,
+// straightPass). Declared ahead of Material, defined after it.
+struct Material;
+inline bool passesStraight(const Material& m);
 inline bool isSpecularType(MatType t) {
     return t == MatType::Dielectric || t == MatType::Mirror ||
            t == MatType::HalfMirror || t == MatType::ThinFilm ||
@@ -3605,7 +3609,7 @@ struct Scene {
         for (const auto& m : mats) if (m.hideCamera) { camHiddenAny = true; break; }
         passThroughAny = false;
         for (const auto& m : mats)
-            if (m.type == MatType::Filter || m.type == MatType::HalfMirror) { passThroughAny = true; break; }
+            if (passesStraight(m)) { passThroughAny = true; break; }
         glowXYZ.clear();
         glowAny = false;
         for (size_t i = 0; i < mats.size(); ++i) {
@@ -5888,7 +5892,7 @@ struct Scene {
             if (!(matId >= 0 && matId < (int)mats.size())) return false;
             const Material& m = mats[(size_t)matId];
             return (camHide && m.hideCamera) ||
-                   (skipPT && (m.type == MatType::Filter || m.type == MatType::HalfMirror));
+                   (skipPT && passesStraight(m));
         };
         return traverseWorldAny(r, tmin, seg, [&](int prim) {
             Hit h; h.t = seg;
@@ -6669,6 +6673,20 @@ inline double transmitSlot(const Scene& scene, const Material& m,
 // A leg that passes nothing at every wavelength is blocked, so it adds no empty hit to the pixel's count
 // (the forward modes' noise estimate reads it).
 constexpr int kCamLegThroughMax = 8;   // the most such surfaces a leg crosses; past them it is blocked
+inline bool passesStraight(const Material& m) {
+    return m.type == MatType::Filter || m.type == MatType::HalfMirror;
+}
+// What a surface that passes light straight on (passesStraight) passes at `h` at `lambda`, in [0, 1], NaN
+// passing nothing: a gel's T(lambda) times `pat`, a half mirror's 1 - R(lambda). `pat`: straightPattern's.
+inline double straightPass(const Scene& scene, const Material& m, const Hit& h, double pat, double lambda) {
+    const double v = m.type == MatType::Filter ? m.transmit(lambda) * pat : 1.0 - reflectSlot(scene, m, h, lambda);
+    return v > 0.0 ? (v < 1.0 ? v : 1.0) : 0.0;
+}
+// A gel's bound transmit pattern at `h` (slotPatMul), 1 for anything else: read once a crossing, whatever
+// the wavelengths straightPass is then asked for.
+inline double straightPattern(const Scene& scene, const Material& m, const Hit& h) {
+    return (m.type == MatType::Filter && m.transmitPat >= 0) ? slotPatMul(scene, m.transmitPat, h) : 1.0;
+}
 inline bool camLegThrough(const Scene& scene, const Vec3& o, const Vec3& dir, double maxDist, double tmin,
                           double curveTmin, int room, const double* lam, int n, double* T) {
     for (int i = 0; i < n; ++i) T[i] = 1.0;
@@ -6684,13 +6702,11 @@ inline bool camLegThrough(const Scene& scene, const Vec3& o, const Vec3& dir, do
         const Hit h = scene.closestHit(Ray{q, dir, cq}, tq, nullptr, false, /*skipCamHidden=*/true, left);
         if (!h.valid || !(h.t < left)) return true;          // the rest of the leg is clear
         const Material& m = scene.mats[(size_t)h.matId];
-        const bool gel = m.type == MatType::Filter;
-        if ((!gel && m.type != MatType::HalfMirror) || k == room) return false;
-        const double pat = (gel && m.transmitPat >= 0) ? slotPatMul(scene, m.transmitPat, h) : 1.0;   // once
+        if (!passesStraight(m) || k == room) return false;
+        const double pat = straightPattern(scene, m, h);
         bool any = false;
         for (int i = 0; i < n; ++i) {
-            const double v = gel ? m.transmit(lam[i]) * pat : 1.0 - reflectSlot(scene, m, h, lam[i]);
-            T[i] *= v > 0.0 ? (v < 1.0 ? v : 1.0) : 0.0;   // NaN passes nothing
+            T[i] *= straightPass(scene, m, h, pat, lam[i]);
             any = any || T[i] > 0.0;
         }
         if (!any) return false;
