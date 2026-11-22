@@ -1300,6 +1300,10 @@ struct Emitter {
     // triangle as its keys have it then (Scene::deformedEmitPoint).
     bool deforms = false;
     EmissionSampler spd;      // for forward per-emitter lambda importance sampling
+    // Its emission's integral over each of the spectral carrier's cells (Scene::specCells, from `spd`;
+    // buildSpecCells): the spectral NEE's quadrature weights (neeLightSpecGlossy), exact for a line
+    // whatever cell it falls in, where a cell's width times the SPD at its wavelength is not.
+    std::vector<double> cellEmit;
     Spectrum spdFn = constantSpectrum(0.0); // raw SPD, for backward per-lambda eval
     double emitIntegral = 0.0;
     double power = 0.0;       // emitIntegral * geomWeight (which carries selW, the selection weight)
@@ -3880,6 +3884,11 @@ struct Scene {
         double left = 0.0;
         specCells.build(chooseSpecCuts(folded, 0.01, left));
         specCells.setMass(emitSampler);
+        for (Emitter& e : emitters) {
+            e.cellEmit.assign((size_t)specCells.n, 0.0);
+            for (int k = 0; k < specCells.n; ++k)
+                e.cellEmit[(size_t)k] = e.spd.integral * (e.spd.cdfAt(specCells.hi[k]) - e.spd.cdfAt(specCells.lo[k]));
+        }
         if (left > 0.0)
             std::fprintf(stderr, "[specgather] warning: the scene's spectra want more than %d cuts of the "
                                  "spectral carrier's bins; the worst left reads %.1f %% of its range off "

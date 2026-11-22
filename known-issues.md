@@ -476,7 +476,19 @@ difference is somewhere the photon pass treats the curve, not yet found. Reprodu
 `scraps/_short_probe.py ftrace.exe mir_short.ftsl` after check_spec_cells has written its scenes.
 check_spec_cells reports the CPU pair KNOWN until it is fixed.
 
-## OPEN (2026-11-20): SPECGATHER-CELL-CENTROID — modes M and S read a carrier cell at its middle, not where the light's wavelengths in it lie
+## DONE (2026-11-21, 0.451.12): SPECNEE-LINE-LIGHT — the spectral NEE at a glossy vertex missed a line light between its cells' nodes
+
+Found while doing SPECGATHER-CELL-CENTROID. Mode M's (and S's) spectral NEE at a glossy or fiber vertex
+is a sum over the carrier's cells, each weighted by its width times the light's SPD at the cell's
+wavelength: a midpoint quadrature, which for a 1 nm line at 589 nm a few nanometres from its cell's middle
+reads next to nothing. A glossy wall under that line behind check_spec_cells' 570-600 nm ramp read 0.58
+of mode R in mode M (its worst tile 0.10), and 0.89 in mode S; a node on the line would have read it
+several times too bright. **Fixed:** a cell is weighted by the emitter's own emission in it,
+`Emitter::cellEmit` (from its 1 nm sampler, `Emitter::spd`; the device's `DScene::emitCellE`), the rest of
+the integrand read at the cell's wavelength -- exact for a line wherever it falls, the old weight to second
+order for a smooth light. check_spec_cells' `line_glossy`: 0.99 in modes M and S, both devices.
+
+## DONE (2026-11-21, 0.451.12): SPECGATHER-CELL-CENTROID — modes M and S read a carrier cell at its middle, not where the light's wavelengths in it lie
 
 Found by the Opus review of 0.451.0 (REVIEW-0451). A cell of the spectral carrier (SpecCells) is read
 at its midpoint -- an unsplit bin at its centre -- whatever the emission does inside it. Under a light
@@ -488,6 +500,12 @@ SpecCells::setMass computes the mass), exact for a line and the midpoint for a f
 every chromatic mode M and S image slightly (the centre and the centroid differ under any real
 illuminant), so it is its own change, measured on check_coat_modes, check_spec_cells and a line-lit
 case of its own; and the device then takes the cells always, not only where a bin is split.
+**Fixed:** `SpecCells::setMass` reads each cell at the walk density's centroid in it
+(`EmissionSampler::massMoment`), the middle where it holds none; the device takes the cells always
+(`DScene::specCells`, its uniform-bin fallback and the cells' unused widths gone). check_spec_cells'
+`line_ramp` (a 1 nm line at 589 nm behind a gel ramping over 570-600 nm): 0.83 -> 0.99-1.01 in modes M and
+S, both devices. Every chromatic mode M and S image moves a little (check_bitid: mean under 0.001 %, a
+pixel at most 3.5 %); the rest of the suite reads as before. Its NEE twin, SPECNEE-LINE-LIGHT.
 
 ## OPEN (2026-11-20): JSPEC-BIN-RESOLUTION — the beam gather's carrier and mode J's still read a step inside a 24-nm bin at its centre
 

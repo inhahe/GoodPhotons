@@ -1672,8 +1672,9 @@ struct DScene {
                                // camera leg may pass through one (dCamLegThrough)
     int compoundStraightAny;   // such a compound (host Scene::compoundStraightAny): LegRule's split
                                // rule has a crossing to keep
-    const DSpecCells* specCells; // the spectral carrier's cells where the scene splits its bins, else
-                               // null (host Scene::specCells; DSpecThr::init)
+    const DSpecCells* specCells; // the spectral carrier's cells (host Scene::specCells; DSpecThr::init)
+    int nSpecCells;            // how many (specCells->n, readable before DSpecCells is defined)
+    const double* emitCellE;   // each emitter's emission over each cell, emitter-major (Emitter::cellEmit)
     DVec3  sensorOrigin, sensorUAxis, sensorVAxis;   // model A contact sensor plane
     DVec3  sceneCenter;              // env (shape==3): bounding-sphere center
     double sceneRadius;              // env (shape==3): bounding-sphere radius
@@ -17391,8 +17392,9 @@ __device__ static double bkNeeLight(const DScene& sc, const DHit& h, Real rho,
 // MIS weight is a ratio of DENSITIES, which are geometric, so it is taken once at `lambdaCam` and shared.
 __device__ static void bkNeeLightSpecGlossy(const DScene& sc, const DHit& h, const DNeeBsdf& nb,
                                             const Real* lam, const double* thrRatio, int K,
-                                            const double* dLam, Real lambdaCam, double thrScalar,
+                                            Real lambdaCam, double thrScalar,
                                             DRng& rng, double* xyz) {
+    const int nC = sc.nSpecCells;   // emitCellE's row length (K is the carrier's, the same)
     DVec3 ngo0 = dShadedNg(h);
     DEmitterDraw draw; dPickEmitters(sc, h.p, &h.n, rng, draw);
     for (int di = 0; di < draw.n; ++di) {
@@ -17435,8 +17437,7 @@ __device__ static void bkNeeLightSpecGlossy(const DScene& sc, const DHit& h, con
         for (int i = 0; i < KK; ++i) {
             const double f = dGlossyFHit(sc, *nb.m, h, nb.wo, g.wi, lam[i]) * ce.at(lam[i]);
             if (!(f > 0.0)) continue;
-            const double v = gBase * dLam[i] * thrRatio[i] * f
-                           * (double)specLookup(em.emitSpd, lam[i]) * Tr[i];
+            const double v = gBase * sc.emitCellE[(size_t)k * (size_t)nC + (size_t)i] * thrRatio[i] * f * Tr[i];
             if (!(v > 0.0)) continue;
             xyz[0] += (double)cieX(lam[i]) * v;
             xyz[1] += (double)cieY(lam[i]) * v;

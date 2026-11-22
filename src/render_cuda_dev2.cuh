@@ -388,19 +388,17 @@ __device__ static double dEmitCdfAt(const DScene& sc, double lam) {
     return sc.emitSamplerCdf[b] + (t - b) * (sc.emitSamplerCdf[b + 1] - sc.emitSamplerCdf[b]);
 }
 
-// The scene's carrier cells (host twin SpecCells: its cells' ends, wavelengths, widths and walk masses,
-// and each uniform bin's first cell and count), uploaded where the scene splits a bin (DScene::specCells);
-// null where it splits none, and the cells are then the uniform bins, read as they always were.
+// The scene's carrier cells (host twin SpecCells: its cells' ends, wavelengths and walk masses, and each
+// uniform bin's first cell and count; DScene::specCells).
 struct DSpecCells {
     int n;
-    double hi[kSpecCellsMax], lam[kSpecCellsMax], width[kSpecCellsMax], mass[kSpecCellsMax];
+    double hi[kSpecCellsMax], lam[kSpecCellsMax], mass[kSpecCellsMax];
     unsigned char first[kBandProbeBins], count[kBandProbeBins];
 };
-// The cell of `c` (null: the uniform bins) wavelength `lam` falls in (host twin SpecCells::cellOf).
+// The cell of `c` wavelength `lam` falls in (host twin SpecCells::cellOf).
 __device__ static inline int dSpecCellOf(const DSpecCells* c, Real lam) {
     int b = (int)(((double)lam - DLMIN) / (DLMAX - DLMIN) * kBandProbeBins);
     b = b < 0 ? 0 : (b >= kBandProbeBins ? kBandProbeBins - 1 : b);
-    if (!c) return b;
     int i = c->first[b];
     for (int e = i + c->count[b] - 1; i < e && (double)lam >= c->hi[i]; ++i) {}
     return i;
@@ -425,19 +423,16 @@ struct DSpecThr {
     double pcam;
     int    partial;
     double pscale;
-    const DSpecCells* cells;   // the scene's (DScene::specCells), null: the uniform bins
+    const DSpecCells* cells;   // the scene's (DScene::specCells)
     int n;                     // its cells: the arrays' first n entries are live
     __device__ void init(const DScene& sc) {
         cells = sc.specCells;
-        n = cells ? (cells->n < K ? cells->n : K) : kBandProbeBins;
+        n = cells->n < K ? cells->n : K;
         for (int k = 0; k < n; ++k) { v[k] = 1.0; p[k] = 1.0f; }
         cam = 1.0; any = 0; pcam = 1.0; partial = 0; pscale = 1.0;
     }
-    // Cell k's wavelength, its quadrature width, the cell `lam` falls in.
-    __device__ Real lamOf(int k) const { return cells ? (Real)cells->lam[k] : (Real)DJSpec::lamOf(k); }
-    __device__ double widthOf(int k) const {
-        return cells ? cells->width[k] : (DLMAX - DLMIN) / (double)kBandProbeBins;
-    }
+    // Cell k's wavelength, the cell `lam` falls in.
+    __device__ Real lamOf(int k) const { return (Real)cells->lam[k]; }
     __device__ int binOf(Real lam) const { return dSpecCellOf(cells, lam); }
     // Fold in a factor already evaluated ON the grid plus its value at the camera's wavelength --
     // the media term, whose per-wavelength values come from one shared walk rather than from a
@@ -541,7 +536,7 @@ struct DSpecThr {
         js.any = 1; js.disp = 0; js.lamC = 0.0f; js.invPdfC = 0.0f;
         js.logS = log(pk);
         for (int k = 0; k < DJSPEC_K; ++k) {
-            const int c = cells ? binOf((Real)DJSpec::lamOf(k)) : k;
+            const int c = binOf((Real)DJSpec::lamOf(k));
             js.r[k] = live ? (float)(v[c] / cam * pscale / pk) : 0.0f;
         }
         return true;
@@ -1020,13 +1015,12 @@ __device__ static void dPhotonGather(const DScene& sc, const DPhotonMap& pm,
                         // evaluated over the carrier's cells, so a gold lobe under a warm light
                         // stops painting each sample one colour.
                         Real   lamG[DSpecThr::K];
-                        double ratG[DSpecThr::K], wG[DSpecThr::K], xyz[3] = {0.0, 0.0, 0.0};
+                        double ratG[DSpecThr::K], xyz[3] = {0.0, 0.0, 0.0};
                         for (int i = 0; i < sthr.n; ++i) {
                             lamG[i] = sthr.lamOf(i);
                             ratG[i] = sthr.ratio(lamG[i]);
-                            wG[i] = sthr.widthOf(i);
                         }
-                        bkNeeLightSpecGlossy(sc, h, nb, lamG, ratG, sthr.n, wG, lambda, thr, rng, xyz);
+                        bkNeeLightSpecGlossy(sc, h, nb, lamG, ratG, sthr.n, lambda, thr, rng, xyz);
                         oX += xyz[0]; oY += xyz[1]; oZ += xyz[2];
                     } else {
                         const DCoatCtx coatC = dCoatCtxOf(m, -rd);

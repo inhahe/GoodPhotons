@@ -1344,9 +1344,13 @@ spectra folded: a specular material's or a fiber's reflectance and transmittance
 coefficients -- absorption, index, a film's, a substrate's, a coat's, a fiber's absorptions, a
 medium's. Not a diffuse or translucent colour, which the gather reads at each photon's own wavelength,
 nor emission, which places the photons and is read where they fall. Analytic spectra (`gaussian`,
-`shortpass`) are sampled like tables. A split cell is read at its midpoint, an unsplit bin at its
-centre with the uniform grid's own expressions for its ends, centre and width, so a scene whose folded
-spectra are near linear across every bin carries exactly what it did. Read at one wavelength, a bin with
+`shortpass`) are sampled like tables. Each cell is read at the walk density's centroid in it
+(`SpecCells::setMass`, `EmissionSampler::massMoment`; 0.451.12, SPECGATHER-CELL-CENTROID), where the
+light's power in the cell sits -- a line's own wavelength -- so a factor near linear across the cell, what
+the cuts leave, gives its photons the value their wavelengths average to; its middle where it holds no
+light. (Read at the middle, a 589 nm line behind a gel ramping over 570-600 nm read 0.83 in modes M and
+S.) A scene whose folded spectra are all flat carries exactly what it did: its ratio is 1 wherever it is
+read. Read at one wavelength, a bin with
 a step inside gave one side's value to the other side's photons, and in the support's sum its whole walk
 density to one side: behind a gel opaque below 546.5 nm (just past bin 9's centre) mode M read mode R's
 green 0.72 and red 1.05, a quarter into the bin green 1.12 and red 0.96, off a half mirror stepping there
@@ -1355,13 +1359,17 @@ bend at 585 inside bin 11, whose centre read the plateau. The carriers' arrays h
 (40). Over the cells: `camMediaTrSpec` / `dCamMediaTrSpec`'s media vector, mode S's per-pixel ratios
 (`SPPMState::vpRatio`, `DSppmState::vpRatio`, `vpCells` a pixel), a fiber's absorption table
 (`hairSigmaCells`) and the spectral NEE's quadrature (`neeLightSpecGlossy` / `neeLightSpecHair` /
-`bkNeeLightSpecGlossy`, each cell weighted by its width). The device takes the cells from
-`DScene::specCells` (`DSpecThr::init(sc)`; null where nothing is split, and the bins then read as they
-always did), with the host's masses and widths. Left on the uniform bins: the beam gather's `JSpec`
+`bkNeeLightSpecGlossy`), each cell weighted by the emitter's own emission in it (`Emitter::cellEmit`,
+from its 1 nm sampler; the device's `DScene::emitCellE`, emitter-major) and the rest read at the cell's
+wavelength -- exact for a line wherever it falls, where a cell's width times the SPD at its wavelength
+read a line between the nodes as next to nothing (a glossy wall under a 589 nm line read 0.10 in mode M,
+SPECNEE-LINE-LIGHT). The device takes the cells from `DScene::specCells` (`DSpecThr::init(sc)`, always
+uploaded), with the host's wavelengths and masses. Left on the uniform bins: the beam gather's `JSpec`
 (`toJSpec` reads each bin's centre's cell) and mode J's carrier, which is its own (known-issues
 JSPEC-BIN-RESOLUTION). `[specgather] ...` says where a render's bins were split;
 `tools/check_spec_cells.py` holds modes M and S, both devices, to mode R across steps inside a bin, a
-bend, a glossy wall behind a step, analytic bands and edges, and a coin's support edge.
+bend, a glossy wall behind a step, analytic bands and edges, a coin's support edge, and a line light
+behind a ramp before a diffuse and a glossy wall.
 
 **The ratio's range (0.433.1, MODEM-COMPOTE-NAN).** Where coloured glass absorbs at the walk's own
 wavelength and passes others, `cam`, and with it the scalar throughput, falls as far as the ratio

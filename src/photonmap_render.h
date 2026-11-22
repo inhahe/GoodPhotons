@@ -1373,8 +1373,7 @@ inline Vec3 photonGather(const Scene& scene, const PhotonMap& pm, Ray ray, doubl
                             lamG[k] = sthr.lamOf(k);
                             ratG[k] = sthr.ratio(lamG[k]);
                         }
-                        bwNee.neeLightSpecGlossy(scene, h, nb, lamG, ratG, sthr.n, sthr.cells->width,
-                                                 lambda, thr, rng, xyz);
+                        bwNee.neeLightSpecGlossy(scene, h, nb, lamG, ratG, sthr.n, lambda, thr, rng, xyz);
                         L += Vec3(xyz[0], xyz[1], xyz[2]);
                     } else {
                         L += Vec3(cieX(lambda), cieY(lambda), cieZ(lambda))
@@ -1474,7 +1473,7 @@ inline Vec3 photonGather(const Scene& scene, const PhotonMap& pm, Ray ray, doubl
                         }
                         const double* sigB = hairSigmaCells(scene, m, h);
                         didSpec = bwNee.neeLightSpecHair(scene, h, m, hs, lamG, ratG, sthr.n,
-                                                         sthr.cells->width, lambda, thr, sigB, rng, xyz);
+                                                         lambda, thr, sigB, rng, xyz);
                         if (didSpec) L += Vec3(xyz[0], xyz[1], xyz[2]);
                     }
                     if (!didSpec)

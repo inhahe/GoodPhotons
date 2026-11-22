@@ -371,6 +371,25 @@ struct EmissionSampler {
         return (cdf[b + 1] - cdf[b]) / step;
     }
 
+    // The density's mass over [a, b] (nm), and in `m1` its first moment there (the integral of lambda
+    // p(lambda)): constant over each `step` nm, as sample() draws it.
+    double massMoment(double a, double b, double& m1) const {
+        m1 = 0.0;
+        const int n = static_cast<int>(cdf.size()) - 1;
+        if (n <= 0 || !(b > a)) return 0.0;
+        const int j0 = std::max(0, static_cast<int>(std::floor((a - LAMBDA_MIN) / step)));
+        const int j1 = std::min(n - 1, static_cast<int>(std::floor((b - LAMBDA_MIN) / step)));
+        double m = 0.0;
+        for (int j = j0; j <= j1; ++j) {
+            const double x0 = std::max(a, LAMBDA_MIN + j * step), x1 = std::min(b, LAMBDA_MIN + (j + 1) * step);
+            if (!(x1 > x0)) continue;
+            const double d = (cdf[(size_t)j + 1] - cdf[(size_t)j]) / step;
+            m += d * (x1 - x0);
+            m1 += d * 0.5 * (x1 * x1 - x0 * x0);
+        }
+        return m;
+    }
+
     // The probability that sample() draws below `lambda`: the CDF, linear within a bin as the
     // draw is. 0 below the range, 1 above it.
     double cdfAt(double lambda) const {
@@ -389,8 +408,8 @@ struct EmissionSampler {
 // photon reads the cell its own wavelength falls in. Read at one wavelength, a cell gives its value to
 // every photon in it, and its whole walk density to whichever side of a support edge that wavelength
 // is on. So the grid is the kBandProbeBins uniform bins, each split where a factor the walk folds is
-// not near linear across it (chooseSpecCuts). A scene with no such factor has exactly the uniform bins,
-// each read at its centre.
+// not near linear across it (chooseSpecCuts) -- a scene with no such factor has exactly the uniform bins --
+// and each cell is read where the light's wavelengths in it lie (setMass, SPECGATHER-CELL-CENTROID).
 constexpr int kSpecCutsMax = 16;
 // A walk whose branches' probability, at some cell, is under this share of its likeliest cell's is partial
 // (SpecThr::p, the device's DSpecThr): the exact ratio p(lamP) / p(lamC) is unbiased only where walks drawn
@@ -403,9 +422,7 @@ constexpr int kSpecCellsMax = kBandProbeBins + kSpecCutsMax;
 struct SpecCells {
     int n = kBandProbeBins;
     double lo[kSpecCellsMax], hi[kSpecCellsMax];   // each cell's ends, ascending, the last's hi LAMBDA_MAX
-    double lam[kSpecCellsMax];                     // the wavelength it is read at
-    double width[kSpecCellsMax];                   // hi - lo, a quadrature's weight (an unsplit bin's
-                                                   // the uniform grid's own expression)
+    double lam[kSpecCellsMax];                     // the wavelength it is read at (setMass)
     double mass[kSpecCellsMax];                    // the walk density's mass in it (setMass)
     unsigned char first[kBandProbeBins];           // each uniform bin's first cell...
     unsigned char count[kBandProbeBins];           // ...and how many it is split into
@@ -415,7 +432,7 @@ struct SpecCells {
     // are none. A cut outside the band, or within 0.05 nm of a bin's end or of a cut kept, is dropped
     // (a step that narrow is one edge); past kSpecCutsMax the rest are (Scene::buildSpecCells orders
     // them, the costliest first). An unsplit bin keeps the uniform grid's own expressions for its
-    // ends and centre, so a scene without cuts reads its carrier where it always did.
+    // ends. Each cell is read at its middle until setMass places it.
     void build(std::vector<double> cuts) {
         const double W = (LAMBDA_MAX - LAMBDA_MIN) / (double)kBandProbeBins;
         std::vector<double> keep;
@@ -437,21 +454,28 @@ struct SpecCells {
             first[k] = (unsigned char)n;
             double a = b0;
             while (ci < keep.size() && keep[ci] < b1) {
-                lo[n] = a; hi[n] = keep[ci]; lam[n] = 0.5 * (a + keep[ci]); width[n] = keep[ci] - a; ++n;
+                lo[n] = a; hi[n] = keep[ci]; lam[n] = 0.5 * (a + keep[ci]); ++n;
                 a = keep[ci++];
             }
             lo[n] = a; hi[n] = b1;
-            const bool whole = a == b0;
-            lam[n] = whole ? bandBinLambda(k) : 0.5 * (a + b1);
-            width[n] = whole ? (LAMBDA_MAX - LAMBDA_MIN) / (double)kBandProbeBins : b1 - a;
+            lam[n] = a == b0 ? bandBinLambda(k) : 0.5 * (a + b1);
             ++n;
             count[k] = (unsigned char)(n - first[k]);
         }
         for (int i = 0; i < n; ++i) mass[i] = 0.0;
     }
-    // The walk density's mass in each cell, as EmissionSampler::binMass has it in each bin.
+    // The walk density's mass in each cell, as EmissionSampler::binMass has it in each bin, and the
+    // wavelength the cell is read at: the density's centroid in it, where the light's power in the cell
+    // sits (a line's own wavelength), so a factor near linear across the cell -- what chooseSpecCuts
+    // leaves it -- gives its photons the value their wavelengths average to; the middle where the
+    // cell holds none of it.
     void setMass(const EmissionSampler& walk) {
-        for (int i = 0; i < n; ++i) mass[i] = walk.cdfAt(hi[i]) - walk.cdfAt(lo[i]);
+        for (int i = 0; i < n; ++i) {
+            mass[i] = walk.cdfAt(hi[i]) - walk.cdfAt(lo[i]);
+            double m1 = 0.0;
+            const double m = walk.massMoment(lo[i], hi[i], m1);
+            if (m > 0.0) lam[i] = std::min(hi[i], std::max(lo[i], m1 / m));
+        }
     }
     // The cell `w` (nm) falls in; the end cells below and above the band. A cut belongs to the cell
     // above it.

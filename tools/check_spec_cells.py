@@ -21,7 +21,11 @@ sRGB's channels cancel behind a gel, where XYZ's do not):
     546.5 nm (analytic spectra, sampled rather than read from knots; the edge's reflectance falls to
     1e-123 in the red, a coin as good as impossible there: known-issues HOST-HALFMIRROR-ANALYTIC);
   - check_coat_modes' tank, its thin-film ball's substrate absorbing above 546.5 nm only: a coin whose
-    branch is impossible on one side of the step.
+    branch is impossible on one side of the step;
+  - a 1 nm line at 589 nm behind a gel ramping over 570-600 nm, before the wall and before a glossy one:
+    a cell is read at the light's centroid in it (SPECGATHER-CELL-CENTROID; its middle read the ramp
+    18 % low), and the spectral NEE at a glossy vertex weighs a cell by the light's own emission in it
+    (Emitter::cellEmit; the cell's width times the SPD at its middle missed the line, x0.10).
 
 Every render must report the carrier split (its `[specgather]` line). Exits 1 on any failure.
 """
@@ -42,6 +46,11 @@ TOL = 0.03
 TANK_TOL = 0.05   # check_coat_modes' for the same tank: its upper tiles are dark
 
 
+def line_lit(lines):
+    """`lines` lit by a 1 nm line at 589 nm in place of the area light's D65."""
+    return [ln.replace("spd preset:d65", "spd gaussian center=589 sigma=1") for ln in lines]
+
+
 CASES = [
     ("gel_centre", filter_scene("table { 380:0 546.5:0 546.52:0.9 780:0.9 }")),
     ("gel_quarter", filter_scene("table { 380:0 541.0:0 541.02:0.9 780:0.9 }")),
@@ -53,6 +62,10 @@ CASES = [
     ("mir_short", half_mirror("shortpass edge=546.5 slope=1 amp=0.9")),
     # check_coat_modes' tank, its substrate stepping inside bin 9: a coin impossible on one side.
     ("tank", partial_tank("table { 380:0 546.5:0 546.52:2 780:2 }")),
+    # A line light behind a gel ramping across its cell: read where the line is, not at the cell's middle.
+    ("line_ramp", line_lit(filter_scene("table { 380:0 570:0 600:0.9 780:0.9 }"))),
+    ("line_glossy", line_lit(filter_scene("table { 380:0 570:0 600:0.9 780:0.9 }",
+                                          "type glossy  reflect 0.7  roughness 0.3"))),
 ]
 
 

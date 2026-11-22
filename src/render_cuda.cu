@@ -2090,22 +2090,27 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
     sc.lenScale = scene.lenScale;
     sc.passThroughAny = scene.passThroughAny ? 1 : 0;
     sc.compoundStraightAny = scene.compoundStraightAny ? 1 : 0;
-    // The spectral carrier's cells, where the scene's tables split its bins (Scene::specCells).
-    sc.specCells = nullptr;
-    if (scene.specCells.split()) {
+    // The spectral carrier's cells (Scene::specCells), and each emitter's emission over them.
+    {
         const SpecCells& c = scene.specCells;
         DSpecCells hc{};
         if (c.n > kSpecCellsMax) throw std::logic_error("buildUploadScene: more spectral cells than the carrier holds");
         hc.n = c.n;
-        for (int i = 0; i < c.n; ++i) {
-            hc.hi[i] = c.hi[i]; hc.lam[i] = c.lam[i]; hc.width[i] = c.width[i]; hc.mass[i] = c.mass[i];
-        }
+        for (int i = 0; i < c.n; ++i) { hc.hi[i] = c.hi[i]; hc.lam[i] = c.lam[i]; hc.mass[i] = c.mass[i]; }
         for (int k = 0; k < kBandProbeBins; ++k) { hc.first[k] = c.first[k]; hc.count[k] = c.count[k]; }
         DSpecCells* d = nullptr;
         CUDA_CHECK(cudaMalloc(&d, sizeof hc));
         CUDA_CHECK(cudaMemcpy(d, &hc, sizeof hc, cudaMemcpyHostToDevice));
         keep(d);
         sc.specCells = d;
+        sc.nSpecCells = c.n;
+        std::vector<double> ce((size_t)scene.emitters.size() * (size_t)c.n, 0.0);
+        for (size_t e = 0; e < scene.emitters.size(); ++e) {
+            const std::vector<double>& row = scene.emitters[e].cellEmit;
+            if (row.size() != (size_t)c.n) throw std::logic_error("buildUploadScene: an emitter's cell emission is stale");
+            std::copy(row.begin(), row.end(), ce.begin() + (std::ptrdiff_t)(e * (size_t)c.n));
+        }
+        sc.emitCellE = ce.empty() ? nullptr : (const double*)keep(uploadVec(ce));
     }
     sc.jBeamDomR2  = scene.jBeamDomainR2;
     // `cavity` probe settings (O3 stage 2). The host loader has already resolved the

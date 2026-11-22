@@ -558,8 +558,9 @@ Then the rest of 4.2-4.6 in their order, 4.7's bookkeeping alongside whatever to
   natural vignetting, the other modes radiance: one camera equation for all, or none; known-issues.
 - [x] **HOST-HALFMIRROR-ANALYTIC** (0.451.2) — a coin far rarer at some cell than at its peak turns mode M's
   and S's walk partial (`kCoinRare`): a half mirror falling to 1e-123 read half bright on the CPU; known-issues.
-- [ ] **SPECGATHER-CELL-CENTROID** — read each carrier cell at the emission's centroid in it, not its middle
-  (a line-lit scene behind a sloped factor reads ~20 % dark in modes M and S); known-issues.
+- [x] **SPECGATHER-CELL-CENTROID** (0.451.12) — each carrier cell read at the emission's centroid in it, not its
+  middle (a line behind a ramp read 0.83 in modes M and S), and the spectral NEE weighted by each light's own
+  emission in a cell (SPECNEE-LINE-LIGHT: a glossy wall under the line read 0.58); known-issues.
 - [ ] **JSPEC-BIN-RESOLUTION** — the beam gather's carrier and mode J's on the scene's cells too, with
   JSPEC-CARRIER-SIZE's half-precision bins; known-issues.
 - [x] **REVIEW-0450R** (0.450.45) — the Opus (max) and Fable (xhigh) reviews of 0.450.43-0.450.44;
