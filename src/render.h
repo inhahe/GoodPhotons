@@ -390,7 +390,8 @@ inline bool legThrough(const Scene& scene, const Vec3& o, const Vec3& dir, doubl
         return false;
     if (!metPT) return true;
     const StraightWalk w = walkStraight(scene, o, dir, maxDist, tmin, curveTmin, leg, camLeg ? CamAt::End : CamAt::None,
-        [&](const Vec3&, const Hit& h, const Material& m) { return straightPassMul(scene, m, h, dir, lam, n, T); });
+        [&](const Vec3&, const Hit& h, const Material& m) { return straightPassMul(scene, m, h, dir, lam, n, T); },
+        nullptr, /*grinClear=*/true);
     if (crossed) *crossed = w.crossings;
     return w.end == StraightEnd::Clear;
 }

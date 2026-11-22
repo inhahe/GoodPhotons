@@ -519,6 +519,34 @@ scene's cells too (its `r[]` sized `kSpecCellsMax`, read by cell rather than int
 its support's `hole` mask per cell) -- which grows the per-segment and per-vertex carrier
 JSPEC-CARRIER-SIZE measures (120 B to about 190 B), so it goes with that entry's half-precision bins.
 
+## DONE (2026-11-21, 0.451.13): REVIEW-0456 — what the Opus (max) review of 0.451.11 found
+
+0.451.11 grew past a follow-up -- a new far-field model, a device walk, a composite redone -- so it had a
+review of its own: Opus (max), a4e85cc..9180d29. It found the rewrites themselves sound; each finding was
+checked against the code.
+
+* **Mode P's sky from the backward layer** (three findings): 0.451.11 took every escaping pixel from
+  it, which put its colour noise in a sky the sky pass draws exactly, and at a silhouette against a black
+  sky (no env, no sun) the backward film's want of a spot light's caustic; and a forward pixel whose
+  samples saw a sun's disc steered forwardScale's fit. An escaping pixel is the forward layer's again,
+  out of the fit (`CompositeClass::SKY`: its photons for what its samples meet, the sky pass for the sky
+  and the disc, exactly), and a pixel a sample of which saw a sun's disc is left out of the fit
+  (`SkyView::sunSeen`). check_sky_fog's `clear`: mode P's sky the same under two seeds (on 0.451.11 its
+  backward layer's noise).
+* **The far sphere held every authored camera** -- flyby frames and cameras the run does not render
+  included -- so a camera a kilometre off made every escaping ray track the field exactly that far: it
+  holds the cameras the run renders now, their motion keys too (main's coverFar after the selection; the
+  loader adds none). **It missed** a collimated light's quad (not in the BVH) and the rim of BDPT's sun
+  disc (sunDiscR, computed after it): both held now, the block moved below the suns' discs.
+* Smaller: walkStraight and dWalkStraight asked crossesGrin each stretch of a leg their caller had found
+  clear (`grinClear`); Blas::occludedLocal and Scene::occludedInstanceNow were near-copies of their
+  pass-through twins (one each now); design.md cited a `beyond` that was gone and a glows-only form that
+  was too, as did check_sky_fog's docstring and compositeFromFilms' comment; check_sky_fog's ground fog
+  read a depth above y = 2 (latent), and its render cache ignored a case's light, medium and rig (latent).
+* **Dismissed**: the multi-point tracker draws each query's coarse far-field part on its own, repeating the
+  pieces -- only a beam that starts outside the far sphere has one, and drawn alone each query's estimate is
+  exactly the single-distance one's.
+
 ## DONE (2026-11-21, 0.451.11): REVIEW-0455 — what the Opus (max) and Fable (xhigh) reviews of 0.451.7-0.451.10 found
 
 Opus (max) reviewed 0d900e2..a4e85cc (0.451.9 REVIEW-0454's follow-up, 0.451.10 the specular

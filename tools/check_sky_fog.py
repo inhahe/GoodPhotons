@@ -3,7 +3,7 @@ mode R's own sky through a fog that absorbs only, against its transmittance work
 
     python tools/check_sky_fog.py [--out png/check_sky_fog] [--exe ftrace.exe] [--no-gpu] [--spp 256] [--modes BAMP]
                                   [--fogs absorb,scatter,field_absorb,ground,expfog,far_expfog,haze,
-                                          sun_haze,ball_edge,sun_sky]
+                                          sun_haze,ball_edge,sun_sky,clear]
 
 A uniform sky (`light env { spd 1.0 }`) over a floor, seen through a fog. The floor is 10 m across, small
 enough that the forward modes' env photons, spread over the scene's bounding sphere, cross the fog often;
@@ -15,7 +15,9 @@ alone, a scattering haze with no bounds, whose sky pixels its still composite ta
 layer -- as it does under a sun alone (`sun_haze`), where those pixels hold the haze's glow; a ball of fog
 against the sky (`ball_edge`, compared pixel by pixel too: mode P's still composite draws the sky its
 forward pixels' samples see past the ball's outline); and no fog at all, a sun
-in the frame over the sky (`sun_sky`: its disc, which the composite takes from its backward layer). (An unbounded
+in the frame over the sky (`sun_sky`: its disc, which the composite draws in its sky pass); and the
+clear sky alone (`clear`, mode P: drawn exactly, so two seeds' sky differ by one factor, the forward
+layer's fitted scale, and not pixel by pixel). (An unbounded
 medium that scatters is no case for the other modes: they light one only near the scene,
 warnHazeOnlyNearScene, where mode R lights all of it.)
 
@@ -26,10 +28,10 @@ mode on the CPU and the GPU against mode R on the CPU, that quarter in X, Y and 
   - mode A through a physical lens, the same pass's lens samples;
   - mode M with -beams, whose camera ray takes the media's extinction whether or not a beam was stored
     (a medium that scatters nothing stores none);
-  - mode P, whose still composite takes the sky seen through a medium from its forward layer
-    (classifyComposite), the sky pass's glows-only form drawing it there.
+  - mode P, whose still composite takes the sky, and the sky seen through a bounded medium, from its
+    forward layer (classifyComposite), the sky pass drawing it there.
 
-The density fields hold an unbounded field's far end (UNBOUNDED-FIELD-FAR, Medium::farEnd): mode R on
+The density fields hold an unbounded field's far end (UNBOUNDED-FIELD-FAR, Medium::farSplit): mode R on
 both devices, divided by its clear sky, must read exp(-sigma_t * F / d_y) per pixel, F the density's
 integral above the eye and d_y the ray's rise -- 0 for the field with a floor, whose optical depth has
 no end, and for the exponential fog that much with its far part counted (the far end's coarse tail), as
@@ -75,8 +77,8 @@ def depth_above(fog, y0):
     """sigma_t times the density's integral over y from y0 to infinity (inf where it has none)."""
     if fog == "field_absorb":
         return math.inf
-    if fog == "ground":
-        return 0.1 * max(0.0, (2.0 - y0) - (4.0 - y0 * y0) / 4.0)   # 1 - y/2 integrated to y = 2
+    if fog == "ground":   # 1 - y/2 integrated from y0 to y = 2, where it ends
+        return 0.1 * ((2.0 - y0) - (4.0 - y0 * y0) / 4.0) if y0 < 2.0 else 0.0
     if fog in ("expfog", "far_expfog"):
         return 0.01 * 20.0 * math.exp(-y0 / 20.0)
     return None
@@ -89,6 +91,7 @@ HAZE = "medium { sigma_t 0.04  albedo 0.5 }"
 # A ball of fog in the sky's rows, its outline crossing their pixels at every offset.
 BALL = "medium { sigma_t 0.5  albedo 0.0  g 0.0  bounds { center 0 1.68 0.83  radius 0.5 } }"
 PIXEL_FOGS = ("ball_edge",)   # also compared pixel by pixel: a one-pixel outline hides in a tile's mean
+EXACT_FOGS = ("clear",)       # a sky drawn exactly: each seed's the same but for one factor
 PIXEL_TOL = 0.25              # ...off by more than this (5 sigma of the noisiest pixel's two seeds)
 FOGS = [   # (name, the rig, the medium, the modes that take it, the light)
     ("absorb", "near", BOX % "0.0", "BAMP", ENV),
@@ -101,6 +104,7 @@ FOGS = [   # (name, the rig, the medium, the modes that take it, the light)
     ("sun_haze", "near", HAZE, "P", SUN),
     ("ball_edge", "near", BALL, "BP", ENV),
     ("sun_sky", "near", "", "BP", ENV + NL + SUN_IN_VIEW),
+    ("clear", "near", "", "P", ENV),
 ]
 MODES = [   # (tag, the camera's extra statement, the mode's arguments)
     ("B", "", ["-mode", "B", "-n", "4000000"]),
@@ -158,7 +162,7 @@ def main():
 
     def sky(name, rig, cam, medium, light, args, dev):
         """Each seed's render, in XYZ, cut to the sky's rows (the PFM stores rows bottom-up)."""
-        key = (name, args[1], dev)
+        key = (name, rig, cam, medium, light, args[1], dev)
         if key in cache:
             return cache[key]
         eye, look, floor = RIGS[rig]
@@ -192,6 +196,11 @@ def main():
                                                  tile_stats(rr[0][..., c], rr[1][..., c]), TOL)
                     good &= not bad.any()
                     parts.append("%s worst x%.3g (%.1f sigma)" % (cname, ratio.flat[int(z.argmax())], z.max()))
+                if fog in EXACT_FOGS:   # the two seeds' sky, Y: one factor apart (mode P's fitted scale), no noise
+                    q = bb[1][..., 1] / np.maximum(bb[0][..., 1], 1e-30)
+                    spread = float((q.max() - q.min()) / max(float(q.mean()), 1e-30))
+                    good &= spread < 1e-5
+                    parts.append("the seeds' ratio spread by %.2g" % spread)
                 if fog in PIXEL_FOGS:   # each pixel's Y
                     mb = 0.5 * (bb[0][..., 1] + bb[1][..., 1])
                     mr = 0.5 * (rr[0][..., 1] + rr[1][..., 1])

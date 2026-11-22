@@ -17,7 +17,7 @@ held by a shutter at x = 6.4 outside the instant's sphere, and 2.75 % at x = 32.
 beams end there, and the MIS weights must leave the merges out past it, the connections rendering
 the haze alone. A weight that still counted them read dark by their share (J-BEAM-FARLIMIT).
 
-Each case renders mode R and the mode under test, two seeds each, and requires the ball's mean and
+Each case renders mode R and the mode under test, two seeds each (mode J in `farfield` six), and requires the ball's mean and
 the haze's (the top corners) to agree within 0.6 % (D) or 1.5 % (J, whose beam merges are
 noisier), or within four of their standard errors from the seeds' spread, whichever is wider.
 
@@ -43,6 +43,10 @@ REF_OF = {"stilldom": "still"}
 # while every case's noise is under the tolerance, which then decides. A case noisier than that
 # needs more seeds and a bound to match (six and 5: P(|t5| > 5) = 0.4 % a region).
 SEEDS, Q = 2, 4.0
+# Such a case: mode J in the blurred density field, each seed's own -jbeams auto knee and beam map,
+# whose haze reads +-1.5 % from seed to seed (seeds 1 and 2 of 0.451.13 agreed to 0.2 % and read
+# 0.983, seeds 3 and 4 1.026 and 0.994): six seeds and Q 5.
+NOISY = {"farfield_J": (6, 5.0)}
 
 
 def scene(still, keys=8.0, at=6.4, medium="medium { sigma_t 0.04  albedo 0.5 }", extra="",
@@ -134,7 +138,8 @@ def main():
                 if key not in refs:
                     refs[key] = [render(name, "R", dev, s) for s in range(1, SEEDS + 1)]
                 R = refs[key]
-                X = [render(name, mode, dev, s) for s in range(1, SEEDS + 1)]
+                nSeeds, q = NOISY.get("%s_%s" % (name, mode), (SEEDS, Q))
+                X = [render(name, mode, dev, s) for s in range(1, nSeeds + 1)]
                 h, w = R[0].shape
                 yy, xx = np.mgrid[0:h, 0:w]
                 ball = (yy - h * 0.5) ** 2 + (xx - w * 0.5) ** 2 < (0.25 * h) ** 2
@@ -144,10 +149,10 @@ def main():
                     r = [x[m].mean() for x in R]
                     v = [x[m].mean() for x in X]
                     ratio = np.mean(v) / np.mean(r)
-                    # The ratio's standard error from the seeds' spread (SEEDS, Q).
+                    # The ratio's standard error from the seeds' spread (SEEDS, Q; NOISY's).
                     se = np.hypot(np.std(v, ddof=1) / np.sqrt(len(v)) / np.mean(v),
                                   np.std(r, ddof=1) / np.sqrt(len(r)) / np.mean(r))
-                    ok = abs(ratio - 1.0) < max(tol, Q * se)
+                    ok = abs(ratio - 1.0) < max(tol, q * se)
                     print("%-22s %-5s %s/R %.4f (+-%.4f)  %s" % (case, region, mode, ratio, se,
                                                               "ok" if ok else "FAIL"))
                     if not ok:

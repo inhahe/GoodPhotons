@@ -13182,7 +13182,8 @@ __device__ static bool dStraightPassMul(const DScene& sc, const DMaterial& m, co
 }
 // Device twin of walkStraight (scene.h, where the why is): a walk along o + t dir, t in [tmin, maxDist),
 // across what passes light straight on -- `cross(h, m)` takes each, nearest first, and returns false where
-// the light passes nothing more. `skipSph`: a sphere the walk does not see (closestHit's).
+// the light passes nothing more. `skipSph`: a sphere the walk does not see (closestHit's); `grinClear`: the
+// caller found the whole segment clear of a region that bends rays.
 struct DStraightWalk {
     StraightEnd end;
     int crossings;   // the surfaces it crossed
@@ -13193,7 +13194,7 @@ struct DStraightWalk {
 template <class Cross>
 __device__ static DStraightWalk dWalkStraight(const DScene& sc, const DVec3& o, const DVec3& dir, Real maxDist,
                                               Real tmin, Real curveTmin, LegRule leg, CamAt camAt, int skipSph,
-                                              Cross&& cross) {
+                                              bool grinClear, Cross&& cross) {
     constexpr int kStepsMax = 4 * kCamLegThroughMax;   // hidden surfaces skipped included
     const int room = leg.room < kCamLegThroughMax ? leg.room : kCamLegThroughMax;
     const bool hideOn = sc.camHiddenAny != 0 && camAt != CamAt::None;
@@ -13208,7 +13209,10 @@ __device__ static DStraightWalk dWalkStraight(const DScene& sc, const DVec3& o, 
     for (int steps = 0; steps < kStepsMax; ++steps) {
         const DHit h = closestHit(sc, w.from, dir, tq, left, /*camHide=*/hideOn && camAtStart && w.crossings == 0,
                                   cq, nullptr, skipSph);
-        if (dCrossesGrin(sc, w.from, dir, h.valid && h.t < left ? h.t : left)) { w.end = StraightEnd::Stopped; return w; }
+        if (!grinClear && dCrossesGrin(sc, w.from, dir, h.valid && h.t < left ? h.t : left)) {
+            w.end = StraightEnd::Stopped;
+            return w;
+        }
         if (!h.valid || !(h.t < left)) {
             w.end = (leg.split && !camAtStart && lastSpecular) ? StraightEnd::Stopped : StraightEnd::Clear;
             return w;
@@ -13260,7 +13264,8 @@ __device__ static bool dLegThrough(const DScene& sc, const DVec3& o, const DVec3
     if (!metPT) return true;   // nothing on it
     // A leg that passes nothing is blocked: no empty hit for the noise estimate.
     const DStraightWalk w = dWalkStraight(sc, o, dir, left, tmin, curveTmin, leg, camLeg ? CamAt::End : CamAt::None,
-        skipSph, [&](const DHit& h, const DMaterial& m) { return dStraightPassMul(sc, m, h, dir, lam, n, T); });
+        skipSph, /*grinClear=*/true,
+        [&](const DHit& h, const DMaterial& m) { return dStraightPassMul(sc, m, h, dir, lam, n, T); });
     if (crossed) *crossed = w.crossings;
     return w.end == StraightEnd::Clear;
 }
@@ -13284,7 +13289,7 @@ __device__ static bool dMirrorSeenThrough(const DScene& sc, const D3& eye, const
     double dist = 0.0;
     bool found = false;
     const DStraightWalk w = dWalkStraight(sc, eye.toR(), dir, (Real)(dE + tol), RAY_TMIN, (Real)0, leg, CamAt::Start,
-        -1, [&](const DHit& h, const DMaterial& m) {
+        -1, /*grinClear=*/false, [&](const DHit& h, const DMaterial& m) {
             if (fabs(dist + (double)h.t - dE) <= tol && dMirrorConnectsMat(m)) { hm = h; found = true; return false; }
             dist += (double)h.t;
             return dStraightPassMul(sc, m, h, dir, lam, n, T);

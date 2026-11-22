@@ -531,6 +531,9 @@ Then the rest of 4.2-4.6 in their order, 4.7's bookkeeping alongside whatever to
 - [x] **REVIEW-0451** (0.451.1) — the Opus (max) and Fable (xhigh) reviews of 0.451.0; known-issues REVIEW-0451.
 - [x] **MODEB-PASSTHROUGH**, the direct legs (0.451.3) — modes A and B's camera legs cross gels and half
   mirrors (camLegThrough / dCamLegThrough); check_passthrough.
+- [x] **REVIEW-0456** (0.451.13) — the Opus (max) review of 0.451.11: mode P's sky the forward layer's again,
+  out of the fit (exact, no seam), a sun's disc out of the fit; the far sphere sized by the cameras a run
+  renders; known-issues REVIEW-0456.
 - [x] **REVIEW-0455** (0.451.11) — the Opus (max) review of 0.451.9-0.451.10 and the Fable (xhigh) review of
   0.451.7-0.451.10: an unbounded density field's far end redone (an exact sphere holding the scene, a coarse
   field outside), mode P's composite over the sky, a gel at a mirror, the walk's budget, one device walk;

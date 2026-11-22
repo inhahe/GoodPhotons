@@ -1062,7 +1062,8 @@ struct Medium {
     // An unbounded density field's far sphere (UNBOUNDED-FIELD-FAR, kFarTailSteps), about farC of radius
     // farR: the field is tracked inside it and coarse outside. It holds everything the scene holds -- its
     // geometry and bounded media, its movers' sweep and the discs a sky or sun photon starts on, its
-    // positioned lights and cameras (Scene::build) -- so a segment between two of them is tracked whole.
+    // spots and collimated lights (Scene::build), the cameras a run renders (Scene::coverFar) -- so a
+    // segment between two of them is tracked whole.
     // farR 0: none (a bounded medium, or a homogeneous one, whose infinite extent is analytic).
     Vec3 farC{0, 0, 0};
     double farR = 0.0;
@@ -1662,17 +1663,13 @@ struct Blas {
     }
     bool occludedLocal(const Ray& lr, double tmin, double maxDist,
                        const float* vcolTable = nullptr) const {
-        const TriShear sh = makeTriShear(lr.d);   // watertight shear: once per ray
-        return bvh.traverseAny(lr, tmin, maxDist, [&](int prim) {
-            Hit h; h.t = maxDist;
-            return intersectTri(sh, lr, tris[prim], tmin, h, vcolTable);
-        });
+        return occludedLocalPast(lr, tmin, maxDist, vcolTable, [](int) { return false; }, nullptr);
     }
     // occludedLocal, but a triangle whose material `passes(matId)` does not block: one met sets *met.
     template <class Passes>
     bool occludedLocalPast(const Ray& lr, double tmin, double maxDist, const float* vcolTable, Passes&& passes,
                            bool* met) const {
-        const TriShear sh = makeTriShear(lr.d);
+        const TriShear sh = makeTriShear(lr.d);   // watertight shear: once per ray
         return bvh.traverseAny(lr, tmin, maxDist, [&](int prim) {
             Hit h; h.t = maxDist;
             if (!intersectTri(sh, lr, tris[prim], tmin, h, vcolTable)) return false;
@@ -2150,8 +2147,7 @@ struct Scene {
     }
     bool occludedInstanceNow(const Ray& r, const MeshInstance& inst, double tmin, double seg,
                              const float* vcol) const {
-        if (inst.motion < 0 || g_motionU < 0.0) return occludedInstance(r, inst, tmin, seg, vcol);
-        return occludedInstance(rayToInstant(motionNowInverse(inst.motion), r), inst, tmin, seg, vcol);
+        return occludedInstancePastNow(r, inst, tmin, seg, vcol, [](int) { return false; }, nullptr);
     }
     // occludedInstanceNow, but a triangle whose material `passes` (by matId) does not block: Blas::occludedLocalPast.
     template <class Passes>
@@ -2169,11 +2165,6 @@ struct Scene {
         instanceHitToWorld(inst, lh, mats.data());
         h = lh;
         return true;
-    }
-    bool occludedInstance(const Ray& r, const MeshInstance& inst, double tmin, double seg,
-                          const float* vcol) const {
-        Ray lr{inst.toLocal.apply(r.o), inst.toLocal.applyDir(r.d)};
-        return blasList[inst.blasId].occludedLocal(lr, tmin, seg, vcol);   // world seg == local seg
     }
     // `r` carried back to the instant by Dinv: the same parameter t names the same point.
     static Ray rayToInstant(const Affine& Dinv, const Ray& r) {
@@ -3080,10 +3071,10 @@ struct Scene {
     // The radius of the sphere about sceneCenter that holds the swept one: what the sky's and the
     // suns' entry discs reach to for a path with a time (lightRadius).
     double sweptReach = 0.0;
-    // Points an unbounded density field's far sphere must hold besides what build() bounds itself:
-    // the cameras' eyes, which the loader sets before build() (Medium::farR).
+    // Points an unbounded density field's far sphere must hold besides what build() bounds itself: the
+    // eyes of the cameras a run renders (coverFar; Medium::farR), kept for a build() that comes after.
     std::vector<Vec3> farCover;
-    // Widen the far spheres to hold p, a camera added after build() (before the media reach the device).
+    // Widen the far spheres to hold p, a camera's eye (before the media reach the device).
     void coverFar(const Vec3& p) {
         farCover.push_back(p);
         for (Medium& md : media)
@@ -5363,17 +5354,6 @@ struct Scene {
             if (sweptReach > sceneRadius) r = std::max(r, sweptReach);
             jBeamDomainR2 = r * r;
         }
-        {   // an unbounded density field's far sphere (Medium::farR): holding all the scene holds -- a sky or
-            // sun photon's entry disc, lightRadius() across at as far upstream, reaching sqrt 2 times that
-            double fr = std::max(kFarFieldScale * std::max(sceneRadius, 1e-3), std::sqrt(2.0) * sweptReach);
-            for (const Vec3& p : farCover) fr = std::max(fr, length(p - sceneCenter));
-            for (const Emitter& e : emitters)
-                if (e.shape == EmitterShape::Spot) fr = std::max(fr, length(e.origin - sceneCenter));
-            for (Medium& md : media) {
-                md.farC = sceneCenter;
-                md.farR = (!md.bounded && md.heterogeneous()) ? fr : 0.0;
-            }
-        }
         // Distant suns are sized by the same bounding sphere: a photon is born on a
         // disc of radius R perpendicular to its (cone-sampled) travel direction, so the
         // phase-space weight is the cone solid angle times that disc's area.
@@ -5387,6 +5367,26 @@ struct Scene {
                 for (double lam = LAMBDA_MIN; lam <= LAMBDA_MAX; lam += 1.0)
                     e.viewXYZ += Vec3(cieX(lam), cieY(lam), cieZ(lam)) * e.spdFn(lam);
             }
+        {   // an unbounded density field's far sphere (Medium::farR), holding all the scene holds
+            const double scale = sceneRadius > 0.0 ? sweptReach / sceneRadius : 1.0;   // lightScale()'s widest
+            // A sky photon's entry disc, lightRadius() across as far upstream, reaches sqrt 2 times that.
+            double fr = std::max(kFarFieldScale * std::max(sceneRadius, 1e-3), std::sqrt(2.0) * sweptReach);
+            for (const Vec3& p : farCover) fr = std::max(fr, length(p - sceneCenter));
+            for (const Emitter& e : emitters) {
+                if (e.shape == EmitterShape::Sun) {   // BDPT's sun disc (bdpt.h sampleSunOrigin), its rim
+                    const double rd = e.sunDiscR * scale;
+                    fr = std::max(fr, std::sqrt(sweptReach * sweptReach + rd * rd));
+                } else if (e.shape == EmitterShape::Spot || e.shape == EmitterShape::Quad) {
+                    // its own corners: a spot's point, a collimated light's quad, neither in the BVH
+                    for (const Vec3& p : {e.origin, e.origin + e.u, e.origin + e.v, e.origin + e.u + e.v})
+                        fr = std::max(fr, length(p - sceneCenter));
+                }
+            }
+            for (Medium& md : media) {
+                md.farC = sceneCenter;
+                md.farR = (!md.bounded && md.heterogeneous()) ? fr : 0.0;
+            }
+        }
         if (envIndex >= 0) {
             emitters[envIndex].envGeom = 4.0 * PI * PI * sceneRadius * sceneRadius;
             // Directly-viewed background colour: integral of L_env(lambda)*CIE dlambda.
@@ -6839,7 +6839,8 @@ struct StraightWalk {
 // nearest first -- `from` the stretch's start, `h` the hit, `m` its material -- and returns false where the
 // light passes nothing more. `leg.room` of them at most (kCamLegThroughMax at most); under `leg.split` the
 // crossing nearest the camera may not be of a specular type (LegRule): such a one stops the walk.
-// `first`, where given, is the walk's first hit, traced already.
+// `first`, where given, is the walk's first hit, traced already; `grinClear`: the caller found the whole
+// segment clear of a region that bends rays (crossesGrin), which each stretch then need not ask.
 //
 // The camera is at the walk's start, at its end, or nowhere on it (`camAt`), and a camera-hidden surface
 // (Material::hideCamera: a `light area`'s, which passes nothing) is hidden only on the stretch next to the
@@ -6850,7 +6851,7 @@ struct StraightWalk {
 template <class Cross>
 inline StraightWalk walkStraight(const Scene& scene, const Vec3& o, const Vec3& dir, double maxDist,
                                  double tmin, double curveTmin, LegRule leg, CamAt camAt, Cross&& cross,
-                                 const Hit* first = nullptr) {
+                                 const Hit* first = nullptr, bool grinClear = false) {
     constexpr int kStepsMax = 4 * kCamLegThroughMax;   // hidden surfaces skipped included
     const int room = std::min(leg.room, kCamLegThroughMax);
     const bool hideOn = scene.camHiddenAny && camAt != CamAt::None;
@@ -6865,7 +6866,10 @@ inline StraightWalk walkStraight(const Scene& scene, const Vec3& o, const Vec3& 
         const Hit h = (first && steps == 0)
             ? *first
             : scene.closestHit(Ray{w.from, dir, cq}, tq, nullptr, false, hideOn && camAtStart && !crossed, left);
-        if (scene.crossesGrin(w.from, dir, h.valid && h.t < left ? h.t : left)) { w.end = StraightEnd::Stopped; return w; }
+        if (!grinClear && scene.crossesGrin(w.from, dir, h.valid && h.t < left ? h.t : left)) {
+            w.end = StraightEnd::Stopped;
+            return w;
+        }
         if (!h.valid || !(h.t < left)) {   // a hidden surface met since the last crossing was on the camera's stretch
             w.end = (leg.split && !camAtStart && lastSpecular) ? StraightEnd::Stopped : StraightEnd::Clear;
             return w;

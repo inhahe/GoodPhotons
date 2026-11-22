@@ -3788,9 +3788,9 @@ was lit differently by every mode (known-issues GLOW-LIGHT-MODES). Now:
   `glowSeenBy` at s = 0, mode U's `camGlow`, M's and S's camera walks past a strand; M's final
   gather does not count one at all. The forward modes see it only directly, in the sky pass
   (`main.cpp glowMatSeen`, `prepareSky`, `addBlurredSkyRows`), through the media's transmittance
-  along the camera ray, whose `glowsOnly` form gives mode P's forward layer the same (its fit over
-  the diffuse-side pixels otherwise read the glow's edge pixels in the camera side only and ran the
-  frame bright); the composite adds those sums where it reads the forward film
+  along the camera ray, which gives mode P's forward layer the same (its fit over the diffuse-side
+  pixels otherwise read the glow's edge pixels in the camera side only and ran the frame bright); the
+  composite adds those sums where it reads the forward film
   (`forwardPixel`), without copying it. Under a blur P's split files each sample by its first
   surface, so its forward layer leaves a glow on a specular-type surface to the camera side, whose
   specular film has it (`glowSeenXYZ`, the one estimator the three sky passes share). A plain glow's colour is exact at a pinhole's 64 points; one seen through a medium
@@ -3808,14 +3808,19 @@ was lit differently by every mode (known-issues GLOW-LIGHT-MODES). Now:
   exact XYZ, and only a pixel its first samples saw through something grows its count with the render
   (`SkyView::grow`; `scaleAt` gives each pixel's sum its own count). The walk starts from the pass's own
   first hit, and a surface it crosses adds what it shows of a glow of its own (a mix's `glow_only`
-  child). Mode P's still composite takes a pixel whose centre ray escapes from its backward layer
-  (SPEC: the sky and a sun's disc as mode R draws them, out of the scale's fit), but for the sky seen
-  through a bounded medium, which is its forward layer's (`classifyComposite` leaves such a pixel DIFF:
-  the forward photons hold the medium's glow) -- unless the medium is an unbounded one a sun or the sky
-  lights (`skyLitHaze`: the forward layer lights such a haze only near the scene). The same pass draws
-  the forward pixels' sky, in the DIFF pixels alone (`prepareSky`'s `skip`): through a filter, and what
-  their samples see directly, at a silhouette or past a fog's bounds (0.451.11; before, a glows-only
-  form left that out, a dark outline around a fog ball). Mode P's blurred
+  child). Mode P's still composite takes a pixel whose centre ray escapes from its forward layer, its
+  photons for what its samples meet of the scene and this pass for the sky and a sun's disc they see,
+  exactly, but out of the scale's fit (`classifyComposite`'s SKY); the sky seen through a bounded medium
+  is the forward layer's and in the fit (DIFF: the forward photons hold the medium's glow) -- unless the
+  medium is an unbounded one a sun or the sky lights, whose pixels are the backward layer's (SPEC,
+  `skyLitHaze`: the forward layer lights such a haze only near the scene). The pass draws the forward
+  pixels' sky, in the DIFF and SKY pixels alone (`prepareSky`'s `skip`, `CompositeClass::skyless`):
+  through a filter, and what their samples see directly, at a silhouette or past a fog's bounds
+  (0.451.11; before, a glows-only form left that out, a dark outline around a fog ball). A pixel a
+  sample of which saw a sun's disc (`SkyView::sunSeen`) is left out of the fit, which its disc, ten
+  thousand times a lit surface and a coverage noise in the backward layer, would steer. (0.451.11 took
+  the sky pixels from the backward layer, which put its colour noise in a sky the pass draws exactly,
+  and a caustic's fringe at a silhouette against a black sky; 0.451.13 put them back.) Mode P's blurred
   split walks only from a first surface of no specular type -- a mix's or a stack's, whose samples its
   camera side leaves to it -- and draws the sky and sun behind it (`splitSeesSkyThrough`). Mode C, which catches photons through
   its pupil, does not see one. The camera's wavelength density includes the glows' emission
@@ -9509,10 +9514,12 @@ as the one at fault.
     nothing: no collision, and a transmittance the roulette (`kTrRoulette`) never sees fall. So such a
     field is tracked exactly only inside its **far sphere** (`Medium::farC`, `farR`; the part of a
     line inside it `Medium::farSplit`, device `dMedFarSplit`, on `sphereChord`): `kFarFieldScale` (8)
-    scene radii about the scene's centre, widened by `Scene::build` to hold the movers' sweep and the
-    entry discs a sky or sun photon starts on (sqrt 2 times `sweptReach`), every positioned light, and
-    every camera (`Scene::farCover`, the loader's authored cameras; `Scene::coverFar`, a `-view` one),
-    so a segment between two things in the scene is tracked whole. Outside it the field is **coarse**
+    scene radii about the scene's centre, widened by `Scene::build` to hold the movers' sweep, the
+    entry discs a sky or sun photon starts on (sqrt 2 times `sweptReach`, and the rim of BDPT's sun disc),
+    a spot's point and a collimated light's quad, and by `Scene::coverFar` the eyes of the cameras the
+    run renders and their motion keys (main, after the selection; kept in `Scene::farCover` for a later
+    build) -- not every authored one, as a camera a kilometre off would make every escaping ray track the
+    field that far -- so a segment between two things in the scene is tracked whole. Outside it the field is **coarse**
     (`kFarTailSteps`): the shells `R 2^i <= r < R 2^(i+1)` about the centre (24 of them, empty past the
     last) cut a segment's outside part into pieces, one each side of the line's closest approach to
     the centre (`farPieces`, `dFarPieces`), and over each piece the field is constant, at its value at
@@ -11742,8 +11749,9 @@ is the check. The sky, sun and glows a forward camera sees directly walk through
 connections' legs: the vertex's leg to a glass sphere or a mirror (`legThrough` with no camera on it,
 `CamAt::None`, its hidden surfaces ordinary ones; device `dLegThrough`, its walk skipping the sphere it
 connects through, `closestHit`'s `skipSph`) and the one on to the eye (the sphere's `legThrough`, the
-mirrors' `mirrorSeenThrough` / `dMirrorSeenThrough`, which take the mirror from the very trace that
-finds the walk's end, `walkStraight`'s `beyond`, one traversal a stretch), the
+mirrors' `mirrorSeenThrough` / `dMirrorSeenThrough`, whose walk runs to the mirror's distance plus its
+tolerance and stops at the surface there that connects as a mirror -- in its `cross` where that is a half
+mirror, as what it meets (`StraightWalk::met`) where not -- one traversal a stretch), the
 two sharing the room the chain's own vertices leave (`room - (c + 1)`, a mirror's `room - 1`).
 
 ## Glossy camera splats, and the rough interference reflector (0.401.0)
