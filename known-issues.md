@@ -526,6 +526,42 @@ R 0.843 / 0.841 of mode R in mode J (GPU / CPU) and 0.852 / 0.865 in mode M -bea
 bin 12 is right at its centre there (SpecThr::atBinCentre); it is not in the check's scenes until this
 is fixed, and then is its test.
 
+## DONE (2026-11-22, 0.451.19): REVIEW-0460 — what the Opus (xhigh) review of 0.451.17 found
+
+Opus (xhigh) reviewed ed01ad0 (0.451.17, REVIEW-0459's follow-up): twelve findings, each checked
+against the code.
+
+* **The low leg read only the last closed solid's face it crossed** (`side`): two boxes overlapping, or
+  touching face to face (their coincident faces one hit, the other stepped past), ended the leg on an
+  exit, and the floor under the second box counted again -- the dark halo back for crates, books and
+  steps. A solid's side now puts a column inside where the leg crosses any closed solid's face, either
+  way (`walkSegment`'s new `solids`; host, device and the -gageom march).
+* **An open face on the leg walled a room's floor off**: an open quad or upright cup standing in a room
+  the gather point lies in. The solid clause no longer reads the leg's open count. What the rule reads
+  short now: the floor past a closed pillar in a room lower than the radius.
+* **capOk's own-face test refused a hat on a table** (its test points on its brim, the piece itself)
+  **and missed a tilted own face crossing the plane at a point**: capOk now skips a point on the
+  piece itself, needs one point at least on another face, and passes the piece's own faces along its
+  rays -- one test, at one rounding-sized tolerance (also the review's note that coversOwn's and
+  capOk's tolerances differed). check_cap_marks' `hat` (eighteen faces): none capped on 0.451.18, eighteen now.
+* **No render measured a mover at the times it hovers**: check_gather_base's `openbox_hover`, the open
+  box held 5 cm up by a mover's keys from faces stored on the floor, is held to the same box authored
+  up there (TWINS) -- resting at the instant, seen over the second half of its rise; on 0.451.15, whose
+  probes kept the instant's cap without the leg, the floor 2-5 cm from its base read 1.29 of the twin's
+  in mode M and 1.10-1.18 in mode S, 1.000 now.
+* **A capped room made every probe in it walk PROBE-PATH's segment** (its box holds every gather point
+  inside it): measured, CPU mode M 2 % on a 3 m room with a lamp (23.47 s against 23.95 s at 64
+  samples). `Scene::solidNear` now asks a world piece of 64 faces or fewer by its faces, not counting
+  one in the gather point's own plane: 23.70 s now, as 0.451.16's 23.73. A closed room had paid the same since PROBE-PATH.
+* GAGEOM-COINCIDENT and PROBE-PARITY-LIMITS' remaining shapes were left open with no blocker: the first
+  is fixed (0.451.18), the second's non-planar hole here (the fan cap, below); its asset and mover
+  shapes are the next work.
+* Smaller: the march's rule summary still said a solid's inside is dropped outright; capOk's comment
+  misstated its ray (d floored at ten eps); check_cap_marks wrote OBJs with a third copy of the writer
+  (it imports check_meshvox's, which now writes UTF-8 and LF); check_gather_base built a bottomless box
+  by filtering formatted quad text (box() takes `bottom`); prepareSky scanned every material each
+  call for a specular one (Scene::specularAny, set at build).
+
 ## DONE (2026-11-22, 0.451.18): GAGEOM-COINCIDENT — `-gageom`'s march counted one of two coincident faces facing apart, by the traversal's choice
 
 **Fixed in 0.451.18, as proposed:** on the plane, within 1e-7 r, the march takes a face either way up;
@@ -3566,10 +3602,11 @@ own cap's points. tools/check_cap_marks.py holds the rules.
   instance a bit per such piece, set where capOk passes for the rim placed by that instance; the probes
   read a hit on an instance's face as capped where its bit is set (host Hit and the device's instance
   record).
-- *A hole that is not planar* (a statue's base on uneven ground). **Proper fix:** a fan of triangles from
-  the rim's centroid closes any rim, and its tetrahedra about the centroid vanish, so the volume taken
-  about the centroid is that closed solid's, planar or not; capOk then asks of every rim vertex (and the
-  centroid) that a face lies under it.
+- DONE (0.451.19): *a hole that is not planar* (a statue's base on uneven ground). The fan of triangles
+  from the rim's centroid closes any rim, its tetrahedra about the centroid vanishing, so the volume taken
+  there is that closed solid's; capOk asks along the rim's normal at the centroid and the points a tenth
+  of the way in, its window widened by twice the rim's spread off its mean plane, passing the piece's
+  own faces. check_cap_marks' `uneven` (a bottomless box on a V-shaped ground): none capped on 0.451.18, sixteen now.
 - *A mover that does not rest where its faces are stored* (a box lowered onto the floor by its keys).
   **Proper fix:** capOk at each motion key, the piece placed there, and the cap where it rests at any of
   them: the low leg decides each path's time.

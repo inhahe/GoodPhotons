@@ -1959,13 +1959,33 @@ struct Scene {
     // point (PROBE-PATH) only where a solid may lie near it. A box too large costs a segment, never
     // a result. `solidBoundsKnown` is false until markSolidFaces takes them, and stays false for a
     // scene that moves, whose boxes hold only for its frame's instant: every segment is traced then.
+    // `solidNearFaces`, by box: a world piece's faces where it has few (watertight::PieceBox), which
+    // decide for it -- a room's box holds every gather point inside it, its faces few of them.
     Bvh solidBoundsBvh;
+    std::vector<std::vector<Vec3>> solidNearFaces;
     bool solidBoundsKnown = false;
-    // Whether a closed solid's box lies within `rad` of `c` (always, when the boxes are not known).
-    bool solidNear(const Vec3& c, double rad) const {
+    // Whether a closed solid lies within `rad` of the gather point `c` (normal `n`): its box, or where
+    // its faces are kept one of them, not counting a face lying in the plane through `c` -- a closed
+    // room's floor under it, which the segment up from the gather point never crosses (always, when
+    // the boxes are not known).
+    bool solidNear(const Vec3& c, const Vec3& n, double rad) const {
         if (!solidBoundsKnown) return true;
         bool any = false;
-        solidBoundsBvh.traverseSphere(c, rad, [&](int) { any = true; });
+        const double onPlane = 1e-6 * rad;
+        solidBoundsBvh.traverseSphere(c, rad, [&](int k) {
+            if (any) return;
+            const std::vector<Vec3>* f = (size_t)k < solidNearFaces.size() ? &solidNearFaces[(size_t)k] : nullptr;
+            if (!f || f->empty()) { any = true; return; }
+            for (size_t j = 0; j + 2 < f->size() && !any; j += 3) {
+                const Vec3& a = (*f)[j];
+                const Vec3& b = (*f)[j + 1];
+                const Vec3& d = (*f)[j + 2];
+                if (std::fabs(dot(a - c, n)) <= onPlane && std::fabs(dot(b - c, n)) <= onPlane &&
+                    std::fabs(dot(d - c, n)) <= onPlane)
+                    continue;
+                any = pointTriDistSq(c, a, b, d) <= rad * rad;
+            }
+        });
         return any;
     }
     // A time in frames (relative to the frame's instant) as the fraction of the motion interval
@@ -3235,6 +3255,10 @@ struct Scene {
     // Whether a mix or layered material passes light straight on (Material::straight): mode P's blurred
     // split then draws the sky seen through one on its forward side (main.cpp addBlurredSkyRows).
     bool compoundStraightAny = false;
+    // Whether a material is of a specular type (isSpecularType, BackwardRenderer::specularFirstSurface's
+    // test): with a region that bends rays (bendsAny), what can mark a pixel of mode P's still composite
+    // the backward layer's (main.cpp prepareSky).
+    bool specularAny = false;
     // Per instanced mesh asset (blasList): whether a triangle of it passes light straight on, so a
     // placement of it may (instancePassesStraight). Rebuilt with passThroughAny.
     std::vector<char> blasPassThrough;
@@ -3702,7 +3726,9 @@ struct Scene {
         for (const auto& m : mats) if (m.hideCamera) { camHiddenAny = true; break; }
         passThroughAny = false;
         compoundStraightAny = false;
+        specularAny = false;
         for (auto& m : mats) {
+            specularAny = specularAny || isSpecularType(m.type);
             m.straight = passesStraightLeaf(m.type);
             if (m.type == MatType::Mix || m.type == MatType::Layered)   // a child that passes light (no nesting)
                 for (int c : m.mixChildren)
@@ -4921,20 +4947,35 @@ struct Scene {
             }
         };
         for (Tri& t : tris) t.boundsSolid = -1;   // (an asset's are its own, set where it is marked)
-        // Whether a face covers the plane (normal `nrm`) of a piece's rim at each of `pts`: a short ray
-        // across the plane there from either side, a thousandth of the rim's `reach` long, meets a face
-        // within half that of the plane (5e-4 of the reach).
-        const watertight::CapOk capOk = [&](const Vec3& nrm, const std::vector<Vec3>& pts, double reach) {
-            const double d = std::max(1e-3 * reach, 10.0 * eps);
+        // Whether a face other than the piece's own (`own`) covers a piece's rim at each of `pts` that
+        // does not lie on the piece itself, one at least, along the rim's normal `nrm`: a short ray across
+        // there from either side, from d beyond `slack` -- d a thousandth of the rim's `reach`, ten `eps`
+        // at least -- meets one within win = 0.5 d + slack of the point (5e-4 of the reach for a planar
+        // rim), passing the piece's own faces on the way. "On the piece" is to within rounding of one of
+        // its faces (`onR`): a hit lies on the face it hit, a point of a brim on the brim.
+        const watertight::CapOk capOk = [&](const Vec3& nrm, const std::vector<Vec3>& pts, double reach,
+                                            double slack, const std::function<bool(const Vec3&, double)>& own) {
+            const double d = std::max(1e-3 * reach, 10.0 * eps), w = d + slack, win = 0.5 * d + slack;
+            const double onR = std::max(1e-6 * reach, 10.0 * eps);
+            int asked = 0;
             for (const Vec3& q : pts) {
+                if (own(q, onR)) continue;   // the piece itself there: a hat's brim on the table
+                ++asked;
                 bool covered = false;
-                for (const double sgn : {1.0, -1.0}) {
-                    const Hit h = closestHit(Ray{q + nrm * (sgn * d), nrm * -sgn}, eps, nullptr, false, false, 2.0 * d);
-                    if (h.valid && std::fabs(h.t - d) < 0.5 * d) { covered = true; break; }
+                for (int side = 0; side < 2 && !covered; ++side) {
+                    const Vec3 dir = nrm * (side ? 1.0 : -1.0);
+                    double t0 = 0.0;   // from q - dir * w, how far the ray has come
+                    for (int k = 0; k < 8 && !covered; ++k) {
+                        const Hit h = closestHit(Ray{q - dir * (w - t0), dir}, eps, nullptr, false, false, 2.0 * w - t0);
+                        if (!h.valid) break;
+                        t0 += h.t;
+                        if (t0 > w + win) break;
+                        if (t0 >= w - win && !own(h.p, onR)) covered = true;
+                    }
                 }
                 if (!covered) return false;
             }
-            return true;
+            return asked > 0;   // all on the piece: nothing shows it rests on anything
         };
         const watertight::CapOk* cap = enclosuresOnly ? nullptr : &capOk;
         for (const MeshGroup& g : meshGroups) {
@@ -4999,6 +5040,7 @@ struct Scene {
             return !(matId >= 0 && matId < (int)mats.size() && passesLight(*this, mats[(size_t)matId]));
         };
         std::vector<Aabb> boxes;
+        std::vector<std::vector<Vec3>> nearFaces;   // by box, the faces that decide for it (solidNear)
         for (const Implicit& im : implicits)
             if (im.solidSide && opaqueMat(im.matId)) boxes.push_back(im.bounds);
         for (const Sphere& sp : spheres) {
@@ -5008,12 +5050,14 @@ struct Scene {
             b.expand(sp.c + Vec3(sp.r, sp.r, sp.r));
             boxes.push_back(b);
         }
-        for (const watertight::PieceBox& pb : worldPieces) {
+        for (watertight::PieceBox& pb : worldPieces) {
             if (!opaqueMat(pb.matId)) continue;
             Aabb b;
             b.expand(pb.lo);
             b.expand(pb.hi);
+            nearFaces.resize(boxes.size());
             boxes.push_back(b);
+            nearFaces.push_back(std::move(pb.faces));
         }
         for (const MeshInstance& inst : instances) {
             if (inst.blasId < 0 || inst.blasId >= (int)blasPieces.size()) continue;
@@ -5027,6 +5071,8 @@ struct Scene {
             }
         }
         solidBoundsBvh.build(boxes);
+        nearFaces.resize(boxes.size());
+        solidNearFaces = std::move(nearFaces);
         solidBoundsKnown = !hasMotion();
         sm.ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
         solidMarks = sm;

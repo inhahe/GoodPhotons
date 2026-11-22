@@ -36,6 +36,45 @@ inline bool clipRayBox(const Vec3& lo, const Vec3& hi, const Vec3& o, const Vec3
     return rayBoxClip(&lo.x, &hi.x, &o.x, &d.x, t0, t1, ta, tb);
 }
 
+// Squared distance from `p` to the triangle (a,b,c) — the exact closest-point routine
+// (Ericson, *Real-Time Collision Detection* §5.1.5): test the three vertex Voronoi
+// regions, then the three edge regions, then fall through to the face interior. Written
+// out rather than reduced to "project and clamp the barycentrics" because that shortcut
+// is wrong on obtuse triangles, which is exactly what an imported mesh is full of.
+inline double pointTriDistSq(const Vec3& p, const Vec3& a, const Vec3& b, const Vec3& c) {
+    const Vec3 ab = b - a, ac = c - a, ap = p - a;
+    const double d1 = dot(ab, ap), d2 = dot(ac, ap);
+    if (d1 <= 0.0 && d2 <= 0.0) return dot(ap, ap);                       // vertex a
+    const Vec3 bp = p - b;
+    const double d3 = dot(ab, bp), d4 = dot(ac, bp);
+    if (d3 >= 0.0 && d4 <= d3) return dot(bp, bp);                        // vertex b
+    const double vc = d1 * d4 - d3 * d2;
+    if (vc <= 0.0 && d1 >= 0.0 && d3 <= 0.0) {                            // edge ab
+        const double v = (d1 - d3 != 0.0) ? d1 / (d1 - d3) : 0.0;
+        const Vec3 q = a + ab * v; const Vec3 e = p - q; return dot(e, e);
+    }
+    const Vec3 cp = p - c;
+    const double d5 = dot(ab, cp), d6 = dot(ac, cp);
+    if (d6 >= 0.0 && d5 <= d6) return dot(cp, cp);                        // vertex c
+    const double vb = d5 * d2 - d1 * d6;
+    if (vb <= 0.0 && d2 >= 0.0 && d6 <= 0.0) {                            // edge ac
+        const double w = (d2 - d6 != 0.0) ? d2 / (d2 - d6) : 0.0;
+        const Vec3 q = a + ac * w; const Vec3 e = p - q; return dot(e, e);
+    }
+    const double va = d3 * d6 - d5 * d4;
+    if (va <= 0.0 && (d4 - d3) >= 0.0 && (d5 - d6) >= 0.0) {              // edge bc
+        const double den = (d4 - d3) + (d5 - d6);
+        const double w = (den != 0.0) ? (d4 - d3) / den : 0.0;
+        const Vec3 q = b + (c - b) * w; const Vec3 e = p - q; return dot(e, e);
+    }
+    const double den = va + vb + vc;                                      // face interior
+    if (!(den > 0.0)) return dot(ap, ap);                                 // degenerate triangle
+    const double inv = 1.0 / den;
+    const Vec3 q = a + ab * (vb * inv) + ac * (vc * inv);
+    const Vec3 e = p - q;
+    return dot(e, e);
+}
+
 // The distance from the origin of a triangle's farthest vertex: its Hit::pscale.
 inline double triReach(const Vec3& a, const Vec3& b, const Vec3& c) {
     return std::sqrt(std::max(dot(a, a), std::max(dot(b, b), dot(c, c))));

@@ -412,7 +412,7 @@ inline double gatherCoverageRaw(const Scene& scene, const Vec3& p, const Vec3& n
             int crossed = 0, lastSolid = kAsk;
             const auto side = [&]() {
                 if (lastSolid == kAsk) {
-                    if (solidsNear < 0) solidsNear = scene.solidNear(p, r * 1.4143) ? 1 : 0;
+                    if (solidsNear < 0) solidsNear = scene.solidNear(p, n, r * 1.4143) ? 1 : 0;
                     const Vec3 o = p + n * pathEps, top = q + n * r;
                     const double len = length(top - o);
                     lastSolid = solidsNear ? walkSegment(scene, o, (top - o) * (1.0 / len), len, pathEps).side : 0;
@@ -438,12 +438,13 @@ inline double gatherCoverageRaw(const Scene& scene, const Vec3& p, const Vec3& n
             // Whether the column lies inside something the gather point does not: an odd parity
             // above it where the low leg crosses an odd count of such faces too (a cup's wall, not a
             // sheet hovering over the surface); or a closed solid's faces above saying it lies in a
-            // solid that the low leg enters or walls off -- the walls of a box resting on the surface,
-            // not a room the gather point lies in itself, nor a box clear of the surface at the
-            // path's time (a mover's).
+            // solid, where the low leg crosses any closed solid's face (walkSegment's `solids`) --
+            // the walls of a box resting on the surface, or of boxes touching or overlapping there,
+            // not a room the gather point lies in itself (an open quad or cup in it no wall), nor a
+            // box clear of the surface at the path's time (a mover's).
             const auto inside = [&]() {
                 if ((crossed & 1) && (!(rr > pathEps) || (lowLeg().open & 1))) return true;
-                return side() > 0 && (lowLeg().side > 0 || (lowLeg().open & 1));
+                return side() > 0 && lowLeg().solids > 0;
             };
             bool found = false;                  // the probe ended on what it counts
             bool ended = false;                  // ... or on what it does not: either way, it ended

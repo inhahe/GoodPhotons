@@ -12080,7 +12080,7 @@ static int checkSdf() {
                 for (int b = -6; b <= 6; ++b)
                     for (int c = -6; c <= 6; ++c) {
                         const Vec3 p(0.25 * a, 0.25 * b, 0.25 * c);
-                        w = std::max(w, std::fabs(meshvox::pointTriDistSq(p, t[0], t[1], t[2]) -
+                        w = std::max(w, std::fabs(pointTriDistSq(p, t[0], t[1], t[2]) -
                                                   refDistSq(p, t[0], t[1], t[2])));
                     }
         ok &= chk("§6 pointTriDistSq vs independent exact routine", w, 0.0, 1e-12);
@@ -16815,12 +16815,8 @@ static bool prepareSky(SkyView& view, const Scene& scene, const Camera& cam, int
     const bool throughDrawn = scene.passThroughAny || !scene.media.empty();
     const bool draws = haveEnv || haveSun || haveGlow;   // else, under a composite, the marks alone
     // Under a composite, whether anything can mark a pixel: a specular-type material or a region that
-    // bends rays (BackwardRenderer::specularFirstSurface's test).
-    bool marks = false;
-    if (cc) {
-        marks = scene.bendsAny;
-        for (const Material& m : scene.mats) marks = marks || isSpecularType(m.type);
-    }
+    // bends rays.
+    const bool marks = cc && (scene.specularAny || scene.bendsAny);
     if ((!draws && !marks) || cam.seesMotion(scene))
         return false;
     constexpr double kLo = LAMBDA_MIN, kHi = LAMBDA_MAX;

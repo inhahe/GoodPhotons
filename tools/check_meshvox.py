@@ -40,7 +40,8 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 # --------------------------------------------------------------------------- meshes
 def write_obj(path, verts, faces):
-    with open(path, "w") as f:
+    """`verts` (x, y, z) and `faces` (0-based a, b, c) as an OBJ."""
+    with open(path, "w", encoding="utf-8", newline="") as f:
         for v in verts:
             f.write("v %.9f %.9f %.9f\n" % v)
         for a, b, c in faces:

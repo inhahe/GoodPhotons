@@ -296,6 +296,9 @@ Then the rest of 4.2-4.6 in their order, 4.7's bookkeeping alongside whatever to
   share of the disc (the footprint): the gap's light stays off the plate, and object bases read true.
 - [x] **GAGEOM-COINCIDENT** (0.451.18) — `-gageom`'s march counted one of two coincident faces facing apart
   by the traversal's choice: on the plane it takes either; known-issues.
+- [x] **REVIEW-0460** (0.451.19) — the Opus (xhigh) review of 0.451.17: the low leg counts every closed
+  solid's face it crosses, capOk skips the piece's own points and faces, a mover's render check, a room's
+  cost (solidNear by faces); known-issues REVIEW-0460.
 - [x] **REVIEW-0459** (0.451.17) — the Fable (xhigh) review of 0.451.11-0.451.16: the low leg decides a
   solid's side (a room the gather point lies in), capOk takes no piece's own faces, the sky pass's marks
   stop early; known-issues REVIEW-0459.
@@ -349,8 +352,8 @@ Then the rest of 4.2-4.6 in their order, 4.7's bookkeeping alongside whatever to
 - [x] **CURVE-GATHER**, mode U's half (VCM-THIN-CURVES) — 0.439.2: mode U merges at no curve
   vertex (`vcmMergeAt` / `dVcmMergeAt`); its coat 2.10 / 2.36 -> 1.000 / 1.014 of mode R.
 - [ ] **PROBE-PARITY-LIMITS** (reopened at 0.451.16) — left: an asset's open piece (a cap per instance), a
-  non-planar hole (a fan cap from the rim's centroid), a mover that does not rest where its faces are
-  stored (capOk per key); the proper fixes are in the entry. 0.451.17 (REVIEW-0459): the low leg decides a
+  mover that does not rest where its faces are stored (capOk per key); the proper fixes are in the entry.
+  The non-planar hole is done (0.451.19, the fan cap). 0.451.17 (REVIEW-0459): the low leg decides a
   solid's side too, so a room and a mover are capped again. 0.451.14: an open solid taller than the radius, its planar rim closed by
   the face it rests on, is closed there for the probes alone (Tri::solidFace 3/4); was: the footprint probe's
   crossing count misreads a photon-holding open

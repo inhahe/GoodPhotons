@@ -20,7 +20,13 @@ exactly its count -- the marking pass's alone, with no noise:
     them a volume, covering the points the cap asks about themselves -- none (0.451.16 capped it on
     itself, two);
   - `pit`: a ground grid of 72 triangles over the floor with a planar border and a pit off its middle --
-    none (0.451.16 capped the pit on the ground's own flat part, 72).
+    none (0.451.16 capped the pit on the ground's own flat part, 72);
+  - `uneven`: a bottomless box of 16 triangles standing on a V-shaped ground, its walls following the
+    valley down, so its rim is no plane -- capped by the fan from the rim's centroid, sixteen (0.451.18
+    capped planar rims alone, none);
+  - `hat`: a crown with a flat brim of 18 triangles lying on the floor, open along the brim's outer edge
+    -- capped, eighteen: the points on the brim, the piece itself, ask nothing, and the floor covers the
+    rest (0.451.17 refused it for lying on its own faces there, none).
 
 Exits 1 on any mismatch.
 """
@@ -33,14 +39,9 @@ NL = chr(10)
 sys.path.insert(0, os.path.join(ROOT, "tools"))
 import check_gather_base as g  # noqa: E402
 import check_motion as cm  # noqa: E402
+from check_meshvox import write_obj  # noqa: E402
 
 B, H = 0.15, 0.04   # the box's half-width and height
-
-
-def write_obj(path, verts, faces):
-    with open(path, "w", encoding="utf-8", newline="") as f:
-        f.writelines("v %.12g %.12g %.12g%s" % (v + (NL,)) for v in verts)
-        f.writelines("f %d %d %d%s" % (a + 1, b + 1, c + 1, NL) for a, b, c in faces)
 
 
 def sheet_obj(path):
@@ -67,6 +68,69 @@ def pit_obj(path):
     write_obj(path, verts, faces)
 
 
+K = 0.2   # the V-ground's slope: y = K |x|
+
+
+def uneven_obj(path):
+    """A bottomless box of half-width B whose walls stand on the V-ground y = K |x|, H over its rim's
+    highest corners, wound outward: its rim six corners, the two at x = 0 K B below the rest."""
+    t = K * B + H
+    vs = {}
+    order = []
+
+    def v(x, y, z):
+        if (x, y, z) not in vs:
+            vs[(x, y, z)] = len(order)
+            order.append((x, y, z))
+        return vs[(x, y, z)]
+    faces = []
+
+    def quad(a, b, c, d):   # a b c d counter-clockwise seen from outside
+        faces.extend([(a, b, c), (a, c, d)])
+    # the walls at x = -B and x = +B, their feet on the ground at y = K B
+    quad(v(-B, K * B, -B), v(-B, K * B, B), v(-B, t, B), v(-B, t, -B))
+    quad(v(B, K * B, B), v(B, K * B, -B), v(B, t, -B), v(B, t, B))
+    for z, s in ((-B, 1), (B, -1)):   # the walls at z = -B (outward -z) and z = +B, each in two halves
+        for x0, x1 in ((-B, 0.0), (0.0, B)):
+            a, b = (x0, x1) if s > 0 else (x1, x0)
+            quad(v(a, K * abs(a), z), v(a, t, z), v(b, t, z), v(b, K * abs(b), z))
+    quad(v(-B, t, -B), v(-B, t, B), v(0.0, t, B), v(0.0, t, -B))   # the top, in two halves
+    quad(v(0.0, t, -B), v(0.0, t, B), v(B, t, B), v(B, t, -B))
+    write_obj(path, order, faces)
+
+
+def oriented(verts, loop, out):
+    """The quad `loop` (four indices into `verts`, in order round it) as two triangles whose normal
+    points along `out`."""
+    a, b, c = (verts[i] for i in loop[:3])
+    n = [(b[1] - a[1]) * (c[2] - a[2]) - (b[2] - a[2]) * (c[1] - a[1]),
+         (b[2] - a[2]) * (c[0] - a[0]) - (b[0] - a[0]) * (c[2] - a[2]),
+         (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0])]
+    if sum(x * y for x, y in zip(n, out)) < 0.0:
+        loop = loop[::-1]
+    return [(loop[0], loop[1], loop[2]), (loop[0], loop[2], loop[3])]
+
+
+def hat_obj(path):
+    """A crown of half-width 8 cm and height 6 cm with a flat brim out to B, on the floor, wound
+    outward: open along the brim's outer edge alone."""
+    a, h = 0.08, 0.06
+    verts, faces = [], []
+
+    def v(x, y, z):
+        verts.append((x, y, z))
+        return len(verts) - 1
+    o = [v(-B, 0.0, -B), v(B, 0.0, -B), v(B, 0.0, B), v(-B, 0.0, B)]      # the brim's outer corners
+    i = [v(-a, 0.0, -a), v(a, 0.0, -a), v(a, 0.0, a), v(-a, 0.0, a)]      # its inner corners, the crown's feet
+    t = [v(-a, h, -a), v(a, h, -a), v(a, h, a), v(-a, h, a)]              # the crown's top
+    sides = [(0, 1, (0, 0, -1)), (1, 2, (1, 0, 0)), (2, 3, (0, 0, 1)), (3, 0, (-1, 0, 0))]
+    for k0, k1, out in sides:
+        faces += oriented(verts, [o[k0], o[k1], i[k1], i[k0]], (0, 1, 0))   # the brim's trapezoid
+        faces += oriented(verts, [i[k0], i[k1], t[k1], t[k0]], out)         # the crown's wall
+    faces += oriented(verts, t, (0, 1, 0))                                     # the crown's top
+    write_obj(path, verts, faces)
+
+
 def scene(kind, out):
     geo = []
     if kind in ("resting", "lamp", "moving", "lifted", "closed"):
@@ -77,10 +141,12 @@ def scene(kind, out):
     if kind == "lamp":
         geo.append("light area { origin -0.03 0.035 -0.03  u 0.06 0 0  v 0 0 0.06  normal 0 -1 0  power 5  "
                    "spd preset:d65 }")
-    if kind in ("sheet", "pit"):
+    if kind in ("sheet", "pit", "uneven", "hat"):
         obj = os.path.join(out, kind + ".obj")
-        (sheet_obj if kind == "sheet" else pit_obj)(obj)
+        {"sheet": sheet_obj, "pit": pit_obj, "uneven": uneven_obj, "hat": hat_obj}[kind](obj)
         geo = ['mesh "%s" { file "%s"  material obj }' % (kind, kind + ".obj")]
+    if kind == "uneven":   # the V-ground it stands on, two quads meeting along x = 0
+        geo += [g.quad((-1, K, -1), (0, 0, 2), (1, -K, 0), "floor"), g.quad((0, 0, -1), (0, 0, 2), (1, K, 0), "floor")]
     shutter = "shutter_open 0  shutter_close 1  " if kind == "moving" else ""
     return NL.join([
         "scene { units meters%s }" % ("  motion_interval 0 1" if kind == "moving" else ""),
@@ -93,7 +159,8 @@ def scene(kind, out):
     ]) + NL
 
 
-CASES = {"resting": 10, "lamp": 10, "moving": 10, "lifted": 0, "closed": 12, "sheet": 0, "pit": 0}
+CASES = {"resting": 10, "lamp": 10, "moving": 10, "lifted": 0, "closed": 12, "sheet": 0, "pit": 0, "uneven": 16,
+         "hat": 18}
 
 
 def main():

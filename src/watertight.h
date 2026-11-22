@@ -142,22 +142,30 @@ inline Report checkTris(const Tri* tris, size_t n) {
 // piece (a number shared by its faces), -1 for a face of none.
 //
 // `capOk`, where given (the footprint probes' pass alone: PROBE-PARITY-LIMITS), also closes a piece open
-// along a planar rim that another face closes -- a statue's open base on the floor it stands on: a piece
-// whose every edge is used twice in opposite directions or once, the once-used ones (its rim) all in one
-// plane, which capOk(normal, points, reach) says some other face covers at `points` -- the rim's
-// centre and a tenth of the way in from its corners, `reach` the farthest corner from the centre. Its
-// volume taken about a point in that plane is the capped solid's, the cap's own tetrahedra vanishing
-// there, and its faces are marked 3 (normals out) or 4 (in): a side the probes read and nothing else does
-// -- a camera or light inside one is not in a solid, a glowing one may still be two-sided -- as the cap
-// is right only for the gather on the face that closes it (an upright cup's rim is planar too and closes
-// on nothing, its floor lit through it). Nor is a piece closed that covers those points itself, lying in
-// the plane there (a near-flat sheet its rounding leaves a volume, a ground whose border closes on its own
-// flat part round a pit). The cap says only which side of the faces is in: whether that side walls a
+// along a rim that another face closes -- a statue's open base on the floor it stands on, planar or on
+// uneven ground: a piece whose every edge is used twice in opposite directions or once, the once-used ones
+// its rim, closed by the fan of triangles from the rim's centroid, which capOk(normal, points, reach,
+// slack, own) says some face not the piece's own covers at `points`: the centroid and a tenth of the way
+// in from its corners, on the fan, `reach` the farthest corner from the centroid, `normal` the rim's
+// area vector (Newell's), `slack` how far the covering face may stray from a point along it beyond a
+// planar rim's allowance (twice the rim's own spread off its mean plane), `own(x, rad)` whether x lies
+// within `rad` of one of the piece's faces. A point on the piece itself asks nothing (a hat's brim on
+// the table), but one point at least must be another face's. Its volume taken about the centroid is the capped solid's, the fan's own
+// tetrahedra vanishing there, and its faces are marked 3 (normals out) or 4 (in): a side the probes read
+// and nothing else does -- a camera or light inside one is not in a solid, a glowing one may still be
+// two-sided -- as the cap is right only for the gather on the face that closes it (an upright cup's rim
+// is planar too and closes on nothing, its floor lit through it). A piece that covers its own points (a
+// near-flat sheet its rounding leaves a volume, a ground whose border closes on its own flat part round a
+// pit) closes on nothing. The cap says only which side of the faces is in: whether that side walls a
 // column off from the gather point the probes' low leg decides (gathercoverage.h inside()) -- a box with
 // a lamp in it is a room the gather point lies in, a mover capped where its faces are stored may be clear
 // of the surface at a path's time. Its pieceOf is -1; its box is given.
-struct PieceBox { Vec3 lo, hi; int matId = 0; };
-using CapOk = std::function<bool(const Vec3& normal, const std::vector<Vec3>& points, double reach)>;
+// A marked piece's box, and (`faces`, corners three a face) its faces where it has kPieceNearFaces or
+// fewer -- a room, a box, a crate -- empty for one with more (Scene::solidNear).
+constexpr size_t kPieceNearFaces = 64;
+struct PieceBox { Vec3 lo, hi; int matId = 0; std::vector<Vec3> faces; size_t count = 0; };
+using CapOk = std::function<bool(const Vec3& normal, const std::vector<Vec3>& points, double reach, double slack,
+                                 const std::function<bool(const Vec3&, double)>& own)>;
 inline size_t markSolidFaces(Tri* const* tris, size_t n, std::vector<PieceBox>* boxes = nullptr,
                              std::vector<int>* pieceOf = nullptr, const CapOk* capOk = nullptr) {
     if (pieceOf) pieceOf->assign(n, -1);
@@ -329,26 +337,15 @@ inline size_t markSolidFaces(Tri* const* tris, size_t n, std::vector<PieceBox>* 
                 if (it != at.end()) it->second = *p[k];
             }
         }
-        // Whether any of `pts` lies on one of the piece's own faces in the rim's plane (all three corners
-        // within `h` of it), the plane's dominant axis dropped: the piece covering its cap itself there.
-        const auto coversOwn = [&](const Cand& cd, const std::vector<Vec3>& pts, double h) {
-            const Vec3 an{std::fabs(cd.nrm.x), std::fabs(cd.nrm.y), std::fabs(cd.nrm.z)};
-            const int drop = an.x >= an.y && an.x >= an.z ? 0 : an.y >= an.z ? 1 : 2;
-            const auto u2 = [&](const Vec3& p) { return drop == 0 ? p.y : p.x; };
-            const auto v2 = [&](const Vec3& p) { return drop == 2 ? p.y : p.z; };
+        // Whether `x` lies within `h` of one of piece `cd`'s own faces (each face's box first).
+        const auto onOwn = [&](const Cand& cd, const Vec3& x, double h) {
             for (size_t i : cd.faces) {
                 const Tri& t = *tris[i];
-                if (std::fabs(dot(t.v0 - cd.c, cd.nrm)) > h || std::fabs(dot(t.v1 - cd.c, cd.nrm)) > h ||
-                    std::fabs(dot(t.v2 - cd.c, cd.nrm)) > h)
+                if (x.x < std::min({t.v0.x, t.v1.x, t.v2.x}) - h || x.x > std::max({t.v0.x, t.v1.x, t.v2.x}) + h ||
+                    x.y < std::min({t.v0.y, t.v1.y, t.v2.y}) - h || x.y > std::max({t.v0.y, t.v1.y, t.v2.y}) + h ||
+                    x.z < std::min({t.v0.z, t.v1.z, t.v2.z}) - h || x.z > std::max({t.v0.z, t.v1.z, t.v2.z}) + h)
                     continue;
-                const double ax = u2(t.v0), ay = v2(t.v0), bx = u2(t.v1) - ax, by = v2(t.v1) - ay;
-                const double cx = u2(t.v2) - ax, cy = v2(t.v2) - ay, det = bx * cy - by * cx;
-                if (!(std::fabs(det) > 0.0)) continue;
-                for (const Vec3& x : pts) {
-                    const double px = u2(x) - ax, py = v2(x) - ay;
-                    const double s = (px * cy - py * cx) / det, w = (bx * py - by * px) / det;
-                    if (s >= 0.0 && w >= 0.0 && s + w <= 1.0) return true;
-                }
+                if (pointTriDistSq(x, t.v0, t.v1, t.v2) <= h * h) return true;
             }
             return false;
         };
@@ -363,28 +360,30 @@ inline size_t markSolidFaces(Tri* const* tris, size_t n, std::vector<PieceBox>* 
             const double nl = std::sqrt(dot(nrm, nrm));
             const Vec3 ext = phi[pc] - plo[pc];
             const double pd = std::sqrt(dot(ext, ext));
-            if (!(nl > 1e-12 * pd * pd)) continue;   // no area: no plane to close it by
+            if (!(nl > 1e-12 * pd * pd)) continue;   // no area: no fan to close it by
             nrm = nrm * (1.0 / nl);
-            bool planar = true;
-            for (const Vec3& p : rim) planar = planar && std::fabs(dot(p - c, nrm)) <= 1e-6 * pd;
-            if (!planar) continue;
+            double spread = 0.0;                     // the rim's farthest corner off its mean plane
+            for (const Vec3& p : rim) spread = std::max(spread, std::fabs(dot(p - c, nrm)));
+            if (spread <= 1e-6 * pd) spread = 0.0;   // planar, to within rounding
             cd.c = c; cd.nrm = nrm;
-            // Its volume about the rim's centre, the cap's own tetrahedra nothing there; a flat piece (a
-            // card, the floor, a light's quad) closes nothing, and asks capOk nothing.
+            // Its volume about the centroid, the fan's own tetrahedra nothing there; a flat piece (a card,
+            // the floor, a light's quad) closes nothing, and asks capOk nothing.
             for (size_t i : cd.faces) {
                 const Vec3 a = tris[i]->v0 - c, b = tris[i]->v1 - c, d = tris[i]->v2 - c;
                 cd.vol += dot(a, cross(b, d));
             }
             if (std::fabs(cd.vol) <= 1e-9 * pd * pd * pd) continue;
-            // The points a face must cover: the rim's centre, and a tenth of the way in from a dozen of
-            // its corners at most.
+            // The points a face must cover: the centroid, and a tenth of the way in from a dozen of the
+            // rim's corners at most -- on the fan.
             double reach = 0.0;
             for (const Vec3& p : rim) reach = std::max(reach, length(p - c));
             std::vector<Vec3> pts{c};
             const size_t step = std::max<size_t>(1, rim.size() / 12);
             for (size_t i = 0; i < rim.size(); i += step) pts.push_back(rim[i] + (c - rim[i]) * 0.1);
-            // Within a thousandth of the reach of the plane, as far as capOk's rays look across it.
-            if (coversOwn(cd, pts, 1e-3 * reach) || !(*capOk)(nrm, pts, reach)) continue;
+            // The piece's own faces cover nothing: what it rests on is something else.
+            if (!(*capOk)(nrm, pts, reach, 2.0 * spread,
+                          [&](const Vec3& x, double rad) { return onOwn(cd, x, rad); }))
+                continue;
             cd.capped = true;
         }
     }
@@ -408,7 +407,15 @@ inline size_t markSolidFaces(Tri* const* tris, size_t n, std::vector<PieceBox>* 
         if (pieceOf && (s == 1 || s == 2)) (*pieceOf)[i] = piece;
         if (boxes && s && boxOf[(size_t)piece] < 0) {
             boxOf[(size_t)piece] = (int)boxes->size();
-            boxes->push_back(PieceBox{plo[(size_t)piece], phi[(size_t)piece], tris[i]->matId});
+            boxes->push_back(PieceBox{plo[(size_t)piece], phi[(size_t)piece], tris[i]->matId, {}, 0});
+        }
+        if (boxes && s) {
+            PieceBox& pb = (*boxes)[(size_t)boxOf[(size_t)piece]];
+            if (++pb.count <= kPieceNearFaces) {
+                pb.faces.push_back(tris[i]->v0); pb.faces.push_back(tris[i]->v1); pb.faces.push_back(tris[i]->v2);
+            } else if (!pb.faces.empty()) {
+                std::vector<Vec3>().swap(pb.faces);
+            }
         }
     }
     return marked;

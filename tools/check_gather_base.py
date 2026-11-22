@@ -2,9 +2,9 @@
 
     python tools/check_gather_base.py [--out png/check_gather_base] [--exe ftrace.exe]
                                       [--objects diffuse,mirror,coated,coaster,openbox,openbox_lifted,
-                                                 tower,isotower,towerfar,opentower,litbox,litbox_closed,
-                                                 ball,meshball,diffuseball,smallball,mirrorsheet,lampsheet,
-                                                 tablesheet]
+                                                 openbox_hover,tower,isotower,towerfar,opentower,litbox,
+                                                 litbox_closed,ball,meshball,diffuseball,smallball,
+                                                 mirrorsheet,lampsheet,tablesheet]
 
 A closed 3 cm box (six quads) standing on a lit floor, seen from straight above, modes M and S at a
 pinned gather radius of 0.1 on the CPU and the GPU, against mode R on the GPU. A mode-M or mode-S
@@ -31,7 +31,12 @@ for a face within 5e-4 of the rim's reach from its corners, 0.1 mm here -- and i
 still shadows the floor inside it: its lid counts toward the parity, which the walls confirm along the
 low leg from the gather point to the column, 1 % of the radius over the floor (1 mm; lifted 1 mm, the
 leg passed under the walls and the floor under the box counted, 0.68 of mode R). The render's own
-`[gather]` count must say it is not capped, or it tests the cap instead (MARKS). A diffuse box 30 cm
+`[gather]` count must say it is not capped, or it tests the cap instead (MARKS). `openbox_hover` is the
+same box resting on the floor at the frame's instant, where its faces are stored, and raised 5 cm by a
+mover's keys over the motion interval, seen through a shutter over its second half: capped as it rests,
+its probes see it where it is at the path's time, 2.5-5 cm up, and the low leg must pass under its walls
+there, so the floor under it counts as its twin's does (TWINS) -- the same motion 0.25 mm higher, out of
+the cap's reach at the instant: the same scene to within that, mode for mode. A diffuse box 30 cm
 tall (`tower`), off to one side so the foot of its near
 face is seen past its top: every probe over it begins inside it, r above the floor, and crosses none
 of its faces going down, so it must know from the path up from the gather point and across that it
@@ -99,20 +104,18 @@ def quad(o, u, v, mat):
     return "quad { origin %g %g %g  u %g %g %g  v %g %g %g  material %s }" % (o + u + v + (mat,))
 
 
-def box(x0, y0, z0, x1, y1, z1, mat):
-    """Six quads, normals out (u x v)."""
+def box(x0, y0, z0, x1, y1, z1, mat, bottom=True):
+    """Six quads, normals out (u x v); without `bottom`, five, open along the bottom's rim."""
     dx, dy, dz = x1 - x0, y1 - y0, z1 - z0
-    return [quad((x0, y1, z0), (0, 0, dz), (dx, 0, 0), mat), quad((x0, y0, z0), (dx, 0, 0), (0, 0, dz), mat),
-            quad((x0, y0, z0), (0, dy, 0), (dx, 0, 0), mat), quad((x0, y0, z1), (dx, 0, 0), (0, dy, 0), mat),
-            quad((x0, y0, z0), (0, 0, dz), (0, dy, 0), mat), quad((x1, y0, z0), (0, dy, 0), (0, 0, dz), mat)]
+    return ([quad((x0, y1, z0), (0, 0, dz), (dx, 0, 0), mat)] +
+            ([quad((x0, y0, z0), (dx, 0, 0), (0, 0, dz), mat)] if bottom else []) +
+            [quad((x0, y0, z0), (0, dy, 0), (dx, 0, 0), mat), quad((x0, y0, z1), (dx, 0, 0), (0, dy, 0), mat),
+             quad((x0, y0, z0), (0, 0, dz), (0, dy, 0), mat), quad((x1, y0, z0), (0, dy, 0), (0, 0, dz), mat)])
 
 
 def open_box(x0, y0, z0, x1, y1, z1, mat):
-    """box()'s quads without its bottom face: five, open along the bottom's rim."""
-    bottom = "origin %g %g %g  u %g 0 0" % (x0, y0, z0, x1 - x0)
-    faces = [f for f in box(x0, y0, z0, x1, y1, z1, mat) if bottom not in f]
-    assert len(faces) == 5
-    return faces
+    """box() without its bottom face."""
+    return box(x0, y0, z0, x1, y1, z1, mat, bottom=False)
 
 
 def write_ball_obj(path, r, n=48):
@@ -153,6 +156,8 @@ def write_ball_obj(path, r, n=48):
 TOP_EYE = 0.9       # the view from above: its eye's height over the box's middle
 TOP_CAM = 'camera "c" { eye 0 %g 0.0001  look_at 0 0 0  up 0 0 1  fov_y %g  film { res %d %d } }' % (
     TOP_EYE, 2 * np.degrees(np.arctan(HALF / TOP_EYE)), W, H)
+# The same view with a shutter over the second half of a motion interval of [0, 1] (SCENE_EXTRA).
+HOVER_CAM = TOP_CAM.replace("film {", "shutter_open 0.5  shutter_close 1  film {")
 SW, SH, SFOV = 160, 100, 30.0
 SEYE, SLOOK = np.array([0.0, 0.06, 0.55]), np.array([0.0, 0.03, 0.0])
 SIDE_CAM = 'camera "c" { eye %g %g %g  look_at %g %g %g  up 0 1 0  fov_y %g  film { res %d %d } }' % (
@@ -224,6 +229,22 @@ def box_floor(X, Z, height):
     half = HALF / W                                         # half a pixel, on the floor
     near = np.maximum(np.abs(X) - half, np.abs(Z) - half) - BOX
     return np.where((d >= 0) & (near < BOX * height / (TOP_EYE - height)), np.nan, d)
+
+
+def hover_lines(mat, lift=0.0, up=0.05, height=0.03):
+    """The open box `lift` over the floor, raised `up` more over the motion interval [0, 1] by a mover's
+    keys, so at the frame's instant (0), where its faces are stored, it stands `lift` up."""
+    keys = "group { motion { key { translate 0 0 0 } key { translate 0 %g 0 } }" % up
+    return [mat, keys] + open_box(-BOX, lift, -BOX, BOX, lift + height, BOX, "obj") + ["}"]
+
+
+def _hover(mat, up=0.05, height=0.03):
+    """hover_lines' box resting on the floor at the instant, seen over [0.5, 1] of its rise; its twin
+    (TWINS) the same 0.25 mm higher, clear of the cap's reach at the instant; rings out from its base
+    clear of its top seen from above."""
+    return (hover_lines(mat, 0.0, up, height), HOVER_CAM,
+            lambda: top_dist(lambda X, Z: box_floor(X, Z, up + height)), ((0.02, 0.05), (0.05, 0.08)),
+            "the base", "twin")
 
 
 def _box(mat, height=0.03, bottom=True, lift=0.0):
@@ -315,6 +336,8 @@ OBJECTS = {
     # faces cannot say their side and hold no photon: its lid still puts the floor inside it out
     # of the parity, which its walls confirm along the low leg.
     "openbox": _box('material "obj" { type glossy reflect 0.6 roughness 0.3 }', bottom=False),
+    # The same box held 5 cm up by a mover's keys, against the box authored there (TWINS).
+    "openbox_hover": _hover('material "obj" { type glossy reflect 0.6 roughness 0.3 }'),
     # The same box lifted 0.25 mm: its rim rests on nothing, so nothing closes it, and the low leg, 1 mm
     # up, still meets its walls.
     "openbox_lifted": _box('material "obj" { type glossy reflect 0.6 roughness 0.3 }', bottom=False,
@@ -358,13 +381,20 @@ OBJECTS = {
 
 # The faces the probes' marking pass takes as a solid's, which the case's renders must report
 # (`[gather] N of M triangles`): what a case tests holds only while its object is marked as it supposes.
-MARKS = {"openbox": 10, "openbox_lifted": 0, "opentower": 10, "litbox": 10, "litbox_closed": 12}
+MARKS = {"openbox": 10, "openbox_lifted": 0, "openbox_hover": 10, "opentower": 10, "litbox": 10,
+         "litbox_closed": 12}
+# A case held to its twin (`against` "twin"): the scene lines of the same thing put another way, rendered
+# with the same arguments and seeds, each ring within TWIN_TOL of the twin's.
+TWINS = {"openbox_hover": hover_lines('material "obj" { type glossy reflect 0.6 roughness 0.3 }', 0.00025)}
+TWIN_TOL = 0.04
+# What a case's `scene { }` line adds.
+SCENE_EXTRA = {"openbox_hover": "  motion_interval 0 1"}
 GATHER_LINE = re.compile(r"\[gather\] (\d+) of (\d+) triangles")
 
 
-def scene(obj_lines, cam):
+def scene(obj_lines, cam, extra=""):
     return NL.join([
-    "scene { units meters }",
+    "scene { units meters%s }" % extra,
     cam,
     'material "floor" { type diffuse reflect 0.5 }',
     'material "gl" { type glossy reflect 0.6 roughness 0.3 }',
@@ -407,14 +437,18 @@ def main():
         lines, cam, distf, rings, base, against = OBJECTS[bname]
         dist = distf()                                 # each pixel's floor distance from `base`
         path = os.path.join(out, "obj_%s.ftsl" % bname)
-        cm.write(path, scene(lines, cam))
+        cm.write(path, scene(lines, cam, SCENE_EXTRA.get(bname, "")))
+        twin = os.path.join(out, "obj_%s_twin.ftsl" % bname)
+        if against == "twin":
+            cm.write(twin, scene(TWINS[bname], cam, SCENE_EXTRA.get(bname, "")))
 
         logs = []
 
-        def image(tag, args, gpu):
-            runs = [cm.render(exe, out, path, "%s_%s_%d" % (bname, tag, s), args, seed=s, want_gpu=gpu)
-                    for s in (1, 2)]
-            logs.extend(r[2] for r in runs)
+        def image(tag, args, gpu, scene_path=None):
+            runs = [cm.render(exe, out, scene_path or path, "%s_%s_%d" % (bname, tag, s), args, seed=s,
+                              want_gpu=gpu) for s in (1, 2)]
+            if scene_path is None:
+                logs.extend(r[2] for r in runs)
             return np.mean([cm.lum(r[0]) for r in runs], axis=0)
 
         R = image("R_gpu", REF, True) if against == "R" else None   # a ball's ring is held to U
@@ -429,10 +463,17 @@ def main():
             # (`against`); not for -gageom, which the pairs below hold to the probe.
             U = (image(name + "_uncovered", args + ["-gatherarea", "0"], "gpu" in name)
                  if against in ("uncovered", "coverage") and "gageom" not in name else None)
+            T = image(name + "_twin", args, "gpu" in name, twin) if against == "twin" else None
             for lo, hi in rings:
                 m = (dist >= lo) & (dist < hi)
                 q = got[name, lo] = M[m].mean() / (R[m].mean() if R is not None else 1.0)
-                if U is None and against == "R":
+                if T is not None:
+                    t = M[m].mean() / T[m].mean()
+                    good = abs(t - 1.0) <= TWIN_TOL
+                    ok &= good
+                    print("%-9s %-12s floor %2.0f-%2.0f cm from %s: %.3f of its twin's  %s" % (
+                        bname, name, lo * 100, hi * 100, base, t, "ok" if good else "FAIL"), flush=True)
+                elif U is None and against == "R":
                     good = abs(q - 1.0) <= TOL
                     ok &= good
                     print("%-9s %-12s floor %2.0f-%2.0f cm from %s: %.3f of mode R  %s" % (

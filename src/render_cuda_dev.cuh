@@ -8752,20 +8752,20 @@ __device__ static inline bool dOnGatherSurfaceSided(const DVec3& x, const DVec3&
 // does not pass that the segment from `o` along unit `d`, `len` long, crosses, curves unseen, the
 // side of the last closed solid's (+1 it ends inside, -1 outside, 0 none) and how many cannot say
 // theirs (up to 15). `eps`: how far past a face crossed it goes on from.
-struct DSegmentCrossings { int side; int open; };
+struct DSegmentCrossings { int side; int open; int solids; };
 // The distance a trace that leaves hit h at exactly h.p must skip to clear its own primitive, whose error
 // near the origin outgrows dEpsAt.
 __device__ static inline Real dHitEps(const DHit& h) {
     return fmax(dEpsAt(h.p), dReachEps(h.pscale));
 }
 __device__ static DSegmentCrossings dWalkSegment(const DScene& sc, DVec3 o, const DVec3& d, Real len, Real eps) {
-    DSegmentCrossings c{0, 0};
+    DSegmentCrossings c{0, 0, 0};
     Real done = (Real)0;
     for (int k = 0; k < 32 && done < len && c.open < 15; ++k) {
         const DHit h = closestHit(sc, o, d, (Real)0, len - done, false, len - done);
         if (!h.valid) break;
         if (!dPassesLight(sc, sc.mats[h.matId])) {
-            if (h.solid) c.side = ((h.solid > 0) == h.back) ? -1 : 1;
+            if (h.solid) { c.side = ((h.solid > 0) == h.back) ? -1 : 1; ++c.solids; }
             else ++c.open;
         }
         const Real step = fmax(eps, dHitEps(h));   // past this face, by its own error at least
@@ -8822,7 +8822,7 @@ __device__ static DProbe dCoverageProbe(const DScene& sc, const DVec3& p, const 
         // The low leg, from just over the gather point to the column's foot: asked once, and only
         // once what lies above puts the column inside (host twin).
         bool legAsked = false;
-        DSegmentCrossings leg{0, 0};
+        DSegmentCrossings leg{0, 0, 0};
         const auto lowLeg = [&]() -> const DSegmentCrossings& {
             if (!legAsked) {
                 legAsked = true;
@@ -8832,11 +8832,12 @@ __device__ static DProbe dCoverageProbe(const DScene& sc, const DVec3& p, const 
             return leg;
         };
         // An odd parity whose low leg crosses an odd count too (a cup's wall, not a hovering sheet), or
-        // a closed solid's side the low leg enters or walls off (a box resting on the surface, not a
-        // room the gather point lies in, nor a mover clear of the surface): host twin's inside().
+        // a closed solid's side where the low leg crosses any closed solid's face (boxes resting on the
+        // surface, touching or not; not a room the gather point lies in, nor a mover clear of the
+        // surface): host twin's inside().
         const auto inside = [&]() {
             if ((crossed & 1) && (!(rr > (double)pathEps) || (lowLeg().open & 1))) return true;
-            return side() > 0 && (lowLeg().side > 0 || (lowLeg().open & 1));
+            return side() > 0 && lowLeg().solids > 0;
         };
         bool found = false;                  // the probe ended on what it counts
         bool ended = false;                  // ... or on what it does not

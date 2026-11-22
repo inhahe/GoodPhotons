@@ -6798,17 +6798,19 @@ as the one at fault.
   of its winding, the whole piece on the same side; the volume says out or in, and a piece of no
   volume (a double-sided card) is no solid. Corners weld at 1e-7 of the piece set's extent, never
   more than a thousandth of its shortest edge. **A piece open along a rim another face closes**
-  (0.451.14, PROBE-PARITY-LIMITS) is closed by that face's plane for the probes alone: a world mesh
-  object or loose piece whose every edge is used twice in opposite directions or once and whose every
-  face's corner normals lie on one side of its winding, the whole piece on the same side, the
-  once-used edges (its rim) in one plane (Newell's normal over them, each run as its one face runs
-  it), which another face covers where the rim encloses it (short rays across the plane at the rim's
-  centre and a tenth of the way in from its corners, meeting a face within 5e-4 of the rim's reach of
-  it: `capOk`; a piece that covers those points itself, lying in the plane there -- a near-flat sheet
-  its rounding leaves a volume, a ground whose border closes on its own flat part round a pit --
-  closes on nothing) -- a statue's open base on its floor, a bottomless box of quads on the ground. Its volume
-  taken about the rim's centre is the capped solid's (the cap's own tetrahedra vanish there; a flat
-  piece, a card or a light's quad, closes nothing and asks `capOk` nothing), and its faces are marked 3
+  (0.451.14, PROBE-PARITY-LIMITS) is closed by it for the probes alone: a world mesh object or loose
+  piece whose every edge is used twice in opposite directions or once and whose every face's corner
+  normals lie on one side of its winding, the whole piece on the same side, the once-used edges its
+  rim (Newell's normal over them, each run as its one face runs it), closed by the fan of triangles
+  from the rim's centroid -- planar or not (0.451.19: a statue's base on uneven ground) -- which
+  another face covers there (`capOk`: short rays along the normal at the centroid and a tenth of the
+  way in from the rim's corners, meeting a face not the piece's own within 5e-4 of the rim's reach of
+  the point, plus twice the rim's own spread off its mean plane; a point on the piece itself asks
+  nothing -- a hat's brim on the table -- but one at least must be another face's, so a near-flat
+  sheet its rounding leaves a volume, or a ground whose border closes on its own flat part round a
+  pit, closes on nothing) -- a statue's open base on its floor, a bottomless box of quads on the
+  ground. Its volume taken about the centroid is the capped solid's (the fan's own tetrahedra vanish
+  there; a flat piece, a card or a light's quad, closes nothing and asks `capOk` nothing), and its faces are marked 3
   or 4 (`Hit::solid` +-2), which the probes read by the sign and the enclosures (`enclosureAt`, a
   camera's or light's medium) and the `emit_two_sided` refusal do not: an upright cup's rim is planar
   too but closes on nothing, its floor lit through it. An asset's pieces are not capped (each
@@ -6830,10 +6832,13 @@ as the one at fault.
   is inside though the probe crosses none of its faces (the dark halo at such a base: within 2 cm of
   a 30 cm box the floor read 0.56 of its value at its true coverage before 0.434.10). The segment
   is one bounded `occluded` ray in open air, curves unseen, and is not traced at all where the
-  probe's own crossings decide, nor, on the host, where no closed solid's box comes within r√2 of the
+  probe's own crossings decide, nor, on the host, where no closed solid comes within r√2 of the
   gather point (`Scene::solidNear`: a tree over the boxes `markSolidFaces` takes -- each closed piece
   the classifier found, an asset's under each instance that places it, and every sphere and closed
-  isosurface light does not pass; off for a scene that moves). On gallery.ftsl the segments cost CPU mode M 7-15 %
+  isosurface light does not pass; off for a scene that moves -- where a world piece of 64 faces or
+  fewer is asked by its faces, not counting one in the gather point's own plane: a room's box holds
+  every gather point inside it, its walls and ceiling few of them, and its floor none. A capped room
+  cost CPU mode M 2 % before that, 0.451.17-0.451.18). On gallery.ftsl the segments cost CPU mode M 7-15 %
   without the boxes and about 4 % with them; GPU mode M 1 %, mode S nothing measurable. A solid's face in the band but above the plane, met
   from inside, is crossed and passed (PROBE-UNDERSIDE): a ball's tilted underside, which the band
   widens to take in, holds no photon facing the gather's way, and the floor below is the column's
@@ -6848,14 +6853,19 @@ as the one at fault.
   where the **low leg** agrees that a wall stands between it and the gather point (0.434.13 for the
   parity, 0.451.17 for a solid's side, REVIEW-0459; `inside()`): the segment from just over the
   gather point (1 % of r up) to the column's foot must cross an odd count of such faces too
-  (`walkSegment`'s `open`), or, for a solid's side, enter a solid (its `side`, +1) or cross an odd
-  count -- asked only once what lies above says inside. A bottomless box of quads, an open glossy cup
-  or a box standing on the surface walls its floor off, so it stays a miss; a sheet hovering over it
-  -- a diffuse table top, a mirror, a light's quad -- encloses nothing, and the floor under it, lit
-  from the sides, is covered; and a room the gather point lies in itself is no wall to its own floor,
-  closed (six quads, a solid) or capped, however much lower than r its lid (`check_gather_base`'s
-  `litbox` and `litbox_closed`: their floor read 9.0 of the uncorrected render with the solid's side
-  alone). `-gageom`'s march climbs and
+  (`walkSegment`'s `open`), or, for a solid's side, cross any closed solid's face (its `solids`, either
+  way: boxes touching face to face or overlapping, whose last face or coincident pair says nothing
+  reliable, wall the column off all the same; 0.451.19, REVIEW-0460) -- asked only once what lies
+  above says inside. A bottomless box of quads, an open glossy cup or a box standing on the surface
+  walls its floor off, so it stays a miss; a sheet hovering over it -- a diffuse table top, a mirror,
+  a light's quad -- encloses nothing, and the floor under it, lit from the sides, is covered; and a
+  room the gather point lies in itself is no wall to its own floor, closed (six quads, a solid) or
+  capped, however much lower than r its lid, nor is an open quad or cup standing in it
+  (`check_gather_base`'s `litbox` and `litbox_closed`: their floor read 9.0 of the uncorrected render
+  with the solid's side alone). What it reads short: the floor past a closed pillar in a room lower
+  than r, the pillar a wall to it. `openbox_hover`, a box held up by a mover's keys from faces stored
+  on the floor, holds the floor under it to the same box authored up there: the probes see it at the
+  path's time, and its leg passes under. `-gageom`'s march climbs and
   decides each in-band layer of a column by the faces above it: the next solid face it meets above
   the layer, met from inside meaning inside, and the parity of the rest, so a coaster's top counts
   while the floor inside the coaster under it does not; a layer no solid face in the window decides
@@ -6872,8 +6882,8 @@ as the one at fault.
   3 cm box at radius 0.1; 0.99 with the count). A closed shelf hovering within the radius is
   crossed twice, and the floor under it counts (the plain disc average across its shadow). What the
   count still misreads (known-issues PROBE-PARITY-LIMITS): an open solid taller than the radius whose
-  hole is not closed by a face it rests on -- not planar, an asset's, or a mover's that does not rest
-  where its faces are stored -- holds the probe's
+  hole is not closed by a face it rests on -- an asset's, or a mover's that does not rest at the frame's
+  instant, where its faces are stored -- holds the probe's
   origin, so nothing is crossed and the floor under it counts.
   `-gageom`'s march takes the same count per column, looking for crossings as high as the probe
   does, r above the plane (0.433.7): a column near the disc's edge has a short chord, and a box top
