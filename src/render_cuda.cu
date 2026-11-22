@@ -1431,6 +1431,7 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
         coat.reflectTex = -1;
         coat.reflectPat = -1;
         coat.mixCount = 0;
+        coat.straight = 0;      // a glossy lobe passes no light straight on, whatever its parent's body does
         coat.coatChild = -1;
         coat.coatLobe = 1;
         coat.coatStack = -1;

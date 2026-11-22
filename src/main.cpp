@@ -16657,14 +16657,14 @@ static int glowMatSeen(const Scene& scene, const Hit& h, const Vec3& d, double l
 // What a camera ray `r` sees of a glow at its hit `h` (glowMatSeen), in XYZ, times `w` (a lens's
 // weight, else 1): a plain glow's whole emission -- Scene::glowXYZ times its pattern at the hit --
 // where `mono` is false and no medium dims it; else its emission at the one wavelength `lambda`, drawn
-// uniformly over [360, 830] nm (hence that span), dimmed by the media along the ray (drawn from `rng`).
+// uniformly over [LAMBDA_MIN, LAMBDA_MAX] (hence that span), dimmed by the media along the ray (drawn from `rng`).
 // `u1` and `u2` draw a compound's coin and child. `perSample`: the sample is filed by its own first
 // surface, as mode P's blurred split files it (BackwardRenderer::noteFirstSurface), so a glow on a
 // specular-type surface is left to the camera side, whose specular film has it. `camMed`: the solid
 // the camera is in (Camera::medium), or -1, whose absorption the ray takes on its way to the glow.
 static Vec3 glowSeenXYZ(const Scene& scene, const Hit& h, const Ray& r, bool mono, double lambda,
                         double u1, double u2, Pcg32& rng, double w, bool perSample, int camMed) {
-    constexpr double kLo = 360.0, kHi = 830.0;
+    constexpr double kLo = LAMBDA_MIN, kHi = LAMBDA_MAX;
     if (perSample && BackwardRenderer::specularFirstSurface(scene, h)) return Vec3{0, 0, 0};
     bool resolved = false;
     const int id = glowMatSeen(scene, h, r.d, lambda, u1, u2, resolved);
@@ -16715,7 +16715,7 @@ static Vec3 skySeenThroughXYZ(const Scene& scene, const Ray& r, const Hit& first
     double T = 1.0, dist = 0.0;
     Vec3 acc{0, 0, 0};   // the glows of the surfaces crossed
     const StraightWalk sw = walkStraight(scene, r.o, r.d, 1e30, Scene::kTminEps, 0.0, LegRule{effMaxBounce(), split},
-        CamAt::Start, [&](const Vec3& from, const Hit& h, const Material& m, bool) {
+        CamAt::Start, [&](const Vec3& from, const Hit& h, const Material& m) {
             if (glowAt)
                 acc += glowSeenXYZ(scene, h, Ray{from, r.d}, /*mono=*/true, lambda, u1, u2, rng,
                                    w * T * legAbsorption(scene, camMed, dist, lambda), /*perSample=*/false, camMed);
@@ -16723,7 +16723,7 @@ static Vec3 skySeenThroughXYZ(const Scene& scene, const Ray& r, const Hit& first
             if (med) T *= Renderer::mediaTransmittance(scene, from, r.d, h.t, lambda, rng);
             dist += h.t;
             return T > 0.0;
-        }, [](bool) {}, &first);
+        }, &first);
     if (sw.end == StraightEnd::Stopped) return acc;
     if (sw.end == StraightEnd::Met) {
         if (!glow) return acc;
@@ -16756,21 +16756,17 @@ static Vec3 skySeenThroughXYZ(const Scene& scene, const Ray& r, const Hit& first
 // (addEnvBackground, which adds it to a film, has the why). Apart so that a caller timing its own
 // work -- a live window's repaint -- can do this first and leave it out of the repaint's cost.
 // False where this pass draws no sky: none in the scene, or a camera under a blur. The glows the
-// camera sees (glowMatSeen) are drawn the same way; `glowsOnly` draws them alone, for mode P's still
-// composite, whose sky the camera side has -- but for the sky seen through a filter (skySeenThrough),
-// which the composite takes from the forward layer (classifyComposite).
+// camera sees (glowMatSeen) are drawn the same way.
 // `skip`, where given: per pixel, nonzero where nothing reads the sums (a still composite's pixels that are
-// not CompositeClass::DIFF), which then take no samples.
+// not CompositeClass::DIFF: its forward layer's, whose escaping samples, at a silhouette or past a fog's
+// bounds, see the sky as this pass draws it), which then take no samples.
 static bool prepareSky(SkyView& view, const Scene& scene, const Camera& cam, int rx, int ry,
-                       long long N, bool glowsOnly = false, const std::vector<char>* skip = nullptr) {
-    const bool haveEnv = !glowsOnly && scene.envIndex >= 0, haveSun = !glowsOnly && scene.sunCount > 0;
+                       long long N, const std::vector<char>* skip = nullptr) {
+    const bool haveEnv = scene.envIndex >= 0, haveSun = scene.sunCount > 0;
     const bool haveGlow = scene.glowAny;
-    // Anything seen through a gel, a half mirror or a medium (skySeenThrough) is a draw a sample, and
-    // the sky behind one is drawn in a glows-only pass too.
+    // Anything seen through a gel, a half mirror or a medium (skySeenThrough) is a draw a sample.
     const bool throughDrawn = scene.passThroughAny || !scene.media.empty();
-    const bool envThrough = scene.envIndex >= 0, sunThrough = scene.sunCount > 0;
-    if ((!haveEnv && !haveSun && !haveGlow && !(throughDrawn && (envThrough || sunThrough))) ||
-        cam.seesMotion(scene))
+    if ((!haveEnv && !haveSun && !haveGlow) || cam.seesMotion(scene))
         return false;
     constexpr double kLo = LAMBDA_MIN, kHi = LAMBDA_MAX;
     constexpr long long kFirst = 64;      // a pinhole's whole count; a lens's first
@@ -16815,8 +16811,8 @@ static bool prepareSky(SkyView& view, const Scene& scene, const Camera& cam, int
         Pcg32 g;
         seedUnit(g, pix, 0x61C0FFEE5EE0ULL ^ ((uint64_t)k * 0x9E3779B97F4A7C15ULL));
         const double u1 = g.uniform(), u2 = g.uniform();
-        return skySeenThroughXYZ(scene, r, h, kLo + (kHi - kLo) * u, u1, u2, g, 1.0, cam.medium(), envThrough,
-                                 sunThrough, haveGlow);
+        return skySeenThroughXYZ(scene, r, h, kLo + (kHi - kLo) * u, u1, u2, g, 1.0, cam.medium(), haveEnv,
+                                 haveSun, haveGlow);
     };
     // A pinhole pixel's samples [k0, k1), points of its rotated Halton (2,3) lattice, added to `s`
     // in k order. Every one is traced: a feature thinner than the lattice's spacing (a strand, a
@@ -16869,7 +16865,7 @@ static bool prepareSky(SkyView& view, const Scene& scene, const Camera& cam, int
             Vec3 c{0, 0, 0};
             if (throughDrawn && skySeenThrough(scene, r, h)) {
                 const double u1 = rng.uniform(), u2 = rng.uniform();
-                c = skySeenThroughXYZ(scene, r, h, lambda, u1, u2, rng, wLens, cam.medium(), envThrough, sunThrough,
+                c = skySeenThroughXYZ(scene, r, h, lambda, u1, u2, rng, wLens, cam.medium(), haveEnv, haveSun,
                                       haveGlow);
                 if (!(c.x + c.y + c.z > 0.0)) continue;
             } else if (h.valid) {
@@ -16991,7 +16987,7 @@ static bool splitSeesSkyThrough(const Scene& scene) {
 static void addBlurredSkyRows(Film& film, const Scene& scene, const Camera& cam, long long N,
                               int nCamsSharing, uint64_t seedBase, int y0, int y1,
                               bool glowsOnly = false) {
-    constexpr double kLo = 360.0, kHi = 830.0;
+    constexpr double kLo = LAMBDA_MIN, kHi = LAMBDA_MAX;
     const bool haveEnv = !glowsOnly && scene.envIndex >= 0, haveSun = !glowsOnly && scene.sunCount > 0;
     const bool haveGlow = scene.glowAny;
     if ((!haveEnv && !haveSun && !haveGlow && !(glowsOnly && splitSeesSkyThrough(scene))) || N <= 0 ||
@@ -17619,26 +17615,30 @@ static Film renderBdpt(const Scene& scene, const Camera& cam, int resX, int resY
 // specular-side pixels. The result is one true-radiance image.
 //
 // NOTE: fluorescence is unsupported here (the backward tracer can't reradiate) —
-// same caveat as modes R/V. Classification uses the pixel-centre camera ray, so
-// silhouette pixels are assigned wholesale to one side (a sub-pixel edge approx).
+// same caveat as modes R/V. Classification uses the pixel-centre camera ray: a backward pixel shows
+// everything its samples see, and a forward one its samples' diffuse surfaces and their sky (the sky
+// pass), but nothing of a specular surface on part of it (a sub-pixel edge approx).
 // Per-pixel first-hit classification for the mode-P composite (view-dependent, so it is
 // computed ONCE and reused across every progressive pass). Each pixel is DIFF (forward
-// model-B layer), SPEC (camera-side backward layer fills the SDS specular gap), or SKY
-// (directly-viewed environment). `skyXYZ` holds the env radiance per SKY pixel.
+// model-B layer) or SPEC (camera-side backward layer: the SDS specular gap, and the sky).
 struct CompositeClass {
-    enum { DIFF = 0, SPEC = 1, SKY = 2 };
+    enum { DIFF = 0, SPEC = 1 };
     std::vector<char> cls;
-    std::vector<Vec3> skyXYZ;   // populated only for env scenes
-    long long nSpec = 0, nSky = 0;
+    long long nSpec = 0;
 };
+
+// Whether a sun or a sky lights a medium with no bounds that attenuates: a haze the forward modes light
+// only near the scene, sending that light in through a disc the scene's size (warnHazeOnlyNearScene),
+// where mode R lights all of it.
+static bool skyLitHaze(const Scene& scene) {
+    return (scene.sunCount > 0 || scene.envIndex >= 0) && scene.unboundedHaze();
+}
 
 static CompositeClass classifyComposite(const Scene& scene, const Camera& cam,
                                         int resX, int resY) {
     CompositeClass cc;
     cc.cls.assign((size_t)resX * resY, CompositeClass::DIFF);
-    const bool unboundedHaze = std::any_of(scene.media.begin(), scene.media.end(),
-                                           [](const Medium& md) { return !md.bounded && md.attenuates(); });
-    if (scene.envIndex >= 0) cc.skyXYZ.assign(cc.cls.size(), {});
+    const bool hazeSky = skyLitHaze(scene);
     for (int py = 0; py < resY; ++py)
         for (int px = 0; px < resX; ++px) {
             size_t i = (size_t)py * resX + px;
@@ -17654,17 +17654,12 @@ static CompositeClass classifyComposite(const Scene& scene, const Camera& cam,
                 continue;
             }
             if (!h.valid) {
-                // The sky seen through a bounded medium is the forward layer's: its sky pass dims it, and
-                // its photons hold the medium's glow in front of it (prepareSky's glows-only pass draws
-                // what skySeenThrough sees). Through an unbounded one it is the backward layer's: the
-                // forward one lights such a haze only near the scene (warnHazeOnlyNearScene).
-                if (scene.envIndex >= 0 && !skySeenThrough(scene, r, h)) {
-                    cc.cls[i] = CompositeClass::SKY;
-                    cc.skyXYZ[i] = scene.envXYZForDir(r.d); ++cc.nSky;
-                } else if (scene.envIndex >= 0 && unboundedHaze) {
-                    cc.cls[i] = CompositeClass::SPEC; ++cc.nSpec;
-                }
-                // (no env => leave as DIFF; the forward film is legitimately black there)
+                // The sky is the backward layer's: it draws the sky and a sun's disc as mode R does, and they
+                // stay out of forwardScale's fit. But seen through a bounded medium it is the forward
+                // layer's: its sky pass dims it, and its photons hold the medium's glow in front of it --
+                // unless the medium is an unbounded one a sun or the sky lights, which the forward layer
+                // lights only near the scene.
+                if (!skySeenThrough(scene, r, h) || hazeSky) { cc.cls[i] = CompositeClass::SPEC; ++cc.nSpec; }
             } else if (BackwardRenderer::specularFirstSurface(scene, h)) {
                 cc.cls[i] = CompositeClass::SPEC; ++cc.nSpec;
             }
@@ -17714,8 +17709,7 @@ static double forwardScale(const Film& fwd, double invF, const Film& ref, double
 // When `verbose` prints the scale/residual diagnostics (once, at the final write). `glow`: the
 // glows the camera sees, which the forward film lacks (forwardPixel), or null.
 static Film compositeFromFilms(const Film& fwd, long long N, const Film& ref, long long spp,
-                               const CompositeClass& cc, bool envScene, bool verbose,
-                               const SkyView* glow = nullptr) {
+                               const CompositeClass& cc, bool verbose, const SkyView* glow = nullptr) {
     using CC = CompositeClass;
     const double invF = 1.0 / (double)N, invR = 1.0 / (double)spp;
     const auto& cls = cc.cls;
@@ -17733,14 +17727,10 @@ static Film compositeFromFilms(const Film& fwd, long long N, const Film& ref, lo
 
     Film comp; comp.resX = fwd.resX; comp.resY = fwd.resY; comp.alloc();
     for (size_t i = 0; i < cls.size(); ++i)
-        comp.xyz[i] = (cls[i] == CC::SPEC) ? ref.xyz[i] * invR
-                    : (cls[i] == CC::SKY)  ? cc.skyXYZ[i]
-                                           : forwardPixel(fwd, i, glow, N) * (invF / s);
+        comp.xyz[i] = (cls[i] == CC::SPEC) ? ref.xyz[i] * invR : forwardPixel(fwd, i, glow, N) * (invF / s);
     if (verbose) {
-        std::printf("[composite] forward->radiance scale s=%.6g  specular-first pixels=%lld/%lld\n",
+        std::printf("[composite] forward->radiance scale s=%.6g  specular-first and sky pixels=%lld/%lld\n",
                     s, cc.nSpec, (long long)cls.size());
-        if (envScene)
-            std::printf("[composite] env background on %lld escaped (sky) pixels\n", cc.nSky);
         std::printf("[composite] diffuse-side residual (forward/s vs backward) rel RMSE=%.4f\n", rmse);
     }
     return comp;
@@ -19909,10 +19899,7 @@ static bool resolveCameraModes(Scene& scene, const std::vector<CamRequest>& cams
 // session, which reloads its scenes for every frame, from repeating it for any of them.
 static void warnHazeOnlyNearScene(const Scene& scene, const std::vector<char>& modes,
                                   const char* scenePath) {
-    if (scene.sunCount == 0 && scene.envIndex < 0) return;
-    if (std::none_of(scene.media.begin(), scene.media.end(),
-                     [](const Medium& md) { return !md.bounded && md.attenuates(); }))
-        return;
+    if (!skyLitHaze(scene)) return;
     std::string which;   // the affected modes, each once, in the order the cameras use them
     for (char m : modes)
         if (modeLightsHazeOnlyNearScene(m) && which.find(m) == std::string::npos) which += m;
@@ -20274,7 +20261,6 @@ static int runCompositeProgressive(
     using clk = std::chrono::steady_clock;
     if (intervalSec <= 0.0) intervalSec = 15.0;
     const bool absolute = scene.absolute;
-    const bool envScene = scene.envIndex >= 0;
     const bool budgeted = timeBudgetSec > 0.0 || noiseTarget > 0.0 || runForever;
     // Photons traced per backward sample-per-pixel, so the two halves grow at the ratio the
     // user requested (N photons alongside spp samples). Defaults keep both halves nonzero.
@@ -20339,7 +20325,7 @@ static int runCompositeProgressive(
     // Compositing is split from persisting so the live window can repaint on its own
     // (much faster) cadence without also rewriting the PNG and the dual-film sidecar —
     // see g_windowIntervalSec.
-    // The glows the camera sees, which the forward layer's photons cannot show (Scene::glowAny): a
+    // The glows and the sky the camera sees, which the forward layer's photons cannot show: a
     // diffuse-side pixel takes them from the sky pass, as mode B's film does (under a blur the
     // forward batches draw them). Fitted with the rest, so the pixels a glow's edge crosses agree.
     SkyView glowView;
@@ -20347,11 +20333,11 @@ static int runCompositeProgressive(
         if (blurP)
             return compositeSplitFilms(acc.fwd, std::max(acc.N, 1LL), acc.ref, acc.spec,
                                        std::max(acc.spp, 1LL), /*verbose*/done);
-        // The glows the camera sees, and the sky it sees through a filter (prepareSky says whether any).
+        // The glows and the sky the forward pixels' samples see (prepareSky says whether any).
         const bool glows = prepareSky(glowView, scene, cam, acc.fwd.resX, acc.fwd.resY,
-                                      std::max(acc.N, 1LL), /*glowsOnly=*/true, &cc.cls);
+                                      std::max(acc.N, 1LL), &cc.cls);
         return compositeFromFilms(acc.fwd, std::max(acc.N, 1LL), acc.ref,
-                                  std::max(acc.spp, 1LL), cc, envScene, /*verbose*/done,
+                                  std::max(acc.spp, 1LL), cc, /*verbose*/done,
                                   glows ? &glowView : nullptr);
     };
     auto persist = [&](const Film& comp, bool done) {
@@ -26648,6 +26634,7 @@ static int run(int argc, char** argv) {
         ftslScene.cameras.push_back(vc);
         cameraSel = "view";
     }
+    if (haveView) scene.coverFar(viewEye);   // the loader's build saw only the authored cameras
 
     if (framesLo >= 0 && !(fromFtsl && !ftslScene.cameras.empty())) {
         std::fprintf(stderr, "error: -frames %lld %lld selects frames of a camera path, and this scene "
@@ -30259,7 +30246,7 @@ static int run(int argc, char** argv) {
                                          false, false, true, e, diffraction,
                                          fwdOnDevice(pBackwardOnGpu(scene, mc.cam) ? 'P' : 'B'));
                 SkyView glowView;   // the glows the camera sees, as the render's compose adds them
-                const bool glows = prepareSky(glowView, scene, mc.cam, W, H, meterN, /*glowsOnly=*/true, &cc.cls);
+                const bool glows = prepareSky(glowView, scene, mc.cam, W, H, meterN, &cc.cls);
                 Film ref;
                 bool refGpu = false;
 #ifdef HAVE_CUDA
@@ -30271,8 +30258,8 @@ static int run(int argc, char** argv) {
 #endif
                 if (!refGpu)
                     ref = renderBackward(scene, mc.cam, W, H, meterSpp, nThreads, diffraction);
-                mf = compositeFromFilms(fwd, meterN, ref, meterSpp, cc,
-                                        scene.envIndex >= 0, /*verbose*/false, glows ? &glowView : nullptr);
+                mf = compositeFromFilms(fwd, meterN, ref, meterSpp, cc, /*verbose*/false,
+                                        glows ? &glowView : nullptr);
                 eAuto = autoExposureOf(filmToLinear(mf, 1.0));
                 break;
             }

@@ -42,7 +42,14 @@ both carries no verdict):
     as it crosses the gel's half;
   - the mix sliding across the shutter in mode P, whose split files a sample by its first surface's own
     type -- a mix's is the forward side's, so its legs and its sky pass see through it;
-  - the sky behind the mix, modes B and P under the shutter.
+  - the sky behind the mix, modes B and P under the shutter;
+  - the tilted mirror under a gel sheet 0.2 mm in front of it, nearer than the tolerance the mirror
+    connection finds the mirror within: the leg crosses the sheet and still finds the mirror;
+  - the gel in front of that mix at -max-bounce 1: the gel takes the one crossing the path has, and the
+    mix, met with no room left, shows its glow and nothing behind it, as mode R's last ray does;
+  - the glass sphere and mirror cases at the two smallest -max-bounce that tell whether the chain fits:
+    the vertices it leaves the legs (Renderer::legRoom, and each connector's share of it) bound what they
+    cross.
 
 Exits 1 on any failure.
 """
@@ -96,11 +103,16 @@ SPHERE_GEL = ([ln for ln in FILTER if not (ln.startswith("quad") and "material r
                'quad { origin -0.6 0.05 0.6  u 1.2 0 0  v 0 1.2 0  material redgel }'])
 GEL_BALL = FILTER + [CHROME, 'sphere { center 0 0.6 0.6  radius 0.3  material chrome }']
 GEL_MIRROR = FILTER + [CHROME, 'quad { origin -0.35 0.85 0.3  u 0.7 0 0  v 0 -0.6 0.35  material chrome }']   # the lit floor
+# The same mirror under a gel sheet 0.2 mm in front of it (along its normal, toward the camera), nearer
+# than the connection's tolerance on where it finds the mirror.
+SHEET_MIRROR = ([ln for ln in GEL_MIRROR if not (ln.startswith("quad") and "material redgel }" in ln)] +
+                ['quad { origin -0.35 0.8498992 0.2998272  u 0.7 0 0  v 0 -0.6 0.35  material redgel }'])
 GLOW_MIX = 'material "glowgel" { type mix  layer "redgel" 0.5  layer "neon" 0.5 }'
 NEON = 'material "neon" { type diffuse  reflect 0.0  emit 0.05  glow_only on }'
 MIX_GLOW = ([ln for ln in FILTER if not (ln.startswith("quad") and "material redgel }" in ln)] +
             [GLOW_MIX, NEON, 'quad { origin -0.6 0.05 -0.5  u 0 1.2 0  v 1.2 0 0  material glowgel }'])   # faces the camera
 COAT_GEL = gel_as(FILTER, "coatgel", COAT)
+GLOW_BUDGET = MIX_GLOW + ['quad { origin -0.6 0.05 -0.9  u 1.2 0 0  v 0 1.2 0  material redgel }']   # in front
 GLOW = FILTER + ['material "glow" { type diffuse  reflect 0.3  emit 0.05  glow_only on }',
                  'quad { origin -0.3 0.3 0.5  u 0 0.6 0  v 0.6 0 0  material glow }']
 PHYS = "focus 4.0  lens { preset achromat  focal 50  fstop 2.8 }"
@@ -143,7 +155,12 @@ CASES = [
     ("mix_blur_P", blurred(MIX_GEL, "mixgel"), ["-mode", "P"], [], None),
     ("mix_sky", gel_as(SKY, "mixgel", MIX), B_ARGS, [], None),
     ("mix_sky_blur_P", blurred(gel_as(SKY, "mixgel", MIX), "mixgel"), ["-mode", "P"], [], None),
-]
+    ("glow_budget", GLOW_BUDGET, B_ARGS, ["-max-bounce", "1"], None),
+    ("sheet_mirror", SHEET_MIRROR, B_ARGS, [], None),
+] + [("%s_b%d" % (name, nb), lines, B_ARGS, ["-max-bounce", str(nb)], None)
+     for name, lines, levels in (("gel_sphere", GEL_SPHERE, (3, 4)), ("sphere_gel", SPHERE_GEL, (3, 4)),
+                                 ("gel_ball", GEL_BALL, (2, 3)), ("gel_mirror", GEL_MIRROR, (2, 3)))
+     for nb in levels]
 
 
 def falloff(a, b):

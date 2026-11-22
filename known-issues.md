@@ -501,7 +501,52 @@ scene's cells too (its `r[]` sized `kSpecCellsMax`, read by cell rather than int
 its support's `hole` mask per cell) -- which grows the per-segment and per-vertex carrier
 JSPEC-CARRIER-SIZE measures (120 B to about 190 B), so it goes with that entry's half-precision bins.
 
-## DONE (2026-11-21, 0.451.9): UNBOUNDED-FIELD-FAR — an unbounded density field that thins to nothing hung every tracker
+## DONE (2026-11-21, 0.451.11): REVIEW-0455 — what the Opus (max) and Fable (xhigh) reviews of 0.451.7-0.451.10 found
+
+Opus (max) reviewed 0d900e2..a4e85cc (0.451.9 REVIEW-0454's follow-up, 0.451.10 the specular
+connections); Fable (xhigh), with its week's share reset, reviewed d721112..a4e85cc (0.451.7-0.451.10),
+the second review 0.451.7-0.451.9 had lacked. Each finding was checked against the code.
+
+* **UNBOUNDED-FIELD-FAR's far sphere was wrong three ways** (both): a field with a floor let 0.2 of
+  the sky through, the near end was clipped too, so a camera outside the sphere lost the fog in front
+  of it, and FTRACE_JBEAMDOMAIN moved the fog in every mode. Redone as an exact sphere holding all the
+  scene holds, cameras and lights included, and a coarse field outside it (UNBOUNDED-FIELD-FAR);
+  check_sky_fog's `field_absorb`, `expfog` and `far_expfog` against the closed form. Opus's fourth,
+  the sun leg's exp(+tau) factor integrating what the walk no longer crossed, needs no change of its
+  own: the walk and the stretch it cancels both lie in the sphere, which holds the swept entry discs.
+* **Mode P's still composite over the sky** (Opus; Fable twice): a sun-only scene's haze sky was fitted
+  as forward pixels; a forward pixel's samples that escaped past a fog's bounds drew no sky (a dark
+  outline of the bounds); a sun's disc showed only through a medium's bounds. An escaping pixel is now
+  the backward layer's (SPEC: the sky and the disc as mode R draws them, out of the fit), but for the
+  sky seen through a bounded medium, and the forward layer's sky pass draws the sky its pixels' samples
+  see directly (prepareSky's glows-only form, and the SKY class, gone); check_sky_fog's `sun_haze`,
+  `ball_edge` (pixel by pixel: on 0.451.10 its outline reads down to 0.71) and `sun_sky`.
+* **A mirror connection dropped a gel lying within its tolerance in front of the mirror** (Fable), and
+  took two traversals a connection (both): the walk now runs to dE + tol and stops at the surface within
+  tol that connects as a mirror, a gel there crossed; one trace a stretch, host and device;
+  check_passthrough's `sheet_mirror`.
+* **A pass-through surface met with no crossing left stopped the sky walk without its glow** (Opus): it
+  is met, as mode R's last ray meets it (`StraightEnd::Met`); check_passthrough's `glow_budget`.
+  The budget's other uses got cases at the -max-bounce that bind them (`gel_sphere_b3` ... `gel_mirror_b3`).
+* **An instance holding one gel triangle could not early-out** (Fable): the any-hit test now notes pass-
+  through triangles one by one (Blas::occludedLocalPast, the device's blasOccluded), a mover on the
+  device still by its whole placement.
+* **Duplication** (Fable): the device's two crossing walks are one `dWalkStraight` beside the host's
+  walkStraight; one pass-multiply helper a side (straightPassMul, dStraightPassMul); one line-sphere chord
+  (sphereChord, for the far sphere and mode J's domain). `unboundedHaze()` inlined twice (both): one
+  helper, skyLitHaze. Kept: the far sphere stored per medium, which the trackers take without the scene,
+  its radius 0 marking a medium that has none.
+* **The split's rule held only by the caller** (Opus): walkStraight stops a walk from the camera at a
+  specular-type first crossing itself, so skySeenThroughXYZ's `split` (Fable: dead) does something.
+* Smaller: mirrorSeenThrough's unread `crossed` (both); the device's synthetic coat lobe inherited its
+  parent's `straight` (Fable, latent); three doc comments parted from their functions, design.md's stale
+  leg section, a stale scene.h reference, the sky pass's literal wavelength span (Fable); check_sky_fog
+  rendering one mode R reference three times (Fable).
+* **Dismissed** -- Opus's hide_camera gel cases: `hide_camera` exists only on a `light area`, which
+  passes nothing, so no hidden surface is ever crossed; the walks' machinery for one that is (a factor
+  set aside until a crossing follows) is gone with it.
+
+## DONE (2026-11-21, 0.451.9 and 0.451.11): UNBOUNDED-FIELD-FAR — an unbounded density field that thins to nothing hung every tracker
 
 Found by the Opus review of 0.451.7-0.451.8 (REVIEW-0454). A `density` field with no `bounds` has no
 majorant grid, so its tracking runs against one global majorant out to the segment's end -- 1e30 for a
@@ -510,12 +555,24 @@ it; where it thins to nothing (a ground fog, `saturate(1 - y/2)`), every step pa
 collision with factor 1, nothing ends the loop, and past t ~ 1e17 a step no longer moves t at all: the
 render hung, `-stop` could not reach it, and on the GPU a kernel timed out. Mode R's delta tracking hung
 on such a field already; 0.451.5's sky pass, taking the media to the sky, made modes A, B and P hang too.
-**Fixed:** every tracker -- free flight and transmittance, scalar and spectral, host and device -- takes
-an unbounded density field only inside a far sphere (`Medium::farClip`, `dMedFarClip`): mode J's beam
-domain, eight times the scene's radius about its centre, past which the field is taken as empty. A
-homogeneous unbounded haze keeps its analytic infinite extent. A deliberate change to mode R's answer for
-such a field, from no answer at all: one with a floor reads as before (its transmittance is gone long
-before the sphere), one that thins out reads what lies within it. check_sky_fog's `ground`.
+**Fixed in 0.451.9** by taking such a field only inside a far sphere, mode J's beam domain, and as empty
+past it -- which REVIEW-0455 showed wrong three ways: a field with a floor let 0.2 of the sky through
+(its optical depth has no end, the sphere's cut gave it one; 0.451.9 claimed it read as before, and it
+did not), the near end was clipped too, so a camera outside the sphere lost the fog in front of it (and
+a ray missing the sphere all of it), and FTRACE_JBEAMDOMAIN, a mode J diagnostic, moved the fog in every
+mode. **Fixed in 0.451.11:** every tracker -- free flight and transmittance, scalar, spectral and
+multi-point, host and device -- tracks such a field exactly inside its far sphere (`Medium::farSplit`,
+`dMedFarSplit`), its radius its own (`kFarFieldScale`, eight scene radii) widened to hold the movers'
+sweep and the photons' entry discs, the positioned lights and every camera (`Scene::farCover`,
+`coverFar`), so a segment between two things in the scene is exact; outside it the field is coarse, one
+sample on each piece 24 doubling shells about the centre cut a segment into (`kFarTailSteps`; `farPieces`,
+`farDepth`, `farCollision` and their device twins), which a floor fills (the sky hidden) and a ground or
+exponential fog leaves clear as its depth says; a segment from a scatter far out costs a few dozen
+pieces. A
+homogeneous unbounded haze keeps its analytic infinite extent. check_sky_fog's `field_absorb`, `expfog`
+and `far_expfog` check mode R's sky against the closed form; all three fail on 0.451.10 (UNBOUNDED-FIELD-FAR's
+sphere: 0.2 of the sky through the floor, the exponential fog's far third missing, and the far camera's
+near fog).
 
 ## DONE (2026-11-21, 0.451.9): REVIEW-0454 — what the Opus (max) review of 0.451.7-0.451.8 found
 

@@ -1123,8 +1123,8 @@ struct DMedium {
     double           emitKelvin;      // Kelvin of the hottest voxel
     double           tempPeak;        // raw temperature-grid peak (for peak-normalisation)
     double           emissionScale;   // brightness multiplier on the Planck term
-    DVec3            farC;            // an unbounded density field's far end (host Medium::farClip):
-    double           farR;            //   tracked inside it, empty past it; farR 0 none
+    DVec3            farC;            // an unbounded density field's far sphere (host Medium::farC/farR):
+    double           farR;            //   tracked inside it, coarse outside; farR 0 none
     int              bounded;         // 1 => clip to the bound region
     int              boundShape;      // 0 => box [bmin,bmax], 1 => sphere, 2 => implicit field,
                                       // 3 => MESH containment (dMeshWeight)
@@ -3346,21 +3346,83 @@ __device__ static DVec3 dMedGradN(const DMedium& m, const DVec3& p, double h,
 // (dGrinMarch — the Eikonal ray marcher — needs DHit + closestHit, so it is defined just
 // after the closestHit definition below.)
 
+// An unbounded density field's far sphere along o + t d (host twin Medium::farSplit; kFarTailSteps): the
+// part inside it, [tin, tout], tracked; tin = tout, the closest approach, where the line misses it; the
+// whole line where the medium has none. In double: a scatter far out sits where float has no digits left.
+__device__ static inline void dMedFarSplit(const DMedium& m, const DVec3& o, const DVec3& d, double& tin,
+                                           double& tout) {
+    if (!(m.farR > 0.0)) { tin = -1e300; tout = 1e300; return; }
+    const double qx = (double)o.x - (double)m.farC.x, qy = (double)o.y - (double)m.farC.y,
+                 qz = (double)o.z - (double)m.farC.z;
+    const double b = qx * (double)d.x + qy * (double)d.y + qz * (double)d.z;
+    const double disc = b * b - (qx * qx + qy * qy + qz * qz - m.farR * m.farR);
+    const double s = disc > 0.0 ? sqrt(disc) : 0.0;
+    tin = -b - s;
+    tout = s - b;
+}
+// The pieces the coarse far field cuts [u0, u1] into, outside the far sphere and on one side of the
+// closest approach (`outward` past it), to f(a, b) nearest first until it returns false (host twin
+// Renderer::farPieces).
+template <class F>
+__device__ static void dFarPieces(const DMedium& m, const DVec3& o, const DVec3& dir, double u0, double u1,
+                                  bool outward, F&& f) {
+    if (!(u1 > u0)) return;
+    const double qx = (double)o.x - (double)m.farC.x, qy = (double)o.y - (double)m.farC.y,
+                 qz = (double)o.z - (double)m.farC.z;
+    const double dx = (double)dir.x, dy = (double)dir.y, dz = (double)dir.z;
+    const double R = m.farR, b = qx * dx + qy * dy + qz * dz;
+    const double rMin2 = fmax(0.0, qx * qx + qy * qy + qz * qz - b * b);
+    const double px = qx + dx * u0, py = qy + dy * u0, pz = qz + dz * u0;
+    int i = (int)fmin(floor(log2(fmax(sqrt(px * px + py * py + pz * pz), R) / R)), (double)kFarTailSteps);
+    for (double t = u0; t < u1 && i >= 0; i += outward ? 1 : -1) {
+        if (outward && i >= kFarTailSteps) return;
+        const double rho = ldexp(R, outward ? i + 1 : i), disc = rho * rho - rMin2;
+        const double s = disc > 0.0 ? sqrt(disc) : 0.0;
+        const double e = fmin(u1, outward ? s - b : -b - s);
+        if (!(e > t)) continue;
+        if (i < kFarTailSteps && !f(t, e)) return;
+        t = e;
+    }
+}
+// The coarse far field's density integral over [u0, u1], stopping once st times it passes kFarTailTau
+// (host twin Renderer::farDepth).
+__device__ static double dFarDepth(const DMedium& m, const DVec3& o, const DVec3& dir, double u0, double u1,
+                                   bool outward, double st, DRng& rng, const DPatEnv& env) {
+    double D = 0.0;
+    dFarPieces(m, o, dir, u0, u1, outward, [&](double a, double b) {
+        const double d = dMedDensityAt(m, o + dir * (Real)(a + (b - a) * (double)rng.uniform()), env);
+        if (d > 0.0) D += d * (b - a);
+        return !(st * D > kFarTailTau);
+    });
+    return D;
+}
+// The same over all of [ta, tb] outside the far sphere's [tin, tout] (host twin Renderer::farDepthOutside).
+__device__ static double dFarDepthOutside(const DMedium& m, const DVec3& o, const DVec3& dir, double ta, double tb,
+                                          double tin, double tout, double st, DRng& rng, const DPatEnv& env) {
+    double D = 0.0;
+    if (tin > ta) D += dFarDepth(m, o, dir, ta, fmin(tb, tin), false, st, rng, env);
+    if (tb > tout) D += dFarDepth(m, o, dir, fmax(ta, tout), tb, true, st, rng, env);
+    return D;
+}
+// A free flight through the coarse far field over [u0, u1] (host twin Renderer::farCollision).
+__device__ static bool dFarCollision(const DMedium& m, const DVec3& o, const DVec3& dir, double u0, double u1,
+                                     bool outward, double st, DRng& rng, const DPatEnv& env, double& tHit) {
+    if (!(u1 > u0)) return false;
+    double E = -log(1.0 - (double)rng.uniformOpen());
+    bool hit = false;
+    dFarPieces(m, o, dir, u0, u1, outward, [&](double a, double b) {
+        const double d = dMedDensityAt(m, o + dir * (Real)(a + (b - a) * (double)rng.uniform()), env);
+        if (!(d > 0.0)) return true;
+        const double sig = st * d;
+        if (sig * (b - a) > E) { tHit = a + E / sig; hit = true; return false; }
+        E -= sig * (b - a);
+        return true;
+    });
+    return hit;
+}
 // Sample the next real collision along (o,dir) within [0,dMax]. Device twin of
 // Renderer::sampleMediumCollision: exact analytic free-flight (one draw) for a
 // homogeneous medium (bit-identical to before), else delta (Woodcock) tracking.
-// Clip [ta, tb] of o + t d (d unit) to an unbounded density field's far sphere (host twin Medium::farClip),
-// where it has one; false if nothing is left.
-__device__ static inline bool dMedFarClip(const DMedium& m, const DVec3& o, const DVec3& d, double& ta, double& tb) {
-    if (!(m.farR > 0.0)) return tb > ta;
-    const DVec3 q = o - m.farC;
-    const double b = (double)dot(q, d), disc = b * b - ((double)dot(q, q) - m.farR * m.farR);
-    if (!(disc > 0.0)) return false;
-    const double sq = sqrt(disc);
-    if (-b - sq > ta) ta = -b - sq;
-    if (-b + sq < tb) tb = -b + sq;
-    return tb > ta;
-}
 __device__ static bool dMedSampleCollision(const DMedium& m, const DVec3& o, const DVec3& dir,
                                            Real dMax, Real lambda, DRng& rng, Real& tHit,
                                            const DPatEnv& env) {
@@ -3395,15 +3457,25 @@ __device__ static bool dMedSampleCollision(const DMedium& m, const DVec3& o, con
     }
     double sigMax = stBase * m.densityMax;
     if (sigMax <= 0.0) return false;
-    if (!dMedFarClip(m, o, dir, ta, tb)) return false;   // an unbounded field's far end
-    double t = ta;
-    for (;;) {
-        t += -log(1.0 - (double)rng.uniformOpen()) / sigMax;
-        if (t >= tb) return false;
-        DVec3 pp = o + dir * (Real)t;
-        double sigT = stBase * dMedDensityAt(m, pp, env);
-        if ((double)rng.uniform() * sigMax < sigT) { tHit = (Real)t; return true; }
+    double tin, tout, tt;   // the far sphere's part, tracked; the coarse far field on either side
+    dMedFarSplit(m, o, dir, tin, tout);
+    if (tin > ta && dFarCollision(m, o, dir, ta, fmin(tb, tin), false, stBase, rng, env, tt)) {
+        tHit = (Real)tt;
+        return true;
     }
+    double t = fmax(ta, tin);
+    const double te = fmin(tb, tout);
+    if (te > t)
+        for (;;) {
+            t += -log(1.0 - (double)rng.uniformOpen()) / sigMax;
+            if (t >= te) break;
+            DVec3 pp = o + dir * (Real)t;
+            double sigT = stBase * dMedDensityAt(m, pp, env);
+            if ((double)rng.uniform() * sigMax < sigT) { tHit = (Real)t; return true; }
+        }
+    if (!(tb > tout) || !dFarCollision(m, o, dir, fmax(ta, tout), tb, true, stBase, rng, env, tt)) return false;
+    tHit = (Real)tt;
+    return true;
 }
 
 // Unbiased transmittance along [o, o+dir*dist]. Device twin of
@@ -3448,11 +3520,20 @@ __device__ static Real dMedTransmittance(const DMedium& m, const DVec3& o, const
     }
     double sigMax = stBase * m.densityMax;
     if (sigMax <= 0.0) return (Real)1;
-    if (!dMedFarClip(m, o, dir, ta, tb)) return (Real)1;   // an unbounded field's far end
-    double Tr = 1.0, t = ta;
+    double tin, tout;   // the far sphere's part, tracked; the coarse far field on either side
+    dMedFarSplit(m, o, dir, tin, tout);
+    double Tr = 1.0;
+    if (tin > ta || tb > tout) {
+        const double D = dFarDepthOutside(m, o, dir, ta, tb, tin, tout, stBase, rng, env);
+        if (stBase * D > kFarTailTau) return (Real)0;   // nothing left, and no walk inside to pay for
+        Tr = exp(-stBase * D);
+    }
+    double t = fmax(ta, tin);
+    const double te = fmin(tb, tout);
+    if (te > t)
     for (;;) {
         t += -log(1.0 - (double)rng.uniformOpen()) / sigMax;
-        if (t >= tb) break;
+        if (t >= te) break;
         DVec3 pp = o + dir * (Real)t;
         double sigT = stBase * dMedDensityAt(m, pp, env);
         Tr *= 1.0 - sigT / sigMax;
@@ -3588,11 +3669,19 @@ __device__ static void dMedTransmittanceMulti(const DMedium& m, const DVec3& o, 
     }
     const double sigMax = stBase * m.densityMax;
     if (sigMax <= 0.0) return;
-    if (!dMedFarClip(m, o, dir, ta, tb)) { for (; k < n; ++k) q.mul(k, Tr); return; }   // far end
-    double t = ta;
-    while (k < n) {
+    double tin, tout;   // the far sphere's part, tracked; the coarse far field on either side
+    dMedFarSplit(m, o, dir, tin, tout);
+    if (tin > ta || tb > tout)   // each query's coarse parts its own draw, as dMedTransmittance(q.t(j)) takes them
+        for (int j = k; j < n; ++j) {
+            const double D = dFarDepthOutside(m, o, dir, ta, (double)q.t(j), tin, tout, stBase, rng, env);
+            if (D > 0.0) q.mul(j, stBase * D > kFarTailTau ? 0.0 : exp(-stBase * D));
+        }
+    const double te = fmin(tb, tout);
+    double t = fmax(ta, tin);
+    while (k < n && (double)q.t(k) <= t) ++k;   // short of the tracked part: nothing more
+    while (k < n && te > t) {
         t += -log(1.0 - (double)rng.uniformOpen()) / sigMax;
-        if (t >= tb) break;
+        if (t >= te) break;
         for (; k < n && (double)q.t(k) < t; ++k) q.mul(k, Tr);
         if (k >= n) break;
         DVec3 pp = o + dir * (Real)t;
@@ -3668,13 +3757,26 @@ __device__ static void dMedTransmittanceSpec(const DMedium& m, const DVec3& o, c
     }
     const double sigMax = stMax * m.densityMax;
     if (sigMax <= 0.0) return;
-    if (!dMedFarClip(m, o, dir, ta, tb)) return;   // an unbounded field's far end
+    double tin, tout;   // the far sphere's part, tracked; the coarse far field on either side
+    dMedFarSplit(m, o, dir, tin, tout);
     double f[DSPEC_TRMAX];   // this medium's factors, multiplied into Tr at the end (host twin)
     for (int i = 0; i < K; ++i) f[i] = 1.0;
-    double t = ta;
+    if (tin > ta || tb > tout) {
+        double stMin = stB[0];
+        for (int i = 1; i < K; ++i) stMin = fmin(stMin, stB[i]);
+        const double D = dFarDepthOutside(m, o, dir, ta, tb, tin, tout, stMin, rng, env);
+        if (stMin * D > kFarTailTau) {   // nothing left at any wavelength
+            for (int i = 0; i < K; ++i) Tr[i] = 0.0;
+            return;
+        }
+        for (int i = 0; i < K; ++i) f[i] = exp(-stB[i] * D);
+    }
+    double t = fmax(ta, tin);
+    const double te = fmin(tb, tout);
+    if (te > t)
     for (;;) {
         t += -log(1.0 - (double)rng.uniformOpen()) / sigMax;
-        if (t >= tb) break;
+        if (t >= te) break;
         const double dens = dMedDensityAt(m, o + dir * (Real)t, env);
         double fMax = 0.0;
         for (int i = 0; i < K; ++i) {
@@ -4994,9 +5096,14 @@ __device__ static bool blasClosest(const DScene& sc, const DInstance& inst,
     return found;
 }
 
-// Any hit inside one BLAS (local space), before `maxDist`. Mirrors Blas::occludedLocal.
+// A surface that passes light straight on, unbent: a gel, a half mirror, or a mix or stack with such a child
+// (host twin passesStraight, Material::straight).
+__device__ static inline bool dPassesStraight(const DMaterial& m) { return m.straight != 0; }
+// Any hit inside one BLAS (local space), before `maxDist`. Mirrors Blas::occludedLocal; with `metPT`,
+// Blas::occludedLocalPast: a triangle that passes light straight on does not block, and sets *metPT.
 __device__ static bool blasOccluded(const DScene& sc, const DInstance& inst,
-                                     const DVec3& lro, const DVec3& lrd, Real tmin, Real maxDist) {
+                                     const DVec3& lro, const DVec3& lrd, Real tmin, Real maxDist,
+                                     bool* metPT = nullptr) {
     const DBlas& bl = sc.blas[inst.blasId];
     const DNode* N = sc.blasNodes + bl.nodeOff;
     const int*   P = sc.blasPrim  + bl.primOff;
@@ -5015,7 +5122,9 @@ __device__ static bool blasOccluded(const DScene& sc, const DInstance& inst,
             for (int i = 0; i < n.count; ++i) {
                 int prim = P[n.first + i];
                 DHit h; h.t = maxDist; h.valid = false;
-                if (intersectTri(sh, lro, lrd, T[prim], tmin, h)) return true;
+                if (!intersectTri(sh, lro, lrd, T[prim], tmin, h)) continue;
+                if (!metPT || !dPassesStraight(sc.mats[T[prim].matId])) return true;
+                *metPT = true;
             }
         } else {
             Real tc;
@@ -5511,9 +5620,6 @@ __device__ static bool dIntersectOtherNow(const DScene& sc, const DVec3& ro, con
     if (!anyHit) dHitToMoved(mc.D, Di, set, h);
     return true;
 }
-// A surface that passes light straight on, unbent: a gel, a half mirror, or a mix or stack with such a child
-// (host twin passesStraight, Material::straight).
-__device__ static inline bool dPassesStraight(const DMaterial& m) { return m.straight != 0; }
 // A primitive's material by global number, or -1 for an instance (whose materials are per BLAS
 // triangle: the camera-hide test skips them, as the static walks do).
 __device__ static inline int dPrimMat(const DScene& sc, int prim) {
@@ -6068,11 +6174,18 @@ __device__ static bool occludedGeometry(const DScene& sc, const DVec3& o, const 
                     // Instance leaf: any-hit inside the shared BLAS in local space. NOT covered by
                     // `hidden()`: instanced materials live per-BLAS-triangle, below this decode, and
                     // nothing that can carry hideCamera today (a `light area`'s two world tris) is
-                    // ever instanced. Same exclusion as closestHit and the host twin. One that may
-                    // pass light straight on is left to dCamLegThrough's walk under `skipPT` (`pt`).
+                    // ever instanced. Same exclusion as closestHit and the host twin. What of one
+                    // passes light straight on is left to dCamLegThrough's walk under `skipPT`,
+                    // noted triangle by triangle (one material overriding the whole placement's).
                     const DInstance& inst = sc.instances[prim - sc.nTris - sc.nSph - sc.nImplicits - sc.nCurveSegs];
                     DVec3 lo = affPoint(inst.Lm, inst.Lt, o);
                     DVec3 ld = affDir(inst.Lm, dir);
+                    if (skipPT && inst.passThrough && inst.matOverride < 0) {
+                        bool met = false;
+                        if (blasOccluded(sc, inst, lo, ld, tmin, tMax, &met)) return true;
+                        if (met && metPT) *metPT = true;
+                        continue;
+                    }
                     blocked = blasOccluded(sc, inst, lo, ld, tmin, tMax);
                 }
                 if (blocked) {   // one that passes light straight on is noted, not a block
@@ -7107,8 +7220,8 @@ __device__ static inline bool dCamSideOk(const DVec3& n, const DVec3& ng, const 
                                          bool glossy, Real& cosSurf) {
     return dCamSideOkT(n, ng, wdir, glossy, cosSurf);
 }
-// Device twin of camLegThrough (scene.h, where the why is, with walkStraight's), defined below
-// dTransmitSlot: false where the camera leg from `o` to `target` (occludedTo's arguments; the camera at
+// Device twin of camLegThrough (render.h, where the why is; walkStraight's in scene.h), defined below
+// dTransmitSlot, on dWalkStraight: false where the camera leg from `o` to `target` (occludedTo's arguments; the camera at
 // `target`) is blocked; else true, T[i] what the gels and half mirrors on it pass at lam[i] (1 with
 // none; dStraightPass's, a mix's or a stack's included), `leg` what it may cross (LegRule, dLegRoom). A leg
 // costs one any-hit walk, and one that met such a surface and nothing else a walk of its closest hits.
@@ -11311,9 +11424,6 @@ __device__ static void dSphScanChains(int nC, const DSphScanEnds& ends, const Ev
 // The number of internal reflections chain c takes, as dSphChainFrom counts them (-1: off the surface; host
 // twin Renderer::sphChainRefl).
 __device__ static inline int dSphChainRefl(bool outside, int c) { return outside ? c - 1 : c; }
-// Connect vertex p to a pinhole through every drawn chain of smooth dielectric sphere S, at the nL
-// wavelengths lam[] that see S alike (`ix`): one geometry for them all. Port of
-// Renderer::connectSpecularSphere.
 // The specular connections' legs, through what passes light straight on: defined below, beside
 // dCamLegThrough (dLegThrough) and dMirrorSeenAt's twin through them (dMirrorSeenThrough).
 __device__ static bool dLegThrough(const DScene& sc, const DVec3& o, const DVec3& target, double absEps,
@@ -11321,6 +11431,9 @@ __device__ static bool dLegThrough(const DScene& sc, const DVec3& o, const DVec3
                                    const Real* lam, int n, Real* T, int* crossed = nullptr);
 __device__ static bool dMirrorSeenThrough(const DScene& sc, const D3& eye, const D3& wE, double dE, DHit& hm,
                                           LegRule leg, const Real* lam, int n, Real* T);
+// Connect vertex p to a pinhole through every drawn chain of smooth dielectric sphere S, at the nL
+// wavelengths lam[] that see S alike (`ix`): one geometry for them all. Port of
+// Renderer::connectSpecularSphere.
 __device__ static void dConnectSpecularSphere(const DScene& sc, const DCamera& cam,
         double* film, double* hits, const DSphere& S, const DSphIndex& ix,
         const D3& p, const DSpecVtx& vt, const Real* lam, const Real* beta, const Real* w, int nL, int room,
@@ -13053,6 +13166,75 @@ __device__ static Real dStraightPass(const DScene& sc, const DMaterial& m, const
     }
     return v > (Real)0 ? (v < (Real)1 ? v : (Real)1) : (Real)0;
 }
+// T[i] *= what `m` passes crossed at `h` along `d` at lam[i], i < n (host twin straightPassMul): whether
+// anything is left.
+__device__ static bool dStraightPassMul(const DScene& sc, const DMaterial& m, const DHit& h, const DVec3& d,
+                                        const Real* lam, int n, Real* T) {
+    DStraightCross x;
+    dStraightCrossAt(sc, m, h, d, x);
+    bool any = false;
+    for (int i = 0; i < n; ++i) {
+        T[i] *= dStraightPass(sc, m, h, x, lam[i]);
+        any = any || T[i] > (Real)0;
+    }
+    return any;
+}
+// Device twin of walkStraight (scene.h, where the why is): a walk along o + t dir, t in [tmin, maxDist),
+// across what passes light straight on -- `cross(h, m)` takes each, nearest first, and returns false where
+// the light passes nothing more. `skipSph`: a sphere the walk does not see (closestHit's).
+struct DStraightWalk {
+    StraightEnd end;
+    int crossings;   // the surfaces it crossed
+    DVec3 from;      // the last stretch's start
+    double dist;     // its distance from the origin
+    DHit met;        // what `Met` met, its t from `from`
+};
+template <class Cross>
+__device__ static DStraightWalk dWalkStraight(const DScene& sc, const DVec3& o, const DVec3& dir, Real maxDist,
+                                              Real tmin, Real curveTmin, LegRule leg, CamAt camAt, int skipSph,
+                                              Cross&& cross) {
+    constexpr int kStepsMax = 4 * kCamLegThroughMax;   // hidden surfaces skipped included
+    const int room = leg.room < kCamLegThroughMax ? leg.room : kCamLegThroughMax;
+    const bool hideOn = sc.camHiddenAny != 0 && camAt != CamAt::None;
+    const bool camAtStart = camAt == CamAt::Start;
+    DStraightWalk w;
+    w.end = StraightEnd::Stopped;
+    w.crossings = 0;
+    w.from = o;
+    w.dist = 0.0;
+    Real left = maxDist, tq = tmin, cq = curveTmin;
+    bool lastSpecular = false, hiddenBlocks = false;   // a hidden surface met since the last crossing
+    for (int steps = 0; steps < kStepsMax; ++steps) {
+        const DHit h = closestHit(sc, w.from, dir, tq, left, /*camHide=*/hideOn && camAtStart && w.crossings == 0,
+                                  cq, nullptr, skipSph);
+        if (dCrossesGrin(sc, w.from, dir, h.valid && h.t < left ? h.t : left)) { w.end = StraightEnd::Stopped; return w; }
+        if (!h.valid || !(h.t < left)) {
+            w.end = (leg.split && !camAtStart && lastSpecular) ? StraightEnd::Stopped : StraightEnd::Clear;
+            return w;
+        }
+        const DMaterial& m = sc.mats[h.matId];
+        if (hideOn && !camAtStart && m.hideCamera) {
+            hiddenBlocks = true;
+        } else {
+            if (!dPassesStraight(m)) { w.end = StraightEnd::Met; w.met = h; return w; }
+            if (hiddenBlocks || (leg.split && camAtStart && w.crossings == 0 && dIsSpecularType(m.type))) {
+                w.end = StraightEnd::Stopped;
+                return w;
+            }
+            if (w.crossings + 1 > room) { w.end = StraightEnd::Met; w.met = h; return w; }
+            if (!cross(h, m)) { w.end = StraightEnd::Stopped; return w; }
+            ++w.crossings;
+            lastSpecular = dIsSpecularType(m.type);
+        }
+        w.from = h.p;
+        w.dist += (double)h.t;
+        left -= h.t;
+        tq = dHitEps(h);   // clear of its own primitive, whose error near the origin outgrows dEpsAt
+        cq = (Real)0;
+    }
+    return w;
+}
+
 // dLegThrough is the same for any leg (host twin legThrough): `camLeg` false puts no camera on it, its hidden
 // surfaces ordinary ones; `skipSph` a sphere it does not see (occludedTo's); `crossed` the surfaces it
 // crossed, where given.
@@ -13075,57 +13257,11 @@ __device__ static bool dLegThrough(const DScene& sc, const DVec3& o, const DVec3
         dCrossesGrin(sc, o, dir, left))
         return false;   // something other than what passes light straight on stops it
     if (!metPT) return true;   // nothing on it
-    // walkStraight's one pass, toward the camera (host twin, where the why is): a camera-hidden surface is
-    // set aside until an unhidden crossing follows it -- an opaque one then blocks, one that passes light
-    // counts -- and dropped where none does.
-    constexpr int kStepsMax = 4 * kCamLegThroughMax;
-    const bool hideOn = camLeg && sc.camHiddenAny != 0;
-    Real Tp[hero::kHeroMax];
-    for (int i = 0; i < n; ++i) Tp[i] = (Real)1;
-    bool hiddenBlocks = false, lastSpecular = false;
-    int hiddenCross = 0;
-    DVec3 q = o;
-    Real tq = tmin, cq = curveTmin;
-    DStraightCross x;
-    int k = 0;
-    for (int steps = 0; steps < kStepsMax; ++steps) {
-        const DHit h = closestHit(sc, q, dir, tq, left, /*camHide=*/false, cq, nullptr, skipSph);
-        if (crossed) *crossed = k;
-        if (!h.valid || !(h.t < left)) return !(leg.split && lastSpecular);   // the rest of the leg is clear
-        const DMaterial& m = sc.mats[h.matId];
-        if (hideOn && m.hideCamera) {
-            bool any = false;
-            if (dPassesStraight(m)) {
-                dStraightCrossAt(sc, m, h, dir, x);
-                for (int i = 0; i < n; ++i) {
-                    Tp[i] *= dStraightPass(sc, m, h, x, lam[i]);
-                    any = any || Tp[i] > (Real)0;
-                }
-            }
-            if (any) ++hiddenCross; else hiddenBlocks = true;
-        } else {
-            if (!dPassesStraight(m) || hiddenBlocks || k + hiddenCross + 1 > room) return false;
-            if (hiddenCross) {
-                for (int i = 0; i < n; ++i) { T[i] *= Tp[i]; Tp[i] = (Real)1; }
-                k += hiddenCross;
-                hiddenCross = 0;
-            }
-            dStraightCrossAt(sc, m, h, dir, x);
-            bool any = false;
-            for (int i = 0; i < n; ++i) {
-                T[i] *= dStraightPass(sc, m, h, x, lam[i]);
-                any = any || T[i] > (Real)0;
-            }
-            if (!any) return false;   // passes nothing: no empty hit for the noise estimate
-            ++k;
-            lastSpecular = dIsSpecularType(m.type);
-        }
-        q = h.p;
-        left -= h.t;
-        tq = dHitEps(h);   // clear of its own primitive, whose error near the origin outgrows dEpsAt
-        cq = (Real)0;
-    }
-    return false;
+    // A leg that passes nothing is blocked: no empty hit for the noise estimate.
+    const DStraightWalk w = dWalkStraight(sc, o, dir, left, tmin, curveTmin, leg, camLeg ? CamAt::End : CamAt::None,
+        skipSph, [&](const DHit& h, const DMaterial& m) { return dStraightPassMul(sc, m, h, dir, lam, n, T); });
+    if (crossed) *crossed = w.crossings;
+    return w.end == StraightEnd::Clear;
 }
 
 __device__ static bool dCamLegThrough(const DScene& sc, const DVec3& o, const DVec3& target, double absEps,
@@ -13134,45 +13270,28 @@ __device__ static bool dCamLegThrough(const DScene& sc, const DVec3& o, const DV
 }
 
 // Twin of Renderer::mirrorSeenThrough (where the why is): the walk from the eye along `wE` crosses what
-// passes light straight on (hidden surfaces skipped until it crosses one), `leg` what it may, to just
-// short of the mirror at `dE`, and one closest hit from there confirms it, in `hm`; T[i] what they pass
-// at lam[i]. False where anything else is in front, or the mirror is not met at dE.
+// passes light straight on (hidden surfaces skipped until it crosses one), `leg` what it may, to the
+// surface within tol of `dE` that connects as a mirror, in `hm`; T[i] what they pass at lam[i]. False
+// where anything else is in front, or the mirror is not met at dE.
 __device__ static bool dMirrorSeenThrough(const DScene& sc, const D3& eye, const D3& wE, double dE, DHit& hm,
                                           LegRule leg, const Real* lam, int n, Real* T) {
     for (int i = 0; i < n; ++i) T[i] = (Real)1;
     const int room = leg.room < kCamLegThroughMax ? leg.room : kCamLegThroughMax;
     if (!sc.passThroughAny || room <= 0) return dMirrorSeenAt(sc, eye, wE, dE, hm);
-    constexpr int kStepsMax = 4 * kCamLegThroughMax;
     const DVec3 dir = wE.toR();
-    DVec3 q = eye.toR();
-    Real tq = RAY_TMIN;
-    double dist = 0.0;
     const double tol = 1e-4 * (1.0 + dE);
-    Real left = (Real)(dE - tol);
-    DStraightCross x;
-    for (int k = 0, steps = 0; steps < kStepsMax; ++steps) {
-        hm = closestHit(sc, q, dir, tq, left, /*camHide=*/k == 0, (Real)0);
-        if (!hm.valid || !(hm.t < left)) {   // clear to just short of the mirror: confirm it
-            hm = closestHit(sc, q, dir, tq, BIG, /*camHide=*/k == 0, (Real)0);
-            if (!hm.valid || fabs(dist + (double)hm.t - dE) > tol) return false;
-            if (dCrossesGrin(sc, q, dir, hm.t)) return false;
-            return dMirrorConnectsMat(sc.mats[hm.matId]);
-        }
-        if (dCrossesGrin(sc, q, dir, hm.t)) return false;
-        const DMaterial& m = sc.mats[hm.matId];
-        if (!dPassesStraight(m)) return false;   // something in front
-        if (k == room) return false;
-        dStraightCrossAt(sc, m, hm, dir, x);
-        bool any = false;
-        for (int i = 0; i < n; ++i) {
-            T[i] *= dStraightPass(sc, m, hm, x, lam[i]);
-            any = any || T[i] > (Real)0;
-        }
-        if (!any) return false;
-        ++k;
-        q = hm.p; dist += (double)hm.t; left -= hm.t; tq = dHitEps(hm);
-    }
-    return false;
+    double dist = 0.0;
+    bool found = false;
+    const DStraightWalk w = dWalkStraight(sc, eye.toR(), dir, (Real)(dE + tol), RAY_TMIN, (Real)0, leg, CamAt::Start,
+        -1, [&](const DHit& h, const DMaterial& m) {
+            if (fabs(dist + (double)h.t - dE) <= tol && dMirrorConnectsMat(m)) { hm = h; found = true; return false; }
+            dist += (double)h.t;
+            return dStraightPassMul(sc, m, h, dir, lam, n, T);
+        });
+    if (found) return true;
+    if (w.end != StraightEnd::Met) return false;   // nothing at dE, or the light passes nothing more
+    hm = w.met;
+    return fabs(w.dist + (double)hm.t - dE) <= tol && dMirrorConnectsMat(sc.mats[hm.matId]);
 }
 
 // ---- emission slot: the two halves of `emit pattern:` on the device -----------------

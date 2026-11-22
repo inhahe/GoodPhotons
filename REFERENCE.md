@@ -1059,7 +1059,11 @@ that converges to the same physical image.
   that mix diffuse lighting with mirrors/coatings. Both layers are GPU-accelerated
   (the forward layer via the `B` megakernel, the camera-side via `R`'s backward
   megakernel) when the scene is within the backward-GPU scope; otherwise the
-  camera-side layer falls back to the CPU. *Cost:* more expensive than plain `B`;
+  camera-side layer falls back to the CPU. The sky, and a sun's disc, that a pixel
+  sees directly come from the camera-side layer, as mode `R` draws them; seen through
+  a fog with `bounds`, from the forward layer, whose photons hold the fog's glow (since
+  0.451.11; before, a still `P` drew no sun's disc and a dark rim around such a fog).
+  *Cost:* more expensive than plain `B`;
   there can be a subtle seam between the two layers. With a **physical lens** the
   pinhole-splat forward pass can't form the lens image, so `P` automatically routes
   to the lens-aware BDPT (`D`) — or, if the scene is outside BDPT scope (env /
@@ -5459,10 +5463,15 @@ boundaries**: e.g. a smooth radial falloff `pow(saturate(1 - dist/R), 2)` render
 glowing sphere of haze whose edge fades gradually instead of a hard surface. Sampling is
 unbiased **delta (Woodcock) tracking** for scattering and **ratio tracking** for shadow
 transmittance — exact, no voxelization. A majorant `density_max` is auto-estimated over
-`bounds` (or set explicitly). A `density` field with **no `bounds`** is tracked out to a sphere
-eight times the scene's radius about its centre and taken as empty past it, in every mode (since
-0.451.9: a field that thins to nothing along a ray escaping to the sky, a ground fog, had no end a
-tracker could reach, and hung the render); a homogeneous haze with no bounds stays infinite. Heterogeneous/bounded fog is honored by the **forward**
+`bounds` (or set explicitly). A `density` field with **no `bounds`** is tracked exactly within a
+sphere about the scene's centre that holds everything in the scene -- eight times its radius at
+least, and every camera and point or spot light -- so the fog between any two things in the scene
+is exact. Outside that sphere the field is crossed coarsely: one sample of it on each stretch a ray
+spends in one of a series of shells about the centre, each twice as far out as the last, out to about
+seventeen million times the sphere's radius (since 0.451.11; a field that thins to nothing along a ray
+escaping to the sky, a ground fog, has no end a tracker could reach). So a field with a floor hides the sky behind it, as a haze does, and one that thins out --
+even exponentially, `exp(-y/20)` -- leaves the sky as clear as its own optical depth says. A
+homogeneous haze with no bounds stays infinite, analytically. Heterogeneous/bounded fog is honored by the **forward**
 modes (A/B/C) on **both the CPU and the GPU** (the device runs the identical density VM +
 delta/ratio tracking). **BDPT `D`** renders media of **every kind** — global haze,
 multiple superposed media, box/sphere/object-**bounded** fog, and **heterogeneous
