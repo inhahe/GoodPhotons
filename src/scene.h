@@ -4952,30 +4952,48 @@ struct Scene {
         // there from either side, from d beyond `slack` -- d a thousandth of the rim's `reach`, ten `eps`
         // at least -- meets one within win = 0.5 d + slack of the point (5e-4 of the reach for a planar
         // rim), passing the piece's own faces on the way. "On the piece" is to within rounding of one of
-        // its faces (`onR`): a hit lies on the face it hit, a point of a brim on the brim.
+        // its faces (`onR`): a hit lies on the face it hit, a point of a brim on the brim. A mover
+        // (`motion` its set) rests where any of its keys places it, each asked at that key's time, the
+        // points carried by its transform from the instant and a hit carried back to be told the
+        // piece's own; the probes' low leg decides every other time.
         const watertight::CapOk capOk = [&](const Vec3& nrm, const std::vector<Vec3>& pts, double reach,
-                                            double slack, const std::function<bool(const Vec3&, double)>& own) {
+                                            double slack, const std::function<bool(const Vec3&, double)>& own,
+                                            int motion) {
             const double d = std::max(1e-3 * reach, 10.0 * eps), w = d + slack, win = 0.5 * d + slack;
             const double onR = std::max(1e-6 * reach, 10.0 * eps);
-            int asked = 0;
-            for (const Vec3& q : pts) {
-                if (own(q, onR)) continue;   // the piece itself there: a hat's brim on the table
-                ++asked;
-                bool covered = false;
-                for (int side = 0; side < 2 && !covered; ++side) {
-                    const Vec3 dir = nrm * (side ? 1.0 : -1.0);
-                    double t0 = 0.0;   // from q - dir * w, how far the ray has come
-                    for (int k = 0; k < 8 && !covered; ++k) {
-                        const Hit h = closestHit(Ray{q - dir * (w - t0), dir}, eps, nullptr, false, false, 2.0 * w - t0);
-                        if (!h.valid) break;
-                        t0 += h.t;
-                        if (t0 > w + win) break;
-                        if (t0 >= w - win && !own(h.p, onR)) covered = true;
+            // Placed by D (from the instant, Dinv back), is every point covered?
+            const auto restsAt = [&](const Affine& D, const Affine& Dinv) {
+                const Vec3 nk = normalize(D.applyCofactor(nrm));
+                int asked = 0;
+                for (const Vec3& q0 : pts) {
+                    if (own(q0, onR)) continue;   // the piece itself there: a hat's brim on the table
+                    ++asked;
+                    const Vec3 q = D.apply(q0);
+                    bool covered = false;
+                    for (int side = 0; side < 2 && !covered; ++side) {
+                        const Vec3 dir = nk * (side ? 1.0 : -1.0);
+                        double t0 = 0.0;   // from q - dir * w, how far the ray has come
+                        for (int k = 0; k < 8 && !covered; ++k) {
+                            const Hit h = closestHit(Ray{q - dir * (w - t0), dir}, eps, nullptr, false, false, 2.0 * w - t0);
+                            if (!h.valid) break;
+                            t0 += h.t;
+                            if (t0 > w + win) break;
+                            if (t0 >= w - win && !own(Dinv.apply(h.p), onR)) covered = true;
+                        }
                     }
+                    if (!covered) return false;
                 }
-                if (!covered) return false;
+                return asked > 0;   // all on the piece: nothing shows it rests on anything
+            };
+            if (motion < 0 || (size_t)motion >= motionSets.size())
+                return restsAt(Affine::identity(), Affine::identity());
+            const MotionKeys& mk = motionSets[(size_t)motion];
+            for (int k = 0; k < mk.keys; ++k) {
+                const MotionTimeScope atKey(motionT[(size_t)(mk.first + k)]);
+                const Affine& D = motionXf[(size_t)(mk.first + k)];
+                if (restsAt(D, D.inverse())) return true;
             }
-            return asked > 0;   // all on the piece: nothing shows it rests on anything
+            return false;
         };
         const watertight::CapOk* cap = enclosuresOnly ? nullptr : &capOk;
         for (const MeshGroup& g : meshGroups) {

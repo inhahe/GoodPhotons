@@ -6816,9 +6816,11 @@ as the one at fault.
   too but closes on nothing, its floor lit through it. An asset's pieces are not capped (each
   instance may rest on something else). The cap says only which side of the faces is in; whether a
   column it puts inside is walled off from the gather point the low leg decides (below): a bottomless
-  box with a lamp in it is a room the gather point lies in, a mover capped where its faces are stored
-  may be clear of the surface at a path's time (0.451.16 refused the cap for both instead, REVIEW-0458;
-  REVIEW-0459). `tools/check_cap_marks.py` reads the pass's own count for each rule. It goes per mesh
+  box with a lamp in it is a room the gather point lies in, a mover capped where it rests may be clear
+  of the surface at a path's time (0.451.16 refused the cap for both instead, REVIEW-0458;
+  REVIEW-0459). A mover (its faces one motion set's, none deforming) is asked at each of its keys,
+  placed there and at that key's time, and capped where any rests it -- one lowered onto the floor by
+  its motion (0.451.20); its faces are stored as it stands at the frame's instant, one of the keys. `tools/check_cap_marks.py` reads the pass's own count for each rule. It goes per mesh
   object, then over every triangle no mesh object holds (quads, a light's own surface) as one pool,
   in which six quads meeting edge to edge form a box. The pass runs once per batch with a mode-M or
   mode-S camera and a footprint taken, before the exposure meter; the flag sits in `Tri`'s and
@@ -6882,8 +6884,7 @@ as the one at fault.
   3 cm box at radius 0.1; 0.99 with the count). A closed shelf hovering within the radius is
   crossed twice, and the floor under it counts (the plain disc average across its shadow). What the
   count still misreads (known-issues PROBE-PARITY-LIMITS): an open solid taller than the radius whose
-  hole is not closed by a face it rests on -- an asset's, or a mover's that does not rest at the frame's
-  instant, where its faces are stored -- holds the probe's
+  hole is not closed by a face it rests on -- an asset's -- holds the probe's
   origin, so nothing is crossed and the floor under it counts.
   `-gageom`'s march takes the same count per column, looking for crossings as high as the probe
   does, r above the plane (0.433.7): a column near the disc's edge has a short chord, and a box top

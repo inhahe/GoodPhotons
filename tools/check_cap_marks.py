@@ -14,6 +14,9 @@ exactly its count -- the marking pass's alone, with no noise:
     `litbox`, which 0.451.16 left uncapped instead);
   - `moving`: the box in a group lifting it 5 cm over the shutter -- capped where its faces are stored,
     the low leg deciding at each path's time whether it rests there;
+  - `lowered`: the box authored 5 cm up, its keys lowering it onto the floor by the end of the interval --
+    capped where its last key rests it (0.451.19 asked only where its faces are stored, at the instant,
+    clear of the floor: none);
   - `lifted`: the box 0.25 mm up, its rim resting on nothing -- none;
   - `closed`: the box with its bottom face, a closed solid whatever is under it -- twelve;
   - `sheet`: two triangles hovering over the floor, one corner 1e-7 off the others' plane, which leaves
@@ -133,11 +136,12 @@ def hat_obj(path):
 
 def scene(kind, out):
     geo = []
-    if kind in ("resting", "lamp", "moving", "lifted", "closed"):
-        lift = 0.00025 if kind == "lifted" else 0.0
+    if kind in ("resting", "lamp", "moving", "lifted", "closed", "lowered"):
+        lift = {"lifted": 0.00025, "lowered": 0.05}.get(kind, 0.0)
         geo = (g.box if kind == "closed" else g.open_box)(-B, lift, -B, B, lift + H, B, "obj")
-    if kind == "moving":
-        geo = ["group { motion { key { translate 0 0 0 } key { translate 0 0.05 0 } }"] + geo + ["}"]
+    if kind in ("moving", "lowered"):
+        geo = ["group { motion { key { translate 0 0 0 } key { translate 0 %g 0 } }" % (
+            0.05 if kind == "moving" else -0.05)] + geo + ["}"]
     if kind == "lamp":
         geo.append("light area { origin -0.03 0.035 -0.03  u 0.06 0 0  v 0 0 0.06  normal 0 -1 0  power 5  "
                    "spd preset:d65 }")
@@ -147,9 +151,10 @@ def scene(kind, out):
         geo = ['mesh "%s" { file "%s"  material obj }' % (kind, kind + ".obj")]
     if kind == "uneven":   # the V-ground it stands on, two quads meeting along x = 0
         geo += [g.quad((-1, K, -1), (0, 0, 2), (1, -K, 0), "floor"), g.quad((0, 0, -1), (0, 0, 2), (1, K, 0), "floor")]
-    shutter = "shutter_open 0  shutter_close 1  " if kind == "moving" else ""
+    moves = kind in ("moving", "lowered")
+    shutter = "shutter_open 0  shutter_close 1  " if moves else ""
     return NL.join([
-        "scene { units meters%s }" % ("  motion_interval 0 1" if kind == "moving" else ""),
+        "scene { units meters%s }" % ("  motion_interval 0 1" if moves else ""),
         'material "floor" { type diffuse reflect 0.5 }',
         'material "obj" { type diffuse reflect 0.5 }',
         g.quad((-2, 0, -2), (0, 0, 4), (4, 0, 0), "floor"),
@@ -159,8 +164,8 @@ def scene(kind, out):
     ]) + NL
 
 
-CASES = {"resting": 10, "lamp": 10, "moving": 10, "lifted": 0, "closed": 12, "sheet": 0, "pit": 0, "uneven": 16,
-         "hat": 18}
+CASES = {"resting": 10, "lamp": 10, "moving": 10, "lowered": 10, "lifted": 0, "closed": 12, "sheet": 0, "pit": 0,
+         "uneven": 16, "hat": 18}
 
 
 def main():

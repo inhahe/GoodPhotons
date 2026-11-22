@@ -3607,9 +3607,10 @@ own cap's points. tools/check_cap_marks.py holds the rules.
   there is that closed solid's; capOk asks along the rim's normal at the centroid and the points a tenth
   of the way in, its window widened by twice the rim's spread off its mean plane, passing the piece's
   own faces. check_cap_marks' `uneven` (a bottomless box on a V-shaped ground): none capped on 0.451.18, sixteen now.
-- *A mover that does not rest where its faces are stored* (a box lowered onto the floor by its keys).
-  **Proper fix:** capOk at each motion key, the piece placed there, and the cap where it rests at any of
-  them: the low leg decides each path's time.
+- DONE (0.451.20): *a mover that does not rest where its faces are stored* (a box lowered onto the floor
+  by its keys). capOk asks it at each of its keys, its points carried there from the instant and the
+  path's time set to the key's, and caps it where any rests it: the low leg decides each path's time.
+  check_cap_marks' `lowered`: none capped on 0.451.19, ten now.
 
 ## DONE (2026-11-16, no change): MODEM-CPU-DARKGLASS-BLUE — CPU mode M reads blue 15 % low through glass that absorbs blue strongly
 

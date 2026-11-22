@@ -149,8 +149,10 @@ inline Report checkTris(const Tri* tris, size_t n) {
 // in from its corners, on the fan, `reach` the farthest corner from the centroid, `normal` the rim's
 // area vector (Newell's), `slack` how far the covering face may stray from a point along it beyond a
 // planar rim's allowance (twice the rim's own spread off its mean plane), `own(x, rad)` whether x lies
-// within `rad` of one of the piece's faces. A point on the piece itself asks nothing (a hat's brim on
-// the table), but one point at least must be another face's. Its volume taken about the centroid is the capped solid's, the fan's own
+// within `rad` of one of the piece's faces, and `motion` the piece's motion set (Scene::motionSets; -1
+// for one that holds still or that moves part by part or deforms): a mover's points are asked where it
+// is at each of its keys, so a piece lowered onto the floor by its motion rests there. A point on the
+// piece itself asks nothing (a hat's brim on the table), but one point at least must be another face's. Its volume taken about the centroid is the capped solid's, the fan's own
 // tetrahedra vanishing there, and its faces are marked 3 (normals out) or 4 (in): a side the probes read
 // and nothing else does -- a camera or light inside one is not in a solid, a glowing one may still be
 // two-sided -- as the cap is right only for the gather on the face that closes it (an upright cup's rim
@@ -165,7 +167,7 @@ inline Report checkTris(const Tri* tris, size_t n) {
 constexpr size_t kPieceNearFaces = 64;
 struct PieceBox { Vec3 lo, hi; int matId = 0; std::vector<Vec3> faces; size_t count = 0; };
 using CapOk = std::function<bool(const Vec3& normal, const std::vector<Vec3>& points, double reach, double slack,
-                                 const std::function<bool(const Vec3&, double)>& own)>;
+                                 const std::function<bool(const Vec3&, double)>& own, int motion)>;
 inline size_t markSolidFaces(Tri* const* tris, size_t n, std::vector<PieceBox>* boxes = nullptr,
                              std::vector<int>* pieceOf = nullptr, const CapOk* capOk = nullptr) {
     if (pieceOf) pieceOf->assign(n, -1);
@@ -309,7 +311,11 @@ inline size_t markSolidFaces(Tri* const* tris, size_t n, std::vector<PieceBox>* 
     std::vector<Edge>().swap(es);
     // The pieces a cap may close (capOk's pass): open only along a rim, every face's side right.
     // Compact: a candidate's slot by its root (`candOf`), only where there is one.
-    struct Cand { int piece; size_t e0, e1; Vec3 c, nrm; double vol = 0.0; bool capped = false; std::vector<size_t> faces; };
+    // `motion`: its faces' motion set, -1 where none moves, -2 where they differ or one deforms; -3 unset.
+    struct Cand {
+        int piece; size_t e0, e1; Vec3 c, nrm; double vol = 0.0; bool capped = false; std::vector<size_t> faces;
+        int motion = -3;
+    };
     std::vector<Cand> cands;
     std::vector<int> candOf;
     if (capOk && !rimEdges.empty()) {
@@ -330,7 +336,10 @@ inline size_t markSolidFaces(Tri* const* tris, size_t n, std::vector<PieceBox>* 
         for (size_t i = 0; i < n; ++i) {
             const int cn = candOf[(size_t)root(vid[i*3])];
             if (cn < 0) continue;
-            cands[(size_t)cn].faces.push_back(i);
+            Cand& cdn = cands[(size_t)cn];
+            cdn.faces.push_back(i);
+            const int fm = tris[i]->vkeys >= 0 ? -2 : tris[i]->motion;
+            cdn.motion = cdn.motion == -3 ? fm : (cdn.motion == fm ? fm : -2);
             const Vec3* p[3] = {&tris[i]->v0, &tris[i]->v1, &tris[i]->v2};
             for (int k = 0; k < 3; ++k) {
                 const auto it = at.find(vid[i*3 + k]);
@@ -382,7 +391,7 @@ inline size_t markSolidFaces(Tri* const* tris, size_t n, std::vector<PieceBox>* 
             for (size_t i = 0; i < rim.size(); i += step) pts.push_back(rim[i] + (c - rim[i]) * 0.1);
             // The piece's own faces cover nothing: what it rests on is something else.
             if (!(*capOk)(nrm, pts, reach, 2.0 * spread,
-                          [&](const Vec3& x, double rad) { return onOwn(cd, x, rad); }))
+                          [&](const Vec3& x, double rad) { return onOwn(cd, x, rad); }, std::max(cd.motion, -1)))
                 continue;
             cd.capped = true;
         }
