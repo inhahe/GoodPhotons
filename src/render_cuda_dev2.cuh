@@ -381,7 +381,7 @@ __device__ static void dSunNeeMarch(const DScene& sc, const DVec3& oc, const DVe
 struct DSpecCells {
     int n;
     double hi[kSpecCellsMax], lam[kSpecCellsMax], mass[kSpecCellsMax];
-    unsigned char first[kBandProbeBins], count[kBandProbeBins];
+    unsigned char first[kBandProbeBins], count[kBandProbeBins], smooth[kBandProbeBins];
 };
 // The cell of `c` wavelength `lam` falls in (host twin SpecCells::cellOf).
 __device__ static inline int dSpecCellOf(const DSpecCells* c, Real lam) {
@@ -428,7 +428,7 @@ struct DSpecThr {
     // `support`: whether a zero in `vk` is a hole in the support, as a zero weight in mul is (a
     // fiber's deterministic per-bin weight, host twin SpecThr::mul) -- not for the media term, a
     // ratio-tracking estimate whose zeros are one realization's (host twin SpecThr::mulVec).
-    __device__ void mulVec(const DScene& sc, const double* vk, double atCam, bool support) {
+    __device__ void mulVec(const double* vk, double atCam, bool support) {
         cam *= atCam;
         bool zero = false;
         for (int k = 0; k < n; ++k) {
@@ -441,7 +441,7 @@ struct DSpecThr {
     // Fold in one spectral factor, f(lambda), at every bin (host twin SpecThr::mul, where the
     // reasoning lives), with `atCam` its value at the camera's wavelength -- passed in rather than
     // recomputed, so the ratio's denominator is exactly the factor sitting inside `thr`.
-    template <class F> __device__ void mul(const DScene& sc, const F& f, double atCam) {
+    template <class F> __device__ void mul(const F& f, double atCam) {
         cam *= atCam;
         double a = 0.0;
         bool flat = true, zero = false;
@@ -458,8 +458,8 @@ struct DSpecThr {
     // Fold in a coin (host twin SpecThr::mulCoin): f(L, prob) the branch's factor at L, its
     // probability alone in `prob`; the same at the walk's wavelength passed in. Without
     // `exhaustive`, mul's probe; with it every bin, once.
-    template <class F> __device__ void mulCoin(const DScene& sc, const F& f, double factorAtCam,
-                                               double probAtCam, bool exhaustive) {
+    template <class F> __device__ void mulCoin(const F& f, double factorAtCam, double probAtCam,
+                                               bool exhaustive) {
         double pr;
         if (!exhaustive) {
             const double a = f(lamOf(0), pr), b = f(lamOf(n / 2), pr), c = f(lamOf(n - 1), pr);
@@ -530,6 +530,7 @@ struct DSpecThr {
         const double lc = cells->lam[c];
         const int o = lk < lc ? c - 1 : c + 1;
         if (o < 0 || o >= n || !(fabs(cells->lam[o] - lc) > 0.0)) return v[c];
+        if (!cells->smooth[lk < lc ? k : k + 1]) return v[c];
         return fmax(0.0, v[c] + (v[o] - v[c]) * (lk - lc) / (cells->lam[o] - lc));
     }
 };
@@ -543,7 +544,7 @@ __device__ static void dFoldCoatCoin(DSpecThr& sthr, const DScene& sc, const DMa
                                      double coatR, double coatCos, Real coatTh) {
     const bool cp = coatPick == 1;
     const double pc = cp ? coatR : 1.0 - coatR;
-    sthr.mulCoin(sc, [&](Real L, double& pr) {
+    sthr.mulCoin([&](Real L, double& pr) {
         const double r = dCoatRAtJ(lm, coatCos, coatTh, L);
         return pr = cp ? r : 1.0 - r;
     }, pc, pc, false);
@@ -562,11 +563,11 @@ __device__ static double dStrandStep(const DScene& sc, const DMaterial& m, const
     const double d = thr * bkNeeLight(sc, h, (Real)rho, invPdfL, lambda, rng, 0, nullptr, nullptr,
                                       coatC.m ? &coatC : nullptr);
     thr *= rho;
-    if (sthr) sthr->mul(sc, [&](Real L) { return (double)clamp01(dDiffuseRho(sc, m, h, L)); }, rho);
+    if (sthr) sthr->mul([&](Real L) { return (double)clamp01(dDiffuseRho(sc, m, h, L)); }, rho);
     cont = dContinueAlong(h, cosineHemisphere(h.n, rng), DL_REFLECT, ro, rd) && thr > 0.0 &&
            dCoatContinueWalk(sc, m, h, waS, rd, lambda, thr, nullptr, nullptr, 0,   // host twin coatWalkOut
                              [&](const DCoatEval& ce, double s) {
-                                 if (sthr) sthr->mul(sc, [&](Real L) { return ce.at(L); }, s); });
+                                 if (sthr) sthr->mul([&](Real L) { return ce.at(L); }, s); });
     return d;
 }
 
@@ -590,7 +591,7 @@ __device__ static void dGatherBeamsM(const DScene& sc, const DBeamMap& bm, const
 // A material's reflect or transmit slot, folded into the carrier (DSpecThr::mul).
 __device__ static void dSpecFold(DSpecThr& st, const DScene& sc, const DMaterial& m, const DHit& h,
                                  double atCam, bool transmit) {
-    st.mul(sc, [&](Real L) {
+    st.mul([&](Real L) {
         return transmit ? (double)clamp01(dTransmitSlot(sc, m, h, L))
                         : (double)clamp01(dReflectSlot(sc, m, h, L));
     }, atCam);
@@ -730,7 +731,7 @@ __device__ static void dPhotonGather(const DScene& sc, const DPhotonMap& pm,
                         double Tv[DSpecThr::K + 1];
                         dCamMediaTrSpec(sc, pro, rd, slen, lambda, rng, sthr, Tv);
                         thr *= Tv[sthr.n];
-                        sthr.mulVec(sc, Tv, Tv[sthr.n], false);
+                        sthr.mulVec(Tv, Tv[sthr.n], false);
                     }
                 }
                 // Coloured glass is spectral (SPECGATHER), whatever it absorbs at the walk's own
@@ -738,7 +739,7 @@ __device__ static void dPhotonGather(const DScene& sc, const DPhotonMap& pm,
                 if (cmIdx >= 0) {
                     const double arc = (double)gm.arc;
                     thr *= exp(-aGlass * arc);
-                    sthr.mul(sc, [&](Real L) {
+                    sthr.mul([&](Real L) {
                         return exp(-(double)specLookup(sc.mats[cmIdx].absorb, L) * arc);
                     }, exp(-aGlass * arc));
                 }
@@ -766,14 +767,14 @@ __device__ static void dPhotonGather(const DScene& sc, const DPhotonMap& pm,
                 double Tv[DSpecThr::K + 1];
                 dCamMediaTrSpec(sc, ro, rd, dSeg, lambda, rng, sthr, Tv);
                 thr *= Tv[sthr.n];
-                sthr.mulVec(sc, Tv, Tv[sthr.n], false);
+                sthr.mulVec(Tv, Tv[sthr.n], false);
             }
             if (thr <= 0.0) return;
         }
         if (h.valid && cmIdx >= 0) {                     // Beer-Lambert in current medium
             const double tt = (double)h.t;               // (spectral: see the march above)
             thr *= exp(-aGlass * tt);
-            sthr.mul(sc, [&](Real L) {
+            sthr.mul([&](Real L) {
                 return exp(-(double)specLookup(sc.mats[cmIdx].absorb, L) * tt);
             }, exp(-aGlass * tt));
         }
@@ -1038,7 +1039,7 @@ __device__ static void dPhotonGather(const DScene& sc, const DPhotonMap& pm,
                     const double Rh = (double)gd.R(lambda);
                     if (!(Rh > 0.0)) return;
                     thr *= Rh;
-                    sthr.mul(sc, [&](double Lw) { return (double)gd.R((Real)Lw); }, Rh);
+                    sthr.mul([&](double Lw) { return (double)gd.R((Real)Lw); }, Rh);
                 }
                 if (sc.bkGlossyNee) {                       // the lobe's own density, for the weight above
                     gmis.pdf  = dGlossyPdfHit(sc, m, h, rd * (Real)(-1), o);
@@ -1059,7 +1060,7 @@ __device__ static void dPhotonGather(const DScene& sc, const DPhotonMap& pm,
                 if (!dDielectricStep(sc, m, h, rd, lambda, rng, stk, nro, nrd, nullptr, &rs,
                                      &st)) return;
                 thr *= rs;                               // radiance across the interface
-                sthr.mulCoin(sc, [&](Real L, double& pr) {
+                sthr.mulCoin([&](Real L, double& pr) {
                     return dStepFactorAt(sc, m, h, d0, st, L, &pr);
                 }, st.factor, st.prob, m.type != D_DIELECTRIC);
                 ro = nro; rd = nrd; break;
@@ -1071,7 +1072,7 @@ __device__ static void dPhotonGather(const DScene& sc, const DPhotonMap& pm,
                 else      { ro = dOffsetAlong(h.p, h.ng, rd, h.pscale); }
                 // SPECGATHER: the coin at each photon's wavelength (host twin).
                 const double pc = refl ? (double)r : 1.0 - (double)r;
-                sthr.mulCoin(sc, [&](Real L, double& pr) {
+                sthr.mulCoin([&](Real L, double& pr) {
                     const double rL = (double)clamp01(dReflectSlot(sc, m, h, L));
                     return pr = refl ? rL : 1.0 - rL;
                 }, pc, pc, true);
@@ -1127,7 +1128,7 @@ __device__ static void dPhotonGather(const DScene& sc, const DPhotonMap& pm,
                         const double w = dHairFoldFCos(la, hsv, spk, wl, cosLong, nullptr) / pdfH;
                         vk[k] = w < 0.0 ? 0.0 : (w > 1.0 ? 1.0 : w);
                     }
-                    sthr.mulVec(sc, vk, wCam, true);
+                    sthr.mulVec(vk, wCam, true);
                 }
                 const DVec3 wOut = dhair::toWorld(hsv.fr, wl);
                 // Clear the strand by skipping curves within its exit distance on the next
@@ -1150,7 +1151,7 @@ __device__ static void dPhotonGather(const DScene& sc, const DPhotonMap& pm,
         // coatWalkOut). A fibre has no coat, so its pass-through never reaches this.
         if (!dCoatContinueWalk(sc, m, h, wArr, rd, lambda, thr, nullptr, nullptr, 0,
                                [&](const DCoatEval& ce, double s) {
-                                   sthr.mul(sc, [&](Real Lw) { return ce.at(Lw); }, s); }))
+                                   sthr.mul([&](Real Lw) { return ce.at(Lw); }, s); }))
             return;
         if (thr <= 0.0) return;
     }
@@ -1327,7 +1328,7 @@ __device__ static void dSppmVisiblePoint(const DScene& sc, DVec3 ro, DVec3 rd, R
                 const double arc = (double)gm.arc;
                 const double T = exp(-(double)specLookup(sc.mats[cm].absorb, lambda) * arc);
                 thr *= T;
-                sthr.mul(sc, [&](Real L) { return exp(-(double)specLookup(sc.mats[cm].absorb, L) * arc); }, T);
+                sthr.mul([&](Real L) { return exp(-(double)specLookup(sc.mats[cm].absorb, L) * arc); }, T);
             }
         }
         // b == 0 is the camera ray this visible-point walk was handed; see DMaterial::hideCamera.
@@ -1338,7 +1339,7 @@ __device__ static void dSppmVisiblePoint(const DScene& sc, DVec3 ro, DVec3 rd, R
                 const double tt = (double)h.t;
                 const double T = exp(-(double)specLookup(sc.mats[cm].absorb, lambda) * tt);
                 thr *= T;
-                sthr.mul(sc, [&](Real L) { return exp(-(double)specLookup(sc.mats[cm].absorb, L) * tt); }, T);
+                sthr.mul([&](Real L) { return exp(-(double)specLookup(sc.mats[cm].absorb, L) * tt); }, T);
             }
         }
         if (!h.valid) {                                  // escaped -> environment (direct)
@@ -1438,7 +1439,7 @@ __device__ static void dSppmVisiblePoint(const DScene& sc, DVec3 ro, DVec3 rd, R
                     const double Rh = (double)gd.R(lambda);
                     if (!(Rh > 0.0)) return;
                     thr *= Rh;
-                    sthr.mul(sc, [&](double Lw) { return (double)gd.R((Real)Lw); }, Rh);
+                    sthr.mul([&](double Lw) { return (double)gd.R((Real)Lw); }, Rh);
                 }
                 if (!dContinueAlong(h, o, DL_REFLECT, ro, rd)) return;
                 contSoft = dContSoftening(m, h, rd); break;
@@ -1452,7 +1453,7 @@ __device__ static void dSppmVisiblePoint(const DScene& sc, DVec3 ro, DVec3 rd, R
                 if (!dDielectricStep(sc, m, h, rd, lambda, rng, stk, nro, nrd, nullptr, &rs, &st))
                     return;
                 thr *= rs;                               // radiance across the interface
-                sthr.mulCoin(sc, [&](Real L, double& pr) {
+                sthr.mulCoin([&](Real L, double& pr) {
                     return dStepFactorAt(sc, m, h, d0, st, L, &pr);
                 }, st.factor, st.prob, m.type != D_DIELECTRIC);
                 ro = nro; rd = nrd; break;
@@ -1463,7 +1464,7 @@ __device__ static void dSppmVisiblePoint(const DScene& sc, DVec3 ro, DVec3 rd, R
                 if (refl) { if (!dContinueAlong(h, reflectv(rd, h.n), DL_REFLECT, ro, rd)) return; }
                 else      { ro = dOffsetAlong(h.p, h.ng, rd, h.pscale); }
                 const double pc = refl ? (double)r : 1.0 - (double)r;
-                sthr.mulCoin(sc, [&](Real L, double& pr) {
+                sthr.mulCoin([&](Real L, double& pr) {
                     const double rL = (double)clamp01(dReflectSlot(sc, m, h, L));
                     return pr = refl ? rL : 1.0 - rL;
                 }, pc, pc, true);
@@ -1486,7 +1487,7 @@ __device__ static void dSppmVisiblePoint(const DScene& sc, DVec3 ro, DVec3 rd, R
         // M's walk).
         if (!dCoatContinueWalk(sc, m, h, wArr, rd, lambda, thr, nullptr, nullptr, 0,
                                [&](const DCoatEval& ce, double s) {
-                                   sthr.mul(sc, [&](Real Lw) { return ce.at(Lw); }, s); }))
+                                   sthr.mul([&](Real Lw) { return ce.at(Lw); }, s); }))
             return;
         if (thr <= 0.0) return;
     }

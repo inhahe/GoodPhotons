@@ -583,9 +583,10 @@ struct SpecThr {
         return true;
     }
     // The product at uniform bin k's centre. A split bin's is the cell's its centre falls in (a split
-    // marks a step or a bend). An unsplit bin is read where the light in it lies (SpecCells::setMass), and
-    // across it the factors are near linear, or it would be split: its centre's value is on the line
-    // through its read and its neighbour's on the centre's side -- between the two, so under the peak.
+    // marks a step or a bend). An unsplit bin is read where the light in it lies (SpecCells::setMass): its
+    // centre's value is on the line through its read and its neighbour's on the centre's side -- between
+    // the two, so under the peak -- where the folded spectra are continuous across the two bins' common
+    // end (SpecCells::smooth: a step there is not), else its own read.
     double atBinCentre(int k) const {
         const double lk = bandBinLambda(k);
         const int c = cells->cellOf(lk);
@@ -593,6 +594,7 @@ struct SpecThr {
         const double lc = cells->lam[c];
         const int o = lk < lc ? c - 1 : c + 1;
         if (o < 0 || o >= n || !(std::fabs(cells->lam[o] - lc) > 0.0)) return v[c];
+        if (!cells->smooth[lk < lc ? k : k + 1]) return v[c];
         return std::max(0.0, v[c] + (v[o] - v[c]) * (lk - lc) / (cells->lam[o] - lc));
     }
 };

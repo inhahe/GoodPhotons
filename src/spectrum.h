@@ -426,6 +426,9 @@ struct SpecCells {
     double mass[kSpecCellsMax];                    // the walk density's mass in it (setMass)
     unsigned char first[kBandProbeBins];           // each uniform bin's first cell...
     unsigned char count[kBandProbeBins];           // ...and how many it is split into
+    // Per uniform bin k >= 1, whether the folded spectra are continuous across bin k's lower end
+    // (chooseSpecCuts' `smooth`; all 1 until Scene::buildSpecCells sets them).
+    unsigned char smooth[kBandProbeBins];
     SpecCells() { build({}); }
 
     // The grid with cuts at `cuts` (nm): one cell a bin and no cut but the bins' own ends where there
@@ -463,6 +466,7 @@ struct SpecCells {
             count[k] = (unsigned char)(n - first[k]);
         }
         for (int i = 0; i < n; ++i) mass[i] = 0.0;
+        for (int k = 0; k < kBandProbeBins; ++k) smooth[k] = 1;
     }
     // The walk density's mass in each cell, as EmissionSampler::binMass has it in each bin, and the
     // wavelength the cell is read at: the density's centroid in it, where the light's power in the cell
@@ -503,9 +507,23 @@ struct SpecCutCurve { const Spectrum* s; bool support; };
 // sits (the centre's bias alone misses a step centred in its cell). The curves are sampled kSpecCutSub times a bin, so a bin's ends are sample
 // boundaries; a cut snaps to a table's knot within a sample of it, so a step there reads exactly.
 // Returns the cuts (nm, in no order); `left` gets the worst error the budget left (0 when none did).
+// `smooth`, where given (kBandProbeBins entries), gets per uniform bin k >= 1 whether every curve is
+// continuous across bin k's lower end: whether the cells on either side of it, as the cuts leave them, meet
+// there along their own least-squares lines, to within kJoinSlack times the two lines' RMS residuals (or
+// `tol` where both are near exact). There a value read in one may be carried to the other's centre along
+// the line between the two reads (SpecThr::atBinCentre). A step on a bin's end cuts neither bin -- each is
+// flat -- and leaves that join rough; a bend there, or a curve across it, leaves it smooth, the line
+// between the two reads nearer the curve than either read alone.
 constexpr int kSpecCutSub = 80;
-inline std::vector<double> chooseSpecCuts(const std::vector<SpecCutCurve>& curves, double tol, double& left) {
+// How far apart, in the two lines' RMS residuals, the cells' lines may meet at a join that is smooth: a
+// least-squares line's end strays from a quadratic by sqrt(5) times its residual, and at a bend the two
+// ends' strays add. 4 holds every smooth curve tried smooth -- Gaussians 3-100 nm wide, sigmoids,
+// blackbodies, a 60 nm sine: at most 3.3, most under 2 -- and a step rough once it passes the cells' error.
+constexpr double kJoinSlack = 4.0;
+inline std::vector<double> chooseSpecCuts(const std::vector<SpecCutCurve>& curves, double tol, double& left,
+                                          std::vector<char>* smooth = nullptr) {
     left = 0.0;
+    if (smooth) smooth->assign(kBandProbeBins, 1);
     const int N = kBandProbeBins * kSpecCutSub;
     const double W = (LAMBDA_MAX - LAMBDA_MIN) / (double)kBandProbeBins, dl = W / kSpecCutSub;
     // Each curve's prefix sums over the samples: of f, f^2 and j f (its linear fit), and of its zeros.
@@ -535,6 +553,19 @@ inline std::vector<double> chooseSpecCuts(const std::vector<SpecCutCurve>& curve
     }
     std::vector<double> cuts;
     if (cs.empty()) return cuts;
+    // A curve's least-squares line over cell [a, b), sample j at position j: its mean, at the cell's middle
+    // sample position, its slope, and its RMS residual over the cell.
+    struct Line {
+        double mean, slope, mid, rms;
+        double at(double x) const { return mean + slope * (x - mid); }
+    };
+    const auto lineOf = [](const Curve& c, int a, int b) {
+        const double n = (double)(b - a), stt = n * (n * n - 1.0) / 12.0;   // sum of (j - mid)^2
+        const double s1 = c.P[(size_t)b] - c.P[(size_t)a], s2 = c.Q[(size_t)b] - c.Q[(size_t)a];
+        const double m = s1 / n, stf = (c.J[(size_t)b] - c.J[(size_t)a]) - 0.5 * (a + b - 1) * s1;
+        const double ss = s2 - n * m * m - (stt > 0.0 ? stf * stf / stt : 0.0);
+        return Line{m, stt > 0.0 ? stf / stt : 0.0, 0.5 * (a + b - 1), std::sqrt(std::max(0.0, ss) / n)};
+    };
     // A cell as sample boundaries [a, b); read at a bin's centre where it is a whole bin, else its middle.
     auto lamOf = [&](int a, int b) {
         return (a % kSpecCutSub == 0 && b == a + kSpecCutSub) ? bandBinLambda(a / kSpecCutSub)
@@ -542,14 +573,11 @@ inline std::vector<double> chooseSpecCuts(const std::vector<SpecCutCurve>& curve
     };
     auto err = [&](int a, int b) {
         const double lam = lamOf(a, b), n = (double)(b - a);
-        const double stt = n * (n * n - 1.0) / 12.0;   // sum of (j - the cell's middle)^2
         double e = 0.0;
         for (const Curve& c : cs) {
             const double at = (*c.s)(lam);
-            const double s1 = c.P[(size_t)b] - c.P[(size_t)a], s2 = c.Q[(size_t)b] - c.Q[(size_t)a];
-            const double m = s1 / n, stf = (c.J[(size_t)b] - c.J[(size_t)a]) - 0.5 * (a + b - 1) * s1;
-            const double ss = s2 - n * m * m - (stt > 0.0 ? stf * stf / stt : 0.0);   // the fit's residual
-            double ec = std::max(std::fabs(m - at), std::sqrt(std::max(0.0, ss) / n)) / c.top;
+            const Line ln = lineOf(c, a, b);
+            double ec = std::max(std::fabs(ln.mean - at), ln.rms) / c.top;
             if (c.support) {
                 const double z = (c.Z[(size_t)b] - c.Z[(size_t)a]) / n;
                 ec += (at == 0.0) ? 1.0 - z : z;
@@ -558,7 +586,7 @@ inline std::vector<double> chooseSpecCuts(const std::vector<SpecCutCurve>& curve
         }
         return e;
     };
-    std::vector<std::pair<int, int>> cells;
+    std::vector<std::pair<int, int>> cells;   // in order, end to end
     for (int k = 0; k < kBandProbeBins; ++k) cells.push_back({k * kSpecCutSub, (k + 1) * kSpecCutSub});
     for (int taken = 0;; ++taken) {
         size_t worst = 0;
@@ -567,8 +595,8 @@ inline std::vector<double> chooseSpecCuts(const std::vector<SpecCutCurve>& curve
             const double e = err(cells[i].first, cells[i].second);
             if (e > we) { we = e; worst = i; }
         }
-        if (we <= tol) return cuts;
-        if (taken == kSpecCutsMax) { left = we; return cuts; }
+        if (we <= tol) break;
+        if (taken == kSpecCutsMax) { left = we; break; }
         const int a = cells[worst].first, b = cells[worst].second;
         int best = -1;
         double be = 0.0;
@@ -576,7 +604,7 @@ inline std::vector<double> chooseSpecCuts(const std::vector<SpecCutCurve>& curve
             const double e = std::max(err(a, c), err(c, b));
             if (best < 0 || e < be) { best = c; be = e; }
         }
-        if (best < 0) { left = we; return cuts; }   // a one-sample cell: nothing finer to cut
+        if (best < 0) { left = we; break; }   // a one-sample cell: nothing finer to cut
         double at = LAMBDA_MIN + best * dl;
         for (const Curve& c : cs)
             for (double kx : c.knots)
@@ -585,4 +613,19 @@ inline std::vector<double> chooseSpecCuts(const std::vector<SpecCutCurve>& curve
         cells[worst].second = best;
         cells.insert(cells.begin() + (std::ptrdiff_t)worst + 1, {best, b});
     }
+    if (smooth) {
+        (*smooth)[0] = 0;
+        size_t i = 0;
+        for (int k = 1; k < kBandProbeBins; ++k) {
+            const int m = k * kSpecCutSub;   // a bin's end is always a cell's
+            while (cells[i].second != m) ++i;
+            bool ok = true;
+            for (const Curve& c : cs) {
+                const Line l = lineOf(c, cells[i].first, m), r = lineOf(c, m, cells[i + 1].second);
+                ok = ok && std::fabs(l.at(m - 0.5) - r.at(m - 0.5)) <= std::max(tol * c.top, kJoinSlack * (l.rms + r.rms));
+            }
+            (*smooth)[(size_t)k] = ok ? 1 : 0;
+        }
+    }
+    return cuts;
 }

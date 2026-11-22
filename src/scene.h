@@ -3876,7 +3876,9 @@ struct Scene {
         }
         for (const Medium& md : media) { folded.push_back({&md.sigma_a, false}); folded.push_back({&md.sigma_s, false}); }
         double left = 0.0;
-        specCells.build(chooseSpecCuts(folded, 0.01, left));
+        std::vector<char> smooth;
+        specCells.build(chooseSpecCuts(folded, 0.01, left, &smooth));
+        for (int k = 0; k < kBandProbeBins; ++k) specCells.smooth[k] = (unsigned char)smooth[(size_t)k];
         specCells.setMass(emitSampler);
         for (Emitter& e : emitters) {
             e.cellEmit.assign((size_t)specCells.n, 0.0);
@@ -4868,7 +4870,8 @@ struct Scene {
     // isosurface's side, and the world boxes of the solids light does not pass (solidNear). The full
     // pass also closes a world mesh object or loose piece open along a planar rim that rests on another
     // face, for the probes alone (watertight's capOk; Tri::solidFace 3 and 4; PROBE-PARITY-LIMITS) -- not
-    // an asset's, whose instances may each rest on something else or nothing.
+    // an asset's, whose instances may each rest on something else or nothing, nor one that moves, nor one
+    // a light lies inside.
     // `enclosuresOnly`: only what enclosureAt reads -- the pieces holding a material a walk can be
     // inside, and the isosurfaces' sides -- which is what build() asks for, the rest left to the full
     // pass a footprint needs. Once a build each: a repeated call returns the first's counts.
@@ -4940,6 +4943,20 @@ struct Scene {
             return true;
         };
         const watertight::CapOk* cap = enclosuresOnly ? nullptr : &capOk;
+        // Where the lights are, which a cap may not enclose (a box with a lamp in it is a room).
+        std::vector<Vec3> lit;
+        if (cap) {
+            for (const Emitter& e : emitters) {
+                if (e.shape == EmitterShape::Quad) lit.push_back(e.origin + e.u * 0.5 + e.v * 0.5);
+                else if (e.shape == EmitterShape::Mesh)
+                    for (const EmitTri& t : e.meshTris) lit.push_back(t.v0 + (t.e1 + t.e2) * (1.0 / 3.0));
+                else if (e.shape == EmitterShape::Spot || e.shape == EmitterShape::Sphere ||
+                         e.shape == EmitterShape::Cylinder)
+                    lit.push_back(e.origin);
+                // (an env and a sun lie outside every piece; a glow lights nothing)
+            }
+            for (const EmissiveVolume& ev : emissiveVolumes) lit.push_back((ev.bmin + ev.bmax) * 0.5);
+        }
         for (const MeshGroup& g : meshGroups) {
             if (g.shapeOnly) continue;
             if (g.blasId >= 0 && g.blasId < (int)blasList.size()) {
@@ -4957,7 +4974,8 @@ struct Scene {
                 std::fill(held.begin() + (std::ptrdiff_t)g.triStart,
                           held.begin() + (std::ptrdiff_t)(g.triStart + g.triCount), (char)1);
                 if (enclosuresOnly && !holdsEnterable(tris.data() + g.triStart, g.triCount)) continue;
-                sm.solid += watertight::markSolidFaces(tris.data() + g.triStart, g.triCount, &worldPieces, &pieceOf, cap);
+                sm.solid += watertight::markSolidFaces(tris.data() + g.triStart, g.triCount, &worldPieces, &pieceOf, cap,
+                                                       &lit);
                 bound([&](size_t i) -> Tri& { return tris[g.triStart + i]; }, g.triCount);
                 sm.seen += g.triCount;
             }
@@ -4981,7 +4999,7 @@ struct Scene {
                 if (!t->solidFace) { rest.push_back(t); ++openSolid; }
         }
         if (!enclosuresOnly || openSolid) {
-            sm.solid += watertight::markSolidFaces(rest.data(), rest.size(), &worldPieces, &pieceOf, cap);
+            sm.solid += watertight::markSolidFaces(rest.data(), rest.size(), &worldPieces, &pieceOf, cap, &lit);
             bound([&](size_t i) -> Tri& { return *rest[i]; }, rest.size());
             sm.seen += rest.size() - openSolid;
         }

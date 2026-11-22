@@ -294,6 +294,9 @@ Then the rest of 4.2-4.6 in their order, 4.7's bookkeeping alongside whatever to
   memory, so the next GPU render paged (~45x slower); it gives the device back as the render ends.
 - [x] **J-THIN-GAP-LEAK** (0.445.3) — J's and U's merges keep their own surface's photons over its
   share of the disc (the footprint): the gap's light stays off the plate, and object bases read true.
+- [x] **REVIEW-0458** (0.451.16) — the Opus (max) review of 0.451.14-0.451.15: the cap closed a room and a
+  mover, the bin-centre line crossed a step on a bin's edge, a lost parity test, the sky pass's idle draws;
+  known-issues REVIEW-0458.
 - [x] **REVIEW-0445B** (0.446.1) — the Opus (max) and Fable (xhigh) reviews of 0.445.4-0.445.9:
   where walks start (tube lights, `-no-env`, open sheets, mixes, strands, the device's cap), the
   legs left unabsorbed (mode C, M's glossy NEE, `-rgb`, a glow seen, a camera in a glass ball,
@@ -340,7 +343,10 @@ Then the rest of 4.2-4.6 in their order, 4.7's bookkeeping alongside whatever to
   seeds GPU over CPU mode M reads 1.0001 in red (known-issues).
 - [x] **CURVE-GATHER**, mode U's half (VCM-THIN-CURVES) — 0.439.2: mode U merges at no curve
   vertex (`vcmMergeAt` / `dVcmMergeAt`); its coat 2.10 / 2.36 -> 1.000 / 1.014 of mode R.
-- [x] **PROBE-PARITY-LIMITS** (0.451.14) — an open solid taller than the radius, its planar rim closed by
+- [ ] **PROBE-PARITY-LIMITS** (reopened at 0.451.16) — left: an asset's open piece (a cap per instance), a
+  non-planar hole (a fan cap from the rim's centroid), a mover that rests at every time (capOk per key); the
+  proper fixes are in the entry. 0.451.16 (REVIEW-0458) refused the cap for a room (a light inside) and a
+  mover. 0.451.14: an open solid taller than the radius, its planar rim closed by
   the face it rests on, is closed there for the probes alone (Tri::solidFace 3/4); was: the footprint probe's
   crossing count misreads a photon-holding open
   surface hovering within the radius, and an open solid taller than it. Closed solids (analytic
@@ -570,7 +576,8 @@ Then the rest of 4.2-4.6 in their order, 4.7's bookkeeping alongside whatever to
   middle (a line behind a ramp read 0.83 in modes M and S), and the spectral NEE weighted by each light's own
   emission in a cell (SPECNEE-LINE-LIGHT: a glossy wall under the line read 0.58); known-issues.
 - [ ] **JSPEC-BIN-RESOLUTION** — the beam gather's carrier and mode J's on the scene's cells too, with
-  JSPEC-CARRIER-SIZE's half-precision bins; known-issues.
+  JSPEC-CARRIER-SIZE's half-precision bins; known-issues. Its test-to-be: scenes/_jfog_gelkink.ftsl (a bend
+  between two bins' centres, J 0.84 and M 0.85 of mode R at 0.451.16), into check_jfog_glass once it holds.
 - [x] **REVIEW-0450R** (0.450.45) — the Opus (max) and Fable (xhigh) reviews of 0.450.43-0.450.44;
   known-issues REVIEW-0450R.
 - [x] **REVIEW-0450Q** (0.450.43) — the Opus (max) and Fable (xhigh) reviews of 0.450.42; known-issues REVIEW-0450Q.

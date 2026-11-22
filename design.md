@@ -1365,8 +1365,15 @@ wavelength -- exact for a line wherever it falls, where a cell's width times the
 read a line between the nodes as next to nothing (a glossy wall under a 589 nm line read 0.10 in mode M,
 SPECNEE-LINE-LIGHT). The device takes the cells from `DScene::specCells` (`DSpecThr::init(sc)`, always
 uploaded), with the host's wavelengths and masses. Left on the uniform bins: the beam gather's `JSpec`
-(`toJSpec` reads each bin's centre's cell) and mode J's carrier, which is its own (known-issues
-JSPEC-BIN-RESOLUTION). `[specgather] ...` says where a render's bins were split;
+(`toJSpec`, each bin at its centre, `atBinCentre`: a split bin's cell there; an unsplit bin's read carried
+to its centre along the line to its neighbour's on that side, where the folded spectra are continuous
+across the two bins' common end -- `SpecCells::smooth`: the lines `chooseSpecCuts` fits over the final
+cells on either side meet there within four times their RMS residuals (`kJoinSlack`; a least-squares
+line's end strays from a smooth curve by about twice its residual) or its tolerance, which a step on a
+bin's end fails though it cuts neither bin, and a bend there or a curve across it passes, the line
+between the reads nearer than either read -- else its own read; 0.451.16, REVIEW-0458: a gel stepping on bin 12's lower edge read a 610 nm
+line through it at 0.85) and
+mode J's carrier, which is its own (known-issues JSPEC-BIN-RESOLUTION). `[specgather] ...` says where a render's bins were split;
 `tools/check_spec_cells.py` holds modes M and S, both devices, to mode R across steps inside a bin, a
 bend, a glossy wall behind a step, analytic bands and edges, a coin's support edge, and a line light
 behind a ramp before a diffuse and a glossy wall.
@@ -3791,7 +3798,7 @@ was lit differently by every mode (known-issues GLOW-LIGHT-MODES). Now:
   along the camera ray, which gives mode P's forward layer the same (its fit over the diffuse-side
   pixels otherwise read the glow's edge pixels in the camera side only and ran the frame bright); the
   composite adds those sums where it reads the forward film
-  (`forwardPixel`), without copying it. Under a blur P's split files each sample by its first
+  (`forwardRadiance`, `skyPassRadiance`), without copying it. Under a blur P's split files each sample by its first
   surface, so its forward layer leaves a glow on a specular-type surface to the camera side, whose
   specular film has it (`glowSeenXYZ`, the one estimator the three sky passes share). A plain glow's colour is exact at a pinhole's 64 points; one seen through a medium
   or on a compound is a draw a sample, and its count grows with the render. The pass sees on
@@ -3821,7 +3828,8 @@ was lit differently by every mode (known-issues GLOW-LIGHT-MODES). Now:
   them (`forwardRadiance`), and the fit takes the photons against the backward layer less them
   (`forwardScale`), so the sky does not wobble with the fit. A forward pixel a sample of which meets
   what the forward layer cannot show -- a specular-type surface first, a region that bends rays
-  (`SkyView::specSeen`; the pass runs for those marks where there is no sky to draw) -- is the backward
+  (`SkyView::specSeen`; where there is nothing to draw the pass runs for those marks alone, at its first
+  count, and a marked pixel's count never grows, nothing reading its sums) -- is the backward
   layer's at the composite, out of the fit: the edge of a glass ball or a mirror against the sky, or
   against a diffuse floor, has no dark rim. The fit also leaves out a pixel whose footprint a sun's disc
   comes near (`CompositeClass::fit`: the disc's cone against the pixel's corners), ten thousand times a
@@ -6790,15 +6798,24 @@ as the one at fault.
   volume (a double-sided card) is no solid. Corners weld at 1e-7 of the piece set's extent, never
   more than a thousandth of its shortest edge. **A piece open along a rim another face closes**
   (0.451.14, PROBE-PARITY-LIMITS) is closed by that face's plane for the probes alone: a world mesh
-  object or loose piece whose every edge is used twice in opposite directions or once, the once-used
-  ones (its rim) in one plane (Newell's normal over them), which a face covers where the rim encloses
-  it (short rays across the plane at the rim's centre and a tenth of the way in from its corners:
+  object or loose piece whose every edge is used twice in opposite directions or once and whose every
+  face's corner normals lie on one side of its winding, the whole piece on the same side, the once-used edges (its rim) in one plane (Newell's
+  normal over them, each run as its one face runs it), which a face covers where the rim encloses it
+  (short rays across the plane at the rim's centre and a tenth of the way in from its corners:
   `capOk`) -- a statue's open base on its floor, a bottomless box of quads on the ground. Its volume
-  taken about the rim's centre is the capped solid's (the cap's own tetrahedra vanish there), and its
-  faces are marked 3 or 4 (`Hit::solid` +-2), which the probes read by the sign and the enclosures
-  (`enclosureAt`, a camera's or light's medium) and the `emit_two_sided` refusal do not: an upright
-  cup's rim is planar too but closes on nothing, its floor lit through it. An asset's pieces are not
-  capped (each instance may rest on something else). It goes per mesh
+  taken about the rim's centre is the capped solid's (the cap's own tetrahedra vanish there; a flat
+  piece, a card or a light's quad, closes nothing and asks `capOk` nothing), and its faces are marked 3
+  or 4 (`Hit::solid` +-2), which the probes read by the sign and the enclosures (`enclosureAt`, a
+  camera's or light's medium) and the `emit_two_sided` refusal do not: an upright cup's rim is planar
+  too but closes on nothing, its floor lit through it. Not capped (0.451.16, REVIEW-0458): an asset's
+  pieces (each instance may rest on something else); a piece that moves or deforms (`Tri::motion`,
+  `vkeys`: it rests where it does at the instant only); and one a light lies inside -- a quad light's
+  centre, a mesh light's triangles' centroids, a spot's, sphere's or cylinder's origin, an emissive
+  volume's box centre, each tested by the parity of a ray's crossings of the piece and its cap --
+  which is a room, not a solid: a bottomless box with a lamp in it, whose floor a probe starting above
+  its lid must count, as the parity and the low leg do (capped, `check_gather_base`'s `litbox` read
+  its floor 9.0 of the uncorrected render; `tools/check_cap_marks.py` reads the pass's own count for each
+  rule). It goes per mesh
   object, then over every triangle no mesh object holds (quads, a light's own surface) as one pool,
   in which six quads meeting edge to edge form a box. The pass runs once per batch with a mode-M or
   mode-S camera and a footprint taken, before the exposure meter; the flag sits in `Tri`'s and
@@ -6845,8 +6862,8 @@ as the one at fault.
   3 cm box at radius 0.1; 0.99 with the count). A closed shelf hovering within the radius is
   crossed twice, and the floor under it counts (the plain disc average across its shadow). What the
   count still misreads (known-issues PROBE-PARITY-LIMITS): an open solid taller than the radius whose
-  hole is not closed by a face it rests on -- not planar, or an asset's -- holds the probe's origin, so
-  nothing is crossed and the floor under it counts.
+  hole is not closed by a face it rests on -- not planar, an asset's or a mover's -- holds the probe's
+  origin, so nothing is crossed and the floor under it counts.
   `-gageom`'s march takes the same count per column, looking for crossings as high as the probe
   does, r above the plane (0.433.7): a column near the disc's edge has a short chord, and a box top
   beyond it would otherwise leave the floor under the box counted. Sixteen faces without an answer

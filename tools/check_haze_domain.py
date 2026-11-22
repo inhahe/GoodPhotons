@@ -18,7 +18,8 @@ beams end there, and the MIS weights must leave the merges out past it, the conn
 the haze alone. A weight that still counted them read dark by their share (J-BEAM-FARLIMIT).
 
 Each case renders mode R and the mode under test, two seeds each (mode J in `farfield` eight, and its
-bound, about 2.7 %, the seeds' own: NOISY), and requires the ball's mean and
+bound, about 2.7 %, the seeds' own: NOISY; its mode R as many, which every mode of that scene then
+shares), and requires the ball's mean and
 the haze's (the top corners) to agree within 0.6 % (D) or 1.5 % (J, whose beam merges are
 noisier), or within four of their standard errors from the seeds' spread, whichever is wider.
 
@@ -127,6 +128,13 @@ def main():
             raise SystemExit("render failed: " + " ".join(cmd))
         return read_pfm(png[:-4] + ".pfm", top_down=True)[..., 1]
 
+    def ref_seeds(ref):
+        """Mode R's seed count for reference scene `ref`: the most any case measured against it
+        renders of its own mode, so the ratio's error has the degrees of freedom that case's bound
+        assumes (two of R's seeds would leave it one, whatever the other side's count)."""
+        return max(NOISY.get("%s_%s" % (n, m), (SEEDS, Q))[0]
+                   for n in scenes if REF_OF.get(n, n) == ref for m in ("D", "J"))
+
     devs = ["cpu"] + ([] if a.no_gpu else ["gpu"])
     only = set(x for x in a.only.split(",") if x)
     refs = {}
@@ -138,7 +146,7 @@ def main():
                     continue
                 key = (REF_OF.get(name, name), dev)
                 if key not in refs:
-                    refs[key] = [render(name, "R", dev, s) for s in range(1, SEEDS + 1)]
+                    refs[key] = [render(name, "R", dev, s) for s in range(1, ref_seeds(key[0]) + 1)]
                 R = refs[key]
                 nSeeds, q = NOISY.get("%s_%s" % (name, mode), (SEEDS, Q))
                 X = [render(name, mode, dev, s) for s in range(1, nSeeds + 1)]

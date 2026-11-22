@@ -2097,7 +2097,9 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
         if (c.n > kSpecCellsMax) throw std::logic_error("buildUploadScene: more spectral cells than the carrier holds");
         hc.n = c.n;
         for (int i = 0; i < c.n; ++i) { hc.hi[i] = c.hi[i]; hc.lam[i] = c.lam[i]; hc.mass[i] = c.mass[i]; }
-        for (int k = 0; k < kBandProbeBins; ++k) { hc.first[k] = c.first[k]; hc.count[k] = c.count[k]; }
+        for (int k = 0; k < kBandProbeBins; ++k) {
+            hc.first[k] = c.first[k]; hc.count[k] = c.count[k]; hc.smooth[k] = c.smooth[k];
+        }
         DSpecCells* d = nullptr;
         CUDA_CHECK(cudaMalloc(&d, sizeof hc));
         CUDA_CHECK(cudaMemcpy(d, &hc, sizeof hc, cudaMemcpyHostToDevice));

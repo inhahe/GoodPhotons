@@ -518,6 +518,67 @@ check_spec_cells' 546.5 nm gel, bin 9 takes the gel's 0 and `JSpec::at` interpol
 scene's cells too (its `r[]` sized `kSpecCellsMax`, read by cell rather than interpolated across a cut,
 its support's `hole` mask per cell) -- which grows the per-segment and per-vertex carrier
 JSPEC-CARRIER-SIZE measures (120 B to about 190 B), so it goes with that entry's half-precision bins.
+**A bend between two bins' centres too (0.451.16):** scenes/_jfog_gelkink.ftsl sees a fog through a gel
+ramping from 0 at 595 nm (bin 12's lower edge) to 0.9 at 620, lit by a 610 nm line. The uniform bins
+hold the gel at 604.8 nm (0.35) and at 624.4 (0.9, past the bend), and `JSpec::at` reads between them
+geometrically: 0.45 at 610 where the gel passes 0.54. check_jfog_glass at that scene read the fog
+R 0.843 / 0.841 of mode R in mode J (GPU / CPU) and 0.852 / 0.865 in mode M -beams, whose carrier's
+bin 12 is right at its centre there (SpecThr::atBinCentre); it is not in the check's scenes until this
+is fixed, and then is its test.
+
+## DONE (2026-11-22, 0.451.16): REVIEW-0458 — what the Opus (max) review of 0.451.14-0.451.15 found
+
+Opus (max) reviewed 06e33ab..f16e571 (0.451.14 PROBE-PARITY-LIMITS' cap, 0.451.15 REVIEW-0457's
+follow-up): fifteen findings, each checked against the code.
+
+* **The cap closed a room** (0.451.14): a bottomless box with a lamp inside it rests on the floor as a
+  statue does, so it was capped, and a probe over its floor -- starting above a lid lower than the
+  radius -- entered the "solid" there and dropped the floor it met: the floor read too bright, by its
+  lost coverage. A piece any light lies inside is not capped now (a quad light's centre, a mesh light's
+  triangles' centroids, a spot's, sphere's or cylinder's origin, an emissive volume's box centre; the
+  parity of a ray's crossings of the piece and its cap). check_gather_base's `litbox`, seen from inside
+  it: 9.0 of the uncorrected render on 0.451.15 in modes M and S, both devices (-gageom 7.1 of the
+  probe's), within 3 % now; tools/check_cap_marks.py's `lamp` counts no capped face.
+* **A mover kept its cap at the times it does not rest** (0.451.14): resting is decided at the instant,
+  so a bottomless box lifting off the floor over the shutter stayed a solid for the probes while it
+  hovered. A piece with a moving or deforming face is not capped (check_cap_marks' `moving`).
+* **atBinCentre carried a bin's read across a step on its edge** (0.451.15): it took an unsplit bin's
+  centre along the line to its neighbour's read, and chooseSpecCuts tests each bin alone, so a step on
+  their common end (both flat, neither cut) was drawn as a ramp: behind a gel stepping 0 -> 0.9 at
+  595 nm, bin 12's lower edge, a 610 nm line read 0.79 at the bin's centre and 0.85 through
+  `JSpec::at`. chooseSpecCuts now says per join whether the folded spectra are continuous there -- the
+  lines it fits over the final cells on either side meeting within four times their residuals or its
+  tolerance (`SpecCells::smooth`, `kJoinSlack`, uploaded with the cells) -- and atBinCentre reads its own
+  value where not. check_jfog_glass's `gelline` (mode M -beams): the fog 0.744 (GPU) and 0.755 (CPU) of
+  mode R in red on 0.451.15. Continuity, not linearity across the pair: at a bend on the join or a curve
+  across it the line between the two reads is nearer than either read: behind a gel ramping from 0 at
+  the join, 595 nm, to 0.9 at 620, the line put bin 12's centre at the gel's value there, where the
+  bin's own read (a first build of this follow-up, linearity across the pair) put the fog 1.146 / 1.164
+  of mode R; the fog's remaining 15 % is the uniform bins' own reach, which mode J shares
+  (JSPEC-BIN-RESOLUTION, scenes/_jfog_gelkink.ftsl).
+* **check_gather_base's `openbox` no longer tested the parity and the low leg** (0.451.14 caps it): the
+  same box lifted 0.25 mm (`openbox_lifted`) does -- its rim rests on nothing, 0.1 mm being the cap's
+  reach, and the low leg, 1 % of the radius up, still meets its walls (lifted 1 mm the leg passed under
+  them and the floor under the box counted, 0.68 of mode R). The check now asserts each such case's
+  marking from the render's `[gather]` count, so a case cannot drift onto the cap's path unseen.
+* **check_haze_domain's farfield mode J bound assumed seven degrees of freedom** with mode R rendered
+  at two seeds; mode R now renders as many seeds as the noisiest case measured against it.
+* **The sky pass ran its draws with nothing to draw** (0.451.15): under a composite with no sky, sun or
+  glow it still walked every through-sample and grew its counts; it now takes the marks alone, at its
+  first count, a marked pixel's count never grows (nothing reads its sums), and a sample's region test
+  for bent rays is made once.
+* **The cap's pass cost**: the flat test (the volume about the rim's centre) now comes before capOk's
+  rays, so a card or a light's quad asks nothing; its arrays are a rim-edge list and the candidates'
+  compact records, not seven per-vertex arrays (some 83 bytes a vertex); a face's side is classified once.
+* Docs and comments: SkyView's comment and the mode P overview had come apart from what they describe,
+  the overview and two of runCompositeProgressive's comments described the composite before 0.451.15;
+  design.md named a removed `forwardPixel`; PROBE-PARITY-LIMITS was DONE with its own gaps listed
+  (reopened, below). Smaller: one `SkyView::specAt` for the composite's rule in place of two copies;
+  `sunNear`'s lens doubling, dead (a lens routes mode P to D or R, and its layers are pinholes); DSpecThr's
+  folds took a scene they never read.
+* Dismissed: **a capped piece's box keeps `solidNear` from short-circuiting inside a room** -- a room
+  holds its light and is no longer capped (the first finding), and a capped solid's box is what lets a
+  probe over a capped piece taller than the radius find it (PROBE-PATH; `opentower`).
 
 ## DONE (2026-11-22, 0.451.15): REVIEW-0457 — what the Opus (max) review of 0.451.12-0.451.13 found
 
@@ -3381,7 +3442,7 @@ know the solid is opaque, which a room built as one closed box seen from inside 
 come with a test that tells an enclosure from an object (whether the gather point lies inside the
 solid).
 
-## DONE (2026-11-21, 0.451.14): PROBE-PARITY-LIMITS — two shapes the footprint probe's crossing count misreads
+## OPEN (2026-11-22, reopened at 0.451.16): PROBE-PARITY-LIMITS — the open solids the footprint probe's crossing count still misreads
 
 Modes M and S count the faces their footprint probe crosses above the gather's tangent-plane band,
 and take an odd count to mean the column lies inside a solid resting on the surface (the halo fix,
@@ -3439,6 +3500,23 @@ upright cup's rim closes on nothing, so its floor stays open. check_gather_base'
 30 cm tower with no bottom face: the floor 0-2 cm and 2-5 cm from its base read 0.56 and 0.71 of
 their true coverage on 0.451.13 in modes M and S, both devices, and 0.99-1.01 now. Left: an asset's open
 pieces (each instance may rest on something else or nothing) and a hole that is not planar.
+**0.451.16 (REVIEW-0458)** refuses the cap where it was wrong: a piece a light lies inside (a room), and a
+piece that moves or deforms (it rests at the instant only). tools/check_cap_marks.py holds the rules.
+**Still open -- an open solid taller than the radius that no cap closes, its floor read dark at its base
+(0.56 of its coverage, `opentower` on 0.451.13):**
+- *An asset's open piece.* Its instances share the asset's triangles, so a face state on them cannot
+  differ per instance. **Proper fix:** mark such a piece's faces by the side its cap would give
+  (object space: the volume about its rim's centre does not depend on the placement), and give each
+  instance a bit per such piece, set where capOk passes for the rim placed by that instance and no light
+  lies inside it there; the probes read a hit on an instance's face as capped where its bit is set
+  (host Hit and the device's instance record).
+- *A hole that is not planar* (a statue's base on uneven ground). **Proper fix:** a fan of triangles from
+  the rim's centroid closes any rim, and its tetrahedra about the centroid vanish, so the volume taken
+  about the centroid is that closed solid's, planar or not; capOk then asks of every rim vertex (and the
+  centroid) that a face lies under it, and the light-inside test crosses the fan instead of the plane.
+- *A mover that rests at every time* (a box sliding along the floor). **Proper fix:** capOk at each
+  motion key, the piece placed there, and the cap only where it rests at all of them (a rigid key's
+  in-plane translation or vertical-axis turn keeps a planar rim on its plane between keys).
 
 ## DONE (2026-11-16, no change): MODEM-CPU-DARKGLASS-BLUE — CPU mode M reads blue 15 % low through glass that absorbs blue strongly
 

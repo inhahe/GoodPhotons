@@ -1,9 +1,9 @@
 """Regression check: modes M and S read the floor at the base of an object standing on it as mode R does.
 
     python tools/check_gather_base.py [--out png/check_gather_base] [--exe ftrace.exe]
-                                      [--objects diffuse,mirror,coated,coaster,openbox,tower,isotower,
-                                                 towerfar,opentower,ball,meshball,diffuseball,smallball,
-                                                 mirrorsheet,lampsheet,tablesheet]
+                                      [--objects diffuse,mirror,coated,coaster,openbox,openbox_lifted,
+                                                 tower,isotower,towerfar,opentower,litbox,ball,meshball,
+                                                 diffuseball,smallball,mirrorsheet,lampsheet,tablesheet]
 
 A closed 3 cm box (six quads) standing on a lit floor, seen from straight above, modes M and S at a
 pinned gather radius of 0.1 on the CPU and the GPU, against mode R on the GPU. A mode-M or mode-S
@@ -23,10 +23,15 @@ so the probe passes their faces, but they are opaque: their faces are crossings 
 (passesLight), or the floor under them counts as covered again. A diffuse box 5 mm tall (`coaster`)
 has its top in the floor's band from 5 cm away, so the floor's gather takes the top's photons there,
 and the top must count as covered: met from outside, a closed solid's face in the band is the
-surface, not a crossing. A glossy box with no bottom face (`openbox`), an open shell that cannot
-say its side and holds no photon, still shadows the floor inside it: its lid counts toward the
-parity, which the walls confirm along the low leg from the gather point to the column. A diffuse
-box 30 cm tall (`tower`), off to one side so the foot of its near
+surface, not a crossing. A glossy box with no bottom face (`openbox`), an open shell that holds no
+photon, rests on the floor, which closes its rim: the probes take it as closed there, as `opentower`
+(below). Lifted a quarter of a millimetre (`openbox_lifted`) its rim rests on nothing -- the cap asks
+for a face within a ten-thousandth of the rim's reach, 0.1 mm here -- and it cannot say its side, but it
+still shadows the floor inside it: its lid counts toward the parity, which the walls confirm along the
+low leg from the gather point to the column, 1 % of the radius over the floor (1 mm; lifted 1 mm, the
+leg passed under the walls and the floor under the box counted, 0.68 of mode R). The render's own
+`[gather]` count must say it is not capped, or it tests the cap instead (MARKS). A diffuse box 30 cm
+tall (`tower`), off to one side so the foot of its near
 face is seen past its top: every probe over it begins inside it, r above the floor, and crosses none
 of its faces going down, so it must know from the path up from the gather point and across that it
 began inside (PROBE-PATH); `isotower` is the same tower as an isosurface, an SDF box, whose side
@@ -36,7 +41,12 @@ solid; `opentower` is the tower with no bottom face, an open piece that cannot s
 rim the floor closes, and which the probes take as closed there (PROBE-PARITY-LIMITS: a probe begun
 inside it crossed nothing, met the floor in the band, and read the floor at its foot dark). Its shadow
 at its foot is too steep for mode R to be a reference within
-the radius, so it is held to its exact coverage (below). Then a glossy ball of the box's
+the radius, so it is held to its exact coverage (below). A diffuse box 4 cm tall with no bottom face
+and a lamp inside it (`litbox`), seen from inside, rests on the floor as `openbox` does, but it is a
+room, not a solid: a probe over its floor starts above its lid and crosses it, and must count the
+floor it meets there by the parity and the low leg. Closed as a solid, the floor 0-4 cm from its
+middle read 9.0 of the uncorrected render in modes M and S, both devices (0.451.15; -gageom 7.1 of
+the probe's). Then a glossy ball of the box's
 half-width resting on the floor, analytic and as a closed OBJ, seen from low beside it with a low
 light from the side reaching under its overhang. There, 4-12 cm from the point it rests on, the gap
 to the ball is under the gather radius, so the probe begins inside the ball and leaves it before it
@@ -54,14 +64,16 @@ there (`tablesheet`), which holds photons and is crossed once, its low leg open.
 
 The floor 0-2 cm and 2-5 cm out from a box's base must each read within 7 % of mode R (two seeds
 apiece), the pixels that reach the box's top as the camera sees it left out (box_floor: a 3 cm top
-hides the floor 5 mm out, and its edge pixels are top). The floor 4-12 cm from a ball's contact must read within 3 % of the same render with the
-footprint correction off (-gatherarea 0), whose coverage there is the whole disc: the kernel's blur
-from the lit floor beyond makes mode R no reference there. The tower's rings must read within 3 % of
+hides the floor 5 mm out, and its edge pixels are top). The floor 4-12 cm from a ball's contact, and
+the room's 0-4 cm from its middle, must read within 3 % of the same render with the footprint
+correction off (-gatherarea 0), whose coverage there is the whole disc: the kernel's blur from the
+lit floor beyond (the lamp's falloff, in the room) makes mode R no reference there. The tower's rings must read within 3 % of
 that render divided by each pixel's share of the disc outside the tower, a circular segment's
 complement, with mode S's radius held (-sppmalpha 1). Exits 0 when every case holds, 1 otherwise.
 """
 import argparse
 import os
+import re
 import sys
 
 import numpy as np
@@ -144,24 +156,31 @@ def top_dist(base):
     return base(X, Z)
 
 
-def side_dist(occluded=True, radius=BOX):
-    """Each pixel of the view from beside the ball (of `radius`, resting on the floor at the origin)
-    as the floor's distance from the point below the ball's centre, or NaN where the pixel sees no
-    floor, or (`occluded`) sees it within 4 mm of the ball's silhouette (which the mesh ball's
-    facets move). The camera's pinhole (fov_y, square pixels, row 0 at the top), checked against
-    marker renders to a pixel."""
-    w = SLOOK - SEYE
+def pinhole(eye, look, fov, w_, h_):
+    """Each pixel's ray direction of a camera at `eye` looking at `look` (fov_y `fov` degrees, up +y,
+    square pixels, row 0 at the top, w_ x h_), and each one's distance along it to the floor, y = 0
+    (inf: parallel)."""
+    w = look - eye
     w = w / np.linalg.norm(w)
     u = np.cross(w, [0.0, 1.0, 0.0])
     u = u / np.linalg.norm(u)
     v = np.cross(u, w)
-    t = np.tan(np.radians(SFOV) / 2)
-    sx = ((np.arange(SW) + 0.5) / SW * 2 - 1) * t * SW / SH
-    sy = (1 - (np.arange(SH) + 0.5) / SH * 2) * t
+    t = np.tan(np.radians(fov) / 2)
+    sx = ((np.arange(w_) + 0.5) / w_ * 2 - 1) * t * w_ / h_
+    sy = (1 - (np.arange(h_) + 0.5) / h_ * 2) * t
     SX, SY = np.meshgrid(sx, sy)
     d = w[None, None, :] + SX[..., None] * u + SY[..., None] * v
     with np.errstate(divide="ignore"):
-        tf = -SEYE[1] / d[..., 1]                              # the floor, y = 0 (inf: parallel)
+        tf = -eye[1] / d[..., 1]
+    return d, tf
+
+
+def side_dist(occluded=True, radius=BOX):
+    """Each pixel of the view from beside the ball (of `radius`, resting on the floor at the origin)
+    as the floor's distance from the point below the ball's centre, or NaN where the pixel sees no
+    floor, or (`occluded`) sees it within 4 mm of the ball's silhouette (which the mesh ball's
+    facets move). The camera's pinhole (`pinhole`), checked against marker renders to a pixel."""
+    d, tf = pinhole(SEYE, SLOOK, SFOV, SW, SH)
     oc = SEYE - np.array([0.0, radius, 0.0])
     b = d @ oc
     a = np.einsum("ijk,ijk->ij", d, d)
@@ -193,13 +212,41 @@ def box_floor(X, Z, height):
     return np.where((d >= 0) & (near < BOX * height / (TOP_EYE - height)), np.nan, d)
 
 
-def _box(mat, height=0.03, bottom=True):
-    faces = box(-BOX, 0.0, -BOX, BOX, height, BOX, "obj")
+def _box(mat, height=0.03, bottom=True, lift=0.0):
+    faces = box(-BOX, lift, -BOX, BOX, lift + height, BOX, "obj")
     if not bottom:
-        faces = [f for f in faces if "origin %g 0 %g  u %g 0 0" % (-BOX, -BOX, 2 * BOX) not in f]
+        faces = [f for f in faces if "origin %g %g %g  u %g 0 0" % (-BOX, lift, -BOX, 2 * BOX) not in f]
         assert len(faces) == 5
-    return ([mat] + faces, TOP_CAM, lambda: top_dist(lambda X, Z: box_floor(X, Z, height)), RINGS,
+    return ([mat] + faces, TOP_CAM, lambda: top_dist(lambda X, Z: box_floor(X, Z, lift + height)), RINGS,
             "the base", "R")
+
+
+# A room: a box 4 cm tall with no bottom face and a lamp under its lid, seen from a camera inside it
+# (the lamp hidden from the camera). Every probe over its floor starts r above the floor, above the
+# lid. Its floor within 4 cm of the middle is held to the same render with the footprint correction
+# off, as a ball's ring is: the disc lies wholly on the floor inside the box there.
+ROOM_H = 0.04
+IEYE, ILOOK, IFOV, IW, IH = np.array([0.12, 0.025, 0.0]), np.array([0.0, 0.0, 0.0]), 60.0, 160, 100
+INNER_CAM = 'camera "c" { eye %g %g %g  look_at %g %g %g  up 0 1 0  fov_y %g  film { res %d %d } }' % (
+    tuple(IEYE) + tuple(ILOOK) + (IFOV, IW, IH))
+
+
+def inner_dist():
+    """Each pixel of the view from inside the room as the floor's distance from the room's middle, or
+    NaN where the pixel sees no floor inside it."""
+    d, tf = pinhole(IEYE, ILOOK, IFOV, IW, IH)
+    P = IEYE + d * np.where(np.isfinite(tf), tf, 0.0)[..., None]
+    seen = (d[..., 1] < 0) & (tf > 0) & (np.maximum(np.abs(P[..., 0]), np.abs(P[..., 2])) < BOX)
+    return np.where(seen, np.hypot(P[..., 0], P[..., 2]), np.nan)
+
+
+def _room(mat):
+    faces = [f for f in box(-BOX, 0.0, -BOX, BOX, ROOM_H, BOX, "obj")
+             if "origin %g 0 %g  u %g 0 0" % (-BOX, -BOX, 2 * BOX) not in f]
+    assert len(faces) == 5
+    lamp = ("light area { origin -0.03 %g -0.03  u 0.06 0 0  v 0 0 0.06  normal 0 -1 0  power 5  "
+            "spd preset:d65  hide_camera on }" % (ROOM_H - 0.005))
+    return [mat] + faces + [lamp], INNER_CAM, inner_dist, ((0.0, 0.04),), "the middle", "uncovered"
 
 
 def _ball(mat, mesh=False, radius=BOX, rings=((0.04, 0.12),)):
@@ -261,6 +308,10 @@ OBJECTS = {
     # faces cannot say their side and hold no photon: its lid still puts the floor inside it out
     # of the parity, which its walls confirm along the low leg.
     "openbox": _box('material "obj" { type glossy reflect 0.6 roughness 0.3 }', bottom=False),
+    # The same box lifted 0.25 mm: its rim rests on nothing, so nothing closes it, and the low leg, 1 mm
+    # up, still meets its walls.
+    "openbox_lifted": _box('material "obj" { type glossy reflect 0.6 roughness 0.3 }', bottom=False,
+                           lift=0.00025),
     # A box 30 cm tall holds every probe over it from its start r above the floor, so the probe
     # crosses none of its faces going down: it must know it begins inside (PROBE-PATH).
     "tower": _tower('material "obj" { type diffuse reflect 0.5 }'),
@@ -271,6 +322,8 @@ OBJECTS = {
     # The tower with no bottom face, as an imported mesh often is: open along a rim the floor closes,
     # which its probes take as closed there (PROBE-PARITY-LIMITS).
     "opentower": _tower('material "obj" { type diffuse reflect 0.5 }', bottom=False),
+    # A bottomless box with a lamp inside it: a room, which no cap may close (PROBE-PARITY-LIMITS).
+    "litbox": _room('material "obj" { type diffuse reflect 0.5 }'),
     # A ball resting on the floor holds the probe's origin over the floor under its overhang, so
     # the probe leaves it before it meets the floor: a closed solid's face says it is out
     # (PROBE-SOLID-SIDE), where a parity reads the floor as inside.
@@ -291,6 +344,12 @@ OBJECTS = {
     "tablesheet": _sheet(['material "obj" { type diffuse reflect 0.5 }',
                           quad((-BOX, 0.08, -BOX), (0, 0, 2 * BOX), (2 * BOX, 0, 0), "obj"), SIDE_LIGHT]),
 }
+
+
+# The faces the probes' marking pass takes as a solid's, which the case's renders must report
+# (`[gather] N of M triangles`): what a case tests holds only while its object is marked as it supposes.
+MARKS = {"openbox": 10, "openbox_lifted": 0, "opentower": 10, "litbox": 0}
+GATHER_LINE = re.compile(r"\[gather\] (\d+) of (\d+) triangles")
 
 
 def scene(obj_lines, cam):
@@ -340,9 +399,13 @@ def main():
         path = os.path.join(out, "obj_%s.ftsl" % bname)
         cm.write(path, scene(lines, cam))
 
+        logs = []
+
         def image(tag, args, gpu):
-            return np.mean([cm.lum(cm.render(exe, out, path, "%s_%s_%d" % (bname, tag, s), args, seed=s,
-                                             want_gpu=gpu)[0]) for s in (1, 2)], axis=0)
+            runs = [cm.render(exe, out, path, "%s_%s_%d" % (bname, tag, s), args, seed=s, want_gpu=gpu)
+                    for s in (1, 2)]
+            logs.extend(r[2] for r in runs)
+            return np.mean([cm.lum(r[0]) for r in runs], axis=0)
 
         R = image("R_gpu", REF, True) if against == "R" else None   # a ball's ring is held to U
         # The share of each pixel's disc on the floor, for a ring held to its exact coverage.
@@ -371,6 +434,13 @@ def main():
                     print("%-9s %-12s floor %2.0f-%2.0f cm from %s: %.3f of the uncorrected / %s  %s" % (
                         bname, name, lo * 100, hi * 100, base, c,
                         "its coverage" if against == "coverage" else "1", "ok" if good else "FAIL"), flush=True)
+        if bname in MARKS:
+            said = [int(m.group(1)) for m in (GATHER_LINE.search(lg) for lg in logs) if m]
+            good = bool(said) and all(n == MARKS[bname] for n in said)
+            ok &= good
+            print("%-9s %d renders' marking pass: %s of its triangles a solid's (want %d)  %s" % (
+                bname, len(said), ",".join(sorted(set(map(str, said)))) or "none said", MARKS[bname],
+                "ok" if good else "FAIL"), flush=True)
         for a_, b_ in PAIRS:
             for lo, hi in rings:
                 q = got[a_, lo] / got[b_, lo]
