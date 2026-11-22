@@ -2,7 +2,7 @@
 
     python tools/check_gather_base.py [--out png/check_gather_base] [--exe ftrace.exe]
                                       [--objects diffuse,mirror,coated,coaster,openbox,tower,isotower,
-                                                 towerfar,ball,meshball,diffuseball,smallball,
+                                                 towerfar,opentower,ball,meshball,diffuseball,smallball,
                                                  mirrorsheet,lampsheet,tablesheet]
 
 A closed 3 cm box (six quads) standing on a lit floor, seen from straight above, modes M and S at a
@@ -32,7 +32,10 @@ of its faces going down, so it must know from the path up from the gather point 
 began inside (PROBE-PATH); `isotower` is the same tower as an isosurface, an SDF box, whose side
 its hits say as a closed mesh's do; `towerfar` is the tower beside a quad 2 km wide out of sight
 below the floor, among the same loose triangles, which must not make the tower too small to be a
-solid. Its shadow at its foot is too steep for mode R to be a reference within
+solid; `opentower` is the tower with no bottom face, an open piece that cannot say its side, but whose
+rim the floor closes, and which the probes take as closed there (PROBE-PARITY-LIMITS: a probe begun
+inside it crossed nothing, met the floor in the band, and read the floor at its foot dark). Its shadow
+at its foot is too steep for mode R to be a reference within
 the radius, so it is held to its exact coverage (below). Then a glossy ball of the box's
 half-width resting on the floor, analytic and as a closed OBJ, seen from low beside it with a low
 light from the side reaching under its overhang. There, 4-12 cm from the point it rests on, the gap
@@ -225,10 +228,13 @@ def seg_cover(d, r=GATHER_R):
     return 1.0 - (r * r * np.arccos(d / r) - d * np.sqrt(r * r - d * d)) / (np.pi * r * r)
 
 
-def _tower(mat, iso=False, far=False):
+def _tower(mat, iso=False, far=False, bottom=True):
     geo = (["isosurface { material obj  box { center %g 0.15 0  size %g 0.3 %g } }" % (
                (TOWER_X0 - BOX) / 2, -BOX - TOWER_X0, 2 * BOX)] if iso else
            box(TOWER_X0, 0.0, -BOX, -BOX, 0.3, BOX, "obj"))
+    if not bottom:   # its floor face gone: an open piece, its rim on the floor
+        geo = [f for f in geo if "origin %g 0 %g  u %g 0 0" % (TOWER_X0, -BOX, -BOX - TOWER_X0) not in f]
+        assert len(geo) == 5
     if far:   # a quad 2 km wide out of sight below the floor, in the same pool of loose triangles
         geo = geo + [quad((-1000, -5, -1000), (0, 0, 2000), (2000, 0, 0), "floor")]
     return ([mat] + geo, TOP_CAM,
@@ -262,6 +268,9 @@ OBJECTS = {
     "isotower": _tower('material "obj" { type diffuse reflect 0.5 }', iso=True),
     # The tower in a pool of loose triangles kilometres wide: it is a solid by its own extent.
     "towerfar": _tower('material "obj" { type diffuse reflect 0.5 }', far=True),
+    # The tower with no bottom face, as an imported mesh often is: open along a rim the floor closes,
+    # which its probes take as closed there (PROBE-PARITY-LIMITS).
+    "opentower": _tower('material "obj" { type diffuse reflect 0.5 }', bottom=False),
     # A ball resting on the floor holds the probe's origin over the floor under its overhang, so
     # the probe leaves it before it meets the floor: a closed solid's face says it is out
     # (PROBE-SOLID-SIDE), where a parity reads the floor as inside.

@@ -3339,7 +3339,7 @@ know the solid is opaque, which a room built as one closed box seen from inside 
 come with a test that tells an enclosure from an object (whether the gather point lies inside the
 solid).
 
-## OPEN (2026-11-04, 0.432.1): PROBE-PARITY-LIMITS — two shapes the footprint probe's crossing count misreads
+## DONE (2026-11-21, 0.451.14): PROBE-PARITY-LIMITS — two shapes the footprint probe's crossing count misreads
 
 Modes M and S count the faces their footprint probe crosses above the gather's tangent-plane band,
 and take an odd count to mean the column lies inside a solid resting on the surface (the halo fix,
@@ -3387,6 +3387,16 @@ in a face that closes it, which wants a test of its own (the rim's plane against
 touch it). tools/check_gather_base.py covers the closed
 solids, the balls, the open sheets (`mirrorsheet`, `lampsheet`, `tablesheet`) and an open box
 (`openbox`); not an open solid taller than the radius.
+**Fixed (0.451.14), as proposed:** the probes' marking pass (Scene::markSolidFaces' full pass, its
+`capOk` handed to watertight::markSolidFaces) closes a world mesh object or loose piece open along a
+planar rim that a face covers where the rim encloses it -- short rays across the plane at the rim's
+centre and a tenth of the way in from its corners -- by that plane, its side from the volume about the
+rim's centre, its faces marked 3 or 4: `Hit::solid` +-2, read by the probes and by neither
+`enclosureAt` (a solid is +-1 there) nor the `emit_two_sided` refusal, which never asks for caps. An
+upright cup's rim closes on nothing, so its floor stays open. check_gather_base's `opentower`, the
+30 cm tower with no bottom face: the floor 0-2 cm and 2-5 cm from its base read 0.56 and 0.71 of
+their true coverage on 0.451.13 in modes M and S, both devices, and 0.99-1.01 now. Left: an asset's open
+pieces (each instance may rest on something else or nothing) and a hole that is not planar.
 
 ## DONE (2026-11-16, no change): MODEM-CPU-DARKGLASS-BLUE — CPU mode M reads blue 15 % low through glass that absorbs blue strongly
 

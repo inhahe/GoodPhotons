@@ -340,7 +340,9 @@ Then the rest of 4.2-4.6 in their order, 4.7's bookkeeping alongside whatever to
   seeds GPU over CPU mode M reads 1.0001 in red (known-issues).
 - [x] **CURVE-GATHER**, mode U's half (VCM-THIN-CURVES) — 0.439.2: mode U merges at no curve
   vertex (`vcmMergeAt` / `dVcmMergeAt`); its coat 2.10 / 2.36 -> 1.000 / 1.014 of mode R.
-- [ ] **PROBE-PARITY-LIMITS** — the footprint probe's crossing count misreads a photon-holding open
+- [x] **PROBE-PARITY-LIMITS** (0.451.14) — an open solid taller than the radius, its planar rim closed by
+  the face it rests on, is closed there for the probes alone (Tri::solidFace 3/4); was: the footprint probe's
+  crossing count misreads a photon-holding open
   surface hovering within the radius, and an open solid taller than it. Closed solids (analytic
   spheres, closed meshes) say their own side (0.434.5, PROBE-SOLID-SIDE); since 0.434.9 so do
   inward-wound meshes and quads closing a box, and open sheets that hold no photon count for

@@ -26,6 +26,7 @@
 #include <cstdint>
 #include <cfloat>
 #include <cmath>
+#include <functional>
 #include "geometry.h"   // Vec3, Tri
 
 namespace watertight {
@@ -139,9 +140,20 @@ inline Report checkTris(const Tri* tris, size_t n) {
 // `boxes`, when given, gets each closed piece's bounds (lo, hi) and the material of one of its faces,
 // so a caller can tell where solids lie without looking at every face; `pieceOf`, each face's closed
 // piece (a number shared by its faces), -1 for a face of none.
+//
+// `capOk`, where given (the footprint probes' pass alone: PROBE-PARITY-LIMITS), also closes a piece open
+// along a planar rim that another face closes -- a statue's open base on the floor it stands on: a piece
+// whose every edge is used twice in opposite directions or once, the once-used ones (its rim) all in one
+// plane, which capOk(centre, normal, rim) says some other face covers where the rim encloses it. Its
+// volume taken about a point in that plane is the capped solid's, the cap's own tetrahedra vanishing
+// there, and its faces are marked 3 (normals out) or 4 (in): a side the probes read and nothing else does
+// -- a camera or light inside one is not in a solid, a glowing one may still be two-sided -- as the cap
+// is right only for the gather on the face that closes it (an upright cup's rim is planar too and closes
+// on nothing, its floor lit through it). Its pieceOf is -1; its box is given.
 struct PieceBox { Vec3 lo, hi; int matId = 0; };
+using CapOk = std::function<bool(const Vec3& centre, const Vec3& normal, const std::vector<Vec3>& rim)>;
 inline size_t markSolidFaces(Tri* const* tris, size_t n, std::vector<PieceBox>* boxes = nullptr,
-                             std::vector<int>* pieceOf = nullptr) {
+                             std::vector<int>* pieceOf = nullptr, const CapOk* capOk = nullptr) {
     if (pieceOf) pieceOf->assign(n, -1);
     if (n == 0) return 0;
     Vec3 lo = tris[0]->v0, hi = tris[0]->v0;
@@ -210,6 +222,7 @@ inline size_t markSolidFaces(Tri* const* tris, size_t n, std::vector<PieceBox>* 
         parent[(size_t)b] = a; parent[(size_t)root(c)] = a;
     }
     std::vector<char> bad(parent.size(), 0);
+    std::vector<char> rimmed(parent.size(), 0);   // bad only by edges used once (a rim): capOk may close it
     std::vector<char> side(parent.size(), 0);     // +1 / -1: the piece's faces' normals with / against winding
     std::vector<double> vol(parent.size(), 0.0);
     // Each piece's own extent, and a corner of it the volume is taken about, so the sums' rounding
@@ -251,12 +264,66 @@ inline size_t markSolidFaces(Tri* const* tris, size_t n, std::vector<PieceBox>* 
     std::sort(es.begin(), es.end(), [](const Edge& x, const Edge& y) {
         return x.a != y.a ? x.a < y.a : x.b < y.b;
     });
+    // A rim's edges, by piece, as vertex pairs in their faces' direction (capOk's pass): each rim vertex
+    // starts one, and the loops' area vector (Newell's) sums them.
+    std::vector<std::vector<std::pair<int, int>>> rimOf(capOk ? parent.size() : 0);
+    std::vector<char> worse(parent.size(), 0);    // an edge used past once each way: no rim closes it
     for (size_t q = 0; q < es.size();) {
         size_t e = q;
         int fwd = 0, rev = 0;
         for (; e < es.size() && es[e].a == es[q].a && es[e].b == es[q].b; ++e) (es[e].rev ? rev : fwd)++;
-        if (!(fwd == 1 && rev == 1)) bad[(size_t)root(es[q].a)] = 1;
+        const size_t pc = (size_t)root(es[q].a);
+        if (!(fwd == 1 && rev == 1)) {
+            bad[pc] = 1;
+            // as its one face runs it (an edge is kept low vertex first, `rev` where the face ran it back)
+            if (capOk && fwd + rev == 1) rimOf[pc].emplace_back(es[q].rev ? es[q].b : es[q].a, es[q].rev ? es[q].a : es[q].b);
+            else worse[pc] = 1;
+        }
         q = e;
+    }
+    // A face's side wrong for its piece is as bad as an edge used thrice: no cap mends it.
+    std::vector<char> sideOk(parent.size(), 1);
+    for (size_t i = 0; i < n; ++i) {
+        const Tri& t = *tris[i];
+        const double c0 = dot(t.gn, t.n0), c1 = dot(t.gn, t.n1), c2 = dot(t.gn, t.n2);
+        const bool anyNeg = c0 < 0.0 || c1 < 0.0 || c2 < 0.0, anyPos = c0 > 0.0 || c1 > 0.0 || c2 > 0.0;
+        const char s = (anyNeg && anyPos) ? 0 : anyNeg ? -1 : 1;
+        const size_t pc = (size_t)root(vid[i*3]);
+        if (s == 0 || s != side[pc]) sideOk[pc] = 0;
+    }
+    // Each rimmed piece's rim plane and the volume about its centre (capOk's pass).
+    std::vector<Vec3> capC(capOk ? parent.size() : 0);
+    std::vector<double> capVol(capOk ? parent.size() : 0, 0.0);
+    if (capOk) {
+        std::vector<Vec3> at((size_t)nv);   // a welded vertex's position
+        for (size_t i = 0; i < n; ++i) {
+            at[(size_t)vid[i*3]] = tris[i]->v0; at[(size_t)vid[i*3+1]] = tris[i]->v1; at[(size_t)vid[i*3+2]] = tris[i]->v2;
+        }
+        for (size_t pc = 0; pc < parent.size(); ++pc) {
+            if (rimOf[pc].empty() || worse[pc] || !sideOk[pc]) continue;
+            std::vector<Vec3> rim;
+            Vec3 c{0, 0, 0};
+            for (const auto& [a, b] : rimOf[pc]) { rim.push_back(at[(size_t)a]); c = c + at[(size_t)a]; }
+            c = c * (1.0 / (double)rim.size());
+            Vec3 nrm{0, 0, 0};   // Newell's: the rim loops' summed area vector
+            for (const auto& [a, b] : rimOf[pc]) nrm = nrm + cross(at[(size_t)a] - c, at[(size_t)b] - c);
+            const double nl = std::sqrt(dot(nrm, nrm));
+            const Vec3 ext = phi[pc] - plo[pc];
+            const double pd = std::sqrt(dot(ext, ext));
+            if (!(nl > 1e-12 * pd * pd)) continue;   // no area: no plane to close it by
+            nrm = nrm * (1.0 / nl);
+            bool planar = true;
+            for (const Vec3& p : rim) planar = planar && std::fabs(dot(p - c, nrm)) <= 1e-6 * pd;
+            if (!planar || !(*capOk)(c, nrm, rim)) continue;
+            rimmed[pc] = 1;
+            capC[pc] = c;
+        }
+        for (size_t i = 0; i < n; ++i) {
+            const size_t pc = (size_t)root(vid[i*3]);
+            if (!rimmed[pc]) continue;
+            const Vec3 a = tris[i]->v0 - capC[pc], b = tris[i]->v1 - capC[pc], d = tris[i]->v2 - capC[pc];
+            capVol[pc] += dot(a, cross(b, d));
+        }
     }
     size_t marked = 0;
     std::vector<int> boxOf;                       // a marked piece's slot in *boxes, or -1
@@ -265,14 +332,16 @@ inline size_t markSolidFaces(Tri* const* tris, size_t n, std::vector<PieceBox>* 
         const int piece = root(vid[i*3]);
         // A piece of no thickness -- a double-sided card, its two faces wound against each other
         // -- is closed and encloses nothing: its sign is rounding's, so it is no solid.
-        const double v = vol[(size_t)piece] * (double)side[(size_t)piece];
+        const bool capped = !rimmed.empty() && rimmed[(size_t)piece];
+        const double v = (capped ? capVol[(size_t)piece] : vol[(size_t)piece]) * (double)side[(size_t)piece];
         const Vec3 ext = phi[(size_t)piece] - plo[(size_t)piece];
         const double pd = std::sqrt(dot(ext, ext));
         const bool flat = std::fabs(v) <= 1e-9 * pd * pd * pd;
-        const unsigned char s = (bad[(size_t)piece] || flat) ? 0 : (v > 0.0 ? 1 : 2);
+        const unsigned char s = capped ? (flat ? 0 : (v > 0.0 ? 3 : 4))
+                                       : (bad[(size_t)piece] || flat) ? 0 : (v > 0.0 ? 1 : 2);
         tris[i]->solidFace = s;
         marked += s ? 1 : 0;
-        if (pieceOf && s) (*pieceOf)[i] = piece;
+        if (pieceOf && (s == 1 || s == 2)) (*pieceOf)[i] = piece;
         if (boxes && s && boxOf[(size_t)piece] < 0) {
             boxOf[(size_t)piece] = (int)boxes->size();
             boxes->push_back(PieceBox{plo[(size_t)piece], phi[(size_t)piece], tris[i]->matId});
@@ -282,10 +351,10 @@ inline size_t markSolidFaces(Tri* const* tris, size_t n, std::vector<PieceBox>* 
 }
 // The same over a contiguous run.
 inline size_t markSolidFaces(Tri* tris, size_t n, std::vector<PieceBox>* boxes = nullptr,
-                             std::vector<int>* pieceOf = nullptr) {
+                             std::vector<int>* pieceOf = nullptr, const CapOk* capOk = nullptr) {
     std::vector<Tri*> p(n);
     for (size_t i = 0; i < n; ++i) p[i] = tris + i;
-    return markSolidFaces(p.data(), n, boxes, pieceOf);
+    return markSolidFaces(p.data(), n, boxes, pieceOf, capOk);
 }
 
 } // namespace watertight

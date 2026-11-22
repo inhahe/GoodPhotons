@@ -6780,7 +6780,17 @@ as the one at fault.
   its connected piece closed, consistently wound and with every face's corner normals on one side
   of its winding, the whole piece on the same side; the volume says out or in, and a piece of no
   volume (a double-sided card) is no solid. Corners weld at 1e-7 of the piece set's extent, never
-  more than a thousandth of its shortest edge. It goes per mesh
+  more than a thousandth of its shortest edge. **A piece open along a rim another face closes**
+  (0.451.14, PROBE-PARITY-LIMITS) is closed by that face's plane for the probes alone: a world mesh
+  object or loose piece whose every edge is used twice in opposite directions or once, the once-used
+  ones (its rim) in one plane (Newell's normal over them), which a face covers where the rim encloses
+  it (short rays across the plane at the rim's centre and a tenth of the way in from its corners:
+  `capOk`) -- a statue's open base on its floor, a bottomless box of quads on the ground. Its volume
+  taken about the rim's centre is the capped solid's (the cap's own tetrahedra vanish there), and its
+  faces are marked 3 or 4 (`Hit::solid` +-2), which the probes read by the sign and the enclosures
+  (`enclosureAt`, a camera's or light's medium) and the `emit_two_sided` refusal do not: an upright
+  cup's rim is planar too but closes on nothing, its floor lit through it. An asset's pieces are not
+  capped (each instance may rest on something else). It goes per mesh
   object, then over every triangle no mesh object holds (quads, a light's own surface) as one pool,
   in which six quads meeting edge to edge form a box. The pass runs once per batch with a mode-M or
   mode-S camera and a footprint taken, before the exposure meter; the flag sits in `Tri`'s and
@@ -6825,11 +6835,10 @@ as the one at fault.
   inside everywhere. Counted as covered, every
   object standing on a surface ringed its base with a dark halo (0.75 of mode R within 5 cm of a
   3 cm box at radius 0.1; 0.99 with the count). A closed shelf hovering within the radius is
-  crossed twice, and the floor under it counts (the plain disc average across its shadow). Two
-  shapes the count misreads (known-issues PROBE-PARITY-LIMITS): an open surface hovering within the
-  radius (one diffuse quad, a leaf) is crossed once, so the floor under it is taken for a solid's
-  inside and reads bright; and an open solid taller than the radius (a bottomless box of quads, an
-  open mesh) holds the probe's origin, so nothing is crossed and the floor under it counts.
+  crossed twice, and the floor under it counts (the plain disc average across its shadow). What the
+  count still misreads (known-issues PROBE-PARITY-LIMITS): an open solid taller than the radius whose
+  hole is not closed by a face it rests on -- not planar, or an asset's -- holds the probe's origin, so
+  nothing is crossed and the floor under it counts.
   `-gageom`'s march takes the same count per column, looking for crossings as high as the probe
   does, r above the plane (0.433.7): a column near the disc's edge has a short chord, and a box top
   beyond it would otherwise leave the floor under the box counted. Sixteen faces without an answer

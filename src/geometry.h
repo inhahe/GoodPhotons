@@ -123,9 +123,10 @@ struct Tri {
     int vkeyCount = 0;
     // On the boundary of a closed solid (Scene::markSolidFaces, over watertight::markSolidFaces):
     // 1 with its normal out, so a ray meeting it from behind (Hit::back) is leaving the solid; 2 with
-    // it in. 0 on any face that cannot say. Set at build where a walk can be inside a solid (only the
-    // closed solids enclose a light or camera: Scene::enclosureAt) and for a footprint's batch, whose
-    // probes read it too.
+    // it in. 3 and 4 the same for a piece open along a rim another face closes, for the footprint
+    // probes alone (PROBE-PARITY-LIMITS). 0 on any face that cannot say. Set at build where a walk can
+    // be inside a solid (only the closed solids enclose a light or camera: Scene::enclosureAt) and for a
+    // footprint's batch, whose probes read it too.
     unsigned char solidFace = 0;
     // The solid a walk can be inside (Scene::encSolidOf) whose closed piece this face is part of, or -1:
     // a face of another material closing it -- a pool's wall under a water surface of one quad -- bounds
@@ -329,7 +330,9 @@ struct Hit {
     // solid's normals out (from behind is leaving: an analytic sphere, a triangle Tri::solidFace
     // marks 1), -1 with them in (from behind is entering), 0 where the side a ray meets a face from
     // says nothing of inside and out (an open quad, a curve, an isosurface that may end at its
-    // container: Implicit::solidSide). Every intersector writes it (the record is reused).
+    // container: Implicit::solidSide). +-2 the same for a piece closed by the face its rim rests on
+    // (Tri::solidFace 3 and 4), which the footprint probes read, by the sign, and the enclosures do
+    // not (a solid is +-1 to them). Every intersector writes it (the record is reused).
     signed char solid = 0;
     // Tri::boundsSolid: the enterable solid a face of another material bounds, or -1 (every
     // intersector writes it).
@@ -724,7 +727,7 @@ inline bool intersectTri(const TriShear& sh, const Ray& r, const Tri& tri,
     hit.ng = gn;
     hit.n = flipped ? -ns : ns;
     hit.back = flipped;
-    hit.solid = tri.solidFace == 1 ? 1 : tri.solidFace == 2 ? -1 : 0;
+    hit.solid = tri.solidFace == 1 ? 1 : tri.solidFace == 2 ? -1 : tri.solidFace == 3 ? 2 : tri.solidFace == 4 ? -2 : 0;
     hit.boundsSolid = tri.boundsSolid;
     hit.tangent = tri.tangent;             // per-triangle tangent (constant across the face)
     // For tangent-space normal mapping (C6): the frame is built about the normal on ng's side,

@@ -842,7 +842,8 @@ struct DMediumStack {
 
 struct DTri    { DVec3 v0, v1, v2, gn; DVec3 uv0, uv1, uv2; DVec3 n0, n1, n2; int matId, sensorId;
                  DVec3 tangent;
-                 unsigned char solid;                    // Tri::solidFace: 1 normals out, 2 in, 0 neither
+                 unsigned char solid;                    // Tri::solidFace: 1 normals out, 2 in (3, 4 the
+                                                         // probes' alone), 0 neither
                  short bounds;                           // Tri::boundsSolid, -1 beyond a short's range
                                                          // (both in FP32's padding before bitangentSign)
                  Real bitangentSign;                     // C6 tangent frame for normal mapping (+-1)
@@ -4774,7 +4775,7 @@ __device__ static inline void dTriFill(const DVec3& rd, const DTri& tri, Real t,
     hit.ng = gn;
     hit.n = flipped ? -ns : ns;
     hit.back = flipped;
-    hit.solid = tri.solid == 1 ? 1 : tri.solid == 2 ? -1 : 0;
+    hit.solid = tri.solid == 1 ? 1 : tri.solid == 2 ? -1 : tri.solid == 3 ? 2 : tri.solid == 4 ? -2 : 0;
     hit.tangent = tri.tangent;                 // per-triangle tangent (C6 normal mapping)
     // About the winding; the frame about ng's side (host twin intersectTri).
     hit.bitangentSign = againstWinding ? -(Real)tri.bitangentSign : (Real)tri.bitangentSign;
@@ -13818,7 +13819,7 @@ __device__ static void dEnclosureAt(const DScene& sc, const DVec3& p, DMediumSta
             tAcc += (double)h.t;
             int si = sc.mats[h.matId].encSolid;           // else its closed piece's (host twin)
             if (si < 0) si = bounds;
-            if (si >= 0 && h.solid != 0) {
+            if (si >= 0 && (h.solid == 1 || h.solid == -1)) {   // a probe-only side (+-2) closes nothing here
                 const bool behind = dot(d, h.ng) > (Real)0;   // the walks' side: leaving
                 int at = -1;
                 for (int i = 0; i < nS[k]; ++i) if (sid[k][i] == si) at = i;
