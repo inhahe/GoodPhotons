@@ -152,8 +152,9 @@ inline Report checkTris(const Tri* tris, size_t n) {
 // within `rad` of one of the piece's faces, and `motion` the piece's motion set (Scene::motionSets; -1
 // for one that holds still or that moves part by part or deforms): a mover's points are asked where it
 // is at each of its keys, so a piece lowered onto the floor by its motion rests there. A point on the
-// piece itself asks nothing (a hat's brim on the table), but one point at least must be another face's. Its volume taken about the centroid is the capped solid's, the fan's own
-// tetrahedra vanishing there, and its faces are marked 3 (normals out) or 4 (in): a side the probes read
+// piece itself asks nothing (a hat's brim on the table), but one point at least must be another face's.
+// Its volume taken about the centroid is the capped solid's, the fan's own tetrahedra vanishing there,
+// and its faces are marked 3 (normals out) or 4 (in): a side the probes read
 // and nothing else does -- a camera or light inside one is not in a solid, a glowing one may still be
 // two-sided -- as the cap is right only for the gather on the face that closes it (an upright cup's rim
 // is planar too and closes on nothing, its floor lit through it). A piece that covers its own points (a
@@ -162,14 +163,43 @@ inline Report checkTris(const Tri* tris, size_t n) {
 // column off from the gather point the probes' low leg decides (gathercoverage.h inside()) -- a box with
 // a lamp in it is a room the gather point lies in, a mover capped where its faces are stored may be clear
 // of the surface at a path's time. Its pieceOf is -1; its box is given.
+//
+// `capCands`, where given in capOk's stead (an asset's pass: its instances may each rest on something
+// else or nothing), takes the pieces a cap would close, the first kCapCandsMax of them, as capOk would
+// be asked of them (CapCand), and marks their faces 5 + 2k (normals out) or 6 + 2k (in), k the piece's
+// place there: a cap each instance that places it resting decides for itself (Scene::markSolidFaces'
+// MeshInstance::capMask, Hit::solid +-(4 + k) until the instance's hit resolves it). They are no solid by
+// themselves, so not counted; their box is given, with the place.
+//
 // A marked piece's box, and (`faces`, corners three a face) its faces where it has kPieceNearFaces or
-// fewer -- a room, a box, a crate -- empty for one with more (Scene::solidNear).
+// fewer -- a room, a box, a crate -- empty for one with more (Scene::solidNear); `cand`, an asset's
+// candidate's place in `capCands`, or -1.
 constexpr size_t kPieceNearFaces = 64;
-struct PieceBox { Vec3 lo, hi; int matId = 0; std::vector<Vec3> faces; size_t count = 0; };
+struct PieceBox { Vec3 lo, hi; int matId = 0; std::vector<Vec3> faces; size_t count = 0; int cand = -1; };
+constexpr int kCapCandsMax = 64;   // MeshInstance::capMask's bits
+// An asset's piece a cap would close, as capOk would be asked of it in the asset's own space: the rim's
+// normal, the points, the reach and the slack, and its faces (indices into the call's).
+struct CapCand { Vec3 nrm; std::vector<Vec3> pts; double reach = 0.0, slack = 0.0; std::vector<size_t> faces; };
+// Whether `x` lies within `h` of one of `faces` (indices, `triAt(i)` the face), each face's box first.
+template <class TriAt>
+inline bool nearFaces(const TriAt& triAt, const std::vector<size_t>& faces, const Vec3& x, double h) {
+    for (size_t i : faces) {
+        const Tri& t = triAt(i);
+        if (x.x < std::min({t.v0.x, t.v1.x, t.v2.x}) - h || x.x > std::max({t.v0.x, t.v1.x, t.v2.x}) + h ||
+            x.y < std::min({t.v0.y, t.v1.y, t.v2.y}) - h || x.y > std::max({t.v0.y, t.v1.y, t.v2.y}) + h ||
+            x.z < std::min({t.v0.z, t.v1.z, t.v2.z}) - h || x.z > std::max({t.v0.z, t.v1.z, t.v2.z}) + h)
+            continue;
+        if (pointTriDistSq(x, t.v0, t.v1, t.v2) <= h * h) return true;
+    }
+    return false;
+}
 using CapOk = std::function<bool(const Vec3& normal, const std::vector<Vec3>& points, double reach, double slack,
                                  const std::function<bool(const Vec3&, double)>& own, int motion)>;
 inline size_t markSolidFaces(Tri* const* tris, size_t n, std::vector<PieceBox>* boxes = nullptr,
-                             std::vector<int>* pieceOf = nullptr, const CapOk* capOk = nullptr) {
+                             std::vector<int>* pieceOf = nullptr, const CapOk* capOk = nullptr,
+                             std::vector<CapCand>* capCands = nullptr) {
+    if (capCands) capCands->clear();
+    const bool caps = capOk || capCands;
     if (pieceOf) pieceOf->assign(n, -1);
     if (n == 0) return 0;
     Vec3 lo = tris[0]->v0, hi = tris[0]->v0;
@@ -242,7 +272,7 @@ inline size_t markSolidFaces(Tri* const* tris, size_t n, std::vector<PieceBox>* 
     // capOk's pass: per piece, kCapSide a face's side is wrong for it, kCapEdge an edge is used past once
     // each way -- neither of which a cap mends -- and kCapRim it has a rim (edges used once).
     enum : char { kCapSide = 1, kCapEdge = 2, kCapRim = 4 };
-    std::vector<char> capFlags(capOk ? parent.size() : 0, 0);
+    std::vector<char> capFlags(caps ? parent.size() : 0, 0);
     std::vector<double> vol(parent.size(), 0.0);
     // Each piece's own extent, and a corner of it the volume is taken about, so the sums' rounding
     // and the no-volume test are at the piece's scale, not the call's.
@@ -279,7 +309,7 @@ inline size_t markSolidFaces(Tri* const* tris, size_t n, std::vector<PieceBox>* 
         char& ps = side[(size_t)piece];
         if (s == 0 || (ps != 0 && ps != s)) {
             bad[(size_t)piece] = 1;
-            if (capOk) capFlags[(size_t)piece] |= kCapSide;
+            if (caps) capFlags[(size_t)piece] |= kCapSide;
         }
         ps = s;
     }
@@ -297,7 +327,7 @@ inline size_t markSolidFaces(Tri* const* tris, size_t n, std::vector<PieceBox>* 
         if (!(fwd == 1 && rev == 1)) {
             const int pc = root(es[q].a);
             bad[(size_t)pc] = 1;
-            if (capOk) {
+            if (caps) {
                 if (fwd + rev == 1) {
                     capFlags[(size_t)pc] |= kCapRim;
                     rimEdges.push_back(RimEdge{pc, es[q].rev ? es[q].b : es[q].a, es[q].rev ? es[q].a : es[q].b});
@@ -312,13 +342,15 @@ inline size_t markSolidFaces(Tri* const* tris, size_t n, std::vector<PieceBox>* 
     // The pieces a cap may close (capOk's pass): open only along a rim, every face's side right.
     // Compact: a candidate's slot by its root (`candOf`), only where there is one.
     // `motion`: its faces' motion set, -1 where none moves, -2 where they differ or one deforms; -3 unset.
+    // `place`: where it is in *capCands, or -1.
     struct Cand {
         int piece; size_t e0, e1; Vec3 c, nrm; double vol = 0.0; bool capped = false; std::vector<size_t> faces;
         int motion = -3;
+        int place = -1;
     };
     std::vector<Cand> cands;
     std::vector<int> candOf;
-    if (capOk && !rimEdges.empty()) {
+    if (caps && !rimEdges.empty()) {
         std::sort(rimEdges.begin(), rimEdges.end(), [](const RimEdge& x, const RimEdge& y) { return x.piece < y.piece; });
         for (size_t q = 0; q < rimEdges.size();) {
             size_t e = q;
@@ -346,17 +378,8 @@ inline size_t markSolidFaces(Tri* const* tris, size_t n, std::vector<PieceBox>* 
                 if (it != at.end()) it->second = *p[k];
             }
         }
-        // Whether `x` lies within `h` of one of piece `cd`'s own faces (each face's box first).
         const auto onOwn = [&](const Cand& cd, const Vec3& x, double h) {
-            for (size_t i : cd.faces) {
-                const Tri& t = *tris[i];
-                if (x.x < std::min({t.v0.x, t.v1.x, t.v2.x}) - h || x.x > std::max({t.v0.x, t.v1.x, t.v2.x}) + h ||
-                    x.y < std::min({t.v0.y, t.v1.y, t.v2.y}) - h || x.y > std::max({t.v0.y, t.v1.y, t.v2.y}) + h ||
-                    x.z < std::min({t.v0.z, t.v1.z, t.v2.z}) - h || x.z > std::max({t.v0.z, t.v1.z, t.v2.z}) + h)
-                    continue;
-                if (pointTriDistSq(x, t.v0, t.v1, t.v2) <= h * h) return true;
-            }
-            return false;
+            return nearFaces([&](size_t i) -> const Tri& { return *tris[i]; }, cd.faces, x, h);
         };
         for (Cand& cd : cands) {
             const size_t pc = (size_t)cd.piece;
@@ -389,6 +412,14 @@ inline size_t markSolidFaces(Tri* const* tris, size_t n, std::vector<PieceBox>* 
             std::vector<Vec3> pts{c};
             const size_t step = std::max<size_t>(1, rim.size() / 12);
             for (size_t i = 0; i < rim.size(); i += step) pts.push_back(rim[i] + (c - rim[i]) * 0.1);
+            // An asset's: handed back for its instances to ask.
+            if (capCands) {
+                if ((int)capCands->size() < kCapCandsMax) {
+                    cd.place = (int)capCands->size();
+                    capCands->push_back(CapCand{nrm, pts, reach, 2.0 * spread, cd.faces});
+                }
+                continue;
+            }
             // The piece's own faces cover nothing: what it rests on is something else.
             if (!(*capOk)(nrm, pts, reach, 2.0 * spread,
                           [&](const Vec3& x, double rad) { return onOwn(cd, x, rad); }, std::max(cd.motion, -1)))
@@ -403,20 +434,22 @@ inline size_t markSolidFaces(Tri* const* tris, size_t n, std::vector<PieceBox>* 
         const int piece = root(vid[i*3]);
         const int cn = candOf.empty() ? -1 : candOf[(size_t)piece];
         const bool capped = cn >= 0 && cands[(size_t)cn].capped;
+        const int place = cn >= 0 ? cands[(size_t)cn].place : -1;
         // A piece of no thickness -- a double-sided card, its two faces wound against each other
         // -- is closed and encloses nothing: its sign is rounding's, so it is no solid.
-        const double v = (capped ? cands[(size_t)cn].vol : vol[(size_t)piece]) * (double)side[(size_t)piece];
+        const double v = (capped || place >= 0 ? cands[(size_t)cn].vol : vol[(size_t)piece]) * (double)side[(size_t)piece];
         const Vec3 ext = phi[(size_t)piece] - plo[(size_t)piece];
         const double pd = std::sqrt(dot(ext, ext));
         const bool flat = std::fabs(v) <= 1e-9 * pd * pd * pd;
-        const unsigned char s = capped ? (v > 0.0 ? 3 : 4)
+        const unsigned char s = place >= 0 ? (unsigned char)(5 + 2 * place + (v > 0.0 ? 0 : 1))
+                              : capped ? (v > 0.0 ? 3 : 4)
                                        : (bad[(size_t)piece] || flat) ? 0 : (v > 0.0 ? 1 : 2);
         tris[i]->solidFace = s;
-        marked += s ? 1 : 0;
+        marked += (s && place < 0) ? 1 : 0;
         if (pieceOf && (s == 1 || s == 2)) (*pieceOf)[i] = piece;
         if (boxes && s && boxOf[(size_t)piece] < 0) {
             boxOf[(size_t)piece] = (int)boxes->size();
-            boxes->push_back(PieceBox{plo[(size_t)piece], phi[(size_t)piece], tris[i]->matId, {}, 0});
+            boxes->push_back(PieceBox{plo[(size_t)piece], phi[(size_t)piece], tris[i]->matId, {}, 0, place});
         }
         if (boxes && s) {
             PieceBox& pb = (*boxes)[(size_t)boxOf[(size_t)piece]];
@@ -431,10 +464,11 @@ inline size_t markSolidFaces(Tri* const* tris, size_t n, std::vector<PieceBox>* 
 }
 // The same over a contiguous run.
 inline size_t markSolidFaces(Tri* tris, size_t n, std::vector<PieceBox>* boxes = nullptr,
-                             std::vector<int>* pieceOf = nullptr, const CapOk* capOk = nullptr) {
+                             std::vector<int>* pieceOf = nullptr, const CapOk* capOk = nullptr,
+                             std::vector<CapCand>* capCands = nullptr) {
     std::vector<Tri*> p(n);
     for (size_t i = 0; i < n; ++i) p[i] = tris + i;
-    return markSolidFaces(p.data(), n, boxes, pieceOf, capOk);
+    return markSolidFaces(p.data(), n, boxes, pieceOf, capOk, capCands);
 }
 
 } // namespace watertight

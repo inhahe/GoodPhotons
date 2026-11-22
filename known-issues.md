@@ -3531,7 +3531,7 @@ know the solid is opaque, which a room built as one closed box seen from inside 
 come with a test that tells an enclosure from an object (whether the gather point lies inside the
 solid).
 
-## OPEN (2026-11-22, reopened at 0.451.16): PROBE-PARITY-LIMITS — the open solids the footprint probe's crossing count still misreads
+## DONE (2026-11-22, 0.451.21; reopened at 0.451.16): PROBE-PARITY-LIMITS — the open solids the footprint probe's crossing count misread
 
 Modes M and S count the faces their footprint probe crosses above the gather's tangent-plane band,
 and take an odd count to mean the column lies inside a solid resting on the surface (the halo fix,
@@ -3594,14 +3594,16 @@ piece that moves or deforms. **0.451.17 (REVIEW-0459)** caps both again and lets
 column a solid's side puts inside stays inside only where the leg from the gather point to it crosses a
 wall, which a room's floor and a mover clear of the floor do not; and it refuses a piece that covers its
 own cap's points. tools/check_cap_marks.py holds the rules.
-**Still open -- an open solid taller than the radius that no cap closes, its floor read dark at its base
-(0.56 of its coverage, `opentower` on 0.451.13):**
-- *An asset's open piece.* Its instances share the asset's triangles, so a face state on them cannot
-  differ per instance. **Proper fix:** mark such a piece's faces by the side its cap would give
-  (object space: the volume about its rim's centre does not depend on the placement), and give each
-  instance a bit per such piece, set where capOk passes for the rim placed by that instance; the probes
-  read a hit on an instance's face as capped where its bit is set (host Hit and the device's instance
-  record).
+**What was left after 0.451.17 -- an open solid taller than the radius that no cap closed, its floor read
+dark at its base (0.56 of its coverage, `opentower` on 0.451.13) -- is done:**
+- DONE (0.451.21): *an asset's open piece.* The asset's pass marks such a piece's faces by the side a cap
+  would give and its place among the asset's candidates (Tri::solidFace 5 + 2k / 6 + 2k, at most 64),
+  each instance asks capOk where it places the piece and keeps a bit for each that rests there
+  (MeshInstance::capMask, DInstance::capMask), and an instance's hit resolves Hit::solid +-(4 + k) to
+  +-2 or 0 (instanceHitToWorld, host and device). check_gather_base's `opentower_asset` (the tower as a
+  mesh_asset placed by an instance): its floor 0-2 cm and 2-5 cm from the base read 0.56 and 0.71 of
+  their true coverage on 0.451.20 in modes M and S, both devices, within 3 % now; check_cap_marks' `asset` (one asset
+  placed resting, lifted and scaled up resting): two caps.
 - DONE (0.451.19): *a hole that is not planar* (a statue's base on uneven ground). The fan of triangles
   from the rim's centroid closes any rim, its tetrahedra about the centroid vanishing, so the volume taken
   there is that closed solid's; capOk asks along the rim's normal at the centroid and the points a tenth

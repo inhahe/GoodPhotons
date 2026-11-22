@@ -941,6 +941,7 @@ struct DInstance {
     // MeshInstance::emitOf: its (material, emitter) pairs, DScene::instEmit[2 * emitOff ..], emitN of them.
     int    emitOff, emitN;
     int    passThrough;   // Scene::instancePassesStraight: it may hold a gel or half mirror
+    unsigned long long capMask;   // MeshInstance::capMask: its asset's pieces it rests capped
 };
 
 // Implicit surfaces (isosurface / CSG / metaballs) — device twins of implicit.h.
@@ -4775,7 +4776,9 @@ __device__ static inline void dTriFill(const DVec3& rd, const DTri& tri, Real t,
     hit.ng = gn;
     hit.n = flipped ? -ns : ns;
     hit.back = flipped;
-    hit.solid = tri.solid == 1 ? 1 : tri.solid == 2 ? -1 : tri.solid == 3 ? 2 : tri.solid == 4 ? -2 : 0;
+    // An asset's piece a cap would close: +-(4 + k), the instance's hit resolves it (host twin intersectTri).
+    hit.solid = tri.solid == 1 ? 1 : tri.solid == 2 ? -1 : tri.solid == 3 ? 2 : tri.solid == 4 ? -2
+              : tri.solid >= 5 ? (signed char)(((tri.solid - 5) & 1 ? -1 : 1) * (4 + (tri.solid - 5) / 2)) : 0;
     hit.tangent = tri.tangent;                 // per-triangle tangent (C6 normal mapping)
     // About the winding; the frame about ng's side (host twin intersectTri).
     hit.bitangentSign = againstWinding ? -(Real)tri.bitangentSign : (Real)tri.bitangentSign;
@@ -5160,6 +5163,11 @@ __device__ static void instanceHitToWorld(const DScene& sc, const DInstance& ins
     else if (inst.route >= 0 && lh.matId >= 0) {         // a tagged instance (host twin)
         const int to = mats[lh.matId].routeTo[inst.route];
         if (to >= 0) lh.matId = to;
+    }
+    // An asset's piece only an instance closes: capped where this one rests it (host twin).
+    if (lh.solid >= 4 || lh.solid <= -4) {
+        const int k = (lh.solid > 0 ? lh.solid : -lh.solid) - 4;
+        lh.solid = (k < 64 && ((inst.capMask >> k) & 1ull)) ? (signed char)(lh.solid > 0 ? 2 : -2) : (signed char)0;
     }
     // Its own light, not the shared asset triangle's (host twin MeshInstance::emitterOf).
     lh.emitter = -1;

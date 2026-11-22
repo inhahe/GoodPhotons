@@ -6813,8 +6813,15 @@ as the one at fault.
   there; a flat piece, a card or a light's quad, closes nothing and asks `capOk` nothing), and its faces are marked 3
   or 4 (`Hit::solid` +-2), which the probes read by the sign and the enclosures (`enclosureAt`, a
   camera's or light's medium) and the `emit_two_sided` refusal do not: an upright cup's rim is planar
-  too but closes on nothing, its floor lit through it. An asset's pieces are not capped (each
-  instance may rest on something else). The cap says only which side of the faces is in; whether a
+  too but closes on nothing, its floor lit through it. An asset's such piece is capped instance by
+  instance (0.451.21): its instances share its triangles, so the asset's pass marks the piece's faces by
+  the side a cap would give and its place among the asset's candidates (`Tri::solidFace` 5 + 2k out,
+  6 + 2k in, at most 64), each instance asks capOk of the candidate placed where it places it (its
+  transform, its mean linear scale, a moving instance at each key) and keeps a bit for each that rests
+  there (`MeshInstance::capMask`, the device's `DInstance::capMask`), and an instance's hit resolves the
+  face's `Hit::solid` +-(4 + k) to +-2 where its bit is set, 0 elsewhere (`instanceHitToWorld`, host
+  and device), before anything reads it. A candidate's box goes to `solidNear` under the instances that
+  cap it alone. The cap says only which side of the faces is in; whether a
   column it puts inside is walled off from the gather point the low leg decides (below): a bottomless
   box with a lamp in it is a room the gather point lies in, a mover capped where it rests may be clear
   of the surface at a path's time (0.451.16 refused the cap for both instead, REVIEW-0458;
@@ -6883,9 +6890,9 @@ as the one at fault.
   object standing on a surface ringed its base with a dark halo (0.75 of mode R within 5 cm of a
   3 cm box at radius 0.1; 0.99 with the count). A closed shelf hovering within the radius is
   crossed twice, and the floor under it counts (the plain disc average across its shadow). What the
-  count still misreads (known-issues PROBE-PARITY-LIMITS): an open solid taller than the radius whose
-  hole is not closed by a face it rests on -- an asset's -- holds the probe's
-  origin, so nothing is crossed and the floor under it counts.
+  count misread until 0.451.21 (known-issues PROBE-PARITY-LIMITS): an open solid taller than the radius
+  whose hole no face it rests on closed -- not planar, an asset's, a mover's resting at a key but not
+  at the instant -- held the probe's origin, so nothing was crossed and the floor under it counted.
   `-gageom`'s march takes the same count per column, looking for crossings as high as the probe
   does, r above the plane (0.433.7): a column near the disc's edge has a short chord, and a box top
   beyond it would otherwise leave the floor under the box counted. Sixteen faces without an answer

@@ -163,7 +163,9 @@ struct Tri {
     // On the boundary of a closed solid (Scene::markSolidFaces, over watertight::markSolidFaces):
     // 1 with its normal out, so a ray meeting it from behind (Hit::back) is leaving the solid; 2 with
     // it in. 3 and 4 the same for a piece open along a rim another face closes, for the footprint
-    // probes alone (PROBE-PARITY-LIMITS). 0 on any face that cannot say. Set at build where a walk can
+    // probes alone (PROBE-PARITY-LIMITS); 5 + 2k and 6 + 2k for an asset's such piece, k its place
+    // among the asset's (watertight::CapCand), closed where an instance placing it rests it
+    // (MeshInstance::capMask). 0 on any face that cannot say. Set at build where a walk can
     // be inside a solid (only the closed solids enclose a light or camera: Scene::enclosureAt) and for a
     // footprint's batch, whose probes read it too.
     unsigned char solidFace = 0;
@@ -371,7 +373,9 @@ struct Hit {
     // says nothing of inside and out (an open quad, a curve, an isosurface that may end at its
     // container: Implicit::solidSide). +-2 the same for a piece closed by the face its rim rests on
     // (Tri::solidFace 3 and 4), which the footprint probes read, by the sign, and the enclosures do
-    // not (a solid is +-1 to them). Every intersector writes it (the record is reused).
+    // not (a solid is +-1 to them). +-(4 + k) for an asset's piece only an instance closes (Tri::solidFace
+    // 5 and up) until the instance's hit resolves it to +-2 or 0. Every intersector writes it (the record
+    // is reused).
     signed char solid = 0;
     // Tri::boundsSolid: the enterable solid a face of another material bounds, or -1 (every
     // intersector writes it).
@@ -766,7 +770,10 @@ inline bool intersectTri(const TriShear& sh, const Ray& r, const Tri& tri,
     hit.ng = gn;
     hit.n = flipped ? -ns : ns;
     hit.back = flipped;
-    hit.solid = tri.solidFace == 1 ? 1 : tri.solidFace == 2 ? -1 : tri.solidFace == 3 ? 2 : tri.solidFace == 4 ? -2 : 0;
+    // An asset's piece a cap would close (5 + 2k out, 6 + 2k in): +-(4 + k), which the instance's hit
+    // resolves (Scene::instanceHitToWorld).
+    hit.solid = tri.solidFace == 1 ? 1 : tri.solidFace == 2 ? -1 : tri.solidFace == 3 ? 2 : tri.solidFace == 4 ? -2
+              : tri.solidFace >= 5 ? (signed char)(((tri.solidFace - 5) & 1 ? -1 : 1) * (4 + (tri.solidFace - 5) / 2)) : 0;
     hit.boundsSolid = tri.boundsSolid;
     hit.tangent = tri.tangent;             // per-triangle tangent (constant across the face)
     // For tangent-space normal mapping (C6): the frame is built about the normal on ng's side,

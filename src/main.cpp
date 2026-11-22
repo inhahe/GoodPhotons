@@ -20827,9 +20827,9 @@ static void prepareSunAim(const Scene& scene) {
 static void markSolidFaces(Scene& scene) {
     const Scene::SolidMarks& sm = scene.markSolidFaces();
     if (sm.seen || !scene.implicits.empty())
-        std::printf("[gather] %zu of %zu triangles and %zu of %zu isosurfaces bound closed solids, "
-                    "whose side the footprint probe reads (%.0f ms)\n", sm.solid, sm.seen, sm.isoSolid,
-                    scene.implicits.size(), sm.ms);
+        std::printf("[gather] %zu of %zu triangles and %zu of %zu isosurfaces bound closed solids, and %zu "
+                    "asset pieces under the instances that rest them, whose side the footprint probe reads "
+                    "(%.0f ms)\n", sm.solid, sm.seen, sm.isoSolid, scene.implicits.size(), sm.instCaps, sm.ms);
 }
 
 // The per-object mode tags a scene carries (Material::route, Medium::route).

@@ -29,7 +29,10 @@ exactly its count -- the marking pass's alone, with no noise:
     capped planar rims alone, none);
   - `hat`: a crown with a flat brim of 18 triangles lying on the floor, open along the brim's outer edge
     -- capped, eighteen: the points on the brim, the piece itself, ask nothing, and the floor covers the
-    rest (0.451.17 refused it for lying on its own faces there, none).
+    rest (0.451.17 refused it for lying on its own faces there, none);
+  - `asset`: the bottomless box as a `mesh_asset` placed three times, resting, lifted 5 cm, and scaled by
+    1.5 resting: no triangle of its own a solid's, and two asset pieces capped under the instances that
+    rest them (the line's `and N asset pieces`; 0.451.20 capped no asset's piece).
 
 Exits 1 on any mismatch.
 """
@@ -41,6 +44,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 NL = chr(10)
 sys.path.insert(0, os.path.join(ROOT, "tools"))
 import check_gather_base as g  # noqa: E402
+import re  # noqa: E402
 import check_motion as cm  # noqa: E402
 from check_meshvox import write_obj  # noqa: E402
 
@@ -149,6 +153,11 @@ def scene(kind, out):
         obj = os.path.join(out, kind + ".obj")
         {"sheet": sheet_obj, "pit": pit_obj, "uneven": uneven_obj, "hat": hat_obj}[kind](obj)
         geo = ['mesh "%s" { file "%s"  material obj }' % (kind, kind + ".obj")]
+    if kind == "asset":
+        g.box_obj(os.path.join(out, "box.obj"), -B, 0.0, -B, B, H, B, bottom=False)
+        geo = ['mesh_asset "box" { file "box.obj"  material obj }', 'mesh_instance { of "box" }',
+               'mesh_instance { of "box"  translate 0.6 0.05 0 }',
+               'mesh_instance { of "box"  translate -0.6 0 0  scale 1.5 }']
     if kind == "uneven":   # the V-ground it stands on, two quads meeting along x = 0
         geo += [g.quad((-1, K, -1), (0, 0, 2), (1, -K, 0), "floor"), g.quad((0, 0, -1), (0, 0, 2), (1, K, 0), "floor")]
     moves = kind in ("moving", "lowered")
@@ -165,7 +174,10 @@ def scene(kind, out):
 
 
 CASES = {"resting": 10, "lamp": 10, "moving": 10, "lowered": 10, "lifted": 0, "closed": 12, "sheet": 0, "pit": 0,
-         "uneven": 16, "hat": 18}
+         "uneven": 16, "hat": 18, "asset": 0}
+# The asset pieces capped under an instance (the line's `and N asset pieces`), where not none.
+INST = {"asset": 2}
+INST_LINE = re.compile(r"and (\d+) asset pieces")
 
 
 def main():
@@ -188,10 +200,12 @@ def main():
             ok = False
             continue
         got = int(m.group(1))
-        good = got == want
+        mi = INST_LINE.search(log)
+        inst = int(mi.group(1)) if mi else -1
+        good = got == want and inst == INST.get(kind, 0)
         ok &= good
-        print("%-8s %2d of %s triangles marked (want %d)  %s" % (kind, got, m.group(2), want,
-                                                              "ok" if good else "FAIL"), flush=True)
+        print("%-8s %2d of %s triangles marked (want %d), %d asset pieces under instances (want %d)  %s" % (
+            kind, got, m.group(2), want, inst, INST.get(kind, 0), "ok" if good else "FAIL"), flush=True)
     print("PASS" if ok else "FAIL")
     return 0 if ok else 1
 

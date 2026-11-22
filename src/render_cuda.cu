@@ -1096,6 +1096,7 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
         d.reachMul = in.reachMul; d.reachAdd = in.reachAdd;
         d.blasId = in.blasId; d.matOverride = in.matOverride; d.route = in.route;
         d.passThrough = scene.instancePassesStraight(in) ? 1 : 0;
+        d.capMask = in.capMask;
         d.emitOff = (int)(instEmit.size() / 2); d.emitN = (int)in.emitOf.size();
         for (const auto& [m, e] : in.emitOf) { instEmit.push_back(m); instEmit.push_back(e); }
     }

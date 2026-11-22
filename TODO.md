@@ -351,9 +351,8 @@ Then the rest of 4.2-4.6 in their order, 4.7's bookkeeping alongside whatever to
   seeds GPU over CPU mode M reads 1.0001 in red (known-issues).
 - [x] **CURVE-GATHER**, mode U's half (VCM-THIN-CURVES) — 0.439.2: mode U merges at no curve
   vertex (`vcmMergeAt` / `dVcmMergeAt`); its coat 2.10 / 2.36 -> 1.000 / 1.014 of mode R.
-- [ ] **PROBE-PARITY-LIMITS** (reopened at 0.451.16) — left: an asset's open piece (a cap per instance); the
-  proper fix is in the entry. The non-planar hole is done (0.451.19, the fan cap), a mover asked at its
-  keys (0.451.20). 0.451.17 (REVIEW-0459): the low leg decides a
+- [x] **PROBE-PARITY-LIMITS** (reopened at 0.451.16, done 0.451.21) — the non-planar hole (0.451.19, the fan
+  cap), a mover asked at its keys (0.451.20), an asset's open piece capped per instance (0.451.21). 0.451.17 (REVIEW-0459): the low leg decides a
   solid's side too, so a room and a mover are capped again. 0.451.14: an open solid taller than the radius, its planar rim closed by
   the face it rests on, is closed there for the probes alone (Tri::solidFace 3/4); was: the footprint probe's
   crossing count misreads a photon-holding open

@@ -1687,6 +1687,9 @@ struct MeshInstance {
     Affine toWorld = Affine::identity();   // local -> world
     Affine toLocal = Affine::identity();   // world -> local (= toWorld.inverse())
     int matOverride = -1;                  // >=0 replaces the BLAS triangles' matId
+    // Bit k: its asset's piece k a cap would close (watertight::CapCand, Tri::solidFace 5 + 2k) rests
+    // where this places it, so capped for its probes (Scene::markSolidFaces; Hit::solid +-2).
+    uint64_t capMask = 0;
     // A per-object render mode (ROUTE_D / ROUTE_J) on an instance without matOverride, or -1: its
     // hits shade with their materials' routed copies (Material::routeTo).
     int route = -1;
@@ -4895,12 +4898,13 @@ struct Scene {
     // and of those that did not close alone. (A sphere's hit says it is solid itself.) Also each
     // isosurface's side, and the world boxes of the solids light does not pass (solidNear). The full
     // pass also closes a world mesh object or loose piece open along a planar rim that rests on another
-    // face, for the probes alone (watertight's capOk; Tri::solidFace 3 and 4; PROBE-PARITY-LIMITS) -- not
-    // an asset's, whose instances may each rest on something else or nothing.
+    // face, for the probes alone (watertight's capOk; Tri::solidFace 3 and 4; PROBE-PARITY-LIMITS), and an
+    // asset's such piece under each instance that places it resting (MeshInstance::capMask).
     // `enclosuresOnly`: only what enclosureAt reads -- the pieces holding a material a walk can be
     // inside, and the isosurfaces' sides -- which is what build() asks for, the rest left to the full
     // pass a footprint needs. Once a build each: a repeated call returns the first's counts.
-    struct SolidMarks { size_t seen = 0, solid = 0, isoSolid = 0; double ms = 0.0; };
+    // `instCaps`: the asset pieces capped under an instance that places them resting (MeshInstance::capMask).
+    struct SolidMarks { size_t seen = 0, solid = 0, isoSolid = 0, instCaps = 0; double ms = 0.0; };
     SolidMarks solidMarks;
     uint64_t solidMarksBuild = 0;       // the buildCount the full pass last ran at (0: never)
     uint64_t enclosureMarksBuild = 0;   // ... and the enclosuresOnly one
@@ -4952,49 +4956,57 @@ struct Scene {
         // there from either side, from d beyond `slack` -- d a thousandth of the rim's `reach`, ten `eps`
         // at least -- meets one within win = 0.5 d + slack of the point (5e-4 of the reach for a planar
         // rim), passing the piece's own faces on the way. "On the piece" is to within rounding of one of
-        // its faces (`onR`): a hit lies on the face it hit, a point of a brim on the brim. A mover
-        // (`motion` its set) rests where any of its keys places it, each asked at that key's time, the
-        // points carried by its transform from the instant and a hit carried back to be told the
-        // piece's own; the probes' low leg decides every other time.
-        const watertight::CapOk capOk = [&](const Vec3& nrm, const std::vector<Vec3>& pts, double reach,
-                                            double slack, const std::function<bool(const Vec3&, double)>& own,
-                                            int motion) {
+        // its faces (`onR`): a hit lies on the face it hit, a point of a brim on the brim. The piece is
+        // placed by D (its points' space to the world's, Dinv back, a hit carried back to be told the
+        // piece's own): the identity for a world piece, an instance's toWorld for an asset's. A mover
+        // (`motion` its set) rests where any of its keys places it, each asked at that key's time, D
+        // its transform from the instant; the probes' low leg decides every other time.
+        using OwnFn = std::function<bool(const Vec3&, double)>;
+        const auto restsAt = [&](const Vec3& nrm, const std::vector<Vec3>& pts, double reach, double slack,
+                                 const OwnFn& own, const Affine& D, const Affine& Dinv) {
             const double d = std::max(1e-3 * reach, 10.0 * eps), w = d + slack, win = 0.5 * d + slack;
             const double onR = std::max(1e-6 * reach, 10.0 * eps);
-            // Placed by D (from the instant, Dinv back), is every point covered?
-            const auto restsAt = [&](const Affine& D, const Affine& Dinv) {
-                const Vec3 nk = normalize(D.applyCofactor(nrm));
-                int asked = 0;
-                for (const Vec3& q0 : pts) {
-                    if (own(q0, onR)) continue;   // the piece itself there: a hat's brim on the table
-                    ++asked;
-                    const Vec3 q = D.apply(q0);
-                    bool covered = false;
-                    for (int side = 0; side < 2 && !covered; ++side) {
-                        const Vec3 dir = nk * (side ? 1.0 : -1.0);
-                        double t0 = 0.0;   // from q - dir * w, how far the ray has come
-                        for (int k = 0; k < 8 && !covered; ++k) {
-                            const Hit h = closestHit(Ray{q - dir * (w - t0), dir}, eps, nullptr, false, false, 2.0 * w - t0);
-                            if (!h.valid) break;
-                            t0 += h.t;
-                            if (t0 > w + win) break;
-                            if (t0 >= w - win && !own(Dinv.apply(h.p), onR)) covered = true;
-                        }
+            const Vec3 nk = normalize(D.applyCofactor(nrm));
+            int asked = 0;
+            for (const Vec3& q0 : pts) {
+                if (own(q0, onR)) continue;   // the piece itself there: a hat's brim on the table
+                ++asked;
+                const Vec3 q = D.apply(q0);
+                bool covered = false;
+                for (int side = 0; side < 2 && !covered; ++side) {
+                    const Vec3 dir = nk * (side ? 1.0 : -1.0);
+                    double t0 = 0.0;   // from q - dir * w, how far the ray has come
+                    for (int k = 0; k < 8 && !covered; ++k) {
+                        const Hit h = closestHit(Ray{q - dir * (w - t0), dir}, eps, nullptr, false, false, 2.0 * w - t0);
+                        if (!h.valid) break;
+                        t0 += h.t;
+                        if (t0 > w + win) break;
+                        if (t0 >= w - win && !own(Dinv.apply(h.p), onR)) covered = true;
                     }
-                    if (!covered) return false;
                 }
-                return asked > 0;   // all on the piece: nothing shows it rests on anything
-            };
+                if (!covered) return false;
+            }
+            return asked > 0;   // all on the piece: nothing shows it rests on anything
+        };
+        // At the placement `place` (as restsAt's D), or for a mover each of its keys' composed with it.
+        const auto restsMoving = [&](const Vec3& nrm, const std::vector<Vec3>& pts, double reach, double slack,
+                                     const OwnFn& own, int motion, const Affine& place) {
             if (motion < 0 || (size_t)motion >= motionSets.size())
-                return restsAt(Affine::identity(), Affine::identity());
+                return restsAt(nrm, pts, reach, slack, own, place, place.inverse());
             const MotionKeys& mk = motionSets[(size_t)motion];
             for (int k = 0; k < mk.keys; ++k) {
                 const MotionTimeScope atKey(motionT[(size_t)(mk.first + k)]);
-                const Affine& D = motionXf[(size_t)(mk.first + k)];
-                if (restsAt(D, D.inverse())) return true;
+                const Affine D = motionXf[(size_t)(mk.first + k)].compose(place);
+                if (restsAt(nrm, pts, reach, slack, own, D, D.inverse())) return true;
             }
             return false;
         };
+        const watertight::CapOk capOk = [&](const Vec3& nrm, const std::vector<Vec3>& pts, double reach,
+                                            double slack, const OwnFn& own, int motion) {
+            return restsMoving(nrm, pts, reach, slack, own, motion, Affine::identity());
+        };
+        // An asset's pieces a cap would close, by asset (its pass alone).
+        std::vector<std::vector<watertight::CapCand>> blasCands(enclosuresOnly ? 0 : blasList.size());
         const watertight::CapOk* cap = enclosuresOnly ? nullptr : &capOk;
         for (const MeshGroup& g : meshGroups) {
             if (g.shapeOnly) continue;
@@ -5006,7 +5018,8 @@ struct Scene {
                     continue;
                 }
                 done[(size_t)g.blasId] = 1;
-                sm.solid += watertight::markSolidFaces(tr.data(), tr.size(), &blasPieces[(size_t)g.blasId], &pieceOf);
+                sm.solid += watertight::markSolidFaces(tr.data(), tr.size(), &blasPieces[(size_t)g.blasId], &pieceOf,
+                                                       nullptr, enclosuresOnly ? nullptr : &blasCands[(size_t)g.blasId]);
                 bound([&](size_t i) -> Tri& { return tr[i]; }, tr.size());
                 sm.seen += tr.size();
             } else if (g.triStart + g.triCount <= tris.size()) {
@@ -5051,6 +5064,25 @@ struct Scene {
             enclosureMarksBuild = buildCount;
             return solidMarks;
         }
+        // Each instance asks its asset's candidates where it places them -- scaled by its mean linear
+        // scale, and a moving one at each of its keys.
+        for (MeshInstance& inst : instances) {
+            inst.capMask = 0;
+            if (inst.blasId < 0 || inst.blasId >= (int)blasCands.size()) continue;
+            const std::vector<watertight::CapCand>& cc = blasCands[(size_t)inst.blasId];
+            const std::vector<Tri>& bt = blasList[(size_t)inst.blasId].tris;
+            const double s = inst.curvScale > 0.0 ? 1.0 / inst.curvScale : 1.0;
+            for (size_t k = 0; k < cc.size(); ++k) {
+                const watertight::CapCand& c = cc[k];
+                const OwnFn own = [&](const Vec3& x, double rad) {
+                    return watertight::nearFaces([&](size_t i) -> const Tri& { return bt[i]; }, c.faces, x, rad / s);
+                };
+                if (restsMoving(c.nrm, c.pts, c.reach * s, c.slack * s, own, inst.motion, inst.toWorld)) {
+                    inst.capMask |= 1ull << k;
+                    ++sm.instCaps;
+                }
+            }
+        }
         // The solids' world boxes (solidNear), those a footprint's segment can meet: every sphere,
         // closed isosurface and closed piece light does not pass (a piece by one of its faces'
         // material) -- an asset's under each instance that places it.
@@ -5081,6 +5113,7 @@ struct Scene {
             if (inst.blasId < 0 || inst.blasId >= (int)blasPieces.size()) continue;
             for (const watertight::PieceBox& lb : blasPieces[(size_t)inst.blasId]) {
                 if (!opaqueMat(inst.matOverride >= 0 ? inst.matOverride : lb.matId)) continue;
+                if (lb.cand >= 0 && !((inst.capMask >> lb.cand) & 1ull)) continue;   // not capped there
                 Aabb b;
                 for (int c = 0; c < 8; ++c)
                     b.expand(inst.toWorld.apply(Vec3((c & 1) ? lb.hi.x : lb.lo.x, (c & 2) ? lb.hi.y : lb.lo.y,
@@ -5869,6 +5902,11 @@ struct Scene {
     // `mats`: the scene's materials, for a tagged instance's routed copies (MeshInstance::route);
     // null only for an instance known to be untagged (a self-test's).
     static void instanceHitToWorld(const MeshInstance& inst, Hit& lh, const Material* mats) {
+        // An asset's piece only an instance closes: capped where this one rests it (MeshInstance::capMask).
+        if (lh.solid >= 4 || lh.solid <= -4) {
+            const int k = std::abs((int)lh.solid) - 4;
+            lh.solid = (k < 64 && ((inst.capMask >> k) & 1ull)) ? (signed char)(lh.solid > 0 ? 2 : -2) : (signed char)0;
+        }
         lh.p  = inst.toWorld.apply(lh.p);             // from the local point (intersectTri says why)
         lh.pscale = inst.reachMul * lh.pscale + inst.reachAdd;
         if (lh.patFrame < 0) lh.patFrame = inst.patFrame;

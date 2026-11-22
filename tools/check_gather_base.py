@@ -2,9 +2,9 @@
 
     python tools/check_gather_base.py [--out png/check_gather_base] [--exe ftrace.exe]
                                       [--objects diffuse,mirror,coated,coaster,openbox,openbox_lifted,
-                                                 openbox_hover,tower,isotower,towerfar,opentower,litbox,
-                                                 litbox_closed,ball,meshball,diffuseball,smallball,
-                                                 mirrorsheet,lampsheet,tablesheet]
+                                                 openbox_hover,tower,isotower,towerfar,opentower,
+                                                 opentower_asset,litbox,litbox_closed,ball,meshball,
+                                                 diffuseball,smallball,mirrorsheet,lampsheet,tablesheet]
 
 A closed 3 cm box (six quads) standing on a lit floor, seen from straight above, modes M and S at a
 pinned gather radius of 0.1 on the CPU and the GPU, against mode R on the GPU. A mode-M or mode-S
@@ -45,7 +45,9 @@ its hits say as a closed mesh's do; `towerfar` is the tower beside a quad 2 km w
 below the floor, among the same loose triangles, which must not make the tower too small to be a
 solid; `opentower` is the tower with no bottom face, an open piece that cannot say its side, but whose
 rim the floor closes, and which the probes take as closed there (PROBE-PARITY-LIMITS: a probe begun
-inside it crossed nothing, met the floor in the band, and read the floor at its foot dark). Its shadow
+inside it crossed nothing, met the floor in the band, and read the floor at its foot dark);
+`opentower_asset` is it as a `mesh_asset` placed by a `mesh_instance`, whose cap the instance decides
+where it places it (MeshInstance::capMask; until 0.451.21 an asset's pieces were never capped). Its shadow
 at its foot is too steep for mode R to be a reference within
 the radius, so it is held to its exact coverage (below). A diffuse box 4 cm tall with no bottom face
 and a lamp inside it (`litbox`), seen from inside, rests on the floor as `openbox` does and is capped
@@ -92,6 +94,7 @@ import numpy as np
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "tools"))
 import check_motion as cm  # noqa: E402
+from check_meshvox import write_obj  # noqa: E402
 
 NL = chr(10)
 W = H = 160
@@ -116,6 +119,27 @@ def box(x0, y0, z0, x1, y1, z1, mat, bottom=True):
 def open_box(x0, y0, z0, x1, y1, z1, mat):
     """box() without its bottom face."""
     return box(x0, y0, z0, x1, y1, z1, mat, bottom=False)
+
+
+def box_obj(path, x0, y0, z0, x1, y1, z1, bottom=True):
+    """box()'s quads as an OBJ of their triangles, wound outward as the quads are (u x v), welded."""
+    dx, dy, dz = x1 - x0, y1 - y0, z1 - z0
+    qs = [((x0, y1, z0), (0, 0, dz), (dx, 0, 0))] + ([((x0, y0, z0), (dx, 0, 0), (0, 0, dz))] if bottom else []) + [
+          ((x0, y0, z0), (0, dy, 0), (dx, 0, 0)), ((x0, y0, z1), (dx, 0, 0), (0, dy, 0)),
+          ((x0, y0, z0), (0, 0, dz), (0, dy, 0)), ((x1, y0, z0), (0, dy, 0), (0, 0, dz))]
+    verts, at, faces = [], {}, []
+
+    def v(p):
+        k = tuple(round(c, 12) for c in p)
+        if k not in at:
+            at[k] = len(verts)
+            verts.append(k)
+        return at[k]
+    for o, u, w in qs:
+        a, b = v(o), v(tuple(o[i] + u[i] for i in range(3)))
+        c, d = v(tuple(o[i] + u[i] + w[i] for i in range(3))), v(tuple(o[i] + w[i] for i in range(3)))
+        faces += [(a, b, c), (a, c, d)]
+    write_obj(path, verts, faces)
 
 
 def write_ball_obj(path, r, n=48):
@@ -296,6 +320,7 @@ def _ball(mat, mesh=False, radius=BOX, rings=((0.04, 0.12),)):
 # same photons, so the ratio is the coverage alone. Mode S keeps its radius for it (-sppmalpha 1).
 TOWER_X0 = -0.45
 GATHER_R = 0.1      # the cases' -pmradius
+TOWER_MAT = 'material "obj" { type diffuse reflect 0.5 }'
 
 
 def seg_cover(d, r=GATHER_R):
@@ -351,7 +376,10 @@ OBJECTS = {
     "towerfar": _tower('material "obj" { type diffuse reflect 0.5 }', far=True),
     # The tower with no bottom face, as an imported mesh often is: open along a rim the floor closes,
     # which its probes take as closed there (PROBE-PARITY-LIMITS).
-    "opentower": _tower('material "obj" { type diffuse reflect 0.5 }', bottom=False),
+    "opentower": _tower(TOWER_MAT, bottom=False),
+    # The open tower as an asset placed by an instance, which caps it where the instance rests it.
+    "opentower_asset": ([TOWER_MAT, 'mesh_asset "tower" { file "tower.obj"  material obj }',
+                         'mesh_instance { of "tower" }'],) + _tower(TOWER_MAT, bottom=False)[1:],
     # A bottomless box with a lamp inside it, seen from inside: capped, but a room the gather point lies
     # in, so the low leg crosses no wall to the columns its lid puts inside (PROBE-PARITY-LIMITS)...
     "litbox": _room('material "obj" { type diffuse reflect 0.5 }'),
@@ -382,7 +410,11 @@ OBJECTS = {
 # The faces the probes' marking pass takes as a solid's, which the case's renders must report
 # (`[gather] N of M triangles`): what a case tests holds only while its object is marked as it supposes.
 MARKS = {"openbox": 10, "openbox_lifted": 0, "openbox_hover": 10, "opentower": 10, "litbox": 10,
-         "litbox_closed": 12}
+         "litbox_closed": 12, "opentower_asset": 0}
+# The asset pieces capped under an instance, which a case's renders must report (the [gather] line's
+# `and N asset pieces`).
+INST_MARKS = {"opentower_asset": 1}
+INST_LINE = re.compile(r"and (\d+) asset pieces")
 # A case held to its twin (`against` "twin"): the scene lines of the same thing put another way, rendered
 # with the same arguments and seeds, each ring within TWIN_TOL of the twin's.
 TWINS = {"openbox_hover": hover_lines('material "obj" { type glossy reflect 0.6 roughness 0.3 }', 0.00025)}
@@ -432,6 +464,7 @@ def main():
     exe, out = os.path.abspath(a.exe), os.path.abspath(a.out)
     os.makedirs(out, exist_ok=True)
     write_ball_obj(os.path.join(out, "ball.obj"), BOX)
+    box_obj(os.path.join(out, "tower.obj"), TOWER_X0, 0.0, -BOX, -BOX, 0.3, BOX, bottom=False)
     ok = True
     for bname in a.objects.split(","):
         lines, cam, distf, rings, base, against = OBJECTS[bname]
@@ -485,6 +518,13 @@ def main():
                     print("%-9s %-12s floor %2.0f-%2.0f cm from %s: %.3f of the uncorrected / %s  %s" % (
                         bname, name, lo * 100, hi * 100, base, c,
                         "its coverage" if against == "coverage" else "1", "ok" if good else "FAIL"), flush=True)
+        if bname in INST_MARKS:
+            said = [int(m.group(1)) for m in (INST_LINE.search(lg) for lg in logs) if m]
+            good = bool(said) and all(n == INST_MARKS[bname] for n in said)
+            ok &= good
+            print("%-9s %d renders' marking pass: %s asset pieces capped under an instance (want %d)  %s" % (
+                bname, len(said), ",".join(sorted(set(map(str, said)))) or "none said", INST_MARKS[bname],
+                "ok" if good else "FAIL"), flush=True)
         if bname in MARKS:
             said = [int(m.group(1)) for m in (GATHER_LINE.search(lg) for lg in logs) if m]
             good = bool(said) and all(n == MARKS[bname] for n in said)
