@@ -309,9 +309,9 @@ Then the rest of 4.2-4.6 in their order, 4.7's bookkeeping alongside whatever to
 - [x] **GPU-SPHERE-CONNECT-SLOW** (0.450.42-0.450.44) — the connection closes on its roots and splats after its
   scan, and the connections are queued into a kernel of their own: 17.5 -> 2.9 s on the outside view at
   5e6 photons (the CPU's 32 threads 11.7); known-issues.
-- [ ] **SPH-SCAN-FP32** — the glass-sphere connection's scan in fp32 and its roots refined in fp64 (the
-  FP64 pipe is what bounds kSphConnect): time it on the outside view, and hold check_ball_images and
-  check_sphere_queue to it.
+- [x] **SPH-SCAN-FP32** (measured, not taken) — the glass-sphere connection's scan in fp32, its candidates
+  refined in fp64: 9.5 -> 9.3 s on the outside view at 20 M photons, 2 %; the splats and the refinement
+  hold the FP64 pipe now, not the scan (known-issues GPU-SPHERE-CONNECT-SLOW).
 - [x] **MODEB-SPHERE-ROOM** (0.448.1) — the check's depth cap, which mode R counts the ball's events
   against and mode B's connection did not (known-issues).
 - [x] **MODEM-BALL-LAMP** (no change) — the lamp's edge pixels' coverage noise at 64 spp, the same

@@ -2060,6 +2060,11 @@ together, after each wave of photons (design.md). 9.2 -> 2.9 s at 5e6 photons --
 the CPU's 32 threads 11.7 s. Under per-photon seeding with no medium the images are the inline ones' to
 the bit (tools/check_sphere_queue.py: five cases, a shrunk queue's 144 waves among them). The scan in
 fp32, refined in fp64, is left as an optimization (TODO SPH-SCAN-FP32): the GPU no longer loses.
+**SPH-SCAN-FP32, measured and not taken (2026-11-22):** the scan in float, each candidate's ends evaluated
+again in fp64 before the refinement, took check_ball_images' outside view at 20 M photons from 9.5 s to
+9.3 s on the GPU, 2 %: past the queue the scan is not what holds the FP64 pipe -- the splats' chain
+traces and the refinement are, as 0.450.42's stage timing had them (53 % and 28 % then). Seventy lines of
+float twins and a root a float's rounding could cost were not worth it.
 
 ## DONE (2026-11-16, 0.448.5): REVIEW-0448C — what the Opus (xhigh) review of 0.448.4 found
 
