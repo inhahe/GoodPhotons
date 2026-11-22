@@ -27,14 +27,15 @@ inline bool probePassesThrough(const Scene& scene, const Material& m, GatherHold
 // (passesLight), curves unseen: `side`, that of the last closed solid's face (Hit::solid) -- +1
 // it ends inside that solid, -1 outside, 0 it crosses none -- and `open`, how many faces that
 // cannot say their side it crosses (up to 15). Two segments of the footprint (PROBE-PATH):
-//   - from the gather point, which no solid holds, to a column's top, r above the tangent plane,
-//     when the probe crosses no closed solid's face on its way down (its `side`): a column inside
-//     a solid taller than the radius standing on the surface is then known to be inside;
-//   - the low leg, from just over the gather point (kLowLegFrac) to the column's foot, when the
-//     parity of the open faces above the plane says inside (its `open`, odd to agree): a cup or a
-//     bottomless box of quads standing on the surface walls the column off, a sheet hovering over
-//     it -- a table top, a mirror, a lamp's quad -- leaves the way open, and the floor under it
-//     lit from the sides.
+//   - from the gather point to a column's top, r above the tangent plane, when the probe crosses no
+//     closed solid's face on its way down (its `side`): a column inside a solid taller than the
+//     radius standing on the surface is then known to be inside;
+//   - the low leg, from just over the gather point (kLowLegFrac) to the column's foot, when what
+//     lies above says the column is inside: the parity of the open faces above the plane (the leg's
+//     `open` odd to agree), or a closed solid's side (the leg's `side` +1, or its `open` odd). A cup,
+//     a bottomless box of quads or a box standing on the surface walls the column off; a sheet
+//     hovering over it -- a table top, a mirror, a lamp's quad -- leaves the way open, the floor
+//     under it lit from the sides, and so does a room the gather point lies in itself.
 // `eps` is how far past a face crossed the segment goes on from, the gather's scale (r * 1e-4).
 // Curves are skipped by their own tmin, the whole leg; the blanket tmin is then 0, so the origin
 // steps past a face by `eps` itself. Open air, the common case, costs one bounded ray. Device twin
@@ -163,7 +164,9 @@ inline double gatherFootprintArea(const Scene& sc, const Vec3& p, const Vec3& n,
         // in `pend` until the next solid face decides it (`dec` if outside, dropped if inside),
         // binned by the parity of the crossings below it, so the column's total says which bin has
         // an even count above.
-        double pend[2] = {0.0, 0.0}, dec[2] = {0.0, 0.0};
+        // `drop`: the layers a solid's face puts inside, by the same bins, which stay out only where
+        // the low leg agrees a wall stands between them and the gather point (the probe's inside()).
+        double pend[2] = {0.0, 0.0}, dec[2] = {0.0, 0.0}, drop[2] = {0.0, 0.0};
         int crossed = 0;
         int strandSkips = 0;
         for (; layers < maxLayers; ++layers) {
@@ -217,6 +220,7 @@ inline double gatherFootprintArea(const Scene& sc, const Vec3& p, const Vec3& n,
             const bool opaque = !(mm && passesLight(sc, *mm)) && !strand;
             if (opaque && h.solid && off > 1e-7 * r) {
                 if ((h.solid > 0) != h.back) { dec[0] += pend[0]; dec[1] += pend[1]; }   // entered: below is outside
+                else { drop[0] += pend[0]; drop[1] += pend[1]; }                         // left: below is inside
                 pend[0] = pend[1] = 0.0;
             }
             // A face that holds no photon is no area above the plane, where the probe passes it (a
@@ -239,14 +243,23 @@ inline double gatherFootprintArea(const Scene& sc, const Vec3& p, const Vec3& n,
         if ((restEv > 0.0 || restOdd > 0.0) && solidsNear) {
             const Vec3 o = p + n * eps, colTop = q + n * r;
             const double len = length(colTop - o);
-            if (walkSegment(sc, o, (colTop - o) * (1.0 / len), len, eps).side > 0) restEv = restOdd = 0.0;
+            if (walkSegment(sc, o, (colTop - o) * (1.0 / len), len, eps).side > 0) {
+                drop[ev] += restEv; drop[ev ^ 1] += restOdd;
+                restEv = restOdd = 0.0;
+            }
         }
-        double col = dec[ev] + restEv;
-        // An odd count above puts a layer inside only where the low leg agrees (the probe's
-        // parityInside): a cup's floor, not the floor under a hovering sheet.
-        const double odd = dec[ev ^ 1] + restOdd;
-        if (odd > 0.0 && rr > eps &&
-            (walkSegment(sc, p + n * (kLowLegFrac * r), (q - p) * (1.0 / rr), rr, eps).open & 1) == 0)
+        // The low leg, from just over the gather point to the column's foot, where anything is to be
+        // decided by it: a solid's inside stays out where it enters a solid or crosses an odd count
+        // of faces that cannot say, a wall between the column and the gather point (a box resting on
+        // the surface, not a room the gather point lies in); an odd count above puts a layer inside
+        // only where the leg's count is odd too (a cup's floor, not the floor under a hovering sheet).
+        SegmentCrossings leg;
+        if ((drop[0] > 0.0 || drop[1] > 0.0 || dec[ev ^ 1] + restOdd > 0.0) && rr > eps)
+            leg = walkSegment(sc, p + n * (kLowLegFrac * r), (q - p) * (1.0 / rr), rr, eps);
+        const bool walled = leg.side > 0 || (leg.open & 1);
+        double col = dec[ev] + restEv + (walled ? 0.0 : drop[ev]);
+        const double odd = dec[ev ^ 1] + restOdd + (walled ? 0.0 : drop[ev ^ 1]);
+        if (odd > 0.0 && rr > eps && (leg.open & 1) == 0)
             col += odd;
         area += col;
         if (layers >= maxLayers && incomplete) *incomplete = true;

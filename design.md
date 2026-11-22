@@ -3828,8 +3828,9 @@ was lit differently by every mode (known-issues GLOW-LIGHT-MODES). Now:
   them (`forwardRadiance`), and the fit takes the photons against the backward layer less them
   (`forwardScale`), so the sky does not wobble with the fit. A forward pixel a sample of which meets
   what the forward layer cannot show -- a specular-type surface first, a region that bends rays
-  (`SkyView::specSeen`; where there is nothing to draw the pass runs for those marks alone, at its first
-  count, and a marked pixel's count never grows, nothing reading its sums) -- is the backward
+  (`SkyView::specSeen`; a marked pixel's samples stop there and its count never grows, nothing reading
+  its sums; where there is nothing to draw the pass runs for those marks alone, at its first count, and
+  not at all where nothing in the scene can set one) -- is the backward
   layer's at the composite, out of the fit: the edge of a glass ball or a mirror against the sky, or
   against a diffuse floor, has no dark rim. The fit also leaves out a pixel whose footprint a sun's disc
   comes near (`CompositeClass::fit`: the disc's cone against the pixel's corners), ten thousand times a
@@ -6799,23 +6800,23 @@ as the one at fault.
   more than a thousandth of its shortest edge. **A piece open along a rim another face closes**
   (0.451.14, PROBE-PARITY-LIMITS) is closed by that face's plane for the probes alone: a world mesh
   object or loose piece whose every edge is used twice in opposite directions or once and whose every
-  face's corner normals lie on one side of its winding, the whole piece on the same side, the once-used edges (its rim) in one plane (Newell's
-  normal over them, each run as its one face runs it), which a face covers where the rim encloses it
-  (short rays across the plane at the rim's centre and a tenth of the way in from its corners:
-  `capOk`) -- a statue's open base on its floor, a bottomless box of quads on the ground. Its volume
+  face's corner normals lie on one side of its winding, the whole piece on the same side, the
+  once-used edges (its rim) in one plane (Newell's normal over them, each run as its one face runs
+  it), which another face covers where the rim encloses it (short rays across the plane at the rim's
+  centre and a tenth of the way in from its corners, meeting a face within 5e-4 of the rim's reach of
+  it: `capOk`; a piece that covers those points itself, lying in the plane there -- a near-flat sheet
+  its rounding leaves a volume, a ground whose border closes on its own flat part round a pit --
+  closes on nothing) -- a statue's open base on its floor, a bottomless box of quads on the ground. Its volume
   taken about the rim's centre is the capped solid's (the cap's own tetrahedra vanish there; a flat
   piece, a card or a light's quad, closes nothing and asks `capOk` nothing), and its faces are marked 3
   or 4 (`Hit::solid` +-2), which the probes read by the sign and the enclosures (`enclosureAt`, a
   camera's or light's medium) and the `emit_two_sided` refusal do not: an upright cup's rim is planar
-  too but closes on nothing, its floor lit through it. Not capped (0.451.16, REVIEW-0458): an asset's
-  pieces (each instance may rest on something else); a piece that moves or deforms (`Tri::motion`,
-  `vkeys`: it rests where it does at the instant only); and one a light lies inside -- a quad light's
-  centre, a mesh light's triangles' centroids, a spot's, sphere's or cylinder's origin, an emissive
-  volume's box centre, each tested by the parity of a ray's crossings of the piece and its cap --
-  which is a room, not a solid: a bottomless box with a lamp in it, whose floor a probe starting above
-  its lid must count, as the parity and the low leg do (capped, `check_gather_base`'s `litbox` read
-  its floor 9.0 of the uncorrected render; `tools/check_cap_marks.py` reads the pass's own count for each
-  rule). It goes per mesh
+  too but closes on nothing, its floor lit through it. An asset's pieces are not capped (each
+  instance may rest on something else). The cap says only which side of the faces is in; whether a
+  column it puts inside is walled off from the gather point the low leg decides (below): a bottomless
+  box with a lamp in it is a room the gather point lies in, a mover capped where its faces are stored
+  may be clear of the surface at a path's time (0.451.16 refused the cap for both instead, REVIEW-0458;
+  REVIEW-0459). `tools/check_cap_marks.py` reads the pass's own count for each rule. It goes per mesh
   object, then over every triangle no mesh object holds (quads, a light's own surface) as one pool,
   in which six quads meeting edge to edge form a box. The pass runs once per batch with a mode-M or
   mode-S camera and a footprint taken, before the exposure meter; the flag sits in `Tri`'s and
@@ -6823,8 +6824,8 @@ as the one at fault.
   the solid or out of it, and the last one crossed, the nearest the plane, puts the column inside
   when it was an entry: under the overhang of a ball resting on the floor the probe begins inside the
   ball and leaves it, where a parity read the floor as inside. **Each probe begins on a known side (PROBE-PATH):** where the
-  probe crosses no closed solid's face, `walkSegment` follows the segment from the gather point,
-  which no solid holds, to the probe's own top, and the last closed solid's face it crosses says
+  probe crosses no closed solid's face, `walkSegment` follows the segment from the gather point to
+  the probe's own top, and the last closed solid's face it crosses says
   whether the top lies in a solid. So a column inside a solid taller than r standing on the surface
   is inside though the probe crosses none of its faces (the dark halo at such a base: within 2 cm of
   a 30 cm box the floor read 0.56 of its value at its true coverage before 0.434.10). The segment
@@ -6843,17 +6844,23 @@ as the one at fault.
   on it to within rounding (1e-7 r on the host, 2 `RAY_EPS` on the device), so the underside of a
   ball resting on the floor is above it all but at the point it touches.
   An opaque face that cannot say (an open quad, a curve, an open isosurface, an open mesh), photon-
-  holding or not, keeps the parity, odd meaning inside -- but only where the **low leg** agrees
-  (0.434.13): the segment from just over the gather point (1 % of r up) to the column's foot must
-  cross an odd count of such faces too (`walkSegment`'s `open`, asked only for an odd parity). A
-  bottomless box of quads or an open glossy cup standing on the surface walls its floor off, so it
-  stays a miss; a sheet hovering over it -- a diffuse table top, a mirror, a light's quad --
-  encloses nothing, and the floor under it, lit from the sides, is covered. Either rule puts the
-  column inside. `-gageom`'s march climbs and
+  holding or not, keeps the parity, odd meaning inside. Either rule puts the column inside only
+  where the **low leg** agrees that a wall stands between it and the gather point (0.434.13 for the
+  parity, 0.451.17 for a solid's side, REVIEW-0459; `inside()`): the segment from just over the
+  gather point (1 % of r up) to the column's foot must cross an odd count of such faces too
+  (`walkSegment`'s `open`), or, for a solid's side, enter a solid (its `side`, +1) or cross an odd
+  count -- asked only once what lies above says inside. A bottomless box of quads, an open glossy cup
+  or a box standing on the surface walls its floor off, so it stays a miss; a sheet hovering over it
+  -- a diffuse table top, a mirror, a light's quad -- encloses nothing, and the floor under it, lit
+  from the sides, is covered; and a room the gather point lies in itself is no wall to its own floor,
+  closed (six quads, a solid) or capped, however much lower than r its lid (`check_gather_base`'s
+  `litbox` and `litbox_closed`: their floor read 9.0 of the uncorrected render with the solid's side
+  alone). `-gageom`'s march climbs and
   decides each in-band layer of a column by the faces above it: the next solid face it meets above
   the layer, met from inside meaning inside, and the parity of the rest, so a coaster's top counts
   while the floor inside the coaster under it does not; a layer no solid face in the window decides
-  takes the side of the column's top, along the same path as the probe's. A face that holds no
+  takes the side of the column's top, along the same path as the probe's, and the low leg agrees or
+  not as the probe's does. A face that holds no
   photon is no area to it above the plane, where the probe passes it (a glossy ball's steep side,
   which the tilt-widened band takes in), and is on the plane, where the probe ends on it. An in-band
   face seen from behind on the plane decides nothing: a room built as one closed box is seen from
@@ -6862,7 +6869,8 @@ as the one at fault.
   3 cm box at radius 0.1; 0.99 with the count). A closed shelf hovering within the radius is
   crossed twice, and the floor under it counts (the plain disc average across its shadow). What the
   count still misreads (known-issues PROBE-PARITY-LIMITS): an open solid taller than the radius whose
-  hole is not closed by a face it rests on -- not planar, an asset's or a mover's -- holds the probe's
+  hole is not closed by a face it rests on -- not planar, an asset's, or a mover's that does not rest
+  where its faces are stored -- holds the probe's
   origin, so nothing is crossed and the floor under it counts.
   `-gageom`'s march takes the same count per column, looking for crossings as high as the probe
   does, r above the plane (0.433.7): a column near the disc's edge has a short chord, and a box top

@@ -8806,9 +8806,9 @@ __device__ static DProbe dCoverageProbe(const DScene& sc, const DVec3& p, const 
         // The opaque faces passed above the plane: a closed solid's says which side the probe
         // went (`lastSolid`, +1 into, -1 out of), and where it crosses none the side it began
         // on, along the segment from the gather point to its top, taken when asked (`kAsk`); one
-        // that cannot say counts toward the parity (`crossed`), whose odd count the low leg must
-        // confirm (parityInside); either can put the column inside (host twin
-        // gatherCoverageRaw).
+        // that cannot say counts toward the parity (`crossed`). Either puts the column inside only
+        // where the low leg agrees a wall stands between it and the gather point (inside(); host
+        // twin gatherCoverageRaw).
         constexpr int kAsk = 2;
         int crossed = 0, lastSolid = kAsk;
         const auto side = [&]() {
@@ -8819,13 +8819,24 @@ __device__ static DProbe dCoverageProbe(const DScene& sc, const DVec3& p, const 
             }
             return lastSolid;
         };
-        // An odd parity puts the column inside only if the low leg agrees (host twin's
-        // parityInside): a cup's wall, not a hovering sheet.
-        const auto parityInside = [&]() {
-            if (!(crossed & 1)) return false;
-            if (!(rr > (double)pathEps)) return true;
-            const Real hL = (Real)kLowLegFrac * r;
-            return (dWalkSegment(sc, p + n * hL, (q - p) * (Real)(1.0 / rr), (Real)rr, pathEps).open & 1) != 0;
+        // The low leg, from just over the gather point to the column's foot: asked once, and only
+        // once what lies above puts the column inside (host twin).
+        bool legAsked = false;
+        DSegmentCrossings leg{0, 0};
+        const auto lowLeg = [&]() -> const DSegmentCrossings& {
+            if (!legAsked) {
+                legAsked = true;
+                if (rr > (double)pathEps)
+                    leg = dWalkSegment(sc, p + n * ((Real)kLowLegFrac * r), (q - p) * (Real)(1.0 / rr), (Real)rr, pathEps);
+            }
+            return leg;
+        };
+        // An odd parity whose low leg crosses an odd count too (a cup's wall, not a hovering sheet), or
+        // a closed solid's side the low leg enters or walls off (a box resting on the surface, not a
+        // room the gather point lies in, nor a mover clear of the surface): host twin's inside().
+        const auto inside = [&]() {
+            if ((crossed & 1) && (!(rr > (double)pathEps) || (lowLeg().open & 1))) return true;
+            return side() > 0 && (lowLeg().side > 0 || (lowLeg().open & 1));
         };
         bool found = false;                  // the probe ended on what it counts
         bool ended = false;                  // ... or on what it does not
@@ -8873,11 +8884,11 @@ __device__ static DProbe dCoverageProbe(const DScene& sc, const DVec3& p, const 
                 // plane says nothing (host twin), "on" to within rounding: twice the relaunch's tmin here.
                 if (h.solid && dzH > fmaxf((Real)1e-7 * r, (Real)2 * dEpsAt(h.p)) && (h.solid > 0) == h.back) {
                     cross();
-                    if (!under.valid) { under = h; underFound = !parityInside() && side() <= 0; }
+                    if (!under.valid) { under = h; underFound = !inside(); }
                     tAcc = h.t; o = h.p; relTmin = dHitEps(h); curveTmin = (Real)0;
                     continue;
                 }
-                found = !parityInside() && side() <= 0;
+                found = !inside();
                 ended = true;
                 break;
             }

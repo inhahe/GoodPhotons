@@ -403,10 +403,11 @@ inline double gatherCoverageRaw(const Scene& scene, const Vec3& p, const Vec3& n
             // the side walkSegment finds along the segment from the gather point to the probe's
             // top, taken only when it is asked (`kAsk`). So a column inside a solid taller than r
             // is inside though the probe crosses none of its faces. An opaque face that cannot say
-            // counts toward a parity (`crossed`), whose odd count puts the column inside when the
-            // low leg agrees (parityInside): a bottomless box's lid or an open cup's top over a
-            // floor its walls close in, not a sheet hovering over an open one. Either rule can
-            // put the column inside.
+            // counts toward a parity (`crossed`). Either puts the column inside only where the low
+            // leg -- from just over the gather point to the column's foot -- agrees that a wall
+            // stands between the two (inside()): a bottomless box's lid or an open cup's top over a
+            // floor its walls close in, a box resting on the floor, not a sheet hovering over it nor
+            // a room the gather point lies in.
             constexpr int kAsk = 2;
             int crossed = 0, lastSolid = kAsk;
             const auto side = [&]() {
@@ -423,14 +424,26 @@ inline double gatherCoverageRaw(const Scene& scene, const Vec3& p, const Vec3& n
                 if (c.solid) lastSolid = ((c.solid > 0) == c.back) ? -1 : 1;   // leaving : entering
                 else ++crossed;
             };
-            // An odd parity puts the column inside only if the low leg, from just over the gather
-            // point to the column's foot, crosses an odd count of such faces too (a cup's wall;
-            // walkSegment): asked only then.
-            const auto parityInside = [&]() {
-                if (!(crossed & 1)) return false;
-                if (!(rr > pathEps)) return true;
-                const double hL = kLowLegFrac * r;
-                return (walkSegment(scene, p + n * hL, (q - p) * (1.0 / rr), rr, pathEps).open & 1) != 0;
+            // The low leg, from just over the gather point to the column's foot (walkSegment): asked
+            // only once what lies above puts the column inside, and then once.
+            bool legAsked = false;
+            SegmentCrossings leg;
+            const auto lowLeg = [&]() -> const SegmentCrossings& {
+                if (!legAsked) {
+                    legAsked = true;
+                    if (rr > pathEps) leg = walkSegment(scene, p + n * (kLowLegFrac * r), (q - p) * (1.0 / rr), rr, pathEps);
+                }
+                return leg;
+            };
+            // Whether the column lies inside something the gather point does not: an odd parity
+            // above it where the low leg crosses an odd count of such faces too (a cup's wall, not a
+            // sheet hovering over the surface); or a closed solid's faces above saying it lies in a
+            // solid that the low leg enters or walls off -- the walls of a box resting on the surface,
+            // not a room the gather point lies in itself, nor a box clear of the surface at the
+            // path's time (a mover's).
+            const auto inside = [&]() {
+                if ((crossed & 1) && (!(rr > pathEps) || (lowLeg().open & 1))) return true;
+                return side() > 0 && (lowLeg().side > 0 || (lowLeg().open & 1));
             };
             bool found = false;                  // the probe ended on what it counts
             bool ended = false;                  // ... or on what it does not: either way, it ended
@@ -491,12 +504,12 @@ inline double gatherCoverageRaw(const Scene& scene, const Vec3& p, const Vec3& n
                     // point it touches, which a probe from inside the ball must leave by.
                     if (h.solid && dzH > 1e-7 * r && (h.solid > 0) == h.back) {
                         cross(h, pm);
-                        if (!under.valid) { under = h; underFound = !parityInside() && side() <= 0; }
+                        if (!under.valid) { under = h; underFound = !inside(); }
                         tAcc = h.t;
                         pr = Ray{h.p + pr.d * 1e-9, pr.d};
                         continue;
                     }
-                    found = !parityInside() && side() <= 0;
+                    found = !inside();
                     ended = true;
                     break;
                 }

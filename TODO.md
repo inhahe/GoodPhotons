@@ -294,6 +294,11 @@ Then the rest of 4.2-4.6 in their order, 4.7's bookkeeping alongside whatever to
   memory, so the next GPU render paged (~45x slower); it gives the device back as the render ends.
 - [x] **J-THIN-GAP-LEAK** (0.445.3) — J's and U's merges keep their own surface's photons over its
   share of the disc (the footprint): the gap's light stays off the plate, and object bases read true.
+- [ ] **GAGEOM-COINCIDENT** — `-gageom`'s march counts one of two coincident faces facing apart by the
+  traversal's choice; the proper fix is in the entry.
+- [x] **REVIEW-0459** (0.451.17) — the Fable (xhigh) review of 0.451.11-0.451.16: the low leg decides a
+  solid's side (a room the gather point lies in), capOk takes no piece's own faces, the sky pass's marks
+  stop early; known-issues REVIEW-0459.
 - [x] **REVIEW-0458** (0.451.16) — the Opus (max) review of 0.451.14-0.451.15: the cap closed a room and a
   mover, the bin-centre line crossed a step on a bin's edge, a lost parity test, the sky pass's idle draws;
   known-issues REVIEW-0458.
@@ -344,9 +349,9 @@ Then the rest of 4.2-4.6 in their order, 4.7's bookkeeping alongside whatever to
 - [x] **CURVE-GATHER**, mode U's half (VCM-THIN-CURVES) — 0.439.2: mode U merges at no curve
   vertex (`vcmMergeAt` / `dVcmMergeAt`); its coat 2.10 / 2.36 -> 1.000 / 1.014 of mode R.
 - [ ] **PROBE-PARITY-LIMITS** (reopened at 0.451.16) — left: an asset's open piece (a cap per instance), a
-  non-planar hole (a fan cap from the rim's centroid), a mover that rests at every time (capOk per key); the
-  proper fixes are in the entry. 0.451.16 (REVIEW-0458) refused the cap for a room (a light inside) and a
-  mover. 0.451.14: an open solid taller than the radius, its planar rim closed by
+  non-planar hole (a fan cap from the rim's centroid), a mover that does not rest where its faces are
+  stored (capOk per key); the proper fixes are in the entry. 0.451.17 (REVIEW-0459): the low leg decides a
+  solid's side too, so a room and a mover are capped again. 0.451.14: an open solid taller than the radius, its planar rim closed by
   the face it rests on, is closed there for the probes alone (Tri::solidFace 3/4); was: the footprint probe's
   crossing count misreads a photon-holding open
   surface hovering within the radius, and an open solid taller than it. Closed solids (analytic

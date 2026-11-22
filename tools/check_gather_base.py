@@ -2,8 +2,9 @@
 
     python tools/check_gather_base.py [--out png/check_gather_base] [--exe ftrace.exe]
                                       [--objects diffuse,mirror,coated,coaster,openbox,openbox_lifted,
-                                                 tower,isotower,towerfar,opentower,litbox,ball,meshball,
-                                                 diffuseball,smallball,mirrorsheet,lampsheet,tablesheet]
+                                                 tower,isotower,towerfar,opentower,litbox,litbox_closed,
+                                                 ball,meshball,diffuseball,smallball,mirrorsheet,lampsheet,
+                                                 tablesheet]
 
 A closed 3 cm box (six quads) standing on a lit floor, seen from straight above, modes M and S at a
 pinned gather radius of 0.1 on the CPU and the GPU, against mode R on the GPU. A mode-M or mode-S
@@ -26,7 +27,7 @@ and the top must count as covered: met from outside, a closed solid's face in th
 surface, not a crossing. A glossy box with no bottom face (`openbox`), an open shell that holds no
 photon, rests on the floor, which closes its rim: the probes take it as closed there, as `opentower`
 (below). Lifted a quarter of a millimetre (`openbox_lifted`) its rim rests on nothing -- the cap asks
-for a face within a ten-thousandth of the rim's reach, 0.1 mm here -- and it cannot say its side, but it
+for a face within 5e-4 of the rim's reach from its corners, 0.1 mm here -- and it cannot say its side, but it
 still shadows the floor inside it: its lid counts toward the parity, which the walls confirm along the
 low leg from the gather point to the column, 1 % of the radius over the floor (1 mm; lifted 1 mm, the
 leg passed under the walls and the floor under the box counted, 0.68 of mode R). The render's own
@@ -42,11 +43,14 @@ rim the floor closes, and which the probes take as closed there (PROBE-PARITY-LI
 inside it crossed nothing, met the floor in the band, and read the floor at its foot dark). Its shadow
 at its foot is too steep for mode R to be a reference within
 the radius, so it is held to its exact coverage (below). A diffuse box 4 cm tall with no bottom face
-and a lamp inside it (`litbox`), seen from inside, rests on the floor as `openbox` does, but it is a
-room, not a solid: a probe over its floor starts above its lid and crosses it, and must count the
-floor it meets there by the parity and the low leg. Closed as a solid, the floor 0-4 cm from its
-middle read 9.0 of the uncorrected render in modes M and S, both devices (0.451.15; -gageom 7.1 of
-the probe's). Then a glossy ball of the box's
+and a lamp inside it (`litbox`), seen from inside, rests on the floor as `openbox` does and is capped
+as it is, but it is a room the gather point lies in: a probe over its floor starts above its lid and
+enters it there, and must still count the floor it meets, the low leg crossing no wall between the two.
+Without that leg the floor 0-4 cm from its middle read 9.0 of the uncorrected render in modes M and S,
+both devices (0.451.15; -gageom 7.1 of the probe's). `litbox_closed` is the same room with its floor
+face, a closed solid without any cap, on no floor quad (NO_FLOOR), which read 9.0 likewise on 0.451.16
+(modes M and S, both devices; -gageom 7.1 of the probe's).
+Then a glossy ball of the box's
 half-width resting on the floor, analytic and as a closed OBJ, seen from low beside it with a low
 light from the side reaching under its overhang. There, 4-12 cm from the point it rests on, the gap
 to the ball is under the gather radius, so the probe begins inside the ball and leaves it before it
@@ -99,6 +103,14 @@ def box(x0, y0, z0, x1, y1, z1, mat):
     return [quad((x0, y1, z0), (0, 0, dz), (dx, 0, 0), mat), quad((x0, y0, z0), (dx, 0, 0), (0, 0, dz), mat),
             quad((x0, y0, z0), (0, dy, 0), (dx, 0, 0), mat), quad((x0, y0, z1), (dx, 0, 0), (0, dy, 0), mat),
             quad((x0, y0, z0), (0, 0, dz), (0, dy, 0), mat), quad((x1, y0, z0), (0, dy, 0), (0, 0, dz), mat)]
+
+
+def open_box(x0, y0, z0, x1, y1, z1, mat):
+    """box()'s quads without its bottom face: five, open along the bottom's rim."""
+    bottom = "origin %g %g %g  u %g 0 0" % (x0, y0, z0, x1 - x0)
+    faces = [f for f in box(x0, y0, z0, x1, y1, z1, mat) if bottom not in f]
+    assert len(faces) == 5
+    return faces
 
 
 def write_ball_obj(path, r, n=48):
@@ -213,10 +225,7 @@ def box_floor(X, Z, height):
 
 
 def _box(mat, height=0.03, bottom=True, lift=0.0):
-    faces = box(-BOX, lift, -BOX, BOX, lift + height, BOX, "obj")
-    if not bottom:
-        faces = [f for f in faces if "origin %g %g %g  u %g 0 0" % (-BOX, lift, -BOX, 2 * BOX) not in f]
-        assert len(faces) == 5
+    faces = (box if bottom else open_box)(-BOX, lift, -BOX, BOX, lift + height, BOX, "obj")
     return ([mat] + faces, TOP_CAM, lambda: top_dist(lambda X, Z: box_floor(X, Z, lift + height)), RINGS,
             "the base", "R")
 
@@ -240,10 +249,8 @@ def inner_dist():
     return np.where(seen, np.hypot(P[..., 0], P[..., 2]), np.nan)
 
 
-def _room(mat):
-    faces = [f for f in box(-BOX, 0.0, -BOX, BOX, ROOM_H, BOX, "obj")
-             if "origin %g 0 %g  u %g 0 0" % (-BOX, -BOX, 2 * BOX) not in f]
-    assert len(faces) == 5
+def _room(mat, bottom=False):
+    faces = (box if bottom else open_box)(-BOX, 0.0, -BOX, BOX, ROOM_H, BOX, "obj")
     lamp = ("light area { origin -0.03 %g -0.03  u 0.06 0 0  v 0 0 0.06  normal 0 -1 0  power 5  "
             "spd preset:d65  hide_camera on }" % (ROOM_H - 0.005))
     return [mat] + faces + [lamp], INNER_CAM, inner_dist, ((0.0, 0.04),), "the middle", "uncovered"
@@ -276,12 +283,10 @@ def seg_cover(d, r=GATHER_R):
 
 
 def _tower(mat, iso=False, far=False, bottom=True):
+    # Without its floor face: an open piece, its rim on the floor.
     geo = (["isosurface { material obj  box { center %g 0.15 0  size %g 0.3 %g } }" % (
                (TOWER_X0 - BOX) / 2, -BOX - TOWER_X0, 2 * BOX)] if iso else
-           box(TOWER_X0, 0.0, -BOX, -BOX, 0.3, BOX, "obj"))
-    if not bottom:   # its floor face gone: an open piece, its rim on the floor
-        geo = [f for f in geo if "origin %g 0 %g  u %g 0 0" % (TOWER_X0, -BOX, -BOX - TOWER_X0) not in f]
-        assert len(geo) == 5
+           (box if bottom else open_box)(TOWER_X0, 0.0, -BOX, -BOX, 0.3, BOX, "obj"))
     if far:   # a quad 2 km wide out of sight below the floor, in the same pool of loose triangles
         geo = geo + [quad((-1000, -5, -1000), (0, 0, 2000), (2000, 0, 0), "floor")]
     return ([mat] + geo, TOP_CAM,
@@ -322,8 +327,11 @@ OBJECTS = {
     # The tower with no bottom face, as an imported mesh often is: open along a rim the floor closes,
     # which its probes take as closed there (PROBE-PARITY-LIMITS).
     "opentower": _tower('material "obj" { type diffuse reflect 0.5 }', bottom=False),
-    # A bottomless box with a lamp inside it: a room, which no cap may close (PROBE-PARITY-LIMITS).
+    # A bottomless box with a lamp inside it, seen from inside: capped, but a room the gather point lies
+    # in, so the low leg crosses no wall to the columns its lid puts inside (PROBE-PARITY-LIMITS)...
     "litbox": _room('material "obj" { type diffuse reflect 0.5 }'),
+    # ...and the same room closed by its floor face, a solid of six quads.
+    "litbox_closed": _room('material "obj" { type diffuse reflect 0.5 }', bottom=True),
     # A ball resting on the floor holds the probe's origin over the floor under its overhang, so
     # the probe leaves it before it meets the floor: a closed solid's face says it is out
     # (PROBE-SOLID-SIDE), where a parity reads the floor as inside.
@@ -348,17 +356,22 @@ OBJECTS = {
 
 # The faces the probes' marking pass takes as a solid's, which the case's renders must report
 # (`[gather] N of M triangles`): what a case tests holds only while its object is marked as it supposes.
-MARKS = {"openbox": 10, "openbox_lifted": 0, "opentower": 10, "litbox": 0}
+MARKS = {"openbox": 10, "openbox_lifted": 0, "opentower": 10, "litbox": 10, "litbox_closed": 12}
 GATHER_LINE = re.compile(r"\[gather\] (\d+) of (\d+) triangles")
 
 
-def scene(obj_lines, cam):
+# The objects whose scene has no floor quad: a closed room, whose own floor would lie on it, the two
+# coincident and facing apart, and the one a ray meets the traversal's choice.
+NO_FLOOR = {"litbox_closed"}
+
+
+def scene(obj_lines, cam, floor=True):
     return NL.join([
     "scene { units meters }",
     cam,
     'material "floor" { type diffuse reflect 0.5 }',
     'material "gl" { type glossy reflect 0.6 roughness 0.3 }',
-    quad((-2, 0, -2), (0, 0, 4), (4, 0, 0), "floor"),
+    ] + ([quad((-2, 0, -2), (0, 0, 4), (4, 0, 0), "floor")] if floor else []) + [
     "light area { origin -0.4 1.5 -0.4  u 0.8 0 0  v 0 0 0.8  normal 0 -1 0  power 300  spd preset:d65 }",
     ] + obj_lines) + NL
 REF = ["-mode", "R", "-device", "gpu", "-spp", "512"]
@@ -397,7 +410,7 @@ def main():
         lines, cam, distf, rings, base, against = OBJECTS[bname]
         dist = distf()                                 # each pixel's floor distance from `base`
         path = os.path.join(out, "obj_%s.ftsl" % bname)
-        cm.write(path, scene(lines, cam))
+        cm.write(path, scene(lines, cam, floor=bname not in NO_FLOOR))
 
         logs = []
 

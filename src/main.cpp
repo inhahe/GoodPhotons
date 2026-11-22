@@ -16806,7 +16806,7 @@ static Vec3 skySeenThroughXYZ(const Scene& scene, const Ray& r, const Hit& first
 // `cc`, where given: a still composite's classes, whose forward pixels alone (DIFF and SKY) this pass
 // draws -- their samples at a silhouette, past a fog's bounds or on the sky see the sky as it draws it --
 // marking each a sample of which meets what the forward layer cannot show (SkyView::specSeen); it then
-// runs where there is no sky to draw, for those marks.
+// runs where there is no sky to draw, for those marks, if the scene has anything that can set one.
 static bool prepareSky(SkyView& view, const Scene& scene, const Camera& cam, int rx, int ry,
                        long long N, const CompositeClass* cc = nullptr) {
     const bool haveEnv = scene.envIndex >= 0, haveSun = scene.sunCount > 0;
@@ -16814,7 +16814,14 @@ static bool prepareSky(SkyView& view, const Scene& scene, const Camera& cam, int
     // Anything seen through a gel, a half mirror or a medium (skySeenThrough) is a draw a sample.
     const bool throughDrawn = scene.passThroughAny || !scene.media.empty();
     const bool draws = haveEnv || haveSun || haveGlow;   // else, under a composite, the marks alone
-    if ((!draws && !cc) || cam.seesMotion(scene))
+    // Under a composite, whether anything can mark a pixel: a specular-type material or a region that
+    // bends rays (BackwardRenderer::specularFirstSurface's test).
+    bool marks = false;
+    if (cc) {
+        marks = scene.bendsAny;
+        for (const Material& m : scene.mats) marks = marks || isSpecularType(m.type);
+    }
+    if ((!draws && !marks) || cam.seesMotion(scene))
         return false;
     constexpr double kLo = LAMBDA_MIN, kHi = LAMBDA_MAX;
     constexpr long long kFirst = 64;      // a pinhole's whole count; a lens's first
@@ -16878,9 +16885,13 @@ static bool prepareSky(SkyView& view, const Scene& scene, const Camera& cam, int
             // A CAMERA ray, so a `hide_camera` flat lets the sky through (Material::hideCamera).
             const Hit h = scene.closestHit(r, Scene::kTminEps, nullptr, /*skipHair=*/false, /*skipCamHidden=*/true);
             // Nothing is seen straight through a region that bends rays, as through glass (B, A); under a
-            // composite, such a sample, or one meeting a specular surface first, marks the pixel.
+            // composite, such a sample, or one meeting a specular surface first, marks the pixel, which
+            // is then the backward layer's: nothing reads its sums, and its other samples are not taken.
             const bool bent = scene.crossesGrin(r.o, r.d, h.valid ? h.t : 1e30);
-            if (cc && (bent || (h.valid && BackwardRenderer::specularFirstSurface(scene, h)))) view.specSeen[pix] = 1;
+            if (marks && (bent || (h.valid && BackwardRenderer::specularFirstSurface(scene, h)))) {
+                view.specSeen[pix] = 1;
+                break;
+            }
             if (bent || !draws) continue;
             Vec3 c{0, 0, 0};
             if (throughDrawn && skySeenThrough(scene, r, h)) {
@@ -16913,9 +16924,13 @@ static bool prepareSky(SkyView& view, const Scene& scene, const Camera& cam, int
             if (!cam.genLensRay(px, py, ur0, ur1, ur2, ur3, lambda, r, wLens) || !(wLens > 0.0)) continue;
             const Hit h = scene.closestHit(r, Scene::kTminEps, nullptr, /*skipHair=*/false, /*skipCamHidden=*/true);
             // Nothing is seen straight through a region that bends rays, as through glass (B, A); under a
-            // composite, such a sample, or one meeting a specular surface first, marks the pixel.
+            // composite, such a sample, or one meeting a specular surface first, marks the pixel, which
+            // is then the backward layer's: nothing reads its sums, and its other samples are not taken.
             const bool bent = scene.crossesGrin(r.o, r.d, h.valid ? h.t : 1e30);
-            if (cc && (bent || (h.valid && BackwardRenderer::specularFirstSurface(scene, h)))) view.specSeen[pix] = 1;
+            if (marks && (bent || (h.valid && BackwardRenderer::specularFirstSurface(scene, h)))) {
+                view.specSeen[pix] = 1;
+                break;
+            }
             if (bent || !draws) continue;
             Vec3 c{0, 0, 0};
             if (throughDrawn && skySeenThrough(scene, r, h)) {

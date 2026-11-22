@@ -526,10 +526,59 @@ R 0.843 / 0.841 of mode R in mode J (GPU / CPU) and 0.852 / 0.865 in mode M -bea
 bin 12 is right at its centre there (SpecThr::atBinCentre); it is not in the check's scenes until this
 is fixed, and then is its test.
 
+## OPEN (2026-11-22): GAGEOM-COINCIDENT — `-gageom`'s march counts one of two coincident faces facing apart, by the traversal's choice
+
+Found building check_gather_base's `litbox_closed` (0.451.17): a closed six-quad room whose floor face lies
+exactly on the scene's floor quad, the two facing apart, seen from inside. The probe ends on whichever of
+the two it meets and counts it (`orientedGeoN`, the side facing the ray); the march keeps a layer only
+where its normal agrees with the gather point's own face (`orient`, its signed test), and after a hit it
+steps on by `eps`, past the coincident twin too, so a column counts or not by which of the two the
+traversal returned: the room's floor read 2.07 (M) and 2.01 (S) of the probe's coverage. The photon
+query keeps a photon on either face whose light-side normal agrees. The image itself z-fights there, so
+the check's room now has no floor quad under it (NO_FLOOR). **Proper fix:** on the plane (|off| within
+rounding) take the face's facing as the probe does, either way up, as the photon query would; off the
+plane keep the signed test, which drops a closed solid's far face.
+
+## DONE (2026-11-22, 0.451.17): REVIEW-0459 — what the Fable (xhigh) review of 0.451.11-0.451.16 found
+
+Fable (xhigh) reviewed a4e85cc..9e6d047 (0.451.11-0.451.16), which no Fable review had read: nine
+findings, each checked against the code.
+
+* **A room the gather point lies in was walled off from its own floor** -- the review's deepest point:
+  refusing the cap where a light lies inside (0.451.16) patched at marking time what is the gather
+  point's own side, needed a special case per way light gets in (a lamp, a glass wall, a lamp flush
+  with the lid, a mover), and still left a closed six-quad room with a lamp inside, lower than the
+  radius, misread as `litbox` had been: its probes enter at the lid and dropped the floor.
+  A column a solid's side puts inside now stays inside only where the low leg -- just over the gather
+  point to the column's foot, as the parity already asked -- enters a solid or crosses an odd count of
+  faces that cannot say: a wall between the two (gathercoverage.h `inside()`, its device twin, the
+  `-gageom` march's `drop`). So the cap no longer refuses a lit piece or a mover, and the light-inside
+  test is gone with its cost (a ray cast over every face of a piece for every light point in its box).
+  check_gather_base's `litbox_closed` (the room with its floor face, seen from inside): 9.0 of the
+  uncorrected render on 0.451.16 in modes M and S, both devices (-gageom 7.1 of the probe's), within
+  3 % now; `litbox`, capped again, within 3 % (9.0 on 0.451.15 without the leg).
+* **capOk took the piece's own faces as the face it rests on**: a near-flat sheet its rounding leaves a
+  volume covered its own cap's points and was capped on itself, a ground whose planar border closes on
+  its own flat part round a pit likewise. A piece any of whose test points lies on one of its own faces
+  in the rim's plane is not capped; check_cap_marks' `sheet` (two of two triangles capped on 0.451.16)
+  and `pit` (72 of 72) read none now.
+* **The sky pass took every sample of a marked pixel** (mode P): it stops at the mark, and with nothing
+  to draw it does not run where nothing in the scene can set a mark (no specular-type material, no
+  region that bends rays).
+* **check_cap_marks repeated its neighbours' helpers**: it imports check_gather_base's quad, box, open
+  box (new, shared by the bottomless cases there too) and `[gather]` pattern, and check_motion's run.
+* **check_gather_base's docstring gave the cap's reach as a ten-thousandth of the rim's reach**: 5e-4.
+* **PROBE-PARITY-LIMITS was left open with no blocker**: its remaining shapes are the next work
+  (TODO), not a standing entry.
+* The flush-lamp and brute-force light-inside findings went with the test itself.
+
 ## DONE (2026-11-22, 0.451.16): REVIEW-0458 — what the Opus (max) review of 0.451.14-0.451.15 found
 
 Opus (max) reviewed 06e33ab..f16e571 (0.451.14 PROBE-PARITY-LIMITS' cap, 0.451.15 REVIEW-0457's
 follow-up): fifteen findings, each checked against the code.
+
+(The cap's two refusals below -- a lit piece, a mover -- gave way in 0.451.17 to the low leg's say over a
+solid's side: REVIEW-0459.)
 
 * **The cap closed a room** (0.451.14): a bottomless box with a lamp inside it rests on the floor as a
   statue does, so it was capped, and a probe over its floor -- starting above a lid lower than the
@@ -3500,23 +3549,26 @@ upright cup's rim closes on nothing, so its floor stays open. check_gather_base'
 30 cm tower with no bottom face: the floor 0-2 cm and 2-5 cm from its base read 0.56 and 0.71 of
 their true coverage on 0.451.13 in modes M and S, both devices, and 0.99-1.01 now. Left: an asset's open
 pieces (each instance may rest on something else or nothing) and a hole that is not planar.
-**0.451.16 (REVIEW-0458)** refuses the cap where it was wrong: a piece a light lies inside (a room), and a
-piece that moves or deforms (it rests at the instant only). tools/check_cap_marks.py holds the rules.
+**0.451.16 (REVIEW-0458)** refused the cap where it was wrong: a piece a light lies inside (a room), and a
+piece that moves or deforms. **0.451.17 (REVIEW-0459)** caps both again and lets the low leg decide: a
+column a solid's side puts inside stays inside only where the leg from the gather point to it crosses a
+wall, which a room's floor and a mover clear of the floor do not; and it refuses a piece that covers its
+own cap's points. tools/check_cap_marks.py holds the rules.
 **Still open -- an open solid taller than the radius that no cap closes, its floor read dark at its base
 (0.56 of its coverage, `opentower` on 0.451.13):**
 - *An asset's open piece.* Its instances share the asset's triangles, so a face state on them cannot
   differ per instance. **Proper fix:** mark such a piece's faces by the side its cap would give
   (object space: the volume about its rim's centre does not depend on the placement), and give each
-  instance a bit per such piece, set where capOk passes for the rim placed by that instance and no light
-  lies inside it there; the probes read a hit on an instance's face as capped where its bit is set
-  (host Hit and the device's instance record).
+  instance a bit per such piece, set where capOk passes for the rim placed by that instance; the probes
+  read a hit on an instance's face as capped where its bit is set (host Hit and the device's instance
+  record).
 - *A hole that is not planar* (a statue's base on uneven ground). **Proper fix:** a fan of triangles from
   the rim's centroid closes any rim, and its tetrahedra about the centroid vanish, so the volume taken
   about the centroid is that closed solid's, planar or not; capOk then asks of every rim vertex (and the
-  centroid) that a face lies under it, and the light-inside test crosses the fan instead of the plane.
-- *A mover that rests at every time* (a box sliding along the floor). **Proper fix:** capOk at each
-  motion key, the piece placed there, and the cap only where it rests at all of them (a rigid key's
-  in-plane translation or vertical-axis turn keeps a planar rim on its plane between keys).
+  centroid) that a face lies under it.
+- *A mover that does not rest where its faces are stored* (a box lowered onto the floor by its keys).
+  **Proper fix:** capOk at each motion key, the piece placed there, and the cap where it rests at any of
+  them: the low leg decides each path's time.
 
 ## DONE (2026-11-16, no change): MODEM-CPU-DARKGLASS-BLUE — CPU mode M reads blue 15 % low through glass that absorbs blue strongly
 
