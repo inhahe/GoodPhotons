@@ -56,7 +56,10 @@ enters it there, and must still count the floor it meets, the low leg crossing n
 Without that leg the floor 0-4 cm from its middle read 9.0 of the uncorrected render in modes M and S,
 both devices (0.451.15; -gageom 7.1 of the probe's). `litbox_closed` is the same room with its floor
 face, a closed solid without any cap, which read 9.0 likewise on 0.451.16 (modes M and S, both devices;
--gageom 7.1 of the probe's). Its floor face lies on the floor quad, facing apart: -gageom took a layer
+-gageom 7.1 of the probe's). `litbox_pillar` stands a closed pillar in it beside the ring, short of the
+lid: a column past the pillar is the room's floor, which the leg crosses the pillar in and out to reach,
+held to the uncorrected render over each pixel's share of the disc not under the pillar (0.451.21 walled
+that floor off: 1.046-1.048 in modes M and S, both devices). Its floor face lies on the floor quad, facing apart: -gageom took a layer
 there only on the one facing the gather point's way, which of the two a ray meets being the
 traversal's, and read 2.07 (M) and 2.01 (S) of the probe on 0.451.17 (GAGEOM-COINCIDENT).
 Then a glossy ball of the box's
@@ -107,13 +110,18 @@ def quad(o, u, v, mat):
     return "quad { origin %g %g %g  u %g %g %g  v %g %g %g  material %s }" % (o + u + v + (mat,))
 
 
-def box(x0, y0, z0, x1, y1, z1, mat, bottom=True):
-    """Six quads, normals out (u x v); without `bottom`, five, open along the bottom's rim."""
+def box_faces(x0, y0, z0, x1, y1, z1, bottom=True):
+    """A box's faces as (origin, u, v), normals out (u x v): six, or without `bottom` five, open along the
+    bottom's rim. box() and box_obj() both build from them."""
     dx, dy, dz = x1 - x0, y1 - y0, z1 - z0
-    return ([quad((x0, y1, z0), (0, 0, dz), (dx, 0, 0), mat)] +
-            ([quad((x0, y0, z0), (dx, 0, 0), (0, 0, dz), mat)] if bottom else []) +
-            [quad((x0, y0, z0), (0, dy, 0), (dx, 0, 0), mat), quad((x0, y0, z1), (dx, 0, 0), (0, dy, 0), mat),
-             quad((x0, y0, z0), (0, 0, dz), (0, dy, 0), mat), quad((x1, y0, z0), (0, dy, 0), (0, 0, dz), mat)])
+    return ([((x0, y1, z0), (0, 0, dz), (dx, 0, 0))] + ([((x0, y0, z0), (dx, 0, 0), (0, 0, dz))] if bottom else []) +
+            [((x0, y0, z0), (0, dy, 0), (dx, 0, 0)), ((x0, y0, z1), (dx, 0, 0), (0, dy, 0)),
+             ((x0, y0, z0), (0, 0, dz), (0, dy, 0)), ((x1, y0, z0), (0, dy, 0), (0, 0, dz))])
+
+
+def box(x0, y0, z0, x1, y1, z1, mat, bottom=True):
+    """box_faces' quads."""
+    return [quad(o, u, v, mat) for o, u, v in box_faces(x0, y0, z0, x1, y1, z1, bottom)]
 
 
 def open_box(x0, y0, z0, x1, y1, z1, mat):
@@ -122,11 +130,8 @@ def open_box(x0, y0, z0, x1, y1, z1, mat):
 
 
 def box_obj(path, x0, y0, z0, x1, y1, z1, bottom=True):
-    """box()'s quads as an OBJ of their triangles, wound outward as the quads are (u x v), welded."""
-    dx, dy, dz = x1 - x0, y1 - y0, z1 - z0
-    qs = [((x0, y1, z0), (0, 0, dz), (dx, 0, 0))] + ([((x0, y0, z0), (dx, 0, 0), (0, 0, dz))] if bottom else []) + [
-          ((x0, y0, z0), (0, dy, 0), (dx, 0, 0)), ((x0, y0, z1), (dx, 0, 0), (0, dy, 0)),
-          ((x0, y0, z0), (0, 0, dz), (0, dy, 0)), ((x1, y0, z0), (0, dy, 0), (0, 0, dz))]
+    """box_faces as an OBJ of their triangles, wound outward as the quads are (u x v), welded."""
+    qs = box_faces(x0, y0, z0, x1, y1, z1, bottom)
     verts, at, faces = [], {}, []
 
     def v(p):
@@ -287,13 +292,45 @@ INNER_CAM = 'camera "c" { eye %g %g %g  look_at %g %g %g  up 0 1 0  fov_y %g  fi
     tuple(IEYE) + tuple(ILOOK) + (IFOV, IW, IH))
 
 
-def inner_dist():
-    """Each pixel of the view from inside the room as the floor's distance from the room's middle, or
-    NaN where the pixel sees no floor inside it."""
+def inner_floor():
+    """Each pixel of the view from inside the room: the floor point it sees (x, z), and whether it sees
+    the floor inside the room at all."""
     d, tf = pinhole(IEYE, ILOOK, IFOV, IW, IH)
     P = IEYE + d * np.where(np.isfinite(tf), tf, 0.0)[..., None]
     seen = (d[..., 1] < 0) & (tf > 0) & (np.maximum(np.abs(P[..., 0]), np.abs(P[..., 2])) < BOX)
-    return np.where(seen, np.hypot(P[..., 0], P[..., 2]), np.nan)
+    return P[..., 0], P[..., 2], seen
+
+
+def inner_dist():
+    """Each pixel of the view from inside the room as the floor's distance from the room's middle, or
+    NaN where the pixel sees no floor inside it."""
+    X, Z, seen = inner_floor()
+    return np.where(seen, np.hypot(X, Z), np.nan)
+
+
+# A closed pillar in the closed room, beside the floor the ring measures and short of the lid: x, z
+# extent, and height.
+PILLAR = (-0.02, 0.06, 0.02, 0.08, 0.03)
+
+
+def pillar_cover(dist, r=None, n=81):
+    """Each pixel's share of its gather disc (radius r about the floor point it sees, the cases' radius
+    by default) not under the pillar, sampled on an n x n grid -- 1 where the pixel sees no floor (a
+    ring holds none of those)."""
+    r = GATHER_R if r is None else r
+    X, Z, seen = inner_floor()
+    x0, z0, x1, z1, _ = PILLAR
+    g = (np.arange(n) + 0.5) / n * 2 - 1
+    gx, gz = np.meshgrid(g, g)
+    inside = gx * gx + gz * gz <= 1.0
+    ox, oz = gx[inside] * r, gz[inside] * r
+    cover = np.ones(X.shape)
+    m = seen & np.isfinite(dist) & (dist < 0.06)
+    for i, j in zip(*np.nonzero(m)):
+        px, pz = X[i, j] + ox, Z[i, j] + oz
+        under = (px > x0) & (px < x1) & (pz > z0) & (pz < z1)
+        cover[i, j] = 1.0 - under.mean()
+    return cover
 
 
 def _room(mat, bottom=False):
@@ -385,6 +422,10 @@ OBJECTS = {
     "litbox": _room('material "obj" { type diffuse reflect 0.5 }'),
     # ...and the same room closed by its floor face, a solid of six quads.
     "litbox_closed": _room('material "obj" { type diffuse reflect 0.5 }', bottom=True),
+    # ...and that with a closed pillar standing in it beside the ring, short of the lid.
+    "litbox_pillar": (_room('material "obj" { type diffuse reflect 0.5 }', bottom=True)[0] +
+                      box(PILLAR[0], 0.0, PILLAR[1], PILLAR[2], PILLAR[4], PILLAR[3], "obj"),
+                      INNER_CAM, inner_dist, ((0.0, 0.04),), "the middle", "coverage"),
     # A ball resting on the floor holds the probe's origin over the floor under its overhang, so
     # the probe leaves it before it meets the floor: a closed solid's face says it is out
     # (PROBE-SOLID-SIDE), where a parity reads the floor as inside.
@@ -410,7 +451,10 @@ OBJECTS = {
 # The faces the probes' marking pass takes as a solid's, which the case's renders must report
 # (`[gather] N of M triangles`): what a case tests holds only while its object is marked as it supposes.
 MARKS = {"openbox": 10, "openbox_lifted": 0, "openbox_hover": 10, "opentower": 10, "litbox": 10,
-         "litbox_closed": 12, "opentower_asset": 0}
+         "litbox_closed": 12, "litbox_pillar": 24, "opentower_asset": 0}
+# A ring held to its exact coverage (`against` "coverage") whose share of the disc is not the tower's
+# straight edge (seg_cover): by object, the function giving it from the pixels' floor distance.
+COVERS = {"litbox_pillar": pillar_cover}
 # The asset pieces capped under an instance, which a case's renders must report (the [gather] line's
 # `and N asset pieces`).
 INST_MARKS = {"opentower_asset": 1}
@@ -486,7 +530,7 @@ def main():
 
         R = image("R_gpu", REF, True) if against == "R" else None   # a ball's ring is held to U
         # The share of each pixel's disc on the floor, for a ring held to its exact coverage.
-        cover = seg_cover(dist) if against == "coverage" else 1.0
+        cover = (COVERS.get(bname, seg_cover)(dist)) if against == "coverage" else 1.0
         got = {}
         for name, args in CASES:
             if against == "coverage" and args[args.index("-mode") + 1] == "S":

@@ -25,8 +25,9 @@ inline bool probePassesThrough(const Scene& scene, const Material& m, GatherHold
 
 // What a segment from `o` along unit `d`, `len` long, crosses of the faces light does not pass
 // (passesLight), curves unseen: `side`, that of the last closed solid's face (Hit::solid) -- +1
-// it ends inside that solid, -1 outside, 0 it crosses none -- `solids`, how many closed solids'
-// faces it crosses, either way, and `open`, how many faces that cannot say their side (up to 15).
+// it ends inside that solid, -1 outside, 0 it crosses none -- `first` that of the first, `solids` how
+// many closed solids' faces it crosses, either way, `net` how many more it enters than leaves, and
+// `open`, how many faces that cannot say their side (up to 15).
 // Two segments of the footprint (PROBE-PATH):
 //   - from the gather point to a column's top, r above the tangent plane, when the probe crosses no
 //     closed solid's face on its way down (its `side`): a column inside a solid taller than the
@@ -35,7 +36,9 @@ inline bool probePassesThrough(const Scene& scene, const Material& m, GatherHold
 //     lies above says the column is inside: the parity of the open faces above the plane (the leg's
 //     `open` odd to agree), or a closed solid's side (the leg crossing any closed solid's face,
 //     `solids` -- boxes overlapping or touching face to face, whose last face or coincident pair
-//     says nothing reliable, wall the column off all the same). A cup, a bottomless box of quads
+//     says nothing reliable, wall the column off all the same -- or, where the gather point lies in a
+//     closed or capped solid itself (a room lower than the radius: inRoomOf), ending inside more of
+//     them than it began, `net`, so a pillar it passes walls nothing). A cup, a bottomless box of quads
 //     or a box standing on the surface walls the column off; a sheet hovering over it -- a table
 //     top, a mirror, a lamp's quad -- leaves the way open, the floor under it lit from the sides,
 //     and so does a room the gather point lies in itself, an open quad or cup inside it no wall.
@@ -43,7 +46,7 @@ inline bool probePassesThrough(const Scene& scene, const Material& m, GatherHold
 // Curves are skipped by their own tmin, the whole leg; the blanket tmin is then 0, so the origin
 // steps past a face by `eps` itself. Open air, the common case, costs one bounded ray. Device twin
 // dWalkSegment.
-struct SegmentCrossings { int side = 0; int open = 0; int solids = 0; };
+struct SegmentCrossings { int side = 0; int open = 0; int solids = 0; int first = 0; int net = 0; };
 inline SegmentCrossings walkSegment(const Scene& sc, Vec3 o, const Vec3& d, double len, double eps) {
     SegmentCrossings c;
     if (!(len > 0.0) || !sc.occludedGeometry(o, d, len, 0.0, false, len)) return c;
@@ -53,13 +56,25 @@ inline SegmentCrossings walkSegment(const Scene& sc, Vec3 o, const Vec3& d, doub
         if (!h.valid || done + h.t > len) break;
         const Material* m = (h.matId >= 0 && h.matId < (int)sc.mats.size()) ? &sc.mats[(size_t)h.matId] : nullptr;
         if (!(m && passesLight(sc, *m))) {
-            if (h.solid) { c.side = ((h.solid > 0) == h.back) ? -1 : 1; ++c.solids; }
-            else ++c.open;
+            if (h.solid) {
+                c.side = ((h.solid > 0) == h.back) ? -1 : 1;
+                if (!c.solids) c.first = c.side;
+                c.net += c.side;
+                ++c.solids;
+            } else {
+                ++c.open;
+            }
         }
         done += h.t + eps;
         o = h.p + d * eps;
     }
     return c;
+}
+// Whether the gather point `p` (normal `n`) lies in a closed or capped solid itself: the first such
+// solid's face the walk straight up from it, `r` long, crosses is one it leaves -- a room's lid lower
+// than the radius, not a shelf over the point, which it enters first.
+inline bool inRoomOf(const Scene& sc, const Vec3& p, const Vec3& n, double r, double eps) {
+    return walkSegment(sc, p + n * eps, n, r, eps).first < 0;
 }
 
 // The geometric footprint: same-facing surface area inside the gather ball, measured from
@@ -125,10 +140,16 @@ inline double gatherFootprintArea(const Scene& sc, const Vec3& p, const Vec3& n,
     // the query does take photons from all of them.
     double orient = 1.0;
     {
-        const Ray cal{p - n * (eps * 4.0), n};
-        const Hit hc = sc.closestHit(cal, eps, nullptr, /*skipHair=*/false,
+        // From below and from above, the surface as each ray meets it: against n only where every face
+        // met says so -- of two coincident faces facing apart (a room's floor on the ground) either may
+        // be the one a ray returns, and the gather's surface is the one facing its way.
+        const Hit hc = sc.closestHit(Ray{p - n * (eps * 4.0), n}, eps, nullptr, /*skipHair=*/false,
                                      /*skipCamHidden=*/true);
-        if (hc.valid && dot(hc.ng, n) < 0.0) orient = -1.0;
+        const Hit hd = sc.closestHit(Ray{p + n * (eps * 4.0), n * -1.0}, eps, nullptr, /*skipHair=*/false,
+                                     /*skipCamHidden=*/true, eps * 8.0);
+        const bool against = (hc.valid || hd.valid) && (!hc.valid || dot(hc.ng, n) < 0.0) &&
+                             (!hd.valid || dot(hd.ng, n) < 0.0);
+        if (against) orient = -1.0;
     }
     const double cellArea = (kPi * r2) / (double)kDisc;
     double area = 0.0;
@@ -143,6 +164,7 @@ inline double gatherFootprintArea(const Scene& sc, const Vec3& p, const Vec3& n,
     // point, which stays within r * sqrt(2) of it). Either way a layer is out only where the low leg
     // agrees a wall stands between it and the gather point, as the probe's inside() asks.
     int solidsNear = -1;
+    int inRoom = -1;   // the gather point in a room lower than r (inRoomOf), asked once, when needed
     for (int i = 0; i < kDisc; ++i) {
         // Sunflower placement: equal-area radii, golden-angle azimuth. Deterministic, so two
         // runs of the same scene give the same footprint and an A/B compares one thing.
@@ -264,7 +286,11 @@ inline double gatherFootprintArea(const Scene& sc, const Vec3& p, const Vec3& n,
         SegmentCrossings leg;
         if ((drop[0] > 0.0 || drop[1] > 0.0 || dec[ev ^ 1] + restOdd > 0.0) && rr > eps)
             leg = walkSegment(sc, p + n * (kLowLegFrac * r), (q - p) * (1.0 / rr), rr, eps);
-        const bool walled = leg.solids > 0;
+        bool walled = false;
+        if (drop[0] > 0.0 || drop[1] > 0.0) {
+            if (inRoom < 0) inRoom = inRoomOf(sc, p, n, r, eps) ? 1 : 0;
+            walled = inRoom ? leg.net > 0 : leg.solids > 0;
+        }
         double col = dec[ev] + restEv + (walled ? 0.0 : drop[ev]);
         const double odd = dec[ev ^ 1] + restOdd + (walled ? 0.0 : drop[ev ^ 1]);
         if (odd > 0.0 && rr > eps && (leg.open & 1) == 0)

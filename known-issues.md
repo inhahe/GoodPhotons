@@ -526,6 +526,47 @@ R 0.843 / 0.841 of mode R in mode J (GPU / CPU) and 0.852 / 0.865 in mode M -bea
 bin 12 is right at its centre there (SpecThr::atBinCentre); it is not in the check's scenes until this
 is fixed, and then is its test.
 
+## DONE (2026-11-22, 0.451.22): REVIEW-0461 — what the Opus (xhigh) review of 0.451.18-0.451.21 found
+
+Opus (xhigh) reviewed ed01ad0..b941ab9 (0.451.18 GAGEOM-COINCIDENT, 0.451.19 REVIEW-0460 and the fan cap,
+0.451.20 the mover's keys, 0.451.21 an asset's caps per instance): thirteen findings, each checked
+against the code.
+
+* **One fan from the centroid closed a rim of several loops** (0.451.19): a lampshade open at its top
+  and its bottom, standing on a table, was capped by its bottom, and the floor lit through its top
+  dropped. Each loop now has its own fan and must rest (watertight::CapLoop; the volume adds the other
+  loops' fans). check_cap_marks' `shade`: all 32 faces capped on 0.451.21, none now.
+* **capOk never asked that the rim touch**: a notched base or one rocking on uneven ground, its interior
+  points within the window, was capped. Each loop's points a hundredth of the way in from its corners
+  must meet a face within 5e-4 of the reach plus 2 % of the slack, at every corner up to 96 (an even
+  stride aliased the notches, every sample on a standing corner). check_cap_marks' `notched`: all 72
+  faces capped on 0.451.21, none now.
+* **The floor past a closed pillar in a low room was walled off** (0.451.19's rule, which the batch
+  noted rather than fixed): where the gather point lies in a closed or capped solid itself -- the walk
+  straight up from it leaving the first such face it crosses (inRoomOf; walkSegment's new `first`) -- a
+  solid's side puts a column inside where the leg ends in more solids than it began in (`net`); elsewhere
+  the leg crossing any closed solid's face, as before (touching boxes). Host probe, device probe, march.
+  check_gather_base's `litbox_pillar` (a closed pillar beside the closed room's ring, held to the exact
+  coverage): 1.046-1.048 of it on 0.451.21 in modes M and S, both devices,
+  within 3 % now.
+* **A point whose ray met the piece's own face skipped a coincident covering face** (the flange of a
+  statue on the ground): the rays from both sides each pass the piece's own faces, so the side that
+  meets the covering face of the pair first finds it. (Letting such a point ask nothing instead, tried
+  first, let a V-shaped ground rest on itself: check_cap_marks' `uneven` counted it.)
+* **An instance's reach and slack took its mean linear scale**, wrong under a non-uniform one: restsAt
+  measures them on the placed points -- the reach across the touch points' images, the slack along the
+  normal's (check_cap_marks' `asset` gains an instance scaled 2 by 0.5 by 1, capped).
+* **Cost**: an own-face test scanned a candidate's every face per point (an asset's, per instance per
+  key): it walks a tree over them now (watertight::OwnFaces), the points on the piece are dropped once per
+  candidate, and the instances run in parallel. PieceBox kept copies of up to 64 faces' corners per
+  piece (0.45 GB for 500 k small cubes): it keeps the triangles, and solidNear their indices, in one flat
+  array beside its boxes; its query stops at the first near face (Bvh::traverseSphereAny) through one
+  face test (watertight::nearFace).
+* **-gageom's orientation was calibrated from whichever coincident face a ray met**: it is against n only
+  where the faces met from above and from below both say so.
+* Smaller: the device's DTri::solid and dWalkSegment comments; restsAt took its own inverse as a second
+  argument; box() and box_obj() listed one box's faces twice (box_faces).
+
 ## DONE (2026-11-22, 0.451.19): REVIEW-0460 — what the Opus (xhigh) review of 0.451.17 found
 
 Opus (xhigh) reviewed ed01ad0 (0.451.17, REVIEW-0459's follow-up): twelve findings, each checked

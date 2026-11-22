@@ -1962,10 +1962,12 @@ struct Scene {
     // point (PROBE-PATH) only where a solid may lie near it. A box too large costs a segment, never
     // a result. `solidBoundsKnown` is false until markSolidFaces takes them, and stays false for a
     // scene that moves, whose boxes hold only for its frame's instant: every segment is traced then.
-    // `solidNearFaces`, by box: a world piece's faces where it has few (watertight::PieceBox), which
-    // decide for it -- a room's box holds every gather point inside it, its faces few of them.
+    // By box, a world piece's faces where it has few (watertight::PieceBox), which decide for it -- a
+    // room's box holds every gather point inside it, its faces few of them: `solidNearSpan[box]` the
+    // start and count of its triangles' indices (`tris`) in `solidNearIdx`, a count of 0 the box alone.
     Bvh solidBoundsBvh;
-    std::vector<std::vector<Vec3>> solidNearFaces;
+    std::vector<uint32_t> solidNearIdx;
+    std::vector<std::pair<uint32_t, uint32_t>> solidNearSpan;
     bool solidBoundsKnown = false;
     // Whether a closed solid lies within `rad` of the gather point `c` (normal `n`): its box, or where
     // its faces are kept one of them, not counting a face lying in the plane through `c` -- a closed
@@ -1973,23 +1975,19 @@ struct Scene {
     // the boxes are not known).
     bool solidNear(const Vec3& c, const Vec3& n, double rad) const {
         if (!solidBoundsKnown) return true;
-        bool any = false;
         const double onPlane = 1e-6 * rad;
-        solidBoundsBvh.traverseSphere(c, rad, [&](int k) {
-            if (any) return;
-            const std::vector<Vec3>* f = (size_t)k < solidNearFaces.size() ? &solidNearFaces[(size_t)k] : nullptr;
-            if (!f || f->empty()) { any = true; return; }
-            for (size_t j = 0; j + 2 < f->size() && !any; j += 3) {
-                const Vec3& a = (*f)[j];
-                const Vec3& b = (*f)[j + 1];
-                const Vec3& d = (*f)[j + 2];
-                if (std::fabs(dot(a - c, n)) <= onPlane && std::fabs(dot(b - c, n)) <= onPlane &&
-                    std::fabs(dot(d - c, n)) <= onPlane)
+        return solidBoundsBvh.traverseSphereAny(c, rad, [&](int k) {
+            if ((size_t)k >= solidNearSpan.size() || solidNearSpan[(size_t)k].second == 0) return true;
+            const auto [at0, cnt] = solidNearSpan[(size_t)k];
+            for (uint32_t j = at0; j < at0 + cnt; ++j) {
+                const Tri& t = tris[solidNearIdx[j]];
+                if (std::fabs(dot(t.v0 - c, n)) <= onPlane && std::fabs(dot(t.v1 - c, n)) <= onPlane &&
+                    std::fabs(dot(t.v2 - c, n)) <= onPlane)
                     continue;
-                any = pointTriDistSq(c, a, b, d) <= rad * rad;
+                if (watertight::nearFace(t, c, rad)) return true;
             }
+            return false;
         });
-        return any;
     }
     // A time in frames (relative to the frame's instant) as the fraction of the motion interval
     // g_motionU holds, clamped to it.
@@ -4951,59 +4949,69 @@ struct Scene {
             }
         };
         for (Tri& t : tris) t.boundsSolid = -1;   // (an asset's are its own, set where it is marked)
-        // Whether a face other than the piece's own (`own`) covers a piece's rim at each of `pts` that
-        // does not lie on the piece itself, one at least, along the rim's normal `nrm`: a short ray across
-        // there from either side, from d beyond `slack` -- d a thousandth of the rim's `reach`, ten `eps`
-        // at least -- meets one within win = 0.5 d + slack of the point (5e-4 of the reach for a planar
-        // rim), passing the piece's own faces on the way. "On the piece" is to within rounding of one of
-        // its faces (`onR`): a hit lies on the face it hit, a point of a brim on the brim. The piece is
-        // placed by D (its points' space to the world's, Dinv back, a hit carried back to be told the
-        // piece's own): the identity for a world piece, an instance's toWorld for an asset's. A mover
-        // (`motion` its set) rests where any of its keys places it, each asked at that key's time, D
-        // its transform from the instant; the probes' low leg decides every other time.
+        // Whether faces other than the piece's own (`own`) hold up every loop of its rim (watertight::CapLoop)
+        // placed by D (the loops' space to the world's; its inverse carries a hit back to be told the
+        // piece's own): the identity for a world piece, an instance's toWorld for an asset's. At each of a
+        // loop's points a short ray along its normal from either side, from d beyond its slack -- d a
+        // thousandth of its reach, ten `eps` at least -- meets a face within 0.5 d + slack of the point (5e-4
+        // of the reach for a planar loop), and at each of its touch points (`rim`) within 0.5 d + 0.02 slack,
+        // the loop touching the face there: a base notched or rocking on uneven ground, hovering between
+        // the corners it stands on, does not rest. The rays pass the piece's own faces, from both sides, so
+        // of a coincident pair -- a statue's flange on the ground -- the side that meets the covering face
+        // first finds it, whichever the other returns. Reach and slack are the world's:
+        // the reach across the touch points' images, the slack along the normal's. A mover (`motion` its
+        // set) rests where any of its keys places it, each asked at that key's time, D its transform from
+        // the instant; the probes' low leg decides every other time.
         using OwnFn = std::function<bool(const Vec3&, double)>;
-        const auto restsAt = [&](const Vec3& nrm, const std::vector<Vec3>& pts, double reach, double slack,
-                                 const OwnFn& own, const Affine& D, const Affine& Dinv) {
-            const double d = std::max(1e-3 * reach, 10.0 * eps), w = d + slack, win = 0.5 * d + slack;
-            const double onR = std::max(1e-6 * reach, 10.0 * eps);
-            const Vec3 nk = normalize(D.applyCofactor(nrm));
-            int asked = 0;
-            for (const Vec3& q0 : pts) {
-                if (own(q0, onR)) continue;   // the piece itself there: a hat's brim on the table
-                ++asked;
-                const Vec3 q = D.apply(q0);
-                bool covered = false;
-                for (int side = 0; side < 2 && !covered; ++side) {
-                    const Vec3 dir = nk * (side ? 1.0 : -1.0);
-                    double t0 = 0.0;   // from q - dir * w, how far the ray has come
-                    for (int k = 0; k < 8 && !covered; ++k) {
-                        const Hit h = closestHit(Ray{q - dir * (w - t0), dir}, eps, nullptr, false, false, 2.0 * w - t0);
-                        if (!h.valid) break;
-                        t0 += h.t;
-                        if (t0 > w + win) break;
-                        if (t0 >= w - win && !own(Dinv.apply(h.p), onR)) covered = true;
+        const auto restsAt = [&](const std::vector<watertight::CapLoop>& loops, const OwnFn& own, const Affine& D) {
+            const Affine Dinv = D.inverse();
+            for (const watertight::CapLoop& L : loops) {
+                const Vec3 nk = normalize(D.applyCofactor(L.nrm));
+                const Vec3 cw = D.apply(L.c);
+                double reach = 0.0;
+                for (const Vec3& rp : L.rim) reach = std::max(reach, length(D.apply(rp) - cw) / 0.99);
+                if (!(reach > 0.0)) reach = L.reach * std::cbrt(std::fabs(D.det()));
+                const double slack = L.slack * std::fabs(dot(D.applyDir(L.nrm), nk));
+                const double d = std::max(1e-3 * reach, 10.0 * eps), w = d + slack;
+                const double onR = std::max(1e-6 * reach, 10.0 * eps);
+                // Whether a face not the piece's lies within `win` of q0 (the loops' space).
+                const auto meet = [&](const Vec3& q0, double win) {
+                    const Vec3 q = D.apply(q0);
+                    for (int side = 0; side < 2; ++side) {
+                        const Vec3 dir = nk * (side ? 1.0 : -1.0);
+                        double t0 = 0.0;   // from q - dir * w, how far the ray has come
+                        for (int k = 0; k < 8; ++k) {
+                            const Hit h = closestHit(Ray{q - dir * (w - t0), dir}, eps, nullptr, false, false, 2.0 * w - t0);
+                            if (!h.valid) break;
+                            t0 += h.t;
+                            if (t0 > w + win) break;
+                            if (t0 >= w - win && !own(Dinv.apply(h.p), onR)) return true;
+                        }
                     }
-                }
-                if (!covered) return false;
+                    return false;
+                };
+                if (L.pts.empty()) return false;   // all on the piece: nothing shows it rests on anything
+                for (const Vec3& q0 : L.pts)
+                    if (!meet(q0, 0.5 * d + slack)) return false;
+                for (const Vec3& q0 : L.rim)
+                    if (!meet(q0, 0.5 * d + 0.02 * slack)) return false;
             }
-            return asked > 0;   // all on the piece: nothing shows it rests on anything
+            return true;
         };
         // At the placement `place` (as restsAt's D), or for a mover each of its keys' composed with it.
-        const auto restsMoving = [&](const Vec3& nrm, const std::vector<Vec3>& pts, double reach, double slack,
-                                     const OwnFn& own, int motion, const Affine& place) {
-            if (motion < 0 || (size_t)motion >= motionSets.size())
-                return restsAt(nrm, pts, reach, slack, own, place, place.inverse());
+        const auto restsMoving = [&](const std::vector<watertight::CapLoop>& loops, const OwnFn& own, int motion,
+                                     const Affine& place) {
+            if (motion < 0 || (size_t)motion >= motionSets.size()) return restsAt(loops, own, place);
             const MotionKeys& mk = motionSets[(size_t)motion];
             for (int k = 0; k < mk.keys; ++k) {
                 const MotionTimeScope atKey(motionT[(size_t)(mk.first + k)]);
-                const Affine D = motionXf[(size_t)(mk.first + k)].compose(place);
-                if (restsAt(nrm, pts, reach, slack, own, D, D.inverse())) return true;
+                if (restsAt(loops, own, motionXf[(size_t)(mk.first + k)].compose(place))) return true;
             }
             return false;
         };
-        const watertight::CapOk capOk = [&](const Vec3& nrm, const std::vector<Vec3>& pts, double reach,
-                                            double slack, const OwnFn& own, int motion) {
-            return restsMoving(nrm, pts, reach, slack, own, motion, Affine::identity());
+        const watertight::CapOk capOk = [&](const std::vector<watertight::CapLoop>& loops, const OwnFn& own,
+                                            int motion) {
+            return restsMoving(loops, own, motion, Affine::identity());
         };
         // An asset's pieces a cap would close, by asset (its pass alone).
         std::vector<std::vector<watertight::CapCand>> blasCands(enclosuresOnly ? 0 : blasList.size());
@@ -5064,25 +5072,26 @@ struct Scene {
             enclosureMarksBuild = buildCount;
             return solidMarks;
         }
-        // Each instance asks its asset's candidates where it places them -- scaled by its mean linear
-        // scale, and a moving one at each of its keys.
-        for (MeshInstance& inst : instances) {
+        // Each instance asks its asset's candidates where it places them, a moving one at each of its
+        // keys -- the instances in parallel, each writing its own mask. `own`'s rounding radius goes into
+        // the asset's space by the instance's mean linear scale.
+        ft::parallelForAll(instances.size(), 1, [&](size_t ii) {
+            MeshInstance& inst = instances[ii];
             inst.capMask = 0;
-            if (inst.blasId < 0 || inst.blasId >= (int)blasCands.size()) continue;
+            if (inst.blasId < 0 || inst.blasId >= (int)blasCands.size()) return;
             const std::vector<watertight::CapCand>& cc = blasCands[(size_t)inst.blasId];
             const std::vector<Tri>& bt = blasList[(size_t)inst.blasId].tris;
             const double s = inst.curvScale > 0.0 ? 1.0 / inst.curvScale : 1.0;
             for (size_t k = 0; k < cc.size(); ++k) {
                 const watertight::CapCand& c = cc[k];
                 const OwnFn own = [&](const Vec3& x, double rad) {
-                    return watertight::nearFaces([&](size_t i) -> const Tri& { return bt[i]; }, c.faces, x, rad / s);
+                    return c.own.onPiece([&](size_t i) -> const Tri& { return bt[i]; }, x, rad / s);
                 };
-                if (restsMoving(c.nrm, c.pts, c.reach * s, c.slack * s, own, inst.motion, inst.toWorld)) {
-                    inst.capMask |= 1ull << k;
-                    ++sm.instCaps;
-                }
+                if (restsMoving(c.loops, own, inst.motion, inst.toWorld)) inst.capMask |= 1ull << k;
             }
-        }
+        });
+        for (const MeshInstance& inst : instances)
+            for (uint64_t m = inst.capMask; m; m &= m - 1) ++sm.instCaps;
         // The solids' world boxes (solidNear), those a footprint's segment can meet: every sphere,
         // closed isosurface and closed piece light does not pass (a piece by one of its faces'
         // material) -- an asset's under each instance that places it.
@@ -5090,24 +5099,34 @@ struct Scene {
             return !(matId >= 0 && matId < (int)mats.size() && passesLight(*this, mats[(size_t)matId]));
         };
         std::vector<Aabb> boxes;
-        std::vector<std::vector<Vec3>> nearFaces;   // by box, the faces that decide for it (solidNear)
+        std::vector<uint32_t> nearIdx;                           // solidNearIdx and solidNearSpan, in step
+        std::vector<std::pair<uint32_t, uint32_t>> nearSpan;
+        // A box, and the faces that decide for it -- world triangles, by their index in `tris` -- or none.
+        const auto addBox = [&](const Aabb& b, const std::vector<const Tri*>* faces) {
+            boxes.push_back(b);
+            const uint32_t at0 = (uint32_t)nearIdx.size();
+            bool all = faces && !faces->empty();
+            for (size_t f = 0; all && f < faces->size(); ++f)
+                all = (*faces)[f] >= tris.data() && (*faces)[f] < tris.data() + tris.size();
+            if (all)
+                for (const Tri* t : *faces) nearIdx.push_back((uint32_t)(t - tris.data()));
+            nearSpan.emplace_back(at0, (uint32_t)nearIdx.size() - at0);
+        };
         for (const Implicit& im : implicits)
-            if (im.solidSide && opaqueMat(im.matId)) boxes.push_back(im.bounds);
+            if (im.solidSide && opaqueMat(im.matId)) addBox(im.bounds, nullptr);
         for (const Sphere& sp : spheres) {
             if (!opaqueMat(sp.matId)) continue;
             Aabb b;
             b.expand(sp.c - Vec3(sp.r, sp.r, sp.r));
             b.expand(sp.c + Vec3(sp.r, sp.r, sp.r));
-            boxes.push_back(b);
+            addBox(b, nullptr);
         }
-        for (watertight::PieceBox& pb : worldPieces) {
+        for (const watertight::PieceBox& pb : worldPieces) {
             if (!opaqueMat(pb.matId)) continue;
             Aabb b;
             b.expand(pb.lo);
             b.expand(pb.hi);
-            nearFaces.resize(boxes.size());
-            boxes.push_back(b);
-            nearFaces.push_back(std::move(pb.faces));
+            addBox(b, &pb.faces);
         }
         for (const MeshInstance& inst : instances) {
             if (inst.blasId < 0 || inst.blasId >= (int)blasPieces.size()) continue;
@@ -5118,12 +5137,12 @@ struct Scene {
                 for (int c = 0; c < 8; ++c)
                     b.expand(inst.toWorld.apply(Vec3((c & 1) ? lb.hi.x : lb.lo.x, (c & 2) ? lb.hi.y : lb.lo.y,
                                                      (c & 4) ? lb.hi.z : lb.lo.z)));
-                boxes.push_back(b);
+                addBox(b, nullptr);
             }
         }
         solidBoundsBvh.build(boxes);
-        nearFaces.resize(boxes.size());
-        solidNearFaces = std::move(nearFaces);
+        solidNearIdx = std::move(nearIdx);
+        solidNearSpan = std::move(nearSpan);
         solidBoundsKnown = !hasMotion();
         sm.ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
         solidMarks = sm;

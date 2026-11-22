@@ -296,6 +296,9 @@ Then the rest of 4.2-4.6 in their order, 4.7's bookkeeping alongside whatever to
   share of the disc (the footprint): the gap's light stays off the plate, and object bases read true.
 - [x] **GAGEOM-COINCIDENT** (0.451.18) — `-gageom`'s march counted one of two coincident faces facing apart
   by the traversal's choice: on the plane it takes either; known-issues.
+- [x] **REVIEW-0461** (0.451.22) — the Opus (xhigh) review of 0.451.18-0.451.21: a cap per rim loop, a rim that
+  touches, the pillar in a low room (the leg's `net` where the gather point lies in a room), costs;
+  known-issues REVIEW-0461.
 - [x] **REVIEW-0460** (0.451.19) — the Opus (xhigh) review of 0.451.17: the low leg counts every closed
   solid's face it crosses, capOk skips the piece's own points and faces, a mover's render check, a room's
   cost (solidNear by faces); known-issues REVIEW-0460.

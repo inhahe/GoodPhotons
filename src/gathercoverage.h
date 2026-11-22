@@ -340,6 +340,7 @@ inline double gatherCoverageRaw(const Scene& scene, const Vec3& p, const Vec3& n
     // Whether a closed solid may lie within reach of a probe's segment from the gather point to its
     // top, which stays within r * sqrt(2) of it: asked once, the first time a probe needs its side.
     int solidsNear = -1;
+    int inRoom = -1;   // the gather point in a room lower than r (inRoomOf), asked once, when needed
     for (int i = 0; i < M; ++i) {
         if (i == probe0 && area >= (double)probe0 * 0.995)
             return 1.0;                // interior of a flat patch: nothing to correct
@@ -441,10 +442,14 @@ inline double gatherCoverageRaw(const Scene& scene, const Vec3& p, const Vec3& n
             // solid, where the low leg crosses any closed solid's face (walkSegment's `solids`) --
             // the walls of a box resting on the surface, or of boxes touching or overlapping there,
             // not a room the gather point lies in itself (an open quad or cup in it no wall), nor a
-            // box clear of the surface at the path's time (a mover's).
+            // box clear of the surface at the path's time (a mover's). Where the gather point lies in
+            // a closed or capped solid itself (a room lower than r, inRoomOf), where the leg ends in
+            // more solids than it began in instead (`net`): a pillar it passes in the room walls nothing.
             const auto inside = [&]() {
                 if ((crossed & 1) && (!(rr > pathEps) || (lowLeg().open & 1))) return true;
-                return side() > 0 && lowLeg().solids > 0;
+                if (!(side() > 0)) return false;
+                if (inRoom < 0) inRoom = inRoomOf(scene, p, n, r, pathEps) ? 1 : 0;
+                return inRoom ? lowLeg().net > 0 : lowLeg().solids > 0;
             };
             bool found = false;                  // the probe ended on what it counts
             bool ended = false;                  // ... or on what it does not: either way, it ended

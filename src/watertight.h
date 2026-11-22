@@ -28,6 +28,7 @@
 #include <cmath>
 #include <functional>
 #include "geometry.h"   // Vec3, Tri
+#include "bvh.h"        // OwnFaces' tree
 
 namespace watertight {
 
@@ -142,27 +143,24 @@ inline Report checkTris(const Tri* tris, size_t n) {
 // piece (a number shared by its faces), -1 for a face of none.
 //
 // `capOk`, where given (the footprint probes' pass alone: PROBE-PARITY-LIMITS), also closes a piece open
-// along a rim that another face closes -- a statue's open base on the floor it stands on, planar or on
+// along a rim that other faces close -- a statue's open base on the floor it stands on, planar or on
 // uneven ground: a piece whose every edge is used twice in opposite directions or once, the once-used ones
-// its rim, closed by the fan of triangles from the rim's centroid, which capOk(normal, points, reach,
-// slack, own) says some face not the piece's own covers at `points`: the centroid and a tenth of the way
-// in from its corners, on the fan, `reach` the farthest corner from the centroid, `normal` the rim's
-// area vector (Newell's), `slack` how far the covering face may stray from a point along it beyond a
-// planar rim's allowance (twice the rim's own spread off its mean plane), `own(x, rad)` whether x lies
-// within `rad` of one of the piece's faces, and `motion` the piece's motion set (Scene::motionSets; -1
-// for one that holds still or that moves part by part or deforms): a mover's points are asked where it
-// is at each of its keys, so a piece lowered onto the floor by its motion rests there. A point on the
-// piece itself asks nothing (a hat's brim on the table), but one point at least must be another face's.
-// Its volume taken about the centroid is the capped solid's, the fan's own tetrahedra vanishing there,
-// and its faces are marked 3 (normals out) or 4 (in): a side the probes read
-// and nothing else does -- a camera or light inside one is not in a solid, a glowing one may still be
-// two-sided -- as the cap is right only for the gather on the face that closes it (an upright cup's rim
-// is planar too and closes on nothing, its floor lit through it). A piece that covers its own points (a
-// near-flat sheet its rounding leaves a volume, a ground whose border closes on its own flat part round a
-// pit) closes on nothing. The cap says only which side of the faces is in: whether that side walls a
-// column off from the gather point the probes' low leg decides (gathercoverage.h inside()) -- a box with
-// a lamp in it is a room the gather point lies in, a mover capped where its faces are stored may be clear
-// of the surface at a path's time. Its pieceOf is -1; its box is given.
+// its rim, in one loop or several, each loop closed by the fan of triangles from its own centroid, which
+// capOk(loops, own, motion) says rests on faces not the piece's own, every loop (CapLoop): a lampshade
+// open at its top and bottom rests by its bottom alone, its top on nothing. `own(x, rad)`: whether x lies
+// within `rad` of one of the piece's faces; `motion` the piece's motion set (Scene::motionSets; -1 for
+// one that holds still or that moves part by part or deforms): a mover is asked where it is at each of
+// its keys, so a piece lowered onto the floor by its motion rests there. Its volume taken about the
+// first loop's centroid, with the other loops' fans, is the capped solid's (the first fan's tetrahedra
+// vanish there), and its faces are marked 3 (normals out) or 4 (in): a side the probes read and nothing
+// else does -- a camera or light inside one is not in a solid, a glowing one may still be two-sided -- as
+// the cap is right only for the gather on the face that closes it (an upright cup's rim is planar too and
+// closes on nothing, its floor lit through it). A piece that covers its own points (a near-flat sheet its
+// rounding leaves a volume, a ground whose border closes on its own flat part round a pit) closes on
+// nothing. The cap says only which side of the faces is in: whether that side walls a column off from
+// the gather point the probes' low leg decides (gathercoverage.h inside()) -- a box with a lamp in it is a
+// room the gather point lies in, a mover capped where it rests may be clear of the surface at a path's
+// time. Its pieceOf is -1; its box is given.
 //
 // `capCands`, where given in capOk's stead (an asset's pass: its instances may each rest on something
 // else or nothing), takes the pieces a cap would close, the first kCapCandsMax of them, as capOk would
@@ -171,30 +169,42 @@ inline Report checkTris(const Tri* tris, size_t n) {
 // MeshInstance::capMask, Hit::solid +-(4 + k) until the instance's hit resolves it). They are no solid by
 // themselves, so not counted; their box is given, with the place.
 //
-// A marked piece's box, and (`faces`, corners three a face) its faces where it has kPieceNearFaces or
-// fewer -- a room, a box, a crate -- empty for one with more (Scene::solidNear); `cand`, an asset's
-// candidate's place in `capCands`, or -1.
+// A marked piece's box, and (`faces`) its faces where it has kPieceNearFaces or fewer -- a room, a box,
+// a crate -- empty for one with more (Scene::solidNear): pointers into the call's triangles, good while
+// they stand; `cand`, an asset's candidate's place in `capCands`, or -1.
 constexpr size_t kPieceNearFaces = 64;
-struct PieceBox { Vec3 lo, hi; int matId = 0; std::vector<Vec3> faces; size_t count = 0; int cand = -1; };
+struct PieceBox { Vec3 lo, hi; int matId = 0; std::vector<const Tri*> faces; size_t count = 0; int cand = -1; };
 constexpr int kCapCandsMax = 64;   // MeshInstance::capMask's bits
-// An asset's piece a cap would close, as capOk would be asked of it in the asset's own space: the rim's
-// normal, the points, the reach and the slack, and its faces (indices into the call's).
-struct CapCand { Vec3 nrm; std::vector<Vec3> pts; double reach = 0.0, slack = 0.0; std::vector<size_t> faces; };
-// Whether `x` lies within `h` of one of `faces` (indices, `triAt(i)` the face), each face's box first.
-template <class TriAt>
-inline bool nearFaces(const TriAt& triAt, const std::vector<size_t>& faces, const Vec3& x, double h) {
-    for (size_t i : faces) {
-        const Tri& t = triAt(i);
-        if (x.x < std::min({t.v0.x, t.v1.x, t.v2.x}) - h || x.x > std::max({t.v0.x, t.v1.x, t.v2.x}) + h ||
-            x.y < std::min({t.v0.y, t.v1.y, t.v2.y}) - h || x.y > std::max({t.v0.y, t.v1.y, t.v2.y}) + h ||
-            x.z < std::min({t.v0.z, t.v1.z, t.v2.z}) - h || x.z > std::max({t.v0.z, t.v1.z, t.v2.z}) + h)
-            continue;
-        if (pointTriDistSq(x, t.v0, t.v1, t.v2) <= h * h) return true;
-    }
-    return false;
+// Whether `x` lies within `h` of triangle `t` (its box first).
+inline bool nearFace(const Tri& t, const Vec3& x, double h) {
+    if (x.x < std::min({t.v0.x, t.v1.x, t.v2.x}) - h || x.x > std::max({t.v0.x, t.v1.x, t.v2.x}) + h ||
+        x.y < std::min({t.v0.y, t.v1.y, t.v2.y}) - h || x.y > std::max({t.v0.y, t.v1.y, t.v2.y}) + h ||
+        x.z < std::min({t.v0.z, t.v1.z, t.v2.z}) - h || x.z > std::max({t.v0.z, t.v1.z, t.v2.z}) + h)
+        return false;
+    return pointTriDistSq(x, t.v0, t.v1, t.v2) <= h * h;
 }
-using CapOk = std::function<bool(const Vec3& normal, const std::vector<Vec3>& points, double reach, double slack,
-                                 const std::function<bool(const Vec3&, double)>& own, int motion)>;
+// One loop of a piece's rim as capOk asks it, in the piece's own space: its centroid `c`, the unit
+// normal of its area vector (Newell's), `pts` the points a face other than the piece's must cover --
+// the centroid and a tenth of the way in from a dozen of the loop's corners at most, on its fan -- and
+// `rim` the points a hundredth of the way in from its corners (every one, up to 96), where the loop must
+// touch one, neither any lying on the piece itself (a hat's brim on the table asks nothing); `reach` the farthest corner
+// from the centroid, `slack` twice the loop's spread off its mean plane (0 for a planar one), how far a
+// covering face may stray from a point along the normal beyond a planar loop's allowance.
+struct CapLoop { Vec3 c{0, 0, 0}, nrm{0, 0, 0}; std::vector<Vec3> pts, rim; double reach = 0.0, slack = 0.0; };
+// A piece's faces (indices into the call's triangles) and a tree over their boxes, leaf k for faces[k]:
+// whether a point lies on the piece.
+struct OwnFaces {
+    std::vector<size_t> faces;
+    Bvh tree;
+    template <class TriAt>
+    bool onPiece(const TriAt& triAt, const Vec3& x, double h) const {
+        return tree.traverseSphereAny(x, h, [&](int k) { return nearFace(triAt(faces[(size_t)k]), x, h); });
+    }
+};
+// An asset's piece a cap would close, as capOk would be asked of it in the asset's own space.
+struct CapCand { std::vector<CapLoop> loops; OwnFaces own; };
+using CapOk = std::function<bool(const std::vector<CapLoop>& loops, const std::function<bool(const Vec3&, double)>& own,
+                                 int motion)>;
 inline size_t markSolidFaces(Tri* const* tris, size_t n, std::vector<PieceBox>* boxes = nullptr,
                              std::vector<int>* pieceOf = nullptr, const CapOk* capOk = nullptr,
                              std::vector<CapCand>* capCands = nullptr) {
@@ -344,7 +354,7 @@ inline size_t markSolidFaces(Tri* const* tris, size_t n, std::vector<PieceBox>* 
     // `motion`: its faces' motion set, -1 where none moves, -2 where they differ or one deforms; -3 unset.
     // `place`: where it is in *capCands, or -1.
     struct Cand {
-        int piece; size_t e0, e1; Vec3 c, nrm; double vol = 0.0; bool capped = false; std::vector<size_t> faces;
+        int piece; size_t e0, e1; double vol = 0.0; bool capped = false; std::vector<size_t> faces;
         int motion = -3;
         int place = -1;
     };
@@ -355,7 +365,7 @@ inline size_t markSolidFaces(Tri* const* tris, size_t n, std::vector<PieceBox>* 
         for (size_t q = 0; q < rimEdges.size();) {
             size_t e = q;
             while (e < rimEdges.size() && rimEdges[e].piece == rimEdges[q].piece) ++e;
-            if (capFlags[(size_t)rimEdges[q].piece] == kCapRim) cands.push_back(Cand{rimEdges[q].piece, q, e, {}, {}});
+            if (capFlags[(size_t)rimEdges[q].piece] == kCapRim) cands.push_back(Cand{rimEdges[q].piece, q, e});
             q = e;
         }
     }
@@ -378,51 +388,109 @@ inline size_t markSolidFaces(Tri* const* tris, size_t n, std::vector<PieceBox>* 
                 if (it != at.end()) it->second = *p[k];
             }
         }
-        const auto onOwn = [&](const Cand& cd, const Vec3& x, double h) {
-            return nearFaces([&](size_t i) -> const Tri& { return *tris[i]; }, cd.faces, x, h);
-        };
+        const auto triAt = [&](size_t i) -> const Tri& { return *tris[i]; };
         for (Cand& cd : cands) {
             const size_t pc = (size_t)cd.piece;
-            std::vector<Vec3> rim;
-            Vec3 c{0, 0, 0};
-            for (size_t q = cd.e0; q < cd.e1; ++q) { rim.push_back(at[rimEdges[q].a]); c = c + rim.back(); }
-            c = c * (1.0 / (double)rim.size());
-            Vec3 nrm{0, 0, 0};
-            for (size_t q = cd.e0; q < cd.e1; ++q) nrm = nrm + cross(at[rimEdges[q].a] - c, at[rimEdges[q].b] - c);
-            const double nl = std::sqrt(dot(nrm, nrm));
             const Vec3 ext = phi[pc] - plo[pc];
             const double pd = std::sqrt(dot(ext, ext));
-            if (!(nl > 1e-12 * pd * pd)) continue;   // no area: no fan to close it by
-            nrm = nrm * (1.0 / nl);
-            double spread = 0.0;                     // the rim's farthest corner off its mean plane
-            for (const Vec3& p : rim) spread = std::max(spread, std::fabs(dot(p - c, nrm)));
-            if (spread <= 1e-6 * pd) spread = 0.0;   // planar, to within rounding
-            cd.c = c; cd.nrm = nrm;
-            // Its volume about the centroid, the fan's own tetrahedra nothing there; a flat piece (a card,
-            // the floor, a light's quad) closes nothing, and asks capOk nothing.
+            // Its rim's loops: each edge runs a -> b as its one face runs it, so a loop follows b to the
+            // edge that starts there, back to where it began. A vertex two loops share (a pinch) starts
+            // two edges; either serves. An end that leads nowhere is no loop, and closes nothing.
+            std::unordered_multimap<int, size_t> from;
+            for (size_t q = cd.e0; q < cd.e1; ++q) from.emplace(rimEdges[q].a, q);
+            std::vector<char> used(cd.e1 - cd.e0, 0);
+            std::vector<std::vector<size_t>> loopEdges;
+            bool broken = false;
+            for (size_t q0 = cd.e0; q0 < cd.e1 && !broken; ++q0) {
+                if (used[q0 - cd.e0]) continue;
+                std::vector<size_t> le;
+                size_t q = q0;
+                while (true) {
+                    used[q - cd.e0] = 1;
+                    le.push_back(q);
+                    if (rimEdges[q].b == rimEdges[q0].a) break;
+                    size_t next = SIZE_MAX;
+                    const auto range = from.equal_range(rimEdges[q].b);
+                    for (auto it = range.first; it != range.second; ++it)
+                        if (!used[it->second - cd.e0]) { next = it->second; break; }
+                    if (next == SIZE_MAX) { broken = true; break; }
+                    q = next;
+                }
+                loopEdges.push_back(std::move(le));
+            }
+            if (broken || loopEdges.empty()) continue;
+            // Each loop's centroid, normal, spread and points (CapLoop).
+            OwnFaces own;
+            own.faces = cd.faces;
+            {
+                std::vector<Aabb> fb(cd.faces.size());
+                for (size_t k = 0; k < cd.faces.size(); ++k) {
+                    const Tri& t = *tris[cd.faces[k]];
+                    fb[k].expand(t.v0); fb[k].expand(t.v1); fb[k].expand(t.v2);
+                }
+                own.tree.build(fb, 1);
+            }
+            std::vector<CapLoop> loops;
+            bool degenerate = false;
+            for (const std::vector<size_t>& le : loopEdges) {
+                CapLoop L;
+                std::vector<Vec3> corner;
+                for (size_t q : le) { corner.push_back(at[rimEdges[q].a]); L.c = L.c + corner.back(); }
+                L.c = L.c * (1.0 / (double)corner.size());
+                Vec3 nrm{0, 0, 0};
+                for (size_t q : le) nrm = nrm + cross(at[rimEdges[q].a] - L.c, at[rimEdges[q].b] - L.c);
+                const double nl = std::sqrt(dot(nrm, nrm));
+                if (!(nl > 1e-12 * pd * pd)) { degenerate = true; break; }   // no area: no fan to close it by
+                L.nrm = nrm * (1.0 / nl);
+                double spread = 0.0;                    // the loop's farthest corner off its mean plane
+                for (const Vec3& p : corner) {
+                    spread = std::max(spread, std::fabs(dot(p - L.c, L.nrm)));
+                    L.reach = std::max(L.reach, length(p - L.c));
+                }
+                L.slack = spread <= 1e-6 * pd ? 0.0 : 2.0 * spread;   // planar, to within rounding: none
+                // On the piece itself, to within rounding: a point it covers itself, which asks nothing.
+                const double onR = 1e-6 * L.reach;
+                if (!own.onPiece(triAt, L.c, onR)) L.pts.push_back(L.c);
+                // Covering points at a dozen corners at most; touching points at every corner up to
+                // kTouchAll, beyond them at an odd stride -- an even one aliases a base notched corner by
+                // corner, every point then on a corner that stands on the floor.
+                const size_t step = std::max<size_t>(1, corner.size() / 12);
+                for (size_t i = 0; i < corner.size(); i += step) {
+                    const Vec3 in10 = corner[i] + (L.c - corner[i]) * 0.1;
+                    if (!own.onPiece(triAt, in10, onR)) L.pts.push_back(in10);
+                }
+                constexpr size_t kTouchAll = 96;
+                const size_t tstep = corner.size() <= kTouchAll ? 1 : ((corner.size() / kTouchAll) | 1);
+                for (size_t i = 0; i < corner.size(); i += tstep) {
+                    const Vec3 in1 = corner[i] + (L.c - corner[i]) * 0.01;
+                    if (!own.onPiece(triAt, in1, onR)) L.rim.push_back(in1);
+                }
+                loops.push_back(std::move(L));
+            }
+            if (degenerate) continue;
+            // Its volume about the first loop's centroid, that loop's fan's tetrahedra nothing there, the
+            // others' added: a fan triangle (c_j, b, a) runs its rim edge against the face that runs it a -> b.
+            // A flat piece (a card, the floor, a light's quad) closes nothing, and asks capOk nothing.
+            const Vec3 o = loops[0].c;
             for (size_t i : cd.faces) {
-                const Vec3 a = tris[i]->v0 - c, b = tris[i]->v1 - c, d = tris[i]->v2 - c;
+                const Vec3 a = tris[i]->v0 - o, b = tris[i]->v1 - o, d = tris[i]->v2 - o;
                 cd.vol += dot(a, cross(b, d));
             }
+            for (size_t j = 1; j < loops.size(); ++j)
+                for (size_t q : loopEdges[j])
+                    cd.vol += dot(loops[j].c - o, cross(at[rimEdges[q].b] - o, at[rimEdges[q].a] - o));
             if (std::fabs(cd.vol) <= 1e-9 * pd * pd * pd) continue;
-            // The points a face must cover: the centroid, and a tenth of the way in from a dozen of the
-            // rim's corners at most -- on the fan.
-            double reach = 0.0;
-            for (const Vec3& p : rim) reach = std::max(reach, length(p - c));
-            std::vector<Vec3> pts{c};
-            const size_t step = std::max<size_t>(1, rim.size() / 12);
-            for (size_t i = 0; i < rim.size(); i += step) pts.push_back(rim[i] + (c - rim[i]) * 0.1);
             // An asset's: handed back for its instances to ask.
             if (capCands) {
                 if ((int)capCands->size() < kCapCandsMax) {
                     cd.place = (int)capCands->size();
-                    capCands->push_back(CapCand{nrm, pts, reach, 2.0 * spread, cd.faces});
+                    capCands->push_back(CapCand{std::move(loops), std::move(own)});
                 }
                 continue;
             }
             // The piece's own faces cover nothing: what it rests on is something else.
-            if (!(*capOk)(nrm, pts, reach, 2.0 * spread,
-                          [&](const Vec3& x, double rad) { return onOwn(cd, x, rad); }, std::max(cd.motion, -1)))
+            if (!(*capOk)(loops, [&](const Vec3& x, double rad) { return own.onPiece(triAt, x, rad); },
+                          std::max(cd.motion, -1)))
                 continue;
             cd.capped = true;
         }
@@ -453,11 +521,8 @@ inline size_t markSolidFaces(Tri* const* tris, size_t n, std::vector<PieceBox>* 
         }
         if (boxes && s) {
             PieceBox& pb = (*boxes)[(size_t)boxOf[(size_t)piece]];
-            if (++pb.count <= kPieceNearFaces) {
-                pb.faces.push_back(tris[i]->v0); pb.faces.push_back(tris[i]->v1); pb.faces.push_back(tris[i]->v2);
-            } else if (!pb.faces.empty()) {
-                std::vector<Vec3>().swap(pb.faces);
-            }
+            if (++pb.count <= kPieceNearFaces) pb.faces.push_back(tris[i]);
+            else if (!pb.faces.empty()) std::vector<const Tri*>().swap(pb.faces);
         }
     }
     return marked;

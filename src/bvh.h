@@ -544,8 +544,29 @@ struct Bvh {
             }
         }
     }
+    // traverseSphere, stopping at the first candidate `pred(primIndex)` accepts: whether one did.
+    template <class Pred>
+    bool traverseSphereAny(const Vec3& c, double r, Pred&& pred) const {
+        if (nodes.empty() || !(r >= 0.0)) return false;
+        const double r2 = r * r;
+        if (nodes[0].box.dist2To(c) > r2) return false;
+        int stack[64]; int sp = 0; stack[sp++] = 0;
+        while (sp) {
+            const BvhNode& n = nodes[stack[--sp]];
+            if (n.isLeaf()) {
+                for (int i = 0; i < n.count; ++i)
+                    if (pred(primIdx[n.first + i])) return true;
+            } else if (sp + 2 <= 64) {
+                if (nodes[n.left].box.dist2To(c)  <= r2) stack[sp++] = n.left;
+                if (nodes[n.right].box.dist2To(c) <= r2) stack[sp++] = n.right;
+            }
+        }
+        return false;
+    }
 };
 
+// (Bvh::traverseSphereAny, below the struct's other queries: traverseSphere that stops at the first
+// candidate `pred` accepts.)
 // `-checkspherequery`: brute-force self-test for traverseSphere. Deterministic, needs no
 // scene, and checks the ONE invariant the footprint measurement depends on — every
 // primitive whose own box meets the ball is reported. A traversal that quietly skipped

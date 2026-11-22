@@ -6801,16 +6801,22 @@ as the one at fault.
   (0.451.14, PROBE-PARITY-LIMITS) is closed by it for the probes alone: a world mesh object or loose
   piece whose every edge is used twice in opposite directions or once and whose every face's corner
   normals lie on one side of its winding, the whole piece on the same side, the once-used edges its
-  rim (Newell's normal over them, each run as its one face runs it), closed by the fan of triangles
-  from the rim's centroid -- planar or not (0.451.19: a statue's base on uneven ground) -- which
-  another face covers there (`capOk`: short rays along the normal at the centroid and a tenth of the
-  way in from the rim's corners, meeting a face not the piece's own within 5e-4 of the rim's reach of
-  the point, plus twice the rim's own spread off its mean plane; a point on the piece itself asks
-  nothing -- a hat's brim on the table -- but one at least must be another face's, so a near-flat
-  sheet its rounding leaves a volume, or a ground whose border closes on its own flat part round a
-  pit, closes on nothing) -- a statue's open base on its floor, a bottomless box of quads on the
-  ground. Its volume taken about the centroid is the capped solid's (the fan's own tetrahedra vanish
-  there; a flat piece, a card or a light's quad, closes nothing and asks `capOk` nothing), and its faces are marked 3
+  rim, in one loop or several (each edge followed as its one face runs it), each loop closed by the
+  fan of triangles from its own centroid -- planar or not (0.451.19: a statue's base on uneven ground)
+  -- and every loop resting on faces not the piece's own (`capOk`, `watertight::CapLoop`: short rays
+  along the loop's normal (Newell's) at its centroid and a tenth of the way in from its corners meet
+  one within 5e-4 of its reach of the point, plus twice its own spread off its mean plane; and a
+  hundredth of the way in from the corners, within 5e-4 of the reach plus 2 % of that slack, the loop
+  touching it there, so a notched base, or one rocking on uneven ground, hovering between the corners it
+  stands on, does not rest -- every corner's, up to 96, the stride odd beyond, so a base notched corner
+  by corner is never sampled on its standing corners alone; a point on the piece itself asks nothing --
+  a hat's brim on the table -- but the rays pass the piece's own faces, from both sides, and one of a
+  loop's points at least must remain, so a near-flat sheet its rounding leaves a volume, or a ground
+  whose border closes on its own flat part round a pit, closes on nothing; 0.451.22, REVIEW-0461: a lampshade open at top and bottom rests by its bottom alone, and one
+  fan over both loops capped it) -- a statue's open base on its floor, a bottomless box of quads on the
+  ground. Its volume taken about the first loop's centroid, with the other loops' fans added, is the
+  capped solid's (the first fan's tetrahedra vanish there; a flat piece, a card or a light's quad,
+  closes nothing and asks `capOk` nothing), and its faces are marked 3
   or 4 (`Hit::solid` +-2), which the probes read by the sign and the enclosures (`enclosureAt`, a
   camera's or light's medium) and the `emit_two_sided` refusal do not: an upright cup's rim is planar
   too but closes on nothing, its floor lit through it. An asset's such piece is capped instance by
@@ -6845,9 +6851,10 @@ as the one at fault.
   gather point (`Scene::solidNear`: a tree over the boxes `markSolidFaces` takes -- each closed piece
   the classifier found, an asset's under each instance that places it, and every sphere and closed
   isosurface light does not pass; off for a scene that moves -- where a world piece of 64 faces or
-  fewer is asked by its faces, not counting one in the gather point's own plane: a room's box holds
-  every gather point inside it, its walls and ceiling few of them, and its floor none. A capped room
-  cost CPU mode M 2 % before that, 0.451.17-0.451.18). On gallery.ftsl the segments cost CPU mode M 7-15 %
+  fewer is asked by its faces (indices into `tris`, `solidNearIdx` / `solidNearSpan`, the query stopping
+  at the first near one), not counting one in the gather point's own plane: a room's box holds every
+  gather point inside it, its walls and ceiling few of them, and its floor none. A capped room cost CPU
+  mode M 2 % before that, 0.451.17-0.451.18). On gallery.ftsl the segments cost CPU mode M 7-15 %
   without the boxes and about 4 % with them; GPU mode M 1 %, mode S nothing measurable. A solid's face in the band but above the plane, met
   from inside, is crossed and passed (PROBE-UNDERSIDE): a ball's tilted underside, which the band
   widens to take in, holds no photon facing the gather's way, and the floor below is the column's
@@ -6864,15 +6871,19 @@ as the one at fault.
   gather point (1 % of r up) to the column's foot must cross an odd count of such faces too
   (`walkSegment`'s `open`), or, for a solid's side, cross any closed solid's face (its `solids`, either
   way: boxes touching face to face or overlapping, whose last face or coincident pair says nothing
-  reliable, wall the column off all the same; 0.451.19, REVIEW-0460) -- asked only once what lies
-  above says inside. A bottomless box of quads, an open glossy cup or a box standing on the surface
+  reliable, wall the column off all the same; 0.451.19, REVIEW-0460) -- or, where the gather point
+  lies in a closed or capped solid itself, end inside more solids than it began in (`net`): the walk
+  straight up from the gather point, r long, leaves the first such solid's face it crosses (`first`,
+  `inRoomOf`), a room's lid lower than r, not a shelf over the point, which it enters first; so a pillar
+  the leg passes in such a room walls nothing (0.451.22, REVIEW-0461) -- asked only once what lies
+  above says inside, the room once a gather. A bottomless box of quads, an open glossy cup or a box standing on the surface
   walls its floor off, so it stays a miss; a sheet hovering over it -- a diffuse table top, a mirror,
   a light's quad -- encloses nothing, and the floor under it, lit from the sides, is covered; and a
   room the gather point lies in itself is no wall to its own floor, closed (six quads, a solid) or
   capped, however much lower than r its lid, nor is an open quad or cup standing in it
   (`check_gather_base`'s `litbox` and `litbox_closed`: their floor read 9.0 of the uncorrected render
-  with the solid's side alone). What it reads short: the floor past a closed pillar in a room lower
-  than r, the pillar a wall to it. `openbox_hover`, a box held up by a mover's keys from faces stored
+  with the solid's side alone; `litbox_pillar` stands a closed pillar in the closed room beside its
+  floor's ring). `openbox_hover`, a box held up by a mover's keys from faces stored
   on the floor, holds the floor under it to the same box authored up there: the probes see it at the
   path's time, and its leg passes under. `-gageom`'s march climbs and
   decides each in-band layer of a column by the faces above it: the next solid face it meets above

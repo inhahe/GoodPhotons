@@ -843,7 +843,8 @@ struct DMediumStack {
 struct DTri    { DVec3 v0, v1, v2, gn; DVec3 uv0, uv1, uv2; DVec3 n0, n1, n2; int matId, sensorId;
                  DVec3 tangent;
                  unsigned char solid;                    // Tri::solidFace: 1 normals out, 2 in (3, 4 the
-                                                         // probes' alone), 0 neither
+                                                         // probes' alone; 5 + 2k, 6 + 2k an asset's piece
+                                                         // an instance may close), 0 neither
                  short bounds;                           // Tri::boundsSolid, -1 beyond a short's range
                                                          // (both in FP32's padding before bitangentSign)
                  Real bitangentSign;                     // C6 tangent frame for normal mapping (+-1)
@@ -8760,21 +8761,27 @@ __device__ static inline bool dOnGatherSurfaceSided(const DVec3& x, const DVec3&
 // does not pass that the segment from `o` along unit `d`, `len` long, crosses, curves unseen, the
 // side of the last closed solid's (+1 it ends inside, -1 outside, 0 none) and how many cannot say
 // theirs (up to 15). `eps`: how far past a face crossed it goes on from.
-struct DSegmentCrossings { int side; int open; int solids; };
+struct DSegmentCrossings { int side; int open; int solids; int first; int net; };   // host twin SegmentCrossings
 // The distance a trace that leaves hit h at exactly h.p must skip to clear its own primitive, whose error
 // near the origin outgrows dEpsAt.
 __device__ static inline Real dHitEps(const DHit& h) {
     return fmax(dEpsAt(h.p), dReachEps(h.pscale));
 }
 __device__ static DSegmentCrossings dWalkSegment(const DScene& sc, DVec3 o, const DVec3& d, Real len, Real eps) {
-    DSegmentCrossings c{0, 0, 0};
+    DSegmentCrossings c{0, 0, 0, 0, 0};
     Real done = (Real)0;
     for (int k = 0; k < 32 && done < len && c.open < 15; ++k) {
         const DHit h = closestHit(sc, o, d, (Real)0, len - done, false, len - done);
         if (!h.valid) break;
         if (!dPassesLight(sc, sc.mats[h.matId])) {
-            if (h.solid) { c.side = ((h.solid > 0) == h.back) ? -1 : 1; ++c.solids; }
-            else ++c.open;
+            if (h.solid) {
+                c.side = ((h.solid > 0) == h.back) ? -1 : 1;
+                if (!c.solids) c.first = c.side;
+                c.net += c.side;
+                ++c.solids;
+            } else {
+                ++c.open;
+            }
         }
         const Real step = fmax(eps, dHitEps(h));   // past this face, by its own error at least
         done += h.t + step;
@@ -8789,9 +8796,11 @@ __device__ static DSegmentCrossings dWalkSegment(const DScene& sc, DVec3 o, cons
 // 0 -- and whether it found geometry facing the wrong way. Draws from `rng`. `pathEps`: the segments'
 // step past a face (dWalkSegment); `holds`: DGatherHolds.
 struct DProbe { double area; int rej; };
+// `inRoom`: whether the gather point lies in a closed or capped solid itself (host twin inRoomOf), -1
+// until a probe asks, shared by a gather's probes.
 __device__ static DProbe dCoverageProbe(const DScene& sc, const DVec3& p, const DVec3& n, const DVec3& t,
                                         const DVec3& b, Real r, Real slack, Real pathEps, DRng& rng,
-                                        int holds) {
+                                        int holds, int& inRoom) {
     DProbe o{0.0, 0};
     const double rr = (double)r * sqrt((double)rng.uniform());
     const double ph = 2.0 * DPI * (double)rng.uniform();
@@ -8830,7 +8839,7 @@ __device__ static DProbe dCoverageProbe(const DScene& sc, const DVec3& p, const 
         // The low leg, from just over the gather point to the column's foot: asked once, and only
         // once what lies above puts the column inside (host twin).
         bool legAsked = false;
-        DSegmentCrossings leg{0, 0, 0};
+        DSegmentCrossings leg{0, 0, 0, 0, 0};
         const auto lowLeg = [&]() -> const DSegmentCrossings& {
             if (!legAsked) {
                 legAsked = true;
@@ -8842,10 +8851,13 @@ __device__ static DProbe dCoverageProbe(const DScene& sc, const DVec3& p, const 
         // An odd parity whose low leg crosses an odd count too (a cup's wall, not a hovering sheet), or
         // a closed solid's side where the low leg crosses any closed solid's face (boxes resting on the
         // surface, touching or not; not a room the gather point lies in, nor a mover clear of the
-        // surface): host twin's inside().
+        // surface), or ends in more than it began in where the gather point lies in one itself (a room
+        // lower than r, a pillar in it no wall): host twin's inside().
         const auto inside = [&]() {
             if ((crossed & 1) && (!(rr > (double)pathEps) || (lowLeg().open & 1))) return true;
-            return side() > 0 && lowLeg().solids > 0;
+            if (!(side() > 0)) return false;
+            if (inRoom < 0) inRoom = dWalkSegment(sc, p + n * pathEps, n, r, pathEps).first < 0 ? 1 : 0;
+            return inRoom ? lowLeg().net > 0 : lowLeg().solids > 0;
         };
         bool found = false;                  // the probe ended on what it counts
         bool ended = false;                  // ... or on what it does not
@@ -8960,9 +8972,10 @@ __device__ static double dGatherCoverage(const DScene& sc, const DVec3& p, const
     int    nRej = 0;                         // probes that FOUND geometry facing the wrong way
     const int probe0 = dGateProbes(sc, M);
     const Real pathEps = fmax(fmax((Real)1e-4 * r, (Real)2 * dEpsAt(p)), dReachEps(reach));
+    int inRoom = -1;
     for (int i = 0; i < M; ++i) {
         if (i == probe0 && area >= (double)probe0 * 0.995) return 1.0;
-        const DProbe o = dCoverageProbe(sc, p, n, t, b, r, slack, pathEps, rng, DGATHER_PHOTONS);
+        const DProbe o = dCoverageProbe(sc, p, n, t, b, r, slack, pathEps, rng, DGATHER_PHOTONS, inRoom);
         area += o.area;
         nRej += o.rej;
     }
@@ -22060,10 +22073,11 @@ __device__ static double dSurfFootprint(const DScene& sc, const DMergeFootprint&
     const int probe0 = dGateProbes(sc, fp.M);
     double area = 0.0;
     int nRej = 0;
+    int inRoom = -1;
     for (int i = 0; i < fp.M; ++i) {
         if (i == probe0 && area >= (double)probe0 * 0.995) return 1.0;   // dGatherCoverage's early gate
         DRng prng = dMergeProbeRng(seed, i);
-        const DProbe o = dCoverageProbe(sc, fp.p, fp.n, t, b, fp.r, fp.slack, pathEps, prng, DGATHER_MERGES);
+        const DProbe o = dCoverageProbe(sc, fp.p, fp.n, t, b, fp.r, fp.slack, pathEps, prng, DGATHER_MERGES, inRoom);
         area += o.area;
         nRej += o.rej;
     }
@@ -22079,9 +22093,10 @@ __device__ static double dSurfFootprintWarp(const DScene& sc, const DMergeFootpr
     const int probe0 = dGateProbes(sc, fp.M);
     double area = 0.0, area0 = 0.0;   // all of this lane's probes; those the early gate reads
     int nRej = 0;
+    int inRoom = -1;   // this lane's
     for (int i = lane; i < fp.M; i += 32) {
         DRng prng = dMergeProbeRng(seed, i);
-        const DProbe o = dCoverageProbe(sc, fp.p, fp.n, t, b, fp.r, fp.slack, pathEps, prng, DGATHER_MERGES);
+        const DProbe o = dCoverageProbe(sc, fp.p, fp.n, t, b, fp.r, fp.slack, pathEps, prng, DGATHER_MERGES, inRoom);
         area += o.area;
         nRej += o.rej;
         if (i < probe0) area0 += o.area;

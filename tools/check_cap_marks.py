@@ -30,9 +30,15 @@ exactly its count -- the marking pass's alone, with no noise:
   - `hat`: a crown with a flat brim of 18 triangles lying on the floor, open along the brim's outer edge
     -- capped, eighteen: the points on the brim, the piece itself, ask nothing, and the floor covers the
     rest (0.451.17 refused it for lying on its own faces there, none);
-  - `asset`: the bottomless box as a `mesh_asset` placed three times, resting, lifted 5 cm, and scaled by
-    1.5 resting: no triangle of its own a solid's, and two asset pieces capped under the instances that
-    rest them (the line's `and N asset pieces`; 0.451.20 capped no asset's piece).
+  - `asset`: the bottomless box as a `mesh_asset` placed four times, resting, lifted 5 cm, scaled by 1.5
+    resting, and scaled 2 by 0.5 by 1 resting: no triangle of its own a solid's, and three asset pieces
+    capped under the instances that rest them (the line's `and N asset pieces`; 0.451.20 capped no
+    asset's piece);
+  - `shade`: a lampshade -- a frustum of 32 triangles open at its top and its bottom -- standing on the
+    floor: its top loop rests on nothing, so none (0.451.21 closed both loops by one fan, all 32);
+  - `notched`: a bottomless box whose walls' bottom edges zigzag, every other corner 1 cm off the floor,
+    72 triangles: its rim does not touch the floor between the corners it stands on, so none (0.451.21
+    asked only points inside the rim, the floor within their window, all 72).
 
 Exits 1 on any mismatch.
 """
@@ -138,6 +144,53 @@ def hat_obj(path):
     write_obj(path, verts, faces)
 
 
+def shade_obj(path, n=16, r0=0.12, r1=0.06, h=0.08):
+    """A frustum's side, its bottom loop (radius r0) on the floor and its top (r1) h up, both open, wound
+    outward."""
+    import math
+    verts = [(r0 * math.cos(2 * math.pi * i / n), 0.0, r0 * math.sin(2 * math.pi * i / n)) for i in range(n)]
+    verts += [(r1 * math.cos(2 * math.pi * i / n), h, r1 * math.sin(2 * math.pi * i / n)) for i in range(n)]
+    faces = []
+    for i in range(n):
+        j = (i + 1) % n
+        faces += oriented(verts, [i, n + i, n + j, j], (verts[i][0], 0.0, verts[i][2]))
+    write_obj(path, verts, faces)
+
+
+def notched_obj(path, k=6, up=0.01):
+    """A bottomless box of half-width B and height H whose walls' bottom edges zigzag: k segments a wall,
+    the corners between them alternately on the floor and `up` over it (the box's own corners on it), the
+    top a fan from its centre over the walls' top corners, wound outward."""
+    verts, at = [], {}
+
+    def v(x, y, z):
+        key = (round(x, 12), round(y, 12), round(z, 12))
+        if key not in at:
+            at[key] = len(verts)
+            verts.append(key)
+        return at[key]
+    corners = [(-B, -B), (B, -B), (B, B), (-B, B)]
+    faces, top = [], []
+    for w in range(4):
+        (x0, z0), (x1, z1) = corners[w], corners[(w + 1) % 4]
+        out = (z1 - z0, 0.0, -(x1 - x0))      # outward of a counter-clockwise loop seen from above
+        for i in range(k):
+            fa, fb = i / k, (i + 1) / k
+            xa, za, xb, zb = x0 + (x1 - x0) * fa, z0 + (z1 - z0) * fa, x0 + (x1 - x0) * fb, z0 + (z1 - z0) * fb
+            ya, yb = (up if i % 2 else 0.0), (up if (i + 1) % 2 else 0.0)
+            faces += oriented(verts, [v(xa, ya, za), v(xb, yb, zb), v(xb, H, zb), v(xa, H, za)], out)
+            top.append(v(xa, H, za))
+    c = v(0.0, H, 0.0)
+    for i in range(len(top)):
+        a, b = top[i], top[(i + 1) % len(top)]
+        tri = (c, a, b)
+        e1 = [verts[a][m] - verts[c][m] for m in range(3)]
+        e2 = [verts[b][m] - verts[c][m] for m in range(3)]
+        ny = e1[2] * e2[0] - e1[0] * e2[2]
+        faces.append(tri if ny > 0 else (c, b, a))
+    write_obj(path, verts, faces)
+
+
 def scene(kind, out):
     geo = []
     if kind in ("resting", "lamp", "moving", "lifted", "closed", "lowered"):
@@ -157,7 +210,12 @@ def scene(kind, out):
         g.box_obj(os.path.join(out, "box.obj"), -B, 0.0, -B, B, H, B, bottom=False)
         geo = ['mesh_asset "box" { file "box.obj"  material obj }', 'mesh_instance { of "box" }',
                'mesh_instance { of "box"  translate 0.6 0.05 0 }',
-               'mesh_instance { of "box"  translate -0.6 0 0  scale 1.5 }']
+               'mesh_instance { of "box"  translate -0.6 0 0  scale 1.5 }',
+               'mesh_instance { of "box"  translate 0 0 0.6  scale 2 0.5 1 }']
+    if kind in ("shade", "notched"):
+        obj = os.path.join(out, kind + ".obj")
+        (shade_obj if kind == "shade" else notched_obj)(obj)
+        geo = ['mesh "%s" { file "%s"  material obj }' % (kind, kind + ".obj")]
     if kind == "uneven":   # the V-ground it stands on, two quads meeting along x = 0
         geo += [g.quad((-1, K, -1), (0, 0, 2), (1, -K, 0), "floor"), g.quad((0, 0, -1), (0, 0, 2), (1, K, 0), "floor")]
     moves = kind in ("moving", "lowered")
@@ -174,9 +232,9 @@ def scene(kind, out):
 
 
 CASES = {"resting": 10, "lamp": 10, "moving": 10, "lowered": 10, "lifted": 0, "closed": 12, "sheet": 0, "pit": 0,
-         "uneven": 16, "hat": 18, "asset": 0}
+         "uneven": 16, "hat": 18, "asset": 0, "shade": 0, "notched": 0}
 # The asset pieces capped under an instance (the line's `and N asset pieces`), where not none.
-INST = {"asset": 2}
+INST = {"asset": 3}
 INST_LINE = re.compile(r"and (\d+) asset pieces")
 
 
