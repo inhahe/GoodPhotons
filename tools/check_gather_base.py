@@ -48,8 +48,10 @@ as it is, but it is a room the gather point lies in: a probe over its floor star
 enters it there, and must still count the floor it meets, the low leg crossing no wall between the two.
 Without that leg the floor 0-4 cm from its middle read 9.0 of the uncorrected render in modes M and S,
 both devices (0.451.15; -gageom 7.1 of the probe's). `litbox_closed` is the same room with its floor
-face, a closed solid without any cap, on no floor quad (NO_FLOOR), which read 9.0 likewise on 0.451.16
-(modes M and S, both devices; -gageom 7.1 of the probe's).
+face, a closed solid without any cap, which read 9.0 likewise on 0.451.16 (modes M and S, both devices;
+-gageom 7.1 of the probe's). Its floor face lies on the floor quad, facing apart: -gageom took a layer
+there only on the one facing the gather point's way, which of the two a ray meets being the
+traversal's, and read 2.07 (M) and 2.01 (S) of the probe on 0.451.17 (GAGEOM-COINCIDENT).
 Then a glossy ball of the box's
 half-width resting on the floor, analytic and as a closed OBJ, seen from low beside it with a low
 light from the side reaching under its overhang. There, 4-12 cm from the point it rests on, the gap
@@ -360,18 +362,13 @@ MARKS = {"openbox": 10, "openbox_lifted": 0, "opentower": 10, "litbox": 10, "lit
 GATHER_LINE = re.compile(r"\[gather\] (\d+) of (\d+) triangles")
 
 
-# The objects whose scene has no floor quad: a closed room, whose own floor would lie on it, the two
-# coincident and facing apart, and the one a ray meets the traversal's choice.
-NO_FLOOR = {"litbox_closed"}
-
-
-def scene(obj_lines, cam, floor=True):
+def scene(obj_lines, cam):
     return NL.join([
     "scene { units meters }",
     cam,
     'material "floor" { type diffuse reflect 0.5 }',
     'material "gl" { type glossy reflect 0.6 roughness 0.3 }',
-    ] + ([quad((-2, 0, -2), (0, 0, 4), (4, 0, 0), "floor")] if floor else []) + [
+    quad((-2, 0, -2), (0, 0, 4), (4, 0, 0), "floor"),
     "light area { origin -0.4 1.5 -0.4  u 0.8 0 0  v 0 0 0.8  normal 0 -1 0  power 300  spd preset:d65 }",
     ] + obj_lines) + NL
 REF = ["-mode", "R", "-device", "gpu", "-spp", "512"]
@@ -410,7 +407,7 @@ def main():
         lines, cam, distf, rings, base, against = OBJECTS[bname]
         dist = distf()                                 # each pixel's floor distance from `base`
         path = os.path.join(out, "obj_%s.ftsl" % bname)
-        cm.write(path, scene(lines, cam, floor=bname not in NO_FLOOR))
+        cm.write(path, scene(lines, cam))
 
         logs = []
 

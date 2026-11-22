@@ -6862,7 +6862,10 @@ as the one at fault.
   takes the side of the column's top, along the same path as the probe's, and the low leg agrees or
   not as the probe's does. A face that holds no
   photon is no area to it above the plane, where the probe passes it (a glossy ball's steep side,
-  which the tilt-widened band takes in), and is on the plane, where the probe ends on it. An in-band
+  which the tilt-widened band takes in), and is on the plane, where the probe ends on it. On the plane,
+  within 1e-7 r, it takes a face either way up, as the probe does: a face lying on another facing apart
+  (a room's floor on the ground) is one surface to the photon query, and which of the two a ray meets
+  is the traversal's choice (0.451.18, GAGEOM-COINCIDENT). An in-band
   face seen from behind on the plane decides nothing: a room built as one closed box is seen from
   inside everywhere. Counted as covered, every
   object standing on a surface ringed its base with a dark halo (0.75 of mode R within 5 cm of a

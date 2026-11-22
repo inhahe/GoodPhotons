@@ -230,7 +230,12 @@ inline double gatherFootprintArea(const Scene& sc, const Vec3& p, const Vec3& n,
             if (passed) {
                 if (opaque && !h.solid) ++crossed;
             } else if (h.t <= span && withinGatherBand(std::fabs(off), dot(dh, dh), std::fabs(c), slack)) {
-                if (c >= kGatherFacingCos) pend[crossed & 1] += cellArea / c;
+                // On the plane, to within rounding, either way up: a face lying on another facing apart
+                // (a room's floor on the ground) is one surface to the photon query, whose photons face
+                // their light whichever of the two they landed on, and which of the two a ray meets is
+                // the traversal's choice (GAGEOM-COINCIDENT). Off it the sign holds.
+                const double cf = std::fabs(off) <= 1e-7 * r ? std::fabs(c) : c;
+                if (cf >= kGatherFacingCos) pend[crossed & 1] += cellArea / cf;
             } else if (off > 0.0 && opaque && !h.solid) {
                 ++crossed;
             }

@@ -526,7 +526,11 @@ R 0.843 / 0.841 of mode R in mode J (GPU / CPU) and 0.852 / 0.865 in mode M -bea
 bin 12 is right at its centre there (SpecThr::atBinCentre); it is not in the check's scenes until this
 is fixed, and then is its test.
 
-## OPEN (2026-11-22): GAGEOM-COINCIDENT — `-gageom`'s march counts one of two coincident faces facing apart, by the traversal's choice
+## DONE (2026-11-22, 0.451.18): GAGEOM-COINCIDENT — `-gageom`'s march counted one of two coincident faces facing apart, by the traversal's choice
+
+**Fixed in 0.451.18, as proposed:** on the plane, within 1e-7 r, the march takes a face either way up;
+off it the signed test stands. check_gather_base's `litbox_closed` stands on the floor quad again and
+its -gageom pairs hold the probe's coverage, where 0.451.17 read 2.07 (M) and 2.01 (S).
 
 Found building check_gather_base's `litbox_closed` (0.451.17): a closed six-quad room whose floor face lies
 exactly on the scene's floor quad, the two facing apart, seen from inside. The probe ends on whichever of
@@ -535,7 +539,7 @@ where its normal agrees with the gather point's own face (`orient`, its signed t
 steps on by `eps`, past the coincident twin too, so a column counts or not by which of the two the
 traversal returned: the room's floor read 2.07 (M) and 2.01 (S) of the probe's coverage. The photon
 query keeps a photon on either face whose light-side normal agrees. The image itself z-fights there, so
-the check's room now has no floor quad under it (NO_FLOOR). **Proper fix:** on the plane (|off| within
+the check's room stood on no floor quad for a while (0.451.17). **Proper fix:** on the plane (|off| within
 rounding) take the face's facing as the probe does, either way up, as the photon query would; off the
 plane keep the signed test, which drops a closed solid's far face.
 

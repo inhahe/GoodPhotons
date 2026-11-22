@@ -294,8 +294,8 @@ Then the rest of 4.2-4.6 in their order, 4.7's bookkeeping alongside whatever to
   memory, so the next GPU render paged (~45x slower); it gives the device back as the render ends.
 - [x] **J-THIN-GAP-LEAK** (0.445.3) — J's and U's merges keep their own surface's photons over its
   share of the disc (the footprint): the gap's light stays off the plate, and object bases read true.
-- [ ] **GAGEOM-COINCIDENT** — `-gageom`'s march counts one of two coincident faces facing apart by the
-  traversal's choice; the proper fix is in the entry.
+- [x] **GAGEOM-COINCIDENT** (0.451.18) — `-gageom`'s march counted one of two coincident faces facing apart
+  by the traversal's choice: on the plane it takes either; known-issues.
 - [x] **REVIEW-0459** (0.451.17) — the Fable (xhigh) review of 0.451.11-0.451.16: the low leg decides a
   solid's side (a room the gather point lies in), capOk takes no piece's own faces, the sky pass's marks
   stop early; known-issues REVIEW-0459.
