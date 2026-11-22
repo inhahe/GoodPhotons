@@ -3,7 +3,7 @@ mode R's own sky through a fog that absorbs only, against its transmittance work
 
     python tools/check_sky_fog.py [--out png/check_sky_fog] [--exe ftrace.exe] [--no-gpu] [--spp 256] [--modes BAMP]
                                   [--fogs absorb,scatter,field_absorb,ground,expfog,far_expfog,haze,
-                                          sun_haze,ball_edge,sun_sky,clear]
+                                          sun_haze,ball_edge,sun_sky,clear,mirror_ball]
 
 A uniform sky (`light env { spd 1.0 }`) over a floor, seen through a fog. The floor is 10 m across, small
 enough that the forward modes' env photons, spread over the scene's bounding sphere, cross the fog often;
@@ -16,8 +16,9 @@ layer -- as it does under a sun alone (`sun_haze`), where those pixels hold the 
 against the sky (`ball_edge`, compared pixel by pixel too: mode P's still composite draws the sky its
 forward pixels' samples see past the ball's outline); and no fog at all, a sun
 in the frame over the sky (`sun_sky`: its disc, which the composite draws in its sky pass); and the
-clear sky alone (`clear`, mode P: drawn exactly, so two seeds' sky differ by one factor, the forward
-layer's fitted scale, and not pixel by pixel). (An unbounded
+clear sky alone (`clear`, mode P: drawn exactly, so two seeds' sky are the same, the forward layer's
+fitted scale no part of it); and a mirror ball against the sky (`mirror_ball`, mode P pixel by pixel:
+a pixel part of which shows the ball is its backward layer's, or the ball has a dark rim). (An unbounded
 medium that scatters is no case for the other modes: they light one only near the scene,
 warnHazeOnlyNearScene, where mode R lights all of it.)
 
@@ -90,8 +91,12 @@ SUN_IN_VIEW = "light sun { dir 0.1 0.33 1  angle 0.53  spd preset:d65 }"   # in 
 HAZE = "medium { sigma_t 0.04  albedo 0.5 }"
 # A ball of fog in the sky's rows, its outline crossing their pixels at every offset.
 BALL = "medium { sigma_t 0.5  albedo 0.0  g 0.0  bounds { center 0 1.68 0.83  radius 0.5 } }"
-PIXEL_FOGS = ("ball_edge",)   # also compared pixel by pixel: a one-pixel outline hides in a tile's mean
-EXACT_FOGS = ("clear",)       # a sky drawn exactly: each seed's the same but for one factor
+PIXEL_FOGS = ("ball_edge", "mirror_ball")   # also pixel by pixel: a one-pixel outline hides in a tile's mean
+EXACT_FOGS = ("clear",)       # a sky drawn exactly: each seed's the same
+# A mirror ball against the sky, mode P pixel by pixel: a forward pixel part of which shows it takes the
+# backward layer's (SkyView::specSeen), or the ball has a dark rim.
+MIRROR_BALL = NL.join(['material "chrome" { type mirror  reflect 0.9 }',
+                       "sphere { center 0 1.68 0.83  radius 0.5  material chrome }"])
 PIXEL_TOL = 0.25              # ...off by more than this (5 sigma of the noisiest pixel's two seeds)
 FOGS = [   # (name, the rig, the medium, the modes that take it, the light)
     ("absorb", "near", BOX % "0.0", "BAMP", ENV),
@@ -105,6 +110,7 @@ FOGS = [   # (name, the rig, the medium, the modes that take it, the light)
     ("ball_edge", "near", BALL, "BP", ENV),
     ("sun_sky", "near", "", "BP", ENV + NL + SUN_IN_VIEW),
     ("clear", "near", "", "P", ENV),
+    ("mirror_ball", "near", MIRROR_BALL, "P", ENV),
 ]
 MODES = [   # (tag, the camera's extra statement, the mode's arguments)
     ("B", "", ["-mode", "B", "-n", "4000000"]),
@@ -196,11 +202,11 @@ def main():
                                                  tile_stats(rr[0][..., c], rr[1][..., c]), TOL)
                     good &= not bad.any()
                     parts.append("%s worst x%.3g (%.1f sigma)" % (cname, ratio.flat[int(z.argmax())], z.max()))
-                if fog in EXACT_FOGS:   # the two seeds' sky, Y: one factor apart (mode P's fitted scale), no noise
+                if fog in EXACT_FOGS:   # the two seeds' sky, Y: the same (mode P's fitted scale no part of it)
                     q = bb[1][..., 1] / np.maximum(bb[0][..., 1], 1e-30)
-                    spread = float((q.max() - q.min()) / max(float(q.mean()), 1e-30))
-                    good &= spread < 1e-5
-                    parts.append("the seeds' ratio spread by %.2g" % spread)
+                    apart = float(np.abs(q - 1.0).max())
+                    good &= apart < 1e-5
+                    parts.append("the seeds' sky apart by %.2g" % apart)
                 if fog in PIXEL_FOGS:   # each pixel's Y
                     mb = 0.5 * (bb[0][..., 1] + bb[1][..., 1])
                     mr = 0.5 * (rr[0][..., 1] + rr[1][..., 1])

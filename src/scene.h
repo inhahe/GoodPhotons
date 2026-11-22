@@ -1062,8 +1062,8 @@ struct Medium {
     // An unbounded density field's far sphere (UNBOUNDED-FIELD-FAR, kFarTailSteps), about farC of radius
     // farR: the field is tracked inside it and coarse outside. It holds everything the scene holds -- its
     // geometry and bounded media, its movers' sweep and the discs a sky or sun photon starts on, its
-    // spots and collimated lights (Scene::build), the cameras a run renders (Scene::coverFar) -- so a
-    // segment between two of them is tracked whole.
+    // spots and collimated lights (Scene::build), every camera (Scene::farCover) -- so a segment between
+    // two of them is tracked whole.
     // farR 0: none (a bounded medium, or a homogeneous one, whose infinite extent is analytic).
     Vec3 farC{0, 0, 0};
     double farR = 0.0;
@@ -3071,10 +3071,13 @@ struct Scene {
     // The radius of the sphere about sceneCenter that holds the swept one: what the sky's and the
     // suns' entry discs reach to for a path with a time (lightRadius).
     double sweptReach = 0.0;
-    // Points an unbounded density field's far sphere must hold besides what build() bounds itself: the
-    // eyes of the cameras a run renders (coverFar; Medium::farR), kept for a build() that comes after.
+    // Points an unbounded density field's far sphere must hold besides what build() bounds itself: every
+    // authored camera's eye and motion keys, which the loader sets before build() (Medium::farR), and a
+    // camera added after it (coverFar). Every one, rendered this run or not, so a frame's field is the
+    // same whichever frames share its run -- and an exposure lock's meter or mode J's probe cameras,
+    // which render through others, are held too.
     std::vector<Vec3> farCover;
-    // Widen the far spheres to hold p, a camera's eye (before the media reach the device).
+    // Widen the far spheres to hold p, a camera added after build() (before the media reach the device).
     void coverFar(const Vec3& p) {
         farCover.push_back(p);
         for (Medium& md : media)

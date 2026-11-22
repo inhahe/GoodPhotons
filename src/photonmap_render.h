@@ -568,8 +568,8 @@ struct SpecThr {
     }
     // The carrier as the beam gather reads it (JSpec, beamgather.h: mode J's carrier, read between
     // bin centres), the ratio over its peak and the peak in logS, so neither leaves a float: on
-    // JSpec's uniform bins, each the cell its centre falls in (the bin itself where it is not split).
-    // False, and `js` untouched, while nothing chromatic was folded: the gather then takes no carrier.
+    // JSpec's uniform bins, each at its centre (atBinCentre). False, and `js` untouched, while nothing
+    // chromatic was folded: the gather then takes no carrier.
     bool toJSpec(JSpec& js) const {
         static_assert(JSpec::K == kBandProbeBins, "the beam gather's carrier is on the uniform bins");
         if (!any) return false;
@@ -578,11 +578,22 @@ struct SpecThr {
         js.any = true;
         js.disp = false; js.lamC = 0.0f; js.invPdfC = 0.0f;
         js.logS = std::log(pk);
-        for (int k = 0; k < JSpec::K; ++k) {
-            const int c = cells->cellOf(bandBinLambda(k));
-            js.r[k] = live ? (float)(v[c] / cam * pscale / pk) : 0.0f;
-        }
+        for (int k = 0; k < JSpec::K; ++k)
+            js.r[k] = live ? (float)(atBinCentre(k) / cam * pscale / pk) : 0.0f;
         return true;
+    }
+    // The product at uniform bin k's centre. A split bin's is the cell's its centre falls in (a split
+    // marks a step or a bend). An unsplit bin is read where the light in it lies (SpecCells::setMass), and
+    // across it the factors are near linear, or it would be split: its centre's value is on the line
+    // through its read and its neighbour's on the centre's side -- between the two, so under the peak.
+    double atBinCentre(int k) const {
+        const double lk = bandBinLambda(k);
+        const int c = cells->cellOf(lk);
+        if (cells->count[k] != 1) return v[c];
+        const double lc = cells->lam[c];
+        const int o = lk < lc ? c - 1 : c + 1;
+        if (o < 0 || o >= n || !(std::fabs(cells->lam[o] - lc) > 0.0)) return v[c];
+        return std::max(0.0, v[c] + (v[o] - v[c]) * (lk - lc) / (cells->lam[o] - lc));
     }
 };
 

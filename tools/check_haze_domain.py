@@ -17,7 +17,8 @@ held by a shutter at x = 6.4 outside the instant's sphere, and 2.75 % at x = 32.
 beams end there, and the MIS weights must leave the merges out past it, the connections rendering
 the haze alone. A weight that still counted them read dark by their share (J-BEAM-FARLIMIT).
 
-Each case renders mode R and the mode under test, two seeds each (mode J in `farfield` six), and requires the ball's mean and
+Each case renders mode R and the mode under test, two seeds each (mode J in `farfield` eight, and its
+bound, about 2.7 %, the seeds' own: NOISY), and requires the ball's mean and
 the haze's (the top corners) to agree within 0.6 % (D) or 1.5 % (J, whose beam merges are
 noisier), or within four of their standard errors from the seeds' spread, whichever is wider.
 
@@ -43,10 +44,11 @@ REF_OF = {"stilldom": "still"}
 # while every case's noise is under the tolerance, which then decides. A case noisier than that
 # needs more seeds and a bound to match (six and 5: P(|t5| > 5) = 0.4 % a region).
 SEEDS, Q = 2, 4.0
-# Such a case: mode J in the blurred density field, each seed's own -jbeams auto knee and beam map,
-# whose haze reads +-1.5 % from seed to seed (seeds 1 and 2 of 0.451.13 agreed to 0.2 % and read
-# 0.983, seeds 3 and 4 1.026 and 0.994): six seeds and Q 5.
-NOISY = {"farfield_J": (6, 5.0)}
+# Such a case: mode J in the blurred density field, whose haze reads +-1.7 % a seed at its 256 samples
+# whatever the beam count (seeds 1-4 at a fixed 7500 beams: 0.986-1.022; seeds 1 and 2 of 0.451.13 at
+# -jbeams auto agreed to 0.2 % and read 0.983): eight seeds and Q 4.5 (P(|t7| > 4.5) = 0.3 %), which
+# hold it to about 2.7 % -- the 1.5 % the other mode J cases are held to would take some twenty.
+NOISY = {"farfield_J": (8, 4.5)}
 
 
 def scene(still, keys=8.0, at=6.4, medium="medium { sigma_t 0.04  albedo 0.5 }", extra="",

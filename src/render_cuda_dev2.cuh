@@ -376,18 +376,6 @@ __device__ static void dSunNeeMarch(const DScene& sc, const DVec3& oc, const DVe
 // wavelength, and that scalar then multiplied a photon sum spanning all of them. Exact for a flat
 // spectrum, wrong in either direction otherwise -- measured against mode D on one Cornell glossy
 // sphere: JH white 0.880x, JH red 1.142x, both ~1.00 after the fix.
-// The emission sampler's CDF at `lam` (host twin EmissionSampler::cdfAt): the probability that a
-// wavelength drawn by dSampleSceneLambda falls below it.
-__device__ static double dEmitCdfAt(const DScene& sc, double lam) {
-    const int n = sc.emitSamplerN;
-    if (n <= 0 || !sc.emitSamplerCdf) return 0.0;
-    const double t = (lam - DLMIN) / sc.emitSamplerStep;
-    if (!(t > 0.0)) return 0.0;
-    if (t >= (double)n) return 1.0;
-    const int b = (int)t;
-    return sc.emitSamplerCdf[b] + (t - b) * (sc.emitSamplerCdf[b + 1] - sc.emitSamplerCdf[b]);
-}
-
 // The scene's carrier cells (host twin SpecCells: its cells' ends, wavelengths and walk masses, and each
 // uniform bin's first cell and count; DScene::specCells).
 struct DSpecCells {
@@ -448,7 +436,7 @@ struct DSpecThr {
             v[k] *= vk[k];
             if (support && !(vk[k] > 0.0)) { p[k] = 0.0f; zero = true; }
         }
-        if (zero) { partial = 1; rescale(sc); }
+        if (zero) { partial = 1; rescale(); }
     }
     // Fold in one spectral factor, f(lambda), at every bin (host twin SpecThr::mul, where the
     // reasoning lives), with `atCam` its value at the camera's wavelength -- passed in rather than
@@ -465,7 +453,7 @@ struct DSpecThr {
             if (!(fk > 0.0)) { p[k] = 0.0f; zero = true; }
         }
         if (!flat) any = 1;
-        if (zero) { partial = 1; rescale(sc); }     // a weight zero in some bins: a support hole
+        if (zero) { partial = 1; rescale(); }     // a weight zero in some bins: a support hole
     }
     // Fold in a coin (host twin SpecThr::mulCoin): f(L, prob) the branch's factor at L, its
     // probability alone in `prob`; the same at the walk's wavelength passed in. Without
@@ -499,18 +487,13 @@ struct DSpecThr {
         // The branches impossible, or as good as, somewhere (kCoinRare, spectrum.h, where the why is).
         if (!(pLo > kCoinRare * pHi)) partial = 1;
         if (!flat || fabs(factorAtCam - a) > 1e-12 * (1.0 + fabs(a))) any = 1;
-        if (partial) rescale(sc);
+        if (partial) rescale();
     }
-    // pscale = pcam / sum_k Q_k p[k], Q_k the emission sampler's mass in cell k (host twin SpecThr::rescale):
-    // the host's masses where the scene splits a bin, the bins' own from the sampler's CDF where not.
-    __device__ void rescale(const DScene& sc) {
+    // pscale = pcam / sum_k Q_k p[k], Q_k the emission sampler's mass in cell k, the host's (host twin
+    // SpecThr::rescale).
+    __device__ void rescale() {
         double D = 0.0;
-        for (int k = 0; k < n; ++k) {
-            if (cells) { D += cells->mass[k] * (double)p[k]; continue; }
-            const double lo = DLMIN + k * (DLMAX - DLMIN) / (double)kBandProbeBins;
-            const double hi = DLMIN + (k + 1) * (DLMAX - DLMIN) / (double)kBandProbeBins;
-            D += (dEmitCdfAt(sc, hi) - dEmitCdfAt(sc, lo)) * (double)p[k];
-        }
+        for (int k = 0; k < n; ++k) D += cells->mass[k] * (double)p[k];
         pscale = (D > 0.0) ? pcam / D : 1.0;
     }
     __device__ double ratio(Real lamP) const { return ratioAt(binOf(lamP)); }
@@ -527,19 +510,27 @@ struct DSpecThr {
         for (int k = 0; k < n; ++k) m = fmax(m, v[k] / cam * pscale);
         return (m > 0.0) ? m : 1.0;
     }
-    // The carrier as the beam gather reads it (host twin SpecThr::toJSpec): on its uniform bins, each
-    // the cell its centre falls in. False, and `js` untouched, while nothing chromatic was folded.
+    // The carrier as the beam gather reads it (host twin SpecThr::toJSpec): on its uniform bins, each at
+    // its centre (atBinCentre). False, and `js` untouched, while nothing chromatic was folded.
     __device__ bool toJSpec(DJSpec& js) const {
         if (!any) return false;
         const double pk = peak();
         const bool live = cam > 1e-300;
         js.any = 1; js.disp = 0; js.lamC = 0.0f; js.invPdfC = 0.0f;
         js.logS = log(pk);
-        for (int k = 0; k < DJSPEC_K; ++k) {
-            const int c = binOf((Real)DJSpec::lamOf(k));
-            js.r[k] = live ? (float)(v[c] / cam * pscale / pk) : 0.0f;
-        }
+        for (int k = 0; k < DJSPEC_K; ++k)
+            js.r[k] = live ? (float)(atBinCentre(k) / cam * pscale / pk) : 0.0f;
         return true;
+    }
+    // The product at uniform bin k's centre (host twin SpecThr::atBinCentre, where the why is).
+    __device__ double atBinCentre(int k) const {
+        const double lk = (double)DJSpec::lamOf(k);
+        const int c = binOf((Real)lk);
+        if (cells->count[k] != 1) return v[c];
+        const double lc = cells->lam[c];
+        const int o = lk < lc ? c - 1 : c + 1;
+        if (o < 0 || o >= n || !(fabs(cells->lam[o] - lc) > 0.0)) return v[c];
+        return fmax(0.0, v[c] + (v[o] - v[c]) * (lk - lc) / (cells->lam[o] - lc));
     }
 };
 static_assert(kBandProbeBins == DJSPEC_K, "the beam gather's carrier is on the uniform bins");

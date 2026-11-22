@@ -1462,6 +1462,14 @@ public:
         // emission patterns (build() derives the probe's reach).
         markCavityReaders(L);
         const bool cavityDerived = L.scene.cavityRadius <= 0.0;   // build() derives it if needed
+        // Every authored camera's eye, a flyby's every frame and a camera's motion keys, for an unbounded
+        // density field's far sphere: the same field for every frame of every run, whichever renders.
+        L.scene.farCover.clear();
+        for (const CamSpec& c : L.cameras) {
+            L.scene.farCover.push_back(c.eye);
+            if (c.motion)
+                for (const CameraPose& k : c.motion->keys) L.scene.farCover.push_back(k.eye);
+        }
         if (L.beforeBvh) L.beforeBvh(L);
         { detail::AccelTimer _ct; L.scene.build(); }
         // build() demotes a fire that emits nothing to the smoke it is made of

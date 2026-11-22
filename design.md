@@ -3814,13 +3814,21 @@ was lit differently by every mode (known-issues GLOW-LIGHT-MODES). Now:
   is the forward layer's and in the fit (DIFF: the forward photons hold the medium's glow) -- unless the
   medium is an unbounded one a sun or the sky lights, whose pixels are the backward layer's (SPEC,
   `skyLitHaze`: the forward layer lights such a haze only near the scene). The pass draws the forward
-  pixels' sky, in the DIFF and SKY pixels alone (`prepareSky`'s `skip`, `CompositeClass::skyless`):
-  through a filter, and what their samples see directly, at a silhouette or past a fog's bounds
-  (0.451.11; before, a glows-only form left that out, a dark outline around a fog ball). A pixel a
-  sample of which saw a sun's disc (`SkyView::sunSeen`) is left out of the fit, which its disc, ten
-  thousand times a lit surface and a coverage noise in the backward layer, would steer. (0.451.11 took
-  the sky pixels from the backward layer, which put its colour noise in a sky the pass draws exactly,
-  and a caustic's fringe at a silhouette against a black sky; 0.451.13 put them back.) Mode P's blurred
+  pixels' sky, in the DIFF and SKY pixels alone (`prepareSky` handed the classes): through a filter,
+  and what their samples see directly, at a silhouette or past a fog's bounds (0.451.11; before, a
+  glows-only form left that out, a dark outline around a fog ball). Its sums are radiance, which the
+  forward layer's fitted scale is no part of: a forward pixel is its photons over that scale plus
+  them (`forwardRadiance`), and the fit takes the photons against the backward layer less them
+  (`forwardScale`), so the sky does not wobble with the fit. A forward pixel a sample of which meets
+  what the forward layer cannot show -- a specular-type surface first, a region that bends rays
+  (`SkyView::specSeen`; the pass runs for those marks where there is no sky to draw) -- is the backward
+  layer's at the composite, out of the fit: the edge of a glass ball or a mirror against the sky, or
+  against a diffuse floor, has no dark rim. The fit also leaves out a pixel whose footprint a sun's disc
+  comes near (`CompositeClass::fit`: the disc's cone against the pixel's corners), ten thousand times a
+  lit surface, which the backward layer's coverage noise would steer, or bias where the pass's points
+  miss a sliver its samples catch. (0.451.11 took the sky pixels from the backward layer, which put its
+  colour noise in a sky the pass draws exactly, and a caustic's fringe at a silhouette against a black
+  sky; 0.451.13 put them back; 0.451.15 gave the specular silhouettes and the scale their due.) Mode P's blurred
   split walks only from a first surface of no specular type -- a mix's or a stack's, whose samples its
   camera side leaves to it -- and draws the sky and sun behind it (`splitSeesSkyThrough`). Mode C, which catches photons through
   its pupil, does not see one. The camera's wavelength density includes the glows' emission
@@ -9525,10 +9533,13 @@ as the one at fault.
     line inside it `Medium::farSplit`, device `dMedFarSplit`, on `sphereChord`): `kFarFieldScale` (8)
     scene radii about the scene's centre, widened by `Scene::build` to hold the movers' sweep, the
     entry discs a sky or sun photon starts on (sqrt 2 times `sweptReach`, and the rim of BDPT's sun disc),
-    a spot's point and a collimated light's quad, and by `Scene::coverFar` the eyes of the cameras the
-    run renders and their motion keys (main, after the selection; kept in `Scene::farCover` for a later
-    build) -- not every authored one, as a camera a kilometre off would make every escaping ray track the
-    field that far -- so a segment between two things in the scene is tracked whole. Outside it the field is **coarse**
+    a spot's point and a collimated light's quad, and every authored camera's eye and motion keys
+    (`Scene::farCover`, the loader's; `Scene::coverFar`, a `-view` one) -- every one, rendered this run
+    or not, so a frame's field is the same whichever frames share its run, and an exposure lock's meter
+    and mode J's probe cameras, which render through others, are held (0.451.13 took the run's own
+    alone, 0.451.15 put them all back; a camera a kilometre off makes every escaping ray track the field
+    exactly that far, the cost of the rule) -- so a segment between two things in the scene is tracked
+    whole. Outside it the field is **coarse**
     (`kFarTailSteps`): the shells `R 2^i <= r < R 2^(i+1)` about the centre (24 of them, empty past the
     last) cut a segment's outside part into pieces, one each side of the line's closest approach to
     the centre (`farPieces`, `dFarPieces`), and over each piece the field is constant, at its value at

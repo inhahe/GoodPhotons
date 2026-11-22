@@ -17393,9 +17393,10 @@ __device__ static double bkNeeLight(const DScene& sc, const DHit& h, Real rho,
 // emitter's spectrum, the shadow leg's media transmittance (one shared walk) and the walk's own
 // throughput (`thrRatio`, DSpecThr's ratio per bin). Accumulates straight into XYZ.
 //
-// `dLam[i]` is wavelength i's quadrature weight, its cell's width: the term stops being one MC sample
-// over lambda and becomes a K-cell sum of the same integral, which is where the colour noise goes. The
-// MIS weight is a ratio of DENSITIES, which are geometric, so it is taken once at `lambdaCam` and shared.
+// The emitter's spectrum enters as its integral over each cell (DScene::emitCellE, Emitter::cellEmit), the
+// rest at the cell's wavelength `lam[i]`: the term stops being one MC sample over lambda and becomes a
+// K-cell sum of the same integral, which is where the colour noise goes. The MIS weight is a ratio of
+// DENSITIES, which are geometric, so it is taken once at `lambdaCam` and shared.
 __device__ static void bkNeeLightSpecGlossy(const DScene& sc, const DHit& h, const DNeeBsdf& nb,
                                             const Real* lam, const double* thrRatio, int K,
                                             Real lambdaCam, double thrScalar,

@@ -519,6 +519,43 @@ scene's cells too (its `r[]` sized `kSpecCellsMax`, read by cell rather than int
 its support's `hole` mask per cell) -- which grows the per-segment and per-vertex carrier
 JSPEC-CARRIER-SIZE measures (120 B to about 190 B), so it goes with that entry's half-precision bins.
 
+## DONE (2026-11-22, 0.451.15): REVIEW-0457 — what the Opus (max) review of 0.451.12-0.451.13 found
+
+Opus (max) reviewed 9180d29..06e33ab (0.451.12 SPECGATHER-CELL-CENTROID, 0.451.13 REVIEW-0456's
+follow-up). Each finding was checked against the code.
+
+* **Mode P's forward pixels at a specular silhouette had a dark rim**: a SKY pixel (its centre on the
+  sky) part of which shows a mirror, glass or metal drew that part black, as neither the forward photons
+  nor the sky pass shows it -- and so did a DIFF pixel at a diffuse/specular edge, since mode P began.
+  The sky pass, which traces every sample, now marks a pixel a sample of which meets a specular-type
+  surface first or a region that bends rays (`SkyView::specSeen`; it runs for the marks where there is
+  no sky to draw), and the composite takes such a pixel from the backward layer, out of the fit.
+  check_sky_fog's `mirror_ball` (mode P pixel by pixel): its rim pixels read down to 0.60 of mode R on
+  0.451.14, within 25 % now.
+* **The sky was divided by the fitted scale** (mode P), so it flickered with the fit: the sky pass's sums
+  are radiance, never scaled (`forwardRadiance`), and the fit takes the photons against the backward layer
+  less them (`forwardScale`). check_sky_fog's `clear`: two seeds' sky the same, where 0.451.13 and 0.451.14
+  had them one factor (the scale's noise, 0.1-0.5 %) apart.
+* **A sun's disc between the sky pass's points steered the fit**: the pixels left out are now those whose
+  footprint the disc's cone comes near (`CompositeClass::fit`), not those a point happened to hit; and the
+  residual diagnostic leaves them out with the fit.
+* **The far sphere held only the cameras a run renders** (0.451.13): an exposure lock's meter and mode J's
+  probe cameras render through others, and a frame's field depended on which frames shared its run. It
+  holds every authored camera and its motion keys again, the cost of a far camera accepted.
+* **The beam gather's carrier was shifted under a narrow light** (0.451.12): `toJSpec` put a cell read at
+  the light's centroid on its bin's centre node. An unsplit bin's centre now takes the line through its
+  read and its neighbour's (`SpecThr::atBinCentre`, device twin): JSpec::at interpolates between those
+  centres, so at the line the old carrier read a linear ramp 11 % low, the new 2 %. No check of its own: a
+  case built for it (a 596.6 nm line lighting a fog behind a 550-650 nm ramp, mode M -beams) moved 0.4 %
+  with it, the beam gather's carrier a small part of that image.
+* **check_haze_domain's farfield mode J bound was ~4 %**, not the 1.5 % its docstring said: its haze reads
+  +-1.7 % a seed at 256 samples whatever the beam count (a fixed 7500 beams: 0.986-1.022), so 1.5 % would
+  take some twenty seeds. Eight seeds and 4.5 standard errors, about 2.7 %, and the docstring says so.
+* Smaller: the device's DSpecThr::rescale kept a null-cells branch and dEmitCdfAt, dead since the cells are
+  always uploaded; bkNeeLightSpecGlossy's comment still described the width-weighted quadrature;
+  CompositeClass::skyless duplicated `cls == SPEC` (prepareSky takes the classes); the sky pass walked the
+  emitters for a sun twice a sample (gone with the geometric test).
+
 ## DONE (2026-11-21, 0.451.13): REVIEW-0456 — what the Opus (max) review of 0.451.11 found
 
 0.451.11 grew past a follow-up -- a new far-field model, a device walk, a composite redone -- so it had a

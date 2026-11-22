@@ -1061,8 +1061,10 @@ that converges to the same physical image.
   megakernel) when the scene is within the backward-GPU scope; otherwise the
   camera-side layer falls back to the CPU. The sky, and a sun's disc, that a pixel
   sees directly are drawn exactly, as mode `B` draws them, and through a fog with
-  `bounds` the forward layer's photons hold the fog's glow (since 0.451.13; before
-  0.451.11 a still `P` drew no sun's disc and a dark rim around such a fog).
+  `bounds` the forward layer's photons hold the fog's glow; a pixel part of which
+  shows a mirror, glass or a metal takes the camera-side layer's, so such an object
+  has no dark rim against the sky or a wall (since 0.451.15; before 0.451.11 a still
+  `P` drew no sun's disc and a dark rim around a fog with bounds).
   *Cost:* more expensive than plain `B`;
   there can be a subtle seam between the two layers. With a **physical lens** the
   pinhole-splat forward pass can't form the lens image, so `P` automatically routes
@@ -5465,7 +5467,7 @@ unbiased **delta (Woodcock) tracking** for scattering and **ratio tracking** for
 transmittance — exact, no voxelization. A majorant `density_max` is auto-estimated over
 `bounds` (or set explicitly). A `density` field with **no `bounds`** is tracked exactly within a
 sphere about the scene's centre that holds everything in the scene -- eight times its radius at
-least, every camera the run renders, and every point, spot or collimated light -- so the fog between
+least, every camera the scene has, and every point, spot or collimated light -- so the fog between
 any two things in the scene
 is exact. Outside that sphere the field is crossed coarsely: one sample of it on each stretch a ray
 spends in one of a series of shells about the centre, each twice as far out as the last, out to about
