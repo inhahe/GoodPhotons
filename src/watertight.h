@@ -186,11 +186,13 @@ inline bool nearFace(const Tri& t, const Vec3& x, double h) {
 // One loop of a piece's rim as capOk asks it, in the piece's own space: its centroid `c`, the unit
 // normal of its area vector (Newell's), `pts` the points a face other than the piece's must cover --
 // the centroid and a tenth of the way in from a dozen of the loop's corners at most, on its fan -- and
-// `rim` the points a hundredth of the way in from its corners (every one, up to 96), where the loop must
-// touch one, neither any lying on the piece itself (a hat's brim on the table asks nothing); `reach` the farthest corner
+// `rim` the points a hundredth of the way in from its corners (every one up to 96, else 96 of them spread
+// evenly), where the loop must touch one, neither any lying on the piece itself (a hat's brim on the
+// table asks nothing); `reach` the farthest corner
 // from the centroid, `slack` twice the loop's spread off its mean plane (0 for a planar one), how far a
 // covering face may stray from a point along the normal beyond a planar loop's allowance.
-struct CapLoop { Vec3 c{0, 0, 0}, nrm{0, 0, 0}; std::vector<Vec3> pts, rim; double reach = 0.0, slack = 0.0; };
+// `farthest` the corner farthest from the centroid, whose image measures the reach where the loop is placed.
+struct CapLoop { Vec3 c{0, 0, 0}, nrm{0, 0, 0}, farthest{0, 0, 0}; std::vector<Vec3> pts, rim; double reach = 0.0, slack = 0.0; };
 // A piece's faces (indices into the call's triangles) and a tree over their boxes, leaf k for faces[k]:
 // whether a point lies on the piece.
 struct OwnFaces {
@@ -416,21 +418,26 @@ inline size_t markSolidFaces(Tri* const* tris, size_t n, std::vector<PieceBox>* 
                     if (next == SIZE_MAX) { broken = true; break; }
                     q = next;
                 }
+                // At a pinch the walk may have run on into the other loop: a vertex it starts twice
+                // closes a loop between the two, split off until none repeats.
+                for (bool split = true; split && !broken;) {
+                    split = false;
+                    std::unordered_map<int, size_t> seenAt;
+                    for (size_t k = 0; k < le.size(); ++k) {
+                        const auto ins = seenAt.emplace(rimEdges[le[k]].a, k);
+                        if (ins.second) continue;
+                        loopEdges.emplace_back(le.begin() + (std::ptrdiff_t)ins.first->second, le.begin() + (std::ptrdiff_t)k);
+                        le.erase(le.begin() + (std::ptrdiff_t)ins.first->second, le.begin() + (std::ptrdiff_t)k);
+                        split = true;
+                        break;
+                    }
+                }
                 loopEdges.push_back(std::move(le));
             }
             if (broken || loopEdges.empty()) continue;
-            // Each loop's centroid, normal, spread and points (CapLoop).
-            OwnFaces own;
-            own.faces = cd.faces;
-            {
-                std::vector<Aabb> fb(cd.faces.size());
-                for (size_t k = 0; k < cd.faces.size(); ++k) {
-                    const Tri& t = *tris[cd.faces[k]];
-                    fb[k].expand(t.v0); fb[k].expand(t.v1); fb[k].expand(t.v2);
-                }
-                own.tree.build(fb, 1);
-            }
+            // Each loop's centroid, normal, spread and farthest corner (CapLoop).
             std::vector<CapLoop> loops;
+            std::vector<std::vector<Vec3>> corners;
             bool degenerate = false;
             for (const std::vector<size_t>& le : loopEdges) {
                 CapLoop L;
@@ -445,32 +452,17 @@ inline size_t markSolidFaces(Tri* const* tris, size_t n, std::vector<PieceBox>* 
                 double spread = 0.0;                    // the loop's farthest corner off its mean plane
                 for (const Vec3& p : corner) {
                     spread = std::max(spread, std::fabs(dot(p - L.c, L.nrm)));
-                    L.reach = std::max(L.reach, length(p - L.c));
+                    const double d = length(p - L.c);
+                    if (d > L.reach) { L.reach = d; L.farthest = p; }
                 }
                 L.slack = spread <= 1e-6 * pd ? 0.0 : 2.0 * spread;   // planar, to within rounding: none
-                // On the piece itself, to within rounding: a point it covers itself, which asks nothing.
-                const double onR = 1e-6 * L.reach;
-                if (!own.onPiece(triAt, L.c, onR)) L.pts.push_back(L.c);
-                // Covering points at a dozen corners at most; touching points at every corner up to
-                // kTouchAll, beyond them at an odd stride -- an even one aliases a base notched corner by
-                // corner, every point then on a corner that stands on the floor.
-                const size_t step = std::max<size_t>(1, corner.size() / 12);
-                for (size_t i = 0; i < corner.size(); i += step) {
-                    const Vec3 in10 = corner[i] + (L.c - corner[i]) * 0.1;
-                    if (!own.onPiece(triAt, in10, onR)) L.pts.push_back(in10);
-                }
-                constexpr size_t kTouchAll = 96;
-                const size_t tstep = corner.size() <= kTouchAll ? 1 : ((corner.size() / kTouchAll) | 1);
-                for (size_t i = 0; i < corner.size(); i += tstep) {
-                    const Vec3 in1 = corner[i] + (L.c - corner[i]) * 0.01;
-                    if (!own.onPiece(triAt, in1, onR)) L.rim.push_back(in1);
-                }
                 loops.push_back(std::move(L));
+                corners.push_back(std::move(corner));
             }
             if (degenerate) continue;
             // Its volume about the first loop's centroid, that loop's fan's tetrahedra nothing there, the
             // others' added: a fan triangle (c_j, b, a) runs its rim edge against the face that runs it a -> b.
-            // A flat piece (a card, the floor, a light's quad) closes nothing, and asks capOk nothing.
+            // A flat piece (a card, the floor, a light's quad) closes nothing, and asks for no more.
             const Vec3 o = loops[0].c;
             for (size_t i : cd.faces) {
                 const Vec3 a = tris[i]->v0 - o, b = tris[i]->v1 - o, d = tris[i]->v2 - o;
@@ -480,12 +472,44 @@ inline size_t markSolidFaces(Tri* const* tris, size_t n, std::vector<PieceBox>* 
                 for (size_t q : loopEdges[j])
                     cd.vol += dot(loops[j].c - o, cross(at[rimEdges[q].b] - o, at[rimEdges[q].a] - o));
             if (std::fabs(cd.vol) <= 1e-9 * pd * pd * pd) continue;
+            if (capCands && (int)capCands->size() >= kCapCandsMax) continue;   // past an asset's mask
+            // The tree over its faces, and each loop's points, none on the piece itself.
+            OwnFaces own;
+            own.faces = cd.faces;
+            {
+                std::vector<Aabb> fb(cd.faces.size());
+                for (size_t k = 0; k < cd.faces.size(); ++k) {
+                    const Tri& t = *tris[cd.faces[k]];
+                    fb[k].expand(t.v0); fb[k].expand(t.v1); fb[k].expand(t.v2);
+                }
+                own.tree.build(fb, 1);
+            }
+            for (size_t j = 0; j < loops.size(); ++j) {
+                CapLoop& L = loops[j];
+                const std::vector<Vec3>& corner = corners[j];
+                // On the piece itself, to within rounding: a point it covers itself, which asks nothing.
+                const double onR = 1e-6 * L.reach;
+                if (!own.onPiece(triAt, L.c, onR)) L.pts.push_back(L.c);
+                // Covering points at a dozen corners at most.
+                const size_t step = std::max<size_t>(1, corner.size() / 12);
+                for (size_t i = 0; i < corner.size(); i += step) {
+                    const Vec3 in10 = corner[i] + (L.c - corner[i]) * 0.1;
+                    if (!own.onPiece(triAt, in10, onR)) L.pts.push_back(in10);
+                }
+                // Every corner up to kTouchAll, else kTouchAll of them spread evenly: a whole stride aliases
+                // a base notched with a period it shares, every sample on a corner that stands.
+                constexpr size_t kTouchAll = 96;
+                const size_t nt = std::min(corner.size(), kTouchAll);
+                for (size_t t = 0; t < nt; ++t) {
+                    const size_t i = corner.size() <= kTouchAll ? t : (t * corner.size()) / kTouchAll;
+                    const Vec3 in1 = corner[i] + (L.c - corner[i]) * 0.01;
+                    if (!own.onPiece(triAt, in1, onR)) L.rim.push_back(in1);
+                }
+            }
             // An asset's: handed back for its instances to ask.
             if (capCands) {
-                if ((int)capCands->size() < kCapCandsMax) {
-                    cd.place = (int)capCands->size();
-                    capCands->push_back(CapCand{std::move(loops), std::move(own)});
-                }
+                cd.place = (int)capCands->size();
+                capCands->push_back(CapCand{std::move(loops), std::move(own)});
                 continue;
             }
             // The piece's own faces cover nothing: what it rests on is something else.

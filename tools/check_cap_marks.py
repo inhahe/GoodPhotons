@@ -38,7 +38,12 @@ exactly its count -- the marking pass's alone, with no noise:
     floor: its top loop rests on nothing, so none (0.451.21 closed both loops by one fan, all 32);
   - `notched`: a bottomless box whose walls' bottom edges zigzag, every other corner 1 cm off the floor,
     72 triangles: its rim does not touch the floor between the corners it stands on, so none (0.451.21
-    asked only points inside the rim, the floor within their window, all 72).
+    asked only points inside the rim, the floor within their window, all 72);
+  - `tube`: a tube of 32 triangles, open at both ends, standing on the floor with a quad laid on its top
+    -- both its loops rest, its volume with the second loop's fan added, so all 32;
+  - `uneven_asset`: `uneven`'s box as a `mesh_asset`, placed by an instance that stretches it 4 high on a
+    V-ground four times as steep -- its rim's spread four times its own, which the window must take along
+    the normal's image, not by the instance's mean scale (4^(1/3)) -- capped, one asset piece.
 
 Exits 1 on any mismatch.
 """
@@ -212,10 +217,17 @@ def scene(kind, out):
                'mesh_instance { of "box"  translate 0.6 0.05 0 }',
                'mesh_instance { of "box"  translate -0.6 0 0  scale 1.5 }',
                'mesh_instance { of "box"  translate 0 0 0.6  scale 2 0.5 1 }']
-    if kind in ("shade", "notched"):
+    if kind in ("shade", "notched", "tube"):
         obj = os.path.join(out, kind + ".obj")
-        (shade_obj if kind == "shade" else notched_obj)(obj)
+        {"shade": shade_obj, "notched": notched_obj, "tube": lambda pth: shade_obj(pth, r1=0.12, h=0.05)}[kind](obj)
         geo = ['mesh "%s" { file "%s"  material obj }' % (kind, kind + ".obj")]
+    if kind == "tube":   # the quad laid on its top
+        geo.append(g.quad((-0.2, 0.05, -0.2), (0, 0, 0.4), (0.4, 0, 0), "floor"))
+    if kind == "uneven_asset":
+        uneven_obj(os.path.join(out, "uneven.obj"))
+        geo = ['mesh_asset "v" { file "uneven.obj"  material obj }', 'mesh_instance { of "v"  scale 1 4 1 }',
+               g.quad((-1, 4 * K, -1), (0, 0, 2), (1, -4 * K, 0), "floor"),
+               g.quad((0, 0, -1), (0, 0, 2), (1, 4 * K, 0), "floor")]
     if kind == "uneven":   # the V-ground it stands on, two quads meeting along x = 0
         geo += [g.quad((-1, K, -1), (0, 0, 2), (1, -K, 0), "floor"), g.quad((0, 0, -1), (0, 0, 2), (1, K, 0), "floor")]
     moves = kind in ("moving", "lowered")
@@ -232,9 +244,9 @@ def scene(kind, out):
 
 
 CASES = {"resting": 10, "lamp": 10, "moving": 10, "lowered": 10, "lifted": 0, "closed": 12, "sheet": 0, "pit": 0,
-         "uneven": 16, "hat": 18, "asset": 0, "shade": 0, "notched": 0}
+         "uneven": 16, "hat": 18, "asset": 0, "shade": 0, "notched": 0, "tube": 32, "uneven_asset": 0}
 # The asset pieces capped under an instance (the line's `and N asset pieces`), where not none.
-INST = {"asset": 3}
+INST = {"asset": 3, "uneven_asset": 1}
 INST_LINE = re.compile(r"and (\d+) asset pieces")
 
 

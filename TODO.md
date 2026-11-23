@@ -296,6 +296,10 @@ Then the rest of 4.2-4.6 in their order, 4.7's bookkeeping alongside whatever to
   share of the disc (the footprint): the gap's light stays off the plate, and object bases read true.
 - [x] **GAGEOM-COINCIDENT** (0.451.18) — `-gageom`'s march counted one of two coincident faces facing apart
   by the traversal's choice: on the plane it takes either; known-issues.
+- [ ] **CAP-TOUCH-ROOM** — two capped boxes touching inside a room lower than the radius read the floor under
+  the second covered: walkSegment must see both faces of a coincident pair (hit identity); known-issues.
+- [x] **REVIEW-0462** (0.451.23) — the Opus (xhigh) review of 0.451.22: the depth rule (leg net/low, the chain
+  over the top), the capMask race, the cap pass's order and costs; known-issues REVIEW-0462.
 - [x] **REVIEW-0461** (0.451.22) — the Opus (xhigh) review of 0.451.18-0.451.21: a cap per rim loop, a rim that
   touches, the pillar in a low room (the leg's `net` where the gather point lies in a room), costs;
   known-issues REVIEW-0461.

@@ -8761,14 +8761,14 @@ __device__ static inline bool dOnGatherSurfaceSided(const DVec3& x, const DVec3&
 // does not pass that the segment from `o` along unit `d`, `len` long, crosses, curves unseen, the
 // side of the last closed solid's (+1 it ends inside, -1 outside, 0 none) and how many cannot say
 // theirs (up to 15). `eps`: how far past a face crossed it goes on from.
-struct DSegmentCrossings { int side; int open; int solids; int first; int net; };   // host twin SegmentCrossings
+struct DSegmentCrossings { int side; int open; int solids; int first; int net, low, net1; };   // host twin SegmentCrossings
 // The distance a trace that leaves hit h at exactly h.p must skip to clear its own primitive, whose error
 // near the origin outgrows dEpsAt.
 __device__ static inline Real dHitEps(const DHit& h) {
     return fmax(dEpsAt(h.p), dReachEps(h.pscale));
 }
 __device__ static DSegmentCrossings dWalkSegment(const DScene& sc, DVec3 o, const DVec3& d, Real len, Real eps) {
-    DSegmentCrossings c{0, 0, 0, 0, 0};
+    DSegmentCrossings c{0, 0, 0, 0, 0, 0, 0};
     Real done = (Real)0;
     for (int k = 0; k < 32 && done < len && c.open < 15; ++k) {
         const DHit h = closestHit(sc, o, d, (Real)0, len - done, false, len - done);
@@ -8778,6 +8778,8 @@ __device__ static DSegmentCrossings dWalkSegment(const DScene& sc, DVec3 o, cons
                 c.side = ((h.solid > 0) == h.back) ? -1 : 1;
                 if (!c.solids) c.first = c.side;
                 c.net += c.side;
+                c.low = c.net < c.low ? c.net : c.low;
+                if (h.solid == 1 || h.solid == -1) c.net1 += c.side;
                 ++c.solids;
             } else {
                 ++c.open;
@@ -8788,6 +8790,12 @@ __device__ static DSegmentCrossings dWalkSegment(const DScene& sc, DVec3 o, cons
         o = h.p + d * step;
     }
     return c;
+}
+
+// Whether the gather point `p` (normal `n`) lies in a closed or capped solid itself: the walk straight up
+// from it, `r` long, leaves more such solids than it enters (host twin inRoomOf).
+__device__ static bool dInRoomOf(const DScene& sc, const DVec3& p, const DVec3& n, Real r, Real eps) {
+    return dWalkSegment(sc, p + n * eps, n, r, eps).net < 0;
 }
 
 // One probe of the footprint (dGatherCoverage's; host twin gatherCoverageRaw's): a column at a
@@ -8828,18 +8836,26 @@ __device__ static DProbe dCoverageProbe(const DScene& sc, const DVec3& p, const 
         // twin gatherCoverageRaw).
         constexpr int kAsk = 2;
         int crossed = 0, lastSolid = kAsk;
-        const auto side = [&]() {
-            if (lastSolid == kAsk) {
+        int probeNet1 = 0;   // closed solids (+-1) the probe enters coming down, less those it leaves
+        bool topWalked = false;   // the segment from the gather point to the probe's top, once asked
+        DSegmentCrossings topWalk{0, 0, 0, 0, 0, 0, 0};
+        const auto walkTop = [&]() -> const DSegmentCrossings& {
+            if (!topWalked) {
+                topWalked = true;
                 const DVec3 so = p + n * pathEps, top = q + n * r;
                 const Real len = length(top - so);
-                lastSolid = dWalkSegment(sc, so, (top - so) * ((Real)1 / len), len, pathEps).side;
+                topWalk = dWalkSegment(sc, so, (top - so) * ((Real)1 / len), len, pathEps);
             }
+            return topWalk;
+        };
+        const auto side = [&]() {
+            if (lastSolid == kAsk) lastSolid = walkTop().side;
             return lastSolid;
         };
         // The low leg, from just over the gather point to the column's foot: asked once, and only
         // once what lies above puts the column inside (host twin).
         bool legAsked = false;
-        DSegmentCrossings leg{0, 0, 0, 0, 0};
+        DSegmentCrossings leg{0, 0, 0, 0, 0, 0, 0};
         const auto lowLeg = [&]() -> const DSegmentCrossings& {
             if (!legAsked) {
                 legAsked = true;
@@ -8848,16 +8864,18 @@ __device__ static DProbe dCoverageProbe(const DScene& sc, const DVec3& p, const 
             }
             return leg;
         };
-        // An odd parity whose low leg crosses an odd count too (a cup's wall, not a hovering sheet), or
-        // a closed solid's side where the low leg crosses any closed solid's face (boxes resting on the
-        // surface, touching or not; not a room the gather point lies in, nor a mover clear of the
-        // surface), or ends in more than it began in where the gather point lies in one itself (a room
-        // lower than r, a pillar in it no wall): host twin's inside().
+        // An odd parity whose low leg crosses an odd count too, or a solid's side where the column lies
+        // deeper in solids than the gather point -- the leg's `net` or `low`, its `solids` where the
+        // gather point lies in no room, or else the chain over the top's `net1`: host twin's inside(),
+        // where the why is.
         const auto inside = [&]() {
             if ((crossed & 1) && (!(rr > (double)pathEps) || (lowLeg().open & 1))) return true;
             if (!(side() > 0)) return false;
-            if (inRoom < 0) inRoom = dWalkSegment(sc, p + n * pathEps, n, r, pathEps).first < 0 ? 1 : 0;
-            return inRoom ? lowLeg().net > 0 : lowLeg().solids > 0;
+            const DSegmentCrossings& L = lowLeg();
+            if (L.net > 0 || L.low < 0) return true;
+            if (inRoom < 0) inRoom = dInRoomOf(sc, p, n, r, pathEps) ? 1 : 0;
+            if (!inRoom && L.solids > 0) return true;
+            return walkTop().net1 + probeNet1 > 0;
         };
         bool found = false;                  // the probe ended on what it counts
         bool ended = false;                  // ... or on what it does not
@@ -8883,8 +8901,12 @@ __device__ static DProbe dCoverageProbe(const DScene& sc, const DVec3& p, const 
             // crossing all the same (dPassesLight) -- host twin.
             const auto cross = [&]() {
                 if (dPassesLight(sc, hm)) return;
-                if (h.solid) lastSolid = ((h.solid > 0) == h.back) ? -1 : 1;   // leaving : entering
-                else ++crossed;
+                if (h.solid) {
+                    lastSolid = ((h.solid > 0) == h.back) ? -1 : 1;   // leaving : entering
+                    if (h.solid == 1 || h.solid == -1) probeNet1 += lastSolid;
+                } else {
+                    ++crossed;
+                }
             };
             if (dProbePassesThrough(sc, hm, holds) && r - h.t > fmaxf((Real)1e-3 * r, (Real)2 * dEpsAt(h.p))) {
                 cross();

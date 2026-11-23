@@ -1980,6 +1980,7 @@ struct Scene {
             if ((size_t)k >= solidNearSpan.size() || solidNearSpan[(size_t)k].second == 0) return true;
             const auto [at0, cnt] = solidNearSpan[(size_t)k];
             for (uint32_t j = at0; j < at0 + cnt; ++j) {
+                if (solidNearIdx[j] >= tris.size()) return true;
                 const Tri& t = tris[solidNearIdx[j]];
                 if (std::fabs(dot(t.v0 - c, n)) <= onPlane && std::fabs(dot(t.v1 - c, n)) <= onPlane &&
                     std::fabs(dot(t.v2 - c, n)) <= onPlane)
@@ -4959,7 +4960,7 @@ struct Scene {
         // the corners it stands on, does not rest. The rays pass the piece's own faces, from both sides, so
         // of a coincident pair -- a statue's flange on the ground -- the side that meets the covering face
         // first finds it, whichever the other returns. Reach and slack are the world's:
-        // the reach across the touch points' images, the slack along the normal's. A mover (`motion` its
+        // the reach to the farthest corner's image, the slack along the normal's. A mover (`motion` its
         // set) rests where any of its keys places it, each asked at that key's time, D its transform from
         // the instant; the probes' low leg decides every other time.
         using OwnFn = std::function<bool(const Vec3&, double)>;
@@ -4967,10 +4968,7 @@ struct Scene {
             const Affine Dinv = D.inverse();
             for (const watertight::CapLoop& L : loops) {
                 const Vec3 nk = normalize(D.applyCofactor(L.nrm));
-                const Vec3 cw = D.apply(L.c);
-                double reach = 0.0;
-                for (const Vec3& rp : L.rim) reach = std::max(reach, length(D.apply(rp) - cw) / 0.99);
-                if (!(reach > 0.0)) reach = L.reach * std::cbrt(std::fabs(D.det()));
+                const double reach = length(D.apply(L.farthest) - D.apply(L.c));
                 const double slack = L.slack * std::fabs(dot(D.applyDir(L.nrm), nk));
                 const double d = std::max(1e-3 * reach, 10.0 * eps), w = d + slack;
                 const double onR = std::max(1e-6 * reach, 10.0 * eps);
@@ -4990,11 +4988,17 @@ struct Scene {
                     }
                     return false;
                 };
-                if (L.pts.empty()) return false;   // all on the piece: nothing shows it rests on anything
-                for (const Vec3& q0 : L.pts)
+                // A point on the piece itself, to the world's rounding, asks nothing (watertight dropped
+                // those within a millionth of the reach in the piece's own space).
+                int asked = 0;
+                for (const Vec3& q0 : L.pts) {
+                    if (own(q0, onR)) continue;
                     if (!meet(q0, 0.5 * d + slack)) return false;
+                    ++asked;
+                }
+                if (asked == 0) return false;   // all on the piece: nothing shows it rests on anything
                 for (const Vec3& q0 : L.rim)
-                    if (!meet(q0, 0.5 * d + 0.02 * slack)) return false;
+                    if (!own(q0, onR) && !meet(q0, 0.5 * d + 0.02 * slack)) return false;
             }
             return true;
         };
@@ -5075,9 +5079,10 @@ struct Scene {
         // Each instance asks its asset's candidates where it places them, a moving one at each of its
         // keys -- the instances in parallel, each writing its own mask. `own`'s rounding radius goes into
         // the asset's space by the instance's mean linear scale.
+        std::vector<uint64_t> masks(instances.size(), 0);   // set after: other workers' hits read capMask
+        for (MeshInstance& inst : instances) inst.capMask = 0;
         ft::parallelForAll(instances.size(), 1, [&](size_t ii) {
-            MeshInstance& inst = instances[ii];
-            inst.capMask = 0;
+            const MeshInstance& inst = instances[ii];
             if (inst.blasId < 0 || inst.blasId >= (int)blasCands.size()) return;
             const std::vector<watertight::CapCand>& cc = blasCands[(size_t)inst.blasId];
             const std::vector<Tri>& bt = blasList[(size_t)inst.blasId].tris;
@@ -5087,11 +5092,13 @@ struct Scene {
                 const OwnFn own = [&](const Vec3& x, double rad) {
                     return c.own.onPiece([&](size_t i) -> const Tri& { return bt[i]; }, x, rad / s);
                 };
-                if (restsMoving(c.loops, own, inst.motion, inst.toWorld)) inst.capMask |= 1ull << k;
+                if (restsMoving(c.loops, own, inst.motion, inst.toWorld)) masks[ii] |= 1ull << k;
             }
         });
-        for (const MeshInstance& inst : instances)
-            for (uint64_t m = inst.capMask; m; m &= m - 1) ++sm.instCaps;
+        for (size_t ii = 0; ii < instances.size(); ++ii) {
+            instances[ii].capMask = masks[ii];
+            for (uint64_t m = masks[ii]; m; m &= m - 1) ++sm.instCaps;
+        }
         // The solids' world boxes (solidNear), those a footprint's segment can meet: every sphere,
         // closed isosurface and closed piece light does not pass (a piece by one of its faces'
         // material) -- an asset's under each instance that places it.
@@ -5399,6 +5406,7 @@ struct Scene {
 
     void build() {
         ++buildCount;
+        solidBoundsKnown = false;   // the solids' boxes and faces are the last marking's: until the next
         for (auto& t : tris) t.finalize();
         bakeMeshSizes();
         for (auto& bl : blasList) bl.build();   // shared instanced assets (local space)

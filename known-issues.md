@@ -526,6 +526,53 @@ R 0.843 / 0.841 of mode R in mode J (GPU / CPU) and 0.852 / 0.865 in mode M -bea
 bin 12 is right at its centre there (SpecThr::atBinCentre); it is not in the check's scenes until this
 is fixed, and then is its test.
 
+## OPEN (2026-11-22): CAP-TOUCH-ROOM — two capped boxes touching face to face inside a closed room lower than the gather radius read the floor under the second covered
+
+What 0.451.23's depth rule still misses (REVIEW-0462). walkSegment steps `eps` past every hit, so of two
+coincident faces -- box A's wall and box B's, touching -- it may see one alone; the leg then reads A
+entered and left, B never. Elsewhere the leg's crossing any solid's face walls the column under B; for
+closed boxes inside a low room the chain over the top (the probe enters B's top) does; for boxes open
+at the bottom (capped, Hit::solid +-2) inside a room lower than r neither does -- the chain leaves cap
+faces out, as its probe never leaves a capped solid by a face. **Proper fix:** let walkSegment see both
+faces of a coincident pair -- a hit names the stored triangle it hit (host: Tri*, the moving copy's
+original; device: the primitive index), and the walk relaunches past that face alone, not by `eps`.
+Then the leg's `net` is exact, and the chain and the `solids` rule are no longer needed. Next in line.
+
+## DONE (2026-11-22, 0.451.23): REVIEW-0462 — what the Opus (xhigh) review of 0.451.22 found
+
+Opus (xhigh) reviewed e0fa9df (0.451.22): fifteen findings, each checked against the code.
+
+* **The room rule's `net` missed a crate past a low room's wall** (leaving the wall, entering the crate:
+  net 0), **missed boxes touching inside one** (the coincident pair met by one face) **and a shelf under
+  its lid hid the room** (the walk's first face entered). A solid's side now walls a column off where it
+  lies deeper in solids than the gather point: the leg's `net` or `low` (it leaves one it began in), its
+  `solids` where the gather point lies in no room, or else the chain over the top's `net1` (closed solids
+  alone); the room is the upward walk's net leaving more than entering. Host probe, device probe
+  (dInRoomOf, a twin now), -gageom march (its climb's net). What it still misses: CAP-TOUCH-ROOM, above.
+* **The per-instance caps wrote capMask while other workers' hits read it** -- a data race: the masks
+  are gathered apart and set after.
+* **Every candidate built its face tree and points before the volume test** threw flat cards out: the
+  loops' frames and the volume come first, the tree and points after, and an asset past its 64 stops
+  there too.
+* **The reach came from the touch points**, some dropped as on the piece: CapLoop keeps its farthest
+  corner, whose image measures it. **The on-piece test lost its ten-eps floor**: restsAt asks it again at
+  the world's rounding.
+* **A pinch vertex could merge two loops into one figure-eight**: a traced loop that starts at a vertex
+  twice is split there.
+* **solidNear read indices into tris a rebuild may have moved**: build() forgets the boxes until the next
+  marking, and an index past the end is the box alone.
+* **The touch points' odd stride aliased other periods**: past 96 corners, 96 spread evenly.
+* **Tests that would pass broken code**: check_cap_marks gains `tube` (open at both ends, resting on the
+  floor and under a quad: both loops rest, the second fan's volume counted; 0.451.21's one fan over both
+  loops, their areas cancelling, capped none of it) and `uneven_asset` (the V-box stretched 4 high by its
+  instance on a V-ground four times as steep: the slack along the normal's image; 0.451.21's mean scale
+  missed the cap).
+* Smaller: traverseSphere is traverseSphereAny with a predicate that never stops.
+* Dismissed: **the check docstrings record what earlier versions read** -- this project's checks keep the
+  failure each one guards as its measure (the global rule's "history" is of code comments); **a warp's
+  lanes each walk the gather point's room** -- asked only by a lane whose probe is decided inside by a
+  solid, rare, and a ballot would cost every footprint.
+
 ## DONE (2026-11-22, 0.451.22): REVIEW-0461 — what the Opus (xhigh) review of 0.451.18-0.451.21 found
 
 Opus (xhigh) reviewed ed01ad0..b941ab9 (0.451.18 GAGEOM-COINCIDENT, 0.451.19 REVIEW-0460 and the fan cap,

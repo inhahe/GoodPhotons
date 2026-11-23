@@ -6871,12 +6871,19 @@ as the one at fault.
   gather point (1 % of r up) to the column's foot must cross an odd count of such faces too
   (`walkSegment`'s `open`), or, for a solid's side, cross any closed solid's face (its `solids`, either
   way: boxes touching face to face or overlapping, whose last face or coincident pair says nothing
-  reliable, wall the column off all the same; 0.451.19, REVIEW-0460) -- or, where the gather point
-  lies in a closed or capped solid itself, end inside more solids than it began in (`net`): the walk
-  straight up from the gather point, r long, leaves the first such solid's face it crosses (`first`,
-  `inRoomOf`), a room's lid lower than r, not a shelf over the point, which it enters first; so a pillar
-  the leg passes in such a room walls nothing (0.451.22, REVIEW-0461) -- asked only once what lies
-  above says inside, the room once a gather. A bottomless box of quads, an open glossy cup or a box standing on the surface
+  reliable, wall the column off all the same; 0.451.19, REVIEW-0460) -- except where the gather point
+  lies in a closed or capped solid itself (`inRoomOf`: the walk straight up from it, r long, leaves
+  more such solids than it enters -- a room's lid lower than r, a shelf under it or not). Throughout, a
+  solid's side walls a column off where the column lies deeper in solids than the gather point (0.451.23,
+  REVIEW-0462): the leg ending in more than it began in (`net`), or leaving one it began in (`low` below
+  0: a crate past a low room's wall); where the gather point lies in no room, the leg crossing any
+  solid's face (`solids`); or else the chain over the top -- the segment from the gather point to the
+  probe's top (`walkTop`, PROBE-PATH's) and the probe's descent -- ending deeper in closed solids
+  (`net1`, a cap's faces left out: its cap is no face either path leaves by), which sees boxes touching
+  inside a low room though the leg meets their coincident pair by one face. So a pillar the leg passes
+  in such a room walls nothing, nor does a box clear of the surface at the path's time. Asked only once
+  what lies above says inside, the room once a gather. What it still misses: boxes open at the bottom
+  touching inside a room lower than r, which neither path sees (CAP-TOUCH-ROOM). A bottomless box of quads, an open glossy cup or a box standing on the surface
   walls its floor off, so it stays a miss; a sheet hovering over it -- a diffuse table top, a mirror,
   a light's quad -- encloses nothing, and the floor under it, lit from the sides, is covered; and a
   room the gather point lies in itself is no wall to its own floor, closed (six quads, a solid) or
