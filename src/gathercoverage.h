@@ -340,7 +340,6 @@ inline double gatherCoverageRaw(const Scene& scene, const Vec3& p, const Vec3& n
     // Whether a closed solid may lie within reach of a probe's segment from the gather point to its
     // top, which stays within r * sqrt(2) of it: asked once, the first time a probe needs its side.
     int solidsNear = -1;
-    int inRoom = -1;   // the gather point in a room lower than r (inRoomOf), asked once, when needed
     for (int i = 0; i < M; ++i) {
         if (i == probe0 && area >= (double)probe0 * 0.995)
             return 1.0;                // interior of a flat patch: nothing to correct
@@ -455,23 +454,19 @@ inline double gatherCoverageRaw(const Scene& scene, const Vec3& p, const Vec3& n
             // it where the low leg crosses an odd count of such faces too (a cup's wall, not a sheet
             // hovering over the surface). Or a solid's faces above saying it lies in a solid, where the
             // column lies deeper in solids than the gather point: the leg ending in more than it began
-            // in (`net`), or leaving one it began in (`low` below 0: a crate past a low room's wall,
-            // the gather point inside); and where the gather point lies in none (inRoomOf), the leg
-            // crossing any closed solid's face (`solids`) -- boxes touching face to face, whose
-            // coincident pair the leg may meet by one face alone; or else the chain over the top --
-            // the segment from the gather point to the probe's top, and the probe's descent -- ending
-            // deeper in closed solids (`net1`, not a cap's faces, which it never leaves by): boxes
-            // touching inside a low room. Not a room the gather point lies in itself, nor a pillar the
-            // leg passes in it, nor an open quad or cup there, nor a box clear of the surface at the
-            // path's time (a mover's).
+            // in (`net`: a box resting on the surface, or one touching it, whose coincident pair the
+            // leg counts both of), or leaving one it began in (`low` below 0: a crate past a low
+            // room's wall, the gather point inside); or else the chain over the top -- the segment from
+            // the gather point to the probe's top, and the probe's descent -- ending deeper in closed
+            // solids (`net1`, not a cap's faces, which it never leaves by): a slab on the surface too
+            // thin for the leg to cross. Not a room the gather point lies in itself (the probe enters
+            // its lid, the leg crosses nothing), nor a pillar the leg passes, nor an open quad or cup
+            // there, nor a box clear of the surface at the path's time (a mover's).
             const auto inside = [&]() {
                 if ((crossed & 1) && (!(rr > pathEps) || (lowLeg().open & 1))) return true;
                 if (!(side() > 0)) return false;
                 const SegmentCrossings& L = lowLeg();
-                if (L.net > 0 || L.low < 0) return true;
-                if (inRoom < 0) inRoom = inRoomOf(scene, p, n, r, pathEps) ? 1 : 0;
-                if (!inRoom && L.solids > 0) return true;
-                return walkTop().net1 + probeNet1 > 0;
+                return L.net > 0 || L.low < 0 || walkTop().net1 + probeNet1 > 0;
             };
             bool found = false;                  // the probe ended on what it counts
             bool ended = false;                  // ... or on what it does not: either way, it ended

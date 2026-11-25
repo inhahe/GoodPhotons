@@ -6211,6 +6211,44 @@ struct Scene {
         });
     }
 
+    // Every face ray `r` crosses with t in [tmin, tMax), curves unseen, handed to leaf(h, tMax) one at a
+    // time: each primitive's nearest crossing there, and every triangle of an instance on its own, so of
+    // two faces lying on each other -- boxes touching, a mesh's two pieces -- both are seen, where a
+    // nearest-hit query returns one. `h` is in world space, as closestHit would return it (less the
+    // shading touches: no normal map, no back-face swap). The leaf may lower tMax, which prunes what
+    // lies beyond. Device twin dForEachCrossing.
+    template <class Leaf>
+    void forEachCrossing(const Ray& r, double tmin, double& tMax, Leaf&& leaf) const {
+        ++raystats::tls;
+        const size_t nT = tris.size(), nS = spheres.size(), nI = implicits.size(), nC = curveSegs.size();
+        const TriShear sh = makeTriShear(r.d);
+        const PatTables tabs = patTables();
+        traverseWorldClosest(r, tmin, tMax, [&](int prim, double& tm) {
+            Hit h; h.t = tm;
+            if (prim < (int)nT) {
+                if (intersectTriNow(sh, r, tris[(size_t)prim], tmin, h)) leaf(h, tm);
+            } else if (prim < (int)(nT + nS)) {
+                if (intersectSphereNow(r, spheres[(size_t)prim - nT], tmin, h)) leaf(h, tm);
+            } else if (prim < (int)(nT + nS + nI)) {
+                if (intersectImplicitNow(r, implicits[(size_t)prim - nT - nS], tmin, h, &tabs)) leaf(h, tm);
+            } else if (prim >= (int)(nT + nS + nI + nC)) {
+                const MeshInstance& inst = instances[(size_t)prim - nT - nS - nI - nC];
+                const bool moves = inst.motion >= 0 && g_motionU >= 0.0;
+                const Ray ri = moves ? rayToInstant(motionNowInverse(inst.motion), r) : r;
+                const Ray lr{inst.toLocal.apply(ri.o), inst.toLocal.applyDir(ri.d)};
+                const Blas& bl = blasList[(size_t)inst.blasId];
+                const TriShear lsh = makeTriShear(lr.d);
+                bl.bvh.traverseClosest(lr, tmin, tm, [&](int lp, double& tml) {
+                    Hit lh; lh.t = tml;
+                    if (!intersectTri(lsh, lr, bl.tris[(size_t)lp], tmin, lh, vcolData())) return;
+                    instanceHitToWorld(inst, lh, mats.data());
+                    if (moves) hitToMoved(motionNow(inst.motion), motionNowInverse(inst.motion), inst.motion, lh);
+                    leaf(lh, tml);
+                });
+            }
+        }, nullptr, /*skipHair=*/true);
+    }
+
     // Fraction of a shadow ray that SURVIVES to `maxDist`: 1 clear, 0 blocked, and in between
     // when it crosses hair whose `opacity` is below 1. Opaque geometry still early-outs, so a
     // scene with no transparent fiber costs exactly what occluded() costs plus one branch per

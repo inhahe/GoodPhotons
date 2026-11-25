@@ -6846,7 +6846,7 @@ as the one at fault.
   whether the top lies in a solid. So a column inside a solid taller than r standing on the surface
   is inside though the probe crosses none of its faces (the dark halo at such a base: within 2 cm of
   a 30 cm box the floor read 0.56 of its value at its true coverage before 0.434.10). The segment
-  is one bounded `occluded` ray in open air, curves unseen, and is not traced at all where the
+  is one bounded traversal in open air, curves unseen, and is not traced at all where the
   probe's own crossings decide, nor, on the host, where no closed solid comes within r√2 of the
   gather point (`Scene::solidNear`: a tree over the boxes `markSolidFaces` takes -- each closed piece
   the classifier found, an asset's under each instance that places it, and every sphere and closed
@@ -6869,28 +6869,34 @@ as the one at fault.
   where the **low leg** agrees that a wall stands between it and the gather point (0.434.13 for the
   parity, 0.451.17 for a solid's side, REVIEW-0459; `inside()`): the segment from just over the
   gather point (1 % of r up) to the column's foot must cross an odd count of such faces too
-  (`walkSegment`'s `open`), or, for a solid's side, cross any closed solid's face (its `solids`, either
-  way: boxes touching face to face or overlapping, whose last face or coincident pair says nothing
-  reliable, wall the column off all the same; 0.451.19, REVIEW-0460) -- except where the gather point
-  lies in a closed or capped solid itself (`inRoomOf`: the walk straight up from it, r long, leaves
-  more such solids than it enters -- a room's lid lower than r, a shelf under it or not). Throughout, a
-  solid's side walls a column off where the column lies deeper in solids than the gather point (0.451.23,
-  REVIEW-0462): the leg ending in more than it began in (`net`), or leaving one it began in (`low` below
-  0: a crate past a low room's wall); where the gather point lies in no room, the leg crossing any
-  solid's face (`solids`); or else the chain over the top -- the segment from the gather point to the
-  probe's top (`walkTop`, PROBE-PATH's) and the probe's descent -- ending deeper in closed solids
-  (`net1`, a cap's faces left out: its cap is no face either path leaves by), which sees boxes touching
-  inside a low room though the leg meets their coincident pair by one face. So a pillar the leg passes
-  in such a room walls nothing, nor does a box clear of the surface at the path's time. Asked only once
-  what lies above says inside, the room once a gather. What it still misses: boxes open at the bottom
-  touching inside a room lower than r, which neither path sees (CAP-TOUCH-ROOM). A bottomless box of quads, an open glossy cup or a box standing on the surface
+  (`walkSegment`'s `open`), or, for a solid's side, show the column deeper in solids than the gather
+  point (0.451.23, REVIEW-0462): the leg ending in more than it began in (`net`: a box resting on the
+  surface, or one touching it), or leaving one it began in (`low` below 0: a crate past a low room's
+  wall); or else the chain over the top -- the segment from the gather point to the probe's top
+  (`walkTop`, PROBE-PATH's) and the probe's descent -- ending deeper in closed solids (`net1`, a cap's
+  faces left out: its cap is no face either path leaves by), which sees a slab on the surface too thin
+  for the leg to cross. So a pillar the leg passes walls nothing, in a room or out of one, nor does a
+  room the gather point lies in (the probe enters its lid, the leg crosses nothing), nor a box clear of
+  the surface at the path's time. **The leg's counts are exact (0.451.24, CAP-TOUCH-ROOM):**
+  `walkSegment` goes window by window, each from the last's end to `eps` past its nearest face (on the
+  device that face's own error where larger), and takes every face in it (`Scene::forEachCrossing`,
+  device `dForEachCrossing`: each primitive's nearest crossing in the window and every triangle of an
+  instance on its own, where a nearest-hit query returns one), so of two faces lying on each other --
+  boxes touching face to face, A's wall left and B's entered -- both count. Faces of one kind in one
+  window are one face (a ray through the edge two triangles share); kinds are a closed solid's face
+  left or entered, a cap's left or entered, and an open face; a window's faces left count before those
+  entered, so `low` sees the dip between two solids touching. Until then the walk stepped `eps` past
+  each nearest hit and saw one face of such a pair: 0.451.19-0.451.23 walled a column off wherever the
+  leg crossed any solid's face outside a room the gather point lay in (`solids`, `inRoomOf`) to cover
+  for it, and still read the floor under the second of two bottomless boxes touching inside a closed
+  room as covered. Asked only once what lies above says inside. A bottomless box of quads, an open glossy cup or a box standing on the surface
   walls its floor off, so it stays a miss; a sheet hovering over it -- a diffuse table top, a mirror,
   a light's quad -- encloses nothing, and the floor under it, lit from the sides, is covered; and a
   room the gather point lies in itself is no wall to its own floor, closed (six quads, a solid) or
   capped, however much lower than r its lid, nor is an open quad or cup standing in it
   (`check_gather_base`'s `litbox` and `litbox_closed`: their floor read 9.0 of the uncorrected render
   with the solid's side alone; `litbox_pillar` stands a closed pillar in the closed room beside its
-  floor's ring). `openbox_hover`, a box held up by a mover's keys from faces stored
+  floor's ring, `litbox_touch` two bottomless boxes touching face to face). `openbox_hover`, a box held up by a mover's keys from faces stored
   on the floor, holds the floor under it to the same box authored up there: the probes see it at the
   path's time, and its leg passes under. `-gageom`'s march climbs and
   decides each in-band layer of a column by the faces above it: the next solid face it meets above

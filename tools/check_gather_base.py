@@ -3,8 +3,9 @@
     python tools/check_gather_base.py [--out png/check_gather_base] [--exe ftrace.exe]
                                       [--objects diffuse,mirror,coated,coaster,openbox,openbox_lifted,
                                                  openbox_hover,tower,isotower,towerfar,opentower,
-                                                 opentower_asset,litbox,litbox_closed,ball,meshball,
-                                                 diffuseball,smallball,mirrorsheet,lampsheet,tablesheet]
+                                                 opentower_asset,litbox,litbox_closed,litbox_pillar,
+                                                 litbox_touch,ball,meshball,diffuseball,smallball,
+                                                 mirrorsheet,lampsheet,tablesheet]
 
 A closed 3 cm box (six quads) standing on a lit floor, seen from straight above, modes M and S at a
 pinned gather radius of 0.1 on the CPU and the GPU, against mode R on the GPU. A mode-M or mode-S
@@ -59,7 +60,12 @@ face, a closed solid without any cap, which read 9.0 likewise on 0.451.16 (modes
 -gageom 7.1 of the probe's). `litbox_pillar` stands a closed pillar in it beside the ring, short of the
 lid: a column past the pillar is the room's floor, which the leg crosses the pillar in and out to reach,
 held to the uncorrected render over each pixel's share of the disc not under the pillar (0.451.21 walled
-that floor off: 1.046-1.048 in modes M and S, both devices). Its floor face lies on the floor quad, facing apart: -gageom took a layer
+that floor off: 1.046-1.048 in modes M and S, both devices). `litbox_touch` stands two bottomless boxes
+in it instead, touching face to face and capped where they rest: the leg to a column under the second
+crosses the first's near wall and then two walls lying on each other, the first's left and the second's
+entered, and must count both, or the floor under the second counts as covered (CAP-TOUCH-ROOM:
+0.451.23 read it 0.920 in mode M on the CPU, 0.969 on the GPU, 0.970 in mode S there; held to its
+coverage outside both). The closed room's floor face lies on the floor quad, facing apart: -gageom took a layer
 there only on the one facing the gather point's way, which of the two a ray meets being the
 traversal's, and read 2.07 (M) and 2.01 (S) of the probe on 0.451.17 (GAGEOM-COINCIDENT).
 Then a glossy ball of the box's
@@ -311,26 +317,35 @@ def inner_dist():
 # A closed pillar in the closed room, beside the floor the ring measures and short of the lid: x, z
 # extent, and height.
 PILLAR = (-0.02, 0.06, 0.02, 0.08, 0.03)
+# Two bottomless boxes in the closed room, touching face to face across z = TOUCH_Z, beside the ring:
+# A nearer it, wider, so every leg to a column under B crosses A first, and B beyond, filling the room
+# to its wall; x, z extent, and height. Their extents differ, so no edge of one is the other's.
+TOUCH_Z = 0.06
+TOUCH_A = (-0.145, 0.045, 0.145, TOUCH_Z, 0.03)
+TOUCH_B = (-0.13, TOUCH_Z, 0.13, 0.145, 0.025)
 
 
-def pillar_cover(dist, r=None, n=81):
-    """Each pixel's share of its gather disc (radius r about the floor point it sees, the cases' radius
-    by default) not under the pillar, sampled on an n x n grid -- 1 where the pixel sees no floor (a
-    ring holds none of those)."""
-    r = GATHER_R if r is None else r
-    X, Z, seen = inner_floor()
-    x0, z0, x1, z1, _ = PILLAR
-    g = (np.arange(n) + 0.5) / n * 2 - 1
-    gx, gz = np.meshgrid(g, g)
-    inside = gx * gx + gz * gz <= 1.0
-    ox, oz = gx[inside] * r, gz[inside] * r
-    cover = np.ones(X.shape)
-    m = seen & np.isfinite(dist) & (dist < 0.06)
-    for i, j in zip(*np.nonzero(m)):
-        px, pz = X[i, j] + ox, Z[i, j] + oz
-        under = (px > x0) & (px < x1) & (pz > z0) & (pz < z1)
-        cover[i, j] = 1.0 - under.mean()
-    return cover
+def floor_cover(rects):
+    """A COVERS function: each pixel's share of its gather disc (radius r about the floor point it sees,
+    the cases' radius by default) not under any of `rects` (x0, z0, x1, z1, ...), sampled on an n x n
+    grid -- 1 where the pixel sees no floor (a ring holds none of those)."""
+    def cover_of(dist, r=None, n=81):
+        r = GATHER_R if r is None else r
+        X, Z, seen = inner_floor()
+        g = (np.arange(n) + 0.5) / n * 2 - 1
+        gx, gz = np.meshgrid(g, g)
+        inside = gx * gx + gz * gz <= 1.0
+        ox, oz = gx[inside] * r, gz[inside] * r
+        cover = np.ones(X.shape)
+        m = seen & np.isfinite(dist) & (dist < 0.06)
+        for i, j in zip(*np.nonzero(m)):
+            px, pz = X[i, j] + ox, Z[i, j] + oz
+            under = np.zeros(px.shape, bool)
+            for x0, z0, x1, z1 in (rc[:4] for rc in rects):
+                under |= (px > x0) & (px < x1) & (pz > z0) & (pz < z1)
+            cover[i, j] = 1.0 - under.mean()
+        return cover
+    return cover_of
 
 
 def _room(mat, bottom=False):
@@ -426,6 +441,13 @@ OBJECTS = {
     "litbox_pillar": (_room('material "obj" { type diffuse reflect 0.5 }', bottom=True)[0] +
                       box(PILLAR[0], 0.0, PILLAR[1], PILLAR[2], PILLAR[4], PILLAR[3], "obj"),
                       INNER_CAM, inner_dist, ((0.0, 0.04),), "the middle", "coverage"),
+    # ...and, in place of the pillar, two bottomless boxes touching face to face, capped where they rest:
+    # the low leg to a column under B crosses A's near wall, then A's far wall and B's near one, which
+    # lie on each other, and must count both.
+    "litbox_touch": (_room('material "obj" { type diffuse reflect 0.5 }', bottom=True)[0] +
+                     open_box(TOUCH_A[0], 0.0, TOUCH_A[1], TOUCH_A[2], TOUCH_A[4], TOUCH_A[3], "obj") +
+                     open_box(TOUCH_B[0], 0.0, TOUCH_B[1], TOUCH_B[2], TOUCH_B[4], TOUCH_B[3], "obj"),
+                     INNER_CAM, inner_dist, ((0.0, 0.04),), "the middle", "coverage"),
     # A ball resting on the floor holds the probe's origin over the floor under its overhang, so
     # the probe leaves it before it meets the floor: a closed solid's face says it is out
     # (PROBE-SOLID-SIDE), where a parity reads the floor as inside.
@@ -451,10 +473,10 @@ OBJECTS = {
 # The faces the probes' marking pass takes as a solid's, which the case's renders must report
 # (`[gather] N of M triangles`): what a case tests holds only while its object is marked as it supposes.
 MARKS = {"openbox": 10, "openbox_lifted": 0, "openbox_hover": 10, "opentower": 10, "litbox": 10,
-         "litbox_closed": 12, "litbox_pillar": 24, "opentower_asset": 0}
+         "litbox_closed": 12, "litbox_pillar": 24, "litbox_touch": 32, "opentower_asset": 0}
 # A ring held to its exact coverage (`against` "coverage") whose share of the disc is not the tower's
 # straight edge (seg_cover): by object, the function giving it from the pixels' floor distance.
-COVERS = {"litbox_pillar": pillar_cover}
+COVERS = {"litbox_pillar": floor_cover([PILLAR]), "litbox_touch": floor_cover([TOUCH_A, TOUCH_B])}
 # The asset pieces capped under an instance, which a case's renders must report (the [gather] line's
 # `and N asset pieces`).
 INST_MARKS = {"opentower_asset": 1}

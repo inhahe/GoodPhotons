@@ -526,17 +526,26 @@ R 0.843 / 0.841 of mode R in mode J (GPU / CPU) and 0.852 / 0.865 in mode M -bea
 bin 12 is right at its centre there (SpecThr::atBinCentre); it is not in the check's scenes until this
 is fixed, and then is its test.
 
-## OPEN (2026-11-22): CAP-TOUCH-ROOM — two capped boxes touching face to face inside a closed room lower than the gather radius read the floor under the second covered
+## DONE (2026-11-25, 0.451.24): CAP-TOUCH-ROOM — two capped boxes touching face to face inside a closed room lower than the gather radius read the floor under the second covered
 
-What 0.451.23's depth rule still misses (REVIEW-0462). walkSegment steps `eps` past every hit, so of two
-coincident faces -- box A's wall and box B's, touching -- it may see one alone; the leg then reads A
-entered and left, B never. Elsewhere the leg's crossing any solid's face walls the column under B; for
-closed boxes inside a low room the chain over the top (the probe enters B's top) does; for boxes open
-at the bottom (capped, Hit::solid +-2) inside a room lower than r neither does -- the chain leaves cap
-faces out, as its probe never leaves a capped solid by a face. **Proper fix:** let walkSegment see both
-faces of a coincident pair -- a hit names the stored triangle it hit (host: Tri*, the moving copy's
-original; device: the primitive index), and the walk relaunches past that face alone, not by `eps`.
-Then the leg's `net` is exact, and the chain and the `solids` rule are no longer needed. Next in line.
+What 0.451.23's depth rule still missed (REVIEW-0462). walkSegment stepped `eps` past every hit, so of
+two coincident faces -- box A's wall and box B's, touching -- it saw one alone; the leg then read A
+entered and left, B never. Elsewhere the leg's crossing any solid's face walled the column under B; for
+closed boxes inside a low room the chain over the top (the probe enters B's top) did; for boxes open
+at the bottom (capped, Hit::solid +-2) inside a room lower than r neither did -- the chain leaves cap
+faces out, as its probe never leaves a capped solid by a face.
+
+**Fix:** the walk goes window by window from a fixed origin, each window from the last's end to `eps`
+past its nearest face (the device: that face's own error where larger), and takes every face in it --
+`Scene::forEachCrossing` / `dForEachCrossing`, each primitive's nearest crossing in the window and
+every triangle of an instance on its own. The windows tile the segment, so no face is stepped over;
+faces of one kind in a window (a closed solid's left or entered, a cap's left or entered, open) are
+one face, the edge two triangles share; a window's faces left count before those entered. The leg's
+`net` is then exact, and the `solids` rule and `inRoomOf` that covered for it are gone (host probe,
+device probe, -gageom march). The chain over the top stays: it sees a slab on the surface too thin for
+the leg (1 % of r up) to cross, which the planned fix had thought it could drop. Its test is
+check_gather_base's `litbox_touch`: two bottomless boxes touching inside the closed room, the ring held
+to its coverage outside both.
 
 ## DONE (2026-11-22, 0.451.23): REVIEW-0462 — what the Opus (xhigh) review of 0.451.22 found
 

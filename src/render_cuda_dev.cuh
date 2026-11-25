@@ -8757,45 +8757,147 @@ __device__ static inline bool dOnGatherSurfaceSided(const DVec3& x, const DVec3&
 //     covered by definition -- and the gate then fires on nearly every gather and the
 //     correction stops happening. Measured: cap_gyroid -16.9 % stratified against -4.3 %
 //     independent. Do not "improve" this without re-reading the host comment.
+// The nearest-first walk of one tree (nodes N, from `root`) that dForEachCrossing makes: leaf(slot, tMax)
+// for every leaf slot (an index into the tree's primitive list) of a node the ray meets nearer than tMax,
+// which the leaf may lower to prune what lies beyond (the order closestHit's walk visits them in).
+template <class Leaf>
+__device__ static void dTraverseNear(const DNode* N, int root, const DVec3& ro, const DVec3& invD, Real tmin,
+                                     Real& tMax, Leaf&& leaf) {
+    int stack[64]; Real tStack[64]; int sp = 0;
+    Real tRoot;
+    if (!boxHit(N[root], ro, invD, tmin, tMax, tRoot)) return;
+    stack[0] = root; tStack[0] = tRoot; sp = 1;
+    while (sp) {
+        --sp;
+        if (tStack[sp] > tMax) continue;
+        const DNode& n = N[stack[sp]];
+        if (n.count > 0) {
+            for (int i = 0; i < n.count; ++i) leaf(n.first + i, tMax);
+        } else {
+            Real tL, tR;
+            const bool hL = boxHit(N[n.left], ro, invD, tmin, tMax, tL);
+            const bool hR = boxHit(N[n.right], ro, invD, tmin, tMax, tR);
+            if (hL && hR) {
+                if (tL <= tR) { stack[sp] = n.right; tStack[sp] = tR; ++sp; stack[sp] = n.left; tStack[sp] = tL; ++sp; }
+                else          { stack[sp] = n.left;  tStack[sp] = tL; ++sp; stack[sp] = n.right; tStack[sp] = tR; ++sp; }
+            } else if (hL) { stack[sp] = n.left;  tStack[sp] = tL; ++sp; }
+            else if (hR)   { stack[sp] = n.right; tStack[sp] = tR; ++sp; }
+        }
+    }
+}
+// A hit's fields as closestHit starts them.
+__device__ static inline DHit dHitUpTo(Real tMax) {
+    DHit h; h.t = tMax; h.valid = false; h.matId = 0; h.sensorId = -1; h.emitter = -1;
+    return h;
+}
+// Every triangle of instance `inst` the ray (lro, lrd), in its local space, crosses with t in
+// [tmin, tMax), each to leaf(h, tMax) in world space -- carried on by the motion `set` at the path's time
+// (mc's D, Di inverse) where `set` >= 0.
+template <class Leaf>
+__device__ static void dInstanceCrossings(const DScene& sc, const DInstance& inst, const DVec3& lro, const DVec3& lrd,
+                                          Real tmin, Real& tMax, int set, DMotionNow& mc, Leaf& leaf) {
+    const DBlas& bl = sc.blas[inst.blasId];
+    const int* P = sc.blasPrim + bl.primOff;
+    const DTri* T = sc.blasTris + bl.triOff;
+    const DVec3 invD{(Real)1 / lrd.x, (Real)1 / lrd.y, (Real)1 / lrd.z};
+    const DTriShear sh = makeTriShear(lrd);
+    dTraverseNear(sc.blasNodes + bl.nodeOff, 0, lro, invD, tmin, tMax, [&](int s, Real& tm) {
+        DHit lh = dHitUpTo(tm);
+        if (!intersectTri(sh, lro, lrd, T[P[s]], tmin, lh)) return;
+        instanceHitToWorld(sc, inst, lh);
+        if (set >= 0) dHitToMoved(mc.D, mc.Di, set, lh);
+        leaf(lh, tm);
+    });
+}
+// Every face the ray (ro, rd) crosses with t in [tmin, tMax), curves unseen, handed to leaf(h, tMax) one
+// at a time: each primitive's nearest crossing there, and every triangle of an instance on its own, so of
+// two faces lying on each other both are seen. `h` is in world space, as closestHit returns it less the
+// shading touches; the leaf may lower tMax. Host twin Scene::forEachCrossing.
+template <class Leaf>
+__device__ static void dForEachCrossing(const DScene& sc, const DVec3& ro, const DVec3& rd, Real tmin, Real& tMax,
+                                        Leaf&& leaf) {
+    if (sc.nNodes == 0) return;
+    const DVec3 invD{(Real)1 / rd.x, (Real)1 / rd.y, (Real)1 / rd.z};
+    const DTriShear sh = makeTriShear(rd);
+    const int iBase = sc.nTris + sc.nSph + sc.nImplicits + sc.nCurveSegs;
+    DMotionNow mc;
+    const bool timed = dTimed(sc);
+    // The still primitives, the movers skipped where the query has a time; then the movers' tree for it.
+    dTraverseNear(sc.nodes, 0, ro, invD, tmin, tMax, [&](int s, Real& tm) {
+        const int prim = sc.primIdx[s];
+        if (timed && sc.mo.primMoves[prim]) return;
+        DHit h = dHitUpTo(tm);
+        if (prim < sc.nTris) {
+            if (intersectTri(sh, ro, rd, sc.tris[prim], tmin, h)) leaf(h, tm);
+        } else if (prim < sc.nTris + sc.nSph) {
+            const DSphere& sp = sc.sph[prim - sc.nTris];
+            if (intersectSphere(ro, rd, sp, tmin, h, sp.frame >= 0 ? sc.sphAxes + 3 * sp.frame : nullptr)) leaf(h, tm);
+        } else if (prim < sc.nTris + sc.nSph + sc.nImplicits) {
+            if (intersectImplicit(sc, sc.implicits[prim - sc.nTris - sc.nSph], ro, rd, tmin, h)) leaf(h, tm);
+        } else if (prim >= iBase) {
+            const DInstance& inst = sc.instances[prim - iBase];
+            dInstanceCrossings(sc, inst, affPoint(inst.Lm, inst.Lt, ro), affDir(inst.Lm, rd), tmin, tm, -1, mc, leaf);
+        }
+    });
+    if (!timed) return;
+    const int root = dMotionSegRoot(sc);
+    if (root < 0) return;
+    dTraverseNear(sc.mo.segNodes, root, ro, invD, tmin, tMax, [&](int s, Real& tm) {
+        const int prim = sc.mo.segPrim[s];
+        DHit h = dHitUpTo(tm);
+        if (prim < sc.nTris) {
+            if (dIntersectTriNow(sc, sh, ro, rd, prim, tmin, h, mc, false)) leaf(h, tm);
+        } else if (prim >= iBase) {
+            const int set = sc.mo.instMotion[prim - iBase];
+            const DInstance& inst = sc.instances[prim - iBase];
+            const DAff& Di = mc.inverse(sc, set);
+            const DVec3 lro = affPoint(Di.m, Di.t, ro), lrd = affDir(Di.m, rd);
+            dInstanceCrossings(sc, inst, affPoint(inst.Lm, inst.Lt, lro), affDir(inst.Lm, lrd), tmin, tm, set, mc, leaf);
+        } else if (prim < sc.nTris + sc.nSph + sc.nImplicits) {
+            if (dIntersectOtherNow(sc, ro, rd, prim, tmin, (Real)0, h, mc, false)) leaf(h, tm);
+        }
+    });
+}
+
 // Host twin walkSegment (gafootprint.h), where the reasoning lives (PROBE-PATH): of the faces light
 // does not pass that the segment from `o` along unit `d`, `len` long, crosses, curves unseen, the
-// side of the last closed solid's (+1 it ends inside, -1 outside, 0 none) and how many cannot say
-// theirs (up to 15). `eps`: how far past a face crossed it goes on from.
-struct DSegmentCrossings { int side; int open; int solids; int first; int net, low, net1; };   // host twin SegmentCrossings
+// side of the last closed solid's (+1 it ends inside, -1 outside, 0 none), how many more it enters
+// than leaves (`net`, `net1` the closed alone) and the least that count reaches (`low`), and how many
+// cannot say theirs (up to 15), window by window: each from the last's end to `eps` past its nearest
+// face -- or that face's own error, where larger -- every face in it seen.
+struct DSegmentCrossings { int side; int open; int net, low, net1; };   // host twin SegmentCrossings
 // The distance a trace that leaves hit h at exactly h.p must skip to clear its own primitive, whose error
 // near the origin outgrows dEpsAt.
 __device__ static inline Real dHitEps(const DHit& h) {
     return fmax(dEpsAt(h.p), dReachEps(h.pscale));
 }
-__device__ static DSegmentCrossings dWalkSegment(const DScene& sc, DVec3 o, const DVec3& d, Real len, Real eps) {
-    DSegmentCrossings c{0, 0, 0, 0, 0, 0, 0};
-    Real done = (Real)0;
-    for (int k = 0; k < 32 && done < len && c.open < 15; ++k) {
-        const DHit h = closestHit(sc, o, d, (Real)0, len - done, false, len - done);
-        if (!h.valid) break;
-        if (!dPassesLight(sc, sc.mats[h.matId])) {
-            if (h.solid) {
-                c.side = ((h.solid > 0) == h.back) ? -1 : 1;
-                if (!c.solids) c.first = c.side;
-                c.net += c.side;
-                c.low = c.net < c.low ? c.net : c.low;
-                if (h.solid == 1 || h.solid == -1) c.net1 += c.side;
-                ++c.solids;
-            } else {
-                ++c.open;
-            }
-        }
-        const Real step = fmax(eps, dHitEps(h));   // past this face, by its own error at least
-        done += h.t + step;
-        o = h.p + d * step;
+__device__ static DSegmentCrossings dWalkSegment(const DScene& sc, const DVec3& o, const DVec3& d, Real len, Real eps) {
+    DSegmentCrossings c{0, 0, 0, 0, 0};
+    // A window's nearest face of each kind: a closed solid's left, entered; a cap's left, entered; open.
+    enum { kLeft1, kIn1, kLeft2, kIn2, kOpen, kKinds };
+    Real from = (Real)0;
+    for (int k = 0; k < 32 && from < len && c.open < 15; ++k) {
+        Real cut = len, nearest[kKinds] = {len, len, len, len, len};
+        dForEachCrossing(sc, o, d, from, cut, [&](const DHit& h, Real& tm) {
+            if (dPassesLight(sc, sc.mats[h.matId])) return;
+            const int kind = !h.solid ? kOpen
+                           : (h.solid == 1 || h.solid == -1 ? kLeft1 : kLeft2) + (((h.solid > 0) == h.back) ? 0 : 1);
+            nearest[kind] = fmin(nearest[kind], h.t);
+            tm = fmin(tm, h.t + fmax(eps, dHitEps(h)));
+        });
+        bool in[kKinds];
+        for (int j = 0; j < kKinds; ++j) in[j] = nearest[j] < cut;
+        const int left = in[kLeft1] + in[kLeft2], entered = in[kIn1] + in[kIn2];
+        if (!(left || entered || in[kOpen])) break;
+        c.net -= left;
+        c.low = c.net < c.low ? c.net : c.low;
+        c.net += entered;
+        c.net1 += in[kIn1] - in[kLeft1];
+        if (left || entered) c.side = entered ? 1 : -1;
+        c.open += in[kOpen];
+        from = cut;
     }
     return c;
-}
-
-// Whether the gather point `p` (normal `n`) lies in a closed or capped solid itself: the walk straight up
-// from it, `r` long, leaves more such solids than it enters (host twin inRoomOf).
-__device__ static bool dInRoomOf(const DScene& sc, const DVec3& p, const DVec3& n, Real r, Real eps) {
-    return dWalkSegment(sc, p + n * eps, n, r, eps).net < 0;
 }
 
 // One probe of the footprint (dGatherCoverage's; host twin gatherCoverageRaw's): a column at a
@@ -8804,11 +8906,9 @@ __device__ static bool dInRoomOf(const DScene& sc, const DVec3& p, const DVec3& 
 // 0 -- and whether it found geometry facing the wrong way. Draws from `rng`. `pathEps`: the segments'
 // step past a face (dWalkSegment); `holds`: DGatherHolds.
 struct DProbe { double area; int rej; };
-// `inRoom`: whether the gather point lies in a closed or capped solid itself (host twin inRoomOf), -1
-// until a probe asks, shared by a gather's probes.
 __device__ static DProbe dCoverageProbe(const DScene& sc, const DVec3& p, const DVec3& n, const DVec3& t,
                                         const DVec3& b, Real r, Real slack, Real pathEps, DRng& rng,
-                                        int holds, int& inRoom) {
+                                        int holds) {
     DProbe o{0.0, 0};
     const double rr = (double)r * sqrt((double)rng.uniform());
     const double ph = 2.0 * DPI * (double)rng.uniform();
@@ -8838,7 +8938,7 @@ __device__ static DProbe dCoverageProbe(const DScene& sc, const DVec3& p, const 
         int crossed = 0, lastSolid = kAsk;
         int probeNet1 = 0;   // closed solids (+-1) the probe enters coming down, less those it leaves
         bool topWalked = false;   // the segment from the gather point to the probe's top, once asked
-        DSegmentCrossings topWalk{0, 0, 0, 0, 0, 0, 0};
+        DSegmentCrossings topWalk{0, 0, 0, 0, 0};
         const auto walkTop = [&]() -> const DSegmentCrossings& {
             if (!topWalked) {
                 topWalked = true;
@@ -8855,7 +8955,7 @@ __device__ static DProbe dCoverageProbe(const DScene& sc, const DVec3& p, const 
         // The low leg, from just over the gather point to the column's foot: asked once, and only
         // once what lies above puts the column inside (host twin).
         bool legAsked = false;
-        DSegmentCrossings leg{0, 0, 0, 0, 0, 0, 0};
+        DSegmentCrossings leg{0, 0, 0, 0, 0};
         const auto lowLeg = [&]() -> const DSegmentCrossings& {
             if (!legAsked) {
                 legAsked = true;
@@ -8865,17 +8965,13 @@ __device__ static DProbe dCoverageProbe(const DScene& sc, const DVec3& p, const 
             return leg;
         };
         // An odd parity whose low leg crosses an odd count too, or a solid's side where the column lies
-        // deeper in solids than the gather point -- the leg's `net` or `low`, its `solids` where the
-        // gather point lies in no room, or else the chain over the top's `net1`: host twin's inside(),
-        // where the why is.
+        // deeper in solids than the gather point -- the leg's `net` or `low`, or else the chain over the
+        // top's `net1`: host twin's inside(), where the why is.
         const auto inside = [&]() {
             if ((crossed & 1) && (!(rr > (double)pathEps) || (lowLeg().open & 1))) return true;
             if (!(side() > 0)) return false;
             const DSegmentCrossings& L = lowLeg();
-            if (L.net > 0 || L.low < 0) return true;
-            if (inRoom < 0) inRoom = dInRoomOf(sc, p, n, r, pathEps) ? 1 : 0;
-            if (!inRoom && L.solids > 0) return true;
-            return walkTop().net1 + probeNet1 > 0;
+            return L.net > 0 || L.low < 0 || walkTop().net1 + probeNet1 > 0;
         };
         bool found = false;                  // the probe ended on what it counts
         bool ended = false;                  // ... or on what it does not
@@ -8994,10 +9090,9 @@ __device__ static double dGatherCoverage(const DScene& sc, const DVec3& p, const
     int    nRej = 0;                         // probes that FOUND geometry facing the wrong way
     const int probe0 = dGateProbes(sc, M);
     const Real pathEps = fmax(fmax((Real)1e-4 * r, (Real)2 * dEpsAt(p)), dReachEps(reach));
-    int inRoom = -1;
     for (int i = 0; i < M; ++i) {
         if (i == probe0 && area >= (double)probe0 * 0.995) return 1.0;
-        const DProbe o = dCoverageProbe(sc, p, n, t, b, r, slack, pathEps, rng, DGATHER_PHOTONS, inRoom);
+        const DProbe o = dCoverageProbe(sc, p, n, t, b, r, slack, pathEps, rng, DGATHER_PHOTONS);
         area += o.area;
         nRej += o.rej;
     }
@@ -22095,11 +22190,10 @@ __device__ static double dSurfFootprint(const DScene& sc, const DMergeFootprint&
     const int probe0 = dGateProbes(sc, fp.M);
     double area = 0.0;
     int nRej = 0;
-    int inRoom = -1;
     for (int i = 0; i < fp.M; ++i) {
         if (i == probe0 && area >= (double)probe0 * 0.995) return 1.0;   // dGatherCoverage's early gate
         DRng prng = dMergeProbeRng(seed, i);
-        const DProbe o = dCoverageProbe(sc, fp.p, fp.n, t, b, fp.r, fp.slack, pathEps, prng, DGATHER_MERGES, inRoom);
+        const DProbe o = dCoverageProbe(sc, fp.p, fp.n, t, b, fp.r, fp.slack, pathEps, prng, DGATHER_MERGES);
         area += o.area;
         nRej += o.rej;
     }
@@ -22115,10 +22209,9 @@ __device__ static double dSurfFootprintWarp(const DScene& sc, const DMergeFootpr
     const int probe0 = dGateProbes(sc, fp.M);
     double area = 0.0, area0 = 0.0;   // all of this lane's probes; those the early gate reads
     int nRej = 0;
-    int inRoom = -1;   // this lane's
     for (int i = lane; i < fp.M; i += 32) {
         DRng prng = dMergeProbeRng(seed, i);
-        const DProbe o = dCoverageProbe(sc, fp.p, fp.n, t, b, fp.r, fp.slack, pathEps, prng, DGATHER_MERGES, inRoom);
+        const DProbe o = dCoverageProbe(sc, fp.p, fp.n, t, b, fp.r, fp.slack, pathEps, prng, DGATHER_MERGES);
         area += o.area;
         nRej += o.rej;
         if (i < probe0) area0 += o.area;
