@@ -43,6 +43,13 @@ constexpr double kGatherFacingCos = 0.5;
 // a gather point's tangent plane, as a share of the radius -- under any lid the parity can count,
 // over the surface's own relief.
 constexpr double kLowLegFrac = 0.01;
+// The kinds of face the footprint's walks and probes count, light-passing faces aside (gafootprint.h
+// faceKind, the device's dFaceKind): a closed solid's face left or entered (Hit::solid +-1), a cap's
+// left or entered (+-2), and an open face, which cannot say its side. Of two faces lying on each other
+// both are met (faceKindsIn), each kind once.
+enum FaceKind { kFaceLeft1, kFaceIn1, kFaceLeft2, kFaceIn2, kFaceOpen, kFaceKinds };
+constexpr unsigned kFacesLeft = (1u << kFaceLeft1) | (1u << kFaceLeft2);
+constexpr unsigned kFacesIn = (1u << kFaceIn1) | (1u << kFaceIn2);
 
 template <class T> FT_GP_HD FT_UNIT_INLINE bool withinGatherBand(T off, T d2, T c, T slack) {
     if (off <= slack) return true;

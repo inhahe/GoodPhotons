@@ -8863,38 +8863,55 @@ __device__ static void dForEachCrossing(const DScene& sc, const DVec3& ro, const
 // does not pass that the segment from `o` along unit `d`, `len` long, crosses, curves unseen, the
 // side of the last closed solid's (+1 it ends inside, -1 outside, 0 none), how many more it enters
 // than leaves (`net`, `net1` the closed alone) and the least that count reaches (`low`), and how many
-// cannot say theirs (up to 15), window by window: each from the last's end to `eps` past its nearest
-// face -- or that face's own error, where larger -- every face in it seen.
+// cannot say theirs (up to 15), window by window: each from the last's end to just past its nearest
+// face -- by the rounding of a distance (`eps` * 1e-3) or that face's own error, where larger --
+// every face in it seen.
 struct DSegmentCrossings { int side; int open; int net, low, net1; };   // host twin SegmentCrossings
 // The distance a trace that leaves hit h at exactly h.p must skip to clear its own primitive, whose error
 // near the origin outgrows dEpsAt.
 __device__ static inline Real dHitEps(const DHit& h) {
     return fmax(dEpsAt(h.p), dReachEps(h.pscale));
 }
+// Hit h's FaceKind along the ray that met it, or -1 for a face light passes (host twin faceKind).
+__device__ static inline int dFaceKind(const DScene& sc, const DHit& h) {
+    if (dPassesLight(sc, sc.mats[h.matId])) return -1;
+    if (!h.solid) return kFaceOpen;
+    return (h.solid == 1 || h.solid == -1 ? kFaceLeft1 : kFaceLeft2) + (((h.solid > 0) == h.back) ? 0 : 1);
+}
+// The kinds of the faces lying where a query along (o, d) from tmin `t0` met its nearest face, at `t`:
+// those with t in [t0, t + tie), bit k one of FaceKind k (host twin faceKindsAt).
+__device__ static unsigned dFaceKindsAt(const DScene& sc, const DVec3& o, const DVec3& d, Real t0, Real t, Real tie) {
+    unsigned k = 0;
+    Real t1 = t + tie;
+    if (!(t1 > t0)) return k;
+    dForEachCrossing(sc, o, d, t0, t1, [&](const DHit& h, Real&) {
+        const int f = dFaceKind(sc, h);
+        if (f >= 0) k |= 1u << f;
+    });
+    return k;
+}
 __device__ static DSegmentCrossings dWalkSegment(const DScene& sc, const DVec3& o, const DVec3& d, Real len, Real eps) {
     DSegmentCrossings c{0, 0, 0, 0, 0};
-    // A window's nearest face of each kind: a closed solid's left, entered; a cap's left, entered; open.
-    enum { kLeft1, kIn1, kLeft2, kIn2, kOpen, kKinds };
+    const Real tie = eps * (Real)1e-3;   // faces this near, or within their own error, lie at one place
     Real from = (Real)0;
     for (int k = 0; k < 32 && from < len && c.open < 15; ++k) {
-        Real cut = len, nearest[kKinds] = {len, len, len, len, len};
+        Real cut = len, nearest[kFaceKinds] = {len, len, len, len, len};   // a window's nearest of each kind
         dForEachCrossing(sc, o, d, from, cut, [&](const DHit& h, Real& tm) {
-            if (dPassesLight(sc, sc.mats[h.matId])) return;
-            const int kind = !h.solid ? kOpen
-                           : (h.solid == 1 || h.solid == -1 ? kLeft1 : kLeft2) + (((h.solid > 0) == h.back) ? 0 : 1);
-            nearest[kind] = fmin(nearest[kind], h.t);
-            tm = fmin(tm, h.t + fmax(eps, dHitEps(h)));
+            const int f = dFaceKind(sc, h);
+            if (f < 0) return;
+            nearest[f] = fmin(nearest[f], h.t);
+            tm = fmin(tm, h.t + fmax(tie, dHitEps(h)));
         });
-        bool in[kKinds];
-        for (int j = 0; j < kKinds; ++j) in[j] = nearest[j] < cut;
-        const int left = in[kLeft1] + in[kLeft2], entered = in[kIn1] + in[kIn2];
-        if (!(left || entered || in[kOpen])) break;
+        bool in[kFaceKinds];
+        for (int j = 0; j < kFaceKinds; ++j) in[j] = nearest[j] < cut;
+        const int left = in[kFaceLeft1] + in[kFaceLeft2], entered = in[kFaceIn1] + in[kFaceIn2];
+        if (!(left || entered || in[kFaceOpen])) break;
         c.net -= left;
         c.low = c.net < c.low ? c.net : c.low;
         c.net += entered;
-        c.net1 += in[kIn1] - in[kLeft1];
+        c.net1 += in[kFaceIn1] - in[kFaceLeft1];
         if (left || entered) c.side = entered ? 1 : -1;
-        c.open += in[kOpen];
+        c.open += in[kFaceOpen];
         from = cut;
     }
     return c;
@@ -8994,15 +9011,17 @@ __device__ static DProbe dCoverageProbe(const DScene& sc, const DVec3& p, const 
             }
             // Only a face above the plane, by more than the relaunch's own tmin skips: one on it
             // is the surface's height (a glass box standing on the floor). An opaque one is a
-            // crossing all the same (dPassesLight) -- host twin.
+            // crossing all the same (dPassesLight) -- host twin. What it crosses there is h and every
+            // face lying on it, from this query's tmin to within the relaunch's skip, each kind once,
+            // those left before those entered (host twin's cross: two boxes stacked).
             const auto cross = [&]() {
-                if (dPassesLight(sc, hm)) return;
-                if (h.solid) {
-                    lastSolid = ((h.solid > 0) == h.back) ? -1 : 1;   // leaving : entering
-                    if (h.solid == 1 || h.solid == -1) probeNet1 += lastSolid;
-                } else {
-                    ++crossed;
-                }
+                const int own = dFaceKind(sc, h);
+                const Real t0 = curveTmin > (Real)0 ? (Real)0 : (relTmin < (Real)0 ? dEpsAt(o) : relTmin);
+                const unsigned k = (own >= 0 ? 1u << own : 0u) | dFaceKindsAt(sc, o, dn, t0, h.t - tAcc, dHitEps(h));
+                if (k & kFacesLeft) lastSolid = -1;
+                if (k & kFacesIn) lastSolid = 1;
+                probeNet1 += (int)((k >> kFaceIn1) & 1u) - (int)((k >> kFaceLeft1) & 1u);
+                if (k & (1u << kFaceOpen)) ++crossed;
             };
             if (dProbePassesThrough(sc, hm, holds) && r - h.t > fmaxf((Real)1e-3 * r, (Real)2 * dEpsAt(h.p))) {
                 cross();

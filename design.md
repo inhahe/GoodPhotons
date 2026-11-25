@@ -6840,7 +6840,11 @@ as the one at fault.
   `DTri`'s padding (FP32). For such a face `Hit::back` and the sign say whether the probe went into
   the solid or out of it, and the last one crossed, the nearest the plane, puts the column inside
   when it was an entry: under the overhang of a ball resting on the floor the probe begins inside the
-  ball and leaves it, where a parity read the floor as inside. **Each probe begins on a known side (PROBE-PATH):** where the
+  ball and leaves it, where a parity read the floor as inside. Where it crosses a face it crosses every
+  face lying on it (`faceKindsAt`, through `Scene::forEachCrossing`; within the relaunch's own skip, so
+  none twice), each kind once and those left before those entered (0.451.25, PROBE-STACKED): of two
+  boxes stacked it leaves B by its bottom and enters A by its top, so the column ends in A, where the
+  nearest-hit query returns one of the two and the floor under A read 0.76 of mode R. **Each probe begins on a known side (PROBE-PATH):** where the
   probe crosses no closed solid's face, `walkSegment` follows the segment from the gather point to
   the probe's own top, and the last closed solid's face it crosses says
   whether the top lies in a solid. So a column inside a solid taller than r standing on the surface
@@ -6878,8 +6882,10 @@ as the one at fault.
   for the leg to cross. So a pillar the leg passes walls nothing, in a room or out of one, nor does a
   room the gather point lies in (the probe enters its lid, the leg crosses nothing), nor a box clear of
   the surface at the path's time. **The leg's counts are exact (0.451.24, CAP-TOUCH-ROOM):**
-  `walkSegment` goes window by window, each from the last's end to `eps` past its nearest face (on the
-  device that face's own error where larger), and takes every face in it (`Scene::forEachCrossing`,
+  `walkSegment` goes window by window from a fixed origin, each from the last's end to just past its
+  nearest face -- by the rounding of a distance, 1e-7 r (on the device that face's own error where
+  larger; 0.451.24 took `eps`, r·1e-4, which ran a solid thinner than that into one window, its faces'
+  order lost) -- and takes every face in it (`Scene::forEachCrossing`,
   device `dForEachCrossing`: each primitive's nearest crossing in the window and every triangle of an
   instance on its own, where a nearest-hit query returns one), so of two faces lying on each other --
   boxes touching face to face, A's wall left and B's entered -- both count. Faces of one kind in one
@@ -6896,12 +6902,16 @@ as the one at fault.
   capped, however much lower than r its lid, nor is an open quad or cup standing in it
   (`check_gather_base`'s `litbox` and `litbox_closed`: their floor read 9.0 of the uncorrected render
   with the solid's side alone; `litbox_pillar` stands a closed pillar in the closed room beside its
-  floor's ring, `litbox_touch` two bottomless boxes touching face to face). `openbox_hover`, a box held up by a mover's keys from faces stored
+  floor's ring, `litbox_touch` two bottomless boxes touching face to face; `stacked` rests a box on
+  the diffuse one). `openbox_hover`, a box held up by a mover's keys from faces stored
   on the floor, holds the floor under it to the same box authored up there: the probes see it at the
   path's time, and its leg passes under. `-gageom`'s march climbs and
   decides each in-band layer of a column by the faces above it: the next solid face it meets above
   the layer, met from inside meaning inside, and the parity of the rest, so a coaster's top counts
-  while the floor inside the coaster under it does not; a layer no solid face in the window decides
+  while the floor inside the coaster under it does not -- the solid faces lying at the face it meets
+  deciding with it, as the probe's crossings take them (0.451.25): a face left there puts the layers
+  below inside, else one entered outside, and where both lie there (two boxes stacked) the layer on the
+  face itself lies outside the one entered; a layer no solid face in the window decides
   takes the side of the column's top, along the same path as the probe's, and the low leg agrees or
   not as the probe's does. A face that holds no
   photon is no area to it above the plane, where the probe passes it (a glossy ball's steep side,

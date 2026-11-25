@@ -526,6 +526,23 @@ R 0.843 / 0.841 of mode R in mode J (GPU / CPU) and 0.852 / 0.865 in mode M -bea
 bin 12 is right at its centre there (SpecThr::atBinCentre); it is not in the check's scenes until this
 is fixed, and then is its test.
 
+## DONE (2026-11-25, 0.451.25): PROBE-STACKED — the floor under two closed boxes stacked read 0.76 of mode R in mode M
+
+Found fixing CAP-TOUCH-ROOM: the probe's descent, and -gageom's climb, met one of two faces lying on each
+other as walkSegment had. A box B resting on a box A: the probe over the floor under them enters B's top,
+then meets B's bottom and A's top at one height, of which the nearest-hit query returns one; relaunched
+past it by its tmin, the probe never meets the other. Left with B's bottom, it reads the column outside
+every solid and counts the floor inside A: the floor 0-2 cm from A's base read 0.755 of mode R in mode M
+on the GPU, 0.780 on the CPU, 0.836 and 0.818 in mode S, and -gageom 0.90; against its exact coverage
+(check_gather_base's `stacked`, which holds it so, the stack's shade blurred by the kernel putting mode R
+6 % off) 0.78 on the GPU and 0.81 on the CPU in both modes (0.451.24). **Fix:** a crossing takes every face lying at it (faceKindsAt: from the query's tmin to within
+the relaunch's own skip, so none is met twice), each kind once, those left before those entered -- the
+column ends in A. The march's climb decides the layers below by the faces lying at the face it meets,
+a face left there putting them inside, else one entered outside; where both lie there, the layer on the
+face itself lies outside the one entered. Host probe, device probe, -gageom march. With it, walkSegment's
+window narrowed from `eps` (r * 1e-4) to the rounding of a distance (eps * 1e-3; the device's that face's
+error where larger): a solid thinner than eps no longer falls in one window, its faces' order lost.
+
 ## DONE (2026-11-25, 0.451.24): CAP-TOUCH-ROOM — two capped boxes touching face to face inside a closed room lower than the gather radius read the floor under the second covered
 
 What 0.451.23's depth rule still missed (REVIEW-0462). walkSegment stepped `eps` past every hit, so of

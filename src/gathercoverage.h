@@ -430,14 +430,21 @@ inline double gatherCoverageRaw(const Scene& scene, const Vec3& p, const Vec3& n
                 if (lastSolid == kAsk) lastSolid = walkTop().side;
                 return lastSolid;
             };
-            const auto cross = [&](const Hit& c, const Material* cm) {
-                if (cm && passesLight(scene, *cm)) return;
-                if (c.solid) {
-                    lastSolid = ((c.solid > 0) == c.back) ? -1 : 1;   // leaving : entering
-                    if (c.solid == 1 || c.solid == -1) probeNet1 += lastSolid;
-                } else {
-                    ++crossed;
-                }
+            // What the probe crosses where it meets `c` (light-passing faces aside): c and every face lying
+            // on it (faceKindsAt, along `pr` from its query's tmin), each kind once, those left before those
+            // entered -- of two boxes stacked, B's bottom left and A's top entered, so the column ends in A,
+            // where the query returns one of the two. Within the relaunch's own skip (the tmin), so no face
+            // is met twice.
+            const double tmin0 = scene.tminOr(Scene::kTminEps);   // every query's here but out of a strand
+            const double tie = std::min(1e-7 * r, tmin0);
+            const auto cross = [&](const Hit& c) {
+                const int own = faceKind(scene, c);
+                const unsigned k = (own >= 0 ? 1u << own : 0u) |
+                                   faceKindsAt(scene, pr, pr.curveTmin > 0.0 ? 0.0 : tmin0, c.t - tAcc, tie);
+                if (k & kFacesLeft) lastSolid = -1;
+                if (k & kFacesIn) lastSolid = 1;
+                probeNet1 += (int)((k >> kFaceIn1) & 1u) - (int)((k >> kFaceLeft1) & 1u);
+                if (k & (1u << kFaceOpen)) ++crossed;
             };
             // The low leg, from just over the gather point to the column's foot (walkSegment): asked
             // only once what lies above puts the column inside, and then once.
@@ -496,7 +503,7 @@ inline double gatherCoverageRaw(const Scene& scene, const Vec3& p, const Vec3& n
                 // height, and passing it would skip the surface beside it. An opaque one is a
                 // crossing all the same: a mirror box shadows the floor under it.
                 if (pm && probePassesThrough(scene, *pm, holds) && r - h.t > 1e-3 * r) {
-                    cross(h, pm);
+                    cross(h);
                     tAcc = h.t;
                     pr = Ray{h.p + pr.d * 1e-9, pr.d};
                     continue;
@@ -526,7 +533,7 @@ inline double gatherCoverageRaw(const Scene& scene, const Vec3& p, const Vec3& n
                     // underside of a ball resting on the floor would be "on" it for 5 mm round the
                     // point it touches, which a probe from inside the ball must leave by.
                     if (h.solid && dzH > 1e-7 * r && (h.solid > 0) == h.back) {
-                        cross(h, pm);
+                        cross(h);
                         if (!under.valid) { under = h; underFound = !inside(); }
                         tAcc = h.t;
                         pr = Ray{h.p + pr.d * 1e-9, pr.d};
@@ -537,7 +544,7 @@ inline double gatherCoverageRaw(const Scene& scene, const Vec3& p, const Vec3& n
                     break;
                 }
                 if (!(dzH > 0.0)) break;                                // below the band: a miss
-                cross(h, pm);
+                cross(h);
                 tAcc = h.t;
                 pr = Ray{h.p + pr.d * 1e-9, pr.d};
             }

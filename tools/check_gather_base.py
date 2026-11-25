@@ -1,7 +1,7 @@
 """Regression check: modes M and S read the floor at the base of an object standing on it as mode R does.
 
     python tools/check_gather_base.py [--out png/check_gather_base] [--exe ftrace.exe]
-                                      [--objects diffuse,mirror,coated,coaster,openbox,openbox_lifted,
+                                      [--objects diffuse,mirror,coated,coaster,stacked,openbox,openbox_lifted,
                                                  openbox_hover,tower,isotower,towerfar,opentower,
                                                  opentower_asset,litbox,litbox_closed,litbox_pillar,
                                                  litbox_touch,ball,meshball,diffuseball,smallball,
@@ -25,9 +25,15 @@ so the probe passes their faces, but they are opaque: their faces are crossings 
 (passesLight), or the floor under them counts as covered again. A diffuse box 5 mm tall (`coaster`)
 has its top in the floor's band from 5 cm away, so the floor's gather takes the top's photons there,
 and the top must count as covered: met from outside, a closed solid's face in the band is the
-surface, not a crossing. A glossy box with no bottom face (`openbox`), an open shell that holds no
-photon, rests on the floor, which closes its rim: the probes take it as closed there, as `opentower`
-(below). Lifted a quarter of a millimetre (`openbox_lifted`) its rim rests on nothing -- the cap asks
+surface, not a crossing. A second closed box resting on the diffuse one (`stacked`, smaller): a probe
+over the floor under both enters B's top, then meets B's bottom and A's top lying on each other, and
+must take both, A entered last, or it reads the column outside every solid and counts the floor under
+A. It is held to its exact coverage, the disc outside A's square, as the tower is (below): its taller
+shade at the base, which the kernel blurs, puts mode R 6 % off there (PROBE-STACKED: 0.451.24 read the
+0-2 cm ring 0.78 of its coverage in modes M and S on the GPU, 0.81 on the CPU, and 2-5 cm out 0.89-0.90;
+against mode R 0.755-0.836, and -gageom 0.90, whose climb met one of the two likewise). A glossy box
+with no bottom face (`openbox`), an open shell that holds no photon, rests on the floor, which closes
+its rim: the probes take it as closed there, as `opentower` (below). Lifted a quarter of a millimetre (`openbox_lifted`) its rim rests on nothing -- the cap asks
 for a face within 5e-4 of the rim's reach from its corners, 0.1 mm here -- and it cannot say its side, but it
 still shadows the floor inside it: its lid counts toward the parity, which the walls confirm along the
 low leg from the gather point to the column, 1 % of the radius over the floor (1 mm; lifted 1 mm, the
@@ -91,7 +97,8 @@ the room's 0-4 cm from its middle, must read within 3 % of the same render with 
 correction off (-gatherarea 0), whose coverage there is the whole disc: the kernel's blur from the
 lit floor beyond (the lamp's falloff, in the room) makes mode R no reference there. The tower's rings must read within 3 % of
 that render divided by each pixel's share of the disc outside the tower, a circular segment's
-complement, with mode S's radius held (-sppmalpha 1). Exits 0 when every case holds, 1 otherwise.
+complement, with mode S's radius held (-sppmalpha 1); so must the stack's, and the rooms holding a
+pillar or two boxes, by the share outside them (COVERS). Exits 0 when every case holds, 1 otherwise.
 """
 import argparse
 import os
@@ -288,6 +295,20 @@ def _box(mat, height=0.03, bottom=True, lift=0.0):
             "the base", "R")
 
 
+# A second closed box resting on the first: B's bottom lies on A's top. Smaller, so no edge of one is the
+# other's, and its top, 6 cm up, hides no floor A's does not. Held to its exact coverage, the disc outside
+# A's square (COVERS): the stack's taller shade at its base, which the kernel blurs, makes mode R no
+# reference within a few percent there.
+STACK_B = 0.13      # B's half-width
+
+
+def _stack(mat, height=0.03):
+    faces = (box(-BOX, 0.0, -BOX, BOX, height, BOX, "obj") +
+             box(-STACK_B, height, -STACK_B, STACK_B, 2 * height, STACK_B, "obj"))
+    return ([mat] + faces, TOP_CAM, lambda: top_dist(lambda X, Z: box_floor(X, Z, height)), RINGS,
+            "the base", "coverage")
+
+
 # A room: a box 4 cm tall with no bottom face and a lamp under its lid, seen from a camera inside it
 # (the lamp hidden from the camera). Every probe over its floor starts r above the floor, above the
 # lid. Its floor within 4 cm of the middle is held to the same render with the footprint correction
@@ -325,19 +346,27 @@ TOUCH_A = (-0.145, 0.045, 0.145, TOUCH_Z, 0.03)
 TOUCH_B = (-0.13, TOUCH_Z, 0.13, 0.145, 0.025)
 
 
-def floor_cover(rects):
-    """A COVERS function: each pixel's share of its gather disc (radius r about the floor point it sees,
-    the cases' radius by default) not under any of `rects` (x0, z0, x1, z1, ...), sampled on an n x n
-    grid -- 1 where the pixel sees no floor (a ring holds none of those)."""
+def top_floor():
+    """Each pixel of the view from above: the floor point it sees (world x, z; top_dist's X, Z negated),
+    and whether it sees the floor -- everywhere, the box's top being left out by a ring's distance."""
+    xs = (np.arange(W) + 0.5) / W * 2 * HALF - HALF
+    X, Z = np.meshgrid(xs, xs)
+    return -X, -Z, np.ones(X.shape, bool)
+
+
+def floor_cover(rects, floor=inner_floor):
+    """A COVERS function: each pixel's share of its gather disc (radius r about the floor point it sees
+    in the view `floor` lays out, the cases' radius by default) not under any of `rects` (x0, z0, x1,
+    z1, ...), sampled on an n x n grid -- 1 where the pixel sees no floor (a ring holds none of those)."""
     def cover_of(dist, r=None, n=81):
         r = GATHER_R if r is None else r
-        X, Z, seen = inner_floor()
+        X, Z, seen = floor()
         g = (np.arange(n) + 0.5) / n * 2 - 1
         gx, gz = np.meshgrid(g, g)
         inside = gx * gx + gz * gz <= 1.0
         ox, oz = gx[inside] * r, gz[inside] * r
         cover = np.ones(X.shape)
-        m = seen & np.isfinite(dist) & (dist < 0.06)
+        m = seen & np.isfinite(dist) & (dist >= 0) & (dist < 0.06)   # the rings' pixels, none on a box
         for i, j in zip(*np.nonzero(m)):
             px, pz = X[i, j] + ox, Z[i, j] + oz
             under = np.zeros(px.shape, bool)
@@ -409,6 +438,10 @@ OBJECTS = {
     # takes its photons, so there the probe must end on it as covered (a closed solid's face met
     # from outside), and the march count it while dropping the floor inside the box below it.
     "coaster": _box('material "obj" { type diffuse reflect 0.5 }', height=0.005),
+    # A box resting on the diffuse box: a probe over the floor under them enters B's top, then meets B's
+    # bottom and A's top lying on each other, and must take both -- left B, entered A -- or it reads the
+    # column outside every solid.
+    "stacked": _stack('material "obj" { type diffuse reflect 0.5 }'),
     # A glossy box with no bottom face -- an open shell, as an imported cup or bowl often is -- whose
     # faces cannot say their side and hold no photon: its lid still puts the floor inside it out
     # of the parity, which its walls confirm along the low leg.
@@ -473,10 +506,11 @@ OBJECTS = {
 # The faces the probes' marking pass takes as a solid's, which the case's renders must report
 # (`[gather] N of M triangles`): what a case tests holds only while its object is marked as it supposes.
 MARKS = {"openbox": 10, "openbox_lifted": 0, "openbox_hover": 10, "opentower": 10, "litbox": 10,
-         "litbox_closed": 12, "litbox_pillar": 24, "litbox_touch": 32, "opentower_asset": 0}
+         "litbox_closed": 12, "litbox_pillar": 24, "litbox_touch": 32, "opentower_asset": 0, "stacked": 24}
 # A ring held to its exact coverage (`against` "coverage") whose share of the disc is not the tower's
 # straight edge (seg_cover): by object, the function giving it from the pixels' floor distance.
-COVERS = {"litbox_pillar": floor_cover([PILLAR]), "litbox_touch": floor_cover([TOUCH_A, TOUCH_B])}
+COVERS = {"litbox_pillar": floor_cover([PILLAR]), "litbox_touch": floor_cover([TOUCH_A, TOUCH_B]),
+          "stacked": floor_cover([(-BOX, -BOX, BOX, BOX)], top_floor)}
 # The asset pieces capped under an instance, which a case's renders must report (the [gather] line's
 # `and N asset pieces`).
 INST_MARKS = {"opentower_asset": 1}
