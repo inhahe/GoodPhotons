@@ -6841,10 +6841,11 @@ as the one at fault.
   the solid or out of it, and the last one crossed, the nearest the plane, puts the column inside
   when it was an entry: under the overhang of a ball resting on the floor the probe begins inside the
   ball and leaves it, where a parity read the floor as inside. Where it crosses a face it crosses every
-  face lying on it (`faceKindsAt`, through `Scene::forEachCrossing`; within the relaunch's own skip, so
-  none twice), each kind once and those left before those entered (0.451.25, PROBE-STACKED): of two
-  boxes stacked it leaves B by its bottom and enters A by its top, so the column ends in A, where the
-  nearest-hit query returns one of the two and the floor under A read 0.76 of mode R. **Each probe begins on a known side (PROBE-PATH):** where the
+  face lying on it (`faceKindsAt`, through `Scene::forEachCrossing`: a near-point look about the face,
+  out to where the next query begins, so none is met twice or stepped over), those left before those
+  entered (0.451.25, PROBE-STACKED): of two boxes stacked it leaves B by its bottom and enters A by its
+  top, so the column ends in A, where the nearest-hit query returns one of the two and the floor under
+  A read 0.76 of mode R. **Each probe begins on a known side (PROBE-PATH):** where the
   probe crosses no closed solid's face, `walkSegment` follows the segment from the gather point to
   the probe's own top, and the last closed solid's face it crosses says
   whether the top lies in a solid. So a column inside a solid taller than r standing on the surface
@@ -6882,16 +6883,18 @@ as the one at fault.
   for the leg to cross. So a pillar the leg passes walls nothing, in a room or out of one, nor does a
   room the gather point lies in (the probe enters its lid, the leg crosses nothing), nor a box clear of
   the surface at the path's time. **The leg's counts are exact (0.451.24, CAP-TOUCH-ROOM):**
-  `walkSegment` goes window by window from a fixed origin, each from the last's end to just past its
-  nearest face -- by the rounding of a distance, 1e-7 r (on the device that face's own error where
-  larger; 0.451.24 took `eps`, r·1e-4, which ran a solid thinner than that into one window, its faces'
-  order lost) -- and takes every face in it (`Scene::forEachCrossing`,
-  device `dForEachCrossing`: each primitive's nearest crossing in the window and every triangle of an
-  instance on its own, where a nearest-hit query returns one), so of two faces lying on each other --
-  boxes touching face to face, A's wall left and B's entered -- both count. Faces of one kind in one
-  window are one face (a ray through the edge two triangles share); kinds are a closed solid's face
-  left or entered, a cap's left or entered, and an open face; a window's faces left count before those
-  entered, so `low` sees the dip between two solids touching. Until then the walk stepped `eps` past
+  from a fixed origin `walkSegment` finds the nearest face past the last place, then counts every face
+  lying there, within the rounding of a distance, 1e-7 r (on the device that face's own error where
+  larger; 0.451.24 took `eps`, r·1e-4, which ran a solid thinner than that into one place, its faces'
+  order lost) -- `faceKindsAt` through `Scene::forEachCrossing` (device `dForEachCrossing`: each
+  primitive's nearest crossing in a stretch of the ray and every triangle of an instance on its own,
+  where a nearest-hit query returns one) -- so of two faces lying on each other -- boxes touching face
+  to face, A's wall left and B's entered, or overlapping with a wall flush, both entered -- each counts.
+  The kinds (`FaceKind`, gatherplane.h) are a closed solid's face left or entered, a cap's left or
+  entered, and an open face; a place's faces left count before those entered, so `low` sees the dip
+  between two solids touching. (A ray exactly through the edge two triangles share meets both, a
+  measure-zero event the counts do not guard against; 0.451.24 counted a kind once a place, which
+  also merged the flush walls of two overlapping boxes.) Until then the walk stepped `eps` past
   each nearest hit and saw one face of such a pair: 0.451.19-0.451.23 walled a column off wherever the
   leg crossed any solid's face outside a room the gather point lay in (`solids`, `inRoomOf`) to cover
   for it, and still read the floor under the second of two bottomless boxes touching inside a closed
@@ -6908,10 +6911,12 @@ as the one at fault.
   path's time, and its leg passes under. `-gageom`'s march climbs and
   decides each in-band layer of a column by the faces above it: the next solid face it meets above
   the layer, met from inside meaning inside, and the parity of the rest, so a coaster's top counts
-  while the floor inside the coaster under it does not -- the solid faces lying at the face it meets
-  deciding with it, as the probe's crossings take them (0.451.25): a face left there puts the layers
-  below inside, else one entered outside, and where both lie there (two boxes stacked) the layer on the
-  face itself lies outside the one entered; a layer no solid face in the window decides
+  while the floor inside the coaster under it does not -- every face lying at the face it meets
+  deciding with it, as the probe's crossings take them (0.451.25), whether the query returned an
+  opaque face or a glass one lying on it: a face left there puts the layers below inside, else one
+  entered outside, and an open face lying there is crossed as the face met would be; the climb steps
+  on by the same tie, 1e-7 r, as the walk does (from a fixed origin a face's distance comes out the same
+  again); a layer no solid face in the window decides
   takes the side of the column's top, along the same path as the probe's, and the low leg agrees or
   not as the probe's does. A face that holds no
   photon is no area to it above the plane, where the probe passes it (a glossy ball's steep side,

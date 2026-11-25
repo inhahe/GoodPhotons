@@ -526,7 +526,44 @@ R 0.843 / 0.841 of mode R in mode J (GPU / CPU) and 0.852 / 0.865 in mode M -bea
 bin 12 is right at its centre there (SpecThr::atBinCentre); it is not in the check's scenes until this
 is fixed, and then is its test.
 
+## DONE (2026-11-25, 0.451.26): REVIEW-0463 — what the Opus (xhigh) review of 0.451.24-0.451.25 found
+
+Opus (xhigh) reviewed fcb07c8..b574efe (CAP-TOUCH-ROOM, PROBE-STACKED): thirteen findings, each checked
+against the code.
+
+* **A kind counted once a place merged distinct solids' faces** -- two capped boxes overlapping with a
+  wall flush, the leg entering both there, read one entry, and the floor inside the farther one counted
+  as covered, which the `solids` rule had walled. The places now count every face (FaceCounts): the merge
+  guarded only a ray exactly through the edge two triangles share, a measure-zero event.
+* **-gageom's climb**: its `pairIn` counted the face trapped between two stacked solids (a coaster's top
+  under a box) as covered area, where the probe reads it uncovered -- gone, the layer waiting for the
+  solid face above as any does; it looked for faces lying at an opaque face only, so a glass box's bottom
+  returned on a box's top hid the top -- it looks at every face but a strand's; an open face lying on a
+  solid's went uncounted -- crossed as the face met would be.
+* **Gaps between a place and the next query**: the host probe's look reached 1e-7 r past a face while
+  its relaunch skipped the scene's eps (1e-6), and the climb's 1e-7 r while it stepped `eps` (r * 1e-4):
+  faces between were met by neither. The probe's look reaches where its next query begins; the climb
+  steps by its tie (from a fixed origin a face's distance comes out the same again).
+* **Each look scanned from the query's tmin** (a second traversal along the whole stretch): it looks
+  about the face alone now, a tie either side, and the walk finds each place's nearest face first.
+* **The instance's ray and hit mapping were written out again** in forEachCrossing: Scene::instanceLocalRay
+  and instanceHitOut serve every instance query (intersectInstanceNow, occludedInstancePastNow,
+  forEachCrossing), and the device's dInstanceLocalRay dIntersectOtherNow and dForEachCrossing.
+* **No test met instanced or moving geometry**: check_gather_base's `litbox_touch_asset` (the two boxes as
+  an asset an instance places), `litbox_touch_moving` (the quads sliding in a moving group) and
+  `litbox_touch_moving_asset` (the instance in one).
+* A comment cited `faceKindsIn`, which never was; the walk's per-kind array hard-coded the kinds' count.
+
+Dismissed: the climb's look where no solid is near (a near-point look now, costing little); the fp32
+device's tie growing with a hit's coordinates, which runs a solid thinner than the error into one place
+(0.451.23's walk stepped that same distance past the face, with the same outcome); folding the device's
+new traversal into closestHit's own (the hottest code, whose codegen this would move); the check
+docstrings recording what earlier versions read (this project's checks keep the failure each guards
+as their measure, as REVIEW-0462 settled).
+
 ## DONE (2026-11-25, 0.451.25): PROBE-STACKED — the floor under two closed boxes stacked read 0.76 of mode R in mode M
+
+(0.451.26, REVIEW-0463: every face at a place counts, not each kind once; the climb's `pairIn` is gone.)
 
 Found fixing CAP-TOUCH-ROOM: the probe's descent, and -gageom's climb, met one of two faces lying on each
 other as walkSegment had. A box B resting on a box A: the probe over the floor under them enters B's top,
@@ -544,6 +581,9 @@ window narrowed from `eps` (r * 1e-4) to the rounding of a distance (eps * 1e-3;
 error where larger): a solid thinner than eps no longer falls in one window, its faces' order lost.
 
 ## DONE (2026-11-25, 0.451.24): CAP-TOUCH-ROOM — two capped boxes touching face to face inside a closed room lower than the gather radius read the floor under the second covered
+
+(0.451.25 narrowed the window to a distance's rounding; 0.451.26, REVIEW-0463, counts every face at a
+place rather than each kind once, and finds each place's nearest face before looking about it.)
 
 What 0.451.23's depth rule still missed (REVIEW-0462). walkSegment stepped `eps` past every hit, so of
 two coincident faces -- box A's wall and box B's, touching -- it saw one alone; the leg then read A

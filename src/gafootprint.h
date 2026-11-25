@@ -43,13 +43,13 @@ inline bool probePassesThrough(const Scene& scene, const Material& m, GatherHold
 //     column off, one touching another too; a sheet hovering over it -- a table top, a mirror, a
 //     lamp's quad -- leaves the way open, the floor under it lit from the sides, and so does a room
 //     the gather point lies in itself, a pillar in it or an open quad or cup there no wall.
-// The counts are exact because the walk sees every face: it goes window by window from a fixed
-// origin, each from the last's end to just past its nearest face -- by the rounding of a distance
-// (`eps` * 1e-3), so faces any farther apart keep their order -- and takes every face in it
-// (Scene::forEachCrossing), so of two lying on each other -- boxes touching face to face, A's wall
-// left and B's entered -- both count. Faces of one kind in one window are one face (a ray through the
-// edge two triangles share); a window's faces left count before those entered, so `low` sees the dip
-// between two solids touching. `eps`: the gather's scale (r * 1e-4). Device twin dWalkSegment.
+// The counts are exact because the walk sees every face: from a fixed origin it finds the nearest face
+// past the last place, then counts every face lying there (faceKindsAt), so of two lying on each other
+// -- boxes touching face to face, A's wall left and B's entered, or overlapping with a wall flush, both
+// entered -- each counts. A place's faces left count before those entered, so `low` sees the dip between
+// two solids touching. Faces farther apart than the rounding of a distance (`eps` * 1e-3) are two
+// places, in order. (A ray exactly through the edge two triangles share meets both, a measure-zero event
+// the counts do not guard against.) `eps`: the gather's scale (r * 1e-4). Device twin dWalkSegment.
 struct SegmentCrossings { int side = 0; int open = 0; int net = 0, low = 0, net1 = 0; };
 // Hit h's FaceKind along the ray that met it, or -1 for a face light passes (passesLight). Device twin
 // dFaceKind.
@@ -59,17 +59,18 @@ inline int faceKind(const Scene& sc, const Hit& h) {
     if (!h.solid) return kFaceOpen;
     return (h.solid == 1 || h.solid == -1 ? kFaceLeft1 : kFaceLeft2) + (((h.solid > 0) == h.back) ? 0 : 1);
 }
-// The kinds of the faces lying where a query along `ray` from tmin `t0` met its nearest face, at `t`:
-// those with t in [t0, t + tie), bit k one of FaceKind k -- of two faces lying on each other both
+// The faces lying where a query along `ray` met its nearest face, at `t`: those with t in [t - tie,
+// t + tie), and none before `t0`, where that query began -- of two lying on each other both
 // (Scene::forEachCrossing), where the query returns one. `tie`: how near two faces lie to be one place,
-// the rounding of their distances (1e-7 of the radius). Device twin dFaceKindsAt.
-inline unsigned faceKindsAt(const Scene& sc, const Ray& ray, double t0, double t, double tie) {
-    unsigned k = 0;
-    double t1 = t + tie;
-    if (!(t1 > t0)) return k;
-    sc.forEachCrossing(ray, t0, t1, [&](const Hit& h, double&) {
+// at least the rounding of their distances. Device twin dFaceKindsAt.
+inline FaceCounts faceKindsAt(const Scene& sc, const Ray& ray, double t0, double t, double tie) {
+    FaceCounts k;
+    const double a = std::max(t0, t - tie);
+    double b = t + tie;
+    if (!(b > a)) return k;
+    sc.forEachCrossing(ray, a, b, [&](const Hit& h, double&) {
         const int f = faceKind(sc, h);
-        if (f >= 0) k |= 1u << f;
+        if (f >= 0) ++k.n[f];
     });
     return k;
 }
@@ -79,24 +80,19 @@ inline SegmentCrossings walkSegment(const Scene& sc, const Vec3& o, const Vec3& 
     const double tie = eps * 1e-3;   // faces this near lie at one place (faceKindsAt)
     double from = 0.0;
     for (int k = 0; k < 32 && from < len && c.open < 15; ++k) {
-        double cut = len, nearest[kFaceKinds] = {len, len, len, len, len};   // a window's nearest of each kind
-        sc.forEachCrossing(ray, from, cut, [&](const Hit& h, double& tm) {
-            const int f = faceKind(sc, h);
-            if (f < 0) return;
-            nearest[f] = std::min(nearest[f], h.t);
-            tm = std::min(tm, h.t + tie);
+        double nearest = len;   // the nearest face past the last place that light does not pass
+        sc.forEachCrossing(ray, from, nearest, [&](const Hit& h, double& tm) {
+            if (faceKind(sc, h) >= 0) tm = h.t;
         });
-        bool in[kFaceKinds];
-        for (int j = 0; j < kFaceKinds; ++j) in[j] = nearest[j] < cut;
-        const int left = in[kFaceLeft1] + in[kFaceLeft2], entered = in[kFaceIn1] + in[kFaceIn2];
-        if (!(left || entered || in[kFaceOpen])) break;
-        c.net -= left;
+        if (!(nearest < len)) break;
+        const FaceCounts f = faceKindsAt(sc, ray, from, nearest, tie);
+        c.net -= f.left();
         c.low = std::min(c.low, c.net);
-        c.net += entered;
-        c.net1 += in[kFaceIn1] - in[kFaceLeft1];
-        if (left || entered) c.side = entered ? 1 : -1;
-        c.open += in[kFaceOpen];
-        from = cut;
+        c.net += f.entered();
+        c.net1 += f.net1();
+        if (f.left() || f.entered()) c.side = f.entered() ? 1 : -1;
+        c.open += f.open();
+        from = nearest + tie;
     }
     return c;
 }
@@ -142,6 +138,7 @@ inline double gatherFootprintArea(const Scene& sc, const Vec3& p, const Vec3& n,
     const double kPi = 3.14159265358979323846;
     const double r2 = r * r;
     const double eps = (r * 1e-4 > 1e-9) ? r * 1e-4 : 1e-9;   // scale-relative, not absolute
+    const double tie = eps * 1e-3;   // faces this near lie at one place (faceKindsAt), as walkSegment's
 
     Vec3 t1 = (std::fabs(n.x) < 0.9) ? Vec3{1, 0, 0} : Vec3{0, 1, 0};
     t1 = normalize(cross(t1, n));
@@ -265,24 +262,25 @@ inline double gatherFootprintArea(const Scene& sc, const Vec3& p, const Vec3& n,
             // (a resting ball's underside near its contact is above it). One that cannot say counts
             // toward the parity where the probe would cross it: off the band, or a face that holds
             // no photon above the plane, which the probe passes through.
-            // A solid's face lying on another decides with it, of two boxes stacked B's bottom with A's top:
-            // the faces lying at h (faceKindsAt; none on the plane) say it, a face left there putting the
-            // layers below inside, else one entered outside -- and where both lie there, h's own layer, if
-            // any, lies outside the solid entered (`pairIn`, below).
+            // Every face lying at h decides with it (faceKindsAt; none on the plane), whatever the
+            // query returned of them -- of two boxes stacked, B's bottom or A's top, or a glass box's on
+            // a box: a solid left there puts the layers below inside, else one entered outside; an open
+            // face lying on h is crossed as h would be (`partnersOpen`, below).
             const bool strand = mm && mm->type == MatType::Hair && h.fiberRadius > 0.0;
             const bool opaque = !(mm && passesLight(sc, *mm)) && !strand;
-            bool pairIn = false;
-            if (opaque && off > 1e-7 * r) {
+            const int own = strand ? -1 : faceKind(sc, h);
+            int partnersOpen = 0;
+            if (!strand && off > 1e-7 * r) {
                 const double t0 = std::max(ct > 0.0 ? 0.0 : tl, half + 1e-7 * r - tBase);
-                const unsigned k = (h.solid ? 1u << faceKind(sc, h) : 0u) |
-                                   faceKindsAt(sc, ray, t0, h.t - tBase, 1e-7 * r);
-                if (k & (kFacesLeft | kFacesIn)) {
-                    climbNet1 += (int)((k >> kFaceIn1) & 1u) - (int)((k >> kFaceLeft1) & 1u);
-                    double* to = (k & kFacesLeft) ? drop : dec;   // left: below is inside; entered: outside
+                FaceCounts f = faceKindsAt(sc, ray, t0, h.t - tBase, tie);
+                f.keep(own);
+                if (f.left() || f.entered()) {
+                    climbNet1 += f.net1();
+                    double* to = f.left() ? drop : dec;   // left: below is inside; entered: outside
                     to[0] += pend[0]; to[1] += pend[1];
                     pend[0] = pend[1] = 0.0;
-                    pairIn = (k & kFacesLeft) && (k & kFacesIn);
                 }
+                partnersOpen = f.open() - (own == kFaceOpen ? 1 : 0);
             }
             // A face that holds no photon is no area above the plane, where the probe passes it (a
             // glossy ball's steep side, which the tilt-widened band takes in); on the plane it is
@@ -290,6 +288,7 @@ inline double gatherFootprintArea(const Scene& sc, const Vec3& p, const Vec3& n,
             const bool passed = mm && probePassesThrough(sc, *mm, holds) && off > 1e-3 * r;
             if (passed) {
                 if (opaque && !h.solid) ++crossed;
+                crossed += partnersOpen;
             } else if (h.t <= span && withinGatherBand(std::fabs(off), dot(dh, dh), std::fabs(c), slack)) {
                 // On the plane, to within rounding, either way up: a face lying on another facing apart
                 // (a room's floor on the ground) is one surface to the photon query, whose photons face
@@ -297,11 +296,13 @@ inline double gatherFootprintArea(const Scene& sc, const Vec3& p, const Vec3& n,
                 // the traversal's choice (GAGEOM-COINCIDENT). Off it the sign holds.
                 const double cf = std::fabs(off) <= 1e-7 * r ? std::fabs(c) : c;
                 if (cf >= kGatherFacingCos) pend[crossed & 1] += cellArea / cf;
-            } else if (off > 0.0 && opaque && !h.solid) {
-                ++crossed;
+            } else if (off > 0.0) {
+                if (opaque && !h.solid) ++crossed;
+                crossed += partnersOpen;
             }
-            if (pairIn) { dec[0] += pend[0]; dec[1] += pend[1]; pend[0] = pend[1] = 0.0; }
-            tl = h.t - tBase + eps; ct = 0.0;
+            // On past h by the tie alone: from a fixed origin h's own distance comes out the same
+            // again, so the next query cannot meet it, and a face any farther on is its own place.
+            tl = h.t - tBase + tie; ct = 0.0;
         }
         // Layers no solid face above decided lie on the column top's side: along the segment from the
         // gather point to the column's top (PROBE-PATH), walked once a column when asked.

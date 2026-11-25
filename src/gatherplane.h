@@ -45,11 +45,23 @@ constexpr double kGatherFacingCos = 0.5;
 constexpr double kLowLegFrac = 0.01;
 // The kinds of face the footprint's walks and probes count, light-passing faces aside (gafootprint.h
 // faceKind, the device's dFaceKind): a closed solid's face left or entered (Hit::solid +-1), a cap's
-// left or entered (+-2), and an open face, which cannot say its side. Of two faces lying on each other
-// both are met (faceKindsIn), each kind once.
+// left or entered (+-2), and an open face, which cannot say its side.
 enum FaceKind { kFaceLeft1, kFaceIn1, kFaceLeft2, kFaceIn2, kFaceOpen, kFaceKinds };
-constexpr unsigned kFacesLeft = (1u << kFaceLeft1) | (1u << kFaceLeft2);
-constexpr unsigned kFacesIn = (1u << kFaceIn1) | (1u << kFaceIn2);
+// How many faces of each kind lie at one place (faceKindsAt, the device's dFaceKindsAt): of two lying
+// on each other -- boxes touching, stacked, or overlapping with a wall flush -- both.
+struct FaceCounts {
+    int n[kFaceKinds];
+    FT_GP_HD FaceCounts() { for (int k = 0; k < kFaceKinds; ++k) n[k] = 0; }
+    FT_GP_HD int left() const { return n[kFaceLeft1] + n[kFaceLeft2]; }      // solids left there
+    FT_GP_HD int entered() const { return n[kFaceIn1] + n[kFaceIn2]; }       // ... and entered
+    FT_GP_HD int net1() const { return n[kFaceIn1] - n[kFaceLeft1]; }        // closed ones entered less left
+    FT_GP_HD int open() const { return n[kFaceOpen]; }
+    FT_GP_HD bool none() const { return !left() && !entered() && !open(); }
+    // Face `own`'s kind is here at least once: the query that met it found it, whatever a second
+    // look at the place makes of it (an isosurface's root, found again from another tmin; a curve,
+    // which it does not look at).
+    FT_GP_HD void keep(int own) { if (own >= 0 && n[own] < 1) n[own] = 1; }
+};
 
 template <class T> FT_GP_HD FT_UNIT_INLINE bool withinGatherBand(T off, T d2, T c, T slack) {
     if (off <= slack) return true;

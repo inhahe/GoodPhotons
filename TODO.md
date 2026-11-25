@@ -296,6 +296,9 @@ Then the rest of 4.2-4.6 in their order, 4.7's bookkeeping alongside whatever to
   share of the disc (the footprint): the gap's light stays off the plate, and object bases read true.
 - [x] **GAGEOM-COINCIDENT** (0.451.18) — `-gageom`'s march counted one of two coincident faces facing apart
   by the traversal's choice: on the plane it takes either; known-issues.
+- [x] **REVIEW-0463** (0.451.26) — the Opus (xhigh) review of 0.451.24-0.451.25: every face at a place counts
+  (flush overlapping boxes), the climb's `pairIn` gone, no gap between a place and the next query, the
+  instance tests; known-issues REVIEW-0463.
 - [x] **PROBE-STACKED** (0.451.25) — the probe's descent and -gageom's climb met one of two faces lying on each
   other: the floor under two boxes stacked read 0.76 of mode R; a crossing takes every face lying at it; known-issues.
 - [x] **CAP-TOUCH-ROOM** (0.451.24) — two capped boxes touching inside a room lower than the radius read the

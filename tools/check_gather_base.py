@@ -1,11 +1,12 @@
 """Regression check: modes M and S read the floor at the base of an object standing on it as mode R does.
 
     python tools/check_gather_base.py [--out png/check_gather_base] [--exe ftrace.exe]
-                                      [--objects diffuse,mirror,coated,coaster,stacked,openbox,openbox_lifted,
+                                      [--objects diffuse,mirror,coated,coaster,stacked,flush,openbox,openbox_lifted,
                                                  openbox_hover,tower,isotower,towerfar,opentower,
                                                  opentower_asset,litbox,litbox_closed,litbox_pillar,
-                                                 litbox_touch,ball,meshball,diffuseball,smallball,
-                                                 mirrorsheet,lampsheet,tablesheet]
+                                                 litbox_touch,litbox_touch_asset,litbox_touch_moving,
+                                                 litbox_touch_moving_asset,ball,meshball,diffuseball,
+                                                 smallball,mirrorsheet,lampsheet,tablesheet]
 
 A closed 3 cm box (six quads) standing on a lit floor, seen from straight above, modes M and S at a
 pinned gather radius of 0.1 on the CPU and the GPU, against mode R on the GPU. A mode-M or mode-S
@@ -71,7 +72,10 @@ in it instead, touching face to face and capped where they rest: the leg to a co
 crosses the first's near wall and then two walls lying on each other, the first's left and the second's
 entered, and must count both, or the floor under the second counts as covered (CAP-TOUCH-ROOM:
 0.451.23 read it 0.920 in mode M on the CPU, 0.969 on the GPU, 0.970 in mode S there; held to its
-coverage outside both). The closed room's floor face lies on the floor quad, facing apart: -gageom took a layer
+coverage outside both). So do `litbox_touch_asset`, the two as an asset an instance places, whose
+triangles the leg meets in the asset's own tree, and `litbox_touch_moving` and
+`litbox_touch_moving_asset`, the quads and the instance sliding 1 mm along the shared wall in a moving
+group over the shutter, met where the path's time has them. The closed room's floor face lies on the floor quad, facing apart: -gageom took a layer
 there only on the one facing the gather point's way, which of the two a ray meets being the
 traversal's, and read 2.07 (M) and 2.01 (S) of the probe on 0.451.17 (GAGEOM-COINCIDENT).
 Then a glossy ball of the box's
@@ -144,7 +148,13 @@ def open_box(x0, y0, z0, x1, y1, z1, mat):
 
 def box_obj(path, x0, y0, z0, x1, y1, z1, bottom=True):
     """box_faces as an OBJ of their triangles, wound outward as the quads are (u x v), welded."""
-    qs = box_faces(x0, y0, z0, x1, y1, z1, bottom)
+    boxes_obj(path, [(x0, y0, z0, x1, y1, z1)], bottom)
+
+
+def boxes_obj(path, boxes, bottom=True):
+    """box_obj of several boxes (x0, y0, z0, x1, y1, z1 each) in one OBJ, one piece apiece where no two
+    share a corner."""
+    qs = [f for b in boxes for f in box_faces(*b, bottom=bottom)]
     verts, at, faces = [], {}, []
 
     def v(p):
@@ -302,6 +312,21 @@ def _box(mat, height=0.03, bottom=True, lift=0.0):
 STACK_B = 0.13      # B's half-width
 
 
+def _flush(mat, height=0.03):
+    """A bottomless box with a second, shorter one inside it against its wall at x = -BOX, the two walls
+    flush there: a leg from beyond that wall to a column past the inner box enters both at once and
+    leaves the inner one, so it must count two entries where it meets one place. Its corners touch none
+    of the outer box's, so the two stay two pieces, each capped where it rests. Held to its exact
+    coverage, the disc outside the outer box's square."""
+    faces = (open_box(-BOX, 0.0, -BOX, BOX, height, BOX, "obj") +
+             open_box(-BOX, 0.0, -FLUSH_Z, -BOX + FLUSH_W, FLUSH_H, FLUSH_Z, "obj"))
+    return ([mat] + faces, TOP_CAM, lambda: top_dist(lambda X, Z: box_floor(X, Z, height)), RINGS,
+            "the base", "coverage")
+
+
+FLUSH_W, FLUSH_Z, FLUSH_H = 0.04, 0.12, 0.02   # the inner box's depth, half-length and height
+
+
 def _stack(mat, height=0.03):
     faces = (box(-BOX, 0.0, -BOX, BOX, height, BOX, "obj") +
              box(-STACK_B, height, -STACK_B, STACK_B, 2 * height, STACK_B, "obj"))
@@ -344,6 +369,18 @@ PILLAR = (-0.02, 0.06, 0.02, 0.08, 0.03)
 TOUCH_Z = 0.06
 TOUCH_A = (-0.145, 0.045, 0.145, TOUCH_Z, 0.03)
 TOUCH_B = (-0.13, TOUCH_Z, 0.13, 0.145, 0.025)
+TOUCH_OBJ = [(b[0], 0.0, b[1], b[2], b[4], b[3]) for b in (TOUCH_A, TOUCH_B)]   # as boxes_obj takes them
+# The two as an asset (touch.obj, written by main) placed where they are authored.
+TOUCH_ASSET = ['mesh_asset "touch" { file "touch.obj"  material obj }', 'mesh_instance { of "touch" }']
+# A group sliding its children 1 mm along the boxes' shared wall over the motion interval [0, 1], resting
+# throughout, and the view from inside the room with a shutter over all of it (SCENE_EXTRA).
+TOUCH_SLIDE = "group { motion { key { translate 0 0 0 } key { translate 0.001 0 0 } }"
+MOVING_INNER_CAM = INNER_CAM.replace("film {", "shutter_open 0  shutter_close 1  film {")
+
+
+def touch_boxes():
+    """The two touching boxes as bottomless boxes of quads."""
+    return [ln for x0, y0, z0, x1, y1, z1 in TOUCH_OBJ for ln in open_box(x0, y0, z0, x1, y1, z1, "obj")]
 
 
 def top_floor():
@@ -442,6 +479,9 @@ OBJECTS = {
     # bottom and A's top lying on each other, and must take both -- left B, entered A -- or it reads the
     # column outside every solid.
     "stacked": _stack('material "obj" { type diffuse reflect 0.5 }'),
+    # Two bottomless boxes overlapping, one inside the other against its wall, the walls flush: the leg
+    # entering both there must count both.
+    "flush": _flush('material "obj" { type diffuse reflect 0.5 }'),
     # A glossy box with no bottom face -- an open shell, as an imported cup or bowl often is -- whose
     # faces cannot say their side and hold no photon: its lid still puts the floor inside it out
     # of the parity, which its walls confirm along the low leg.
@@ -477,10 +517,20 @@ OBJECTS = {
     # ...and, in place of the pillar, two bottomless boxes touching face to face, capped where they rest:
     # the low leg to a column under B crosses A's near wall, then A's far wall and B's near one, which
     # lie on each other, and must count both.
-    "litbox_touch": (_room('material "obj" { type diffuse reflect 0.5 }', bottom=True)[0] +
-                     open_box(TOUCH_A[0], 0.0, TOUCH_A[1], TOUCH_A[2], TOUCH_A[4], TOUCH_A[3], "obj") +
-                     open_box(TOUCH_B[0], 0.0, TOUCH_B[1], TOUCH_B[2], TOUCH_B[4], TOUCH_B[3], "obj"),
+    "litbox_touch": (_room('material "obj" { type diffuse reflect 0.5 }', bottom=True)[0] + touch_boxes(),
                      INNER_CAM, inner_dist, ((0.0, 0.04),), "the middle", "coverage"),
+    # ...the two boxes as an asset an instance places, its two pieces capped under it, whose triangles a
+    # look along the leg meets one by one in the asset's own tree...
+    "litbox_touch_asset": (_room('material "obj" { type diffuse reflect 0.5 }', bottom=True)[0] + TOUCH_ASSET,
+                           INNER_CAM, inner_dist, ((0.0, 0.04),), "the middle", "coverage"),
+    # ...and either way sliding 1 mm along the shared wall over the shutter, met where the path's time
+    # has them: the world's quads as movers, and the instance in a moving group.
+    "litbox_touch_moving": (_room('material "obj" { type diffuse reflect 0.5 }', bottom=True)[0] +
+                            [TOUCH_SLIDE] + touch_boxes() + ["}"], MOVING_INNER_CAM, inner_dist, ((0.0, 0.04),),
+                            "the middle", "coverage"),
+    "litbox_touch_moving_asset": (_room('material "obj" { type diffuse reflect 0.5 }', bottom=True)[0] +
+                                  TOUCH_ASSET[:1] + [TOUCH_SLIDE] + TOUCH_ASSET[1:] + ["}"], MOVING_INNER_CAM,
+                                  inner_dist, ((0.0, 0.04),), "the middle", "coverage"),
     # A ball resting on the floor holds the probe's origin over the floor under its overhang, so
     # the probe leaves it before it meets the floor: a closed solid's face says it is out
     # (PROBE-SOLID-SIDE), where a parity reads the floor as inside.
@@ -506,21 +556,24 @@ OBJECTS = {
 # The faces the probes' marking pass takes as a solid's, which the case's renders must report
 # (`[gather] N of M triangles`): what a case tests holds only while its object is marked as it supposes.
 MARKS = {"openbox": 10, "openbox_lifted": 0, "openbox_hover": 10, "opentower": 10, "litbox": 10,
-         "litbox_closed": 12, "litbox_pillar": 24, "litbox_touch": 32, "opentower_asset": 0, "stacked": 24}
+         "litbox_closed": 12, "litbox_pillar": 24, "litbox_touch": 32, "litbox_touch_asset": 12,
+         "litbox_touch_moving": 32, "litbox_touch_moving_asset": 12, "opentower_asset": 0, "stacked": 24, "flush": 20}
 # A ring held to its exact coverage (`against` "coverage") whose share of the disc is not the tower's
 # straight edge (seg_cover): by object, the function giving it from the pixels' floor distance.
-COVERS = {"litbox_pillar": floor_cover([PILLAR]), "litbox_touch": floor_cover([TOUCH_A, TOUCH_B]),
-          "stacked": floor_cover([(-BOX, -BOX, BOX, BOX)], top_floor)}
+COVERS = {"litbox_pillar": floor_cover([PILLAR]), "stacked": floor_cover([(-BOX, -BOX, BOX, BOX)], top_floor),
+          "flush": floor_cover([(-BOX, -BOX, BOX, BOX)], top_floor)}
+for _k in ("litbox_touch", "litbox_touch_asset", "litbox_touch_moving", "litbox_touch_moving_asset"):
+    COVERS[_k] = floor_cover([TOUCH_A, TOUCH_B])   # (the slide, 1 mm, moves no cover by 0.1 %)
 # The asset pieces capped under an instance, which a case's renders must report (the [gather] line's
 # `and N asset pieces`).
-INST_MARKS = {"opentower_asset": 1}
+INST_MARKS = {"opentower_asset": 1, "litbox_touch_asset": 2, "litbox_touch_moving_asset": 2}
 INST_LINE = re.compile(r"and (\d+) asset pieces")
 # A case held to its twin (`against` "twin"): the scene lines of the same thing put another way, rendered
 # with the same arguments and seeds, each ring within TWIN_TOL of the twin's.
 TWINS = {"openbox_hover": hover_lines('material "obj" { type glossy reflect 0.6 roughness 0.3 }', 0.00025)}
 TWIN_TOL = 0.04
 # What a case's `scene { }` line adds.
-SCENE_EXTRA = {"openbox_hover": "  motion_interval 0 1"}
+SCENE_EXTRA = {k: "  motion_interval 0 1" for k in ("openbox_hover", "litbox_touch_moving", "litbox_touch_moving_asset")}
 GATHER_LINE = re.compile(r"\[gather\] (\d+) of (\d+) triangles")
 
 
@@ -565,6 +618,7 @@ def main():
     os.makedirs(out, exist_ok=True)
     write_ball_obj(os.path.join(out, "ball.obj"), BOX)
     box_obj(os.path.join(out, "tower.obj"), TOWER_X0, 0.0, -BOX, -BOX, 0.3, BOX, bottom=False)
+    boxes_obj(os.path.join(out, "touch.obj"), TOUCH_OBJ, bottom=False)
     ok = True
     for bname in a.objects.split(","):
         lines, cam, distf, rings, base, against = OBJECTS[bname]

@@ -5577,6 +5577,18 @@ __device__ static inline DSphere dMovedSphere(const DSphere& s0, const DAff& D) 
     s.r = s0.r * dAffScale(D);
     return s;
 }
+// Ray (ro, rd) in instance `inst`'s local space as the path's time places it -- carried back to the
+// instant first by its motion `set` (mc's inverse) where `set` >= 0 -- on which the same t names the same
+// point (host twin Scene::instanceLocalRay).
+__device__ static inline void dInstanceLocalRay(const DScene& sc, const DInstance& inst, int set, DMotionNow& mc,
+                                                const DVec3& ro, const DVec3& rd, DVec3& lro, DVec3& lrd) {
+    DVec3 o = ro, d = rd;
+    if (set >= 0) {
+        const DAff& Di = mc.inverse(sc, set);
+        o = affPoint(Di.m, Di.t, ro); d = affDir(Di.m, rd);
+    }
+    lro = affPoint(inst.Lm, inst.Lt, o); lrd = affDir(inst.Lm, d);
+}
 // Any other moving primitive (global number `prim`, of kind sphere, isosurface, curve segment or
 // instance) at the path's time: a sphere moved (its radius by the motion's mean scale, its axes
 // turned); the rest met at the instant by the ray carried back there (an affine map keeps the
@@ -5616,7 +5628,8 @@ __device__ static bool dIntersectOtherNow(const DScene& sc, const DVec3& ro, con
                                 fmaxf((float)tmin, (float)curveTmin), h, anyHit);
     } else {
         const DInstance& inst = sc.instances[k - sc.nImplicits - sc.nCurveSegs];
-        const DVec3 iro = affPoint(inst.Lm, inst.Lt, lro), ird = affDir(inst.Lm, lrd);
+        DVec3 iro, ird;
+        dInstanceLocalRay(sc, inst, set, mc, ro, rd, iro, ird);
         if (anyHit) return blasOccluded(sc, inst, iro, ird, tmin, h.t);
         DHit lh; lh.t = h.t; lh.valid = false;
         int lb = -1;
@@ -8836,7 +8849,9 @@ __device__ static void dForEachCrossing(const DScene& sc, const DVec3& ro, const
             if (intersectImplicit(sc, sc.implicits[prim - sc.nTris - sc.nSph], ro, rd, tmin, h)) leaf(h, tm);
         } else if (prim >= iBase) {
             const DInstance& inst = sc.instances[prim - iBase];
-            dInstanceCrossings(sc, inst, affPoint(inst.Lm, inst.Lt, ro), affDir(inst.Lm, rd), tmin, tm, -1, mc, leaf);
+            DVec3 lro, lrd;
+            dInstanceLocalRay(sc, inst, -1, mc, ro, rd, lro, lrd);
+            dInstanceCrossings(sc, inst, lro, lrd, tmin, tm, -1, mc, leaf);
         }
     });
     if (!timed) return;
@@ -8850,9 +8865,9 @@ __device__ static void dForEachCrossing(const DScene& sc, const DVec3& ro, const
         } else if (prim >= iBase) {
             const int set = sc.mo.instMotion[prim - iBase];
             const DInstance& inst = sc.instances[prim - iBase];
-            const DAff& Di = mc.inverse(sc, set);
-            const DVec3 lro = affPoint(Di.m, Di.t, ro), lrd = affDir(Di.m, rd);
-            dInstanceCrossings(sc, inst, affPoint(inst.Lm, inst.Lt, lro), affDir(inst.Lm, lrd), tmin, tm, set, mc, leaf);
+            DVec3 lro, lrd;
+            dInstanceLocalRay(sc, inst, set, mc, ro, rd, lro, lrd);
+            dInstanceCrossings(sc, inst, lro, lrd, tmin, tm, set, mc, leaf);
         } else if (prim < sc.nTris + sc.nSph + sc.nImplicits) {
             if (dIntersectOtherNow(sc, ro, rd, prim, tmin, (Real)0, h, mc, false)) leaf(h, tm);
         }
@@ -8863,9 +8878,8 @@ __device__ static void dForEachCrossing(const DScene& sc, const DVec3& ro, const
 // does not pass that the segment from `o` along unit `d`, `len` long, crosses, curves unseen, the
 // side of the last closed solid's (+1 it ends inside, -1 outside, 0 none), how many more it enters
 // than leaves (`net`, `net1` the closed alone) and the least that count reaches (`low`), and how many
-// cannot say theirs (up to 15), window by window: each from the last's end to just past its nearest
-// face -- by the rounding of a distance (`eps` * 1e-3) or that face's own error, where larger --
-// every face in it seen.
+// cannot say theirs (up to 15), place by place: the nearest face past the last place and every face
+// lying there, within the rounding of a distance (`eps` * 1e-3) or that face's own error, where larger.
 struct DSegmentCrossings { int side; int open; int net, low, net1; };   // host twin SegmentCrossings
 // The distance a trace that leaves hit h at exactly h.p must skip to clear its own primitive, whose error
 // near the origin outgrows dEpsAt.
@@ -8878,15 +8892,16 @@ __device__ static inline int dFaceKind(const DScene& sc, const DHit& h) {
     if (!h.solid) return kFaceOpen;
     return (h.solid == 1 || h.solid == -1 ? kFaceLeft1 : kFaceLeft2) + (((h.solid > 0) == h.back) ? 0 : 1);
 }
-// The kinds of the faces lying where a query along (o, d) from tmin `t0` met its nearest face, at `t`:
-// those with t in [t0, t + tie), bit k one of FaceKind k (host twin faceKindsAt).
-__device__ static unsigned dFaceKindsAt(const DScene& sc, const DVec3& o, const DVec3& d, Real t0, Real t, Real tie) {
-    unsigned k = 0;
-    Real t1 = t + tie;
-    if (!(t1 > t0)) return k;
-    dForEachCrossing(sc, o, d, t0, t1, [&](const DHit& h, Real&) {
+// The faces lying where a query along (o, d) met its nearest face, at `t`: those with t in
+// [t - tie, t + tie), none before `t0`, where that query began (host twin faceKindsAt).
+__device__ static FaceCounts dFaceKindsAt(const DScene& sc, const DVec3& o, const DVec3& d, Real t0, Real t, Real tie) {
+    FaceCounts k;
+    const Real a = fmax(t0, t - tie);
+    Real b = t + tie;
+    if (!(b > a)) return k;
+    dForEachCrossing(sc, o, d, a, b, [&](const DHit& h, Real&) {
         const int f = dFaceKind(sc, h);
-        if (f >= 0) k |= 1u << f;
+        if (f >= 0) ++k.n[f];
     });
     return k;
 }
@@ -8895,24 +8910,21 @@ __device__ static DSegmentCrossings dWalkSegment(const DScene& sc, const DVec3& 
     const Real tie = eps * (Real)1e-3;   // faces this near, or within their own error, lie at one place
     Real from = (Real)0;
     for (int k = 0; k < 32 && from < len && c.open < 15; ++k) {
-        Real cut = len, nearest[kFaceKinds] = {len, len, len, len, len};   // a window's nearest of each kind
-        dForEachCrossing(sc, o, d, from, cut, [&](const DHit& h, Real& tm) {
-            const int f = dFaceKind(sc, h);
-            if (f < 0) return;
-            nearest[f] = fmin(nearest[f], h.t);
-            tm = fmin(tm, h.t + fmax(tie, dHitEps(h)));
+        Real nearest = len, w = tie;   // the nearest face past the last place light does not pass, its tie
+        dForEachCrossing(sc, o, d, from, nearest, [&](const DHit& h, Real& tm) {
+            if (dFaceKind(sc, h) < 0) return;
+            tm = h.t;
+            w = fmax(tie, dHitEps(h));
         });
-        bool in[kFaceKinds];
-        for (int j = 0; j < kFaceKinds; ++j) in[j] = nearest[j] < cut;
-        const int left = in[kFaceLeft1] + in[kFaceLeft2], entered = in[kFaceIn1] + in[kFaceIn2];
-        if (!(left || entered || in[kFaceOpen])) break;
-        c.net -= left;
+        if (!(nearest < len)) break;
+        const FaceCounts f = dFaceKindsAt(sc, o, d, from, nearest, w);
+        c.net -= f.left();
         c.low = c.net < c.low ? c.net : c.low;
-        c.net += entered;
-        c.net1 += in[kFaceIn1] - in[kFaceLeft1];
-        if (left || entered) c.side = entered ? 1 : -1;
-        c.open += in[kFaceOpen];
-        from = cut;
+        c.net += f.entered();
+        c.net1 += f.net1();
+        if (f.left() || f.entered()) c.side = f.entered() ? 1 : -1;
+        c.open += f.open();
+        from = nearest + w;
     }
     return c;
 }
@@ -9012,16 +9024,16 @@ __device__ static DProbe dCoverageProbe(const DScene& sc, const DVec3& p, const 
             // Only a face above the plane, by more than the relaunch's own tmin skips: one on it
             // is the surface's height (a glass box standing on the floor). An opaque one is a
             // crossing all the same (dPassesLight) -- host twin. What it crosses there is h and every
-            // face lying on it, from this query's tmin to within the relaunch's skip, each kind once,
-            // those left before those entered (host twin's cross: two boxes stacked).
+            // face lying on it, out to where the relaunch's skip ends, those left before those entered
+            // (host twin's cross: two boxes stacked).
             const auto cross = [&]() {
-                const int own = dFaceKind(sc, h);
                 const Real t0 = curveTmin > (Real)0 ? (Real)0 : (relTmin < (Real)0 ? dEpsAt(o) : relTmin);
-                const unsigned k = (own >= 0 ? 1u << own : 0u) | dFaceKindsAt(sc, o, dn, t0, h.t - tAcc, dHitEps(h));
-                if (k & kFacesLeft) lastSolid = -1;
-                if (k & kFacesIn) lastSolid = 1;
-                probeNet1 += (int)((k >> kFaceIn1) & 1u) - (int)((k >> kFaceLeft1) & 1u);
-                if (k & (1u << kFaceOpen)) ++crossed;
+                FaceCounts f = dFaceKindsAt(sc, o, dn, t0, h.t - tAcc, dHitEps(h));
+                f.keep(dFaceKind(sc, h));
+                if (f.left()) lastSolid = -1;
+                if (f.entered()) lastSolid = 1;
+                probeNet1 += f.net1();
+                crossed += f.open();
             };
             if (dProbePassesThrough(sc, hm, holds) && r - h.t > fmaxf((Real)1e-3 * r, (Real)2 * dEpsAt(h.p))) {
                 cross();

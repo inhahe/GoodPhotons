@@ -2161,10 +2161,10 @@ struct Scene {
     // An instance's nearest hit nearer than h.t, written to h in world space.
     bool intersectInstanceNow(const Ray& r, const MeshInstance& inst, double tmin, Hit& h,
                               const float* vcol) const {
-        if (inst.motion < 0 || g_motionU < 0.0) return intersectInstance(r, inst, tmin, h, vcol);
-        const Ray lr = rayToInstant(motionNowInverse(inst.motion), r);
-        if (!intersectInstance(lr, inst, tmin, h, vcol)) return false;
-        hitToMoved(motionNow(inst.motion), motionNowInverse(inst.motion), inst.motion, h);
+        Hit lh; lh.t = h.t;                    // running world tMax == local tMax
+        if (!blasList[inst.blasId].intersectLocal(instanceLocalRay(inst, r), tmin, lh, vcol)) return false;
+        instanceHitOut(inst, lh);
+        h = lh;
         return true;
     }
     bool occludedInstanceNow(const Ray& r, const MeshInstance& inst, double tmin, double seg,
@@ -2175,18 +2175,21 @@ struct Scene {
     template <class Passes>
     bool occludedInstancePastNow(const Ray& r, const MeshInstance& inst, double tmin, double seg, const float* vcol,
                                  Passes&& passes, bool* met) const {
-        const Ray ri = (inst.motion < 0 || g_motionU < 0.0) ? r : rayToInstant(motionNowInverse(inst.motion), r);
-        const Ray lr{inst.toLocal.apply(ri.o), inst.toLocal.applyDir(ri.d)};
-        return blasList[inst.blasId].occludedLocalPast(lr, tmin, seg, vcol, passes, met);   // world seg == local seg
+        return blasList[inst.blasId].occludedLocalPast(instanceLocalRay(inst, r), tmin, seg, vcol, passes,
+                                                       met);   // world seg == local seg
     }
-    bool intersectInstance(const Ray& r, const MeshInstance& inst, double tmin, Hit& h,
-                           const float* vcol) const {
-        Ray lr{inst.toLocal.apply(r.o), inst.toLocal.applyDir(r.d)};
-        Hit lh; lh.t = h.t;                    // running world tMax == local tMax
-        if (!blasList[inst.blasId].intersectLocal(lr, tmin, lh, vcol)) return false;
+    // Whether instance `inst` moves for the path's time.
+    bool instanceMovesNow(const MeshInstance& inst) const { return inst.motion >= 0 && g_motionU >= 0.0; }
+    // Ray `r` in `inst`'s local space as the path's time places it -- carried back to the instant first
+    // where it moves -- on which the same t names the same point; and a hit `lh` found on it carried out
+    // to world space, and on by the motion. Every query of an instance's triangles goes by these two.
+    Ray instanceLocalRay(const MeshInstance& inst, const Ray& r) const {
+        const Ray ri = instanceMovesNow(inst) ? rayToInstant(motionNowInverse(inst.motion), r) : r;
+        return Ray{inst.toLocal.apply(ri.o), inst.toLocal.applyDir(ri.d)};
+    }
+    void instanceHitOut(const MeshInstance& inst, Hit& lh) const {
         instanceHitToWorld(inst, lh, mats.data());
-        h = lh;
-        return true;
+        if (instanceMovesNow(inst)) hitToMoved(motionNow(inst.motion), motionNowInverse(inst.motion), inst.motion, lh);
     }
     // `r` carried back to the instant by Dinv: the same parameter t names the same point.
     static Ray rayToInstant(const Affine& Dinv, const Ray& r) {
@@ -6233,16 +6236,13 @@ struct Scene {
                 if (intersectImplicitNow(r, implicits[(size_t)prim - nT - nS], tmin, h, &tabs)) leaf(h, tm);
             } else if (prim >= (int)(nT + nS + nI + nC)) {
                 const MeshInstance& inst = instances[(size_t)prim - nT - nS - nI - nC];
-                const bool moves = inst.motion >= 0 && g_motionU >= 0.0;
-                const Ray ri = moves ? rayToInstant(motionNowInverse(inst.motion), r) : r;
-                const Ray lr{inst.toLocal.apply(ri.o), inst.toLocal.applyDir(ri.d)};
+                const Ray lr = instanceLocalRay(inst, r);
                 const Blas& bl = blasList[(size_t)inst.blasId];
                 const TriShear lsh = makeTriShear(lr.d);
                 bl.bvh.traverseClosest(lr, tmin, tm, [&](int lp, double& tml) {
                     Hit lh; lh.t = tml;
                     if (!intersectTri(lsh, lr, bl.tris[(size_t)lp], tmin, lh, vcolData())) return;
-                    instanceHitToWorld(inst, lh, mats.data());
-                    if (moves) hitToMoved(motionNow(inst.motion), motionNowInverse(inst.motion), inst.motion, lh);
+                    instanceHitOut(inst, lh);
                     leaf(lh, tml);
                 });
             }
