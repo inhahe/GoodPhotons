@@ -783,7 +783,7 @@ struct JSpecWalk {
     // sigma_t is chromatic. A flat sigma_t gives exactly 1, and checking costs 25 deterministic
     // marches per segment.
     bool trSpec = false;
-    void reset() { run = JSpecRun(); vert.clear(); }
+    void reset(const SpecCells& c) { run = JSpecRun(c); vert.clear(); }
 };
 
 // Fold a segment's chromatic transmittance ratio Tr(lam)/Tr(lambda) into `jr` (device twin dJTrFold).
@@ -797,7 +797,7 @@ constexpr int kJTrQuad = 32;
 inline void jTrFold(const Scene& scene, JSpecRun& jr, const Vec3& o, const Vec3& d, double dist,
                     double lambda) {
     const PatTables tabs = scene.patTables();
-    double e[JSpec::K] = {0.0};   // the exponent at each bin, summed medium by medium
+    double e[JSpecRun::K] = {0.0};   // the exponent at each cell, summed medium by medium
     for (const Medium& m : scene.media) {
         double ta, tb;
         if (!m.clipToBounds(o, d, 0.0, dist, ta, tb) || !(tb > ta)) continue;
@@ -810,9 +810,9 @@ inline void jTrFold(const Scene& scene, JSpecRun& jr, const Vec3& o, const Vec3&
         }
         if (!(tau > 0.0)) continue;
         const double s0 = m.sigmaT(lambda);
-        for (int k = 0; k < JSpec::K; ++k) e[k] += (m.sigmaT(JSpec::lamOf(k)) - s0) * tau;
+        for (int k = 0; k < jr.n; ++k) e[k] += (m.sigmaT(jr.lamOf(k)) - s0) * tau;
     }
-    for (int k = 0; k < JSpec::K; ++k) e[k] = std::exp(-e[k]);
+    for (int k = 0; k < jr.n; ++k) e[k] = std::exp(-e[k]);
     jr.mulVec(e, 1.0);
 }
 
@@ -1624,10 +1624,10 @@ inline void randomWalk(const Scene& scene, const Camera& cam, const Renderer& ma
                 // stopped lambda, and read red 1.3 % high around the fur. A pass-through
                 // missed the fiber at every wavelength and is flat.
                 if (jsw && !passThru) {
-                    const double* sigB = hairSigmaBins<JSpec::K, &JSpec::lamOf>(scene, *mp, h);
-                    double hv[JSpec::K];
-                    for (int k = 0; k < JSpec::K; ++k) {
-                        const HairShade hk = hairShadeRetint(scene, *mp, h, JSpec::lamOf(k), hs,
+                    const double* sigB = hairSigmaCells(scene, *mp, h);
+                    double hv[JSpecRun::K];
+                    for (int k = 0; k < jsw->run.n; ++k) {
+                        const HairShade hk = hairShadeRetint(scene, *mp, h, jsw->run.lamOf(k), hs,
                                                              sigB ? sigB[k] : -1.0);
                         hv[k] = clamp01(hairFoldFCos(la, hk, wl, cosLong, nullptr) / pdfH);
                     }
@@ -1889,7 +1889,7 @@ inline int generateCameraSubpath(const Scene& scene, const Camera& cam, const Re
     const double lambda = hb.lam[0];
     path.clear();
     if (jsw) {                                      // eye[0], the camera: no factor yet
-        jsw->reset();
+        jsw->reset(scene.specCells);
         jsw->vert.resize(1);
         jsw->run.walkDensity = &scene.camSampler;   // the camera wavelength's density (the support)
     }
@@ -1934,10 +1934,10 @@ inline int generateCameraSubpath(const Scene& scene, const Camera& cam, const Re
         // the path's merges take the dispersive window (JSpec::disp); otherwise they keep this
         // ray's direction at every wavelength, a chromatic aberration a few pixels wide at most.
         if (jsw) {
-            double wb[JSpec::K];
-            for (int k = 0; k < JSpec::K; ++k) {
+            double wb[JSpecRun::K];
+            for (int k = 0; k < jsw->run.n; ++k) {
                 Pcg32 rk = rngLens; Ray rr; double wk = 0.0;
-                wb[k] = genLens(rk, JSpec::lamOf(k), rr, wk) ? std::max(0.0, wk) : 0.0;
+                wb[k] = genLens(rk, jsw->run.lamOf(k), rr, wk) ? std::max(0.0, wk) : 0.0;
             }
             jsw->run.mulVec(wb, wLens, true);   // a bin the lens passes nothing at is a hole
             if (g_jDispAll) jsw->run.markDisp(lambda, hb.invPdf[0]);
@@ -4600,8 +4600,8 @@ struct BeamMergeWeight {
         const double trC = chromaM ? camTr->atLam(tc, lamW)
                                    : camTr->at(tc);                   // Tr~(x -> eye[k])
         if (!(trC > 0.0)) return 0.0;
-        const double etaKCoefW = chromaM ? specBinAt(chromaK, lamW) : etaKCoef;
-        const double segSumMW  = chromaM ? specBinAt(chromaM, lamW) : segSumM;
+        const double etaKCoefW = chromaM ? chromaBinAt(chromaK, lamW) : etaKCoef;
+        const double segSumMW  = chromaM ? chromaBinAt(chromaM, lamW) : segSumM;
         // eta of THIS merge against C1 — the numerator of the weight, and a term of its
         // denominator (a technique competes with itself at ratio exactly its own).
         const double etaS = kappa * bh.sinT * gL / (sigT * trC);
@@ -4726,8 +4726,8 @@ struct SurfMergeWeight {
         // pdfRev(eye[k-1]) in the MERGED path, and with it the camera loop's second step.
         const double pdfRevKm1 = pdfDirFwd * cosPrev * invDistPrev2;
         const double D2 = pdfRevKm1 * invPdfFwdKm1;
-        const double etaKm1 = chromaM ? specBinAt(chromaKm1, lam) : etaKm1Coef;
-        const double sumM   = chromaM ? specBinAt(chromaM, lam) : segSumM;
+        const double etaKm1 = chromaM ? chromaBinAt(chromaKm1, lam) : etaKm1Coef;
+        const double sumM   = chromaM ? chromaBinAt(chromaM, lam) : segSumM;
         const double den = (double)lm.gateC1                     // C1 itself (ratio 1)
                          + R * (lm.sumC                          // light-side connections
                                 + kappaB * lm.sumMb              // light-side merges, both
@@ -4803,21 +4803,21 @@ inline void cameraSideSums(const Scene& scene, const std::vector<Vertex>& eye, i
 // So in such a scene the wavelength-dependent part is tabulated at the K bins of JSpec's grid,
 // once per camera path -- from geometry taken once per vertex, the segment's per-medium depths
 // (trDetDepthMedium) -- and each merge reads it at its own beam's or photon's wavelength,
-// interpolated as JSpec is (specBinAt). The connections' weights (misWeight) belong to paths of
+// interpolated between bin centres (chromaBinAt). The connections' weights (misWeight) belong to paths of
 // the camera's one wavelength and stay there. The device's twins are dChromaBeamEta1 and
 // DChromaRun.
 struct ChromaMis {
-    static constexpr int K = JSpec::K;
+    static constexpr int K = kChromaBins;
     bool on = false;
     int M = 0;                         // scene.media.size()
-    std::vector<double> sig;           // sig[m*K + b]: media[m].sigmaT at JSpec::lamOf(b)
+    std::vector<double> sig;           // sig[m*K + b]: media[m].sigmaT at chromaBinLambda(b)
     void build(const Scene& scene) {
         on = jChromaEnabled() && anyMediumSigmaTChromatic(scene);
         if (!on) return;
         M = (int)scene.media.size();
         sig.assign((size_t)M * K, 0.0);
         for (int m = 0; m < M; ++m)
-            for (int b = 0; b < K; ++b) sig[(size_t)m * K + b] = scene.media[(size_t)m].sigmaT(JSpec::lamOf(b));
+            for (int b = 0; b < K; ++b) sig[(size_t)m * K + b] = scene.media[(size_t)m].sigmaT(chromaBinLambda(b));
     }
     // mergeEtaPrimeBeam with pLight 1, at every bin: sin / (sigma_t * Tr) for a beam merge at the
     // medium vertex v, between the unit directions `a` and `dout`, Tr over the segment

@@ -376,21 +376,7 @@ __device__ static void dSunNeeMarch(const DScene& sc, const DVec3& oc, const DVe
 // wavelength, and that scalar then multiplied a photon sum spanning all of them. Exact for a flat
 // spectrum, wrong in either direction otherwise -- measured against mode D on one Cornell glossy
 // sphere: JH white 0.880x, JH red 1.142x, both ~1.00 after the fix.
-// The scene's carrier cells (host twin SpecCells: its cells' ends, wavelengths and walk masses, and each
-// uniform bin's first cell and count; DScene::specCells).
-struct DSpecCells {
-    int n;
-    double hi[kSpecCellsMax], lam[kSpecCellsMax], mass[kSpecCellsMax];
-    unsigned char first[kBandProbeBins], count[kBandProbeBins], smooth[kBandProbeBins];
-};
-// The cell of `c` wavelength `lam` falls in (host twin SpecCells::cellOf).
-__device__ static inline int dSpecCellOf(const DSpecCells* c, Real lam) {
-    int b = (int)(((double)lam - DLMIN) / (DLMAX - DLMIN) * kBandProbeBins);
-    b = b < 0 ? 0 : (b >= kBandProbeBins ? kBandProbeBins - 1 : b);
-    int i = c->first[b];
-    for (int e = i + c->count[b] - 1; i < e && (double)lam >= c->hi[i]; ++i) {}
-    return i;
-}
+// (DSpecCells and dSpecCellOf: render_cuda_dev.cuh, with mode J's carrier, which reads them too.)
 
 struct DSpecThr {
     static const int K = kSpecCellsMax;   // room for the most cells (SpecThr::K)
@@ -510,31 +496,21 @@ struct DSpecThr {
         for (int k = 0; k < n; ++k) m = fmax(m, v[k] / cam * pscale);
         return (m > 0.0) ? m : 1.0;
     }
-    // The carrier as the beam gather reads it (host twin SpecThr::toJSpec): on its uniform bins, each at
-    // its centre (atBinCentre). False, and `js` untouched, while nothing chromatic was folded.
+    // The carrier as the beam gather reads it (host twin SpecThr::toJSpec): on these same cells, over its
+    // peak as codes (DJSpecRun::snap's), the peak in logS. False, and `js` untouched, while nothing
+    // chromatic was folded.
     __device__ bool toJSpec(DJSpec& js) const {
         if (!any) return false;
         const double pk = peak();
         const bool live = cam > 1e-300;
         js.any = 1; js.disp = 0; js.lamC = 0.0f; js.invPdfC = 0.0f;
         js.logS = log(pk);
-        for (int k = 0; k < DJSPEC_K; ++k)
-            js.r[k] = live ? (float)(atBinCentre(k) / cam * pscale / pk) : 0.0f;
+        for (int k = 0; k < n; ++k)
+            js.q[k] = live ? dJQEncode(v[k] / cam * pscale / pk) : (unsigned short)DJQ_DEAD;
         return true;
     }
-    // The product at uniform bin k's centre (host twin SpecThr::atBinCentre, where the why is).
-    __device__ double atBinCentre(int k) const {
-        const double lk = (double)DJSpec::lamOf(k);
-        const int c = binOf((Real)lk);
-        if (cells->count[k] != 1) return v[c];
-        const double lc = cells->lam[c];
-        const int o = lk < lc ? c - 1 : c + 1;
-        if (o < 0 || o >= n || !(fabs(cells->lam[o] - lc) > 0.0)) return v[c];
-        if (!cells->smooth[lk < lc ? k : k + 1]) return v[c];
-        return fmax(0.0, v[c] + (v[o] - v[c]) * (lk - lc) / (cells->lam[o] - lc));
-    }
 };
-static_assert(kBandProbeBins == DJSPEC_K, "the beam gather's carrier is on the uniform bins");
+static_assert(DSpecThr::K == kSpecCellsMax, "the beam gather's carrier is on the walk's cells");
 static_assert(DSPEC_TRMAX >= DSpecThr::K + 1, "a media vector holds every cell and the walk's own wavelength");
 
 // SPECGATHER: a layered coat's coin at every bin, for mode M's walk and mode S's (host twin
@@ -1934,13 +1910,13 @@ __device__ static void dVcmScatter(const DScene& sc, const DMaterial& m, const D
             // loop: a second call site of the BCSDF readers tips nvcc into emitting them out of
             // line (mode J's walk, and DJBase).
             if (nSec) *secChromatic = true;
-            const int nJ = (jr && !passThru) ? DJSPEC_K + 1 : 0;
-            double hv[DJSPEC_K + 1];
+            const int nJ = (jr && !passThru) ? jr->n + 1 : 0;
+            double hv[kSpecCellsMax + 1];
             for (int i = 0; i < nSec + nJ; ++i) {
                 const bool sec = i < nSec;
                 if (sec && passThru) { secF[i] = 1.0; continue; }   // the ray missed the fiber at every λ
                 const int jk = i - nSec - 1;                        // -1: lambda itself
-                const Real Li = sec ? lamAll[i + 1] : (jk < 0 ? lambda : (Real)DJSpec::lamOf(jk));
+                const Real Li = sec ? lamAll[i + 1] : (jk < 0 ? lambda : jr->lamOf(jk));
                 const DHairShade hsi = dHairShadeAt(sc, m, h, Li, wo);
                 const double fc = (double)dHairFCos(hsi, wi);
                 if (sec) secF[i] = fc / pdfH; else hv[jk + 1] = (double)clamp01((Real)(fc / pdfH));
@@ -2563,7 +2539,7 @@ __device__ __forceinline__ static bool dVcmMergeSum(const DScene& sc, const DVcm
         // around lambda coloured there (host twin).
         const bool win = js && js->disp;
         double wgt = misW * fCam * lv.beta;
-        if (js) wgt *= win ? js->winW((double)lam) : js->at((double)lam);
+        if (js) wgt *= win ? js->winW((double)lam) : js->at(sc.specCells, (double)lam);
         double ax = lv.cx * wgt, ay = lv.cy * wgt, az = lv.cz * wgt;
         if (win) ax = ay = az = 0.0;
         double wWin = win ? wgt : 0.0;
@@ -2572,7 +2548,7 @@ __device__ __forceinline__ static bool dVcmMergeSum(const DScene& sc, const DVcm
             if (q + 1 >= lvUp) break;
             double wq = misW * fSec[q] * gcorr * row[q].beta;
             const Real lq = (Real)row[q].lam;
-            if (js) wq *= win ? js->winW((double)lq) : js->at((double)lq);
+            if (js) wq *= win ? js->winW((double)lq) : js->at(sc.specCells, (double)lq);
             if (win) { wWin += wq; continue; }
             ax += (double)cieX(lq) * wq;
             ay += (double)cieY(lq) * wq;
@@ -2702,7 +2678,7 @@ __global__ void kVcmCameraT(DScene sc, DCamera cam, int diffraction, DVcmCtx ctx
         double beta = 1.0;
         // VCM-SPEC: the walk's spectral factors on mode J's carrier (host twin vcm.h).
         const bool jOn = c_jSpecOn != 0;
-        DJSpecRun jrun; jrun.init();
+        DJSpecRun jrun; jrun.init(sc);
         double dVCM = ctx.nLightPaths / cameraPdfW;
         double dVC = 0.0, dVM = 0.0;
         DMediumStack stk = cam.enclosure;   // from the eye's solids

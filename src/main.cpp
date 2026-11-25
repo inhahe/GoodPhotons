@@ -16247,7 +16247,7 @@ static constexpr int kCheckJSurfWSamples = 4096;   // samples recorded: absolute
 static int checkJSurfTap(const Scene& scene, int maxDepth, const BeamMap* beams,
                          const bdpt::SurfMap* photons) {
     using namespace bdpt;
-    static_assert(kJSurfTapK == ChromaMis::K, "the tap's bins are JSpec's");
+    static_assert(kJSurfTapK == ChromaMis::K, "the tap's bins are the chromatic MIS tables'");
     constexpr double kTol = 1e-4;     // relative, for fields, bins and weights
     constexpr double kShift = 1e-3;   // a weight the one-bin shift moves by more than this, relatively
     std::vector<JSurfTapVertex> tv;
@@ -16282,8 +16282,8 @@ static int checkJSurfTap(const Scene& scene, int maxDepth, const BeamMap* beams,
     rng.seed(0x6A535746ULL, 0x243F6A8885A308D3ULL);
     const auto uni = [&rng]() { return rng.uniform(); };
     const auto logU = [&uni](double lo, double hi) { return std::pow(10.0, lo + (hi - lo) * uni()); };
-    const double binW = JSpec::lamOf(1) - JSpec::lamOf(0);
-    const double lamLo = JSpec::lamOf(0) - binW, lamHi = JSpec::lamOf(JSpec::K - 1) + binW;
+    const double binW = chromaBinLambda(1) - chromaBinLambda(0);   // the chromatic MIS tables' grid
+    const double lamLo = chromaBinLambda(0) - binW, lamHi = chromaBinLambda(kChromaBins - 1) + binW;
 
     long long nPaths = 0, nSkipped = 0, nHalves = 0, nChroma = 0, nSiteBad = 0, nChromaBad = 0;
     long long nFieldBad = 0, nBinBad = 0;

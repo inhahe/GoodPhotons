@@ -1492,7 +1492,7 @@ __device__ static inline bool dBowEval(const DBowTab& bt, int em, int med, doubl
     return true;
 }
 
-struct DSpecCells;   // render_cuda_dev2.cuh: mode M's and mode S's carrier cells
+struct DSpecCells;   // the carriers' cells (defined with mode J's carrier, DJSpec)
 
 struct DScene {
     // Per-vertex colours (Scene::vertColors), three linear-RGB floats per entry, indexed
@@ -1648,7 +1648,7 @@ struct DScene {
     const double*    camCdf; const double* camVisCdf; const double* camWCdf;
     double           camG;
     const DMedium*   media;    // participating media array (superposed); null if none
-    // UPBP-W-CHROMATIC: media[m]'s sigma_t at the JSpec bins, chromaSig[m*DJSPEC_K + b], when
+    // UPBP-W-CHROMATIC: media[m]'s sigma_t at the JSpec bins, chromaSig[m*DCHROMA_K + b], when
     // some medium's extinction varies with wavelength; null otherwise (DChromaRun).
     const double*    chromaSig;
     DBowTab bow;   // gather-time spectral fold tables (FOLD-GPU (2)); bow.tab null = none
@@ -9476,11 +9476,10 @@ FT_DEVGLOBAL(__constant__ int c_jTrSpec, = 0);
 FT_DEVGLOBAL(__constant__ int c_jChroma, = 1);
 FT_DEVGLOBAL(__constant__ double c_jDispWin, = 10.0);   // the dispersive window's width, nm (host g_jDispWinNm)
 FT_DEVGLOBAL(__constant__ int    c_jDispAll, = 0);      // -jdispall (host g_jDispAll)
-// The camera wavelength's density mass in each carrier bin, for DJSpecRun's support (host twin
-// JSpecRun::supportShare): uploaded by renderBdptCuda and vcmSessionBegin from the emission
+// The camera wavelength's density mass in each carrier cell (DScene::specCells), for DJSpecRun's support
+// (host twin JSpecRun::supportShare): uploaded by renderBdptCuda and vcmSessionBegin from the emission
 // sampler, which both device walks draw from. All zero turns it off.
-#define DJSPEC_K_BINS 24
-FT_DEVGLOBAL(__constant__ double c_jBinQ[DJSPEC_K_BINS]);
+FT_DEVGLOBAL(__constant__ double c_jCellQ[kSpecCellsMax]);
 // Merges after a specular bounce read the light-side density's 0 as 1 (host bdpt::g_jDeltaMerge,
 // MODE-J-SDS, 0.387.0). 0 = the pre-0.387.0 reading, for A/B runs (FTRACE_JDELTA=0).
 FT_DEVGLOBAL(__constant__ int    c_jDeltaMerge, = 1);
@@ -9613,28 +9612,62 @@ __device__ static double dSunOriginPdfAlong(const DScene& sc, const DEmitter& em
 __device__ static inline double dMergeLightDensity(double p, bool fromDelta) {
     return c_jDeltaMerge ? dMisRevDensity(p, fromDelta) : p;
 }
-#define DJSPEC_K    24     // JSpec::K
-static_assert(DJSPEC_K == kBandProbeBins, "the device carrier's grid must be the host's (JSpec::K)");
-// A table over the DJSPEC_K bins read at `lam` (host twin specBinAt, where the why is): between
+#define DCHROMA_K    24     // kChromaBins: the chromatic MIS tables' uniform bins
+static_assert(DCHROMA_K == kBandProbeBins, "the chromatic MIS tables are on the host's uniform bins (kChromaBins)");
+// A table over the DCHROMA_K bins read at `lam` (host twin chromaBinAt, where the why is): between
 // bin centres, geometric where both are live, held flat past the outer two. In double, as the
 // host's: the merge weights' tables run far past a float.
-__device__ static double dSpecBinAt(const double* r, double lam) {
-    const double u = (lam - DLMIN) / (DLMAX - DLMIN) * (double)DJSPEC_K - 0.5;
+__device__ static double dChromaBinAt(const double* r, double lam) {
+    const double u = (lam - DLMIN) / (DLMAX - DLMIN) * (double)DCHROMA_K - 0.5;
     if (!(u > 0.0)) return r[0];
-    if (u >= (double)(DJSPEC_K - 1)) return r[DJSPEC_K - 1];
+    if (u >= (double)(DCHROMA_K - 1)) return r[DCHROMA_K - 1];
     const int i = (int)u;
     const double f = u - (double)i;
     const double a = r[i], b = r[i + 1];
     if (a > 0.0 && b > 0.0) return a * pow(b / a, f);
     return a + (b - a) * f;
 }
+// The scene's carrier cells (host twin SpecCells: its cells' ends, wavelengths and walk masses, and each
+// uniform bin's first cell and count; DScene::specCells): the grid modes M and S fold their walks' spectra
+// on, and modes J and U theirs.
+struct DSpecCells {
+    int n;
+    double hi[kSpecCellsMax], lam[kSpecCellsMax], mass[kSpecCellsMax];
+    unsigned char first[kBandProbeBins], count[kBandProbeBins], smooth[kBandProbeBins];
+};
+// The uniform bin wavelength `lam` falls in, clamped to the band (host twin bandBinOf).
+__device__ static inline int dBandBinOf(double lam) {
+    const int b = (int)((lam - DLMIN) / (DLMAX - DLMIN) * kBandProbeBins);
+    return b < 0 ? 0 : (b >= kBandProbeBins ? kBandProbeBins - 1 : b);
+}
+// The cell of `c` wavelength `lam` falls in (host twin SpecCells::cellOf).
+__device__ static inline int dSpecCellOf(const DSpecCells* c, Real lam) {
+    const int b = dBandBinOf((double)lam);
+    int i = c->first[b];
+    for (int e = i + c->count[b] - 1; i < e && (double)lam >= c->hi[i]; ++i) {}
+    return i;
+}
 #define DJSPEC_FOLD 12     // scene.h kFoldBins (static_assert'ed at the upload)
-struct DJSpec {   // 120 B, unpadded: one rides on every recorded segment and eye vertex
-    float  r[DJSPEC_K];
-    double logS;   // the carrier's magnitude, apart from `r` (host twin JSpec::logS, where the why is)
+// A carrier cell as it rides on a segment or a vertex: -DJQ_SCALE log2 of its ratio to the largest cell's,
+// rounded, DJQ_DEAD for exactly 0. Off by at most 0.07 % of the value, as far down as a float reaches
+// (2^-128) -- half floats stop at 6e-8, where dark glass's cells still live -- and the geometric
+// interpolation DJSpec::at makes is a straight line between two codes.
+#define DJQ_SCALE 512.0
+#define DJQ_DEAD  0xFFFFu
+__device__ static inline unsigned short dJQEncode(double x) {   // x in [0, 1]
+    if (!(x > 0.0)) return (unsigned short)DJQ_DEAD;
+    const double c = -log2(x) * DJQ_SCALE + 0.5;
+    return (unsigned short)(c < 65534.0 ? (unsigned)c : 65534u);
+}
+__device__ static inline float dJQDecode(unsigned short q) {
+    return q == DJQ_DEAD ? 0.0f : exp2f(-(float)q * (float)(1.0 / DJQ_SCALE));
+}
+struct DJSpec {   // 104 B, unpadded: one rides on every recorded segment and eye vertex
+    unsigned short q[kSpecCellsMax];   // cell k's ratio over the largest (dJQEncode); the largest is in logS
+    double logS;   // the carrier's magnitude, apart from `q` (host twin JSpec::logS, where the why is)
+    float  lamC, invPdfC;
     int    any;
     int    disp;   // the dispersive window is open (host twin JSpec::disp)
-    float  lamC, invPdfC;
     __device__ double beta(double b) const {
         if (logS == 0.0 || !(b > 0.0)) return b;
         return exp(log(b) + logS);
@@ -9646,82 +9679,83 @@ struct DJSpec {   // 120 B, unpadded: one rides on every recorded segment and ey
         if (!(fabs(lam - (double)lamC) <= 0.5 * c_jDispWin)) return 0.0;
         return (double)invPdfC / c_jDispWin;
     }
-    __device__ static double lamOf(int k) {
-        return DLMIN + ((double)k + 0.5) * (DLMAX - DLMIN) / (double)DJSPEC_K;
-    }
-    __device__ double at(double lam) const {
+    // Read at `lam` on the cells `c` the walk folded over (DScene::specCells; host twin JSpec::at and
+    // specCellsAt, where the why is): the cell `lam` falls in, carried toward its neighbour across a
+    // smooth join between two bins, geometric -- a line between two codes -- where both are live.
+    __device__ double at(const DSpecCells* c, double lam) const {
         if (!any) return 1.0;
-        const double u = (lam - DLMIN) / (DLMAX - DLMIN) * (double)DJSPEC_K - 0.5;
-        if (!(u > 0.0)) return (double)r[0];
-        if (u >= (double)(DJSPEC_K - 1)) return (double)r[DJSPEC_K - 1];
-        const int i = (int)u;
-        const double f = u - (double)i;
-        // Geometric between two live bins (host twin JSpec::at, where the why is), in log space:
-        // the bins span ~1e-38..1e15, so b/a can pass FLT_MAX where log2 b - log2 a cannot, and
-        // the hardware log2/exp2 cost less than a powf.
-        const float a = r[i], b = r[i + 1];
-        if (a > 0.f && b > 0.f) {
-            const float la = __log2f(a), lb = __log2f(b);
-            return (double)exp2f(la + (float)f * (lb - la));
-        }
-        return (double)a + ((double)b - (double)a) * f;
+        const int i = dSpecCellOf(c, (Real)lam);
+        const double li = c->lam[i];
+        const int o = lam < li ? i - 1 : i + 1;
+        if (o < 0 || o >= c->n || !(fabs(c->lam[o] - li) > 0.0)) return (double)dJQDecode(q[i]);
+        const int b = dBandBinOf(lam);
+        const int bo = o < c->first[b] ? b - 1 : (o >= c->first[b] + c->count[b] ? b + 1 : b);
+        if (bo == b || !c->smooth[bo > b ? bo : b]) return (double)dJQDecode(q[i]);
+        const float f = (float)((lam - li) / (c->lam[o] - li));
+        if (q[i] != DJQ_DEAD && q[o] != DJQ_DEAD)
+            return (double)exp2f(-((float)q[i] + f * ((float)q[o] - (float)q[i])) * (float)(1.0 / DJQ_SCALE));
+        const double a = (double)dJQDecode(q[i]), e = (double)dJQDecode(q[o]);
+        return a + (e - a) * (double)f;
     }
 };
-static_assert(sizeof(DJSpec) == 120, "DJSpec has picked up padding");
-static_assert(DJSPEC_K_BINS == DJSPEC_K, "c_jBinQ holds one mass per carrier bin");
+static_assert(sizeof(DJSpec) == 104, "DJSpec has picked up padding");
 struct DJSpecRun {
-    double r[DJSPEC_K];
+    double r[kSpecCellsMax];
+    const DSpecCells* cells;         // the scene's grid (DScene::specCells)
+    int    n;                        // its cells: the arrays' first n entries are live
     int    any;
     double logS;                     // see DJSpec::logS
     int    disp;                     // see DJSpec::disp
     double lamC, invPdfC;
-    unsigned hole;                   // bins where a folded weight or coin was 0 (host twin JSpecRun::hole)
-    __device__ void init() {
-        for (int k = 0; k < DJSPEC_K; ++k) r[k] = 1.0;
-        any = 0; logS = 0.0; disp = 0; lamC = 0.0; invPdfC = 0.0; hole = 0u;
+    unsigned long long hole;         // cells where a folded weight or coin was 0 (host twin JSpecRun::hole)
+    __device__ void init(const DScene& sc) {
+        cells = sc.specCells;
+        n = cells->n < kSpecCellsMax ? cells->n : kSpecCellsMax;
+        for (int k = 0; k < n; ++k) r[k] = 1.0;
+        any = 0; logS = 0.0; disp = 0; lamC = 0.0; invPdfC = 0.0; hole = 0ull;
     }
+    __device__ Real lamOf(int k) const { return (Real)cells->lam[k]; }   // cell k's wavelength
     // The share of the camera wavelength's density whose walk could have come this way (host twin).
     __device__ double supportShare() const {
         if (!hole) return 1.0;
         double open = 0.0;
-        for (int k = 0; k < DJSPEC_K; ++k) if (!(hole >> k & 1u)) open += c_jBinQ[k];
+        for (int k = 0; k < n; ++k) if (!(hole >> k & 1ull)) open += c_jCellQ[k];
         return (open > 0.0) ? open : 1.0;
     }
     __device__ void markDisp(double lam, double invPdf) {
         if (disp) return;
         disp = 1; lamC = lam; invPdfC = invPdf;
     }
-    // ONE call site for `f`, deliberately (host twin JSpecRun::mul has two): the three probe bins
+    // ONE call site for `f`, deliberately (host twin JSpecRun::mul has two): the three probe cells
     // are simply visited first. `f` is a texture or pattern read, and every extra inlined copy of
     // one pushes nvcc's inliner to emit it out of line, where its register count no longer fits
     // the kernels' __launch_bounds__ and nvlink refuses the build.
     template <class F> __device__ void mul(const F& f, double atCam, bool exhaustive) {
         if (!(atCam > 0.0)) return;
         const double tol = 1e-12 * (1.0 + fabs(atCam));
-        double v[DJSPEC_K];
+        double v[kSpecCellsMax];
         bool probeFlat = !exhaustive;
-        for (int j = 0; j < DJSPEC_K; ++j) {
-            const int k = (j == 0) ? 0 : (j == 1) ? DJSPEC_K / 2 : (j == 2) ? DJSPEC_K - 1
-                        : (j - 2 < DJSPEC_K / 2) ? j - 2 : j - 1;
-            v[k] = f(DJSpec::lamOf(k));
+        for (int j = 0; j < n; ++j) {
+            const int k = (j == 0) ? 0 : (j == 1) ? n / 2 : (j == 2) ? n - 1 : (j - 2 < n / 2) ? j - 2 : j - 1;
+            v[k] = f(lamOf(k));
             if (probeFlat && fabs(v[k] - atCam) > tol) probeFlat = false;
             if (j == 2 && probeFlat) return;
         }
         mulVec(v, atCam, true);
     }
-    // The fold from values already in hand at the bin centres (host twin JSpecRun::mulVec, where
-    // `support` is explained). `v` is overwritten.
+    // The fold from values already in hand at the cells (host twin JSpecRun::mulVec, where `support` is
+    // explained). `v` is overwritten.
     __device__ void mulVec(double* v, double atCam, bool support = false) {
         if (!(atCam > 0.0)) return;
         if (support)
-            for (int k = 0; k < DJSPEC_K; ++k)
-                if (!(v[k] > 0.0)) hole |= 1u << k;
+            for (int k = 0; k < n; ++k)
+                if (!(v[k] > 0.0)) hole |= 1ull << k;
         // Magnitudes past a float go to logS (host twin JSpecRun::mul).
         double inv = 1.0;
         if (atCam < 1e-280) logS -= log(atCam); else inv = 1.0 / atCam;
         double qMax = 0.0;
         bool flat = true;
-        for (int k = 0; k < DJSPEC_K; ++k) {
+        for (int k = 0; k < n; ++k) {
             double q = v[k] * inv;
             if (!isfinite(q) || q < 0.0) q = 0.0;
             if (fabs(q - 1.0) > 1e-12) flat = false;
@@ -9729,22 +9763,27 @@ struct DJSpecRun {
             qMax = fmax(qMax, q);
         }
         if (qMax > 1e30) {
-            for (int k = 0; k < DJSPEC_K; ++k) v[k] /= qMax;
+            for (int k = 0; k < n; ++k) v[k] /= qMax;
             logS += log(qMax);
         }
         double rMax = 0.0;
-        for (int k = 0; k < DJSPEC_K; ++k) { r[k] *= v[k]; rMax = fmax(rMax, r[k]); }
+        for (int k = 0; k < n; ++k) { r[k] *= v[k]; rMax = fmax(rMax, r[k]); }
         if (rMax > 1e15 || (rMax > 0.0 && rMax < 1e-15)) {
-            for (int k = 0; k < DJSPEC_K; ++k) r[k] /= rMax;
+            for (int k = 0; k < n; ++k) r[k] /= rMax;
             logS += log(rMax);
         }
         if (!flat) any = 1;
     }
+    // The carrier as it rides on (host twin JSpecRun::snap): the cells over their largest, as codes, and
+    // the largest folded into logS -- a flat carrier's cells are all 1 and read as 1 anyway.
     __device__ void snap(DJSpec& o) const {
         o.any = any;
-        o.logS = logS - log(supportShare());   // the merges past a hole stand in for it
         o.disp = disp; o.lamC = (float)lamC; o.invPdfC = (float)invPdfC;
-        for (int k = 0; k < DJSPEC_K; ++k) o.r[k] = (float)r[k];
+        double m = 0.0;
+        if (any) for (int k = 0; k < n; ++k) m = fmax(m, r[k]);
+        const double inv = m > 0.0 ? 1.0 / m : 0.0;
+        for (int k = 0; k < n; ++k) o.q[k] = any ? dJQEncode(r[k] * inv) : (unsigned short)0;
+        o.logS = logS + (m > 0.0 ? log(m) : 0.0) - log(supportShare());   // past a hole, the merges stand in for it
     }
 };
 // A hit's reflect-slot SPECTRAL SHAPE, captured from the walk's own dReflectBase call (0.386.2):
@@ -9775,7 +9814,7 @@ __device__ static bool dJSpecFoldColor(const DScene& sc, const DJSpec& js, int e
     for (int k = 0; k < DJSPEC_FOLD; ++k) {
         const float* e = t + k * 4;
         if (e[1] == 0.f && e[2] == 0.f && e[3] == 0.f) continue;
-        const double q = js.at((double)e[0]);
+        const double q = js.at(sc.specCells, (double)e[0]);
         cx += (double)e[1] * q; cy += (double)e[2] * q; cz += (double)e[3] * q;
     }
     return true;
@@ -9953,7 +9992,7 @@ struct DBeamMergeW {
     double segSumM    = 0.0;  // camera-side merge accumulator, kappa factored out
     int    camVert    = 0;    // k: the camera subpath index of the vertex this segment leaves
     int    maxDepth   = 0;    // the same cap the connection loop applies
-    // UPBP-W-CHROMATIC (DChromaRun): segSumM and etaKCoef at the DJSPEC_K bins, one after the
+    // UPBP-W-CHROMATIC (DChromaRun): segSumM and etaKCoef at the DCHROMA_K bins, one after the
     // other, read at the beam's wavelength with the merge's own sigma_t and Tr; null where no
     // medium's extinction varies with wavelength. A queued segment's points into the queue's own
     // table (DWfQueue::chroma), an inline one's into the camera kernel's.
@@ -10119,8 +10158,8 @@ __device__ static double dBeamMergeWeight(const DScene& sc, const DBeamMergeW& m
     const double trC = mw.chroma ? camTr.atLam(sc, oc, dc, tCam, lamW, env)
                                  : camTr.at(sc, oc, dc, tCam, lamW, env);   // Tr~(x -> eye[k])
     if (!(trC > 0.0)) return 0.0;
-    const double etaKCoef = mw.chroma ? dSpecBinAt(mw.chroma + DJSPEC_K, (double)lamW) : mw.etaKCoef;
-    const double segSumM  = mw.chroma ? dSpecBinAt(mw.chroma, (double)lamW) : mw.segSumM;
+    const double etaKCoef = mw.chroma ? dChromaBinAt(mw.chroma + DCHROMA_K, (double)lamW) : mw.etaKCoef;
+    const double segSumM  = mw.chroma ? dChromaBinAt(mw.chroma, (double)lamW) : mw.segSumM;
     // eta of THIS merge against C1 — the numerator of the weight, and a term of its
     // denominator (a technique competes with itself at ratio exactly its own).
     const double etaS = mw.kappa * sinT * gL / (sigT * trC);
@@ -10295,10 +10334,10 @@ __device__ static void dBeamHitEval(const DScene& sc, const DBeamMap& bm, const 
                       const double pwf = (double)b.pw * w;
                       oX += fcx * pwf; oY += fcy * pwf; oZ += fcz * pwf; }
         else if (specOn && b.achro == 1) {   // not recoloured: at its own wavelength (host twin)
-                      const double q = (double)b.pw * w * js->at((double)lam);
+                      const double q = (double)b.pw * w * js->at(sc.specCells, (double)lam);
                       oX += (double)cieX(lam) * q; oY += (double)cieY(lam) * q; oZ += (double)cieZ(lam) * q; }
         else if (specOn) {
-                      const double q = w * js->at((double)lam);
+                      const double q = w * js->at(sc.specCells, (double)lam);
                       oX += (double)b.pX * q; oY += (double)b.pY * q; oZ += (double)b.pZ * q; }
         else        { oX += (double)b.pX * w; oY += (double)b.pY * w; oZ += (double)b.pZ * w; }
         // SECONDARY wavelengths of the spectral bundle (host twin: gatherPhotonBeams).
@@ -10325,7 +10364,7 @@ __device__ static void dBeamHitEval(const DScene& sc, const DBeamMap& bm, const 
                     continue;
                 }
                 const double wi = wShared * (double)b.pwSec[k] * ssi * phi *
-                                  (specOn ? js->at((double)li) : 1.0);
+                                  (specOn ? js->at(sc.specCells, (double)li) : 1.0);
                 oX += (double)cieX(li) * wi;
                 oY += (double)cieY(li) * wi;
                 oZ += (double)cieZ(li) * wi;
@@ -10630,7 +10669,7 @@ struct DWfSeg {
     int    glassMat;    // DPathSeg::glassMat, for the camera-side glass under JSPEC
 };
 #if FTRACE_GPU_FP32
-static_assert(sizeof(DWfSeg) == 424, "DWfSeg changed size: update renderBdptCuda's segCap note");
+static_assert(sizeof(DWfSeg) == 408, "DWfSeg changed size: update renderBdptCuda's segCap note");
 #endif
 struct DWfHit { int seg; int beam; float t, s; };
 // One band of the wave-schedule PROFILE (see renderBdptCuda): what the paths of pixel slots
@@ -10642,7 +10681,7 @@ static std::vector<WfBand> g_wfProfile;
 static int g_wfProfileResX = -1, g_wfProfileResY = -1, g_wfProfileDepth = -1;
 struct DWfQueue {
     DWfSeg* segs;  int* nSegs; int segCap;
-    double* chroma;     // 2*DJSPEC_K per segment slot (DBeamMergeW::chroma), or null when off
+    double* chroma;     // 2*DCHROMA_K per segment slot (DBeamMergeW::chroma), or null when off
     DWfHit* hits;  int* nHits; int hitCap;
     int*    resume;     // per segment slot: candidates already queued when the hit queue filled, or -1
     int*    overflow;   // [0] segments gathered inline (queue full), [1] segments deferred this pass
@@ -20412,8 +20451,8 @@ __device__ static double dJSlotAt(const DScene& sc, const DMaterial& m, const DJ
 __device__ static void dJTrFold(const DScene& sc, DJSpecRun& jr, const DVec3& o, const DVec3& d,
                                 double dist, Real lambda) {
     const DPatEnv env = dPatEnvOf(sc);
-    double e[DJSPEC_K];   // the exponent at each bin, summed medium by medium
-    for (int k = 0; k < DJSPEC_K; ++k) e[k] = 0.0;
+    double e[kSpecCellsMax];   // the exponent at each cell, summed medium by medium
+    for (int k = 0; k < jr.n; ++k) e[k] = 0.0;
     for (int i = 0; i < sc.mediaN; ++i) {
         const DMedium& m = sc.media[i];
         double ta, tb;
@@ -20427,10 +20466,10 @@ __device__ static void dJTrFold(const DScene& sc, DJSpecRun& jr, const DVec3& o,
         }
         if (!(tau > 0.0)) continue;
         const double s0 = (double)medSigmaT(m, lambda);
-        for (int k = 0; k < DJSPEC_K; ++k)
-            e[k] += ((double)medSigmaT(m, (Real)DJSpec::lamOf(k)) - s0) * tau;
+        for (int k = 0; k < jr.n; ++k)
+            e[k] += ((double)medSigmaT(m, jr.lamOf(k)) - s0) * tau;
     }
-    for (int k = 0; k < DJSPEC_K; ++k) e[k] = exp(-e[k]);
+    for (int k = 0; k < jr.n; ++k) e[k] = exp(-e[k]);
     jr.mulVec(e, 1.0);
 }
 
@@ -20861,14 +20900,14 @@ __device__ static void dRandomWalk(const DScene& sc, const DCamera& cam, int dif
                 // ONE loop: a second call site of the BCSDF readers is the kind of growth that tips
                 // nvcc into emitting them out of line (see DJBase).
                 const int nSec = nUp - 1;
-                const int nJ = (jrun && !passThru) ? DJSPEC_K + 1 : 0;
-                double hv[DJSPEC_K + 1];
+                const int nJ = (jrun && !passThru) ? jrun->n + 1 : 0;
+                double hv[kSpecCellsMax + 1];
                 for (int i = 0; i < nSec + nJ; ++i) {
                     const bool sec = i < nSec;
                     if (sec && passThru) { secF[i] = 1.0; continue; }   // the ray missed the fiber at every λ
                     if (sec && collapse) { secF[i] = 0.0; continue; }   // the hero goes on alone
                     const int jk = i - nSec - 1;                        // -1: lambda itself
-                    const Real Li = sec ? hb.lam[i + 1] : (jk < 0 ? lambda : (Real)DJSpec::lamOf(jk));
+                    const Real Li = sec ? hb.lam[i + 1] : (jk < 0 ? lambda : jrun->lamOf(jk));
                     const DHairShade hsi = dHairShadeAt(sc, *mp, h, Li, wo);
                     const double fc = (double)dHairFCos(hsi, wi);
                     if (sec) secF[i] = fc / pdfH; else hv[jk + 1] = (double)clamp01((Real)(fc / pdfH));
@@ -21098,7 +21137,7 @@ __device__ static int dGenCameraSubpath(const DScene& sc, const DCamera& cam, in
                                         int maxSegs = 0, DJSpecRun* jrun = nullptr,
                                         DJSpec* vspec = nullptr) {
     const Real lambda = hb.lam[0];
-    if (jrun) jrun->init();   // JSPEC: the camera vertex carries no spectral factor
+    if (jrun) jrun->init(sc);   // JSPEC: the camera vertex carries no spectral factor
     if (jrun && vspec) jrun->snap(vspec[0]);
     // The camera vertex sees every wavelength at unit throughput: the bundle starts at full
     // width with all secondary throughputs 1 (importance leaves the camera achromatic).
@@ -21121,11 +21160,11 @@ __device__ static int dGenCameraSubpath(const DScene& sc, const DCamera& cam, in
         // JSPEC: the same film and pupil sample traced at every bin too (host twin
         // generateCameraSubpath), in the one loop -- one call site of the lens tracer.
         bool okL = false;
-        double wB[DJSPEC_K];
-        const int nLam = jrun ? DJSPEC_K + 1 : 1;
+        double wB[kSpecCellsMax];
+        const int nLam = jrun ? jrun->n + 1 : 1;
         for (int j = 0; j < nLam; ++j) {
             DVec3 roj, rdj; Real wlj = 0;
-            const Real Lj = (j == 0) ? lambda : (Real)DJSpec::lamOf(j - 1);
+            const Real Lj = (j == 0) ? lambda : jrun->lamOf(j - 1);
             const bool okj = dGenLensRay(cam, px, py, jx, jy, u1, u2, Lj, roj, rdj, wlj);
             if (j == 0) { okL = okj; ro = roj; rd = rdj; wl = wlj; if (!okL || wl <= 0) break; }
             else wB[j - 1] = (okj && wlj > 0) ? (double)wlj : 0.0;
@@ -21926,7 +21965,7 @@ __device__ static double dConnectBDPT(const DScene& sc, const DCamera& cam,
 __device__ static void dChromaBeamEta1(const DScene& sc, const DVertex& v, const DVec3& a,
                                        const DVec3& dout, double dn, const DPatEnv& env,
                                        double* out) {
-    for (int b = 0; b < DJSPEC_K; ++b) out[b] = 0.0;
+    for (int b = 0; b < DCHROMA_K; ++b) out[b] = 0.0;
     if (v.type != BV_MEDIUM || v.mediumId < 0 || v.mediumId >= sc.mediaN || !(dn > 0.0)) return;
     if (!dJBeamMerges(sc, sc.media[v.mediumId], v.p)) return;
     const double c = ddot(a, dout);
@@ -21934,18 +21973,18 @@ __device__ static void dChromaBeamEta1(const DScene& sc, const DVertex& v, const
     if (!(s2 > 0.0)) return;
     const double sn = sqrt(s2);
     const double dens = dMedDensityAt(sc.media[v.mediumId], v.p, env);
-    double depth[DJSPEC_K];
-    for (int b = 0; b < DJSPEC_K; ++b) depth[b] = 0.0;
+    double depth[DCHROMA_K];
+    for (int b = 0; b < DCHROMA_K; ++b) depth[b] = 0.0;
     for (int m = 0; m < sc.mediaN; ++m) {
         const double L = dTrDetDepthMedium(sc.media[m], v.p, dout, dn, env);
         if (!(L > 0.0)) continue;
-        for (int b = 0; b < DJSPEC_K; ++b) {
-            const double st = sc.chromaSig[m * DJSPEC_K + b];
+        for (int b = 0; b < DCHROMA_K; ++b) {
+            const double st = sc.chromaSig[m * DCHROMA_K + b];
             if (st > 0.0) depth[b] += st * L;   // a medium dTrDet skips adds nothing
         }
     }
-    for (int b = 0; b < DJSPEC_K; ++b) {
-        const double st = sc.chromaSig[v.mediumId * DJSPEC_K + b] * dens;
+    for (int b = 0; b < DCHROMA_K; ++b) {
+        const double st = sc.chromaSig[v.mediumId * DCHROMA_K + b] * dens;
         if (!(st > 0.0)) continue;
         const double t = exp(-depth[b]);
         if (t > 0.0) out[b] = sn / (st * t);
@@ -21955,11 +21994,11 @@ __device__ static void dChromaBeamEta1(const DScene& sc, const DVertex& v, const
 // whole table: `m` is segSumM at row k at every bin, `mPrev` row k-1, `e1` the merge at eye[k-1]
 // (both kinds, scaled) with its light density left out. Rows 0 and 1 are 0, as the host's are.
 struct DChromaRun {
-    double m[DJSPEC_K], mPrev[DJSPEC_K], e1[DJSPEC_K];
+    double m[DCHROMA_K], mPrev[DCHROMA_K], e1[DCHROMA_K];
     int k;
     __device__ void reset() {
         k = 1;
-        for (int b = 0; b < DJSPEC_K; ++b) m[b] = mPrev[b] = e1[b] = 0.0;
+        for (int b = 0; b < DCHROMA_K; ++b) m[b] = mPrev[b] = e1[b] = 0.0;
     }
     // Up to row kt (< nE). The walk records its segments and vertices in order, so this only
     // ever climbs; asked for a lower row it starts over.
@@ -21969,7 +22008,7 @@ struct DChromaRun {
         while (k < kt) {
             ++k;
             const DVertex& v = eye[k - 1];
-            for (int b = 0; b < DJSPEC_K; ++b) e1[b] = 0.0;
+            for (int b = 0; b < DCHROMA_K; ++b) e1[b] = 0.0;
             if (kappaB > 0.0 && v.type == BV_MEDIUM) {
                 // dMergeEtaPrime's directions: arriving from eye[k], leaving for eye[k-2].
                 DVec3 din = v.p - eye[k].p;
@@ -21977,20 +22016,20 @@ struct DChromaRun {
                 DVec3 dout = eye[k - 2].p - v.p;
                 const double dn = sqrt(ddot(dout, dout));
                 if (dl > 0.0 && dn > 0.0) {
-                    double tmp[DJSPEC_K];
+                    double tmp[DCHROMA_K];
                     dChromaBeamEta1(sc, v, din * (Real)(1.0 / dl), dout * (Real)(1.0 / dn), dn,
                                     env, tmp);
-                    for (int b = 0; b < DJSPEC_K; ++b) e1[b] = kappaB * tmp[b];
+                    for (int b = 0; b < DCHROMA_K; ++b) e1[b] = kappaB * tmp[b];
                 }
             }
             if (kappaS > 0.0 && v.type != BV_MEDIUM && dSurfMergeSite(sc, v))
-                for (int b = 0; b < DJSPEC_K; ++b) e1[b] += kappaS;
+                for (int b = 0; b < DCHROMA_K; ++b) e1[b] += kappaS;
             const double pL = dMergeLightDensity((double)eye[k - 1].pdfRev, eye[k].delta != 0);
             const double rC = dMisRevDensity(eye[k - 1].pdfRev, eye[k].delta != 0) /
                               dMisRemap0(eye[k - 1].pdfFwd);
             const bool fiberK = !eye[k].delta && eye[k].type == BV_SURFACE &&
                                 eye[k].matId >= 0 && sc.mats[eye[k].matId].type == D_HAIR;
-            for (int b = 0; b < DJSPEC_K; ++b) {
+            for (int b = 0; b < DCHROMA_K; ++b) {
                 const double mb = fiberK ? 0.0 : ((pL > 0.0 ? e1[b] * pL : 0.0) + (rC != 0.0 ? rC * m[b] : 0.0));
                 mPrev[b] = m[b];
                 m[b] = mb;
@@ -22018,7 +22057,7 @@ struct DSurfMergeW {
     double invPdfFwdKm1 = 1.0, etaKm1Coef = 0.0, segSumC = 0.0, segSumM = 0.0;
     int camVert = 0, maxDepth = 0;
     // UPBP-W-CHROMATIC (host twin SurfMergeWeight::chromaM): segSumM and etaKm1Coef at the
-    // DJSPEC_K bins, read at the photon's wavelength `lam`; null where nothing is chromatic.
+    // DCHROMA_K bins, read at the photon's wavelength `lam`; null where nothing is chromatic.
     const double* chromaM = nullptr;
     const double* chromaKm1 = nullptr;
 
@@ -22031,8 +22070,8 @@ struct DSurfMergeW {
         const double D1 = lm.pdfFwdA * invPdfFwdK;        // pdfFwdA > 0, as etaS is
         const double pdfRevKm1 = pdfDirFwd * cosPrev * invDistPrev2;
         const double D2 = pdfRevKm1 * invPdfFwdKm1;
-        const double etaKm1 = chromaM ? dSpecBinAt(chromaKm1, lam) : etaKm1Coef;
-        const double sumM   = chromaM ? dSpecBinAt(chromaM, lam) : segSumM;
+        const double etaKm1 = chromaM ? dChromaBinAt(chromaKm1, lam) : etaKm1Coef;
+        const double sumM   = chromaM ? dChromaBinAt(chromaM, lam) : segSumM;
         const double den = (double)lm.gateC1
                          + R * (lm.sumC + kappaB * lm.sumMb + kappaS * lm.sumMs)
                          + etaS
@@ -22054,7 +22093,7 @@ struct DSurfTap {
     JSurfTapHalf* halves;    // [n * stride], by camera vertex
 };
 FT_DEVGLOBAL(__constant__ DSurfTap c_surfTap, = {0, 0, nullptr, nullptr, nullptr, nullptr});
-static_assert(kJSurfTapK == DJSPEC_K, "the tap's bins are DJSpec's");
+static_assert(kJSurfTapK == DCHROMA_K, "the tap's bins are DJSpec's");
 static_assert(kJSurfTapMaxV == BDPT_MAXV_OF(BDPT_DEEPDEPTH), "the tap keeps a deep walk whole");
 
 __device__ static void dSurfTapPath(long long gidx, const DVertex* eye, int nE, double lam) {
@@ -22085,7 +22124,7 @@ __device__ static void dSurfTapHalf(long long gidx, int k, const DSurfMergeW& sw
     h.etaKm1Coef = sw.etaKm1Coef; h.segSumC = sw.segSumC; h.segSumM = sw.segSumM;
     h.camVert = sw.camVert; h.maxDepth = sw.maxDepth;
     h.chroma = (mPrev && e1) ? 1 : 0;
-    for (int b = 0; b < DJSPEC_K; ++b) {
+    for (int b = 0; b < DCHROMA_K; ++b) {
         h.mPrev[b] = h.chroma ? mPrev[b] : 0.0;
         h.e1[b]    = h.chroma ? e1[b] : 0.0;
     }
@@ -22131,7 +22170,7 @@ struct DSurfReq {
 struct DSurfQueue {
     DSurfReq* reqs; int* nReqs; int cap;   // null reqs: gather inline
     DJSpec*   spec;          // per slot when JSPEC is on, else null
-    double*   chroma;        // per slot 2*DJSPEC_K (segSumM, etaKm1 bins) when chromatic, else null
+    double*   chroma;        // per slot 2*DCHROMA_K (segSumM, etaKm1 bins) when chromatic, else null
     int*      overflow;      // sites gathered inline, the queue full
     int*      carried;       // sites whose photons passing filled more than a warp (dSiteListWarp)
 };
@@ -22201,7 +22240,7 @@ __device__ static inline void dSurfMergeWeigh(const DScene& sc, const DSurfMap& 
         gX += (double)cieX((Real)lc) * cfw; gY += (double)cieY((Real)lc) * cfw; gZ += (double)cieZ((Real)lc) * cfw;
         return;
     }
-    const double cf = w * fCam * (double)ph.beta * (js ? js->at((double)lam) : 1.0);   // JSPEC
+    const double cf = w * fCam * (double)ph.beta * (js ? js->at(sc.specCells, (double)lam) : 1.0);   // JSPEC
     gX += (double)ph.cx * cf; gY += (double)ph.cy * cf; gZ += (double)ph.cz * cf;
 }
 // The merge footprint of modes J and U draws probe `i` at a site off a stream of its own, seeded from
@@ -22423,8 +22462,8 @@ __global__ void kWfSurfGather(DScene sc, DSurfMap sm, DSurfQueue sq, int n, doub
         const DSurfReq& rq = sq.reqs[r];
         DSurfMergeW sw = rq.sw;
         if (rq.flags & 2) {
-            sw.chromaM   = sq.chroma + (size_t)r * 2 * DJSPEC_K;
-            sw.chromaKm1 = sw.chromaM + DJSPEC_K;
+            sw.chromaM   = sq.chroma + (size_t)r * 2 * DCHROMA_K;
+            sw.chromaKm1 = sw.chromaM + DCHROMA_K;
         }
         const DJSpec* js = (rq.flags & 1) ? &sq.spec[r] : nullptr;
         const DSurfSite site(sc, sm, rq.vk);

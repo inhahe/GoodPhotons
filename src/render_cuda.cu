@@ -916,7 +916,7 @@ static int siteWarpGrid(long long sites) {
 // bins where those are on.
 static size_t surfReqBytes() {
     return sizeof(gpu::DSurfReq) + (g_jSpecHost ? sizeof(gpu::DJSpec) : 0) +
-           ((g_jTrSpecHost && g_jChromaHost) ? 2 * DJSPEC_K * sizeof(double) : 0);
+           ((g_jTrSpecHost && g_jChromaHost) ? 2 * DCHROMA_K * sizeof(double) : 0);
 }
 // The requests a merge queue gets (modes J and U: DSurfQueue, DVcmMergeQueue): up to `hardCap`, or
 // what an eighth of `room` holds at `perReq` bytes a request; 0, the queue left out, below 65 536.
@@ -1988,10 +1988,10 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
         // only then is it uploaded (cudaSetJSwitches runs before any render's upload).
         sc.chromaSig = nullptr;
         if (!scene.media.empty() && g_jTrSpecHost && g_jChromaHost) {
-            std::vector<double> sig(scene.media.size() * (size_t)DJSPEC_K);
+            std::vector<double> sig(scene.media.size() * (size_t)DCHROMA_K);
             for (size_t m = 0; m < scene.media.size(); ++m)
-                for (int b = 0; b < DJSPEC_K; ++b)
-                    sig[m * DJSPEC_K + b] = scene.media[m].sigmaT(bandBinLambda(b));
+                for (int b = 0; b < DCHROMA_K; ++b)
+                    sig[m * DCHROMA_K + b] = scene.media[m].sigmaT(bandBinLambda(b));
             sc.chromaSig = (const double*)keep(uploadVec(sig));
         }
         // GATHER-TIME SPECTRAL FOLD tables (FOLD-GPU (2), host: Scene::bowLuts). One
@@ -3423,11 +3423,13 @@ void cudaSetJSwitches(int jSpec, int trSpec, int deltaMerge, int half, int chrom
     g_jSpecHost = jSpec; g_jTrSpecHost = trSpec; g_jDeltaMergeHost = deltaMerge; g_jHalfHost = half;
     g_jChromaHost = chroma;
 }
-// gpu::c_jBinQ from the sampler the camera walk's wavelength is drawn from: on the device both modes
-// draw from the emission sampler (dSampleSceneLambda), where the host's mode J draws from camSampler.
-static void uploadJBinQ(const EmissionSampler& s) {
-    static_assert(sizeof(s.binMass) == sizeof(double) * DJSPEC_K, "c_jBinQ mirrors EmissionSampler::binMass");
-    CUDA_CHECK(cudaMemcpyToSymbol(gpu::c_jBinQ, s.binMass, sizeof(s.binMass)));
+// gpu::c_jCellQ from the sampler the camera walk's wavelength is drawn from, its mass in each of the
+// carrier's cells `c` (JSpecRun::supportShare's): on the device both modes draw from the emission sampler
+// (dSampleSceneLambda), where the host's mode J draws from camSampler.
+static void uploadJCellQ(const EmissionSampler& s, const SpecCells& c) {
+    double q[kSpecCellsMax] = {};
+    for (int k = 0; k < c.n && k < kSpecCellsMax; ++k) q[k] = s.cdfAt(c.hi[k]) - s.cdfAt(c.lo[k]);
+    CUDA_CHECK(cudaMemcpyToSymbol(gpu::c_jCellQ, q, sizeof(q)));
 }
 // The aimed sun (bdpt.h SunAim): host copies, uploaded at the top of every renderBdptCuda.
 static std::vector<gpu::Real> g_sunAimWHost;
@@ -4243,7 +4245,7 @@ Film renderBdptCuda(const Scene& scene, const Camera& cam, int resX, int resY,
     // Mode J's switches, as the host settled them for this render (cudaSetJSwitches).
     CUDA_CHECK(cudaMemcpyToSymbol(gpu::c_jHalf, &g_jHalfHost, sizeof(int)));
     CUDA_CHECK(cudaMemcpyToSymbol(gpu::c_jSpecOn, &g_jSpecHost, sizeof(int)));
-    uploadJBinQ(scene.emitSampler);   // the camera walk's wavelength density (DJSpecRun::hole):
+    uploadJCellQ(scene.emitSampler, scene.specCells);   // the camera walk's wavelength density (DJSpecRun::hole):
                                       // the device's draw (dSampleSceneLambda), not camSampler
     CUDA_CHECK(cudaMemcpyToSymbol(gpu::c_jTrSpec, &g_jTrSpecHost, sizeof(int)));
     CUDA_CHECK(cudaMemcpyToSymbol(gpu::c_jChroma, &g_jChromaHost, sizeof(int)));
@@ -4270,7 +4272,7 @@ Film renderBdptCuda(const Scene& scene, const Camera& cam, int resX, int resY,
     long long waveSamples = 0;
     if (dbm.gathers() &&
         !(std::getenv("FTRACE_NOWAVEFRONT") && std::atoi(std::getenv("FTRACE_NOWAVEFRONT")) != 0)) {
-        const int segCap = kWfSegCap;        // 424 B each (~445 MB), 128 of them JSPEC's
+        const int segCap = kWfSegCap;        // 408 B each (~428 MB), 104 of them JSPEC's
         int hitCap = kWfHitCap;              // 16 B each  (512 MB): a dense map yields thousands of
                                              // candidates per segment (_fog_cornell: ~2000), and what
                                              // does not fit costs a resume pass (kWfBeamHits)
@@ -4290,7 +4292,7 @@ Film renderBdptCuda(const Scene& scene, const Camera& cam, int resX, int resY,
         // camera kernel (the queue test there), which is slower but the same estimator, where a
         // failed or paged-out allocation would abort the render or crawl it.
         if (g_jTrSpecHost && g_jChromaHost) {
-            const size_t want = (size_t)segCap * 2 * DJSPEC_K * sizeof(double);
+            const size_t want = (size_t)segCap * 2 * DCHROMA_K * sizeof(double);
             size_t freeB = 0, totalB = 0;
             const bool room = cudaMemGetInfo(&freeB, &totalB) == cudaSuccess &&
                               freeB > want + ((size_t)512 << 20);
@@ -4359,7 +4361,7 @@ Film renderBdptCuda(const Scene& scene, const Camera& cam, int resX, int resY,
             CUDA_CHECK(cudaMalloc(&sq.reqs, (size_t)cap * sizeof(DSurfReq)));
             if (g_jSpecHost) CUDA_CHECK(cudaMalloc(&sq.spec, (size_t)cap * sizeof(DJSpec)));
             if (g_jTrSpecHost && g_jChromaHost)
-                CUDA_CHECK(cudaMalloc(&sq.chroma, (size_t)cap * 2 * DJSPEC_K * sizeof(double)));
+                CUDA_CHECK(cudaMalloc(&sq.chroma, (size_t)cap * 2 * DCHROMA_K * sizeof(double)));
             CUDA_CHECK(cudaMalloc(&d_sqCounters, 3 * sizeof(int)));
             CUDA_CHECK(cudaMemset(d_sqCounters, 0, 3 * sizeof(int)));
             sq.nReqs = d_sqCounters; sq.overflow = d_sqCounters + 1; sq.carried = d_sqCounters + 2;
@@ -6957,7 +6959,7 @@ VcmSession* vcmSessionBegin(const Scene& scene, const Camera& cam, int resX, int
     CUDA_CHECK(cudaMemcpyToSymbol(gpu::c_jSpecOn, &g_jSpecHost, sizeof(int)));
     CUDA_CHECK(cudaMemcpyToSymbol(gpu::c_jDispWin, &g_jDispWinHost, sizeof(double)));
     CUDA_CHECK(cudaMemcpyToSymbol(gpu::c_jDispAll, &g_jDispAllHost, sizeof(int)));
-    uploadJBinQ(scene.emitSampler);   // mode U's bundles are drawn from it (DJSpecRun::hole)
+    uploadJCellQ(scene.emitSampler, scene.specCells);   // mode U's bundles are drawn from it (DJSpecRun::hole)
     VcmSession* s = new VcmSession();
     s->resX = resX; s->resY = resY; s->npix = (size_t)resX * resY;
     s->diffraction = diffraction ? 1 : 0;

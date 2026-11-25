@@ -1364,16 +1364,10 @@ from its 1 nm sampler; the device's `DScene::emitCellE`, emitter-major) and the 
 wavelength -- exact for a line wherever it falls, where a cell's width times the SPD at its wavelength
 read a line between the nodes as next to nothing (a glossy wall under a 589 nm line read 0.10 in mode M,
 SPECNEE-LINE-LIGHT). The device takes the cells from `DScene::specCells` (`DSpecThr::init(sc)`, always
-uploaded), with the host's wavelengths and masses. Left on the uniform bins: the beam gather's `JSpec`
-(`toJSpec`, each bin at its centre, `atBinCentre`: a split bin's cell there; an unsplit bin's read carried
-to its centre along the line to its neighbour's on that side, where the folded spectra are continuous
-across the two bins' common end -- `SpecCells::smooth`: the lines `chooseSpecCuts` fits over the final
-cells on either side meet there within four times their RMS residuals (`kJoinSlack`; a least-squares
-line's end strays from a smooth curve by about twice its residual) or its tolerance, which a step on a
-bin's end fails though it cuts neither bin, and a bend there or a curve across it passes, the line
-between the reads nearer than either read -- else its own read; 0.451.16, REVIEW-0458: a gel stepping on bin 12's lower edge read a 610 nm
-line through it at 0.85) and
-mode J's carrier, which is its own (known-issues JSPEC-BIN-RESOLUTION). `[specgather] ...` says where a render's bins were split;
+uploaded), with the host's wavelengths and masses. The beam gather's `JSpec` is on the same cells
+(`toJSpec` copies them, the ratio over its peak; mode J's carrier, below, is on them too since 0.451.27,
+JSPEC-BIN-RESOLUTION: 0.451.16-0.451.26 carried an unsplit bin's read to its centre for it, along the
+line to its neighbour's across a smooth join, `atBinCentre`). `[specgather] ...` says where a render's bins were split;
 `tools/check_spec_cells.py` holds modes M and S, both devices, to mode R across steps inside a bin, a
 bend, a glossy wall behind a step, analytic bands and edges, a coin's support edge, and a line light
 behind a ramp before a diffuse and a glossy wall.
@@ -3137,13 +3131,23 @@ a sum over beams of every wavelength computes r(λ_c)·Σ L_b CIE(λ_b), where t
 (SPECGATHER, above). Mode J's camera walk also bounces diffusely and scatters in media, and nothing
 re-expressed it. The connections are immune: both of their subpaths run at λ_c.
 
-**Fix.** The camera walk carries its spectral factors on a 24-bin grid (`JSpec` / `JSpecRun`,
-beamgather.h; `DJSpec` / `DJSpecRun` on the device). Each bin holds Π f(λ_k) / f(λ_c), so
-`beta · at(λ_b)` is the camera side evaluated at the beam's wavelength. `at()` interpolates
-geometrically between two live bin centres, which is exact where an absorption exponent is linear
-in λ across a bin; a straight line overestimated coloured glass's transmission by its convexity
-(G +7 % on fog seen through a tinted sphere before 0.391.4; `tools/check_jfog_glass.py`). Beside a
-dead bin it stays linear. A segment snapshots the carrier at its origin (`PathSeg::spec`), and
+**Fix.** The camera walk carries its spectral factors over the scene's carrier cells (`JSpec` /
+`JSpecRun`, beamgather.h; `DJSpec` / `DJSpecRun` on the device; `Scene::specCells`, mode M's grid:
+the 24 uniform bins cut where a factor steps or bends, a gel's edge, each read where the emission in
+it lies; 0.451.27, JSPEC-BIN-RESOLUTION -- until then the 24 uniform bins at their centres, which
+read a gel ramping up from a bin's edge 15 % low between them, scenes/_jfog_gelkink). Each cell holds
+Π f(λ_k) / f(λ_c), so `beta · at(λ_b)` is the camera side evaluated at the beam's wavelength. `at()`
+reads the cell λ_b falls in and carries it toward its neighbour where the two are cells of two bins
+whose join is smooth (`specCellsAt`; `SpecCells::smooth`), geometrically between two live reads,
+which is exact where an absorption exponent is linear in λ between them; a straight line
+overestimated coloured glass's transmission by its convexity (G +7 % on fog seen through a tinted
+sphere before 0.391.4; `tools/check_jfog_glass.py`). Beside a dead cell it stays linear; across a
+cut, at a rough join and past the outer reads it holds the cell's own. On the device the carrier a
+segment or vertex keeps holds each cell as a 16-bit code, -512 log2 of its ratio to the largest
+(`dJQEncode`; the largest in `logS`): within 0.07 % of the value down to 2^-128, where half floats
+stop at 6e-8, and the geometric interpolation is a line between two codes -- 104 B a carrier
+where the 24 float bins took 120 (JSPEC-CARRIER-SIZE). The chromatic MIS tables (below) stay on the
+uniform bins (`kChromaBins`, `chromaBinAt`): a weight the strategies share needs no finer grid. A segment snapshots the carrier at its origin (`PathSeg::spec`), and
 the point merges read it as it arrives at their vertex (`JSpecWalk::vert`; the device rebuilds it
 from the previous segment's snapshot). What is folded, each against the value `beta` took at λ_c:
 - **Lambertian, glossy, diffuse-transmit:** the lobe's albedo. Any lobe coin cancels, because the
@@ -3307,9 +3311,9 @@ term (it cancels between the strategies), so nothing else in the camera half has
 it; the connections' weights (`misWeight`) are single-wavelength paths and stay at the camera's.
 
 So where some medium's extinction varies with wavelength (`anyMediumSigmaTChromatic`), the
-wavelength-dependent part of the camera half is tabulated at the K bins of JSpec's grid and every
-merge reads it at its own beam's or photon's wavelength, geometrically interpolated as JSpec is
-(`specBinAt`); the merge's own `sigma_t` and `Tr` are evaluated there exactly. A medium's
+wavelength-dependent part of the camera half is tabulated at the uniform bins (`kChromaBins`) and every
+merge reads it at its own beam's or photon's wavelength, geometrically interpolated between bin
+centres (`chromaBinAt`); the merge's own `sigma_t` and `Tr` are evaluated there exactly. A medium's
 extinction is `sigma_t(lambda) * density(x)`, so a segment's transmittance at every bin comes from
 its per-medium depths, taken once (`trDetDepthMedium` / `dTrDetDepthMedium`). On the CPU
 `ChromaMis` holds the scene's `sigma_t` per bin and `cameraSideSumsChroma` fills the camera path's
@@ -3345,7 +3349,7 @@ held too. The host (`checkJSurfTap`) turns the device's vertices into its own, r
 with the code `renderRows` uses (`cameraSideSums`, `cameraSideSumsChroma`, `surfMergeWeightAt`),
 and requires the fields, the bins, the set of merge sites and the weight itself -- DSurfMergeW in
 a kernel of its own (`kJSurfWEval`) against SurfMergeWeight, at 8 photon states a half drawn over
-six decades of density and past both ends of JSpec's grid -- to agree to 1e-4 of themselves (the
+six decades of density and past both ends of the uniform bins -- to agree to 1e-4 of themselves (the
 device's positions are fp32; a NaN or infinity on either side fails). The merge constants are
 the host's, from the call's own maps. `etaKm1Coef` is held to 1e-3: it is `sigma_t * Tr` at the
 camera's own wavelength, which the device reads off its tabulated spectra in fp32

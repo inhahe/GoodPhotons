@@ -297,10 +297,11 @@ inline bool spectrumKnots(const Spectrum& s, std::vector<double>& x, std::vector
 // sRGB under D65). The earlier three-lobe placeholder was removed once the
 // proper fit landed; `rgb r g b` in FTSL routes through the JH upsampler.
 
-// The spectral carriers' uniform bins (JSpec::K; SpecThr's cells split them, SpecCells), and so the
-// wavelengths at which the question "does this vary over the band?" is asked.
+// The spectral carriers' uniform bins (the cells of SpecCells split them; the chromatic MIS tables keep
+// them, kChromaBins), and so the wavelengths at which the question "does this vary over the band?" is
+// asked.
 constexpr int kBandProbeBins = 24;
-// Bin k's centre on that grid (JSpec::lamOf, the mode-J merge weights' tables).
+// Bin k's centre on that grid (an unsplit bin's read before SpecCells::setMass places it; chromaBinLambda).
 inline double bandBinLambda(int k) {
     return LAMBDA_MIN + (k + 0.5) * (LAMBDA_MAX - LAMBDA_MIN) / (double)kBandProbeBins;
 }
@@ -492,6 +493,9 @@ struct SpecCells {
     bool split() const { return n != kBandProbeBins; }
 };
 
+// The uniform bins alone, each read at its centre: the grid of a carrier no scene has given one yet.
+inline const SpecCells& uniformSpecCells() { static const SpecCells c; return c; }
+
 // A spectrum the camera walk folds, for the carrier's cuts (Scene::buildSpecCells). `support`: its zeros
 // are holes in the walk's support (a reflectance, a filter's transmittance), not a coefficient's value
 // (an absorption, an index).
@@ -511,7 +515,7 @@ struct SpecCutCurve { const Spectrum* s; bool support; };
 // continuous across bin k's lower end: whether the cells on either side of it, as the cuts leave them, meet
 // there along their own least-squares lines, to within kJoinSlack times the two lines' RMS residuals (or
 // `tol` where both are near exact). There a value read in one may be carried to the other's centre along
-// the line between the two reads (SpecThr::atBinCentre). A step on a bin's end cuts neither bin -- each is
+// the line between the two reads (specCellsAt). A step on a bin's end cuts neither bin -- each is
 // flat -- and leaves that join rough; a bend there, or a curve across it, leaves it smooth, the line
 // between the two reads nearer the curve than either read alone.
 constexpr int kSpecCutSub = 80;

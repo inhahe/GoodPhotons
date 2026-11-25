@@ -595,9 +595,9 @@ Then the rest of 4.2-4.6 in their order, 4.7's bookkeeping alongside whatever to
 - [x] **SPECGATHER-CELL-CENTROID** (0.451.12) — each carrier cell read at the emission's centroid in it, not its
   middle (a line behind a ramp read 0.83 in modes M and S), and the spectral NEE weighted by each light's own
   emission in a cell (SPECNEE-LINE-LIGHT: a glossy wall under the line read 0.58); known-issues.
-- [ ] **JSPEC-BIN-RESOLUTION** — the beam gather's carrier and mode J's on the scene's cells too, with
-  JSPEC-CARRIER-SIZE's half-precision bins; known-issues. Its test-to-be: scenes/_jfog_gelkink.ftsl (a bend
-  between two bins' centres, J 0.84 and M 0.85 of mode R at 0.451.16), into check_jfog_glass once it holds.
+- [x] **JSPEC-BIN-RESOLUTION** (0.451.27) — the beam gather's carrier and mode J's on the scene's cells too,
+  each cell a 16-bit log code on the device (104 B a carrier); check_jfog_glass's `gelkink` (a bend between two
+  bins' centres) J 0.84 and M 0.85 of mode R before, 1.00 / 1.00-1.015 now; known-issues.
 - [x] **REVIEW-0450R** (0.450.45) — the Opus (max) and Fable (xhigh) reviews of 0.450.43-0.450.44;
   known-issues REVIEW-0450R.
 - [x] **REVIEW-0450Q** (0.450.43) — the Opus (max) and Fable (xhigh) reviews of 0.450.42; known-issues REVIEW-0450Q.
@@ -847,13 +847,13 @@ Then the rest of 4.2-4.6 in their order, 4.7's bookkeeping alongside whatever to
   `_fog_cornell`, 3.5x mode D's instructions). The surface gather is queued since 0.437.0 (1.7x
   on `_fog_cornell`'s surface merges). Left: a smaller SoA vertex record, then `__launch_bounds__`
   again.
-- [ ] **JSPEC-CARRIER-SIZE** — every mode-J GPU thread reserves a 120-byte spectral carrier per
+- [x] **JSPEC-CARRIER-SIZE** (0.451.27) — every mode-J GPU thread reserves a 120-byte spectral carrier per
   segment and per eye vertex, chromatic scene or not: VRAM (~0.5 GB, ~3.2 GB on the deep kernel),
   not speed. The slow camera pass measured against it was the MIS weights' per-connection
   transmittances, computed once a sample since 0.436.5 (known-issues). Left: the template
   parameter that sizes the carrier to nothing in an achromatic render costs two more variants of
   the largest kernel -- decided (1) (4.1), with (2)'s half-precision bins kept for if VRAM gets
-  tight.
+  tight. Done as (2) with JSPEC-BIN-RESOLUTION: 16-bit log codes, 104 B a carrier.
 - [x] **RADCACHE-BATCHES** — 0.439.3: the cache advances at its own schedule's boundaries over
   absolute samples, its merge canonical; the chunks follow the clock, and the image is the same
   at any thread count, chunking or stop and resume (`tools/check_radcache_det.py`).

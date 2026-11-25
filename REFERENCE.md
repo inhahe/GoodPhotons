@@ -1203,7 +1203,9 @@ that converges to the same physical image.
   (`[specgather] warning: …`). Before then such a step was read at the bin's centre, up to 28 % off in a channel
   (a gel opaque below 546.5 nm read mode R's green 0.72). Where a render's bins were split it
   says so: `[specgather] the spectral carrier's 24 bins split at … nm`. Mode `S` carries the same
-  grid.
+  grid, and since 0.451.27 so do mode `M`'s beam gather (`-beams`) and modes `J` and `U`, whose
+  camera walk also bounces off coloured walls and scatters in media: a fog seen through a gel whose
+  ramp bends between two bins' centres read 15 % dark there before.
 - **`S` — SPPM (progressive, caustic-strong).** Stochastic progressive photon mapping
   (Hachisuka 2008/2009): instead of one fixed-radius map, it runs **repeated bounded
   photon passes** and **shrinks each pixel's gather radius** over iterations, so the

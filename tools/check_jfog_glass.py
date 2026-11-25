@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Regression gate: modes J's and M's beam merges in a fog beside, behind and inside coloured glass.
 
-Five scenes (scenes/_jfog_floor, _jfog_behind, _jfog_inside, _jfog_gel, _jfog_gelline; their headers
+Six scenes (scenes/_jfog_floor, _jfog_behind, _jfog_inside, _jfog_gel, _jfog_gelline, _jfog_gelkink; their headers
 say what each guards), each rendered in mode R, the reference, and in modes J and M (`-beams`) on the GPU and on
 the CPU. The fog's region of the frame is compared channel by channel. Every arm runs at
 -max-bounce 32: modes D, J and U default to 8 edges and mode R to 32, and a comparison across two
@@ -31,9 +31,11 @@ The gelline scene sees the fog through a gel stepping on a boundary of the carri
 line at 610 nm in the bin above it. Mode M's beam gather carried that bin's read to its centre along
 the line to the bin below, across the step (REVIEW-0458): 0.451.15 read the fog R 0.744 on the GPU and
 0.755 on the CPU. Only red is checked there: a 610 nm line's linear-sRGB green and blue are small
-negative shares of its red, which carry nothing red does not. (scenes/_jfog_gelkink, the gel ramping up
-from that boundary instead, waits on known-issues JSPEC-BIN-RESOLUTION: the uniform bins read the bend
-between their centres 15 % low in modes J and M alike.)
+negative shares of its red, which carry nothing red does not. The gelkink scene sees it through a gel
+ramping up from that boundary instead, a bend between two bins' centres, which the uniform bins read
+15 % low in modes J and M alike (JSPEC-BIN-RESOLUTION: 0.451.26 read the fog R 0.843 / 0.841 in mode
+J, GPU / CPU, and 0.852 / 0.865 in mode M); the carriers on the scene's cells read 1.000 / 0.998 and
+1.000 / 1.015 (0.451.27). Red alone again.
 
 Blue is left out of the tinted scenes: the glass passes about 1 % of it, so its ratio is
 noise. The behind scene's green keeps a wider tolerance for the bins' resolution (known-issues
@@ -41,7 +43,7 @@ J-GPU-ETAPREVS, the note on the carrier).
 
 Usage::
 
-    python tools/check_jfog_glass.py [--out DIR] [--exe EXE] [--scenes floor,behind,inside,gel,gelline]
+    python tools/check_jfog_glass.py [--out DIR] [--exe EXE] [--scenes floor,behind,inside,gel,gelline,gelkink]
                                      [--arms J-gpu,J-cpu,M-gpu,M-cpu]
 
 Exit status is non-zero if any channel of any arm misses mode R by more than its tolerance.
@@ -68,6 +70,7 @@ _SCENES = {
     "inside": (3.0, 3.0, None),
     "gel":    (3.0, 3.0, None),
     "gelline": (3.0, None, None),
+    "gelkink": (3.0, None, None),
 }
 # Mode J at -jbeams auto: the knee-sized map these tolerances were set against; the sparse fixed
 # default (0.435.0) gives the merges under test a far smaller share.

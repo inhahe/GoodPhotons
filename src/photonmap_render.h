@@ -566,36 +566,20 @@ struct SpecThr {
         for (int k = 0; k < n; ++k) m = std::max(m, v[k] / cam * pscale);
         return (m > 0.0) ? m : 1.0;
     }
-    // The carrier as the beam gather reads it (JSpec, beamgather.h: mode J's carrier, read between
-    // bin centres), the ratio over its peak and the peak in logS, so neither leaves a float: on
-    // JSpec's uniform bins, each at its centre (atBinCentre). False, and `js` untouched, while nothing
-    // chromatic was folded: the gather then takes no carrier.
+    // The carrier as the beam gather reads it (JSpec, beamgather.h: mode J's carrier, on these same
+    // cells), the ratio over its peak and the peak in logS, so neither leaves a float. False, and `js`
+    // untouched, while nothing chromatic was folded: the gather then takes no carrier.
     bool toJSpec(JSpec& js) const {
-        static_assert(JSpec::K == kBandProbeBins, "the beam gather's carrier is on the uniform bins");
+        static_assert(JSpec::K == K, "the beam gather's carrier is on the walk's cells");
         if (!any) return false;
         const double pk = peak();
         const bool live = cam > 1e-300;
+        js.cells = cells;
         js.any = true;
         js.disp = false; js.lamC = 0.0f; js.invPdfC = 0.0f;
         js.logS = std::log(pk);
-        for (int k = 0; k < JSpec::K; ++k)
-            js.r[k] = live ? (float)(atBinCentre(k) / cam * pscale / pk) : 0.0f;
+        for (int k = 0; k < n; ++k) js.r[k] = live ? (float)(v[k] / cam * pscale / pk) : 0.0f;
         return true;
-    }
-    // The product at uniform bin k's centre. A split bin's is the cell's its centre falls in (a split
-    // marks a step or a bend). An unsplit bin is read where the light in it lies (SpecCells::setMass): its
-    // centre's value is on the line through its read and its neighbour's on the centre's side -- between
-    // the two, so under the peak -- where the folded spectra are continuous across the two bins' common
-    // end (SpecCells::smooth: a step there is not), else its own read.
-    double atBinCentre(int k) const {
-        const double lk = bandBinLambda(k);
-        const int c = cells->cellOf(lk);
-        if (cells->count[k] != 1) return v[c];
-        const double lc = cells->lam[c];
-        const int o = lk < lc ? c - 1 : c + 1;
-        if (o < 0 || o >= n || !(std::fabs(cells->lam[o] - lc) > 0.0)) return v[c];
-        if (!cells->smooth[lk < lc ? k : k + 1]) return v[c];
-        return std::max(0.0, v[c] + (v[o] - v[c]) * (lk - lc) / (cells->lam[o] - lc));
     }
 };
 

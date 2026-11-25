@@ -1,13 +1,11 @@
-# Modes J's and M's beam merges in a fog seen through a gel whose ramp begins on a boundary of the 24-bin
-# spectral carrier, lit by a line inside the bin above it (known-issues JSPEC-BIN-RESOLUTION, REVIEW-0458):
-# _jfog_gelline's companion. The gel passes nothing below 595 nm -- bin 12's lower edge -- and ramps to 0.9
-# at 620 nm; the lamp emits a 1 nm line at 610 nm, in bin 12. Mode M's carrier is right at bin 12's
-# centre (SpecThr::atBinCentre: the curve is continuous across the join below it, SpecCells::smooth); but
-# the beam gather's JSpec, and mode J's carrier, hold the gel on the uniform bins, at 604.8 nm and at 624.4
-# past the bend, and read 610 between them, 15 % low (0.451.16: J 0.84, M 0.85-0.87 of mode R). Read by
-# its own value alone, bin 12 put mode M's fog 15 % bright. Not in check_jfog_glass until the carrier
-# holds the cells. _jfog_gel's fog box over a grey floor, lit by a big sphere lamp from above; every mode
-# at -max-bounce 32.
+# Modes J's and M's beam merges in a fog seen through a gel whose ramp begins on a boundary of the uniform
+# bins, lit by a line inside the bin above it (known-issues JSPEC-BIN-RESOLUTION, REVIEW-0458):
+# _jfog_gelline's companion, and check_jfog_glass's `gelkink`. The gel passes nothing below 595 nm --
+# bin 12's lower edge -- and ramps to 0.9 at 620 nm; the lamp emits a 1 nm line at 610 nm, in bin 12. The
+# carriers hold the gel on the scene's cells, which cut it at its bend, bin 12 read where the line is;
+# held on the uniform bins, at 604.8 nm and at 624.4 past the bend, the beam gather's carrier and mode J's
+# read 610 between them 15 % low (0.451.26: J 0.843 / 0.841 of mode R, GPU / CPU; M 0.852 / 0.865).
+# _jfog_gel's fog box over a grey floor, lit by a big sphere lamp from above; every mode at -max-bounce 32.
 
 scene {
     units    meters

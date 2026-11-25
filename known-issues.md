@@ -507,7 +507,7 @@ case of its own; and the device then takes the cells always, not only where a bi
 S, both devices. Every chromatic mode M and S image moves a little (check_bitid: mean under 0.001 %, a
 pixel at most 3.5 %); the rest of the suite reads as before. Its NEE twin, SPECNEE-LINE-LIGHT.
 
-## OPEN (2026-11-20): JSPEC-BIN-RESOLUTION — the beam gather's carrier and mode J's still read a step inside a 24-nm bin at its centre
+## DONE (2026-11-25, 0.451.27): JSPEC-BIN-RESOLUTION — the beam gather's carrier and mode J's still read a step inside a 24-nm bin at its centre
 
 Found by the Opus review of 0.451.0 (REVIEW-0451). Mode M's camera walk reads its own carrier in the
 scene's cells since 0.451.0 (SPECGATHER-BIN-RESOLUTION), but hands the beam gather (`-beams`) a `JSpec`
@@ -525,6 +525,22 @@ geometrically: 0.45 at 610 where the gel passes 0.54. check_jfog_glass at that s
 R 0.843 / 0.841 of mode R in mode J (GPU / CPU) and 0.852 / 0.865 in mode M -beams, whose carrier's
 bin 12 is right at its centre there (SpecThr::atBinCentre); it is not in the check's scenes until this
 is fixed, and then is its test.
+
+**Fix:** mode J's and mode U's carrier, and the beam gather's, are on the scene's carrier cells, mode M's
+grid (Scene::specCells: the uniform bins cut where a factor the walk folds steps or bends, each cell
+read where the emission in it lies). JSpec / JSpecRun hold kSpecCellsMax cells; JSpec::at reads the
+cell a wavelength falls in and carries it toward its neighbour where the two are cells of two bins whose
+join is smooth (specCellsAt, the device's DJSpec::at), never across a cut; the support's hole mask is
+per cell (64 bits), each cell's walk mass taken from the walk's own density (the device's c_jCellQ).
+The chromatic MIS tables (UPBP-W-CHROMATIC) keep the uniform bins under their own name (kChromaBins,
+chromaBinAt, DCHROMA_K): any weight the strategies share is unbiased, so they need no finer grid. On
+the device a carrier riding on a segment or vertex holds each cell as a 16-bit code, -512 log2 of its
+ratio to the largest (dJQEncode, the largest in logS): within 0.07 % of the value, as far down as a
+float reaches -- half floats, JSPEC-CARRIER-SIZE's plan, flush below 6e-8, where dark glass's cells still
+live -- and the geometric interpolation a line between two codes; 104 B a carrier against 120 (the
+segment queue's DWfSeg 424 -> 408 B). SpecThr::toJSpec copies the cells (atBinCentre is gone). The test
+is check_jfog_glass's `gelkink` (scenes/_jfog_gelkink.ftsl): 0.451.27 reads the fog R 1.000 / 0.998 of
+mode R in mode J (GPU / CPU), 1.000 / 1.015 in mode M -beams.
 
 ## DONE (2026-11-25, 0.451.26): REVIEW-0463 — what the Opus (xhigh) review of 0.451.24-0.451.25 found
 
@@ -6711,7 +6727,14 @@ beam gather. The steep 590-610 nm edge suggests a spectral read with too coarse 
 (SPECGATHER-BIN-RESOLUTION) somewhere the photon's wavelength meets the table, but nothing here
 says which. Copy the scene into `scenes/` before working on it.
 
-## OPEN (2026-10-21): JSPEC-CARRIER-SIZE — every mode-J GPU thread reserves room for a 120-byte spectral carrier per segment and per eye vertex, chromatic scene or not
+## DONE (2026-11-25, 0.451.27): JSPEC-CARRIER-SIZE — every mode-J GPU thread reserves room for a 120-byte spectral carrier per segment and per eye vertex, chromatic scene or not
+
+**Done as (2), differently (0.451.27, with JSPEC-BIN-RESOLUTION):** moving the carrier onto the scene's cells
+(up to 40, against 24 bins) would have grown it to 184 B in float; each cell is a 16-bit code instead,
+-512 log2 of its ratio to the largest, the largest folded into logS -- 104 B a carrier, below the 120 B
+it was, within 0.07 % of each value (round to nearest in log space: no bias to first order), as far down
+as a float reaches, where `__half` flushes below 6e-8. (1), a carrier sized to nothing where it is off,
+stays declined, for the reasons below.
 
 **Not what made mode J's camera pass slow (measured 2026-11-10, 0.436.5).** `_slab_ss` at 128x96,
 30 s, GPU mode J with a 64-beam map (`-jbeams 64`, about zero beam hits a camera segment) rendered

@@ -2,7 +2,7 @@
 // weights, in plain types both halves read.
 //
 // A point merge's MIS weight is DSurfMergeW on the device and SurfMergeWeight on the host. Where
-// a medium's extinction varies with wavelength its camera half carries two rows of JSpec's bins
+// a medium's extinction varies with wavelength its camera half carries two rows of the uniform bins
 // (UPBP-W-CHROMATIC: segSumM and the merge at eye[k-1], read at the photon's wavelength), built
 // along the camera subpath by DChromaRun and cameraSideSumsChroma. No frame-level check can hold
 // them: where they matter, beams and point merges competing for one path, the point merges carry
@@ -15,7 +15,7 @@
 // Dependency-free so the two sides share one definition (lattice_probe.h's reasoning).
 #pragma once
 
-inline constexpr int kJSurfTapK = 24;      // JSpec::K and DJSPEC_K, asserted on each side
+inline constexpr int kJSurfTapK = 24;      // the chromatic MIS tables' bins (kChromaBins, DCHROMA_K), asserted
 inline constexpr int kJSurfTapMaxV = 67;   // vertices kept a sample: the deep kernel's MAXV
 
 // An eye vertex: what the camera half reads of it. `type` numbers as VType and BV_* do (camera,

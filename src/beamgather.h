@@ -51,12 +51,14 @@
 // (photonmap_render.h, SpecThr). This is that fix for a walk that also bounces diffusely and
 // scatters in media.
 //
-// `r[k]` is prod_events f(lam_k) / f(lambda_c) on a K-bin grid over the band, so a merge that
-// multiplies `beta * at(lambda_b)` gets the camera's factors evaluated at the beam's own
-// wavelength. `any` stays false while every factor met so far was flat; at() is then exactly 1,
-// so a camera path with no chromatic factor renders bit-for-bit as before.
+// `r[k]` is prod_events f(lam_k) / f(lambda_c) over the scene's carrier cells (Scene::specCells,
+// SpecCells: the uniform bins, cut where a factor the walk folds steps or bends -- a gel's edge -- as
+// mode M's carrier is), so a merge that multiplies `beta * at(lambda_b)` gets the camera's factors
+// evaluated at the beam's own wavelength. `any` stays false while every factor met so far was flat;
+// at() is then exactly 1, so a camera path with no chromatic factor renders bit-for-bit as before.
 struct JSpec {
-    static constexpr int K = kBandProbeBins;           // SpecThr's grid: ~19.6 nm bins
+    static constexpr int K = kSpecCellsMax;            // room for the most cells a scene's grid has
+    const SpecCells* cells = nullptr;                  // the grid `r` is on (set wherever `any` is)
     float r[K];
     bool  any = false;
     // The carrier's magnitude, kept apart from `r`: the ratio is r * exp(logS). Inside coloured
@@ -88,23 +90,47 @@ struct JSpec {
     // -- the path is evaluated at lambda_c and so is the light it takes -- but the caller scales
     // `beta` by exp(logS) (beta()), which this undoes.
     double atC() const { return (logS == 0.0) ? 1.0 : std::exp(-logS); }
-    static double lamOf(int k) { return bandBinLambda(k); }
-    // Interpolated between bin centres (specBinAt), held flat past the outer two. SpecThr reads
-    // the nearest bin; interpolating costs one more load and follows a steep reflectance edge (a
-    // red wall's ~600 nm rise) instead of stepping across it.
+    // The cell `lam` falls in, carried toward its neighbour across a smooth join (specCellsAt). Mode
+    // M's walk reads the cell alone; a merge here may meet any wavelength in a cell, and carrying
+    // follows a steep reflectance (a red wall's ~600 nm rise) across a join instead of stepping.
     double at(double lam) const;
 };
 
-// A table over JSpec's K bins (bin b at JSpec::lamOf(b)) read at `lam`: interpolated between bin
-// centres and held flat past the outer two. Geometric between two live bins, because what these
-// tables hold is largely exponential in wavelength (glass absorption over a path, a medium's
-// transmittance), which a straight line overestimates by the convexity of exp across a bin;
-// geometric interpolation is exact wherever the exponent is linear in wavelength within the bin.
-// A dead bin keeps the straight line, which reaches 0 at that bin rather than everywhere next
-// to it.
+// A table over the carrier cells `c` (value k read at c.lam[k]) read at `lam`: the value of the cell
+// `lam` falls in, carried toward its neighbour on lam's side along the line between the two reads
+// where they are cells of two bins whose common end the folded spectra are continuous across
+// (SpecCells::smooth), and held at the cell's own read across a cut (which marks a step or a bend), at a
+// rough join, and past the outer reads. Geometric between two live reads, because what these tables hold
+// is largely exponential in wavelength (glass absorption over a path, a medium's transmittance), which a
+// straight line overestimates by the convexity of exp; geometric is exact wherever the exponent is
+// linear between the reads. A dead read keeps the straight line, which reaches 0 at that cell rather
+// than everywhere next to it. Device twin dSpecCellsAt.
 template <typename T>
-inline double specBinAt(const T* r, double lam) {
-    constexpr int K = JSpec::K;
+inline double specCellsAt(const SpecCells& c, const T* r, double lam) {
+    const int i = c.cellOf(lam);
+    const double li = c.lam[i];
+    const int o = lam < li ? i - 1 : i + 1;
+    if (o < 0 || o >= c.n || !(std::fabs(c.lam[o] - li) > 0.0)) return (double)r[i];
+    const int b = bandBinOf(lam);
+    const int bo = o < c.first[b] ? b - 1 : (o >= c.first[b] + c.count[b] ? b + 1 : b);
+    if (bo == b || !c.smooth[std::max(b, bo)]) return (double)r[i];
+    const double f = (lam - li) / (c.lam[o] - li);
+    const double a = (double)r[i], e = (double)r[o];
+    if (a > 0.0 && e > 0.0) return a * std::pow(e / a, f);
+    return a + (e - a) * f;
+}
+inline double JSpec::at(double lam) const { return any ? specCellsAt(*cells, r, lam) : 1.0; }
+
+// The chromatic MIS tables' grid (UPBP-W-CHROMATIC: the merge weights' segSumM and etaKCoef rows at each
+// bin, ChromaMis, the device's DChromaRun): the uniform bins, bin b at chromaBinLambda(b). A weight needs
+// no finer grid than that -- any weight the strategies share is unbiased -- so it keeps this one whatever
+// the carrier's cells. Read at `lam` between bin centres, held flat past the outer two, geometric between
+// two live bins (specCellsAt's reason). Device twin dChromaBinAt.
+constexpr int kChromaBins = kBandProbeBins;
+inline double chromaBinLambda(int b) { return bandBinLambda(b); }
+template <typename T>
+inline double chromaBinAt(const T* r, double lam) {
+    constexpr int K = kChromaBins;
     const double u = (lam - LAMBDA_MIN) / (LAMBDA_MAX - LAMBDA_MIN) * (double)K - 0.5;
     if (!(u > 0.0)) return (double)r[0];
     if (u >= (double)(K - 1)) return (double)r[K - 1];
@@ -114,36 +140,43 @@ inline double specBinAt(const T* r, double lam) {
     if (a > 0.0 && b > 0.0) return a * std::pow(b / a, f);
     return a + (b - a) * f;
 }
-inline double JSpec::at(double lam) const { return any ? specBinAt(r, lam) : 1.0; }
 
-// The running product a camera walk accumulates (in double) and snapshots into JSpec.
+// The running product a camera walk accumulates (in double) and snapshots into JSpec, over the scene's
+// carrier cells.
 struct JSpecRun {
-    double r[JSpec::K];
+    static constexpr int K = JSpec::K;
+    const SpecCells* cells;            // the scene's grid (Scene::specCells), never null
+    int    n;                          // its cells: the arrays' first n entries are live
+    double r[K];
     bool   any = false;
     double logS = 0.0;                 // see JSpec::logS
     bool   disp = false;               // see JSpec::disp
     double lamC = 0.0, invPdfC = 0.0;
-    // THE SUPPORT (JSPEC-GAPS). Bit k is set once a factor this walk folded was exactly 0 at bin
+    // THE SUPPORT (JSPEC-GAPS). Bit k is set once a factor this walk folded was exactly 0 at cell
     // k: a gel opaque there, a coin whose branch is impossible there, glass dark enough to
     // underflow. A walk drawn at such a wavelength dies at that event and makes no merge beyond
     // it, at any wavelength, so the walks that pass stand in for it: snap() divides every merge
     // past a hole by the share of the camera wavelength's density (`walkDensity`) left open, as
-    // SPECGATHER's support correction does (photonmap_render.h SpecThr::p). Which bins are holes
+    // SPECGATHER's support correction does (photonmap_render.h SpecThr::p). Which cells are holes
     // depends on the branches the walk took, never on its own wavelength, so the division stays
     // unbiased. The media term is not marked: a ratio-tracking estimate's zeros are one
     // realization's. Null `walkDensity` turns the correction off.
-    unsigned hole = 0;
+    uint64_t hole = 0;
     const EmissionSampler* walkDensity = nullptr;
-    static_assert(JSpec::K <= 32, "JSpecRun::hole holds one bit per bin");
-    JSpecRun() { for (double& x : r) x = 1.0; }
+    static_assert(JSpec::K <= 64, "JSpecRun::hole holds one bit per cell");
+    explicit JSpecRun(const SpecCells& c) : cells(&c), n(c.n < K ? c.n : K) {
+        for (int k = 0; k < n; ++k) r[k] = 1.0;
+    }
+    JSpecRun() : JSpecRun(uniformSpecCells()) {}   // until a walk's reset gives it the scene's
+    double lamOf(int k) const { return cells->lam[k]; }   // cell k's wavelength
     // The share of the camera wavelength's density whose walk could have taken every branch and
-    // carried every weight this one did (1 with no hole).
+    // carried every weight this one did (1 with no hole): its mass in the cells left open.
     double supportShare() const {
         if (!hole || !walkDensity) return 1.0;
         double open = 0.0;
-        for (int k = 0; k < JSpec::K; ++k)
-            if (!(hole >> k & 1u)) open += walkDensity->binMass[k];
-        // Every bin a hole while the walk itself passed: the bins cannot resolve the support,
+        for (int k = 0; k < n; ++k)
+            if (!(hole >> k & 1u)) open += walkDensity->cdfAt(cells->hi[k]) - walkDensity->cdfAt(cells->lo[k]);
+        // Every cell a hole while the walk itself passed: the cells cannot resolve the support,
         // and the walk's own wavelength serves (SpecThr::rescale's fallback).
         return (open > 0.0) ? open : 1.0;
     }
@@ -162,54 +195,54 @@ struct JSpecRun {
     template <class F> void mul(const F& f, double atCam, bool exhaustive) {
         if (!(atCam > 0.0)) return;            // beta just went to 0: the walk ends here anyway
         if (!exhaustive) {
-            const double a = f(JSpec::lamOf(0)), b = f(JSpec::lamOf(JSpec::K / 2)),
-                         c = f(JSpec::lamOf(JSpec::K - 1));
+            const double a = f(lamOf(0)), b = f(lamOf(n / 2)), c = f(lamOf(n - 1));
             const double tol = 1e-12 * (1.0 + std::fabs(atCam));
             if (std::fabs(a - atCam) <= tol && std::fabs(b - atCam) <= tol &&
                 std::fabs(c - atCam) <= tol) return;
         }
-        double v[JSpec::K];
-        for (int k = 0; k < JSpec::K; ++k) v[k] = f(JSpec::lamOf(k));
+        double v[K];
+        for (int k = 0; k < n; ++k) v[k] = f(lamOf(k));
         mulVec(v, atCam, true);
     }
-    // The same fold from values already evaluated at the bin centres (`v[k]` at lamOf(k)), for a
+    // The same fold from values already evaluated at the cells (`v[k]` at lamOf(k), k < n), for a
     // factor whose evaluation shares work across wavelengths (a fiber, a lens trace).
     // `support`: whether a zero in `v` is a hole in the walk's support (a weight or a coin, as from
     // mul), not one realization's (the media term).
     void mulVec(const double* v, double atCam, bool support = false) {
         if (!(atCam > 0.0)) return;
         if (support)
-            for (int k = 0; k < JSpec::K; ++k)
-                if (!(v[k] > 0.0)) hole |= 1u << k;
+            for (int k = 0; k < n; ++k)
+                if (!(v[k] > 0.0)) hole |= uint64_t(1) << k;
         // A factor all but zero at lambda_c (deep in a glass's absorption band) would overflow
         // 1/atCam; its magnitude goes to logS instead (JSpec::logS).
         double inv = 1.0;
         if (atCam < 1e-280) logS -= std::log(atCam); else inv = 1.0 / atCam;
-        double q[JSpec::K], qMax = 0.0;
+        double q[K], qMax = 0.0;
         bool flat = true;
-        for (int k = 0; k < JSpec::K; ++k) {
+        for (int k = 0; k < n; ++k) {
             q[k] = v[k] * inv;
-            if (!std::isfinite(q[k]) || q[k] < 0.0) q[k] = 0.0;   // never let one bin poison the rest
+            if (!std::isfinite(q[k]) || q[k] < 0.0) q[k] = 0.0;   // never let one cell poison the rest
             if (std::fabs(q[k] - 1.0) > 1e-12) flat = false;
             qMax = std::max(qMax, q[k]);
         }
         if (qMax > 1e30) {                              // fold the magnitude first, then multiply
-            for (int k = 0; k < JSpec::K; ++k) q[k] /= qMax;
+            for (int k = 0; k < n; ++k) q[k] /= qMax;
             logS += std::log(qMax);
         }
         double rMax = 0.0;
-        for (int k = 0; k < JSpec::K; ++k) { r[k] *= q[k]; rMax = std::max(rMax, r[k]); }
+        for (int k = 0; k < n; ++k) { r[k] *= q[k]; rMax = std::max(rMax, r[k]); }
         if (rMax > 1e15 || (rMax > 0.0 && rMax < 1e-15)) {   // keep `r` well inside a float
-            for (int k = 0; k < JSpec::K; ++k) r[k] /= rMax;
+            for (int k = 0; k < n; ++k) r[k] /= rMax;
             logS += std::log(rMax);
         }
         if (!flat) any = true;
     }
     void snap(JSpec& s) const {
+        s.cells = cells;
         s.any = any;
         s.logS = logS - std::log(supportShare());   // the merges past a hole stand in for it
         s.disp = disp; s.lamC = (float)lamC; s.invPdfC = (float)invPdfC;
-        for (int k = 0; k < JSpec::K; ++k) s.r[k] = (float)r[k];
+        for (int k = 0; k < n; ++k) s.r[k] = (float)r[k];
     }
 };
 

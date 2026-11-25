@@ -347,7 +347,7 @@ kBdptT(DScene sc, const __grid_constant__ DCamera cam, double* camFilm, double* 
             const DPatEnv envC = dPatEnvOf(sc);
             typename std::conditional<MERGE, DChromaRun, DChromaRunNone>::type crun;
             if (chromaOn) crun.reset();
-            double cbuf[MERGE ? 2 * DJSPEC_K : 1];   // this segment's segSumM and etaKCoef bins
+            double cbuf[MERGE ? 2 * DCHROMA_K : 1];   // this segment's segSumM and etaKCoef bins
             if (mergeKappa > 0.0 || kappaSurf > 0.0) {
                 for (int k = 0; k < nE && k < (int)SEGN; ++k) segSumC[k] = segSumM[k] = 0.0;
                 for (int k = 1; k < nE && k < (int)SEGN; ++k) {
@@ -426,7 +426,7 @@ kBdptT(DScene sc, const __grid_constant__ DCamera cam, double* camFilm, double* 
                     // at light vertex j on this segment makes a path of depth j + k + 1.
                     mw.camVert    = k;
                     mw.maxDepth   = maxDepth;
-                    if (chromaOn) for (int b = 0; b < DJSPEC_K; ++b) cbuf[DJSPEC_K + b] = 0.0;
+                    if (chromaOn) for (int b = 0; b < DCHROMA_K; ++b) cbuf[DCHROMA_K + b] = 0.0;
                     // The merge AT eye[k]. Its light-side incoming direction is -sg.d
                     // whatever x turns out to be, so sin(theta) and the whole coefficient are
                     // merge-point INDEPENDENT and belong here, not in the per-hit weight.
@@ -447,12 +447,12 @@ kBdptT(DScene sc, const __grid_constant__ DCamera cam, double* camFilm, double* 
                             if (s2 > 0.0 && sT > 0.0 && tr > 0.0)
                                 mw.etaKCoef = sqrt(s2) / (sT * tr);
                             if (chromaOn)
-                                dChromaBeamEta1(sc, vk, sg.d, dp, dn, env, cbuf + DJSPEC_K);
+                                dChromaBeamEta1(sc, vk, sg.d, dp, dn, env, cbuf + DCHROMA_K);
                         }
                     }
                     if (chromaOn) {
                         crun.advanceTo(k < 0 ? 0 : k, sc, eye, mergeKappa, kappaSurf, envC);
-                        for (int b = 0; b < DJSPEC_K; ++b) cbuf[b] = crun.m[b];
+                        for (int b = 0; b < DCHROMA_K; ++b) cbuf[b] = crun.m[b];
                         mw.chroma = cbuf;
                     }
                 }
@@ -477,8 +477,8 @@ kBdptT(DScene sc, const __grid_constant__ DCamera cam, double* camFilm, double* 
                         ws.routeMedJ = routeMedJ;
                         ws.mw = mw; ws.tr = camTr; ws.px = px; ws.py = py; ws.lambda = (float)lambda;
                         if (mw.chroma) {   // the bins move into the queue's table with the segment
-                            double* q = wq.chroma + (size_t)si * 2 * DJSPEC_K;
-                            for (int b = 0; b < 2 * DJSPEC_K; ++b) q[b] = cbuf[b];
+                            double* q = wq.chroma + (size_t)si * 2 * DCHROMA_K;
+                            for (int b = 0; b < 2 * DCHROMA_K; ++b) q[b] = cbuf[b];
                             ws.mw.chroma = q;
                         }
                         ws.spec = sg.spec;   // JSPEC (any == 0 when the carrier is off)
@@ -578,10 +578,10 @@ kBdptT(DScene sc, const __grid_constant__ DCamera cam, double* camFilm, double* 
                             rq.flags = 0;
                             if (vks) { sq.spec[qslot] = *vks; rq.flags |= 1; }
                             if (chromaOn) {
-                                double* ch = sq.chroma + (size_t)qslot * 2 * DJSPEC_K;
-                                for (int b = 0; b < DJSPEC_K; ++b) {
+                                double* ch = sq.chroma + (size_t)qslot * 2 * DCHROMA_K;
+                                for (int b = 0; b < DCHROMA_K; ++b) {
                                     ch[b] = crun.mPrev[b];
-                                    ch[DJSPEC_K + b] = crun.e1[b];
+                                    ch[DCHROMA_K + b] = crun.e1[b];
                                 }
                                 rq.flags |= 2;
                             }
