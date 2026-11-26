@@ -1746,18 +1746,19 @@ static void buildUploadScene(const Scene& scene, DUpload& up) {
     sc.patNodes = d_pnodes; sc.patterns = d_pat; sc.nPatterns = (int)dpat.size();
     sc.recCoeff = d_recCoeff; sc.recDrivers = d_recDrv; sc.recScalarStops = d_recStops;
     sc.emitters = d_ems; sc.nEmitters = (int)dems.size();
-    {   // JSPEC: each emitter's fold quadrature, {lam, X, Y, Z} x DJSPEC_FOLD (dJSpecFoldColor)
-        static_assert(kFoldBins == DJSPEC_FOLD, "DJSPEC_FOLD must track scene.h kFoldBins");
-        std::vector<float> fold((size_t)scene.emitters.size() * DJSPEC_FOLD * 4, 0.0f);
+    {   // JSPEC: each emitter's CIE response in each carrier cell, {X, Y, Z} x nSpecCells (dJSpecFoldColor)
+        const int nc = scene.specCells.n;
+        std::vector<float> cie((size_t)scene.emitters.size() * (size_t)nc * 3, 0.0f);
         for (size_t e = 0; e < scene.emitters.size(); ++e) {
             const Emitter& em = scene.emitters[e];
-            for (int k = 0; k < em.foldN && k < DJSPEC_FOLD; ++k) {
-                float* f = fold.data() + (e * DJSPEC_FOLD + (size_t)k) * 4;
-                f[0] = (float)em.foldLam[k];
-                f[1] = (float)em.foldCie[k].x; f[2] = (float)em.foldCie[k].y; f[3] = (float)em.foldCie[k].z;
+            if (em.cellCie.size() != (size_t)nc) continue;   // no emission: its row stays 0
+            for (int k = 0; k < nc; ++k) {
+                float* f = cie.data() + (e * (size_t)nc + (size_t)k) * 3;
+                f[0] = (float)em.cellCie[(size_t)k].x; f[1] = (float)em.cellCie[(size_t)k].y;
+                f[2] = (float)em.cellCie[(size_t)k].z;
             }
         }
-        sc.emFold = fold.empty() ? nullptr : (const float*)keep(uploadVec(fold));
+        sc.emCellCie = cie.empty() ? nullptr : (const float*)keep(uploadVec(cie));
         std::vector<float> spdInv(scene.emitters.size(), 0.0f);
         for (size_t e = 0; e < scene.emitters.size(); ++e)
             spdInv[e] = scene.emitters[e].spdDen > 0.0 ? (float)(1.0 / scene.emitters[e].spdDen) : 0.0f;
@@ -3423,14 +3424,6 @@ void cudaSetJSwitches(int jSpec, int trSpec, int deltaMerge, int half, int chrom
     g_jSpecHost = jSpec; g_jTrSpecHost = trSpec; g_jDeltaMergeHost = deltaMerge; g_jHalfHost = half;
     g_jChromaHost = chroma;
 }
-// gpu::c_jCellQ from the sampler the camera walk's wavelength is drawn from, its mass in each of the
-// carrier's cells `c` (JSpecRun::supportShare's): on the device both modes draw from the emission sampler
-// (dSampleSceneLambda), where the host's mode J draws from camSampler.
-static void uploadJCellQ(const EmissionSampler& s, const SpecCells& c) {
-    double q[kSpecCellsMax] = {};
-    for (int k = 0; k < c.n && k < kSpecCellsMax; ++k) q[k] = s.cdfAt(c.hi[k]) - s.cdfAt(c.lo[k]);
-    CUDA_CHECK(cudaMemcpyToSymbol(gpu::c_jCellQ, q, sizeof(q)));
-}
 // The aimed sun (bdpt.h SunAim): host copies, uploaded at the top of every renderBdptCuda.
 static std::vector<gpu::Real> g_sunAimWHost;
 static std::vector<double> g_sunAimRHost;
@@ -4245,8 +4238,6 @@ Film renderBdptCuda(const Scene& scene, const Camera& cam, int resX, int resY,
     // Mode J's switches, as the host settled them for this render (cudaSetJSwitches).
     CUDA_CHECK(cudaMemcpyToSymbol(gpu::c_jHalf, &g_jHalfHost, sizeof(int)));
     CUDA_CHECK(cudaMemcpyToSymbol(gpu::c_jSpecOn, &g_jSpecHost, sizeof(int)));
-    uploadJCellQ(scene.emitSampler, scene.specCells);   // the camera walk's wavelength density (DJSpecRun::hole):
-                                      // the device's draw (dSampleSceneLambda), not camSampler
     CUDA_CHECK(cudaMemcpyToSymbol(gpu::c_jTrSpec, &g_jTrSpecHost, sizeof(int)));
     CUDA_CHECK(cudaMemcpyToSymbol(gpu::c_jChroma, &g_jChromaHost, sizeof(int)));
     CUDA_CHECK(cudaMemcpyToSymbol(gpu::c_jDeltaMerge, &g_jDeltaMergeHost, sizeof(int)));
@@ -6959,7 +6950,6 @@ VcmSession* vcmSessionBegin(const Scene& scene, const Camera& cam, int resX, int
     CUDA_CHECK(cudaMemcpyToSymbol(gpu::c_jSpecOn, &g_jSpecHost, sizeof(int)));
     CUDA_CHECK(cudaMemcpyToSymbol(gpu::c_jDispWin, &g_jDispWinHost, sizeof(double)));
     CUDA_CHECK(cudaMemcpyToSymbol(gpu::c_jDispAll, &g_jDispAllHost, sizeof(int)));
-    uploadJCellQ(scene.emitSampler, scene.specCells);   // mode U's bundles are drawn from it (DJSpecRun::hole)
     VcmSession* s = new VcmSession();
     s->resX = resX; s->resY = resY; s->npix = (size_t)resX * resY;
     s->diffraction = diffraction ? 1 : 0;

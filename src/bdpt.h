@@ -1624,7 +1624,7 @@ inline void randomWalk(const Scene& scene, const Camera& cam, const Renderer& ma
                 // stopped lambda, and read red 1.3 % high around the fur. A pass-through
                 // missed the fiber at every wavelength and is flat.
                 if (jsw && !passThru) {
-                    const double* sigB = hairSigmaCells(scene, *mp, h);
+                    const double* sigB = hairSigmaCells(scene, *jsw->run.cells, *mp, h);
                     double hv[JSpecRun::K];
                     for (int k = 0; k < jsw->run.n; ++k) {
                         const HairShade hk = hairShadeRetint(scene, *mp, h, jsw->run.lamOf(k), hs,
@@ -1891,7 +1891,7 @@ inline int generateCameraSubpath(const Scene& scene, const Camera& cam, const Re
     if (jsw) {                                      // eye[0], the camera: no factor yet
         jsw->reset(scene.specCells);
         jsw->vert.resize(1);
-        jsw->run.walkDensity = &scene.camSampler;   // the camera wavelength's density (the support)
+        jsw->run.walkMass = scene.camCellMass.data();   // the camera wavelength's density (the support)
     }
     // The camera vertex is wavelength-neutral: every λ in the bundle leaves it with
     // throughput 1 (the per-pixel radiance convention), so the bundle starts C wide.
@@ -4557,7 +4557,7 @@ struct BeamMergeWeight {
     const Material* glass = nullptr;
     const Material* glassCam() const { return glass; }
     // UPBP-W-CHROMATIC (ChromaMis): in a medium whose extinction varies with wavelength, this
-    // segment's segSumM and etaKCoef at each of JSpec's bins (K each), read at the beam's
+    // segment's segSumM and etaKCoef at each of the uniform bins (kChromaBins each), read at the beam's
     // wavelength along with the merge's own sigma_t and Tr; null elsewhere, and then all four
     // are the camera's.
     const double* chromaM = nullptr;
@@ -4700,7 +4700,7 @@ struct SurfMergeWeight {
                                 // scaled by their kappas       (segSumM[k-1])
     int    camVert      = 0;    // k
     int    maxDepth     = 0;
-    // UPBP-W-CHROMATIC (ChromaMis): segSumM and etaKm1Coef at each of JSpec's bins (K each), read
+    // UPBP-W-CHROMATIC (ChromaMis): segSumM and etaKm1Coef at each of the uniform bins (kChromaBins each), read
     // at the photon's wavelength; null where no medium's extinction varies with wavelength.
     const double* chromaM   = nullptr;
     const double* chromaKm1 = nullptr;
@@ -4800,7 +4800,7 @@ inline void cameraSideSums(const Scene& scene, const std::vector<Vertex>& eye, i
 // carry no free-flight term: it cancels between the strategies), which no wavelength enters but
 // a rainbow phase's (UPBP-W-RAINBOW).
 //
-// So in such a scene the wavelength-dependent part is tabulated at the K bins of JSpec's grid,
+// So in such a scene the wavelength-dependent part is tabulated at the uniform bins (kChromaBins, not the carrier's cells),
 // once per camera path -- from geometry taken once per vertex, the segment's per-medium depths
 // (trDetDepthMedium) -- and each merge reads it at its own beam's or photon's wavelength,
 // interpolated between bin centres (chromaBinAt). The connections' weights (misWeight) belong to paths of
@@ -4980,7 +4980,7 @@ struct BdptRenderer {
         // The beam merge's factors at the subpaths' interior vertices (mergeGeoOfSubpaths), which
         // every connection's weight reads. Same hoist.
         std::vector<MergeGeo> geoE, geoL;
-        // ...and their wavelength-dependent half at JSpec's bins, where a medium's extinction
+        // ...and their wavelength-dependent half at the uniform bins (kChromaBins), where a medium's extinction
         // varies with wavelength (ChromaMis): segSumM and the point merges' eta at eye[k-1] per
         // eye vertex, and one segment's eta at eye[k].
         std::vector<double> chromaM, chromaE1, chromaK(ChromaMis::K);

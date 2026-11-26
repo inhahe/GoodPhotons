@@ -453,7 +453,7 @@ inline void scatterSample(const Scene& scene, const Renderer& mats, const Materi
             betaFactor = clamp01(fv * cosLong / pdfH);   // == T = sum_p A_p (hair.h)
             // the same sample's weight at every bin (mode J's Hair fold); a pass-through is flat
             if (jr && !passThru) {
-                const double* sigB = hairSigmaCells(scene, *mp, h);
+                const double* sigB = hairSigmaCells(scene, *jr->cells, *mp, h);
                 double hv[JSpecRun::K];
                 for (int k = 0; k < jr->n; ++k) {
                     const HairShade hk = hairShadeRetint(scene, *mp, h, jr->lamOf(k), hs,
@@ -961,7 +961,7 @@ inline Vec3 traceCameraSubpath(const Scene& scene, const Camera& cam, const Rend
     // factors at its own: beta * at(lambda_v). FTRACE_JSPEC=0 turns it off with mode J's.
     const bool jOn = bdpt::jSpecEnabled();
     JSpecRun jr(scene.specCells);
-    jr.walkDensity = &scene.emitSampler;   // the pixel's bundle is drawn from it (JSpecRun::hole)
+    jr.walkMass = scene.specCells.mass;   // the pixel's bundle is drawn from emitSampler (JSpecRun::hole)
     Vec3 prevP = cam.eye;
     // Has this eye chain passed through ONLY delta (specular) vertices so far? That is the
     // precondition for the escaped-sun strategy below; tracked explicitly rather than

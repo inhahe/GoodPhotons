@@ -71,20 +71,19 @@ inline double hairSigmaAAt(const Scene& scene, const Material& m, const Hit& hit
     return std::max(0.0, m.hairSigmaA(lambda));
 }
 
-// The absorption at the wavelengths of the scene's spectral carrier cells (Scene::specCells: the walks of
-// modes M, S, J and U), per material, when the fiber's colour is a CONSTANT spectrum (no texture,
-// pattern, record or vertex colour on the reflect slot): computed once per thread per material, never per
-// bounce, a cell's entry at its own wavelength, so a split cell reads the absorption on its side of the
-// split. Null otherwise.
-inline const double* hairSigmaCells(const Scene& scene, const Material& m, const Hit& hit) {
-    const SpecCells& cells = scene.specCells;
+// The absorption at the wavelengths of the spectral carrier cells `cells` (the scene's, Scene::specCells, the
+// grid the walks of modes M, S, J and U fold on), per material, when the fiber's colour is a CONSTANT
+// spectrum (no texture, pattern, record or vertex colour on the reflect slot): computed once per thread per
+// material and grid (SpecCells::gen), never per bounce, a cell's entry at its own wavelength, so a split cell
+// reads the absorption on its side of the split. Null otherwise.
+inline const double* hairSigmaCells(const Scene& scene, const SpecCells& cells, const Material& m, const Hit& hit) {
     if (m.reflectTex >= 0 || m.reflectPat >= 0 || hit.hasVcol) return nullptr;
     { double rv; if (recordReflectBound(scene, m, hit, cells.lam[0], rv)) return nullptr; }
-    struct Entry { const SpecCells* cells; std::array<double, kSpecCellsMax> v; };
+    struct Entry { unsigned gen; std::array<double, kSpecCellsMax> v; };
     thread_local std::unordered_map<const Material*, Entry> cache;
     auto it = cache.find(&m);
-    if (it == cache.end() || it->second.cells != &cells) {
-        Entry e{&cells, {}};
+    if (it == cache.end() || it->second.gen != cells.gen) {
+        Entry e{cells.gen, {}};
         for (int k = 0; k < cells.n; ++k) e.v[(size_t)k] = hairSigmaAAt(scene, m, hit, cells.lam[k]);
         it = cache.insert_or_assign(&m, e).first;
     }
@@ -152,7 +151,7 @@ inline HairShade hairShadeAt(const Scene& scene, const Material& m, const Hit& h
 // with only the wavelength-dependent coefficients re-read (hair::makeSpectral). The frame, the
 // impact parameter, the roughness and the tilt are the same at every wavelength, so a hero
 // bundle builds them once. `sigmaA`, if not negative, is the absorption at `lambda` already in
-// hand (hairSigmaBins) instead of hairSigmaAAt's.
+// hand (hairSigmaCells) instead of hairSigmaAAt's.
 inline HairShade hairShadeRetint(const Scene& scene, const Material& m, const Hit& hit,
                                  double lambda, const HairShade& base, double sigmaA = -1.0) {
     HairShade s = base;

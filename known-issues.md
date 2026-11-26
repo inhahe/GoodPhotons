@@ -507,6 +507,44 @@ case of its own; and the device then takes the cells always, not only where a bi
 S, both devices. Every chromatic mode M and S image moves a little (check_bitid: mean under 0.001 %, a
 pixel at most 3.5 %); the rest of the suite reads as before. Its NEE twin, SPECNEE-LINE-LIGHT.
 
+## DONE (2026-11-25, 0.451.28): REVIEW-0464 — what the Opus (xhigh) review of 0.451.27 found
+
+Opus (xhigh) reviewed 4a8f1f3..59b5873 (JSPEC-BIN-RESOLUTION): nine findings, each checked against the code.
+
+* **hairSigmaCells' per-thread cache was keyed on the material's and the grid's addresses**, which a grid
+  rebuilt in place (finalizeEmitters again, setMass moving each cell's wavelength) keeps: SpecCells
+  carries a process-unique generation (`gen`, drawn again by build() and setMass()) the cache compares,
+  and the function takes the grid it is read on, the walk's own, where it read the scene's.
+* **The device's code took a double log2 a cell at every snapshot**: in float now (the code's step is
+  1/512 of a doubling, which log2f resolves a hundred times over).
+* **c_jCellQ copied SpecCells::mass** (both the emission sampler's mass over the same cells), a second
+  table to keep in step and a process-global one: the device's support rule reads the cells' own.
+  EmissionSampler::binMass, which nothing read any more, is gone; the host's support rule reads a table
+  of masses (JSpecRun::walkMass: Scene::camCellMass for mode J's camSampler, the cells' own for mode U)
+  rather than walking the CDF twice a cell at each snapshot past a hole.
+* **A carrier read looked its cell's bin up twice** (SpecCells::cellOf, dSpecCellOf hand it back now).
+* **The cut warning and the split report named modes M and S alone**: modes J and U read the cells too.
+* **Stale names**: comments calling the chromatic MIS tables' grid JSpec's, hairSigmaBins, dSpecBinAt,
+  c_jBinQ, atBinCentre (scenes/_jfog_gelline.ftsl's header rewritten for the cells).
+
+And one the review did not find, but check_jfog_glass's `gel` did, in modes J and M -beams on both devices:
+0.451.27 read its fog R 0.959 and G 1.037 of mode R (0.451.26: 0.988, 1.003). A deposit-folded beam's
+colour under a chromatic camera carrier was the emitter's 12-point fold quadrature read at points
+(foldLam), each standing for a twelfth of the emission; the gel steps at 497.08 nm, a cell's end, and
+the carrier on the cells holds each side's read across that rough join, so the quadrature point nearest
+the step took its whole twelfth on one side -- where the uniform carrier, interpolating between bin
+centres either side of the step, had smeared it into a fraction that happened to cancel. **Fix:** the
+colour is the emitter's CIE response in each carrier cell times the cell's read (Emitter::cellCie, the
+device's DScene::emCellCie in place of emFold), exact for the carrier as the cuts leave it and summing
+to cieMean exactly, as the fold's bins do.
+
+Dismissed: mode J's diffuse colours, which the cuts and joins (mode M's curves) do not follow, held
+across a rough join a gel's step sets -- the carrier is one product of every factor, which at such a join
+can be carried for none of them or all; holding is mode M's rule everywhere, and the uniform carrier's
+interpolating everywhere smeared the gel's step instead (design.md says so); version-tagged measurements
+in a scene header and a check docstring (this project's tests record the failure each guards, as
+REVIEW-0462 and REVIEW-0463 settled).
+
 ## DONE (2026-11-25, 0.451.27): JSPEC-BIN-RESOLUTION — the beam gather's carrier and mode J's still read a step inside a 24-nm bin at its centre
 
 Found by the Opus review of 0.451.0 (REVIEW-0451). Mode M's camera walk reads its own carrier in the

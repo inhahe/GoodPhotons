@@ -107,11 +107,11 @@ struct JSpec {
 // than everywhere next to it. Device twin dSpecCellsAt.
 template <typename T>
 inline double specCellsAt(const SpecCells& c, const T* r, double lam) {
-    const int i = c.cellOf(lam);
+    int b;
+    const int i = c.cellOf(lam, &b);
     const double li = c.lam[i];
     const int o = lam < li ? i - 1 : i + 1;
     if (o < 0 || o >= c.n || !(std::fabs(c.lam[o] - li) > 0.0)) return (double)r[i];
-    const int b = bandBinOf(lam);
     const int bo = o < c.first[b] ? b - 1 : (o >= c.first[b] + c.count[b] ? b + 1 : b);
     if (bo == b || !c.smooth[std::max(b, bo)]) return (double)r[i];
     const double f = (lam - li) / (c.lam[o] - li);
@@ -156,13 +156,14 @@ struct JSpecRun {
     // k: a gel opaque there, a coin whose branch is impossible there, glass dark enough to
     // underflow. A walk drawn at such a wavelength dies at that event and makes no merge beyond
     // it, at any wavelength, so the walks that pass stand in for it: snap() divides every merge
-    // past a hole by the share of the camera wavelength's density (`walkDensity`) left open, as
+    // past a hole by the share of the camera wavelength's density (`walkMass`) left open, as
     // SPECGATHER's support correction does (photonmap_render.h SpecThr::p). Which cells are holes
     // depends on the branches the walk took, never on its own wavelength, so the division stays
     // unbiased. The media term is not marked: a ratio-tracking estimate's zeros are one
-    // realization's. Null `walkDensity` turns the correction off.
+    // realization's. `walkMass`: that density's mass in each of the n cells (Scene::camCellMass,
+    // SpecCells::mass for a walk drawn from the emission sampler); null turns the correction off.
     uint64_t hole = 0;
-    const EmissionSampler* walkDensity = nullptr;
+    const double* walkMass = nullptr;
     static_assert(JSpec::K <= 64, "JSpecRun::hole holds one bit per cell");
     explicit JSpecRun(const SpecCells& c) : cells(&c), n(c.n < K ? c.n : K) {
         for (int k = 0; k < n; ++k) r[k] = 1.0;
@@ -172,10 +173,10 @@ struct JSpecRun {
     // The share of the camera wavelength's density whose walk could have taken every branch and
     // carried every weight this one did (1 with no hole): its mass in the cells left open.
     double supportShare() const {
-        if (!hole || !walkDensity) return 1.0;
+        if (!hole || !walkMass) return 1.0;
         double open = 0.0;
         for (int k = 0; k < n; ++k)
-            if (!(hole >> k & 1u)) open += walkDensity->cdfAt(cells->hi[k]) - walkDensity->cdfAt(cells->lo[k]);
+            if (!(hole >> k & 1u)) open += walkMass[k];
         // Every cell a hole while the walk itself passed: the cells cannot resolve the support,
         // and the walk's own wavelength serves (SpecThr::rescale's fallback).
         return (open > 0.0) ? open : 1.0;
@@ -269,13 +270,16 @@ inline double jDispWeight(const JSpec& cs, double lam) {
 // A DEPOSIT-folded beam (PhotonBeam::achro == 1) carries one colour, its emitter's cieMean,
 // rather than a wavelength, so at() has nothing to evaluate. Mode J folds only beams whose
 // light path met no chromatic factor (bdpt.h depositSeg), whose spectrum is exactly the
-// emitter's SPD. The camera-corrected colour is then the emitter's fold quadrature, reweighted
-// bin by bin: sum_k foldCie[k] * r(foldLam[k]). sum_k foldCie[k] == cieMean is an identity
-// (scene.h), so a flat carrier reproduces the stored colour.
+// emitter's SPD. The camera-corrected colour is then the emitter's CIE response reweighted cell
+// by cell: sum_k cellCie[k] * r[k], the carrier's own cells (Emitter::cellCie), exact for the
+// carrier as the cuts leave it, flat across a cell -- a gel stepping on a cell's end takes its
+// cells whole on either side, where a quadrature read at points (foldLam) took a whole share of the
+// emission on one side of a step it straddled. sum_k cellCie[k] == cieMean exactly (scene.h), so a
+// flat carrier reproduces the stored colour.
 inline Vec3 jSpecFoldColor(const JSpec& cs, const Emitter& em, const Vec3& fallback) {
-    if (em.foldN <= 0) return fallback;
+    if (!cs.cells || em.cellCie.size() != (size_t)cs.cells->n) return fallback;
     Vec3 c{0, 0, 0};
-    for (int k = 0; k < em.foldN; ++k) c += em.foldCie[k] * cs.at(em.foldLam[k]);
+    for (int k = 0; k < cs.cells->n; ++k) c += em.cellCie[(size_t)k] * (double)cs.r[k];
     return c;
 }
 
@@ -1135,7 +1139,7 @@ inline Vec3 gatherPhotonBeamsW(const Scene& scene, const Renderer& mats, const B
             const Emitter* flat = flatFoldEmitter(b);
             if (flat && flat->foldN > 0) {
                 // Constant over the segment for one emitter, and most beams in a frame share
-                // one: computed once per run of them (it is 12 reads of the carrier).
+                // one: computed once per run of them (a pass over the carrier's cells).
                 if ((int)b.srcEm != foldEm) {
                     foldEm = (int)b.srcEm;
                     foldCol = jSpecFoldColor(*camSpec, *flat, bm.cie[bh.idx]);

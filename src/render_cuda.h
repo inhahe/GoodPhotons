@@ -747,7 +747,7 @@ bool cudaLatticeProbe(const unsigned long long* idx, int n, double* out);
 void cudaJSurfTapArm(int n, int stride);
 bool cudaJSurfTapTake(std::vector<JSurfTapVertex>& eye, std::vector<int>& nE,
                       std::vector<double>& lam, std::vector<JSurfTapHalf>& halves, int& stride);
-// The device's own weight (DSurfMergeW, its bins read by dSpecBinAt) of each state against the
+// The device's own weight (DSurfMergeW, its bins read by dChromaBinAt) of each state against the
 // half it names: out[i] for states[i]. False if there is no device or the launch failed.
 bool cudaJSurfWEval(const std::vector<JSurfTapHalf>& halves,
                     const std::vector<JSurfTapState>& states, std::vector<double>& out);

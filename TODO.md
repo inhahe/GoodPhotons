@@ -595,6 +595,8 @@ Then the rest of 4.2-4.6 in their order, 4.7's bookkeeping alongside whatever to
 - [x] **SPECGATHER-CELL-CENTROID** (0.451.12) — each carrier cell read at the emission's centroid in it, not its
   middle (a line behind a ramp read 0.83 in modes M and S), and the spectral NEE weighted by each light's own
   emission in a cell (SPECNEE-LINE-LIGHT: a glossy wall under the line read 0.58); known-issues.
+- [x] **REVIEW-0464** (0.451.28) — the Opus (xhigh) review of 0.451.27: the fiber table's cache, the device
+  code's float log2, the cells' own masses for the support, J and U told of the cuts; known-issues REVIEW-0464.
 - [x] **JSPEC-BIN-RESOLUTION** (0.451.27) — the beam gather's carrier and mode J's on the scene's cells too,
   each cell a 16-bit log code on the device (104 B a carrier); check_jfog_glass's `gelkink` (a bend between two
   bins' centres) J 0.84 and M 0.85 of mode R before, 1.00 / 1.00-1.015 now; known-issues.

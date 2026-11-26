@@ -2,6 +2,7 @@
 // Phase 0 uses std::function for flexibility (CPU only). A POD/tagged form will
 // replace this when we port the hot loop to GPU.
 #pragma once
+#include <atomic>
 #include <functional>
 #include <vector>
 #include <cmath>
@@ -318,10 +319,6 @@ struct EmissionSampler {
     std::vector<double> cdf;   // size N+1
     double step = 1.0;
     double integral = 0.0;     // integral of SPD over range
-    // The density's mass in each of the uniform kBandProbeBins bins, which mode J's support rule divides
-    // by (JSpecRun::supportShare, the device's c_jBinQ; mode M's and S's take SpecCells::mass). Filled by
-    // build(), once, so a walk reads it rather than walking the CDF.
-    double binMass[kBandProbeBins] = {};
 
     void build(const Spectrum& spd, double stepNm = 1.0) {
         step = stepNm;
@@ -335,11 +332,6 @@ struct EmissionSampler {
         }
         integral = acc;
         if (acc > 0) for (auto& c : cdf) c /= acc; // normalise to [0,1]
-        for (int k = 0; k < kBandProbeBins; ++k) {
-            const double lo = LAMBDA_MIN + k * (LAMBDA_MAX - LAMBDA_MIN) / (double)kBandProbeBins;
-            const double hi = LAMBDA_MIN + (k + 1) * (LAMBDA_MAX - LAMBDA_MIN) / (double)kBandProbeBins;
-            binMass[k] = cdfAt(hi) - cdfAt(lo);
-        }
     }
 
     // Invert the CDF at a supplied uniform u in [0,1). Sets pdf (per nm) and
@@ -430,6 +422,11 @@ struct SpecCells {
     // Per uniform bin k >= 1, whether the folded spectra are continuous across bin k's lower end
     // (chooseSpecCuts' `smooth`; all 1 until Scene::buildSpecCells sets them).
     unsigned char smooth[kBandProbeBins];
+    // A number no other grid in the process has had, drawn again by every build() and setMass(), so a table
+    // taken at the cells' wavelengths (hairSigmaCells) knows when the grid it was taken on has moved, at
+    // the same address or another grid's.
+    unsigned gen = 0;
+    static unsigned nextGen() { static std::atomic<unsigned> g{0}; return ++g; }
     SpecCells() { build({}); }
 
     // The grid with cuts at `cuts` (nm): one cell a bin and no cut but the bins' own ends where there
@@ -468,8 +465,9 @@ struct SpecCells {
         }
         for (int i = 0; i < n; ++i) mass[i] = 0.0;
         for (int k = 0; k < kBandProbeBins; ++k) smooth[k] = 1;
+        gen = nextGen();
     }
-    // The walk density's mass in each cell, as EmissionSampler::binMass has it in each bin, and the
+    // The walk density's mass in each cell, and the
     // wavelength the cell is read at: the density's centroid in it, where the light's power in the cell
     // sits (a line's own wavelength), so a factor near linear across the cell -- what chooseSpecCuts
     // leaves it -- gives its photons the value their wavelengths average to; the middle where the
@@ -481,11 +479,13 @@ struct SpecCells {
             const double m = walk.massMoment(lo[i], hi[i], m1);
             if (m > 0.0) lam[i] = std::min(hi[i], std::max(lo[i], m1 / m));
         }
+        gen = nextGen();
     }
     // The cell `w` (nm) falls in; the end cells below and above the band. A cut belongs to the cell
-    // above it.
-    int cellOf(double w) const {
+    // above it. `*bin`, where given: the uniform bin it is in.
+    int cellOf(double w, int* bin = nullptr) const {
         const int b = bandBinOf(w);
+        if (bin) *bin = b;
         int c = first[b];
         for (int e = c + count[b] - 1; c < e && w >= hi[c]; ++c) {}
         return c;

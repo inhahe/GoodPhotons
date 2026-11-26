@@ -1574,10 +1574,10 @@ struct DScene {
     // sliced by DMaterial::recRoughStopOff/recRoughStopN. Null when no scalar record is bound.
     const DRecScalarStop* recScalarStops;
     const DEmitter*  emitters; int nEmitters;
-    // JSPEC (0.386.1): each emitter's spectral fold quadrature (scene.h Emitter::foldLam/foldCie),
-    // DJSPEC_FOLD x {lam, X, Y, Z} per emitter, zero past its foldN. Read only when a mode-J merge
-    // re-colours a deposit-folded beam for a chromatic camera path (dJSpecFoldColor).
-    const float*     emFold;
+    // JSPEC: each emitter's CIE response in each carrier cell (scene.h Emitter::cellCie), nSpecCells x
+    // {X, Y, Z} per emitter. Read only when a mode-J merge re-colours a deposit-folded beam for a chromatic
+    // camera path (dJSpecFoldColor).
+    const float*     emCellCie;
     // 1 / (sum over the 1 nm grid of the emitter's SPD), per emitter: emitSpd(lambda) * this is its
     // spectral density per nm, which a windowed merge reads for a flat-folded beam (0.386.2).
     const float*     emSpdInv;
@@ -1648,7 +1648,7 @@ struct DScene {
     const double*    camCdf; const double* camVisCdf; const double* camWCdf;
     double           camG;
     const DMedium*   media;    // participating media array (superposed); null if none
-    // UPBP-W-CHROMATIC: media[m]'s sigma_t at the JSpec bins, chromaSig[m*DCHROMA_K + b], when
+    // UPBP-W-CHROMATIC: media[m]'s sigma_t at the uniform bins, chromaSig[m*DCHROMA_K + b], when
     // some medium's extinction varies with wavelength; null otherwise (DChromaRun).
     const double*    chromaSig;
     DBowTab bow;   // gather-time spectral fold tables (FOLD-GPU (2)); bow.tab null = none
@@ -9476,10 +9476,6 @@ FT_DEVGLOBAL(__constant__ int c_jTrSpec, = 0);
 FT_DEVGLOBAL(__constant__ int c_jChroma, = 1);
 FT_DEVGLOBAL(__constant__ double c_jDispWin, = 10.0);   // the dispersive window's width, nm (host g_jDispWinNm)
 FT_DEVGLOBAL(__constant__ int    c_jDispAll, = 0);      // -jdispall (host g_jDispAll)
-// The camera wavelength's density mass in each carrier cell (DScene::specCells), for DJSpecRun's support
-// (host twin JSpecRun::supportShare): uploaded by renderBdptCuda and vcmSessionBegin from the emission
-// sampler, which both device walks draw from. All zero turns it off.
-FT_DEVGLOBAL(__constant__ double c_jCellQ[kSpecCellsMax]);
 // Merges after a specular bounce read the light-side density's 0 as 1 (host bdpt::g_jDeltaMerge,
 // MODE-J-SDS, 0.387.0). 0 = the pre-0.387.0 reading, for A/B runs (FTRACE_JDELTA=0).
 FT_DEVGLOBAL(__constant__ int    c_jDeltaMerge, = 1);
@@ -9640,24 +9636,28 @@ __device__ static inline int dBandBinOf(double lam) {
     const int b = (int)((lam - DLMIN) / (DLMAX - DLMIN) * kBandProbeBins);
     return b < 0 ? 0 : (b >= kBandProbeBins ? kBandProbeBins - 1 : b);
 }
-// The cell of `c` wavelength `lam` falls in (host twin SpecCells::cellOf).
-__device__ static inline int dSpecCellOf(const DSpecCells* c, Real lam) {
+// The cell of `c` wavelength `lam` falls in (host twin SpecCells::cellOf), and in `*bin`, where given, the
+// uniform bin it is in.
+__device__ static inline int dSpecCellOf(const DSpecCells* c, Real lam, int* bin = nullptr) {
     const int b = dBandBinOf((double)lam);
+    if (bin) *bin = b;
     int i = c->first[b];
     for (int e = i + c->count[b] - 1; i < e && (double)lam >= c->hi[i]; ++i) {}
     return i;
 }
-#define DJSPEC_FOLD 12     // scene.h kFoldBins (static_assert'ed at the upload)
 // A carrier cell as it rides on a segment or a vertex: -DJQ_SCALE log2 of its ratio to the largest cell's,
 // rounded, DJQ_DEAD for exactly 0. Off by at most 0.07 % of the value, as far down as a float reaches
 // (2^-128) -- half floats stop at 6e-8, where dark glass's cells still live -- and the geometric
 // interpolation DJSpec::at makes is a straight line between two codes.
 #define DJQ_SCALE 512.0
 #define DJQ_DEAD  0xFFFFu
+// In float: the code's step is 1/512 of a doubling, which a float's log2 resolves a hundred times over, and a
+// carrier takes one a cell at every snapshot, where the double's costs 32-64 times the rate on a consumer GPU.
 __device__ static inline unsigned short dJQEncode(double x) {   // x in [0, 1]
-    if (!(x > 0.0)) return (unsigned short)DJQ_DEAD;
-    const double c = -log2(x) * DJQ_SCALE + 0.5;
-    return (unsigned short)(c < 65534.0 ? (unsigned)c : 65534u);
+    const float xf = (float)x;   // below a float's least, nothing a code could hold either
+    if (!(xf > 0.0f)) return (unsigned short)DJQ_DEAD;
+    const float c = -log2f(xf) * (float)DJQ_SCALE + 0.5f;
+    return (unsigned short)(c < 65534.0f ? (unsigned)c : 65534u);
 }
 __device__ static inline float dJQDecode(unsigned short q) {
     return q == DJQ_DEAD ? 0.0f : exp2f(-(float)q * (float)(1.0 / DJQ_SCALE));
@@ -9684,11 +9684,11 @@ struct DJSpec {   // 104 B, unpadded: one rides on every recorded segment and ey
     // smooth join between two bins, geometric -- a line between two codes -- where both are live.
     __device__ double at(const DSpecCells* c, double lam) const {
         if (!any) return 1.0;
-        const int i = dSpecCellOf(c, (Real)lam);
+        int b;
+        const int i = dSpecCellOf(c, (Real)lam, &b);
         const double li = c->lam[i];
         const int o = lam < li ? i - 1 : i + 1;
         if (o < 0 || o >= c->n || !(fabs(c->lam[o] - li) > 0.0)) return (double)dJQDecode(q[i]);
-        const int b = dBandBinOf(lam);
         const int bo = o < c->first[b] ? b - 1 : (o >= c->first[b] + c->count[b] ? b + 1 : b);
         if (bo == b || !c->smooth[bo > b ? bo : b]) return (double)dJQDecode(q[i]);
         const float f = (float)((lam - li) / (c->lam[o] - li));
@@ -9715,11 +9715,13 @@ struct DJSpecRun {
         any = 0; logS = 0.0; disp = 0; lamC = 0.0; invPdfC = 0.0; hole = 0ull;
     }
     __device__ Real lamOf(int k) const { return (Real)cells->lam[k]; }   // cell k's wavelength
-    // The share of the camera wavelength's density whose walk could have come this way (host twin).
+    // The share of the camera wavelength's density whose walk could have come this way (host twin): its
+    // mass in the cells left open, the cells' own -- both device walks draw from the emission sampler
+    // (dSampleSceneLambda), whose masses SpecCells::setMass gave them.
     __device__ double supportShare() const {
         if (!hole) return 1.0;
         double open = 0.0;
-        for (int k = 0; k < n; ++k) if (!(hole >> k & 1ull)) open += c_jCellQ[k];
+        for (int k = 0; k < n; ++k) if (!(hole >> k & 1ull)) open += cells->mass[k];
         return (open > 0.0) ? open : 1.0;
     }
     __device__ void markDisp(double lam, double invPdf) {
@@ -9804,18 +9806,19 @@ struct DJBase {
 };
 
 // Re-colour a DEPOSIT-folded beam (achro == 1) for a chromatic camera path, through its emitter's
-// fold quadrature (host twin jSpecFoldColor). False if the table or the emitter is unknown, and the
-// caller keeps the record's colour.
+// CIE response in each carrier cell (host twin jSpecFoldColor, where the why is). False if the table or
+// the emitter is unknown, and the caller keeps the record's colour.
 __device__ static bool dJSpecFoldColor(const DScene& sc, const DJSpec& js, int em,
                                        double& cx, double& cy, double& cz) {
     cx = cy = cz = 0.0;
-    if (!sc.emFold || em < 0 || em >= sc.nEmitters) return false;
-    const float* t = sc.emFold + (size_t)em * DJSPEC_FOLD * 4;
-    for (int k = 0; k < DJSPEC_FOLD; ++k) {
-        const float* e = t + k * 4;
-        if (e[1] == 0.f && e[2] == 0.f && e[3] == 0.f) continue;
-        const double q = js.at(sc.specCells, (double)e[0]);
-        cx += (double)e[1] * q; cy += (double)e[2] * q; cz += (double)e[3] * q;
+    if (!sc.emCellCie || em < 0 || em >= sc.nEmitters) return false;
+    const int n = sc.nSpecCells;
+    const float* t = sc.emCellCie + (size_t)em * (size_t)n * 3;
+    for (int k = 0; k < n; ++k) {
+        const float* e = t + k * 3;
+        if (e[0] == 0.f && e[1] == 0.f && e[2] == 0.f) continue;
+        const double q = (double)dJQDecode(js.q[k]);
+        cx += (double)e[0] * q; cy += (double)e[1] * q; cz += (double)e[2] * q;
     }
     return true;
 }
@@ -22093,7 +22096,7 @@ struct DSurfTap {
     JSurfTapHalf* halves;    // [n * stride], by camera vertex
 };
 FT_DEVGLOBAL(__constant__ DSurfTap c_surfTap, = {0, 0, nullptr, nullptr, nullptr, nullptr});
-static_assert(kJSurfTapK == DCHROMA_K, "the tap's bins are DJSpec's");
+static_assert(kJSurfTapK == DCHROMA_K, "the tap's bins are the chromatic MIS tables'");
 static_assert(kJSurfTapMaxV == BDPT_MAXV_OF(BDPT_DEEPDEPTH), "the tap keeps a deep walk whole");
 
 __device__ static void dSurfTapPath(long long gidx, const DVertex* eye, int nE, double lam) {

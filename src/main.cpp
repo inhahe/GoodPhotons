@@ -16405,7 +16405,7 @@ static int checkJSurfTap(const Scene& scene, int maxDepth, const BeamMap* beams,
                 }
             }
             // The weight at photon states that reach every term: depths on both sides of the
-            // cap, densities over six decades, and wavelengths over JSpec's grid and past its ends.
+            // cap, densities over six decades, and wavelengths over the uniform bins and past their ends.
             const int half = (int)evalH.size();
             evalH.push_back(dh);
             for (int m = 0; m < 8; ++m) {
@@ -30093,7 +30093,7 @@ static int run(int argc, char** argv) {
     }
 
     for (const RenderCam& rc : toRender)
-        if (rc.mode == 'M' || rc.mode == 'S') { reportSpecCells(scene); break; }
+        if (rc.mode == 'M' || rc.mode == 'S' || rc.mode == 'J' || rc.mode == 'U') { reportSpecCells(scene); break; }
 
     // The footprint probes of modes M and S, and of J's and U's merges, read which side of a closed
     // solid a face is met from (Hit::solid): marked once for the whole batch, before the meter below

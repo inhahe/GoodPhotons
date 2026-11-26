@@ -1386,7 +1386,8 @@ reads the carrier as mode J's does: `photonGather`'s `gatherBeams` (device: `dGa
 peak, the peak in `logS`) through `BeamWeightOne`, scales the result by `JSpec::beta(thr)`, and hands
 it the dielectric the segment runs through, whose absorption over the partial segment is then taken
 at each beam's wavelength. A deposit-folded beam (`achro == 1`) is re-coloured through its emitter's
-fold quadrature (`jSpecFoldColor`, computed once per emitter per segment). The gather-time bow fold
+CIE response in each carrier cell (`jSpecFoldColor`, `Emitter::cellCie`, computed once per emitter per
+segment). The gather-time bow fold
 (`achro == 2`) is declined while the carrier is live -- the carrier is a function of λ, and the bow
 table holds the integral without it -- and the beam counts at its own wavelength, as an unfolded
 beam. Nothing chromatic met and no glass around the segment: two nulls, and the gather as before.
@@ -3147,7 +3148,13 @@ segment or vertex keeps holds each cell as a 16-bit code, -512 log2 of its ratio
 (`dJQEncode`; the largest in `logS`): within 0.07 % of the value down to 2^-128, where half floats
 stop at 6e-8, and the geometric interpolation is a line between two codes -- 104 B a carrier
 where the 24 float bins took 120 (JSPEC-CARRIER-SIZE). The chromatic MIS tables (below) stay on the
-uniform bins (`kChromaBins`, `chromaBinAt`): a weight the strategies share needs no finer grid. A segment snapshots the carrier at its origin (`PathSeg::spec`), and
+uniform bins (`kChromaBins`, `chromaBinAt`): a weight the strategies share needs no finer grid. The cuts and
+joins are mode M's -- they follow the curves its walk folds, specular slots, coefficients, media -- and
+mode J's walk folds diffuse colours besides, which are smooth and move none of them. The carrier is one
+product of every factor, so where a folded spectrum steps across a join (a gel's edge on a bin's end) it
+holds each side's read for all of them: a smooth factor beside it, a red wall's rise, reads stepped across
+that join too, within the two cells beside it, as mode M's walk reads every cell -- where the uniform
+carrier, interpolating everywhere, smeared the gel's step instead (REVIEW-0464). A segment snapshots the carrier at its origin (`PathSeg::spec`), and
 the point merges read it as it arrives at their vertex (`JSpecWalk::vert`; the device rebuilds it
 from the previous segment's snapshot). What is folded, each against the value `beta` took at λ_c:
 - **Lambertian, glossy, diffuse-transmit:** the lobe's albedo. Any lobe coin cancels, because the
@@ -3169,8 +3176,13 @@ chromatic has `any == false`, and its merges are bit-for-bit the old arithmetic.
 `at()` has nothing to read. Mode J now folds only a path that met nothing chromatic
 (`PathSeg::fFlat`), whose spectrum is exactly its emitter's SPD, and records the emitter
 (`PhotonBeam::srcEm`, uploaded as `DBeamRec::emIdx`). For a chromatic camera path the merge
-re-colours the beam through that emitter's own fold quadrature, Σ_k foldCie[k] · r(foldLam[k])
-(`jSpecFoldColor`). The identity Σ foldCie = cieMean makes that exact at r ≡ 1. A path that DID
+re-colours the beam through that emitter's CIE response in each of the carrier's cells, Σ_k cellCie[k] ·
+r[k] (`jSpecFoldColor`; `Emitter::cellCie`, the 1 nm grid's CIE · SPD summed into the cells, over the
+SPD's sum; the device's `DScene::emCellCie`). The identity Σ cellCie = cieMean makes that exact at r ≡
+1, and it is exact for the carrier as the cuts leave it, flat across a cell. (0.451.27 read it at the
+fold quadrature's 12 points, Σ foldCie[k] · r(foldLam[k]): a point nearest a gel's step took its
+twelfth of the emission wholly on one side, the fog behind `_jfog_gel` R 0.96 G 1.04 of mode R; the
+uniform carrier's interpolation across the step had blurred that into a fraction. 0.451.28.) A path that DID
 meet a chromatic factor deposits the `-beamspec` bundle instead, whose members each have a
 wavelength. `gallery_rain`'s sunlit cloud keeps its fold. A beam off a coloured floor becomes a
 bundle.

@@ -359,7 +359,7 @@ inline void sppmVisiblePoint(const Scene& scene, Ray ray, Pcg32& rng, bool diffr
                 }
                 if (!passedThru) {
                     pastDiffuse = true;   // a fibre's scattering: no glow is seen past it
-                    const double* bins = hairSigmaCells(scene, m, h);
+                    const double* bins = hairSigmaCells(scene, *sthr.cells, m, h);
                     sthr.mul([&](double lamK) {
                         const HairShade hk = hairShadeRetint(scene, m, h, lamK, hs,
                                                              bins ? bins[sthr.binOf(lamK)] : -1.0);

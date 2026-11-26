@@ -1305,6 +1305,11 @@ struct Emitter {
     // buildSpecCells): the spectral NEE's quadrature weights (neeLightSpecGlossy), exact for a line
     // whatever cell it falls in, where a cell's width times the SPD at its wavelength is not.
     std::vector<double> cellEmit;
+    // Its CIE response in each of those cells, over its emission: sum over the 1 nm grid's samples in cell k of
+    // CIE(lam) * SPD(lam), over spdDen (each sample whole in the cell it falls in, so the cells sum to cieMean
+    // exactly, as foldCie's bins do). What a deposit-folded beam's colour is under a chromatic camera carrier,
+    // cell by cell (jSpecFoldColor; the device's DScene::emCellCie).
+    std::vector<Vec3> cellCie;
     Spectrum spdFn = constantSpectrum(0.0); // raw SPD, for backward per-lambda eval
     double emitIntegral = 0.0;
     double power = 0.0;       // emitIntegral * geomWeight (which carries selW, the selection weight)
@@ -2511,6 +2516,10 @@ struct Scene {
     // camera path samples its wavelengths from, invPdf = camG / (g(lambda) + fireG(lambda)).
     EmissionSampler camSampler;
     double camG = 0.0;
+    // camSampler's mass in each carrier cell (specCells): what mode J's support rule weighs the cells a
+    // walk left open by (JSpecRun::walkMass). Mode U's walk is drawn from emitSampler, whose masses the
+    // cells hold themselves (SpecCells::mass).
+    std::vector<double> camCellMass;
     // What a backward camera path actually DRAWS its wavelengths from: camSampler's g(lambda)
     // times a window over the visible band, so no draw is spent where the eye sees nothing --
     // for a 1500 K fire most of g lies in the near infrared. The radiance estimate keeps the
@@ -3912,6 +3921,14 @@ struct Scene {
         for (int k = 0; k < kBandProbeBins; ++k) specCells.smooth[k] = (unsigned char)smooth[(size_t)k];
         specCells.setMass(emitSampler);
         for (Emitter& e : emitters) {
+            e.cellCie.assign((size_t)specCells.n, Vec3{0, 0, 0});
+            if (e.spdDen > 0.0) {
+                for (double lam = LAMBDA_MIN; lam <= LAMBDA_MAX; lam += 1.0) {   // foldCie's grid
+                    const double s = e.spdFn(lam);
+                    if (s > 0.0) e.cellCie[(size_t)specCells.cellOf(lam)] += Vec3(cieX(lam), cieY(lam), cieZ(lam)) * s;
+                }
+                for (Vec3& c : e.cellCie) c = c * (1.0 / e.spdDen);
+            }
             e.cellEmit.assign((size_t)specCells.n, 0.0);
             for (int k = 0; k < specCells.n; ++k)
                 e.cellEmit[(size_t)k] = e.spd.integral * (e.spd.cdfAt(specCells.hi[k]) - e.spd.cdfAt(specCells.lo[k]));
@@ -3919,7 +3936,7 @@ struct Scene {
         if (left > 0.0)
             std::fprintf(stderr, "[specgather] warning: the scene's spectra want more than %d cuts of the "
                                  "spectral carrier's bins; the worst left reads %.1f %% of its range off "
-                                 "(modes M and S)\n", kSpecCutsMax, 100.0 * left);
+                                 "(modes M, S, J and U)\n", kSpecCutsMax, 100.0 * left);
     }
 
     // The wavelength densities of a BACKWARD camera path (backward.h renderRows) and the
@@ -3977,6 +3994,9 @@ struct Scene {
             };
             mm.fluoInSampler.build(prod, emitSampler.step);
         }
+        camCellMass.assign((size_t)specCells.n, 0.0);
+        for (int k = 0; k < specCells.n; ++k)
+            camCellMass[(size_t)k] = camSampler.cdfAt(specCells.hi[k]) - camSampler.cdfAt(specCells.lo[k]);
     }
 
     // Fire `f`'s share of the fires' power, and the fire a uniform u in [0, 1) picks in proportion

@@ -1,12 +1,10 @@
-# Mode M's beam gather in a fog seen through a gel whose step lies on a boundary of the 24-bin spectral
-# carrier, lit by a line inside the bin above it (known-issues REVIEW-0458). The gel passes nothing below
-# 595 nm and 0.9 above it -- 360 + 12 x 470 / 24, bin 12's lower edge -- so bins 11 and 12 are each flat,
-# and no cut splits either; the lamp emits a 1 nm line at 610 nm, in bin 12. The beam gather reads the
-# camera walk's carrier on the uniform bins, each at its centre (SpecThr::toJSpec, atBinCentre): bin
-# 12's read lies at the line, and carried to its centre along the line to bin 11's (0) it read 0.79 there,
-# the fog 0.74-0.76 of mode R (0.451.15), where the step between the two is no line to carry it along
-# (SpecCells::smooth).
-# Mode J's carrier is its own, on the uniform bins (each at its centre), and reads the gel exactly here.
+# Modes M's (-beams) and J's beam merges in a fog seen through a gel whose step lies on a boundary of the
+# 24 uniform bins, lit by a line inside the bin above it (known-issues REVIEW-0458). The gel passes nothing
+# below 595 nm and 0.9 above it -- 360 + 12 x 470 / 24, bin 12's lower edge -- so bins 11 and 12 are each
+# flat, and no cut splits either; the lamp emits a 1 nm line at 610 nm, in bin 12. The carriers read bin
+# 12's cell where the line is and hold it there: the join below it is rough (SpecCells::smooth: the step),
+# no line to carry the read along toward bin 11's 0 -- which the beam gather once did, the fog 0.74-0.76 of
+# mode R (0.451.15).
 # _jfog_gel's fog box over a grey floor, lit by a big sphere lamp from above; every mode at -max-bounce 32.
 
 scene {

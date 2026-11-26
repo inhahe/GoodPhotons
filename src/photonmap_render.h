@@ -583,7 +583,7 @@ struct SpecThr {
     }
 };
 
-// Says, where the scene's tables split the carrier's bins (SpecCells), where: a mode M or S render's
+// Says, where the scene's tables split the carrier's bins (SpecCells), where: a mode M, S, J or U render's
 // opening line beside its others, once a scene (as CudaSceneHold tells scenes apart), however many of
 // the routes that start one call it.
 inline void reportSpecCells(const Scene& scene) {
@@ -1468,7 +1468,7 @@ inline Vec3 photonGather(const Scene& scene, const PhotonMap& pm, Ray ray, doubl
                             lamG[k] = sthr.lamOf(k);
                             ratG[k] = sthr.ratio(lamG[k]);
                         }
-                        const double* sigB = hairSigmaCells(scene, m, h);
+                        const double* sigB = hairSigmaCells(scene, *sthr.cells, m, h);
                         didSpec = bwNee.neeLightSpecHair(scene, h, m, hs, lamG, ratG, sthr.n,
                                                          lambda, thr, sigB, rng, xyz);
                         if (didSpec) L += Vec3(xyz[0], xyz[1], xyz[2]);
@@ -1522,7 +1522,7 @@ inline Vec3 photonGather(const Scene& scene, const PhotonMap& pm, Ray ray, doubl
                     // medulla is live depends on the wavelength.
                     // the absorption per cell: a per-material table when the colour is constant
                     // (hairSigmaCells), else inverted at each wavelength
-                    const double* bins = hairSigmaCells(scene, m, h);
+                    const double* bins = hairSigmaCells(scene, *sthr.cells, m, h);
                     sthr.mul([&](double lamK) {
                         // this wavelength's shade, folded from the sample's angular half where
                         // both fibers are solid and evaluated in full where not (hairFoldFCos)
