@@ -578,7 +578,11 @@ float reaches -- half floats, JSPEC-CARRIER-SIZE's plan, flush below 6e-8, where
 live -- and the geometric interpolation a line between two codes; 104 B a carrier against 120 (the
 segment queue's DWfSeg 424 -> 408 B). SpecThr::toJSpec copies the cells (atBinCentre is gone). The test
 is check_jfog_glass's `gelkink` (scenes/_jfog_gelkink.ftsl): 0.451.27 reads the fog R 1.000 / 0.998 of
-mode R in mode J (GPU / CPU), 1.000 / 1.015 in mode M -beams.
+mode R in mode J (GPU / CPU), 1.000 / 1.015 in mode M -beams. Every chromatic mode J and U image moves a
+little (check_bitid at 0.451.28 against 0.451.26: means within 0.0005 %, a pixel of its low-sample frames
+at most 15 % on the GPU, 4 % on the CPU, as re-weighted merges draw their noise again); modes R, D, B, M
+and S are identical (the GPU's M and S to their last bits); the rest of the suite reads as before
+(check_jchroma X/Y 0.998 and 0.994, Z/Y 0.997 and 1.003 on GPU and CPU).
 
 ## DONE (2026-11-25, 0.451.26): REVIEW-0463 — what the Opus (xhigh) review of 0.451.24-0.451.25 found
 
